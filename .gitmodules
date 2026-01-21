@@ -1,6 +1,3 @@
-[submodule "modules/tiktok_transcripter"]
-	path = modules/tiktok_transcripter
-	url = git@github.com:Sididi/tiktok-transcripter.git
 [submodule "modules/anime_searcher"]
 	path = modules/anime_searcher
 	url = git@github.com:Sididi/anime-searcher.git
