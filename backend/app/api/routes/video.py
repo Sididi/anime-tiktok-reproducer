@@ -96,20 +96,24 @@ async def get_source_video(
 
     # If not a valid full path, treat as an episode name and search for it
     if not is_valid:
-        episode_name = decoded_path  # e.g., "episode_02"
+        episode_name = decoded_path  # e.g., "[9volt] Hanebado! - 03 [D0B8F455]"
         found_path = None
 
         for src_path in source_dirs:
             if src_path.is_dir():
-                # Search for matching file in directory
+                # Search for matching file in directory and subdirectories
                 for ext in VIDEO_EXTENSIONS:
+                    # Try direct path first
                     candidate = src_path / f"{episode_name}{ext}"
                     if candidate.exists():
                         found_path = candidate
                         break
-                    # Also search recursively
-                    for match in src_path.rglob(f"{episode_name}{ext}"):
-                        found_path = match
+                    # Search recursively using rglob for subdirectories
+                    for match in src_path.rglob(f"*{ext}"):
+                        if match.stem == episode_name:
+                            found_path = match
+                            break
+                    if found_path:
                         break
                 if found_path:
                     break

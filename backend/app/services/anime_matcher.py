@@ -2,6 +2,7 @@
 
 import asyncio
 import sys
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator
@@ -127,16 +128,13 @@ class AnimeMatcherService:
         middle_candidates: list[MatchCandidate],
         end_candidates: list[MatchCandidate],
         scene_duration: float,
-    ) -> tuple[SceneMatch | None, list[AlternativeMatch]]:
+    ) -> SceneMatch | None:
         """
         Find a temporally consistent match across start/middle/end candidates.
-        Returns the best match and up to 5 alternative matches using Weighted Voting.
 
-        Weighted Voting Algorithm:
-        - Score = sum of (similarity * position_weight) for each frame position
-        - Position weights: start=1.0, middle=0.8, end=1.0 (edges more important)
-        - Vote count = number of frame positions that include this episode
-        - Alternatives ranked by score, with vote_count as tiebreaker
+        The algorithm looks for candidates from the same episode where the timestamps
+        follow each other in order (start < middle < end) with a speed ratio between
+        70% and 160% of original speed.
 
         Args:
             start_candidates: Top 5 matches for scene start frame
@@ -145,13 +143,13 @@ class AnimeMatcherService:
             scene_duration: Duration of the scene in the TikTok
 
         Returns:
-            Tuple of (best match or None, list of up to 5 alternative matches)
+            SceneMatch if a consistent match is found, None otherwise
         """
         MIN_SPEED = 0.70  # 70% - slowed down
         MAX_SPEED = 1.60  # 160% - sped up
 
-        # Collect all valid temporal matches
-        all_matches: list[tuple[float, int, SceneMatch]] = []  # (score, vote_count, match)
+        best_match: SceneMatch | None = None
+        best_confidence = 0.0
 
         for start in start_candidates:
             for middle in middle_candidates:
@@ -175,13 +173,10 @@ class AnimeMatcherService:
                     if not (MIN_SPEED <= speed_ratio <= MAX_SPEED):
                         continue
 
-                    # Weighted Voting: edges (start/end) weighted more than middle
-                    # Position weights: start=1.0, middle=0.8, end=1.0
-                    weighted_score = (
-                        start.similarity * 1.0 +
-                        middle.similarity * 0.8 +
-                        end.similarity * 1.0
-                    ) / 2.8  # Normalize to 0-1 range
+                    # Calculate confidence based on similarities and temporal consistency
+                    avg_similarity = (
+                        start.similarity + middle.similarity + end.similarity
+                    ) / 3
 
                     # Bonus for middle frame being roughly in the middle
                     expected_middle = start.timestamp + source_duration / 2
@@ -189,51 +184,201 @@ class AnimeMatcherService:
                     middle_deviation = abs(actual_middle - expected_middle) / source_duration
                     temporal_bonus = max(0, 1 - middle_deviation * 2) * 0.1
 
-                    confidence = weighted_score + temporal_bonus
+                    confidence = avg_similarity + temporal_bonus
 
-                    # Count how many frame positions voted for this episode
-                    vote_count = 3  # All three frames match this episode
+                    if confidence > best_confidence:
+                        best_confidence = confidence
+                        best_match = SceneMatch(
+                            scene_index=0,  # Will be set later
+                            episode=start.episode,
+                            start_time=start.timestamp,
+                            end_time=end.timestamp,
+                            confidence=confidence,
+                            speed_ratio=speed_ratio,
+                            start_candidates=[start],
+                            middle_candidates=[middle],
+                            end_candidates=[end],
+                        )
 
-                    match = SceneMatch(
-                        scene_index=0,  # Will be set later
-                        episode=start.episode,
-                        start_time=start.timestamp,
-                        end_time=end.timestamp,
-                        confidence=confidence,
-                        speed_ratio=speed_ratio,
-                        start_candidates=[start],
-                        middle_candidates=[middle],
-                        end_candidates=[end],
-                    )
-                    all_matches.append((confidence, vote_count, match))
+        return best_match
 
-        # Sort by confidence (desc), then vote_count (desc)
-        all_matches.sort(key=lambda x: (x[0], x[1]), reverse=True)
-
-        # Take top 5 unique episodes for alternatives
-        alternatives: list[AlternativeMatch] = []
-        seen_episodes: set[str] = set()
+    @classmethod
+    def _compute_alternatives(
+        cls,
+        start_candidates: list[MatchCandidate],
+        middle_candidates: list[MatchCandidate],
+        end_candidates: list[MatchCandidate],
+        scene_duration: float,
+    ) -> list[AlternativeMatch]:
+        """
+        Compute up to 7 alternative matches using three different algorithms:
+        - Weighted Average: Up to 3 candidates (averages similarity across frame positions)
+        - Best Frame Winner: Up to 2 candidates (single best match from any frame)
+        - Union of Top-K: Up to 2 candidates (top matches from combined pool)
         
-        for confidence, vote_count, match in all_matches:
-            if match.episode not in seen_episodes:
-                seen_episodes.add(match.episode)
-                alternatives.append(
-                    AlternativeMatch(
-                        episode=match.episode,
-                        start_time=match.start_time,
-                        end_time=match.end_time,
-                        confidence=confidence,
-                        speed_ratio=match.speed_ratio,
-                        vote_count=vote_count,
-                    )
-                )
-                if len(alternatives) >= 5:
-                    break
-
-        # Best match is the first one (if any)
-        best_match = all_matches[0][2] if all_matches else None
-
-        return best_match, alternatives
+        Each algorithm maintains its own seen_episodes set to allow different algorithms
+        to surface the same episode with different timing estimates. This provides more
+        diverse alternatives for manual review.
+        
+        Args:
+            start_candidates: Top 5 matches for scene start frame
+            middle_candidates: Top 5 matches for scene middle frame
+            end_candidates: Top 5 matches for scene end frame
+            scene_duration: Duration of the scene in the TikTok
+            
+        Returns:
+            List of up to 7 AlternativeMatch objects from different algorithms
+        """
+        alternatives: list[AlternativeMatch] = []
+        
+        # ============ Algorithm 1: Weighted Average (up to 3) ============
+        # Aggregate votes by episode across all frame positions
+        seen_weighted_avg: set[str] = set()
+        episode_votes: dict[str, dict] = defaultdict(lambda: {
+            'total_similarity': 0.0,
+            'vote_count': 0,
+            'timestamps': [],
+        })
+        
+        all_candidates = [
+            ('start', start_candidates),
+            ('middle', middle_candidates),
+            ('end', end_candidates),
+        ]
+        
+        for position, candidates in all_candidates:
+            for candidate in candidates:
+                ep = candidate.episode
+                episode_votes[ep]['total_similarity'] += candidate.similarity
+                episode_votes[ep]['vote_count'] += 1
+                episode_votes[ep]['timestamps'].append((position, candidate.timestamp))
+        
+        weighted_avg_alts: list[tuple[float, AlternativeMatch]] = []
+        for episode, data in episode_votes.items():
+            if data['vote_count'] == 0:
+                continue
+                
+            avg_similarity = data['total_similarity'] / data['vote_count']
+            timestamps = sorted(data['timestamps'], key=lambda x: x[1])
+            
+            # Estimate start/end times from available timestamps
+            min_ts = min(t[1] for t in timestamps)
+            max_ts = max(t[1] for t in timestamps)
+            
+            if max_ts - min_ts > 0.5:
+                start_time = min_ts
+                end_time = max_ts
+            else:
+                mid_ts = (min_ts + max_ts) / 2
+                start_time = mid_ts - scene_duration / 2
+                end_time = mid_ts + scene_duration / 2
+                
+            source_duration = end_time - start_time
+            speed_ratio = scene_duration / source_duration if source_duration > 0 else 1.0
+            
+            # Score: vote_count * 10 + avg_similarity (favor more votes)
+            score = data['vote_count'] * 10 + avg_similarity
+            weighted_avg_alts.append((score, AlternativeMatch(
+                episode=episode,
+                start_time=max(0, start_time),
+                end_time=end_time,
+                confidence=avg_similarity,
+                speed_ratio=speed_ratio,
+                vote_count=data['vote_count'],
+                algorithm='weighted_avg',
+            )))
+        
+        # Sort by score and take top 3
+        weighted_avg_alts.sort(key=lambda x: -x[0])
+        for score, alt in weighted_avg_alts[:3]:
+            if alt.episode not in seen_weighted_avg:
+                alternatives.append(alt)
+                seen_weighted_avg.add(alt.episode)
+        
+        # ============ Algorithm 2: Best Frame Winner (up to 2) ============
+        # Take the single highest-confidence match from each frame position
+        seen_best_frame: set[str] = set()
+        best_frame_alts: list[tuple[float, AlternativeMatch]] = []
+        
+        for position, candidates in all_candidates:
+            if not candidates:
+                continue
+            # Get the best candidate from this position
+            best = max(candidates, key=lambda c: c.similarity)
+            
+            # Estimate timing based on position
+            if position == 'start':
+                start_time = best.timestamp
+                end_time = best.timestamp + scene_duration
+            elif position == 'middle':
+                start_time = best.timestamp - scene_duration / 2
+                end_time = best.timestamp + scene_duration / 2
+            else:  # end
+                start_time = best.timestamp - scene_duration
+                end_time = best.timestamp
+            
+            best_frame_alts.append((best.similarity, AlternativeMatch(
+                episode=best.episode,
+                start_time=max(0, start_time),
+                end_time=end_time,
+                confidence=best.similarity,
+                speed_ratio=1.0,  # Assuming 1:1 speed since we estimate from duration
+                vote_count=1,
+                algorithm='best_frame',
+            )))
+        
+        # Sort by similarity and take top 2 unique episodes
+        best_frame_alts.sort(key=lambda x: -x[0])
+        bf_added = 0
+        for sim, alt in best_frame_alts:
+            if alt.episode not in seen_best_frame and bf_added < 2:
+                alternatives.append(alt)
+                seen_best_frame.add(alt.episode)
+                bf_added += 1
+        
+        # ============ Algorithm 3: Union of Top-K (up to 2) ============
+        # Pool all candidates and take top K by raw similarity
+        seen_union_topk: set[str] = set()
+        all_pooled = []
+        for position, candidates in all_candidates:
+            for c in candidates:
+                all_pooled.append((position, c))
+        
+        # Sort by similarity
+        all_pooled.sort(key=lambda x: -x[1].similarity)
+        
+        utk_added = 0
+        for position, c in all_pooled:
+            if c.episode not in seen_union_topk and utk_added < 2:
+                # Estimate timing
+                if position == 'start':
+                    start_time = c.timestamp
+                    end_time = c.timestamp + scene_duration
+                elif position == 'middle':
+                    start_time = c.timestamp - scene_duration / 2
+                    end_time = c.timestamp + scene_duration / 2
+                else:
+                    start_time = c.timestamp - scene_duration
+                    end_time = c.timestamp
+                
+                alternatives.append(AlternativeMatch(
+                    episode=c.episode,
+                    start_time=max(0, start_time),
+                    end_time=end_time,
+                    confidence=c.similarity,
+                    speed_ratio=1.0,
+                    vote_count=1,
+                    algorithm='union_topk',
+                ))
+                seen_union_topk.add(c.episode)
+                utk_added += 1
+        
+        # Final sort: weighted_avg first, then best_frame, then union_topk
+        # Within each algorithm, sort by confidence
+        algorithm_order = {'weighted_avg': 0, 'best_frame': 1, 'union_topk': 2}
+        alternatives.sort(key=lambda x: (algorithm_order.get(x.algorithm, 99), -x.confidence))
+        
+        return alternatives[:7]
 
     @classmethod
     async def match_scenes(
@@ -292,13 +437,16 @@ class AnimeMatcherService:
 
             try:
                 # Extract frames at start, middle, end of scene
-                # Use 100ms (3 frames at 30fps) offset from boundaries to avoid
-                # scene transition artifacts (cross-fades, motion blur, detection errors)
-                FRAME_OFFSET = 0.10  # 100ms offset from scene boundaries
+                # Add 125ms offset from boundaries to avoid transition artifacts
+                FRAME_OFFSET = 0.125  # 125ms offset from scene boundaries
                 
-                start_time = scene.start_time + FRAME_OFFSET
+                scene_duration = scene.end_time - scene.start_time
+                # Ensure we have enough duration for offset
+                safe_offset = min(FRAME_OFFSET, scene_duration / 4)
+                
+                start_time = scene.start_time + safe_offset
                 middle_time = (scene.start_time + scene.end_time) / 2
-                end_time = scene.end_time - FRAME_OFFSET
+                end_time = scene.end_time - safe_offset
 
                 # Run frame extraction in thread pool
                 frames = await loop.run_in_executor(
@@ -360,7 +508,7 @@ class AnimeMatcherService:
                 end_candidates = to_candidates(end_results)
 
                 # Find temporal match
-                match, alternatives = cls._find_temporal_match(
+                match = cls._find_temporal_match(
                     start_candidates,
                     middle_candidates,
                     end_candidates,
@@ -369,13 +517,25 @@ class AnimeMatcherService:
 
                 if match:
                     match.scene_index = scene.index
-                    match.alternatives = alternatives
                     match.start_candidates = start_candidates
                     match.middle_candidates = middle_candidates
                     match.end_candidates = end_candidates
+                    # Also compute alternatives for matched scenes (for editing)
+                    match.alternatives = cls._compute_alternatives(
+                        start_candidates,
+                        middle_candidates,
+                        end_candidates,
+                        scene.duration,
+                    )
                     matches.matches.append(match)
                 else:
-                    # No match found - store candidates and alternatives for manual selection
+                    # No match found - compute alternatives for manual selection
+                    alternatives = cls._compute_alternatives(
+                        start_candidates,
+                        middle_candidates,
+                        end_candidates,
+                        scene.duration,
+                    )
                     matches.matches.append(
                         SceneMatch(
                             scene_index=scene.index,

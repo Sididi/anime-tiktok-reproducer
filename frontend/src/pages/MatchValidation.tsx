@@ -1,13 +1,13 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { Check, Loader2, AlertCircle, Search, Edit, ArrowLeft, Play, ChevronLeft, ChevronRight } from 'lucide-react';
+import { Check, Loader2, AlertCircle, Edit, Play, ArrowLeft, RefreshCw, Search } from 'lucide-react';
 import { Button } from '@/components/ui';
 import { ClippedVideoPlayer, ManualMatchModal } from '@/components/video';
-import type { ClippedVideoPlayerHandle } from '@/components/video';
+import type { ClippedVideoPlayerHandle } from '@/components/video/ClippedVideoPlayer';
 import { useProjectStore, useSceneStore } from '@/stores';
 import { api } from '@/api/client';
 import { formatTime } from '@/utils';
-import type { SceneMatch, Scene, AlternativeMatch } from '@/types';
+import type { SceneMatch, Scene } from '@/types';
 
 interface MatchProgress {
   status: string;
@@ -24,125 +24,9 @@ interface MatchCardProps {
   projectId: string;
   episodes: string[];
   onManualMatch: (sceneIndex: number, episode: string, startTime: number, endTime: number) => void;
-  onSelectAlternative: (sceneIndex: number, alt: AlternativeMatch) => void;
 }
 
-/**
- * Inline carousel for quick selection of alternative matches.
- * Shows thumbnails with confidence scores for one-click selection.
- */
-function AlternativeCarousel({
-  alternatives,
-  currentEpisode,
-  projectId,
-  onSelect,
-}: {
-  alternatives: AlternativeMatch[];
-  currentEpisode: string;
-  projectId: string;
-  onSelect: (alt: AlternativeMatch) => void;
-}) {
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const [canScrollLeft, setCanScrollLeft] = useState(false);
-  const [canScrollRight, setCanScrollRight] = useState(false);
-
-  // Filter out the current selection and show other alternatives
-  const otherAlternatives = alternatives.filter(alt => alt.episode !== currentEpisode);
-
-  const updateScrollState = useCallback(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    setCanScrollLeft(el.scrollLeft > 0);
-    setCanScrollRight(el.scrollLeft < el.scrollWidth - el.clientWidth - 1);
-  }, []);
-
-  useEffect(() => {
-    updateScrollState();
-    const el = scrollRef.current;
-    if (el) {
-      el.addEventListener('scroll', updateScrollState);
-      return () => el.removeEventListener('scroll', updateScrollState);
-    }
-  }, [updateScrollState]);
-
-  const scroll = (direction: 'left' | 'right') => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const scrollAmount = 120;
-    el.scrollBy({ left: direction === 'left' ? -scrollAmount : scrollAmount, behavior: 'smooth' });
-  };
-
-  if (otherAlternatives.length === 0) return null;
-
-  return (
-    <div className="mt-2">
-      <p className="text-xs text-[hsl(var(--muted-foreground))] mb-1">
-        Other candidates ({otherAlternatives.length}):
-      </p>
-      <div className="relative">
-        {/* Left scroll button */}
-        {canScrollLeft && (
-          <button
-            onClick={() => scroll('left')}
-            className="absolute left-0 top-1/2 -translate-y-1/2 z-10 bg-black/70 hover:bg-black/90 rounded-full p-1"
-          >
-            <ChevronLeft className="h-4 w-4 text-white" />
-          </button>
-        )}
-
-        {/* Scrollable container */}
-        <div
-          ref={scrollRef}
-          className="flex gap-2 overflow-x-auto scrollbar-hide px-1 py-1"
-          style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}
-        >
-          {otherAlternatives.map((alt, idx) => (
-            <button
-              key={`${alt.episode}-${idx}`}
-              onClick={() => onSelect(alt)}
-              className="flex-shrink-0 group relative rounded overflow-hidden border-2 border-transparent hover:border-[hsl(var(--primary))] transition-colors"
-              title={`${alt.episode.split('/').pop()} - ${Math.round(alt.confidence * 100)}%`}
-            >
-              {/* Thumbnail preview - use video poster or frame */}
-              <div className="w-20 h-12 bg-black/40 relative">
-                <video
-                  src={api.getSourceVideoUrl(projectId, alt.episode)}
-                  className="w-full h-full object-cover"
-                  muted
-                  preload="metadata"
-                  onLoadedMetadata={(e) => {
-                    // Seek to the start time to show a frame preview
-                    (e.target as HTMLVideoElement).currentTime = alt.start_time;
-                  }}
-                />
-                {/* Confidence badge */}
-                <div className="absolute bottom-0 right-0 bg-black/80 text-white text-[10px] px-1 py-0.5">
-                  {Math.round(alt.confidence * 100)}%
-                </div>
-              </div>
-              {/* Episode name */}
-              <div className="text-[9px] text-center truncate max-w-20 px-0.5 bg-[hsl(var(--muted))]">
-                {alt.episode.split('/').pop()?.replace(/\.[^.]+$/, '')}
-              </div>
-            </button>
-          ))}
-        </div>
-
-        {/* Right scroll button */}
-        {canScrollRight && (
-          <button
-            onClick={() => scroll('right')}
-            className="absolute right-0 top-1/2 -translate-y-1/2 z-10 bg-black/70 hover:bg-black/90 rounded-full p-1"
-          >
-            <ChevronRight className="h-4 w-4 text-white" />
-          </button>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function MatchCard({ scene, match, projectId, episodes, onManualMatch, onSelectAlternative }: MatchCardProps) {
+function MatchCard({ scene, match, projectId, episodes, onManualMatch }: MatchCardProps) {
   const [showManualModal, setShowManualModal] = useState(false);
   const tiktokPlayerRef = useRef<ClippedVideoPlayerHandle>(null);
   const sourcePlayerRef = useRef<ClippedVideoPlayerHandle>(null);
@@ -159,20 +43,20 @@ function MatchCard({ scene, match, projectId, episodes, onManualMatch, onSelectA
     onManualMatch(scene.index, episode, startTime, endTime);
   }, [scene.index, onManualMatch]);
 
+  // Sync play both videos simultaneously using refs
   const handleSyncPlay = useCallback(() => {
-    // Play both videos simultaneously from their start times
-    tiktokPlayerRef.current?.play();
-    sourcePlayerRef.current?.play();
+    tiktokPlayerRef.current?.playFromStart();
+    sourcePlayerRef.current?.playFromStart();
   }, []);
 
   return (
-    <div className="bg-[hsl(var(--card))] rounded-lg p-4 space-y-4">
+    <div className="bg-[hsl(var(--card))] rounded-lg p-4 space-y-4" data-scene-index={scene.index}>
       <div className="flex items-center justify-between">
         <h3 className="font-semibold">Scene {scene.index + 1}</h3>
         {hasMatch ? (
           <span className="flex items-center gap-1 text-sm text-emerald-500">
             <Check className="h-4 w-4" />
-            Matched ({Math.round(match.confidence * 100)}%)
+            {Math.round(match.confidence * 100)}% match
           </span>
         ) : (
           <span className="flex items-center gap-1 text-sm text-amber-500">
@@ -184,7 +68,7 @@ function MatchCard({ scene, match, projectId, episodes, onManualMatch, onSelectA
 
       <div className="grid grid-cols-2 gap-4">
         {/* TikTok clip */}
-        <div>
+        <div data-video-type="tiktok">
           <p className="text-xs text-[hsl(var(--muted-foreground))] mb-2">TikTok Clip</p>
           <div className="aspect-[9/16] bg-black rounded overflow-hidden">
             <ClippedVideoPlayer
@@ -201,7 +85,7 @@ function MatchCard({ scene, match, projectId, episodes, onManualMatch, onSelectA
         </div>
 
         {/* Source clip */}
-        <div>
+        <div data-video-type="source">
           <p className="text-xs text-[hsl(var(--muted-foreground))] mb-2 truncate" title={match.episode || 'Not found'}>
             Source: {match.episode ? match.episode.split('/').pop() : 'Not found'}
           </p>
@@ -215,16 +99,21 @@ function MatchCard({ scene, match, projectId, episodes, onManualMatch, onSelectA
                 className="w-full h-full"
               />
             ) : (
-              <div className="flex flex-col items-center gap-2 text-[hsl(var(--muted-foreground))]">
-                <p className="text-xs">No match</p>
+              <div className="flex flex-col items-center gap-2 text-[hsl(var(--muted-foreground))] p-4">
+                <AlertCircle className="h-8 w-8 text-amber-500 mb-2" />
+                <p className="text-xs text-center">No automatic match found</p>
+                <p className="text-xs text-center opacity-60">
+                  {match.alternatives?.length || 0} AI candidates available
+                </p>
                 {episodes.length > 0 && (
                   <Button
                     variant="outline"
                     size="sm"
                     onClick={() => setShowManualModal(true)}
+                    className="w-full mt-2"
                   >
                     <Edit className="h-3 w-3 mr-1" />
-                    Select Manually
+                    Find Match
                   </Button>
                 )}
               </div>
@@ -237,24 +126,14 @@ function MatchCard({ scene, match, projectId, episodes, onManualMatch, onSelectA
           ) : (
             <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">&nbsp;</p>
           )}
-
-          {/* Alternative candidates carousel */}
-          {match.alternatives && match.alternatives.length > 1 && (
-            <AlternativeCarousel
-              alternatives={match.alternatives}
-              currentEpisode={match.episode}
-              projectId={projectId}
-              onSelect={(alt) => onSelectAlternative(scene.index, alt)}
-            />
-          )}
         </div>
       </div>
 
-      {/* Action buttons */}
-      <div className="flex gap-2">
-        {hasMatch && (
+      {/* Action buttons for matched scenes */}
+      {hasMatch && (
+        <div className="flex gap-2">
           <Button
-            variant="default"
+            variant="outline"
             size="sm"
             className="flex-1"
             onClick={handleSyncPlay}
@@ -262,8 +141,6 @@ function MatchCard({ scene, match, projectId, episodes, onManualMatch, onSelectA
             <Play className="h-4 w-4 mr-2" />
             Play Both
           </Button>
-        )}
-        {hasMatch && (
           <Button
             variant="outline"
             size="sm"
@@ -271,25 +148,15 @@ function MatchCard({ scene, match, projectId, episodes, onManualMatch, onSelectA
           >
             <Edit className="h-4 w-4" />
           </Button>
-        )}
-        {!hasMatch && episodes.length > 0 && (
-          <Button
-            variant="default"
-            size="sm"
-            className="flex-1"
-            onClick={() => setShowManualModal(true)}
-          >
-            <Edit className="h-4 w-4 mr-2" />
-            Select Manually
-          </Button>
-        )}
-      </div>
+        </div>
+      )}
 
       {/* Manual match modal */}
       <ManualMatchModal
         isOpen={showManualModal}
         onClose={() => setShowManualModal(false)}
         scene={scene}
+        match={match}
         projectId={projectId}
         episodes={episodes}
         onSave={handleManualSave}
@@ -342,7 +209,6 @@ export function MatchValidation() {
     setMatchProgress({ status: 'starting', progress: 0, message: 'Starting match search...' });
 
     try {
-      // No longer need source_path - uses configured library path on backend
       const response = await api.findMatches(projectId);
 
       if (!response.ok) {
@@ -372,7 +238,6 @@ export function MatchValidation() {
               setMatchProgress(data);
 
               if (data.status === 'complete' && data.matches) {
-                // data.matches is {matches: [...]} from MatchList.model_dump()
                 const matchesData = data.matches as unknown as { matches: SceneMatch[] };
                 setMatches(matchesData.matches || []);
               }
@@ -417,44 +282,26 @@ export function MatchValidation() {
     [projectId]
   );
 
-  // Quick select an alternative match (one-click from carousel)
-  const handleSelectAlternative = useCallback(
-    async (sceneIndex: number, alt: AlternativeMatch) => {
-      if (!projectId) return;
+  const handleBackToScenes = () => {
+    if (projectId) {
+      navigate(`/project/${projectId}/scenes`);
+    }
+  };
 
-      try {
-        const { match: updatedMatch } = await api.updateMatch(projectId, sceneIndex, {
-          episode: alt.episode,
-          start_time: alt.start_time,
-          end_time: alt.end_time,
-          confirmed: true,
-        });
+  const handleRecomputeMatches = async () => {
+    // Clear existing matches and recompute
+    setMatches([]);
+    await handleFindMatches();
+  };
 
-        setMatches((prev) =>
-          prev.map((m) => (m.scene_index === sceneIndex ? updatedMatch : m))
-        );
-      } catch (err) {
-        setError((err as Error).message);
-      }
-    },
-    [projectId]
-  );
-
-  // Count confirmed: matches with a match (confidence > 0) are auto-confirmed
-  // Unmatched scenes (confidence === 0, no episode) need manual selection
-  const matchedCount = matches.filter((m) => m.confidence > 0 && m.episode).length;
-  const unmatchedCount = matches.filter((m) => m.confidence === 0 || !m.episode).length;
-  const allMatched = matches.length > 0 && unmatchedCount === 0;
+  // Count confirmed matches (those with valid match data)
+  const confirmedCount = matches.filter((m) => m.confidence > 0 && m.episode).length;
+  const totalCount = matches.length;
+  const allConfirmed = totalCount > 0 && confirmedCount === totalCount;
 
   const handleContinue = () => {
     if (projectId) {
       navigate(`/project/${projectId}/transcription`);
-    }
-  };
-
-  const handleBack = () => {
-    if (projectId) {
-      navigate(`/project/${projectId}/scenes`);
     }
   };
 
@@ -479,9 +326,8 @@ export function MatchValidation() {
       <div className="max-w-4xl mx-auto space-y-6">
         <header className="flex items-center justify-between">
           <div className="flex items-center gap-4">
-            <Button variant="ghost" size="sm" onClick={handleBack}>
-              <ArrowLeft className="h-4 w-4 mr-2" />
-              Back to Scenes
+            <Button variant="ghost" size="icon" onClick={handleBackToScenes}>
+              <ArrowLeft className="h-5 w-5" />
             </Button>
             <div>
               <h1 className="text-xl font-bold">Match Validation</h1>
@@ -491,13 +337,21 @@ export function MatchValidation() {
             </div>
           </div>
           <div className="flex items-center gap-4">
+            {matches.length > 0 && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleRecomputeMatches}
+                disabled={matching}
+              >
+                <RefreshCw className={`h-4 w-4 mr-2 ${matching ? 'animate-spin' : ''}`} />
+                Recompute
+              </Button>
+            )}
             <span className="text-sm text-[hsl(var(--muted-foreground))]">
-              {matchedCount} / {matches.length} matched
-              {unmatchedCount > 0 && (
-                <span className="text-amber-500 ml-1">({unmatchedCount} need manual selection)</span>
-              )}
+              {confirmedCount} / {totalCount} matched
             </span>
-            <Button onClick={handleContinue} disabled={!allMatched}>
+            <Button onClick={handleContinue} disabled={!allConfirmed}>
               Continue to Transcription
             </Button>
           </div>
@@ -563,7 +417,6 @@ export function MatchValidation() {
                 projectId={projectId!}
                 episodes={episodes}
                 onManualMatch={handleManualMatch}
-                onSelectAlternative={handleSelectAlternative}
               />
             );
           })}

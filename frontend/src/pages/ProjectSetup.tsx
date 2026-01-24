@@ -462,31 +462,32 @@ export function ProjectSetup() {
                       variant="outline"
                       disabled={isLoading}
                       onClick={async () => {
-                        // Try to use File System Access API if available
+                        // Use native File System Access API
                         if ('showDirectoryPicker' in window) {
                           try {
-                            const dirHandle = await (window as any).showDirectoryPicker();
-                            // Get the path - note: this only works on some browsers
-                            // For most browsers, we can only get the directory name
+                            const dirHandle = await (window as Window & { showDirectoryPicker: () => Promise<FileSystemDirectoryHandle> }).showDirectoryPicker();
+                            // Get the path - note: browser API doesn't expose full path for security
+                            // We need to prompt user to enter the path manually after selection
+                            // or use a backend endpoint to resolve the folder
                             setNewAnimePath(dirHandle.name);
                           } catch (err) {
-                            // User cancelled or API not supported
+                            // User cancelled or error
                             if ((err as Error).name !== 'AbortError') {
-                              // Fallback to prompt
-                              const path = prompt('Enter the full path to the anime folder:');
-                              if (path) setNewAnimePath(path);
+                              console.error('Failed to open folder picker:', err);
                             }
                           }
                         } else {
-                          // Fallback for browsers without File System Access API
-                          const path = prompt('Enter the full path to the anime folder:');
-                          if (path) setNewAnimePath(path);
+                          // Fallback: show alert for browsers without support
+                          alert('Folder picker not supported in this browser. Please enter the path manually.');
                         }
                       }}
                     >
                       <FolderOpen className="h-4 w-4" />
                     </Button>
                   </div>
+                  <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
+                    Note: Enter the full absolute path (e.g., /home/user/anime/MyAnime)
+                  </p>
                 </div>
 
                 <div>

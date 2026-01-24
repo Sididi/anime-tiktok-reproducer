@@ -52,6 +52,7 @@ export interface AlternativeMatch {
   confidence: number;
   speed_ratio: number;
   vote_count: number;
+  algorithm?: string;  // 'weighted_avg' | 'best_frame' | 'union_topk'
 }
 
 export interface SceneMatch {

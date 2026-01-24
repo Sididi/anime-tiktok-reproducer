@@ -80,7 +80,11 @@ class AnimeLibraryService:
 
         try:
             result = json.loads(stdout.decode())
-            return result.get("series", [])
+            series = result.get("series", [])
+            # CLI returns objects with {name, frames}, extract just names
+            if series and isinstance(series[0], dict):
+                return [s["name"] for s in series]
+            return series
         except json.JSONDecodeError:
             return []
 

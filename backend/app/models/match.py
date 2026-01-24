@@ -20,6 +20,8 @@ class AlternativeMatch(BaseModel):
     speed_ratio: float
     # Number of frame positions that voted for this episode
     vote_count: int = 0
+    # Algorithm used: 'weighted_avg', 'best_frame', 'union_topk'
+    algorithm: str = 'weighted_avg'
 
 
 class SceneMatch(BaseModel):
