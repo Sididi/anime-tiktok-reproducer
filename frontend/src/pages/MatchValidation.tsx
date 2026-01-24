@@ -1,13 +1,22 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
-import { Check, Loader2, AlertCircle, Edit, Play, ArrowLeft, RefreshCw, Search } from 'lucide-react';
-import { Button } from '@/components/ui';
-import { ClippedVideoPlayer, ManualMatchModal } from '@/components/video';
-import type { ClippedVideoPlayerHandle } from '@/components/video/ClippedVideoPlayer';
-import { useProjectStore, useSceneStore } from '@/stores';
-import { api } from '@/api/client';
-import { formatTime } from '@/utils';
-import type { SceneMatch, Scene } from '@/types';
+import { useEffect, useState, useCallback, useRef } from "react";
+import { useParams, useNavigate } from "react-router-dom";
+import {
+  Check,
+  Loader2,
+  AlertCircle,
+  Edit,
+  Play,
+  ArrowLeft,
+  RefreshCw,
+  Search,
+} from "lucide-react";
+import { Button } from "@/components/ui";
+import { ClippedVideoPlayer, ManualMatchModal } from "@/components/video";
+import type { ClippedVideoPlayerHandle } from "@/components/video/ClippedVideoPlayer";
+import { useProjectStore, useSceneStore } from "@/stores";
+import { api } from "@/api/client";
+import { formatTime } from "@/utils";
+import type { SceneMatch, Scene } from "@/types";
 
 interface MatchProgress {
   status: string;
@@ -23,25 +32,41 @@ interface MatchCardProps {
   match: SceneMatch;
   projectId: string;
   episodes: string[];
-  onManualMatch: (sceneIndex: number, episode: string, startTime: number, endTime: number) => void;
+  onManualMatch: (
+    sceneIndex: number,
+    episode: string,
+    startTime: number,
+    endTime: number,
+  ) => void;
 }
 
-function MatchCard({ scene, match, projectId, episodes, onManualMatch }: MatchCardProps) {
+function MatchCard({
+  scene,
+  match,
+  projectId,
+  episodes,
+  onManualMatch,
+}: MatchCardProps) {
   const [showManualModal, setShowManualModal] = useState(false);
   const tiktokPlayerRef = useRef<ClippedVideoPlayerHandle>(null);
   const sourcePlayerRef = useRef<ClippedVideoPlayerHandle>(null);
-  
+
   const tiktokVideoUrl = api.getVideoUrl(projectId);
   const hasMatch = match.confidence > 0 && match.episode;
-  const sourceVideoUrl = hasMatch ? api.getSourceVideoUrl(projectId, match.episode) : null;
+  const sourceVideoUrl = hasMatch
+    ? api.getSourceVideoUrl(projectId, match.episode)
+    : null;
 
   // Calculate durations
   const tiktokDuration = scene.end_time - scene.start_time;
   const sourceDuration = hasMatch ? match.end_time - match.start_time : 0;
 
-  const handleManualSave = useCallback((episode: string, startTime: number, endTime: number) => {
-    onManualMatch(scene.index, episode, startTime, endTime);
-  }, [scene.index, onManualMatch]);
+  const handleManualSave = useCallback(
+    (episode: string, startTime: number, endTime: number) => {
+      onManualMatch(scene.index, episode, startTime, endTime);
+    },
+    [scene.index, onManualMatch],
+  );
 
   // Sync play both videos simultaneously using refs
   const handleSyncPlay = useCallback(() => {
@@ -50,7 +75,10 @@ function MatchCard({ scene, match, projectId, episodes, onManualMatch }: MatchCa
   }, []);
 
   return (
-    <div className="bg-[hsl(var(--card))] rounded-lg p-4 space-y-4" data-scene-index={scene.index}>
+    <div
+      className="bg-[hsl(var(--card))] rounded-lg p-4 space-y-4"
+      data-scene-index={scene.index}
+    >
       <div className="flex items-center justify-between">
         <h3 className="font-semibold">Scene {scene.index + 1}</h3>
         {hasMatch ? (
@@ -69,7 +97,9 @@ function MatchCard({ scene, match, projectId, episodes, onManualMatch }: MatchCa
       <div className="grid grid-cols-2 gap-4">
         {/* TikTok clip */}
         <div data-video-type="tiktok">
-          <p className="text-xs text-[hsl(var(--muted-foreground))] mb-2">TikTok Clip</p>
+          <p className="text-xs text-[hsl(var(--muted-foreground))] mb-2">
+            TikTok Clip
+          </p>
           <div className="aspect-[9/16] bg-black rounded overflow-hidden">
             <ClippedVideoPlayer
               ref={tiktokPlayerRef}
@@ -80,14 +110,19 @@ function MatchCard({ scene, match, projectId, episodes, onManualMatch }: MatchCa
             />
           </div>
           <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
-            {formatTime(scene.start_time)} - {formatTime(scene.end_time)} (<strong>{formatTime(tiktokDuration)}</strong>)
+            {formatTime(scene.start_time)} - {formatTime(scene.end_time)} (
+            <strong>{formatTime(tiktokDuration)}</strong>)
           </p>
         </div>
 
         {/* Source clip */}
         <div data-video-type="source">
-          <p className="text-xs text-[hsl(var(--muted-foreground))] mb-2 truncate" title={match.episode || 'Not found'}>
-            Source: {match.episode ? match.episode.split('/').pop() : 'Not found'}
+          <p
+            className="text-xs text-[hsl(var(--muted-foreground))] mb-2 truncate"
+            title={match.episode || "Not found"}
+          >
+            Source:{" "}
+            {match.episode ? match.episode.split("/").pop() : "Not found"}
           </p>
           <div className="aspect-[9/16] bg-black rounded overflow-hidden flex items-center justify-center">
             {hasMatch && sourceVideoUrl ? (
@@ -121,10 +156,14 @@ function MatchCard({ scene, match, projectId, episodes, onManualMatch }: MatchCa
           </div>
           {hasMatch ? (
             <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
-              {formatTime(match.start_time)} - {formatTime(match.end_time)} (<strong>{formatTime(sourceDuration)}</strong> ~{match.speed_ratio.toFixed(2)}x speed)
+              {formatTime(match.start_time)} - {formatTime(match.end_time)} (
+              <strong>{formatTime(sourceDuration)}</strong> ~
+              {match.speed_ratio.toFixed(2)}x speed)
             </p>
           ) : (
-            <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">&nbsp;</p>
+            <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
+              &nbsp;
+            </p>
           )}
         </div>
       </div>
@@ -175,7 +214,9 @@ export function MatchValidation() {
   const [episodes, setEpisodes] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [matching, setMatching] = useState(false);
-  const [matchProgress, setMatchProgress] = useState<MatchProgress | null>(null);
+  const [matchProgress, setMatchProgress] = useState<MatchProgress | null>(
+    null,
+  );
   const [error, setError] = useState<string | null>(null);
 
   // Load data
@@ -206,44 +247,50 @@ export function MatchValidation() {
     if (!projectId) return;
 
     setMatching(true);
-    setMatchProgress({ status: 'starting', progress: 0, message: 'Starting match search...' });
+    setMatchProgress({
+      status: "starting",
+      progress: 0,
+      message: "Starting match search...",
+    });
 
     try {
       const response = await api.findMatches(projectId);
 
       if (!response.ok) {
-        throw new Error('Failed to start matching');
+        throw new Error("Failed to start matching");
       }
 
       const reader = response.body?.getReader();
       if (!reader) {
-        throw new Error('No response body');
+        throw new Error("No response body");
       }
 
       const decoder = new TextDecoder();
-      let buffer = '';
+      let buffer = "";
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n\n');
-        buffer = lines.pop() || '';
+        const lines = buffer.split("\n\n");
+        buffer = lines.pop() || "";
 
         for (const line of lines) {
-          if (line.startsWith('data: ')) {
+          if (line.startsWith("data: ")) {
             try {
               const data = JSON.parse(line.slice(6)) as MatchProgress;
               setMatchProgress(data);
 
-              if (data.status === 'complete' && data.matches) {
-                const matchesData = data.matches as unknown as { matches: SceneMatch[] };
+              if (data.status === "complete" && data.matches) {
+                const matchesData = data.matches as unknown as {
+                  matches: SceneMatch[];
+                };
                 setMatches(matchesData.matches || []);
               }
 
-              if (data.status === 'error') {
-                throw new Error(data.error || 'Matching failed');
+              if (data.status === "error") {
+                throw new Error(data.error || "Matching failed");
               }
             } catch (e) {
               if (e instanceof SyntaxError) continue;
@@ -261,25 +308,34 @@ export function MatchValidation() {
   }, [projectId]);
 
   const handleManualMatch = useCallback(
-    async (sceneIndex: number, episode: string, startTime: number, endTime: number) => {
+    async (
+      sceneIndex: number,
+      episode: string,
+      startTime: number,
+      endTime: number,
+    ) => {
       if (!projectId) return;
 
       try {
-        const { match: updatedMatch } = await api.updateMatch(projectId, sceneIndex, {
-          episode,
-          start_time: startTime,
-          end_time: endTime,
-          confirmed: true,
-        });
+        const { match: updatedMatch } = await api.updateMatch(
+          projectId,
+          sceneIndex,
+          {
+            episode,
+            start_time: startTime,
+            end_time: endTime,
+            confirmed: true,
+          },
+        );
 
         setMatches((prev) =>
-          prev.map((m) => (m.scene_index === sceneIndex ? updatedMatch : m))
+          prev.map((m) => (m.scene_index === sceneIndex ? updatedMatch : m)),
         );
       } catch (err) {
         setError((err as Error).message);
       }
     },
-    [projectId]
+    [projectId],
   );
 
   const handleBackToScenes = () => {
@@ -295,7 +351,9 @@ export function MatchValidation() {
   };
 
   // Count confirmed matches (those with valid match data)
-  const confirmedCount = matches.filter((m) => m.confidence > 0 && m.episode).length;
+  const confirmedCount = matches.filter(
+    (m) => m.confidence > 0 && m.episode,
+  ).length;
   const totalCount = matches.length;
   const allConfirmed = totalCount > 0 && confirmedCount === totalCount;
 
@@ -344,7 +402,9 @@ export function MatchValidation() {
                 onClick={handleRecomputeMatches}
                 disabled={matching}
               >
-                <RefreshCw className={`h-4 w-4 mr-2 ${matching ? 'animate-spin' : ''}`} />
+                <RefreshCw
+                  className={`h-4 w-4 mr-2 ${matching ? "animate-spin" : ""}`}
+                />
                 Recompute
               </Button>
             )}
@@ -364,7 +424,8 @@ export function MatchValidation() {
             <div>
               <h2 className="text-lg font-semibold">No Matches Found Yet</h2>
               <p className="text-sm text-[hsl(var(--muted-foreground))]">
-                Click to search for anime source clips matching your TikTok scenes
+                Click to search for anime source clips matching your TikTok
+                scenes
               </p>
               {project?.anime_name && (
                 <p className="text-xs text-[hsl(var(--muted-foreground))] mt-2">
@@ -390,7 +451,8 @@ export function MatchValidation() {
               </p>
               {matchProgress.scene_index !== undefined && (
                 <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
-                  Processing scene {matchProgress.scene_index + 1} of {scenes.length}
+                  Processing scene {matchProgress.scene_index + 1} of{" "}
+                  {scenes.length}
                 </p>
               )}
             </div>

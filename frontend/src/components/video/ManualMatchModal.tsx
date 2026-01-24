@@ -1,10 +1,10 @@
-import { useState, useCallback, useRef, useEffect } from 'react';
-import { X, Play, Pause, Check, Sparkles } from 'lucide-react';
-import { Button, Input } from '@/components/ui';
-import { ClippedVideoPlayer } from './ClippedVideoPlayer';
-import { formatTime, parseTime } from '@/utils';
-import { api } from '@/api/client';
-import type { Scene, SceneMatch, AlternativeMatch } from '@/types';
+import { useState, useCallback, useRef, useEffect } from "react";
+import { X, Play, Pause, Check, Sparkles } from "lucide-react";
+import { Button, Input } from "@/components/ui";
+import { ClippedVideoPlayer } from "./ClippedVideoPlayer";
+import { formatTime, parseTime } from "@/utils";
+import { api } from "@/api/client";
+import type { Scene, SceneMatch, AlternativeMatch } from "@/types";
 
 interface ManualMatchModalProps {
   isOpen: boolean;
@@ -26,18 +26,30 @@ export function ManualMatchModal({
   onSave,
 }: ManualMatchModalProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
-  
+
   // Initialize with existing match data if available
-  const initialEpisode = match?.episode && match.confidence > 0 
-    ? episodes.find(ep => ep.includes(match.episode) || match.episode.includes(ep.split('/').pop() || '')) || episodes[0] || ''
-    : episodes[0] || '';
-  
-  const [selectedEpisode, setSelectedEpisode] = useState<string>(initialEpisode);
+  const initialEpisode =
+    match?.episode && match.confidence > 0
+      ? episodes.find(
+          (ep) =>
+            ep.includes(match.episode) ||
+            match.episode.includes(ep.split("/").pop() || ""),
+        ) ||
+        episodes[0] ||
+        ""
+      : episodes[0] || "";
+
+  const [selectedEpisode, setSelectedEpisode] =
+    useState<string>(initialEpisode);
   const [startTime, setStartTime] = useState<string>(
-    match?.confidence && match.confidence > 0 ? formatTime(match.start_time) : '00:00.00'
+    match?.confidence && match.confidence > 0
+      ? formatTime(match.start_time)
+      : "00:00.00",
   );
   const [endTime, setEndTime] = useState<string>(
-    match?.confidence && match.confidence > 0 ? formatTime(match.end_time) : '00:00.00'
+    match?.confidence && match.confidence > 0
+      ? formatTime(match.end_time)
+      : "00:00.00",
   );
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -45,7 +57,7 @@ export function ManualMatchModal({
 
   // Calculate scene duration for reference
   const sceneDuration = scene.end_time - scene.start_time;
-  
+
   // Get alternatives from match
   const alternatives = match?.alternatives || [];
 
@@ -54,8 +66,10 @@ export function ManualMatchModal({
     if (isOpen) {
       // Reset to match data if available
       if (match?.confidence && match.confidence > 0 && match.episode) {
-        const matchEpisode = episodes.find(ep => 
-          ep.includes(match.episode) || match.episode.includes(ep.split('/').pop() || '')
+        const matchEpisode = episodes.find(
+          (ep) =>
+            ep.includes(match.episode) ||
+            match.episode.includes(ep.split("/").pop() || ""),
         );
         if (matchEpisode) {
           setSelectedEpisode(matchEpisode);
@@ -63,7 +77,7 @@ export function ManualMatchModal({
         setStartTime(formatTime(match.start_time));
         setEndTime(formatTime(match.end_time));
       } else {
-        setStartTime('00:00.00');
+        setStartTime("00:00.00");
         setEndTime(formatTime(sceneDuration));
       }
     }
@@ -136,32 +150,37 @@ export function ManualMatchModal({
   }, [startTime, endTime, selectedEpisode, onSave, onClose]);
 
   // Handle selecting a candidate - auto-populate fields and start playback
-  const handleSelectCandidate = useCallback((candidate: AlternativeMatch) => {
-    // Find matching episode in episodes list
-    const matchingEpisode = episodes.find(ep => 
-      ep.includes(candidate.episode) || candidate.episode.includes(ep.split('/').pop() || '')
-    );
-    
-    if (matchingEpisode) {
-      setSelectedEpisode(matchingEpisode);
-    }
-    
-    setStartTime(formatTime(candidate.start_time));
-    setEndTime(formatTime(candidate.end_time));
-    
-    // Wait for video to update then seek and play
-    setTimeout(() => {
-      if (videoRef.current) {
-        videoRef.current.currentTime = candidate.start_time;
-        videoRef.current.play();
-        setIsPlaying(true);
-      }
-    }, 100);
-  }, [episodes]);
+  const handleSelectCandidate = useCallback(
+    (candidate: AlternativeMatch) => {
+      // Find matching episode in episodes list
+      const matchingEpisode = episodes.find(
+        (ep) =>
+          ep.includes(candidate.episode) ||
+          candidate.episode.includes(ep.split("/").pop() || ""),
+      );
 
-  const sourceVideoUrl = selectedEpisode 
-    ? api.getSourceVideoUrl(projectId, selectedEpisode) 
-    : '';
+      if (matchingEpisode) {
+        setSelectedEpisode(matchingEpisode);
+      }
+
+      setStartTime(formatTime(candidate.start_time));
+      setEndTime(formatTime(candidate.end_time));
+
+      // Wait for video to update then seek and play
+      setTimeout(() => {
+        if (videoRef.current) {
+          videoRef.current.currentTime = candidate.start_time;
+          videoRef.current.play();
+          setIsPlaying(true);
+        }
+      }, 100);
+    },
+    [episodes],
+  );
+
+  const sourceVideoUrl = selectedEpisode
+    ? api.getSourceVideoUrl(projectId, selectedEpisode)
+    : "";
 
   const tiktokVideoUrl = api.getVideoUrl(projectId);
 
@@ -172,7 +191,9 @@ export function ManualMatchModal({
       <div className="bg-[hsl(var(--card))] rounded-lg w-full max-w-7xl max-h-[95vh] overflow-hidden flex flex-col">
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-[hsl(var(--border))]">
-          <h2 className="text-lg font-semibold">Manual Match Selection - Scene {scene.index + 1}</h2>
+          <h2 className="text-lg font-semibold">
+            Manual Match Selection - Scene {scene.index + 1}
+          </h2>
           <button
             onClick={onClose}
             className="p-1 hover:bg-[hsl(var(--muted))] rounded"
@@ -216,10 +237,17 @@ export function ManualMatchModal({
                         className="flex items-center justify-between w-full px-3 py-2 bg-[hsl(var(--background))] hover:bg-[hsl(var(--accent))] rounded text-sm text-left transition-colors"
                       >
                         <div className="flex-1 min-w-0">
-                          <div className="font-medium truncate text-xs">{alt.episode.split('/').pop()}</div>
+                          <div className="font-medium truncate text-xs">
+                            {alt.episode.split("/").pop()}
+                          </div>
                           <div className="text-xs text-[hsl(var(--muted-foreground))]">
-                            {formatTime(alt.start_time)} - {formatTime(alt.end_time)}
-                            {alt.algorithm && <span className="ml-1 opacity-60">[{alt.algorithm}]</span>}
+                            {formatTime(alt.start_time)} -{" "}
+                            {formatTime(alt.end_time)}
+                            {alt.algorithm && (
+                              <span className="ml-1 opacity-60">
+                                [{alt.algorithm}]
+                              </span>
+                            )}
                           </div>
                         </div>
                         <div className="ml-2 text-xs font-mono text-emerald-500">
@@ -236,7 +264,9 @@ export function ManualMatchModal({
             <div className="space-y-4">
               {/* Episode selector */}
               <div>
-                <label className="block text-sm font-medium mb-1">Select Episode</label>
+                <label className="block text-sm font-medium mb-1">
+                  Select Episode
+                </label>
                 <select
                   value={selectedEpisode}
                   onChange={(e) => setSelectedEpisode(e.target.value)}
@@ -244,7 +274,7 @@ export function ManualMatchModal({
                 >
                   {episodes.map((ep) => (
                     <option key={ep} value={ep}>
-                      {ep.split('/').pop()}
+                      {ep.split("/").pop()}
                     </option>
                   ))}
                 </select>
@@ -268,8 +298,16 @@ export function ManualMatchModal({
 
                   {/* Video controls */}
                   <div className="flex items-center gap-2">
-                    <Button variant="ghost" size="icon" onClick={handlePlayPause}>
-                      {isPlaying ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={handlePlayPause}
+                    >
+                      {isPlaying ? (
+                        <Pause className="h-4 w-4" />
+                      ) : (
+                        <Play className="h-4 w-4" />
+                      )}
                     </Button>
                     <input
                       type="range"
@@ -290,7 +328,9 @@ export function ManualMatchModal({
               {/* Time inputs */}
               <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-sm font-medium mb-1">Start Time</label>
+                  <label className="block text-sm font-medium mb-1">
+                    Start Time
+                  </label>
                   <div className="flex gap-2">
                     <Input
                       value={startTime}
@@ -298,13 +338,19 @@ export function ManualMatchModal({
                       placeholder="00:00.00"
                       className="flex-1 font-mono"
                     />
-                    <Button variant="outline" size="sm" onClick={handleSetStart}>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleSetStart}
+                    >
                       Set Current
                     </Button>
                   </div>
                 </div>
                 <div>
-                  <label className="block text-sm font-medium mb-1">End Time</label>
+                  <label className="block text-sm font-medium mb-1">
+                    End Time
+                  </label>
                   <div className="flex gap-2">
                     <Input
                       value={endTime}
@@ -320,7 +366,11 @@ export function ManualMatchModal({
               </div>
 
               {/* Preview button */}
-              <Button variant="outline" onClick={handlePreview} className="w-full">
+              <Button
+                variant="outline"
+                onClick={handlePreview}
+                className="w-full"
+              >
                 <Play className="h-4 w-4 mr-2" />
                 Preview from Start Time
               </Button>

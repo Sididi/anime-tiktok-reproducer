@@ -1,14 +1,14 @@
 export type ProjectPhase =
-  | 'setup'
-  | 'downloading'
-  | 'scene_detection'
-  | 'scene_validation'
-  | 'matching'
-  | 'match_validation'
-  | 'transcription'
-  | 'script_restructure'
-  | 'processing'
-  | 'complete';
+  | "setup"
+  | "downloading"
+  | "scene_detection"
+  | "scene_validation"
+  | "matching"
+  | "match_validation"
+  | "transcription"
+  | "script_restructure"
+  | "processing"
+  | "complete";
 
 export interface Project {
   id: string;
@@ -52,7 +52,7 @@ export interface AlternativeMatch {
   confidence: number;
   speed_ratio: number;
   vote_count: number;
-  algorithm?: string;  // 'weighted_avg' | 'best_frame' | 'union_topk'
+  algorithm?: string; // 'weighted_avg' | 'best_frame' | 'union_topk'
 }
 
 export interface SceneMatch {

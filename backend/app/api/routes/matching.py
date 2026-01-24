@@ -178,6 +178,10 @@ async def update_match(project_id: str, scene_index: int, request: UpdateMatchRe
     match.end_time = request.end_time
     match.confirmed = request.confirmed
 
+    # Set confidence to 1.0 for manually confirmed matches (if it was 0)
+    if match.confidence == 0 and request.confirmed:
+        match.confidence = 1.0
+
     # Recalculate speed ratio
     scenes = ProjectService.load_scenes(project_id)
     if scenes and scene_index < len(scenes.scenes):

@@ -53,7 +53,7 @@ async def get_source_video(
 ) -> FileResponse:
     """
     Stream a source anime episode file.
-    
+
     The path can be either:
     - A full path that matches one of the source_paths or anime_library_path
     - A short episode name (stem) that will be searched for in source_paths/anime_library_path

@@ -1,9 +1,9 @@
-import { useState, useCallback, useEffect, useMemo } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { Loader2, ChevronDown, Plus, FolderOpen } from 'lucide-react';
-import { Button, Input } from '@/components/ui';
-import { useProjectStore } from '@/stores';
-import { api } from '@/api/client';
+import { useState, useCallback, useEffect, useMemo } from "react";
+import { useNavigate } from "react-router-dom";
+import { Loader2, ChevronDown, Plus, FolderOpen } from "lucide-react";
+import { Button, Input } from "@/components/ui";
+import { useProjectStore } from "@/stores";
+import { api } from "@/api/client";
 
 interface DownloadProgress {
   status: string;
@@ -24,31 +24,39 @@ interface DetectionProgress {
   status: string;
   progress: number;
   message: string;
-  scenes?: import('@/types').Scene[];
+  scenes?: import("@/types").Scene[];
   error: string | null;
 }
 
 export function ProjectSetup() {
   const navigate = useNavigate();
-  const { createProject, loading: creatingProject, error: createError } = useProjectStore();
-  
+  const {
+    createProject,
+    loading: creatingProject,
+    error: createError,
+  } = useProjectStore();
+
   // Form state
-  const [tiktokUrl, setTiktokUrl] = useState('');
+  const [tiktokUrl, setTiktokUrl] = useState("");
   const [selectedAnime, setSelectedAnime] = useState<string | null>(null);
   const [showAnimeDropdown, setShowAnimeDropdown] = useState(false);
-  const [animeSearch, setAnimeSearch] = useState('');
+  const [animeSearch, setAnimeSearch] = useState("");
   const [indexNewMode, setIndexNewMode] = useState(false);
-  const [newAnimePath, setNewAnimePath] = useState('');
-  const [newAnimeName, setNewAnimeName] = useState('');
-  
+  const [newAnimePath, setNewAnimePath] = useState("");
+  const [newAnimeName, setNewAnimeName] = useState("");
+
   // Anime list state
   const [indexedAnime, setIndexedAnime] = useState<string[]>([]);
   const [loadingAnime, setLoadingAnime] = useState(true);
-  
+
   // Progress state
-  const [downloadProgress, setDownloadProgress] = useState<DownloadProgress | null>(null);
-  const [indexProgress, setIndexProgress] = useState<IndexProgress | null>(null);
-  const [detectionProgress, setDetectionProgress] = useState<DetectionProgress | null>(null);
+  const [downloadProgress, setDownloadProgress] =
+    useState<DownloadProgress | null>(null);
+  const [indexProgress, setIndexProgress] = useState<IndexProgress | null>(
+    null,
+  );
+  const [detectionProgress, setDetectionProgress] =
+    useState<DetectionProgress | null>(null);
   const [downloading, setDownloading] = useState(false);
   const [indexing, setIndexing] = useState(false);
   const [detecting, setDetecting] = useState(false);
@@ -60,7 +68,7 @@ export function ProjectSetup() {
         const result = await api.listIndexedAnime();
         setIndexedAnime(result.series);
       } catch (err) {
-        console.error('Failed to load indexed anime:', err);
+        console.error("Failed to load indexed anime:", err);
       } finally {
         setLoadingAnime(false);
       }
@@ -72,153 +80,175 @@ export function ProjectSetup() {
   const filteredAnime = useMemo(() => {
     if (!animeSearch.trim()) return indexedAnime;
     const search = animeSearch.toLowerCase();
-    return indexedAnime.filter(a => a.toLowerCase().includes(search));
+    return indexedAnime.filter((a) => a.toLowerCase().includes(search));
   }, [indexedAnime, animeSearch]);
 
   // Run scene detection after download
-  const handleSceneDetection = useCallback(async (projectId: string): Promise<boolean> => {
-    setDetecting(true);
-    setDetectionProgress({ status: 'starting', progress: 0, message: 'Starting scene detection...', error: null });
-
-    try {
-      const response = await api.detectScenes(projectId);
-
-      if (!response.ok) {
-        throw new Error('Failed to start scene detection');
-      }
-
-      const reader = response.body?.getReader();
-      if (!reader) {
-        throw new Error('No response body');
-      }
-
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(line.slice(6)) as DetectionProgress;
-              setDetectionProgress(data);
-
-              if (data.status === 'complete') {
-                return true;
-              }
-
-              if (data.status === 'error') {
-                throw new Error(data.error || 'Scene detection failed');
-              }
-            } catch (e) {
-              if (e instanceof SyntaxError) continue;
-              throw e;
-            }
-          }
-        }
-      }
-      return true;
-    } catch (err) {
+  const handleSceneDetection = useCallback(
+    async (projectId: string): Promise<boolean> => {
+      setDetecting(true);
       setDetectionProgress({
-        status: 'error',
+        status: "starting",
         progress: 0,
-        message: '',
-        error: (err as Error).message,
+        message: "Starting scene detection...",
+        error: null,
       });
-      return false;
-    } finally {
-      setDetecting(false);
-    }
-  }, []);
 
-  const handleDownload = useCallback(async (projectId: string, url: string): Promise<boolean> => {
-    setDownloading(true);
-    setDownloadProgress({ status: 'starting', progress: 0, message: 'Starting download...', error: null });
+      try {
+        const response = await api.detectScenes(projectId);
 
-    try {
-      const response = await api.downloadVideo(projectId, url);
+        if (!response.ok) {
+          throw new Error("Failed to start scene detection");
+        }
 
-      if (!response.ok) {
-        throw new Error('Failed to start download');
-      }
+        const reader = response.body?.getReader();
+        if (!reader) {
+          throw new Error("No response body");
+        }
 
-      const reader = response.body?.getReader();
-      if (!reader) {
-        throw new Error('No response body');
-      }
+        const decoder = new TextDecoder();
+        let buffer = "";
 
-      const decoder = new TextDecoder();
-      let buffer = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n\n");
+          buffer = lines.pop() || "";
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n\n');
-        buffer = lines.pop() || '';
+          for (const line of lines) {
+            if (line.startsWith("data: ")) {
+              try {
+                const data = JSON.parse(line.slice(6)) as DetectionProgress;
+                setDetectionProgress(data);
 
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(line.slice(6)) as DownloadProgress;
-              setDownloadProgress(data);
+                if (data.status === "complete") {
+                  return true;
+                }
 
-              if (data.status === 'complete') {
-                return true;
+                if (data.status === "error") {
+                  throw new Error(data.error || "Scene detection failed");
+                }
+              } catch (e) {
+                if (e instanceof SyntaxError) continue;
+                throw e;
               }
-
-              if (data.status === 'error') {
-                throw new Error(data.error || 'Download failed');
-              }
-            } catch (e) {
-              if (e instanceof SyntaxError) continue;
-              throw e;
             }
           }
         }
+        return true;
+      } catch (err) {
+        setDetectionProgress({
+          status: "error",
+          progress: 0,
+          message: "",
+          error: (err as Error).message,
+        });
+        return false;
+      } finally {
+        setDetecting(false);
       }
-      return true;
-    } catch (err) {
+    },
+    [],
+  );
+
+  const handleDownload = useCallback(
+    async (projectId: string, url: string): Promise<boolean> => {
+      setDownloading(true);
       setDownloadProgress({
-        status: 'error',
+        status: "starting",
         progress: 0,
-        message: '',
-        error: (err as Error).message,
+        message: "Starting download...",
+        error: null,
       });
-      return false;
-    } finally {
-      setDownloading(false);
-    }
-  }, []);
+
+      try {
+        const response = await api.downloadVideo(projectId, url);
+
+        if (!response.ok) {
+          throw new Error("Failed to start download");
+        }
+
+        const reader = response.body?.getReader();
+        if (!reader) {
+          throw new Error("No response body");
+        }
+
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n\n");
+          buffer = lines.pop() || "";
+
+          for (const line of lines) {
+            if (line.startsWith("data: ")) {
+              try {
+                const data = JSON.parse(line.slice(6)) as DownloadProgress;
+                setDownloadProgress(data);
+
+                if (data.status === "complete") {
+                  return true;
+                }
+
+                if (data.status === "error") {
+                  throw new Error(data.error || "Download failed");
+                }
+              } catch (e) {
+                if (e instanceof SyntaxError) continue;
+                throw e;
+              }
+            }
+          }
+        }
+        return true;
+      } catch (err) {
+        setDownloadProgress({
+          status: "error",
+          progress: 0,
+          message: "",
+          error: (err as Error).message,
+        });
+        return false;
+      } finally {
+        setDownloading(false);
+      }
+    },
+    [],
+  );
 
   const handleIndexAnime = useCallback(async (): Promise<boolean> => {
     if (!newAnimePath.trim()) return false;
 
     setIndexing(true);
-    setIndexProgress({ status: 'starting', phase: 'starting', progress: 0, message: 'Starting indexing...', error: null });
+    setIndexProgress({
+      status: "starting",
+      phase: "starting",
+      progress: 0,
+      message: "Starting indexing...",
+      error: null,
+    });
 
     try {
       const animeName = newAnimeName.trim() || undefined;
       const response = await api.indexAnime(newAnimePath, animeName, 2.0);
 
       if (!response.ok) {
-        throw new Error('Failed to start indexing');
+        throw new Error("Failed to start indexing");
       }
 
       const reader = response.body?.getReader();
       if (!reader) {
-        throw new Error('No response body');
+        throw new Error("No response body");
       }
 
       const decoder = new TextDecoder();
-      let buffer = '';
+      let buffer = "";
       let finalAnimeName: string | null = null;
 
       while (true) {
@@ -226,24 +256,30 @@ export function ProjectSetup() {
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n\n');
-        buffer = lines.pop() || '';
+        const lines = buffer.split("\n\n");
+        buffer = lines.pop() || "";
 
         for (const line of lines) {
-          if (line.startsWith('data: ')) {
+          if (line.startsWith("data: ")) {
             try {
-              const data = JSON.parse(line.slice(6)) as IndexProgress & { anime_name?: string };
+              const data = JSON.parse(line.slice(6)) as IndexProgress & {
+                anime_name?: string;
+              };
               setIndexProgress(data);
 
-              if (data.status === 'complete') {
-                finalAnimeName = data.anime_name || animeName || newAnimePath.split('/').pop() || null;
+              if (data.status === "complete") {
+                finalAnimeName =
+                  data.anime_name ||
+                  animeName ||
+                  newAnimePath.split("/").pop() ||
+                  null;
                 // Reload anime list
                 const result = await api.listIndexedAnime();
                 setIndexedAnime(result.series);
               }
 
-              if (data.status === 'error') {
-                throw new Error(data.error || 'Indexing failed');
+              if (data.status === "error") {
+                throw new Error(data.error || "Indexing failed");
               }
             } catch (e) {
               if (e instanceof SyntaxError) continue;
@@ -256,8 +292,8 @@ export function ProjectSetup() {
       if (finalAnimeName) {
         setSelectedAnime(finalAnimeName);
         setIndexNewMode(false);
-        setNewAnimePath('');
-        setNewAnimeName('');
+        setNewAnimePath("");
+        setNewAnimeName("");
         setIndexProgress(null);
         return true;
       }
@@ -265,10 +301,10 @@ export function ProjectSetup() {
       return false;
     } catch (err) {
       setIndexProgress({
-        status: 'error',
-        phase: 'error',
+        status: "error",
+        phase: "error",
         progress: 0,
-        message: '',
+        message: "",
         error: (err as Error).message,
       });
       return false;
@@ -290,23 +326,23 @@ export function ProjectSetup() {
     }
 
     // Need anime selected
-    const animeName = indexNewMode 
-      ? (newAnimeName.trim() || newAnimePath.split('/').pop() || null)
+    const animeName = indexNewMode
+      ? newAnimeName.trim() || newAnimePath.split("/").pop() || null
       : selectedAnime;
-    
+
     if (!animeName) return;
 
     try {
       const project = await createProject(tiktokUrl, undefined, animeName);
-      
+
       // Step 1: Download video
       const downloadSuccess = await handleDownload(project.id, tiktokUrl);
       if (!downloadSuccess) return;
-      
+
       // Step 2: Run scene detection
       const detectionSuccess = await handleSceneDetection(project.id);
       if (!detectionSuccess) return;
-      
+
       // Step 3: Navigate to scene validation (now with video and scenes ready)
       navigate(`/project/${project.id}/scenes`);
     } catch {
@@ -317,7 +353,7 @@ export function ProjectSetup() {
   const selectAnime = (anime: string) => {
     setSelectedAnime(anime);
     setShowAnimeDropdown(false);
-    setAnimeSearch('');
+    setAnimeSearch("");
     setIndexNewMode(false);
   };
 
@@ -328,8 +364,14 @@ export function ProjectSetup() {
   };
 
   const isLoading = creatingProject || downloading || indexing || detecting;
-  const error = createError || downloadProgress?.error || indexProgress?.error || detectionProgress?.error;
-  const canSubmit = tiktokUrl.trim() && (selectedAnime || (indexNewMode && newAnimePath.trim()));
+  const error =
+    createError ||
+    downloadProgress?.error ||
+    indexProgress?.error ||
+    detectionProgress?.error;
+  const canSubmit =
+    tiktokUrl.trim() &&
+    (selectedAnime || (indexNewMode && newAnimePath.trim()));
 
   return (
     <div className="min-h-screen flex items-center justify-center p-4">
@@ -361,9 +403,10 @@ export function ProjectSetup() {
           {/* Anime Selection */}
           <div>
             <label className="text-sm text-[hsl(var(--muted-foreground))] mb-1 block">
-              Source Anime <span className="text-[hsl(var(--destructive))]">*</span>
+              Source Anime{" "}
+              <span className="text-[hsl(var(--destructive))]">*</span>
             </label>
-            
+
             {!indexNewMode ? (
               <div className="relative">
                 <button
@@ -373,11 +416,15 @@ export function ProjectSetup() {
                   className="w-full flex items-center justify-between px-3 py-2 border border-[hsl(var(--border))] rounded-md bg-[hsl(var(--background))] text-left disabled:opacity-50"
                 >
                   {loadingAnime ? (
-                    <span className="text-[hsl(var(--muted-foreground))]">Loading anime...</span>
+                    <span className="text-[hsl(var(--muted-foreground))]">
+                      Loading anime...
+                    </span>
                   ) : selectedAnime ? (
                     <span>{selectedAnime}</span>
                   ) : (
-                    <span className="text-[hsl(var(--muted-foreground))]">Select an anime...</span>
+                    <span className="text-[hsl(var(--muted-foreground))]">
+                      Select an anime...
+                    </span>
                   )}
                   <ChevronDown className="h-4 w-4 text-[hsl(var(--muted-foreground))]" />
                 </button>
@@ -400,7 +447,9 @@ export function ProjectSetup() {
                     <div className="overflow-y-auto max-h-40">
                       {filteredAnime.length === 0 ? (
                         <div className="px-3 py-2 text-sm text-[hsl(var(--muted-foreground))]">
-                          {indexedAnime.length === 0 ? 'No anime indexed yet' : 'No matches found'}
+                          {indexedAnime.length === 0
+                            ? "No anime indexed yet"
+                            : "No matches found"}
                         </div>
                       ) : (
                         filteredAnime.map((anime) => (
@@ -463,22 +512,31 @@ export function ProjectSetup() {
                       disabled={isLoading}
                       onClick={async () => {
                         // Use native File System Access API
-                        if ('showDirectoryPicker' in window) {
+                        if ("showDirectoryPicker" in window) {
                           try {
-                            const dirHandle = await (window as Window & { showDirectoryPicker: () => Promise<FileSystemDirectoryHandle> }).showDirectoryPicker();
+                            const dirHandle = await (
+                              window as Window & {
+                                showDirectoryPicker: () => Promise<FileSystemDirectoryHandle>;
+                              }
+                            ).showDirectoryPicker();
                             // Get the path - note: browser API doesn't expose full path for security
                             // We need to prompt user to enter the path manually after selection
                             // or use a backend endpoint to resolve the folder
                             setNewAnimePath(dirHandle.name);
                           } catch (err) {
                             // User cancelled or error
-                            if ((err as Error).name !== 'AbortError') {
-                              console.error('Failed to open folder picker:', err);
+                            if ((err as Error).name !== "AbortError") {
+                              console.error(
+                                "Failed to open folder picker:",
+                                err,
+                              );
                             }
                           }
                         } else {
                           // Fallback: show alert for browsers without support
-                          alert('Folder picker not supported in this browser. Please enter the path manually.');
+                          alert(
+                            "Folder picker not supported in this browser. Please enter the path manually.",
+                          );
                         }
                       }}
                     >
@@ -486,7 +544,8 @@ export function ProjectSetup() {
                     </Button>
                   </div>
                   <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
-                    Note: Enter the full absolute path (e.g., /home/user/anime/MyAnime)
+                    Note: Enter the full absolute path (e.g.,
+                    /home/user/anime/MyAnime)
                   </p>
                 </div>
 
@@ -504,7 +563,7 @@ export function ProjectSetup() {
                 </div>
 
                 {/* Indexing progress */}
-                {indexProgress && indexProgress.status !== 'error' && (
+                {indexProgress && indexProgress.status !== "error" && (
                   <div className="space-y-2">
                     <div className="flex items-center gap-2 text-xs text-[hsl(var(--muted-foreground))]">
                       <Loader2 className="h-3 w-3 animate-spin" />
@@ -523,7 +582,7 @@ export function ProjectSetup() {
           </div>
 
           {/* Download progress */}
-          {downloadProgress && downloadProgress.status !== 'error' && (
+          {downloadProgress && downloadProgress.status !== "error" && (
             <div className="space-y-2">
               <div className="flex items-center gap-2 text-sm text-[hsl(var(--muted-foreground))]">
                 <Loader2 className="h-4 w-4 animate-spin" />
@@ -539,7 +598,7 @@ export function ProjectSetup() {
           )}
 
           {/* Scene detection progress */}
-          {detectionProgress && detectionProgress.status !== 'error' && (
+          {detectionProgress && detectionProgress.status !== "error" && (
             <div className="space-y-2">
               <div className="flex items-center gap-2 text-sm text-[hsl(var(--muted-foreground))]">
                 <Loader2 className="h-4 w-4 animate-spin" />
@@ -558,21 +617,27 @@ export function ProjectSetup() {
             <p className="text-sm text-[hsl(var(--destructive))]">{error}</p>
           )}
 
-          <Button 
-            type="submit" 
-            className="w-full" 
+          <Button
+            type="submit"
+            className="w-full"
             disabled={isLoading || !canSubmit}
             data-testid="create-project-btn"
           >
             {isLoading ? (
               <>
                 <Loader2 className="h-4 w-4 animate-spin mr-2" />
-                {indexing ? 'Indexing...' : downloading ? 'Downloading...' : detecting ? 'Detecting scenes...' : 'Creating...'}
+                {indexing
+                  ? "Indexing..."
+                  : downloading
+                    ? "Downloading..."
+                    : detecting
+                      ? "Detecting scenes..."
+                      : "Creating..."}
               </>
             ) : indexNewMode ? (
-              'Index & Start'
+              "Index & Start"
             ) : (
-              'Download & Start'
+              "Download & Start"
             )}
           </Button>
         </form>
