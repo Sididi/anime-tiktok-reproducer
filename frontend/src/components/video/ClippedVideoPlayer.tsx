@@ -15,6 +15,7 @@ interface ClippedVideoPlayerProps {
   startTime: number;
   endTime: number;
   className?: string;
+  muted?: boolean;
 }
 
 export interface ClippedVideoPlayerHandle {
@@ -32,7 +33,10 @@ export interface ClippedVideoPlayerHandle {
 export const ClippedVideoPlayer = forwardRef<
   ClippedVideoPlayerHandle,
   ClippedVideoPlayerProps
->(function ClippedVideoPlayer({ src, startTime, endTime, className }, ref) {
+>(function ClippedVideoPlayer(
+  { src, startTime, endTime, className, muted = true },
+  ref,
+) {
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const [isVisible, setIsVisible] = useState(false);
@@ -255,7 +259,7 @@ export const ClippedVideoPlayer = forwardRef<
           onPlay={handlePlay}
           onSeeked={handleSeeked}
           controls
-          muted
+          muted={muted}
           preload="metadata"
         />
       )}

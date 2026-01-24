@@ -1,11 +1,12 @@
-import { useEffect, useState, useCallback } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
-import { Loader2, Play, ArrowRight } from 'lucide-react';
-import { Button } from '@/components/ui';
-import { useProjectStore, useSceneStore } from '@/stores';
-import { api } from '@/api/client';
-import { formatTime } from '@/utils';
-import type { Transcription } from '@/types';
+import { useEffect, useState, useCallback } from "react";
+import { useParams, useNavigate } from "react-router-dom";
+import { Loader2, Play, ArrowRight } from "lucide-react";
+import { Button } from "@/components/ui";
+import { ClippedVideoPlayer } from "@/components/video";
+import { useProjectStore, useSceneStore } from "@/stores";
+import { api } from "@/api/client";
+import { formatTime } from "@/utils";
+import type { Transcription } from "@/types";
 
 interface TranscriptionProgress {
   status: string;
@@ -16,10 +17,10 @@ interface TranscriptionProgress {
 }
 
 const LANGUAGES = [
-  { value: 'auto', label: 'Auto-detect' },
-  { value: 'en', label: 'English' },
-  { value: 'fr', label: 'Français' },
-  { value: 'es', label: 'Español' },
+  { value: "auto", label: "Auto-detect" },
+  { value: "en", label: "English" },
+  { value: "fr", label: "Français" },
+  { value: "es", label: "Español" },
 ];
 
 export function TranscriptionPage() {
@@ -28,11 +29,13 @@ export function TranscriptionPage() {
   const { loadProject } = useProjectStore();
   const { scenes, loadScenes } = useSceneStore();
 
-  const [transcription, setTranscription] = useState<Transcription | null>(null);
+  const [transcription, setTranscription] = useState<Transcription | null>(
+    null,
+  );
   const [loading, setLoading] = useState(true);
   const [transcribing, setTranscribing] = useState(false);
   const [progress, setProgress] = useState<TranscriptionProgress | null>(null);
-  const [language, setLanguage] = useState('auto');
+  const [language, setLanguage] = useState("auto");
   const [editedTexts, setEditedTexts] = useState<Record<number, string>>({});
   const [error, setError] = useState<string | null>(null);
 
@@ -69,39 +72,44 @@ export function TranscriptionPage() {
     if (!projectId) return;
 
     setTranscribing(true);
-    setProgress({ status: 'starting', progress: 0, message: 'Starting...', error: null });
+    setProgress({
+      status: "starting",
+      progress: 0,
+      message: "Starting...",
+      error: null,
+    });
     setError(null);
 
     try {
       const response = await api.startTranscription(projectId, language);
 
       if (!response.ok) {
-        throw new Error('Failed to start transcription');
+        throw new Error("Failed to start transcription");
       }
 
       const reader = response.body?.getReader();
       if (!reader) {
-        throw new Error('No response body');
+        throw new Error("No response body");
       }
 
       const decoder = new TextDecoder();
-      let buffer = '';
+      let buffer = "";
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n\n');
-        buffer = lines.pop() || '';
+        const lines = buffer.split("\n\n");
+        buffer = lines.pop() || "";
 
         for (const line of lines) {
-          if (line.startsWith('data: ')) {
+          if (line.startsWith("data: ")) {
             try {
               const data = JSON.parse(line.slice(6)) as TranscriptionProgress;
               setProgress(data);
 
-              if (data.status === 'complete' && data.transcription) {
+              if (data.status === "complete" && data.transcription) {
                 setTranscription(data.transcription);
                 const texts: Record<number, string> = {};
                 data.transcription.scenes.forEach((s) => {
@@ -110,8 +118,8 @@ export function TranscriptionPage() {
                 setEditedTexts(texts);
               }
 
-              if (data.status === 'error') {
-                throw new Error(data.error || 'Transcription failed');
+              if (data.status === "error") {
+                throw new Error(data.error || "Transcription failed");
               }
             } catch (e) {
               if (e instanceof SyntaxError) continue;
@@ -139,7 +147,10 @@ export function TranscriptionPage() {
         scene_index: parseInt(index, 10),
         text,
       }));
-      const { transcription: updated } = await api.updateTranscription(projectId, updates);
+      const { transcription: updated } = await api.updateTranscription(
+        projectId,
+        updates,
+      );
       setTranscription(updated);
     } catch (err) {
       setError((err as Error).message);
@@ -175,7 +186,7 @@ export function TranscriptionPage() {
             <p className="text-sm text-[hsl(var(--muted-foreground))]">
               {transcription
                 ? `${transcription.scenes.length} scenes transcribed in ${transcription.language}`
-                : 'Transcribe the TikTok audio'}
+                : "Transcribe the TikTok audio"}
             </p>
           </div>
           {transcription && (
@@ -202,17 +213,21 @@ export function TranscriptionPage() {
                 value={language}
                 onChange={(e) => setLanguage(e.target.value)}
                 disabled={transcribing}
-                className="w-full h-10 px-3 rounded-md border border-[hsl(var(--input))] bg-transparent"
+                className="w-full h-10 px-3 rounded-md border border-[hsl(var(--input))] bg-[hsl(var(--background))] text-[hsl(var(--foreground))]"
               >
                 {LANGUAGES.map((lang) => (
-                  <option key={lang.value} value={lang.value}>
+                  <option
+                    key={lang.value}
+                    value={lang.value}
+                    className="bg-[hsl(var(--background))] text-[hsl(var(--foreground))]"
+                  >
                     {lang.label}
                   </option>
                 ))}
               </select>
             </div>
 
-            {progress && progress.status !== 'complete' && (
+            {progress && progress.status !== "complete" && (
               <div className="space-y-2">
                 <div className="flex items-center gap-2 text-sm text-[hsl(var(--muted-foreground))]">
                   <Loader2 className="h-4 w-4 animate-spin" />
@@ -247,28 +262,54 @@ export function TranscriptionPage() {
           </div>
         )}
 
-        {transcription && (
+        {transcription && projectId && (
           <div className="space-y-4">
             {scenes.map((scene) => {
               const sceneTranscription = transcription.scenes.find(
-                (s) => s.scene_index === scene.index
+                (s) => s.scene_index === scene.index,
               );
               if (!sceneTranscription) return null;
 
+              const videoUrl = api.getVideoUrl(projectId);
+              const sceneDuration = scene.end_time - scene.start_time;
+
               return (
-                <div key={scene.index} className="bg-[hsl(var(--card))] rounded-lg p-4 space-y-2">
-                  <div className="flex items-center justify-between">
+                <div
+                  key={scene.index}
+                  className="bg-[hsl(var(--card))] rounded-lg p-4"
+                >
+                  <div className="flex items-center justify-between mb-3">
                     <span className="font-medium">Scene {scene.index + 1}</span>
                     <span className="text-xs text-[hsl(var(--muted-foreground))]">
-                      {formatTime(scene.start_time)} - {formatTime(scene.end_time)}
+                      {formatTime(scene.start_time)} -{" "}
+                      {formatTime(scene.end_time)} ({formatTime(sceneDuration)})
                     </span>
                   </div>
-                  <textarea
-                    value={editedTexts[scene.index] ?? sceneTranscription.text}
-                    onChange={(e) => handleTextChange(scene.index, e.target.value)}
-                    className="w-full min-h-[80px] p-2 rounded-md border border-[hsl(var(--input))] bg-transparent resize-y"
-                    placeholder="No transcription for this scene"
-                  />
+                  <div className="grid grid-cols-[180px_1fr] gap-4">
+                    {/* Video preview */}
+                    <div className="aspect-[9/16] bg-black rounded overflow-hidden">
+                      <ClippedVideoPlayer
+                        src={videoUrl}
+                        startTime={scene.start_time}
+                        endTime={scene.end_time}
+                        className="w-full h-full"
+                        muted={false}
+                      />
+                    </div>
+                    {/* Transcription text */}
+                    <div className="flex flex-col">
+                      <textarea
+                        value={
+                          editedTexts[scene.index] ?? sceneTranscription.text
+                        }
+                        onChange={(e) =>
+                          handleTextChange(scene.index, e.target.value)
+                        }
+                        className="flex-1 w-full min-h-[120px] p-3 rounded-md border border-[hsl(var(--input))] bg-transparent resize-y text-sm"
+                        placeholder="No transcription for this scene"
+                      />
+                    </div>
+                  </div>
                 </div>
               );
             })}

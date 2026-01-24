@@ -1,12 +1,19 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
-import { Loader2, Copy, Check, ArrowRight, Upload, FileAudio } from 'lucide-react';
-import { Button } from '@/components/ui';
-import { useProjectStore, useSceneStore } from '@/stores';
-import { api } from '@/api/client';
-import type { Transcription } from '@/types';
+import { useEffect, useState, useCallback, useRef } from "react";
+import { useParams, useNavigate } from "react-router-dom";
+import {
+  Loader2,
+  Copy,
+  Check,
+  ArrowRight,
+  Upload,
+  FileAudio,
+} from "lucide-react";
+import { Button } from "@/components/ui";
+import { useProjectStore, useSceneStore } from "@/stores";
+import { api } from "@/api/client";
+import type { Transcription } from "@/types";
 
-const RESTRUCTURE_PROMPT_TEMPLATE = `Tu es un expert en réécriture de scripts pour des vidéos courtes sur les réseaux sociaux. 
+const RESTRUCTURE_PROMPT_TEMPLATE = `Tu es un expert en réécriture de scripts pour des vidéos courtes sur les réseaux sociaux.
 Ta mission est de réécrire le script suivant en français tout en gardant le même sens et la même structure narrative.
 
 RÈGLES IMPORTANTES:
@@ -25,17 +32,24 @@ DONNÉES D'ENTRÉE:
 `;
 
 function generatePrompt(transcription: Transcription): string {
-  const sceneData = transcription.scenes.map(scene => ({
+  const sceneData = transcription.scenes.map((scene) => ({
     scene_index: scene.scene_index,
     text: scene.text,
     duration_seconds: (scene.end_time - scene.start_time).toFixed(2),
-    estimated_word_count: scene.text.split(/\s+/).filter(w => w).length,
+    estimated_word_count: scene.text.split(/\s+/).filter((w) => w).length,
   }));
 
-  return RESTRUCTURE_PROMPT_TEMPLATE + JSON.stringify({
-    language: 'fr',
-    scenes: sceneData,
-  }, null, 2);
+  return (
+    RESTRUCTURE_PROMPT_TEMPLATE +
+    JSON.stringify(
+      {
+        language: "fr",
+        scenes: sceneData,
+      },
+      null,
+      2,
+    )
+  );
 }
 
 export function ScriptRestructurePage() {
@@ -45,13 +59,15 @@ export function ScriptRestructurePage() {
   const { loadScenes } = useSceneStore();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const [transcription, setTranscription] = useState<Transcription | null>(null);
+  const [transcription, setTranscription] = useState<Transcription | null>(
+    null,
+  );
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
   // New script state
-  const [newScriptJson, setNewScriptJson] = useState('');
+  const [newScriptJson, setNewScriptJson] = useState("");
   const [jsonError, setJsonError] = useState<string | null>(null);
   const [jsonValid, setJsonValid] = useState(false);
 
@@ -86,7 +102,6 @@ export function ScriptRestructurePage() {
     const prompt = generatePrompt(transcription);
     await navigator.clipboard.writeText(prompt);
     setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
   }, [transcription]);
 
   const handleJsonChange = useCallback((value: string) => {
@@ -107,11 +122,11 @@ export function ScriptRestructurePage() {
       }
 
       for (const scene of parsed.scenes) {
-        if (typeof scene.scene_index !== 'number') {
+        if (typeof scene.scene_index !== "number") {
           setJsonError('Each scene must have a numeric "scene_index"');
           return;
         }
-        if (typeof scene.text !== 'string') {
+        if (typeof scene.text !== "string") {
           setJsonError('Each scene must have a "text" string');
           return;
         }
@@ -123,18 +138,21 @@ export function ScriptRestructurePage() {
     }
   }, []);
 
-  const handleFileSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      // Validate audio file
-      if (!file.type.startsWith('audio/')) {
-        setError('Please select an audio file');
-        return;
+  const handleFileSelect = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (file) {
+        // Validate audio file
+        if (!file.type.startsWith("audio/")) {
+          setError("Please select an audio file");
+          return;
+        }
+        setAudioFile(file);
+        setError(null);
       }
-      setAudioFile(file);
-      setError(null);
-    }
-  }, []);
+    },
+    [],
+  );
 
   const handleContinue = useCallback(async () => {
     if (!projectId || !jsonValid || !audioFile) return;
@@ -145,17 +163,22 @@ export function ScriptRestructurePage() {
     try {
       // Submit new script and audio
       const formData = new FormData();
-      formData.append('script', newScriptJson);
-      formData.append('audio', audioFile);
+      formData.append("script", newScriptJson);
+      formData.append("audio", audioFile);
 
-      const response = await fetch(`/api/projects/${projectId}/script/restructured`, {
-        method: 'POST',
-        body: formData,
-      });
+      const response = await fetch(
+        `/api/projects/${projectId}/script/restructured`,
+        {
+          method: "POST",
+          body: formData,
+        },
+      );
 
       if (!response.ok) {
-        const err = await response.json().catch(() => ({ detail: 'Upload failed' }));
-        throw new Error(err.detail || 'Upload failed');
+        const err = await response
+          .json()
+          .catch(() => ({ detail: "Upload failed" }));
+        throw new Error(err.detail || "Upload failed");
       }
 
       navigate(`/project/${projectId}/processing`);
@@ -221,7 +244,9 @@ export function ScriptRestructurePage() {
         {/* Step 1: Copy Prompt */}
         <div className="bg-[hsl(var(--card))] rounded-lg p-6 space-y-4">
           <div className="flex items-center justify-between">
-            <h2 className="font-semibold">Step 1: Copy Restructuration Prompt</h2>
+            <h2 className="font-semibold">
+              Step 1: Copy Restructuration Prompt
+            </h2>
             <Button variant="outline" size="sm" onClick={handleCopyPrompt}>
               {copied ? (
                 <>
@@ -237,11 +262,13 @@ export function ScriptRestructurePage() {
             </Button>
           </div>
           <p className="text-sm text-[hsl(var(--muted-foreground))]">
-            Use this prompt with an AI (Claude, ChatGPT, etc.) to generate a new French script.
-            The AI will return JSON that you can paste below.
+            Use this prompt with an AI (Claude, ChatGPT, etc.) to generate a new
+            French script. The AI will return JSON that you can paste below.
           </p>
           <div className="max-h-48 overflow-y-auto bg-[hsl(var(--muted))] rounded-lg p-3">
-            <pre className="text-xs whitespace-pre-wrap font-mono">{prompt}</pre>
+            <pre className="text-xs whitespace-pre-wrap font-mono">
+              {prompt}
+            </pre>
           </div>
         </div>
 
@@ -257,7 +284,8 @@ export function ScriptRestructurePage() {
             )}
           </div>
           <p className="text-sm text-[hsl(var(--muted-foreground))]">
-            Paste the JSON response from the AI here. It should contain the restructured script.
+            Paste the JSON response from the AI here. It should contain the
+            restructured script.
           </p>
           <textarea
             value={newScriptJson}
@@ -266,7 +294,9 @@ export function ScriptRestructurePage() {
             className="w-full min-h-[200px] p-3 rounded-md border border-[hsl(var(--input))] bg-transparent font-mono text-sm resize-y"
           />
           {jsonError && (
-            <p className="text-sm text-[hsl(var(--destructive))]">{jsonError}</p>
+            <p className="text-sm text-[hsl(var(--destructive))]">
+              {jsonError}
+            </p>
           )}
         </div>
 
@@ -274,7 +304,8 @@ export function ScriptRestructurePage() {
         <div className="bg-[hsl(var(--card))] rounded-lg p-6 space-y-4">
           <h2 className="font-semibold">Step 3: Upload TTS Audio</h2>
           <p className="text-sm text-[hsl(var(--muted-foreground))]">
-            Generate TTS audio from the new script (using ElevenLabs or similar) and upload it here.
+            Generate TTS audio from the new script (using ElevenLabs or similar)
+            and upload it here.
           </p>
 
           <input
@@ -319,15 +350,21 @@ export function ScriptRestructurePage() {
           <h3 className="font-medium mb-2">Checklist</h3>
           <ul className="space-y-1 text-sm">
             <li className="flex items-center gap-2">
-              <div className={`h-3 w-3 rounded-full ${copied ? 'bg-green-500' : 'bg-[hsl(var(--border))]'}`} />
+              <div
+                className={`h-3 w-3 rounded-full ${copied ? "bg-green-500" : "bg-[hsl(var(--border))]"}`}
+              />
               Prompt copied
             </li>
             <li className="flex items-center gap-2">
-              <div className={`h-3 w-3 rounded-full ${jsonValid ? 'bg-green-500' : 'bg-[hsl(var(--border))]'}`} />
+              <div
+                className={`h-3 w-3 rounded-full ${jsonValid ? "bg-green-500" : "bg-[hsl(var(--border))]"}`}
+              />
               New script JSON validated
             </li>
             <li className="flex items-center gap-2">
-              <div className={`h-3 w-3 rounded-full ${audioFile ? 'bg-green-500' : 'bg-[hsl(var(--border))]'}`} />
+              <div
+                className={`h-3 w-3 rounded-full ${audioFile ? "bg-green-500" : "bg-[hsl(var(--border))]"}`}
+              />
               TTS audio uploaded
             </li>
           </ul>

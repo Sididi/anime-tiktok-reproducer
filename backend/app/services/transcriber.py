@@ -50,28 +50,35 @@ LANGUAGE_MAP = {
 class TranscriberService:
     """Service for transcribing audio using faster-whisper."""
 
-    _model = None
+    _models: dict = {}  # Cache models by size
 
     @classmethod
-    def _init_model(cls, model_size: str = "base"):
-        """Initialize the whisper model."""
-        if cls._model is not None:
-            return
+    def _init_model(cls, model_size: str = "large-v3"):
+        """Initialize the whisper model for a given size."""
+        if model_size in cls._models:
+            return cls._models[model_size]
 
         from faster_whisper import WhisperModel
 
-        cls._model = WhisperModel(model_size, device="auto", compute_type="auto")
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"Initializing faster-whisper model: {model_size}")
+
+        model = WhisperModel(model_size, device="auto", compute_type="auto")
+        cls._models[model_size] = model
+        return model
 
     @classmethod
     def _transcribe_sync(
         cls,
         audio_path: Path,
         language: str | None = None,
+        model_size: str = "large-v3",
     ) -> tuple[list[dict], str]:
         """Synchronous transcription with word-level timestamps."""
-        cls._init_model()
+        model = cls._init_model(model_size)
 
-        segments, info = cls._model.transcribe(
+        segments, info = model.transcribe(
             str(audio_path),
             language=language,
             word_timestamps=True,
@@ -157,13 +164,11 @@ class TranscriberService:
 
             yield TranscriptionProgress("transcribing", 0.2, "Transcribing audio (this may take a while)...")
 
-            # Run transcription in thread pool
+            # Run transcription in thread pool (use large-v3 for original TikTok video)
             loop = asyncio.get_event_loop()
             words, detected_lang = await loop.run_in_executor(
                 None,
-                cls._transcribe_sync,
-                video_path,
-                lang_code,
+                lambda: cls._transcribe_sync(video_path, lang_code, "large-v3"),
             )
 
             yield TranscriptionProgress("processing", 0.8, "Assigning words to scenes...")
@@ -194,6 +199,7 @@ class TranscriberService:
         cls,
         audio_path: Path,
         script: dict,
+        model_size: str = "medium",
     ) -> Transcription:
         """
         Transcribe audio and align with a known script.
@@ -204,14 +210,13 @@ class TranscriberService:
         Args:
             audio_path: Path to the audio file
             script: Script JSON with scenes and text
+            model_size: Whisper model size (default: medium for TTS audio)
 
         Returns:
             Transcription with word-level timings
         """
-        cls._init_model()
-
-        # Transcribe to get timings
-        words, detected_lang = cls._transcribe_sync(audio_path, None)
+        # Transcribe to get timings (use medium model for TTS audio)
+        words, detected_lang = cls._transcribe_sync(audio_path, None, model_size)
 
         # Build scene transcriptions from script + timing alignment
         scene_transcriptions = []

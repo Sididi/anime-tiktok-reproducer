@@ -1,13 +1,13 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
-import { useParams } from 'react-router-dom';
-import { Loader2, Check, Download, Package } from 'lucide-react';
-import { Button } from '@/components/ui';
-import { useProjectStore } from '@/stores';
+import { useEffect, useState, useCallback, useRef } from "react";
+import { useParams } from "react-router-dom";
+import { Loader2, Check, Download, Package } from "lucide-react";
+import { Button } from "@/components/ui";
+import { useProjectStore } from "@/stores";
 
 interface ProcessingStep {
   id: string;
   label: string;
-  status: 'pending' | 'processing' | 'complete' | 'error';
+  status: "pending" | "processing" | "complete" | "error";
   message?: string;
 }
 
@@ -30,11 +30,27 @@ export function ProcessingPage() {
   const [error, setError] = useState<string | null>(null);
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const [steps, setSteps] = useState<ProcessingStep[]>([
-    { id: 'auto_editor', label: 'Running auto-editor on TTS audio', status: 'pending' },
-    { id: 'transcription', label: 'Extracting word timings from audio', status: 'pending' },
-    { id: 'jsx_generation', label: 'Generating Premiere Pro script', status: 'pending' },
-    { id: 'srt_generation', label: 'Creating subtitles', status: 'pending' },
-    { id: 'bundling', label: 'Bundling project assets', status: 'pending' },
+    {
+      id: "auto_editor",
+      label: "Running auto-editor (audio + XML export)",
+      status: "pending",
+    },
+    {
+      id: "transcription",
+      label: "Extracting word timings from audio",
+      status: "pending",
+    },
+    {
+      id: "srt_generation",
+      label: "Creating subtitles with word timing",
+      status: "pending",
+    },
+    {
+      id: "xml_generation",
+      label: "Generating Premiere Pro XML project",
+      status: "pending",
+    },
+    { id: "bundling", label: "Bundling project assets", status: "pending" },
   ]);
 
   // Load project
@@ -63,31 +79,31 @@ export function ProcessingPage() {
 
     try {
       const response = await fetch(`/api/projects/${projectId}/process`, {
-        method: 'POST',
+        method: "POST",
       });
 
       if (!response.ok) {
-        throw new Error('Failed to start processing');
+        throw new Error("Failed to start processing");
       }
 
       const reader = response.body?.getReader();
       if (!reader) {
-        throw new Error('No response body');
+        throw new Error("No response body");
       }
 
       const decoder = new TextDecoder();
-      let buffer = '';
+      let buffer = "";
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n\n');
-        buffer = lines.pop() || '';
+        const lines = buffer.split("\n\n");
+        buffer = lines.pop() || "";
 
         for (const line of lines) {
-          if (line.startsWith('data: ')) {
+          if (line.startsWith("data: ")) {
             try {
               const data = JSON.parse(line.slice(6)) as ProcessingProgress;
 
@@ -97,35 +113,38 @@ export function ProcessingPage() {
                 setSteps((prev) =>
                   prev.map((step) => {
                     const stepIndex = prev.findIndex((s) => s.id === step.id);
-                    const currentIndex = prev.findIndex((s) => s.id === data.step);
+                    const currentIndex = prev.findIndex(
+                      (s) => s.id === data.step,
+                    );
 
                     if (stepIndex < currentIndex) {
-                      return { ...step, status: 'complete' };
+                      return { ...step, status: "complete" };
                     }
                     if (step.id === data.step) {
                       return {
                         ...step,
-                        status: data.status === 'error' ? 'error' : 'processing',
+                        status:
+                          data.status === "error" ? "error" : "processing",
                         message: data.message,
                       };
                     }
                     return step;
-                  })
+                  }),
                 );
               }
 
-              if (data.status === 'complete') {
+              if (data.status === "complete") {
                 // Mark all steps as complete
                 setSteps((prev) =>
-                  prev.map((step) => ({ ...step, status: 'complete' }))
+                  prev.map((step) => ({ ...step, status: "complete" })),
                 );
                 if (data.download_url) {
                   setDownloadUrl(data.download_url);
                 }
               }
 
-              if (data.status === 'error') {
-                throw new Error(data.error || 'Processing failed');
+              if (data.status === "error") {
+                throw new Error(data.error || "Processing failed");
               }
             } catch (e) {
               if (e instanceof SyntaxError) continue;
@@ -143,7 +162,14 @@ export function ProcessingPage() {
 
   // Start processing automatically
   useEffect(() => {
-    if (!projectId || loading || processing || downloadUrl || hasStartedProcessing.current) return;
+    if (
+      !projectId ||
+      loading ||
+      processing ||
+      downloadUrl ||
+      hasStartedProcessing.current
+    )
+      return;
 
     hasStartedProcessing.current = true;
     startProcessing();
@@ -168,12 +194,12 @@ export function ProcessingPage() {
       <div className="max-w-lg w-full space-y-8">
         <div className="text-center space-y-2">
           <h1 className="text-2xl font-bold">
-            {downloadUrl ? 'Processing Complete!' : 'Processing Your Project'}
+            {downloadUrl ? "Processing Complete!" : "Processing Your Project"}
           </h1>
           <p className="text-[hsl(var(--muted-foreground))]">
             {downloadUrl
-              ? 'Your Premiere Pro project bundle is ready for download'
-              : 'Please wait while we generate your Premiere Pro project'}
+              ? "Your Premiere Pro project bundle is ready for download"
+              : "Please wait while we generate your Premiere Pro project"}
           </p>
         </div>
 
@@ -195,13 +221,13 @@ export function ProcessingPage() {
           {steps.map((step) => (
             <div key={step.id} className="flex items-start gap-3">
               <div className="shrink-0 mt-0.5">
-                {step.status === 'complete' ? (
+                {step.status === "complete" ? (
                   <div className="h-5 w-5 rounded-full bg-green-500 flex items-center justify-center">
                     <Check className="h-3 w-3 text-white" />
                   </div>
-                ) : step.status === 'processing' ? (
+                ) : step.status === "processing" ? (
                   <Loader2 className="h-5 w-5 animate-spin text-[hsl(var(--primary))]" />
-                ) : step.status === 'error' ? (
+                ) : step.status === "error" ? (
                   <div className="h-5 w-5 rounded-full bg-[hsl(var(--destructive))]" />
                 ) : (
                   <div className="h-5 w-5 rounded-full border-2 border-[hsl(var(--border))]" />
@@ -210,9 +236,9 @@ export function ProcessingPage() {
               <div className="flex-1 min-w-0">
                 <p
                   className={`font-medium ${
-                    step.status === 'pending'
-                      ? 'text-[hsl(var(--muted-foreground))]'
-                      : ''
+                    step.status === "pending"
+                      ? "text-[hsl(var(--muted-foreground))]"
+                      : ""
                   }`}
                 >
                   {step.label}
@@ -234,8 +260,8 @@ export function ProcessingPage() {
               Download Project Bundle
             </Button>
             <p className="text-xs text-center text-[hsl(var(--muted-foreground))]">
-              The bundle contains: .jsx script, edited TTS audio, subtitles (.srt),
-              and references to source episodes
+              The bundle contains: .jsx script, edited TTS audio, subtitles
+              (.srt), and references to source episodes
             </p>
           </div>
         )}
