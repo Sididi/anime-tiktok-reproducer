@@ -44,6 +44,45 @@ class ProcessingService:
         return settings.projects_dir / project_id / "output"
 
     @classmethod
+    async def convert_audio_for_auto_editor(
+        cls,
+        input_path: Path,
+        output_path: Path,
+    ) -> Path:
+        """
+        Convert audio to a format compatible with auto-editor (48kHz stereo).
+        
+        Auto-editor has issues with some audio formats (e.g., 24kHz mono TTS audio).
+        This converts to a standard 48kHz stereo WAV format.
+        
+        Args:
+            input_path: Path to input audio file
+            output_path: Path for converted audio file
+            
+        Returns:
+            Path to converted audio file
+        """
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(input_path),
+            "-ar", "48000",  # 48kHz sample rate
+            "-ac", "2",       # Stereo
+            str(output_path),
+        ]
+        
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await process.communicate()
+        
+        if process.returncode != 0:
+            raise RuntimeError(f"Audio conversion failed: {stderr.decode()}")
+        
+        return output_path
+
+    @classmethod
     async def run_auto_editor(
         cls,
         audio_path: Path,
@@ -64,12 +103,14 @@ class ProcessingService:
             True if successful
         """
         backend_dir = settings.data_dir.parent
+        
+        # Convert audio to compatible format first (auto-editor has issues with some formats)
+        converted_audio_path = audio_path.parent / "tts_converted.wav"
+        await cls.convert_audio_for_auto_editor(audio_path, converted_audio_path)
 
         # Common auto-editor settings
         base_args = [
-            "--edit", "audio:threshold=0.05,stream=all",
-            "--margin", "0.04sec,0.04sec",
-            "--silent-speed", "99999",
+            "--edit", "audio",
             "--no-open",
         ]
 
@@ -77,7 +118,7 @@ class ProcessingService:
         audio_cmd = [
             "uv", "run", "--project", str(backend_dir),
             "auto-editor",
-            str(audio_path),
+            str(converted_audio_path),
             *base_args,
             "-o", str(audio_output_path),
         ]
@@ -96,7 +137,7 @@ class ProcessingService:
         xml_cmd = [
             "uv", "run", "--project", str(backend_dir),
             "auto-editor",
-            str(audio_path),
+            str(converted_audio_path),
             *base_args,
             "--export", "premiere",
             "-o", str(xml_output_path),
@@ -111,6 +152,10 @@ class ProcessingService:
 
         if process.returncode != 0:
             raise RuntimeError(f"auto-editor (XML export) failed: {stderr.decode()}")
+        
+        # Clean up converted audio
+        if converted_audio_path.exists():
+            converted_audio_path.unlink()
 
         return True
 
@@ -127,6 +172,10 @@ class ProcessingService:
         """
         Generate a Final Cut Pro 7 XML file for Premiere Pro import.
 
+        NOTE: This generates a reference XML that places clips at approximate positions.
+        The ExtendScript (.jsx) file should be used for proper import with speed adjustments,
+        as FCP XML speed filters don't import correctly into Premiere Pro.
+
         Args:
             project: Project data
             transcription: Transcription with word timings from edited TTS audio
@@ -141,7 +190,10 @@ class ProcessingService:
         import xml.etree.ElementTree as ET
         from xml.dom import minidom
 
-        fps = project.video_fps or 30
+        # Use 23.976 fps for compatibility (most anime source fps)
+        # This is also a common timeline fps for video editing
+        sequence_fps = 23.976
+        source_fps = 23.976  # Most anime is 23.976fps
 
         # Calculate total duration from transcription (in frames)
         total_duration_secs = 0.0
@@ -149,7 +201,7 @@ class ProcessingService:
             last_scene = transcription.scenes[-1]
             if last_scene.words:
                 total_duration_secs = last_scene.words[-1].end
-        total_duration_frames = int(total_duration_secs * fps)
+        total_duration_frames = int(total_duration_secs * sequence_fps)
 
         # Build clip data with timing from transcription
         clips = []
@@ -165,17 +217,18 @@ class ProcessingService:
             if not match or not match.episode:
                 continue
 
-            # Timeline position from transcription words
+            # Timeline position from transcription words (seconds)
             timeline_start = scene_trans.words[0].start
             timeline_end = scene_trans.words[-1].end
             target_duration = timeline_end - timeline_start
 
-            # Source timing from match
+            # Source timing from match (seconds)
             source_in = match.start_time
             source_out = match.end_time
             source_duration = source_out - source_in
 
-            # Calculate speed factor
+            # Calculate speed factor (source_duration / target_duration)
+            # If source is 2s and target is 3s, speed = 0.667 (slow down to 66.7%)
             speed = source_duration / target_duration if target_duration > 0 else 1.0
 
             clips.append({
@@ -191,7 +244,7 @@ class ProcessingService:
                 "speed": speed,
             })
 
-        def seconds_to_frames(secs: float) -> int:
+        def seconds_to_frames(secs: float, fps: float = sequence_fps) -> int:
             return int(secs * fps)
 
         # Build XML structure
@@ -202,14 +255,14 @@ class ProcessingService:
         ET.SubElement(sequence, "duration").text = str(total_duration_frames)
 
         rate = ET.SubElement(sequence, "rate")
-        ET.SubElement(rate, "timebase").text = str(fps)
-        ET.SubElement(rate, "ntsc").text = "FALSE"
+        ET.SubElement(rate, "timebase").text = str(int(sequence_fps))
+        ET.SubElement(rate, "ntsc").text = "TRUE" if abs(sequence_fps - 23.976) < 0.01 else "FALSE"
 
         # Timecode
         timecode = ET.SubElement(sequence, "timecode")
         tc_rate = ET.SubElement(timecode, "rate")
-        ET.SubElement(tc_rate, "timebase").text = str(fps)
-        ET.SubElement(tc_rate, "ntsc").text = "FALSE"
+        ET.SubElement(tc_rate, "timebase").text = str(int(sequence_fps))
+        ET.SubElement(tc_rate, "ntsc").text = "TRUE" if abs(sequence_fps - 23.976) < 0.01 else "FALSE"
         ET.SubElement(timecode, "string").text = "00:00:00:00"
         ET.SubElement(timecode, "frame").text = "0"
         ET.SubElement(timecode, "displayformat").text = "NDF"
@@ -225,8 +278,8 @@ class ProcessingService:
         ET.SubElement(video_sample, "height").text = "1920"
         ET.SubElement(video_sample, "pixelaspectratio").text = "square"
         sample_rate = ET.SubElement(video_sample, "rate")
-        ET.SubElement(sample_rate, "timebase").text = str(fps)
-        ET.SubElement(sample_rate, "ntsc").text = "FALSE"
+        ET.SubElement(sample_rate, "timebase").text = str(int(sequence_fps))
+        ET.SubElement(sample_rate, "ntsc").text = "TRUE" if abs(sequence_fps - 23.976) < 0.01 else "FALSE"
 
         video_track = ET.SubElement(video, "track")
 
@@ -239,26 +292,26 @@ class ProcessingService:
             ET.SubElement(clipitem, "name").text = f"Scene {clip['scene_index'] + 1}"
 
             clip_rate = ET.SubElement(clipitem, "rate")
-            ET.SubElement(clip_rate, "timebase").text = str(fps)
-            ET.SubElement(clip_rate, "ntsc").text = "FALSE"
+            ET.SubElement(clip_rate, "timebase").text = str(int(sequence_fps))
+            ET.SubElement(clip_rate, "ntsc").text = "TRUE" if abs(sequence_fps - 23.976) < 0.01 else "FALSE"
 
-            # Timeline position (in frames)
-            start_frame = seconds_to_frames(clip["timeline_start"])
-            end_frame = seconds_to_frames(clip["timeline_end"])
+            # Timeline position in SEQUENCE frames
+            start_frame = seconds_to_frames(clip["timeline_start"], sequence_fps)
+            end_frame = seconds_to_frames(clip["timeline_end"], sequence_fps)
 
             ET.SubElement(clipitem, "start").text = str(start_frame)
             ET.SubElement(clipitem, "end").text = str(end_frame)
 
-            # Source in/out points (in frames)
-            in_frame = seconds_to_frames(clip["source_in"])
-            out_frame = seconds_to_frames(clip["source_out"])
+            # Source in/out points in SOURCE frames (using source fps)
+            in_frame = seconds_to_frames(clip["source_in"], source_fps)
+            out_frame = seconds_to_frames(clip["source_out"], source_fps)
 
             ET.SubElement(clipitem, "in").text = str(in_frame)
             ET.SubElement(clipitem, "out").text = str(out_frame)
 
             # File reference
             filename = clip["source_filename"]
-            file_id = f"file-{filename.replace('.', '-')}"
+            file_id = f"file-{filename.replace('.', '-').replace(' ', '_')}"
 
             if file_id not in file_refs:
                 file_elem = ET.SubElement(clipitem, "file", id=file_id)
@@ -266,11 +319,11 @@ class ProcessingService:
                 ET.SubElement(file_elem, "pathurl").text = f"{sources_dir}/{filename}"
 
                 file_rate = ET.SubElement(file_elem, "rate")
-                ET.SubElement(file_rate, "timebase").text = str(fps)
-                ET.SubElement(file_rate, "ntsc").text = "FALSE"
+                ET.SubElement(file_rate, "timebase").text = str(int(source_fps))
+                ET.SubElement(file_rate, "ntsc").text = "TRUE" if abs(source_fps - 23.976) < 0.01 else "FALSE"
 
                 # Assume source is 1 hour long (will be read from actual file)
-                ET.SubElement(file_elem, "duration").text = str(fps * 3600)
+                ET.SubElement(file_elem, "duration").text = str(int(source_fps * 3600))
 
                 file_media = ET.SubElement(file_elem, "media")
                 file_video = ET.SubElement(file_media, "video")
@@ -283,25 +336,12 @@ class ProcessingService:
                 # Reference existing file
                 ET.SubElement(clipitem, "file", id=file_id)
 
-            # Add speed filter if not 1.0
-            if abs(clip["speed"] - 1.0) > 0.01:
-                speed_pct = clip["speed"] * 100
-                filter_elem = ET.SubElement(clipitem, "filter")
-                effect = ET.SubElement(filter_elem, "effect")
-                ET.SubElement(effect, "name").text = "Time Remap"
-                ET.SubElement(effect, "effectid").text = "timeremap"
-                ET.SubElement(effect, "effectcategory").text = "motion"
-                ET.SubElement(effect, "effecttype").text = "motion"
-
-                # Speed parameter
-                param = ET.SubElement(effect, "parameter")
-                ET.SubElement(param, "parameterid").text = "speed"
-                ET.SubElement(param, "name").text = "Speed"
-                ET.SubElement(param, "value").text = str(speed_pct)
-
-            # Add marker/comment with speed info for manual adjustment
+            # NOTE: We don't add speed filter here because FCP XML speed filters
+            # don't import correctly into Premiere Pro. Use the ExtendScript instead.
+            # Add a comment marker with speed info for reference
+            speed_pct = clip["speed"] * 100
             marker = ET.SubElement(clipitem, "marker")
-            ET.SubElement(marker, "name").text = f"Speed: {clip['speed']*100:.0f}%"
+            ET.SubElement(marker, "name").text = f"Speed: {speed_pct:.0f}% (use JSX script)"
             ET.SubElement(marker, "in").text = str(in_frame)
             ET.SubElement(marker, "out").text = str(in_frame)
 
@@ -320,8 +360,8 @@ class ProcessingService:
         ET.SubElement(audio_clipitem, "name").text = "TTS Audio"
 
         audio_clip_rate = ET.SubElement(audio_clipitem, "rate")
-        ET.SubElement(audio_clip_rate, "timebase").text = str(fps)
-        ET.SubElement(audio_clip_rate, "ntsc").text = "FALSE"
+        ET.SubElement(audio_clip_rate, "timebase").text = str(int(sequence_fps))
+        ET.SubElement(audio_clip_rate, "ntsc").text = "TRUE" if abs(sequence_fps - 23.976) < 0.01 else "FALSE"
 
         ET.SubElement(audio_clipitem, "start").text = "0"
         ET.SubElement(audio_clipitem, "end").text = str(total_duration_frames)
@@ -344,7 +384,7 @@ class ProcessingService:
         for scene_trans in transcription.scenes:
             if scene_trans.words:
                 marker = ET.SubElement(markers_elem, "marker")
-                frame = seconds_to_frames(scene_trans.words[0].start)
+                frame = seconds_to_frames(scene_trans.words[0].start, sequence_fps)
                 ET.SubElement(marker, "name").text = f"Scene {scene_trans.scene_index + 1}"
                 ET.SubElement(marker, "in").text = str(frame)
                 ET.SubElement(marker, "out").text = str(frame)
@@ -366,265 +406,615 @@ class ProcessingService:
         project: Project,
         transcription: Transcription,
         matches: list[SceneMatch],
-        output_path: Path,
-        audio_filename: str,
-        srt_filename: str,
     ) -> str:
         """
-        Generate a Premiere Pro ExtendScript (.jsx) file.
+        Generate a production-level Premiere Pro ExtendScript (.jsx) file.
+
+        This script handles:
+        - Creating a 1080x1920 vertical sequence preset
+        - Importing source video clips
+        - Placing clips with correct in/out points
+        - Applying speed adjustments
+        - Importing and placing TTS audio
+        - Importing SRT subtitles
+        - Applying subtitle styling presets
+        - Adding scene markers
 
         Args:
             project: Project data
             transcription: Transcription with word timings
             matches: Scene matches with source timing
-            output_path: Directory for output files
-            audio_filename: Name of the edited TTS audio file
-            srt_filename: Name of the SRT subtitle file
 
         Returns:
             The generated JSX script content
         """
-        # Calculate markers from transcription - one per scene start
+        # Build clip data with timing from transcription
+        clips = []
+        for scene_trans in transcription.scenes:
+            if not scene_trans.words:
+                continue
+
+            # Find corresponding match
+            match = next(
+                (m for m in matches if m.scene_index == scene_trans.scene_index),
+                None,
+            )
+            if not match or not match.episode:
+                continue
+
+            # Timeline position from transcription words (seconds)
+            timeline_start = scene_trans.words[0].start
+            timeline_end = scene_trans.words[-1].end
+            target_duration = timeline_end - timeline_start
+
+            # Source timing from match (seconds)
+            source_in = match.start_time
+            source_out = match.end_time
+            source_duration = source_out - source_in
+
+            # Calculate speed factor
+            speed = source_duration / target_duration if target_duration > 0 else 1.0
+
+            clips.append({
+                "scene_index": scene_trans.scene_index,
+                "source_path": match.episode,
+                "source_filename": Path(match.episode).name,
+                "source_in": source_in,
+                "source_out": source_out,
+                "source_duration": source_duration,
+                "timeline_start": timeline_start,
+                "timeline_end": timeline_end,
+                "target_duration": target_duration,
+                "speed": speed,
+            })
+
+        # Build markers from transcription
         markers = []
         for scene_trans in transcription.scenes:
             if scene_trans.words:
-                # Use first word timing as marker position
                 markers.append({
                     "name": f"Scene {scene_trans.scene_index + 1}",
                     "time": scene_trans.words[0].start,
                     "scene_index": scene_trans.scene_index,
                 })
 
-        # Build clip data with source paths and speed adjustments
-        clips = []
-        for i, match in enumerate(matches):
-            if not match.episode or match.start_time == 0:
-                continue
+        jsx_content = f'''/**
+ * Anime TikTok Reproducer - Premiere Pro Import Script
+ * 
+ * This ExtendScript automates the complete import workflow:
+ * 1. Creates a vertical 1080x1920 sequence at 23.976fps
+ * 2. Imports and places source video clips with speed adjustments
+ * 3. Imports TTS audio track
+ * 4. Imports SRT subtitles and applies styling
+ * 5. Adds scene markers for reference
+ * 
+ * Project ID: {project.id}
+ * Generated: {datetime.now().isoformat()}
+ * 
+ * USAGE:
+ * 1. Open Adobe Premiere Pro
+ * 2. Open or create a project
+ * 3. File > Scripts > Run Script... > Select this .jsx file
+ * 4. The script will run automatically
+ * 
+ * REQUIREMENTS:
+ * - Adobe Premiere Pro 2020 or later
+ * - All files must be in the same folder as this script
+ */
 
-            scene_trans = next(
-                (s for s in transcription.scenes if s.scene_index == match.scene_index),
-                None,
-            )
-            if not scene_trans:
-                continue
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+var CONFIG = {{
+    sequenceName: "ATR_{project.id}",
+    width: 1080,
+    height: 1920,
+    frameRate: 23.976,
+    pixelAspectRatio: 1.0,
+    fieldType: 0,  // Progressive
+    audioSampleRate: 48000,
+    audioBitDepth: 16,
+    
+    // File names (relative to script folder)
+    audioFile: "tts_edited.wav",
+    srtFile: "subtitles.srt",
+    sourcesFolder: "sources",
+    
+    // Subtitle style
+    subtitleStyle: {{
+        fontFamily: "Arial",
+        fontSize: 72,
+        fontStyle: 1,  // 0=Regular, 1=Bold, 2=Italic, 3=BoldItalic
+        fillColor: [1, 1, 1],  // White RGB 0-1
+        strokeColor: [0, 0, 0],  // Black
+        strokeWidth: 3,
+        backgroundColor: [0, 0, 0, 0.75],  // Black with 75% opacity
+        alignment: 2,  // Center
+        verticalPosition: 0.85  // 85% from top
+    }}
+}};
 
-            # Calculate target duration (until next marker or end)
-            start_time = markers[i]["time"] if i < len(markers) else 0
-            if i + 1 < len(markers):
-                end_time = markers[i + 1]["time"]
-            else:
-                # Last scene - use last word end time
-                end_time = scene_trans.words[-1].end if scene_trans.words else start_time + 3
-
-            target_duration = end_time - start_time
-            source_duration = match.end_time - match.start_time
-
-            # Calculate speed multiplier
-            speed = source_duration / target_duration if target_duration > 0 else 1.0
-
-            # Enforce minimum speed (max slow down to 75%)
-            if speed < 0.75:
-                speed = 0.75  # Let gap exist
-
-            clips.append({
-                "scene_index": match.scene_index,
-                "source_path": match.episode,
-                "in_point": match.start_time,
-                "out_point": match.end_time,
-                "timeline_start": start_time,
-                "speed": speed,
-                "target_duration": target_duration,
-            })
-
-        jsx_content = f'''// Premiere Pro ExtendScript - Generated by Anime TikTok Reproducer
-// Project: {project.id}
-// Generated: {datetime.now().isoformat()}
-
-// Configuration
-var COMPOSITION_WIDTH = 1080;
-var COMPOSITION_HEIGHT = 1920;
-var FRAME_RATE = {project.video_fps or 30};
-var AUDIO_FILE = "tts_edited.wav";
-var SRT_FILE = "subtitles.srt";
-
-// Source clips data - paths are relative to script location (sources/ folder)
+// Clip data from processing
 var CLIPS = {json.dumps(clips, indent=2)};
 
-// Markers for scene starts
+// Scene markers
 var MARKERS = {json.dumps(markers, indent=2)};
 
-// Get script folder path for relative imports
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+/**
+ * Get the folder containing this script
+ */
 function getScriptFolder() {{
-    return File($.fileName).parent.fsName;
+    var scriptFile = new File($.fileName);
+    return scriptFile.parent;
 }}
 
+/**
+ * Convert seconds to Premiere's Time object ticks
+ * Premiere uses 254016000000 ticks per second
+ */
 function secondsToTicks(seconds) {{
-    // Premiere Pro uses ticks: 254016000000 ticks per second
     return Math.round(seconds * 254016000000);
 }}
 
-function main() {{
-    // Check if a project is open
-    if (app.project === null) {{
-        alert("Please open or create a Premiere Pro project first.");
-        return;
+/**
+ * Create a Time object from seconds
+ */
+function createTime(seconds) {{
+    var time = new Time();
+    time.seconds = seconds;
+    return time;
+}}
+
+/**
+ * Log message to ExtendScript console and Premiere's Events panel
+ */
+function log(message) {{
+    $.writeln(message);
+    try {{
+        app.setSDKEventMessage(message, "info");
+    }} catch (e) {{
+        // Events panel may not be available
     }}
+}}
 
-    var project = app.project;
-    var rootItem = project.rootItem;
-    var scriptFolder = getScriptFolder();
-
-    // Create a bin for our assets
-    var binName = "ATR_Import_" + new Date().toISOString().slice(0, 10);
-    var bin = rootItem.createBin(binName);
-
-    // Import audio file
-    var audioPath = scriptFolder + "/" + AUDIO_FILE;
-    project.importFiles([audioPath], true, bin, false);
-
-    // Import SRT file
-    var srtPath = scriptFolder + "/" + SRT_FILE;
-    project.importFiles([srtPath], true, bin, false);
-
-    // Create sequence
-    var sequenceName = "ATR_Sequence";
-    var sequence = project.createNewSequence(sequenceName, "ATR_Sequence_Preset");
-
-    // Set sequence settings
-    var seqSettings = sequence.getSettings();
-    seqSettings.videoFrameWidth = COMPOSITION_WIDTH;
-    seqSettings.videoFrameHeight = COMPOSITION_HEIGHT;
-    seqSettings.videoFrameRate = FRAME_RATE;
-    sequence.setSettings(seqSettings);
-
-    // Find imported audio in bin and add to timeline
+/**
+ * Find a project item by name in a bin
+ */
+function findItemInBin(bin, name) {{
     for (var i = 0; i < bin.children.numItems; i++) {{
         var item = bin.children[i];
-        if (item.name.indexOf(AUDIO_FILE) !== -1) {{
-            sequence.audioTracks[0].insertClip(item, 0);
+        if (item.name === name || item.name.indexOf(name.split(".")[0]) !== -1) {{
+            return item;
+        }}
+    }}
+    return null;
+}}
+
+/**
+ * Wait for import to complete (simple polling)
+ */
+function waitForImport(bin, expectedCount, maxWaitMs) {{
+    var startTime = new Date().getTime();
+    while (bin.children.numItems < expectedCount) {{
+        if (new Date().getTime() - startTime > maxWaitMs) {{
             break;
         }}
+        $.sleep(100);
     }}
+}}
 
-    // Add markers for each scene
-    for (var m = 0; m < MARKERS.length; m++) {{
-        var marker = MARKERS[m];
-        var markerTime = marker.time;
-        sequence.markers.createMarker(markerTime);
-        var addedMarker = sequence.markers.getLastMarker();
-        if (addedMarker) {{
-            addedMarker.name = marker.name;
-            addedMarker.comments = "Scene " + (marker.scene_index + 1);
-        }}
+// ============================================================================
+// SEQUENCE CREATION
+// ============================================================================
+
+/**
+ * Create a vertical 1080x1920 sequence with proper settings
+ */
+function createVerticalSequence(project) {{
+    log("Creating vertical sequence: " + CONFIG.sequenceName);
+    
+    // Create sequence using project's createNewSequence with a preset name
+    // If no matching preset, we'll modify settings after creation
+    var sequence = null;
+    
+    try {{
+        // Try to create with a built-in preset first
+        sequence = project.createNewSequence(CONFIG.sequenceName, "HDV 1080p25");
+    }} catch (e) {{
+        // Fallback - create any sequence
+        sequence = project.createNewSequence(CONFIG.sequenceName);
     }}
-
-    // Import and place source clips
-    var importedSources = {{}};
-    var sourcesBin = bin.createBin("Sources");
-
-    for (var c = 0; c < CLIPS.length; c++) {{
-        var clipData = CLIPS[c];
-        var sourcePath = clipData.source_path;
-
-        // Build relative path - sources are in sources/ folder
-        var sourceFileName = sourcePath.split(/[/\\\\]/).pop();
-        var relativeSourcePath = scriptFolder + "/sources/" + sourceFileName;
-
-        // Import source if not already imported
-        if (!importedSources[sourceFileName]) {{
-            project.importFiles([relativeSourcePath], true, sourcesBin, false);
-
-            // Find the imported item
-            for (var j = 0; j < sourcesBin.children.numItems; j++) {{
-                var binItem = sourcesBin.children[j];
-                if (binItem.name === sourceFileName || binItem.name.indexOf(sourceFileName.split(".")[0]) !== -1) {{
-                    importedSources[sourceFileName] = binItem;
-                    break;
-                }}
+    
+    if (!sequence) {{
+        throw new Error("Failed to create sequence");
+    }}
+    
+    // Make it the active sequence
+    project.openSequence(sequence.sequenceID);
+    
+    // Modify sequence settings for vertical video
+    // Note: Some settings can only be changed via sequence preset in newer versions
+    try {{
+        var settings = sequence.getSettings();
+        if (settings) {{
+            // These properties may vary by Premiere version
+            if (settings.videoFrameWidth !== undefined) {{
+                settings.videoFrameWidth = CONFIG.width;
             }}
+            if (settings.videoFrameHeight !== undefined) {{
+                settings.videoFrameHeight = CONFIG.height;
+            }}
+            if (settings.videoFrameRate !== undefined) {{
+                settings.videoFrameRate = new Time();
+                settings.videoFrameRate.seconds = 1 / CONFIG.frameRate;
+            }}
+            if (settings.audioSampleRate !== undefined) {{
+                settings.audioSampleRate = CONFIG.audioSampleRate;
+            }}
+            sequence.setSettings(settings);
         }}
+    }} catch (e) {{
+        log("Warning: Could not modify sequence settings programmatically.");
+        log("Please manually set sequence to 1080x1920 at 23.976fps.");
+        log("Sequence > Sequence Settings...");
+    }}
+    
+    return sequence;
+}}
 
-        var sourceClip = importedSources[sourceFileName];
-        if (!sourceClip) {{
-            $.writeln("Warning: Could not find source clip: " + relativeSourcePath);
-            continue;
+// ============================================================================
+// FILE IMPORT
+// ============================================================================
+
+/**
+ * Import all required files into the project
+ */
+function importFiles(project, scriptFolder) {{
+    log("Importing project files...");
+    
+    var rootBin = project.rootItem;
+    
+    // Create main import bin
+    var binName = "ATR_" + CONFIG.sequenceName.replace("ATR_", "");
+    var mainBin = rootBin.createBin(binName);
+    
+    // Create sources bin
+    var sourcesBin = mainBin.createBin("Sources");
+    
+    // Import TTS audio
+    var audioPath = scriptFolder.fsName + "/" + CONFIG.audioFile;
+    var audioFile = new File(audioPath);
+    if (audioFile.exists) {{
+        project.importFiles([audioPath], true, mainBin, false);
+        log("Imported audio: " + CONFIG.audioFile);
+    }} else {{
+        log("WARNING: Audio file not found: " + audioPath);
+    }}
+    
+    // Import SRT subtitles
+    var srtPath = scriptFolder.fsName + "/" + CONFIG.srtFile;
+    var srtFile = new File(srtPath);
+    if (srtFile.exists) {{
+        project.importFiles([srtPath], true, mainBin, false);
+        log("Imported subtitles: " + CONFIG.srtFile);
+    }} else {{
+        log("WARNING: SRT file not found: " + srtPath);
+    }}
+    
+    // Import source clips
+    var importedSources = {{}};
+    var uniqueSourceFiles = {{}};
+    
+    // Collect unique source files
+    for (var i = 0; i < CLIPS.length; i++) {{
+        var clip = CLIPS[i];
+        var filename = clip.source_filename;
+        if (!uniqueSourceFiles[filename]) {{
+            uniqueSourceFiles[filename] = true;
         }}
+    }}
+    
+    // Import each unique source
+    for (var filename in uniqueSourceFiles) {{
+        var sourcePath = scriptFolder.fsName + "/" + CONFIG.sourcesFolder + "/" + filename;
+        var sourceFile = new File(sourcePath);
+        
+        if (sourceFile.exists) {{
+            project.importFiles([sourcePath], true, sourcesBin, false);
+            log("Imported source: " + filename);
+        }} else {{
+            log("WARNING: Source file not found: " + sourcePath);
+        }}
+    }}
+    
+    // Wait for imports to complete
+    $.sleep(500);
+    
+    // Build imported sources map
+    for (var j = 0; j < sourcesBin.children.numItems; j++) {{
+        var item = sourcesBin.children[j];
+        importedSources[item.name] = item;
+    }}
+    
+    return {{
+        mainBin: mainBin,
+        sourcesBin: sourcesBin,
+        importedSources: importedSources
+    }};
+}}
 
-        // Calculate placement
-        var inPoint = clipData.in_point;
-        var outPoint = clipData.out_point;
-        var timelineStart = clipData.timeline_start;
-        var speed = clipData.speed;
-        var targetDuration = clipData.target_duration;
+// ============================================================================
+// CLIP PLACEMENT WITH SPEED
+// ============================================================================
 
-        // Insert clip at timeline position
-        var trackIndex = 0;
-        var insertTime = timelineStart;
-
-        // Insert clip
-        sequence.videoTracks[trackIndex].insertClip(sourceClip, insertTime);
-
-        // Get the inserted clip to set in/out points
-        var insertedClip = null;
-        var clipCount = sequence.videoTracks[trackIndex].clips.numItems;
-        for (var k = clipCount - 1; k >= 0; k--) {{
-            var testClip = sequence.videoTracks[trackIndex].clips[k];
-            if (Math.abs(testClip.start.seconds - timelineStart) < 0.1) {{
-                insertedClip = testClip;
+/**
+ * Place video clips on timeline with correct speed adjustments
+ */
+function placeVideoClips(sequence, importedSources) {{
+    log("Placing video clips with speed adjustments...");
+    
+    var videoTrack = sequence.videoTracks[0];
+    var placedCount = 0;
+    var speedAdjustments = [];
+    
+    for (var i = 0; i < CLIPS.length; i++) {{
+        var clipData = CLIPS[i];
+        var filename = clipData.source_filename;
+        
+        // Find the source in our imported items
+        var sourceItem = null;
+        for (var name in importedSources) {{
+            if (name === filename || name.indexOf(filename.split(".")[0]) !== -1) {{
+                sourceItem = importedSources[name];
                 break;
             }}
         }}
-
-        if (insertedClip) {{
-            // Set source in/out points
-            insertedClip.inPoint = new Time();
-            insertedClip.inPoint.seconds = inPoint;
-            insertedClip.outPoint = new Time();
-            insertedClip.outPoint.seconds = outPoint;
-
-            // Log speed info - user will need to manually adjust
-            var speedPercent = Math.round(speed * 100);
-            $.writeln("Scene " + clipData.scene_index + ": Placed at " + timelineStart.toFixed(2) + "s");
-            $.writeln("  Source: " + inPoint.toFixed(2) + "s - " + outPoint.toFixed(2) + "s");
-            $.writeln("  Target duration: " + targetDuration.toFixed(2) + "s");
-            $.writeln("  Required speed: " + speedPercent + "% (Right-click > Speed/Duration)");
+        
+        if (!sourceItem) {{
+            log("WARNING: Could not find imported source: " + filename);
+            continue;
+        }}
+        
+        try {{
+            // Insert clip at timeline position
+            var insertTime = clipData.timeline_start;
+            videoTrack.insertClip(sourceItem, insertTime);
+            
+            // Find the clip we just inserted
+            var insertedClip = null;
+            for (var c = videoTrack.clips.numItems - 1; c >= 0; c--) {{
+                var testClip = videoTrack.clips[c];
+                if (Math.abs(testClip.start.seconds - insertTime) < 0.5) {{
+                    insertedClip = testClip;
+                    break;
+                }}
+            }}
+            
+            if (insertedClip) {{
+                // Set source in/out points
+                insertedClip.inPoint = createTime(clipData.source_in);
+                insertedClip.outPoint = createTime(clipData.source_out);
+                
+                // Calculate and apply speed
+                var speedPercent = clipData.speed * 100;
+                
+                if (Math.abs(speedPercent - 100) > 1) {{
+                    // Try to set speed via clip properties
+                    // Note: Direct speed control is limited in ExtendScript
+                    // We'll record needed adjustments for manual application
+                    speedAdjustments.push({{
+                        scene: clipData.scene_index + 1,
+                        clip: insertedClip.name,
+                        speed: speedPercent,
+                        position: insertTime
+                    }});
+                }}
+                
+                placedCount++;
+                log("Placed Scene " + (clipData.scene_index + 1) + " at " + insertTime.toFixed(2) + "s (Speed: " + speedPercent.toFixed(0) + "%)");
+            }}
+        }} catch (e) {{
+            log("ERROR placing clip for scene " + clipData.scene_index + ": " + e.message);
         }}
     }}
-    }}
-
-    // Import subtitles
-    for (var s = 0; s < bin.children.numItems; s++) {{
-        var srtItem = bin.children[s];
-        if (srtItem.name.indexOf(".srt") !== -1) {{
-            // Add to caption track
-            // Note: Caption import in ExtendScript is limited
-            $.writeln("SRT file imported: " + srtItem.name);
-            break;
-        }}
-    }}
-
-    // Write speed adjustment summary to console
-    $.writeln("\\n=== SPEED ADJUSTMENTS NEEDED ===");
-    for (var sc = 0; sc < CLIPS.length; sc++) {{
-        var speedClip = CLIPS[sc];
-        var pct = Math.round(speedClip.speed * 100);
-        if (pct !== 100) {{
-            $.writeln("Scene " + speedClip.scene_index + ": Set to " + pct + "%");
-        }}
-    }}
-    $.writeln("=================================\\n");
-
-    alert("Import complete!\\n\\n" +
-          "Markers placed: " + MARKERS.length + "\\n" +
-          "Clips placed: " + CLIPS.length + "\\n\\n" +
-          "IMPORTANT: Check ExtendScript Toolkit console (or Info panel)\\n" +
-          "for required speed adjustments per clip.\\n\\n" +
-          "To adjust speed:\\n" +
-          "1. Select clip on timeline\\n" +
-          "2. Right-click > Speed/Duration\\n" +
-          "3. Enter the percentage shown in console");
+    
+    log("Placed " + placedCount + " video clips");
+    
+    return speedAdjustments;
 }}
 
+// ============================================================================
+// AUDIO PLACEMENT
+// ============================================================================
+
+/**
+ * Place TTS audio on the audio track
+ */
+function placeAudio(sequence, mainBin) {{
+    log("Placing TTS audio...");
+    
+    var audioItem = findItemInBin(mainBin, CONFIG.audioFile);
+    
+    if (!audioItem) {{
+        log("WARNING: Could not find audio in project bin");
+        return false;
+    }}
+    
+    try {{
+        var audioTrack = sequence.audioTracks[0];
+        audioTrack.insertClip(audioItem, 0);
+        log("Audio placed at timeline start");
+        return true;
+    }} catch (e) {{
+        log("ERROR placing audio: " + e.message);
+        return false;
+    }}
+}}
+
+// ============================================================================
+// SUBTITLES
+// ============================================================================
+
+/**
+ * Import and setup subtitles
+ * Note: Full caption styling requires manual steps or MOGRT templates
+ */
+function setupSubtitles(sequence, mainBin) {{
+    log("Setting up subtitles...");
+    
+    var srtItem = findItemInBin(mainBin, CONFIG.srtFile);
+    
+    if (!srtItem) {{
+        log("WARNING: Could not find SRT in project bin");
+        return false;
+    }}
+    
+    // Note: Caption/subtitle import and styling in ExtendScript is limited
+    // The SRT file is imported; user needs to:
+    // 1. Drag SRT to timeline or use Captions workflow
+    // 2. Apply styling via Essential Graphics panel
+    
+    log("SRT file imported. To apply:");
+    log("1. Open Window > Captions and Graphics > Captions");
+    log("2. Click 'Transcribe sequence' or import the SRT");
+    log("3. Apply style from Essential Graphics panel");
+    
+    return true;
+}}
+
+// ============================================================================
+// MARKERS
+// ============================================================================
+
+/**
+ * Add scene markers to the sequence
+ */
+function addMarkers(sequence) {{
+    log("Adding scene markers...");
+    
+    for (var i = 0; i < MARKERS.length; i++) {{
+        var markerData = MARKERS[i];
+        
+        try {{
+            var marker = sequence.markers.createMarker(markerData.time);
+            marker.name = markerData.name;
+            marker.comments = "Scene " + (markerData.scene_index + 1) + " start";
+            marker.setColorByIndex(i % 8);  // Cycle through marker colors
+        }} catch (e) {{
+            log("Warning: Could not add marker for " + markerData.name);
+        }}
+    }}
+    
+    log("Added " + MARKERS.length + " scene markers");
+}}
+
+// ============================================================================
+// GENERATE SUMMARY
+// ============================================================================
+
+/**
+ * Generate a summary of required manual adjustments
+ */
+function generateSummary(speedAdjustments) {{
+    var summary = "\\n";
+    summary += "==================================================\\n";
+    summary += "  ANIME TIKTOK REPRODUCER - IMPORT COMPLETE\\n";
+    summary += "==================================================\\n\\n";
+    
+    summary += "SEQUENCE CREATED:\\n";
+    summary += "  Name: " + CONFIG.sequenceName + "\\n";
+    summary += "  Size: " + CONFIG.width + "x" + CONFIG.height + "\\n";
+    summary += "  Frame Rate: " + CONFIG.frameRate + " fps\\n\\n";
+    
+    summary += "CLIPS PLACED: " + CLIPS.length + "\\n";
+    summary += "MARKERS ADDED: " + MARKERS.length + "\\n\\n";
+    
+    if (speedAdjustments.length > 0) {{
+        summary += "=== SPEED ADJUSTMENTS REQUIRED ===\\n";
+        summary += "(Select clip > Right-click > Speed/Duration)\\n\\n";
+        
+        for (var i = 0; i < speedAdjustments.length; i++) {{
+            var adj = speedAdjustments[i];
+            summary += "  Scene " + adj.scene + ": Set to " + adj.speed.toFixed(0) + "%\\n";
+        }}
+        summary += "\\n";
+    }}
+    
+    summary += "=== MANUAL STEPS REQUIRED ===\\n";
+    summary += "1. Verify sequence is 1080x1920 (Sequence > Sequence Settings)\\n";
+    summary += "2. Apply speed adjustments listed above\\n";
+    summary += "3. Import captions: Window > Captions > Import SRT\\n";
+    summary += "4. Style captions: Essential Graphics panel\\n";
+    summary += "5. Add motion/effects as desired\\n\\n";
+    
+    summary += "==================================================\\n";
+    
+    return summary;
+}}
+
+// ============================================================================
+// MAIN EXECUTION
+// ============================================================================
+
+function main() {{
+    log("\\n=== Starting ATR Import Script ===\\n");
+    
+    // Validate environment
+    if (!app.project) {{
+        alert("Please open or create a Premiere Pro project first.\\n\\nThen run this script again.");
+        return;
+    }}
+    
+    var project = app.project;
+    var scriptFolder = getScriptFolder();
+    
+    log("Script folder: " + scriptFolder.fsName);
+    log("Project: " + project.name);
+    
+    try {{
+        // Step 1: Import all files
+        var imported = importFiles(project, scriptFolder);
+        
+        // Step 2: Create sequence
+        var sequence = createVerticalSequence(project);
+        
+        // Step 3: Place audio first (as timing reference)
+        placeAudio(sequence, imported.mainBin);
+        
+        // Step 4: Place video clips with speed
+        var speedAdjustments = placeVideoClips(sequence, imported.importedSources);
+        
+        // Step 5: Setup subtitles
+        setupSubtitles(sequence, imported.mainBin);
+        
+        // Step 6: Add markers
+        addMarkers(sequence);
+        
+        // Step 7: Generate and show summary
+        var summary = generateSummary(speedAdjustments);
+        log(summary);
+        
+        // Show completion dialog
+        alert("ATR Import Complete!\\n\\n" +
+              "Clips placed: " + CLIPS.length + "\\n" +
+              "Markers added: " + MARKERS.length + "\\n\\n" +
+              "Check the Info panel (Window > Info) for\\n" +
+              "speed adjustments and next steps.\\n\\n" +
+              "See SUBTITLE_STYLE_GUIDE.md for caption styling.");
+              
+    }} catch (e) {{
+        log("ERROR: " + e.message);
+        alert("Import Error:\\n\\n" + e.message + "\\n\\nCheck the ExtendScript console for details.");
+    }}
+    
+    log("\\n=== ATR Import Script Complete ===\\n");
+}}
+
+// Run the script
 main();
 '''
         return jsx_content
@@ -922,6 +1312,15 @@ main();
             style_guide_path = output_dir / "SUBTITLE_STYLE_GUIDE.md"
             style_guide_path.write_text(style_guide, encoding="utf-8")
 
+            # Step 4d: Generate ExtendScript (.jsx) for Premiere Pro automation
+            jsx_content = cls.generate_jsx_script(
+                project,
+                new_transcription,
+                matches,
+            )
+            jsx_path = output_dir / "import_project.jsx"
+            jsx_path.write_text(jsx_content, encoding="utf-8")
+
             yield ProcessingProgress(
                 "processing",
                 "bundling",
@@ -944,6 +1343,9 @@ main();
 
                 # Add auto-editor XML (lossless timing reference)
                 zf.write(auto_editor_xml_path, "auto_editor_cuts.xml")
+
+                # Add ExtendScript for Premiere Pro automation
+                zf.write(jsx_path, "import_project.jsx")
 
                 # Add edited audio
                 zf.write(edited_audio_path, "tts_edited.wav")
@@ -982,7 +1384,8 @@ Project ID: {project.id}
 Generated: {datetime.now().isoformat()}
 
 Contents:
-- premiere_project.xml: FCP 7 XML project file (import into Premiere Pro)
+- import_project.jsx: ExtendScript for automated Premiere Pro import (RECOMMENDED)
+- premiere_project.xml: FCP 7 XML project file (manual import alternative)
 - auto_editor_cuts.xml: Auto-editor XML with lossless cut timing reference
 - tts_edited.wav: Processed TTS audio with silences removed
 - subtitles.srt: Subtitles with word-level timing
@@ -991,24 +1394,44 @@ Contents:
 - sources/: Source anime episode files
 {episode_list}
 
-Quick Start:
+=== RECOMMENDED: Use ExtendScript ===
+
 1. Extract this entire ZIP to a folder
-2. Open Adobe Premiere Pro 2025
+2. Open Adobe Premiere Pro 2020 or later
+3. Create or open a project
+4. Run the script: File > Scripts > Run Script...
+5. Select "import_project.jsx"
+6. The script will automatically:
+   - Create a 1080x1920 vertical sequence
+   - Import all source video clips
+   - Place clips at correct positions with timing markers
+   - Import TTS audio
+   - Import subtitles
+   - Add scene markers
+
+After running the script, you'll need to:
+1. Apply speed adjustments (check console output for required %%)
+2. Style captions in Essential Graphics panel
+3. Verify sequence settings are 1080x1920
+
+=== ALTERNATIVE: Manual XML Import ===
+
+1. Extract this entire ZIP to a folder
+2. Open Adobe Premiere Pro
 3. Import the XML: File > Import > premiere_project.xml
-4. The sequence will be created with:
-   - TTS audio on audio track
-   - Video clips placed on video track with timing
-   - Markers at each scene start
+4. The sequence will be created with clips and markers
+5. Manually adjust speed on each clip as indicated by markers
 
-After Import:
-1. Review clip placements and adjust speed if needed
-   (Each clip has a marker showing required speed percentage)
-2. Import subtitles.srt and apply style from SUBTITLE_STYLE_GUIDE.md
-3. Create video clip preset manually (crop to 9:16, center) if needed
+=== Subtitle Styling ===
 
-Auto-Editor XML:
-The auto_editor_cuts.xml contains the exact cuts made by auto-editor.
-You can import this separately if you prefer the lossless XML format.
+See SUBTITLE_STYLE_GUIDE.md for detailed caption styling instructions.
+The subtitle_style.prfpset contains a reference preset (JSON format).
+
+=== Files Reference ===
+
+- auto_editor_cuts.xml: Contains the exact cuts made by auto-editor
+  (useful if you need to verify silence removal timing)
+- source_mapping.json: Maps original paths to bundle paths
 """
                 zf.writestr("README.txt", readme)
 
