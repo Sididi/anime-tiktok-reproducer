@@ -51,14 +51,14 @@ class ProcessingService:
     ) -> Path:
         """
         Convert audio to a format compatible with auto-editor (48kHz stereo).
-        
+
         Auto-editor has issues with some audio formats (e.g., 24kHz mono TTS audio).
         This converts to a standard 48kHz stereo WAV format.
-        
+
         Args:
             input_path: Path to input audio file
             output_path: Path for converted audio file
-            
+
         Returns:
             Path to converted audio file
         """
@@ -69,17 +69,17 @@ class ProcessingService:
             "-ac", "2",       # Stereo
             str(output_path),
         ]
-        
+
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         _, stderr = await process.communicate()
-        
+
         if process.returncode != 0:
             raise RuntimeError(f"Audio conversion failed: {stderr.decode()}")
-        
+
         return output_path
 
     @classmethod
@@ -103,7 +103,7 @@ class ProcessingService:
             True if successful
         """
         backend_dir = settings.data_dir.parent
-        
+
         # Convert audio to compatible format first (auto-editor has issues with some formats)
         converted_audio_path = audio_path.parent / "tts_converted.wav"
         await cls.convert_audio_for_auto_editor(audio_path, converted_audio_path)
@@ -152,7 +152,7 @@ class ProcessingService:
 
         if process.returncode != 0:
             raise RuntimeError(f"auto-editor (XML export) failed: {stderr.decode()}")
-        
+
         # Clean up converted audio
         if converted_audio_path.exists():
             converted_audio_path.unlink()
@@ -408,17 +408,13 @@ class ProcessingService:
         matches: list[SceneMatch],
     ) -> str:
         """
-        Generate a production-level Premiere Pro ExtendScript (.jsx) file.
+        Generate a production-ready Premiere Pro 2025 ExtendScript (.jsx) file.
 
-        This script handles:
-        - Creating a 1080x1920 vertical sequence preset
-        - Importing source video clips
-        - Placing clips with correct in/out points
-        - Applying speed adjustments
-        - Importing and placing TTS audio
-        - Importing SRT subtitles
-        - Applying subtitle styling presets
-        - Adding scene markers
+        Uses the QE (Quality Engineering) DOM for reliable:
+        - 60fps vertical sequence creation via .sqpreset
+        - Speed adjustments via qeItem.setSpeed()
+        - Video effect application via QE DOM
+        - MOGRT subtitle placement per scene
 
         Args:
             project: Project data
@@ -426,10 +422,10 @@ class ProcessingService:
             matches: Scene matches with source timing
 
         Returns:
-            The generated JSX script content
+            The generated JSX script content (ES3 compatible)
         """
-        # Build clip data with timing from transcription
-        clips = []
+        # Build scenes data with timing from transcription and elastic time logic
+        scenes = []
         for scene_trans in transcription.scenes:
             if not scene_trans.words:
                 continue
@@ -442,580 +438,727 @@ class ProcessingService:
             if not match or not match.episode:
                 continue
 
-            # Timeline position from transcription words (seconds)
+            # Timeline position from TTS transcription words (seconds)
             timeline_start = scene_trans.words[0].start
             timeline_end = scene_trans.words[-1].end
             target_duration = timeline_end - timeline_start
 
-            # Source timing from match (seconds)
+            # Source timing from match (seconds) - the original anime clip
             source_in = match.start_time
             source_out = match.end_time
-            source_duration = source_out - source_in
+            clip_original_duration = source_out - source_in
 
-            # Calculate speed factor
-            speed = source_duration / target_duration if target_duration > 0 else 1.0
+            # Elastic Time: SpeedRatio = ClipOriginalDuration / TargetDuration
+            # If ratio > 1: clip is too long, speed UP
+            # If ratio < 1: clip is too short, slow DOWN (with 75% floor)
+            speed_ratio = clip_original_duration / target_duration if target_duration > 0 else 1.0
 
-            clips.append({
+            # Apply 75% floor constraint for slowdowns
+            effective_speed = speed_ratio
+            leaves_gap = False
+            if speed_ratio < 1.0:
+                # Need to slow down
+                if speed_ratio < 0.75:
+                    # Cap at 75% - clip will finish before next marker
+                    effective_speed = 0.75
+                    leaves_gap = True
+
+            # Subtitle text for this scene
+            subtitle_text = scene_trans.text if scene_trans.text else ""
+
+            scenes.append({
                 "scene_index": scene_trans.scene_index,
-                "source_path": match.episode,
-                "source_filename": Path(match.episode).name,
+                "start": timeline_start,
+                "end": timeline_end,
+                "text": subtitle_text,
+                "clipName": Path(match.episode).name,
                 "source_in": source_in,
                 "source_out": source_out,
-                "source_duration": source_duration,
-                "timeline_start": timeline_start,
-                "timeline_end": timeline_end,
+                "clip_duration": clip_original_duration,
                 "target_duration": target_duration,
-                "speed": speed,
+                "speed_ratio": speed_ratio,
+                "effective_speed": effective_speed,
+                "leaves_gap": leaves_gap,
             })
 
-        # Build markers from transcription
-        markers = []
-        for scene_trans in transcription.scenes:
-            if scene_trans.words:
-                markers.append({
-                    "name": f"Scene {scene_trans.scene_index + 1}",
-                    "time": scene_trans.words[0].start,
-                    "scene_index": scene_trans.scene_index,
-                })
-
         jsx_content = f'''/**
- * Anime TikTok Reproducer - Premiere Pro Import Script
- * 
- * This ExtendScript automates the complete import workflow:
- * 1. Creates a vertical 1080x1920 sequence at 23.976fps
- * 2. Imports and places source video clips with speed adjustments
- * 3. Imports TTS audio track
- * 4. Imports SRT subtitles and applies styling
- * 5. Adds scene markers for reference
- * 
+ * Anime TikTok Reproducer - Premiere Pro 2025 Automation Script
+ *
+ * PRODUCTION-READY ExtendScript (ES3) for Adobe Premiere Pro 2025
+ *
  * Project ID: {project.id}
  * Generated: {datetime.now().isoformat()}
- * 
+ *
  * USAGE:
- * 1. Open Adobe Premiere Pro
- * 2. Open or create a project
- * 3. File > Scripts > Run Script... > Select this .jsx file
- * 4. The script will run automatically
- * 
- * REQUIREMENTS:
- * - Adobe Premiere Pro 2020 or later
- * - All files must be in the same folder as this script
+ * 1. Extract the entire ZIP to a folder
+ * 2. Open Adobe Premiere Pro 2025
+ * 3. Open or create a project
+ * 4. File > Scripts > Run Script... > Select this .jsx file
  */
 
-// ============================================================================
-// CONFIGURATION
-// ============================================================================
-var CONFIG = {{
-    sequenceName: "ATR_{project.id}",
-    width: 1080,
-    height: 1920,
-    frameRate: 23.976,
-    pixelAspectRatio: 1.0,
-    fieldType: 0,  // Progressive
-    audioSampleRate: 48000,
-    audioBitDepth: 16,
-    
-    // File names (relative to script folder)
-    audioFile: "tts_edited.wav",
-    srtFile: "subtitles.srt",
-    sourcesFolder: "sources",
-    
-    // Subtitle style
-    subtitleStyle: {{
-        fontFamily: "Arial",
-        fontSize: 72,
-        fontStyle: 1,  // 0=Regular, 1=Bold, 2=Italic, 3=BoldItalic
-        fillColor: [1, 1, 1],  // White RGB 0-1
-        strokeColor: [0, 0, 0],  // Black
-        strokeWidth: 3,
-        backgroundColor: [0, 0, 0, 0.75],  // Black with 75% opacity
-        alignment: 2,  // Center
-        verticalPosition: 0.85  // 85% from top
-    }}
-}};
-
-// Clip data from processing
-var CLIPS = {json.dumps(clips, indent=2)};
-
-// Scene markers
-var MARKERS = {json.dumps(markers, indent=2)};
-
-// ============================================================================
-// UTILITY FUNCTIONS
-// ============================================================================
-
-/**
- * Get the folder containing this script
- */
-function getScriptFolder() {{
+(function() {{
+    // ========================================================================
+    // 1. DYNAMIC ROOT DETECTION
+    // ========================================================================
     var scriptFile = new File($.fileName);
-    return scriptFile.parent;
-}}
+    var rootDir = scriptFile.parent.fsName;
+    var assetsDir = rootDir + "/assets";
+    var sourcesDir = rootDir + "/sources";
 
-/**
- * Convert seconds to Premiere's Time object ticks
- * Premiere uses 254016000000 ticks per second
- */
-function secondsToTicks(seconds) {{
-    return Math.round(seconds * 254016000000);
-}}
+    // 2. ASSET MAPPING
+    var SEQUENCE_PRESET_PATH = assetsDir + "/TikTok60fps.sqpreset";
+    var MOGRT_PATH = assetsDir + "/SPM_Anime_Subtitle.mogrt";
+    var VIDEO_EFFECT_NAME = "SPM_Anime_Tiktok";
+    var MAIN_AUDIO_NAME = "tts_edited.wav";
+    var TICKS_PER_SECOND = 254016000000;
 
-/**
- * Create a Time object from seconds
- */
-function createTime(seconds) {{
-    var time = new Time();
-    time.seconds = seconds;
-    return time;
-}}
+    // 3. INPUT DATA (Generated by Python)
+    var scenes = {json.dumps(scenes, indent=4)};
 
-/**
- * Log message to ExtendScript console and Premiere's Events panel
- */
-function log(message) {{
-    $.writeln(message);
-    try {{
-        app.setSDKEventMessage(message, "info");
-    }} catch (e) {{
-        // Events panel may not be available
+    // ========================================================================
+    // UTILITY FUNCTIONS
+    // ========================================================================
+
+    function timeToTicks(seconds) {{
+        return Math.round(seconds * TICKS_PER_SECOND);
     }}
-}}
 
-/**
- * Find a project item by name in a bin
- */
-function findItemInBin(bin, name) {{
-    for (var i = 0; i < bin.children.numItems; i++) {{
-        var item = bin.children[i];
-        if (item.name === name || item.name.indexOf(name.split(".")[0]) !== -1) {{
-            return item;
-        }}
+    function ticksToSeconds(ticks) {{
+        return ticks / TICKS_PER_SECOND;
     }}
-    return null;
-}}
 
-/**
- * Wait for import to complete (simple polling)
- */
-function waitForImport(bin, expectedCount, maxWaitMs) {{
-    var startTime = new Date().getTime();
-    while (bin.children.numItems < expectedCount) {{
-        if (new Date().getTime() - startTime > maxWaitMs) {{
-            break;
-        }}
-        $.sleep(100);
+    function log(message) {{
+        $.writeln("[ATR] " + message);
     }}
-}}
 
-// ============================================================================
-// SEQUENCE CREATION
-// ============================================================================
+    function criticalError(message) {{
+        alert("ATR Error:\\n\\n" + message);
+        throw new Error(message);
+    }}
 
-/**
- * Create a vertical 1080x1920 sequence with proper settings
- */
-function createVerticalSequence(project) {{
-    log("Creating vertical sequence: " + CONFIG.sequenceName);
-    
-    // Create sequence using project's createNewSequence with a preset name
-    // If no matching preset, we'll modify settings after creation
-    var sequence = null;
-    
-    try {{
-        // Try to create with a built-in preset first
-        sequence = project.createNewSequence(CONFIG.sequenceName, "HDV 1080p25");
-    }} catch (e) {{
-        // Fallback - create any sequence
-        sequence = project.createNewSequence(CONFIG.sequenceName);
+    function fileExists(path) {{
+        var f = new File(path);
+        return f.exists;
     }}
-    
-    if (!sequence) {{
-        throw new Error("Failed to create sequence");
-    }}
-    
-    // Make it the active sequence
-    project.openSequence(sequence.sequenceID);
-    
-    // Modify sequence settings for vertical video
-    // Note: Some settings can only be changed via sequence preset in newer versions
-    try {{
-        var settings = sequence.getSettings();
-        if (settings) {{
-            // These properties may vary by Premiere version
-            if (settings.videoFrameWidth !== undefined) {{
-                settings.videoFrameWidth = CONFIG.width;
+
+    function findProjectItem(name, searchBin) {{
+        var bin = searchBin || app.project.rootItem;
+        for (var i = 0; i < bin.children.numItems; i++) {{
+            var item = bin.children[i];
+            if (item.name === name) {{
+                return item;
             }}
-            if (settings.videoFrameHeight !== undefined) {{
-                settings.videoFrameHeight = CONFIG.height;
+            if (item.type === ProjectItemType.BIN) {{
+                var found = findProjectItem(name, item);
+                if (found) return found;
             }}
-            if (settings.videoFrameRate !== undefined) {{
-                settings.videoFrameRate = new Time();
-                settings.videoFrameRate.seconds = 1 / CONFIG.frameRate;
+        }}
+        return null;
+    }}
+
+    function findProjectItemByPartialName(partialName, searchBin) {{
+        var bin = searchBin || app.project.rootItem;
+        for (var i = 0; i < bin.children.numItems; i++) {{
+            var item = bin.children[i];
+            if (item.name.indexOf(partialName) !== -1) {{
+                return item;
             }}
-            if (settings.audioSampleRate !== undefined) {{
-                settings.audioSampleRate = CONFIG.audioSampleRate;
+            if (item.type === ProjectItemType.BIN) {{
+                var found = findProjectItemByPartialName(partialName, item);
+                if (found) return found;
             }}
-            sequence.setSettings(settings);
         }}
-    }} catch (e) {{
-        log("Warning: Could not modify sequence settings programmatically.");
-        log("Please manually set sequence to 1080x1920 at 23.976fps.");
-        log("Sequence > Sequence Settings...");
+        return null;
     }}
-    
-    return sequence;
-}}
 
-// ============================================================================
-// FILE IMPORT
-// ============================================================================
+    // ========================================================================
+    // VALIDATION
+    // ========================================================================
 
-/**
- * Import all required files into the project
- */
-function importFiles(project, scriptFolder) {{
-    log("Importing project files...");
-    
-    var rootBin = project.rootItem;
-    
-    // Create main import bin
-    var binName = "ATR_" + CONFIG.sequenceName.replace("ATR_", "");
-    var mainBin = rootBin.createBin(binName);
-    
-    // Create sources bin
-    var sourcesBin = mainBin.createBin("Sources");
-    
-    // Import TTS audio
-    var audioPath = scriptFolder.fsName + "/" + CONFIG.audioFile;
-    var audioFile = new File(audioPath);
-    if (audioFile.exists) {{
-        project.importFiles([audioPath], true, mainBin, false);
-        log("Imported audio: " + CONFIG.audioFile);
-    }} else {{
-        log("WARNING: Audio file not found: " + audioPath);
-    }}
-    
-    // Import SRT subtitles
-    var srtPath = scriptFolder.fsName + "/" + CONFIG.srtFile;
-    var srtFile = new File(srtPath);
-    if (srtFile.exists) {{
-        project.importFiles([srtPath], true, mainBin, false);
-        log("Imported subtitles: " + CONFIG.srtFile);
-    }} else {{
-        log("WARNING: SRT file not found: " + srtPath);
-    }}
-    
-    // Import source clips
-    var importedSources = {{}};
-    var uniqueSourceFiles = {{}};
-    
-    // Collect unique source files
-    for (var i = 0; i < CLIPS.length; i++) {{
-        var clip = CLIPS[i];
-        var filename = clip.source_filename;
-        if (!uniqueSourceFiles[filename]) {{
-            uniqueSourceFiles[filename] = true;
+    function validateEnvironment() {{
+        log("Validating environment...");
+
+        if (!app.project) {{
+            criticalError("Please open or create a Premiere Pro project first.");
         }}
-    }}
-    
-    // Import each unique source
-    for (var filename in uniqueSourceFiles) {{
-        var sourcePath = scriptFolder.fsName + "/" + CONFIG.sourcesFolder + "/" + filename;
-        var sourceFile = new File(sourcePath);
-        
-        if (sourceFile.exists) {{
-            project.importFiles([sourcePath], true, sourcesBin, false);
-            log("Imported source: " + filename);
-        }} else {{
-            log("WARNING: Source file not found: " + sourcePath);
+
+        var assetsFolder = new Folder(assetsDir);
+        if (!assetsFolder.exists) {{
+            criticalError("Assets folder missing at:\\n" + assetsDir);
         }}
-    }}
-    
-    // Wait for imports to complete
-    $.sleep(500);
-    
-    // Build imported sources map
-    for (var j = 0; j < sourcesBin.children.numItems; j++) {{
-        var item = sourcesBin.children[j];
-        importedSources[item.name] = item;
-    }}
-    
-    return {{
-        mainBin: mainBin,
-        sourcesBin: sourcesBin,
-        importedSources: importedSources
-    }};
-}}
 
-// ============================================================================
-// CLIP PLACEMENT WITH SPEED
-// ============================================================================
+        if (!fileExists(SEQUENCE_PRESET_PATH)) {{
+            criticalError("Sequence preset missing at:\\n" + SEQUENCE_PRESET_PATH);
+        }}
 
-/**
- * Place video clips on timeline with correct speed adjustments
- */
-function placeVideoClips(sequence, importedSources) {{
-    log("Placing video clips with speed adjustments...");
-    
-    var videoTrack = sequence.videoTracks[0];
-    var placedCount = 0;
-    var speedAdjustments = [];
-    
-    for (var i = 0; i < CLIPS.length; i++) {{
-        var clipData = CLIPS[i];
-        var filename = clipData.source_filename;
-        
-        // Find the source in our imported items
-        var sourceItem = null;
-        for (var name in importedSources) {{
-            if (name === filename || name.indexOf(filename.split(".")[0]) !== -1) {{
-                sourceItem = importedSources[name];
+        if (!fileExists(MOGRT_PATH)) {{
+            criticalError("MOGRT template missing at:\\n" + MOGRT_PATH);
+        }}
+
+        var audioPath = rootDir + "/" + MAIN_AUDIO_NAME;
+        if (!fileExists(audioPath)) {{
+            criticalError("TTS audio missing at:\\n" + audioPath);
+        }}
+
+        var sourcesFolder = new Folder(sourcesDir);
+        if (!sourcesFolder.exists) {{
+            criticalError("Sources folder missing at:\\n" + sourcesDir);
+        }}
+
+        log("Environment validated successfully");
+        return true;
+    }}
+
+    // ========================================================================
+    // STEP A: SEQUENCE CREATION
+    // ========================================================================
+
+    function getOrCreateSequence() {{
+        log("Getting or creating sequence...");
+
+        var sequenceName = "ATR_{project.id}";
+        var sequence = null;
+
+        // First check if sequence already exists
+        for (var i = 0; i < app.project.sequences.numSequences; i++) {{
+            var seq = app.project.sequences[i];
+            if (seq.name === sequenceName) {{
+                sequence = seq;
+                log("Found existing sequence: " + sequenceName);
                 break;
             }}
         }}
-        
-        if (!sourceItem) {{
-            log("WARNING: Could not find imported source: " + filename);
-            continue;
+
+        if (!sequence) {{
+            // Try to create with QE DOM using preset file
+            try {{
+                app.enableQE();
+
+                if (typeof qe !== "undefined" && qe.project) {{
+                    // QE expects file:// URL format on some systems
+                    var presetFile = new File(SEQUENCE_PRESET_PATH);
+                    var presetPath = presetFile.fsName;
+
+                    log("Attempting QE sequence creation with preset: " + presetPath);
+                    qe.project.newSequence(sequenceName, presetPath);
+
+                    $.sleep(500);
+
+                    // Find the newly created sequence
+                    for (var j = 0; j < app.project.sequences.numSequences; j++) {{
+                        var newSeq = app.project.sequences[j];
+                        if (newSeq.name === sequenceName) {{
+                            sequence = newSeq;
+                            log("Sequence created via QE DOM");
+                            break;
+                        }}
+                    }}
+                }}
+            }} catch (e) {{
+                log("QE sequence creation failed: " + e.message);
+            }}
         }}
-        
+
+        if (!sequence) {{
+            // Fallback: use active sequence or ask user to create one
+            sequence = app.project.activeSequence;
+            if (sequence) {{
+                log("Using active sequence: " + sequence.name);
+                alert("Using existing active sequence: " + sequence.name + "\\n\\n" +
+                      "Please ensure it is set to:\\n" +
+                      "- 1080 x 1920\\n" +
+                      "- 60 fps\\n\\n" +
+                      "You can change this in Sequence > Sequence Settings...");
+            }} else {{
+                criticalError("No sequence available.\\n\\n" +
+                    "Please manually create a sequence first:\\n" +
+                    "1. File > New > Sequence\\n" +
+                    "2. Choose a preset or set: 1080x1920, 60fps\\n" +
+                    "3. Run this script again.");
+            }}
+        }}
+
+        // Open/activate the sequence
+        app.project.openSequence(sequence.sequenceID);
+
+        return sequence;
+    }}
+
+    // ========================================================================
+    // STEP B: IMPORT & PLACE MAIN AUDIO
+    // ========================================================================
+
+    function importAndPlaceAudio(sequence) {{
+        log("Importing and placing TTS audio...");
+
+        var audioPath = rootDir + "/" + MAIN_AUDIO_NAME;
+
+        // Import audio file
+        app.project.importFiles([audioPath], true, app.project.rootItem, false);
+        $.sleep(500);
+
+        // Find the imported audio item
+        var audioItem = findProjectItem(MAIN_AUDIO_NAME);
+        if (!audioItem) {{
+            audioItem = findProjectItemByPartialName("tts_edited");
+        }}
+
+        if (!audioItem) {{
+            criticalError("Could not find imported audio in project");
+        }}
+
+        log("Found audio item: " + audioItem.name);
+
+        // Ensure we have audio tracks
+        if (sequence.audioTracks.numTracks < 1) {{
+            criticalError("Sequence has no audio tracks");
+        }}
+
+        // Place on Audio Track 1 at Time 0.0
+        var audioTrack = sequence.audioTracks[0];
+        log("Inserting audio on track: " + audioTrack.name + " (Audio Track 1)");
+
         try {{
-            // Insert clip at timeline position
-            var insertTime = clipData.timeline_start;
-            videoTrack.insertClip(sourceItem, insertTime);
-            
-            // Find the clip we just inserted
+            // Insert at time 0
+            audioTrack.insertClip(audioItem, 0);
+            log("Audio placed on Audio Track 1 at 0.0s");
+        }} catch (e) {{
+            log("Error inserting audio: " + e.message);
+            // Try overwrite insert
+            try {{
+                audioTrack.overwriteClip(audioItem, 0);
+                log("Audio placed via overwrite");
+            }} catch (e2) {{
+                criticalError("Failed to place audio: " + e2.message);
+            }}
+        }}
+
+        return audioItem;
+    }}
+
+    // ========================================================================
+    // STEP C: IMPORT AND PLACE VIDEO CLIPS
+    // ========================================================================
+
+    function importSourceClips() {{
+        log("Importing source video clips...");
+
+        var uniqueClips = {{}};
+        for (var i = 0; i < scenes.length; i++) {{
+            var clipName = scenes[i].clipName;
+            if (!uniqueClips[clipName]) {{
+                uniqueClips[clipName] = true;
+            }}
+        }}
+
+        var importPaths = [];
+        for (var clipName in uniqueClips) {{
+            var clipPath = sourcesDir + "/" + clipName;
+            if (fileExists(clipPath)) {{
+                importPaths.push(clipPath);
+                log("Will import: " + clipName);
+            }} else {{
+                log("WARNING: Source clip not found: " + clipPath);
+            }}
+        }}
+
+        if (importPaths.length > 0) {{
+            app.project.importFiles(importPaths, true, app.project.rootItem, false);
+            $.sleep(1000);
+        }}
+
+        log("Imported " + importPaths.length + " source clips");
+    }}
+
+    function placeClipsWithElasticTime(sequence) {{
+        log("Placing clips with Elastic Time logic...");
+
+        var videoTrack = sequence.videoTracks[0];
+        var speedInfo = [];
+
+        // Enable QE for potential speed control
+        var qeSeq = null;
+        try {{
+            app.enableQE();
+            qeSeq = qe.project.getActiveSequence();
+        }} catch (e) {{
+            log("QE not available for speed control");
+        }}
+
+        for (var i = 0; i < scenes.length; i++) {{
+            var scene = scenes[i];
+            log("\\nProcessing Scene " + (scene.scene_index + 1) + "...");
+            log("  Timeline: " + scene.start.toFixed(3) + "s - " + scene.end.toFixed(3) + "s");
+            log("  Source: " + scene.source_in.toFixed(3) + "s - " + scene.source_out.toFixed(3) + "s");
+            log("  Speed: " + (scene.effective_speed * 100).toFixed(1) + "%");
+
+            // 1. Create marker at scene start
+            try {{
+                var marker = sequence.markers.createMarker(scene.start);
+                marker.name = "Scene " + (scene.scene_index + 1);
+                if (scene.text) {{
+                    marker.comments = scene.text.substring(0, 100);
+                }}
+                marker.setColorByIndex(i % 8);
+                log("  Marker created at " + scene.start.toFixed(3) + "s");
+            }} catch (e) {{
+                log("  Warning: Could not create marker: " + e.message);
+            }}
+
+            // 2. Find the source clip in project
+            var sourceItem = findProjectItem(scene.clipName);
+            if (!sourceItem) {{
+                var baseName = scene.clipName.replace(/\\.[^.]+$/, "");
+                sourceItem = findProjectItemByPartialName(baseName);
+            }}
+
+            if (!sourceItem) {{
+                log("  ERROR: Could not find source: " + scene.clipName);
+                continue;
+            }}
+
+            log("  Found source: " + sourceItem.name);
+
+            // 3. Create a subclip with the correct in/out points
+            // This ensures the clip starts from the correct source position
+            var inPointTicks = timeToTicks(scene.source_in);
+            var outPointTicks = timeToTicks(scene.source_out);
+
+            // 4. Insert clip at the timeline position
+            var insertTimeTicks = timeToTicks(scene.start);
+
+            try {{
+                // Use overwriteClip for precise placement
+                videoTrack.overwriteClip(sourceItem, scene.start);
+                log("  Clip inserted at " + scene.start.toFixed(3) + "s");
+            }} catch (e) {{
+                log("  Insert failed, trying insertClip: " + e.message);
+                try {{
+                    videoTrack.insertClip(sourceItem, scene.start);
+                }} catch (e2) {{
+                    log("  ERROR: Could not insert clip: " + e2.message);
+                    continue;
+                }}
+            }}
+
+            // 5. Find and adjust the clip we just inserted
+            $.sleep(100);  // Brief wait for clip to be available
+
             var insertedClip = null;
-            for (var c = videoTrack.clips.numItems - 1; c >= 0; c--) {{
+            var numClips = videoTrack.clips.numItems;
+
+            // Find clip closest to our insert position
+            for (var c = 0; c < numClips; c++) {{
                 var testClip = videoTrack.clips[c];
-                if (Math.abs(testClip.start.seconds - insertTime) < 0.5) {{
+                var clipStartSec = ticksToSeconds(testClip.start.ticks);
+                if (Math.abs(clipStartSec - scene.start) < 0.5) {{
                     insertedClip = testClip;
                     break;
                 }}
             }}
-            
-            if (insertedClip) {{
-                // Set source in/out points
-                insertedClip.inPoint = createTime(clipData.source_in);
-                insertedClip.outPoint = createTime(clipData.source_out);
-                
-                // Calculate and apply speed
-                var speedPercent = clipData.speed * 100;
-                
-                if (Math.abs(speedPercent - 100) > 1) {{
-                    // Try to set speed via clip properties
-                    // Note: Direct speed control is limited in ExtendScript
-                    // We'll record needed adjustments for manual application
-                    speedAdjustments.push({{
-                        scene: clipData.scene_index + 1,
-                        clip: insertedClip.name,
-                        speed: speedPercent,
-                        position: insertTime
-                    }});
-                }}
-                
-                placedCount++;
-                log("Placed Scene " + (clipData.scene_index + 1) + " at " + insertTime.toFixed(2) + "s (Speed: " + speedPercent.toFixed(0) + "%)");
+
+            if (!insertedClip) {{
+                log("  WARNING: Could not locate inserted clip");
+                continue;
             }}
-        }} catch (e) {{
-            log("ERROR placing clip for scene " + clipData.scene_index + ": " + e.message);
+
+            // 6. Set source in/out points on the clip
+            try {{
+                // Create Time objects for in/out points
+                var inTime = new Time();
+                inTime.ticks = String(inPointTicks);
+
+                var outTime = new Time();
+                outTime.ticks = String(outPointTicks);
+
+                insertedClip.inPoint = inTime;
+                insertedClip.outPoint = outTime;
+
+                log("  In/Out set: " + scene.source_in.toFixed(3) + "s - " + scene.source_out.toFixed(3) + "s");
+            }} catch (e) {{
+                log("  Warning: Could not set in/out points: " + e.message);
+            }}
+
+            // 7. Set clip start position precisely
+            try {{
+                var startTime = new Time();
+                startTime.ticks = String(insertTimeTicks);
+                insertedClip.start = startTime;
+                log("  Start position set to " + scene.start.toFixed(3) + "s");
+            }} catch (e) {{
+                log("  Warning: Could not set start position: " + e.message);
+            }}
+
+            // 8. Apply speed if needed
+            var speedPercent = scene.effective_speed * 100;
+            var speedApplied = false;
+
+            if (Math.abs(speedPercent - 100) > 1) {{
+                // Try QE speed control
+                if (qeSeq) {{
+                    try {{
+                        var qeTrack = qeSeq.getVideoTrackAt(0);
+                        var qeNumItems = qeTrack.numItems;
+
+                        for (var q = 0; q < qeNumItems; q++) {{
+                            var qeItem = qeTrack.getItemAt(q);
+                            if (qeItem && qeItem.start) {{
+                                var qeStartSec = qeItem.start.secs;
+                                if (Math.abs(qeStartSec - scene.start) < 0.5) {{
+                                    // setSpeed(speed, ripple, maintainPitch)
+                                    qeItem.setSpeed(speedPercent, false, true);
+                                    speedApplied = true;
+                                    log("  Speed set to " + speedPercent.toFixed(0) + "% via QE");
+                                    break;
+                                }}
+                            }}
+                        }}
+                    }} catch (e) {{
+                        log("  QE speed failed: " + e.message);
+                    }}
+                }}
+            }} else {{
+                speedApplied = true;  // No speed change needed
+            }}
+
+            speedInfo.push({{
+                scene: scene.scene_index + 1,
+                speed: speedPercent,
+                applied: speedApplied,
+                gap: scene.leaves_gap
+            }});
         }}
+
+        return speedInfo;
     }}
-    
-    log("Placed " + placedCount + " video clips");
-    
-    return speedAdjustments;
-}}
 
-// ============================================================================
-// AUDIO PLACEMENT
-// ============================================================================
+    // ========================================================================
+    // STEP D: APPLY VIDEO PRESET
+    // ========================================================================
 
-/**
- * Place TTS audio on the audio track
- */
-function placeAudio(sequence, mainBin) {{
-    log("Placing TTS audio...");
-    
-    var audioItem = findItemInBin(mainBin, CONFIG.audioFile);
-    
-    if (!audioItem) {{
-        log("WARNING: Could not find audio in project bin");
-        return false;
-    }}
-    
-    try {{
-        var audioTrack = sequence.audioTracks[0];
-        audioTrack.insertClip(audioItem, 0);
-        log("Audio placed at timeline start");
-        return true;
-    }} catch (e) {{
-        log("ERROR placing audio: " + e.message);
-        return false;
-    }}
-}}
+    function applyVideoPreset(sequence) {{
+        log("\\nApplying video effect preset: " + VIDEO_EFFECT_NAME);
 
-// ============================================================================
-// SUBTITLES
-// ============================================================================
-
-/**
- * Import and setup subtitles
- * Note: Full caption styling requires manual steps or MOGRT templates
- */
-function setupSubtitles(sequence, mainBin) {{
-    log("Setting up subtitles...");
-    
-    var srtItem = findItemInBin(mainBin, CONFIG.srtFile);
-    
-    if (!srtItem) {{
-        log("WARNING: Could not find SRT in project bin");
-        return false;
-    }}
-    
-    // Note: Caption/subtitle import and styling in ExtendScript is limited
-    // The SRT file is imported; user needs to:
-    // 1. Drag SRT to timeline or use Captions workflow
-    // 2. Apply styling via Essential Graphics panel
-    
-    log("SRT file imported. To apply:");
-    log("1. Open Window > Captions and Graphics > Captions");
-    log("2. Click 'Transcribe sequence' or import the SRT");
-    log("3. Apply style from Essential Graphics panel");
-    
-    return true;
-}}
-
-// ============================================================================
-// MARKERS
-// ============================================================================
-
-/**
- * Add scene markers to the sequence
- */
-function addMarkers(sequence) {{
-    log("Adding scene markers...");
-    
-    for (var i = 0; i < MARKERS.length; i++) {{
-        var markerData = MARKERS[i];
-        
         try {{
-            var marker = sequence.markers.createMarker(markerData.time);
-            marker.name = markerData.name;
-            marker.comments = "Scene " + (markerData.scene_index + 1) + " start";
-            marker.setColorByIndex(i % 8);  // Cycle through marker colors
+            app.enableQE();
+            var qeSeq = qe.project.getActiveSequence();
+            var qeTrack = qeSeq.getVideoTrackAt(0);
+
+            var effect = qe.project.getVideoEffectByName(VIDEO_EFFECT_NAME);
+
+            if (!effect) {{
+                log("WARNING: Video effect '" + VIDEO_EFFECT_NAME + "' not found.");
+                log("Please manually apply your desired effect to all clips.");
+                return false;
+            }}
+
+            var applied = 0;
+            var numItems = qeTrack.numItems;
+            for (var i = 0; i < numItems; i++) {{
+                var qeItem = qeTrack.getItemAt(i);
+                if (qeItem) {{
+                    try {{
+                        qeItem.addVideoEffect(effect);
+                        applied++;
+                    }} catch (e) {{
+                        // Ignore individual failures
+                    }}
+                }}
+            }}
+
+            log("Applied video effect to " + applied + " clips");
+            return true;
+
         }} catch (e) {{
-            log("Warning: Could not add marker for " + markerData.name);
+            log("ERROR applying video preset: " + e.message);
+            return false;
         }}
     }}
-    
-    log("Added " + MARKERS.length + " scene markers");
-}}
 
-// ============================================================================
-// GENERATE SUMMARY
-// ============================================================================
+    // ========================================================================
+    // STEP E: SUBTITLES (MOGRT WORKFLOW)
+    // ========================================================================
 
-/**
- * Generate a summary of required manual adjustments
- */
-function generateSummary(speedAdjustments) {{
-    var summary = "\\n";
-    summary += "==================================================\\n";
-    summary += "  ANIME TIKTOK REPRODUCER - IMPORT COMPLETE\\n";
-    summary += "==================================================\\n\\n";
-    
-    summary += "SEQUENCE CREATED:\\n";
-    summary += "  Name: " + CONFIG.sequenceName + "\\n";
-    summary += "  Size: " + CONFIG.width + "x" + CONFIG.height + "\\n";
-    summary += "  Frame Rate: " + CONFIG.frameRate + " fps\\n\\n";
-    
-    summary += "CLIPS PLACED: " + CLIPS.length + "\\n";
-    summary += "MARKERS ADDED: " + MARKERS.length + "\\n\\n";
-    
-    if (speedAdjustments.length > 0) {{
-        summary += "=== SPEED ADJUSTMENTS REQUIRED ===\\n";
-        summary += "(Select clip > Right-click > Speed/Duration)\\n\\n";
-        
-        for (var i = 0; i < speedAdjustments.length; i++) {{
-            var adj = speedAdjustments[i];
-            summary += "  Scene " + adj.scene + ": Set to " + adj.speed.toFixed(0) + "%\\n";
+    function placeSubtitles(sequence) {{
+        log("\\nPlacing MOGRT subtitles...");
+
+        var placedCount = 0;
+        var textSetCount = 0;
+
+        // Ensure we have at least 2 video tracks
+        while (sequence.videoTracks.numTracks < 2) {{
+            try {{
+                sequence.videoTracks.addTrack();
+            }} catch (e) {{
+                break;
+            }}
         }}
-        summary += "\\n";
-    }}
-    
-    summary += "=== MANUAL STEPS REQUIRED ===\\n";
-    summary += "1. Verify sequence is 1080x1920 (Sequence > Sequence Settings)\\n";
-    summary += "2. Apply speed adjustments listed above\\n";
-    summary += "3. Import captions: Window > Captions > Import SRT\\n";
-    summary += "4. Style captions: Essential Graphics panel\\n";
-    summary += "5. Add motion/effects as desired\\n\\n";
-    
-    summary += "==================================================\\n";
-    
-    return summary;
-}}
 
-// ============================================================================
-// MAIN EXECUTION
-// ============================================================================
+        for (var i = 0; i < scenes.length; i++) {{
+            var scene = scenes[i];
 
-function main() {{
-    log("\\n=== Starting ATR Import Script ===\\n");
-    
-    // Validate environment
-    if (!app.project) {{
-        alert("Please open or create a Premiere Pro project first.\\n\\nThen run this script again.");
-        return;
+            if (!scene.text || scene.text.length === 0) {{
+                log("  Scene " + (scene.scene_index + 1) + ": No text, skipping");
+                continue;
+            }}
+
+            try {{
+                // importMGT(mogrtPath, time, videoTrackIndex, audioTrackIndex)
+                // videoTrackIndex 1 = Video Track 2
+                var mgtResult = sequence.importMGT(
+                    MOGRT_PATH,
+                    scene.start,
+                    1,
+                    0
+                );
+
+                if (mgtResult) {{
+                    placedCount++;
+
+                    // Try to find the clip and set text
+                    var subtitleTrack = sequence.videoTracks[1];
+                    var numClips = subtitleTrack.clips.numItems;
+
+                    // Get the last added clip (should be our MOGRT)
+                    if (numClips > 0) {{
+                        var mgtClip = subtitleTrack.clips[numClips - 1];
+
+                        // Try to set the text
+                        try {{
+                            var mgtComp = mgtClip.getMGTComponent();
+                            if (mgtComp) {{
+                                var numProps = mgtComp.properties.numProperties;
+                                for (var p = 0; p < numProps; p++) {{
+                                    var prop = mgtComp.properties[p];
+                                    var propName = prop.displayName;
+
+                                    // Look for text-related properties
+                                    if (propName === "TextLayer" ||
+                                        propName === "Source Text" ||
+                                        propName === "Text" ||
+                                        propName.toLowerCase().indexOf("text") !== -1) {{
+
+                                        log("  Found property: " + propName);
+
+                                        // Try to set value
+                                        prop.setValue(scene.text);
+                                        textSetCount++;
+                                        log("  Text set for Scene " + (scene.scene_index + 1));
+                                        break;
+                                    }}
+                                }}
+                            }}
+                        }} catch (textErr) {{
+                            log("  Could not set text: " + textErr.message);
+                        }}
+
+                        // Set duration
+                        try {{
+                            var endTime = new Time();
+                            endTime.ticks = String(timeToTicks(scene.end));
+                            mgtClip.end = endTime;
+                        }} catch (durErr) {{
+                            // Ignore duration errors
+                        }}
+                    }}
+
+                    log("  Scene " + (scene.scene_index + 1) + ": MOGRT placed at " + scene.start.toFixed(3) + "s");
+                }}
+
+            }} catch (e) {{
+                log("  ERROR placing MOGRT for scene " + (scene.scene_index + 1) + ": " + e.message);
+            }}
+        }}
+
+        log("Placed " + placedCount + " MOGRTs, text set on " + textSetCount);
+
+        if (textSetCount < placedCount) {{
+            log("\\nNOTE: Some MOGRT text may need manual editing.");
+            log("Select MOGRT clip > Essential Graphics panel > Edit text");
+        }}
+
+        return placedCount;
     }}
-    
-    var project = app.project;
-    var scriptFolder = getScriptFolder();
-    
-    log("Script folder: " + scriptFolder.fsName);
-    log("Project: " + project.name);
-    
-    try {{
-        // Step 1: Import all files
-        var imported = importFiles(project, scriptFolder);
-        
-        // Step 2: Create sequence
-        var sequence = createVerticalSequence(project);
-        
-        // Step 3: Place audio first (as timing reference)
-        placeAudio(sequence, imported.mainBin);
-        
-        // Step 4: Place video clips with speed
-        var speedAdjustments = placeVideoClips(sequence, imported.importedSources);
-        
-        // Step 5: Setup subtitles
-        setupSubtitles(sequence, imported.mainBin);
-        
-        // Step 6: Add markers
-        addMarkers(sequence);
-        
-        // Step 7: Generate and show summary
-        var summary = generateSummary(speedAdjustments);
+
+    // ========================================================================
+    // SUMMARY
+    // ========================================================================
+
+    function generateSummary(speedInfo, subtitleCount) {{
+        var summary = "\\n";
+        summary += "==========================================================\\n";
+        summary += "  ATR IMPORT COMPLETE\\n";
+        summary += "==========================================================\\n\\n";
+
+        summary += "SEQUENCE: " + app.project.activeSequence.name + "\\n";
+        summary += "CLIPS: " + scenes.length + "\\n";
+        summary += "SUBTITLES: " + subtitleCount + " MOGRTs\\n\\n";
+
+        var manualSpeeds = [];
+        for (var i = 0; i < speedInfo.length; i++) {{
+            if (!speedInfo[i].applied && Math.abs(speedInfo[i].speed - 100) > 1) {{
+                manualSpeeds.push(speedInfo[i]);
+            }}
+        }}
+
+        if (manualSpeeds.length > 0) {{
+            summary += "=== MANUAL SPEED ADJUSTMENTS NEEDED ===\\n";
+            summary += "(Right-click clip > Speed/Duration)\\n\\n";
+            for (var j = 0; j < manualSpeeds.length; j++) {{
+                summary += "  Scene " + manualSpeeds[j].scene + ": " + manualSpeeds[j].speed.toFixed(0) + "%\\n";
+            }}
+            summary += "\\n";
+        }}
+
+        summary += "=== NEXT STEPS ===\\n";
+        summary += "1. Check clip positions match markers\\n";
+        summary += "2. Verify/apply speed adjustments\\n";
+        summary += "3. Edit MOGRT text in Essential Graphics if needed\\n";
+        summary += "4. Add transitions and polish\\n";
+        summary += "==========================================================\\n";
+
+        return summary;
+    }}
+
+    // ========================================================================
+    // MAIN
+    // ========================================================================
+
+    function main() {{
+        log("\\n========================================");
+        log("ATR Import Script Starting");
+        log("Root: " + rootDir);
+        log("========================================\\n");
+
+        validateEnvironment();
+
+        var sequence = getOrCreateSequence();
+        log("Using sequence: " + sequence.name);
+
+        importAndPlaceAudio(sequence);
+
+        importSourceClips();
+        var speedInfo = placeClipsWithElasticTime(sequence);
+
+        applyVideoPreset(sequence);
+
+        var subtitleCount = placeSubtitles(sequence);
+
+        var summary = generateSummary(speedInfo, subtitleCount);
         log(summary);
-        
-        // Show completion dialog
-        alert("ATR Import Complete!\\n\\n" +
-              "Clips placed: " + CLIPS.length + "\\n" +
-              "Markers added: " + MARKERS.length + "\\n\\n" +
-              "Check the Info panel (Window > Info) for\\n" +
-              "speed adjustments and next steps.\\n\\n" +
-              "See SUBTITLE_STYLE_GUIDE.md for caption styling.");
-              
-    }} catch (e) {{
-        log("ERROR: " + e.message);
-        alert("Import Error:\\n\\n" + e.message + "\\n\\nCheck the ExtendScript console for details.");
-    }}
-    
-    log("\\n=== ATR Import Script Complete ===\\n");
-}}
 
-// Run the script
-main();
+        alert("ATR Import Complete!\\n\\n" +
+              "Sequence: " + sequence.name + "\\n" +
+              "Clips: " + scenes.length + "\\n" +
+              "Subtitles: " + subtitleCount + "\\n\\n" +
+              "Check ExtendScript console (Window > Console)\\nfor detailed log.");
+
+        log("\\n=== DONE ===\\n");
+    }}
+
+    main();
+
+}})();
 '''
         return jsx_content
 
@@ -1218,6 +1361,12 @@ main();
 """
 
     @classmethod
+    def get_assets_dir(cls) -> Path:
+        """Get the static assets directory (contains .sqpreset, .mogrt, etc.)."""
+        # Assets are in the repository root /assets folder
+        return Path(__file__).parent.parent.parent.parent / "assets"
+
+    @classmethod
     async def process(
         cls,
         project: Project,
@@ -1227,6 +1376,12 @@ main();
     ) -> AsyncIterator[ProcessingProgress]:
         """
         Run the full processing pipeline.
+
+        Generates a Premiere Pro 2025 automation bundle with:
+        - JSX script using QE DOM for 60fps sequence, speed control, MOGRT subtitles
+        - Static assets (TikTok60fps.sqpreset, SPM_Anime_Subtitle.mogrt)
+        - Processed TTS audio
+        - Source video clips
 
         Args:
             project: Project data
@@ -1274,45 +1429,13 @@ main();
 
             yield ProcessingProgress(
                 "processing",
-                "srt_generation",
+                "jsx_generation",
                 0.5,
-                "Creating subtitles...",
+                "Generating Premiere Pro automation script...",
             )
 
-            # Step 3: Generate SRT
-            srt_content = cls.generate_srt(new_transcription)
-            srt_path = output_dir / "subtitles.srt"
-            srt_path.write_text(srt_content, encoding="utf-8")
-
-            yield ProcessingProgress(
-                "processing",
-                "xml_generation",
-                0.7,
-                "Generating Premiere Pro XML project...",
-            )
-
-            # Step 4: Generate FCP XML for Premiere Pro
-            fcp_xml_content = cls.generate_fcp_xml(
-                project,
-                new_transcription,
-                matches,
-                "tts_edited.wav",
-                "subtitles.srt",
-            )
-            fcp_xml_path = output_dir / "premiere_project.xml"
-            fcp_xml_path.write_text(fcp_xml_content, encoding="utf-8")
-
-            # Step 4b: Generate subtitle style preset
-            style_preset = cls.generate_subtitle_style_preset()
-            style_preset_path = output_dir / "subtitle_style.prfpset"
-            style_preset_path.write_text(style_preset, encoding="utf-8")
-
-            # Step 4c: Generate subtitle style guide
-            style_guide = cls.generate_subtitle_style_guide()
-            style_guide_path = output_dir / "SUBTITLE_STYLE_GUIDE.md"
-            style_guide_path.write_text(style_guide, encoding="utf-8")
-
-            # Step 4d: Generate ExtendScript (.jsx) for Premiere Pro automation
+            # Step 3: Generate ExtendScript (.jsx) for Premiere Pro 2025 automation
+            # Uses QE DOM for 60fps sequence creation, speed control, and MOGRT subtitles
             jsx_content = cls.generate_jsx_script(
                 project,
                 new_transcription,
@@ -1324,12 +1447,13 @@ main();
             yield ProcessingProgress(
                 "processing",
                 "bundling",
-                0.9,
+                0.7,
                 "Creating project bundle...",
             )
 
-            # Step 5: Bundle everything
+            # Step 4: Bundle everything
             bundle_path = cls.get_output_dir(project.id).parent / "project_bundle.zip"
+            assets_dir = cls.get_assets_dir()
 
             # Collect unique source episodes
             source_episodes: set[str] = set()
@@ -1338,26 +1462,28 @@ main();
                     source_episodes.add(match.episode)
 
             with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                # Add FCP XML project
-                zf.write(fcp_xml_path, "premiere_project.xml")
+                # Add ExtendScript for Premiere Pro automation (main entry point)
+                zf.write(jsx_path, "import_project.jsx")
+
+                # Add edited TTS audio
+                zf.write(edited_audio_path, "tts_edited.wav")
 
                 # Add auto-editor XML (lossless timing reference)
                 zf.write(auto_editor_xml_path, "auto_editor_cuts.xml")
 
-                # Add ExtendScript for Premiere Pro automation
-                zf.write(jsx_path, "import_project.jsx")
+                # Add static assets to assets/ folder
+                sqpreset_path = assets_dir / "TikTok60fps.sqpreset"
+                mogrt_path = assets_dir / "SPM_Anime_Subtitle.mogrt"
 
-                # Add edited audio
-                zf.write(edited_audio_path, "tts_edited.wav")
+                if sqpreset_path.exists():
+                    zf.write(sqpreset_path, "assets/TikTok60fps.sqpreset")
+                else:
+                    raise FileNotFoundError(f"Sequence preset not found: {sqpreset_path}")
 
-                # Add subtitles
-                zf.write(srt_path, "subtitles.srt")
-
-                # Add subtitle style preset
-                zf.write(style_preset_path, "subtitle_style.prfpset")
-
-                # Add subtitle style guide
-                zf.write(style_guide_path, "SUBTITLE_STYLE_GUIDE.md")
+                if mogrt_path.exists():
+                    zf.write(mogrt_path, "assets/SPM_Anime_Subtitle.mogrt")
+                else:
+                    raise FileNotFoundError(f"MOGRT template not found: {mogrt_path}")
 
                 # Add source episode files to sources/ folder
                 episode_paths_in_bundle = {}
@@ -1375,63 +1501,82 @@ main();
                     json.dumps(episode_paths_in_bundle, indent=2),
                 )
 
-                # Add README
+                # Count scenes for README
+                scene_count = len([m for m in matches if m.episode])
                 episode_list = "\n".join(f"  - {Path(ep).name}" for ep in source_episodes)
+
                 readme = f"""Anime TikTok Reproducer - Project Bundle
 =========================================
 
 Project ID: {project.id}
 Generated: {datetime.now().isoformat()}
+Scenes: {scene_count}
 
-Contents:
-- import_project.jsx: ExtendScript for automated Premiere Pro import (RECOMMENDED)
-- premiere_project.xml: FCP 7 XML project file (manual import alternative)
-- auto_editor_cuts.xml: Auto-editor XML with lossless cut timing reference
-- tts_edited.wav: Processed TTS audio with silences removed
-- subtitles.srt: Subtitles with word-level timing
-- subtitle_style.prfpset: Subtitle style preset (centered TikTok style)
-- SUBTITLE_STYLE_GUIDE.md: Manual subtitle styling instructions
-- sources/: Source anime episode files
+=== CONTENTS ===
+
+import_project.jsx     - Premiere Pro 2025 automation script (MAIN)
+tts_edited.wav         - Processed TTS audio (silences removed)
+auto_editor_cuts.xml   - Auto-editor timing reference
+source_mapping.json    - Original path to bundle path mapping
+
+assets/
+  TikTok60fps.sqpreset       - 60fps 1080x1920 sequence preset
+  SPM_Anime_Subtitle.mogrt   - Styled subtitle MOGRT template
+
+sources/
 {episode_list}
 
-=== RECOMMENDED: Use ExtendScript ===
+=== USAGE (Premiere Pro 2025) ===
 
 1. Extract this entire ZIP to a folder
-2. Open Adobe Premiere Pro 2020 or later
+2. Open Adobe Premiere Pro 2025
 3. Create or open a project
-4. Run the script: File > Scripts > Run Script...
+4. File > Scripts > Run Script...
 5. Select "import_project.jsx"
-6. The script will automatically:
-   - Create a 1080x1920 vertical sequence
-   - Import all source video clips
-   - Place clips at correct positions with timing markers
-   - Import TTS audio
-   - Import subtitles
-   - Add scene markers
 
-After running the script, you'll need to:
-1. Apply speed adjustments (check console output for required %%)
-2. Style captions in Essential Graphics panel
-3. Verify sequence settings are 1080x1920
+The script will automatically:
+  - Create 60fps 1080x1920 vertical sequence (via QE DOM)
+  - Import and place TTS audio on Audio Track 1
+  - Import source video clips
+  - Place clips with Elastic Time logic:
+    * Speed UP clips that are too long
+    * Slow DOWN clips that are too short (75% floor)
+    * Creates gaps when slowdown would exceed 75%
+  - Apply SPM_Anime_Tiktok video effect preset
+  - Place MOGRT subtitles on Video Track 2 for each scene
+  - Add scene markers at each clip start
 
-=== ALTERNATIVE: Manual XML Import ===
+=== MANUAL STEPS AFTER SCRIPT ===
 
-1. Extract this entire ZIP to a folder
-2. Open Adobe Premiere Pro
-3. Import the XML: File > Import > premiere_project.xml
-4. The sequence will be created with clips and markers
-5. Manually adjust speed on each clip as indicated by markers
+1. Check console output for any clips needing manual speed adjustment
+2. Edit MOGRT subtitle text if auto-population didn't work:
+   - Select MOGRT clip on Track 2
+   - Essential Graphics panel > Edit "TextLayer" property
+3. Fill any gaps if clips were capped at 75% slowdown
+4. Add transitions and final polish
+5. Export!
 
-=== Subtitle Styling ===
+=== TROUBLESHOOTING ===
 
-See SUBTITLE_STYLE_GUIDE.md for detailed caption styling instructions.
-The subtitle_style.prfpset contains a reference preset (JSON format).
+"QE DOM not available":
+  - Ensure you're using Premiere Pro 2025
+  - Try creating a blank sequence first, then re-run
 
-=== Files Reference ===
+"SPM_Anime_Tiktok effect not found":
+  - The video effect preset must be installed in Premiere Pro
+  - Manually apply your desired effect to all clips
 
-- auto_editor_cuts.xml: Contains the exact cuts made by auto-editor
-  (useful if you need to verify silence removal timing)
-- source_mapping.json: Maps original paths to bundle paths
+Speed not applied:
+  - Right-click clip > Speed/Duration
+  - Enter the percentage shown in console output
+
+=== TECHNICAL NOTES ===
+
+- Sequence preset: TikTok60fps.sqpreset (60fps, 1080x1920, progressive)
+- Elastic Time: SpeedRatio = SourceDuration / TargetDuration
+- 75% Floor: Clips won't slow below 75% (leaves gap to next scene)
+- MOGRT: SPM_Anime_Subtitle with "TextLayer" property (id: 3)
+- Ticks per second: 254016000000
 """
                 zf.writestr("README.txt", readme)
 
