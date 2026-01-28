@@ -41,13 +41,13 @@ export function ProcessingPage() {
       status: "pending",
     },
     {
-      id: "srt_generation",
-      label: "Creating subtitles with word timing",
+      id: "xml_generation",
+      label: "Generating FCP XML V5 project (tracks + effects)",
       status: "pending",
     },
     {
-      id: "xml_generation",
-      label: "Generating Premiere Pro XML project",
+      id: "srt_generation",
+      label: "Creating subtitles",
       status: "pending",
     },
     { id: "bundling", label: "Bundling project assets", status: "pending" },
@@ -260,8 +260,8 @@ export function ProcessingPage() {
               Download Project Bundle
             </Button>
             <p className="text-xs text-center text-[hsl(var(--muted-foreground))]">
-              The bundle contains: .jsx script, edited TTS audio, subtitles
-              (.srt), and references to source episodes
+              The bundle contains: FCP XML project, edited TTS audio, subtitles
+              (.srt), white border image, and source episodes
             </p>
           </div>
         )}

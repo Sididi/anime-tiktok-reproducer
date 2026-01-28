@@ -17,6 +17,8 @@ dependencies = [
     "opencv-python>=4.10.0",
     "auto-editor>=28.0.0,<29.0.0",
     "scipy>=1.10.0",
+    "nvidia-cublas-cu12",
+    "nvidia-cudnn-cu12",
 ]
 
 [project.optional-dependencies]

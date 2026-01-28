@@ -11,6 +11,14 @@ from typing import AsyncIterator
 from ..config import settings
 from ..models import Project, Transcription, SceneMatch
 from .transcriber import TranscriberService
+from .fcp_xml_generator import (
+    FCPXMLGenerator,
+    AutoEditorXMLParser,
+    VideoClipInfo,
+    TimebaseInfo,
+    detect_video_fps,
+    generate_white_rectangle,
+)
 
 
 @dataclass
@@ -399,6 +407,115 @@ class ProcessingService:
         lines.insert(1, "<!DOCTYPE xmeml>")
 
         return "\n".join(lines)
+
+    @classmethod
+    async def generate_fcp_xml_v5(
+        cls,
+        project: Project,
+        transcription: Transcription,
+        matches: list[SceneMatch],
+        auto_editor_xml_path: Path,
+        output_dir: Path,
+    ) -> tuple[str, Path]:
+        """
+        Generate FCP XML Version 5 file for Premiere Pro import.
+
+        Creates a complete XML file with:
+        - V1: Blurred background (Scale 183 + Gaussian Blur 50)
+        - V2: White rectangle border (926x746)
+        - V3: Main video (Scale 68)
+        - A1: Original anime audio (DISABLED)
+        - A2: TTS audio with auto-editor cuts
+
+        Args:
+            project: Project data
+            transcription: Transcription with word timings from edited TTS audio
+            matches: Scene matches with source timing
+            auto_editor_xml_path: Path to auto-editor generated XML
+            output_dir: Directory for output files
+
+        Returns:
+            Tuple of (XML content string, white rectangle image path)
+        """
+        # Parse auto-editor XML for audio cuts
+        audio_cuts, auto_editor_timebase = AutoEditorXMLParser.parse(auto_editor_xml_path)
+
+        # Detect source video FPS (use first match's episode)
+        first_episode = next((m.episode for m in matches if m.episode), None)
+        if first_episode:
+            source_timebase = await detect_video_fps(Path(first_episode))
+        else:
+            source_timebase = TimebaseInfo(timebase=24, ntsc=True)  # Default 23.976
+
+        # Generate white rectangle image (926x746 centered)
+        white_rect_path = output_dir / "white_rectangle.png"
+        generate_white_rectangle(white_rect_path)
+
+        # Build clip info list with speed calculations
+        clips = []
+        for scene_trans in transcription.scenes:
+            if not scene_trans.words:
+                continue
+
+            match = next(
+                (m for m in matches if m.scene_index == scene_trans.scene_index),
+                None,
+            )
+            if not match or not match.episode:
+                continue
+
+            timeline_start = scene_trans.words[0].start
+            timeline_end = scene_trans.words[-1].end
+            target_duration = timeline_end - timeline_start
+
+            source_in = match.start_time
+            source_out = match.end_time
+            source_duration = source_out - source_in
+
+            # Speed ratio: how much to speed/slow the clip
+            # speed_ratio > 1: clip needs to be sped up
+            # speed_ratio < 1: clip needs to be slowed down
+            speed_ratio = source_duration / target_duration if target_duration > 0 else 1.0
+
+            # Apply 75% floor for slowdowns
+            effective_speed = speed_ratio
+            leaves_gap = False
+            if speed_ratio < 0.75:
+                effective_speed = 0.75
+                leaves_gap = True
+
+            clips.append(VideoClipInfo(
+                scene_index=scene_trans.scene_index,
+                source_path=Path(match.episode),
+                source_in_seconds=source_in,
+                source_out_seconds=source_out,
+                timeline_start_seconds=timeline_start,
+                timeline_end_seconds=timeline_end,
+                speed_ratio=speed_ratio,
+                effective_speed=effective_speed,
+                leaves_gap=leaves_gap,
+            ))
+
+        # Calculate total duration
+        total_duration = 0.0
+        if transcription.scenes and transcription.scenes[-1].words:
+            total_duration = transcription.scenes[-1].words[-1].end
+
+        # Generate XML
+        generator = FCPXMLGenerator(
+            project_id=project.id,
+            clips=clips,
+            audio_cuts=audio_cuts,
+            auto_editor_timebase=auto_editor_timebase,
+            source_timebase=source_timebase,
+            tts_audio_filename="tts_edited.wav",
+            white_rect_filename="white_rectangle.png",
+            total_duration_seconds=total_duration,
+        )
+
+        xml_content = generator.generate()
+
+        return xml_content, white_rect_path
 
     @classmethod
     def generate_jsx_script(
@@ -1377,11 +1494,19 @@ class ProcessingService:
         """
         Run the full processing pipeline.
 
-        Generates a Premiere Pro 2025 automation bundle with:
-        - JSX script using QE DOM for 60fps sequence, speed control, MOGRT subtitles
-        - Static assets (TikTok60fps.sqpreset, SPM_Anime_Subtitle.mogrt)
-        - Processed TTS audio
+        Generates a Premiere Pro project bundle with:
+        - FCP XML V5 file with multi-track layout and effects
+        - White rectangle image for border effect
+        - Processed TTS audio with auto-editor cuts
+        - SRT subtitles
         - Source video clips
+
+        Track layout in generated XML:
+        - V1: Blurred background (Scale 183% + Gaussian Blur 50)
+        - V2: White rectangle border (926x746)
+        - V3: Main video (Scale 68%)
+        - A1: Original anime audio (DISABLED)
+        - A2: TTS audio with cuts from auto-editor
 
         Args:
             project: Project data
@@ -1429,20 +1554,34 @@ class ProcessingService:
 
             yield ProcessingProgress(
                 "processing",
-                "jsx_generation",
+                "xml_generation",
                 0.5,
-                "Generating Premiere Pro automation script...",
+                "Generating FCP XML V5 project file...",
             )
 
-            # Step 3: Generate ExtendScript (.jsx) for Premiere Pro 2025 automation
-            # Uses QE DOM for 60fps sequence creation, speed control, and MOGRT subtitles
-            jsx_content = cls.generate_jsx_script(
+            # Step 3: Generate FCP XML V5 for Premiere Pro import
+            # Creates multi-track project with effects pre-applied
+            xml_content, white_rect_path = await cls.generate_fcp_xml_v5(
                 project,
                 new_transcription,
                 matches,
+                auto_editor_xml_path,
+                output_dir,
             )
-            jsx_path = output_dir / "import_project.jsx"
-            jsx_path.write_text(jsx_content, encoding="utf-8")
+            xml_path = output_dir / "project.xml"
+            xml_path.write_text(xml_content, encoding="utf-8")
+
+            yield ProcessingProgress(
+                "processing",
+                "srt_generation",
+                0.6,
+                "Creating subtitles...",
+            )
+
+            # Step 4: Generate SRT subtitles
+            srt_content = cls.generate_srt(new_transcription)
+            srt_path = output_dir / "subtitles.srt"
+            srt_path.write_text(srt_content, encoding="utf-8")
 
             yield ProcessingProgress(
                 "processing",
@@ -1451,9 +1590,8 @@ class ProcessingService:
                 "Creating project bundle...",
             )
 
-            # Step 4: Bundle everything
+            # Step 5: Bundle everything
             bundle_path = cls.get_output_dir(project.id).parent / "project_bundle.zip"
-            assets_dir = cls.get_assets_dir()
 
             # Collect unique source episodes
             source_episodes: set[str] = set()
@@ -1462,28 +1600,20 @@ class ProcessingService:
                     source_episodes.add(match.episode)
 
             with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                # Add ExtendScript for Premiere Pro automation (main entry point)
-                zf.write(jsx_path, "import_project.jsx")
+                # Add FCP XML V5 project file (main entry point)
+                zf.write(xml_path, "project.xml")
 
                 # Add edited TTS audio
                 zf.write(edited_audio_path, "tts_edited.wav")
 
-                # Add auto-editor XML (lossless timing reference)
+                # Add SRT subtitles
+                zf.write(srt_path, "subtitles.srt")
+
+                # Add auto-editor XML (for reference/debugging)
                 zf.write(auto_editor_xml_path, "auto_editor_cuts.xml")
 
-                # Add static assets to assets/ folder
-                sqpreset_path = assets_dir / "TikTok60fps.sqpreset"
-                mogrt_path = assets_dir / "SPM_Anime_Subtitle.mogrt"
-
-                if sqpreset_path.exists():
-                    zf.write(sqpreset_path, "assets/TikTok60fps.sqpreset")
-                else:
-                    raise FileNotFoundError(f"Sequence preset not found: {sqpreset_path}")
-
-                if mogrt_path.exists():
-                    zf.write(mogrt_path, "assets/SPM_Anime_Subtitle.mogrt")
-                else:
-                    raise FileNotFoundError(f"MOGRT template not found: {mogrt_path}")
+                # Add white rectangle image to assets/
+                zf.write(white_rect_path, "assets/white_rectangle.png")
 
                 # Add source episode files to sources/ folder
                 episode_paths_in_bundle = {}
@@ -1514,69 +1644,66 @@ Scenes: {scene_count}
 
 === CONTENTS ===
 
-import_project.jsx     - Premiere Pro 2025 automation script (MAIN)
+project.xml            - FCP XML V5 project file (IMPORT THIS)
 tts_edited.wav         - Processed TTS audio (silences removed)
+subtitles.srt          - Word-timed subtitles
 auto_editor_cuts.xml   - Auto-editor timing reference
 source_mapping.json    - Original path to bundle path mapping
 
 assets/
-  TikTok60fps.sqpreset       - 60fps 1080x1920 sequence preset
-  SPM_Anime_Subtitle.mogrt   - Styled subtitle MOGRT template
+  white_rectangle.png  - White border image for V2 track
 
 sources/
 {episode_list}
 
-=== USAGE (Premiere Pro 2025) ===
+=== USAGE (Premiere Pro 25.5.0) ===
 
 1. Extract this entire ZIP to a folder
-2. Open Adobe Premiere Pro 2025
-3. Create or open a project
-4. File > Scripts > Run Script...
-5. Select "import_project.jsx"
+2. Open Adobe Premiere Pro
+3. File > Import... > Select "project.xml"
+4. Choose "Import Entire Sequence"
 
-The script will automatically:
-  - Create 60fps 1080x1920 vertical sequence (via QE DOM)
-  - Import and place TTS audio on Audio Track 1
-  - Import source video clips
-  - Place clips with Elastic Time logic:
-    * Speed UP clips that are too long
-    * Slow DOWN clips that are too short (75% floor)
-    * Creates gaps when slowdown would exceed 75%
-  - Apply SPM_Anime_Tiktok video effect preset
-  - Place MOGRT subtitles on Video Track 2 for each scene
-  - Add scene markers at each clip start
+The XML will create a sequence with:
+  - V1: Blurred background clips (Scale 183% + Gaussian Blur 50)
+  - V2: White rectangle border (926x746 centered)
+  - V3: Main video clips (Scale 68%)
+  - A1: Original anime audio (DISABLED - for reference)
+  - A2: TTS audio with auto-editor cuts preserved
 
-=== MANUAL STEPS AFTER SCRIPT ===
+=== TRACK LAYOUT ===
 
-1. Check console output for any clips needing manual speed adjustment
-2. Edit MOGRT subtitle text if auto-population didn't work:
-   - Select MOGRT clip on Track 2
-   - Essential Graphics panel > Edit "TextLayer" property
-3. Fill any gaps if clips were capped at 75% slowdown
-4. Add transitions and final polish
+V3 [Main Video]      - Anime clips at 68% scale (centered)
+V2 [White Border]    - White rectangle creating border effect
+V1 [Blurred BG]      - Same clips at 183% scale + blur
+
+A2 [TTS Audio]       - Generated voice with silence removed
+A1 [Anime Audio]     - Original audio from clips (DISABLED)
+
+=== AFTER IMPORT ===
+
+1. Relink media if paths changed:
+   - Right-click offline media > Link Media
+   - Navigate to sources/ folder
+
+2. Import subtitles:
+   - File > Import > subtitles.srt
+   - Drag to a video track above V3
+
+3. Adjust effects if needed:
+   - V1 clips: Scale 183%, Gaussian Blur 50
+   - V3 clips: Scale 68%
+
+4. Review any clips with gaps (75% speed floor was hit)
+
 5. Export!
-
-=== TROUBLESHOOTING ===
-
-"QE DOM not available":
-  - Ensure you're using Premiere Pro 2025
-  - Try creating a blank sequence first, then re-run
-
-"SPM_Anime_Tiktok effect not found":
-  - The video effect preset must be installed in Premiere Pro
-  - Manually apply your desired effect to all clips
-
-Speed not applied:
-  - Right-click clip > Speed/Duration
-  - Enter the percentage shown in console output
 
 === TECHNICAL NOTES ===
 
-- Sequence preset: TikTok60fps.sqpreset (60fps, 1080x1920, progressive)
-- Elastic Time: SpeedRatio = SourceDuration / TargetDuration
-- 75% Floor: Clips won't slow below 75% (leaves gap to next scene)
-- MOGRT: SPM_Anime_Subtitle with "TextLayer" property (id: 3)
-- Ticks per second: 254016000000
+- Sequence: 60fps, 1080x1920 (vertical TikTok format)
+- Speed Logic: source_duration / target_duration
+- 75% Floor: Clips won't slow below 75% (leaves gap)
+- Effects applied via FCP XML filters
+- White border: 926x746 PNG at position (540, 960)
 """
                 zf.writestr("README.txt", readme)
 
