@@ -199,7 +199,7 @@ class TranscriberService:
         cls,
         audio_path: Path,
         script: dict,
-        model_size: str = "medium",
+        model_size: str = "large-v3",
     ) -> Transcription:
         """
         Transcribe audio and align with a known script.
@@ -215,7 +215,7 @@ class TranscriberService:
         Returns:
             Transcription with word-level timings
         """
-        # Transcribe to get timings (use medium model for TTS audio)
+        # Transcribe to get timings (use large-v3 model for better word-level accuracy)
         words, detected_lang = cls._transcribe_sync(audio_path, None, model_size)
 
         # Build scene transcriptions from script + timing alignment
