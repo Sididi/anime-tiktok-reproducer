@@ -49,13 +49,13 @@ class ProcessingService:
     async def detect_video_fps(video_path: Path) -> Fraction:
         """
         Detect video frame rate using ffprobe, returning as a Fraction for precision.
-        
+
         Handles NTSC rates (23.976 -> 24000/1001, 29.97 -> 30000/1001, 59.94 -> 60000/1001)
         and standard rates (24/1, 30/1, 60/1).
-        
+
         Args:
             video_path: Path to video file
-            
+
         Returns:
             Frame rate as a Fraction (e.g., Fraction(24000, 1001) for 23.976fps)
         """
@@ -66,18 +66,18 @@ class ProcessingService:
             "-of", "default=noprint_wrappers=1:nokey=1",
             str(video_path),
         ]
-        
+
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, _ = await process.communicate()
-        
+
         if process.returncode != 0:
             # Default to 24fps if detection fails
             return Fraction(24, 1)
-        
+
         fps_str = stdout.decode().strip()
         if "/" in fps_str:
             num, den = fps_str.split("/")
@@ -469,7 +469,7 @@ class ProcessingService:
         - Speed adjustments via qeItem.setSpeed()
         - 4-Track Structure: V4(Subtitles), V3(Main), V2(Border), V1(Background)
         - Scaling: V1 (183%), V3 (68%)
-        
+
         Frame-Perfect Timing:
         - All timeline positions are snapped to 60fps frame grid
         - Uses OTIOTimingCalculator for Fraction-based speed calculations
@@ -488,7 +488,7 @@ class ProcessingService:
         # Set up frame-accurate timing calculator
         # Sequence rate: 60fps (non-NTSC for TikTok)
         sequence_rate = FrameRateInfo(timebase=60, ntsc=False)
-        
+
         # Source rate: detect from anime or default to 23.976fps
         if source_fps is not None:
             # Determine if NTSC from the fraction
@@ -496,16 +496,16 @@ class ProcessingService:
             source_rate = FrameRateInfo.from_fps(fps_float)
         else:
             source_rate = FrameRateInfo(timebase=24, ntsc=True)  # Default 23.976
-        
+
         calculator = OTIOTimingCalculator(
             sequence_rate=sequence_rate,
             source_rate=source_rate,
         )
-        
+
         # Build scenes data with frame-perfect timing
         scenes = []
         clip_timings = []  # For continuity validation
-        
+
         for scene_trans in transcription.scenes:
             if not scene_trans.words:
                 continue
@@ -521,11 +521,11 @@ class ProcessingService:
             # Timeline position from TTS transcription words (seconds)
             timeline_start_sec = scene_trans.words[0].start
             timeline_end_sec = scene_trans.words[-1].end
-            
+
             # Source timing from match (seconds) - the original anime clip
             source_in_sec = match.start_time
             source_out_sec = match.end_time
-            
+
             # Calculate frame-perfect timing using OTIO
             clip_timing = calculator.calculate_clip_timing(
                 scene_index=scene_trans.scene_index,
@@ -537,16 +537,16 @@ class ProcessingService:
                 timeline_end_seconds=timeline_end_sec,
             )
             clip_timings.append(clip_timing)
-            
+
             # Convert timeline positions to frame-snapped seconds (60fps grid)
             # This ensures no sub-frame positioning
             timeline_start_frames = clip_timing.timeline_start_frames
             timeline_end_frames = clip_timing.timeline_end_frames
-            
+
             # Convert back to seconds at exactly 60fps
             timeline_start_snapped = timeline_start_frames / 60.0
             timeline_end_snapped = timeline_end_frames / 60.0
-            
+
             # Subtitle text for this scene
             subtitle_text = scene_trans.text if scene_trans.text else ""
 
@@ -566,7 +566,7 @@ class ProcessingService:
                 "effective_speed": round(float(clip_timing.effective_speed), 4),
                 "leaves_gap": clip_timing.leaves_gap,  # True if 75% floor hit
             })
-        
+
         # Validate continuity - log warnings for intentional gaps
         issues = calculator.validate_clip_continuity(clip_timings, tolerance_frames=1)
         for issue in issues:
