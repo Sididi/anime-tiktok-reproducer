@@ -5,12 +5,14 @@ import json
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
+from fractions import Fraction
 from pathlib import Path
 from typing import AsyncIterator
 
 from ..config import settings
 from ..models import Project, Transcription, SceneMatch
 from .transcriber import TranscriberService
+from .otio_timing import OTIOTimingCalculator, FrameRateInfo
 
 
 @dataclass
@@ -42,6 +44,56 @@ class ProcessingService:
     def get_output_dir(project_id: str) -> Path:
         """Get the output directory for processed files."""
         return settings.projects_dir / project_id / "output"
+
+    @staticmethod
+    async def detect_video_fps(video_path: Path) -> Fraction:
+        """
+        Detect video frame rate using ffprobe, returning as a Fraction for precision.
+        
+        Handles NTSC rates (23.976 -> 24000/1001, 29.97 -> 30000/1001, 59.94 -> 60000/1001)
+        and standard rates (24/1, 30/1, 60/1).
+        
+        Args:
+            video_path: Path to video file
+            
+        Returns:
+            Frame rate as a Fraction (e.g., Fraction(24000, 1001) for 23.976fps)
+        """
+        cmd = [
+            "ffprobe", "-v", "quiet",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=r_frame_rate",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(video_path),
+        ]
+        
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await process.communicate()
+        
+        if process.returncode != 0:
+            # Default to 24fps if detection fails
+            return Fraction(24, 1)
+        
+        fps_str = stdout.decode().strip()
+        if "/" in fps_str:
+            num, den = fps_str.split("/")
+            return Fraction(int(num), int(den))
+        else:
+            # Handle decimal format (less common)
+            fps_float = float(fps_str)
+            # Detect NTSC rates
+            if abs(fps_float - 23.976) < 0.01:
+                return Fraction(24000, 1001)
+            elif abs(fps_float - 29.97) < 0.01:
+                return Fraction(30000, 1001)
+            elif abs(fps_float - 59.94) < 0.01:
+                return Fraction(60000, 1001)
+            else:
+                return Fraction(int(round(fps_float)), 1)
 
     @classmethod
     async def convert_audio_for_auto_editor(
@@ -406,6 +458,7 @@ class ProcessingService:
         project: Project,
         transcription: Transcription,
         matches: list[SceneMatch],
+        source_fps: Fraction | None = None,
     ) -> str:
         """
         Generate a production-ready Premiere Pro 2025 ExtendScript (.jsx) file.
@@ -416,17 +469,43 @@ class ProcessingService:
         - Speed adjustments via qeItem.setSpeed()
         - 4-Track Structure: V4(Subtitles), V3(Main), V2(Border), V1(Background)
         - Scaling: V1 (183%), V3 (68%)
+        
+        Frame-Perfect Timing:
+        - All timeline positions are snapped to 60fps frame grid
+        - Uses OTIOTimingCalculator for Fraction-based speed calculations
+        - Gaps only occur when 75% speed floor is reached
 
         Args:
             project: Project data
             transcription: Transcription with word timings
             matches: Scene matches with source timing
+            source_fps: Source video frame rate as Fraction (e.g., 24000/1001 for 23.976)
+                        If None, defaults to 23.976fps
 
         Returns:
             The generated JSX script content (ES3 compatible)
         """
-        # Build scenes data with timing from transcription and elastic time logic
+        # Set up frame-accurate timing calculator
+        # Sequence rate: 60fps (non-NTSC for TikTok)
+        sequence_rate = FrameRateInfo(timebase=60, ntsc=False)
+        
+        # Source rate: detect from anime or default to 23.976fps
+        if source_fps is not None:
+            # Determine if NTSC from the fraction
+            fps_float = float(source_fps)
+            source_rate = FrameRateInfo.from_fps(fps_float)
+        else:
+            source_rate = FrameRateInfo(timebase=24, ntsc=True)  # Default 23.976
+        
+        calculator = OTIOTimingCalculator(
+            sequence_rate=sequence_rate,
+            source_rate=source_rate,
+        )
+        
+        # Build scenes data with frame-perfect timing
         scenes = []
+        clip_timings = []  # For continuity validation
+        
         for scene_trans in transcription.scenes:
             if not scene_trans.words:
                 continue
@@ -440,45 +519,70 @@ class ProcessingService:
                 continue
 
             # Timeline position from TTS transcription words (seconds)
-            timeline_start = scene_trans.words[0].start
-            timeline_end = scene_trans.words[-1].end
-            target_duration = timeline_end - timeline_start
-
+            timeline_start_sec = scene_trans.words[0].start
+            timeline_end_sec = scene_trans.words[-1].end
+            
             # Source timing from match (seconds) - the original anime clip
-            source_in = match.start_time
-            source_out = match.end_time
-            clip_original_duration = source_out - source_in
-
-            # Elastic Time: SpeedRatio = ClipOriginalDuration / TargetDuration
-            # If ratio > 1: clip is too long, speed UP
-            # If ratio < 1: clip is too short, slow DOWN (with 75% floor)
-            speed_ratio = clip_original_duration / target_duration if target_duration > 0 else 1.0
-
-            # Apply 75% floor constraint for slowdowns
-            effective_speed = speed_ratio
-            if speed_ratio < 1.0:
-                # Need to slow down
-                if speed_ratio < 0.75:
-                    # Cap at 75% - clip will finish before next marker
-                    effective_speed = 0.75
-
+            source_in_sec = match.start_time
+            source_out_sec = match.end_time
+            
+            # Calculate frame-perfect timing using OTIO
+            clip_timing = calculator.calculate_clip_timing(
+                scene_index=scene_trans.scene_index,
+                source_path=Path(match.episode),
+                bundle_filename=Path(match.episode).stem,
+                source_in_seconds=source_in_sec,
+                source_out_seconds=source_out_sec,
+                timeline_start_seconds=timeline_start_sec,
+                timeline_end_seconds=timeline_end_sec,
+            )
+            clip_timings.append(clip_timing)
+            
+            # Convert timeline positions to frame-snapped seconds (60fps grid)
+            # This ensures no sub-frame positioning
+            timeline_start_frames = clip_timing.timeline_start_frames
+            timeline_end_frames = clip_timing.timeline_end_frames
+            
+            # Convert back to seconds at exactly 60fps
+            timeline_start_snapped = timeline_start_frames / 60.0
+            timeline_end_snapped = timeline_end_frames / 60.0
+            
             # Subtitle text for this scene
             subtitle_text = scene_trans.text if scene_trans.text else ""
 
-            # Round values for cleaner output
+            # Build scene data with frame-perfect values
+            # effective_speed is stored as float for JSX (Premiere expects decimal)
             scenes.append({
                 "scene_index": scene_trans.scene_index,
-                "start": round(timeline_start, 2),
-                "end": round(timeline_end, 2),
+                "start": round(timeline_start_snapped, 6),  # Frame-snapped, more precision
+                "end": round(timeline_end_snapped, 6),
                 "text": subtitle_text,
-                "clipName": Path(match.episode).stem,  # No extension for cleaner name matching
-                "source_in": round(source_in, 2),
-                "source_out": round(source_out, 2),
-                "clip_duration": round(clip_original_duration, 2),
-                "target_duration": round(target_duration, 2),
-                "speed_ratio": round(speed_ratio, 2),
-                "effective_speed": round(effective_speed, 2),
+                "clipName": Path(match.episode).stem,
+                "source_in": round(source_in_sec, 4),
+                "source_out": round(source_out_sec, 4),
+                "clip_duration": round(clip_timing.source_duration.to_seconds(), 4),
+                "target_duration": round(clip_timing.target_duration.to_seconds(), 4),
+                "speed_ratio": round(float(clip_timing.speed_ratio), 4),
+                "effective_speed": round(float(clip_timing.effective_speed), 4),
+                "leaves_gap": clip_timing.leaves_gap,  # True if 75% floor hit
             })
+        
+        # Validate continuity - log warnings for intentional gaps
+        issues = calculator.validate_clip_continuity(clip_timings, tolerance_frames=1)
+        for issue in issues:
+            if issue.issue_type == "gap":
+                # Check if this is an expected gap (75% floor)
+                scene_a = issue.between_scenes[0]
+                clip_a = next((c for c in clip_timings if c.scene_index == scene_a), None)
+                if clip_a and clip_a.leaves_gap:
+                    # Expected gap due to 75% floor - this is fine
+                    pass
+                else:
+                    # Unexpected gap - log warning (would be nice to surface this)
+                    import sys
+                    print(f"[WARNING] Unexpected {issue.duration_seconds*1000:.1f}ms gap "
+                          f"between scenes {issue.between_scenes[0]} and {issue.between_scenes[1]} "
+                          f"at {issue.position_seconds:.3f}s", file=sys.stderr)
 
         # Generate scenes JSON with proper indentation
         scenes_json = json.dumps(scenes, indent=4, ensure_ascii=False)
@@ -1195,8 +1299,19 @@ class ProcessingService:
                 "Generating Premiere Pro JSX script...",
             )
 
-            # Step 3: Generate JSX script (v7.1 format - matching working_script.jsx)
-            jsx_content = cls.generate_jsx_script(project, new_transcription, matches)
+            # Step 3: Detect source FPS from first available episode
+            source_fps = None
+            for match in matches:
+                if match.episode:
+                    episode_path = Path(match.episode)
+                    if episode_path.exists():
+                        source_fps = await cls.detect_video_fps(episode_path)
+                        break  # Use first valid episode's FPS
+
+            # Step 4: Generate JSX script (v7.1 format - matching working_script.jsx)
+            jsx_content = cls.generate_jsx_script(
+                project, new_transcription, matches, source_fps=source_fps
+            )
             jsx_path = output_dir / "import_project.jsx"
             jsx_path.write_text(jsx_content, encoding="utf-8")
 
