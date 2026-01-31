@@ -9,6 +9,8 @@ import {
   ArrowLeft,
   RefreshCw,
   Search,
+  Sparkles,
+  Wand2,
 } from "lucide-react";
 import { Button } from "@/components/ui";
 import { ClippedVideoPlayer, ManualMatchModal } from "@/components/video";
@@ -80,7 +82,15 @@ function MatchCard({
       data-scene-index={scene.index}
     >
       <div className="flex items-center justify-between">
-        <h3 className="font-semibold">Scene {scene.index + 1}</h3>
+        <div className="flex items-center gap-2">
+          <h3 className="font-semibold">Scene {scene.index + 1}</h3>
+          {match.was_no_match && (
+            <span className="flex items-center gap-1 text-xs px-1.5 py-0.5 rounded bg-purple-500/10 text-purple-500 border border-purple-500/20">
+              <Sparkles className="h-3 w-3" />
+              manually set
+            </span>
+          )}
+        </div>
         {hasMatch ? (
           <span className="flex items-center gap-1 text-sm text-emerald-500">
             <Check className="h-4 w-4" />
@@ -229,7 +239,12 @@ export function MatchValidation() {
         await loadProject(projectId);
         await loadScenes(projectId);
         const { matches: loadedMatches } = await api.getMatches(projectId);
-        setMatches(loadedMatches);
+        // Track which scenes were initially "no match found"
+        const matchesWithTracking = loadedMatches.map(m => ({
+          ...m,
+          was_no_match: m.was_no_match ?? (m.confidence === 0 && !m.episode)
+        }));
+        setMatches(matchesWithTracking);
         // Load available episodes for manual matching
         const { episodes: loadedEpisodes } = await api.getEpisodes(projectId);
         setEpisodes(loadedEpisodes);
@@ -286,7 +301,12 @@ export function MatchValidation() {
                 const matchesData = data.matches as unknown as {
                   matches: SceneMatch[];
                 };
-                setMatches(matchesData.matches || []);
+                // Track which scenes are initially "no match found"
+                const matchesWithTracking = (matchesData.matches || []).map(m => ({
+                  ...m,
+                  was_no_match: m.confidence === 0 && !m.episode
+                }));
+                setMatches(matchesWithTracking);
               }
 
               if (data.status === "error") {
@@ -329,7 +349,14 @@ export function MatchValidation() {
         );
 
         setMatches((prev) =>
-          prev.map((m) => (m.scene_index === sceneIndex ? updatedMatch : m)),
+          prev.map((m) => {
+            if (m.scene_index === sceneIndex) {
+              // Preserve the was_no_match flag if it was true
+              const wasNoMatch = m.confidence === 0 && !m.episode;
+              return { ...updatedMatch, was_no_match: m.was_no_match || wasNoMatch };
+            }
+            return m;
+          }),
         );
       } catch (err) {
         setError((err as Error).message);
@@ -349,6 +376,54 @@ export function MatchValidation() {
     setMatches([]);
     await handleFindMatches();
   };
+
+  const handleAutoFillBestCandidates = useCallback(async () => {
+    if (!projectId) return;
+
+    try {
+      // Find all scenes with no match
+      const noMatchScenes = matches.filter(m => m.confidence === 0 && !m.episode && m.alternatives?.length > 0);
+      
+      if (noMatchScenes.length === 0) return;
+
+      // Update each scene with its best alternative
+      for (const match of noMatchScenes) {
+        const bestAlternative = match.alternatives[0]; // Highest ranked candidate
+        
+        await api.updateMatch(
+          projectId,
+          match.scene_index,
+          {
+            episode: bestAlternative.episode,
+            start_time: bestAlternative.start_time,
+            end_time: bestAlternative.end_time,
+            confirmed: true,
+          },
+        );
+
+        // Update local state
+        setMatches((prev) =>
+          prev.map((m) => {
+            if (m.scene_index === match.scene_index) {
+              return {
+                ...m,
+                episode: bestAlternative.episode,
+                start_time: bestAlternative.start_time,
+                end_time: bestAlternative.end_time,
+                confidence: bestAlternative.confidence,
+                speed_ratio: bestAlternative.speed_ratio,
+                confirmed: true,
+                was_no_match: true, // Mark as manually set
+              };
+            }
+            return m;
+          }),
+        );
+      }
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }, [projectId, matches]);
 
   // Count confirmed matches (those with valid match data)
   const confirmedCount = matches.filter(
@@ -382,39 +457,63 @@ export function MatchValidation() {
   return (
     <div className="min-h-screen p-4">
       <div className="max-w-4xl mx-auto space-y-6">
-        <header className="flex items-center justify-between">
-          <div className="flex items-center gap-4">
-            <Button variant="ghost" size="icon" onClick={handleBackToScenes}>
-              <ArrowLeft className="h-5 w-5" />
-            </Button>
-            <div>
-              <h1 className="text-xl font-bold">Match Validation</h1>
-              <p className="text-sm text-[hsl(var(--muted-foreground))]">
-                Verify the detected anime source clips
-              </p>
+        <header className="space-y-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-4">
+              <Button variant="ghost" size="icon" onClick={handleBackToScenes}>
+                <ArrowLeft className="h-5 w-5" />
+              </Button>
+              <div>
+                <h1 className="text-xl font-bold">Match Validation</h1>
+                <p className="text-sm text-[hsl(var(--muted-foreground))]">
+                  Verify the detected anime source clips
+                </p>
+              </div>
+            </div>
+            <div className="text-right">
+              <div className="text-sm text-[hsl(var(--muted-foreground))]">
+                {confirmedCount} / {totalCount} matched
+              </div>
             </div>
           </div>
-          <div className="flex items-center gap-4">
-            {matches.length > 0 && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={handleRecomputeMatches}
-                disabled={matching}
-              >
-                <RefreshCw
-                  className={`h-4 w-4 mr-2 ${matching ? "animate-spin" : ""}`}
-                />
-                Recompute
+
+          {matches.length > 0 && (
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleRecomputeMatches}
+                  disabled={matching}
+                  title="Re-run the matching algorithm"
+                >
+                  <RefreshCw
+                    className={`h-4 w-4 mr-1 ${matching ? "animate-spin" : ""}`}
+                  />
+                  Recompute
+                </Button>
+                {(() => {
+                  const noMatchCount = matches.filter(m => m.confidence === 0 && !m.episode && m.alternatives?.length > 0).length;
+                  return noMatchCount > 0 && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleAutoFillBestCandidates}
+                      disabled={matching}
+                      className="border-purple-500/30 hover:bg-purple-500/10 text-purple-500 hover:text-purple-400"
+                      title={`Auto-fill ${noMatchCount} unmatched scene${noMatchCount !== 1 ? 's' : ''} with best candidate`}
+                    >
+                      <Wand2 className="h-4 w-4 mr-1" />
+                      <span className="text-xs">Fill {noMatchCount}</span>
+                    </Button>
+                  );
+                })()}
+              </div>
+              <Button onClick={handleContinue} disabled={!allConfirmed}>
+                Continue to Transcription
               </Button>
-            )}
-            <span className="text-sm text-[hsl(var(--muted-foreground))]">
-              {confirmedCount} / {totalCount} matched
-            </span>
-            <Button onClick={handleContinue} disabled={!allConfirmed}>
-              Continue to Transcription
-            </Button>
-          </div>
+            </div>
+          )}
         </header>
 
         {/* No matches yet - show Find Matches button */}

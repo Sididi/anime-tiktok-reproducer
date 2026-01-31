@@ -470,6 +470,7 @@ class AnimeMatcherService:
                             end_time=0,
                             confidence=0,
                             speed_ratio=1.0,
+                            was_no_match=True,
                         )
                     )
                     continue
@@ -544,6 +545,7 @@ class AnimeMatcherService:
                             end_time=0,
                             confidence=0,
                             speed_ratio=1.0,
+                            was_no_match=True,
                             alternatives=alternatives,
                             start_candidates=start_candidates,
                             middle_candidates=middle_candidates,
@@ -561,6 +563,7 @@ class AnimeMatcherService:
                         end_time=0,
                         confidence=0,
                         speed_ratio=1.0,
+                        was_no_match=True,
                     )
                 )
                 print(f"Error matching scene {i}: {e}")

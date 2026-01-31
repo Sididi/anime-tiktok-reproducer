@@ -179,8 +179,10 @@ async def update_match(project_id: str, scene_index: int, request: UpdateMatchRe
     match.confirmed = request.confirmed
 
     # Set confidence to 1.0 for manually confirmed matches (if it was 0)
+    # Also preserve was_no_match flag if it was initially true
     if match.confidence == 0 and request.confirmed:
         match.confidence = 1.0
+        # was_no_match should already be set, but ensure it's preserved
 
     # Recalculate speed ratio
     scenes = ProjectService.load_scenes(project_id)

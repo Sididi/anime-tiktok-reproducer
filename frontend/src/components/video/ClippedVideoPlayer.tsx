@@ -46,6 +46,11 @@ export const ClippedVideoPlayer = forwardRef<
   const [retryCount, setRetryCount] = useState(0);
   const [isRetrying, setIsRetrying] = useState(false);
 
+  // Add a small offset to startTime to compensate for keyframe seeking
+  // HTML video seeks to nearest keyframe which can be before the target time
+  // Adding ~2 frames (at 30fps = 0.067s) ensures we land on correct frame
+  const adjustedStartTime = startTime + 0.067;
+
   // Add cache-busting parameter on retry to bypass browser cache
   const videoSrc = useMemo(() => {
     if (retryCount === 0) return src;
@@ -60,13 +65,13 @@ export const ClippedVideoPlayer = forwardRef<
     () => ({
       playFromStart: () => {
         if (videoRef.current) {
-          videoRef.current.currentTime = startTime;
+          videoRef.current.currentTime = adjustedStartTime;
           setIsEnded(false);
           videoRef.current.play().catch(console.error);
         }
       },
     }),
-    [startTime],
+    [adjustedStartTime],
   );
 
   // Intersection Observer for lazy loading AND unloading
@@ -108,11 +113,11 @@ export const ClippedVideoPlayer = forwardRef<
   // Set initial time when video loads
   const handleLoadedMetadata = useCallback(() => {
     if (videoRef.current) {
-      videoRef.current.currentTime = startTime;
+      videoRef.current.currentTime = adjustedStartTime;
       setIsLoaded(true);
       setHasError(false);
     }
-  }, [startTime]);
+  }, [adjustedStartTime]);
 
   const handleError = useCallback(
     (e: React.SyntheticEvent<HTMLVideoElement>) => {
@@ -138,32 +143,32 @@ export const ClippedVideoPlayer = forwardRef<
       video.currentTime = endTime;
       setIsEnded(true);
     }
-    // Also check start boundary
-    if (video.currentTime < startTime) {
-      video.currentTime = startTime;
+    // Also check start boundary (use adjusted time)
+    if (video.currentTime < adjustedStartTime) {
+      video.currentTime = adjustedStartTime;
     }
-  }, [startTime, endTime]);
+  }, [adjustedStartTime, endTime]);
 
   const handlePlay = useCallback(() => {
     // When play is triggered, ensure we're within bounds
     if (videoRef.current) {
       if (
-        videoRef.current.currentTime < startTime ||
+        videoRef.current.currentTime < adjustedStartTime ||
         videoRef.current.currentTime >= endTime
       ) {
-        videoRef.current.currentTime = startTime;
+        videoRef.current.currentTime = adjustedStartTime;
       }
       setIsEnded(false);
     }
-  }, [startTime, endTime]);
+  }, [adjustedStartTime, endTime]);
 
   const handleSeeked = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
 
-    // If user seeks before start, reset to start
-    if (video.currentTime < startTime) {
-      video.currentTime = startTime;
+    // If user seeks before start, reset to adjusted start
+    if (video.currentTime < adjustedStartTime) {
+      video.currentTime = adjustedStartTime;
     }
     // If user seeks past end, set to end and show ended state
     if (video.currentTime >= endTime) {
@@ -171,23 +176,23 @@ export const ClippedVideoPlayer = forwardRef<
       video.pause();
       setIsEnded(true);
     }
-  }, [startTime, endTime]);
+  }, [adjustedStartTime, endTime]);
 
   // Reset to start when src or times change
   useEffect(() => {
     if (videoRef.current && isLoaded) {
-      videoRef.current.currentTime = startTime;
+      videoRef.current.currentTime = adjustedStartTime;
       setIsEnded(false);
     }
-  }, [src, startTime, isLoaded]);
+  }, [src, adjustedStartTime, isLoaded]);
 
   const handleReplay = useCallback(() => {
     if (videoRef.current) {
-      videoRef.current.currentTime = startTime;
+      videoRef.current.currentTime = adjustedStartTime;
       setIsEnded(false);
       videoRef.current.play().catch(console.error);
     }
-  }, [startTime]);
+  }, [adjustedStartTime]);
 
   const handleRetry = useCallback(() => {
     // Set retrying state to force complete unmount

@@ -67,6 +67,7 @@ export interface SceneMatch {
   start_candidates: MatchCandidate[];
   middle_candidates: MatchCandidate[];
   end_candidates: MatchCandidate[];
+  was_no_match?: boolean; // Track if this scene was initially "no match found"
 }
 
 export interface Word {

@@ -34,6 +34,7 @@ class SceneMatch(BaseModel):
     confidence: float
     speed_ratio: float  # tiktok_duration / source_duration
     confirmed: bool = False
+    was_no_match: bool = False  # Track if initially no match was found
 
     # Top 5 alternative matches for quick selection (Weighted Voting algorithm)
     alternatives: list[AlternativeMatch] = []
