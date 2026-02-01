@@ -35,7 +35,10 @@ export function ProcessingPage() {
   const [error, setError] = useState<string | null>(null);
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const [gapsDetected, setGapsDetected] = useState(false);
-  const [gapInfo, setGapInfo] = useState<{ count: number; duration: number } | null>(null);
+  const [gapInfo, setGapInfo] = useState<{
+    count: number;
+    duration: number;
+  } | null>(null);
   const [steps, setSteps] = useState<ProcessingStep[]>([
     {
       id: "auto_editor",
@@ -130,15 +133,21 @@ export function ProcessingPage() {
                 setSteps((prev) =>
                   prev.map((step) => {
                     if (step.id === "gap_detection") {
-                      return { ...step, status: "paused", message: data.message };
+                      return {
+                        ...step,
+                        status: "paused",
+                        message: data.message,
+                      };
                     }
                     const stepIndex = prev.findIndex((s) => s.id === step.id);
-                    const currentIndex = prev.findIndex((s) => s.id === "gap_detection");
+                    const currentIndex = prev.findIndex(
+                      (s) => s.id === "gap_detection",
+                    );
                     if (stepIndex < currentIndex) {
                       return { ...step, status: "complete" };
                     }
                     return step;
-                  })
+                  }),
                 );
                 setProcessing(false);
                 return; // Stop processing here
@@ -211,7 +220,14 @@ export function ProcessingPage() {
 
     hasStartedProcessing.current = true;
     startProcessing();
-  }, [projectId, loading, processing, downloadUrl, gapsDetected, startProcessing]);
+  }, [
+    projectId,
+    loading,
+    processing,
+    downloadUrl,
+    gapsDetected,
+    startProcessing,
+  ]);
 
   const handleDownload = () => {
     if (downloadUrl) {
@@ -241,15 +257,15 @@ export function ProcessingPage() {
             {downloadUrl
               ? "Processing Complete!"
               : gapsDetected
-              ? "Gaps Detected"
-              : "Processing Your Project"}
+                ? "Gaps Detected"
+                : "Processing Your Project"}
           </h1>
           <p className="text-[hsl(var(--muted-foreground))]">
             {downloadUrl
               ? "Your Premiere Pro project bundle is ready for download"
               : gapsDetected
-              ? "Some clips need adjustments to fill timeline gaps"
-              : "Please wait while we generate your Premiere Pro project"}
+                ? "Some clips need adjustments to fill timeline gaps"
+                : "Please wait while we generate your Premiere Pro project"}
           </p>
         </div>
 
@@ -274,11 +290,13 @@ export function ProcessingPage() {
               <AlertTriangle className="h-5 w-5 text-amber-500 shrink-0 mt-0.5" />
               <div className="space-y-2 flex-1">
                 <p className="text-sm font-medium">
-                  {gapInfo.count} clip{gapInfo.count !== 1 ? "s" : ""} hit the 75% speed floor
+                  {gapInfo.count} clip{gapInfo.count !== 1 ? "s" : ""} hit the
+                  75% speed floor
                 </p>
                 <p className="text-xs text-[hsl(var(--muted-foreground))]">
-                  Total gap duration: {gapInfo.duration.toFixed(2)}s. You can extend these clips
-                  to fill the gaps, or skip to keep them as-is.
+                  Total gap duration: {gapInfo.duration.toFixed(2)}s. You can
+                  extend these clips to fill the gaps, or skip to keep them
+                  as-is.
                 </p>
                 <Button onClick={handleResolveGaps} className="w-full mt-2">
                   <AlertTriangle className="h-4 w-4 mr-2" />
@@ -315,8 +333,8 @@ export function ProcessingPage() {
                     step.status === "pending"
                       ? "text-[hsl(var(--muted-foreground))]"
                       : step.status === "paused"
-                      ? "text-amber-500"
-                      : ""
+                        ? "text-amber-500"
+                        : ""
                   }`}
                 >
                   {step.label}

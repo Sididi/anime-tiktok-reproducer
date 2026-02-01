@@ -1249,7 +1249,7 @@ class ProcessingService:
         state_path = output_dir / "processing_state.json"
         if state_path.exists():
             state_path.unlink()
-        
+
         project_dir = settings.projects_dir / project_id
         flag_path = project_dir / "gaps_resolved.flag"
         if flag_path.exists():
@@ -1293,20 +1293,20 @@ class ProcessingService:
         output_dir = cls.get_output_dir(project.id)
         output_dir.mkdir(parents=True, exist_ok=True)
         assets_dir = cls.get_assets_dir()
-        
+
         # Check if we're resuming after gap resolution
         resuming_after_gaps = cls.check_has_saved_state(project.id) and cls.check_gaps_resolved(project.id)
-        
+
         if resuming_after_gaps:
             # Load saved state and skip to JSX generation
             state_path = output_dir / "processing_state.json"
             state = json.loads(state_path.read_text())
             edited_audio_path = Path(state["edited_audio_path"])
             transcription_timing_path = Path(state["transcription_path"])
-            
+
             # Load transcription from saved state
             transcription_data = json.loads(transcription_timing_path.read_text())
-            
+
             # Reconstruct Transcription object
             from ..models import Transcription
             from ..models.transcription import SceneTranscription, Word
@@ -1323,7 +1323,7 @@ class ProcessingService:
                     for s in transcription_data["scenes"]
                 ],
             )
-            
+
             yield ProcessingProgress(
                 "processing",
                 "jsx_generation",
@@ -1377,7 +1377,7 @@ class ProcessingService:
                     ]
                 }
                 transcription_timing_path.write_text(json.dumps(transcription_data, indent=2))
-                
+
                 # Also save to project root for gap resolution endpoint
                 project_dir = settings.projects_dir / project.id
                 gap_transcription_path = project_dir / "gap_detection_transcription.json"
@@ -1393,18 +1393,28 @@ class ProcessingService:
                 # Step 2b: Check for gaps (scenes that hit 75% speed floor)
                 # Skip this check if gaps were already resolved in a previous run
                 gaps_already_resolved = cls.check_gaps_resolved(project.id)
-                
+
                 if gaps_already_resolved:
                     # User already resolved/skipped gaps in a previous run
                     # Don't ask them to do it again
                     gaps = []
                 else:
                     gaps = GapResolutionService.calculate_gaps(matches, transcription_data["scenes"])
-                
+
                 if gaps:
                     # Gaps detected - pause processing for user to resolve
                     total_gap_duration = sum(g.gap_duration for g in gaps)
-                    
+
+                    # Backup current matches before gap resolution modifies them
+                    # This allows the user to reset and start over
+                    matches_backup_path = project_dir / "matches_before_gaps.json"
+                    if not matches_backup_path.exists():
+                        # Only backup if we haven't already (avoid overwriting with modified matches)
+                        matches_path = project_dir / "matches.json"
+                        if matches_path.exists():
+                            import shutil
+                            shutil.copy(matches_path, matches_backup_path)
+
                     # Save current processing state so we can resume later
                     processing_state = {
                         "step": "gap_detection",
@@ -1413,7 +1423,7 @@ class ProcessingService:
                     }
                     state_path = output_dir / "processing_state.json"
                     state_path.write_text(json.dumps(processing_state, indent=2))
-                    
+
                     yield ProcessingProgress(
                         "gaps_detected",
                         "gap_detection",

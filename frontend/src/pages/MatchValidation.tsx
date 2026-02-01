@@ -393,9 +393,12 @@ export function MatchValidation() {
 
       if (noMatchScenes.length === 0) return;
 
-      // Update each scene with its best alternative
+      // Update each scene with its best alternative (highest confidence)
       for (const match of noMatchScenes) {
-        const bestAlternative = match.alternatives[0]; // Highest ranked candidate
+        // Sort to find the one with highest confidence
+        const bestAlternative = [...match.alternatives].sort(
+          (a, b) => b.confidence - a.confidence
+        )[0];
 
         await api.updateMatch(projectId, match.scene_index, {
           episode: bestAlternative.episode,
