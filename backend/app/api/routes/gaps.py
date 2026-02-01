@@ -159,7 +159,7 @@ class AutoFillResponse(BaseModel):
 @router.post("/auto-fill")
 async def auto_fill_all_gaps(project_id: str) -> AutoFillResponse:
     """Automatically fill all gaps with their best AI candidate.
-    
+
     For each gap, generates candidates and applies the one closest to 100% speed.
     Gaps without valid candidates are skipped.
     """
@@ -354,7 +354,7 @@ async def mark_gaps_resolved(project_id: str):
 @router.post("/reset")
 async def reset_gaps(project_id: str):
     """Reset gap resolution state, allowing gaps to be reprocessed.
-    
+
     This removes the gaps_resolved.flag and resets all matches to their
     original timings (before any gap resolution was applied).
     The original matches are stored when gap detection first runs.
@@ -364,21 +364,21 @@ async def reset_gaps(project_id: str):
         raise HTTPException(status_code=404, detail="Project not found")
 
     project_dir = ProjectService.get_project_dir(project_id)
-    
+
     # Remove the gaps_resolved flag
     gaps_resolved_flag = project_dir / "gaps_resolved.flag"
     if gaps_resolved_flag.exists():
         gaps_resolved_flag.unlink()
-    
+
     # Check if we have a backup of original matches (before gap resolution)
     original_matches_path = project_dir / "matches_before_gaps.json"
     matches_path = project_dir / "matches.json"
-    
+
     if original_matches_path.exists():
         # Restore original matches
         import shutil
         shutil.copy(original_matches_path, matches_path)
-    
+
     return {
         "status": "ok",
         "message": "Gap resolution reset. Navigate to /processing to re-detect gaps.",

@@ -397,7 +397,7 @@ export function MatchValidation() {
       for (const match of noMatchScenes) {
         // Sort to find the one with highest confidence
         const bestAlternative = [...match.alternatives].sort(
-          (a, b) => b.confidence - a.confidence
+          (a, b) => b.confidence - a.confidence,
         )[0];
 
         await api.updateMatch(projectId, match.scene_index, {

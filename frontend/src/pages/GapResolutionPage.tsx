@@ -119,7 +119,7 @@ function GapCard({
         candidate.end_time,
         candidate.effective_speed,
       );
-      
+
       // Reset and auto-play both previews after a short delay for state update
       setTimeout(() => {
         tiktokPlayerRef.current?.playFromStart();
@@ -246,10 +246,27 @@ function GapCard({
                 <div className="bg-[hsl(var(--popover))] border border-[hsl(var(--border))] rounded-lg p-3 shadow-lg whitespace-nowrap text-xs">
                   <div className="font-medium mb-1">Speed Calculation</div>
                   <div className="text-[hsl(var(--muted-foreground))] space-y-1">
-                    <div>Source clip: <span className="font-mono">{(displayEnd - displayStart).toFixed(2)}s</span></div>
-                    <div>TTS duration: <span className="font-mono">{gap.target_duration.toFixed(2)}s</span></div>
+                    <div>
+                      Source clip:{" "}
+                      <span className="font-mono">
+                        {(displayEnd - displayStart).toFixed(2)}s
+                      </span>
+                    </div>
+                    <div>
+                      TTS duration:{" "}
+                      <span className="font-mono">
+                        {gap.target_duration.toFixed(2)}s
+                      </span>
+                    </div>
                     <div className="border-t border-[hsl(var(--border))] pt-1 mt-1">
-                      <span className="font-mono">{(displayEnd - displayStart).toFixed(2)}s ÷ {gap.target_duration.toFixed(2)}s</span> = <span className="font-semibold">{formatSpeed(displaySpeed)}</span>
+                      <span className="font-mono">
+                        {(displayEnd - displayStart).toFixed(2)}s ÷{" "}
+                        {gap.target_duration.toFixed(2)}s
+                      </span>{" "}
+                      ={" "}
+                      <span className="font-semibold">
+                        {formatSpeed(displaySpeed)}
+                      </span>
                     </div>
                     {displaySpeed < 1 && (
                       <div className="text-amber-500 pt-1">
@@ -539,8 +556,12 @@ export function GapResolutionPage() {
   const [resetting, setResetting] = useState(false);
   const handleReset = useCallback(async () => {
     if (!projectId) return;
-    
-    if (!window.confirm("Reset all gap resolutions? This will restore original timings and you'll need to re-resolve all gaps.")) {
+
+    if (
+      !window.confirm(
+        "Reset all gap resolutions? This will restore original timings and you'll need to re-resolve all gaps.",
+      )
+    ) {
       return;
     }
 
@@ -549,7 +570,7 @@ export function GapResolutionPage() {
       await fetch(`/api/projects/${projectId}/gaps/reset`, {
         method: "POST",
       });
-      
+
       // Navigate back to processing to re-trigger gap detection
       navigate(`/project/${projectId}/processing`);
     } catch (err) {
@@ -565,9 +586,12 @@ export function GapResolutionPage() {
 
     setAutoFilling(true);
     try {
-      const response = await fetch(`/api/projects/${projectId}/gaps/auto-fill`, {
-        method: "POST",
-      });
+      const response = await fetch(
+        `/api/projects/${projectId}/gaps/auto-fill`,
+        {
+          method: "POST",
+        },
+      );
 
       if (!response.ok) {
         throw new Error("Failed to auto-fill gaps");

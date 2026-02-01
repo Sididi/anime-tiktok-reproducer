@@ -13,10 +13,11 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-from scenedetect import open_video, SceneManager, ContentDetector
+from scenedetect import ContentDetector, SceneManager, open_video
 
 from ..config import settings
 from ..models import SceneMatch
+from .otio_timing import FrameRateInfo, OTIOTimingCalculator
 
 
 @dataclass
@@ -326,17 +327,36 @@ class GapResolutionService:
         cls,
         matches: list[SceneMatch],
         scene_timings: list[dict],  # From transcription, each has words with start/end
+        source_fps: Fraction | None = None,  # Source video FPS for frame-perfect calculations
     ) -> list[GapInfo]:
         """Calculate which scenes have gaps due to 75% speed floor.
+
+        Uses OTIOTimingCalculator for frame-perfect speed calculations,
+        consistent with the Premiere Pro JSX generation.
 
         Args:
             matches: Scene matches with source timings
             scene_timings: Scene timings from TTS transcription (each has scene_index, words)
+            source_fps: Optional source video FPS (defaults to 23.976fps)
 
         Returns:
             List of GapInfo for scenes that have gaps
         """
         gaps = []
+
+        # Set up frame-accurate timing calculator (same as JSX generation)
+        sequence_rate = FrameRateInfo(timebase=60, ntsc=False)  # 60fps timeline
+
+        if source_fps is not None:
+            fps_float = float(source_fps)
+            source_rate = FrameRateInfo.from_fps(fps_float)
+        else:
+            source_rate = FrameRateInfo(timebase=24, ntsc=True)  # Default 23.976fps
+
+        calculator = OTIOTimingCalculator(
+            sequence_rate=sequence_rate,
+            source_rate=source_rate,
+        )
 
         for match in matches:
             if not match.episode:
@@ -357,17 +377,18 @@ class GapResolutionService:
 
             source_duration = match.end_time - match.start_time
 
-            # Calculate speed
-            if target_duration > 0:
-                speed_ratio = source_duration / target_duration
-            else:
+            if target_duration <= 0:
                 continue
 
+            # Use OTIO Fraction-based calculation for frame-perfect speed
+            speed_ratio, effective_speed, leaves_gap = calculator.calculate_speed(
+                source_duration, target_duration
+            )
+
             # Check if this scene hits the 75% floor
-            if speed_ratio < cls.MIN_SPEED:
-                # Calculate gap
-                effective_speed = cls.MIN_SPEED
-                actual_duration = source_duration / effective_speed
+            if leaves_gap:
+                # Calculate gap duration using Fraction arithmetic
+                actual_duration = float(Fraction(source_duration).limit_denominator(100000) / effective_speed)
                 gap_duration = target_duration - actual_duration
 
                 gaps.append(GapInfo(
@@ -379,8 +400,8 @@ class GapResolutionService:
                     timeline_start=timeline_start,
                     timeline_end=timeline_end,
                     target_duration=target_duration,
-                    required_speed=speed_ratio,
-                    effective_speed=effective_speed,
+                    required_speed=float(speed_ratio),
+                    effective_speed=float(effective_speed),
                     gap_duration=gap_duration,
                 ))
 
@@ -432,16 +453,27 @@ class GapResolutionService:
         candidates = []
         seen_timings = set()  # Avoid duplicates
 
+        # Fraction-based speed limits for precise comparison
+        min_speed_frac = Fraction(75, 100)
+        max_speed_frac = Fraction(160, 100)
+        target_speed_frac = Fraction(1, 1)
+        target_duration_frac = Fraction(target_duration).limit_denominator(100000)
+
         def add_candidate(new_start: float, new_end: float, extend_type: str, description: str) -> bool:
-            """Helper to add a candidate if valid."""
+            """Helper to add a candidate if valid. Uses Fraction for precise speed calculation."""
             new_duration = new_end - new_start
             if new_duration <= 0:
                 return False
 
-            speed = new_duration / target_duration if target_duration > 0 else 1.0
+            if target_duration <= 0:
+                return False
+
+            # Use Fraction for precise speed calculation
+            duration_frac = Fraction(new_duration).limit_denominator(100000)
+            speed_frac = duration_frac / target_duration_frac
 
             # Check if speed is in valid range
-            if speed < cls.MIN_SPEED or speed > cls.MAX_SPEED:
+            if speed_frac < min_speed_frac or speed_frac > max_speed_frac:
                 return False
 
             timing_key = (round(new_start, 3), round(new_end, 3))
@@ -449,13 +481,15 @@ class GapResolutionService:
                 return False
             seen_timings.add(timing_key)
 
-            speed_diff = abs(speed - cls.TARGET_SPEED)
+            # Calculate speed_diff using Fraction
+            speed_diff_frac = abs(speed_frac - target_speed_frac)
+
             candidates.append(GapCandidate(
                 start_time=new_start,
                 end_time=new_end,
                 duration=new_duration,
-                effective_speed=speed,
-                speed_diff=speed_diff,
+                effective_speed=float(speed_frac),
+                speed_diff=float(speed_diff_frac),
                 extend_type=extend_type,
                 snap_description=description,
             ))
@@ -561,7 +595,7 @@ class GapResolutionService:
 
         # Sort by speed_diff (closest to 100% first) and take top candidates
         candidates.sort(key=lambda c: c.speed_diff)
-        
+
         # Fallback Strategy 4: If no candidates found, try to calculate exact timing for 100% speed
         # This extends outward (both backward and forward) to hit exactly 100%
         if not candidates:
@@ -569,11 +603,11 @@ class GapResolutionService:
             needed_duration = target_duration
             current_duration = current_end - current_start
             extra_needed = needed_duration - current_duration
-            
+
             if extra_needed > 0:
                 # Split the extra time: try extending backward from current start
                 # and calculate how much forward extension would be needed for 100%
-                
+
                 # Try 1: Extend only backward (add all extra to start)
                 new_start = current_start - extra_needed
                 if new_start >= 0:  # Don't go before start of video
@@ -583,7 +617,7 @@ class GapResolutionService:
                         "fallback_extend_start",
                         f"Extend start for 100% speed (-{extra_needed:.2f}s)",
                     )
-                
+
                 # Try 2: Extend only forward (add all extra to end)
                 new_end = current_end + extra_needed
                 add_candidate(
@@ -592,7 +626,7 @@ class GapResolutionService:
                     "fallback_extend_end",
                     f"Extend end for 100% speed (+{extra_needed:.2f}s)",
                 )
-                
+
                 # Try 3: Extend both ways (split extra evenly)
                 half_extra = extra_needed / 2
                 new_start = current_start - half_extra
@@ -604,10 +638,10 @@ class GapResolutionService:
                         "fallback_extend_both",
                         f"Extend both for 100% speed (-{half_extra:.2f}s, +{half_extra:.2f}s)",
                     )
-                
+
                 # Sort fallback candidates by speed_diff too
                 candidates.sort(key=lambda c: c.speed_diff)
-        
+
         return candidates[:max_candidates]
 
     @classmethod
@@ -618,6 +652,9 @@ class GapResolutionService:
         target_duration: float,
     ) -> float:
         """Compute the effective speed for given timing.
+
+        Uses Fraction-based arithmetic for frame-perfect precision,
+        consistent with OTIOTimingCalculator.
 
         Args:
             source_start: Source in point (seconds)
@@ -631,10 +668,17 @@ class GapResolutionService:
         if target_duration <= 0:
             return 1.0
 
-        speed = source_duration / target_duration
+        # Use Fraction for precise calculation
+        source_frac = Fraction(source_duration).limit_denominator(100000)
+        target_frac = Fraction(target_duration).limit_denominator(100000)
+        speed = source_frac / target_frac
 
         # Clamp to valid range
-        return max(cls.MIN_SPEED, min(cls.MAX_SPEED, speed))
+        min_speed = Fraction(75, 100)
+        max_speed = Fraction(160, 100)
+        clamped = max(min_speed, min(max_speed, speed))
+
+        return float(clamped)
 
     @classmethod
     def compute_raw_speed_for_timing(
@@ -644,6 +688,9 @@ class GapResolutionService:
         target_duration: float,
     ) -> float:
         """Compute the raw (unclamped) speed for given timing.
+
+        Uses Fraction-based arithmetic for frame-perfect precision,
+        consistent with OTIOTimingCalculator.
 
         Args:
             source_start: Source in point (seconds)
@@ -657,4 +704,8 @@ class GapResolutionService:
         if target_duration <= 0:
             return 1.0
 
-        return source_duration / target_duration
+        # Use Fraction for precise calculation
+        source_frac = Fraction(source_duration).limit_denominator(100000)
+        target_frac = Fraction(target_duration).limit_denominator(100000)
+
+        return float(source_frac / target_frac)
