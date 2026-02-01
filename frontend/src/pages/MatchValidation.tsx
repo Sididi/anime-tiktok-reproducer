@@ -240,9 +240,9 @@ export function MatchValidation() {
         await loadScenes(projectId);
         const { matches: loadedMatches } = await api.getMatches(projectId);
         // Track which scenes were initially "no match found"
-        const matchesWithTracking = loadedMatches.map(m => ({
+        const matchesWithTracking = loadedMatches.map((m) => ({
           ...m,
-          was_no_match: m.was_no_match ?? (m.confidence === 0 && !m.episode)
+          was_no_match: m.was_no_match ?? (m.confidence === 0 && !m.episode),
         }));
         setMatches(matchesWithTracking);
         // Load available episodes for manual matching
@@ -302,10 +302,12 @@ export function MatchValidation() {
                   matches: SceneMatch[];
                 };
                 // Track which scenes are initially "no match found"
-                const matchesWithTracking = (matchesData.matches || []).map(m => ({
-                  ...m,
-                  was_no_match: m.confidence === 0 && !m.episode
-                }));
+                const matchesWithTracking = (matchesData.matches || []).map(
+                  (m) => ({
+                    ...m,
+                    was_no_match: m.confidence === 0 && !m.episode,
+                  }),
+                );
                 setMatches(matchesWithTracking);
               }
 
@@ -353,7 +355,10 @@ export function MatchValidation() {
             if (m.scene_index === sceneIndex) {
               // Preserve the was_no_match flag if it was true
               const wasNoMatch = m.confidence === 0 && !m.episode;
-              return { ...updatedMatch, was_no_match: m.was_no_match || wasNoMatch };
+              return {
+                ...updatedMatch,
+                was_no_match: m.was_no_match || wasNoMatch,
+              };
             }
             return m;
           }),
@@ -382,24 +387,22 @@ export function MatchValidation() {
 
     try {
       // Find all scenes with no match
-      const noMatchScenes = matches.filter(m => m.confidence === 0 && !m.episode && m.alternatives?.length > 0);
-      
+      const noMatchScenes = matches.filter(
+        (m) => m.confidence === 0 && !m.episode && m.alternatives?.length > 0,
+      );
+
       if (noMatchScenes.length === 0) return;
 
       // Update each scene with its best alternative
       for (const match of noMatchScenes) {
         const bestAlternative = match.alternatives[0]; // Highest ranked candidate
-        
-        await api.updateMatch(
-          projectId,
-          match.scene_index,
-          {
-            episode: bestAlternative.episode,
-            start_time: bestAlternative.start_time,
-            end_time: bestAlternative.end_time,
-            confirmed: true,
-          },
-        );
+
+        await api.updateMatch(projectId, match.scene_index, {
+          episode: bestAlternative.episode,
+          start_time: bestAlternative.start_time,
+          end_time: bestAlternative.end_time,
+          confirmed: true,
+        });
 
         // Update local state
         setMatches((prev) =>
@@ -493,19 +496,26 @@ export function MatchValidation() {
                   Recompute
                 </Button>
                 {(() => {
-                  const noMatchCount = matches.filter(m => m.confidence === 0 && !m.episode && m.alternatives?.length > 0).length;
-                  return noMatchCount > 0 && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={handleAutoFillBestCandidates}
-                      disabled={matching}
-                      className="border-purple-500/30 hover:bg-purple-500/10 text-purple-500 hover:text-purple-400"
-                      title={`Auto-fill ${noMatchCount} unmatched scene${noMatchCount !== 1 ? 's' : ''} with best candidate`}
-                    >
-                      <Wand2 className="h-4 w-4 mr-1" />
-                      <span className="text-xs">Fill {noMatchCount}</span>
-                    </Button>
+                  const noMatchCount = matches.filter(
+                    (m) =>
+                      m.confidence === 0 &&
+                      !m.episode &&
+                      m.alternatives?.length > 0,
+                  ).length;
+                  return (
+                    noMatchCount > 0 && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleAutoFillBestCandidates}
+                        disabled={matching}
+                        className="border-purple-500/30 hover:bg-purple-500/10 text-purple-500 hover:text-purple-400"
+                        title={`Auto-fill ${noMatchCount} unmatched scene${noMatchCount !== 1 ? "s" : ""} with best candidate`}
+                      >
+                        <Wand2 className="h-4 w-4 mr-1" />
+                        <span className="text-xs">Fill {noMatchCount}</span>
+                      </Button>
+                    )
                   );
                 })()}
               </div>

@@ -13,18 +13,23 @@ from ..config import settings
 from ..models import Project, Transcription, SceneMatch
 from .transcriber import TranscriberService
 from .otio_timing import OTIOTimingCalculator, FrameRateInfo
+from .gap_resolution import GapResolutionService
 
 
 @dataclass
 class ProcessingProgress:
     """Progress information for processing."""
 
-    status: str  # starting, processing, complete, error
+    status: str  # starting, processing, complete, error, gaps_detected
     step: str = ""  # Current step ID
     progress: float = 0.0
     message: str = ""
     error: str | None = None
     download_url: str | None = None
+    # Gap resolution fields
+    gaps_detected: bool = False
+    gap_count: int = 0
+    total_gap_duration: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -34,6 +39,9 @@ class ProcessingProgress:
             "message": self.message,
             "error": self.error,
             "download_url": self.download_url,
+            "gaps_detected": self.gaps_detected,
+            "gap_count": self.gap_count,
+            "total_gap_duration": self.total_gap_duration,
         }
 
 
@@ -1222,6 +1230,32 @@ class ProcessingService:
         return Path(__file__).parent.parent.parent.parent / "assets"
 
     @classmethod
+    def check_has_saved_state(cls, project_id: str) -> bool:
+        """Check if there's saved processing state (interrupted by gaps)."""
+        output_dir = cls.get_output_dir(project_id)
+        state_path = output_dir / "processing_state.json"
+        return state_path.exists()
+
+    @classmethod
+    def check_gaps_resolved(cls, project_id: str) -> bool:
+        """Check if gap resolution has been completed."""
+        project_dir = settings.projects_dir / project_id
+        return (project_dir / "gaps_resolved.flag").exists()
+
+    @classmethod
+    def clear_processing_state(cls, project_id: str) -> None:
+        """Clear saved processing state after completion."""
+        output_dir = cls.get_output_dir(project_id)
+        state_path = output_dir / "processing_state.json"
+        if state_path.exists():
+            state_path.unlink()
+        
+        project_dir = settings.projects_dir / project_id
+        flag_path = project_dir / "gaps_resolved.flag"
+        if flag_path.exists():
+            flag_path.unlink()
+
+    @classmethod
     async def process(
         cls,
         project: Project,
@@ -1259,45 +1293,144 @@ class ProcessingService:
         output_dir = cls.get_output_dir(project.id)
         output_dir.mkdir(parents=True, exist_ok=True)
         assets_dir = cls.get_assets_dir()
-
-        yield ProcessingProgress(
-            "processing",
-            "auto_editor",
-            0.1,
-            "Running auto-editor on TTS audio...",
-        )
-
-        try:
-            # Step 1: Auto-editor (generates edited audio with silences removed)
-            edited_audio_path = output_dir / "tts_edited.wav"
-            auto_editor_xml_path = output_dir / "auto_editor_cuts.xml"
-            await cls.run_auto_editor(audio_path, edited_audio_path, auto_editor_xml_path)
-
-            yield ProcessingProgress(
-                "processing",
-                "transcription",
-                0.3,
-                "Extracting word timings from audio...",
+        
+        # Check if we're resuming after gap resolution
+        resuming_after_gaps = cls.check_has_saved_state(project.id) and cls.check_gaps_resolved(project.id)
+        
+        if resuming_after_gaps:
+            # Load saved state and skip to JSX generation
+            state_path = output_dir / "processing_state.json"
+            state = json.loads(state_path.read_text())
+            edited_audio_path = Path(state["edited_audio_path"])
+            transcription_timing_path = Path(state["transcription_path"])
+            
+            # Load transcription from saved state
+            transcription_data = json.loads(transcription_timing_path.read_text())
+            
+            # Reconstruct Transcription object
+            from ..models import Transcription
+            from ..models.transcription import SceneTranscription, Word
+            new_transcription = Transcription(
+                language="auto",
+                scenes=[
+                    SceneTranscription(
+                        scene_index=s["scene_index"],
+                        text=s["text"],
+                        words=[Word(**w) for w in s["words"]],
+                        start_time=s["words"][0]["start"] if s["words"] else 0.0,
+                        end_time=s["words"][-1]["end"] if s["words"] else 0.0,
+                    )
+                    for s in transcription_data["scenes"]
+                ],
             )
-
-            # Step 2: Transcribe edited audio for timings
-            transcriber = TranscriberService()
-
-            # Run transcription in thread pool
-            loop = asyncio.get_event_loop()
-            new_transcription = await loop.run_in_executor(
-                None,
-                transcriber.transcribe_with_alignment,
-                edited_audio_path,
-                new_script,
-            )
-
+            
             yield ProcessingProgress(
                 "processing",
                 "jsx_generation",
                 0.5,
-                "Generating Premiere Pro JSX script...",
+                "Resuming - Generating Premiere Pro JSX script...",
             )
+        else:
+            yield ProcessingProgress(
+                "processing",
+                "auto_editor",
+                0.1,
+                "Running auto-editor on TTS audio...",
+            )
+
+        try:
+            if not resuming_after_gaps:
+                # Step 1: Auto-editor (generates edited audio with silences removed)
+                edited_audio_path = output_dir / "tts_edited.wav"
+                auto_editor_xml_path = output_dir / "auto_editor_cuts.xml"
+                await cls.run_auto_editor(audio_path, edited_audio_path, auto_editor_xml_path)
+
+                yield ProcessingProgress(
+                    "processing",
+                    "transcription",
+                    0.3,
+                    "Extracting word timings from audio...",
+                )
+
+                # Step 2: Transcribe edited audio for timings
+                transcriber = TranscriberService()
+
+                # Run transcription in thread pool
+                loop = asyncio.get_event_loop()
+                new_transcription = await loop.run_in_executor(
+                    None,
+                    transcriber.transcribe_with_alignment,
+                    edited_audio_path,
+                    new_script,
+                )
+
+                # Save transcription for gap detection
+                transcription_timing_path = output_dir / "transcription_timing.json"
+                transcription_data = {
+                    "scenes": [
+                        {
+                            "scene_index": s.scene_index,
+                            "text": s.text,
+                            "words": [{"text": w.text, "start": w.start, "end": w.end, "confidence": w.confidence} for w in s.words],
+                        }
+                        for s in new_transcription.scenes
+                    ]
+                }
+                transcription_timing_path.write_text(json.dumps(transcription_data, indent=2))
+                
+                # Also save to project root for gap resolution endpoint
+                project_dir = settings.projects_dir / project.id
+                gap_transcription_path = project_dir / "gap_detection_transcription.json"
+                gap_transcription_path.write_text(json.dumps(transcription_data, indent=2))
+
+                yield ProcessingProgress(
+                    "processing",
+                    "gap_detection",
+                    0.35,
+                    "Checking for clips with gaps...",
+                )
+
+                # Step 2b: Check for gaps (scenes that hit 75% speed floor)
+                # Skip this check if gaps were already resolved in a previous run
+                gaps_already_resolved = cls.check_gaps_resolved(project.id)
+                
+                if gaps_already_resolved:
+                    # User already resolved/skipped gaps in a previous run
+                    # Don't ask them to do it again
+                    gaps = []
+                else:
+                    gaps = GapResolutionService.calculate_gaps(matches, transcription_data["scenes"])
+                
+                if gaps:
+                    # Gaps detected - pause processing for user to resolve
+                    total_gap_duration = sum(g.gap_duration for g in gaps)
+                    
+                    # Save current processing state so we can resume later
+                    processing_state = {
+                        "step": "gap_detection",
+                        "edited_audio_path": str(edited_audio_path),
+                        "transcription_path": str(transcription_timing_path),
+                    }
+                    state_path = output_dir / "processing_state.json"
+                    state_path.write_text(json.dumps(processing_state, indent=2))
+                    
+                    yield ProcessingProgress(
+                        "gaps_detected",
+                        "gap_detection",
+                        0.4,
+                        f"Found {len(gaps)} clip(s) with gaps that need resolution",
+                        gaps_detected=True,
+                        gap_count=len(gaps),
+                        total_gap_duration=total_gap_duration,
+                    )
+                    return  # Stop processing here - frontend will redirect to gap resolution
+
+                yield ProcessingProgress(
+                    "processing",
+                    "jsx_generation",
+                    0.5,
+                    "Generating Premiere Pro JSX script...",
+                )
 
             # Step 3: Detect source FPS from first available episode
             source_fps = None
@@ -1448,6 +1581,9 @@ A1 [Anime Audio]     - Original audio from clips (MUTED)
                 zf.writestr("README.txt", readme)
 
             download_url = f"/api/projects/{project.id}/download/bundle"
+
+            # Clear processing state now that we're done
+            cls.clear_processing_state(project.id)
 
             yield ProcessingProgress(
                 "complete",

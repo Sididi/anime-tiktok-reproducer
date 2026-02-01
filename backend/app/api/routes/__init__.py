@@ -8,6 +8,7 @@ from .matching import router as matching_router
 from .transcription import router as transcription_router
 from .processing import router as processing_router
 from .anime import router as anime_router
+from .gaps import router as gaps_router
 # TEMPORARILY DISABLED - Subtitle video generation feature
 # from .subtitles import router as subtitles_router
 
@@ -20,6 +21,7 @@ api_router.include_router(matching_router)
 api_router.include_router(transcription_router)
 api_router.include_router(processing_router)
 api_router.include_router(anime_router)
+api_router.include_router(gaps_router)
 # TEMPORARILY DISABLED - Subtitle video generation feature
 # api_router.include_router(subtitles_router)
 

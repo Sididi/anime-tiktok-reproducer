@@ -1,5 +1,30 @@
 const API_BASE = '/api';
 
+// Gap resolution types
+interface GapInfo {
+  scene_index: number;
+  episode: string;
+  current_start: number;
+  current_end: number;
+  current_duration: number;
+  timeline_start: number;
+  timeline_end: number;
+  target_duration: number;
+  required_speed: number;
+  effective_speed: number;
+  gap_duration: number;
+}
+
+interface GapCandidate {
+  start_time: number;
+  end_time: number;
+  duration: number;
+  effective_speed: number;
+  speed_diff: number;
+  extend_type: string;
+  snap_description: string;
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     headers: {
@@ -173,4 +198,45 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ path }),
     }),
+
+  // Gap Resolution
+  getGaps: (projectId: string) =>
+    request<{ has_gaps: boolean; gaps: GapInfo[]; total_gap_duration: number }>(
+      `/projects/${projectId}/gaps`
+    ),
+
+  getGapCandidates: (projectId: string, sceneIndex: number) =>
+    request<{ scene_index: number; candidates: GapCandidate[] }>(
+      `/projects/${projectId}/gaps/${sceneIndex}/candidates`
+    ),
+
+  updateGapTiming: (
+    projectId: string,
+    sceneIndex: number,
+    data: { start_time: number; end_time: number; skipped?: boolean }
+  ) =>
+    request<{ status: string; scene_index: number }>(
+      `/projects/${projectId}/gaps/${sceneIndex}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(data),
+      }
+    ),
+
+  markGapsResolved: (projectId: string) =>
+    request<{ status: string }>(`/projects/${projectId}/gaps/mark-resolved`, {
+      method: 'POST',
+    }),
+
+  computeSpeed: (
+    projectId: string,
+    data: { start_time: number; end_time: number; target_duration: number }
+  ) =>
+    request<{ effective_speed: number; raw_speed: number; has_gap: boolean }>(
+      `/projects/${projectId}/gaps/compute-speed`,
+      {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }
+    ),
 };

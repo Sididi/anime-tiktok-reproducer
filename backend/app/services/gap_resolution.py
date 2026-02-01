@@ -1,0 +1,613 @@
+"""Gap Resolution Service for extending clips that hit the 75% speed floor.
+
+This service handles:
+1. Detecting which scenes have gaps (speed < 75% required)
+2. Running pyscenedetect on source anime episodes to find cut points
+3. Generating AI candidates for extending clips to fill gaps
+4. Caching scene cut data per episode
+"""
+
+import asyncio
+import json
+from dataclasses import dataclass
+from fractions import Fraction
+from pathlib import Path
+
+from scenedetect import open_video, SceneManager, ContentDetector
+
+from ..config import settings
+from ..models import SceneMatch
+
+
+@dataclass
+class GapInfo:
+    """Information about a scene that has a gap (hit 75% speed floor)."""
+    
+    scene_index: int
+    # Current match data
+    episode: str
+    current_start: float  # Current source start time
+    current_end: float    # Current source end time
+    current_duration: float  # Current source duration
+    
+    # Timeline data (from TTS transcription)
+    timeline_start: float
+    timeline_end: float
+    target_duration: float  # How long the clip needs to be on timeline
+    
+    # Gap calculations
+    required_speed: float  # Speed that would be needed (< 0.75)
+    effective_speed: float  # Capped at 0.75
+    gap_duration: float    # Duration of gap in seconds
+    
+    def to_dict(self) -> dict:
+        return {
+            "scene_index": self.scene_index,
+            "episode": self.episode,
+            "current_start": round(self.current_start, 4),
+            "current_end": round(self.current_end, 4),
+            "current_duration": round(self.current_duration, 4),
+            "timeline_start": round(self.timeline_start, 4),
+            "timeline_end": round(self.timeline_end, 4),
+            "target_duration": round(self.target_duration, 4),
+            "required_speed": round(self.required_speed, 4),
+            "effective_speed": round(self.effective_speed, 4),
+            "gap_duration": round(self.gap_duration, 4),
+        }
+
+
+@dataclass
+class GapCandidate:
+    """A candidate for extending a clip to fill a gap."""
+    
+    start_time: float  # Proposed source start time
+    end_time: float    # Proposed source end time
+    duration: float    # Proposed source duration
+    effective_speed: float  # Speed with this timing (clamped to 0.75-1.60)
+    speed_diff: float  # Difference from 100% (for ranking, lower is better)
+    extend_type: str   # 'extend_start', 'extend_end', 'extend_both'
+    snap_description: str  # Human-readable description of what scene cuts were used
+    
+    def to_dict(self) -> dict:
+        return {
+            "start_time": round(self.start_time, 4),
+            "end_time": round(self.end_time, 4),
+            "duration": round(self.duration, 4),
+            "effective_speed": round(self.effective_speed, 4),
+            "speed_diff": round(self.speed_diff, 4),
+            "extend_type": self.extend_type,
+            "snap_description": self.snap_description,
+        }
+
+
+@dataclass 
+class GapResolutionProgress:
+    """Progress information for gap resolution operations."""
+    
+    status: str  # 'starting', 'detecting', 'complete', 'error'
+    progress: float = 0.0
+    message: str = ""
+    error: str | None = None
+    gaps: list[GapInfo] | None = None
+    
+    def to_dict(self) -> dict:
+        return {
+            "status": self.status,
+            "progress": self.progress,
+            "message": self.message,
+            "error": self.error,
+            "gaps": [g.to_dict() for g in self.gaps] if self.gaps else None,
+        }
+
+
+class GapResolutionService:
+    """Service for resolving gaps in clips that hit the 75% speed floor."""
+    
+    # Speed constraints
+    MIN_SPEED = 0.75
+    MAX_SPEED = 1.60
+    TARGET_SPEED = 1.0
+    
+    # Scene detection settings for source anime
+    SCENE_THRESHOLD = 27.0
+    MIN_SCENE_LEN = 10  # Frames
+    
+    # Safety frames offset (number of frames to stay away from scene boundaries)
+    SAFETY_FRAMES = 3
+    DEFAULT_FPS = 23.976  # Fallback if FPS detection fails
+    
+    @staticmethod
+    async def detect_video_fps(video_path: Path) -> Fraction:
+        """Detect video frame rate using ffprobe, returning as a Fraction for precision.
+        
+        Args:
+            video_path: Path to video file
+            
+        Returns:
+            Frame rate as a Fraction (e.g., Fraction(24000, 1001) for 23.976fps)
+        """
+        cmd = [
+            "ffprobe", "-v", "quiet",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=r_frame_rate",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(video_path),
+        ]
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await process.communicate()
+
+        if process.returncode != 0:
+            # Default to 24fps if detection fails
+            return Fraction(24, 1)
+
+        fps_str = stdout.decode().strip()
+        if "/" in fps_str:
+            num, den = fps_str.split("/")
+            return Fraction(int(num), int(den))
+        else:
+            # Handle decimal format (less common)
+            fps_float = float(fps_str)
+            # Detect NTSC rates
+            if abs(fps_float - 23.976) < 0.01:
+                return Fraction(24000, 1001)
+            elif abs(fps_float - 29.97) < 0.01:
+                return Fraction(30000, 1001)
+            elif abs(fps_float - 59.94) < 0.01:
+                return Fraction(60000, 1001)
+            else:
+                return Fraction(int(round(fps_float)), 1)
+    
+    @classmethod
+    async def get_frame_offset(cls, video_path: Path) -> float:
+        """Get the safety frame offset in seconds based on video FPS.
+        
+        We use 3 frames at source FPS to avoid accidentally including
+        frames from adjacent scenes or transitions.
+        
+        Args:
+            video_path: Path to the video file to detect FPS from
+            
+        Returns:
+            Frame offset in seconds
+        """
+        try:
+            fps_fraction = await cls.detect_video_fps(video_path)
+            fps = float(fps_fraction)
+        except Exception:
+            fps = cls.DEFAULT_FPS
+        
+        return cls.SAFETY_FRAMES / fps
+    
+    @classmethod
+    def resolve_episode_path(cls, episode_name: str) -> Path | None:
+        """Resolve an episode name to its full path in the anime library.
+        
+        Args:
+            episode_name: Episode name (e.g., "[9volt] Hanebado! - 03 [D0B8F455]")
+                         or a full path
+        
+        Returns:
+            Full path to the episode file, or None if not found.
+        """
+        # First check if it's already a valid full path
+        episode_path = Path(episode_name)
+        if episode_path.is_absolute() and episode_path.exists():
+            return episode_path
+        
+        # Search in the anime library
+        library_path = settings.anime_library_path
+        if not library_path or not library_path.exists():
+            return None
+        
+        VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm", ".mov"}
+        
+        # Search for matching file in library and subdirectories
+        for ext in VIDEO_EXTENSIONS:
+            # Try direct path first
+            candidate = library_path / f"{episode_name}{ext}"
+            if candidate.exists():
+                return candidate
+            
+            # Search recursively using rglob for subdirectories
+            for match in library_path.rglob(f"*{ext}"):
+                if match.stem == episode_name:
+                    return match
+        
+        return None
+    
+    @classmethod
+    def get_scene_cache_path(cls, episode_path: str) -> Path:
+        """Get the cache file path for scene cuts of an episode."""
+        # Hash the episode path to create a unique cache filename
+        import hashlib
+        path_hash = hashlib.md5(episode_path.encode()).hexdigest()[:16]
+        episode_name = Path(episode_path).stem
+        return settings.cache_dir / "scene_cuts" / f"{episode_name}_{path_hash}.json"
+    
+    @classmethod
+    def load_cached_scene_cuts(cls, episode_path: str) -> list[float] | None:
+        """Load cached scene cut times for an episode.
+        
+        Returns:
+            List of cut times in seconds, or None if cache doesn't exist.
+        """
+        cache_path = cls.get_scene_cache_path(episode_path)
+        if cache_path.exists():
+            try:
+                data = json.loads(cache_path.read_text())
+                return data.get("cuts", [])
+            except (json.JSONDecodeError, KeyError):
+                return None
+        return None
+    
+    @classmethod
+    def save_scene_cuts_cache(cls, episode_path: str, cuts: list[float]) -> None:
+        """Save scene cut times to cache."""
+        cache_path = cls.get_scene_cache_path(episode_path)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "episode_path": episode_path,
+            "cuts": cuts,
+        }
+        cache_path.write_text(json.dumps(data, indent=2))
+    
+    @classmethod
+    async def detect_scene_cuts(
+        cls,
+        episode_path: str,
+        threshold: float | None = None,
+        min_scene_len: int | None = None,
+    ) -> list[float]:
+        """Detect scene cuts in an anime episode.
+        
+        Uses cache if available, otherwise runs pyscenedetect.
+        
+        Args:
+            episode_path: Path to the video file
+            threshold: ContentDetector threshold (optional)
+            min_scene_len: Minimum scene length in frames (optional)
+            
+        Returns:
+            List of cut times in seconds (start of each scene)
+        """
+        # Check cache first
+        cached = cls.load_cached_scene_cuts(episode_path)
+        if cached is not None:
+            return cached
+        
+        # Run detection
+        loop = asyncio.get_event_loop()
+        cuts = await loop.run_in_executor(
+            None,
+            cls._detect_scene_cuts_sync,
+            episode_path,
+            threshold or cls.SCENE_THRESHOLD,
+            min_scene_len or cls.MIN_SCENE_LEN,
+        )
+        
+        # Cache the results
+        cls.save_scene_cuts_cache(episode_path, cuts)
+        
+        return cuts
+    
+    @staticmethod
+    def _detect_scene_cuts_sync(
+        video_path: str,
+        threshold: float,
+        min_scene_len: int,
+    ) -> list[float]:
+        """Synchronous scene cut detection using pyscenedetect."""
+        video = open_video(video_path)
+        scene_manager = SceneManager()
+        scene_manager.add_detector(
+            ContentDetector(threshold=threshold, min_scene_len=min_scene_len)
+        )
+        
+        scene_manager.detect_scenes(video, show_progress=False)
+        scene_list = scene_manager.get_scene_list()
+        
+        # Return the start time of each scene (these are the cut points)
+        cuts = [0.0]  # Include start of video
+        for start, end in scene_list:
+            cuts.append(start.get_seconds())
+        
+        # Add video duration as final "cut"
+        cuts.append(video.duration.get_seconds())
+        
+        return sorted(set(cuts))  # Remove duplicates and sort
+    
+    @classmethod
+    def calculate_gaps(
+        cls,
+        matches: list[SceneMatch],
+        scene_timings: list[dict],  # From transcription, each has words with start/end
+    ) -> list[GapInfo]:
+        """Calculate which scenes have gaps due to 75% speed floor.
+        
+        Args:
+            matches: Scene matches with source timings
+            scene_timings: Scene timings from TTS transcription (each has scene_index, words)
+            
+        Returns:
+            List of GapInfo for scenes that have gaps
+        """
+        gaps = []
+        
+        for match in matches:
+            if not match.episode:
+                continue
+                
+            # Find corresponding scene timing
+            scene_timing = next(
+                (s for s in scene_timings if s.get("scene_index") == match.scene_index),
+                None,
+            )
+            if not scene_timing or not scene_timing.get("words"):
+                continue
+            
+            words = scene_timing["words"]
+            timeline_start = words[0]["start"]
+            timeline_end = words[-1]["end"]
+            target_duration = timeline_end - timeline_start
+            
+            source_duration = match.end_time - match.start_time
+            
+            # Calculate speed
+            if target_duration > 0:
+                speed_ratio = source_duration / target_duration
+            else:
+                continue
+            
+            # Check if this scene hits the 75% floor
+            if speed_ratio < cls.MIN_SPEED:
+                # Calculate gap
+                effective_speed = cls.MIN_SPEED
+                actual_duration = source_duration / effective_speed
+                gap_duration = target_duration - actual_duration
+                
+                gaps.append(GapInfo(
+                    scene_index=match.scene_index,
+                    episode=match.episode,
+                    current_start=match.start_time,
+                    current_end=match.end_time,
+                    current_duration=source_duration,
+                    timeline_start=timeline_start,
+                    timeline_end=timeline_end,
+                    target_duration=target_duration,
+                    required_speed=speed_ratio,
+                    effective_speed=effective_speed,
+                    gap_duration=gap_duration,
+                ))
+        
+        return gaps
+    
+    @classmethod
+    async def generate_candidates(
+        cls,
+        gap: GapInfo,
+        max_candidates: int = 6,
+    ) -> list[GapCandidate]:
+        """Generate AI candidates for extending a clip to fill a gap.
+        
+        Uses pyscenedetect to find nearby scene cuts and proposes timings
+        that snap to these cuts. Candidates are ranked by closeness to 100% speed.
+        
+        Strategies:
+        1. Push to current scene boundaries (if clip is inside a scene)
+        2. Extend end to next scene cut
+        3. Extend start to previous scene cut
+        4. Extend both directions
+        
+        All candidates include a 2-3 frame safety offset to avoid
+        accidentally including frames from transitions.
+        
+        Args:
+            gap: Gap information for the scene
+            max_candidates: Maximum number of candidates to return
+            
+        Returns:
+            List of GapCandidate objects, sorted by speed_diff (closest to 100% first)
+        """
+        # Resolve episode path
+        episode_path = cls.resolve_episode_path(gap.episode)
+        if not episode_path:
+            return []
+        
+        # Get scene cuts for this episode
+        cuts = await cls.detect_scene_cuts(str(episode_path))
+        
+        if not cuts or len(cuts) < 2:
+            return []
+        
+        current_start = gap.current_start
+        current_end = gap.current_end
+        target_duration = gap.target_duration
+        frame_offset = await cls.get_frame_offset(episode_path)
+        
+        candidates = []
+        seen_timings = set()  # Avoid duplicates
+        
+        def add_candidate(new_start: float, new_end: float, extend_type: str, description: str) -> bool:
+            """Helper to add a candidate if valid."""
+            new_duration = new_end - new_start
+            if new_duration <= 0:
+                return False
+            
+            speed = new_duration / target_duration if target_duration > 0 else 1.0
+            
+            # Check if speed is in valid range
+            if speed < cls.MIN_SPEED or speed > cls.MAX_SPEED:
+                return False
+            
+            timing_key = (round(new_start, 3), round(new_end, 3))
+            if timing_key in seen_timings:
+                return False
+            seen_timings.add(timing_key)
+            
+            speed_diff = abs(speed - cls.TARGET_SPEED)
+            candidates.append(GapCandidate(
+                start_time=new_start,
+                end_time=new_end,
+                duration=new_duration,
+                effective_speed=speed,
+                speed_diff=speed_diff,
+                extend_type=extend_type,
+                snap_description=description,
+            ))
+            return True
+        
+        # Find the scene that contains our current clip
+        # A scene is defined by two consecutive cuts
+        current_scene_start = None
+        current_scene_end = None
+        
+        for i in range(len(cuts) - 1):
+            scene_start = cuts[i]
+            scene_end = cuts[i + 1]
+            
+            # Check if our clip is within this scene
+            # (clip start and end are both within scene boundaries)
+            if scene_start <= current_start and current_end <= scene_end:
+                current_scene_start = scene_start
+                current_scene_end = scene_end
+                break
+        
+        # Strategy 0: Push to current scene boundaries (if inside a scene)
+        # This is often the best option as it uses the full scene without crossing cuts
+        if current_scene_start is not None and current_scene_end is not None:
+            # Apply safety offset: add frames to start (move inward), subtract from end (move inward)
+            safe_start = current_scene_start + frame_offset
+            safe_end = current_scene_end - frame_offset
+            
+            if safe_start < current_start or safe_end > current_end:  # Only if we're extending
+                add_candidate(
+                    safe_start,
+                    safe_end,
+                    "fill_scene",
+                    f"Fill current scene ({current_scene_end - current_scene_start:.2f}s scene)",
+                )
+            
+            # Also try just extending to end of current scene
+            if safe_end > current_end:
+                add_candidate(
+                    current_start,
+                    safe_end,
+                    "extend_to_scene_end",
+                    f"Extend to scene end (+{safe_end - current_end:.2f}s)",
+                )
+            
+            # And just extending to start of current scene  
+            if safe_start < current_start:
+                add_candidate(
+                    safe_start,
+                    current_end,
+                    "extend_to_scene_start",
+                    f"Extend to scene start (-{current_start - safe_start:.2f}s)",
+                )
+        
+        # Find cuts before and after current timing (for adjacent scenes)
+        cuts_before = [c for c in cuts if c < current_start]
+        cuts_after = [c for c in cuts if c > current_end]
+        
+        # Sort by distance from current position
+        cuts_before.sort(key=lambda c: current_start - c)  # Closest first
+        cuts_after.sort(key=lambda c: c - current_end)  # Closest first
+        
+        # Strategy 1: Extend end to next scene cut
+        # When extending end: the cut marks the START of the next scene,
+        # so we subtract offset to stay in current scene
+        for cut_end in cuts_after[:5]:
+            new_start = current_start
+            new_end = cut_end - frame_offset  # Subtract to stay before the cut
+            
+            add_candidate(
+                new_start,
+                new_end,
+                "extend_end",
+                f"Extend end to next cut (+{new_end - current_end:.2f}s)",
+            )
+        
+        # Strategy 2: Extend start to previous scene cut
+        # When extending start: the cut marks the START of current scene,
+        # so we add offset to stay in current scene
+        for cut_start in cuts_before[:5]:
+            new_start = cut_start + frame_offset  # Add to stay after the cut
+            new_end = current_end
+            
+            add_candidate(
+                new_start,
+                new_end,
+                "extend_start",
+                f"Extend start to previous cut (-{current_start - new_start:.2f}s)",
+            )
+        
+        # Strategy 3: Extend both directions to adjacent scene cuts
+        for cut_start in cuts_before[:3]:
+            for cut_end in cuts_after[:3]:
+                new_start = cut_start + frame_offset  # Add to stay after the cut
+                new_end = cut_end - frame_offset  # Subtract to stay before the cut
+                
+                add_candidate(
+                    new_start,
+                    new_end,
+                    "extend_both",
+                    f"Extend both (-{current_start - new_start:.2f}s, +{new_end - current_end:.2f}s)",
+                )
+        
+        # Sort by speed_diff (closest to 100% first) and take top candidates
+        candidates.sort(key=lambda c: c.speed_diff)
+        return candidates[:max_candidates]
+    
+    @classmethod
+    def compute_speed_for_timing(
+        cls,
+        source_start: float,
+        source_end: float,
+        target_duration: float,
+    ) -> float:
+        """Compute the effective speed for given timing.
+        
+        Args:
+            source_start: Source in point (seconds)
+            source_end: Source out point (seconds) 
+            target_duration: Target duration on timeline (seconds)
+            
+        Returns:
+            Effective speed (clamped to 0.75-1.60)
+        """
+        source_duration = source_end - source_start
+        if target_duration <= 0:
+            return 1.0
+        
+        speed = source_duration / target_duration
+        
+        # Clamp to valid range
+        return max(cls.MIN_SPEED, min(cls.MAX_SPEED, speed))
+    
+    @classmethod
+    def compute_raw_speed_for_timing(
+        cls,
+        source_start: float,
+        source_end: float,
+        target_duration: float,
+    ) -> float:
+        """Compute the raw (unclamped) speed for given timing.
+        
+        Args:
+            source_start: Source in point (seconds)
+            source_end: Source out point (seconds) 
+            target_duration: Target duration on timeline (seconds)
+            
+        Returns:
+            Raw speed (may be outside 0.75-1.60 range)
+        """
+        source_duration = source_end - source_start
+        if target_duration <= 0:
+            return 1.0
+        
+        return source_duration / target_duration
