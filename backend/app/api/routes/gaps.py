@@ -215,7 +215,8 @@ async def auto_fill_all_gaps(project_id: str) -> AutoFillResponse:
             if match.scene_index == gap.scene_index:
                 match.start_time = best.start_time
                 match.end_time = best.end_time
-                match.speed_ratio = best.effective_speed
+                # Convert Fraction to float for Pydantic model
+                match.speed_ratio = float(best.effective_speed)
                 match.confirmed = True
                 break
 
@@ -224,7 +225,7 @@ async def auto_fill_all_gaps(project_id: str) -> AutoFillResponse:
             success=True,
             start_time=best.start_time,
             end_time=best.end_time,
-            speed=best.effective_speed,
+            speed=float(best.effective_speed),  # Convert Fraction to float
             message=f"Applied: {best.snap_description}",
         ))
         filled_count += 1
@@ -281,8 +282,13 @@ async def update_gap_timing(
                     if scene_timing and scene_timing.get("words"):
                         words = scene_timing["words"]
                         target_duration = words[-1]["end"] - words[0]["start"]
-                        source_duration = request.end_time - request.start_time
-                        match.speed_ratio = source_duration / target_duration if target_duration > 0 else 1.0
+                        # Use the Fraction-based compute function for precision
+                        speed_frac = GapResolutionService.compute_raw_speed_for_timing(
+                            request.start_time,
+                            request.end_time,
+                            target_duration,
+                        )
+                        match.speed_ratio = float(speed_frac)  # Convert to float for model
                 except (json.JSONDecodeError, KeyError):
                     pass
 
@@ -313,23 +319,24 @@ async def compute_speed(project_id: str, request: ComputeSpeedRequest) -> Comput
     """Compute the speed for given timing parameters.
 
     Useful for showing live speed feedback when manually adjusting timings.
+    Uses Fraction-based arithmetic for frame-perfect precision.
     """
-    effective_speed = GapResolutionService.compute_speed_for_timing(
+    effective_speed_frac = GapResolutionService.compute_speed_for_timing(
         request.start_time,
         request.end_time,
         request.target_duration,
     )
 
-    raw_speed = GapResolutionService.compute_raw_speed_for_timing(
+    raw_speed_frac = GapResolutionService.compute_raw_speed_for_timing(
         request.start_time,
         request.end_time,
         request.target_duration,
     )
 
     return ComputeSpeedResponse(
-        effective_speed=effective_speed,
-        raw_speed=raw_speed,
-        has_gap=raw_speed < GapResolutionService.MIN_SPEED,
+        effective_speed=float(effective_speed_frac),  # Convert Fraction to float
+        raw_speed=float(raw_speed_frac),  # Convert Fraction to float
+        has_gap=raw_speed_frac < GapResolutionService.MIN_SPEED,
     )
 
 

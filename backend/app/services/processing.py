@@ -1506,14 +1506,29 @@ class ProcessingService:
                     zf.write(border_mogrt, "assets/White border 5px.mogrt")
 
                 # Add source episode files to sources/ folder
+                # Episode names in matches may be just filenames without extension,
+                # so we need to resolve them to full paths using the anime library
+                # Track by resolved path to avoid duplicates when same episode 
+                # appears with different name formats (e.g., name vs full path)
                 episode_paths_in_bundle = {}
-                for episode_path_str in source_episodes:
-                    episode_path = Path(episode_path_str)
-                    if episode_path.exists():
+                for episode_name in source_episodes:
+                    # Try to resolve the episode name to a full path
+                    resolved_path = GapResolutionService.resolve_episode_path(episode_name)
+                    
+                    if resolved_path and resolved_path.exists():
+                        # Skip if we already added this resolved path
+                        resolved_str = str(resolved_path)
+                        if resolved_str in episode_paths_in_bundle:
+                            continue
+                            
                         # Use just the filename in sources/ folder
-                        dest_name = f"sources/{episode_path.name}"
-                        zf.write(episode_path, dest_name)
-                        episode_paths_in_bundle[episode_path_str] = dest_name
+                        dest_name = f"sources/{resolved_path.name}"
+                        zf.write(resolved_path, dest_name)
+                        episode_paths_in_bundle[resolved_str] = dest_name
+                    else:
+                        # Log warning but continue - some episodes may not be found
+                        import sys
+                        print(f"[WARNING] Could not resolve episode: {episode_name}", file=sys.stderr)
 
                 # Add episode mapping file (for debugging)
                 zf.writestr(
@@ -1523,7 +1538,8 @@ class ProcessingService:
 
                 # Count scenes for README
                 scene_count = len([m for m in matches if m.episode])
-                episode_list = "\n".join(f"  - {Path(ep).name}" for ep in source_episodes)
+                # Use the bundle paths we actually included
+                episode_list = "\n".join(f"  - {Path(bundle_path).name}" for bundle_path in episode_paths_in_bundle.values())
 
                 readme = f"""Anime TikTok Reproducer - Project Bundle
 =========================================
