@@ -1624,57 +1624,58 @@ class ProcessingService:
                 gap_transcription_path = project_dir / "gap_detection_transcription.json"
                 gap_transcription_path.write_text(json.dumps(transcription_data, indent=2))
 
-                yield ProcessingProgress(
-                    "processing",
-                    "gap_detection",
-                    0.35,
-                    "Checking for clips with gaps...",
-                )
-
-                # Step 2b: Check for gaps (scenes that hit 75% speed floor)
-                # Skip this check if gaps were already resolved in a previous run
-                gaps_already_resolved = cls.check_gaps_resolved(project.id)
-
-                if gaps_already_resolved:
-                    # User already resolved/skipped gaps in a previous run
-                    # Don't ask them to do it again
-                    gaps = []
-                else:
-                    gaps = GapResolutionService.calculate_gaps(matches, transcription_data["scenes"])
-
-                if gaps:
-                    # Gaps detected - pause processing for user to resolve
-                    total_gap_duration = sum(g.gap_duration for g in gaps)
-
-                    # Backup current matches before gap resolution modifies them
-                    # This allows the user to reset and start over
-                    matches_backup_path = project_dir / "matches_before_gaps.json"
-                    if not matches_backup_path.exists():
-                        # Only backup if we haven't already (avoid overwriting with modified matches)
-                        matches_path = project_dir / "matches.json"
-                        if matches_path.exists():
-                            import shutil
-                            shutil.copy(matches_path, matches_backup_path)
-
-                    # Save current processing state so we can resume later
-                    processing_state = {
-                        "step": "gap_detection",
-                        "edited_audio_path": str(edited_audio_path),
-                        "transcription_path": str(transcription_timing_path),
-                    }
-                    state_path = output_dir / "processing_state.json"
-                    state_path.write_text(json.dumps(processing_state, indent=2))
-
-                    yield ProcessingProgress(
-                        "gaps_detected",
-                        "gap_detection",
-                        0.4,
-                        f"Found {len(gaps)} clip(s) with gaps that need resolution",
-                        gaps_detected=True,
-                        gap_count=len(gaps),
-                        total_gap_duration=total_gap_duration,
-                    )
-                    return  # Stop processing here - frontend will redirect to gap resolution
+                # NOTE: Gap detection temporarily disabled.
+                # yield ProcessingProgress(
+                #     "processing",
+                #     "gap_detection",
+                #     0.35,
+                #     "Checking for clips with gaps...",
+                # )
+                #
+                # # Step 2b: Check for gaps (scenes that hit 75% speed floor)
+                # # Skip this check if gaps were already resolved in a previous run
+                # gaps_already_resolved = cls.check_gaps_resolved(project.id)
+                #
+                # if gaps_already_resolved:
+                #     # User already resolved/skipped gaps in a previous run
+                #     # Don't ask them to do it again
+                #     gaps = []
+                # else:
+                #     gaps = GapResolutionService.calculate_gaps(matches, transcription_data["scenes"])
+                #
+                # if gaps:
+                #     # Gaps detected - pause processing for user to resolve
+                #     total_gap_duration = sum(g.gap_duration for g in gaps)
+                #
+                #     # Backup current matches before gap resolution modifies them
+                #     # This allows the user to reset and start over
+                #     matches_backup_path = project_dir / "matches_before_gaps.json"
+                #     if not matches_backup_path.exists():
+                #         # Only backup if we haven't already (avoid overwriting with modified matches)
+                #         matches_path = project_dir / "matches.json"
+                #         if matches_path.exists():
+                #             import shutil
+                #             shutil.copy(matches_path, matches_backup_path)
+                #
+                #     # Save current processing state so we can resume later
+                #     processing_state = {
+                #         "step": "gap_detection",
+                #         "edited_audio_path": str(edited_audio_path),
+                #         "transcription_path": str(transcription_timing_path),
+                #     }
+                #     state_path = output_dir / "processing_state.json"
+                #     state_path.write_text(json.dumps(processing_state, indent=2))
+                #
+                #     yield ProcessingProgress(
+                #         "gaps_detected",
+                #         "gap_detection",
+                #         0.4,
+                #         f"Found {len(gaps)} clip(s) with gaps that need resolution",
+                #         gaps_detected=True,
+                #         gap_count=len(gaps),
+                #         total_gap_duration=total_gap_duration,
+                #     )
+                #     return  # Stop processing here - frontend will redirect to gap resolution
 
                 yield ProcessingProgress(
                     "processing",
