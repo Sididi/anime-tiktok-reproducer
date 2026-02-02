@@ -12,7 +12,7 @@ A web application to remaster TikTok videos featuring anime content for other sh
 4. **Scene Validation** - Interactive timeline editor to refine scene boundaries
 5. **Anime Matching** - SSCD+FAISS-powered matching to find original anime clips
 6. **Match Validation** - Side-by-side comparison of TikTok and source clips
-7. **Transcription** - Word-level transcription using faster-whisper
+7. **Transcription** - Word-level transcription using WhisperX
 8. **Script Restructure** - AI-assisted script rewriting with duration constraints
 9. **Processing** - Auto-editor silence removal and Premiere Pro project generation
 
@@ -50,20 +50,21 @@ A web application to remaster TikTok videos featuring anime content for other sh
 
 - **Python 3.11+**
 - **Node.js 18+** (managed via fnm recommended)
-- **uv** - Python package manager
-- **ffmpeg** - Video processing
+- **pixi** - Package manager for GPU-accelerated Python environments
+- **NVIDIA GPU** with CUDA 12.4+ for GPU acceleration
 - **Adobe Premiere Pro 2025** - For final project generation
 
-### Python Dependencies
+### Python Dependencies (Managed by pixi)
 
 - FastAPI + Uvicorn
 - PySceneDetect
-- faster-whisper
+- WhisperX (GPU-accelerated)
 - yt-dlp
 - auto-editor
-- OpenCV (cv2)
+- OpenCV
 - Pillow
-- PyTorch + FAISS (for anime_searcher)
+- PyTorch + CUDA
+- FAISS-GPU (for anime_searcher)
 
 ### Frontend Dependencies
 
@@ -76,41 +77,40 @@ A web application to remaster TikTok videos featuring anime content for other sh
 
 ## Installation
 
-### 1. Clone the repository
+### 1. Install pixi (Arch Linux)
+
+```bash
+# Install pixi using the official installer
+curl -fsSL https://pixi.sh/install.sh | bash
+
+# Or using yay/paru from AUR
+paru -S pixi
+```
+
+### 2. Clone the repository
 
 ```bash
 git clone --recursive https://github.com/your-repo/anime-tiktok-reproducer.git
 cd anime-tiktok-reproducer
 ```
 
-### 2. Backend Setup
+### 3. Install all dependencies with pixi
 
 ```bash
-cd backend
-
-# Create virtual environment and install dependencies
-uv sync
+# This installs all Python dependencies including PyTorch with CUDA, WhisperX, FAISS-GPU, etc.
+pixi install
 
 # The SSCD model should be in modules/anime_searcher/
 # Download if not present: sscd_disc_mixup.torchscript.pt
 ```
 
-### 3. Frontend Setup
+### 4. Frontend Setup
 
 ```bash
 cd frontend
 
 # Install dependencies
 npm install
-```
-
-### 4. Anime Searcher Submodule
-
-```bash
-cd modules/anime_searcher
-
-# Install submodule dependencies
-uv sync
 ```
 
 ## Configuration
@@ -136,12 +136,15 @@ Environment variables or defaults in `backend/app/config.py`:
 ./scripts/dev.sh
 ```
 
-**Option 2: Manual startup**
+**Option 2: Using pixi tasks**
 
 ```bash
-# Terminal 1: Backend
-cd backend
-uv run uvicorn app.main:app --reload --port 8000
+# Start backend only
+pixi run backend
+
+# Or start in a subshell
+pixi shell
+uvicorn app.main:app --reload --port 8000
 
 # Terminal 2: Frontend
 cd frontend
@@ -209,16 +212,14 @@ Review matched anime clips:
 The anime_searcher submodule provides CLI tools:
 
 ```bash
-cd modules/anime_searcher
-
 # List indexed anime
-uv run anime-search list /path/to/library
+pixi run anime-search list /path/to/library
 
 # Index new anime
-uv run anime-search index /path/to/library --fps 2
+pixi run anime-search index /path/to/library --fps 2
 
 # Search for a frame
-uv run anime-search search /path/to/library image.png --flip --series "Anime Name"
+pixi run anime-search search /path/to/library image.png --flip --series "Anime Name"
 ```
 
 ## API Reference

@@ -4,12 +4,11 @@
 set -e
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$PROJECT_ROOT"
 
-# Start backend
+# Start backend using pixi
 echo "Starting backend..."
-cd "$PROJECT_ROOT/backend"
-source .venv/bin/activate
-uvicorn app.main:app --reload --host 127.0.0.1 --port 8000 &
+pixi run backend &
 BACKEND_PID=$!
 
 # Start frontend

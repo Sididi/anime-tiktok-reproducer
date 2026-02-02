@@ -1,4 +1,7 @@
 import asyncio
+import re
+import statistics
+import unicodedata
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -48,25 +51,103 @@ LANGUAGE_MAP = {
 
 
 class TranscriberService:
-    """Service for transcribing audio using faster-whisper."""
+    """Service for transcribing audio using WhisperX."""
 
-    _models: dict = {}  # Cache models by size
+    _asr_models: dict = {}
+    _align_models: dict = {}
+
+    @staticmethod
+    def _get_device() -> str:
+        try:
+            import torch
+
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            return "cpu"
+
+    @staticmethod
+    def _get_compute_type(device: str) -> str:
+        return "float16" if device == "cuda" else "int8"
 
     @classmethod
-    def _init_model(cls, model_size: str = "large-v3"):
-        """Initialize the whisper model for a given size."""
-        if model_size in cls._models:
-            return cls._models[model_size]
+    def _load_asr_model(cls, model_size: str, device: str, compute_type: str):
+        key = (model_size, device, compute_type)
+        if key in cls._asr_models:
+            return cls._asr_models[key]
 
-        from faster_whisper import WhisperModel
+        import whisperx
 
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.info(f"Initializing faster-whisper model: {model_size}")
-
-        model = WhisperModel(model_size, device="auto", compute_type="auto")
-        cls._models[model_size] = model
+        model = whisperx.load_model(model_size, device, compute_type=compute_type)
+        cls._asr_models[key] = model
         return model
+
+    @classmethod
+    def _load_align_model(cls, language_code: str, device: str):
+        key = (language_code or "unknown", device)
+        if key in cls._align_models:
+            return cls._align_models[key]
+
+        import whisperx
+
+        model_a, metadata = whisperx.load_align_model(language_code=language_code, device=device)
+        cls._align_models[key] = (model_a, metadata)
+        return model_a, metadata
+
+    @staticmethod
+    def _segment_words_from_text(segment: dict) -> list[dict]:
+        text = segment.get("text") or ""
+        words = [w for w in text.split() if w]
+        if not words:
+            return []
+        start = segment.get("start")
+        end = segment.get("end")
+        if start is None or end is None:
+            return []
+        duration = max(end - start, 0.0)
+        step = duration / max(len(words), 1)
+        out = []
+        for idx, word in enumerate(words):
+            w_start = start + step * idx
+            w_end = w_start + step
+            out.append({
+                "text": word,
+                "start": w_start,
+                "end": w_end,
+                "confidence": segment.get("confidence", 1.0),
+            })
+        return out
+
+    @classmethod
+    def _extract_words_from_segments(cls, segments: list[dict]) -> list[dict]:
+        words: list[dict] = []
+        for segment in segments:
+            segment_words = segment.get("words") or []
+            if segment_words:
+                for word in segment_words:
+                    text = word.get("word") or word.get("text") or ""
+                    text = text.strip()
+                    if not text:
+                        continue
+                    start = word.get("start")
+                    end = word.get("end")
+                    if start is None or end is None:
+                        continue
+                    confidence = word.get("score")
+                    if confidence is None:
+                        confidence = word.get("confidence")
+                    if confidence is None:
+                        confidence = word.get("probability")
+                    if confidence is None:
+                        confidence = 1.0
+                    words.append({
+                        "text": text,
+                        "start": float(start),
+                        "end": float(end),
+                        "confidence": float(confidence),
+                    })
+            else:
+                words.extend(cls._segment_words_from_text(segment))
+        return words
 
     @classmethod
     def _transcribe_sync(
@@ -75,29 +156,274 @@ class TranscriberService:
         language: str | None = None,
         model_size: str = "large-v3",
     ) -> tuple[list[dict], str]:
-        """Synchronous transcription with word-level timestamps."""
-        model = cls._init_model(model_size)
+        import whisperx
 
-        segments, info = model.transcribe(
-            str(audio_path),
-            language=language,
-            word_timestamps=True,
-            vad_filter=True,
+        device = cls._get_device()
+        compute_type = cls._get_compute_type(device)
+        batch_size = 16 if device == "cuda" else 4
+
+        audio = whisperx.load_audio(str(audio_path))
+        model = cls._load_asr_model(model_size, device, compute_type)
+        result = model.transcribe(audio, batch_size=batch_size, language=language)
+
+        detected_language = result.get("language") or (language or "en")
+        segments = result.get("segments") or []
+
+        try:
+            model_a, metadata = cls._load_align_model(detected_language, device)
+            aligned = whisperx.align(segments, model_a, metadata, audio, device)
+            segments = aligned.get("segments") or segments
+        except Exception:
+            # If alignment fails, fall back to segment-level timings.
+            pass
+
+        words = cls._extract_words_from_segments(segments)
+        return words, detected_language
+
+    @staticmethod
+    def _normalize_token(token: str) -> str:
+        if not token:
+            return ""
+        token = token.strip().lower()
+        token = unicodedata.normalize("NFKD", token)
+        token = "".join(ch for ch in token if not unicodedata.combining(ch))
+        token = re.sub(r"[^a-z0-9']+", "", token)
+        return token
+
+    @classmethod
+    def _sequence_align(cls, script_tokens: list[str], asr_tokens: list[str]) -> list[int | None]:
+        n = len(script_tokens)
+        m = len(asr_tokens)
+        if n == 0:
+            return []
+
+        # DP for sequence alignment: substitution mismatch is more costly than insert/delete.
+        sub_mismatch_cost = 2
+        ins_cost = 1
+        del_cost = 1
+
+        dp = [[0] * (m + 1) for _ in range(n + 1)]
+        back = [[None] * (m + 1) for _ in range(n + 1)]
+
+        for i in range(1, n + 1):
+            dp[i][0] = i * del_cost
+            back[i][0] = "del"
+        for j in range(1, m + 1):
+            dp[0][j] = j * ins_cost
+            back[0][j] = "ins"
+
+        for i in range(1, n + 1):
+            s_tok = script_tokens[i - 1]
+            for j in range(1, m + 1):
+                a_tok = asr_tokens[j - 1]
+                sub_cost = 0 if s_tok and s_tok == a_tok else sub_mismatch_cost
+
+                cost_sub = dp[i - 1][j - 1] + sub_cost
+                cost_del = dp[i - 1][j] + del_cost
+                cost_ins = dp[i][j - 1] + ins_cost
+
+                best = cost_sub
+                best_step = "sub"
+                if cost_del < best:
+                    best = cost_del
+                    best_step = "del"
+                if cost_ins < best:
+                    best = cost_ins
+                    best_step = "ins"
+
+                dp[i][j] = best
+                back[i][j] = best_step
+
+        mapping: list[int | None] = [None] * n
+        i = n
+        j = m
+        while i > 0 or j > 0:
+            step = back[i][j]
+            if step == "sub":
+                s_tok = script_tokens[i - 1]
+                a_tok = asr_tokens[j - 1]
+                if s_tok and s_tok == a_tok:
+                    mapping[i - 1] = j - 1
+                i -= 1
+                j -= 1
+            elif step == "del":
+                mapping[i - 1] = None
+                i -= 1
+            else:
+                j -= 1
+
+        return mapping
+
+    @staticmethod
+    def _median_word_duration(words: list[dict]) -> float:
+        durations = [
+            w["end"] - w["start"]
+            for w in words
+            if w.get("end") is not None and w.get("start") is not None
+        ]
+        durations = [d for d in durations if d > 0]
+        if not durations:
+            return 0.2
+        return max(0.05, statistics.median(durations))
+
+    @classmethod
+    def _fill_missing_word_times(cls, entries: list[dict], default_duration: float) -> None:
+        if not entries:
+            return
+
+        known = [i for i, e in enumerate(entries) if e.get("start") is not None and e.get("end") is not None]
+        if not known:
+            t = 0.0
+            for e in entries:
+                e["start"] = t
+                e["end"] = t + default_duration
+                t = e["end"]
+            return
+
+        first = known[0]
+        t = entries[first]["start"]
+        for i in range(first - 1, -1, -1):
+            end = t
+            start = max(0.0, end - default_duration)
+            entries[i]["start"] = start
+            entries[i]["end"] = end
+            t = start
+
+        for idx in range(len(known) - 1):
+            left = known[idx]
+            right = known[idx + 1]
+            gap_count = right - left - 1
+            if gap_count <= 0:
+                continue
+
+            left_end = entries[left]["end"]
+            right_start = entries[right]["start"]
+            gap = right_start - left_end
+
+            if gap <= 0:
+                step = default_duration
+            else:
+                step = gap / (gap_count + 1)
+
+            for offset in range(1, gap_count + 1):
+                start = left_end + step * (offset - 1)
+                duration = min(default_duration, step)
+                entries[left + offset]["start"] = start
+                entries[left + offset]["end"] = start + duration
+
+        last = known[-1]
+        t = entries[last]["end"]
+        for i in range(last + 1, len(entries)):
+            start = t
+            end = start + default_duration
+            entries[i]["start"] = start
+            entries[i]["end"] = end
+            t = end
+
+        # Enforce monotonic timings
+        prev_end = 0.0
+        min_duration = 0.02
+        for e in entries:
+            start = e.get("start", 0.0)
+            end = e.get("end", start + default_duration)
+            if start < prev_end:
+                start = prev_end
+            if end < start + min_duration:
+                end = start + min_duration
+            e["start"] = start
+            e["end"] = end
+            prev_end = end
+
+    @classmethod
+    def _align_script_to_words(
+        cls,
+        script: dict,
+        timed_words: list[dict],
+    ) -> list[SceneTranscription]:
+        script_entries: list[dict] = []
+        for scene_data in script.get("scenes", []):
+            scene_index = scene_data.get("scene_index", 0)
+            text = scene_data.get("text", "")
+            for raw_word in text.split():
+                script_entries.append({
+                    "scene_index": scene_index,
+                    "text": raw_word,
+                    "norm": cls._normalize_token(raw_word),
+                })
+
+        asr_entries = []
+        for word in timed_words:
+            text = word.get("text", "")
+            norm = cls._normalize_token(text)
+            if not norm:
+                continue
+            asr_entries.append({
+                "text": text,
+                "norm": norm,
+                "start": word.get("start"),
+                "end": word.get("end"),
+                "confidence": word.get("confidence", 1.0),
+            })
+
+        mapping = cls._sequence_align(
+            [e["norm"] for e in script_entries],
+            [e["norm"] for e in asr_entries],
         )
 
-        words = []
-        for segment in segments:
-            if segment.words:
-                for word in segment.words:
-                    words.append({
-                        "text": word.word.strip(),
-                        "start": word.start,
-                        "end": word.end,
-                        "confidence": word.probability,
-                    })
+        aligned_entries = []
+        for idx, entry in enumerate(script_entries):
+            mapped_idx = mapping[idx] if idx < len(mapping) else None
+            if mapped_idx is not None:
+                asr = asr_entries[mapped_idx]
+                aligned_entries.append({
+                    "scene_index": entry["scene_index"],
+                    "text": entry["text"],
+                    "start": asr.get("start"),
+                    "end": asr.get("end"),
+                    "confidence": asr.get("confidence", 1.0),
+                })
+            else:
+                aligned_entries.append({
+                    "scene_index": entry["scene_index"],
+                    "text": entry["text"],
+                    "start": None,
+                    "end": None,
+                    "confidence": 0.0,
+                })
 
-        detected_language = info.language if info else (language or "en")
-        return words, detected_language
+        default_duration = cls._median_word_duration(timed_words)
+        cls._fill_missing_word_times(aligned_entries, default_duration)
+
+        scene_word_map: dict[int, list[Word]] = {}
+        for entry in aligned_entries:
+            scene_word_map.setdefault(entry["scene_index"], []).append(Word(
+                text=entry["text"],
+                start=float(entry["start"]),
+                end=float(entry["end"]),
+                confidence=float(entry.get("confidence", 0.0)),
+            ))
+
+        scene_transcriptions = []
+        for scene_data in script.get("scenes", []):
+            scene_index = scene_data.get("scene_index", 0)
+            scene_text = scene_data.get("text", "")
+            words = scene_word_map.get(scene_index, [])
+            if words:
+                start_time = words[0].start
+                end_time = words[-1].end
+            else:
+                start_time = 0.0
+                end_time = 0.0
+
+            scene_transcriptions.append(SceneTranscription(
+                scene_index=scene_index,
+                text=scene_text,
+                words=words,
+                start_time=start_time,
+                end_time=end_time,
+            ))
+
+        return scene_transcriptions
 
     @classmethod
     def _assign_words_to_scenes(
@@ -204,60 +530,28 @@ class TranscriberService:
         """
         Transcribe audio and align with a known script.
 
-        This is used when we have the text but need accurate word timings.
-        The transcription will be done normally, then aligned to the provided script.
+        Uses WhisperX for transcription + alignment, then aligns the script
+        to the timed words with a sequence alignment step.
 
         Args:
             audio_path: Path to the audio file
             script: Script JSON with scenes and text
-            model_size: Whisper model size (default: medium for TTS audio)
+            model_size: Whisper model size (default: large-v3)
 
         Returns:
             Transcription with word-level timings
         """
-        # Transcribe to get timings (use large-v3 model for better word-level accuracy)
-        words, detected_lang = cls._transcribe_sync(audio_path, None, model_size)
+        script_lang = script.get("language")
+        if isinstance(script_lang, str):
+            lang_code = LANGUAGE_MAP.get(script_lang.lower(), script_lang)
+        else:
+            lang_code = None
 
-        # Build scene transcriptions from script + timing alignment
-        scene_transcriptions = []
-        word_index = 0
+        # Transcribe to get timed words (WhisperX alignment)
+        words, detected_lang = cls._transcribe_sync(audio_path, lang_code, model_size)
 
-        for scene_data in script.get("scenes", []):
-            scene_index = scene_data.get("scene_index", 0)
-            expected_text = scene_data.get("text", "")
-            expected_words = expected_text.split()
-
-            scene_words = []
-            matched_text_parts = []
-
-            # Simple greedy alignment - match words by position
-            for expected_word in expected_words:
-                if word_index < len(words):
-                    w = words[word_index]
-                    scene_words.append(Word(
-                        text=expected_word,  # Use expected text, timing from transcription
-                        start=w["start"],
-                        end=w["end"],
-                        confidence=w["confidence"],
-                    ))
-                    matched_text_parts.append(expected_word)
-                    word_index += 1
-
-            # Determine scene timing from words
-            if scene_words:
-                start_time = scene_words[0].start
-                end_time = scene_words[-1].end
-            else:
-                start_time = 0.0
-                end_time = 0.0
-
-            scene_transcriptions.append(SceneTranscription(
-                scene_index=scene_index,
-                text=" ".join(matched_text_parts) or expected_text,
-                words=scene_words,
-                start_time=start_time,
-                end_time=end_time,
-            ))
+        # Align script text to timed words
+        scene_transcriptions = cls._align_script_to_words(script, words)
 
         return Transcription(
             language=script.get("language", detected_lang),

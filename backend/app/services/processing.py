@@ -152,7 +152,7 @@ class ProcessingService:
     ) -> bool:
         """
         Run auto-editor on TTS audio twice:
-        1. Export as audio file (for whisper transcription)
+        1. Export as audio file (for WhisperX transcription)
         2. Export as XML (lossless reference for timing)
 
         Args:
@@ -175,7 +175,7 @@ class ProcessingService:
             "--no-open",
         ]
 
-        # Run 1: Export as audio file for whisper transcription
+        # Run 1: Export as audio file for WhisperX transcription
         audio_cmd = [
             "uv", "run", "--project", str(backend_dir),
             "auto-editor",
@@ -669,6 +669,109 @@ class ProcessingService:
   function sleep(ms) {{
     $.sleep(ms);
   }}
+  var TICKS_PER_SECOND = 254016000000; // Premiere Pro timebase constant
+
+  function secondsToTicks(sec) {{
+    return Math.round(sec * TICKS_PER_SECOND);
+  }}
+
+  function buildTimeFromSeconds(sec) {{
+    var t = new Time();
+    try {{
+      t.ticks = secondsToTicks(sec);
+    }} catch (e) {{
+      t.seconds = sec;
+    }}
+    return t;
+  }}
+
+  function getStartTicks(item) {{
+    if (!item || !item.start) return null;
+    try {{
+      if (typeof item.start.ticks === "number") return item.start.ticks;
+    }} catch (e) {{}}
+    try {{
+      if (typeof item.start.seconds === "number")
+        return secondsToTicks(item.start.seconds);
+    }} catch (e2) {{}}
+    try {{
+      if (typeof item.start.secs === "number")
+        return secondsToTicks(item.start.secs);
+    }} catch (e3) {{}}
+    return null;
+  }}
+
+  function findTrackItemAtStart(track, startSeconds, nameRef) {{
+    if (!track || !track.clips) return null;
+    var targetTicks = secondsToTicks(startSeconds);
+    var toleranceTicks = secondsToTicks(0.25);
+    for (var i = 0; i < track.clips.numItems; i++) {{
+      var item = track.clips[i];
+      if (!item) continue;
+      var itemStartTicks = getStartTicks(item);
+      if (typeof itemStartTicks === "number") {{
+        if (Math.abs(itemStartTicks - targetTicks) > toleranceTicks) continue;
+      }} else {{
+        // Fallback to seconds if ticks not available
+        try {{
+          if (
+            typeof item.start.seconds === "number" &&
+            Math.abs(item.start.seconds - startSeconds) > 0.25
+          ) {{
+            continue;
+          }}
+        }} catch (e) {{}}
+      }}
+
+      if (nameRef) {{
+        var itemName = item.name ? item.name.toString() : "";
+        if (itemName.replace(/\\s/g, "") !== "") {{
+          if (
+            itemName.indexOf(nameRef) === -1 &&
+            nameRef.indexOf(itemName) === -1
+          ) {{
+            continue;
+          }}
+        }}
+      }}
+      return item;
+    }}
+    return null;
+  }}
+
+  function setTrackItemInOut(track, startSeconds, inSeconds, outSeconds, nameRef) {{
+    var item = findTrackItemAtStart(track, startSeconds, nameRef);
+    if (!item) return null;
+    try {{
+      item.inPoint = buildTimeFromSeconds(inSeconds);
+      item.outPoint = buildTimeFromSeconds(outSeconds);
+    }} catch (e) {{
+      log("Warning: Failed to set in/out for item at " + startSeconds);
+    }}
+    return item;
+  }}
+
+  function logClipDuration(item, targetSeconds, label) {{
+    if (!item || !label) return;
+    try {{
+      var dur = null;
+      if (item.duration && typeof item.duration.seconds === "number") {{
+        dur = item.duration.seconds;
+      }} else if (item.duration && typeof item.duration.ticks === "number") {{
+        dur = item.duration.ticks / TICKS_PER_SECOND;
+      }}
+      if (typeof dur === "number") {{
+        log(
+          label +
+            " duration " +
+            dur.toFixed(4) +
+            "s (target " +
+            targetSeconds.toFixed(4) +
+            "s)"
+        );
+      }}
+    }} catch (e) {{}}
+  }}
 
   function findProjectItem(name) {{
     var findInBin = function (bin) {{
@@ -784,15 +887,53 @@ class ProcessingService:
       var cleanName = nameCleaner(s.clipName);
 
       if (clip) {{
-        // Setup Clip In/Out
-        clip.setInPoint(s.source_in, 4);
-        clip.setOutPoint(s.source_out, 4);
-
         // 1. PLACE ON V3 (Main)
         if (v3) v3.overwriteClip(clip, s.start);
 
         // 2. PLACE ON V1 (Background)
         if (v1) v1.overwriteClip(clip, s.start);
+
+        // 2b. SET PER-INSTANCE IN/OUT (TrackItem) TO AVOID UNIT AMBIGUITY
+        sleep(200);
+        var v3Item = null;
+        if (v3) {{
+          v3Item = setTrackItemInOut(
+            v3,
+            s.start,
+            s.source_in,
+            s.source_out,
+            cleanName
+          );
+          if (!v3Item) {{
+            sleep(200);
+            v3Item = setTrackItemInOut(
+              v3,
+              s.start,
+              s.source_in,
+              s.source_out,
+              cleanName
+            );
+          }}
+        }}
+        if (v1) {{
+          var v1Item = setTrackItemInOut(
+            v1,
+            s.start,
+            s.source_in,
+            s.source_out,
+            cleanName
+          );
+          if (!v1Item) {{
+            sleep(200);
+            setTrackItemInOut(
+              v1,
+              s.start,
+              s.source_in,
+              s.source_out,
+              cleanName
+            );
+          }}
+        }}
 
         // Force backend update & clear selection to avoid "Invalid TrackItem" assertion
         // The assertion often happens if a previous selection is invalid.
@@ -815,6 +956,11 @@ class ProcessingService:
         if (v1) setScaleAndPosition(v1, s.start, 183); // Background Scaled Up
 
         sleep(200);
+        if (v3) {{
+          var v3ItemForLog = findTrackItemAtStart(v3, s.start, cleanName);
+          if (v3ItemForLog)
+            logClipDuration(v3ItemForLog, s.target_duration, "Scene " + s.scene_index);
+        }}
       }}
     }}
 
@@ -881,7 +1027,7 @@ class ProcessingService:
     speed,
     trackIndex,
     trackType,
-    clipNameRef,
+    clipNameRef
   ) {{
     try {{
       var qeSeq = qe.project.getActiveSequence();
@@ -899,8 +1045,34 @@ class ProcessingService:
           // Defensive: access properties safely
           if (!item || typeof item.start === "undefined") continue;
 
-          // Time Check (0.25s tolerance)
-          if (Math.abs(item.start.secs - startTime) < 0.25) {{
+          // Time Check (0.25s tolerance), prefer ticks when available
+          var startTicks = null;
+          try {{
+            if (typeof item.start.ticks === "number") startTicks = item.start.ticks;
+          }} catch (e0) {{}}
+          if (startTicks === null) {{
+            try {{
+              if (typeof item.start.seconds === "number")
+                startTicks = secondsToTicks(item.start.seconds);
+            }} catch (e1) {{}}
+          }}
+          if (startTicks === null) {{
+            try {{
+              if (typeof item.start.secs === "number")
+                startTicks = secondsToTicks(item.start.secs);
+            }} catch (e2) {{}}
+          }}
+
+          var matchTime = false;
+          if (typeof startTicks === "number") {{
+            matchTime =
+              Math.abs(startTicks - secondsToTicks(startTime)) <
+              secondsToTicks(0.25);
+          }} else {{
+            matchTime = Math.abs(item.start.secs - startTime) < 0.25;
+          }}
+
+          if (matchTime) {{
             // Name Check (if ref provided)
             if (clipNameRef) {{
               var itemName = item.name ? item.name.toString() : "";
@@ -942,7 +1114,7 @@ class ProcessingService:
           startTime +
           " (" +
           clipNameRef +
-          ") for Speed change.",
+          ") for Speed change."
       );
     }} catch (e) {{
       log("QE Speed Fail: " + e.message);
@@ -956,7 +1128,15 @@ class ProcessingService:
       // Standard API timings are in seconds (usually) or ticks.
       // item.start.seconds is available in 2025?
       // Use ticks if needed, but 'seconds' property usually works.
-      if (Math.abs(item.start.seconds - startTime) < 0.2) {{
+      var itemStartTicks = getStartTicks(item);
+      if (
+        (typeof itemStartTicks === "number" &&
+          Math.abs(itemStartTicks - secondsToTicks(startTime)) <
+            secondsToTicks(0.2)) ||
+        (item.start &&
+          typeof item.start.seconds === "number" &&
+          Math.abs(item.start.seconds - startTime) < 0.2)
+      ) {{
         var m = item.components[1]; // Motion is usually index 1 (Opacity is 0 or 2?)
         // Actually index varies. Search for "Motion" or "Trajectoire"
         for (var c = 0; c < item.components.numItems; c++) {{

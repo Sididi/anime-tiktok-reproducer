@@ -1,0 +1,81 @@
+[workspace]
+name = "anime-tiktok-reproducer"
+version = "0.1.0"
+description = "Web app to remaster TikToks by finding anime source clips and generating Premiere Pro projects"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+# Request CUDA support for PyTorch
+[system-requirements]
+cuda = "12"
+
+[dependencies]
+# Python
+python = ">=3.11,<3.13"
+
+# FFmpeg for video processing
+ffmpeg = ">=6.0"
+
+# OpenCV from conda-forge
+opencv = ">=4.10"
+
+[pypi-dependencies]
+# PyTorch with CUDA from PyPI (required for whisperx compatibility)
+torch = { version = ">=2.8.0,<2.9.0", index = "https://download.pytorch.org/whl/cu128" }
+torchaudio = { version = ">=2.8.0,<2.9.0", index = "https://download.pytorch.org/whl/cu128" }
+torchvision = { version = ">=0.23.0", index = "https://download.pytorch.org/whl/cu128" }
+
+# WhisperX (requires torch 2.8.x) - GPU accelerated transcription
+whisperx = ">=3.7.6"
+
+# FAISS for similarity search (CPU is fast enough for our use case)
+faiss-cpu = ">=1.7.4"
+
+# FastAPI + server
+fastapi = ">=0.115.0"
+uvicorn = { version = ">=0.32.0", extras = ["standard"] }
+python-multipart = ">=0.0.18"
+pydantic = ">=2.10.0"
+pydantic-settings = ">=2.6.0"
+aiofiles = ">=24.1.0"
+
+# Video/Audio processing
+yt-dlp = ">=2024.12.0"
+scenedetect = ">=0.6.5"
+auto-editor = ">=28.0.0,<29.0.0"
+opentimelineio = ">=0.18.1"
+pillow = ">=10.0"
+scipy = ">=1.10.0"
+
+# CLI tools for anime_searcher
+typer = ">=0.9"
+rich = ">=13.0"
+
+[feature.dev.pypi-dependencies]
+pytest = ">=8.0.0"
+pytest-asyncio = ">=0.24.0"
+httpx = ">=0.28.0"
+
+[environments]
+default = { features = [], solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }
+
+[tasks]
+# Backend tasks
+backend = { cmd = "uvicorn app.main:app --reload --host 127.0.0.1 --port 8000", cwd = "backend" }
+
+# Frontend tasks (assumes fnm/npm available in PATH)
+frontend = { cmd = "npm run dev", cwd = "frontend" }
+
+# Combined dev server
+dev = { depends-on = ["backend"] }
+
+# Anime searcher CLI
+anime-search = { cmd = "python -m anime_searcher.cli", cwd = "modules/anime_searcher" }
+
+# Testing
+test = { cmd = "pytest", cwd = "backend" }
+test-verbose = { cmd = "pytest -v", cwd = "backend" }
+
+# Index anime library
+index-anime = { cmd = "python -m anime_searcher.cli index", cwd = "modules/anime_searcher" }

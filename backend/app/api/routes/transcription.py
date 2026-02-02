@@ -19,7 +19,7 @@ class UpdateTranscriptionRequest(BaseModel):
 
 @router.post("/start")
 async def start_transcription(project_id: str, request: StartTranscriptionRequest):
-    """Start transcription with faster-whisper."""
+    """Start transcription with WhisperX."""
     project = ProjectService.load(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
