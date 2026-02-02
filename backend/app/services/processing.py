@@ -55,6 +55,29 @@ class ProcessingService:
         return settings.projects_dir / project_id / "output"
 
     @staticmethod
+    def normalize_transcription_timings(transcription: Transcription) -> None:
+        """Shift transcription timings so the earliest word starts at 0s."""
+        min_start = None
+        for scene in transcription.scenes:
+            for word in scene.words:
+                if min_start is None or word.start < min_start:
+                    min_start = word.start
+
+        if min_start is None:
+            return
+
+        # Only shift if there's a meaningful leading offset
+        if min_start <= 0.001:
+            return
+
+        for scene in transcription.scenes:
+            for word in scene.words:
+                word.start = max(0.0, word.start - min_start)
+                word.end = max(0.0, word.end - min_start)
+            scene.start_time = max(0.0, scene.start_time - min_start)
+            scene.end_time = max(0.0, scene.end_time - min_start)
+
+    @staticmethod
     async def detect_video_fps(video_path: Path) -> Fraction:
         """
         Detect video frame rate using ffprobe, returning as a Fraction for precision.
@@ -1539,6 +1562,7 @@ class ProcessingService:
                     for s in transcription_data["scenes"]
                 ],
             )
+            cls.normalize_transcription_timings(new_transcription)
 
             yield ProcessingProgress(
                 "processing",
@@ -1579,6 +1603,7 @@ class ProcessingService:
                     edited_audio_path,
                     new_script,
                 )
+                cls.normalize_transcription_timings(new_transcription)
 
                 # Save transcription for gap detection
                 transcription_timing_path = output_dir / "transcription_timing.json"

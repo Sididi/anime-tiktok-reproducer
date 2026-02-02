@@ -30,6 +30,7 @@ export function ProcessingPage() {
   const location = useLocation();
   const { loadProject } = useProjectStore();
   const hasStartedProcessing = useRef(false);
+  const resumeAfterGapsRef = useRef(false);
 
   const initialSteps: ProcessingStep[] = [
     {
@@ -92,6 +93,9 @@ export function ProcessingPage() {
   // Reset local processing state when returning to this page
   useEffect(() => {
     hasStartedProcessing.current = false;
+    resumeAfterGapsRef.current = Boolean(
+      (location.state as { resumeAfterGaps?: boolean } | null)?.resumeAfterGaps,
+    );
     setProcessing(false);
     setError(null);
     setDownloadUrl(null);
@@ -105,6 +109,21 @@ export function ProcessingPage() {
 
     setProcessing(true);
     setError(null);
+
+    if (resumeAfterGapsRef.current) {
+      setSteps((prev) =>
+        prev.map((step) => {
+          if (step.id === "jsx_generation") {
+            return { ...step, status: "processing", message: "Resuming..." };
+          }
+          if (step.id === "srt_generation" || step.id === "bundling") {
+            return { ...step, status: "pending" };
+          }
+          return { ...step, status: "complete" };
+        }),
+      );
+      resumeAfterGapsRef.current = false;
+    }
 
     try {
       const response = await fetch(`/api/projects/${projectId}/process`, {

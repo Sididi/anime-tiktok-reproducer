@@ -545,7 +545,9 @@ export function GapResolutionPage() {
       });
 
       // Navigate back to processing page to resume
-      navigate(`/project/${projectId}/processing`);
+      navigate(`/project/${projectId}/processing`, {
+        state: { resumeAfterGaps: true },
+      });
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -572,7 +574,9 @@ export function GapResolutionPage() {
       });
 
       // Navigate back to processing to re-trigger gap detection
-      navigate(`/project/${projectId}/processing`);
+      navigate(`/project/${projectId}/processing`, {
+        state: { resumeAfterGaps: false },
+      });
     } catch (err) {
       setError((err as Error).message);
     } finally {
