@@ -331,12 +331,12 @@ Optimized for ElevenLabs TTS audio:
 **"Import could not be resolved" errors in IDE**
 
 - Ensure you've activated the virtual environment
-- Run `uv sync` in both backend and modules/anime_searcher
+- Run `pixi install` at the repo root
 
 **anime_searcher not found**
 
 - Initialize submodules: `git submodule update --init --recursive`
-- Install submodule deps: `cd modules/anime_searcher && uv sync`
+- Install submodule deps: `pixi install`
 
 **SSCD model not found**
 
@@ -344,12 +344,12 @@ Optimized for ElevenLabs TTS audio:
 
 **Video download fails**
 
-- Update yt-dlp: `uv pip install -U yt-dlp`
+- Update yt-dlp: `pixi update yt-dlp`
 - Check TikTok URL format
 
 **Matching returns no results**
 
-- Verify anime is indexed: `uv run anime-search list /path/to/library`
+- Verify anime is indexed: `pixi run anime-search list /path/to/library`
 - Check that the correct anime is selected in project
 
 ## License

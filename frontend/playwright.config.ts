@@ -48,7 +48,7 @@ export default defineConfig({
       timeout: 120000,
     },
     {
-      command: "cd ../backend && uv run uvicorn app.main:app --reload --port 8000",
+      command: "cd .. && pixi run backend",
       url: "http://localhost:8000/health",
       reuseExistingServer: !process.env.CI,
       timeout: 120000,

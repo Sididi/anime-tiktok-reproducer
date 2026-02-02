@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import { useParams, useNavigate, useLocation } from "react-router-dom";
 import { Loader2, Check, Download, Package, AlertTriangle } from "lucide-react";
 import { Button } from "@/components/ui";
 import { useProjectStore } from "@/stores";
@@ -27,19 +27,11 @@ interface ProcessingProgress {
 export function ProcessingPage() {
   const { projectId } = useParams<{ projectId: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
   const { loadProject } = useProjectStore();
   const hasStartedProcessing = useRef(false);
 
-  const [loading, setLoading] = useState(true);
-  const [processing, setProcessing] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
-  const [gapsDetected, setGapsDetected] = useState(false);
-  const [gapInfo, setGapInfo] = useState<{
-    count: number;
-    duration: number;
-  } | null>(null);
-  const [steps, setSteps] = useState<ProcessingStep[]>([
+  const initialSteps: ProcessingStep[] = [
     {
       id: "auto_editor",
       label: "Running auto-editor (audio + XML export)",
@@ -66,7 +58,18 @@ export function ProcessingPage() {
       status: "pending",
     },
     { id: "bundling", label: "Bundling project assets", status: "pending" },
-  ]);
+  ];
+
+  const [loading, setLoading] = useState(true);
+  const [processing, setProcessing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+  const [gapsDetected, setGapsDetected] = useState(false);
+  const [gapInfo, setGapInfo] = useState<{
+    count: number;
+    duration: number;
+  } | null>(null);
+  const [steps, setSteps] = useState<ProcessingStep[]>(initialSteps);
 
   // Load project
   useEffect(() => {
@@ -85,6 +88,17 @@ export function ProcessingPage() {
 
     loadData();
   }, [projectId, loadProject]);
+
+  // Reset local processing state when returning to this page
+  useEffect(() => {
+    hasStartedProcessing.current = false;
+    setProcessing(false);
+    setError(null);
+    setDownloadUrl(null);
+    setGapsDetected(false);
+    setGapInfo(null);
+    setSteps(initialSteps);
+  }, [projectId, location.key]);
 
   const startProcessing = useCallback(async () => {
     if (!projectId) return;

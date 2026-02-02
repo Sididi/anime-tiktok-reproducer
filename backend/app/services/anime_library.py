@@ -58,10 +58,10 @@ class AnimeLibraryService:
         library_path = cls.get_library_path()
         searcher_path = cls.get_anime_searcher_path()
 
-        # Use uv run to call anime-search list --json
+        # Use pixi run to call anime-search list --json
         cmd = [
-            "uv", "run", "--project", str(searcher_path),
-            "anime-search", "list", str(library_path), "--json"
+            "pixi", "run", "--locked", "anime-search",
+            "list", str(library_path), "--json"
         ]
 
         process = await asyncio.create_subprocess_exec(
@@ -193,7 +193,7 @@ class AnimeLibraryService:
                     completed_files=i + 1,
                 )
 
-        # Run indexing with uv run
+        # Run indexing with pixi run
         yield IndexProgress(
             status="indexing",
             message=f"Indexing {anime_name} at {fps} fps",
@@ -202,8 +202,8 @@ class AnimeLibraryService:
         )
 
         cmd = [
-            "uv", "run", "--project", str(searcher_path),
-            "anime-search", "index", str(library_path),
+            "pixi", "run", "--locked", "anime-search",
+            "index", str(library_path),
             "--fps", str(fps),
         ]
 
@@ -277,8 +277,8 @@ class AnimeLibraryService:
         searcher_path = cls.get_anime_searcher_path()
 
         cmd = [
-            "uv", "run", "--project", str(searcher_path),
-            "anime-search", "search", str(image_path),
+            "pixi", "run", "--locked", "anime-search",
+            "search", str(image_path),
             "--library", str(library_path),
             "--top-n", str(top_n),
             "--json",

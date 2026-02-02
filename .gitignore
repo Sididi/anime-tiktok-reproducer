@@ -47,3 +47,5 @@ examples/source_anime/
 .claude/
 .DS_Store
 Thumbs.db
+# pixi/uv artifacts
+backend/uv.lock

@@ -177,7 +177,7 @@ class ProcessingService:
 
         # Run 1: Export as audio file for WhisperX transcription
         audio_cmd = [
-            "uv", "run", "--project", str(backend_dir),
+            "pixi", "run", "--locked", "--",
             "auto-editor",
             str(converted_audio_path),
             *base_args,
@@ -196,7 +196,7 @@ class ProcessingService:
 
         # Run 2: Export as Premiere XML for lossless timing reference
         xml_cmd = [
-            "uv", "run", "--project", str(backend_dir),
+            "pixi", "run", "--locked", "--",
             "auto-editor",
             str(converted_audio_path),
             *base_args,
