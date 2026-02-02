@@ -1,4 +1,5 @@
 import asyncio
+import os
 import re
 import statistics
 import unicodedata
@@ -55,6 +56,15 @@ class TranscriberService:
 
     _asr_models: dict = {}
     _align_models: dict = {}
+    _unsafe_env_applied: bool = False
+
+    @classmethod
+    def _ensure_unsafe_torch_load_env(cls) -> None:
+        """Force PyTorch to use weights_only=False via environment variable."""
+        if cls._unsafe_env_applied:
+            return
+        os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
+        cls._unsafe_env_applied = True
 
     @staticmethod
     def _get_device() -> str:
@@ -75,6 +85,8 @@ class TranscriberService:
         if key in cls._asr_models:
             return cls._asr_models[key]
 
+        cls._ensure_unsafe_torch_load_env()
+
         import whisperx
 
         model = whisperx.load_model(model_size, device, compute_type=compute_type)
@@ -86,6 +98,8 @@ class TranscriberService:
         key = (language_code or "unknown", device)
         if key in cls._align_models:
             return cls._align_models[key]
+
+        cls._ensure_unsafe_torch_load_env()
 
         import whisperx
 
