@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from ...services import ProjectService
 from ...services.gap_resolution import GapResolutionService
+from ...utils.timing import compute_adjusted_scene_end_times
 
 router = APIRouter(prefix="/projects/{project_id}/gaps", tags=["gap-resolution"])
 
@@ -275,13 +276,24 @@ async def update_gap_timing(
                 try:
                     transcription_data = json.loads(transcription_path.read_text())
                     scene_timings = transcription_data.get("scenes", [])
+
+                    # Compute adjusted end times to eliminate gaps between scenes
+                    adjusted_ends = compute_adjusted_scene_end_times(
+                        scenes=scene_timings,
+                        get_scene_index=lambda s: s.get("scene_index"),
+                        get_first_word_start=lambda s: s["words"][0]["start"] if s.get("words") else None,
+                        get_last_word_end=lambda s: s["words"][-1]["end"] if s.get("words") else None,
+                    )
+
                     scene_timing = next(
                         (s for s in scene_timings if s.get("scene_index") == scene_index),
                         None,
                     )
                     if scene_timing and scene_timing.get("words"):
                         words = scene_timing["words"]
-                        target_duration = words[-1]["end"] - words[0]["start"]
+                        # Use adjusted end time to eliminate gaps between scenes
+                        timeline_end = adjusted_ends.get(scene_index, words[-1]["end"])
+                        target_duration = timeline_end - words[0]["start"]
                         # Use the Fraction-based compute function for precision
                         speed_frac = GapResolutionService.compute_raw_speed_for_timing(
                             request.start_time,

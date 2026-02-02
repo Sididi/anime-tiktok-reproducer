@@ -11,6 +11,7 @@ from typing import AsyncIterator
 
 from ..config import settings
 from ..models import Project, Transcription, SceneMatch
+from ..utils.timing import compute_adjusted_scene_end_times
 from .transcriber import TranscriberService
 from .otio_timing import OTIOTimingCalculator, FrameRateInfo
 from .gap_resolution import GapResolutionService
@@ -263,6 +264,15 @@ class ProcessingService:
                 total_duration_secs = last_scene.words[-1].end
         total_duration_frames = int(total_duration_secs * sequence_fps)
 
+        # Compute adjusted end times to eliminate gaps between scenes
+        # Each scene's end is extended to the next scene's start
+        adjusted_ends = compute_adjusted_scene_end_times(
+            scenes=transcription.scenes,
+            get_scene_index=lambda s: s.scene_index,
+            get_first_word_start=lambda s: s.words[0].start if s.words else None,
+            get_last_word_end=lambda s: s.words[-1].end if s.words else None,
+        )
+
         # Build clip data with timing from transcription
         clips = []
         for i, scene_trans in enumerate(transcription.scenes):
@@ -278,8 +288,9 @@ class ProcessingService:
                 continue
 
             # Timeline position from transcription words (seconds)
+            # Use adjusted end time to eliminate gaps between scenes
             timeline_start = scene_trans.words[0].start
-            timeline_end = scene_trans.words[-1].end
+            timeline_end = adjusted_ends.get(scene_trans.scene_index, scene_trans.words[-1].end)
             target_duration = timeline_end - timeline_start
 
             # Source timing from match (seconds)
@@ -510,50 +521,74 @@ class ProcessingService:
             source_rate=source_rate,
         )
 
+        # Compute adjusted end times to eliminate gaps between scenes
+        # Each scene's end is extended to the next scene's start
+        adjusted_ends_jsx = compute_adjusted_scene_end_times(
+            scenes=transcription.scenes,
+            get_scene_index=lambda s: s.scene_index,
+            get_first_word_start=lambda s: s.words[0].start if s.words else None,
+            get_last_word_end=lambda s: s.words[-1].end if s.words else None,
+        )
+
         # Build scenes data with frame-perfect timing
         scenes = []
         clip_timings = []  # For continuity validation
+        matches_by_scene = {m.scene_index: m for m in matches}
 
         for scene_trans in transcription.scenes:
             if not scene_trans.words:
                 continue
 
-            # Find corresponding match
-            match = next(
-                (m for m in matches if m.scene_index == scene_trans.scene_index),
-                None,
-            )
-            if not match or not match.episode:
+            # Find corresponding match (fallback to best alternative if missing)
+            match = matches_by_scene.get(scene_trans.scene_index)
+            if not match:
                 continue
 
-            # Timeline position from TTS transcription words (seconds)
-            timeline_start_sec = scene_trans.words[0].start
-            timeline_end_sec = scene_trans.words[-1].end
-
-            # Source timing from match (seconds) - the original anime clip
+            episode = match.episode
             source_in_sec = match.start_time
             source_out_sec = match.end_time
+            used_alternative = False
+
+            if not episode:
+                # Use best available alternative to avoid dropping the scene (prevents gaps)
+                alternative = next((alt for alt in match.alternatives if alt.episode), None)
+                if alternative:
+                    episode = alternative.episode
+                    source_in_sec = alternative.start_time
+                    source_out_sec = alternative.end_time
+                    used_alternative = True
+                else:
+                    continue
+
+            # Timeline position from TTS transcription words (seconds)
+            # Use adjusted end time to eliminate gaps between scenes
+            timeline_start_raw = scene_trans.words[0].start
+            timeline_end_raw = adjusted_ends_jsx.get(
+                scene_trans.scene_index, scene_trans.words[-1].end
+            )
+
+            # Snap timeline positions to 60fps frame grid BEFORE speed calculation
+            # This keeps speed and placement perfectly aligned to frame boundaries
+            timeline_start_frames = calculator.sequence_rate.frames_from_seconds(timeline_start_raw)
+            timeline_end_frames = calculator.sequence_rate.frames_from_seconds(timeline_end_raw)
+            timeline_start_snapped = calculator.sequence_rate.seconds_from_frames(
+                timeline_start_frames
+            )
+            timeline_end_snapped = calculator.sequence_rate.seconds_from_frames(
+                timeline_end_frames
+            )
 
             # Calculate frame-perfect timing using OTIO
             clip_timing = calculator.calculate_clip_timing(
                 scene_index=scene_trans.scene_index,
-                source_path=Path(match.episode),
-                bundle_filename=Path(match.episode).stem,
+                source_path=Path(episode),
+                bundle_filename=Path(episode).stem,
                 source_in_seconds=source_in_sec,
                 source_out_seconds=source_out_sec,
-                timeline_start_seconds=timeline_start_sec,
-                timeline_end_seconds=timeline_end_sec,
+                timeline_start_seconds=timeline_start_snapped,
+                timeline_end_seconds=timeline_end_snapped,
             )
             clip_timings.append(clip_timing)
-
-            # Convert timeline positions to frame-snapped seconds (60fps grid)
-            # This ensures no sub-frame positioning
-            timeline_start_frames = clip_timing.timeline_start_frames
-            timeline_end_frames = clip_timing.timeline_end_frames
-
-            # Convert back to seconds at exactly 60fps
-            timeline_start_snapped = timeline_start_frames / 60.0
-            timeline_end_snapped = timeline_end_frames / 60.0
 
             # Subtitle text for this scene
             subtitle_text = scene_trans.text if scene_trans.text else ""
@@ -565,7 +600,7 @@ class ProcessingService:
                 "start": round(timeline_start_snapped, 6),  # Frame-snapped, more precision
                 "end": round(timeline_end_snapped, 6),
                 "text": subtitle_text,
-                "clipName": Path(match.episode).stem,
+                "clipName": Path(episode).stem,
                 "source_in": round(source_in_sec, 4),
                 "source_out": round(source_out_sec, 4),
                 "clip_duration": round(clip_timing.source_duration.to_seconds(), 4),
@@ -573,6 +608,7 @@ class ProcessingService:
                 "speed_ratio": round(float(clip_timing.speed_ratio), 4),
                 "effective_speed": round(float(clip_timing.effective_speed), 4),
                 "leaves_gap": clip_timing.leaves_gap,  # True if 75% floor hit
+                "used_alternative": used_alternative,
             })
 
         # Validate continuity - log warnings for intentional gaps
@@ -1508,19 +1544,19 @@ class ProcessingService:
                 # Add source episode files to sources/ folder
                 # Episode names in matches may be just filenames without extension,
                 # so we need to resolve them to full paths using the anime library
-                # Track by resolved path to avoid duplicates when same episode 
+                # Track by resolved path to avoid duplicates when same episode
                 # appears with different name formats (e.g., name vs full path)
                 episode_paths_in_bundle = {}
                 for episode_name in source_episodes:
                     # Try to resolve the episode name to a full path
                     resolved_path = GapResolutionService.resolve_episode_path(episode_name)
-                    
+
                     if resolved_path and resolved_path.exists():
                         # Skip if we already added this resolved path
                         resolved_str = str(resolved_path)
                         if resolved_str in episode_paths_in_bundle:
                             continue
-                            
+
                         # Use just the filename in sources/ folder
                         dest_name = f"sources/{resolved_path.name}"
                         zf.write(resolved_path, dest_name)

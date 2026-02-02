@@ -20,13 +20,14 @@ from scenedetect import open_video, SceneManager, ContentDetector
 
 from ..config import settings
 from ..models import SceneMatch
+from ..utils.timing import compute_adjusted_scene_end_times
 from .otio_timing import OTIOTimingCalculator, FrameRateInfo
 
 
 @dataclass
 class GapInfo:
     """Information about a scene that has a gap (hit 75% speed floor).
-    
+
     Uses Fraction-based arithmetic internally for frame-perfect precision,
     matching the OTIOTimingCalculator used in Premiere Pro JSX generation.
     """
@@ -67,7 +68,7 @@ class GapInfo:
 @dataclass
 class GapCandidate:
     """A candidate for extending a clip to fill a gap.
-    
+
     Uses Fraction-based arithmetic for effective_speed to match OTIO precision.
     """
 
@@ -113,7 +114,7 @@ class GapResolutionProgress:
 
 class GapResolutionService:
     """Service for resolving gaps in clips that hit the 75% speed floor.
-    
+
     Uses OTIOTimingCalculator for frame-perfect precision, ensuring
     consistent results that match the Premiere Pro JSX automation.
     """
@@ -130,7 +131,7 @@ class GapResolutionService:
     # Safety frames offset (number of frames to stay away from scene boundaries)
     SAFETY_FRAMES = 3
     DEFAULT_FPS = Fraction(24000, 1001)  # 23.976fps as exact fraction
-    
+
     # Default timeline rate (60fps for TikTok)
     TIMELINE_RATE = FrameRateInfo(timebase=60, ntsc=False)
     # Default source rate (23.976fps for most anime)
@@ -360,16 +361,35 @@ class GapResolutionService:
             List of GapInfo for scenes that have gaps
         """
         gaps = []
-        
+
         # Create calculator for frame-perfect timing (same as processing.py)
         calculator = OTIOTimingCalculator(
             sequence_rate=cls.TIMELINE_RATE,
             source_rate=cls.SOURCE_RATE,
         )
 
+        # Compute adjusted end times to eliminate gaps between scenes
+        # Each scene's end is extended to the next scene's start
+        adjusted_ends = compute_adjusted_scene_end_times(
+            scenes=scene_timings,
+            get_scene_index=lambda s: s.get("scene_index"),
+            get_first_word_start=lambda s: s["words"][0]["start"] if s.get("words") else None,
+            get_last_word_end=lambda s: s["words"][-1]["end"] if s.get("words") else None,
+        )
+
         for match in matches:
-            if not match.episode:
-                continue
+            # Resolve match (fallback to best alternative if missing)
+            episode = match.episode
+            source_start = match.start_time
+            source_end = match.end_time
+            if not episode:
+                alternative = next((alt for alt in match.alternatives if alt.episode), None)
+                if alternative:
+                    episode = alternative.episode
+                    source_start = alternative.start_time
+                    source_end = alternative.end_time
+                else:
+                    continue
 
             # Find corresponding scene timing
             scene_timing = next(
@@ -381,27 +401,26 @@ class GapResolutionService:
 
             words = scene_timing["words"]
             timeline_start_raw = words[0]["start"]
-            timeline_end_raw = words[-1]["end"]
-            
+            # Use adjusted end time to eliminate gaps between scenes
+            timeline_end_raw = adjusted_ends.get(match.scene_index, words[-1]["end"])
+
             # Snap timeline positions to 60fps frame grid (matching processing.py)
             # This ensures we use the exact same values as JSX generation
             timeline_start_rt = calculator.seconds_to_timeline_time(timeline_start_raw)
             timeline_end_rt = calculator.seconds_to_timeline_time(timeline_end_raw)
-            
+
             # Get frame-snapped seconds
             timeline_start_frames = int(timeline_start_rt.to_frames())
             timeline_end_frames = int(timeline_end_rt.to_frames())
             timeline_start = timeline_start_frames / 60.0  # Frame-snapped
             timeline_end = timeline_end_frames / 60.0  # Frame-snapped
-            
+
             # Calculate target duration using Fraction for exact arithmetic
             target_duration_frac = Fraction(timeline_end).limit_denominator(100000) - \
                                    Fraction(timeline_start).limit_denominator(100000)
             target_duration = float(target_duration_frac)
 
-            # Source timing from match
-            source_start = match.start_time
-            source_end = match.end_time
+            # Source timing from match (resolved)
             source_duration_frac = Fraction(source_end).limit_denominator(100000) - \
                                    Fraction(source_start).limit_denominator(100000)
             source_duration = float(source_duration_frac)
@@ -422,7 +441,7 @@ class GapResolutionService:
 
                 gaps.append(GapInfo(
                     scene_index=match.scene_index,
-                    episode=match.episode,
+                    episode=episode,
                     current_start=source_start,
                     current_end=source_end,
                     current_duration=source_duration,
@@ -446,7 +465,7 @@ class GapResolutionService:
 
         Uses pyscenedetect to find nearby scene cuts and proposes timings
         that snap to these cuts. Candidates are ranked by closeness to 100% speed.
-        
+
         Uses Fraction-based arithmetic for frame-perfect precision.
 
         Strategies:
@@ -493,7 +512,7 @@ class GapResolutionService:
             new_end_frac = Fraction(new_end).limit_denominator(100000)
             new_duration_frac = new_end_frac - new_start_frac
             new_duration = float(new_duration_frac)
-            
+
             if new_duration <= 0:
                 return False
 
@@ -696,9 +715,9 @@ class GapResolutionService:
         source_start_frac = Fraction(source_start).limit_denominator(100000)
         source_end_frac = Fraction(source_end).limit_denominator(100000)
         target_frac = Fraction(target_duration).limit_denominator(100000)
-        
+
         source_duration_frac = source_end_frac - source_start_frac
-        
+
         if target_frac <= 0:
             return Fraction(1, 1)
 
@@ -732,9 +751,9 @@ class GapResolutionService:
         source_start_frac = Fraction(source_start).limit_denominator(100000)
         source_end_frac = Fraction(source_end).limit_denominator(100000)
         target_frac = Fraction(target_duration).limit_denominator(100000)
-        
+
         source_duration_frac = source_end_frac - source_start_frac
-        
+
         if target_frac <= 0:
             return Fraction(1, 1)
 
