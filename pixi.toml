@@ -51,6 +51,12 @@ scipy = ">=1.10.0"
 typer = ">=0.9"
 rich = ">=13.0"
 
+# NLP for determiner detection in SRT generation
+spacy = ">=3.7.0"
+fr-core-news-sm = { url = "https://github.com/explosion/spacy-models/releases/download/fr_core_news_sm-3.8.0/fr_core_news_sm-3.8.0-py3-none-any.whl" }
+en-core-web-sm = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }
+es-core-news-sm = { url = "https://github.com/explosion/spacy-models/releases/download/es_core_news_sm-3.8.0/es_core_news_sm-3.8.0-py3-none-any.whl" }
+
 [feature.dev.pypi-dependencies]
 pytest = ">=8.0.0"
 pytest-asyncio = ">=0.24.0"

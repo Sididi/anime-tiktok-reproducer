@@ -11,27 +11,205 @@ import {
 import { Button } from "@/components/ui";
 import { useProjectStore, useSceneStore } from "@/stores";
 import { api } from "@/api/client";
-import type { Transcription } from "@/types";
+import type { Transcription, Project } from "@/types";
 
-const RESTRUCTURE_PROMPT_TEMPLATE = `Tu es un expert en réécriture de scripts pour des vidéos courtes sur les réseaux sociaux.
-Ta mission est de réécrire le script suivant en français tout en gardant le même sens et la même structure narrative.
+// French-only prompt template (when target is French)
+const PROMPT_FR_TEMPLATE = `# RÔLE
 
-RÈGLES IMPORTANTES:
-1. Le nouveau script doit avoir une durée de narration TTS similaire pour chaque scène
-2. Chaque scène doit garder approximativement la même durée de parole (±20%)
-3. Le texte doit être naturel et engageant pour un format court (TikTok/Reels/Shorts)
-4. Évite les phrases trop longues - vise 1-2 phrases par scène maximum
-5. Garde le même ton et le même style narratif
-6. Le script doit être suffisamment différent pour ne pas être un copier-coller
+Tu es un Expert en Adaptation de Scripts Vidéo (Post-Synchro).
+Ta mission : Réécrire un script de [SOURCE] vers Français pour un format vidéo court (TikTok).
+Le but est d'obtenir un texte **indétectable comme copie (anti-plagiat)**, fluide à l'oreille, et parfaitement synchronisé temporellement.
 
-FORMAT DE SORTIE:
-Tu dois retourner UNIQUEMENT un JSON valide avec la même structure que l'entrée, mais avec les textes réécrits.
-Ne mets aucun texte avant ou après le JSON.
+# CONTEXTE
 
-DONNÉES D'ENTRÉE:
+Titre de l'œuvre : [OEUVRE]
+_Instruction : Utilise ce titre pour comprendre le contexte et le vocabulaire spécifique (sport, magie, scifi...), mais NE CITE JAMAIS ce titre ni les noms des personnages dans le script final._
+
+# DONNÉES D'ENTRÉE
+
+Tu reçois un JSON contenant des scènes. Chaque scène possède :
+
+- \`text\` : Le script original.
+- \`duration_seconds\` : La durée stricte de la scène.
+- \`estimated_word_count\` : Indication de la densité originale.
+
+# RÈGLES D'EXÉCUTION (Priorité Absolue)
+
+### 1. LA "RÈGLE DU HOOK" (Scène 0 - Exception)
+
+- La **Scène 0** est l'accroche virale. Tu dois conserver son **intention** et sa **structure percutante** le plus fidèlement possible.
+- Ne la reformule pas inutilement, sauf pour l'anonymiser. Elle doit "claquer" immédiatement.
+
+### 2. FLUIDITÉ & RESTRUCTURATION (Anti-Plagiat)
+
+- **Ne traduis jamais phrase par phrase.** Lis le script par blocs de 2 ou 3 scènes pour comprendre le sens global.
+- **Reformulation totalement :** Modifie la structure syntaxique pour éviter le plagiat. Utilise des verbes forts et des synonymes percutants.
+- **Voix Active :** Pour le dynamisme TikTok, privilégie la voix active.
+  - _Mauvais :_ "Il a été surpris par l'attaque."
+  - _Bon :_ "L'attaque l'a surpris."
+- **Objectif :** Le texte français doit sembler avoir été écrit nativement, pas traduit.
+
+### 3. LA "RÈGLE DU CAFÉ" (Ton & Registre)
+
+- **Ton :** Tu ne rédiges pas un livre, tu racontes une histoire à un pote dans un café. C'est du "Storytime".
+- **Vocabulaire :** BANNIS le langage soutenu ("Néanmoins", "Cependant", "Demeurer", "Auparavant", "Impérial", "Dédain").
+  - _Remplace par :_ "Mais", "Juste avant", "Incroyable", "Mépris".
+- **Les Transitions (Crucial) :** Remplace les connecteurs écrits ("Par conséquent", "Ensuite") par des connecteurs oraux fluides : **"Du coup", "Alors", "Et là", "Bref", "Au final".**
+- **Structure :** Fais des phrases courtes et directes (Sujet + Verbe + Complément).
+- **Interdit :** Pas de passé simple (sauf effet dramatique), pas d'inversion sujet-verbe complexe. Ça doit sonner parlé.
+
+### 4. GESTION DES PRÉNOMS (Anonymisation)
+
+- **Suppression Totale :** Aucun prénom ne doit apparaître.
+- **L'introduction :** À la première apparition, remplace le nom par une description naturelle (ex: "La jeune prodige", "Le nouvel élève").
+- **Ensuite :** Utilise STRICTEMENT des pronoms (Elle, Il, Lui, Son) pour 90% des cas. Ne réutilise une description ("La fille") que si l'ambiguïté est totale.
+- **La Règle de Clarté (IMPORTANT) :**
+  - _Cas simple (Genres différents ou personnage seul) :_ Utilise massivement les pronoms (Il, Elle, Lui) pour la fluidité.
+  - _Cas complexe (Même genre) :_ Si l'action implique deux hommes (ou deux femmes), **l'utilisation seule de "Il" est interdite** car elle crée la confusion. Tu dois alterner les pronoms avec des **désignations fonctionnelles** (ex: "L'agresseur", "La victime", "Le coach", "Son frère").
+- **Critère de réussite :** On doit savoir INSTANTANÉMENT qui fait l'action, sans avoir l'image.
+
+### 5. SYNCHRONISATION & DENSITÉ (Le défi du temps)
+
+Le français est naturellement plus long. Pour respecter la \`duration_seconds\` :
+
+- **Condensation Intelligente :** Tu DOIS retirer les "mots vides", les adjectifs superflus ou les connecteurs lourds. Va droit au but.
+- **Ancrage Visuel (Crucial) :** Même en condensant, **l'action montrée à l'écran doit être décrite dans la scène correspondante**. Si la scène 4 montre un smash, le mot "smash" (ou verbe associé) doit être dans le segment 4.
+- **Débordement Autorisé :** Tu as le droit de finir une phrase sur la scène suivante (décalage de ±0.5s) si cela rend l'audio plus fluide, tant que l'action visuelle principale reste synchronisée.
+
+### 6. FORMATTAGE AUDIO
+
+- Le texte est destiné à un TTS (Text-To-Speech).
+- Évite les phrases trop complexes à prononcer.
+- Utilise une ponctuation rythmique (virgules, points) pour guider l'IA vocale.
+
+# FORMAT DE SORTIE
+
+- Retourne **UNIQUEMENT** un JSON valide.
+- Garde **STRICTEMENT** la même structure (mêmes clés, mêmes \`duration_seconds\`, même nombre d'objets).
+- Ne mets aucun markdown (pas de \`\`\`json), pas d'intro, pas de conclusion. Juste le raw JSON string.
+
+DONNÉES D'ENTRÉE :
 `;
 
-function generatePrompt(transcription: Transcription): string {
+// Multilingual prompt template (when target is not French)
+const PROMPT_MULTILINGUAL_TEMPLATE = `# RÔLE
+
+Tu es un Expert en Adaptation de Scripts Vidéo (Post-Synchro).
+Ta mission : Réécrire un script de [SOURCE] vers [CIBLE] pour un format vidéo court (TikTok).
+Le but est d'obtenir un texte **indétectable comme copie (anti-plagiat)**, fluide à l'oreille, et parfaitement synchronisé temporellement.
+
+# CONTEXTE
+
+Titre de l'œuvre : [OEUVRE]
+_Instruction : Utilise ce titre pour comprendre le contexte et le vocabulaire spécifique (sport, magie, scifi...), mais NE CITE JAMAIS ce titre ni les noms des personnages dans le script final._
+
+# DONNÉES D'ENTRÉE
+
+Tu reçois un JSON contenant des scènes. Chaque scène possède :
+
+- \`text\` : Le script original.
+- \`duration_seconds\` : La durée stricte de la scène.
+- \`estimated_word_count\` : Indication de la densité originale.
+
+# RÈGLES D'EXÉCUTION (Priorité Absolue)
+
+### 1. LA "RÈGLE DU HOOK" (Scène 0 - Exception)
+
+- La **Scène 0** est l'accroche virale. Tu dois conserver son **intention** et sa **structure percutante** le plus fidèlement possible.
+- Ne la reformule pas inutilement, sauf pour l'anonymiser. Elle doit "claquer" immédiatement dans la langue [CIBLE].
+
+### 2. FLUIDITÉ & RESTRUCTURATION (Anti-Plagiat)
+
+- **Ne traduis jamais phrase par phrase.** Lis le script par blocs de 2 ou 3 scènes pour comprendre le sens global.
+- **Reformulation totale :** Modifie la structure syntaxique pour éviter le plagiat. Utilise des verbes forts et des synonymes percutants propres à la [CIBLE].
+- **Voix Active :** Pour le dynamisme TikTok, privilégie systématiquement la voix active.
+  - _Concept :_ Au lieu de dire "L'ennemi a été frappé par lui" (Passif), dis "Il a frappé l'ennemi" (Actif).
+- **Objectif :** Le texte en [CIBLE] doit sembler avoir été écrit nativement, pas traduit.
+
+### 3. LA "RÈGLE DU CAFÉ" (Ton & Registre)
+
+- **Ton :** Tu ne rédiges pas un livre, tu racontes une histoire à un pote dans un café. C'est du "Storytime".
+- **Vocabulaire :** BANNIS le langage soutenu (ex: "Néanmoins", "Cependant", "Demeurer", "Auparavant", "Impérial", "Dédain" pour FR).
+  - _Remplace par :_ "Mais", "Juste avant", "Incroyable", "Mépris".
+- **Les Transitions (Crucial) :** Remplace les connecteurs écrits (ex: "Par conséquent", "Ensuite" pour FR) par des connecteurs oraux fluides : **"Du coup", "Alors", "Et là", "Bref", "Au final".**
+- **Structure :** Fais des phrases courtes et directes (Sujet + Verbe + Complément).
+- **Interdit :** Pas de passé simple (sauf effet dramatique), pas d'inversion sujet-verbe complexe. Ça doit sonner parlé.
+
+### 4. GESTION DES PRÉNOMS (Anonymisation)
+
+- **Suppression Totale :** Aucun prénom ne doit apparaître.
+- **Première Scène :** Remplace le nom par une description naturelle (ex: "La jeune prodige", "Le nouvel élève").
+- **Ensuite :** Utilise STRICTEMENT des pronoms personnels appropriés à la grammaire de la [CIBLE] (ex: Il/Elle pour FR, He/She pour EN) pour 90% des cas. Ne réutilise une description ("La fille") que si l'ambiguïté est totale.
+- **Interdit :** Les répétitions de démonstratifs.
+
+### 5. SYNCHRONISATION & DENSITÉ (Le défi du temps)
+
+Tu dois gérer le débit de parole selon la langue :
+
+- **Facteur de Densité :** Si la [CIBLE] est naturellement plus longue/verbeuse que la [SOURCE] (ex: EN -> FR ou EN -> ES), tu DOIS **condenser intelligemment**. Retire les "mots vides", les adjectifs superflus ou les connecteurs lourds.
+- **Ancrage Visuel (Crucial) :** Même en condensant, **l'action montrée à l'écran doit être décrite dans la scène correspondante**. Si la scène 4 montre un smash, le mot correspondant à "smash" en [CIBLE] doit être dans le segment 4.
+- **Débordement Autorisé :** Tu as le droit de finir une phrase sur la scène suivante (décalage de ±0.5s) si cela rend l'audio plus fluide, tant que l'action visuelle principale reste synchronisée.
+
+### 6. FORMATTAGE AUDIO
+
+- Le texte est destiné à un TTS (Text-To-Speech).
+- Évite les phrases trop complexes à prononcer.
+- Utilise une ponctuation rythmique (virgules, points) pour guider l'IA vocale.
+
+# FORMAT DE SORTIE
+
+- Retourne **UNIQUEMENT** un JSON valide.
+- Garde **STRICTEMENT** la même structure (mêmes clés, mêmes \`duration_seconds\`, même nombre d'objets).
+- La clé \`language\` du JSON doit correspondre au code ISO de la [CIBLE].
+- Ne mets aucun markdown (pas de \`\`\`json), pas d'intro, pas de conclusion. Juste le raw JSON string.
+
+DONNÉES D'ENTRÉE :
+`;
+
+// Language options for the selector
+const LANGUAGE_OPTIONS = [
+  { value: "fr", label: "Francais" },
+  { value: "en", label: "Anglais" },
+  { value: "es", label: "Espagnol" },
+] as const;
+
+// Display names for languages (used in prompts)
+const LANGUAGE_DISPLAY_NAMES: Record<string, string> = {
+  en: "Anglais",
+  fr: "Francais",
+  es: "Espagnol",
+};
+
+type TargetLanguage = "fr" | "en" | "es";
+
+function generatePrompt(
+  transcription: Transcription,
+  project: Project | null,
+  targetLang: TargetLanguage,
+): string {
+  // Choose the right template based on target language
+  const template =
+    targetLang === "fr" ? PROMPT_FR_TEMPLATE : PROMPT_MULTILINGUAL_TEMPLATE;
+
+  // Source language from transcription
+  const sourceLanguage =
+    LANGUAGE_DISPLAY_NAMES[transcription.language] || transcription.language;
+  const targetLanguage = LANGUAGE_DISPLAY_NAMES[targetLang];
+
+  // Get anime name from project
+  const animeName = project?.anime_name || "Inconnu";
+
+  // Replace template variables
+  let prompt = template
+    .replace(/\[SOURCE\]/g, sourceLanguage)
+    .replace(/\[OEUVRE\]/g, animeName);
+
+  // For multilingual template, also replace [CIBLE]
+  if (targetLang !== "fr") {
+    prompt = prompt.replace(/\[CIBLE\]/g, targetLanguage);
+  }
+
+  // Build scene data for JSON
   const sceneData = transcription.scenes.map((scene) => ({
     scene_index: scene.scene_index,
     text: scene.text,
@@ -39,11 +217,12 @@ function generatePrompt(transcription: Transcription): string {
     estimated_word_count: scene.text.split(/\s+/).filter((w) => w).length,
   }));
 
+  // Append JSON data
   return (
-    RESTRUCTURE_PROMPT_TEMPLATE +
+    prompt +
     JSON.stringify(
       {
-        language: "fr",
+        language: targetLang,
         scenes: sceneData,
       },
       null,
@@ -55,13 +234,14 @@ function generatePrompt(transcription: Transcription): string {
 export function ScriptRestructurePage() {
   const { projectId } = useParams<{ projectId: string }>();
   const navigate = useNavigate();
-  const { loadProject } = useProjectStore();
+  const { project, loadProject } = useProjectStore();
   const { loadScenes } = useSceneStore();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [transcription, setTranscription] = useState<Transcription | null>(
     null,
   );
+  const [targetLanguage, setTargetLanguage] = useState<TargetLanguage>("fr");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -82,7 +262,7 @@ export function ScriptRestructurePage() {
     const loadData = async () => {
       setLoading(true);
       try {
-        await loadProject(projectId);
+        await loadProject(projectId); // Stores project in Zustand store
         await loadScenes(projectId);
         const { transcription: loaded } = await api.getTranscription(projectId);
         setTranscription(loaded);
@@ -99,10 +279,10 @@ export function ScriptRestructurePage() {
   const handleCopyPrompt = useCallback(async () => {
     if (!transcription) return;
 
-    const prompt = generatePrompt(transcription);
+    const prompt = generatePrompt(transcription, project, targetLanguage);
     await navigator.clipboard.writeText(prompt);
     setCopied(true);
-  }, [transcription]);
+  }, [transcription, project, targetLanguage]);
 
   const handleJsonChange = useCallback((value: string) => {
     setNewScriptJson(value);
@@ -207,7 +387,7 @@ export function ScriptRestructurePage() {
     );
   }
 
-  const prompt = generatePrompt(transcription);
+  const prompt = generatePrompt(transcription, project, targetLanguage);
   const canContinue = jsonValid && audioFile !== null;
 
   return (
@@ -241,6 +421,28 @@ export function ScriptRestructurePage() {
           </div>
         )}
 
+        {/* Language Selection */}
+        <div className="bg-[hsl(var(--card))] rounded-lg p-6 space-y-4">
+          <h2 className="font-semibold">Langue de sortie</h2>
+          <p className="text-sm text-[hsl(var(--muted-foreground))]">
+            Choisissez la langue cible pour le script restructuré.
+          </p>
+          <select
+            value={targetLanguage}
+            onChange={(e) => {
+              setTargetLanguage(e.target.value as TargetLanguage);
+              setCopied(false); // Reset copied state when language changes
+            }}
+            className="w-full p-2 rounded-md border border-[hsl(var(--input))] bg-[hsl(var(--background))] text-sm"
+          >
+            {LANGUAGE_OPTIONS.map((opt) => (
+              <option key={opt.value} value={opt.value}>
+                {opt.label}
+              </option>
+            ))}
+          </select>
+        </div>
+
         {/* Step 1: Copy Prompt */}
         <div className="bg-[hsl(var(--card))] rounded-lg p-6 space-y-4">
           <div className="flex items-center justify-between">
@@ -262,8 +464,9 @@ export function ScriptRestructurePage() {
             </Button>
           </div>
           <p className="text-sm text-[hsl(var(--muted-foreground))]">
-            Use this prompt with an AI (Claude, ChatGPT, etc.) to generate a new
-            French script. The AI will return JSON that you can paste below.
+            Use this prompt with an AI (Claude, ChatGPT, etc.) to generate a new{" "}
+            {LANGUAGE_OPTIONS.find((l) => l.value === targetLanguage)?.label}{" "}
+            script. The AI will return JSON that you can paste below.
           </p>
           <div className="max-h-48 overflow-y-auto bg-[hsl(var(--muted))] rounded-lg p-3">
             <pre className="text-xs whitespace-pre-wrap font-mono">

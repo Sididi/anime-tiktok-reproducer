@@ -9,12 +9,107 @@ from fractions import Fraction
 from pathlib import Path
 from typing import AsyncIterator
 
+import spacy
+
 from ..config import settings
 from ..models import Project, Transcription, SceneMatch
+from ..models.transcription import Word
 from ..utils.timing import compute_adjusted_scene_end_times
 from .transcriber import TranscriberService
 from .otio_timing import OTIOTimingCalculator, FrameRateInfo
 from .gap_resolution import GapResolutionService
+
+
+# =============================================================================
+# spaCy helpers for determiner detection
+# =============================================================================
+
+# Cache of loaded spaCy models
+_SPACY_MODELS: dict[str, spacy.Language] = {}
+
+SPACY_MODEL_MAP = {
+    "fr": "fr_core_news_sm",
+    "en": "en_core_web_sm",
+    "es": "es_core_news_sm",
+}
+
+
+def _get_spacy_model(lang: str) -> spacy.Language:
+    """Load and cache the spaCy model for the given language."""
+    if lang not in _SPACY_MODELS:
+        model_name = SPACY_MODEL_MAP.get(lang, "en_core_web_sm")
+        try:
+            _SPACY_MODELS[lang] = spacy.load(model_name, disable=["ner", "parser"])
+        except OSError:
+            # Model not installed, fall back to English
+            import sys
+            print(f"[WARNING] spaCy model '{model_name}' not found, falling back to en_core_web_sm", file=sys.stderr)
+            if "en" not in _SPACY_MODELS:
+                _SPACY_MODELS["en"] = spacy.load("en_core_web_sm", disable=["ner", "parser"])
+            _SPACY_MODELS[lang] = _SPACY_MODELS["en"]
+    return _SPACY_MODELS[lang]
+
+
+def is_determiner(word: str, language: str) -> bool:
+    """Check if a word is a determiner using spaCy POS tagging."""
+    nlp = _get_spacy_model(language)
+    doc = nlp(word)
+    if doc and len(doc) > 0:
+        return doc[0].pos_ == "DET"
+    return False
+
+
+# Subject pronouns that start clauses (should not be isolated at end of subtitle)
+SUBJECT_PRONOUNS = {
+    "fr": {"je", "tu", "il", "elle", "on", "nous", "vous", "ils", "elles", "j'", "c'", "ça"},
+    "en": {"i", "you", "he", "she", "it", "we", "they"},
+    "es": {"yo", "tú", "él", "ella", "usted", "nosotros", "nosotras", "vosotros", "vosotras", "ellos", "ellas", "ustedes"},
+}
+
+
+def is_clause_starter(word: str, language: str) -> bool:
+    """
+    Check if a word should not be isolated at the end of a subtitle block.
+
+    This includes:
+    - Determiners (le, la, un, the, a, el, la...)
+    - Subject pronouns that start clauses (il, elle, he, she, yo, él...)
+
+    These words introduce the next element (noun or verb) and should stay with it.
+    """
+    # Check if it's a determiner
+    if is_determiner(word, language):
+        return True
+
+    # Check if it's a subject pronoun
+    word_lower = word.lower().strip()
+    lang_pronouns = SUBJECT_PRONOUNS.get(language, SUBJECT_PRONOUNS.get("en", set()))
+    if word_lower in lang_pronouns:
+        return True
+
+    return False
+
+
+def strip_punctuation(text: str) -> str:
+    """Strip leading/trailing punctuation from a word, keeping apostrophes in contractions."""
+    import re
+    # Remove leading punctuation (except apostrophe for contractions like l', d', j')
+    text = re.sub(r'^[^\w\'\']+',"", text)
+    # Remove trailing punctuation
+    text = re.sub(r'[^\w\'\']+$', "", text)
+    return text
+
+
+# Sentence-ending punctuation that should trigger a subtitle break
+SENTENCE_ENDING_PUNCT = {'.', '!', '?', '…', ':', ';'}
+
+
+def has_sentence_ending(text: str) -> bool:
+    """Check if a word ends with sentence-ending punctuation."""
+    if not text:
+        return False
+    # Check if the original text (before stripping) ends with sentence punctuation
+    return any(text.rstrip().endswith(p) for p in SENTENCE_ENDING_PUNCT)
 
 
 @dataclass
@@ -1268,16 +1363,22 @@ class ProcessingService:
     def generate_srt(
         cls,
         transcription: Transcription,
-        max_chars_per_line: int = 42,
-        max_lines: int = 2,
+        language: str = "fr",
     ) -> str:
         """
-        Generate SRT subtitles optimized for short-form video.
+        Generate SRT subtitles with aggressive Hormozi-style segmentation.
+
+        Rules:
+        - 1-2 words per subtitle ideally
+        - Max 3 words ONLY if total length < 12 characters
+        - Max 20 characters per subtitle (spaces included)
+        - Single line only (never 2 lines)
+        - No temporal gaps: end of block N = start of block N+1 (except obvious silence > 0.3s)
+        - Never isolate a determiner at the end of a block
 
         Args:
             transcription: Transcription with word timings
-            max_chars_per_line: Maximum characters per line
-            max_lines: Maximum lines per subtitle block
+            language: Language code for determiner detection (fr, en, es)
 
         Returns:
             SRT file content
@@ -1285,40 +1386,99 @@ class ProcessingService:
         srt_blocks = []
         block_index = 1
 
+        # Collect all words with timings across all scenes
+        all_words = []
         for scene_trans in transcription.scenes:
-            words = scene_trans.words
-            if not words:
-                continue
+            all_words.extend(scene_trans.words)
 
-            current_block_words = []
-            current_block_chars = 0
+        if not all_words:
+            return ""
 
-            for word in words:
-                word_len = len(word.text) + 1  # +1 for space
+        i = 0
+        while i < len(all_words):
+            current_block = []
+            current_len = 0
 
-                # Check if we need to start a new block
-                if current_block_chars + word_len > max_chars_per_line * max_lines:
-                    # Flush current block
-                    if current_block_words:
-                        block = cls._create_srt_block(
-                            block_index,
-                            current_block_words,
-                            max_chars_per_line,
-                        )
-                        srt_blocks.append(block)
-                        block_index += 1
-                        current_block_words = []
-                        current_block_chars = 0
+            while i < len(all_words):
+                word = all_words[i]
+                # Strip punctuation from word text
+                word_text = strip_punctuation(word.text)
 
-                current_block_words.append(word)
-                current_block_chars += word_len
+                # Skip empty words (e.g., standalone punctuation)
+                if not word_text:
+                    i += 1
+                    continue
 
-            # Flush remaining words
-            if current_block_words:
-                block = cls._create_srt_block(
-                    block_index,
-                    current_block_words,
-                    max_chars_per_line,
+                # Calculate new length with space (if not first word)
+                new_len = current_len + len(word_text) + (1 if current_block else 0)
+                word_count = len(current_block) + 1
+
+                # Determine if we can add this word
+                can_add = False
+
+                if word_count <= 2:
+                    # For 1-2 words, just check 20 char limit
+                    can_add = new_len <= 20
+                elif word_count == 3 and new_len < 12:
+                    # Allow 3rd word only if total stays under 12 chars
+                    can_add = True
+
+                # Special case: if word itself is > 20 chars, accept it alone
+                if not current_block and len(word_text) > 20:
+                    can_add = True
+
+                if can_add:
+                    # Store cleaned word text
+                    word_copy = Word(
+                        text=word_text,
+                        start=word.start,
+                        end=word.end,
+                        confidence=word.confidence,
+                    )
+                    current_block.append(word_copy)
+                    current_len = new_len
+                    i += 1
+
+                    # Check if original word had sentence-ending punctuation
+                    # If so, break here to start a new subtitle block
+                    if has_sentence_ending(word.text):
+                        break
+                else:
+                    # Can't add this word - check if last word is a clause starter
+                    # (determiner or subject pronoun) that shouldn't be isolated
+                    # But only if we have more than 1 word (to avoid infinite loop)
+                    if len(current_block) >= 2:
+                        last_word_text = current_block[-1].text
+                        if is_clause_starter(last_word_text, language):
+                            # Pop the clause starter - it will start the next block
+                            i -= 1  # Rewind to re-process it
+                            current_block.pop()
+                            # Recalculate current_len using cleaned text
+                            current_len = sum(len(w.text) for w in current_block)
+                            if len(current_block) > 1:
+                                current_len += len(current_block) - 1  # spaces
+                    break
+
+            # Create the SRT block (only if we have words)
+            if current_block:
+                # Determine end time:
+                # - If there's a next word, check for gap
+                # - If gap > 0.3s (obvious silence), use current block's last word end
+                # - Otherwise, extend to next word's start (no temporal gap)
+                if i < len(all_words):
+                    gap = all_words[i].start - current_block[-1].end
+                    if gap > 0.3:
+                        # Obvious silence - don't force continuity
+                        end_time = current_block[-1].end
+                    else:
+                        # Continuity: extend to next word's start
+                        end_time = all_words[i].start
+                else:
+                    # Last block - use natural end
+                    end_time = current_block[-1].end
+
+                block = cls._create_srt_block_aggressive(
+                    block_index, current_block, end_time
                 )
                 srt_blocks.append(block)
                 block_index += 1
@@ -1326,17 +1486,16 @@ class ProcessingService:
         return "\n".join(srt_blocks)
 
     @staticmethod
-    def _create_srt_block(
+    def _create_srt_block_aggressive(
         index: int,
         words: list,
-        max_chars_per_line: int,
+        end_time: float,
     ) -> str:
-        """Create a single SRT block from words."""
+        """Create a single SRT block for aggressive/Hormozi style (single line only)."""
         if not words:
             return ""
 
         start_time = words[0].start
-        end_time = words[-1].end
 
         # Format timestamps
         def format_srt_time(seconds: float) -> str:
@@ -1346,30 +1505,10 @@ class ProcessingService:
             millis = int((seconds % 1) * 1000)
             return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
-        # Build text with line breaks
+        # Single line text - no line breaks
         text = " ".join(w.text for w in words)
 
-        # Split into lines if needed
-        lines = []
-        current_line = []
-        current_len = 0
-
-        for word in text.split():
-            word_len = len(word) + 1
-            if current_len + word_len > max_chars_per_line and current_line:
-                lines.append(" ".join(current_line))
-                current_line = [word]
-                current_len = word_len
-            else:
-                current_line.append(word)
-                current_len += word_len
-
-        if current_line:
-            lines.append(" ".join(current_line))
-
-        formatted_text = "\n".join(lines[:2])  # Max 2 lines
-
-        return f"{index}\n{format_srt_time(start_time)} --> {format_srt_time(end_time)}\n{formatted_text}\n"
+        return f"{index}\n{format_srt_time(start_time)} --> {format_srt_time(end_time)}\n{text}\n"
 
     @classmethod
     def generate_subtitle_style_preset(cls) -> str:
@@ -1550,7 +1689,7 @@ class ProcessingService:
             from ..models import Transcription
             from ..models.transcription import SceneTranscription, Word
             new_transcription = Transcription(
-                language="auto",
+                language=transcription_data.get("language", "fr"),  # Default to French for backwards compat
                 scenes=[
                     SceneTranscription(
                         scene_index=s["scene_index"],
@@ -1608,6 +1747,7 @@ class ProcessingService:
                 # Save transcription for gap detection
                 transcription_timing_path = output_dir / "transcription_timing.json"
                 transcription_data = {
+                    "language": new_transcription.language,
                     "scenes": [
                         {
                             "scene_index": s.scene_index,
@@ -1706,8 +1846,8 @@ class ProcessingService:
                 "Creating subtitles...",
             )
 
-            # Step 4: Generate SRT subtitles
-            srt_content = cls.generate_srt(new_transcription)
+            # Step 4: Generate SRT subtitles (aggressive Hormozi style)
+            srt_content = cls.generate_srt(new_transcription, language=new_transcription.language)
             srt_path = output_dir / "subtitles.srt"
             srt_path.write_text(srt_content, encoding="utf-8")
 
