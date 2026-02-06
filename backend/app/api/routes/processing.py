@@ -2,7 +2,12 @@
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, FileResponse
+from typing import Optional
 import json
+import tempfile
+from pathlib import Path
+
+from pydub import AudioSegment
 
 from ...models import ProjectPhase
 from ...services import ProjectService, ProcessingService
@@ -14,12 +19,25 @@ router = APIRouter(prefix="/projects/{project_id}", tags=["processing"])
 async def upload_restructured_script(
     project_id: str,
     script: str = Form(...),
-    audio: UploadFile = File(...),
+    audio: Optional[UploadFile] = File(None),
+    audio_parts: Optional[list[UploadFile]] = File(None),
 ):
-    """Upload the restructured script JSON and new TTS audio file."""
+    """Upload the restructured script JSON and new TTS audio file(s).
+
+    Accepts either:
+    - A single 'audio' file
+    - Multiple 'audio_parts' files (will be concatenated in order)
+    """
     project = ProjectService.load(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    # Validate that we have at least one audio source
+    if audio is None and (audio_parts is None or len(audio_parts) == 0):
+        raise HTTPException(
+            status_code=400,
+            detail="Either 'audio' or 'audio_parts' must be provided"
+        )
 
     # Validate JSON
     try:
@@ -36,10 +54,41 @@ async def upload_restructured_script(
     script_path = project_dir / "new_script.json"
     script_path.write_text(json.dumps(script_data, indent=2))
 
-    # Save audio file
+    # Handle audio file(s)
     audio_path = project_dir / "new_tts.wav"
-    content = await audio.read()
-    audio_path.write_bytes(content)
+
+    if audio is not None:
+        # Single file upload
+        content = await audio.read()
+        audio_path.write_bytes(content)
+    else:
+        # Multiple files - concatenate them
+        combined_audio: Optional[AudioSegment] = None
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+
+            for i, part in enumerate(audio_parts):
+                # Save each part temporarily
+                part_content = await part.read()
+                part_path = tmp_path / f"part_{i}{Path(part.filename or '.mp3').suffix}"
+                part_path.write_bytes(part_content)
+
+                # Load and concatenate
+                segment = AudioSegment.from_file(str(part_path))
+                if combined_audio is None:
+                    combined_audio = segment
+                else:
+                    combined_audio = combined_audio + segment
+
+            # Export combined audio
+            if combined_audio is not None:
+                combined_audio.export(str(audio_path), format="wav")
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Failed to process audio parts"
+                )
 
     # Update phase
     project.phase = ProjectPhase.PROCESSING

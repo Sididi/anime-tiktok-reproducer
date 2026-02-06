@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import {
   Loader2,
@@ -7,11 +7,25 @@ import {
   ArrowRight,
   Upload,
   FileAudio,
+  Files,
+  FileAudio2,
 } from "lucide-react";
 import { Button } from "@/components/ui";
 import { useProjectStore, useSceneStore } from "@/stores";
 import { api } from "@/api/client";
 import type { Transcription, Project } from "@/types";
+
+// Upload mode types
+type UploadMode = "single" | "multiple";
+
+// Segment type for multi-file upload
+interface AudioSegment {
+  id: number;
+  sceneIndices: number[];
+  text: string;
+  characterCount: number;
+}
+
 
 // French-only prompt template (when target is French)
 const PROMPT_FR_TEMPLATE = `# RÔLE
@@ -184,6 +198,123 @@ const LANGUAGE_DISPLAY_NAMES: Record<string, string> = {
 
 type TargetLanguage = "fr" | "en" | "es";
 
+// Check if text ends with sentence-ending punctuation
+function endsWithSentence(text: string): boolean {
+  const trimmed = text.trim();
+  return /[.!?]$/.test(trimmed);
+}
+
+// ElevenLabs optimal character range
+const ELEVENLABS_MIN = 800;
+const ELEVENLABS_MAX = 1000;
+const ELEVENLABS_SOFT_MIN = 700; // Fallback threshold when 800+ isn't possible
+const ELEVENLABS_HARD_LIMIT = 1800; // Force split to prevent runaway
+
+// Segment scenes into groups based on character limit for ElevenLabs
+// Only splits at sentence boundaries (., !, ?) to preserve context
+// Prefers splitting within the 800-1000 char sweet spot
+function segmentScenes(
+  scenes: Array<{ scene_index: number; text: string }>,
+): AudioSegment[] {
+  const segments: AudioSegment[] = [];
+  let currentSegment: AudioSegment = {
+    id: 1,
+    sceneIndices: [],
+    text: "",
+    characterCount: 0,
+  };
+
+  // Track split candidates at sentence boundaries
+  let bestSplit: {
+    sceneIndex: number;
+    segment: AudioSegment;
+    priority: number; // Higher = better (800-1000 is best)
+  } | null = null;
+
+  for (let i = 0; i < scenes.length; i++) {
+    const scene = scenes[i];
+    const sceneText = scene.text;
+
+    // Add scene to current segment
+    currentSegment.sceneIndices.push(scene.scene_index);
+    currentSegment.text += (currentSegment.text ? " " : "") + sceneText;
+    currentSegment.characterCount += sceneText.length;
+
+    // If this is a sentence boundary, evaluate as split candidate
+    if (endsWithSentence(currentSegment.text)) {
+      const chars = currentSegment.characterCount;
+      let priority = 0;
+
+      if (chars >= ELEVENLABS_MIN && chars <= ELEVENLABS_MAX) {
+        // Perfect: within 800-1000 range
+        priority = 3;
+      } else if (chars >= ELEVENLABS_SOFT_MIN && chars < ELEVENLABS_MIN) {
+        // Good fallback: 700-799 range
+        priority = 2;
+      } else if (chars >= 500) {
+        // Acceptable: 500-699 range
+        priority = 1;
+      }
+
+      // Save if better than current best, or if we don't have one yet
+      if (priority > 0 && (bestSplit === null || priority >= bestSplit.priority)) {
+        bestSplit = {
+          sceneIndex: i,
+          segment: {
+            ...currentSegment,
+            sceneIndices: [...currentSegment.sceneIndices], // Deep copy array
+          },
+          priority,
+        };
+      }
+    }
+
+    // Check if we should split
+    const exceededMax = currentSegment.characterCount > ELEVENLABS_MAX;
+    const exceededHardLimit =
+      currentSegment.characterCount >= ELEVENLABS_HARD_LIMIT;
+
+    if (exceededMax || exceededHardLimit) {
+      if (bestSplit !== null) {
+        // Use the best split point we found
+        segments.push(bestSplit.segment);
+
+        // Rebuild current segment with remaining scenes
+        const remainingStartIndex = bestSplit.sceneIndex + 1;
+        const remainingScenes = scenes.slice(remainingStartIndex, i + 1);
+
+        currentSegment = {
+          id: segments.length + 1,
+          sceneIndices: remainingScenes.map((s) => s.scene_index),
+          text: remainingScenes.map((s) => s.text).join(" "),
+          characterCount: remainingScenes.reduce(
+            (sum, s) => sum + s.text.length,
+            0,
+          ),
+        };
+        bestSplit = null;
+      } else if (endsWithSentence(currentSegment.text) || exceededHardLimit) {
+        // No good split point found, but we end with sentence or hit hard limit
+        segments.push(currentSegment);
+        currentSegment = {
+          id: segments.length + 1,
+          sceneIndices: [],
+          text: "",
+          characterCount: 0,
+        };
+      }
+      // else: keep accumulating until we find a sentence end
+    }
+  }
+
+  // Don't forget the last segment
+  if (currentSegment.sceneIndices.length > 0) {
+    segments.push(currentSegment);
+  }
+
+  return segments;
+}
+
 function generatePrompt(
   transcription: Transcription,
   project: Project | null,
@@ -254,8 +385,30 @@ export function ScriptRestructurePage() {
   const [jsonValid, setJsonValid] = useState(false);
 
   // Audio file state
+  const [uploadMode, setUploadMode] = useState<UploadMode>("multiple");
   const [audioFile, setAudioFile] = useState<File | null>(null);
+  const [segmentFiles, setSegmentFiles] = useState<Map<number, File>>(
+    new Map(),
+  );
+  const [copiedSegment, setCopiedSegment] = useState<number | null>(null);
   const [uploading, setUploading] = useState(false);
+
+  // Parse scenes from JSON for segmentation
+  const parsedScenes = useMemo(() => {
+    if (!jsonValid || !newScriptJson) return null;
+    try {
+      const parsed = JSON.parse(newScriptJson);
+      return parsed.scenes as Array<{ scene_index: number; text: string }>;
+    } catch {
+      return null;
+    }
+  }, [jsonValid, newScriptJson]);
+
+  // Compute segments when JSON is valid
+  const audioSegments = useMemo(() => {
+    if (!parsedScenes) return [];
+    return segmentScenes(parsedScenes);
+  }, [parsedScenes]);
 
   // Load data
   useEffect(() => {
@@ -336,17 +489,61 @@ export function ScriptRestructurePage() {
     [],
   );
 
+  const handleSegmentFileSelect = useCallback(
+    (segmentId: number, e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (file) {
+        if (!file.type.startsWith("audio/")) {
+          setError("Please select an audio file");
+          return;
+        }
+        setSegmentFiles((prev) => {
+          const next = new Map(prev);
+          next.set(segmentId, file);
+          return next;
+        });
+        setError(null);
+      }
+    },
+    [],
+  );
+
+  const handleCopySegment = useCallback(async (segment: AudioSegment) => {
+    await navigator.clipboard.writeText(segment.text);
+    setCopiedSegment(segment.id);
+    setTimeout(() => setCopiedSegment(null), 2000);
+  }, []);
+
   const handleContinue = useCallback(async () => {
-    if (!projectId || !jsonValid || !audioFile) return;
+    if (!projectId || !jsonValid) return;
+
+    // Validate based on upload mode
+    if (uploadMode === "single" && !audioFile) return;
+    if (uploadMode === "multiple") {
+      const allSegmentsHaveFiles = audioSegments.every((seg) =>
+        segmentFiles.has(seg.id),
+      );
+      if (!allSegmentsHaveFiles) return;
+    }
 
     setUploading(true);
     setError(null);
 
     try {
-      // Submit new script and audio
       const formData = new FormData();
       formData.append("script", newScriptJson);
-      formData.append("audio", audioFile);
+
+      if (uploadMode === "single") {
+        formData.append("audio", audioFile!);
+      } else {
+        // Send multiple files in order
+        for (const segment of audioSegments) {
+          const file = segmentFiles.get(segment.id);
+          if (file) {
+            formData.append("audio_parts", file);
+          }
+        }
+      }
 
       const response = await fetch(
         `/api/projects/${projectId}/script/restructured`,
@@ -369,7 +566,16 @@ export function ScriptRestructurePage() {
     } finally {
       setUploading(false);
     }
-  }, [projectId, jsonValid, audioFile, newScriptJson, navigate]);
+  }, [
+    projectId,
+    jsonValid,
+    audioFile,
+    newScriptJson,
+    navigate,
+    uploadMode,
+    audioSegments,
+    segmentFiles,
+  ]);
 
   if (loading) {
     return (
@@ -390,7 +596,13 @@ export function ScriptRestructurePage() {
   }
 
   const prompt = generatePrompt(transcription, project, targetLanguage);
-  const canContinue = jsonValid && audioFile !== null;
+  const canContinue =
+    jsonValid &&
+    (uploadMode === "single"
+      ? audioFile !== null
+      : audioSegments.length > 0 &&
+        audioSegments.every((seg) => segmentFiles.has(seg.id)));
+  const uploadedSegmentsCount = segmentFiles.size;
 
   return (
     <div className="min-h-screen p-4">
@@ -513,6 +725,27 @@ export function ScriptRestructurePage() {
             and upload it here.
           </p>
 
+          {/* Upload Mode Selector */}
+          <div className="flex items-center gap-2">
+            <select
+              value={uploadMode}
+              onChange={(e) => {
+                setUploadMode(e.target.value as UploadMode);
+                setAudioFile(null);
+                setSegmentFiles(new Map());
+              }}
+              className="p-2 rounded-md border border-[hsl(var(--input))] bg-[hsl(var(--background))] text-sm"
+            >
+              <option value="multiple">Multiple files (Recommended)</option>
+              <option value="single">Single file</option>
+            </select>
+            <span className="text-xs text-[hsl(var(--muted-foreground))]">
+              {uploadMode === "multiple"
+                ? "Split into segments for better ElevenLabs quality"
+                : "Upload one combined audio file"}
+            </span>
+          </div>
+
           <input
             ref={fileInputRef}
             type="file"
@@ -521,32 +754,154 @@ export function ScriptRestructurePage() {
             className="hidden"
           />
 
-          {audioFile ? (
-            <div className="flex items-center gap-3 p-3 bg-[hsl(var(--muted))] rounded-lg">
-              <FileAudio className="h-8 w-8 text-[hsl(var(--primary))]" />
-              <div className="flex-1 min-w-0">
-                <p className="font-medium truncate">{audioFile.name}</p>
-                <p className="text-xs text-[hsl(var(--muted-foreground))]">
-                  {(audioFile.size / (1024 * 1024)).toFixed(2)} MB
-                </p>
-              </div>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => fileInputRef.current?.click()}
-              >
-                Change
-              </Button>
-            </div>
+          {uploadMode === "single" ? (
+            // Single file upload (original behavior)
+            <>
+              {audioFile ? (
+                <div className="flex items-center gap-3 p-3 bg-[hsl(var(--muted))] rounded-lg">
+                  <FileAudio className="h-8 w-8 text-[hsl(var(--primary))]" />
+                  <div className="flex-1 min-w-0">
+                    <p className="font-medium truncate">{audioFile.name}</p>
+                    <p className="text-xs text-[hsl(var(--muted-foreground))]">
+                      {(audioFile.size / (1024 * 1024)).toFixed(2)} MB
+                    </p>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => fileInputRef.current?.click()}
+                  >
+                    Change
+                  </Button>
+                </div>
+              ) : (
+                <Button
+                  variant="outline"
+                  className="w-full h-24 border-dashed"
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  <Upload className="h-6 w-6 mr-2" />
+                  Click to upload audio file
+                </Button>
+              )}
+            </>
           ) : (
-            <Button
-              variant="outline"
-              className="w-full h-24 border-dashed"
-              onClick={() => fileInputRef.current?.click()}
-            >
-              <Upload className="h-6 w-6 mr-2" />
-              Click to upload audio file
-            </Button>
+            // Multiple files upload
+            <>
+              {!jsonValid ? (
+                <div className="p-4 bg-[hsl(var(--muted))] rounded-lg text-center">
+                  <Files className="h-8 w-8 mx-auto mb-2 text-[hsl(var(--muted-foreground))]" />
+                  <p className="text-sm text-[hsl(var(--muted-foreground))]">
+                    Paste valid JSON in Step 2 to see audio segments
+                  </p>
+                </div>
+              ) : audioSegments.length === 0 ? (
+                <div className="p-4 bg-[hsl(var(--muted))] rounded-lg text-center">
+                  <p className="text-sm text-[hsl(var(--muted-foreground))]">
+                    No segments generated from script
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between text-sm">
+                    <span className="text-[hsl(var(--muted-foreground))]">
+                      {audioSegments.length} segment
+                      {audioSegments.length > 1 ? "s" : ""} (800-1000 chars
+                      target for optimal quality)
+                    </span>
+                    <span className="text-[hsl(var(--muted-foreground))]">
+                      {uploadedSegmentsCount}/{audioSegments.length} uploaded
+                    </span>
+                  </div>
+                  {audioSegments.map((segment) => {
+                    const file = segmentFiles.get(segment.id);
+                    const inputId = `segment-file-${segment.id}`;
+                    return (
+                      <div
+                        key={segment.id}
+                        className="border border-[hsl(var(--border))] rounded-lg p-3 space-y-2"
+                      >
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <span className="font-medium text-sm">
+                              Part {segment.id}
+                            </span>
+                            <span className="text-xs px-2 py-0.5 bg-[hsl(var(--muted))] rounded">
+                              Scenes{" "}
+                              {segment.sceneIndices.length === 1
+                                ? segment.sceneIndices[0]
+                                : `${segment.sceneIndices[0]}-${segment.sceneIndices[segment.sceneIndices.length - 1]}`}
+                            </span>
+                            <span className="text-xs text-[hsl(var(--muted-foreground))]">
+                              {segment.characterCount} chars
+                            </span>
+                          </div>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => handleCopySegment(segment)}
+                            className="h-7 px-2"
+                          >
+                            {copiedSegment === segment.id ? (
+                              <>
+                                <Check className="h-3 w-3 mr-1" />
+                                Copied
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="h-3 w-3 mr-1" />
+                                Copy text
+                              </>
+                            )}
+                          </Button>
+                        </div>
+                        <div className="text-xs text-[hsl(var(--muted-foreground))] line-clamp-2 italic">
+                          "{segment.text.slice(0, 150)}
+                          {segment.text.length > 150 ? "..." : ""}"
+                        </div>
+                        <input
+                          id={inputId}
+                          type="file"
+                          accept="audio/*"
+                          onChange={(e) => handleSegmentFileSelect(segment.id, e)}
+                          className="hidden"
+                        />
+                        {file ? (
+                          <div className="flex items-center gap-2 p-2 bg-[hsl(var(--muted))] rounded">
+                            <FileAudio2 className="h-5 w-5 text-green-500" />
+                            <span className="text-xs truncate flex-1">
+                              {file.name}
+                            </span>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-6 px-2 text-xs"
+                              onClick={() =>
+                                document.getElementById(inputId)?.click()
+                              }
+                            >
+                              Change
+                            </Button>
+                          </div>
+                        ) : (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="w-full h-10 border-dashed"
+                            onClick={() =>
+                              document.getElementById(inputId)?.click()
+                            }
+                          >
+                            <Upload className="h-4 w-4 mr-2" />
+                            Upload Part {segment.id}
+                          </Button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </>
           )}
         </div>
 
@@ -568,9 +923,20 @@ export function ScriptRestructurePage() {
             </li>
             <li className="flex items-center gap-2">
               <div
-                className={`h-3 w-3 rounded-full ${audioFile ? "bg-green-500" : "bg-[hsl(var(--border))]"}`}
+                className={`h-3 w-3 rounded-full ${
+                  uploadMode === "single"
+                    ? audioFile
+                      ? "bg-green-500"
+                      : "bg-[hsl(var(--border))]"
+                    : uploadedSegmentsCount === audioSegments.length &&
+                        audioSegments.length > 0
+                      ? "bg-green-500"
+                      : "bg-[hsl(var(--border))]"
+                }`}
               />
-              TTS audio uploaded
+              {uploadMode === "single"
+                ? "TTS audio uploaded"
+                : `TTS audio uploaded (${uploadedSegmentsCount}/${audioSegments.length} parts)`}
             </li>
           </ul>
         </div>
