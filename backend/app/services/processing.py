@@ -719,8 +719,8 @@ class ProcessingService:
                 "end": round(timeline_end_snapped, 6),
                 "text": subtitle_text,
                 "clipName": Path(episode).stem,
-                "source_in": round(source_in_sec, 4),
-                "source_out": round(source_out_sec, 4),
+                "source_in": round(clip_timing.source_in_seconds, 6),
+                "source_out": round(clip_timing.source_out_seconds, 6),
                 "clip_duration": round(clip_timing.source_duration.to_seconds(), 4),
                 "target_duration": round(clip_timing.target_duration.to_seconds(), 4),
                 "speed_ratio": round(float(clip_timing.speed_ratio), 4),
@@ -788,15 +788,28 @@ class ProcessingService:
     $.sleep(ms);
   }}
   var TICKS_PER_SECOND = 254016000000; // Premiere Pro timebase constant
+  var SEQ_FPS = 60; // TikTok preset is 60fps
+  var TICKS_PER_FRAME = TICKS_PER_SECOND / SEQ_FPS;
+
+  function snapSecondsToFrame(sec) {{
+    // Add small epsilon to prevent floating-point rounding errors
+    // Values like 17.583333 (representing 1055/60) become 1054.99998 due to float precision
+    // Without epsilon, this can cause 1-frame drift when truncated elsewhere
+    return Math.round(sec * SEQ_FPS + 0.0001) / SEQ_FPS;
+  }}
 
   function secondsToTicks(sec) {{
-    return Math.round(sec * TICKS_PER_SECOND);
+    // Snap to frame boundaries to avoid 1-frame drift
+    // Add small epsilon to prevent floating-point rounding errors (same as snapSecondsToFrame)
+    return Math.round(sec * SEQ_FPS + 0.0001) * TICKS_PER_FRAME;
   }}
 
   function buildTimeFromSeconds(sec) {{
     var t = new Time();
     try {{
-      t.ticks = secondsToTicks(sec);
+      // 2025: ticks might need to be a String or Number.
+      // Safe to assign Number, PPro handles it.
+      t.ticks = secondsToTicks(sec).toString();
     }} catch (e) {{
       t.seconds = sec;
     }}
@@ -805,56 +818,60 @@ class ProcessingService:
 
   function getStartTicks(item) {{
     if (!item || !item.start) return null;
-    try {{
-      if (typeof item.start.ticks === "number") return item.start.ticks;
-    }} catch (e) {{}}
-    try {{
-      if (typeof item.start.seconds === "number")
-        return secondsToTicks(item.start.seconds);
-    }} catch (e2) {{}}
-    try {{
-      if (typeof item.start.secs === "number")
-        return secondsToTicks(item.start.secs);
-    }} catch (e3) {{}}
+    // PPro 2024/2025: .ticks is often a String. Parse it!
+    if (item.start.ticks !== undefined) {{
+      var val = parseInt(item.start.ticks, 10);
+      if (!isNaN(val)) return val;
+    }}
+    // Fallback
+    if (typeof item.start.seconds === "number") {{
+      return secondsToTicks(item.start.seconds);
+    }}
     return null;
   }}
 
   function findTrackItemAtStart(track, startSeconds, nameRef) {{
     if (!track || !track.clips) return null;
+
     var targetTicks = secondsToTicks(startSeconds);
-    var toleranceTicks = secondsToTicks(0.25);
+    // Relaxed tolerance
+    var toleranceTicks = secondsToTicks(0.1);
+
+    var bestItem = null;
+    var minDiff = toleranceTicks + 1;
+
     for (var i = 0; i < track.clips.numItems; i++) {{
       var item = track.clips[i];
       if (!item) continue;
-      var itemStartTicks = getStartTicks(item);
-      if (typeof itemStartTicks === "number") {{
-        if (Math.abs(itemStartTicks - targetTicks) > toleranceTicks) continue;
-      }} else {{
-        // Fallback to seconds if ticks not available
-        try {{
-          if (
-            typeof item.start.seconds === "number" &&
-            Math.abs(item.start.seconds - startSeconds) > 0.25
-          ) {{
-            continue;
-          }}
-        }} catch (e) {{}}
-      }}
 
-      if (nameRef) {{
-        var itemName = item.name ? item.name.toString() : "";
-        if (itemName.replace(/\\s/g, "") !== "") {{
-          if (
-            itemName.indexOf(nameRef) === -1 &&
-            nameRef.indexOf(itemName) === -1
-          ) {{
-            continue;
+      var itemTicks = getStartTicks(item);
+      if (itemTicks === null) continue;
+
+      var diff = Math.abs(itemTicks - targetTicks);
+
+      if (diff <= toleranceTicks) {{
+        // Name Check
+        if (nameRef) {{
+          var itemName = item.name ? item.name.toString() : "";
+          if (itemName.replace(/\\s/g, "") !== "") {{
+            // Check containment both ways
+            if (
+              itemName.indexOf(nameRef) === -1 &&
+              nameRef.indexOf(itemName) === -1
+            ) {{
+              continue;
+            }}
           }}
         }}
+
+        // We found a candidate. Is it the best one?
+        if (diff < minDiff) {{
+          minDiff = diff;
+          bestItem = item;
+        }}
       }}
-      return item;
     }}
-    return null;
+    return bestItem;
   }}
 
   function setTrackItemInOut(track, startSeconds, inSeconds, outSeconds, nameRef) {{
@@ -987,9 +1004,11 @@ class ProcessingService:
     // --- MARKERS ---
     log("Creating Markers...");
     for (var i = 0; i < scenes.length; i++) {{
-      var m = sequence.markers.createMarker(scenes[i].start);
+      var mStart = snapSecondsToFrame(scenes[i].start);
+      var mEnd = snapSecondsToFrame(scenes[i].end);
+      var m = sequence.markers.createMarker(mStart);
       m.name = "Scene " + scenes[i].scene_index;
-      m.duration = scenes[i].end - scenes[i].start;
+      m.duration = mEnd - mStart;
     }}
 
     // --- INTERLEAVED PROCESSING (V1 & V3) ---
@@ -1001,23 +1020,27 @@ class ProcessingService:
 
     for (var i = 0; i < scenes.length; i++) {{
       var s = scenes[i];
+      var startSec = snapSecondsToFrame(s.start);
       var clip = getOrImportClip(s.clipName);
       var cleanName = nameCleaner(s.clipName);
 
       if (clip) {{
         // 1. PLACE ON V3 (Main)
-        if (v3) v3.overwriteClip(clip, s.start);
+        if (v3) v3.overwriteClip(clip, startSec);
 
         // 2. PLACE ON V1 (Background)
-        if (v1) v1.overwriteClip(clip, s.start);
+        if (v1) v1.overwriteClip(clip, startSec);
 
         // 2b. SET PER-INSTANCE IN/OUT (TrackItem) TO AVOID UNIT AMBIGUITY
         sleep(200);
         var v3Item = null;
+        var v1Item = null;
+        var a1Item = null;
+        var a2Item = null;
         if (v3) {{
           v3Item = setTrackItemInOut(
             v3,
-            s.start,
+            startSec,
             s.source_in,
             s.source_out,
             cleanName
@@ -1026,7 +1049,7 @@ class ProcessingService:
             sleep(200);
             v3Item = setTrackItemInOut(
               v3,
-              s.start,
+              startSec,
               s.source_in,
               s.source_out,
               cleanName
@@ -1034,18 +1057,56 @@ class ProcessingService:
           }}
         }}
         if (v1) {{
-          var v1Item = setTrackItemInOut(
+          v1Item = setTrackItemInOut(
             v1,
-            s.start,
+            startSec,
             s.source_in,
             s.source_out,
             cleanName
           );
           if (!v1Item) {{
             sleep(200);
-            setTrackItemInOut(
+            v1Item = setTrackItemInOut(
               v1,
-              s.start,
+              startSec,
+              s.source_in,
+              s.source_out,
+              cleanName
+            );
+          }}
+        }}
+        if (a1) {{
+          a1Item = setTrackItemInOut(
+            a1,
+            startSec,
+            s.source_in,
+            s.source_out,
+            cleanName
+          );
+          if (!a1Item) {{
+            sleep(200);
+            a1Item = setTrackItemInOut(
+              a1,
+              startSec,
+              s.source_in,
+              s.source_out,
+              cleanName
+            );
+          }}
+        }}
+        if (a2 && a2 !== a1) {{
+          a2Item = setTrackItemInOut(
+            a2,
+            startSec,
+            s.source_in,
+            s.source_out,
+            cleanName
+          );
+          if (!a2Item) {{
+            sleep(200);
+            a2Item = setTrackItemInOut(
+              a2,
+              startSec,
               s.source_in,
               s.source_out,
               cleanName
@@ -1059,23 +1120,36 @@ class ProcessingService:
         clearSelection(sequence);
         sleep(200);
 
-        // 3. APPLY SPEED (Both V1, V3)
-        // Skip Audio A1 speed change to reduce QE calls/crashes (A1 is muted and overwritten anyway)
+        // 3. ENFORCE DURATION (ALL SPEEDS)
+        // Always enforce the target timeline duration, even at 1.0x.
+        // If in/out fails or speed is exactly 1.0, this prevents huge clip lengths.
+        var newDurationSeconds = snapSecondsToFrame(s.clip_duration / s.effective_speed);
+        if (v3Item) {{ try {{ var newEnd = v3Item.start.seconds + newDurationSeconds; v3Item.end = buildTimeFromSeconds(newEnd); }} catch (e) {{}} }}
+        if (v1Item) {{ try {{ var newEnd = v1Item.start.seconds + newDurationSeconds; v1Item.end = buildTimeFromSeconds(newEnd); }} catch (e) {{}} }}
+        if (a1Item) {{ try {{ var newEnd = a1Item.start.seconds + newDurationSeconds; a1Item.end = buildTimeFromSeconds(newEnd); }} catch (e) {{}} }}
+        if (a2Item) {{ try {{ var newEnd = a2Item.start.seconds + newDurationSeconds; a2Item.end = buildTimeFromSeconds(newEnd); }} catch (e) {{}} }}
+
+        // 4. APPLY SPEED (Both V1, V3, A1, A2)
+        // QE setSpeed often fails to ripple-edit duration for speedups, so we pre-resize above.
         if (Math.abs(s.effective_speed - 1.0) > 0.01) {{
           if (v3)
-            safeApplySpeedQE(s.start, s.effective_speed, 2, "Video", cleanName); // V3 is index 2
+            safeApplySpeedQE(startSec, s.effective_speed, 2, "Video", cleanName);
           if (v1)
-            safeApplySpeedQE(s.start, s.effective_speed, 0, "Video", cleanName); // V1 is index 0
+            safeApplySpeedQE(startSec, s.effective_speed, 0, "Video", cleanName);
+          if (a1 && a1Item)
+            safeApplySpeedQE(startSec, s.effective_speed, 0, "Audio", cleanName);
+          if (a2 && a2Item && a2 !== a1)
+            safeApplySpeedQE(startSec, s.effective_speed, 1, "Audio", cleanName);
         }}
 
         // 4. APPLY SCALE (Standard API)
         // Need to find the items we just placed.
-        if (v3) setScaleAndPosition(v3, s.start, 68); // Main Scaled Down
-        if (v1) setScaleAndPosition(v1, s.start, 183); // Background Scaled Up
+        if (v3) setScaleAndPosition(v3, startSec, 68); // Main Scaled Down
+        if (v1) setScaleAndPosition(v1, startSec, 183); // Background Scaled Up
 
         sleep(200);
         if (v3) {{
-          var v3ItemForLog = findTrackItemAtStart(v3, s.start, cleanName);
+          var v3ItemForLog = findTrackItemAtStart(v3, startSec, cleanName);
           if (v3ItemForLog)
             logClipDuration(v3ItemForLog, s.target_duration, "Scene " + s.scene_index);
         }}
@@ -1088,7 +1162,7 @@ class ProcessingService:
       try {{
         // Insert once at 0
         var totalDuration =
-          scenes.length > 0 ? scenes[scenes.length - 1].end : 0;
+          scenes.length > 0 ? snapSecondsToFrame(scenes[scenes.length - 1].end) : 0;
         if (totalDuration > 0) {{
           var mgt = sequence.importMGT(BORDER_MOGRT_PATH, 0, 1, 0); // Index 1 starts V2 ?? Wait, numTracks test used sequence.videoTracks[1]?
           // No, importMGT(path, time, videoTrackIndex, audioTrackIndex)
@@ -1163,31 +1237,36 @@ class ProcessingService:
           // Defensive: access properties safely
           if (!item || typeof item.start === "undefined") continue;
 
-          // Time Check (0.25s tolerance), prefer ticks when available
+          // Time Check using Ticks (Robust)
           var startTicks = null;
+          // 1. Try Ticks (String or Number)
           try {{
-            if (typeof item.start.ticks === "number") startTicks = item.start.ticks;
+            if (item.start.ticks !== undefined) {{
+              startTicks = parseInt(item.start.ticks, 10);
+            }}
           }} catch (e0) {{}}
-          if (startTicks === null) {{
+
+          // 2. Fallback to Seconds
+          if (isNaN(startTicks) || startTicks === null) {{
             try {{
               if (typeof item.start.seconds === "number")
                 startTicks = secondsToTicks(item.start.seconds);
-            }} catch (e1) {{}}
-          }}
-          if (startTicks === null) {{
-            try {{
-              if (typeof item.start.secs === "number")
+              else if (typeof item.start.secs === "number")
                 startTicks = secondsToTicks(item.start.secs);
-            }} catch (e2) {{}}
+            }} catch (e1) {{}}
           }}
 
           var matchTime = false;
-          if (typeof startTicks === "number") {{
+          if (typeof startTicks === "number" && !isNaN(startTicks)) {{
+            // Use relaxed tolerance (0.2s)
             matchTime =
               Math.abs(startTicks - secondsToTicks(startTime)) <
-              secondsToTicks(0.25);
+              secondsToTicks(0.2);
           }} else {{
-            matchTime = Math.abs(item.start.secs - startTime) < 0.25;
+            // Last resort fallback
+            try {{
+              matchTime = Math.abs(item.start.secs - startTime) < 0.2;
+            }} catch (e3) {{}}
           }}
 
           if (matchTime) {{
