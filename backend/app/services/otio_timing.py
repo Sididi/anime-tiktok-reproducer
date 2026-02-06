@@ -7,6 +7,7 @@ when converting between seconds and frames.
 
 from dataclasses import dataclass
 from fractions import Fraction
+import math
 from pathlib import Path
 from typing import NamedTuple
 
@@ -45,6 +46,22 @@ class FrameRateInfo(NamedTuple):
         """Convert seconds to frame count at this frame rate."""
         rt = self.to_rational_time(seconds)
         return int(rt.to_frames())
+
+    def frames_from_seconds_at_or_after(
+        self,
+        seconds: float,
+        epsilon_frames: float = 1e-4,
+    ) -> int:
+        """Map seconds to the first frame at/after that time.
+
+        Uses a tiny epsilon window so values that are effectively on-frame
+        after decimal serialization (e.g. 419.001917) don't get bumped by 1.
+        """
+        frame_pos = float(Fraction(str(seconds)) * self.rate)
+        nearest = round(frame_pos)
+        if abs(frame_pos - nearest) <= epsilon_frames:
+            return int(nearest)
+        return int(math.ceil(frame_pos))
 
     def seconds_from_frames(self, frames: int) -> float:
         """Convert frame count to seconds at this frame rate."""

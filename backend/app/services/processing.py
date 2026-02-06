@@ -663,8 +663,8 @@ class ProcessingService:
                 continue
 
             episode = match.episode
-            source_in_sec = match.start_time
-            source_out_sec = match.end_time
+            source_in_raw_sec = match.start_time
+            source_out_raw_sec = match.end_time
             used_alternative = False
 
             if not episode:
@@ -672,11 +672,21 @@ class ProcessingService:
                 alternative = next((alt for alt in match.alternatives if alt.episode), None)
                 if alternative:
                     episode = alternative.episode
-                    source_in_sec = alternative.start_time
-                    source_out_sec = alternative.end_time
+                    source_in_raw_sec = alternative.start_time
+                    source_out_raw_sec = alternative.end_time
                     used_alternative = True
                 else:
                     continue
+
+            # Snap source in/out to source-frame boundaries using "at-or-after" semantics.
+            # This matches what users validate in browser playback at non-frame timestamps.
+            source_in_frames = source_rate.frames_from_seconds_at_or_after(source_in_raw_sec)
+            source_out_frames = source_rate.frames_from_seconds_at_or_after(source_out_raw_sec)
+            if source_out_frames <= source_in_frames:
+                source_out_frames = source_in_frames + 1
+
+            source_in_sec = source_rate.seconds_from_frames(source_in_frames)
+            source_out_sec = source_rate.seconds_from_frames(source_out_frames)
 
             # Timeline position from TTS transcription words (seconds)
             # Use adjusted end time to eliminate gaps between scenes
@@ -719,6 +729,8 @@ class ProcessingService:
                 "end": round(timeline_end_snapped, 6),
                 "text": subtitle_text,
                 "clipName": Path(episode).stem,
+                "source_in_frame": source_in_frames,
+                "source_out_frame": source_out_frames,
                 "source_in": round(clip_timing.source_in_seconds, 6),
                 "source_out": round(clip_timing.source_out_seconds, 6),
                 "clip_duration": round(clip_timing.source_duration.to_seconds(), 4),
@@ -789,6 +801,8 @@ class ProcessingService:
   }}
   var TICKS_PER_SECOND = 254016000000; // Premiere Pro timebase constant
   var SEQ_FPS = 60; // TikTok preset is 60fps
+  var SOURCE_FPS_NUM = {source_rate.rate.numerator};
+  var SOURCE_FPS_DEN = {source_rate.rate.denominator};
   var TICKS_PER_FRAME = TICKS_PER_SECOND / SEQ_FPS;
 
   function snapSecondsToFrame(sec) {{
@@ -804,7 +818,21 @@ class ProcessingService:
     return Math.round(sec * SEQ_FPS + 0.0001) * TICKS_PER_FRAME;
   }}
 
-  function buildTimeFromSeconds(sec) {{
+  function secondsToRawTicks(sec) {{
+    // Raw tick conversion (no sequence-frame snap), used for source in/out.
+    return Math.round(sec * TICKS_PER_SECOND);
+  }}
+
+  function sourceFramesToRawTicks(frame) {{
+    // Exact source frame -> ticks conversion (avoids decimal precision drift).
+    return Math.round((frame * TICKS_PER_SECOND * SOURCE_FPS_DEN) / SOURCE_FPS_NUM);
+  }}
+
+  function sourceFrameDurationTicks() {{
+    return (TICKS_PER_SECOND * SOURCE_FPS_DEN) / SOURCE_FPS_NUM;
+  }}
+
+  function buildSequenceTimeFromSeconds(sec) {{
     var t = new Time();
     try {{
       // 2025: ticks might need to be a String or Number.
@@ -812,6 +840,30 @@ class ProcessingService:
       t.ticks = secondsToTicks(sec).toString();
     }} catch (e) {{
       t.seconds = sec;
+    }}
+    return t;
+  }}
+
+  function buildRawTimeFromSeconds(sec) {{
+    var t = new Time();
+    try {{
+      t.ticks = secondsToRawTicks(sec).toString();
+    }} catch (e) {{
+      t.seconds = sec;
+    }}
+    return t;
+  }}
+
+  function buildRawTimeFromSourceFrame(frame, centerInFrame) {{
+    var t = new Time();
+    var center = !!centerInFrame;
+    var frameTicks = sourceFrameDurationTicks();
+    var targetTicks = sourceFramesToRawTicks(frame) + (center ? Math.floor(frameTicks / 2) : 0);
+    try {{
+      t.ticks = Math.round(targetTicks).toString();
+    }} catch (e) {{
+      // Fallback should be unreachable with valid frame numbers.
+      t.ticks = secondsToRawTicks((frame * SOURCE_FPS_DEN) / SOURCE_FPS_NUM).toString();
     }}
     return t;
   }}
@@ -874,12 +926,19 @@ class ProcessingService:
     return bestItem;
   }}
 
-  function setTrackItemInOut(track, startSeconds, inSeconds, outSeconds, nameRef) {{
+  function setTrackItemInOut(track, startSeconds, inSeconds, outSeconds, nameRef, inFrame, outFrame) {{
     var item = findTrackItemAtStart(track, startSeconds, nameRef);
     if (!item) return null;
     try {{
-      item.inPoint = buildTimeFromSeconds(inSeconds);
-      item.outPoint = buildTimeFromSeconds(outSeconds);
+      if (typeof inFrame === "number" && typeof outFrame === "number") {{
+        // In-point is nudged to frame center to avoid boundary rounding to previous frame.
+        item.inPoint = buildRawTimeFromSourceFrame(inFrame, true);
+        // Out-point stays on frame boundary (exclusive end frame).
+        item.outPoint = buildRawTimeFromSourceFrame(outFrame, false);
+      }} else {{
+        item.inPoint = buildRawTimeFromSeconds(inSeconds);
+        item.outPoint = buildRawTimeFromSeconds(outSeconds);
+      }}
     }} catch (e) {{
       log("Warning: Failed to set in/out for item at " + startSeconds);
     }}
@@ -1043,7 +1102,9 @@ class ProcessingService:
             startSec,
             s.source_in,
             s.source_out,
-            cleanName
+            cleanName,
+            s.source_in_frame,
+            s.source_out_frame
           );
           if (!v3Item) {{
             sleep(200);
@@ -1052,7 +1113,9 @@ class ProcessingService:
               startSec,
               s.source_in,
               s.source_out,
-              cleanName
+              cleanName,
+              s.source_in_frame,
+              s.source_out_frame
             );
           }}
         }}
@@ -1062,7 +1125,9 @@ class ProcessingService:
             startSec,
             s.source_in,
             s.source_out,
-            cleanName
+            cleanName,
+            s.source_in_frame,
+            s.source_out_frame
           );
           if (!v1Item) {{
             sleep(200);
@@ -1071,7 +1136,9 @@ class ProcessingService:
               startSec,
               s.source_in,
               s.source_out,
-              cleanName
+              cleanName,
+              s.source_in_frame,
+              s.source_out_frame
             );
           }}
         }}
@@ -1081,7 +1148,9 @@ class ProcessingService:
             startSec,
             s.source_in,
             s.source_out,
-            cleanName
+            cleanName,
+            s.source_in_frame,
+            s.source_out_frame
           );
           if (!a1Item) {{
             sleep(200);
@@ -1090,7 +1159,9 @@ class ProcessingService:
               startSec,
               s.source_in,
               s.source_out,
-              cleanName
+              cleanName,
+              s.source_in_frame,
+              s.source_out_frame
             );
           }}
         }}
@@ -1100,7 +1171,9 @@ class ProcessingService:
             startSec,
             s.source_in,
             s.source_out,
-            cleanName
+            cleanName,
+            s.source_in_frame,
+            s.source_out_frame
           );
           if (!a2Item) {{
             sleep(200);
@@ -1109,7 +1182,9 @@ class ProcessingService:
               startSec,
               s.source_in,
               s.source_out,
-              cleanName
+              cleanName,
+              s.source_in_frame,
+              s.source_out_frame
             );
           }}
         }}
@@ -1124,10 +1199,10 @@ class ProcessingService:
         // Always enforce the target timeline duration, even at 1.0x.
         // If in/out fails or speed is exactly 1.0, this prevents huge clip lengths.
         var newDurationSeconds = snapSecondsToFrame(s.clip_duration / s.effective_speed);
-        if (v3Item) {{ try {{ var newEnd = v3Item.start.seconds + newDurationSeconds; v3Item.end = buildTimeFromSeconds(newEnd); }} catch (e) {{}} }}
-        if (v1Item) {{ try {{ var newEnd = v1Item.start.seconds + newDurationSeconds; v1Item.end = buildTimeFromSeconds(newEnd); }} catch (e) {{}} }}
-        if (a1Item) {{ try {{ var newEnd = a1Item.start.seconds + newDurationSeconds; a1Item.end = buildTimeFromSeconds(newEnd); }} catch (e) {{}} }}
-        if (a2Item) {{ try {{ var newEnd = a2Item.start.seconds + newDurationSeconds; a2Item.end = buildTimeFromSeconds(newEnd); }} catch (e) {{}} }}
+        if (v3Item) {{ try {{ var newEnd = v3Item.start.seconds + newDurationSeconds; v3Item.end = buildSequenceTimeFromSeconds(newEnd); }} catch (e) {{}} }}
+        if (v1Item) {{ try {{ var newEnd = v1Item.start.seconds + newDurationSeconds; v1Item.end = buildSequenceTimeFromSeconds(newEnd); }} catch (e) {{}} }}
+        if (a1Item) {{ try {{ var newEnd = a1Item.start.seconds + newDurationSeconds; a1Item.end = buildSequenceTimeFromSeconds(newEnd); }} catch (e) {{}} }}
+        if (a2Item) {{ try {{ var newEnd = a2Item.start.seconds + newDurationSeconds; a2Item.end = buildSequenceTimeFromSeconds(newEnd); }} catch (e) {{}} }}
 
         // 4. APPLY SPEED (Both V1, V3, A1, A2)
         // QE setSpeed often fails to ripple-edit duration for speedups, so we pre-resize above.
