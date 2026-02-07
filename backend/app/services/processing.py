@@ -2040,6 +2040,11 @@ class ProcessingService:
                 if border_mogrt.exists():
                     zf.write(border_mogrt, "assets/White border 5px.mogrt")
 
+                # Add run_in_premiere.bat launcher
+                bat_launcher = assets_dir / "run_in_premiere.bat"
+                if bat_launcher.exists():
+                    zf.write(bat_launcher, "run_in_premiere.bat")
+
                 # Add source episode files to sources/ folder
                 # Episode names in matches may be just filenames without extension,
                 # so we need to resolve them to full paths using the anime library
@@ -2085,7 +2090,8 @@ Scenes: {scene_count}
 
 === CONTENTS ===
 
-import_project.jsx     - Premiere Pro 2025 automation script (RUN THIS)
+run_in_premiere.bat    - Double-click to run the script in Premiere Pro
+import_project.jsx     - Premiere Pro 2025 automation script
 tts_edited.wav         - Processed TTS audio (silences removed)
 subtitles.srt          - Word-timed subtitles
 source_mapping.json    - Original path to bundle path mapping
@@ -2099,11 +2105,22 @@ sources/
 
 === USAGE (Premiere Pro 2025) ===
 
-1. Extract this entire ZIP to a folder
-2. Open Adobe Premiere Pro 2025
-3. Create or open a project
-4. File > Scripts > Run Script... > Select "import_project.jsx"
-5. The script will automatically:
+Option A - Double-click launcher (recommended):
+  1. Extract this entire ZIP to a folder
+  2. Open Adobe Premiere Pro 2025 (JSX Runner panel must be installed)
+  3. Double-click "run_in_premiere.bat"
+  4. Check the JSX Runner panel for execution status
+
+Option B - Browse from within Premiere Pro:
+  1. Extract this entire ZIP to a folder
+  2. In Premiere Pro, open Window > Extensions > JSX Runner
+  3. Click "Browse & Run" and select "import_project.jsx"
+
+First-time setup:
+  Install the JSX Runner extension from the project repository
+  (premiere-extension/install_extension.bat), then restart Premiere Pro.
+
+The script will automatically:
    - Create a new sequence with correct settings
    - Import and place all clips
    - Apply speed adjustments

@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>JSX Runner</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="app">
+        <div id="header">
+            <h1>JSX Runner</h1>
+            <div id="status-indicator" class="idle" title="Watching for scripts"></div>
+        </div>
+
+        <button id="btn-browse" title="Browse for a .jsx script to run">Browse &amp; Run</button>
+
+        <div id="recent-section">
+            <h2>Recent Scripts</h2>
+            <ul id="recent-list"></ul>
+        </div>
+
+        <div id="log-section">
+            <h2>Log</h2>
+            <div id="log"></div>
+        </div>
+    </div>
+
+    <!-- CSInterface library (bundled with CEP runtime) -->
+    <script src="CSInterface.js"></script>
+    <script src="main.js"></script>
+</body>
+</html>
