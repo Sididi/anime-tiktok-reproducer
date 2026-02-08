@@ -121,7 +121,7 @@ export const api = {
   },
 
   // Scene Detection
-  detectScenes: (projectId: string, threshold = 27.0, minSceneLen = 15) => {
+  detectScenes: (projectId: string, threshold = 20.0, minSceneLen = 15) => {
     return fetch(`${API_BASE}/projects/${projectId}/scenes/detect`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -145,11 +145,11 @@ export const api = {
   getEpisodes: (projectId: string) =>
     request<{ episodes: string[] }>(`/projects/${projectId}/sources/episodes`),
 
-  findMatches: (projectId: string, sourcePath?: string) => {
+  findMatches: (projectId: string, sourcePath?: string, mergeContinuous = true) => {
     return fetch(`${API_BASE}/projects/${projectId}/matches/find`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ source_path: sourcePath }),
+      body: JSON.stringify({ source_path: sourcePath, merge_continuous: mergeContinuous }),
     });
   },
 
@@ -174,6 +174,12 @@ export const api = {
         method: "PUT",
         body: JSON.stringify(data),
       },
+    ),
+
+  undoMerge: (projectId: string, sceneIndex: number) =>
+    request<{ scenes: import("@/types").Scene[]; matches: import("@/types").SceneMatch[] }>(
+      `/projects/${projectId}/matches/undo-merge/${sceneIndex}`,
+      { method: "POST" },
     ),
 
   // Source video

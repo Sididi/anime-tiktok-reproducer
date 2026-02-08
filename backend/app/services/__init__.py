@@ -9,10 +9,11 @@ from .subtitle_video import SubtitleVideoService
 from .subtitle_renderer import SubtitleFrameRenderer
 from .subtitle_styles import get_style, list_styles
 from .gap_resolution import GapResolutionService
+from .scene_merger import SceneMergerService
 
 __all__ = [
     "ProjectService", "DownloaderService", "SceneDetectorService",
     "AnimeMatcherService", "AnimeLibraryService", "TranscriberService", "ProcessingService",
     "SubtitleVideoService", "SubtitleFrameRenderer", "get_style", "list_styles",
-    "GapResolutionService",
+    "GapResolutionService", "SceneMergerService",
 ]

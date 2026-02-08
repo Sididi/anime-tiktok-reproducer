@@ -387,6 +387,9 @@ class AnimeMatcherService:
         scenes: SceneList,
         library_path: Path,
         anime_name: str | None = None,
+        scene_indices_to_match: list[int] | None = None,
+        existing_matches: MatchList | None = None,
+        pass_label: str = "",
     ) -> AsyncIterator[MatchProgress]:
         """
         Match all scenes in a video to anime source episodes.
@@ -396,15 +399,24 @@ class AnimeMatcherService:
             scenes: List of detected scenes
             library_path: Path to the indexed anime library
             anime_name: Optional anime name to filter search results
+            scene_indices_to_match: If set, only match these scene indices
+            existing_matches: Pre-existing matches to copy for skipped scenes
+            pass_label: Optional prefix for progress messages (e.g. "Pass 1: ")
 
         Yields:
             MatchProgress objects with status updates
         """
         total_scenes = len(scenes.scenes)
+        scenes_to_process = (
+            len(scene_indices_to_match) if scene_indices_to_match is not None
+            else total_scenes
+        )
+        prefix = f"{pass_label}" if pass_label else ""
+
         yield MatchProgress(
             "starting",
             0,
-            f"Initializing matcher for {total_scenes} scenes...",
+            f"{prefix}Initializing matcher for {scenes_to_process} scenes...",
             0,
             total_scenes,
         )
@@ -425,12 +437,33 @@ class AnimeMatcherService:
             return
 
         matches = MatchList()
+        processed_count = 0
 
         for i, scene in enumerate(scenes.scenes):
+            # Skip scenes not in the target list
+            if scene_indices_to_match is not None and i not in scene_indices_to_match:
+                # Copy existing match
+                if existing_matches and i < len(existing_matches.matches):
+                    match_copy = existing_matches.matches[i].model_copy()
+                    match_copy.scene_index = scene.index
+                    matches.matches.append(match_copy)
+                else:
+                    matches.matches.append(SceneMatch(
+                        scene_index=scene.index,
+                        episode="",
+                        start_time=0,
+                        end_time=0,
+                        confidence=0,
+                        speed_ratio=1.0,
+                        was_no_match=True,
+                    ))
+                continue
+
+            processed_count += 1
             yield MatchProgress(
                 "matching",
-                i / total_scenes,
-                f"Matching scene {i + 1}/{total_scenes}",
+                processed_count / scenes_to_process,
+                f"{prefix}Matching scene {processed_count}/{scenes_to_process}",
                 i + 1,
                 total_scenes,
             )

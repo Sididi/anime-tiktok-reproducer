@@ -35,6 +35,7 @@ class SceneMatch(BaseModel):
     speed_ratio: float  # tiktok_duration / source_duration
     confirmed: bool = False
     was_no_match: bool = False  # Track if initially no match was found
+    merged_from: list[int] | None = None  # Original scene indices before merge (e.g. [3, 4])
 
     # Top 5 alternative matches for quick selection (Weighted Voting algorithm)
     alternatives: list[AlternativeMatch] = []

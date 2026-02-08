@@ -5,8 +5,8 @@ import json
 from pathlib import Path
 
 from ...config import settings
-from ...models import ProjectPhase, MatchList
-from ...services import ProjectService, AnimeMatcherService
+from ...models import ProjectPhase, MatchList, SceneMatch, Scene, SceneList
+from ...services import ProjectService, AnimeMatcherService, SceneMergerService
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["matching"])
 
@@ -17,6 +17,7 @@ class SetSourcesRequest(BaseModel):
 
 class FindMatchesRequest(BaseModel):
     source_path: str | None = None  # Optional, defaults to anime_library_path
+    merge_continuous: bool = True  # Auto-merge continuous anime scenes
 
 
 @router.post("/sources")
@@ -81,7 +82,7 @@ async def list_episodes(project_id: str):
 
 @router.post("/matches/find")
 async def find_matches(project_id: str, request: FindMatchesRequest):
-    """Find anime source matches for all scenes."""
+    """Find anime source matches for all scenes with optional continuous scene merging."""
     project = ProjectService.load(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -106,23 +107,100 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
 
     # Get anime name for filtering (if set on project)
     anime_name = project.anime_name
+    merge_continuous = request.merge_continuous
 
     async def stream_progress():
+        # === PASS 1: Match all scenes ===
+        first_pass_label = "Pass 1: " if merge_continuous else ""
+        first_pass_matches: MatchList | None = None
+
         async for progress in AnimeMatcherService.match_scenes(
-            video_path, scenes, source_path, anime_name=anime_name
+            video_path, scenes, source_path,
+            anime_name=anime_name,
+            pass_label=first_pass_label,
         ):
             yield f"data: {json.dumps(progress.to_dict())}\n\n"
 
             if progress.status == "complete" and progress.matches:
-                # Save matches
-                ProjectService.save_matches(project_id, progress.matches)
+                first_pass_matches = progress.matches
+            elif progress.status == "error":
+                project.phase = ProjectPhase.SCENE_VALIDATION
+                ProjectService.save(project)
+                return
 
-                # Update phase
+        if not first_pass_matches:
+            return
+
+        # If merge disabled or no matches, save and finish
+        if not merge_continuous:
+            ProjectService.save_matches(project_id, first_pass_matches)
+            project.phase = ProjectPhase.MATCH_VALIDATION
+            ProjectService.save(project)
+            return
+
+        # === CONTINUITY DETECTION ===
+        yield f"data: {json.dumps({'status': 'matching', 'progress': 0.5, 'message': 'Detecting continuous scenes...', 'current_scene': 0, 'total_scenes': len(scenes.scenes), 'error': None})}\n\n"
+
+        pairs = SceneMergerService.detect_continuous_pairs(scenes, first_pass_matches)
+
+        if not pairs:
+            # No continuous scenes found, save first pass results
+            ProjectService.save_matches(project_id, first_pass_matches)
+            project.phase = ProjectPhase.MATCH_VALIDATION
+            ProjectService.save(project)
+            yield f"data: {json.dumps({'status': 'complete', 'progress': 1.0, 'message': f'Matched {len(first_pass_matches.matches)} scenes (no continuous scenes found)', 'current_scene': len(scenes.scenes), 'total_scenes': len(scenes.scenes), 'error': None, 'matches': first_pass_matches.model_dump()})}\n\n"
+            return
+
+        chains = SceneMergerService.build_merge_chains(pairs, scenes, first_pass_matches)
+
+        if not chains:
+            ProjectService.save_matches(project_id, first_pass_matches)
+            project.phase = ProjectPhase.MATCH_VALIDATION
+            ProjectService.save(project)
+            yield f"data: {json.dumps({'status': 'complete', 'progress': 1.0, 'message': f'Matched {len(first_pass_matches.matches)} scenes', 'current_scene': len(scenes.scenes), 'total_scenes': len(scenes.scenes), 'error': None, 'matches': first_pass_matches.model_dump()})}\n\n"
+            return
+
+        # === MERGE ===
+        merged_count = sum(len(c) for c in chains)
+        group_count = len(chains)
+        merged_scenes, merged_matches, backup = SceneMergerService.merge_scenes_and_matches(
+            scenes, first_pass_matches, chains,
+        )
+
+        SceneMergerService.save_pre_merge_backup(project_id, backup)
+        ProjectService.save_scenes(project_id, merged_scenes)
+
+        yield f"data: {json.dumps({'status': 'matching', 'progress': 0.6, 'message': f'Merged {merged_count} scenes into {group_count} groups. Re-matching...', 'current_scene': 0, 'total_scenes': len(merged_scenes.scenes), 'error': None})}\n\n"
+
+        # === PASS 2: Re-match only merged scenes ===
+        merged_indices = [
+            i for i, m in enumerate(merged_matches.matches)
+            if m.merged_from is not None
+        ]
+
+        async for progress in AnimeMatcherService.match_scenes(
+            video_path, merged_scenes, source_path,
+            anime_name=anime_name,
+            scene_indices_to_match=merged_indices,
+            existing_matches=merged_matches,
+            pass_label="Pass 2: ",
+        ):
+            if progress.status == "complete" and progress.matches:
+                # Preserve merged_from metadata on re-matched scenes
+                for i in merged_indices:
+                    if i < len(progress.matches.matches) and i < len(merged_matches.matches):
+                        progress.matches.matches[i].merged_from = merged_matches.matches[i].merged_from
+
+                ProjectService.save_matches(project_id, progress.matches)
                 project.phase = ProjectPhase.MATCH_VALIDATION
                 ProjectService.save(project)
 
-            elif progress.status == "error":
-                project.phase = ProjectPhase.SCENE_VALIDATION
+            yield f"data: {json.dumps(progress.to_dict())}\n\n"
+
+            if progress.status == "error":
+                # On pass 2 error, still save what we have from pass 1
+                ProjectService.save_matches(project_id, merged_matches)
+                project.phase = ProjectPhase.MATCH_VALIDATION
                 ProjectService.save(project)
 
     return StreamingResponse(
@@ -196,3 +274,24 @@ async def update_match(project_id: str, scene_index: int, request: UpdateMatchRe
     ProjectService.save_matches(project_id, matches)
 
     return {"status": "ok", "match": match.model_dump()}
+
+
+@router.post("/matches/undo-merge/{scene_index}")
+async def undo_merge(project_id: str, scene_index: int):
+    """Undo a merge for a specific scene, restoring original sub-scenes."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    result = SceneMergerService.undo_merge(project_id, scene_index)
+    if not result:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot undo: scene is not a merged scene or no backup found",
+        )
+
+    restored_scenes, restored_matches = result
+    return {
+        "scenes": [s.model_dump() for s in restored_scenes.scenes],
+        "matches": [m.model_dump() for m in restored_matches.matches],
+    }

@@ -11,6 +11,8 @@ import {
   Search,
   Sparkles,
   Wand2,
+  Undo2,
+  Merge,
 } from "lucide-react";
 import { Button } from "@/components/ui";
 import { ClippedVideoPlayer, ManualMatchModal } from "@/components/video";
@@ -40,6 +42,7 @@ interface MatchCardProps {
     startTime: number,
     endTime: number,
   ) => void;
+  onUndoMerge?: (sceneIndex: number) => void;
 }
 
 function MatchCard({
@@ -48,6 +51,7 @@ function MatchCard({
   projectId,
   episodes,
   onManualMatch,
+  onUndoMerge,
 }: MatchCardProps) {
   const [showManualModal, setShowManualModal] = useState(false);
   const tiktokPlayerRef = useRef<ClippedVideoPlayerHandle>(null);
@@ -84,11 +88,27 @@ function MatchCard({
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <h3 className="font-semibold">Scene {scene.index + 1}</h3>
-          {match.was_no_match && (
+          {match.was_no_match && !match.merged_from && (
             <span className="flex items-center gap-1 text-xs px-1.5 py-0.5 rounded bg-purple-500/10 text-purple-500 border border-purple-500/20">
               <Sparkles className="h-3 w-3" />
               manually set
             </span>
+          )}
+          {match.merged_from && (
+            <span className="flex items-center gap-1 text-xs px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-500 border border-blue-500/20">
+              <Merge className="h-3 w-3" />
+              Merged (was scenes {match.merged_from.map((i) => i + 1).join("+")})
+            </span>
+          )}
+          {match.merged_from && onUndoMerge && (
+            <button
+              onClick={() => onUndoMerge(scene.index)}
+              className="flex items-center gap-1 text-xs px-1.5 py-0.5 rounded hover:bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))] transition-colors"
+              title="Undo merge and restore original scenes"
+            >
+              <Undo2 className="h-3 w-3" />
+              Undo
+            </button>
           )}
         </div>
         {hasMatch ? (
@@ -228,6 +248,7 @@ export function MatchValidation() {
     null,
   );
   const [error, setError] = useState<string | null>(null);
+  const [mergeContinuous, setMergeContinuous] = useState(true);
 
   // Load data
   useEffect(() => {
@@ -269,7 +290,7 @@ export function MatchValidation() {
     });
 
     try {
-      const response = await api.findMatches(projectId);
+      const response = await api.findMatches(projectId, undefined, mergeContinuous);
 
       if (!response.ok) {
         throw new Error("Failed to start matching");
@@ -305,10 +326,12 @@ export function MatchValidation() {
                 const matchesWithTracking = (matchesData.matches || []).map(
                   (m) => ({
                     ...m,
-                    was_no_match: m.confidence === 0 && !m.episode,
+                    was_no_match: m.was_no_match ?? (m.confidence === 0 && !m.episode),
                   }),
                 );
                 setMatches(matchesWithTracking);
+                // Reload scenes since merge may have modified them
+                await loadScenes(projectId);
               }
 
               if (data.status === "error") {
@@ -327,7 +350,7 @@ export function MatchValidation() {
     } finally {
       setMatching(false);
     }
-  }, [projectId]);
+  }, [projectId, mergeContinuous, loadScenes]);
 
   const handleManualMatch = useCallback(
     async (
@@ -431,6 +454,25 @@ export function MatchValidation() {
     }
   }, [projectId, matches]);
 
+  const handleUndoMerge = useCallback(
+    async (sceneIndex: number) => {
+      if (!projectId) return;
+      try {
+        const result = await api.undoMerge(projectId, sceneIndex);
+        // Reload scenes and matches after undo
+        await loadScenes(projectId);
+        const matchesWithTracking = result.matches.map((m) => ({
+          ...m,
+          was_no_match: m.was_no_match ?? (m.confidence === 0 && !m.episode),
+        }));
+        setMatches(matchesWithTracking);
+      } catch (err) {
+        setError((err as Error).message);
+      }
+    },
+    [projectId, loadScenes],
+  );
+
   // Count confirmed matches (those with valid match data)
   const confirmedCount = matches.filter(
     (m) => m.confidence > 0 && m.episode,
@@ -498,6 +540,16 @@ export function MatchValidation() {
                   />
                   Recompute
                 </Button>
+                <label className="flex items-center gap-1.5 text-xs text-[hsl(var(--muted-foreground))]">
+                  <input
+                    type="checkbox"
+                    checked={mergeContinuous}
+                    onChange={(e) => setMergeContinuous(e.target.checked)}
+                    className="rounded"
+                    disabled={matching}
+                  />
+                  Merge continuous
+                </label>
                 {(() => {
                   const noMatchCount = matches.filter(
                     (m) =>
@@ -545,10 +597,21 @@ export function MatchValidation() {
                 </p>
               )}
             </div>
-            <Button onClick={handleFindMatches} disabled={!projectId}>
-              <Search className="h-4 w-4 mr-2" />
-              Find Matches
-            </Button>
+            <div className="flex flex-col items-center gap-3">
+              <Button onClick={handleFindMatches} disabled={!projectId}>
+                <Search className="h-4 w-4 mr-2" />
+                Find Matches
+              </Button>
+              <label className="flex items-center gap-2 text-sm text-[hsl(var(--muted-foreground))]">
+                <input
+                  type="checkbox"
+                  checked={mergeContinuous}
+                  onChange={(e) => setMergeContinuous(e.target.checked)}
+                  className="rounded"
+                />
+                Merge continuous scenes
+              </label>
+            </div>
           </div>
         )}
 
@@ -591,6 +654,7 @@ export function MatchValidation() {
                 projectId={projectId!}
                 episodes={episodes}
                 onManualMatch={handleManualMatch}
+                onUndoMerge={handleUndoMerge}
               />
             );
           })}

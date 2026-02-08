@@ -68,6 +68,7 @@ export interface SceneMatch {
   middle_candidates: MatchCandidate[];
   end_candidates: MatchCandidate[];
   was_no_match?: boolean; // Track if this scene was initially "no match found"
+  merged_from?: number[] | null; // Original scene indices before merge
 }
 
 export interface Word {
