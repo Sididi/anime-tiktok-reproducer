@@ -75,9 +75,18 @@ function MatchCard({
   );
 
   // Sync play both videos simultaneously using refs
-  const handleSyncPlay = useCallback(() => {
-    tiktokPlayerRef.current?.playFromStart();
-    sourcePlayerRef.current?.playFromStart();
+  // Two-phase: seek both first, then play together for precise sync
+  const handleSyncPlay = useCallback(async () => {
+    const tiktok = tiktokPlayerRef.current;
+    const source = sourcePlayerRef.current;
+    if (!tiktok || !source) {
+      tiktok?.playFromStart();
+      source?.playFromStart();
+      return;
+    }
+    await Promise.all([tiktok.seekToStart(), source.seekToStart()]);
+    tiktok.play();
+    source.play();
   }, []);
 
   return (

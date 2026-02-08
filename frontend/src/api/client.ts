@@ -242,6 +242,13 @@ export const api = {
       body: JSON.stringify({ path }),
     }),
 
+  browseDirectories: (path?: string) =>
+    request<{
+      current_path: string;
+      parent_path: string | null;
+      entries: { name: string; path: string; is_dir: boolean; has_videos: boolean }[];
+    }>(`/anime/browse${path ? `?path=${encodeURIComponent(path)}` : ""}`),
+
   // Gap Resolution
   getGaps: (projectId: string) =>
     request<{ has_gaps: boolean; gaps: GapInfo[]; total_gap_duration: number }>(

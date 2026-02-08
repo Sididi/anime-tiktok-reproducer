@@ -1,8 +1,10 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
+import { flushSync } from "react-dom";
 import { useParams, useNavigate } from "react-router-dom";
 import { Loader2, Play, ArrowRight } from "lucide-react";
 import { Button } from "@/components/ui";
 import { ClippedVideoPlayer } from "@/components/video";
+import { FloatingAudioPlayer } from "@/components/FloatingAudioPlayer";
 import { useProjectStore, useSceneStore } from "@/stores";
 import { api } from "@/api/client";
 import { formatTime } from "@/utils";
@@ -38,6 +40,24 @@ export function TranscriptionPage() {
   const [language, setLanguage] = useState("auto");
   const [editedTexts, setEditedTexts] = useState<Record<number, string>>({});
   const [error, setError] = useState<string | null>(null);
+  const [activeSceneIndex, setActiveSceneIndex] = useState(-1);
+  const [autoScroll, setAutoScroll] = useState(true);
+  const sceneRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const autoScrollRef = useRef(true);
+  autoScrollRef.current = autoScroll;
+
+  const handleSceneChange = useCallback((index: number) => {
+    // flushSync forces the highlight to paint before we scroll
+    flushSync(() => {
+      setActiveSceneIndex(index);
+    });
+    if (autoScrollRef.current) {
+      const el = sceneRefs.current.get(index);
+      if (el) {
+        el.scrollIntoView({ behavior: "instant", block: "center" });
+      }
+    }
+  }, []);
 
   // Load data
   useEffect(() => {
@@ -276,7 +296,11 @@ export function TranscriptionPage() {
               return (
                 <div
                   key={scene.index}
-                  className="bg-[hsl(var(--card))] rounded-lg p-4"
+                  ref={(el) => {
+                    if (el) sceneRefs.current.set(scene.index, el);
+                    else sceneRefs.current.delete(scene.index);
+                  }}
+                  className={`bg-[hsl(var(--card))] rounded-lg p-4 ${activeSceneIndex === scene.index ? "ring-2 ring-[hsl(var(--primary))]" : ""}`}
                 >
                   <div className="flex items-center justify-between mb-3">
                     <span className="font-medium">Scene {scene.index + 1}</span>
@@ -314,7 +338,7 @@ export function TranscriptionPage() {
               );
             })}
 
-            <div className="flex justify-end gap-2">
+            <div className="flex justify-end gap-2 pb-20">
               <Button variant="outline" onClick={handleSave}>
                 Save Changes
               </Button>
@@ -326,6 +350,16 @@ export function TranscriptionPage() {
           </div>
         )}
       </div>
+
+      {transcription && projectId && (
+        <FloatingAudioPlayer
+          videoUrl={api.getVideoUrl(projectId)}
+          scenes={scenes}
+          onSceneChange={handleSceneChange}
+          autoScroll={autoScroll}
+          onAutoScrollChange={setAutoScroll}
+        />
+      )}
     </div>
   );
 }

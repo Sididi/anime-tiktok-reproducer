@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import { Loader2, ChevronDown, Plus, FolderOpen } from "lucide-react";
 import { Button, Input } from "@/components/ui";
+import { FolderBrowserModal } from "@/components/FolderBrowserModal";
 import { useProjectStore } from "@/stores";
 import { api } from "@/api/client";
 
@@ -60,6 +61,7 @@ export function ProjectSetup() {
   const [downloading, setDownloading] = useState(false);
   const [indexing, setIndexing] = useState(false);
   const [detecting, setDetecting] = useState(false);
+  const [showFolderBrowser, setShowFolderBrowser] = useState(false);
 
   // Load indexed anime on mount
   useEffect(() => {
@@ -510,35 +512,7 @@ export function ProjectSetup() {
                       type="button"
                       variant="outline"
                       disabled={isLoading}
-                      onClick={async () => {
-                        // Use native File System Access API
-                        if ("showDirectoryPicker" in window) {
-                          try {
-                            const dirHandle = await (
-                              window as Window & {
-                                showDirectoryPicker: () => Promise<FileSystemDirectoryHandle>;
-                              }
-                            ).showDirectoryPicker();
-                            // Get the path - note: browser API doesn't expose full path for security
-                            // We need to prompt user to enter the path manually after selection
-                            // or use a backend endpoint to resolve the folder
-                            setNewAnimePath(dirHandle.name);
-                          } catch (err) {
-                            // User cancelled or error
-                            if ((err as Error).name !== "AbortError") {
-                              console.error(
-                                "Failed to open folder picker:",
-                                err,
-                              );
-                            }
-                          }
-                        } else {
-                          // Fallback: show alert for browsers without support
-                          alert(
-                            "Folder picker not supported in this browser. Please enter the path manually.",
-                          );
-                        }
-                      }}
+                      onClick={() => setShowFolderBrowser(true)}
                     >
                       <FolderOpen className="h-4 w-4" />
                     </Button>
@@ -646,6 +620,12 @@ export function ProjectSetup() {
           Enter a TikTok URL and select the anime to reproduce from
         </p>
       </div>
+
+      <FolderBrowserModal
+        open={showFolderBrowser}
+        onClose={() => setShowFolderBrowser(false)}
+        onSelect={(path) => setNewAnimePath(path)}
+      />
     </div>
   );
 }

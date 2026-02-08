@@ -178,15 +178,50 @@ class AnimeLibraryService:
             # Create destination directory
             dest_path.mkdir(parents=True, exist_ok=True)
 
-            # Copy each file
+            # Copy/remux each file
             for i, video_file in enumerate(video_files):
-                dest_file = dest_path / video_file.name
+                is_mkv = video_file.suffix.lower() == ".mkv"
+                dest_file = dest_path / (video_file.stem + ".mp4" if is_mkv else video_file.name)
+
                 if not dest_file.exists():
-                    shutil.copy2(video_file, dest_file)
+                    if is_mkv:
+                        # Remux MKV to MP4 (no re-encoding, fast)
+                        yield IndexProgress(
+                            status="copying",
+                            message=f"Remuxing {video_file.name} → .mp4",
+                            progress=(i + 0.5) / total_files * 0.3,
+                            current_file=video_file.name,
+                            total_files=total_files,
+                            completed_files=i,
+                        )
+                        try:
+                            proc = await asyncio.create_subprocess_exec(
+                                "ffmpeg", "-y", "-i", str(video_file),
+                                "-c", "copy", "-movflags", "+faststart",
+                                str(dest_file),
+                                stdout=asyncio.subprocess.DEVNULL,
+                                stderr=asyncio.subprocess.PIPE,
+                            )
+                            _, stderr = await proc.communicate()
+                            if proc.returncode != 0:
+                                import sys
+                                print(f"[WARNING] ffmpeg remux failed for {video_file.name}: {stderr.decode()[:200]}", file=sys.stderr)
+                                # Fallback: copy as-is
+                                fallback_dest = dest_path / video_file.name
+                                if not fallback_dest.exists():
+                                    shutil.copy2(video_file, fallback_dest)
+                        except FileNotFoundError:
+                            import sys
+                            print("[WARNING] ffmpeg not found, falling back to copy", file=sys.stderr)
+                            fallback_dest = dest_path / video_file.name
+                            if not fallback_dest.exists():
+                                shutil.copy2(video_file, fallback_dest)
+                    else:
+                        shutil.copy2(video_file, dest_file)
 
                 yield IndexProgress(
                     status="copying",
-                    message=f"Copying {video_file.name}",
+                    message=f"{'Remuxing' if is_mkv else 'Copying'} {video_file.name}",
                     progress=(i + 1) / total_files * 0.3,  # Copying is 30% of progress
                     current_file=video_file.name,
                     total_files=total_files,

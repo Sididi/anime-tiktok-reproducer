@@ -141,9 +141,17 @@ function GapCard({
     [gap.scene_index, gap.target_duration, onUpdate],
   );
 
-  const handleSyncPlay = useCallback(() => {
-    tiktokPlayerRef.current?.playFromStart();
-    sourcePlayerRef.current?.playFromStart();
+  const handleSyncPlay = useCallback(async () => {
+    const tiktok = tiktokPlayerRef.current;
+    const source = sourcePlayerRef.current;
+    if (!tiktok || !source) {
+      tiktok?.playFromStart();
+      source?.playFromStart();
+      return;
+    }
+    await Promise.all([tiktok.seekToStart(), source.seekToStart()]);
+    tiktok.play();
+    source.play();
   }, []);
 
   const formatSpeed = (speed: number) => {

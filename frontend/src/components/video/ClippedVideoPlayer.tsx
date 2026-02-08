@@ -20,6 +20,8 @@ interface ClippedVideoPlayerProps {
 
 export interface ClippedVideoPlayerHandle {
   playFromStart: () => void;
+  seekToStart: () => Promise<void>;
+  play: () => void;
 }
 
 /**
@@ -59,13 +61,35 @@ export const ClippedVideoPlayer = forwardRef<
     return `${src}${separator}_retry=${retryCount}`;
   }, [src, retryCount]);
 
-  // Expose playFromStart method to parent
+  // Expose playback control methods to parent
   useImperativeHandle(
     ref,
     () => ({
       playFromStart: () => {
         if (videoRef.current) {
           videoRef.current.currentTime = adjustedStartTime;
+          setIsEnded(false);
+          videoRef.current.play().catch(console.error);
+        }
+      },
+      seekToStart: () => {
+        return new Promise<void>((resolve) => {
+          const video = videoRef.current;
+          if (!video) {
+            resolve();
+            return;
+          }
+          video.currentTime = adjustedStartTime;
+          setIsEnded(false);
+          const onSeeked = () => {
+            video.removeEventListener("seeked", onSeeked);
+            resolve();
+          };
+          video.addEventListener("seeked", onSeeked);
+        });
+      },
+      play: () => {
+        if (videoRef.current) {
           setIsEnded(false);
           videoRef.current.play().catch(console.error);
         }
@@ -133,7 +157,9 @@ export const ClippedVideoPlayer = forwardRef<
     [src],
   );
 
-  // Monitor playback to enforce end boundary - use onTimeUpdate prop instead of effect
+  // Monitor playback to enforce end boundary only.
+  // Start boundary is handled by handleSeeked (user scrubbing) — not needed
+  // during normal playback since video always moves forward.
   const handleTimeUpdate = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
@@ -143,19 +169,14 @@ export const ClippedVideoPlayer = forwardRef<
       video.currentTime = endTime;
       setIsEnded(true);
     }
-    // Also check start boundary (use adjusted time)
-    if (video.currentTime < adjustedStartTime) {
-      video.currentTime = adjustedStartTime;
-    }
-  }, [adjustedStartTime, endTime]);
+  }, [endTime]);
 
   const handlePlay = useCallback(() => {
-    // When play is triggered, ensure we're within bounds
+    // Only re-seek if clearly out of bounds (with tolerance to avoid
+    // floating-point cascading seeks that cause visible stutter)
     if (videoRef.current) {
-      if (
-        videoRef.current.currentTime < adjustedStartTime ||
-        videoRef.current.currentTime >= endTime
-      ) {
+      const cur = videoRef.current.currentTime;
+      if (cur < adjustedStartTime - 0.15 || cur >= endTime) {
         videoRef.current.currentTime = adjustedStartTime;
       }
       setIsEnded(false);
@@ -166,11 +187,11 @@ export const ClippedVideoPlayer = forwardRef<
     const video = videoRef.current;
     if (!video) return;
 
-    // If user seeks before start, reset to adjusted start
-    if (video.currentTime < adjustedStartTime) {
+    // Use tolerance to prevent cascading re-seek loops from floating-point
+    // imprecision. Only clamp if genuinely out of bounds.
+    if (video.currentTime < adjustedStartTime - 0.15) {
       video.currentTime = adjustedStartTime;
     }
-    // If user seeks past end, set to end and show ended state
     if (video.currentTime >= endTime) {
       video.currentTime = endTime;
       video.pause();

@@ -1,14 +1,65 @@
 """API routes for anime library management."""
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from pathlib import Path
 import json
+import os
 
 from ...services import AnimeLibraryService
 
 router = APIRouter(prefix="/anime", tags=["anime"])
+
+VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".webm"}
+
+
+@router.get("/browse")
+async def browse_directories(path: str | None = Query(default=None)):
+    """Browse directories on the server filesystem."""
+    browse_path = Path(path) if path else Path.home()
+
+    if not browse_path.exists() or not browse_path.is_dir():
+        raise HTTPException(status_code=400, detail=f"Not a valid directory: {browse_path}")
+
+    parent_path = str(browse_path.parent) if browse_path != browse_path.parent else None
+
+    dirs = []
+    files = []
+    try:
+        for entry in sorted(browse_path.iterdir(), key=lambda e: e.name.lower()):
+            if entry.name.startswith("."):
+                continue
+            if entry.is_dir():
+                try:
+                    has_videos = any(
+                        child.suffix.lower() in VIDEO_EXTENSIONS
+                        for child in entry.iterdir()
+                        if child.is_file()
+                    )
+                except PermissionError:
+                    has_videos = False
+                dirs.append({
+                    "name": entry.name,
+                    "path": str(entry),
+                    "is_dir": True,
+                    "has_videos": has_videos,
+                })
+            elif entry.is_file() and entry.suffix.lower() in VIDEO_EXTENSIONS:
+                files.append({
+                    "name": entry.name,
+                    "path": str(entry),
+                    "is_dir": False,
+                    "has_videos": False,
+                })
+    except PermissionError:
+        raise HTTPException(status_code=403, detail=f"Permission denied: {browse_path}")
+
+    return {
+        "current_path": str(browse_path),
+        "parent_path": parent_path,
+        "entries": dirs + files,
+    }
 
 
 @router.get("/list")

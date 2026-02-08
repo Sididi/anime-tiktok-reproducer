@@ -2015,6 +2015,14 @@ class ProcessingService:
             # Step 5: Bundle everything
             bundle_path = cls.get_output_dir(project.id).parent / "project_bundle.zip"
 
+            # Derive wrapping folder name from anime name
+            import re as _re
+            _raw_name = project.anime_name or project.id
+            # Remove filesystem-unsafe characters and collapse whitespace/underscores
+            _folder_name = _re.sub(r'[<>:"/\\|?*]', '', _raw_name).strip()
+            _folder_name = _re.sub(r'[\s_]+', '_', _folder_name) or "project"
+            folder_name = _folder_name
+
             # Collect unique source episodes
             source_episodes: set[str] = set()
             for match in matches:
@@ -2023,27 +2031,27 @@ class ProcessingService:
 
             with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED) as zf:
                 # Add JSX script (main entry point)
-                zf.write(jsx_path, "import_project.jsx")
+                zf.write(jsx_path, f"{folder_name}/import_project.jsx")
 
                 # Add edited TTS audio (root level)
-                zf.write(edited_audio_path, "tts_edited.wav")
+                zf.write(edited_audio_path, f"{folder_name}/tts_edited.wav")
 
                 # Add SRT subtitles
-                zf.write(srt_path, "subtitles.srt")
+                zf.write(srt_path, f"{folder_name}/subtitles.srt")
 
                 # Add static assets to assets/ folder
                 sequence_preset = assets_dir / "TikTok60fps.sqpreset"
                 if sequence_preset.exists():
-                    zf.write(sequence_preset, "assets/TikTok60fps.sqpreset")
+                    zf.write(sequence_preset, f"{folder_name}/assets/TikTok60fps.sqpreset")
 
                 border_mogrt = assets_dir / "White border 5px.mogrt"
                 if border_mogrt.exists():
-                    zf.write(border_mogrt, "assets/White border 5px.mogrt")
+                    zf.write(border_mogrt, f"{folder_name}/assets/White border 5px.mogrt")
 
                 # Add run_in_premiere.bat launcher
                 bat_launcher = assets_dir / "run_in_premiere.bat"
                 if bat_launcher.exists():
-                    zf.write(bat_launcher, "run_in_premiere.bat")
+                    zf.write(bat_launcher, f"{folder_name}/run_in_premiere.bat")
 
                 # Add source episode files to sources/ folder
                 # Episode names in matches may be just filenames without extension,
@@ -2062,7 +2070,7 @@ class ProcessingService:
                             continue
 
                         # Use just the filename in sources/ folder
-                        dest_name = f"sources/{resolved_path.name}"
+                        dest_name = f"{folder_name}/sources/{resolved_path.name}"
                         zf.write(resolved_path, dest_name)
                         episode_paths_in_bundle[resolved_str] = dest_name
                     else:
@@ -2072,7 +2080,7 @@ class ProcessingService:
 
                 # Add episode mapping file (for debugging)
                 zf.writestr(
-                    "source_mapping.json",
+                    f"{folder_name}/source_mapping.json",
                     json.dumps(episode_paths_in_bundle, indent=2),
                 )
 
@@ -2156,7 +2164,7 @@ A1 [Anime Audio]     - Original audio from clips (MUTED)
 - Scale: V3 at 68%, V1 at 183%
 - Border: Single MOGRT spanning entire timeline
 """
-                zf.writestr("README.txt", readme)
+                zf.writestr(f"{folder_name}/README.txt", readme)
 
             download_url = f"/api/projects/{project.id}/download/bundle"
 
