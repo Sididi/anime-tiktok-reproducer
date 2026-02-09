@@ -8,6 +8,7 @@ from typing import AsyncIterator
 
 from ..models import Word, SceneTranscription, Transcription, SceneList
 from ..services import ProjectService
+from ..utils.process_cleanup import shutdown_torch_compile_workers
 
 
 class TranscriptionProgress:
@@ -60,11 +61,20 @@ class TranscriberService:
 
     @classmethod
     def _ensure_unsafe_torch_load_env(cls) -> None:
-        """Force PyTorch to use weights_only=False via environment variable."""
+        """Set runtime env knobs before importing WhisperX/Torch stacks."""
         if cls._unsafe_env_applied:
             return
         os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
+        # Avoid huge compile-worker fanout (defaults to up to 32 processes).
+        os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+        # Keep joblib from starting large process pools in inference code paths.
+        os.environ.setdefault("JOBLIB_MULTIPROCESSING", "0")
         cls._unsafe_env_applied = True
+
+    @staticmethod
+    def _cleanup_runtime_workers() -> None:
+        """Shut down transient TorchInductor compile pools after ASR."""
+        shutdown_torch_compile_workers()
 
     @staticmethod
     def _get_device() -> str:
@@ -170,29 +180,38 @@ class TranscriberService:
         language: str | None = None,
         model_size: str = "large-v3",
     ) -> tuple[list[dict], str]:
+        cls._ensure_unsafe_torch_load_env()
         import whisperx
 
-        device = cls._get_device()
-        compute_type = cls._get_compute_type(device)
-        batch_size = 16 if device == "cuda" else 4
-
-        audio = whisperx.load_audio(str(audio_path))
-        model = cls._load_asr_model(model_size, device, compute_type)
-        result = model.transcribe(audio, batch_size=batch_size, language=language)
-
-        detected_language = result.get("language") or (language or "en")
-        segments = result.get("segments") or []
-
         try:
-            model_a, metadata = cls._load_align_model(detected_language, device)
-            aligned = whisperx.align(segments, model_a, metadata, audio, device)
-            segments = aligned.get("segments") or segments
-        except Exception:
-            # If alignment fails, fall back to segment-level timings.
-            pass
+            device = cls._get_device()
+            compute_type = cls._get_compute_type(device)
+            batch_size = 16 if device == "cuda" else 4
 
-        words = cls._extract_words_from_segments(segments)
-        return words, detected_language
+            audio = whisperx.load_audio(str(audio_path))
+            model = cls._load_asr_model(model_size, device, compute_type)
+            result = model.transcribe(
+                audio,
+                batch_size=batch_size,
+                num_workers=0,
+                language=language,
+            )
+
+            detected_language = result.get("language") or (language or "en")
+            segments = result.get("segments") or []
+
+            try:
+                model_a, metadata = cls._load_align_model(detected_language, device)
+                aligned = whisperx.align(segments, model_a, metadata, audio, device)
+                segments = aligned.get("segments") or segments
+            except Exception:
+                # If alignment fails, fall back to segment-level timings.
+                pass
+
+            words = cls._extract_words_from_segments(segments)
+            return words, detected_language
+        finally:
+            cls._cleanup_runtime_workers()
 
     @staticmethod
     def _normalize_token(token: str) -> str:
