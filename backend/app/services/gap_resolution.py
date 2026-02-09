@@ -132,6 +132,13 @@ class GapResolutionService:
     SAFETY_FRAMES = 3
     DEFAULT_FPS = Fraction(24000, 1001)  # 23.976fps as exact fraction
 
+    # Prevent stampedes when many gap cards request candidates at once.
+    # 1) `_scene_cut_inflight` deduplicates concurrent detection for same episode.
+    # 2) `_scene_cut_semaphore` limits concurrent heavy scene detections globally.
+    _scene_cut_inflight: dict[str, asyncio.Task[list[float]]] = {}
+    _scene_cut_inflight_lock = asyncio.Lock()
+    _scene_cut_semaphore = asyncio.Semaphore(2)
+
     # Default timeline rate (60fps for TikTok)
     TIMELINE_RATE = FrameRateInfo(timebase=60, ntsc=False)
     # Default source rate (23.976fps for most anime)
@@ -301,19 +308,50 @@ class GapResolutionService:
         if cached is not None:
             return cached
 
-        # Run detection
+        abs_episode_key = str(Path(episode_path).resolve())
+        threshold_val = threshold or cls.SCENE_THRESHOLD
+        min_scene_len_val = min_scene_len or cls.MIN_SCENE_LEN
+
+        async with cls._scene_cut_inflight_lock:
+            task = cls._scene_cut_inflight.get(abs_episode_key)
+            if task is None:
+                task = asyncio.create_task(
+                    cls._detect_and_cache_scene_cuts(
+                        episode_path=episode_path,
+                        threshold=threshold_val,
+                        min_scene_len=min_scene_len_val,
+                    )
+                )
+                cls._scene_cut_inflight[abs_episode_key] = task
+
+        try:
+            return await task
+        finally:
+            if task.done():
+                async with cls._scene_cut_inflight_lock:
+                    current = cls._scene_cut_inflight.get(abs_episode_key)
+                    if current is task:
+                        cls._scene_cut_inflight.pop(abs_episode_key, None)
+
+    @classmethod
+    async def _detect_and_cache_scene_cuts(
+        cls,
+        episode_path: str,
+        threshold: float,
+        min_scene_len: int,
+    ) -> list[float]:
+        """Run scene detection once and persist cache for future requests."""
         loop = asyncio.get_event_loop()
-        cuts = await loop.run_in_executor(
-            None,
-            cls._detect_scene_cuts_sync,
-            episode_path,
-            threshold or cls.SCENE_THRESHOLD,
-            min_scene_len or cls.MIN_SCENE_LEN,
-        )
+        async with cls._scene_cut_semaphore:
+            cuts = await loop.run_in_executor(
+                None,
+                cls._detect_scene_cuts_sync,
+                episode_path,
+                threshold,
+                min_scene_len,
+            )
 
-        # Cache the results
         cls.save_scene_cuts_cache(episode_path, cuts)
-
         return cuts
 
     @staticmethod
