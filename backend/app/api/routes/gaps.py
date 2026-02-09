@@ -224,9 +224,10 @@ async def auto_fill_all_gaps(project_id: str) -> AutoFillResponse:
         results.append(AutoFillResult(
             scene_index=gap.scene_index,
             success=True,
-            start_time=best.start_time,
-            end_time=best.end_time,
-            speed=float(best.effective_speed),  # Convert Fraction to float
+            # Keep response precision aligned with /candidates payload.
+            start_time=round(best.start_time, 6),
+            end_time=round(best.end_time, 6),
+            speed=round(float(best.effective_speed), 6),  # Convert Fraction to float
             message=f"Applied: {best.snap_description}",
         ))
         filled_count += 1

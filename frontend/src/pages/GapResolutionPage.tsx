@@ -44,6 +44,8 @@ interface GapCandidate {
   snap_description: string;
 }
 
+const CANDIDATE_MATCH_EPSILON = 1e-4;
+
 interface GapCardProps {
   gap: GapInfo;
   scene: Scene | undefined;
@@ -311,40 +313,48 @@ function GapCard({
 
         {candidates.length > 0 ? (
           <div className="grid grid-cols-2 gap-2">
-            {candidates.map((candidate, idx) => (
-              <button
-                key={idx}
-                onClick={() => handleSelectCandidate(candidate)}
-                className={`flex flex-col px-3 py-2 rounded text-sm text-left transition-colors ${
-                  resolvedTiming?.start === candidate.start_time &&
-                  resolvedTiming?.end === candidate.end_time
-                    ? "bg-green-500/20 border border-green-500/50"
-                    : "bg-[hsl(var(--muted))] hover:bg-[hsl(var(--accent))]"
-                }`}
-                title={`${candidate.duration.toFixed(2)}s source ÷ ${gap.target_duration.toFixed(2)}s TTS = ${formatSpeed(candidate.effective_speed)}`}
-              >
-                <div className="flex items-center justify-between w-full">
-                  <span
-                    className={`font-mono text-xs ${
-                      candidate.effective_speed >= 0.95 &&
-                      candidate.effective_speed <= 1.05
-                        ? "text-green-500"
-                        : candidate.effective_speed < 0.75
-                          ? "text-red-500"
-                          : "text-amber-500"
-                    }`}
-                  >
-                    {formatSpeed(candidate.effective_speed)}
+            {candidates.map((candidate, idx) => {
+              const isSelected =
+                !!resolvedTiming &&
+                Math.abs(resolvedTiming.start - candidate.start_time) <
+                  CANDIDATE_MATCH_EPSILON &&
+                Math.abs(resolvedTiming.end - candidate.end_time) <
+                  CANDIDATE_MATCH_EPSILON;
+
+              return (
+                <button
+                  key={idx}
+                  onClick={() => handleSelectCandidate(candidate)}
+                  className={`flex flex-col px-3 py-2 rounded text-sm text-left transition-colors ${
+                    isSelected
+                      ? "bg-green-500/20 border border-green-500/50"
+                      : "bg-[hsl(var(--muted))] hover:bg-[hsl(var(--accent))]"
+                  }`}
+                  title={`${candidate.duration.toFixed(2)}s source ÷ ${gap.target_duration.toFixed(2)}s TTS = ${formatSpeed(candidate.effective_speed)}`}
+                >
+                  <div className="flex items-center justify-between w-full">
+                    <span
+                      className={`font-mono text-xs ${
+                        candidate.effective_speed >= 0.95 &&
+                        candidate.effective_speed <= 1.05
+                          ? "text-green-500"
+                          : candidate.effective_speed < 0.75
+                            ? "text-red-500"
+                            : "text-amber-500"
+                      }`}
+                    >
+                      {formatSpeed(candidate.effective_speed)}
+                    </span>
+                    <span className="text-xs text-[hsl(var(--muted-foreground))]">
+                      {candidate.extend_type.replace("extend_", "")}
+                    </span>
+                  </div>
+                  <span className="text-xs text-[hsl(var(--muted-foreground))] mt-1 truncate w-full">
+                    {candidate.snap_description}
                   </span>
-                  <span className="text-xs text-[hsl(var(--muted-foreground))]">
-                    {candidate.extend_type.replace("extend_", "")}
-                  </span>
-                </div>
-                <span className="text-xs text-[hsl(var(--muted-foreground))] mt-1 truncate w-full">
-                  {candidate.snap_description}
-                </span>
-              </button>
-            ))}
+                </button>
+              );
+            })}
           </div>
         ) : !loadingCandidates ? (
           <p className="text-xs text-[hsl(var(--muted-foreground))]">
