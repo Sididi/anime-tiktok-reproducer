@@ -2015,13 +2015,15 @@ class ProcessingService:
             # Step 5: Bundle everything
             bundle_path = cls.get_output_dir(project.id).parent / "project_bundle.zip"
 
-            # Derive wrapping folder name from anime name
+            # Derive wrapping folder name: SPMAnime_{ANIME_TITLE}_{PROJECT_ID}
             import re as _re
-            _raw_name = project.anime_name or project.id
+            _raw_name = project.anime_name or "project"
             # Remove filesystem-unsafe characters and collapse whitespace/underscores
-            _folder_name = _re.sub(r'[<>:"/\\|?*]', '', _raw_name).strip()
-            _folder_name = _re.sub(r'[\s_]+', '_', _folder_name) or "project"
-            folder_name = _folder_name
+            _anime_title = _re.sub(r'[<>:"/\\|?*]', '', _raw_name).strip()
+            _anime_title = _re.sub(r'[\s_]+', '_', _anime_title) or "project"
+            _project_id = _re.sub(r'[<>:"/\\|?*]', '', project.id).strip()
+            _project_id = _re.sub(r'[\s_]+', '_', _project_id) or "unknown"
+            folder_name = f"SPMAnime_{_anime_title}_{_project_id}"
 
             # Collect unique source episodes
             source_episodes: set[str] = set()

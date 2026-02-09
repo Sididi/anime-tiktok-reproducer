@@ -3,6 +3,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import json
 from pathlib import Path
+import re
 
 from ...config import settings
 from ...models import ProjectPhase, MatchList, SceneMatch, Scene, SceneList
@@ -18,6 +19,28 @@ class SetSourcesRequest(BaseModel):
 class FindMatchesRequest(BaseModel):
     source_path: str | None = None  # Optional, defaults to anime_library_path
     merge_continuous: bool = True  # Auto-merge continuous anime scenes
+
+
+def _normalize_name(value: str) -> str:
+    """Normalize folder/anime names for robust matching."""
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _resolve_anime_source_dir(library_root: Path, anime_name: str) -> Path | None:
+    """Resolve the anime directory in the library using exact or normalized name match."""
+    if not library_root.exists() or not library_root.is_dir():
+        return None
+
+    direct = library_root / anime_name
+    if direct.exists() and direct.is_dir():
+        return direct
+
+    target = _normalize_name(anime_name)
+    for child in library_root.iterdir():
+        if child.is_dir() and _normalize_name(child.name) == target:
+            return child
+
+    return None
 
 
 @router.post("/sources")
@@ -58,12 +81,20 @@ async def list_episodes(project_id: str):
     VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm", ".mov"}
     episodes: list[str] = []
 
-    # Use project source_paths if configured, otherwise fall back to anime_library_path
+    # Use project source_paths if configured. Otherwise, scope to project anime in
+    # the library so manual editors only offer episodes for this anime.
     source_dirs: list[Path] = []
     if project.source_paths:
         source_dirs = [Path(src) for src in project.source_paths]
     elif settings.anime_library_path and settings.anime_library_path.exists():
-        source_dirs = [settings.anime_library_path]
+        if project.anime_name:
+            scoped_dir = _resolve_anime_source_dir(
+                settings.anime_library_path,
+                project.anime_name,
+            )
+            source_dirs = [scoped_dir] if scoped_dir else []
+        else:
+            source_dirs = [settings.anime_library_path]
 
     for src_path in source_dirs:
         if src_path.is_dir():

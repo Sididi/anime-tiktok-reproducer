@@ -16,12 +16,18 @@ interface ClippedVideoPlayerProps {
   endTime: number;
   className?: string;
   muted?: boolean;
+  playbackRate?: number;
+  onClipEnded?: () => void;
 }
 
 export interface ClippedVideoPlayerHandle {
   playFromStart: () => void;
   seekToStart: () => Promise<void>;
   play: () => void;
+  pause: () => void;
+  waitUntilReady: () => Promise<void>;
+  forceLoad: () => void;
+  releaseLoad: () => void;
 }
 
 /**
@@ -36,17 +42,28 @@ export const ClippedVideoPlayer = forwardRef<
   ClippedVideoPlayerHandle,
   ClippedVideoPlayerProps
 >(function ClippedVideoPlayer(
-  { src, startTime, endTime, className, muted = true },
+  { src, startTime, endTime, className, muted = true, playbackRate = 1, onClipEnded },
   ref,
 ) {
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const readyResolversRef = useRef<Array<() => void>>([]);
+  const endNotifiedRef = useRef(false);
+  const forceLoadedRef = useRef(false);
+  const isIntersectingRef = useRef(false);
   const [isVisible, setIsVisible] = useState(false);
   const [isLoaded, setIsLoaded] = useState(false);
   const [isEnded, setIsEnded] = useState(false);
   const [hasError, setHasError] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
   const [isRetrying, setIsRetrying] = useState(false);
+
+  const resolveReadyWaiters = useCallback(() => {
+    const waiters = readyResolversRef.current;
+    if (waiters.length === 0) return;
+    readyResolversRef.current = [];
+    waiters.forEach((resolve) => resolve());
+  }, []);
 
   // Add a small offset to startTime to compensate for keyframe seeking
   // HTML video seeks to nearest keyframe which can be before the target time
@@ -68,6 +85,7 @@ export const ClippedVideoPlayer = forwardRef<
       playFromStart: () => {
         if (videoRef.current) {
           videoRef.current.currentTime = adjustedStartTime;
+          endNotifiedRef.current = false;
           setIsEnded(false);
           videoRef.current.play().catch(console.error);
         }
@@ -80,6 +98,7 @@ export const ClippedVideoPlayer = forwardRef<
             return;
           }
           video.currentTime = adjustedStartTime;
+          endNotifiedRef.current = false;
           setIsEnded(false);
           const onSeeked = () => {
             video.removeEventListener("seeked", onSeeked);
@@ -90,12 +109,48 @@ export const ClippedVideoPlayer = forwardRef<
       },
       play: () => {
         if (videoRef.current) {
+          endNotifiedRef.current = false;
           setIsEnded(false);
           videoRef.current.play().catch(console.error);
         }
       },
+      pause: () => {
+        videoRef.current?.pause();
+      },
+      waitUntilReady: () => {
+        return new Promise<void>((resolve) => {
+          const video = videoRef.current;
+          if (video && isLoaded) {
+            resolve();
+            return;
+          }
+
+          readyResolversRef.current.push(resolve);
+          // Avoid deadlocks if loading fails or takes too long.
+          setTimeout(() => {
+            const idx = readyResolversRef.current.indexOf(resolve);
+            if (idx >= 0) {
+              readyResolversRef.current.splice(idx, 1);
+              resolve();
+            }
+          }, 4000);
+        });
+      },
+      forceLoad: () => {
+        forceLoadedRef.current = true;
+        setIsVisible(true);
+      },
+      releaseLoad: () => {
+        forceLoadedRef.current = false;
+        if (isIntersectingRef.current) return;
+        setIsVisible(false);
+        setIsLoaded(false);
+        setHasError(false);
+        setIsEnded(false);
+        endNotifiedRef.current = false;
+      },
     }),
-    [adjustedStartTime],
+    [adjustedStartTime, isLoaded],
   );
 
   // Intersection Observer for lazy loading AND unloading
@@ -108,15 +163,20 @@ export const ClippedVideoPlayer = forwardRef<
     const observer = new IntersectionObserver(
       (entries) => {
         entries.forEach((entry) => {
+          isIntersectingRef.current = entry.isIntersecting;
           if (entry.isIntersecting) {
             // Video is entering viewport - load it
             setIsVisible(true);
           } else {
+            if (forceLoadedRef.current) {
+              return;
+            }
             // Video is leaving viewport - unload it to free connections
             setIsVisible(false);
             setIsLoaded(false);
             setHasError(false);
             setIsEnded(false);
+            endNotifiedRef.current = false;
             // Don't reset retryCount - keep it so next load uses fresh URL if needed
           }
         });
@@ -138,10 +198,12 @@ export const ClippedVideoPlayer = forwardRef<
   const handleLoadedMetadata = useCallback(() => {
     if (videoRef.current) {
       videoRef.current.currentTime = adjustedStartTime;
+      videoRef.current.playbackRate = playbackRate;
       setIsLoaded(true);
       setHasError(false);
+      resolveReadyWaiters();
     }
-  }, [adjustedStartTime]);
+  }, [adjustedStartTime, playbackRate, resolveReadyWaiters]);
 
   const handleError = useCallback(
     (e: React.SyntheticEvent<HTMLVideoElement>) => {
@@ -153,8 +215,9 @@ export const ClippedVideoPlayer = forwardRef<
       );
       setHasError(true);
       setIsLoaded(true); // Stop showing loader
+      resolveReadyWaiters();
     },
-    [src],
+    [src, resolveReadyWaiters],
   );
 
   // Monitor playback to enforce end boundary only.
@@ -168,20 +231,26 @@ export const ClippedVideoPlayer = forwardRef<
       video.pause();
       video.currentTime = endTime;
       setIsEnded(true);
+      if (!endNotifiedRef.current) {
+        endNotifiedRef.current = true;
+        onClipEnded?.();
+      }
     }
-  }, [endTime]);
+  }, [endTime, onClipEnded]);
 
   const handlePlay = useCallback(() => {
     // Only re-seek if clearly out of bounds (with tolerance to avoid
     // floating-point cascading seeks that cause visible stutter)
     if (videoRef.current) {
+      videoRef.current.playbackRate = playbackRate;
       const cur = videoRef.current.currentTime;
       if (cur < adjustedStartTime - 0.15 || cur >= endTime) {
         videoRef.current.currentTime = adjustedStartTime;
       }
+      endNotifiedRef.current = false;
       setIsEnded(false);
     }
-  }, [adjustedStartTime, endTime]);
+  }, [adjustedStartTime, endTime, playbackRate]);
 
   const handleSeeked = useCallback(() => {
     const video = videoRef.current;
@@ -191,29 +260,37 @@ export const ClippedVideoPlayer = forwardRef<
     // imprecision. Only clamp if genuinely out of bounds.
     if (video.currentTime < adjustedStartTime - 0.15) {
       video.currentTime = adjustedStartTime;
+      endNotifiedRef.current = false;
     }
     if (video.currentTime >= endTime) {
       video.currentTime = endTime;
       video.pause();
       setIsEnded(true);
+      if (!endNotifiedRef.current) {
+        endNotifiedRef.current = true;
+        onClipEnded?.();
+      }
     }
-  }, [adjustedStartTime, endTime]);
+  }, [adjustedStartTime, endTime, onClipEnded]);
 
   // Reset to start when src or times change
   useEffect(() => {
     if (videoRef.current && isLoaded) {
       videoRef.current.currentTime = adjustedStartTime;
-      setIsEnded(false);
+      videoRef.current.playbackRate = playbackRate;
+      endNotifiedRef.current = false;
     }
-  }, [src, adjustedStartTime, isLoaded]);
+  }, [src, adjustedStartTime, isLoaded, playbackRate]);
 
   const handleReplay = useCallback(() => {
     if (videoRef.current) {
       videoRef.current.currentTime = adjustedStartTime;
+      videoRef.current.playbackRate = playbackRate;
+      endNotifiedRef.current = false;
       setIsEnded(false);
       videoRef.current.play().catch(console.error);
     }
-  }, [adjustedStartTime]);
+  }, [adjustedStartTime, playbackRate]);
 
   const handleRetry = useCallback(() => {
     // Set retrying state to force complete unmount

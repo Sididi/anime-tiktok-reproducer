@@ -1,4 +1,12 @@
-import { useEffect, useState, useCallback, useRef } from "react";
+import {
+  useEffect,
+  useState,
+  useCallback,
+  useRef,
+  useMemo,
+  forwardRef,
+  useImperativeHandle,
+} from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import {
   Check,
@@ -6,6 +14,7 @@ import {
   AlertCircle,
   Edit,
   Play,
+  Pause,
   ArrowLeft,
   RefreshCw,
   Search,
@@ -19,7 +28,7 @@ import { ClippedVideoPlayer, ManualMatchModal } from "@/components/video";
 import type { ClippedVideoPlayerHandle } from "@/components/video/ClippedVideoPlayer";
 import { useProjectStore, useSceneStore } from "@/stores";
 import { api } from "@/api/client";
-import { formatTime } from "@/utils";
+import { cn, formatTime } from "@/utils";
 import type { SceneMatch, Scene } from "@/types";
 
 interface MatchProgress {
@@ -36,6 +45,8 @@ interface MatchCardProps {
   match: SceneMatch;
   projectId: string;
   episodes: string[];
+  isActive?: boolean;
+  playbackRate?: number;
   onManualMatch: (
     sceneIndex: number,
     episode: string,
@@ -45,20 +56,34 @@ interface MatchCardProps {
   onUndoMerge?: (sceneIndex: number) => void;
 }
 
-function MatchCard({
-  scene,
-  match,
-  projectId,
-  episodes,
-  onManualMatch,
-  onUndoMerge,
-}: MatchCardProps) {
+interface MatchCardHandle {
+  playBothAndWait: () => Promise<void>;
+  prepareForAutoplay: () => Promise<void>;
+  releasePreload: () => void;
+  stop: () => void;
+}
+
+const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(function MatchCard(
+  {
+    scene,
+    match,
+    projectId,
+    episodes,
+    isActive = false,
+    playbackRate = 1,
+    onManualMatch,
+    onUndoMerge,
+  },
+  ref,
+) {
   const [showManualModal, setShowManualModal] = useState(false);
   const tiktokPlayerRef = useRef<ClippedVideoPlayerHandle>(null);
   const sourcePlayerRef = useRef<ClippedVideoPlayerHandle>(null);
+  const pendingResolverRef = useRef<(() => void) | null>(null);
+  const endedRef = useRef({ tiktok: false, source: false });
 
   const tiktokVideoUrl = api.getVideoUrl(projectId);
-  const hasMatch = match.confidence > 0 && match.episode;
+  const hasMatch = Boolean(match.confidence > 0 && match.episode);
   const sourceVideoUrl = hasMatch
     ? api.getSourceVideoUrl(projectId, match.episode)
     : null;
@@ -76,7 +101,9 @@ function MatchCard({
 
   // Sync play both videos simultaneously using refs
   // Two-phase: seek both first, then play together for precise sync
-  const handleSyncPlay = useCallback(async () => {
+  const playBothFromStart = useCallback(async () => {
+    if (!hasMatch) return;
+
     const tiktok = tiktokPlayerRef.current;
     const source = sourcePlayerRef.current;
     if (!tiktok || !source) {
@@ -84,14 +111,101 @@ function MatchCard({
       source?.playFromStart();
       return;
     }
+
+    endedRef.current = { tiktok: false, source: false };
+    await Promise.all([tiktok.waitUntilReady(), source.waitUntilReady()]);
     await Promise.all([tiktok.seekToStart(), source.seekToStart()]);
     tiktok.play();
     source.play();
+  }, [hasMatch]);
+
+  const prepareForAutoplay = useCallback(async () => {
+    if (!hasMatch) return;
+
+    const tiktok = tiktokPlayerRef.current;
+    const source = sourcePlayerRef.current;
+    if (!tiktok || !source) return;
+
+    tiktok.forceLoad();
+    source.forceLoad();
+    await Promise.all([tiktok.waitUntilReady(), source.waitUntilReady()]);
+  }, [hasMatch]);
+
+  const releasePreload = useCallback(() => {
+    tiktokPlayerRef.current?.releaseLoad();
+    sourcePlayerRef.current?.releaseLoad();
+  }, []);
+
+  const stop = useCallback(() => {
+    tiktokPlayerRef.current?.pause();
+    sourcePlayerRef.current?.pause();
+    if (pendingResolverRef.current) {
+      pendingResolverRef.current();
+      pendingResolverRef.current = null;
+    }
+  }, []);
+
+  const onClipEnded = useCallback(
+    (player: "tiktok" | "source") => {
+      endedRef.current[player] = true;
+      if (endedRef.current.tiktok && endedRef.current.source) {
+        if (pendingResolverRef.current) {
+          pendingResolverRef.current();
+          pendingResolverRef.current = null;
+        }
+      }
+    },
+    [],
+  );
+
+  const playBothAndWait = useCallback(async () => {
+    if (!hasMatch) return;
+
+    await playBothFromStart();
+
+    await new Promise<void>((resolve) => {
+      if (endedRef.current.tiktok && endedRef.current.source) {
+        resolve();
+        return;
+      }
+
+      pendingResolverRef.current = resolve;
+      // Fallback to avoid deadlock if browser misses an ended callback.
+      setTimeout(() => {
+        if (pendingResolverRef.current === resolve) {
+          pendingResolverRef.current = null;
+          resolve();
+        }
+      }, 15000);
+    });
+  }, [hasMatch, playBothFromStart]);
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      playBothAndWait,
+      prepareForAutoplay,
+      releasePreload,
+      stop,
+    }),
+    [playBothAndWait, prepareForAutoplay, releasePreload, stop],
+  );
+
+  useEffect(() => {
+    return () => {
+      if (pendingResolverRef.current) {
+        pendingResolverRef.current();
+        pendingResolverRef.current = null;
+      }
+    };
   }, []);
 
   return (
     <div
-      className="bg-[hsl(var(--card))] rounded-lg p-4 space-y-4"
+      className={cn(
+        "bg-[hsl(var(--card))] rounded-lg p-4 space-y-4",
+        isActive && "ring-2 ring-[hsl(var(--primary))]",
+      )}
       data-scene-index={scene.index}
     >
       <div className="flex items-center justify-between">
@@ -145,6 +259,8 @@ function MatchCard({
               src={tiktokVideoUrl}
               startTime={scene.start_time}
               endTime={scene.end_time}
+              onClipEnded={() => onClipEnded("tiktok")}
+              playbackRate={playbackRate}
               className="w-full h-full"
             />
           </div>
@@ -170,6 +286,8 @@ function MatchCard({
                 src={sourceVideoUrl}
                 startTime={match.start_time}
                 endTime={match.end_time}
+                onClipEnded={() => onClipEnded("source")}
+                playbackRate={playbackRate}
                 className="w-full h-full"
               />
             ) : (
@@ -214,7 +332,7 @@ function MatchCard({
             variant="outline"
             size="sm"
             className="flex-1"
-            onClick={handleSyncPlay}
+            onClick={playBothFromStart}
           >
             <Play className="h-4 w-4 mr-2" />
             Play Both
@@ -241,7 +359,7 @@ function MatchCard({
       />
     </div>
   );
-}
+});
 
 export function MatchValidation() {
   const { projectId } = useParams<{ projectId: string }>();
@@ -258,6 +376,76 @@ export function MatchValidation() {
   );
   const [error, setError] = useState<string | null>(null);
   const [mergeContinuous, setMergeContinuous] = useState(true);
+  const [activeSceneIndex, setActiveSceneIndex] = useState(-1);
+  const [autoScroll, setAutoScroll] = useState(true);
+  const [fastWatchPlaying, setFastWatchPlaying] = useState(false);
+  const [playbackRate, setPlaybackRate] = useState(1);
+  const sceneRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const cardRefs = useRef<Map<number, MatchCardHandle>>(new Map());
+  const autoplayTokenRef = useRef(0);
+  const autoScrollRef = useRef(true);
+  autoScrollRef.current = autoScroll;
+
+  const stopFastWatch = useCallback(() => {
+    autoplayTokenRef.current += 1;
+    setFastWatchPlaying(false);
+    cardRefs.current.forEach((card) => {
+      card.stop();
+      card.releasePreload();
+    });
+  }, []);
+
+  const scrollToScene = useCallback((sceneIndex: number, force = false) => {
+    if (!force && !autoScrollRef.current) return;
+    const el = sceneRefs.current.get(sceneIndex);
+    if (el) {
+      el.scrollIntoView({ behavior: "instant", block: "center" });
+    }
+  }, []);
+
+  const playFastWatchFromScene = useCallback(
+    async (startSceneIndex: number) => {
+      if (!scenes.length) return;
+
+      const token = autoplayTokenRef.current + 1;
+      autoplayTokenRef.current = token;
+      setFastWatchPlaying(true);
+
+      const startPos = scenes.findIndex((scene) => scene.index === startSceneIndex);
+      const orderedScenes = startPos >= 0 ? scenes.slice(startPos) : scenes;
+
+      for (let i = 0; i < orderedScenes.length; i += 1) {
+        if (autoplayTokenRef.current !== token) {
+          return;
+        }
+
+        const scene = orderedScenes[i];
+        const card = cardRefs.current.get(scene.index);
+        if (!card) continue;
+
+        await card.prepareForAutoplay();
+
+        const nextScene = orderedScenes[i + 1];
+        const nextCard = nextScene
+          ? cardRefs.current.get(nextScene.index)
+          : undefined;
+        if (nextCard) {
+          void nextCard.prepareForAutoplay();
+        }
+
+        setActiveSceneIndex(scene.index);
+        const playback = card.playBothAndWait();
+        scrollToScene(scene.index);
+        await playback;
+        card.releasePreload();
+      }
+
+      if (autoplayTokenRef.current === token) {
+        setFastWatchPlaying(false);
+      }
+    },
+    [scenes, scrollToScene],
+  );
 
   // Load data
   useEffect(() => {
@@ -288,9 +476,35 @@ export function MatchValidation() {
     loadData();
   }, [projectId, loadProject, loadScenes]);
 
+  useEffect(() => {
+    if (scenes.length === 0) {
+      setActiveSceneIndex(-1);
+      return;
+    }
+
+    setActiveSceneIndex((prev) => {
+      if (prev >= 0 && scenes.some((scene) => scene.index === prev)) {
+        return prev;
+      }
+      return scenes[0].index;
+    });
+  }, [scenes]);
+
+  useEffect(() => {
+    const cards = cardRefs.current;
+    return () => {
+      autoplayTokenRef.current += 1;
+      cards.forEach((card) => {
+        card.stop();
+        card.releasePreload();
+      });
+    };
+  }, []);
+
   const handleFindMatches = useCallback(async () => {
     if (!projectId) return;
 
+    stopFastWatch();
     setMatching(true);
     setMatchProgress({
       status: "starting",
@@ -359,7 +573,7 @@ export function MatchValidation() {
     } finally {
       setMatching(false);
     }
-  }, [projectId, mergeContinuous, loadScenes]);
+  }, [projectId, mergeContinuous, loadScenes, stopFastWatch]);
 
   const handleManualMatch = useCallback(
     async (
@@ -371,6 +585,7 @@ export function MatchValidation() {
       if (!projectId) return;
 
       try {
+        stopFastWatch();
         const { match: updatedMatch } = await api.updateMatch(
           projectId,
           sceneIndex,
@@ -399,7 +614,7 @@ export function MatchValidation() {
         setError((err as Error).message);
       }
     },
-    [projectId],
+    [projectId, stopFastWatch],
   );
 
   const handleBackToScenes = () => {
@@ -410,6 +625,7 @@ export function MatchValidation() {
 
   const handleRecomputeMatches = async () => {
     // Clear existing matches and recompute
+    stopFastWatch();
     setMatches([]);
     await handleFindMatches();
   };
@@ -418,6 +634,7 @@ export function MatchValidation() {
     if (!projectId) return;
 
     try {
+      stopFastWatch();
       // Find all scenes with no match
       const noMatchScenes = matches.filter(
         (m) => m.confidence === 0 && !m.episode && m.alternatives?.length > 0,
@@ -461,12 +678,13 @@ export function MatchValidation() {
     } catch (err) {
       setError((err as Error).message);
     }
-  }, [projectId, matches]);
+  }, [projectId, matches, stopFastWatch]);
 
   const handleUndoMerge = useCallback(
     async (sceneIndex: number) => {
       if (!projectId) return;
       try {
+        stopFastWatch();
         const result = await api.undoMerge(projectId, sceneIndex);
         // Reload scenes and matches after undo
         await loadScenes(projectId);
@@ -479,7 +697,7 @@ export function MatchValidation() {
         setError((err as Error).message);
       }
     },
-    [projectId, loadScenes],
+    [projectId, loadScenes, stopFastWatch],
   );
 
   // Count confirmed matches (those with valid match data)
@@ -494,6 +712,51 @@ export function MatchValidation() {
       navigate(`/project/${projectId}/transcription`);
     }
   };
+
+  const activeScenePosition = useMemo(() => {
+    if (scenes.length === 0) return 0;
+    const index = scenes.findIndex((scene) => scene.index === activeSceneIndex);
+    return index >= 0 ? index : 0;
+  }, [scenes, activeSceneIndex]);
+
+  const hasAnyMatch = useMemo(
+    () => matches.some((match) => match.confidence > 0 && match.episode),
+    [matches],
+  );
+
+  const handleToggleFastWatch = useCallback(() => {
+    if (fastWatchPlaying) {
+      stopFastWatch();
+      return;
+    }
+
+    const startSceneIndex =
+      activeSceneIndex >= 0 ? activeSceneIndex : scenes[0]?.index;
+    if (startSceneIndex === undefined) return;
+
+    void playFastWatchFromScene(startSceneIndex);
+  }, [
+    fastWatchPlaying,
+    stopFastWatch,
+    activeSceneIndex,
+    scenes,
+    playFastWatchFromScene,
+  ]);
+
+  const handleTimelineSeek = useCallback(
+    (position: number) => {
+      const targetScene = scenes[position];
+      if (!targetScene) return;
+
+      setActiveSceneIndex(targetScene.index);
+      scrollToScene(targetScene.index, true);
+
+      if (fastWatchPlaying) {
+        void playFastWatchFromScene(targetScene.index);
+      }
+    },
+    [scenes, scrollToScene, fastWatchPlaying, playFastWatchFromScene],
+  );
 
   if (loading) {
     return (
@@ -512,7 +775,7 @@ export function MatchValidation() {
   }
 
   return (
-    <div className="min-h-screen p-4">
+    <div className="min-h-screen p-4 pb-28">
       <div className="max-w-4xl mx-auto space-y-6">
         <header className="space-y-4">
           <div className="flex items-center justify-between">
@@ -656,19 +919,102 @@ export function MatchValidation() {
             if (!match) return null;
 
             return (
-              <MatchCard
+              <div
                 key={scene.index}
-                scene={scene}
-                match={match}
-                projectId={projectId!}
-                episodes={episodes}
-                onManualMatch={handleManualMatch}
-                onUndoMerge={handleUndoMerge}
-              />
+                ref={(el) => {
+                  if (el) sceneRefs.current.set(scene.index, el);
+                  else sceneRefs.current.delete(scene.index);
+                }}
+              >
+                <MatchCard
+                  ref={(card) => {
+                    if (card) cardRefs.current.set(scene.index, card);
+                    else cardRefs.current.delete(scene.index);
+                  }}
+                  scene={scene}
+                  match={match}
+                  projectId={projectId!}
+                  episodes={episodes}
+                  isActive={activeSceneIndex === scene.index}
+                  playbackRate={playbackRate}
+                  onManualMatch={handleManualMatch}
+                  onUndoMerge={handleUndoMerge}
+                />
+              </div>
             );
           })}
         </div>
       </div>
+
+      {matches.length > 0 && scenes.length > 0 && (
+        <div className="fixed bottom-0 left-0 right-0 z-50 bg-[hsl(var(--card))] border-t border-[hsl(var(--border))] shadow-lg">
+          <div className="max-w-4xl mx-auto px-4 py-2 space-y-2">
+            <div className="flex items-center gap-3">
+              <Button
+                variant={fastWatchPlaying ? "default" : "outline"}
+                size="sm"
+                onClick={handleToggleFastWatch}
+                disabled={!hasAnyMatch}
+              >
+                {fastWatchPlaying ? (
+                  <>
+                    <Pause className="h-4 w-4 mr-1" />
+                    Pause
+                  </>
+                ) : (
+                  <>
+                    <Play className="h-4 w-4 mr-1" />
+                    Fast Watch
+                  </>
+                )}
+              </Button>
+
+              <span className="text-xs text-[hsl(var(--muted-foreground))] min-w-[110px]">
+                Scene {activeScenePosition + 1} / {scenes.length}
+              </span>
+
+              <label className="flex items-center gap-1.5 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={autoScroll}
+                  onChange={(e) => setAutoScroll(e.target.checked)}
+                  className="accent-[hsl(var(--primary))] h-3.5 w-3.5"
+                />
+                <span className="text-xs text-[hsl(var(--muted-foreground))]">
+                  Scroll
+                </span>
+              </label>
+
+              <div className="flex-1" />
+
+              <span className="text-xs font-mono text-[hsl(var(--muted-foreground))] min-w-[34px] text-right">
+                {playbackRate}x
+              </span>
+              <input
+                type="range"
+                min="0.5"
+                max="6"
+                step="0.25"
+                value={playbackRate}
+                onChange={(e) => setPlaybackRate(parseFloat(e.target.value))}
+                className="w-24 h-1 accent-[hsl(var(--primary))]"
+                title={`Playback speed: ${playbackRate}x`}
+              />
+            </div>
+
+            <input
+              type="range"
+              min={0}
+              max={Math.max(0, scenes.length - 1)}
+              step={1}
+              value={activeScenePosition}
+              onChange={(e) => handleTimelineSeek(parseInt(e.target.value, 10))}
+              className="w-full h-1 accent-[hsl(var(--primary))]"
+              title="Timeline scroller"
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }
