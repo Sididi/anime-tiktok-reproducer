@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { X } from "lucide-react";
 import { useEditor, EditorContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
@@ -6,7 +6,7 @@ import { Button } from "@/components/ui";
 import { SceneHeader } from "./SceneHeaderExtension";
 import {
   estimateTtsDuration,
-  getDeltaCategory,
+  getSpeedCategory,
   DELTA_COLORS,
 } from "./durationEstimation";
 import type { Transcription } from "@/types";
@@ -107,6 +107,8 @@ export function ScriptEditorModal({
   targetLanguage,
 }: ScriptEditorModalProps) {
   const [updateCounter, setUpdateCounter] = useState(0);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const [scenePositions, setScenePositions] = useState<number[]>([]);
 
   // Parse the incoming JSON
   const parsedScript = useMemo<ParsedScript | null>(() => {
@@ -148,6 +150,28 @@ export function ScriptEditorModal({
     }
   }, [isOpen, editor, parsedScript]);
 
+  // Measure scene header chip positions for aligning stats
+  useEffect(() => {
+    if (!isOpen || !editor) return;
+
+    const measure = () => {
+      const container = scrollContainerRef.current;
+      if (!container) return;
+
+      const chips = container.querySelectorAll(".scene-header-chip");
+      if (chips.length === 0) return;
+
+      const containerRect = container.getBoundingClientRect();
+      const positions = Array.from(chips).map((chip) => {
+        const chipRect = chip.getBoundingClientRect();
+        return chipRect.top - containerRect.top + container.scrollTop;
+      });
+      setScenePositions(positions);
+    };
+
+    requestAnimationFrame(measure);
+  }, [updateCounter, isOpen, editor]);
+
   // Live duration stats
   const sceneStats = useMemo(() => {
     if (!editor || !parsedScript || !transcription) return [];
@@ -165,11 +189,10 @@ export function ScriptEditorModal({
         ? origScene.end_time - origScene.start_time
         : parseFloat(scene.duration_seconds) || 0;
 
-      const deltaPct =
-        originalDuration > 0
-          ? ((estimatedDuration - originalDuration) / originalDuration) * 100
-          : 0;
-      const category = getDeltaCategory(deltaPct);
+      const speedRatio =
+        originalDuration > 0 ? estimatedDuration / originalDuration : 1;
+      const deltaPct = (speedRatio - 1) * 100;
+      const category = getSpeedCategory(speedRatio);
 
       return {
         sceneIndex: scene.scene_index,
@@ -177,7 +200,6 @@ export function ScriptEditorModal({
         originalDuration,
         deltaPct,
         category,
-        wordCount: newText.trim().split(/\s+/).filter(Boolean).length,
       };
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -230,67 +252,56 @@ export function ScriptEditorModal({
           </button>
         </div>
 
-        {/* Content */}
-        <div className="flex-1 overflow-hidden flex min-h-0">
-          {/* Left panel - Editor */}
-          <div className="flex-[7] overflow-y-auto p-4 border-r border-[hsl(var(--border))]">
-            <EditorContent
-              editor={editor}
-              className="tiptap-editor prose prose-invert max-w-none min-h-[300px]"
-            />
-          </div>
+        {/* Content — single scroll container for linked scroll */}
+        <div ref={scrollContainerRef} className="flex-1 overflow-y-auto min-h-0">
+          <div className="flex">
+            {/* Editor panel */}
+            <div className="flex-[7] p-4 border-r border-[hsl(var(--border))]">
+              <EditorContent
+                editor={editor}
+                className="tiptap-editor prose prose-invert max-w-none min-h-[300px]"
+              />
+            </div>
 
-          {/* Right panel - Duration stats */}
-          <div className="flex-[3] overflow-y-auto p-4 space-y-2">
-            <h3 className="text-sm font-semibold text-[hsl(var(--muted-foreground))] uppercase tracking-wide mb-3">
-              Duration Estimates
-            </h3>
-
-            {sceneStats.map((stat) => (
-              <div
-                key={stat.sceneIndex}
-                className="flex items-center justify-between py-1.5 px-2 rounded hover:bg-[hsl(var(--muted))] text-sm"
-              >
-                <span className="font-medium text-[hsl(var(--muted-foreground))]">
-                  Scene {stat.sceneIndex + 1}
-                </span>
-                <div className="text-right font-mono text-xs">
-                  <span>~{stat.estimatedDuration.toFixed(1)}s</span>
-                  <span className="text-[hsl(var(--muted-foreground))]">
-                    {" / "}
-                    {stat.originalDuration.toFixed(1)}s
-                  </span>
-                  <span className={`ml-1.5 font-semibold ${DELTA_COLORS[stat.category]}`}>
-                    {stat.deltaPct >= 0 ? "+" : ""}
-                    {stat.deltaPct.toFixed(0)}%
-                  </span>
-                </div>
-              </div>
-            ))}
-
-            {/* Separator */}
-            <div className="border-t border-[hsl(var(--border))] my-2" />
-
-            {/* Totals */}
-            <div className="flex items-center justify-between py-1.5 px-2 text-sm font-semibold">
-              <span>Total</span>
-              <div className="text-right font-mono text-xs">
-                <span>{totals.totalEstimated.toFixed(1)}s</span>
-                <span className="text-[hsl(var(--muted-foreground))]">
-                  {" / "}
-                  {totals.totalOriginal.toFixed(1)}s
-                </span>
-              </div>
+            {/* Stats panel — absolutely positioned per-scene, aligned with editor */}
+            <div className="flex-[3] relative">
+              {scenePositions.length > 0 &&
+                sceneStats.map((stat, i) => (
+                  <div
+                    key={stat.sceneIndex}
+                    className="absolute left-0 right-0 px-4 font-mono text-xs whitespace-nowrap"
+                    style={{ top: scenePositions[i] ?? 0 }}
+                  >
+                    <span>~{stat.estimatedDuration.toFixed(1)}s</span>
+                    <span className="text-[hsl(var(--muted-foreground))]">
+                      {" / "}
+                      {stat.originalDuration.toFixed(1)}s
+                    </span>
+                    <span
+                      className={`ml-1.5 font-semibold ${DELTA_COLORS[stat.category]}`}
+                    >
+                      {stat.deltaPct >= 0 ? "+" : ""}
+                      {stat.deltaPct.toFixed(0)}%
+                    </span>
+                  </div>
+                ))}
             </div>
           </div>
         </div>
 
-        {/* Footer */}
-        <div className="flex justify-end gap-2 p-4 border-t border-[hsl(var(--border))]">
-          <Button variant="outline" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button onClick={handleSave}>Save Changes</Button>
+        {/* Footer — totals + actions */}
+        <div className="flex items-center justify-between p-4 border-t border-[hsl(var(--border))]">
+          <div className="text-sm font-mono text-[hsl(var(--muted-foreground))]">
+            Total: {totals.totalEstimated.toFixed(1)}s
+            {" / "}
+            {totals.totalOriginal.toFixed(1)}s
+          </div>
+          <div className="flex gap-2">
+            <Button variant="outline" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button onClick={handleSave}>Save Changes</Button>
+          </div>
         </div>
       </div>
     </div>

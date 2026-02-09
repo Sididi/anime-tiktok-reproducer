@@ -1,8 +1,8 @@
 import { useEffect, useState, useCallback } from "react";
 import { Volume2, VolumeX } from "lucide-react";
-import { useVideo } from '@/contexts';
-import { VideoControls } from './VideoControls';
-import { cn } from '@/utils';
+import { useVideo } from "@/contexts";
+import { VideoControls } from "./VideoControls";
+import { cn } from "@/utils";
 
 interface VideoPlayerProps {
   src: string;
@@ -10,7 +10,8 @@ interface VideoPlayerProps {
 }
 
 export function VideoPlayer({ src, className }: VideoPlayerProps) {
-  const { videoRef, play, pause, nextFrame, prevFrame, seekTo, handlers } = useVideo();
+  const { videoRef, play, pause, nextFrame, prevFrame, seekTo, handlers } =
+    useVideo();
   const [volume, setVolume] = useState(1);
   const [muted, setMuted] = useState(false);
 
@@ -20,20 +21,23 @@ export function VideoPlayer({ src, className }: VideoPlayerProps) {
     videoRef.current.muted = muted;
   }, [videoRef, volume, muted]);
 
-  const handleVolumeChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    const nextVolume = parseFloat(e.target.value);
-    setVolume(nextVolume);
-    if (nextVolume > 0 && muted) {
-      setMuted(false);
-    }
-  }, [muted]);
+  const handleVolumeChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const nextVolume = parseFloat(e.target.value);
+      setVolume(nextVolume);
+      if (nextVolume > 0 && muted) {
+        setMuted(false);
+      }
+    },
+    [muted],
+  );
 
   const toggleMute = useCallback(() => {
     setMuted((prev) => !prev);
   }, []);
 
   return (
-    <div className={cn('flex flex-col gap-2', className)}>
+    <div className={cn("flex flex-col gap-2", className)}>
       <div className="relative bg-black rounded-lg overflow-hidden aspect-[9/16] max-h-[60vh]">
         <video
           ref={videoRef}
