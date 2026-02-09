@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
-import { Loader2, ChevronDown, Plus, FolderOpen } from "lucide-react";
+import { Loader2, ChevronDown, Plus, FolderOpen, FolderPlus } from "lucide-react";
 import { Button, Input } from "@/components/ui";
 import { FolderBrowserModal } from "@/components/FolderBrowserModal";
 import { useProjectStore } from "@/stores";
@@ -45,6 +45,7 @@ export function ProjectSetup() {
   const [indexNewMode, setIndexNewMode] = useState(false);
   const [newAnimePath, setNewAnimePath] = useState("");
   const [newAnimeName, setNewAnimeName] = useState("");
+  const [updateAnimeName, setUpdateAnimeName] = useState<string | null>(null);
 
   // Anime list state
   const [indexedAnime, setIndexedAnime] = useState<string[]>([]);
@@ -224,7 +225,7 @@ export function ProjectSetup() {
     [],
   );
 
-  const handleIndexAnime = useCallback(async (): Promise<boolean> => {
+  const handleIndexAnime = useCallback(async (overrideName?: string): Promise<boolean> => {
     if (!newAnimePath.trim()) return false;
 
     setIndexing(true);
@@ -237,7 +238,7 @@ export function ProjectSetup() {
     });
 
     try {
-      const animeName = newAnimeName.trim() || undefined;
+      const animeName = overrideName || newAnimeName.trim() || undefined;
       const response = await api.indexAnime(newAnimePath, animeName, 2.0);
 
       if (!response.ok) {
@@ -294,6 +295,7 @@ export function ProjectSetup() {
       if (finalAnimeName) {
         setSelectedAnime(finalAnimeName);
         setIndexNewMode(false);
+        setUpdateAnimeName(null);
         setNewAnimePath("");
         setNewAnimeName("");
         setIndexProgress(null);
@@ -313,7 +315,12 @@ export function ProjectSetup() {
     } finally {
       setIndexing(false);
     }
-  }, [newAnimePath, newAnimeName]);
+  }, [newAnimePath, newAnimeName, updateAnimeName]);
+
+  const handleUpdateAnime = async () => {
+    if (!updateAnimeName || !newAnimePath.trim()) return;
+    await handleIndexAnime(updateAnimeName);
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -361,8 +368,17 @@ export function ProjectSetup() {
 
   const startIndexNew = () => {
     setIndexNewMode(true);
+    setUpdateAnimeName(null);
     setShowAnimeDropdown(false);
     setSelectedAnime(null);
+  };
+
+  const startUpdateAnime = (anime: string) => {
+    setUpdateAnimeName(anime);
+    setIndexNewMode(false);
+    setShowAnimeDropdown(false);
+    setNewAnimePath("");
+    setIndexProgress(null);
   };
 
   const isLoading = creatingProject || downloading || indexing || detecting;
@@ -409,7 +425,88 @@ export function ProjectSetup() {
               <span className="text-[hsl(var(--destructive))]">*</span>
             </label>
 
-            {!indexNewMode ? (
+            {updateAnimeName ? (
+              /* Update Episodes Mode */
+              <div className="space-y-3 p-3 border border-[hsl(var(--border))] rounded-md bg-[hsl(var(--muted))/0.3]">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm font-medium">Update episodes for {updateAnimeName}</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setUpdateAnimeName(null);
+                      setNewAnimePath("");
+                      setIndexProgress(null);
+                    }}
+                    className="text-xs text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))]"
+                  >
+                    Cancel
+                  </button>
+                </div>
+
+                <div>
+                  <label className="text-xs text-[hsl(var(--muted-foreground))] mb-1 block">
+                    Folder path with episodes (existing + new)
+                  </label>
+                  <div className="flex gap-2">
+                    <Input
+                      type="text"
+                      placeholder="/path/to/anime/episodes"
+                      value={newAnimePath}
+                      onChange={(e) => setNewAnimePath(e.target.value)}
+                      disabled={isLoading}
+                      className="flex-1"
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      disabled={isLoading}
+                      onClick={() => setShowFolderBrowser(true)}
+                    >
+                      <FolderOpen className="h-4 w-4" />
+                    </Button>
+                  </div>
+                  <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
+                    Only new episodes will be copied and indexed
+                  </p>
+                </div>
+
+                <Button
+                  type="button"
+                  className="w-full"
+                  disabled={isLoading || !newAnimePath.trim()}
+                  onClick={handleUpdateAnime}
+                >
+                  {indexing ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                      Updating...
+                    </>
+                  ) : (
+                    "Update Episodes"
+                  )}
+                </Button>
+
+                {/* Indexing progress */}
+                {indexProgress && indexProgress.status !== "error" && (
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2 text-xs text-[hsl(var(--muted-foreground))]">
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                      <span>{indexProgress.message}</span>
+                    </div>
+                    <div className="h-1.5 bg-[hsl(var(--muted))] rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-[hsl(var(--primary))] transition-all duration-300"
+                        style={{ width: `${indexProgress.progress * 100}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {indexProgress?.error && (
+                  <p className="text-xs text-[hsl(var(--destructive))]">{indexProgress.error}</p>
+                )}
+              </div>
+            ) : !indexNewMode ? (
               <div className="relative">
                 <button
                   type="button"
@@ -455,14 +552,29 @@ export function ProjectSetup() {
                         </div>
                       ) : (
                         filteredAnime.map((anime) => (
-                          <button
+                          <div
                             key={anime}
-                            type="button"
-                            onClick={() => selectAnime(anime)}
-                            className="w-full text-left px-3 py-2 hover:bg-[hsl(var(--muted))] text-sm"
+                            className="flex items-center hover:bg-[hsl(var(--muted))]"
                           >
-                            {anime}
-                          </button>
+                            <button
+                              type="button"
+                              onClick={() => selectAnime(anime)}
+                              className="flex-1 text-left px-3 py-2 text-sm"
+                            >
+                              {anime}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                startUpdateAnime(anime);
+                              }}
+                              className="px-2 py-2 text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--primary))]"
+                              title="Update episodes"
+                            >
+                              <FolderPlus className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
                         ))
                       )}
                     </div>
@@ -587,33 +699,35 @@ export function ProjectSetup() {
             </div>
           )}
 
-          {error && (
+          {error && !updateAnimeName && (
             <p className="text-sm text-[hsl(var(--destructive))]">{error}</p>
           )}
 
-          <Button
-            type="submit"
-            className="w-full"
-            disabled={isLoading || !canSubmit}
-            data-testid="create-project-btn"
-          >
-            {isLoading ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin mr-2" />
-                {indexing
-                  ? "Indexing..."
-                  : downloading
-                    ? "Downloading..."
-                    : detecting
-                      ? "Detecting scenes..."
-                      : "Creating..."}
-              </>
-            ) : indexNewMode ? (
-              "Index & Start"
-            ) : (
-              "Download & Start"
-            )}
-          </Button>
+          {!updateAnimeName && (
+            <Button
+              type="submit"
+              className="w-full"
+              disabled={isLoading || !canSubmit}
+              data-testid="create-project-btn"
+            >
+              {isLoading ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                  {indexing
+                    ? "Indexing..."
+                    : downloading
+                      ? "Downloading..."
+                      : detecting
+                        ? "Detecting scenes..."
+                        : "Creating..."}
+                </>
+              ) : indexNewMode ? (
+                "Index & Start"
+              ) : (
+                "Download & Start"
+              )}
+            </Button>
+          )}
         </form>
 
         <p className="text-xs text-center text-[hsl(var(--muted-foreground))]">
