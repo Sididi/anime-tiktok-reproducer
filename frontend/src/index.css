@@ -36,3 +36,22 @@ body {
 #root {
   min-height: 100vh;
 }
+
+/* TipTap editor styling */
+.tiptap-editor .tiptap {
+  outline: none;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: baseline;
+  gap: 0.25rem 0.75rem;
+}
+
+.tiptap-editor .tiptap p {
+  margin: 0;
+  line-height: 1.6;
+}
+
+.tiptap-editor .tiptap .scene-header-chip {
+  margin: 0;
+  line-height: 1.6;
+}

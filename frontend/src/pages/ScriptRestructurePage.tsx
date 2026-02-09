@@ -9,11 +9,13 @@ import {
   FileAudio,
   Files,
   FileAudio2,
+  Pencil,
 } from "lucide-react";
 import { Button } from "@/components/ui";
 import { useProjectStore, useSceneStore } from "@/stores";
 import { api } from "@/api/client";
 import type { Transcription, Project } from "@/types";
+import { ScriptEditorModal } from "@/components/script";
 
 // Upload mode types
 type UploadMode = "single" | "multiple";
@@ -391,7 +393,9 @@ export function ScriptRestructurePage() {
     new Map(),
   );
   const [copiedSegment, setCopiedSegment] = useState<number | null>(null);
+  const [copiedFullScript, setCopiedFullScript] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [scriptEditorOpen, setScriptEditorOpen] = useState(false);
 
   // Parse scenes from JSON for segmentation
   const parsedScenes = useMemo(() => {
@@ -512,6 +516,43 @@ export function ScriptRestructurePage() {
     await navigator.clipboard.writeText(segment.text);
     setCopiedSegment(segment.id);
     setTimeout(() => setCopiedSegment(null), 2000);
+  }, []);
+
+  const handleCopyFullScript = useCallback(async () => {
+    if (!parsedScenes) return;
+    const fullText = parsedScenes.map((s) => s.text).join(" ");
+    await navigator.clipboard.writeText(fullText);
+    setCopiedFullScript(true);
+    setTimeout(() => setCopiedFullScript(false), 2000);
+  }, [parsedScenes]);
+
+  const handleDrop = useCallback(
+    (e: React.DragEvent, target: "single" | number) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const file = e.dataTransfer.files[0];
+      if (!file) return;
+      if (!file.type.startsWith("audio/")) {
+        setError("Please drop an audio file");
+        return;
+      }
+      if (target === "single") {
+        setAudioFile(file);
+      } else {
+        setSegmentFiles((prev) => {
+          const next = new Map(prev);
+          next.set(target, file);
+          return next;
+        });
+      }
+      setError(null);
+    },
+    [],
+  );
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
   }, []);
 
   const handleContinue = useCallback(async () => {
@@ -693,12 +734,24 @@ export function ScriptRestructurePage() {
         <div className="bg-[hsl(var(--card))] rounded-lg p-6 space-y-4">
           <div className="flex items-center justify-between">
             <h2 className="font-semibold">Step 2: Paste New Script JSON</h2>
-            {jsonValid && (
-              <span className="text-sm text-green-500 flex items-center gap-1">
-                <Check className="h-4 w-4" />
-                Valid JSON
-              </span>
-            )}
+            <div className="flex items-center gap-2">
+              {jsonValid && (
+                <>
+                  <span className="text-sm text-green-500 flex items-center gap-1">
+                    <Check className="h-4 w-4" />
+                    Valid JSON
+                  </span>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setScriptEditorOpen(true)}
+                  >
+                    <Pencil className="h-4 w-4 mr-1.5" />
+                    Edit Script
+                  </Button>
+                </>
+              )}
+            </div>
           </div>
           <p className="text-sm text-[hsl(var(--muted-foreground))]">
             Paste the JSON response from the AI here. It should contain the
@@ -757,8 +810,37 @@ export function ScriptRestructurePage() {
           {uploadMode === "single" ? (
             // Single file upload (original behavior)
             <>
+              {jsonValid && parsedScenes && (
+                <div className="flex items-center justify-between p-2 bg-[hsl(var(--muted))] rounded-lg">
+                  <span className="text-xs text-[hsl(var(--muted-foreground))] truncate flex-1 mx-2 italic">
+                    "{parsedScenes.map((s) => s.text).join(" ").slice(0, 120)}..."
+                  </span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={handleCopyFullScript}
+                    className="h-7 px-2 shrink-0"
+                  >
+                    {copiedFullScript ? (
+                      <>
+                        <Check className="h-3 w-3 mr-1" />
+                        Copied
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="h-3 w-3 mr-1" />
+                        Copy text
+                      </>
+                    )}
+                  </Button>
+                </div>
+              )}
               {audioFile ? (
-                <div className="flex items-center gap-3 p-3 bg-[hsl(var(--muted))] rounded-lg">
+                <div
+                  className="flex items-center gap-3 p-3 bg-[hsl(var(--muted))] rounded-lg"
+                  onDrop={(e) => handleDrop(e, "single")}
+                  onDragOver={handleDragOver}
+                >
                   <FileAudio className="h-8 w-8 text-[hsl(var(--primary))]" />
                   <div className="flex-1 min-w-0">
                     <p className="font-medium truncate">{audioFile.name}</p>
@@ -779,9 +861,11 @@ export function ScriptRestructurePage() {
                   variant="outline"
                   className="w-full h-24 border-dashed"
                   onClick={() => fileInputRef.current?.click()}
+                  onDrop={(e) => handleDrop(e, "single")}
+                  onDragOver={handleDragOver}
                 >
                   <Upload className="h-6 w-6 mr-2" />
-                  Click to upload audio file
+                  Drop or click to upload audio file
                 </Button>
               )}
             </>
@@ -867,7 +951,11 @@ export function ScriptRestructurePage() {
                           className="hidden"
                         />
                         {file ? (
-                          <div className="flex items-center gap-2 p-2 bg-[hsl(var(--muted))] rounded">
+                          <div
+                            className="flex items-center gap-2 p-2 bg-[hsl(var(--muted))] rounded"
+                            onDrop={(e) => handleDrop(e, segment.id)}
+                            onDragOver={handleDragOver}
+                          >
                             <FileAudio2 className="h-5 w-5 text-green-500" />
                             <span className="text-xs truncate flex-1">
                               {file.name}
@@ -891,9 +979,11 @@ export function ScriptRestructurePage() {
                             onClick={() =>
                               document.getElementById(inputId)?.click()
                             }
+                            onDrop={(e) => handleDrop(e, segment.id)}
+                            onDragOver={handleDragOver}
                           >
                             <Upload className="h-4 w-4 mr-2" />
-                            Upload Part {segment.id}
+                            Drop or upload Part {segment.id}
                           </Button>
                         )}
                       </div>
@@ -941,6 +1031,21 @@ export function ScriptRestructurePage() {
           </ul>
         </div>
       </div>
+
+      {/* Script Editor Modal */}
+      {transcription && (
+        <ScriptEditorModal
+          isOpen={scriptEditorOpen}
+          onClose={() => setScriptEditorOpen(false)}
+          onSave={(updatedJson) => {
+            handleJsonChange(updatedJson);
+            setScriptEditorOpen(false);
+          }}
+          scenesJson={newScriptJson}
+          transcription={transcription}
+          targetLanguage={targetLanguage}
+        />
+      )}
     </div>
   );
 }
