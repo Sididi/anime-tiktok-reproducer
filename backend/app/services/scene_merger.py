@@ -14,6 +14,9 @@ class SceneMergerService:
     # minor timestamp jitter between adjacent source candidates.
     CONTINUITY_GAP_TOLERANCE = 0.30  # seconds
     CONTINUITY_EPSILON = 1e-3  # allow tiny numerical jitter
+    # Minimum direct pair continuity score required before considering a merge.
+    # Keeps weak/noisy candidate overlap from creating accidental chains.
+    MIN_PAIR_CONTINUITY_SCORE = 0.22
     MIN_ALT_CONFIDENCE = 0.25
     MIN_RAW_CANDIDATE_CONFIDENCE = 0.30
     CANDIDATE_TIME_ROUNDING = 3
@@ -22,6 +25,10 @@ class SceneMergerService:
     CHAIN_BRIDGE_WINDOW = 2
     CHAIN_BRIDGE_GAP_TOLERANCE = 1.0
     CHAIN_BRIDGE_MIN_SCORE = 0.22
+    # For chain-to-chain stitching (not singleton recovery), require stronger
+    # evidence to avoid collapsing distinct scenes.
+    CHAIN_BRIDGE_STRONG_SCORE = 0.32
+    CHAIN_BRIDGE_MIN_SUPPORT = 6
 
     @classmethod
     def _get_scene_half_duration(
@@ -269,7 +276,11 @@ class SceneMergerService:
             aggregated_scores.keys(),
             key=lambda ep: (aggregated_scores[ep], episode_support.get(ep, 0)),
         )
-        return best_episode, aggregated_scores[best_episode]
+        best_score = aggregated_scores[best_episode]
+        if best_score < cls.MIN_PAIR_CONTINUITY_SCORE:
+            return None
+
+        return best_episode, best_score
 
     @classmethod
     def _build_chain_candidates(
@@ -358,7 +369,7 @@ class SceneMergerService:
         right_chain: list[int],
         matches: MatchList,
         scenes: SceneList,
-    ) -> tuple[str, float] | None:
+    ) -> tuple[str, float, int] | None:
         """
         Find continuity between adjacent chains using a small boundary window.
 
@@ -433,7 +444,7 @@ class SceneMergerService:
         if best_score < cls.CHAIN_BRIDGE_MIN_SCORE:
             return None
 
-        return best_episode, best_score
+        return best_episode, best_score, episode_support.get(best_episode, 0)
 
     @classmethod
     def _stitch_adjacent_chains(
@@ -470,16 +481,60 @@ class SceneMergerService:
             j = i + 1
 
             while j < len(segments) and current[-1] + 1 == segments[j][0]:
+                next_segment = segments[j]
+
+                # Stitching is only for recovering a single uncertain boundary scene.
+                # Do not chain-merge two multi-scene groups, which can over-merge
+                # distinct content when continuity evidence is weak/noisy.
+                left_uncertain_singleton = (
+                    len(current) == 1
+                    and current[0] < len(matches.matches)
+                    and matches.matches[current[0]].was_no_match
+                )
+                right_uncertain_singleton = (
+                    len(next_segment) == 1
+                    and next_segment[0] < len(matches.matches)
+                    and matches.matches[next_segment[0]].was_no_match
+                )
+                singleton_involved = (
+                    left_uncertain_singleton
+                    or right_uncertain_singleton
+                )
+
+                # For chain-to-chain stitching, require uncertain boundary scenes
+                # on both sides; otherwise keep chains separate.
+                if not singleton_involved:
+                    left_boundary_no_match = (
+                        current[-1] < len(matches.matches)
+                        and matches.matches[current[-1]].was_no_match
+                    )
+                    right_boundary_no_match = (
+                        next_segment[0] < len(matches.matches)
+                        and matches.matches[next_segment[0]].was_no_match
+                    )
+                    if not (left_boundary_no_match and right_boundary_no_match):
+                        break
+
                 bridge = cls._get_chain_bridge_continuity(
                     current,
-                    segments[j],
+                    next_segment,
                     matches,
                     scenes,
                 )
                 if not bridge:
                     break
 
-                current.extend(segments[j])
+                _, bridge_score, bridge_support = bridge
+                if (
+                    not singleton_involved
+                    and (
+                        bridge_score < cls.CHAIN_BRIDGE_STRONG_SCORE
+                        or bridge_support < cls.CHAIN_BRIDGE_MIN_SUPPORT
+                    )
+                ):
+                    break
+
+                current.extend(next_segment)
                 j += 1
 
             stitched.append(current)

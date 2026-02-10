@@ -147,8 +147,8 @@ async def merge_scenes(project_id: str, request: MergeScenesRequest) -> ScenesRe
 
 
 class DetectScenesRequest(BaseModel):
-    threshold: float = 20.0
-    min_scene_len: int = 15
+    threshold: float = 18.0
+    min_scene_len: int = 10
 
 
 @router.post("/detect")
@@ -169,8 +169,8 @@ async def detect_scenes(project_id: str, request: DetectScenesRequest | None = N
     project.phase = ProjectPhase.SCENE_DETECTION
     ProjectService.save(project)
 
-    threshold = request.threshold if request else 20.0
-    min_scene_len = request.min_scene_len if request else 15
+    threshold = request.threshold if request else 18.0
+    min_scene_len = request.min_scene_len if request else 10
 
     async def stream_progress():
         async for progress in SceneDetectorService.detect_scenes(

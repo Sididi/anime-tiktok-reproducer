@@ -51,8 +51,8 @@ class SceneDetectorService:
     async def detect_scenes(
         cls,
         video_path: Path,
-        threshold: float = 20.0,
-        min_scene_len: int = 15,
+        threshold: float = 18.0,
+        min_scene_len: int = 10,
     ) -> AsyncIterator[SceneDetectionProgress]:
         """
         Detect scenes in a video and yield progress updates.
