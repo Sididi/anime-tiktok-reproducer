@@ -2,6 +2,8 @@ import asyncio
 import os
 import re
 import statistics
+import subprocess
+import tempfile
 import unicodedata
 from pathlib import Path
 from typing import AsyncIterator
@@ -51,6 +53,10 @@ LANGUAGE_MAP = {
     "français": "fr",
 }
 
+VIDEO_EXTENSIONS = {
+    ".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".3gp", ".ts", ".m2ts",
+}
+
 
 class TranscriberService:
     """Service for transcribing audio using WhisperX."""
@@ -84,6 +90,86 @@ class TranscriberService:
             return "cuda" if torch.cuda.is_available() else "cpu"
         except Exception:
             return "cpu"
+
+    @staticmethod
+    def _has_audio_stream(media_path: Path) -> bool | None:
+        """Return whether input has at least one audio stream.
+
+        Returns None when ffprobe is unavailable or probing fails.
+        """
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "a",
+            "-show_entries", "stream=index",
+            "-of", "csv=p=0",
+            str(media_path),
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            return None
+
+        if result.returncode != 0:
+            return None
+
+        return bool(result.stdout.strip())
+
+    @staticmethod
+    def _extract_audio_for_whisper(media_path: Path, output_wav: Path) -> None:
+        """Extract first audio stream to 16kHz mono PCM WAV for WhisperX."""
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(media_path),
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            str(output_wav),
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("ffmpeg is required to extract audio for transcription.") from exc
+
+        if result.returncode == 0 and output_wav.exists():
+            return
+
+        stderr = result.stderr.strip()
+        lower_stderr = stderr.lower()
+        if (
+            "matches no streams" in lower_stderr
+            or "does not contain any stream" in lower_stderr
+            or ("stream map" in lower_stderr and "audio" in lower_stderr)
+        ):
+            raise ValueError(
+                f"Input file has no usable audio stream ({media_path.name}). "
+                "Transcription needs an audio track."
+            )
+
+        raise RuntimeError(
+            "Failed to extract audio for transcription. "
+            f"ffmpeg error: {stderr[:400]}"
+        )
 
     @staticmethod
     def _get_compute_type(device: str) -> str:
@@ -183,12 +269,38 @@ class TranscriberService:
         cls._ensure_unsafe_torch_load_env()
         import whisperx
 
+        temp_audio_path: Path | None = None
         try:
             device = cls._get_device()
             compute_type = cls._get_compute_type(device)
             batch_size = 16 if device == "cuda" else 4
 
-            audio = whisperx.load_audio(str(audio_path))
+            has_audio = cls._has_audio_stream(audio_path)
+            if has_audio is False:
+                raise ValueError(
+                    f"Input file has no audio stream ({audio_path.name}). "
+                    "Transcription needs an audio track. Re-download the TikTok with audio "
+                    "or provide a file that includes audio."
+                )
+
+            load_path = audio_path
+            if audio_path.suffix.lower() in VIDEO_EXTENSIONS:
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                    temp_audio_path = Path(tmp.name)
+                cls._extract_audio_for_whisper(audio_path, temp_audio_path)
+                load_path = temp_audio_path
+
+            try:
+                audio = whisperx.load_audio(str(load_path))
+            except Exception as exc:
+                msg = str(exc)
+                if "Output file does not contain any stream" in msg:
+                    raise ValueError(
+                        f"Failed to read audio from {load_path.name}. "
+                        "The file appears to be video-only (no audio stream)."
+                    ) from exc
+                raise
+
             model = cls._load_asr_model(model_size, device, compute_type)
             result = model.transcribe(
                 audio,
@@ -211,6 +323,8 @@ class TranscriberService:
             words = cls._extract_words_from_segments(segments)
             return words, detected_language
         finally:
+            if temp_audio_path and temp_audio_path.exists():
+                temp_audio_path.unlink(missing_ok=True)
             cls._cleanup_runtime_workers()
 
     @staticmethod

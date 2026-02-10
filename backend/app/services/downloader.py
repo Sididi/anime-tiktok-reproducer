@@ -63,7 +63,9 @@ class DownloaderService:
             "--progress",
             "--newline",
             "--no-playlist",
-            "-f", "best[ext=mp4]/best",
+            # Prefer best quality muxed as MP4 with audio when possible.
+            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best",
+            "--merge-output-format", "mp4",
             "-o", str(output_path),
             "--force-overwrites",
             url,
