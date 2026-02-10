@@ -54,6 +54,8 @@ interface GapCardProps {
   isResolved: boolean;
   isSkipped: boolean;
   resolvedTiming: { start: number; end: number; speed: number } | null;
+  candidates: GapCandidate[];
+  loadingCandidates: boolean;
   onUpdate: (
     sceneIndex: number,
     startTime: number,
@@ -71,39 +73,17 @@ function GapCard({
   isResolved,
   isSkipped,
   resolvedTiming,
+  candidates,
+  loadingCandidates,
   onUpdate,
   onSkip,
 }: GapCardProps) {
   const [showManualModal, setShowManualModal] = useState(false);
-  const [candidates, setCandidates] = useState<GapCandidate[]>([]);
-  const [loadingCandidates, setLoadingCandidates] = useState(true);
   const tiktokPlayerRef = useRef<ClippedVideoPlayerHandle>(null);
   const sourcePlayerRef = useRef<ClippedVideoPlayerHandle>(null);
 
   const tiktokVideoUrl = api.getVideoUrl(projectId);
   const sourceVideoUrl = api.getSourceVideoUrl(projectId, gap.episode);
-
-  // Load AI candidates
-  useEffect(() => {
-    const loadCandidates = async () => {
-      setLoadingCandidates(true);
-      try {
-        const response = await fetch(
-          `/api/projects/${projectId}/gaps/${gap.scene_index}/candidates`,
-        );
-        if (response.ok) {
-          const data = await response.json();
-          setCandidates(data.candidates || []);
-        }
-      } catch (err) {
-        console.error("Failed to load candidates:", err);
-      } finally {
-        setLoadingCandidates(false);
-      }
-    };
-
-    loadCandidates();
-  }, [projectId, gap.scene_index]);
 
   // Use resolved timing if available, otherwise current
   const displayStart = resolvedTiming?.start ?? gap.current_start;
@@ -440,6 +420,10 @@ export function GapResolutionPage() {
   >(new Map());
   const [skippedGaps, setSkippedGaps] = useState<Set<number>>(new Set());
   const [saving, setSaving] = useState(false);
+  const [candidatesByScene, setCandidatesByScene] = useState<
+    Record<number, GapCandidate[]>
+  >({});
+  const [loadingCandidates, setLoadingCandidates] = useState(false);
 
   // Load data
   useEffect(() => {
@@ -455,7 +439,26 @@ export function GapResolutionPage() {
         const gapsResponse = await fetch(`/api/projects/${projectId}/gaps`);
         if (gapsResponse.ok) {
           const gapsData = await gapsResponse.json();
-          setGaps(gapsData.gaps || []);
+          const loadedGaps: GapInfo[] = gapsData.gaps || [];
+          setGaps(loadedGaps);
+
+          // Batch-fetch all candidates in a single request
+          if (loadedGaps.length > 0) {
+            setLoadingCandidates(true);
+            try {
+              const candidatesResponse = await fetch(
+                `/api/projects/${projectId}/gaps/all-candidates`,
+              );
+              if (candidatesResponse.ok) {
+                const candidatesData = await candidatesResponse.json();
+                setCandidatesByScene(candidatesData.candidates_by_scene || {});
+              }
+            } catch (err) {
+              console.error("Failed to batch-load candidates:", err);
+            } finally {
+              setLoadingCandidates(false);
+            }
+          }
         }
 
         // Load episodes for manual editing
@@ -781,6 +784,8 @@ export function GapResolutionPage() {
                 isResolved={isResolved || isSkipped}
                 isSkipped={isSkipped}
                 resolvedTiming={resolvedTiming}
+                candidates={candidatesByScene[gap.scene_index] || []}
+                loadingCandidates={loadingCandidates}
                 onUpdate={handleUpdateGap}
                 onSkip={handleSkipGap}
               />

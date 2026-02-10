@@ -93,6 +93,58 @@ async def get_gaps(project_id: str) -> GapsResponse:
     )
 
 
+class AllCandidatesResponse(BaseModel):
+    """Response containing candidates for all gaps in one batch."""
+
+    candidates_by_scene: dict[int, list[dict]]
+
+
+@router.get("/all-candidates")
+async def get_all_candidates(project_id: str) -> AllCandidatesResponse:
+    """Get AI candidates for ALL gaps in a single batch request.
+
+    Loads matches/transcription once, calculates gaps once, then generates
+    candidates sequentially to avoid subprocess storms (ffprobe, pyscenedetect).
+    """
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project_dir = ProjectService.get_project_dir(project_id)
+
+    # Load matches ONCE
+    matches = ProjectService.load_matches(project_id)
+    if not matches:
+        return AllCandidatesResponse(candidates_by_scene={})
+
+    # Load transcription ONCE
+    transcription_path = project_dir / "gap_detection_transcription.json"
+    if not transcription_path.exists():
+        transcription_path = project_dir / "output" / "transcription_timing.json"
+        if not transcription_path.exists():
+            return AllCandidatesResponse(candidates_by_scene={})
+
+    try:
+        transcription_data = json.loads(transcription_path.read_text())
+        scene_timings = transcription_data.get("scenes", [])
+    except (json.JSONDecodeError, KeyError):
+        return AllCandidatesResponse(candidates_by_scene={})
+
+    # Calculate gaps ONCE
+    gaps = GapResolutionService.calculate_gaps(matches.matches, scene_timings)
+
+    # Generate candidates SEQUENTIALLY (avoids subprocess storm)
+    candidates_by_scene: dict[int, list[dict]] = {}
+    for gap in gaps:
+        try:
+            candidates = await GapResolutionService.generate_candidates(gap)
+            candidates_by_scene[gap.scene_index] = [c.to_dict() for c in candidates]
+        except Exception:
+            candidates_by_scene[gap.scene_index] = []
+
+    return AllCandidatesResponse(candidates_by_scene=candidates_by_scene)
+
+
 @router.get("/{scene_index}/candidates")
 async def get_gap_candidates(project_id: str, scene_index: int) -> GapCandidatesResponse:
     """Get AI candidates for resolving a specific gap.

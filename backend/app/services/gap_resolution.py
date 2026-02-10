@@ -139,14 +139,20 @@ class GapResolutionService:
     _scene_cut_inflight_lock = asyncio.Lock()
     _scene_cut_semaphore = asyncio.Semaphore(2)
 
+    # FPS cache: avoids redundant ffprobe calls for the same video file.
+    _fps_cache: dict[str, Fraction] = {}
+
     # Default timeline rate (60fps for TikTok)
     TIMELINE_RATE = FrameRateInfo(timebase=60, ntsc=False)
     # Default source rate (23.976fps for most anime)
     SOURCE_RATE = FrameRateInfo(timebase=24, ntsc=True)
 
-    @staticmethod
-    async def detect_video_fps(video_path: Path) -> Fraction:
+    @classmethod
+    async def detect_video_fps(cls, video_path: Path) -> Fraction:
         """Detect video frame rate using ffprobe, returning as a Fraction for precision.
+
+        Results are cached by resolved path to avoid redundant ffprobe subprocesses
+        (e.g. multiple gaps referencing the same episode).
 
         Args:
             video_path: Path to video file
@@ -154,6 +160,10 @@ class GapResolutionService:
         Returns:
             Frame rate as a Fraction (e.g., Fraction(24000, 1001) for 23.976fps)
         """
+        cache_key = str(video_path.resolve())
+        if cache_key in cls._fps_cache:
+            return cls._fps_cache[cache_key]
+
         cmd = [
             "ffprobe", "-v", "quiet",
             "-select_streams", "v:0",
@@ -170,25 +180,25 @@ class GapResolutionService:
         stdout, _ = await process.communicate()
 
         if process.returncode != 0:
-            # Default to 24fps if detection fails
-            return Fraction(24, 1)
-
-        fps_str = stdout.decode().strip()
-        if "/" in fps_str:
-            num, den = fps_str.split("/")
-            return Fraction(int(num), int(den))
+            result = Fraction(24, 1)
         else:
-            # Handle decimal format (less common)
-            fps_float = float(fps_str)
-            # Detect NTSC rates
-            if abs(fps_float - 23.976) < 0.01:
-                return Fraction(24000, 1001)
-            elif abs(fps_float - 29.97) < 0.01:
-                return Fraction(30000, 1001)
-            elif abs(fps_float - 59.94) < 0.01:
-                return Fraction(60000, 1001)
+            fps_str = stdout.decode().strip()
+            if "/" in fps_str:
+                num, den = fps_str.split("/")
+                result = Fraction(int(num), int(den))
             else:
-                return Fraction(int(round(fps_float)), 1)
+                fps_float = float(fps_str)
+                if abs(fps_float - 23.976) < 0.01:
+                    result = Fraction(24000, 1001)
+                elif abs(fps_float - 29.97) < 0.01:
+                    result = Fraction(30000, 1001)
+                elif abs(fps_float - 59.94) < 0.01:
+                    result = Fraction(60000, 1001)
+                else:
+                    result = Fraction(int(round(fps_float)), 1)
+
+        cls._fps_cache[cache_key] = result
+        return result
 
     @classmethod
     async def get_frame_offset(cls, video_path: Path) -> float:
