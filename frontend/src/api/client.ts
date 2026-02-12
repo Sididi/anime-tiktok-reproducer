@@ -232,6 +232,10 @@ export const api = {
         source_path: sourcePath,
         anime_name: animeName,
         fps,
+        batch_size: 64,
+        prefetch_batches: 3,
+        transform_workers: 4,
+        require_gpu: true,
       }),
     });
   },

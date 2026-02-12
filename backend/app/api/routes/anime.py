@@ -1,5 +1,6 @@
 """API routes for anime library management."""
 
+import asyncio
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -24,9 +25,9 @@ async def browse_directories(path: str | None = Query(default=None)):
 
     parent_path = str(browse_path.parent) if browse_path != browse_path.parent else None
 
-    dirs = []
-    files = []
-    try:
+    def _scan_path() -> tuple[list[dict], list[dict]]:
+        dirs = []
+        files = []
         for entry in sorted(browse_path.iterdir(), key=lambda e: e.name.lower()):
             if entry.name.startswith("."):
                 continue
@@ -52,6 +53,10 @@ async def browse_directories(path: str | None = Query(default=None)):
                     "is_dir": False,
                     "has_videos": False,
                 })
+        return dirs, files
+
+    try:
+        dirs, files = await asyncio.to_thread(_scan_path)
     except PermissionError:
         raise HTTPException(status_code=403, detail=f"Permission denied: {browse_path}")
 
@@ -76,6 +81,10 @@ class IndexAnimeRequest(BaseModel):
     source_path: str
     anime_name: str | None = None
     fps: float = 2.0
+    batch_size: int = 64
+    prefetch_batches: int = 3
+    transform_workers: int = 4
+    require_gpu: bool = True
 
 
 @router.post("/index")
@@ -99,6 +108,10 @@ async def index_anime(request: IndexAnimeRequest):
             source_folder=source_folder,
             anime_name=request.anime_name,
             fps=request.fps,
+            batch_size=request.batch_size,
+            prefetch_batches=request.prefetch_batches,
+            transform_workers=request.transform_workers,
+            require_gpu=request.require_gpu,
         ):
             if progress.status == "complete" and is_update:
                 # Mark only this series as stale so matcher reloads cache lazily
