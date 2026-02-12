@@ -1,3 +1,12 @@
+import os
+
+# Set BEFORE any import that may transitively load torch (e.g. anime_searcher).
+# torch._inductor.config reads TORCHINDUCTOR_COMPILE_THREADS at import time
+# and caches it; if already loaded with the default (os.cpu_count()) the later
+# setdefault in transcriber.py has no effect, leading to dozens of compile
+# worker processes that never get cleaned up.
+os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 

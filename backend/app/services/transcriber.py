@@ -4,7 +4,9 @@ import re
 import statistics
 import subprocess
 import tempfile
+import threading
 import unicodedata
+from contextlib import suppress
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -64,6 +66,9 @@ class TranscriberService:
     _asr_models: dict = {}
     _align_models: dict = {}
     _unsafe_env_applied: bool = False
+    _model_lock = threading.RLock()
+    _active_transcriptions: int = 0
+    _unload_requested: bool = False
 
     @classmethod
     def _ensure_unsafe_torch_load_env(cls) -> None:
@@ -81,6 +86,97 @@ class TranscriberService:
     def _cleanup_runtime_workers() -> None:
         """Shut down transient TorchInductor compile pools after ASR."""
         shutdown_torch_compile_workers()
+
+    @classmethod
+    def _start_transcription_session(cls) -> None:
+        with cls._model_lock:
+            cls._active_transcriptions += 1
+
+    @classmethod
+    def _end_transcription_session(cls) -> None:
+        should_unload = False
+        with cls._model_lock:
+            if cls._active_transcriptions > 0:
+                cls._active_transcriptions -= 1
+            if cls._active_transcriptions == 0 and cls._unload_requested:
+                should_unload = True
+
+        if should_unload:
+            cls.unload_models()
+
+    @classmethod
+    def unload_models(cls) -> None:
+        """Release cached WhisperX models and free GPU/CPU memory.
+
+        Should be called after transcription is no longer needed (e.g. after
+        the processing pipeline's alignment step) so that VRAM held by the
+        large-v3 ASR model, alignment models, and associated CUDA tensors is
+        returned to the system.
+        """
+        import gc
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        with cls._model_lock:
+            if cls._active_transcriptions > 0:
+                cls._unload_requested = True
+                return
+
+            had_asr = len(cls._asr_models)
+            had_align = len(cls._align_models)
+            asr_models = [cls._asr_models.pop(key) for key in list(cls._asr_models)]
+            align_models = [cls._align_models.pop(key) for key in list(cls._align_models)]
+            cls._unload_requested = False
+
+        # --- ASR pipelines (FasterWhisperPipeline) ---
+        # Each holds a CTranslate2 model (own CUDA allocator) + pyannote VAD.
+        for pipeline in asr_models:
+            # 1. CTranslate2 Whisper model – has its own GPU allocator that
+            #    torch.cuda.empty_cache() cannot reach.
+            ct2_model = getattr(getattr(pipeline, "model", None), "model", None)
+            if ct2_model is not None:
+                with suppress(Exception):
+                    ct2_model.unload_model()
+
+            # 2. Pyannote VAD pipeline – holds a segmentation nn.Module on GPU.
+            vad = getattr(pipeline, "vad_model", None)
+            if vad is not None:
+                vad_pipe = getattr(vad, "vad_pipeline", None)
+                if vad_pipe is not None:
+                    with suppress(Exception):
+                        vad_pipe.to("cpu")
+
+            # Break references so GC can collect the whole graph.
+            with suppress(Exception):
+                pipeline.model = None
+            with suppress(Exception):
+                pipeline.vad_model = None
+
+        # --- Alignment models (PyTorch nn.Module + metadata) ---
+        for model_data in align_models:
+            if isinstance(model_data, tuple):
+                for item in model_data:
+                    if hasattr(item, "cpu"):
+                        with suppress(Exception):
+                            item.cpu()
+
+        cls._cleanup_runtime_workers()
+
+        # Force multiple GC passes to break reference cycles in ML model graphs.
+        gc.collect()
+        gc.collect()
+
+        with suppress(Exception):
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                vram_mib = torch.cuda.memory_allocated() / (1024 * 1024)
+                logger.info(
+                    "unload_models: freed %d ASR + %d align models, "
+                    "PyTorch VRAM after empty_cache: %.0f MiB",
+                    had_asr, had_align, vram_mib,
+                )
 
     @staticmethod
     def _get_device() -> str:
@@ -178,30 +274,30 @@ class TranscriberService:
     @classmethod
     def _load_asr_model(cls, model_size: str, device: str, compute_type: str):
         key = (model_size, device, compute_type)
-        if key in cls._asr_models:
-            return cls._asr_models[key]
-
         cls._ensure_unsafe_torch_load_env()
+        with cls._model_lock:
+            if key in cls._asr_models:
+                return cls._asr_models[key]
 
-        import whisperx
+            import whisperx
 
-        model = whisperx.load_model(model_size, device, compute_type=compute_type)
-        cls._asr_models[key] = model
-        return model
+            model = whisperx.load_model(model_size, device, compute_type=compute_type)
+            cls._asr_models[key] = model
+            return model
 
     @classmethod
     def _load_align_model(cls, language_code: str, device: str):
         key = (language_code or "unknown", device)
-        if key in cls._align_models:
-            return cls._align_models[key]
-
         cls._ensure_unsafe_torch_load_env()
+        with cls._model_lock:
+            if key in cls._align_models:
+                return cls._align_models[key]
 
-        import whisperx
+            import whisperx
 
-        model_a, metadata = whisperx.load_align_model(language_code=language_code, device=device)
-        cls._align_models[key] = (model_a, metadata)
-        return model_a, metadata
+            model_a, metadata = whisperx.load_align_model(language_code=language_code, device=device)
+            cls._align_models[key] = (model_a, metadata)
+            return model_a, metadata
 
     @staticmethod
     def _segment_words_from_text(segment: dict) -> list[dict]:
@@ -267,10 +363,12 @@ class TranscriberService:
         model_size: str = "large-v3",
     ) -> tuple[list[dict], str]:
         cls._ensure_unsafe_torch_load_env()
-        import whisperx
+        cls._start_transcription_session()
 
         temp_audio_path: Path | None = None
         try:
+            import whisperx
+
             device = cls._get_device()
             compute_type = cls._get_compute_type(device)
             batch_size = 16 if device == "cuda" else 4
@@ -325,7 +423,9 @@ class TranscriberService:
         finally:
             if temp_audio_path and temp_audio_path.exists():
                 temp_audio_path.unlink(missing_ok=True)
-            cls._cleanup_runtime_workers()
+            with suppress(Exception):
+                cls._cleanup_runtime_workers()
+            cls._end_transcription_session()
 
     @staticmethod
     def _normalize_token(token: str) -> str:
@@ -657,6 +757,10 @@ class TranscriberService:
             # Save transcription
             ProjectService.save_transcription(project_id, transcription)
 
+            # Free WhisperX models and GPU VRAM — the user will interact with
+            # scenes/matches/script before transcription is needed again.
+            cls.unload_models()
+
             yield TranscriptionProgress(
                 "complete",
                 1.0,
@@ -665,6 +769,8 @@ class TranscriberService:
             )
 
         except Exception as e:
+            with suppress(Exception):
+                cls.unload_models()
             yield TranscriptionProgress("error", 0, "", error=str(e))
 
     @classmethod

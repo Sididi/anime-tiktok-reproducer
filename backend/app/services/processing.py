@@ -1890,13 +1890,17 @@ class ProcessingService:
 
                 # Run transcription in thread pool
                 loop = asyncio.get_event_loop()
-                new_transcription = await loop.run_in_executor(
-                    None,
-                    transcriber.transcribe_with_alignment,
-                    edited_audio_path,
-                    new_script,
-                )
-                cls.normalize_transcription_timings(new_transcription)
+                try:
+                    new_transcription = await loop.run_in_executor(
+                        None,
+                        transcriber.transcribe_with_alignment,
+                        edited_audio_path,
+                        new_script,
+                    )
+                    cls.normalize_transcription_timings(new_transcription)
+                finally:
+                    # Always attempt model unload, including failure paths.
+                    TranscriberService.unload_models()
 
                 # Save transcription for gap detection
                 transcription_timing_path = output_dir / "transcription_timing.json"
