@@ -7,7 +7,7 @@ from pathlib import Path
 import json
 import os
 
-from ...services import AnimeLibraryService
+from ...services import AnimeLibraryService, AnimeMatcherService
 
 router = APIRouter(prefix="/anime", tags=["anime"])
 
@@ -89,12 +89,21 @@ async def index_anime(request: IndexAnimeRequest):
     if not source_folder.is_dir():
         raise HTTPException(status_code=400, detail=f"Source path is not a directory: {request.source_path}")
 
+    # If this series already exists in the index, this operation is an update.
+    target_anime_name = request.anime_name or source_folder.name
+    indexed_series = await AnimeLibraryService.list_indexed_anime()
+    is_update = target_anime_name in indexed_series
+
     async def stream_progress():
         async for progress in AnimeLibraryService.index_anime(
             source_folder=source_folder,
             anime_name=request.anime_name,
             fps=request.fps,
         ):
+            if progress.status == "complete" and is_update:
+                # Mark only this series as stale so matcher reloads cache lazily
+                # when this exact anime is matched next time.
+                AnimeMatcherService.mark_series_updated(target_anime_name)
             yield f"data: {json.dumps(progress.to_dict())}\n\n"
 
     return StreamingResponse(

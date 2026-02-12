@@ -48,14 +48,24 @@ class AnimeMatcherService:
     _embedder = None
     _query_processor = None
     _loaded_library_path: Path | None = None
+    # Series that were updated on disk and require cache refresh before matching.
+    _stale_series: set[str] = set()
 
     @classmethod
-    def _init_searcher(cls, library_path: Path) -> bool:
+    def mark_series_updated(cls, series_name: str | None) -> None:
+        """Mark one series as stale so next match for it reloads the index cache."""
+        if not series_name:
+            return
+        cls._stale_series.add(series_name)
+
+    @classmethod
+    def _init_searcher(cls, library_path: Path, anime_name: str | None = None) -> bool:
         """
         Initialize the anime_searcher components.
 
         Args:
             library_path: Path to the anime library with index
+            anime_name: Optional series name currently being matched
 
         Returns:
             True if initialization succeeded
@@ -65,8 +75,11 @@ class AnimeMatcherService:
         if str(searcher_path.parent) not in sys.path:
             sys.path.insert(0, str(searcher_path.parent))
 
-        # Skip if already loaded for same library
-        if cls._loaded_library_path == library_path and cls._query_processor is not None:
+        # Reuse cache unless current series was updated on disk.
+        cache_ready = cls._loaded_library_path == library_path and cls._query_processor is not None
+        needs_refresh_for_series = anime_name is not None and anime_name in cls._stale_series
+        needs_refresh_for_unscoped_match = anime_name is None and bool(cls._stale_series)
+        if cache_ready and not (needs_refresh_for_series or needs_refresh_for_unscoped_match):
             return True
 
         try:
@@ -88,6 +101,8 @@ class AnimeMatcherService:
             cls._embedder = SSCDEmbedder(model_path)
             cls._query_processor = QueryProcessor(cls._index_manager, cls._embedder)
             cls._loaded_library_path = library_path
+            # Full reload brings all series up to date.
+            cls._stale_series.clear()
 
             return True
 
@@ -424,7 +439,7 @@ class AnimeMatcherService:
         # Initialize searcher in thread pool
         loop = asyncio.get_event_loop()
         init_success = await loop.run_in_executor(
-            None, cls._init_searcher, library_path
+            None, cls._init_searcher, library_path, anime_name
         )
 
         if not init_success:

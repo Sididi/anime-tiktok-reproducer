@@ -28,7 +28,6 @@ interface AudioSegment {
   characterCount: number;
 }
 
-
 // French-only prompt template (when target is French)
 const PROMPT_FR_TEMPLATE = `# RÔLE
 
@@ -57,7 +56,7 @@ Tu reçois un JSON contenant des scènes. Chaque scène possède :
 
 ### 2. FLUIDITÉ & RESTRUCTURATION (Anti-Plagiat)
 
-- **Ne traduis jamais phrase par phrase.** Lis le script par blocs de 2 ou 3 scènes pour comprendre le sens global.
+- **Ne traduis jamais phrase par phrase.** Lis le script par blocs pour comprendre le sens global et identifier les scènes (Règle 7).
 - **Reformulation totalement :** Modifie la structure syntaxique pour éviter le plagiat. Utilise des verbes forts et des synonymes percutants.
 - **Voix Active :** Pour le dynamisme TikTok, privilégie la voix active.
   - _Mauvais :_ "Il a été surpris par l'attaque."
@@ -69,7 +68,7 @@ Tu reçois un JSON contenant des scènes. Chaque scène possède :
 - **Ton :** Tu ne rédiges pas un livre, tu racontes une histoire à un pote dans un café. C'est du "Storytime".
 - **Vocabulaire :** BANNIS le langage soutenu ("Néanmoins", "Cependant", "Demeurer", "Auparavant", "Impérial", "Dédain").
   - _Remplace par :_ "Mais", "Juste avant", "Incroyable", "Mépris".
-  Expressions Datées/Ringardes) :** BANNIS les expressions idiomatiques vieillottes comme "Faire le pied de grue", "En mettre plein la vue", "Tomber des nues", "Prendre ses jambes à son cou".
+- **Expressions Datées/Ringardes :** BANNIS les expressions idiomatiques vieillottes comme "Faire le pied de grue", "En mettre plein la vue", "Tomber des nues", "Prendre ses jambes à son cou".
   - _Remplace par du concret/visuel :_ Au lieu de "Faire le pied de grue", dis "Rester planté là". Au lieu de "10 points dans la vue", dis "10 points d'écart" ou "Se prendre 10 points".
 - **Les Transitions (Crucial) :** Remplace les connecteurs écrits ("Par conséquent", "Ensuite") par des connecteurs oraux fluides : **"Du coup", "Alors", "Et là", "Bref", "Au final".**
 - **Structure :** Fais des phrases courtes et directes (Sujet + Verbe + Complément).
@@ -85,24 +84,55 @@ Tu reçois un JSON contenant des scènes. Chaque scène possède :
   - _Cas complexe (Même genre) :_ Si l'action implique deux hommes (ou deux femmes), **l'utilisation seule de "Il" est interdite** car elle crée la confusion. Tu dois alterner les pronoms avec des **désignations fonctionnelles** (ex: "L'agresseur", "La victime", "Le coach", "Son frère").
 - **Critère de réussite :** On doit savoir INSTANTANÉMENT qui fait l'action, sans avoir l'image.
 
-### 5. SYNCHRONISATION & DENSITÉ (Le défi du temps)
+### 5. SYNCHRONISATION, DENSITÉ & FLEXIBILITÉ TEMPORELLE (Calcul Technique)
 
-Le français est naturellement plus long. Pour respecter la \`duration_seconds\` :
+Le français est plus long, MAIS notre voix TTS parle vite (x1.15) et la vidéo est "élastique" (on peut la ralentir/accélérer au montage).
 
-- **Condensation Intelligente :** Tu DOIS retirer les "mots vides", les adjectifs superflus ou les connecteurs lourds. Va droit au but.
-- **Ancrage Visuel (Crucial) :** Même en condensant, **l'action montrée à l'écran doit être décrite dans la scène correspondante**. Si la scène 4 montre un smash, le mot "smash" (ou verbe associé) doit être dans le segment 4.
-- **Débordement Autorisé :** Tu as le droit de finir une phrase sur la scène suivante (décalage de ±0.5s) si cela rend l'audio plus fluide, tant que l'action visuelle principale reste synchronisée.
+- **La Règle d'Or du débit :** Vise une moyenne de **3 à 4 mots par seconde** de \`duration_seconds\`.
+  - *Exemple :* Si une scène dure 2.0s, tu as la place pour 6 à 8 mots.
+- **Priorité à l'Impact :** Ne cherche pas à "remplir" le temps si ce n'est pas nécessaire. Une phrase courte et tranchante ("Il est mort.") est meilleure qu'une phrase longue, car on peut accélérer la vidéo (cut) massivement.
+- **Gestion du débordement :** Tu as le droit de déborder légèrement de la durée théorique ou d'être plus court. Ce qui compte, c'est que le texte soit percutant.
 
-### 6. FORMATTAGE AUDIO
+### 6. STRUCTURE DE RÉTENTION
+
+Si possible, chaque séquence (aggrégat de plans de coupe) doit suivre au moins une de ces logiques :
+
+## Curiosity
+Créer une attente :
+- “Sauf que…”
+- “Le problème, c’est que…”
+- “Il ne le sait pas encore, mais…”
+
+## Escalade
+Chaque séquence doit :
+- augmenter le danger
+- ou augmenter l’enjeu
+- ou révéler une info clé
+
+## Payoff visuel
+Quand une action arrive à l’écran :
+- elle doit être annoncée
+- puis livrée
+
+### 7. PRINCIPE DE "MACRO-SÉQUENCE" & ANCRAGE VISUEL
+
+Ton input JSON découpe la vidéo en "plans de coupe" (cuts) très courts. Ne traduis pas cut par cut, cela rendrait le texte robotique.
+
+1. **Regroupement (Macro-Séquence) :** Identifie des groupes de 2 à 5 cuts qui forment une idée narrative complète. Écris ta phrase française sur l'ensemble de ce groupe pour qu'elle soit fluide.
+2. **Redistribution :** Découpe ensuite cette phrase pour la répartir dans les objets JSON correspondants.
+3. **L'Ancrage Visuel (IMPÉRATIF) :** C'est ta seule contrainte rigide lors de la redistribution.
+   - Si la scène X montre une action spécifique (ex: un coup de poing), le mot correspondant ("frappe", "cogne") DOIT être dans l'objet JSON de la scène X.
+   - *Méthode :* Écris l'histoire fluide, puis "épingle" les mots-clés sur les bons index temporels.
+
+### 8. FORMATTAGE AUDIO
 
 - Le texte est destiné à un TTS (Text-To-Speech).
-- Évite les phrases trop complexes à prononcer.
-- Utilise une ponctuation rythmique (virgules, points) pour guider l'IA vocale.
+- Utilise une ponctuation rythmique (virgule, point d'exclamation, point d'interrogation) pour guider l'IA vocale.
 
 # FORMAT DE SORTIE
 
 - Retourne **UNIQUEMENT** un JSON valide.
-- Garde **STRICTEMENT** la même structure (mêmes clés, mêmes \`duration_seconds\`, même nombre d'objets).
+- Garde **STRICTEMENT** la même structure (mêmes clés, même nombre d'objets).
 - Ne mets aucun markdown (pas de \`\`\`json), pas d'intro, pas de conclusion. Juste le raw JSON string.
 
 DONNÉES D'ENTRÉE :
@@ -112,7 +142,7 @@ DONNÉES D'ENTRÉE :
 const PROMPT_MULTILINGUAL_TEMPLATE = `# RÔLE
 
 Tu es un Expert en Adaptation de Scripts Vidéo (Post-Synchro).
-Ta mission : Réécrire un script de [SOURCE] vers [CIBLE] pour un format vidéo court (TikTok).
+Ta mission : Réécrire un script de [SOURCE] vers [TARGET] pour un format vidéo court (TikTok/Reels).
 Le but est d'obtenir un texte **indétectable comme copie (anti-plagiat)**, fluide à l'oreille, et parfaitement synchronisé temporellement.
 
 # CONTEXTE
@@ -124,7 +154,7 @@ _Instruction : Utilise ce titre pour comprendre le contexte et le vocabulaire sp
 
 Tu reçois un JSON contenant des scènes. Chaque scène possède :
 
-- \`text\` : Le script original.
+- \`text\` : Le script original en [SOURCE].
 - \`duration_seconds\` : La durée stricte de la scène.
 - \`estimated_word_count\` : Indication de la densité originale.
 
@@ -132,53 +162,86 @@ Tu reçois un JSON contenant des scènes. Chaque scène possède :
 
 ### 1. LA "RÈGLE DU HOOK" (Première phrase - Exception)
 
-- La **première phrase** est l'accroche virale. Tu dois la **garder telle quelle** et la **traduire** le plus fidèlement possible dans la langue [CIBLE]. Fais une traduction contextuelle (plus naturel).
+- La **première phrase** est l'accroche virale. Tu dois la **garder telle quelle** sur le fond mais la **traduire** en [TARGET] le plus fidèlement possible. Fais une traduction contextuelle (plus naturel).
 
 ### 2. FLUIDITÉ & RESTRUCTURATION (Anti-Plagiat)
 
-- **Ne traduis jamais phrase par phrase.** Lis le script par blocs de 2 ou 3 scènes pour comprendre le sens global.
-- **Reformulation totale :** Modifie la structure syntaxique pour éviter le plagiat. Utilise des verbes forts et des synonymes percutants propres à la [CIBLE].
-- **Voix Active :** Pour le dynamisme TikTok, privilégie systématiquement la voix active.
-  - _Concept :_ Au lieu de dire "L'ennemi a été frappé par lui" (Passif), dis "Il a frappé l'ennemi" (Actif).
-- **Objectif :** Le texte en [CIBLE] doit sembler avoir été écrit nativement, pas traduit.
+- **Ne traduis jamais phrase par phrase.** Lis le script par blocs pour comprendre le sens global et identifier les scènes (Règle 7).
+- **Reformulation totale :** Modifie la structure syntaxique pour éviter le calque de la langue [SOURCE]. Utilise des verbes forts et des synonymes percutants propres à la langue [TARGET].
+- **Voix Active :** Pour le dynamisme TikTok, privilégie la voix active.
+- **Objectif :** Le texte en [TARGET] doit sembler avoir été écrit nativement, pas traduit.
 
 ### 3. LA "RÈGLE DU CAFÉ" (Ton & Registre)
 
 - **Ton :** Tu ne rédiges pas un livre, tu racontes une histoire à un pote dans un café. C'est du "Storytime".
-- **Vocabulaire :** BANNIS le langage soutenu (ex: "Néanmoins", "Cependant", "Demeurer", "Auparavant", "Impérial", "Dédain" pour FR).
-  - _Remplace par :_ "Mais", "Juste avant", "Incroyable", "Mépris".
-Expressions Datées/Ringardes) :** BANNIS les expressions idiomatiques vieillottes comme "Faire le pied de grue", "En mettre plein la vue", "Tomber des nues", "Prendre ses jambes à son cou".
-  - _Remplace par du concret/visuel :_ Au lieu de "Faire le pied de grue", dis "Rester planté là". Au lieu de "10 points dans la vue", dis "10 points d'écart" ou "Se prendre 10 points".
-- **Les Transitions (Crucial) :** Remplace les connecteurs écrits (ex: "Par conséquent", "Ensuite" pour FR) par des connecteurs oraux fluides : **"Du coup", "Alors", "Et là", "Bref", "Au final".**
-- **Structure :** Fais des phrases courtes et directes (Sujet + Verbe + Complément).
-- **Interdit :** Pas de passé simple (sauf effet dramatique), pas d'inversion sujet-verbe complexe. Ça doit sonner parlé.
+- **Vocabulaire :** BANNIS le langage soutenu, académique ou littéraire de la langue [TARGET].
+  - _Exemple de logique :_ Ne dis pas "Néanmoins" ou "Cependant", dis "Mais" ou "Pourtant" (utilise les équivalents oraux de [TARGET]).
+- **Expressions Datées/Ringardes :** BANNIS les idiomes vieillots.
+  - _Remplace par du concret/visuel :_ Utilise le langage courant et moderne parlé actuellement par les jeunes adultes natifs en [TARGET].
+- **Les Transitions (Crucial) :** Remplace les connecteurs écrits par des connecteurs oraux fluides typiques de [TARGET] (équivalents de "Du coup", "Alors", "Bref", "Au final").
+- **Structure :** Fais des phrases courtes et directes.
+- **Interdit :** Pas de temps verbaux purement littéraires (comme le Passé Simple en français), sauf effet dramatique. Ça doit sonner parlé.
 
 ### 4. GESTION DES PRÉNOMS (Anonymisation)
 
 - **Suppression Totale :** Aucun prénom ne doit apparaître.
-- **Première Scène :** Remplace le nom par une description naturelle (ex: "La jeune prodige", "Le nouvel élève").
-- **Ensuite :** Utilise STRICTEMENT des pronoms personnels appropriés à la grammaire de la [CIBLE] (ex: Il/Elle pour FR, He/She pour EN) pour 90% des cas. Ne réutilise une description ("La fille") que si l'ambiguïté est totale.
-- **Interdit :** Les répétitions de démonstratifs.
+- **L'introduction :** À la première apparition, remplace le nom par une description naturelle (ex: "La jeune prodige", "Le nouvel élève").
+- **Ensuite :** Utilise STRICTEMENT des pronoms de la langue [TARGET] pour 90% des cas. Ne réutilise une description que si l'ambiguïté est totale.
+- **La Règle de Clarté (IMPORTANT) :**
+  - _Cas simple (Genres différents ou personnage seul) :_ Utilise massivement les pronoms pour la fluidité.
+  - _Cas complexe (Même genre) :_ Si l'action implique deux personnages du même genre, l'utilisation seule du pronom est interdite car elle crée la confusion. Tu dois alterner les pronoms avec des **désignations fonctionnelles** (ex: "L'agresseur", "La victime", "Le coach", "Son frère").
+- **Critère de réussite :** On doit savoir INSTANTANÉMENT qui fait l'action, sans avoir l'image.
 
-### 5. SYNCHRONISATION & DENSITÉ (Le défi du temps)
+### 5. SYNCHRONISATION, DENSITÉ & FLEXIBILITÉ TEMPORELLE
 
-Tu dois gérer le débit de parole selon la langue :
+La langue [TARGET] peut avoir une densité syllabique différente de la langue [SOURCE].
 
-- **Facteur de Densité :** Si la [CIBLE] est naturellement plus longue/verbeuse que la [SOURCE] (ex: EN -> FR ou EN -> ES), tu DOIS **condenser intelligemment**. Retire les "mots vides", les adjectifs superflus ou les connecteurs lourds.
-- **Ancrage Visuel (Crucial) :** Même en condensant, **l'action montrée à l'écran doit être décrite dans la scène correspondante**. Si la scène 4 montre un smash, le mot correspondant à "smash" en [CIBLE] doit être dans le segment 4.
-- **Débordement Autorisé :** Tu as le droit de finir une phrase sur la scène suivante (décalage de ±0.5s) si cela rend l'audio plus fluide, tant que l'action visuelle principale reste synchronisée.
+- **La Règle d'Or du débit :** Vise une moyenne de **3 à 4 mots par seconde** de \`duration_seconds\` (à ajuster légèrement selon la rapidité naturelle de la langue [TARGET]).
+  - *Exemple :* Si une scène dure 2.0s, tu as la place pour environ 6 à 8 mots.
+- **Priorité à l'Impact :** Ne cherche pas à "remplir" le temps si ce n'est pas nécessaire. Une phrase courte et tranchante est meilleure qu'une phrase longue.
+- **Gestion du débordement :** Tu as le droit de déborder légèrement de la durée théorique ou d'être plus court. Ce qui compte, c'est que le texte soit percutant.
 
-### 6. FORMATTAGE AUDIO
+### 6. STRUCTURE DE RÉTENTION
 
-- Le texte est destiné à un TTS (Text-To-Speech).
-- Évite les phrases trop complexes à prononcer.
-- Utilise une ponctuation rythmique (virgules, points) pour guider l'IA vocale.
+Si possible, chaque séquence (aggrégat de plans de coupe) doit suivre au moins une de ces logiques :
+
+## Curiosity
+Créer une attente (utilisant les formulations typiques de [TARGET] pour le suspense) :
+- “Sauf que…”
+- “Le problème, c’est que…”
+- “Il ne le sait pas encore, mais…”
+
+## Escalade
+Chaque séquence doit :
+- augmenter le danger
+- ou augmenter l’enjeu
+- ou révéler une info clé
+
+## Payoff visuel
+Quand une action arrive à l’écran :
+- elle doit être annoncée
+- puis livrée
+
+### 7. PRINCIPE DE "MACRO-SÉQUENCE" & ANCRAGE VISUEL
+
+Ton input JSON découpe la vidéo en "plans de coupe" (cuts) très courts. Ne traduis pas cut par cut, cela rendrait le texte robotique.
+
+1. **Regroupement (Macro-Séquence) :** Identifie des groupes de 2 à 5 cuts qui forment une idée narrative complète. Écris ta phrase en [TARGET] sur l'ensemble de ce groupe pour qu'elle soit fluide.
+2. **Redistribution :** Découpe ensuite cette phrase pour la répartir dans les objets JSON correspondants.
+3. **L'Ancrage Visuel (IMPÉRATIF) :** C'est ta seule contrainte rigide lors de la redistribution.
+   - Si la scène X montre une action spécifique (ex: un coup de poing), le mot correspondant en [TARGET] DOIT être dans l'objet JSON de la scène X.
+   - *Méthode :* Écris l'histoire fluide, puis "épingle" les mots-clés sur les bons index temporels.
+
+### 8. FORMATTAGE AUDIO
+
+- Le texte est destiné à un TTS (Text-To-Speech) en langue [TARGET].
+- Utilise une ponctuation rythmique (virgule, point d'exclamation, point d'interrogation) pour guider l'IA vocale.
 
 # FORMAT DE SORTIE
 
 - Retourne **UNIQUEMENT** un JSON valide.
-- Garde **STRICTEMENT** la même structure (mêmes clés, mêmes \`duration_seconds\`, même nombre d'objets).
-- La clé \`language\` du JSON doit correspondre au code ISO de la [CIBLE].
+- Garde **STRICTEMENT** la même structure (mêmes clés, même nombre d'objets).
+- Change la valeur de la clé \`"language"\` pour le code ISO de [TARGET] (ex: "fr", "es", "de").
 - Ne mets aucun markdown (pas de \`\`\`json), pas d'intro, pas de conclusion. Juste le raw JSON string.
 
 DONNÉES D'ENTRÉE :
@@ -211,14 +274,65 @@ const ELEVENLABS_MIN = 800;
 const ELEVENLABS_MAX = 1000;
 const ELEVENLABS_SOFT_MIN = 700; // Fallback threshold when 800+ isn't possible
 const ELEVENLABS_HARD_LIMIT = 1800; // Force split to prevent runaway
+const ELEVENLABS_MIN_SPLIT = 500; // Avoid very short chunks when splitting
+
+function getSegmentQualityScore(chars: number): number {
+  if (chars >= ELEVENLABS_MIN && chars <= ELEVENLABS_MAX) {
+    return 6;
+  }
+  if (chars >= ELEVENLABS_SOFT_MIN && chars < ELEVENLABS_MIN) {
+    return 5;
+  }
+  if (chars >= ELEVENLABS_MIN_SPLIT && chars < ELEVENLABS_SOFT_MIN) {
+    return 4;
+  }
+  if (chars > ELEVENLABS_MAX && chars <= ELEVENLABS_HARD_LIMIT) {
+    return 2;
+  }
+  if (chars > ELEVENLABS_HARD_LIMIT) {
+    return 1;
+  }
+  return 0;
+}
+
+function scoreSplitCandidate(
+  currentChars: number,
+  remainingChars: number,
+): { score: number; imbalance: number } | null {
+  if (currentChars < ELEVENLABS_MIN_SPLIT || remainingChars <= 0) {
+    return null;
+  }
+
+  const imbalance = Math.abs(currentChars - remainingChars);
+  let score = getSegmentQualityScore(currentChars);
+
+  if (remainingChars < ELEVENLABS_MIN_SPLIT) {
+    score -= 5;
+  } else {
+    score += getSegmentQualityScore(remainingChars);
+  }
+
+  if (remainingChars <= ELEVENLABS_HARD_LIMIT) {
+    score += Math.max(0, 2 - imbalance / 300);
+  }
+
+  return { score, imbalance };
+}
 
 // Segment scenes into groups based on character limit for ElevenLabs
-// Only splits at sentence boundaries (., !, ?) to preserve context
-// Prefers splitting within the 800-1000 char sweet spot
+// Splits only at sentence-ending boundaries (., !, ?)
+// Uses scoring to choose the best sentence boundary for balanced chunks
 function segmentScenes(
   scenes: Array<{ scene_index: number; text: string }>,
 ): AudioSegment[] {
+  if (scenes.length === 0) {
+    return [];
+  }
+
   const segments: AudioSegment[] = [];
+  const totalCharacterCount = scenes.map((scene) => scene.text).join(" ").length;
+  let processedCharacterCount = 0;
+
   let currentSegment: AudioSegment = {
     id: 1,
     sceneIndices: [],
@@ -226,48 +340,53 @@ function segmentScenes(
     characterCount: 0,
   };
 
-  // Track split candidates at sentence boundaries
+  // Track split candidates at sentence boundaries only.
   let bestSplit: {
     sceneIndex: number;
     segment: AudioSegment;
-    priority: number; // Higher = better (800-1000 is best)
+    score: number;
+    imbalance: number;
   } | null = null;
 
   for (let i = 0; i < scenes.length; i++) {
     const scene = scenes[i];
     const sceneText = scene.text;
+    const separator = currentSegment.text ? " " : "";
 
     // Add scene to current segment
     currentSegment.sceneIndices.push(scene.scene_index);
-    currentSegment.text += (currentSegment.text ? " " : "") + sceneText;
-    currentSegment.characterCount += sceneText.length;
+    currentSegment.text += separator + sceneText;
+    currentSegment.characterCount += separator.length + sceneText.length;
 
-    // If this is a sentence boundary, evaluate as split candidate
-    if (endsWithSentence(currentSegment.text)) {
-      const chars = currentSegment.characterCount;
-      let priority = 0;
+    // Track globally processed chars based on the full script concatenation.
+    processedCharacterCount += sceneText.length + (i > 0 ? 1 : 0);
+    const remainingChars = totalCharacterCount - processedCharacterCount;
+    const isSentenceBoundary = endsWithSentence(currentSegment.text);
 
-      if (chars >= ELEVENLABS_MIN && chars <= ELEVENLABS_MAX) {
-        // Perfect: within 800-1000 range
-        priority = 3;
-      } else if (chars >= ELEVENLABS_SOFT_MIN && chars < ELEVENLABS_MIN) {
-        // Good fallback: 700-799 range
-        priority = 2;
-      } else if (chars >= 500) {
-        // Acceptable: 500-699 range
-        priority = 1;
-      }
+    if (isSentenceBoundary) {
+      const candidate = scoreSplitCandidate(
+        currentSegment.characterCount,
+        remainingChars,
+      );
 
-      // Save if better than current best, or if we don't have one yet
-      if (priority > 0 && (bestSplit === null || priority >= bestSplit.priority)) {
-        bestSplit = {
-          sceneIndex: i,
-          segment: {
-            ...currentSegment,
-            sceneIndices: [...currentSegment.sceneIndices], // Deep copy array
-          },
-          priority,
-        };
+      if (candidate !== null) {
+        const shouldReplaceBestSplit =
+          bestSplit === null ||
+          candidate.score > bestSplit.score ||
+          (Math.abs(candidate.score - bestSplit.score) < 0.01 &&
+            candidate.imbalance < bestSplit.imbalance);
+
+        if (shouldReplaceBestSplit) {
+          bestSplit = {
+            sceneIndex: i,
+            segment: {
+              ...currentSegment,
+              sceneIndices: [...currentSegment.sceneIndices], // Deep copy array
+            },
+            score: candidate.score,
+            imbalance: candidate.imbalance,
+          };
+        }
       }
     }
 
@@ -284,19 +403,17 @@ function segmentScenes(
         // Rebuild current segment with remaining scenes
         const remainingStartIndex = bestSplit.sceneIndex + 1;
         const remainingScenes = scenes.slice(remainingStartIndex, i + 1);
+        const remainingText = remainingScenes.map((s) => s.text).join(" ");
 
         currentSegment = {
           id: segments.length + 1,
           sceneIndices: remainingScenes.map((s) => s.scene_index),
-          text: remainingScenes.map((s) => s.text).join(" "),
-          characterCount: remainingScenes.reduce(
-            (sum, s) => sum + s.text.length,
-            0,
-          ),
+          text: remainingText,
+          characterCount: remainingText.length,
         };
         bestSplit = null;
       } else if (endsWithSentence(currentSegment.text) || exceededHardLimit) {
-        // No good split point found, but we end with sentence or hit hard limit
+        // Safety fallback: always split at hard limit even if sentence isn't closed.
         segments.push(currentSegment);
         currentSegment = {
           id: segments.length + 1,
@@ -339,9 +456,9 @@ function generatePrompt(
     .replace(/\[SOURCE\]/g, sourceLanguage)
     .replace(/\[OEUVRE\]/g, animeName);
 
-  // For multilingual template, also replace [CIBLE]
+  // For multilingual template, also replace [TARGET]
   if (targetLang !== "fr") {
-    prompt = prompt.replace(/\[CIBLE\]/g, targetLanguage);
+    prompt = prompt.replace(/\[TARGET\]/g, targetLanguage);
   }
 
   // Build scene data for JSON
@@ -813,7 +930,12 @@ export function ScriptRestructurePage() {
               {jsonValid && parsedScenes && (
                 <div className="flex items-center justify-between p-2 bg-[hsl(var(--muted))] rounded-lg">
                   <span className="text-xs text-[hsl(var(--muted-foreground))] truncate flex-1 mx-2 italic">
-                    "{parsedScenes.map((s) => s.text).join(" ").slice(0, 120)}..."
+                    "
+                    {parsedScenes
+                      .map((s) => s.text)
+                      .join(" ")
+                      .slice(0, 120)}
+                    ..."
                   </span>
                   <Button
                     variant="ghost"
@@ -947,7 +1069,9 @@ export function ScriptRestructurePage() {
                           id={inputId}
                           type="file"
                           accept="audio/*"
-                          onChange={(e) => handleSegmentFileSelect(segment.id, e)}
+                          onChange={(e) =>
+                            handleSegmentFileSelect(segment.id, e)
+                          }
                           className="hidden"
                         />
                         {file ? (

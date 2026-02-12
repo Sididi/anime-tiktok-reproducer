@@ -29,6 +29,11 @@ interface DetectionProgress {
   error: string | null;
 }
 
+const sortAnimeNames = (series: string[]) =>
+  [...series].sort((a, b) =>
+    a.localeCompare(b, undefined, { sensitivity: "base", numeric: true }),
+  );
+
 export function ProjectSetup() {
   const navigate = useNavigate();
   const {
@@ -69,7 +74,7 @@ export function ProjectSetup() {
     async function loadAnime() {
       try {
         const result = await api.listIndexedAnime();
-        setIndexedAnime(result.series);
+        setIndexedAnime(sortAnimeNames(result.series));
       } catch (err) {
         console.error("Failed to load indexed anime:", err);
       } finally {
@@ -278,7 +283,7 @@ export function ProjectSetup() {
                   null;
                 // Reload anime list
                 const result = await api.listIndexedAnime();
-                setIndexedAnime(result.series);
+                setIndexedAnime(sortAnimeNames(result.series));
               }
 
               if (data.status === "error") {
@@ -315,7 +320,7 @@ export function ProjectSetup() {
     } finally {
       setIndexing(false);
     }
-  }, [newAnimePath, newAnimeName, updateAnimeName]);
+  }, [newAnimePath, newAnimeName]);
 
   const handleUpdateAnime = async () => {
     if (!updateAnimeName || !newAnimePath.trim()) return;
@@ -529,7 +534,7 @@ export function ProjectSetup() {
                 </button>
 
                 {showAnimeDropdown && (
-                  <div className="absolute z-10 mt-1 w-full bg-[hsl(var(--background))] border border-[hsl(var(--border))] rounded-md shadow-lg max-h-60 overflow-hidden">
+                  <div className="absolute z-10 mt-1 w-full bg-[hsl(var(--background))] border border-[hsl(var(--border))] rounded-md shadow-lg flex max-h-[min(80vh,24rem)] flex-col overflow-hidden">
                     {/* Search input */}
                     <div className="p-2 border-b border-[hsl(var(--border))]">
                       <Input
@@ -543,7 +548,7 @@ export function ProjectSetup() {
                     </div>
 
                     {/* Anime list */}
-                    <div className="overflow-y-auto max-h-40">
+                    <div className="overflow-y-auto min-h-0 flex-1">
                       {filteredAnime.length === 0 ? (
                         <div className="px-3 py-2 text-sm text-[hsl(var(--muted-foreground))]">
                           {indexedAnime.length === 0
@@ -580,7 +585,7 @@ export function ProjectSetup() {
                     </div>
 
                     {/* Index new option */}
-                    <div className="border-t border-[hsl(var(--border))] p-2">
+                    <div className="shrink-0 border-t border-[hsl(var(--border))] p-2">
                       <button
                         type="button"
                         onClick={startIndexNew}

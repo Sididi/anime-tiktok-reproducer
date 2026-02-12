@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator
@@ -35,6 +36,37 @@ class DownloaderService:
         """Get the output path for a downloaded video."""
         return settings.projects_dir / project_id / "tiktok.mp4"
 
+    @staticmethod
+    def _has_audio_stream(video_path: Path) -> bool | None:
+        """Return whether a media file contains at least one audio stream."""
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
+            str(video_path),
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            return None
+
+        if result.returncode != 0:
+            return None
+
+        return bool(result.stdout.strip())
+
     @classmethod
     async def download(
         cls,
@@ -56,16 +88,24 @@ class DownloaderService:
         output_path = cls.get_output_path(project_id)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # yt-dlp command with progress output
+        # yt-dlp command with progress output.
+        # Format selector guarantees that every fallback includes an audio codec.
+        format_selector = (
+            "bv*[ext=mp4]+ba[ext=m4a]/"
+            "bv*+ba/"
+            "b[ext=mp4][acodec!=none]/"
+            "b[acodec!=none]"
+        )
         cmd = [
             "yt-dlp",
             "--no-warnings",
             "--progress",
             "--newline",
             "--no-playlist",
-            # Prefer best quality muxed as MP4 with audio when possible.
-            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best",
-            "--merge-output-format", "mp4",
+            "-f",
+            format_selector,
+            "--merge-output-format",
+            "mp4",
             "-o", str(output_path),
             "--force-overwrites",
             url,
@@ -130,6 +170,20 @@ class DownloaderService:
                     0,
                     "",
                     error="Download completed but file not found",
+                )
+                return
+
+            has_audio = cls._has_audio_stream(output_path)
+            if has_audio is False:
+                output_path.unlink(missing_ok=True)
+                yield DownloadProgress(
+                    "error",
+                    0,
+                    "",
+                    error=(
+                        "Downloaded video has no audio stream. "
+                        "yt-dlp now enforces audio formats; please retry download."
+                    ),
                 )
                 return
 
