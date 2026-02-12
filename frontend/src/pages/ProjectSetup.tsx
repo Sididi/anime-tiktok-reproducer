@@ -50,6 +50,7 @@ export function ProjectSetup() {
   const [indexNewMode, setIndexNewMode] = useState(false);
   const [newAnimePath, setNewAnimePath] = useState("");
   const [newAnimeName, setNewAnimeName] = useState("");
+  const [newAnimeFps, setNewAnimeFps] = useState(2);
   const [updateAnimeName, setUpdateAnimeName] = useState<string | null>(null);
 
   // Anime list state
@@ -230,7 +231,7 @@ export function ProjectSetup() {
     [],
   );
 
-  const handleIndexAnime = useCallback(async (overrideName?: string): Promise<boolean> => {
+  const handleIndexAnime = useCallback(async (overrideName?: string, overrideFps?: number): Promise<boolean> => {
     if (!newAnimePath.trim()) return false;
 
     setIndexing(true);
@@ -244,7 +245,8 @@ export function ProjectSetup() {
 
     try {
       const animeName = overrideName || newAnimeName.trim() || undefined;
-      const response = await api.indexAnime(newAnimePath, animeName, 2.0);
+      const selectedFps = overrideFps ?? newAnimeFps;
+      const response = await api.indexAnime(newAnimePath, animeName, selectedFps);
 
       if (!response.ok) {
         throw new Error("Failed to start indexing");
@@ -303,6 +305,7 @@ export function ProjectSetup() {
         setUpdateAnimeName(null);
         setNewAnimePath("");
         setNewAnimeName("");
+        setNewAnimeFps(2);
         setIndexProgress(null);
         return true;
       }
@@ -320,11 +323,11 @@ export function ProjectSetup() {
     } finally {
       setIndexing(false);
     }
-  }, [newAnimePath, newAnimeName]);
+  }, [newAnimePath, newAnimeName, newAnimeFps]);
 
   const handleUpdateAnime = async () => {
     if (!updateAnimeName || !newAnimePath.trim()) return;
-    await handleIndexAnime(updateAnimeName);
+    await handleIndexAnime(updateAnimeName, 2);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -376,6 +379,7 @@ export function ProjectSetup() {
     setUpdateAnimeName(null);
     setShowAnimeDropdown(false);
     setSelectedAnime(null);
+    setNewAnimeFps(2);
   };
 
   const startUpdateAnime = (anime: string) => {
@@ -605,7 +609,10 @@ export function ProjectSetup() {
                   <span className="text-sm font-medium">Index New Anime</span>
                   <button
                     type="button"
-                    onClick={() => setIndexNewMode(false)}
+                    onClick={() => {
+                      setIndexNewMode(false);
+                      setNewAnimeFps(2);
+                    }}
                     className="text-xs text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))]"
                   >
                     Cancel
@@ -651,6 +658,22 @@ export function ProjectSetup() {
                     onChange={(e) => setNewAnimeName(e.target.value)}
                     disabled={isLoading}
                   />
+                </div>
+
+                <div>
+                  <label className="text-xs text-[hsl(var(--muted-foreground))] mb-1 block">
+                    Index FPS
+                  </label>
+                  <select
+                    value={newAnimeFps}
+                    onChange={(e) => setNewAnimeFps(Number(e.target.value))}
+                    disabled={isLoading}
+                    className="w-full rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--background))] px-3 py-2 text-sm"
+                  >
+                    <option value={1}>1 FPS</option>
+                    <option value={2}>2 FPS</option>
+                    <option value={4}>4 FPS</option>
+                  </select>
                 </div>
 
                 {/* Indexing progress */}

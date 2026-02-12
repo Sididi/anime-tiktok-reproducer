@@ -41,6 +41,10 @@ class AnimeLibraryService:
     """Service for managing the anime library."""
 
     VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".webm", ".mov", ".m4v"}
+    INDEX_DIR_NAME = ".index"
+    MANIFEST_FILE = "manifest.json"
+    LEGACY_METADATA_FILE = "metadata.json"
+    STATE_FILE = "state.json"
     LIST_TIMEOUT_SECONDS = 120.0
     SEARCH_TIMEOUT_SECONDS = 120.0
     REMUX_TIMEOUT_SECONDS = 600.0
@@ -58,6 +62,76 @@ class AnimeLibraryService:
     def get_anime_searcher_path() -> Path:
         """Get the anime_searcher module path."""
         return settings.anime_searcher_path
+
+    @staticmethod
+    def _coerce_fps(value: object) -> float | None:
+        """Convert candidate FPS value to a positive float when possible."""
+        try:
+            fps = float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        if fps <= 0:
+            return None
+        return fps
+
+    @classmethod
+    def _get_indexed_series_fps_sync(cls, anime_name: str) -> float | None:
+        """Read FPS for an already indexed series from index metadata."""
+        index_dir = cls.get_library_path() / cls.INDEX_DIR_NAME
+        manifest_path = index_dir / cls.MANIFEST_FILE
+        if manifest_path.exists():
+            try:
+                payload = json.loads(manifest_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                payload = None
+
+            if isinstance(payload, dict):
+                series_map = payload.get("series", {})
+                if isinstance(series_map, dict):
+                    entry = series_map.get(anime_name)
+                    if entry is not None:
+                        if isinstance(entry, dict):
+                            series_fps = cls._coerce_fps(entry.get("fps"))
+                            if series_fps is not None:
+                                return series_fps
+                        config = payload.get("config", {})
+                        if isinstance(config, dict):
+                            return cls._coerce_fps(
+                                config.get("default_fps", config.get("fps"))
+                            )
+
+        # Legacy fallback: single global FPS in metadata config.
+        legacy_metadata_path = index_dir / cls.LEGACY_METADATA_FILE
+        if not legacy_metadata_path.exists():
+            return None
+
+        # Legacy index is global; ensure this series actually exists in state.
+        state_path = index_dir / cls.STATE_FILE
+        if state_path.exists():
+            try:
+                state_payload = json.loads(state_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                state_payload = {}
+            files = state_payload.get("files", {}) if isinstance(state_payload, dict) else {}
+            if isinstance(files, dict):
+                has_series_state = any(
+                    path == anime_name or path.startswith(f"{anime_name}/")
+                    for path in files
+                )
+                if not has_series_state:
+                    return None
+
+        try:
+            legacy_payload = json.loads(legacy_metadata_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+
+        if not isinstance(legacy_payload, dict):
+            return None
+        config = legacy_payload.get("config", {})
+        if not isinstance(config, dict):
+            return None
+        return cls._coerce_fps(config.get("fps"))
 
     @classmethod
     def get_episode_manifest_path(cls) -> Path:
@@ -266,7 +340,7 @@ class AnimeLibraryService:
         Args:
             source_folder: Path to folder containing episodes.
             anime_name: Name for the anime (default: folder name).
-            fps: Frames per second for indexing.
+            fps: Requested FPS for indexing (used for new series).
             batch_size: Embedding batch size.
             prefetch_batches: Pipeline prefetch queue size.
             transform_workers: CPU worker count for image transforms.
@@ -284,6 +358,16 @@ class AnimeLibraryService:
         # Determine anime name
         if anime_name is None:
             anime_name = source_folder.name
+
+        requested_fps = fps
+        effective_fps = fps
+        existing_series_fps = await asyncio.to_thread(
+            cls._get_indexed_series_fps_sync,
+            anime_name,
+        )
+        is_existing_series = existing_series_fps is not None
+        if existing_series_fps is not None:
+            effective_fps = existing_series_fps
 
         dest_path = library_path / anime_name
 
@@ -422,10 +506,21 @@ class AnimeLibraryService:
                     )
                     return
 
+        if is_existing_series and abs(effective_fps - requested_fps) > 1e-9:
+            yield IndexProgress(
+                status="indexing",
+                message=(
+                    f"{anime_name} already indexed at {effective_fps:g} fps; "
+                    f"keeping existing FPS (requested {requested_fps:g} ignored)"
+                ),
+                progress=0.3,
+                total_files=total_files,
+            )
+
         # Run indexing with pixi run
         yield IndexProgress(
             status="indexing",
-            message=f"Indexing {anime_name} at {fps} fps",
+            message=f"Indexing {anime_name} at {effective_fps:g} fps",
             progress=0.3,
             total_files=total_files,
         )
@@ -433,7 +528,7 @@ class AnimeLibraryService:
         cmd = [
             "pixi", "run", "--locked", "anime-search",
             "index", str(library_path),
-            "--fps", str(fps),
+            "--fps", str(effective_fps),
             "--series", anime_name,
             "--batch-size", str(batch_size),
             "--prefetch-batches", str(prefetch_batches),
