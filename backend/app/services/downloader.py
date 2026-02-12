@@ -89,12 +89,15 @@ class DownloaderService:
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         # yt-dlp command with progress output.
-        # Format selector guarantees that every fallback includes an audio codec.
+        # Format selector prefers audio+video but falls back to video-only if needed.
         format_selector = (
             "bv*[ext=mp4]+ba[ext=m4a]/"
             "bv*+ba/"
             "b[ext=mp4][acodec!=none]/"
-            "b[acodec!=none]"
+            "b[acodec!=none]/"
+            "bv*[ext=mp4]/"
+            "bv*/"
+            "b"
         )
         cmd = [
             "yt-dlp",
@@ -182,7 +185,8 @@ class DownloaderService:
                     "",
                     error=(
                         "Downloaded video has no audio stream. "
-                        "yt-dlp now enforces audio formats; please retry download."
+                        "This TikTok may not have audio or the audio stream is unavailable. "
+                        "Note: Audio is required for transcription in this project."
                     ),
                 )
                 return
