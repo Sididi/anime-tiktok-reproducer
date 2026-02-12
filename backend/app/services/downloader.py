@@ -2,12 +2,13 @@
 
 import asyncio
 import json
-import subprocess
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator
 
 from ..config import settings
+from ..utils.subprocess_runner import CommandTimeoutError, run_command, terminate_process
 
 
 @dataclass
@@ -31,13 +32,16 @@ class DownloadProgress:
 class DownloaderService:
     """Service for downloading TikTok videos using yt-dlp."""
 
+    DOWNLOAD_TIMEOUT_SECONDS = 1800.0
+    FFPROBE_TIMEOUT_SECONDS = 30.0
+
     @staticmethod
     def get_output_path(project_id: str) -> Path:
         """Get the output path for a downloaded video."""
         return settings.projects_dir / project_id / "tiktok.mp4"
 
     @staticmethod
-    def _has_audio_stream(video_path: Path) -> bool | None:
+    async def _has_audio_stream(video_path: Path) -> bool | None:
         """Return whether a media file contains at least one audio stream."""
         cmd = [
             "ffprobe",
@@ -52,20 +56,14 @@ class DownloaderService:
             str(video_path),
         ]
         try:
-            result = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-            )
-        except FileNotFoundError:
+            result = await run_command(cmd, timeout_seconds=DownloaderService.FFPROBE_TIMEOUT_SECONDS)
+        except (CommandTimeoutError, FileNotFoundError):
             return None
 
         if result.returncode != 0:
             return None
 
-        return bool(result.stdout.strip())
+        return bool(result.stdout.decode().strip())
 
     @classmethod
     async def download(
@@ -114,20 +112,33 @@ class DownloaderService:
             url,
         ]
 
+        process: asyncio.subprocess.Process | None = None
+        stderr_task: asyncio.Task[bytes] | None = None
+        aborted = False
+
         try:
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+            stderr_task = asyncio.create_task(
+                process.stderr.read() if process.stderr is not None else asyncio.sleep(0, result=b"")
+            )
 
             last_progress = 0.0
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + cls.DOWNLOAD_TIMEOUT_SECONDS
 
             while True:
                 if process.stdout is None:
                     break
 
-                line = await process.stdout.readline()
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+
+                line = await asyncio.wait_for(process.stdout.readline(), timeout=remaining)
                 if not line:
                     break
 
@@ -151,13 +162,13 @@ class DownloaderService:
                     except (ValueError, IndexError):
                         pass
 
-            # Wait for process to complete
-            await process.wait()
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            await asyncio.wait_for(process.wait(), timeout=remaining)
 
+            stderr = (await stderr_task).decode() if stderr_task is not None else ""
             if process.returncode != 0:
-                stderr = ""
-                if process.stderr:
-                    stderr = (await process.stderr.read()).decode()
                 yield DownloadProgress(
                     "error",
                     0,
@@ -176,7 +187,7 @@ class DownloaderService:
                 )
                 return
 
-            has_audio = cls._has_audio_stream(output_path)
+            has_audio = await cls._has_audio_stream(output_path)
             if has_audio is False:
                 output_path.unlink(missing_ok=True)
                 yield DownloadProgress(
@@ -193,7 +204,23 @@ class DownloaderService:
 
             yield DownloadProgress("complete", 1.0, "Download complete!")
 
+        except asyncio.CancelledError:
+            aborted = True
+            if process is not None:
+                await terminate_process(process)
+            raise
+        except asyncio.TimeoutError:
+            aborted = True
+            if process is not None:
+                await terminate_process(process)
+            yield DownloadProgress(
+                "error",
+                0,
+                "",
+                error=f"Download timed out after {int(cls.DOWNLOAD_TIMEOUT_SECONDS)} seconds",
+            )
         except FileNotFoundError:
+            aborted = True
             yield DownloadProgress(
                 "error",
                 0,
@@ -201,7 +228,15 @@ class DownloaderService:
                 error="yt-dlp not found. Please install it: pip install yt-dlp",
             )
         except Exception as e:
+            aborted = True
+            if process is not None:
+                await terminate_process(process)
             yield DownloadProgress("error", 0, "", error=str(e))
+        finally:
+            if aborted and stderr_task is not None and not stderr_task.done():
+                stderr_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await stderr_task
 
     @staticmethod
     async def get_video_info(video_path: Path) -> dict:
@@ -224,14 +259,13 @@ class DownloaderService:
         ]
 
         try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            result = await run_command(
+                cmd,
+                timeout_seconds=DownloaderService.FFPROBE_TIMEOUT_SECONDS,
             )
-            stdout, _ = await process.communicate()
-
-            data = json.loads(stdout.decode())
+            if result.returncode != 0:
+                return {}
+            data = json.loads(result.stdout.decode())
 
             # Find video stream
             video_stream = None

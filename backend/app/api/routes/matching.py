@@ -1,3 +1,4 @@
+import asyncio
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -7,7 +8,7 @@ import re
 
 from ...config import settings
 from ...models import ProjectPhase, MatchList, SceneMatch, Scene, SceneList
-from ...services import ProjectService, AnimeMatcherService, SceneMergerService
+from ...services import ProjectService, AnimeMatcherService, SceneMergerService, AnimeLibraryService
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["matching"])
 
@@ -96,14 +97,46 @@ async def list_episodes(project_id: str):
         else:
             source_dirs = [settings.anime_library_path]
 
-    for src_path in source_dirs:
+    def _is_under(path: Path, root: Path) -> bool:
+        try:
+            path.resolve().relative_to(root.resolve())
+            return True
+        except ValueError:
+            return False
+
+    def _scan_source_dir_sync(src_path: Path) -> list[str]:
+        found: list[str] = []
         if src_path.is_dir():
-            # Collect all video files in directory
             for ext in VIDEO_EXTENSIONS:
-                episodes.extend(str(f) for f in src_path.glob(f"*{ext}"))
-                episodes.extend(str(f) for f in src_path.glob(f"**/*{ext}"))
+                found.extend(str(f.resolve()) for f in src_path.glob(f"*{ext}"))
+                found.extend(str(f.resolve()) for f in src_path.glob(f"**/*{ext}"))
         elif src_path.is_file() and src_path.suffix.lower() in VIDEO_EXTENSIONS:
-            episodes.append(str(src_path))
+            found.append(str(src_path.resolve()))
+        return found
+
+    library_root = settings.anime_library_path
+    manifest: dict | None = None
+    if library_root and any(_is_under(src, library_root) or src.resolve() == library_root.resolve() for src in source_dirs if src.exists()):
+        manifest = await AnimeLibraryService.ensure_episode_manifest()
+
+    manifest_episodes: list[str] = AnimeLibraryService.list_episode_paths(manifest) if manifest else []
+
+    for src_path in source_dirs:
+        if (
+            manifest is not None
+            and library_root is not None
+            and src_path.exists()
+            and (_is_under(src_path, library_root) or src_path.resolve() == library_root.resolve())
+        ):
+            src_resolved = src_path.resolve()
+            for episode in manifest_episodes:
+                episode_path = Path(episode)
+                if src_resolved.is_dir() and _is_under(episode_path, src_resolved):
+                    episodes.append(episode)
+                elif src_resolved.is_file() and episode_path.resolve() == src_resolved:
+                    episodes.append(episode)
+        else:
+            episodes.extend(await asyncio.to_thread(_scan_source_dir_sync, src_path))
 
     # Remove duplicates and sort
     episodes = sorted(set(episodes))

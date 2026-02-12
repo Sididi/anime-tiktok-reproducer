@@ -1,5 +1,6 @@
 """Processing routes for script restructure and final export."""
 
+import asyncio
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, FileResponse
 from typing import Optional
@@ -13,6 +14,19 @@ from ...models import ProjectPhase
 from ...services import ProjectService, ProcessingService
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["processing"])
+
+
+UPLOAD_CHUNK_SIZE = 1024 * 1024
+
+
+async def _write_upload_to_path(upload: UploadFile, destination: Path) -> None:
+    """Stream uploaded file to disk in chunks."""
+    with destination.open("wb") as out:
+        while True:
+            chunk = await upload.read(UPLOAD_CHUNK_SIZE)
+            if not chunk:
+                break
+            out.write(chunk)
 
 
 @router.post("/script/restructured")
@@ -59,32 +73,34 @@ async def upload_restructured_script(
 
     if audio is not None:
         # Single file upload
-        content = await audio.read()
-        audio_path.write_bytes(content)
+        await _write_upload_to_path(audio, audio_path)
     else:
         # Multiple files - concatenate them
-        combined_audio: Optional[AudioSegment] = None
-
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
+            part_paths: list[Path] = []
 
             for i, part in enumerate(audio_parts):
                 # Save each part temporarily
-                part_content = await part.read()
                 part_path = tmp_path / f"part_{i}{Path(part.filename or '.mp3').suffix}"
-                part_path.write_bytes(part_content)
+                await _write_upload_to_path(part, part_path)
+                part_paths.append(part_path)
 
-                # Load and concatenate
-                segment = AudioSegment.from_file(str(part_path))
+            def _concat_parts_to_wav() -> None:
+                combined_audio: Optional[AudioSegment] = None
+                for part_path in part_paths:
+                    segment = AudioSegment.from_file(str(part_path))
+                    if combined_audio is None:
+                        combined_audio = segment
+                    else:
+                        combined_audio = combined_audio + segment
                 if combined_audio is None:
-                    combined_audio = segment
-                else:
-                    combined_audio = combined_audio + segment
-
-            # Export combined audio
-            if combined_audio is not None:
+                    raise ValueError("Failed to process audio parts")
                 combined_audio.export(str(audio_path), format="wav")
-            else:
+
+            try:
+                await asyncio.to_thread(_concat_parts_to_wav)
+            except ValueError:
                 raise HTTPException(
                     status_code=400,
                     detail="Failed to process audio parts"

@@ -21,6 +21,8 @@ from scenedetect import open_video, SceneManager, ContentDetector
 from ..config import settings
 from ..models import SceneMatch
 from ..utils.timing import compute_adjusted_scene_end_times
+from ..utils.subprocess_runner import CommandTimeoutError, run_command
+from .anime_library import AnimeLibraryService
 from .otio_timing import OTIOTimingCalculator, FrameRateInfo
 
 
@@ -172,30 +174,28 @@ class GapResolutionService:
             str(video_path),
         ]
 
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await process.communicate()
-
-        if process.returncode != 0:
+        try:
+            result = await run_command(cmd, timeout_seconds=30.0)
+        except (CommandTimeoutError, FileNotFoundError):
             result = Fraction(24, 1)
         else:
-            fps_str = stdout.decode().strip()
-            if "/" in fps_str:
-                num, den = fps_str.split("/")
-                result = Fraction(int(num), int(den))
+            if result.returncode != 0:
+                result = Fraction(24, 1)
             else:
-                fps_float = float(fps_str)
-                if abs(fps_float - 23.976) < 0.01:
-                    result = Fraction(24000, 1001)
-                elif abs(fps_float - 29.97) < 0.01:
-                    result = Fraction(30000, 1001)
-                elif abs(fps_float - 59.94) < 0.01:
-                    result = Fraction(60000, 1001)
+                fps_str = result.stdout.decode().strip()
+                if "/" in fps_str:
+                    num, den = fps_str.split("/")
+                    result = Fraction(int(num), int(den))
                 else:
-                    result = Fraction(int(round(fps_float)), 1)
+                    fps_float = float(fps_str)
+                    if abs(fps_float - 23.976) < 0.01:
+                        result = Fraction(24000, 1001)
+                    elif abs(fps_float - 29.97) < 0.01:
+                        result = Fraction(30000, 1001)
+                    elif abs(fps_float - 59.94) < 0.01:
+                        result = Fraction(60000, 1001)
+                    else:
+                        result = Fraction(int(round(fps_float)), 1)
 
         cls._fps_cache[cache_key] = result
         return result
@@ -232,31 +232,7 @@ class GapResolutionService:
         Returns:
             Full path to the episode file, or None if not found.
         """
-        # First check if it's already a valid full path
-        episode_path = Path(episode_name)
-        if episode_path.is_absolute() and episode_path.exists():
-            return episode_path
-
-        # Search in the anime library
-        library_path = settings.anime_library_path
-        if not library_path or not library_path.exists():
-            return None
-
-        VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm", ".mov"}
-
-        # Search for matching file in library and subdirectories
-        for ext in VIDEO_EXTENSIONS:
-            # Try direct path first
-            candidate = library_path / f"{episode_name}{ext}"
-            if candidate.exists():
-                return candidate
-
-            # Search recursively using rglob for subdirectories
-            for match in library_path.rglob(f"*{ext}"):
-                if match.stem == episode_name:
-                    return match
-
-        return None
+        return AnimeLibraryService.resolve_episode_path(episode_name)
 
     @classmethod
     def get_scene_cache_path(cls, episode_path: str) -> Path:
@@ -532,8 +508,13 @@ class GapResolutionService:
         Returns:
             List of GapCandidate objects, sorted by speed_diff (closest to 100% first)
         """
-        # Resolve episode path
+        await AnimeLibraryService.ensure_episode_manifest()
+
+        # Resolve episode path using indexed manifest (no recursive scan).
         episode_path = cls.resolve_episode_path(gap.episode)
+        if not episode_path:
+            manifest = await AnimeLibraryService.ensure_episode_manifest(force_refresh=True)
+            episode_path = AnimeLibraryService.resolve_episode_path(gap.episode, manifest)
         if not episode_path:
             return []
 

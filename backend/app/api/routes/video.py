@@ -1,12 +1,49 @@
+import asyncio
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 from pathlib import Path
 from urllib.parse import unquote
 
 from ...config import settings
-from ...services import ProjectService
+from ...services import ProjectService, AnimeLibraryService
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["video"])
+
+
+def _is_under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _is_path_allowed(path: Path, source_dirs: list[Path]) -> bool:
+    for src_path in source_dirs:
+        if src_path.is_dir():
+            if _is_under(path, src_path):
+                return True
+        elif path.resolve() == src_path.resolve():
+            return True
+    return False
+
+
+def _search_episode_sync(episode_name: str, source_dirs: list[Path], video_extensions: set[str]) -> Path | None:
+    for src_path in source_dirs:
+        if src_path.is_dir():
+            # Try direct child first
+            for ext in video_extensions:
+                candidate = src_path / f"{episode_name}{ext}"
+                if candidate.exists():
+                    return candidate
+            # Then recursive search
+            for ext in video_extensions:
+                for match in src_path.rglob(f"*{ext}"):
+                    if match.stem == episode_name:
+                        return match
+        elif src_path.is_file() and src_path.stem == episode_name:
+            return src_path
+    return None
 
 
 @router.get("/video")
@@ -99,27 +136,21 @@ async def get_source_video(
         episode_name = decoded_path  # e.g., "[9volt] Hanebado! - 03 [D0B8F455]"
         found_path = None
 
-        for src_path in source_dirs:
-            if src_path.is_dir():
-                # Search for matching file in directory and subdirectories
-                for ext in VIDEO_EXTENSIONS:
-                    # Try direct path first
-                    candidate = src_path / f"{episode_name}{ext}"
-                    if candidate.exists():
-                        found_path = candidate
-                        break
-                    # Search recursively using rglob for subdirectories
-                    for match in src_path.rglob(f"*{ext}"):
-                        if match.stem == episode_name:
-                            found_path = match
-                            break
-                    if found_path:
-                        break
-                if found_path:
-                    break
-            elif src_path.is_file() and src_path.stem == episode_name:
-                found_path = src_path
-                break
+        # Fast-path through indexed manifest for anime library lookups.
+        if settings.anime_library_path and settings.anime_library_path.exists():
+            manifest = await AnimeLibraryService.ensure_episode_manifest()
+            candidate = AnimeLibraryService.resolve_episode_path(episode_name, manifest)
+            if candidate and _is_path_allowed(candidate, source_dirs):
+                found_path = candidate
+
+        # Fallback for non-library custom source directories.
+        if found_path is None:
+            found_path = await asyncio.to_thread(
+                _search_episode_sync,
+                episode_name,
+                source_dirs,
+                VIDEO_EXTENSIONS,
+            )
 
         if found_path:
             source_path = found_path
