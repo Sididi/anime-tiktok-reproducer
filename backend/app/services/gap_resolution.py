@@ -129,6 +129,8 @@ class GapResolutionService:
     # Scene detection settings for source anime
     SCENE_THRESHOLD = 27.0
     MIN_SCENE_LEN = 10  # Frames
+    # Analyze every other frame for a large speedup with negligible UX impact.
+    SCENE_DETECTION_FRAME_SKIP = 1
 
     # Safety frames offset (number of frames to stay away from scene boundaries)
     SAFETY_FRAMES = 3
@@ -140,6 +142,10 @@ class GapResolutionService:
     _scene_cut_inflight: dict[str, asyncio.Task[list[float]]] = {}
     _scene_cut_inflight_lock = asyncio.Lock()
     _scene_cut_semaphore = asyncio.Semaphore(2)
+    _scene_cut_cache: dict[str, list[float]] = {}
+    _episode_analysis_semaphore = asyncio.Semaphore(4)
+    _candidate_batch_inflight: dict[str, asyncio.Task[dict[int, list["GapCandidate"]]]] = {}
+    _candidate_batch_lock = asyncio.Lock()
 
     # FPS cache: avoids redundant ffprobe calls for the same video file.
     _fps_cache: dict[str, Fraction] = {}
@@ -250,11 +256,18 @@ class GapResolutionService:
         Returns:
             List of cut times in seconds, or None if cache doesn't exist.
         """
+        cache_key = str(Path(episode_path).resolve())
+        in_memory = cls._scene_cut_cache.get(cache_key)
+        if in_memory is not None:
+            return in_memory
+
         cache_path = cls.get_scene_cache_path(episode_path)
         if cache_path.exists():
             try:
                 data = json.loads(cache_path.read_text())
-                return data.get("cuts", [])
+                cuts = data.get("cuts", [])
+                cls._scene_cut_cache[cache_key] = cuts
+                return cuts
             except (json.JSONDecodeError, KeyError):
                 return None
         return None
@@ -262,6 +275,8 @@ class GapResolutionService:
     @classmethod
     def save_scene_cuts_cache(cls, episode_path: str, cuts: list[float]) -> None:
         """Save scene cut times to cache."""
+        cache_key = str(Path(episode_path).resolve())
+        cls._scene_cut_cache[cache_key] = cuts
         cache_path = cls.get_scene_cache_path(episode_path)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         data = {
@@ -276,6 +291,7 @@ class GapResolutionService:
         episode_path: str,
         threshold: float | None = None,
         min_scene_len: int | None = None,
+        frame_skip: int | None = None,
     ) -> list[float]:
         """Detect scene cuts in an anime episode.
 
@@ -285,6 +301,7 @@ class GapResolutionService:
             episode_path: Path to the video file
             threshold: ContentDetector threshold (optional)
             min_scene_len: Minimum scene length in frames (optional)
+            frame_skip: Number of frames to skip during detection (optional)
 
         Returns:
             List of cut times in seconds (start of each scene)
@@ -297,6 +314,7 @@ class GapResolutionService:
         abs_episode_key = str(Path(episode_path).resolve())
         threshold_val = threshold or cls.SCENE_THRESHOLD
         min_scene_len_val = min_scene_len or cls.MIN_SCENE_LEN
+        frame_skip_val = frame_skip if frame_skip is not None else cls.SCENE_DETECTION_FRAME_SKIP
 
         async with cls._scene_cut_inflight_lock:
             task = cls._scene_cut_inflight.get(abs_episode_key)
@@ -306,6 +324,7 @@ class GapResolutionService:
                         episode_path=episode_path,
                         threshold=threshold_val,
                         min_scene_len=min_scene_len_val,
+                        frame_skip=frame_skip_val,
                     )
                 )
                 cls._scene_cut_inflight[abs_episode_key] = task
@@ -325,6 +344,7 @@ class GapResolutionService:
         episode_path: str,
         threshold: float,
         min_scene_len: int,
+        frame_skip: int,
     ) -> list[float]:
         """Run scene detection once and persist cache for future requests."""
         loop = asyncio.get_event_loop()
@@ -335,6 +355,7 @@ class GapResolutionService:
                 episode_path,
                 threshold,
                 min_scene_len,
+                frame_skip,
             )
 
         cls.save_scene_cuts_cache(episode_path, cuts)
@@ -345,6 +366,7 @@ class GapResolutionService:
         video_path: str,
         threshold: float,
         min_scene_len: int,
+        frame_skip: int,
     ) -> list[float]:
         """Synchronous scene cut detection using pyscenedetect."""
         video = open_video(video_path)
@@ -353,7 +375,7 @@ class GapResolutionService:
             ContentDetector(threshold=threshold, min_scene_len=min_scene_len)
         )
 
-        scene_manager.detect_scenes(video, show_progress=False)
+        scene_manager.detect_scenes(video, show_progress=False, frame_skip=frame_skip)
         scene_list = scene_manager.get_scene_list()
 
         # Return the start time of each scene (these are the cut points)
@@ -508,35 +530,165 @@ class GapResolutionService:
         Returns:
             List of GapCandidate objects, sorted by speed_diff (closest to 100% first)
         """
-        await AnimeLibraryService.ensure_episode_manifest()
+        manifest = await AnimeLibraryService.ensure_episode_manifest()
 
         # Resolve episode path using indexed manifest (no recursive scan).
-        episode_path = cls.resolve_episode_path(gap.episode)
+        episode_path = AnimeLibraryService.resolve_episode_path(gap.episode, manifest)
         if not episode_path:
             manifest = await AnimeLibraryService.ensure_episode_manifest(force_refresh=True)
             episode_path = AnimeLibraryService.resolve_episode_path(gap.episode, manifest)
         if not episode_path:
             return []
 
-        # Get scene cuts for this episode
-        cuts = await cls.detect_scene_cuts(str(episode_path))
+        cuts, frame_offset = await cls._analyze_episode(episode_path)
+        return cls._generate_candidates_from_cuts(
+            gap=gap,
+            cuts=cuts,
+            frame_offset=frame_offset,
+            max_candidates=max_candidates,
+        )
 
+    @classmethod
+    async def _analyze_episode(cls, episode_path: Path) -> tuple[list[float], float]:
+        """Load per-episode analysis data once (scene cuts + frame offset)."""
+        async with cls._episode_analysis_semaphore:
+            cuts, frame_offset = await asyncio.gather(
+                cls.detect_scene_cuts(str(episode_path)),
+                cls.get_frame_offset(episode_path),
+            )
+        return cuts, frame_offset
+
+    @classmethod
+    def _build_gap_batch_key(cls, gaps: list[GapInfo], max_candidates: int) -> str:
+        """Build a stable key to dedupe concurrent all-candidates requests."""
+        import hashlib
+
+        payload = [
+            {
+                "scene_index": gap.scene_index,
+                "episode": gap.episode,
+                "current_start": round(gap.current_start, 6),
+                "current_end": round(gap.current_end, 6),
+                "target_duration": round(gap.target_duration, 6),
+            }
+            for gap in gaps
+        ]
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        digest = hashlib.sha1(encoded).hexdigest()
+        return f"{max_candidates}:{digest}"
+
+    @classmethod
+    async def generate_candidates_batch_dedup(
+        cls,
+        gaps: list[GapInfo],
+        max_candidates: int = 6,
+    ) -> dict[int, list[GapCandidate]]:
+        """Deduplicate concurrent batch-generation calls for the same gap set."""
+        if not gaps:
+            return {}
+
+        key = cls._build_gap_batch_key(gaps, max_candidates)
+        async with cls._candidate_batch_lock:
+            task = cls._candidate_batch_inflight.get(key)
+            if task is None:
+                task = asyncio.create_task(
+                    cls.generate_candidates_batch(gaps, max_candidates=max_candidates)
+                )
+                cls._candidate_batch_inflight[key] = task
+
+        try:
+            return await task
+        finally:
+            if task.done():
+                async with cls._candidate_batch_lock:
+                    current = cls._candidate_batch_inflight.get(key)
+                    if current is task:
+                        cls._candidate_batch_inflight.pop(key, None)
+
+    @classmethod
+    async def generate_candidates_batch(
+        cls,
+        gaps: list[GapInfo],
+        max_candidates: int = 6,
+    ) -> dict[int, list[GapCandidate]]:
+        """Generate candidates for many gaps with deduplicated per-episode analysis."""
+        if not gaps:
+            return {}
+
+        manifest = await AnimeLibraryService.ensure_episode_manifest()
+        resolved_by_scene: dict[int, Path] = {}
+        unresolved: list[GapInfo] = []
+
+        for gap in gaps:
+            resolved = AnimeLibraryService.resolve_episode_path(gap.episode, manifest)
+            if resolved and resolved.exists():
+                resolved_by_scene[gap.scene_index] = resolved
+            else:
+                unresolved.append(gap)
+
+        if unresolved:
+            refreshed_manifest = await AnimeLibraryService.ensure_episode_manifest(force_refresh=True)
+            for gap in unresolved:
+                resolved = AnimeLibraryService.resolve_episode_path(gap.episode, refreshed_manifest)
+                if resolved and resolved.exists():
+                    resolved_by_scene[gap.scene_index] = resolved
+
+        unique_episodes = sorted({str(path.resolve()) for path in resolved_by_scene.values()})
+        analysis_tasks = {
+            episode_path: asyncio.create_task(cls._analyze_episode(Path(episode_path)))
+            for episode_path in unique_episodes
+        }
+
+        episode_analysis: dict[str, tuple[list[float], float]] = {}
+        for episode_path, task in analysis_tasks.items():
+            try:
+                episode_analysis[episode_path] = await task
+            except Exception:
+                continue
+
+        candidates_by_scene: dict[int, list[GapCandidate]] = {}
+        for gap in gaps:
+            resolved = resolved_by_scene.get(gap.scene_index)
+            if not resolved:
+                candidates_by_scene[gap.scene_index] = []
+                continue
+
+            analysis = episode_analysis.get(str(resolved.resolve()))
+            if not analysis:
+                candidates_by_scene[gap.scene_index] = []
+                continue
+
+            cuts, frame_offset = analysis
+            candidates_by_scene[gap.scene_index] = cls._generate_candidates_from_cuts(
+                gap=gap,
+                cuts=cuts,
+                frame_offset=frame_offset,
+                max_candidates=max_candidates,
+            )
+
+        return candidates_by_scene
+
+    @classmethod
+    def _generate_candidates_from_cuts(
+        cls,
+        gap: GapInfo,
+        cuts: list[float],
+        frame_offset: float,
+        max_candidates: int = 6,
+    ) -> list[GapCandidate]:
+        """Generate timing candidates from precomputed scene cuts."""
         if not cuts or len(cuts) < 2:
             return []
 
         current_start = gap.current_start
         current_end = gap.current_end
-        # Use the Fraction-based target_duration from GapInfo
         target_duration_frac = Fraction(gap.target_duration).limit_denominator(100000)
         target_duration = gap.target_duration
-        frame_offset = await cls.get_frame_offset(episode_path)
 
         candidates = []
-        seen_timings = set()  # Avoid duplicates
+        seen_timings = set()
 
         def add_candidate(new_start: float, new_end: float, extend_type: str, description: str) -> bool:
-            """Helper to add a candidate if valid. Uses Fraction arithmetic."""
-            # Use Fraction for precise duration calculation
             new_start_frac = Fraction(new_start).limit_denominator(100000)
             new_end_frac = Fraction(new_end).limit_denominator(100000)
             new_duration_frac = new_end_frac - new_start_frac
@@ -545,13 +697,11 @@ class GapResolutionService:
             if new_duration <= 0:
                 return False
 
-            # Calculate speed using Fraction
             if target_duration_frac > 0:
                 speed_frac = new_duration_frac / target_duration_frac
             else:
                 speed_frac = Fraction(1, 1)
 
-            # Check if speed is in valid range (using Fraction comparison)
             if speed_frac < cls.MIN_SPEED or speed_frac > cls.MAX_SPEED:
                 return False
 
@@ -561,41 +711,34 @@ class GapResolutionService:
             seen_timings.add(timing_key)
 
             speed_diff = abs(float(speed_frac) - float(cls.TARGET_SPEED))
-            candidates.append(GapCandidate(
-                start_time=new_start,
-                end_time=new_end,
-                duration=new_duration,
-                effective_speed=speed_frac,
-                speed_diff=speed_diff,
-                extend_type=extend_type,
-                snap_description=description,
-            ))
+            candidates.append(
+                GapCandidate(
+                    start_time=new_start,
+                    end_time=new_end,
+                    duration=new_duration,
+                    effective_speed=speed_frac,
+                    speed_diff=speed_diff,
+                    extend_type=extend_type,
+                    snap_description=description,
+                )
+            )
             return True
 
-        # Find the scene that contains our current clip
-        # A scene is defined by two consecutive cuts
         current_scene_start = None
         current_scene_end = None
-
         for i in range(len(cuts) - 1):
             scene_start = cuts[i]
             scene_end = cuts[i + 1]
-
-            # Check if our clip is within this scene
-            # (clip start and end are both within scene boundaries)
             if scene_start <= current_start and current_end <= scene_end:
                 current_scene_start = scene_start
                 current_scene_end = scene_end
                 break
 
-        # Strategy 0: Push to current scene boundaries (if inside a scene)
-        # This is often the best option as it uses the full scene without crossing cuts
         if current_scene_start is not None and current_scene_end is not None:
-            # Apply safety offset: add frames to start (move inward), subtract from end (move inward)
             safe_start = current_scene_start + frame_offset
             safe_end = current_scene_end - frame_offset
 
-            if safe_start < current_start or safe_end > current_end:  # Only if we're extending
+            if safe_start < current_start or safe_end > current_end:
                 add_candidate(
                     safe_start,
                     safe_end,
@@ -603,7 +746,6 @@ class GapResolutionService:
                     f"Fill current scene ({current_scene_end - current_scene_start:.2f}s scene)",
                 )
 
-            # Also try just extending to end of current scene
             if safe_end > current_end:
                 add_candidate(
                     current_start,
@@ -612,7 +754,6 @@ class GapResolutionService:
                     f"Extend to scene end (+{safe_end - current_end:.2f}s)",
                 )
 
-            # And just extending to start of current scene
             if safe_start < current_start:
                 add_candidate(
                     safe_start,
@@ -621,21 +762,14 @@ class GapResolutionService:
                     f"Extend to scene start (-{current_start - safe_start:.2f}s)",
                 )
 
-        # Find cuts before and after current timing (for adjacent scenes)
         cuts_before = [c for c in cuts if c < current_start]
         cuts_after = [c for c in cuts if c > current_end]
+        cuts_before.sort(key=lambda c: current_start - c)
+        cuts_after.sort(key=lambda c: c - current_end)
 
-        # Sort by distance from current position
-        cuts_before.sort(key=lambda c: current_start - c)  # Closest first
-        cuts_after.sort(key=lambda c: c - current_end)  # Closest first
-
-        # Strategy 1: Extend end to next scene cut
-        # When extending end: the cut marks the START of the next scene,
-        # so we subtract offset to stay in current scene
         for cut_end in cuts_after[:5]:
             new_start = current_start
-            new_end = cut_end - frame_offset  # Subtract to stay before the cut
-
+            new_end = cut_end - frame_offset
             add_candidate(
                 new_start,
                 new_end,
@@ -643,13 +777,9 @@ class GapResolutionService:
                 f"Extend end to next cut (+{new_end - current_end:.2f}s)",
             )
 
-        # Strategy 2: Extend start to previous scene cut
-        # When extending start: the cut marks the START of current scene,
-        # so we add offset to stay in current scene
         for cut_start in cuts_before[:5]:
-            new_start = cut_start + frame_offset  # Add to stay after the cut
+            new_start = cut_start + frame_offset
             new_end = current_end
-
             add_candidate(
                 new_start,
                 new_end,
@@ -657,12 +787,10 @@ class GapResolutionService:
                 f"Extend start to previous cut (-{current_start - new_start:.2f}s)",
             )
 
-        # Strategy 3: Extend both directions to adjacent scene cuts
         for cut_start in cuts_before[:3]:
             for cut_end in cuts_after[:3]:
-                new_start = cut_start + frame_offset  # Add to stay after the cut
-                new_end = cut_end - frame_offset  # Subtract to stay before the cut
-
+                new_start = cut_start + frame_offset
+                new_end = cut_end - frame_offset
                 add_candidate(
                     new_start,
                     new_end,
@@ -670,24 +798,16 @@ class GapResolutionService:
                     f"Extend both (-{current_start - new_start:.2f}s, +{new_end - current_end:.2f}s)",
                 )
 
-        # Sort by speed_diff (closest to 100% first) and take top candidates
         candidates.sort(key=lambda c: c.speed_diff)
 
-        # Fallback Strategy 4: If no candidates found, try to calculate exact timing for 100% speed
-        # This extends outward (both backward and forward) to hit exactly 100%
         if not candidates:
-            # To get 100% speed, we need source_duration = target_duration
             needed_duration = target_duration
             current_duration = current_end - current_start
             extra_needed = needed_duration - current_duration
 
             if extra_needed > 0:
-                # Split the extra time: try extending backward from current start
-                # and calculate how much forward extension would be needed for 100%
-
-                # Try 1: Extend only backward (add all extra to start)
                 new_start = current_start - extra_needed
-                if new_start >= 0:  # Don't go before start of video
+                if new_start >= 0:
                     add_candidate(
                         new_start,
                         current_end,
@@ -695,7 +815,6 @@ class GapResolutionService:
                         f"Extend start for 100% speed (-{extra_needed:.2f}s)",
                     )
 
-                # Try 2: Extend only forward (add all extra to end)
                 new_end = current_end + extra_needed
                 add_candidate(
                     current_start,
@@ -704,7 +823,6 @@ class GapResolutionService:
                     f"Extend end for 100% speed (+{extra_needed:.2f}s)",
                 )
 
-                # Try 3: Extend both ways (split extra evenly)
                 half_extra = extra_needed / 2
                 new_start = current_start - half_extra
                 new_end = current_end + half_extra
@@ -716,7 +834,6 @@ class GapResolutionService:
                         f"Extend both for 100% speed (-{half_extra:.2f}s, +{half_extra:.2f}s)",
                     )
 
-                # Sort fallback candidates by speed_diff too
                 candidates.sort(key=lambda c: c.speed_diff)
 
         return candidates[:max_candidates]

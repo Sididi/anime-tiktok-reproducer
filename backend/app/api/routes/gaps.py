@@ -133,14 +133,14 @@ async def get_all_candidates(project_id: str) -> AllCandidatesResponse:
     # Calculate gaps ONCE
     gaps = GapResolutionService.calculate_gaps(matches.matches, scene_timings)
 
-    # Generate candidates SEQUENTIALLY (avoids subprocess storm)
-    candidates_by_scene: dict[int, list[dict]] = {}
-    for gap in gaps:
-        try:
-            candidates = await GapResolutionService.generate_candidates(gap)
-            candidates_by_scene[gap.scene_index] = [c.to_dict() for c in candidates]
-        except Exception:
-            candidates_by_scene[gap.scene_index] = []
+    try:
+        candidates_by_scene_raw = await GapResolutionService.generate_candidates_batch_dedup(gaps)
+    except Exception:
+        candidates_by_scene_raw = {gap.scene_index: [] for gap in gaps}
+    candidates_by_scene = {
+        scene_index: [candidate.to_dict() for candidate in candidates]
+        for scene_index, candidates in candidates_by_scene_raw.items()
+    }
 
     return AllCandidatesResponse(candidates_by_scene=candidates_by_scene)
 
@@ -247,9 +247,10 @@ async def auto_fill_all_gaps(project_id: str) -> AutoFillResponse:
     filled_count = 0
     skipped_count = 0
 
+    candidates_by_scene = await GapResolutionService.generate_candidates_batch_dedup(gaps)
+
     for gap in gaps:
-        # Generate candidates for this gap
-        candidates = await GapResolutionService.generate_candidates(gap)
+        candidates = candidates_by_scene.get(gap.scene_index, [])
 
         if not candidates:
             results.append(AutoFillResult(

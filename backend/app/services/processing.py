@@ -149,6 +149,34 @@ class ProcessingService:
     FFPROBE_TIMEOUT_SECONDS = 30.0
     FFMPEG_TIMEOUT_SECONDS = 1200.0
     AUTO_EDITOR_TIMEOUT_SECONDS = 1800.0
+    _gap_candidate_prewarm_tasks: dict[str, asyncio.Task[None]] = {}
+
+    @classmethod
+    def schedule_gap_candidate_prewarm(cls, project_id: str, gaps: list) -> None:
+        """Start a background prewarm for gap candidate generation."""
+        if not gaps:
+            return
+
+        existing = cls._gap_candidate_prewarm_tasks.get(project_id)
+        if existing and not existing.done():
+            return
+
+        async def _run() -> None:
+            try:
+                await GapResolutionService.generate_candidates_batch_dedup(gaps)
+            except Exception:
+                # Best-effort optimization only; failures should never block processing.
+                return
+
+        task = asyncio.create_task(_run())
+        cls._gap_candidate_prewarm_tasks[project_id] = task
+
+        def _cleanup(_: asyncio.Task[None]) -> None:
+            current = cls._gap_candidate_prewarm_tasks.get(project_id)
+            if current is task:
+                cls._gap_candidate_prewarm_tasks.pop(project_id, None)
+
+        task.add_done_callback(_cleanup)
 
     @staticmethod
     def get_output_dir(project_id: str) -> Path:
@@ -2086,6 +2114,9 @@ A1 [Anime Audio]     - Original audio from clips (MUTED)
                 if gaps:
                     # Gaps detected - pause processing for user to resolve
                     total_gap_duration = sum(g.gap_duration for g in gaps)
+
+                    # Prewarm scene-cut/fps analysis in background so /gaps loads faster.
+                    cls.schedule_gap_candidate_prewarm(project.id, gaps)
 
                     # Backup current matches before gap resolution modifies them
                     # This allows the user to reset and start over
