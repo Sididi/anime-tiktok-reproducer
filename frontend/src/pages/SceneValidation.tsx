@@ -8,6 +8,7 @@ import { Button } from '@/components/ui';
 import { useProjectStore, useVideoStore, useSceneStore } from '@/stores';
 import { VideoProvider, useVideo } from '@/contexts';
 import { api } from '@/api/client';
+import { readSSEStream } from '@/utils/sse';
 
 interface DetectionProgress {
   status: string;
@@ -95,46 +96,13 @@ function SceneValidationContent() {
     try {
       const response = await api.detectScenes(projectId);
 
-      if (!response.ok) {
-        throw new Error('Failed to start scene detection');
-      }
+      await readSSEStream<DetectionProgress>(response, (data) => {
+        setDetectionProgress(data);
 
-      const reader = response.body?.getReader();
-      if (!reader) {
-        throw new Error('No response body');
-      }
-
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(line.slice(6)) as DetectionProgress;
-              setDetectionProgress(data);
-
-              if (data.status === 'complete' && data.scenes) {
-                setScenes(data.scenes);
-              }
-
-              if (data.status === 'error') {
-                throw new Error(data.error || 'Detection failed');
-              }
-            } catch (e) {
-              if (e instanceof SyntaxError) continue;
-              throw e;
-            }
-          }
+        if (data.status === 'complete' && data.scenes) {
+          setScenes(data.scenes);
         }
-      }
+      });
     } catch (err) {
       setDetectionProgress({
         status: 'error',

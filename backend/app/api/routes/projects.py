@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+from typing import Any
 
 from ...models import Project, ProjectPhase
 from ...services import ProjectService
@@ -28,6 +29,13 @@ class ProjectResponse(BaseModel):
     video_duration: float | None
     video_fps: float | None
     anime_name: str | None
+    output_language: str | None
+    drive_folder_id: str | None
+    drive_folder_url: str | None
+    generation_discord_message_id: str | None
+    final_upload_discord_message_id: str | None
+    upload_completed_at: str | None
+    upload_last_result: dict[str, Any] | None
 
     @classmethod
     def from_project(cls, project: Project) -> "ProjectResponse":
@@ -42,6 +50,13 @@ class ProjectResponse(BaseModel):
             video_duration=project.video_duration,
             video_fps=project.video_fps,
             anime_name=project.anime_name,
+            output_language=project.output_language,
+            drive_folder_id=project.drive_folder_id,
+            drive_folder_url=project.drive_folder_url,
+            generation_discord_message_id=project.generation_discord_message_id,
+            final_upload_discord_message_id=project.final_upload_discord_message_id,
+            upload_completed_at=project.upload_completed_at.isoformat() if project.upload_completed_at else None,
+            upload_last_result=project.upload_last_result,
         )
 
 

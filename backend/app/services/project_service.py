@@ -1,9 +1,20 @@
 import json
+import re
 from pathlib import Path
 from datetime import datetime
 
 from ..config import settings
 from ..models import Project, ProjectPhase, SceneList
+
+_PROJECT_ID_RE = re.compile(r"[a-zA-Z0-9_-]+$")
+
+
+def _validate_project_id(project_id: str) -> None:
+    """Reject project IDs that could escape the projects directory."""
+    if not project_id or not _PROJECT_ID_RE.fullmatch(project_id):
+        raise ValueError(
+            f"Invalid project id: must be non-empty alphanumeric/hyphen/underscore, got {project_id!r}"
+        )
 
 
 class ProjectService:
@@ -12,6 +23,7 @@ class ProjectService:
     @staticmethod
     def get_project_dir(project_id: str) -> Path:
         """Get the directory for a project."""
+        _validate_project_id(project_id)
         return settings.projects_dir / project_id
 
     @staticmethod
@@ -104,6 +116,16 @@ class ProjectService:
     def get_matches_file(cls, project_id: str) -> Path:
         """Get the matches.json file path."""
         return cls.get_project_dir(project_id) / "matches.json"
+
+    @classmethod
+    def get_metadata_file(cls, project_id: str) -> Path:
+        """Get the metadata.json file path."""
+        return cls.get_project_dir(project_id) / "metadata.json"
+
+    @classmethod
+    def get_metadata_html_file(cls, project_id: str) -> Path:
+        """Get the metadata.html file path."""
+        return cls.get_project_dir(project_id) / "metadata.html"
 
     @classmethod
     def save_matches(cls, project_id: str, matches: "MatchList") -> None:

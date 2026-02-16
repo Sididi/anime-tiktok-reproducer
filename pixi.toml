@@ -38,6 +38,7 @@ python-multipart = ">=0.0.18"
 pydantic = ">=2.10.0"
 pydantic-settings = ">=2.6.0"
 aiofiles = ">=24.1.0"
+requests = ">=2.32.0"
 
 # Video/Audio processing
 yt-dlp = ">=2026.2.4"
@@ -57,6 +58,12 @@ spacy = ">=3.7.0"
 fr-core-news-sm = { url = "https://github.com/explosion/spacy-models/releases/download/fr_core_news_sm-3.8.0/fr_core_news_sm-3.8.0-py3-none-any.whl" }
 en-core-web-sm = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }
 es-core-news-sm = { url = "https://github.com/explosion/spacy-models/releases/download/es_core_news_sm-3.8.0/es_core_news_sm-3.8.0-py3-none-any.whl" }
+
+# External platform integrations
+google-api-python-client = ">=2.173.0"
+google-auth = ">=2.40.0"
+google-auth-httplib2 = ">=0.2.0"
+google-auth-oauthlib = ">=1.2.2"
 
 [feature.dev.pypi-dependencies]
 pytest = ">=8.0.0"

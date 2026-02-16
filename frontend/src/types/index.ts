@@ -21,6 +21,48 @@ export interface Project {
   video_duration: number | null;
   video_fps: number | null;
   anime_name: string | null;
+  output_language: string | null;
+  drive_folder_id: string | null;
+  drive_folder_url: string | null;
+  generation_discord_message_id: string | null;
+  final_upload_discord_message_id: string | null;
+  upload_completed_at: string | null;
+  upload_last_result: Record<string, unknown> | null;
+}
+
+export interface PlatformMetadata {
+  facebook: {
+    title: string;
+    description: string;
+    tags: string[];
+  };
+  instagram: {
+    caption: string;
+  };
+  youtube: {
+    title: string;
+    description: string;
+    tags: string[];
+  };
+  tiktok: {
+    description: string;
+  };
+}
+
+export interface ProjectManagerRow {
+  project_id: string;
+  anime_title: string | null;
+  local_size_bytes: number;
+  uploaded: boolean;
+  uploaded_status: "green" | "red";
+  can_upload_status: "green" | "orange" | "red";
+  can_upload_reasons: string[];
+  has_metadata: boolean;
+  drive_video_count: number;
+  drive_video_name: string | null;
+  drive_video_web_url: string | null;
+  drive_folder_id: string | null;
+  drive_folder_url: string | null;
 }
 
 export interface Scene {

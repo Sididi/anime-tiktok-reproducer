@@ -7,7 +7,7 @@ import { ClippedVideoPlayer } from "@/components/video";
 import { FloatingAudioPlayer } from "@/components/FloatingAudioPlayer";
 import { useProjectStore, useSceneStore } from "@/stores";
 import { api } from "@/api/client";
-import { formatTime } from "@/utils";
+import { formatTime, readSSEStream } from "@/utils";
 import type { Transcription } from "@/types";
 
 interface TranscriptionProgress {
@@ -103,51 +103,18 @@ export function TranscriptionPage() {
     try {
       const response = await api.startTranscription(projectId, language);
 
-      if (!response.ok) {
-        throw new Error("Failed to start transcription");
-      }
+      await readSSEStream<TranscriptionProgress>(response, (data) => {
+        setProgress(data);
 
-      const reader = response.body?.getReader();
-      if (!reader) {
-        throw new Error("No response body");
-      }
-
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n\n");
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          if (line.startsWith("data: ")) {
-            try {
-              const data = JSON.parse(line.slice(6)) as TranscriptionProgress;
-              setProgress(data);
-
-              if (data.status === "complete" && data.transcription) {
-                setTranscription(data.transcription);
-                const texts: Record<number, string> = {};
-                data.transcription.scenes.forEach((s) => {
-                  texts[s.scene_index] = s.text;
-                });
-                setEditedTexts(texts);
-              }
-
-              if (data.status === "error") {
-                throw new Error(data.error || "Transcription failed");
-              }
-            } catch (e) {
-              if (e instanceof SyntaxError) continue;
-              throw e;
-            }
-          }
+        if (data.status === "complete" && data.transcription) {
+          setTranscription(data.transcription);
+          const texts: Record<number, string> = {};
+          data.transcription.scenes.forEach((s) => {
+            texts[s.scene_index] = s.text;
+          });
+          setEditedTexts(texts);
         }
-      }
+      });
     } catch (err) {
       setError((err as Error).message);
     } finally {

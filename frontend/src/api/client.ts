@@ -72,6 +72,23 @@ export const api = {
   deleteProject: (id: string) =>
     request<{ status: string }>(`/projects/${id}`, { method: "DELETE" }),
 
+  // Project manager
+  listProjectManagerProjects: () =>
+    request<{ projects: import("@/types").ProjectManagerRow[] }>(
+      "/project-manager/projects",
+    ),
+
+  runProjectUpload: (projectId: string) =>
+    fetch(`${API_BASE}/project-manager/projects/${projectId}/upload`, {
+      method: "POST",
+    }),
+
+  deleteManagedProject: (projectId: string) =>
+    request<{ status: string; local_deleted: boolean; drive_deleted: boolean }>(
+      `/project-manager/projects/${projectId}`,
+      { method: "DELETE" },
+    ),
+
   // Video
   getVideoInfo: (projectId: string) =>
     request<import("@/types").VideoInfo>(`/projects/${projectId}/video/info`),
@@ -293,4 +310,30 @@ export const api = {
         body: JSON.stringify(data),
       },
     ),
+
+  // Metadata
+  getProjectMetadata: (projectId: string) =>
+    request<{ exists: boolean; metadata: import("@/types").PlatformMetadata | null }>(
+      `/projects/${projectId}/metadata`,
+    ),
+
+  buildMetadataPrompt: (
+    projectId: string,
+    payload: { script: string; target_language: string },
+  ) =>
+    request<{ prompt: string }>(`/projects/${projectId}/metadata/prompt`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
+  // Exports
+  createBundleExport: (projectId: string) =>
+    fetch(`${API_BASE}/projects/${projectId}/exports/bundle`, {
+      method: "POST",
+    }),
+
+  uploadExportToGDrive: (projectId: string) =>
+    fetch(`${API_BASE}/projects/${projectId}/exports/gdrive`, {
+      method: "POST",
+    }),
 };

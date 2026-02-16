@@ -11,6 +11,13 @@ from .subtitle import (
     SubtitlePreviewRequest,
     SubtitleGenerationProgress,
 )
+from .metadata import (
+    FacebookMetadata,
+    InstagramMetadata,
+    YouTubeMetadata,
+    TikTokMetadata,
+    VideoMetadataPayload,
+)
 
 __all__ = [
     "Project", "ProjectPhase", "Scene", "SceneList",
@@ -18,4 +25,6 @@ __all__ = [
     "Word", "SceneTranscription", "Transcription",
     "SubtitleStyleType", "SubtitleWord", "KaraokeEffect", "SubtitleStyle",
     "SubtitleGenerationRequest", "SubtitlePreviewRequest", "SubtitleGenerationProgress",
+    "FacebookMetadata", "InstagramMetadata", "YouTubeMetadata",
+    "TikTokMetadata", "VideoMetadataPayload",
 ]

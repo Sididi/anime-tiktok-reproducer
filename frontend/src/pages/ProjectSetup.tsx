@@ -1,10 +1,12 @@
-import { useState, useCallback, useEffect, useMemo } from "react";
+import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import { Loader2, ChevronDown, Plus, FolderOpen, FolderPlus } from "lucide-react";
+import { Loader2, ChevronDown, Plus, FolderOpen, FolderPlus, FolderKanban } from "lucide-react";
 import { Button, Input } from "@/components/ui";
 import { FolderBrowserModal } from "@/components/FolderBrowserModal";
+import { ProjectManagerModal } from "@/components/ProjectManagerModal";
 import { useProjectStore } from "@/stores";
 import { api } from "@/api/client";
+import { readSSEStream } from "@/utils/sse";
 
 interface DownloadProgress {
   status: string;
@@ -69,6 +71,8 @@ export function ProjectSetup() {
   const [indexing, setIndexing] = useState(false);
   const [detecting, setDetecting] = useState(false);
   const [showFolderBrowser, setShowFolderBrowser] = useState(false);
+  const [showProjectManager, setShowProjectManager] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
 
   // Load indexed anime on mount
   useEffect(() => {
@@ -92,6 +96,17 @@ export function ProjectSetup() {
     return indexedAnime.filter((a) => a.toLowerCase().includes(search));
   }, [indexedAnime, animeSearch]);
 
+  useEffect(() => {
+    if (!showAnimeDropdown) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+        setShowAnimeDropdown(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [showAnimeDropdown]);
+
   // Run scene detection after download
   const handleSceneDetection = useCallback(
     async (projectId: string): Promise<boolean> => {
@@ -106,46 +121,9 @@ export function ProjectSetup() {
       try {
         const response = await api.detectScenes(projectId);
 
-        if (!response.ok) {
-          throw new Error("Failed to start scene detection");
-        }
-
-        const reader = response.body?.getReader();
-        if (!reader) {
-          throw new Error("No response body");
-        }
-
-        const decoder = new TextDecoder();
-        let buffer = "";
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n\n");
-          buffer = lines.pop() || "";
-
-          for (const line of lines) {
-            if (line.startsWith("data: ")) {
-              try {
-                const data = JSON.parse(line.slice(6)) as DetectionProgress;
-                setDetectionProgress(data);
-
-                if (data.status === "complete") {
-                  return true;
-                }
-
-                if (data.status === "error") {
-                  throw new Error(data.error || "Scene detection failed");
-                }
-              } catch (e) {
-                if (e instanceof SyntaxError) continue;
-                throw e;
-              }
-            }
-          }
-        }
+        await readSSEStream<DetectionProgress>(response, (data) => {
+          setDetectionProgress(data);
+        });
         return true;
       } catch (err) {
         setDetectionProgress({
@@ -175,46 +153,12 @@ export function ProjectSetup() {
       try {
         const response = await api.downloadVideo(projectId, url);
 
-        if (!response.ok) {
-          throw new Error("Failed to start download");
-        }
-
-        const reader = response.body?.getReader();
-        if (!reader) {
-          throw new Error("No response body");
-        }
-
-        const decoder = new TextDecoder();
-        let buffer = "";
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n\n");
-          buffer = lines.pop() || "";
-
-          for (const line of lines) {
-            if (line.startsWith("data: ")) {
-              try {
-                const data = JSON.parse(line.slice(6)) as DownloadProgress;
-                setDownloadProgress(data);
-
-                if (data.status === "complete") {
-                  return true;
-                }
-
-                if (data.status === "error") {
-                  throw new Error(data.error || "Download failed");
-                }
-              } catch (e) {
-                if (e instanceof SyntaxError) continue;
-                throw e;
-              }
-            }
+        await readSSEStream<DownloadProgress>(response, (data) => {
+          setDownloadProgress(data);
+          if (data.status === "complete") {
+            // handled by return below
           }
-        }
+        });
         return true;
       } catch (err) {
         setDownloadProgress({
@@ -248,56 +192,15 @@ export function ProjectSetup() {
       const selectedFps = overrideFps ?? newAnimeFps;
       const response = await api.indexAnime(newAnimePath, animeName, selectedFps);
 
-      if (!response.ok) {
-        throw new Error("Failed to start indexing");
-      }
-
-      const reader = response.body?.getReader();
-      if (!reader) {
-        throw new Error("No response body");
-      }
-
-      const decoder = new TextDecoder();
-      let buffer = "";
       let finalAnimeName: string | null = null;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n\n");
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          if (line.startsWith("data: ")) {
-            try {
-              const data = JSON.parse(line.slice(6)) as IndexProgress & {
-                anime_name?: string;
-              };
-              setIndexProgress(data);
-
-              if (data.status === "complete") {
-                finalAnimeName =
-                  data.anime_name ||
-                  animeName ||
-                  newAnimePath.split("/").pop() ||
-                  null;
-                // Reload anime list
-                const result = await api.listIndexedAnime();
-                setIndexedAnime(sortAnimeNames(result.series));
-              }
-
-              if (data.status === "error") {
-                throw new Error(data.error || "Indexing failed");
-              }
-            } catch (e) {
-              if (e instanceof SyntaxError) continue;
-              throw e;
-            }
-          }
+      await readSSEStream<IndexProgress & { anime_name?: string }>(response, async (data) => {
+        setIndexProgress(data);
+        if (data.status === "complete") {
+          finalAnimeName = data.anime_name || animeName || newAnimePath.split("/").pop() || null;
+          const result = await api.listIndexedAnime();
+          setIndexedAnime(sortAnimeNames(result.series));
         }
-      }
+      });
 
       if (finalAnimeName) {
         setSelectedAnime(finalAnimeName);
@@ -408,6 +311,16 @@ export function ProjectSetup() {
           <p className="text-[hsl(var(--muted-foreground))] mt-2">
             Remaster your TikToks for other platforms
           </p>
+          <div className="mt-4">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setShowProjectManager(true)}
+            >
+              <FolderKanban className="h-4 w-4 mr-2" />
+              Open Project Manager
+            </Button>
+          </div>
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-4">
@@ -436,7 +349,7 @@ export function ProjectSetup() {
 
             {updateAnimeName ? (
               /* Update Episodes Mode */
-              <div className="space-y-3 p-3 border border-[hsl(var(--border))] rounded-md bg-[hsl(var(--muted))/0.3]">
+              <div className="space-y-3 p-3 border border-[hsl(var(--border))] rounded-md bg-[hsl(var(--muted)/0.3)]">
                 <div className="flex items-center justify-between">
                   <span className="text-sm font-medium">Update episodes for {updateAnimeName}</span>
                   <button
@@ -516,7 +429,7 @@ export function ProjectSetup() {
                 )}
               </div>
             ) : !indexNewMode ? (
-              <div className="relative">
+              <div className="relative" ref={dropdownRef}>
                 <button
                   type="button"
                   onClick={() => setShowAnimeDropdown(!showAnimeDropdown)}
@@ -604,7 +517,7 @@ export function ProjectSetup() {
               </div>
             ) : (
               /* Index New Mode */
-              <div className="space-y-3 p-3 border border-[hsl(var(--border))] rounded-md bg-[hsl(var(--muted))/0.3]">
+              <div className="space-y-3 p-3 border border-[hsl(var(--border))] rounded-md bg-[hsl(var(--muted)/0.3)]">
                 <div className="flex items-center justify-between">
                   <span className="text-sm font-medium">Index New Anime</span>
                   <button
@@ -767,6 +680,10 @@ export function ProjectSetup() {
         open={showFolderBrowser}
         onClose={() => setShowFolderBrowser(false)}
         onSelect={(path) => setNewAnimePath(path)}
+      />
+      <ProjectManagerModal
+        open={showProjectManager}
+        onClose={() => setShowProjectManager(false)}
       />
     </div>
   );

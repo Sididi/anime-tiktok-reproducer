@@ -1,6 +1,7 @@
 from enum import Enum
 from datetime import datetime
 from pydantic import BaseModel, Field
+from typing import Any
 import uuid
 
 
@@ -36,3 +37,12 @@ class Project(BaseModel):
     video_fps: float | None = None
     video_width: int | None = None
     video_height: int | None = None
+
+    # Output / integration state
+    output_language: str | None = None
+    drive_folder_id: str | None = None
+    drive_folder_url: str | None = None
+    generation_discord_message_id: str | None = None
+    final_upload_discord_message_id: str | None = None
+    upload_completed_at: datetime | None = None
+    upload_last_result: dict[str, Any] | None = None

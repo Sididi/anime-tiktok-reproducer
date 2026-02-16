@@ -10,6 +10,9 @@ import {
   Files,
   FileAudio2,
   Pencil,
+  ChevronDown,
+  ChevronUp,
+  FileText,
 } from "lucide-react";
 import { Button } from "@/components/ui";
 import { useProjectStore, useSceneStore } from "@/stores";
@@ -483,6 +486,69 @@ function generatePrompt(
   );
 }
 
+function validateMetadataObject(
+  payload: unknown,
+): { valid: boolean; error: string | null } {
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+    return { valid: false, error: "Metadata JSON must be an object" };
+  }
+  const obj = payload as Record<string, unknown>;
+  const expectedKeys = ["facebook", "instagram", "youtube", "tiktok"];
+  const keys = Object.keys(obj);
+  const missing = expectedKeys.filter((k) => !(k in obj));
+  const extras = keys.filter((k) => !expectedKeys.includes(k));
+  if (missing.length > 0) {
+    return { valid: false, error: `Missing keys: ${missing.join(", ")}` };
+  }
+  if (extras.length > 0) {
+    return { valid: false, error: `Unexpected keys: ${extras.join(", ")}` };
+  }
+
+  const asRecord = (value: unknown, label: string) => {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new Error(`${label} must be an object`);
+    }
+    return value as Record<string, unknown>;
+  };
+  const asString = (value: unknown, label: string) => {
+    if (typeof value !== "string" || !value.trim()) {
+      throw new Error(`${label} must be a non-empty string`);
+    }
+  };
+  const asStringArray = (value: unknown, label: string) => {
+    if (!Array.isArray(value) || value.length === 0) {
+      throw new Error(`${label} must be a non-empty string array`);
+    }
+    for (const item of value) {
+      if (typeof item !== "string" || !item.trim()) {
+        throw new Error(`${label} entries must be non-empty strings`);
+      }
+    }
+  };
+
+  try {
+    const facebook = asRecord(obj.facebook, "facebook");
+    asString(facebook.title, "facebook.title");
+    asString(facebook.description, "facebook.description");
+    asStringArray(facebook.tags, "facebook.tags");
+
+    const instagram = asRecord(obj.instagram, "instagram");
+    asString(instagram.caption, "instagram.caption");
+
+    const youtube = asRecord(obj.youtube, "youtube");
+    asString(youtube.title, "youtube.title");
+    asString(youtube.description, "youtube.description");
+    asStringArray(youtube.tags, "youtube.tags");
+
+    const tiktok = asRecord(obj.tiktok, "tiktok");
+    asString(tiktok.description, "tiktok.description");
+  } catch (err) {
+    return { valid: false, error: (err as Error).message };
+  }
+
+  return { valid: true, error: null };
+}
+
 export function ScriptRestructurePage() {
   const { projectId } = useParams<{ projectId: string }>();
   const navigate = useNavigate();
@@ -502,6 +568,15 @@ export function ScriptRestructurePage() {
   const [newScriptJson, setNewScriptJson] = useState("");
   const [jsonError, setJsonError] = useState<string | null>(null);
   const [jsonValid, setJsonValid] = useState(false);
+
+  // Optional metadata state
+  const [metadataExpanded, setMetadataExpanded] = useState(false);
+  const [metadataJson, setMetadataJson] = useState("");
+  const [metadataValid, setMetadataValid] = useState(false);
+  const [metadataError, setMetadataError] = useState<string | null>(null);
+  const [metadataCopiedPrompt, setMetadataCopiedPrompt] = useState(false);
+  const [metadataDetected, setMetadataDetected] = useState(false);
+  const [metadataPromptLoading, setMetadataPromptLoading] = useState(false);
 
   // Audio file state
   const [uploadMode, setUploadMode] = useState<UploadMode>("multiple");
@@ -542,6 +617,13 @@ export function ScriptRestructurePage() {
         await loadScenes(projectId);
         const { transcription: loaded } = await api.getTranscription(projectId);
         setTranscription(loaded);
+        const metadataResult = await api.getProjectMetadata(projectId);
+        if (metadataResult.exists && metadataResult.metadata) {
+          const pretty = JSON.stringify(metadataResult.metadata, null, 2);
+          setMetadataJson(pretty);
+          setMetadataValid(true);
+          setMetadataDetected(true);
+        }
       } catch (err) {
         setError((err as Error).message);
       } finally {
@@ -556,8 +638,13 @@ export function ScriptRestructurePage() {
     if (!transcription) return;
 
     const prompt = generatePrompt(transcription, project, targetLanguage);
-    await navigator.clipboard.writeText(prompt);
-    setCopied(true);
+    try {
+      await navigator.clipboard.writeText(prompt);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard API may fail in insecure contexts
+    }
   }, [transcription, project, targetLanguage]);
 
   const handleJsonChange = useCallback((value: string) => {
@@ -593,6 +680,45 @@ export function ScriptRestructurePage() {
       setJsonError(`Invalid JSON: ${(e as Error).message}`);
     }
   }, []);
+
+  const handleMetadataJsonChange = useCallback((value: string) => {
+    setMetadataJson(value);
+    setMetadataError(null);
+    setMetadataValid(false);
+    if (!value.trim()) {
+      setMetadataDetected(false);
+      return;
+    }
+    try {
+      const parsed = JSON.parse(value);
+      const validation = validateMetadataObject(parsed);
+      if (!validation.valid) {
+        setMetadataError(validation.error);
+        return;
+      }
+      setMetadataValid(true);
+    } catch (err) {
+      setMetadataError(`Invalid JSON: ${(err as Error).message}`);
+    }
+  }, []);
+
+  const handleCopyMetadataPrompt = useCallback(async () => {
+    if (!projectId || !jsonValid || !newScriptJson) return;
+    setMetadataPromptLoading(true);
+    try {
+      const { prompt } = await api.buildMetadataPrompt(projectId, {
+        script: newScriptJson,
+        target_language: targetLanguage,
+      });
+      await navigator.clipboard.writeText(prompt);
+      setMetadataCopiedPrompt(true);
+      setTimeout(() => setMetadataCopiedPrompt(false), 1500);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setMetadataPromptLoading(false);
+    }
+  }, [projectId, jsonValid, newScriptJson, targetLanguage]);
 
   const handleFileSelect = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -630,17 +756,25 @@ export function ScriptRestructurePage() {
   );
 
   const handleCopySegment = useCallback(async (segment: AudioSegment) => {
-    await navigator.clipboard.writeText(segment.text);
-    setCopiedSegment(segment.id);
-    setTimeout(() => setCopiedSegment(null), 2000);
+    try {
+      await navigator.clipboard.writeText(segment.text);
+      setCopiedSegment(segment.id);
+      setTimeout(() => setCopiedSegment(null), 2000);
+    } catch {
+      // Clipboard API may fail in insecure contexts
+    }
   }, []);
 
   const handleCopyFullScript = useCallback(async () => {
     if (!parsedScenes) return;
     const fullText = parsedScenes.map((s) => s.text).join(" ");
-    await navigator.clipboard.writeText(fullText);
-    setCopiedFullScript(true);
-    setTimeout(() => setCopiedFullScript(false), 2000);
+    try {
+      await navigator.clipboard.writeText(fullText);
+      setCopiedFullScript(true);
+      setTimeout(() => setCopiedFullScript(false), 2000);
+    } catch {
+      // Clipboard API may fail in insecure contexts
+    }
   }, [parsedScenes]);
 
   const handleDrop = useCallback(
@@ -690,6 +824,9 @@ export function ScriptRestructurePage() {
     try {
       const formData = new FormData();
       formData.append("script", newScriptJson);
+      if (metadataValid && metadataJson.trim()) {
+        formData.append("metadata_json", metadataJson);
+      }
 
       if (uploadMode === "single") {
         formData.append("audio", audioFile!);
@@ -733,6 +870,8 @@ export function ScriptRestructurePage() {
     uploadMode,
     audioSegments,
     segmentFiles,
+    metadataValid,
+    metadataJson,
   ]);
 
   if (loading) {
@@ -761,13 +900,22 @@ export function ScriptRestructurePage() {
       : audioSegments.length > 0 &&
         audioSegments.every((seg) => segmentFiles.has(seg.id)));
   const uploadedSegmentsCount = segmentFiles.size;
+  const metadataDone = metadataValid || metadataDetected;
 
   return (
     <div className="min-h-screen p-4">
       <div className="max-w-4xl mx-auto space-y-6">
         <header className="flex items-center justify-between">
           <div>
-            <h1 className="text-xl font-bold">Script Restructuration</h1>
+            <h1 className="text-xl font-bold flex items-center gap-2">
+              Script Restructuration
+              {metadataDetected && (
+                <span className="inline-flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-full bg-green-500/15 text-green-500">
+                  <Check className="h-3.5 w-3.5" />
+                  Metadata detected
+                </span>
+              )}
+            </h1>
             <p className="text-sm text-[hsl(var(--muted-foreground))]">
               Generate a new script and TTS audio for your video
             </p>
@@ -804,6 +952,7 @@ export function ScriptRestructurePage() {
             onChange={(e) => {
               setTargetLanguage(e.target.value as TargetLanguage);
               setCopied(false); // Reset copied state when language changes
+              setMetadataCopiedPrompt(false);
             }}
             className="w-full p-2 rounded-md border border-[hsl(var(--input))] bg-[hsl(var(--background))] text-sm"
           >
@@ -884,6 +1033,93 @@ export function ScriptRestructurePage() {
             <p className="text-sm text-[hsl(var(--destructive))]">
               {jsonError}
             </p>
+          )}
+        </div>
+
+        {/* Optional metadata step */}
+        <div className="bg-[hsl(var(--card))] rounded-lg p-6 space-y-4">
+          <div className="flex items-center justify-between">
+            <div className="space-y-1">
+              <h2 className="font-semibold flex items-center gap-2">
+                <FileText className="h-4 w-4" />
+                Optional: Generate Platform Metadata
+                {metadataDone && (
+                  <span className="inline-flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-full bg-green-500/15 text-green-500">
+                    <Check className="h-3.5 w-3.5" />
+                    Ready
+                  </span>
+                )}
+              </h2>
+              <p className="text-sm text-[hsl(var(--muted-foreground))]">
+                Build JSON metadata for YouTube, Facebook, Instagram, and TikTok.
+              </p>
+            </div>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setMetadataExpanded((prev) => !prev)}
+            >
+              {metadataExpanded ? (
+                <>
+                  Hide
+                  <ChevronUp className="h-4 w-4 ml-2" />
+                </>
+              ) : (
+                <>
+                  Show
+                  <ChevronDown className="h-4 w-4 ml-2" />
+                </>
+              )}
+            </Button>
+          </div>
+
+          {metadataExpanded && (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <p className="text-sm text-[hsl(var(--muted-foreground))]">
+                  Copy the metadata prompt, run it in your LLM, and paste the JSON response.
+                </p>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleCopyMetadataPrompt}
+                  disabled={!jsonValid || metadataPromptLoading}
+                >
+                  {metadataPromptLoading ? (
+                    <>
+                      <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                      Building...
+                    </>
+                  ) : metadataCopiedPrompt ? (
+                    <>
+                      <Check className="h-4 w-4 mr-2" />
+                      Copied
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="h-4 w-4 mr-2" />
+                      Copy Metadata Prompt
+                    </>
+                  )}
+                </Button>
+              </div>
+
+              {!jsonValid && (
+                <div className="p-3 rounded-md bg-[hsl(var(--muted))] text-sm text-[hsl(var(--muted-foreground))]">
+                  Validate script JSON in Step 2 first to enable metadata prompt generation.
+                </div>
+              )}
+
+              <textarea
+                value={metadataJson}
+                onChange={(e) => handleMetadataJsonChange(e.target.value)}
+                placeholder='{"facebook": {...}, "instagram": {...}, "youtube": {...}, "tiktok": {...}}'
+                className="w-full min-h-[180px] p-3 rounded-md border border-[hsl(var(--input))] bg-transparent font-mono text-sm resize-y"
+              />
+              {metadataError && (
+                <p className="text-sm text-[hsl(var(--destructive))]">{metadataError}</p>
+              )}
+            </div>
           )}
         </div>
 
@@ -1134,6 +1370,12 @@ export function ScriptRestructurePage() {
                 className={`h-3 w-3 rounded-full ${jsonValid ? "bg-green-500" : "bg-[hsl(var(--border))]"}`}
               />
               New script JSON validated
+            </li>
+            <li className="flex items-center gap-2">
+              <div
+                className={`h-3 w-3 rounded-full ${metadataDone ? "bg-green-500" : "bg-[hsl(var(--border))]"}`}
+              />
+              Optional metadata {metadataDone ? "ready" : "skipped"}
             </li>
             <li className="flex items-center gap-2">
               <div

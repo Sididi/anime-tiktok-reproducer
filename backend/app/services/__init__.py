@@ -10,10 +10,22 @@ from .subtitle_renderer import SubtitleFrameRenderer
 from .subtitle_styles import get_style, list_styles
 from .gap_resolution import GapResolutionService
 from .scene_merger import SceneMergerService
+from .metadata import MetadataService
+from .google_drive_service import GoogleDriveService
+from .discord_service import DiscordService
+from .export_service import ExportService
+from .social_upload_service import SocialUploadService, PlatformUploadResult
+from .upload_phase import UploadPhaseService
+from .meta_token_service import MetaTokenService
+from .integration_health_service import IntegrationHealthService
 
 __all__ = [
     "ProjectService", "DownloaderService", "SceneDetectorService",
     "AnimeMatcherService", "AnimeLibraryService", "TranscriberService", "ProcessingService",
     "SubtitleVideoService", "SubtitleFrameRenderer", "get_style", "list_styles",
     "GapResolutionService", "SceneMergerService",
+    "MetadataService", "GoogleDriveService", "DiscordService", "ExportService",
+    "SocialUploadService", "PlatformUploadResult", "UploadPhaseService",
+    "MetaTokenService",
+    "IntegrationHealthService",
 ]

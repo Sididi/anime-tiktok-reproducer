@@ -28,6 +28,7 @@ import { ClippedVideoPlayer, ManualMatchModal } from "@/components/video";
 import type { ClippedVideoPlayerHandle } from "@/components/video/ClippedVideoPlayer";
 import { useProjectStore, useSceneStore } from "@/stores";
 import { api } from "@/api/client";
+import { readSSEStream } from "@/utils/sse";
 import { cn, formatTime } from "@/utils";
 import type { SceneMatch, Scene } from "@/types";
 
@@ -515,58 +516,23 @@ export function MatchValidation() {
     try {
       const response = await api.findMatches(projectId, undefined, mergeContinuous);
 
-      if (!response.ok) {
-        throw new Error("Failed to start matching");
-      }
+      await readSSEStream<MatchProgress>(response, async (data) => {
+        setMatchProgress(data);
 
-      const reader = response.body?.getReader();
-      if (!reader) {
-        throw new Error("No response body");
-      }
-
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n\n");
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          if (line.startsWith("data: ")) {
-            try {
-              const data = JSON.parse(line.slice(6)) as MatchProgress;
-              setMatchProgress(data);
-
-              if (data.status === "complete" && data.matches) {
-                const matchesData = data.matches as unknown as {
-                  matches: SceneMatch[];
-                };
-                // Track which scenes are initially "no match found"
-                const matchesWithTracking = (matchesData.matches || []).map(
-                  (m) => ({
-                    ...m,
-                    was_no_match: m.was_no_match ?? (m.confidence === 0 && !m.episode),
-                  }),
-                );
-                setMatches(matchesWithTracking);
-                // Reload scenes since merge may have modified them
-                await loadScenes(projectId);
-              }
-
-              if (data.status === "error") {
-                throw new Error(data.error || "Matching failed");
-              }
-            } catch (e) {
-              if (e instanceof SyntaxError) continue;
-              throw e;
-            }
-          }
+        if (data.status === "complete" && data.matches) {
+          const matchesData = data.matches as unknown as {
+            matches: SceneMatch[];
+          };
+          const matchesWithTracking = (matchesData.matches || []).map(
+            (m) => ({
+              ...m,
+              was_no_match: m.was_no_match ?? (m.confidence === 0 && !m.episode),
+            }),
+          );
+          setMatches(matchesWithTracking);
+          await loadScenes(projectId);
         }
-      }
+      });
     } catch (err) {
       setError((err as Error).message);
       setMatchProgress(null);

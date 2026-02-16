@@ -2,9 +2,7 @@
 
 import asyncio
 import json
-import zipfile
 from dataclasses import dataclass
-from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
 from typing import AsyncIterator
@@ -20,6 +18,7 @@ from .anime_library import AnimeLibraryService
 from .transcriber import TranscriberService
 from .otio_timing import OTIOTimingCalculator, FrameRateInfo
 from .gap_resolution import GapResolutionService
+from .export_service import ExportService
 
 
 # =============================================================================
@@ -1773,12 +1772,6 @@ class ProcessingService:
 """
 
     @classmethod
-    def get_assets_dir(cls) -> Path:
-        """Get the static assets directory (contains .sqpreset, .mogrt, etc.)."""
-        # Assets are in the repository root /assets folder
-        return Path(__file__).parent.parent.parent.parent / "assets"
-
-    @classmethod
     def check_has_saved_state(cls, project_id: str) -> bool:
         """Check if there's saved processing state (interrupted by gaps)."""
         output_dir = cls.get_output_dir(project_id)
@@ -1805,160 +1798,6 @@ class ProcessingService:
             flag_path.unlink()
 
     @classmethod
-    def _create_project_bundle_sync(
-        cls,
-        *,
-        bundle_path: Path,
-        folder_name: str,
-        jsx_path: Path,
-        edited_audio_path: Path,
-        srt_path: Path,
-        assets_dir: Path,
-        project: Project,
-        matches: list[SceneMatch],
-    ) -> None:
-        """Create the final ZIP bundle (sync, intended for asyncio.to_thread)."""
-        # Collect unique source episodes
-        source_episodes: set[str] = set()
-        for match in matches:
-            if match.episode:
-                source_episodes.add(match.episode)
-
-        with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            # Add JSX script (main entry point)
-            zf.write(jsx_path, f"{folder_name}/import_project.jsx")
-
-            # Add edited TTS audio (root level)
-            zf.write(edited_audio_path, f"{folder_name}/tts_edited.wav")
-
-            # Add SRT subtitles
-            zf.write(srt_path, f"{folder_name}/subtitles.srt")
-
-            # Add static assets to assets/ folder
-            sequence_preset = assets_dir / "TikTok60fps.sqpreset"
-            if sequence_preset.exists():
-                zf.write(sequence_preset, f"{folder_name}/assets/TikTok60fps.sqpreset")
-
-            border_mogrt = assets_dir / "White border 5px.mogrt"
-            if border_mogrt.exists():
-                zf.write(border_mogrt, f"{folder_name}/assets/White border 5px.mogrt")
-
-            # Add run_in_premiere.bat launcher
-            bat_launcher = assets_dir / "run_in_premiere.bat"
-            if bat_launcher.exists():
-                zf.write(bat_launcher, f"{folder_name}/run_in_premiere.bat")
-
-            # Add source episode files to sources/ folder
-            # Episode names in matches may be just filenames without extension,
-            # so we need to resolve them to full paths from the episode manifest.
-            episode_paths_in_bundle = {}
-            for episode_name in source_episodes:
-                resolved_path = GapResolutionService.resolve_episode_path(episode_name)
-
-                if resolved_path and resolved_path.exists():
-                    # Skip if we already added this resolved path
-                    resolved_str = str(resolved_path)
-                    if resolved_str in episode_paths_in_bundle:
-                        continue
-
-                    # Use just the filename in sources/ folder
-                    dest_name = f"{folder_name}/sources/{resolved_path.name}"
-                    zf.write(resolved_path, dest_name)
-                    episode_paths_in_bundle[resolved_str] = dest_name
-                else:
-                    # Log warning but continue - some episodes may not be found
-                    import sys
-                    print(f"[WARNING] Could not resolve episode: {episode_name}", file=sys.stderr)
-
-            # Add episode mapping file (for debugging)
-            zf.writestr(
-                f"{folder_name}/source_mapping.json",
-                json.dumps(episode_paths_in_bundle, indent=2),
-            )
-
-            # Count scenes for README
-            scene_count = len([m for m in matches if m.episode])
-            # Use the bundle paths we actually included
-            episode_list = "\n".join(f"  - {Path(bundle_item).name}" for bundle_item in episode_paths_in_bundle.values())
-
-            readme = f"""Anime TikTok Reproducer - Project Bundle
-=========================================
-
-Project ID: {project.id}
-Generated: {datetime.now().isoformat()}
-Scenes: {scene_count}
-
-=== CONTENTS ===
-
-run_in_premiere.bat    - Double-click to run the script in Premiere Pro
-import_project.jsx     - Premiere Pro 2025 automation script
-tts_edited.wav         - Processed TTS audio (silences removed)
-subtitles.srt          - Word-timed subtitles
-source_mapping.json    - Original path to bundle path mapping
-
-assets/
-  TikTok60fps.sqpreset - Sequence preset (1080x1920 @ 60fps)
-  White border 5px.mogrt - Border MOGRT for V2 track
-
-sources/
-{episode_list}
-
-=== USAGE (Premiere Pro 2025) ===
-
-Option A - Double-click launcher (recommended):
-  1. Extract this entire ZIP to a folder
-  2. Open Adobe Premiere Pro 2025 (JSX Runner panel must be installed)
-  3. Double-click "run_in_premiere.bat"
-  4. Check the JSX Runner panel for execution status
-
-Option B - Browse from within Premiere Pro:
-  1. Extract this entire ZIP to a folder
-  2. In Premiere Pro, open Window > Extensions > JSX Runner
-  3. Click "Browse & Run" and select "import_project.jsx"
-
-First-time setup:
-  Install the JSX Runner extension from the project repository
-  (premiere-extension/install_extension.bat), then restart Premiere Pro.
-
-The script will automatically:
-   - Create a new sequence with correct settings
-   - Import and place all clips
-   - Apply speed adjustments
-   - Set scale values
-   - Add the border MOGRT
-   - Place TTS audio
-
-=== TRACK LAYOUT ===
-
-V4 [Subtitles]       - Reserved for manually added subtitles
-V3 [Main Video]      - Anime clips at 68% scale (centered)
-V2 [White Border]    - Border MOGRT spanning entire duration
-V1 [Blurred BG]      - Same clips at 183% scale
-
-A2 [TTS Audio]       - Generated voice with silence removed
-A1 [Anime Audio]     - Original audio from clips (MUTED)
-
-=== AFTER RUNNING SCRIPT ===
-
-1. Check clip positions match markers
-2. Import subtitles.srt if needed:
-   - File > Import > subtitles.srt
-   - Drag to V4 video track
-3. Review any clips with gaps (75% speed floor was hit)
-4. Add transitions and polish
-5. Export!
-
-=== TECHNICAL NOTES ===
-
-- Sequence: 60fps, 1080x1920 (vertical TikTok format)
-- Speed Logic: source_duration / target_duration
-- 75% Floor: Clips won't slow below 75% (leaves gap)
-- Scale: V3 at 68%, V1 at 183%
-- Border: Single MOGRT spanning entire timeline
-"""
-            zf.writestr(f"{folder_name}/README.txt", readme)
-
-    @classmethod
     async def process(
         cls,
         project: Project,
@@ -1969,12 +1808,12 @@ A1 [Anime Audio]     - Original audio from clips (MUTED)
         """
         Run the full processing pipeline.
 
-        Generates a Premiere Pro project bundle with:
+        Generates core project output files:
         - JSX automation script (v7.1 format matching working_script.jsx)
         - Processed TTS audio with auto-editor cuts
         - SRT subtitles
-        - Source video clips
-        - Required assets (sequence preset, border MOGRT)
+
+        Bundling and cloud export are handled by export routes/services.
 
         Track layout (created by JSX script):
         - V4: Reserved for subtitles
@@ -1995,7 +1834,6 @@ A1 [Anime Audio]     - Original audio from clips (MUTED)
         """
         output_dir = cls.get_output_dir(project.id)
         output_dir.mkdir(parents=True, exist_ok=True)
-        assets_dir = cls.get_assets_dir()
 
         # Check if we're resuming after gap resolution
         resuming_after_gaps = cls.check_has_saved_state(project.id) and cls.check_gaps_resolved(project.id)
@@ -2180,53 +2018,18 @@ A1 [Anime Audio]     - Original audio from clips (MUTED)
 
             # Step 4: Generate SRT subtitles (aggressive Hormozi style)
             srt_content = cls.generate_srt(new_transcription, language=new_transcription.language)
-            srt_path = output_dir / "subtitles.srt"
+            srt_filename = ExportService.subtitle_filename(project)
+            srt_path = output_dir / srt_filename
             srt_path.write_text(srt_content, encoding="utf-8")
-
-            yield ProcessingProgress(
-                "processing",
-                "bundling",
-                0.7,
-                "Creating project bundle...",
-            )
-
-            # Step 5: Bundle everything
-            bundle_path = cls.get_output_dir(project.id).parent / "project_bundle.zip"
-
-            # Derive wrapping folder name: SPMAnime_{ANIME_TITLE}_{PROJECT_ID}
-            import re as _re
-            _raw_name = project.anime_name or "project"
-            # Remove filesystem-unsafe characters and collapse whitespace/underscores
-            _anime_title = _re.sub(r'[<>:"/\\|?*]', '', _raw_name).strip()
-            _anime_title = _re.sub(r'[\s_]+', '_', _anime_title) or "project"
-            _project_id = _re.sub(r'[<>:"/\\|?*]', '', project.id).strip()
-            _project_id = _re.sub(r'[\s_]+', '_', _project_id) or "unknown"
-            folder_name = f"SPMAnime_{_anime_title}_{_project_id}"
-
-            await AnimeLibraryService.ensure_episode_manifest()
-            await asyncio.to_thread(
-                cls._create_project_bundle_sync,
-                bundle_path=bundle_path,
-                folder_name=folder_name,
-                jsx_path=jsx_path,
-                edited_audio_path=edited_audio_path,
-                srt_path=srt_path,
-                assets_dir=assets_dir,
-                project=project,
-                matches=matches,
-            )
-
-            download_url = f"/api/projects/{project.id}/download/bundle"
 
             # Clear processing state now that we're done
             cls.clear_processing_state(project.id)
 
             yield ProcessingProgress(
                 "complete",
-                "bundling",
+                "srt_generation",
                 1.0,
                 "Processing complete!",
-                download_url=download_url,
             )
 
         except Exception as e:
