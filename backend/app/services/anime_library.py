@@ -265,10 +265,11 @@ class AnimeLibraryService:
         library_path = cls.get_library_path()
         searcher_path = cls.get_anime_searcher_path()
 
-        # Use pixi run to call anime-search list --json
+        # Call anime_searcher directly via pixi to avoid task-shell quoting issues.
         cmd = [
-            "pixi", "run", "--locked", "anime-search",
-            "list", str(library_path), "--json"
+            "pixi", "run", "--locked",
+            "python", "-m", "anime_searcher.cli",
+            "list", str(library_path), "--json",
         ]
 
         try:
@@ -526,7 +527,8 @@ class AnimeLibraryService:
         )
 
         cmd = [
-            "pixi", "run", "--locked", "anime-search",
+            "pixi", "run", "--locked",
+            "python", "-m", "anime_searcher.cli",
             "index", str(library_path),
             "--fps", str(effective_fps),
             "--series", anime_name,
@@ -643,7 +645,8 @@ class AnimeLibraryService:
         searcher_path = cls.get_anime_searcher_path()
 
         cmd = [
-            "pixi", "run", "--locked", "anime-search",
+            "pixi", "run", "--locked",
+            "python", "-m", "anime_searcher.cli",
             "search", str(image_path),
             "--library", str(library_path),
             "--top-n", str(top_n),

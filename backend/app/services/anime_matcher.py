@@ -76,10 +76,26 @@ class AnimeMatcherService:
             sys.path.insert(0, str(searcher_path.parent))
 
         # Reuse cache unless current series was updated on disk.
-        cache_ready = cls._loaded_library_path == library_path and cls._query_processor is not None
+        cache_ready = (
+            cls._loaded_library_path == library_path
+            and cls._query_processor is not None
+            and cls._index_manager is not None
+        )
         needs_refresh_for_series = anime_name is not None and anime_name in cls._stale_series
         needs_refresh_for_unscoped_match = anime_name is None and bool(cls._stale_series)
-        if cache_ready and not (needs_refresh_for_series or needs_refresh_for_unscoped_match):
+        missing_scoped_series = (
+            cache_ready
+            and anime_name is not None
+            and anime_name not in cls._index_manager.get_series_list()
+        )
+        if (
+            cache_ready
+            and not (
+                needs_refresh_for_series
+                or needs_refresh_for_unscoped_match
+                or missing_scoped_series
+            )
+        ):
             return True
 
         try:

@@ -98,10 +98,7 @@ async def index_anime(request: IndexAnimeRequest):
     if not source_folder.is_dir():
         raise HTTPException(status_code=400, detail=f"Source path is not a directory: {request.source_path}")
 
-    # If this series already exists in the index, this operation is an update.
     target_anime_name = request.anime_name or source_folder.name
-    indexed_series = await AnimeLibraryService.list_indexed_anime()
-    is_update = target_anime_name in indexed_series
 
     async def stream_progress():
         async for progress in AnimeLibraryService.index_anime(
@@ -113,9 +110,9 @@ async def index_anime(request: IndexAnimeRequest):
             transform_workers=request.transform_workers,
             require_gpu=request.require_gpu,
         ):
-            if progress.status == "complete" and is_update:
-                # Mark only this series as stale so matcher reloads cache lazily
-                # when this exact anime is matched next time.
+            if progress.status == "complete":
+                # Any successful indexing (new series or update) may change the in-memory
+                # matcher index cache; mark this series stale for lazy reload on next match.
                 AnimeMatcherService.mark_series_updated(target_anime_name)
             yield f"data: {json.dumps(progress.to_dict())}\n\n"
 
