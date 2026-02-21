@@ -43,6 +43,10 @@ backend/data/
 backend/.venv/
 examples/source_anime/
 
+# Account config (secrets) and avatars
+config/accounts/config.yaml
+config/accounts/avatars/
+
 # Local tooling
 .claude/
 .DS_Store

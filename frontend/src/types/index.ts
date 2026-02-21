@@ -52,6 +52,7 @@ export interface PlatformMetadata {
 export interface ProjectManagerRow {
   project_id: string;
   anime_title: string | null;
+  language: string | null;
   local_size_bytes: number;
   uploaded: boolean;
   uploaded_status: "green" | "red";
@@ -63,6 +64,16 @@ export interface ProjectManagerRow {
   drive_video_web_url: string | null;
   drive_folder_id: string | null;
   drive_folder_url: string | null;
+  scheduled_at: string | null;
+  scheduled_account_id: string | null;
+}
+
+export interface Account {
+  id: string;
+  name: string;
+  language: string;
+  avatar_url: string;
+  slots: string[];
 }
 
 export interface Scene {

@@ -72,15 +72,21 @@ export const api = {
   deleteProject: (id: string) =>
     request<{ status: string }>(`/projects/${id}`, { method: "DELETE" }),
 
+  // Accounts
+  listAccounts: () =>
+    request<{ accounts: import("@/types").Account[] }>("/accounts"),
+
   // Project manager
   listProjectManagerProjects: () =>
     request<{ projects: import("@/types").ProjectManagerRow[] }>(
       "/project-manager/projects",
     ),
 
-  runProjectUpload: (projectId: string) =>
+  runProjectUpload: (projectId: string, accountId?: string) =>
     fetch(`${API_BASE}/project-manager/projects/${projectId}/upload`, {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ account_id: accountId ?? null }),
     }),
 
   deleteManagedProject: (projectId: string) =>

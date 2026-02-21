@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 import json
 import time
@@ -174,6 +175,35 @@ class SocialUploadService:
         return "page access token is required" in message
 
     @classmethod
+    def _is_instagram_container_field_error(cls, response: requests.Response) -> bool:
+        err = cls._graph_error_object(response)
+        message = str(err.get("message") or "").lower()
+        code = int(err.get("code") or 0) if err.get("code") is not None else 0
+        subcode = int(err.get("error_subcode") or 0) if err.get("error_subcode") is not None else 0
+        if code != 100:
+            return False
+        markers = (
+            "nonexisting field",
+            "invalid parameter",
+            "not a valid parameter",
+            "paramètre non valide",
+        )
+        return subcode == 2207065 or any(marker in message for marker in markers)
+
+    @classmethod
+    def _is_instagram_resumable_upload_indeterminate(cls, response: requests.Response) -> bool:
+        try:
+            payload = response.json()
+        except Exception:
+            return False
+        debug_info = payload.get("debug_info")
+        if not isinstance(debug_info, dict):
+            return False
+        debug_type = str(debug_info.get("type") or "").strip().lower()
+        debug_message = str(debug_info.get("message") or "").strip().lower()
+        return debug_type == "processingfailederror" and "request processing failed" in debug_message
+
+    @classmethod
     def is_youtube_configured(cls) -> bool:
         return bool(
             settings.youtube_google_client_id
@@ -284,20 +314,48 @@ class SocialUploadService:
         subtitle_locale: str,
         target_language: str | None,
         metadata: VideoMetadataPayload,
+        credentials: Credentials | None = None,
+        scheduled_at: datetime | None = None,
+        category_id: str | None = None,
+        channel_id: str | None = None,
     ) -> PlatformUploadResult:
         try:
-            youtube = build("youtube", "v3", credentials=cls._google_credentials(), cache_discovery=False)
-            expected_channel_id, channel_error = cls._validate_youtube_target_channel(youtube)
-            if channel_error:
-                return PlatformUploadResult(
-                    platform="youtube",
-                    status="failed",
-                    detail=channel_error,
-                )
+            creds = credentials if credentials is not None else cls._google_credentials()
+            if credentials is not None:
+                from google.auth.transport.requests import Request as _Request
+                creds.refresh(_Request())
+            youtube = build("youtube", "v3", credentials=creds, cache_discovery=False)
+            if channel_id is not None:
+                expected_channel_id = channel_id or None
+            else:
+                expected_channel_id, channel_error = cls._validate_youtube_target_channel(youtube)
+                if channel_error:
+                    return PlatformUploadResult(
+                        platform="youtube",
+                        status="failed",
+                        detail=channel_error,
+                    )
             youtube_language = cls._youtube_language_code(
                 target_language=target_language,
                 subtitle_locale=subtitle_locale,
             )
+
+            effective_category = category_id or settings.youtube_category_id
+
+            if scheduled_at:
+                privacy_status = "private"
+                publish_at = scheduled_at.isoformat()
+            else:
+                privacy_status = "public"
+                publish_at = None
+
+            status_body: dict[str, Any] = {
+                "privacyStatus": privacy_status,
+                "selfDeclaredMadeForKids": False,
+                "containsSyntheticMedia": False,
+            }
+            if publish_at:
+                status_body["publishAt"] = publish_at
 
             upload_request = youtube.videos().insert(
                 part="snippet,status",
@@ -306,15 +364,11 @@ class SocialUploadService:
                         "title": metadata.youtube.title,
                         "description": metadata.youtube.description,
                         "tags": metadata.youtube.tags,
-                        "categoryId": settings.youtube_category_id,
+                        "categoryId": effective_category,
                         "defaultLanguage": youtube_language,
                         "defaultAudioLanguage": youtube_language,
                     },
-                    "status": {
-                        "privacyStatus": "private",
-                        "selfDeclaredMadeForKids": False,
-                        "containsSyntheticMedia": False,
-                    },
+                    "status": status_body,
                 },
                 media_body=MediaFileUpload(str(video_path), chunksize=-1, resumable=True),
             )
@@ -348,11 +402,16 @@ class SocialUploadService:
                 media_body=MediaFileUpload(str(subtitle_path), mimetype="application/octet-stream"),
             ).execute()
 
+            detail_parts = []
+            if scheduled_at:
+                detail_parts.append(f"Scheduled for {scheduled_at.isoformat()}")
+
             return PlatformUploadResult(
                 platform="youtube",
                 status="uploaded",
                 url=f"https://youtu.be/{video_id}",
                 resource_id=video_id,
+                detail="; ".join(detail_parts) if detail_parts else None,
             )
         except HttpError as exc:
             quota_exceeded = _is_youtube_quota_error(exc)
@@ -385,18 +444,24 @@ class SocialUploadService:
         subtitle_locale: str,
         metadata: VideoMetadataPayload,
         video_url: str | None = None,
+        page_id: str | None = None,
+        page_access_token: str | None = None,
+        scheduled_at: datetime | None = None,
     ) -> PlatformUploadResult:
-        try:
-            creds = MetaTokenService.get_upload_credentials()
-        except Exception as exc:
-            return PlatformUploadResult(
-                platform="facebook",
-                status="skipped",
-                detail=f"Facebook token resolution failed: {exc}",
-            )
-
-        page_id = creds.page_id
-        token = creds.facebook_page_access_token
+        # Use explicit per-account credentials if provided, else fall back to global
+        if page_id and page_access_token:
+            token = page_access_token
+        else:
+            try:
+                creds = MetaTokenService.get_upload_credentials()
+            except Exception as exc:
+                return PlatformUploadResult(
+                    platform="facebook",
+                    status="skipped",
+                    detail=f"Facebook token resolution failed: {exc}",
+                )
+            page_id = creds.page_id
+            token = creds.facebook_page_access_token
         if not page_id or not token:
             return PlatformUploadResult(
                 platform="facebook",
@@ -405,6 +470,15 @@ class SocialUploadService:
             )
 
         base = cls._graph_base()
+
+        # Build publish fields: scheduled or immediate
+        fb_publish_fields: dict[str, str] = {}
+        if scheduled_at:
+            fb_publish_fields["published"] = "false"
+            fb_publish_fields["scheduled_publish_time"] = str(int(scheduled_at.timestamp()))
+        else:
+            fb_publish_fields["published"] = "true"
+
         try:
             with requests.Session() as session:
                 source_mode = "local"
@@ -418,7 +492,7 @@ class SocialUploadService:
                             data={
                                 "title": metadata.facebook.title,
                                 "description": metadata.facebook.description,
-                                "published": "false",
+                                **fb_publish_fields,
                                 "access_token": token,
                                 "file_url": video_url,
                             },
@@ -442,7 +516,7 @@ class SocialUploadService:
                                 data={
                                     "title": metadata.facebook.title,
                                     "description": metadata.facebook.description,
-                                    "published": "false",
+                                    **fb_publish_fields,
                                     "access_token": token,
                                 },
                                 files={"source": source},
@@ -517,18 +591,24 @@ class SocialUploadService:
         video_path: Path,
         metadata: VideoMetadataPayload,
         preferred_video_url: str | None = None,
+        ig_user_id: str | None = None,
+        ig_access_token: str | None = None,
+        scheduled_at: datetime | None = None,
     ) -> PlatformUploadResult:
-        try:
-            creds = MetaTokenService.get_upload_credentials()
-        except Exception as exc:
-            return PlatformUploadResult(
-                platform="instagram",
-                status="skipped",
-                detail=f"Instagram token resolution failed: {exc}",
-            )
-
-        ig_user_id = creds.instagram_business_account_id
-        token = creds.instagram_access_token
+        # Use explicit per-account credentials if provided, else fall back to global
+        if ig_user_id and ig_access_token:
+            token = ig_access_token
+        else:
+            try:
+                creds = MetaTokenService.get_upload_credentials()
+            except Exception as exc:
+                return PlatformUploadResult(
+                    platform="instagram",
+                    status="skipped",
+                    detail=f"Instagram token resolution failed: {exc}",
+                )
+            ig_user_id = creds.instagram_business_account_id
+            token = creds.instagram_access_token
         if not ig_user_id or not token:
             return PlatformUploadResult(
                 platform="instagram",
@@ -536,91 +616,100 @@ class SocialUploadService:
                 detail="Instagram API credentials are not configured",
             )
 
+        # Build extra container params for scheduling
+        ig_schedule_params: dict[str, str] = {}
+        if scheduled_at:
+            ig_schedule_params["scheduled_publish_time"] = str(int(scheduled_at.timestamp()))
+
         try:
             base = cls._graph_base()
             with requests.Session() as session:
+                fallback_reason: str | None = None
                 ingestion_mode = "resumable_local"
-                container_id: str | None = None
 
                 if preferred_video_url:
                     try:
-                        container_id = cls._create_instagram_container_url(
+                        url_container_id = cls._create_instagram_container_url(
                             session=session,
                             base=base,
                             ig_user_id=ig_user_id,
                             token=token,
                             caption=metadata.instagram.caption,
                             video_url=preferred_video_url,
+                            extra_params=ig_schedule_params,
                         )
                         ingestion_mode = "drive_url"
-                    except Exception:
-                        container_id = None
+                        if scheduled_at:
+                            # Scheduled: Meta auto-publishes; skip poll + publish
+                            return PlatformUploadResult(
+                                platform="instagram",
+                                status="uploaded",
+                                resource_id=url_container_id,
+                                detail=f"Scheduled for {scheduled_at.isoformat()}; ingestion mode={ingestion_mode}",
+                            )
+                        media_id, permalink = cls._publish_instagram_container(
+                            session=session,
+                            base=base,
+                            ig_user_id=ig_user_id,
+                            token=token,
+                            container_id=url_container_id,
+                        )
+                        return PlatformUploadResult(
+                            platform="instagram",
+                            status="uploaded",
+                            url=permalink,
+                            resource_id=media_id,
+                            detail=f"Published successfully; ingestion mode={ingestion_mode}",
+                        )
+                    except Exception as exc:
+                        fallback_reason = str(exc)
 
-                if not container_id:
-                    container_id = cls._create_instagram_container_resumable(
+                try:
+                    resumable_container_id = cls._create_instagram_container_resumable(
                         session=session,
                         base=base,
                         ig_user_id=ig_user_id,
                         token=token,
                         caption=metadata.instagram.caption,
                         video_path=video_path,
+                        extra_params=ig_schedule_params,
                     )
-
-                cls._poll_instagram_container_ready(
-                    session=session,
-                    base=base,
-                    container_id=container_id,
-                    token=token,
-                )
-
-                publish_resp = cls._request_with_retries(
-                    lambda: session.post(
-                        f"{base}/{ig_user_id}/media_publish",
-                        data={
-                            "creation_id": container_id,
-                            "access_token": token,
-                        },
-                        timeout=120,
-                    ),
-                    max_attempts=3,
-                )
-                if publish_resp.status_code >= 400:
-                    return PlatformUploadResult(
-                        platform="instagram",
-                        status="failed",
-                        detail=f"media_publish failed: {_extract_graph_error(publish_resp)}",
+                    if scheduled_at:
+                        # Scheduled: Meta auto-publishes; skip poll + publish
+                        detail = f"Scheduled for {scheduled_at.isoformat()}; ingestion mode={ingestion_mode}"
+                        if fallback_reason:
+                            detail = f"{detail} | fallback_from_drive_url={fallback_reason}"
+                        return PlatformUploadResult(
+                            platform="instagram",
+                            status="uploaded",
+                            resource_id=resumable_container_id,
+                            detail=detail,
+                        )
+                    media_id, permalink = cls._publish_instagram_container(
+                        session=session,
+                        base=base,
+                        ig_user_id=ig_user_id,
+                        token=token,
+                        container_id=resumable_container_id,
                     )
-                media_id = str(publish_resp.json().get("id") or "")
-                if not media_id:
-                    return PlatformUploadResult(
-                        platform="instagram",
-                        status="failed",
-                        detail=f"media_publish returned no media id: {publish_resp.text}",
-                    )
+                except Exception as resumable_exc:
+                    if fallback_reason:
+                        raise RuntimeError(
+                            "Instagram drive_url upload failed and resumable fallback failed: "
+                            f"drive_url={fallback_reason} | resumable={resumable_exc}"
+                        ) from resumable_exc
+                    raise
 
-                permalink = None
-                media_info = cls._request_with_retries(
-                    lambda: session.get(
-                        f"{base}/{media_id}",
-                        params={"fields": "permalink", "access_token": token},
-                        timeout=60,
-                    ),
-                    max_attempts=2,
-                )
-                if media_info.status_code < 400:
-                    permalink = media_info.json().get("permalink")
-                if not permalink:
-                    permalink = f"https://www.instagram.com/p/{media_id}/"
+                detail = f"Published successfully; ingestion mode={ingestion_mode}"
+                if fallback_reason:
+                    detail = f"{detail} | fallback_from_drive_url={fallback_reason}"
 
             return PlatformUploadResult(
                 platform="instagram",
                 status="uploaded",
                 url=permalink,
                 resource_id=media_id,
-                detail=(
-                    "Published without sidecar subtitle (not supported by Instagram Graph API); "
-                    f"ingestion mode={ingestion_mode}"
-                ),
+                detail=detail,
             )
         except Exception as exc:
             return PlatformUploadResult(
@@ -651,7 +740,10 @@ class SocialUploadService:
                             "access_token": token,
                             "locale": subtitle_locale,
                         },
-                        files={"captions_file": captions_file},
+                        files={
+                            # Meta expects captions_file as text/plain or application/octet-stream.
+                            "captions_file": (subtitle_path.name, captions_file, "text/plain")
+                        },
                         timeout=120,
                     )
 
@@ -692,17 +784,21 @@ class SocialUploadService:
         token: str,
         caption: str,
         video_path: Path,
+        extra_params: dict[str, str] | None = None,
     ) -> str:
+        container_data = {
+            "media_type": "REELS",
+            "upload_type": "resumable",
+            "caption": caption,
+            "share_to_feed": "true",
+            "access_token": token,
+        }
+        if extra_params:
+            container_data.update(extra_params)
         container_resp = cls._request_with_retries(
             lambda: session.post(
                 f"{base}/{ig_user_id}/media",
-                data={
-                    "media_type": "REELS",
-                    "upload_type": "resumable",
-                    "caption": caption,
-                    "share_to_feed": "true",
-                    "access_token": token,
-                },
+                data=container_data,
                 timeout=120,
             ),
             max_attempts=3,
@@ -737,7 +833,7 @@ class SocialUploadService:
 
         upload_resp = cls._request_with_retries(_upload_once, max_attempts=2)
 
-        if upload_resp.status_code >= 400:
+        if upload_resp.status_code >= 400 and not cls._is_instagram_resumable_upload_indeterminate(upload_resp):
             raise RuntimeError(
                 f"Instagram resumable upload failed: {_extract_graph_error(upload_resp)}"
             )
@@ -754,17 +850,21 @@ class SocialUploadService:
         token: str,
         caption: str,
         video_url: str,
+        extra_params: dict[str, str] | None = None,
     ) -> str:
+        container_data = {
+            "media_type": "REELS",
+            "video_url": video_url,
+            "caption": caption,
+            "share_to_feed": "true",
+            "access_token": token,
+        }
+        if extra_params:
+            container_data.update(extra_params)
         container_resp = cls._request_with_retries(
             lambda: session.post(
                 f"{base}/{ig_user_id}/media",
-                data={
-                    "media_type": "REELS",
-                    "video_url": video_url,
-                    "caption": caption,
-                    "share_to_feed": "true",
-                    "access_token": token,
-                },
+                data=container_data,
                 timeout=120,
             ),
             max_attempts=3,
@@ -778,6 +878,56 @@ class SocialUploadService:
         if not container_id:
             raise RuntimeError(f"Instagram video_url container returned no id: {payload}")
         return str(container_id)
+
+    @classmethod
+    def _publish_instagram_container(
+        cls,
+        *,
+        session: requests.Session,
+        base: str,
+        ig_user_id: str,
+        token: str,
+        container_id: str,
+    ) -> tuple[str, str]:
+        cls._poll_instagram_container_ready(
+            session=session,
+            base=base,
+            container_id=container_id,
+            token=token,
+        )
+
+        publish_resp = cls._request_with_retries(
+            lambda: session.post(
+                f"{base}/{ig_user_id}/media_publish",
+                data={
+                    "creation_id": container_id,
+                    "access_token": token,
+                },
+                timeout=120,
+            ),
+            max_attempts=3,
+        )
+        if publish_resp.status_code >= 400:
+            raise RuntimeError(f"media_publish failed: {_extract_graph_error(publish_resp)}")
+
+        media_id = str(publish_resp.json().get("id") or "").strip()
+        if not media_id:
+            raise RuntimeError(f"media_publish returned no media id: {publish_resp.text}")
+
+        permalink: str | None = None
+        media_info = cls._request_with_retries(
+            lambda: session.get(
+                f"{base}/{media_id}",
+                params={"fields": "permalink", "access_token": token},
+                timeout=60,
+            ),
+            max_attempts=2,
+        )
+        if media_info.status_code < 400:
+            permalink = str(media_info.json().get("permalink") or "").strip() or None
+        if not permalink:
+            permalink = f"https://www.instagram.com/p/{media_id}/"
+        return media_id, permalink
 
     @classmethod
     def _poll_instagram_container_ready(
@@ -794,32 +944,39 @@ class SocialUploadService:
         last_status = ""
 
         while time.monotonic() < deadline:
-            status_resp = cls._request_with_retries(
-                lambda: session.get(
-                    f"{base}/{container_id}",
-                    params={
-                        # "error_message" is not available on all IG container node types.
-                        "fields": "status_code,status",
-                        "access_token": token,
-                    },
-                    timeout=60,
-                ),
-                max_attempts=3,
+            payload = cls._get_instagram_container_status_payload(
+                session=session,
+                base=base,
+                container_id=container_id,
+                token=token,
             )
-            if status_resp.status_code >= 400:
-                raise RuntimeError(
-                    f"Instagram container status failed: {_extract_graph_error(status_resp)}"
-                )
-
-            payload = status_resp.json()
             status_code = str(payload.get("status_code") or "").upper()
             status_text = str(payload.get("status") or "")
             error_message = str(payload.get("error_message") or payload.get("message") or "").strip()
+            video_status = payload.get("video_status")
             effective_status = status_code or status_text.upper()
             if effective_status == "FINISHED":
                 return
             if effective_status in {"ERROR", "EXPIRED"}:
+                phase_bits: list[str] = []
+                if isinstance(video_status, dict):
+                    uploading_phase = video_status.get("uploading_phase")
+                    processing_phase = video_status.get("processing_phase")
+                    if isinstance(uploading_phase, dict):
+                        up_status = str(uploading_phase.get("status") or "").strip()
+                        bytes_transferred = uploading_phase.get("bytes_transferred")
+                        if up_status:
+                            phase_bits.append(f"uploading_phase={up_status}")
+                        if bytes_transferred is not None:
+                            phase_bits.append(f"bytes_transferred={bytes_transferred}")
+                    if isinstance(processing_phase, dict):
+                        proc_status = str(processing_phase.get("status") or "").strip()
+                        if proc_status:
+                            phase_bits.append(f"processing_phase={proc_status}")
+
                 detail = error_message or status_text or status_code or "Unknown container error"
+                if phase_bits:
+                    detail = f"{detail} ({', '.join(phase_bits)})"
                 raise RuntimeError(f"Instagram container failed: {detail}")
             if effective_status:
                 last_status = effective_status
@@ -830,3 +987,47 @@ class SocialUploadService:
         raise TimeoutError(
             f"Instagram container did not reach FINISHED within {timeout_seconds}s{suffix}"
         )
+
+    @classmethod
+    def _get_instagram_container_status_payload(
+        cls,
+        *,
+        session: requests.Session,
+        base: str,
+        container_id: str,
+        token: str,
+    ) -> dict[str, Any]:
+        field_candidates = (
+            "status_code,status,error_message,video_status",
+            "status_code,status,video_status",
+            "status_code,status",
+            "status_code",
+        )
+        last_error_detail = ""
+
+        for fields in field_candidates:
+            status_resp = cls._request_with_retries(
+                lambda: session.get(
+                    f"{base}/{container_id}",
+                    params={
+                        "fields": fields,
+                        "access_token": token,
+                    },
+                    timeout=60,
+                ),
+                max_attempts=3,
+            )
+            if status_resp.status_code < 400:
+                payload = status_resp.json()
+                if isinstance(payload, dict):
+                    return payload
+                return {}
+
+            detail = _extract_graph_error(status_resp)
+            if cls._is_instagram_container_field_error(status_resp):
+                last_error_detail = detail
+                continue
+            raise RuntimeError(f"Instagram container status failed: {detail}")
+
+        suffix = f" after field fallback ({last_error_detail})" if last_error_detail else ""
+        raise RuntimeError(f"Instagram container status failed{suffix}")

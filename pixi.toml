@@ -59,6 +59,9 @@ fr-core-news-sm = { url = "https://github.com/explosion/spacy-models/releases/do
 en-core-web-sm = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }
 es-core-news-sm = { url = "https://github.com/explosion/spacy-models/releases/download/es_core_news_sm-3.8.0/es_core_news_sm-3.8.0-py3-none-any.whl" }
 
+# YAML config parsing
+pyyaml = ">=6.0"
+
 # External platform integrations
 google-api-python-client = ">=2.173.0"
 google-auth = ">=2.40.0"

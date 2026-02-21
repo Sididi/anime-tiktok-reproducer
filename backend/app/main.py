@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
 from .api import api_router
+from .services.account_service import AccountService
 from .services.integration_health_service import IntegrationHealthService
 
 
@@ -24,7 +25,8 @@ logger = logging.getLogger("uvicorn.error")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Run integration health checks on startup."""
+    """Load accounts and run integration health checks on startup."""
+    AccountService.load()
     try:
         result = await asyncio.to_thread(IntegrationHealthService.run_startup_health_check)
         app.state.integrations_health = result

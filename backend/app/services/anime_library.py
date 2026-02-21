@@ -333,7 +333,7 @@ class AnimeLibraryService:
     ) -> AsyncIterator[IndexProgress]:
         """
         Copy anime folder to library and index it.
-        
+
         This method ensures all file copying/remuxing operations complete
         and files are verified before starting the indexing process to
         prevent race conditions.
@@ -482,15 +482,15 @@ class AnimeLibraryService:
                 total_files=total_files,
                 completed_files=total_files,
             )
-            
+
             # Small delay to ensure filesystem has flushed all writes
             await asyncio.sleep(1.0)
-            
+
             # Verify each file is readable and has valid size
             for video_file in video_files:
                 is_mkv = video_file.suffix.lower() == ".mkv"
                 dest_file = dest_path / (video_file.stem + ".mp4" if is_mkv else video_file.name)
-                
+
                 # Check if file exists and has size > 0
                 if not dest_file.exists():
                     yield IndexProgress(
@@ -498,7 +498,7 @@ class AnimeLibraryService:
                         error=f"Copied file missing after copy: {dest_file.name}",
                     )
                     return
-                
+
                 file_stat = await asyncio.to_thread(dest_file.stat)
                 if file_stat.st_size == 0:
                     yield IndexProgress(

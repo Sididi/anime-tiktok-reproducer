@@ -1,0 +1,40 @@
+# Account configuration for multi-channel upload scheduling.
+# Copy this file to config.yaml and fill in your credentials.
+#
+# Global credentials (Meta app_id/secret, Google OAuth client, Discord, Drive)
+# stay in .env. Only per-account tokens go here.
+
+accounts:
+  anime_fr:
+    name: "Anime FR"
+    language: "fr"
+    avatar: "anime_fr.jpg"       # filename in avatars/ directory
+    slots:                        # UTC hours, each = 1 upload/day
+      - "14:00"
+      - "18:00"
+      - "21:00"
+    youtube:
+      refresh_token: "1//0..."
+      channel_id: "UC..."        # optional: enforce upload target
+      category_id: "22"          # optional: defaults to global ATR_YOUTUBE_CATEGORY_ID
+    meta:
+      token_mode: "system_user"  # "system_user" or "long_lived_user"
+      facebook_page_id: "123..."
+      facebook_page_access_token: "EAA..."
+      instagram_business_account_id: "456..."
+      instagram_access_token: "IGA..."  # optional: defaults to facebook_page_access_token
+
+  # anime_en:
+  #   name: "Anime EN"
+  #   language: "en"
+  #   avatar: "anime_en.png"
+  #   slots:
+  #     - "15:00"
+  #     - "20:00"
+  #   youtube:
+  #     refresh_token: "1//0..."
+  #   meta:
+  #     token_mode: "system_user"
+  #     facebook_page_id: "789..."
+  #     facebook_page_access_token: "EAA..."
+  #     instagram_business_account_id: "012..."

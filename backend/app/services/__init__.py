@@ -1,3 +1,4 @@
+from .account_service import AccountService
 from .project_service import ProjectService
 from .downloader import DownloaderService
 from .scene_detector import SceneDetectorService
@@ -15,16 +16,19 @@ from .google_drive_service import GoogleDriveService
 from .discord_service import DiscordService
 from .export_service import ExportService
 from .social_upload_service import SocialUploadService, PlatformUploadResult
+from .scheduling_service import SchedulingService
 from .upload_phase import UploadPhaseService
 from .meta_token_service import MetaTokenService
 from .integration_health_service import IntegrationHealthService
 
 __all__ = [
+    "AccountService",
     "ProjectService", "DownloaderService", "SceneDetectorService",
     "AnimeMatcherService", "AnimeLibraryService", "TranscriberService", "ProcessingService",
     "SubtitleVideoService", "SubtitleFrameRenderer", "get_style", "list_styles",
     "GapResolutionService", "SceneMergerService",
     "MetadataService", "GoogleDriveService", "DiscordService", "ExportService",
+    "SchedulingService",
     "SocialUploadService", "PlatformUploadResult", "UploadPhaseService",
     "MetaTokenService",
     "IntegrationHealthService",

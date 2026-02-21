@@ -10,11 +10,13 @@ import os
 
 from ..models import Project
 from ..config import settings
+from .account_service import AccountService
 from .discord_service import DiscordService
 from .export_service import ExportService
 from .google_drive_service import GoogleDriveService
 from .metadata import MetadataService
 from .project_service import ProjectService
+from .scheduling_service import SchedulingService
 from .social_upload_service import PlatformUploadResult, SocialUploadService
 
 
@@ -181,6 +183,7 @@ class UploadPhaseService:
             return {
                 "project_id": project.id,
                 "anime_title": project.anime_name,
+                "language": project.output_language,
                 "local_size_bytes": _dir_size(project_dir) if project_dir.exists() else 0,
                 "uploaded": bool(project.final_upload_discord_message_id),
                 "uploaded_status": "green" if project.final_upload_discord_message_id else "red",
@@ -192,6 +195,8 @@ class UploadPhaseService:
                 "drive_video_web_url": readiness.drive_video_web_url,
                 "drive_folder_id": readiness.drive_folder_id,
                 "drive_folder_url": readiness.drive_folder_url,
+                "scheduled_at": project.scheduled_at.isoformat() if project.scheduled_at else None,
+                "scheduled_account_id": project.scheduled_account_id,
             }
 
         if not projects:
@@ -220,9 +225,13 @@ class UploadPhaseService:
         youtube_description: str,
         youtube_tags: list[str],
         tiktok_description: str,
+        scheduled_at: datetime | None = None,
     ) -> str:
+        header = f"Upload complete for project `{project.id}`"
+        if scheduled_at:
+            header += f" (scheduled: {scheduled_at.strftime('%Y-%m-%d %H:%M UTC')})"
         lines = [
-            f"Upload complete for project `{project.id}`",
+            header,
             f"Drive video: {drive_video_url}",
             "",
             "Platform results:",
@@ -259,10 +268,24 @@ class UploadPhaseService:
         return "\n".join(lines)
 
     @classmethod
-    def execute_upload(cls, project_id: str) -> dict[str, Any]:
+    def execute_upload(cls, project_id: str, account_id: str | None = None) -> dict[str, Any]:
         project = ProjectService.load(project_id)
         if not project:
             raise ValueError("Project not found")
+
+        # Validate account if provided
+        account = None
+        scheduled_at: datetime | None = None
+        slot_dt: datetime | None = None
+        if account_id:
+            account = AccountService.get_account(account_id)
+            if not account:
+                raise ValueError(f"Account '{account_id}' not found")
+            if project.output_language and account.language != project.output_language:
+                raise ValueError(
+                    f"Project language '{project.output_language}' does not match "
+                    f"account language '{account.language}'"
+                )
 
         readiness = cls.compute_readiness(project)
         if readiness.status != "green" or not readiness.drive_video_id:
@@ -279,6 +302,10 @@ class UploadPhaseService:
             raise ValueError("Subtitle file is missing")
         subtitle_locale = ExportService.language_to_locale(project.output_language)
 
+        # Calculate scheduled time if account has slots
+        if account and account.slots and account_id:
+            slot_dt, scheduled_at = SchedulingService.find_next_slot(account_id)
+
         # Public share the drive video before upload phase.
         GoogleDriveService.set_public_read(readiness.drive_video_id)
         drive_video_url = readiness.drive_video_web_url or GoogleDriveService.get_web_view_url(readiness.drive_video_id)
@@ -288,29 +315,70 @@ class UploadPhaseService:
             local_video_path = Path(tmp_dir) / (readiness.drive_video_name or "final_video.mp4")
             GoogleDriveService.download_file(readiness.drive_video_id, local_video_path)
 
-            jobs = {
-                "youtube": lambda: SocialUploadService.upload_youtube(
+            jobs: dict[str, Any] = {}
+
+            # YouTube job
+            if account and account.youtube and account_id:
+                yt_creds = AccountService.get_youtube_credentials(account_id)
+                yt_config = account.youtube
+                jobs["youtube"] = lambda: SocialUploadService.upload_youtube(
                     video_path=local_video_path,
                     subtitle_path=subtitle_path,
                     subtitle_locale=subtitle_locale,
                     target_language=project.output_language,
                     metadata=metadata,
-                ),
-                "facebook": lambda: SocialUploadService.upload_facebook(
+                    credentials=yt_creds,
+                    scheduled_at=scheduled_at,
+                    category_id=yt_config.category_id,
+                    channel_id=yt_config.channel_id,
+                )
+            elif not account:
+                # Global (backwards compat)
+                jobs["youtube"] = lambda: SocialUploadService.upload_youtube(
+                    video_path=local_video_path,
+                    subtitle_path=subtitle_path,
+                    subtitle_locale=subtitle_locale,
+                    target_language=project.output_language,
+                    metadata=metadata,
+                )
+
+            # Facebook + Instagram jobs
+            if account and account.meta and account_id:
+                meta_creds = AccountService.get_meta_credentials(account_id)
+                jobs["facebook"] = lambda: SocialUploadService.upload_facebook(
                     video_path=local_video_path,
                     subtitle_path=subtitle_path,
                     subtitle_locale=subtitle_locale,
                     metadata=metadata,
                     video_url=direct_drive_download,
-                ),
-                "instagram": lambda: SocialUploadService.upload_instagram(
+                    page_id=meta_creds.page_id,
+                    page_access_token=meta_creds.facebook_page_access_token,
+                    scheduled_at=scheduled_at,
+                )
+                jobs["instagram"] = lambda: SocialUploadService.upload_instagram(
                     video_path=local_video_path,
                     metadata=metadata,
                     preferred_video_url=direct_drive_download,
-                ),
-            }
+                    ig_user_id=meta_creds.instagram_business_account_id,
+                    ig_access_token=meta_creds.instagram_access_token,
+                    scheduled_at=scheduled_at,
+                )
+            elif not account:
+                # Global (backwards compat)
+                jobs["facebook"] = lambda: SocialUploadService.upload_facebook(
+                    video_path=local_video_path,
+                    subtitle_path=subtitle_path,
+                    subtitle_locale=subtitle_locale,
+                    metadata=metadata,
+                    video_url=direct_drive_download,
+                )
+                jobs["instagram"] = lambda: SocialUploadService.upload_instagram(
+                    video_path=local_video_path,
+                    metadata=metadata,
+                    preferred_video_url=direct_drive_download,
+                )
 
-            max_parallel = max(1, min(settings.social_upload_max_parallel, len(jobs)))
+            max_parallel = max(1, min(settings.social_upload_max_parallel, len(jobs))) if jobs else 1
             results_by_platform: dict[str, PlatformUploadResult] = {}
             with ThreadPoolExecutor(max_workers=max_parallel) as executor:
                 future_to_platform = {
@@ -330,15 +398,9 @@ class UploadPhaseService:
 
             # Keep deterministic ordering in reports/messages.
             platform_results = [
-                results_by_platform.get(
-                    platform,
-                    PlatformUploadResult(
-                        platform=platform,
-                        status="failed",
-                        detail="Upload task did not return a result",
-                    ),
-                )
+                results_by_platform[platform]
                 for platform in ("youtube", "facebook", "instagram")
+                if platform in results_by_platform
             ]
 
         # Remove generation message first (if any), then post final upload message.
@@ -358,6 +420,7 @@ class UploadPhaseService:
                 youtube_description=metadata.youtube.description,
                 youtube_tags=metadata.youtube.tags,
                 tiktok_description=metadata.tiktok.description,
+                scheduled_at=scheduled_at,
             )
         )
 
@@ -370,6 +433,15 @@ class UploadPhaseService:
             "drive_video_url": drive_video_url,
             "direct_drive_download": direct_drive_download,
         }
+
+        # Save scheduling info
+        if account_id:
+            project.scheduled_account_id = account_id
+        if scheduled_at:
+            project.scheduled_at = scheduled_at
+        if slot_dt:
+            project.scheduled_slot = slot_dt.isoformat()
+
         ProjectService.save(project)
 
         return {
@@ -377,6 +449,7 @@ class UploadPhaseService:
             "drive_video_url": drive_video_url,
             "direct_drive_download": direct_drive_download,
             "discord_message_id": project.final_upload_discord_message_id,
+            "scheduled_at": scheduled_at.isoformat() if scheduled_at else None,
         }
 
     @classmethod

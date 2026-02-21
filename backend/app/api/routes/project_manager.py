@@ -1,7 +1,8 @@
 import asyncio
 import json
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Body, HTTPException
 from fastapi.responses import StreamingResponse
 
 from ...services import UploadPhaseService
@@ -21,12 +22,15 @@ async def list_project_manager_projects():
 
 
 @router.post("/projects/{project_id}/upload")
-async def run_upload_phase(project_id: str):
+async def run_upload_phase(
+    project_id: str,
+    account_id: Annotated[str | None, Body(embed=True)] = None,
+):
     """Upload a ready project to configured platforms."""
     async def stream_progress():
         yield f"data: {json.dumps({'status': 'processing', 'step': 'prepare', 'progress': 0.1, 'message': 'Preparing upload phase...'})}\n\n"
         try:
-            result = await asyncio.to_thread(UploadPhaseService.execute_upload, project_id)
+            result = await asyncio.to_thread(UploadPhaseService.execute_upload, project_id, account_id)
             yield f"data: {json.dumps({'status': 'complete', 'step': 'complete', 'progress': 1.0, 'message': 'Upload phase complete', 'result': result})}\n\n"
         except Exception as exc:
             yield f"data: {json.dumps({'status': 'error', 'step': 'upload', 'progress': 0.0, 'error': str(exc), 'message': 'Upload phase failed'})}\n\n"

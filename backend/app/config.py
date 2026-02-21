@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     anime_library_path: Path = Path(__file__).parent.parent.parent / "modules" / "anime_searcher" / "library"
     sscd_model_path: Path | None = None  # User should set this
 
+    # Accounts
+    accounts_config_path: Path = PROJECT_ROOT / "config" / "accounts" / "config.yaml"
+
     # CORS
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
 

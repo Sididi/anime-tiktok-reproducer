@@ -1,5 +1,6 @@
 from fastapi import APIRouter
 
+from .accounts import router as accounts_router
 from .projects import router as projects_router
 from .video import router as video_router
 from .scenes import router as scenes_router
@@ -15,6 +16,7 @@ from .integrations import router as integrations_router
 # from .subtitles import router as subtitles_router
 
 api_router = APIRouter(prefix="/api")
+api_router.include_router(accounts_router)
 api_router.include_router(projects_router)
 api_router.include_router(video_router)
 api_router.include_router(scenes_router)
