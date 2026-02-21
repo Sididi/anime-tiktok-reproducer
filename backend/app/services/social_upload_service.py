@@ -396,6 +396,7 @@ class SocialUploadService:
                     "snippet": {
                         "videoId": video_id,
                         "language": youtube_language,
+                        "name": youtube_language,
                         "isDraft": False,
                     }
                 },
@@ -616,10 +617,8 @@ class SocialUploadService:
                 detail="Instagram API credentials are not configured",
             )
 
-        # Build extra container params for scheduling
-        ig_schedule_params: dict[str, str] = {}
-        if scheduled_at:
-            ig_schedule_params["scheduled_publish_time"] = str(int(scheduled_at.timestamp()))
+        # Instagram API does not support scheduled_publish_time for Reels,
+        # so we always publish immediately regardless of scheduled_at.
 
         try:
             base = cls._graph_base()
@@ -636,17 +635,8 @@ class SocialUploadService:
                             token=token,
                             caption=metadata.instagram.caption,
                             video_url=preferred_video_url,
-                            extra_params=ig_schedule_params,
                         )
                         ingestion_mode = "drive_url"
-                        if scheduled_at:
-                            # Scheduled: Meta auto-publishes; skip poll + publish
-                            return PlatformUploadResult(
-                                platform="instagram",
-                                status="uploaded",
-                                resource_id=url_container_id,
-                                detail=f"Scheduled for {scheduled_at.isoformat()}; ingestion mode={ingestion_mode}",
-                            )
                         media_id, permalink = cls._publish_instagram_container(
                             session=session,
                             base=base,
@@ -659,7 +649,7 @@ class SocialUploadService:
                             status="uploaded",
                             url=permalink,
                             resource_id=media_id,
-                            detail=f"Published successfully; ingestion mode={ingestion_mode}",
+                            detail=f"Published immediately; ingestion mode={ingestion_mode}",
                         )
                     except Exception as exc:
                         fallback_reason = str(exc)
@@ -672,19 +662,7 @@ class SocialUploadService:
                         token=token,
                         caption=metadata.instagram.caption,
                         video_path=video_path,
-                        extra_params=ig_schedule_params,
                     )
-                    if scheduled_at:
-                        # Scheduled: Meta auto-publishes; skip poll + publish
-                        detail = f"Scheduled for {scheduled_at.isoformat()}; ingestion mode={ingestion_mode}"
-                        if fallback_reason:
-                            detail = f"{detail} | fallback_from_drive_url={fallback_reason}"
-                        return PlatformUploadResult(
-                            platform="instagram",
-                            status="uploaded",
-                            resource_id=resumable_container_id,
-                            detail=detail,
-                        )
                     media_id, permalink = cls._publish_instagram_container(
                         session=session,
                         base=base,

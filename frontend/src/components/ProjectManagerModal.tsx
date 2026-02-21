@@ -344,7 +344,7 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
     setHoldingDeleteId(null);
   };
 
-  const colCount = 7; // uploaded, can_upload, lang, anime_title, local_size, scheduled_at, actions
+  const colCount = 8; // uploaded, can_upload, lang, anime_title, local_size, scheduled_at, account, actions
 
   if (!open) return null;
 
@@ -502,6 +502,7 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
                     Scheduled At
                   </button>
                 </th>
+                <th className="py-2 pr-3">Account</th>
                 <th className="py-2 pr-3">Actions</th>
               </tr>
             </thead>
@@ -527,7 +528,11 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
                       <td className="py-3 pr-3">
                         {statusCircle(
                           row.uploaded_status,
-                          row.uploaded ? "Uploaded" : "Not uploaded",
+                          row.uploaded
+                            ? "Uploaded"
+                            : row.uploaded_status === "orange"
+                              ? "Scheduled"
+                              : "Not uploaded",
                         )}
                       </td>
                       <td className="py-3 pr-3">
@@ -559,8 +564,20 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
                       <td className="py-3 pr-3">{formatBytes(row.local_size_bytes)}</td>
                       <td className="py-3 pr-3">
                         <span className="text-xs text-[hsl(var(--muted-foreground))]">
-                          {row.uploaded ? formatScheduledAt(row.scheduled_at) || "Uploaded" : ""}
+                          {formatScheduledAt(row.scheduled_at) || (row.uploaded ? "Uploaded" : "")}
                         </span>
+                      </td>
+                      <td className="py-3 pr-3">
+                        {row.scheduled_account_id && (() => {
+                          const acc = accounts.find((a) => a.id === row.scheduled_account_id);
+                          if (!acc) return <span className="text-xs text-[hsl(var(--muted-foreground))]">{row.scheduled_account_id}</span>;
+                          return (
+                            <div className="flex items-center gap-1.5">
+                              <img src={acc.avatar_url} alt="" className="w-5 h-5 rounded-full object-cover" />
+                              <span className="text-xs">{acc.name}</span>
+                            </div>
+                          );
+                        })()}
                       </td>
                       <td className="py-3 pr-3">
                         <div className="flex items-center gap-2">

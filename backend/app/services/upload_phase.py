@@ -33,6 +33,27 @@ class UploadReadiness:
     drive_folder_url: str | None
 
 
+def _uploaded_fields(project: "Project") -> dict[str, Any]:
+    """Return uploaded + uploaded_status based on scheduled_at vs now."""
+    has_discord = bool(project.final_upload_discord_message_id)
+    scheduled_at = project.scheduled_at
+    if scheduled_at is not None:
+        now = datetime.now(tz=timezone.utc)
+        is_live = scheduled_at <= now
+        if is_live:
+            status = "green"
+        elif has_discord:
+            status = "orange"  # scheduled, not yet published
+        else:
+            status = "red"
+        return {"uploaded": is_live, "uploaded_status": status}
+    # No scheduling: rely on discord message presence (immediate publish)
+    return {
+        "uploaded": has_discord,
+        "uploaded_status": "green" if has_discord else "red",
+    }
+
+
 def _dir_size(path: Path) -> int:
     total = 0
     for root, _, files in os.walk(path):
@@ -185,8 +206,7 @@ class UploadPhaseService:
                 "anime_title": project.anime_name,
                 "language": project.output_language,
                 "local_size_bytes": _dir_size(project_dir) if project_dir.exists() else 0,
-                "uploaded": bool(project.final_upload_discord_message_id),
-                "uploaded_status": "green" if project.final_upload_discord_message_id else "red",
+                **_uploaded_fields(project),
                 "can_upload_status": readiness.status,
                 "can_upload_reasons": readiness.reasons,
                 "has_metadata": readiness.metadata_exists,

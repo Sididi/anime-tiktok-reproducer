@@ -201,16 +201,47 @@ class AccountService:
 
     @classmethod
     def get_meta_credentials(cls, account_id: str) -> MetaUploadCredentials:
-        """Build Meta upload credentials from account config."""
+        """Build Meta upload credentials from account config.
+
+        For system_user mode, the configured token may be a system-user token
+        rather than a page-scoped token.  We derive the real page token (and
+        discover the Instagram business account) the same way the global
+        MetaTokenService does.
+        """
         account = cls.get_account(account_id)
         if not account or not account.meta:
             raise ValueError(f"No Meta config for account {account_id}")
         meta = account.meta
-        ig_token = meta.instagram_access_token or meta.facebook_page_access_token
+
+        page_id = meta.facebook_page_id
+        page_token = meta.facebook_page_access_token
+        ig_user_id = meta.instagram_business_account_id
+        ig_token = meta.instagram_access_token or page_token
+
+        # Derive page-scoped token from system-user token when needed
+        if meta.token_mode == "system_user" and page_id and page_token:
+            from .meta_token_service import MetaTokenService
+            derived_page_token, discovered_ig_id = MetaTokenService._derive_page_credentials_from_token(
+                page_id=page_id,
+                access_token=page_token,
+            )
+            if derived_page_token:
+                page_token = derived_page_token
+                if not meta.instagram_access_token:
+                    ig_token = derived_page_token
+            if not ig_user_id and discovered_ig_id:
+                ig_user_id = discovered_ig_id
+
+        if not ig_user_id and page_id and page_token:
+            ig_user_id = MetaTokenService._discover_ig_user_id(
+                page_id=page_id,
+                page_access_token=page_token,
+            )
+
         return MetaUploadCredentials(
-            page_id=meta.facebook_page_id,
-            facebook_page_access_token=meta.facebook_page_access_token,
-            instagram_business_account_id=meta.instagram_business_account_id,
+            page_id=page_id,
+            facebook_page_access_token=page_token,
+            instagram_business_account_id=ig_user_id,
             instagram_access_token=ig_token,
             mode=meta.token_mode,
         )

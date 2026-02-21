@@ -55,7 +55,7 @@ export interface ProjectManagerRow {
   language: string | null;
   local_size_bytes: number;
   uploaded: boolean;
-  uploaded_status: "green" | "red";
+  uploaded_status: "green" | "orange" | "red";
   can_upload_status: "green" | "orange" | "red";
   can_upload_reasons: string[];
   has_metadata: boolean;
