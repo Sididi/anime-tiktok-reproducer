@@ -270,11 +270,15 @@ class MetaTokenService:
                 page_id=page_id,
                 access_token=page_token,
             )
-            if derived_page_token:
-                page_token = derived_page_token
-                # Default Instagram token to the derived page token when no explicit token is set.
-                if not settings.instagram_access_token:
-                    ig_token = derived_page_token
+            if not derived_page_token:
+                raise RuntimeError(
+                    "Page access token required: derivation failed for configured system-user token. "
+                    f"Unable to resolve page-scoped token for page {page_id} via /{page_id}?fields=access_token."
+                )
+            page_token = derived_page_token
+            # Default Instagram token to the derived page token when no explicit token is set.
+            if not settings.instagram_access_token:
+                ig_token = derived_page_token
             if not ig_user_id and discovered_ig_id:
                 ig_user_id = discovered_ig_id
 

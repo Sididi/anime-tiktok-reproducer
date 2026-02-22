@@ -11,7 +11,7 @@ import yaml
 from google.oauth2.credentials import Credentials
 
 from ..config import settings
-from .meta_token_service import MetaUploadCredentials
+from .meta_token_service import MetaTokenService, MetaUploadCredentials
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -220,15 +220,18 @@ class AccountService:
 
         # Derive page-scoped token from system-user token when needed
         if meta.token_mode == "system_user" and page_id and page_token:
-            from .meta_token_service import MetaTokenService
             derived_page_token, discovered_ig_id = MetaTokenService._derive_page_credentials_from_token(
                 page_id=page_id,
                 access_token=page_token,
             )
-            if derived_page_token:
-                page_token = derived_page_token
-                if not meta.instagram_access_token:
-                    ig_token = derived_page_token
+            if not derived_page_token:
+                raise RuntimeError(
+                    "Page access token required: derivation failed for account "
+                    f"'{account_id}' (page_id={page_id}). Provide a real page access token."
+                )
+            page_token = derived_page_token
+            if not meta.instagram_access_token:
+                ig_token = derived_page_token
             if not ig_user_id and discovered_ig_id:
                 ig_user_id = discovered_ig_id
 

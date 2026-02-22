@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     social_upload_max_parallel: int = 3
 
     # Meta Graph API
-    meta_graph_api_version: str = "v22.0"
+    meta_graph_api_version: str = "v25.0"
     # Token strategy:
     # - "system_user": use pre-generated system user/page tokens from env
     # - "long_lived_user": auto-refresh user token and derive page token on server
@@ -72,6 +72,9 @@ class Settings(BaseSettings):
     instagram_access_token: str | None = None
     instagram_publish_poll_interval_seconds: int = 5
     instagram_publish_timeout_seconds: int = 15 * 60
+
+    # n8n webhook for deferred Instagram publishing at scheduled time
+    n8n_webhook_url: str | None = None
 
     @property
     def drive_google_client_id(self) -> str | None:

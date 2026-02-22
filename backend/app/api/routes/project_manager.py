@@ -1,14 +1,20 @@
 import asyncio
 import json
-from typing import Annotated
+from typing import Literal
 
 from fastapi import APIRouter, Body, HTTPException
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from ...services import UploadPhaseService
 
 
 router = APIRouter(prefix="/project-manager", tags=["project-manager"])
+
+
+class UploadProjectRequest(BaseModel):
+    account_id: str | None = None
+    platforms: list[Literal["youtube", "facebook", "instagram"]] | None = None
 
 
 @router.get("/projects")
@@ -24,13 +30,19 @@ async def list_project_manager_projects():
 @router.post("/projects/{project_id}/upload")
 async def run_upload_phase(
     project_id: str,
-    account_id: Annotated[str | None, Body(embed=True)] = None,
+    payload: UploadProjectRequest | None = Body(default=None),
 ):
     """Upload a ready project to configured platforms."""
     async def stream_progress():
+        req = payload or UploadProjectRequest()
         yield f"data: {json.dumps({'status': 'processing', 'step': 'prepare', 'progress': 0.1, 'message': 'Preparing upload phase...'})}\n\n"
         try:
-            result = await asyncio.to_thread(UploadPhaseService.execute_upload, project_id, account_id)
+            result = await asyncio.to_thread(
+                UploadPhaseService.execute_upload,
+                project_id,
+                req.account_id,
+                req.platforms,
+            )
             yield f"data: {json.dumps({'status': 'complete', 'step': 'complete', 'progress': 1.0, 'message': 'Upload phase complete', 'result': result})}\n\n"
         except Exception as exc:
             yield f"data: {json.dumps({'status': 'error', 'step': 'upload', 'progress': 0.0, 'error': str(exc), 'message': 'Upload phase failed'})}\n\n"

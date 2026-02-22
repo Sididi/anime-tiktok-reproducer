@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import json
+import logging
 import time
 from typing import Callable, Any
 
@@ -18,6 +19,8 @@ from ..config import settings
 from ..models import VideoMetadataPayload
 from ..utils.meta_graph import extract_graph_error as _extract_graph_error
 from .meta_token_service import MetaTokenService
+
+logger = logging.getLogger("uvicorn.error")
 
 
 @dataclass
@@ -470,15 +473,20 @@ class SocialUploadService:
                 detail="Facebook API credentials are not configured",
             )
 
-        base = cls._graph_base()
-
-        # Build publish fields: scheduled or immediate
-        fb_publish_fields: dict[str, str] = {}
+        # Scheduling: use Reels API 3-phase upload with video_state=SCHEDULED
         if scheduled_at:
-            fb_publish_fields["published"] = "false"
-            fb_publish_fields["scheduled_publish_time"] = str(int(scheduled_at.timestamp()))
-        else:
-            fb_publish_fields["published"] = "true"
+            return cls._upload_facebook_reel_scheduled(
+                video_path=video_path,
+                subtitle_path=subtitle_path,
+                subtitle_locale=subtitle_locale,
+                metadata=metadata,
+                page_id=page_id,
+                token=token,
+                scheduled_at=scheduled_at,
+            )
+
+        # Immediate publish: use standard /videos endpoint
+        base = cls._graph_base()
 
         try:
             with requests.Session() as session:
@@ -493,7 +501,7 @@ class SocialUploadService:
                             data={
                                 "title": metadata.facebook.title,
                                 "description": metadata.facebook.description,
-                                **fb_publish_fields,
+                                "published": "true",
                                 "access_token": token,
                                 "file_url": video_url,
                             },
@@ -517,7 +525,7 @@ class SocialUploadService:
                                 data={
                                     "title": metadata.facebook.title,
                                     "description": metadata.facebook.description,
-                                    **fb_publish_fields,
+                                    "published": "true",
                                     "access_token": token,
                                 },
                                 files={"source": source},
@@ -591,10 +599,8 @@ class SocialUploadService:
         *,
         video_path: Path,
         metadata: VideoMetadataPayload,
-        preferred_video_url: str | None = None,
         ig_user_id: str | None = None,
         ig_access_token: str | None = None,
-        scheduled_at: datetime | None = None,
     ) -> PlatformUploadResult:
         # Use explicit per-account credentials if provided, else fall back to global
         if ig_user_id and ig_access_token:
@@ -617,77 +623,33 @@ class SocialUploadService:
                 detail="Instagram API credentials are not configured",
             )
 
-        # Instagram API does not support scheduled_publish_time for Reels,
-        # so we always publish immediately regardless of scheduled_at.
+        # Instagram API does not support scheduled_publish_time for Reels
+        # and does not reliably ingest via URL; always use resumable local upload.
 
         try:
             base = cls._graph_base()
             with requests.Session() as session:
-                fallback_reason: str | None = None
-                ingestion_mode = "resumable_local"
-
-                if preferred_video_url:
-                    try:
-                        url_container_id = cls._create_instagram_container_url(
-                            session=session,
-                            base=base,
-                            ig_user_id=ig_user_id,
-                            token=token,
-                            caption=metadata.instagram.caption,
-                            video_url=preferred_video_url,
-                        )
-                        ingestion_mode = "drive_url"
-                        media_id, permalink = cls._publish_instagram_container(
-                            session=session,
-                            base=base,
-                            ig_user_id=ig_user_id,
-                            token=token,
-                            container_id=url_container_id,
-                        )
-                        return PlatformUploadResult(
-                            platform="instagram",
-                            status="uploaded",
-                            url=permalink,
-                            resource_id=media_id,
-                            detail=f"Published immediately; ingestion mode={ingestion_mode}",
-                        )
-                    except Exception as exc:
-                        fallback_reason = str(exc)
-
-                try:
-                    resumable_container_id = cls._create_instagram_container_resumable(
-                        session=session,
-                        base=base,
-                        ig_user_id=ig_user_id,
-                        token=token,
-                        caption=metadata.instagram.caption,
-                        video_path=video_path,
-                    )
-                    media_id, permalink = cls._publish_instagram_container(
-                        session=session,
-                        base=base,
-                        ig_user_id=ig_user_id,
-                        token=token,
-                        container_id=resumable_container_id,
-                    )
-                except Exception as resumable_exc:
-                    if fallback_reason:
-                        raise RuntimeError(
-                            "Instagram drive_url upload failed and resumable fallback failed: "
-                            f"drive_url={fallback_reason} | resumable={resumable_exc}"
-                        ) from resumable_exc
-                    raise
-
-                detail = f"Published successfully; ingestion mode={ingestion_mode}"
-                if fallback_reason:
-                    detail = f"{detail} | fallback_from_drive_url={fallback_reason}"
+                container_id = cls._create_instagram_container_resumable(
+                    session=session,
+                    base=base,
+                    ig_user_id=ig_user_id,
+                    token=token,
+                    caption=metadata.instagram.caption,
+                    video_path=video_path,
+                )
+                media_id, permalink = cls._publish_instagram_container(
+                    session=session,
+                    base=base,
+                    ig_user_id=ig_user_id,
+                    token=token,
+                    container_id=container_id,
+                )
 
             return PlatformUploadResult(
                 platform="instagram",
                 status="uploaded",
                 url=permalink,
                 resource_id=media_id,
-                detail=detail,
             )
         except Exception as exc:
             return PlatformUploadResult(
@@ -695,6 +657,179 @@ class SocialUploadService:
                 status="failed",
                 detail=str(exc),
             )
+
+    @classmethod
+    def _upload_facebook_reel_scheduled(
+        cls,
+        *,
+        video_path: Path,
+        subtitle_path: Path,
+        subtitle_locale: str,
+        metadata: VideoMetadataPayload,
+        page_id: str,
+        token: str,
+        scheduled_at: datetime,
+    ) -> PlatformUploadResult:
+        """Schedule a Facebook Reel via 3-phase Reels API (video_state=SCHEDULED)."""
+        base = cls._graph_base()
+
+        try:
+            with requests.Session() as session:
+                # Phase 1: Start — initialize upload session
+                start_resp = cls._request_with_retries(
+                    lambda: session.post(
+                        f"{base}/{page_id}/video_reels",
+                        data={
+                            "upload_phase": "start",
+                            "access_token": token,
+                        },
+                        timeout=60,
+                    ),
+                    max_attempts=3,
+                )
+                if start_resp.status_code >= 400:
+                    return PlatformUploadResult(
+                        platform="facebook",
+                        status="failed",
+                        detail=f"Reel start phase failed: {_extract_graph_error(start_resp)}",
+                    )
+                start_payload = start_resp.json()
+                video_id = start_payload.get("video_id")
+                upload_url = start_payload.get("upload_url")
+                if not video_id:
+                    return PlatformUploadResult(
+                        platform="facebook",
+                        status="failed",
+                        detail=f"Reel start phase returned no video_id: {start_payload}",
+                    )
+                if not upload_url:
+                    return PlatformUploadResult(
+                        platform="facebook",
+                        status="failed",
+                        detail=f"Reel start phase returned no upload_url: {start_payload}",
+                    )
+
+                # Phase 2: Upload binary to rupload endpoint
+                file_size = video_path.stat().st_size
+
+                def _upload_binary() -> requests.Response:
+                    with video_path.open("rb") as f:
+                        return session.post(
+                            str(upload_url),
+                            headers={
+                                "Authorization": f"OAuth {token}",
+                                "offset": "0",
+                                "file_size": str(file_size),
+                                "Content-Type": "application/octet-stream",
+                            },
+                            data=f,
+                            timeout=1800,
+                        )
+
+                upload_resp = cls._request_with_retries(_upload_binary, max_attempts=2)
+                if upload_resp.status_code >= 400:
+                    return PlatformUploadResult(
+                        platform="facebook",
+                        status="failed",
+                        detail=f"Reel upload phase failed ({upload_resp.status_code}): {upload_resp.text[:300]}",
+                    )
+
+                # Phase 3: Finish with video_state=SCHEDULED
+                finish_resp = cls._request_with_retries(
+                    lambda: session.post(
+                        f"{base}/{page_id}/video_reels",
+                        data={
+                            "upload_phase": "finish",
+                            "video_id": video_id,
+                            "access_token": token,
+                            "video_state": "SCHEDULED",
+                            "scheduled_publish_time": str(int(scheduled_at.timestamp())),
+                            "title": metadata.facebook.title,
+                            "description": metadata.facebook.description,
+                        },
+                        timeout=120,
+                    ),
+                    max_attempts=3,
+                )
+                if finish_resp.status_code >= 400:
+                    return PlatformUploadResult(
+                        platform="facebook",
+                        status="failed",
+                        detail=f"Reel finish phase failed: {_extract_graph_error(finish_resp)}",
+                    )
+                finish_payload = finish_resp.json()
+                if not cls._is_facebook_reel_finish_payload_valid(
+                    finish_payload=finish_payload,
+                    expected_video_id=str(video_id),
+                ):
+                    return PlatformUploadResult(
+                        platform="facebook",
+                        status="failed",
+                        detail=f"Reel finish phase returned ambiguous payload: {finish_payload}",
+                    )
+
+                # Upload captions (non-fatal for the reel itself)
+                cap_resp = cls._upload_facebook_caption_with_wait(
+                    session=session,
+                    base=base,
+                    video_id=str(video_id),
+                    token=token,
+                    subtitle_path=subtitle_path,
+                    subtitle_locale=subtitle_locale,
+                )
+                caption_detail = ""
+                if cap_resp.status_code >= 400:
+                    logger.warning(
+                        "Facebook scheduled captions failed for video_id=%s status=%s error=%s",
+                        video_id,
+                        cap_resp.status_code,
+                        _extract_graph_error(cap_resp),
+                    )
+                    caption_detail = f"; captions failed: {_extract_graph_error(cap_resp)}"
+
+            return PlatformUploadResult(
+                platform="facebook",
+                status="uploaded",
+                url=f"https://www.facebook.com/reel/{video_id}",
+                resource_id=str(video_id),
+                detail=f"Reel scheduled for {scheduled_at.isoformat()}{caption_detail}",
+            )
+        except Exception as exc:
+            return PlatformUploadResult(
+                platform="facebook",
+                status="failed",
+                detail=str(exc),
+            )
+
+    @classmethod
+    def _coerce_bool(cls, value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y"}
+        return False
+
+    @classmethod
+    def _is_facebook_reel_finish_payload_valid(
+        cls,
+        *,
+        finish_payload: dict[str, Any],
+        expected_video_id: str,
+    ) -> bool:
+        success = cls._coerce_bool(finish_payload.get("success"))
+        returned_video_id = finish_payload.get("video_id") or finish_payload.get("id")
+        returned_post_id = finish_payload.get("post_id")
+        if returned_video_id is not None and str(returned_video_id) != expected_video_id:
+            return False
+        if success:
+            return True
+        if returned_video_id is not None and str(returned_video_id) == expected_video_id:
+            return True
+        if returned_post_id:
+            return True
+        return False
 
     @classmethod
     def _upload_facebook_caption_with_wait(

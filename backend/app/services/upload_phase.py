@@ -8,6 +8,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import tempfile
 import os
 
+import requests
+
 from ..models import Project
 from ..config import settings
 from .account_service import AccountService
@@ -68,6 +70,7 @@ def _dir_size(path: Path) -> int:
 
 class UploadPhaseService:
     """Project manager view, upload execution, and managed delete flow."""
+    _SUPPORTED_PLATFORMS = ("youtube", "facebook", "instagram")
 
     @classmethod
     def _resolve_drive_folder(
@@ -288,10 +291,36 @@ class UploadPhaseService:
         return "\n".join(lines)
 
     @classmethod
-    def execute_upload(cls, project_id: str, account_id: str | None = None) -> dict[str, Any]:
+    def _normalize_platforms(cls, platforms: list[str] | None) -> tuple[str, ...]:
+        if platforms is None:
+            return cls._SUPPORTED_PLATFORMS
+        normalized: list[str] = []
+        for platform in platforms:
+            key = str(platform).strip().lower()
+            if not key:
+                continue
+            if key not in cls._SUPPORTED_PLATFORMS:
+                raise ValueError(
+                    f"Unsupported platform '{platform}'. "
+                    f"Supported values: {', '.join(cls._SUPPORTED_PLATFORMS)}"
+                )
+            if key not in normalized:
+                normalized.append(key)
+        if not normalized:
+            raise ValueError("At least one platform is required when 'platforms' is provided.")
+        return tuple(normalized)
+
+    @classmethod
+    def execute_upload(
+        cls,
+        project_id: str,
+        account_id: str | None = None,
+        platforms: list[str] | None = None,
+    ) -> dict[str, Any]:
         project = ProjectService.load(project_id)
         if not project:
             raise ValueError("Project not found")
+        requested_platforms = cls._normalize_platforms(platforms)
 
         # Validate account if provided
         account = None
@@ -336,9 +365,10 @@ class UploadPhaseService:
             GoogleDriveService.download_file(readiness.drive_video_id, local_video_path)
 
             jobs: dict[str, Any] = {}
+            instagram_enabled = bool((settings.n8n_webhook_url or "").strip())
 
             # YouTube job
-            if account and account.youtube and account_id:
+            if "youtube" in requested_platforms and account and account.youtube and account_id:
                 yt_creds = AccountService.get_youtube_credentials(account_id)
                 yt_config = account.youtube
                 jobs["youtube"] = lambda: SocialUploadService.upload_youtube(
@@ -352,7 +382,7 @@ class UploadPhaseService:
                     category_id=yt_config.category_id,
                     channel_id=yt_config.channel_id,
                 )
-            elif not account:
+            elif "youtube" in requested_platforms and not account:
                 # Global (backwards compat)
                 jobs["youtube"] = lambda: SocialUploadService.upload_youtube(
                     video_path=local_video_path,
@@ -363,47 +393,78 @@ class UploadPhaseService:
                 )
 
             # Facebook + Instagram jobs
-            if account and account.meta and account_id:
+            if account and account.meta and account_id and (
+                "facebook" in requested_platforms or "instagram" in requested_platforms
+            ):
                 meta_creds = AccountService.get_meta_credentials(account_id)
-                jobs["facebook"] = lambda: SocialUploadService.upload_facebook(
-                    video_path=local_video_path,
-                    subtitle_path=subtitle_path,
-                    subtitle_locale=subtitle_locale,
-                    metadata=metadata,
-                    video_url=direct_drive_download,
-                    page_id=meta_creds.page_id,
-                    page_access_token=meta_creds.facebook_page_access_token,
-                    scheduled_at=scheduled_at,
-                )
-                jobs["instagram"] = lambda: SocialUploadService.upload_instagram(
-                    video_path=local_video_path,
-                    metadata=metadata,
-                    preferred_video_url=direct_drive_download,
-                    ig_user_id=meta_creds.instagram_business_account_id,
-                    ig_access_token=meta_creds.instagram_access_token,
-                    scheduled_at=scheduled_at,
-                )
+
+                if "facebook" in requested_platforms:
+                    jobs["facebook"] = lambda: SocialUploadService.upload_facebook(
+                        video_path=local_video_path,
+                        subtitle_path=subtitle_path,
+                        subtitle_locale=subtitle_locale,
+                        metadata=metadata,
+                        video_url=direct_drive_download,
+                        page_id=meta_creds.page_id,
+                        page_access_token=meta_creds.facebook_page_access_token,
+                        scheduled_at=scheduled_at,
+                    )
+
+                # Instagram: disabled when n8n webhook is not configured.
+                if "instagram" in requested_platforms and instagram_enabled:
+                    if scheduled_at:
+                        ig_deferred = cls._send_n8n_instagram_webhook(
+                            project_id=project_id,
+                            scheduled_at=scheduled_at,
+                            drive_video_id=readiness.drive_video_id,
+                            metadata=metadata,
+                            ig_user_id=meta_creds.instagram_business_account_id,
+                            ig_access_token=meta_creds.instagram_access_token,
+                        )
+                        jobs["instagram"] = lambda: ig_deferred
+                    else:
+                        jobs["instagram"] = lambda: SocialUploadService.upload_instagram(
+                            video_path=local_video_path,
+                            metadata=metadata,
+                            ig_user_id=meta_creds.instagram_business_account_id,
+                            ig_access_token=meta_creds.instagram_access_token,
+                        )
             elif not account:
                 # Global (backwards compat)
-                jobs["facebook"] = lambda: SocialUploadService.upload_facebook(
-                    video_path=local_video_path,
-                    subtitle_path=subtitle_path,
-                    subtitle_locale=subtitle_locale,
-                    metadata=metadata,
-                    video_url=direct_drive_download,
-                )
-                jobs["instagram"] = lambda: SocialUploadService.upload_instagram(
-                    video_path=local_video_path,
-                    metadata=metadata,
-                    preferred_video_url=direct_drive_download,
+                if "facebook" in requested_platforms:
+                    jobs["facebook"] = lambda: SocialUploadService.upload_facebook(
+                        video_path=local_video_path,
+                        subtitle_path=subtitle_path,
+                        subtitle_locale=subtitle_locale,
+                        metadata=metadata,
+                        video_url=direct_drive_download,
+                    )
+                if "instagram" in requested_platforms and instagram_enabled:
+                    jobs["instagram"] = lambda: SocialUploadService.upload_instagram(
+                        video_path=local_video_path,
+                        metadata=metadata,
+                    )
+
+            results_by_platform: dict[str, PlatformUploadResult] = {}
+            selected_jobs = {platform: jobs[platform] for platform in requested_platforms if platform in jobs}
+
+            for platform in requested_platforms:
+                if platform in jobs:
+                    continue
+                detail = "Platform is not configured for this upload context"
+                if platform == "instagram" and not instagram_enabled:
+                    detail = "Instagram upload disabled: ATR_N8N_WEBHOOK_URL is not configured"
+                results_by_platform[platform] = PlatformUploadResult(
+                    platform=platform,
+                    status="skipped",
+                    detail=detail,
                 )
 
-            max_parallel = max(1, min(settings.social_upload_max_parallel, len(jobs))) if jobs else 1
-            results_by_platform: dict[str, PlatformUploadResult] = {}
+            max_parallel = max(1, min(settings.social_upload_max_parallel, len(selected_jobs))) if selected_jobs else 1
             with ThreadPoolExecutor(max_workers=max_parallel) as executor:
                 future_to_platform = {
                     executor.submit(job): platform
-                    for platform, job in jobs.items()
+                    for platform, job in selected_jobs.items()
                 }
                 for future in as_completed(future_to_platform):
                     platform = future_to_platform[future]
@@ -419,7 +480,7 @@ class UploadPhaseService:
             # Keep deterministic ordering in reports/messages.
             platform_results = [
                 results_by_platform[platform]
-                for platform in ("youtube", "facebook", "instagram")
+                for platform in requested_platforms
                 if platform in results_by_platform
             ]
 
@@ -450,6 +511,7 @@ class UploadPhaseService:
         project.upload_completed_at = datetime.now(timezone.utc)
         project.upload_last_result = {
             "platforms": [asdict(item) for item in platform_results],
+            "requested_platforms": list(requested_platforms),
             "drive_video_url": drive_video_url,
             "direct_drive_download": direct_drive_download,
         }
@@ -466,11 +528,77 @@ class UploadPhaseService:
 
         return {
             "platform_results": [asdict(item) for item in platform_results],
+            "requested_platforms": list(requested_platforms),
             "drive_video_url": drive_video_url,
             "direct_drive_download": direct_drive_download,
             "discord_message_id": project.final_upload_discord_message_id,
             "scheduled_at": scheduled_at.isoformat() if scheduled_at else None,
         }
+
+    @classmethod
+    def _send_n8n_payload(
+        cls,
+        *,
+        platform: str,
+        payload: dict[str, Any],
+        success_detail: str,
+    ) -> PlatformUploadResult:
+        webhook_url = settings.n8n_webhook_url
+        if not webhook_url:
+            return PlatformUploadResult(
+                platform=platform,
+                status="skipped",
+                detail="n8n webhook URL not configured",
+            )
+        try:
+            resp = requests.post(webhook_url, json=payload, timeout=15)
+            if resp.status_code >= 400:
+                return PlatformUploadResult(
+                    platform=platform,
+                    status="failed",
+                    detail=f"n8n webhook returned {resp.status_code}: {resp.text[:200]}",
+                )
+            return PlatformUploadResult(
+                platform=platform,
+                status="uploaded",
+                detail=success_detail,
+            )
+        except Exception as exc:
+            return PlatformUploadResult(
+                platform=platform,
+                status="failed",
+                detail=f"n8n webhook call failed: {exc}",
+            )
+
+    @classmethod
+    def _send_n8n_instagram_webhook(
+        cls,
+        *,
+        project_id: str,
+        scheduled_at: datetime,
+        drive_video_id: str,
+        metadata: "VideoMetadataPayload",
+        ig_user_id: str,
+        ig_access_token: str,
+    ) -> PlatformUploadResult:
+        """Send self-contained webhook to n8n for deferred Instagram publish."""
+        payload = {
+            "project_id": project_id,
+            "scheduled_at": scheduled_at.isoformat(),
+            "drive_video_id": drive_video_id,
+            "graph_api_version": settings.meta_graph_api_version,
+            "instagram": {
+                "ig_user_id": ig_user_id,
+                "ig_access_token": ig_access_token,
+                "caption": metadata.instagram.caption,
+            },
+            "discord_webhook_url": settings.discord_webhook_url,
+        }
+        return cls._send_n8n_payload(
+            platform="instagram",
+            payload=payload,
+            success_detail=f"Deferred to n8n; scheduled for {scheduled_at.isoformat()}",
+        )
 
     @classmethod
     def managed_delete(cls, project_id: str) -> dict[str, Any]:

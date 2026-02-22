@@ -105,6 +105,39 @@ class IntegrationHealthService:
             return {"status": "error", "detail": str(exc)}
 
     @classmethod
+    def _meta_endpoint_failure_detail(cls, endpoint: str, response: requests.Response) -> str:
+        return (
+            f"Meta endpoint `{endpoint}` failed: {extract_graph_error(response)}. "
+            "Action: use a PAGE access token with pages_show_list, pages_read_engagement and pages_manage_posts."
+        )
+
+    @classmethod
+    def _check_meta_page_endpoints(
+        cls,
+        *,
+        base: str,
+        page_id: str,
+        page_access_token: str,
+        mode: str | None = None,
+    ) -> dict[str, Any] | None:
+        checks = (
+            (f"/{page_id}", {"fields": "id,name"}),
+            (f"/{page_id}/videos", {"limit": 1}),
+            (f"/{page_id}/video_reels", {"limit": 1}),
+            (f"/{page_id}/posts", {"limit": 1}),
+        )
+        for endpoint, params in checks:
+            payload = {"access_token": page_access_token, **params}
+            resp = requests.get(f"{base}{endpoint}", params=payload, timeout=30)
+            if resp.status_code >= 400:
+                detail = cls._meta_endpoint_failure_detail(endpoint, resp)
+                result: dict[str, Any] = {"status": "error", "detail": detail}
+                if mode:
+                    result["mode"] = mode
+                return result
+        return None
+
+    @classmethod
     def _check_meta(cls) -> dict[str, Any]:
         mode = (settings.meta_token_mode or "system_user").strip().lower()
         try:
@@ -121,39 +154,14 @@ class IntegrationHealthService:
 
         base = f"https://graph.facebook.com/{settings.meta_graph_api_version}"
         try:
-            page_resp = requests.get(
-                f"{base}/{creds.page_id}",
-                params={
-                    "fields": "id,name",
-                    "access_token": creds.facebook_page_access_token,
-                },
-                timeout=30,
+            endpoints_error = cls._check_meta_page_endpoints(
+                base=base,
+                page_id=creds.page_id,
+                page_access_token=creds.facebook_page_access_token,
+                mode=creds.mode,
             )
-            if page_resp.status_code >= 400:
-                return {
-                    "status": "error",
-                    "mode": creds.mode,
-                    "detail": f"Facebook page check failed: {page_resp.text[:300]}",
-                }
-
-            # Ensure token is usable for page video operations (not just generic page read).
-            videos_resp = requests.get(
-                f"{base}/{creds.page_id}/videos",
-                params={
-                    "limit": 1,
-                    "access_token": creds.facebook_page_access_token,
-                },
-                timeout=30,
-            )
-            if videos_resp.status_code >= 400:
-                return {
-                    "status": "error",
-                    "mode": creds.mode,
-                    "detail": (
-                        "Facebook page video endpoint check failed: "
-                        f"{extract_graph_error(videos_resp)}"
-                    ),
-                }
+            if endpoints_error:
+                return endpoints_error
 
             if not creds.instagram_business_account_id or not creds.instagram_access_token:
                 return {
@@ -174,7 +182,10 @@ class IntegrationHealthService:
                 return {
                     "status": "error",
                     "mode": creds.mode,
-                    "detail": f"Instagram account check failed: {ig_resp.text[:300]}",
+                    "detail": (
+                        "Instagram account check failed: "
+                        f"{extract_graph_error(ig_resp)}"
+                    ),
                 }
         except Exception as exc:
             return {
@@ -236,13 +247,13 @@ class IntegrationHealthService:
 
         base = f"https://graph.facebook.com/{settings.meta_graph_api_version}"
         try:
-            page_resp = requests.get(
-                f"{base}/{meta_creds.page_id}",
-                params={"fields": "id,name", "access_token": meta_creds.facebook_page_access_token},
-                timeout=30,
+            endpoints_error = cls._check_meta_page_endpoints(
+                base=base,
+                page_id=meta_creds.page_id,
+                page_access_token=meta_creds.facebook_page_access_token,
             )
-            if page_resp.status_code >= 400:
-                return {"status": "error", "detail": f"Facebook page check failed: {page_resp.text[:300]}"}
+            if endpoints_error:
+                return endpoints_error
 
             if meta_creds.instagram_business_account_id and meta_creds.instagram_access_token:
                 ig_resp = requests.get(
@@ -251,7 +262,10 @@ class IntegrationHealthService:
                     timeout=30,
                 )
                 if ig_resp.status_code >= 400:
-                    return {"status": "error", "detail": f"Instagram check failed: {ig_resp.text[:300]}"}
+                    return {
+                        "status": "error",
+                        "detail": f"Instagram check failed: {extract_graph_error(ig_resp)}",
+                    }
 
             return {"status": "ok", "detail": "Meta credentials valid"}
         except Exception as exc:
