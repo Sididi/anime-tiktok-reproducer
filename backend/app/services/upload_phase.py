@@ -239,12 +239,26 @@ class UploadPhaseService:
                 rows[idx] = future.result()
         return [row for row in rows if row is not None]
 
+    _FRENCH_DAYS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+    _FRENCH_MONTHS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"]
+    _PLATFORM_DISPLAY = {
+        "youtube": "__Youtube__",
+        "facebook": "__Facebook:__",
+        "instagram": "__*Instagram:*__",
+    }
+
+    @classmethod
+    def _format_french_datetime(cls, dt: datetime) -> str:
+        day_name = cls._FRENCH_DAYS[dt.weekday()]
+        month_name = cls._FRENCH_MONTHS[dt.month - 1]
+        return f"{day_name} {dt.day} {month_name} {dt.year} à {dt.strftime('%H:%M')}"
+
     @classmethod
     def _format_upload_discord_message(
         cls,
         *,
         project: Project,
-        drive_video_url: str,
+        drive_download_url: str,
         platform_results: list[PlatformUploadResult],
         youtube_title: str,
         youtube_description: str,
@@ -252,20 +266,28 @@ class UploadPhaseService:
         tiktok_description: str,
         scheduled_at: datetime | None = None,
     ) -> str:
-        header = f"Upload complete for project `{project.id}`"
+        anime_title = project.anime_name or "Inconnu"
+        header = f"**{anime_title}**: Upload terminé pour le projet `{project.id}`"
         if scheduled_at:
-            header += f" (scheduled: {scheduled_at.strftime('%Y-%m-%d %H:%M UTC')})"
+            header += f" (programmé le *{cls._format_french_datetime(scheduled_at)}*)"
         lines = [
             header,
-            f"Drive video: {drive_video_url}",
+            f"__**Lien vidéo:**__ {drive_download_url}",
             "",
-            "Platform results:",
+            "Plateformes:",
         ]
         for result in platform_results:
-            icon = "✅" if result.status == "uploaded" else "⚠️" if result.status == "skipped" else "❌"
-            url_part = f" - {result.url}" if result.url else ""
-            detail_part = f" ({result.detail})" if result.detail else ""
-            lines.append(f"{icon} {result.platform}: {result.status}{url_part}{detail_part}")
+            icon = ":white_check_mark:" if result.status == "uploaded" else ":warning:" if result.status == "skipped" else ":x:"
+            platform_display = cls._PLATFORM_DISPLAY.get(result.platform, result.platform)
+            if result.status == "uploaded":
+                url_part = f" - <{result.url}>" if result.url else ""
+                lines.append(f"{icon} {platform_display}: Uploaded{url_part}")
+            elif result.status == "skipped":
+                detail_part = f" ({result.detail})" if result.detail else ""
+                lines.append(f"{icon} {platform_display}: Skipped{detail_part}")
+            else:
+                detail_part = f" ({result.detail})" if result.detail else ""
+                lines.append(f"{icon} {platform_display}: Failed{detail_part}")
 
         youtube_quota_hit = any(
             item.platform == "youtube" and item.status == "failed" and item.quota_exceeded
@@ -287,9 +309,7 @@ class UploadPhaseService:
 
         lines.append("")
         lines.append("TikTok metadata:")
-        lines.append("```")
-        lines.append(tiktok_description)
-        lines.append("```")
+        lines.append(f"`{tiktok_description}`")
         return "\n".join(lines)
 
     @classmethod
@@ -497,7 +517,7 @@ class UploadPhaseService:
         final_message = DiscordService.post_message(
             cls._format_upload_discord_message(
                 project=project,
-                drive_video_url=drive_video_url,
+                drive_download_url=direct_drive_download,
                 platform_results=platform_results,
                 youtube_title=metadata.youtube.title,
                 youtube_description=metadata.youtube.description,
@@ -609,10 +629,24 @@ class UploadPhaseService:
             raise ValueError("Project not found")
 
         if project.final_upload_discord_message_id:
-            DiscordService.edit_message(
-                project.final_upload_discord_message_id,
-                "~~Upload removed~~",
-            )
+            existing = DiscordService.get_message(project.final_upload_discord_message_id)
+            if existing:
+                content = existing.content
+                # Disable video embed by wrapping the direct download URL in angle brackets
+                direct_url = (project.upload_last_result or {}).get("direct_drive_download", "")
+                if direct_url and direct_url in content:
+                    content = content.replace(direct_url, f"<{direct_url}>")
+                # Strike through each line of the original content
+                struck_lines = [f"~~{line}~~" if line.strip() else "" for line in content.splitlines()]
+                DiscordService.edit_message(
+                    project.final_upload_discord_message_id,
+                    "\n".join(struck_lines),
+                )
+            else:
+                DiscordService.edit_message(
+                    project.final_upload_discord_message_id,
+                    "~~Upload removed~~",
+                )
         elif project.generation_discord_message_id:
             DiscordService.delete_message(project.generation_discord_message_id)
 

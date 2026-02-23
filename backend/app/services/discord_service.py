@@ -56,6 +56,17 @@ class DiscordService:
         return True
 
     @classmethod
+    def get_message(cls, message_id: str) -> DiscordMessage | None:
+        if not cls.is_configured() or not message_id:
+            return None
+        response = requests.get(cls._messages_url(message_id), timeout=20)
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        payload: dict[str, Any] = response.json()
+        return DiscordMessage(id=str(payload["id"]), content=payload.get("content", ""))
+
+    @classmethod
     def edit_message(cls, message_id: str, content: str) -> DiscordMessage | None:
         if not cls.is_configured() or not message_id:
             return None

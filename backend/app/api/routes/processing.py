@@ -302,11 +302,12 @@ async def upload_to_gdrive(project_id: str):
                     DiscordService.delete_message(project.generation_discord_message_id)
                     project.generation_discord_message_id = None
 
+                anime_title = project.anime_name or "Inconnu"
                 discord_message = DiscordService.post_message(
                     "\n".join(
                         [
-                            f"Generation complete for project `{project.id}`",
-                            f"Google Drive folder: {result['folder_url']}",
+                            f"**{anime_title}**: Génération terminée pour le projet `{project.id}`.",
+                            f"Dossier Google Drive: <{result['folder_url']}>",
                         ]
                     )
                 )
