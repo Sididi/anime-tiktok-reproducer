@@ -46,7 +46,7 @@ class ExportService:
     def output_folder_name(cls, project: Project) -> str:
         anime = cls.sanitize_slug(project.anime_name or "project")
         pid = re.sub(r"[^a-zA-Z0-9]+", "_", project.id).strip("_") or "unknown"
-        return f"SPMAnime_{anime}_{pid}"
+        return f"SPM_{anime}_{pid}"
 
     @classmethod
     def language_to_locale(cls, language: str | None) -> str:
@@ -210,9 +210,10 @@ sources/                - Source episode files
             raise RuntimeError("Google Drive integration is not configured")
 
         drive = GoogleDriveService.client()
+        folder_name = cls.output_folder_name(project)
         _, entries = cls.build_manifest(project, matches)
         folder_id, folder_url = GoogleDriveService.ensure_project_folder(
-            project.id,
+            folder_name,
             existing_folder_id=project.drive_folder_id,
             drive=drive,
         )
@@ -239,10 +240,13 @@ sources/                - Source episode files
         for entry in entries:
             rel = Path(entry.relative_path)
             parts = list(rel.parts)
+            # Strip the leading folder-name prefix (first component) since the Drive
+            # root folder already represents that level — no nested subfolder needed.
+            parts = parts[1:]
             filename = parts[-1]
             parent = folder_id
             if len(parts) > 1:
-                # Preserve ZIP architecture inside Drive folder.
+                # Preserve sub-directory architecture inside the Drive root folder.
                 parent = _resolve_parent(parts[:-1])
             if entry.source_path is not None:
                 GoogleDriveService.upload_local_file(

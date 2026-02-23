@@ -127,7 +127,7 @@ class GoogleDriveService:
         return items
 
     @classmethod
-    def find_project_folder_by_name(cls, project_id: str, *, drive=None) -> dict[str, Any] | None:
+    def find_project_folder_by_name(cls, folder_name: str, *, drive=None) -> dict[str, Any] | None:
         if not cls.is_configured():
             return None
 
@@ -136,7 +136,7 @@ class GoogleDriveService:
             raise RuntimeError("Google Drive parent folder not configured")
         q = (
             f"mimeType='{FOLDER_MIME}' and trashed=false and "
-            f"name='{_escape_query_value(project_id)}' and '{_escape_query_value(parent)}' in parents"
+            f"name='{_escape_query_value(folder_name)}' and '{_escape_query_value(parent)}' in parents"
         )
         results = cls._query_files(q, drive=drive)
         return results[0] if results else None
@@ -166,7 +166,7 @@ class GoogleDriveService:
     @classmethod
     def ensure_project_folder(
         cls,
-        project_id: str,
+        folder_name: str,
         existing_folder_id: str | None = None,
         *,
         drive=None,
@@ -184,14 +184,14 @@ class GoogleDriveService:
             except Exception:
                 pass
 
-        existing = cls.find_project_folder_by_name(project_id, drive=drive)
+        existing = cls.find_project_folder_by_name(folder_name, drive=drive)
         if existing:
             return existing["id"], existing.get("webViewLink", "")
 
         parent = settings.google_drive_parent_folder_id
         if parent is None:
             raise RuntimeError("Google Drive parent folder not configured")
-        metadata = {"name": project_id, "mimeType": FOLDER_MIME, "parents": [parent]}
+        metadata = {"name": folder_name, "mimeType": FOLDER_MIME, "parents": [parent]}
         created = drive.files().create(
             body=metadata,
             fields="id,webViewLink",

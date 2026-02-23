@@ -94,14 +94,14 @@ class UploadPhaseService:
                 return project.drive_folder_id, f"https://drive.google.com/drive/folders/{project.drive_folder_id}"
 
         if folder_candidates_by_name is not None:
-            found = folder_candidates_by_name.get(project.id)
+            found = folder_candidates_by_name.get(ExportService.output_folder_name(project))
             if not found:
                 return None, None
             folder_id = found["id"]
             folder_url = found.get("webViewLink") or f"https://drive.google.com/drive/folders/{folder_id}"
             return folder_id, folder_url
 
-        found = GoogleDriveService.find_project_folder_by_name(project.id)
+        found = GoogleDriveService.find_project_folder_by_name(ExportService.output_folder_name(project))
         if not found:
             return None, None
         return found["id"], found.get("webViewLink")
@@ -653,7 +653,7 @@ class UploadPhaseService:
         drive_deleted = False
         drive_folder_id = project.drive_folder_id
         if not drive_folder_id:
-            found = GoogleDriveService.find_project_folder_by_name(project.id) if GoogleDriveService.is_configured() else None
+            found = GoogleDriveService.find_project_folder_by_name(ExportService.output_folder_name(project)) if GoogleDriveService.is_configured() else None
             drive_folder_id = found["id"] if found else None
         if drive_folder_id and GoogleDriveService.is_configured():
             try:
