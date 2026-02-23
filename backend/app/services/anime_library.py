@@ -50,8 +50,11 @@ class AnimeLibraryService:
     LIST_TIMEOUT_SECONDS = 120.0
     SEARCH_TIMEOUT_SECONDS = 120.0
     REMUX_TIMEOUT_SECONDS = 600.0
+    TRANSCODE_TIMEOUT_SECONDS = 3600.0
     INDEX_TIMEOUT_SECONDS = 7200.0
     PREVIEW_PROXY_TIMEOUT_SECONDS = 3600.0
+    GPU_HWACCEL = "cuda"
+    GPU_H264_ENCODER = "h264_nvenc"
 
     _episode_manifest_cache: dict | None = None
     _episode_manifest_lock: asyncio.Lock | None = None
@@ -324,6 +327,64 @@ class AnimeLibraryService:
         return stream if isinstance(stream, dict) else None
 
     @classmethod
+    def get_primary_video_codec_sync(cls, video_path: Path) -> str | None:
+        """Return normalized codec name for the first video stream."""
+        stream = cls._probe_video_stream_sync(video_path)
+        if stream is None:
+            return None
+        codec = str(stream.get("codec_name", "")).strip().lower()
+        return codec or None
+
+    @classmethod
+    def _build_gpu_h264_base_cmd(
+        cls,
+        source_path: Path,
+        *,
+        source_codec: str | None = None,
+    ) -> list[str]:
+        """Build a strict GPU-only ffmpeg command for H.264 MP4 output."""
+        codec = (source_codec or "").strip().lower()
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-hwaccel",
+            cls.GPU_HWACCEL,
+            "-hwaccel_output_format",
+            cls.GPU_HWACCEL,
+        ]
+        # Force hardware decoder when known so conversion stays GPU-only.
+        if codec == "av1":
+            cmd.extend(["-c:v", "av1_cuvid"])
+        elif codec == "h264":
+            cmd.extend(["-c:v", "h264_cuvid"])
+        elif codec == "hevc":
+            cmd.extend(["-c:v", "hevc_cuvid"])
+
+        cmd.extend(
+            [
+                "-i",
+                str(source_path),
+                "-map",
+                "0:v:0",
+                "-vf",
+                "scale_cuda=format=nv12",
+                "-c:v",
+                cls.GPU_H264_ENCODER,
+                "-preset",
+                "p5",
+                "-cq",
+                "23",
+                "-b:v",
+                "0",
+                "-profile:v",
+                "high",
+                "-movflags",
+                "+faststart",
+            ]
+        )
+        return cmd
+
+    @classmethod
     def is_browser_preview_compatible(cls, source_path: Path) -> bool:
         """
         Return True when a source file is safe to play directly in browser preview.
@@ -333,11 +394,13 @@ class AnimeLibraryService:
         if source_path.suffix.lower() != ".mp4":
             return False
 
+        codec = cls.get_primary_video_codec_sync(source_path)
+        if codec is None:
+            return False
+
         stream = cls._probe_video_stream_sync(source_path)
         if stream is None:
             return False
-
-        codec = str(stream.get("codec_name", "")).lower()
         pix_fmt = str(stream.get("pix_fmt", "")).lower()
         return codec == "h264" and pix_fmt in {"yuv420p", "yuvj420p"}
 
@@ -364,27 +427,19 @@ class AnimeLibraryService:
             return proxy_path
 
         tmp_path = proxy_path.with_suffix(".tmp.mp4")
-        base_cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(source_path),
+        source_codec = cls.get_primary_video_codec_sync(source_path)
+        base_cmd = cls._build_gpu_h264_base_cmd(
+            source_path,
+            source_codec=source_codec,
+        )
+        cmd_with_audio_copy = base_cmd + [
             "-map",
-            "0:v:0",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "20",
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
+            "0:a:0?",
+            "-c:a",
+            "copy",
+            str(tmp_path),
         ]
-
-        # Try with audio first when available, fallback to silent preview.
-        cmd_with_audio = base_cmd + [
+        cmd_with_audio_aac = base_cmd + [
             "-map",
             "0:a:0?",
             "-c:a",
@@ -397,11 +452,10 @@ class AnimeLibraryService:
             "48000",
             str(tmp_path),
         ]
-        cmd_video_only = base_cmd + ["-an", str(tmp_path)]
 
         try:
             result = subprocess.run(
-                cmd_with_audio,
+                cmd_with_audio_copy,
                 capture_output=True,
                 text=True,
                 timeout=cls.PREVIEW_PROXY_TIMEOUT_SECONDS,
@@ -413,7 +467,7 @@ class AnimeLibraryService:
         if result.returncode != 0:
             try:
                 result = subprocess.run(
-                    cmd_video_only,
+                    cmd_with_audio_aac,
                     capture_output=True,
                     text=True,
                     timeout=cls.PREVIEW_PROXY_TIMEOUT_SECONDS,
@@ -579,7 +633,7 @@ class AnimeLibraryService:
         """
         Copy anime folder to library and index it.
 
-        This method ensures all file copying/remuxing operations complete
+        This method ensures all file copy/remux/transcode operations complete
         and files are verified before starting the indexing process to
         prevent race conditions.
 
@@ -649,137 +703,266 @@ class AnimeLibraryService:
         total_files = len(video_files)
         prepared_files: list[Path] = []
 
-        # Copy files if not already in library
+        async def _transcode_av1_to_mp4(source_file: Path, destination_file: Path) -> str | None:
+            """Transcode AV1 source to browser-safe H.264 MP4 using GPU-only path."""
+            destination_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp_dest = destination_file.with_suffix(".tmp.mp4")
+            with suppress(OSError):
+                tmp_dest.unlink()
+
+            base_cmd = cls._build_gpu_h264_base_cmd(
+                source_file,
+                source_codec="av1",
+            )
+            cmd_with_audio_copy = base_cmd + [
+                "-map",
+                "0:a:0?",
+                "-c:a",
+                "copy",
+                str(tmp_dest),
+            ]
+            cmd_with_audio_aac = base_cmd + [
+                "-map",
+                "0:a:0?",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-ac",
+                "2",
+                "-ar",
+                "48000",
+                str(tmp_dest),
+            ]
+
+            try:
+                result = await run_command(
+                    cmd_with_audio_copy,
+                    timeout_seconds=cls.TRANSCODE_TIMEOUT_SECONDS,
+                )
+            except CommandTimeoutError:
+                return (
+                    f"GPU AV1 transcode timed out for {source_file.name} after "
+                    f"{int(cls.TRANSCODE_TIMEOUT_SECONDS)}s"
+                )
+            except FileNotFoundError:
+                return "ffmpeg is required for GPU AV1 transcode"
+
+            if result.returncode != 0:
+                try:
+                    result = await run_command(
+                        cmd_with_audio_aac,
+                        timeout_seconds=cls.TRANSCODE_TIMEOUT_SECONDS,
+                    )
+                except CommandTimeoutError:
+                    return (
+                        f"GPU AV1 transcode timed out for {source_file.name} after "
+                        f"{int(cls.TRANSCODE_TIMEOUT_SECONDS)}s"
+                    )
+                except FileNotFoundError:
+                    return "ffmpeg is required for GPU AV1 transcode"
+                if result.returncode != 0:
+                    return (
+                        f"GPU AV1 transcode failed for {source_file.name}: "
+                        f"{result.stderr.decode()[:220]}"
+                    )
+
+            if not tmp_dest.exists():
+                return f"Transcode output missing for {source_file.name}"
+            if tmp_dest.stat().st_size == 0:
+                with suppress(OSError):
+                    tmp_dest.unlink()
+                return f"Transcode output is empty for {source_file.name}"
+
+            tmp_dest.replace(destination_file)
+            return None
+
         if dest_path != source_folder:
             yield IndexProgress(
                 status="copying",
-                message=f"Copying {total_files} files to library",
+                message=f"Preparing {total_files} files for library import",
                 total_files=total_files,
             )
-
-            # Create destination directory
             dest_path.mkdir(parents=True, exist_ok=True)
-
-            # Copy/remux each file
-            for i, video_file in enumerate(video_files):
-                is_mkv = video_file.suffix.lower() == ".mkv"
-                preferred_dest = dest_path / (video_file.stem + ".mp4" if is_mkv else video_file.name)
-                actual_dest = preferred_dest
-
-                if not preferred_dest.exists():
-                    if is_mkv:
-                        # Remux MKV to MP4 (no re-encoding, fast)
-                        yield IndexProgress(
-                            status="copying",
-                            message=f"Remuxing {video_file.name} → .mp4",
-                            progress=(i + 0.5) / total_files * 0.3,
-                            current_file=video_file.name,
-                            total_files=total_files,
-                            completed_files=i,
-                        )
-                        try:
-                            remux_result = await run_command(
-                                [
-                                    "ffmpeg", "-y", "-i", str(video_file),
-                                    "-c", "copy", "-movflags", "+faststart",
-                                    str(preferred_dest),
-                                ],
-                                timeout_seconds=cls.REMUX_TIMEOUT_SECONDS,
-                            )
-                            if remux_result.returncode != 0:
-                                import sys
-                                print(
-                                    f"[WARNING] ffmpeg remux failed for {video_file.name}: "
-                                    f"{remux_result.stderr.decode()[:200]}",
-                                    file=sys.stderr,
-                                )
-                                # Fallback: copy as-is
-                                fallback_dest = dest_path / video_file.name
-                                if not fallback_dest.exists():
-                                    await asyncio.to_thread(shutil.copy2, video_file, fallback_dest)
-                                actual_dest = fallback_dest
-                        except CommandTimeoutError:
-                            import sys
-                            print(f"[WARNING] ffmpeg remux timed out for {video_file.name}, falling back to copy", file=sys.stderr)
-                            fallback_dest = dest_path / video_file.name
-                            if not fallback_dest.exists():
-                                await asyncio.to_thread(shutil.copy2, video_file, fallback_dest)
-                            actual_dest = fallback_dest
-                        except FileNotFoundError:
-                            import sys
-                            print("[WARNING] ffmpeg not found, falling back to copy", file=sys.stderr)
-                            fallback_dest = dest_path / video_file.name
-                            if not fallback_dest.exists():
-                                await asyncio.to_thread(shutil.copy2, video_file, fallback_dest)
-                            actual_dest = fallback_dest
-                    else:
-                        await asyncio.to_thread(shutil.copy2, video_file, preferred_dest)
-                else:
-                    actual_dest = preferred_dest
-
-                prepared_files.append(actual_dest)
-
-                yield IndexProgress(
-                    status="copying",
-                    message=f"{'Remuxing' if is_mkv else 'Copying'} {video_file.name}",
-                    progress=(i + 1) / total_files * 0.3,  # Copying is 30% of progress
-                    current_file=video_file.name,
-                    total_files=total_files,
-                    completed_files=i + 1,
-                )
-
-            # Verify all copied files are accessible and complete before indexing
+        else:
             yield IndexProgress(
                 status="copying",
-                message="Verifying copied files before indexing...",
-                progress=0.3,
+                message=f"Normalizing {total_files} files in library",
                 total_files=total_files,
-                completed_files=total_files,
             )
 
-            # Small delay to ensure filesystem has flushed all writes
-            await asyncio.sleep(1.0)
+        # Copy/remux/transcode each file.
+        for i, video_file in enumerate(video_files):
+            source_codec = await asyncio.to_thread(cls.get_primary_video_codec_sync, video_file)
+            is_av1 = source_codec == "av1"
+            is_mkv = video_file.suffix.lower() == ".mkv"
+            requires_mp4 = is_av1 or is_mkv
+            preferred_dest = dest_path / (video_file.stem + ".mp4" if requires_mp4 else video_file.name)
+            actual_dest = preferred_dest
 
-            # Verify each file is readable and has valid size
-            for dest_file in prepared_files:
-                # Check if file exists and has size > 0
-                if not dest_file.exists():
-                    yield IndexProgress(
-                        status="error",
-                        error=f"Copied file missing after copy: {dest_file.name}",
+            existing_ready = False
+            if preferred_dest.exists():
+                if is_av1:
+                    existing_codec = await asyncio.to_thread(
+                        cls.get_primary_video_codec_sync,
+                        preferred_dest,
                     )
-                    return
-
-                file_stat = await asyncio.to_thread(dest_file.stat)
-                if file_stat.st_size == 0:
-                    yield IndexProgress(
-                        status="error",
-                        error=f"Copied file is empty: {dest_file.name}",
+                    existing_ready = (
+                        preferred_dest.suffix.lower() == ".mp4"
+                        and existing_codec == "h264"
                     )
-                    return
-        else:
-            prepared_files = list(video_files)
+                else:
+                    existing_ready = True
 
-        # Build browser-safe preview proxies for files that need it.
-        # This keeps match validation video previews reliable across codecs.
+            action = "Copying"
+            if is_av1:
+                action = "Transcoding AV1"
+            elif is_mkv:
+                action = "Remuxing"
+
+            if not existing_ready:
+                yield IndexProgress(
+                    status="copying",
+                    message=f"{action} {video_file.name}",
+                    progress=(i + 0.5) / total_files * 0.3,
+                    current_file=video_file.name,
+                    total_files=total_files,
+                    completed_files=i,
+                )
+
+                if is_av1:
+                    error = await _transcode_av1_to_mp4(video_file, preferred_dest)
+                    if error is not None:
+                        yield IndexProgress(status="error", error=error)
+                        return
+                elif is_mkv:
+                    try:
+                        remux_result = await run_command(
+                            [
+                                "ffmpeg",
+                                "-y",
+                                "-i",
+                                str(video_file),
+                                "-c",
+                                "copy",
+                                "-movflags",
+                                "+faststart",
+                                str(preferred_dest),
+                            ],
+                            timeout_seconds=cls.REMUX_TIMEOUT_SECONDS,
+                        )
+                        if remux_result.returncode != 0:
+                            import sys
+                            print(
+                                f"[WARNING] ffmpeg remux failed for {video_file.name}: "
+                                f"{remux_result.stderr.decode()[:200]}",
+                                file=sys.stderr,
+                            )
+                            fallback_dest = dest_path / video_file.name
+                            if fallback_dest != video_file and not fallback_dest.exists():
+                                await asyncio.to_thread(shutil.copy2, video_file, fallback_dest)
+                            actual_dest = fallback_dest
+                    except CommandTimeoutError:
+                        import sys
+                        print(
+                            f"[WARNING] ffmpeg remux timed out for {video_file.name}, "
+                            "falling back to copy",
+                            file=sys.stderr,
+                        )
+                        fallback_dest = dest_path / video_file.name
+                        if fallback_dest != video_file and not fallback_dest.exists():
+                            await asyncio.to_thread(shutil.copy2, video_file, fallback_dest)
+                        actual_dest = fallback_dest
+                    except FileNotFoundError:
+                        import sys
+                        print("[WARNING] ffmpeg not found, falling back to copy", file=sys.stderr)
+                        fallback_dest = dest_path / video_file.name
+                        if fallback_dest != video_file and not fallback_dest.exists():
+                            await asyncio.to_thread(shutil.copy2, video_file, fallback_dest)
+                        actual_dest = fallback_dest
+                elif preferred_dest != video_file:
+                    await asyncio.to_thread(shutil.copy2, video_file, preferred_dest)
+            else:
+                action = "Using existing"
+
+            # When normalizing in-place, drop old non-MP4 source if replacement succeeded.
+            if (
+                dest_path == source_folder
+                and actual_dest == preferred_dest
+                and preferred_dest != video_file
+                and preferred_dest.exists()
+            ):
+                with suppress(OSError):
+                    await asyncio.to_thread(video_file.unlink)
+
+            if actual_dest not in prepared_files:
+                prepared_files.append(actual_dest)
+
+            yield IndexProgress(
+                status="copying",
+                message=f"{action} {video_file.name}",
+                progress=(i + 1) / total_files * 0.3,
+                current_file=video_file.name,
+                total_files=total_files,
+                completed_files=i + 1,
+            )
+
+        # Verify all prepared files are accessible and complete before indexing.
         yield IndexProgress(
             status="copying",
-            message="Preparing browser preview proxies...",
+            message="Verifying prepared files before indexing...",
             progress=0.3,
-            total_files=len(prepared_files),
+            total_files=total_files,
+            completed_files=total_files,
         )
-        for i, prepared_file in enumerate(prepared_files):
-            try:
-                await asyncio.to_thread(cls.ensure_preview_proxy_sync, prepared_file)
-            except Exception:
-                # Preview proxy failures should not block indexing/matching.
-                pass
-            if prepared_files:
+
+        # Small delay to ensure filesystem has flushed all writes.
+        await asyncio.sleep(1.0)
+
+        for dest_file in prepared_files:
+            if not dest_file.exists():
+                yield IndexProgress(
+                    status="error",
+                    error=f"Prepared file missing after import: {dest_file.name}",
+                )
+                return
+
+            file_stat = await asyncio.to_thread(dest_file.stat)
+            if file_stat.st_size == 0:
+                yield IndexProgress(
+                    status="error",
+                    error=f"Prepared file is empty: {dest_file.name}",
+                )
+                return
+
+        # Build browser-safe preview proxies only for files still incompatible.
+        preview_candidates: list[Path] = []
+        for prepared_file in prepared_files:
+            compatible = await asyncio.to_thread(
+                cls.is_browser_preview_compatible,
+                prepared_file,
+            )
+            if not compatible:
+                preview_candidates.append(prepared_file)
+
+        if preview_candidates:
+            yield IndexProgress(
+                status="copying",
+                message="Preparing browser preview proxies...",
+                progress=0.3,
+                total_files=len(preview_candidates),
+            )
+            for i, prepared_file in enumerate(preview_candidates):
+                try:
+                    await asyncio.to_thread(cls.ensure_preview_proxy_sync, prepared_file)
+                except Exception:
+                    # Preview proxy failures should not block indexing/matching.
+                    pass
                 yield IndexProgress(
                     status="copying",
                     message=f"Preparing preview {prepared_file.name}",
-                    progress=0.3 + 0.05 * ((i + 1) / len(prepared_files)),
-                    total_files=len(prepared_files),
+                    progress=0.3 + 0.05 * ((i + 1) / len(preview_candidates)),
+                    total_files=len(preview_candidates),
                     completed_files=i + 1,
                 )
 

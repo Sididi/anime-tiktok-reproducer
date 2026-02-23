@@ -32,27 +32,27 @@ export function VideoPreviewModal({ driveVideoId, onClose }: VideoPreviewModalPr
           transition={{ duration: 0.15 }}
           onClick={onClose}
         >
+          {/* Vertical (9:16) container — max 80vh tall */}
           <motion.div
-            className="relative w-full max-w-4xl bg-black rounded-xl overflow-hidden shadow-2xl"
+            className="relative bg-black rounded-xl overflow-hidden shadow-2xl h-[80vh] aspect-[9/16]"
             initial={{ scale: 0.9, opacity: 0 }}
             animate={{ scale: 1, opacity: 1 }}
             exit={{ scale: 0.9, opacity: 0 }}
             transition={{ duration: 0.2 }}
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="absolute top-3 right-3 z-10">
+            {/* X button at top-LEFT to avoid GDrive's native top-right controls */}
+            <div className="absolute top-3 left-3 z-10">
               <Button variant="ghost" size="icon" onClick={onClose} className="text-white hover:bg-white/20">
                 <X className="h-5 w-5" />
               </Button>
             </div>
-            <div className="aspect-video">
-              <iframe
-                src={`https://drive.google.com/file/d/${driveVideoId}/preview`}
-                className="w-full h-full"
-                allow="autoplay"
-                allowFullScreen
-              />
-            </div>
+            <iframe
+              src={`https://drive.google.com/file/d/${driveVideoId}/preview`}
+              className="w-full h-full"
+              allow="autoplay"
+              allowFullScreen
+            />
           </motion.div>
         </motion.div>
       )}

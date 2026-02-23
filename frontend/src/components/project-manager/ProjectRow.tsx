@@ -14,6 +14,9 @@ interface ProjectRowProps {
   onDeleteHoldStart: (row: ProjectManagerRow) => void;
   onDeleteHoldCancel: () => void;
   onPreview: (driveVideoId: string) => void;
+  multiDeleteMode: boolean;
+  isSelected: boolean;
+  onToggleSelect: (id: string) => void;
 }
 
 export function ProjectRow({
@@ -26,6 +29,9 @@ export function ProjectRow({
   onDeleteHoldStart,
   onDeleteHoldCancel,
   onPreview,
+  multiDeleteMode,
+  isSelected,
+  onToggleSelect,
 }: ProjectRowProps) {
   const canUpload = row.can_upload_status === "green" && row.uploaded_status === "red";
 
@@ -58,7 +64,13 @@ export function ProjectRow({
   );
 
   return (
-    <tr className="border-b border-[hsl(var(--border))]/50 hover:bg-[hsl(var(--muted))]/30 transition-colors duration-150">
+    <tr
+      className={`border-b border-[hsl(var(--border))]/50 transition-colors duration-150 ${
+        multiDeleteMode && isSelected
+          ? "bg-[hsl(var(--destructive))]/10"
+          : "hover:bg-[hsl(var(--muted))]/30"
+      }`}
+    >
       {/* Status */}
       <td className="py-3 pr-3">
         <span
@@ -73,10 +85,10 @@ export function ProjectRow({
         />
       </td>
 
-      {/* Anime Title */}
-      <td className="py-3 pr-3">
-        <div className="font-medium">{row.anime_title || "Unknown"}</div>
-        <div className="font-mono text-[11px] tracking-wide text-[hsl(var(--muted-foreground))]">
+      {/* Anime Title — truncate to prevent overflow */}
+      <td className="py-3 pr-3 overflow-hidden">
+        <div className="font-medium truncate">{row.anime_title || "Unknown"}</div>
+        <div className="font-mono text-[11px] tracking-wide text-[hsl(var(--muted-foreground))] truncate">
           {row.project_id}
         </div>
         {row.drive_folder_url && (
@@ -93,14 +105,14 @@ export function ProjectRow({
       </td>
 
       {/* Account */}
-      <td className="py-3 pr-3">
+      <td className="py-3 pr-3 overflow-hidden">
         {account ? (
-          <div className="flex items-center gap-1.5">
-            <img src={account.avatar_url} alt="" className="w-5 h-5 rounded-full object-cover" />
-            <span className="text-xs">{account.name}</span>
+          <div className="flex items-center gap-1.5 min-w-0">
+            <img src={account.avatar_url} alt="" className="w-5 h-5 rounded-full object-cover shrink-0" />
+            <span className="text-xs truncate">{account.name}</span>
           </div>
         ) : row.scheduled_account_id ? (
-          <span className="text-xs text-[hsl(var(--muted-foreground))]">{row.scheduled_account_id}</span>
+          <span className="text-xs text-[hsl(var(--muted-foreground))] truncate block">{row.scheduled_account_id}</span>
         ) : null}
       </td>
 
@@ -130,13 +142,13 @@ export function ProjectRow({
               size="icon"
               variant="ghost"
               onClick={() => onPreview(row.drive_video_id!)}
-              className="h-9 w-9 active:scale-95 transition-transform"
+              className="h-9 w-9 active:scale-95 transition-transform shrink-0"
               title="Preview video"
             >
               <Eye className="h-4 w-4" />
             </Button>
           ) : (
-            <div className="h-9 w-9" />
+            <div className="h-9 w-9 shrink-0" />
           )}
 
           {/* Upload */}
@@ -152,7 +164,7 @@ export function ProjectRow({
           <Button
             size="icon"
             variant="destructive"
-            className="relative overflow-hidden h-9 w-9 active:scale-95 transition-transform"
+            className="relative overflow-hidden h-9 w-9 active:scale-95 transition-transform shrink-0"
             disabled={activeDeleteId !== null}
             onMouseDown={() => onDeleteHoldStart(row)}
             onMouseUp={onDeleteHoldCancel}
@@ -178,6 +190,18 @@ export function ProjectRow({
           </Button>
         </div>
       </td>
+
+      {/* Checkbox (multi-delete mode) */}
+      {multiDeleteMode && (
+        <td className="py-3 pr-3">
+          <input
+            type="checkbox"
+            checked={isSelected}
+            onChange={() => onToggleSelect(row.project_id)}
+            className="h-4 w-4 rounded cursor-pointer accent-[hsl(var(--destructive))]"
+          />
+        </td>
+      )}
     </tr>
   );
 }

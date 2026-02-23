@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Loader2, RefreshCw, X } from "lucide-react";
+import { Loader2, RefreshCw, X, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui";
 import { api } from "@/api/client";
 import { readSSEStream } from "@/utils/sse";
@@ -38,6 +38,12 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
   const [deleteConfirmRow, setDeleteConfirmRow] = useState<ProjectManagerRow | null>(null);
   const [previewVideoId, setPreviewVideoId] = useState<string | null>(null);
 
+  // Multi-delete state
+  const [multiDeleteMode, setMultiDeleteMode] = useState(false);
+  const [selectedProjectIds, setSelectedProjectIds] = useState<Set<string>>(new Set());
+  const [showMultiDeleteConfirm, setShowMultiDeleteConfirm] = useState(false);
+  const [multiDeleting, setMultiDeleting] = useState(false);
+
   const selectedAccount = useMemo(
     () => accounts.find((a) => a.id === selectedAccountId) ?? null,
     [accounts, selectedAccountId],
@@ -46,11 +52,7 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
   /* ── Data loading (accounts fast, projects slow) ── */
   const loadData = useCallback(async () => {
     setError(null);
-
-    // Accounts arrive fast — set immediately
     api.listAccounts().then((res) => setAccounts(res.accounts)).catch(() => {});
-
-    // Projects are slow — manage loading state around them
     setLoading(true);
     try {
       const projectsRes = await api.listProjectManagerProjects();
@@ -66,18 +68,19 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
     if (open) loadData();
   }, [open, loadData]);
 
-  /* ── Escape key (preview takes priority) ── */
+  /* ── Escape key ── */
   useEffect(() => {
     if (!open) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        if (previewVideoId) return; // VideoPreviewModal handles its own Escape
+        if (previewVideoId) return;
+        if (multiDeleteMode) { exitMultiDeleteMode(); return; }
         onClose();
       }
     };
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [open, onClose, previewVideoId]);
+  }, [open, onClose, previewVideoId, multiDeleteMode]);
 
   useEffect(
     () => () => {
@@ -85,6 +88,37 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
     },
     [],
   );
+
+  /* ── Multi-delete ── */
+  const exitMultiDeleteMode = () => {
+    setMultiDeleteMode(false);
+    setSelectedProjectIds(new Set());
+  };
+
+  const toggleMultiDeleteMode = () => {
+    if (multiDeleteMode) exitMultiDeleteMode();
+    else setMultiDeleteMode(true);
+  };
+
+  const toggleSelectProject = (id: string) => {
+    setSelectedProjectIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const handleMultiDelete = async () => {
+    setShowMultiDeleteConfirm(false);
+    setMultiDeleting(true);
+    const ids = Array.from(selectedProjectIds);
+    await Promise.all(ids.map((id) => api.deleteManagedProject(id).catch(() => {})));
+    setSelectedProjectIds(new Set());
+    setMultiDeleteMode(false);
+    setMultiDeleting(false);
+    await loadData();
+  };
 
   /* ── Filtering ── */
   const filteredRows = useMemo(() => {
@@ -265,6 +299,61 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
                 </div>
               </div>
               <div className="flex items-center gap-2">
+                {/* Multi-delete controls */}
+                <AnimatePresence mode="wait">
+                  {multiDeleteMode ? (
+                    <motion.div
+                      key="multi-delete-active"
+                      className="flex items-center gap-2"
+                      initial={{ opacity: 0, x: 10 }}
+                      animate={{ opacity: 1, x: 0 }}
+                      exit={{ opacity: 0, x: 10 }}
+                      transition={{ duration: 0.15 }}
+                    >
+                      <Button
+                        variant="destructive"
+                        size="sm"
+                        disabled={selectedProjectIds.size === 0 || multiDeleting}
+                        onClick={() => setShowMultiDeleteConfirm(true)}
+                        className="active:scale-95 transition-transform"
+                      >
+                        {multiDeleting ? (
+                          <Loader2 className="h-4 w-4 animate-spin mr-1.5" />
+                        ) : (
+                          <Trash2 className="h-4 w-4 mr-1.5" />
+                        )}
+                        Delete{selectedProjectIds.size > 0 ? ` (${selectedProjectIds.size})` : ""}
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={exitMultiDeleteMode}
+                        className="active:scale-95 transition-transform"
+                      >
+                        Cancel
+                      </Button>
+                    </motion.div>
+                  ) : (
+                    <motion.div
+                      key="multi-delete-inactive"
+                      initial={{ opacity: 0, x: 10 }}
+                      animate={{ opacity: 1, x: 0 }}
+                      exit={{ opacity: 0, x: 10 }}
+                      transition={{ duration: 0.15 }}
+                    >
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={toggleMultiDeleteMode}
+                        title="Multi-select delete"
+                        className="active:scale-95 transition-transform"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+
                 <Button
                   variant="outline"
                   size="sm"
@@ -298,7 +387,7 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
             )}
 
             {/* Table */}
-            <div className="flex-1 overflow-auto p-6">
+            <div className="flex-1 overflow-y-auto overflow-x-hidden p-6">
               <ProjectTable
                 rows={sortedRows}
                 accounts={accounts}
@@ -313,6 +402,9 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
                 onDeleteHoldStart={startDeleteHold}
                 onDeleteHoldCancel={cancelDeleteHold}
                 onPreview={(id) => setPreviewVideoId(id)}
+                multiDeleteMode={multiDeleteMode}
+                selectedProjectIds={selectedProjectIds}
+                onToggleSelect={toggleSelectProject}
               />
             </div>
           </motion.div>
@@ -340,6 +432,43 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
             }}
             onCancel={() => setDeleteConfirmRow(null)}
           />
+
+          {/* Multi-delete confirmation */}
+          <AnimatePresence>
+            {showMultiDeleteConfirm && (
+              <motion.div
+                className="fixed inset-0 z-[60] bg-black/50 flex items-center justify-center"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                onClick={() => setShowMultiDeleteConfirm(false)}
+              >
+                <motion.div
+                  className="bg-[hsl(var(--card))] border border-[hsl(var(--border))] rounded-lg p-5 max-w-sm shadow-xl"
+                  initial={{ scale: 0.95, opacity: 0 }}
+                  animate={{ scale: 1, opacity: 1 }}
+                  exit={{ scale: 0.95, opacity: 0 }}
+                  transition={{ duration: 0.15 }}
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <h3 className="font-semibold mb-2">
+                    Delete {selectedProjectIds.size} project{selectedProjectIds.size !== 1 ? "s" : ""}?
+                  </h3>
+                  <p className="text-sm text-[hsl(var(--muted-foreground))] mb-4">
+                    This will permanently delete all selected projects. This action cannot be undone.
+                  </p>
+                  <div className="flex justify-end gap-2">
+                    <Button variant="ghost" size="sm" onClick={() => setShowMultiDeleteConfirm(false)}>
+                      Cancel
+                    </Button>
+                    <Button variant="destructive" size="sm" onClick={handleMultiDelete}>
+                      Delete All
+                    </Button>
+                  </div>
+                </motion.div>
+              </motion.div>
+            )}
+          </AnimatePresence>
 
           {/* Video preview */}
           <VideoPreviewModal
