@@ -199,6 +199,24 @@ export const api = {
       },
     ),
 
+  updateMatchesBatch: (
+    projectId: string,
+    updates: Array<{
+      scene_index: number;
+      episode: string;
+      start_time: number;
+      end_time: number;
+      confirmed?: boolean;
+    }>,
+  ) =>
+    request<{ status: string; matches: import("@/types").SceneMatch[] }>(
+      `/projects/${projectId}/matches`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ updates }),
+      },
+    ),
+
   undoMerge: (projectId: string, sceneIndex: number) =>
     request<{ scenes: import("@/types").Scene[]; matches: import("@/types").SceneMatch[] }>(
       `/projects/${projectId}/matches/undo-merge/${sceneIndex}`,

@@ -4,6 +4,7 @@ import {
   useCallback,
   useRef,
   useMemo,
+  memo,
   forwardRef,
   useImperativeHandle,
 } from "react";
@@ -59,7 +60,7 @@ interface MatchCardProps {
 
 interface MatchCardHandle {
   playBothAndWait: () => Promise<void>;
-  prepareForAutoplay: () => Promise<void>;
+  prepareForAutoplay: () => Promise<boolean>;
   releasePreload: () => void;
   stop: () => void;
 }
@@ -82,6 +83,8 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(function MatchCard
   const sourcePlayerRef = useRef<ClippedVideoPlayerHandle>(null);
   const pendingResolverRef = useRef<(() => void) | null>(null);
   const endedRef = useRef({ tiktok: false, source: false });
+  const primedForFastWatchRef = useRef(false);
+  const loadFailureRef = useRef(false);
 
   const tiktokVideoUrl = api.getVideoUrl(projectId);
   const hasMatch = Boolean(match.confidence > 0 && match.episode);
@@ -92,6 +95,11 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(function MatchCard
   // Calculate durations
   const tiktokDuration = scene.end_time - scene.start_time;
   const sourceDuration = hasMatch ? match.end_time - match.start_time : 0;
+  const fastWatchMinReadyState =
+    playbackRate >= 3
+      ? HTMLMediaElement.HAVE_FUTURE_DATA
+      : HTMLMediaElement.HAVE_CURRENT_DATA;
+  const fastWatchReadyTimeoutMs = playbackRate >= 4 ? 9000 : 7000;
 
   const handleManualSave = useCallback(
     (episode: string, startTime: number, endTime: number) => {
@@ -99,6 +107,49 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(function MatchCard
     },
     [scene.index, onManualMatch],
   );
+
+  const hasPairLoadError = useCallback(() => {
+    const tiktok = tiktokPlayerRef.current;
+    const source = sourcePlayerRef.current;
+    if (!tiktok || !source) return true;
+    return tiktok.hasLoadError() || source.hasLoadError();
+  }, []);
+
+  const warmupPair = useCallback(
+    async (timeoutMs: number): Promise<boolean> => {
+      const tiktok = tiktokPlayerRef.current;
+      const source = sourcePlayerRef.current;
+      if (!tiktok || !source) return false;
+
+      await Promise.all([
+        tiktok.waitUntilReady({
+          minReadyState: fastWatchMinReadyState,
+          timeoutMs,
+        }),
+        source.waitUntilReady({
+          minReadyState: fastWatchMinReadyState,
+          timeoutMs,
+        }),
+      ]);
+      if (hasPairLoadError()) {
+        return false;
+      }
+
+      await Promise.all([tiktok.seekToStart(), source.seekToStart()]);
+      return !hasPairLoadError();
+    },
+    [fastWatchMinReadyState, hasPairLoadError],
+  );
+
+  const recoverPairLoadOnce = useCallback(async (): Promise<boolean> => {
+    const tiktok = tiktokPlayerRef.current;
+    const source = sourcePlayerRef.current;
+    if (!tiktok || !source) return false;
+
+    await Promise.all([tiktok.retryLoad(), source.retryLoad()]);
+    const recoveryTimeout = Math.max(fastWatchReadyTimeoutMs + 1500, 9000);
+    return warmupPair(recoveryTimeout);
+  }, [fastWatchReadyTimeoutMs, warmupPair]);
 
   // Sync play both videos simultaneously using refs
   // Two-phase: seek both first, then play together for precise sync
@@ -114,30 +165,91 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(function MatchCard
     }
 
     endedRef.current = { tiktok: false, source: false };
-    await Promise.all([tiktok.waitUntilReady(), source.waitUntilReady()]);
+    if (primedForFastWatchRef.current) {
+      primedForFastWatchRef.current = false;
+      if (hasPairLoadError()) {
+        loadFailureRef.current = true;
+        return;
+      }
+      loadFailureRef.current = false;
+      tiktok.play();
+      source.play();
+      return;
+    }
+    await Promise.all([
+      tiktok.waitUntilReady({
+        minReadyState: fastWatchMinReadyState,
+        timeoutMs: fastWatchReadyTimeoutMs,
+      }),
+      source.waitUntilReady({
+        minReadyState: fastWatchMinReadyState,
+        timeoutMs: fastWatchReadyTimeoutMs,
+      }),
+    ]);
+    if (hasPairLoadError()) {
+      loadFailureRef.current = true;
+      return;
+    }
     await Promise.all([tiktok.seekToStart(), source.seekToStart()]);
+    if (hasPairLoadError()) {
+      loadFailureRef.current = true;
+      return;
+    }
+    loadFailureRef.current = false;
     tiktok.play();
     source.play();
-  }, [hasMatch]);
+  }, [
+    hasMatch,
+    fastWatchMinReadyState,
+    fastWatchReadyTimeoutMs,
+    hasPairLoadError,
+  ]);
 
   const prepareForAutoplay = useCallback(async () => {
-    if (!hasMatch) return;
+    if (!hasMatch) return true;
 
     const tiktok = tiktokPlayerRef.current;
     const source = sourcePlayerRef.current;
-    if (!tiktok || !source) return;
+    if (!tiktok || !source) {
+      loadFailureRef.current = true;
+      return false;
+    }
 
     tiktok.forceLoad();
     source.forceLoad();
-    await Promise.all([tiktok.waitUntilReady(), source.waitUntilReady()]);
-  }, [hasMatch]);
+
+    // First attempt: normal preload path.
+    let prepared = await warmupPair(fastWatchReadyTimeoutMs);
+    // Recovery attempt: retry source loads once with cache-busting.
+    if (!prepared) {
+      prepared = await recoverPairLoadOnce();
+    }
+    if (!prepared) {
+      loadFailureRef.current = true;
+      primedForFastWatchRef.current = false;
+      return false;
+    }
+
+    loadFailureRef.current = false;
+    primedForFastWatchRef.current = true;
+    return true;
+  }, [
+    hasMatch,
+    fastWatchReadyTimeoutMs,
+    warmupPair,
+    recoverPairLoadOnce,
+  ]);
 
   const releasePreload = useCallback(() => {
+    primedForFastWatchRef.current = false;
+    loadFailureRef.current = false;
     tiktokPlayerRef.current?.releaseLoad();
     sourcePlayerRef.current?.releaseLoad();
   }, []);
 
   const stop = useCallback(() => {
+    primedForFastWatchRef.current = false;
+    loadFailureRef.current = false;
     tiktokPlayerRef.current?.pause();
     sourcePlayerRef.current?.pause();
     if (pendingResolverRef.current) {
@@ -161,21 +273,63 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(function MatchCard
 
   const playBothAndWait = useCallback(async () => {
     if (!hasMatch) return;
+    if (loadFailureRef.current) return;
 
     await playBothFromStart();
+    if (loadFailureRef.current) return;
 
     await new Promise<void>((resolve) => {
+      const finalize = () => {
+        pendingResolverRef.current = null;
+        window.clearTimeout(hardTimeoutId);
+        window.clearInterval(stallGuardId);
+        resolve();
+      };
+
       if (endedRef.current.tiktok && endedRef.current.source) {
         resolve();
         return;
       }
 
       pendingResolverRef.current = resolve;
+      const startedAt = Date.now();
+      const stallGuardId = window.setInterval(() => {
+        if (pendingResolverRef.current !== resolve) {
+          window.clearInterval(stallGuardId);
+          return;
+        }
+
+        const tiktok = tiktokPlayerRef.current;
+        const source = sourcePlayerRef.current;
+        if (!tiktok || !source) {
+          loadFailureRef.current = true;
+          finalize();
+          return;
+        }
+
+        if (tiktok.hasLoadError() || source.hasLoadError()) {
+          loadFailureRef.current = true;
+          finalize();
+          return;
+        }
+
+        // If playback did not actually start shortly after trigger, skip
+        // the scene to preserve Fast Watch continuity.
+        if (
+          Date.now() - startedAt > 1400 &&
+          !tiktok.isPlaying() &&
+          !source.isPlaying()
+        ) {
+          loadFailureRef.current = true;
+          finalize();
+        }
+      }, 200);
+
       // Fallback to avoid deadlock if browser misses an ended callback.
-      setTimeout(() => {
+      const hardTimeoutId = window.setTimeout(() => {
         if (pendingResolverRef.current === resolve) {
-          pendingResolverRef.current = null;
-          resolve();
+          loadFailureRef.current = true;
+          finalize();
         }
       }, 15000);
     });
@@ -194,6 +348,8 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(function MatchCard
 
   useEffect(() => {
     return () => {
+      primedForFastWatchRef.current = false;
+      loadFailureRef.current = false;
       if (pendingResolverRef.current) {
         pendingResolverRef.current();
         pendingResolverRef.current = null;
@@ -362,6 +518,8 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(function MatchCard
   );
 });
 
+const MemoizedMatchCard = memo(MatchCard);
+
 export function MatchValidation() {
   const { projectId } = useParams<{ projectId: string }>();
   const navigate = useNavigate();
@@ -384,8 +542,125 @@ export function MatchValidation() {
   const sceneRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const cardRefs = useRef<Map<number, MatchCardHandle>>(new Map());
   const autoplayTokenRef = useRef(0);
+  const preparedScenesRef = useRef<Set<number>>(new Set());
+  const failedPreparedScenesRef = useRef<Set<number>>(new Set());
+  const preparingScenesRef = useRef<Map<number, Promise<void>>>(new Map());
+  const prefetchQueueRef = useRef<Promise<void>>(Promise.resolve());
   const autoScrollRef = useRef(true);
   autoScrollRef.current = autoScroll;
+
+  const fastWatchPrefetchAhead = useMemo(() => {
+    if (playbackRate >= 5) return 4;
+    if (playbackRate >= 3) return 3;
+    if (playbackRate >= 2) return 2;
+    return 1;
+  }, [playbackRate]);
+
+  const clearFastWatchBuffers = useCallback(() => {
+    preparedScenesRef.current.clear();
+    failedPreparedScenesRef.current.clear();
+    preparingScenesRef.current.clear();
+    prefetchQueueRef.current = Promise.resolve();
+  }, []);
+
+  const ensureScenePrepared = useCallback(
+    (sceneIndex: number, token: number): Promise<void> => {
+      if (autoplayTokenRef.current !== token) {
+        return Promise.resolve();
+      }
+      if (failedPreparedScenesRef.current.has(sceneIndex)) {
+        return Promise.resolve();
+      }
+      if (preparedScenesRef.current.has(sceneIndex)) {
+        return Promise.resolve();
+      }
+
+      const existing = preparingScenesRef.current.get(sceneIndex);
+      if (existing) {
+        return existing;
+      }
+
+      const card = cardRefs.current.get(sceneIndex);
+      if (!card) {
+        return Promise.resolve();
+      }
+
+      const promise = card
+        .prepareForAutoplay()
+        .then((isPrepared) => {
+          if (autoplayTokenRef.current !== token) {
+            card.releasePreload();
+            return;
+          }
+          if (!isPrepared) {
+            failedPreparedScenesRef.current.add(sceneIndex);
+            preparedScenesRef.current.delete(sceneIndex);
+            return;
+          }
+          failedPreparedScenesRef.current.delete(sceneIndex);
+          preparedScenesRef.current.add(sceneIndex);
+        })
+        .catch(() => {
+          // Fast Watch should continue even if one card fails to preload.
+          failedPreparedScenesRef.current.add(sceneIndex);
+        })
+        .finally(() => {
+          preparingScenesRef.current.delete(sceneIndex);
+        });
+
+      preparingScenesRef.current.set(sceneIndex, promise);
+      return promise;
+    },
+    [],
+  );
+
+  const scheduleScenePreparation = useCallback(
+    (sceneIndex: number, token: number) => {
+      if (autoplayTokenRef.current !== token) return;
+      if (failedPreparedScenesRef.current.has(sceneIndex)) return;
+      if (preparedScenesRef.current.has(sceneIndex)) return;
+      if (preparingScenesRef.current.has(sceneIndex)) return;
+
+      prefetchQueueRef.current = prefetchQueueRef.current
+        .then(() => ensureScenePrepared(sceneIndex, token))
+        .catch(() => {
+          // Keep queue alive even if one preparation fails.
+        });
+    },
+    [ensureScenePrepared],
+  );
+
+  const releaseOutsideFastWatchWindow = useCallback(
+    (orderedScenes: Scene[], currentOffset: number) => {
+      const keepBehind = playbackRate >= 3 ? 0 : 1;
+      const keepStart = Math.max(0, currentOffset - keepBehind);
+      const keepEnd = Math.min(
+        orderedScenes.length - 1,
+        currentOffset + fastWatchPrefetchAhead,
+      );
+      const keepSceneIndices = new Set<number>();
+
+      for (let i = keepStart; i <= keepEnd; i += 1) {
+        const scene = orderedScenes[i];
+        if (scene) {
+          keepSceneIndices.add(scene.index);
+        }
+      }
+
+      for (const preparedSceneIndex of Array.from(preparedScenesRef.current)) {
+        if (keepSceneIndices.has(preparedSceneIndex)) continue;
+        cardRefs.current.get(preparedSceneIndex)?.releasePreload();
+        preparedScenesRef.current.delete(preparedSceneIndex);
+      }
+
+      for (const failedSceneIndex of Array.from(failedPreparedScenesRef.current)) {
+        if (keepSceneIndices.has(failedSceneIndex)) continue;
+        cardRefs.current.get(failedSceneIndex)?.releasePreload();
+        failedPreparedScenesRef.current.delete(failedSceneIndex);
+      }
+    },
+    [fastWatchPrefetchAhead, playbackRate],
+  );
 
   const stopFastWatch = useCallback(() => {
     autoplayTokenRef.current += 1;
@@ -394,7 +669,8 @@ export function MatchValidation() {
       card.stop();
       card.releasePreload();
     });
-  }, []);
+    clearFastWatchBuffers();
+  }, [clearFastWatchBuffers]);
 
   const scrollToScene = useCallback((sceneIndex: number, force = false) => {
     if (!force && !autoScrollRef.current) return;
@@ -411,9 +687,24 @@ export function MatchValidation() {
       const token = autoplayTokenRef.current + 1;
       autoplayTokenRef.current = token;
       setFastWatchPlaying(true);
+      clearFastWatchBuffers();
 
       const startPos = scenes.findIndex((scene) => scene.index === startSceneIndex);
       const orderedScenes = startPos >= 0 ? scenes.slice(startPos) : scenes;
+      const initialWindow = orderedScenes.slice(0, fastWatchPrefetchAhead + 1);
+      const mandatoryWarmup = initialWindow.slice(0, Math.min(2, initialWindow.length));
+      for (const scene of mandatoryWarmup) {
+        await ensureScenePrepared(scene.index, token);
+        if (autoplayTokenRef.current !== token) {
+          return;
+        }
+      }
+      for (const scene of initialWindow.slice(mandatoryWarmup.length)) {
+        scheduleScenePreparation(scene.index, token);
+      }
+      if (autoplayTokenRef.current !== token) {
+        return;
+      }
 
       for (let i = 0; i < orderedScenes.length; i += 1) {
         if (autoplayTokenRef.current !== token) {
@@ -424,28 +715,48 @@ export function MatchValidation() {
         const card = cardRefs.current.get(scene.index);
         if (!card) continue;
 
-        await card.prepareForAutoplay();
+        await ensureScenePrepared(scene.index, token);
+        if (autoplayTokenRef.current !== token) {
+          return;
+        }
+        if (failedPreparedScenesRef.current.has(scene.index)) {
+          setActiveSceneIndex(scene.index);
+          scrollToScene(scene.index);
+          releaseOutsideFastWatchWindow(orderedScenes, i + 1);
+          continue;
+        }
 
-        const nextScene = orderedScenes[i + 1];
-        const nextCard = nextScene
-          ? cardRefs.current.get(nextScene.index)
-          : undefined;
-        if (nextCard) {
-          void nextCard.prepareForAutoplay();
+        for (let offset = 1; offset <= fastWatchPrefetchAhead; offset += 1) {
+          const nextScene = orderedScenes[i + offset];
+          if (!nextScene) break;
+          scheduleScenePreparation(nextScene.index, token);
         }
 
         setActiveSceneIndex(scene.index);
         const playback = card.playBothAndWait();
         scrollToScene(scene.index);
         await playback;
-        card.releasePreload();
+        releaseOutsideFastWatchWindow(orderedScenes, i + 1);
       }
 
       if (autoplayTokenRef.current === token) {
+        autoplayTokenRef.current = token + 1;
         setFastWatchPlaying(false);
+        for (const preparedSceneIndex of Array.from(preparedScenesRef.current)) {
+          cardRefs.current.get(preparedSceneIndex)?.releasePreload();
+        }
+        clearFastWatchBuffers();
       }
     },
-    [scenes, scrollToScene],
+    [
+      scenes,
+      scrollToScene,
+      fastWatchPrefetchAhead,
+      ensureScenePrepared,
+      scheduleScenePreparation,
+      releaseOutsideFastWatchWindow,
+      clearFastWatchBuffers,
+    ],
   );
 
   // Load data
@@ -499,8 +810,9 @@ export function MatchValidation() {
         card.stop();
         card.releasePreload();
       });
+      clearFastWatchBuffers();
     };
-  }, []);
+  }, [clearFastWatchBuffers]);
 
   const handleFindMatches = useCallback(async () => {
     if (!projectId) return;
@@ -608,39 +920,65 @@ export function MatchValidation() {
 
       if (noMatchScenes.length === 0) return;
 
-      // Update each scene with its best alternative (highest confidence)
+      // Build one batch payload and persist all updates in a single request.
+      const updates: Array<{
+        scene_index: number;
+        episode: string;
+        start_time: number;
+        end_time: number;
+        confirmed: boolean;
+      }> = [];
+      const bestByScene = new Map<
+        number,
+        {
+          episode: string;
+          start_time: number;
+          end_time: number;
+          confidence: number;
+          speed_ratio: number;
+        }
+      >();
+
       for (const match of noMatchScenes) {
-        // Sort to find the one with highest confidence
         const bestAlternative = [...match.alternatives].sort(
           (a, b) => b.confidence - a.confidence,
         )[0];
 
-        await api.updateMatch(projectId, match.scene_index, {
+        updates.push({
+          scene_index: match.scene_index,
           episode: bestAlternative.episode,
           start_time: bestAlternative.start_time,
           end_time: bestAlternative.end_time,
           confirmed: true,
         });
-
-        // Update local state
-        setMatches((prev) =>
-          prev.map((m) => {
-            if (m.scene_index === match.scene_index) {
-              return {
-                ...m,
-                episode: bestAlternative.episode,
-                start_time: bestAlternative.start_time,
-                end_time: bestAlternative.end_time,
-                confidence: bestAlternative.confidence,
-                speed_ratio: bestAlternative.speed_ratio,
-                confirmed: true,
-                was_no_match: true, // Mark as manually set
-              };
-            }
-            return m;
-          }),
-        );
+        bestByScene.set(match.scene_index, {
+          episode: bestAlternative.episode,
+          start_time: bestAlternative.start_time,
+          end_time: bestAlternative.end_time,
+          confidence: bestAlternative.confidence,
+          speed_ratio: bestAlternative.speed_ratio,
+        });
       }
+
+      await api.updateMatchesBatch(projectId, updates);
+
+      // Update local state once to avoid N re-renders.
+      setMatches((prev) =>
+        prev.map((m) => {
+          const best = bestByScene.get(m.scene_index);
+          if (!best) return m;
+          return {
+            ...m,
+            episode: best.episode,
+            start_time: best.start_time,
+            end_time: best.end_time,
+            confidence: best.confidence,
+            speed_ratio: best.speed_ratio,
+            confirmed: true,
+            was_no_match: true,
+          };
+        }),
+      );
     } catch (err) {
       setError((err as Error).message);
     }
@@ -689,6 +1027,10 @@ export function MatchValidation() {
     () => matches.some((match) => match.confidence > 0 && match.episode),
     [matches],
   );
+
+  const matchesBySceneIndex = useMemo(() => {
+    return new Map(matches.map((match) => [match.scene_index, match]));
+  }, [matches]);
 
   const handleToggleFastWatch = useCallback(() => {
     if (fastWatchPlaying) {
@@ -881,18 +1223,19 @@ export function MatchValidation() {
         {/* Show matches */}
         <div className="space-y-4">
           {scenes.map((scene) => {
-            const match = matches.find((m) => m.scene_index === scene.index);
+            const match = matchesBySceneIndex.get(scene.index);
             if (!match) return null;
 
             return (
               <div
                 key={scene.index}
+                className="[content-visibility:auto] [contain-intrinsic-size:960px]"
                 ref={(el) => {
                   if (el) sceneRefs.current.set(scene.index, el);
                   else sceneRefs.current.delete(scene.index);
                 }}
               >
-                <MatchCard
+                <MemoizedMatchCard
                   ref={(card) => {
                     if (card) cardRefs.current.set(scene.index, card);
                     else cardRefs.current.delete(scene.index);

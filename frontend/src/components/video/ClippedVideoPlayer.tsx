@@ -25,9 +25,23 @@ export interface ClippedVideoPlayerHandle {
   seekToStart: () => Promise<void>;
   play: () => void;
   pause: () => void;
-  waitUntilReady: () => Promise<void>;
+  waitUntilReady: (options?: WaitUntilReadyOptions) => Promise<void>;
+  hasLoadError: () => boolean;
+  isPlaying: () => boolean;
+  retryLoad: () => Promise<void>;
   forceLoad: () => void;
   releaseLoad: () => void;
+}
+
+export interface WaitUntilReadyOptions {
+  minReadyState?: number;
+  timeoutMs?: number;
+}
+
+interface ReadyWaiter {
+  resolve: () => void;
+  minReadyState: number;
+  timeoutId: number;
 }
 
 /**
@@ -47,28 +61,66 @@ export const ClippedVideoPlayer = forwardRef<
 ) {
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
-  const readyResolversRef = useRef<Array<() => void>>([]);
+  const readyWaitersRef = useRef<ReadyWaiter[]>([]);
   const endNotifiedRef = useRef(false);
+  const isClipEndedRef = useRef(false);
   const forceLoadedRef = useRef(false);
   const isIntersectingRef = useRef(false);
+  const hasErrorRef = useRef(false);
   const [isVisible, setIsVisible] = useState(false);
   const [isLoaded, setIsLoaded] = useState(false);
   const [isEnded, setIsEnded] = useState(false);
   const [hasError, setHasError] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
   const [isRetrying, setIsRetrying] = useState(false);
+  const [preloadMode, setPreloadMode] = useState<"metadata" | "auto">("metadata");
 
-  const resolveReadyWaiters = useCallback(() => {
-    const waiters = readyResolversRef.current;
+  const resolveReadyWaiters = useCallback((force = false) => {
+    const waiters = readyWaitersRef.current;
     if (waiters.length === 0) return;
-    readyResolversRef.current = [];
-    waiters.forEach((resolve) => resolve());
+
+    const readyState = videoRef.current?.readyState ?? HTMLMediaElement.HAVE_NOTHING;
+    const remainingWaiters: ReadyWaiter[] = [];
+    for (const waiter of waiters) {
+      if (force || hasErrorRef.current || readyState >= waiter.minReadyState) {
+        clearTimeout(waiter.timeoutId);
+        waiter.resolve();
+      } else {
+        remainingWaiters.push(waiter);
+      }
+    }
+    readyWaitersRef.current = remainingWaiters;
   }, []);
 
   // Add a small offset to startTime to compensate for keyframe seeking
   // HTML video seeks to nearest keyframe which can be before the target time
   // Adding ~2 frames (at 30fps = 0.067s) ensures we land on correct frame
   const adjustedStartTime = startTime + 0.067;
+
+  const resetClipEndedState = useCallback(() => {
+    endNotifiedRef.current = false;
+    isClipEndedRef.current = false;
+    setIsEnded(false);
+  }, []);
+
+  const markClipEnded = useCallback(() => {
+    if (!isClipEndedRef.current) {
+      isClipEndedRef.current = true;
+      setIsEnded(true);
+    }
+    // Always notify parent exactly once so orchestration can advance.
+    if (!endNotifiedRef.current) {
+      endNotifiedRef.current = true;
+      onClipEnded?.();
+    }
+  }, [onClipEnded]);
+
+  const notifyClipCompleted = useCallback(() => {
+    if (!endNotifiedRef.current) {
+      endNotifiedRef.current = true;
+      onClipEnded?.();
+    }
+  }, [onClipEnded]);
 
   // Add cache-busting parameter on retry to bypass browser cache
   const videoSrc = useMemo(() => {
@@ -78,6 +130,24 @@ export const ClippedVideoPlayer = forwardRef<
     return `${src}${separator}_retry=${retryCount}`;
   }, [src, retryCount]);
 
+  const triggerRetryLoad = useCallback(() => {
+    return new Promise<void>((resolve) => {
+      setIsRetrying(true);
+      setHasError(false);
+      hasErrorRef.current = false;
+      setIsLoaded(false);
+      setPreloadMode("auto");
+      resolveReadyWaiters(true);
+
+      // Small delay to ensure video element is unmounted before creating new one
+      window.setTimeout(() => {
+        setRetryCount((c) => c + 1);
+        setIsRetrying(false);
+        resolve();
+      }, 100);
+    });
+  }, [resolveReadyWaiters]);
+
   // Expose playback control methods to parent
   useImperativeHandle(
     ref,
@@ -85,59 +155,97 @@ export const ClippedVideoPlayer = forwardRef<
       playFromStart: () => {
         if (videoRef.current) {
           videoRef.current.currentTime = adjustedStartTime;
-          endNotifiedRef.current = false;
-          setIsEnded(false);
+          resetClipEndedState();
           videoRef.current.play().catch(console.error);
         }
       },
       seekToStart: () => {
         return new Promise<void>((resolve) => {
           const video = videoRef.current;
-          if (!video) {
+          if (!video || hasErrorRef.current) {
             resolve();
             return;
           }
-          video.currentTime = adjustedStartTime;
-          endNotifiedRef.current = false;
-          setIsEnded(false);
-          const onSeeked = () => {
+
+          // Avoid hanging forever when seek is impossible (e.g. failed load).
+          if (video.readyState < HTMLMediaElement.HAVE_METADATA) {
+            resolve();
+            return;
+          }
+
+          resetClipEndedState();
+          let done = false;
+          const finalize = () => {
+            if (done) return;
+            done = true;
+            window.clearTimeout(timeoutId);
             video.removeEventListener("seeked", onSeeked);
+            video.removeEventListener("error", onError);
             resolve();
           };
+          const onSeeked = () => finalize();
+          const onError = () => finalize();
+          const timeoutId = window.setTimeout(finalize, 1200);
+
           video.addEventListener("seeked", onSeeked);
+          video.addEventListener("error", onError);
+          try {
+            video.currentTime = adjustedStartTime;
+          } catch {
+            finalize();
+          }
         });
       },
       play: () => {
         if (videoRef.current) {
-          endNotifiedRef.current = false;
-          setIsEnded(false);
+          resetClipEndedState();
           videoRef.current.play().catch(console.error);
         }
       },
       pause: () => {
         videoRef.current?.pause();
       },
-      waitUntilReady: () => {
+      waitUntilReady: (options) => {
         return new Promise<void>((resolve) => {
+          const minReadyState =
+            options?.minReadyState ?? HTMLMediaElement.HAVE_CURRENT_DATA;
+          const timeoutMs = options?.timeoutMs ?? 6000;
           const video = videoRef.current;
-          if (video && isLoaded) {
+          if (!video || hasErrorRef.current || video.readyState >= minReadyState) {
             resolve();
             return;
           }
 
-          readyResolversRef.current.push(resolve);
-          // Avoid deadlocks if loading fails or takes too long.
-          setTimeout(() => {
-            const idx = readyResolversRef.current.indexOf(resolve);
-            if (idx >= 0) {
-              readyResolversRef.current.splice(idx, 1);
+          let waiter: ReadyWaiter | null = null;
+          const timeoutId = window.setTimeout(() => {
+            if (!waiter) {
               resolve();
+              return;
             }
-          }, 4000);
+            const idx = readyWaitersRef.current.indexOf(waiter);
+            if (idx >= 0) {
+              readyWaitersRef.current.splice(idx, 1);
+            }
+            resolve();
+          }, timeoutMs);
+
+          waiter = { resolve, minReadyState, timeoutId };
+          readyWaitersRef.current.push(waiter);
+          // Avoid deadlocks if loading fails or takes too long.
         });
+      },
+      hasLoadError: () => hasErrorRef.current,
+      isPlaying: () => {
+        const video = videoRef.current;
+        if (!video) return false;
+        return !video.paused && !video.ended;
+      },
+      retryLoad: async () => {
+        await triggerRetryLoad();
       },
       forceLoad: () => {
         forceLoadedRef.current = true;
+        setPreloadMode("auto");
         setIsVisible(true);
       },
       releaseLoad: () => {
@@ -146,11 +254,18 @@ export const ClippedVideoPlayer = forwardRef<
         setIsVisible(false);
         setIsLoaded(false);
         setHasError(false);
-        setIsEnded(false);
-        endNotifiedRef.current = false;
+        hasErrorRef.current = false;
+        resetClipEndedState();
+        setPreloadMode("metadata");
+        resolveReadyWaiters(true);
       },
     }),
-    [adjustedStartTime, isLoaded],
+    [
+      adjustedStartTime,
+      resolveReadyWaiters,
+      resetClipEndedState,
+      triggerRetryLoad,
+    ],
   );
 
   // Intersection Observer for lazy loading AND unloading
@@ -175,8 +290,10 @@ export const ClippedVideoPlayer = forwardRef<
             setIsVisible(false);
             setIsLoaded(false);
             setHasError(false);
-            setIsEnded(false);
-            endNotifiedRef.current = false;
+            hasErrorRef.current = false;
+            resetClipEndedState();
+            setPreloadMode("metadata");
+            resolveReadyWaiters(true);
             // Don't reset retryCount - keep it so next load uses fresh URL if needed
           }
         });
@@ -192,7 +309,13 @@ export const ClippedVideoPlayer = forwardRef<
     return () => {
       observer.disconnect();
     };
-  }, []);
+  }, [resolveReadyWaiters, resetClipEndedState]);
+
+  useEffect(() => {
+    return () => {
+      resolveReadyWaiters(true);
+    };
+  }, [resolveReadyWaiters]);
 
   // Set initial time when video loads
   const handleLoadedMetadata = useCallback(() => {
@@ -201,9 +324,18 @@ export const ClippedVideoPlayer = forwardRef<
       videoRef.current.playbackRate = playbackRate;
       setIsLoaded(true);
       setHasError(false);
-      resolveReadyWaiters();
+      hasErrorRef.current = false;
+      if (videoRef.current.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+        resolveReadyWaiters();
+      }
     }
   }, [adjustedStartTime, playbackRate, resolveReadyWaiters]);
+
+  const handleCanPlay = useCallback(() => {
+    if (videoRef.current) {
+      resolveReadyWaiters();
+    }
+  }, [resolveReadyWaiters]);
 
   const handleError = useCallback(
     (e: React.SyntheticEvent<HTMLVideoElement>) => {
@@ -214,10 +346,12 @@ export const ClippedVideoPlayer = forwardRef<
         `Video load error for ${src}: code=${errorCode}, message=${errorMessage}`,
       );
       setHasError(true);
+      hasErrorRef.current = true;
       setIsLoaded(true); // Stop showing loader
-      resolveReadyWaiters();
+      notifyClipCompleted();
+      resolveReadyWaiters(true);
     },
-    [src, resolveReadyWaiters],
+    [src, notifyClipCompleted, resolveReadyWaiters],
   );
 
   // Monitor playback to enforce end boundary only.
@@ -228,15 +362,16 @@ export const ClippedVideoPlayer = forwardRef<
     if (!video) return;
 
     if (video.currentTime >= endTime) {
-      video.pause();
-      video.currentTime = endTime;
-      setIsEnded(true);
-      if (!endNotifiedRef.current) {
-        endNotifiedRef.current = true;
-        onClipEnded?.();
+      if (!video.paused) {
+        video.pause();
       }
+      // Avoid endless seek loops from re-applying the same end boundary.
+      if (Math.abs(video.currentTime - endTime) > 0.03) {
+        video.currentTime = endTime;
+      }
+      markClipEnded();
     }
-  }, [endTime, onClipEnded]);
+  }, [endTime, markClipEnded]);
 
   const handlePlay = useCallback(() => {
     // Only re-seek if clearly out of bounds (with tolerance to avoid
@@ -247,10 +382,9 @@ export const ClippedVideoPlayer = forwardRef<
       if (cur < adjustedStartTime - 0.15 || cur >= endTime) {
         videoRef.current.currentTime = adjustedStartTime;
       }
-      endNotifiedRef.current = false;
-      setIsEnded(false);
+      resetClipEndedState();
     }
-  }, [adjustedStartTime, endTime, playbackRate]);
+  }, [adjustedStartTime, endTime, playbackRate, resetClipEndedState]);
 
   const handleSeeked = useCallback(() => {
     const video = videoRef.current;
@@ -260,18 +394,18 @@ export const ClippedVideoPlayer = forwardRef<
     // imprecision. Only clamp if genuinely out of bounds.
     if (video.currentTime < adjustedStartTime - 0.15) {
       video.currentTime = adjustedStartTime;
-      endNotifiedRef.current = false;
+      resetClipEndedState();
     }
     if (video.currentTime >= endTime) {
-      video.currentTime = endTime;
-      video.pause();
-      setIsEnded(true);
-      if (!endNotifiedRef.current) {
-        endNotifiedRef.current = true;
-        onClipEnded?.();
+      if (Math.abs(video.currentTime - endTime) > 0.03) {
+        video.currentTime = endTime;
       }
+      if (!video.paused) {
+        video.pause();
+      }
+      markClipEnded();
     }
-  }, [adjustedStartTime, endTime, onClipEnded]);
+  }, [adjustedStartTime, endTime, markClipEnded, resetClipEndedState]);
 
   // Reset to start when src or times change
   useEffect(() => {
@@ -279,6 +413,7 @@ export const ClippedVideoPlayer = forwardRef<
       videoRef.current.currentTime = adjustedStartTime;
       videoRef.current.playbackRate = playbackRate;
       endNotifiedRef.current = false;
+      isClipEndedRef.current = false;
     }
   }, [src, adjustedStartTime, isLoaded, playbackRate]);
 
@@ -286,24 +421,14 @@ export const ClippedVideoPlayer = forwardRef<
     if (videoRef.current) {
       videoRef.current.currentTime = adjustedStartTime;
       videoRef.current.playbackRate = playbackRate;
-      endNotifiedRef.current = false;
-      setIsEnded(false);
+      resetClipEndedState();
       videoRef.current.play().catch(console.error);
     }
-  }, [adjustedStartTime, playbackRate]);
+  }, [adjustedStartTime, playbackRate, resetClipEndedState]);
 
   const handleRetry = useCallback(() => {
-    // Set retrying state to force complete unmount
-    setIsRetrying(true);
-    setHasError(false);
-    setIsLoaded(false);
-
-    // Small delay to ensure video element is unmounted before creating new one
-    setTimeout(() => {
-      setRetryCount((c) => c + 1);
-      setIsRetrying(false);
-    }, 100);
-  }, []);
+    void triggerRetryLoad();
+  }, [triggerRetryLoad]);
 
   return (
     <div
@@ -357,13 +482,16 @@ export const ClippedVideoPlayer = forwardRef<
           src={videoSrc}
           className="w-full h-full object-contain"
           onLoadedMetadata={handleLoadedMetadata}
+          onLoadedData={handleCanPlay}
+          onCanPlay={handleCanPlay}
           onError={handleError}
           onTimeUpdate={handleTimeUpdate}
           onPlay={handlePlay}
           onSeeked={handleSeeked}
           controls
           muted={muted}
-          preload="metadata"
+          playsInline
+          preload={preloadMode}
         />
       )}
 

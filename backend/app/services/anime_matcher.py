@@ -4,11 +4,12 @@ import asyncio
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import AsyncIterator
 
 import cv2
-from PIL import Image
+from PIL import Image, ImageOps
 
 from ..config import settings
 from ..models import AlternativeMatch, MatchCandidate, MatchList, SceneMatch, SceneList
@@ -151,6 +152,89 @@ class AnimeMatcherService:
             return Image.fromarray(frame_rgb)
         finally:
             cap.release()
+
+    @staticmethod
+    def extract_frames(video_path: Path, timestamps: list[float]) -> list[Image.Image | None]:
+        """
+        Extract multiple frames in one pass using a single VideoCapture instance.
+
+        Args:
+            video_path: Path to the video file
+            timestamps: List of times in seconds
+
+        Returns:
+            List of PIL images (or None on extraction failure), in input order.
+        """
+        cap = cv2.VideoCapture(str(video_path))
+        frames: list[Image.Image | None] = []
+        try:
+            for timestamp in timestamps:
+                cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, timestamp) * 1000)
+                ret, frame = cap.read()
+                if not ret:
+                    frames.append(None)
+                    continue
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames.append(Image.fromarray(frame_rgb))
+            return frames
+        finally:
+            cap.release()
+
+    @classmethod
+    def _search_image_batch(
+        cls,
+        images: list[Image.Image],
+        *,
+        top_n: int = 5,
+        threshold: float | None = None,
+        flip: bool = False,
+        series: str | None = None,
+    ) -> list[list]:
+        """
+        Run batched embedding + search for a list of query images.
+
+        Returns one search result list per input image.
+        """
+        processor = cls._query_processor
+        prepared = [img.convert("RGB") for img in images]
+
+        embeddings = processor.embedder.embed_batch(prepared)
+        per_image_results = [
+            processor.index_manager.search(
+                embeddings[i],
+                top_n,
+                threshold,
+                series=series,
+            )
+            for i in range(len(prepared))
+        ]
+
+        if flip:
+            flipped = [ImageOps.mirror(img) for img in prepared]
+            flip_embeddings = processor.embedder.embed_batch(flipped)
+            per_image_flip_results = [
+                processor.index_manager.search(
+                    flip_embeddings[i],
+                    top_n,
+                    threshold,
+                    series=series,
+                )
+                for i in range(len(prepared))
+            ]
+            merged_results = [
+                processor._merge_results(per_image_results[i], per_image_flip_results[i], top_n)
+                for i in range(len(prepared))
+            ]
+        else:
+            merged_results = per_image_results
+
+        return [
+            [
+                processor._format_result(rank + 1, similarity, metadata)
+                for rank, (similarity, metadata) in enumerate(results)
+            ]
+            for results in merged_results
+        ]
 
     @classmethod
     def _find_temporal_match(
@@ -512,17 +596,13 @@ class AnimeMatcherService:
                 middle_time = (scene.start_time + scene.end_time) / 2
                 end_time = scene.end_time - safe_offset
 
-                # Run frame extraction in thread pool
-                frames = await loop.run_in_executor(
+                # Run frame extraction in one capture pass.
+                start_frame, middle_frame, end_frame = await loop.run_in_executor(
                     None,
-                    lambda: (
-                        cls.extract_frame(video_path, start_time),
-                        cls.extract_frame(video_path, middle_time),
-                        cls.extract_frame(video_path, end_time),
-                    ),
+                    cls.extract_frames,
+                    video_path,
+                    [start_time, middle_time, end_time],
                 )
-
-                start_frame, middle_frame, end_frame = frames
 
                 if not all([start_frame, middle_frame, end_frame]):
                     # Create empty match for this scene
@@ -539,21 +619,18 @@ class AnimeMatcherService:
                     )
                     continue
 
-                # Search for each frame
-                def search_frames():
-                    start_results = cls._query_processor.search_image(
-                        start_frame, top_n=5, flip=True, series=anime_name
-                    )
-                    middle_results = cls._query_processor.search_image(
-                        middle_frame, top_n=5, flip=True, series=anime_name
-                    )
-                    end_results = cls._query_processor.search_image(
-                        end_frame, top_n=5, flip=True, series=anime_name
-                    )
-                    return start_results, middle_results, end_results
-
+                # Batched query embedding/search for start/middle/end frames.
+                search_batch = partial(
+                    cls._search_image_batch,
+                    [start_frame, middle_frame, end_frame],
+                    top_n=5,
+                    threshold=None,
+                    flip=True,
+                    series=anime_name,
+                )
                 start_results, middle_results, end_results = await loop.run_in_executor(
-                    None, search_frames
+                    None,
+                    search_batch,
                 )
 
                 # Convert to MatchCandidate objects

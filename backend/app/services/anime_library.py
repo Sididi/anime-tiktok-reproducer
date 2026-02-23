@@ -1,7 +1,9 @@
 """Service for managing the anime library (indexing, listing, copying)."""
 
 import asyncio
+import hashlib
 import json
+import subprocess
 import shutil
 from contextlib import suppress
 from dataclasses import dataclass
@@ -49,9 +51,12 @@ class AnimeLibraryService:
     SEARCH_TIMEOUT_SECONDS = 120.0
     REMUX_TIMEOUT_SECONDS = 600.0
     INDEX_TIMEOUT_SECONDS = 7200.0
+    PREVIEW_PROXY_TIMEOUT_SECONDS = 3600.0
 
     _episode_manifest_cache: dict | None = None
     _episode_manifest_lock: asyncio.Lock | None = None
+    _preview_generation_lock: asyncio.Lock | None = None
+    _preview_generation_inflight: set[str] = set()
 
     @staticmethod
     def get_library_path() -> Path:
@@ -143,6 +148,12 @@ class AnimeLibraryService:
         if cls._episode_manifest_lock is None:
             cls._episode_manifest_lock = asyncio.Lock()
         return cls._episode_manifest_lock
+
+    @classmethod
+    def _get_preview_generation_lock(cls) -> asyncio.Lock:
+        if cls._preview_generation_lock is None:
+            cls._preview_generation_lock = asyncio.Lock()
+        return cls._preview_generation_lock
 
     @classmethod
     def _scan_library_episodes_sync(cls) -> dict:
@@ -253,6 +264,240 @@ class AnimeLibraryService:
         if manifest_data is None:
             return []
         return [p for p in manifest_data.get("episodes", []) if Path(p).exists()]
+
+    @classmethod
+    def get_preview_proxy_dir(cls) -> Path:
+        """Directory holding browser-safe source preview proxies."""
+        return settings.cache_dir / "source_previews"
+
+    @classmethod
+    def _build_preview_proxy_key(cls, source_path: Path) -> str:
+        """Build a stable proxy key that changes when source content changes."""
+        stat = source_path.stat()
+        payload = f"{source_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}"
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def get_preview_proxy_path(cls, source_path: Path) -> Path:
+        """Compute the expected proxy path for a source file."""
+        key = cls._build_preview_proxy_key(source_path)
+        return cls.get_preview_proxy_dir() / f"{key}.mp4"
+
+    @staticmethod
+    def _probe_video_stream_sync(video_path: Path) -> dict | None:
+        """Return ffprobe stream info for the first video stream."""
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,pix_fmt",
+            "-of",
+            "json",
+            str(video_path),
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+
+        if result.returncode != 0:
+            return None
+
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return None
+
+        streams = payload.get("streams", [])
+        if not streams:
+            return None
+        stream = streams[0]
+        return stream if isinstance(stream, dict) else None
+
+    @classmethod
+    def is_browser_preview_compatible(cls, source_path: Path) -> bool:
+        """
+        Return True when a source file is safe to play directly in browser preview.
+
+        Conservative rule: MP4 + H.264 + 4:2:0 8-bit.
+        """
+        if source_path.suffix.lower() != ".mp4":
+            return False
+
+        stream = cls._probe_video_stream_sync(source_path)
+        if stream is None:
+            return False
+
+        codec = str(stream.get("codec_name", "")).lower()
+        pix_fmt = str(stream.get("pix_fmt", "")).lower()
+        return codec == "h264" and pix_fmt in {"yuv420p", "yuvj420p"}
+
+    @classmethod
+    def ensure_preview_proxy_sync(cls, source_path: Path) -> Path | None:
+        """
+        Ensure a browser-safe MP4 preview proxy exists for source_path.
+
+        Returns:
+            - original source path when direct playback is compatible
+            - proxy path when transcoding is needed/succeeds
+            - None when proxy creation fails
+        """
+        if not source_path.exists() or not source_path.is_file():
+            return None
+
+        if cls.is_browser_preview_compatible(source_path):
+            return source_path
+
+        preview_dir = cls.get_preview_proxy_dir()
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        proxy_path = cls.get_preview_proxy_path(source_path)
+        if proxy_path.exists() and proxy_path.stat().st_size > 0:
+            return proxy_path
+
+        tmp_path = proxy_path.with_suffix(".tmp.mp4")
+        base_cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(source_path),
+            "-map",
+            "0:v:0",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+        ]
+
+        # Try with audio first when available, fallback to silent preview.
+        cmd_with_audio = base_cmd + [
+            "-map",
+            "0:a:0?",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-ac",
+            "2",
+            "-ar",
+            "48000",
+            str(tmp_path),
+        ]
+        cmd_video_only = base_cmd + ["-an", str(tmp_path)]
+
+        try:
+            result = subprocess.run(
+                cmd_with_audio,
+                capture_output=True,
+                text=True,
+                timeout=cls.PREVIEW_PROXY_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+
+        if result.returncode != 0:
+            try:
+                result = subprocess.run(
+                    cmd_video_only,
+                    capture_output=True,
+                    text=True,
+                    timeout=cls.PREVIEW_PROXY_TIMEOUT_SECONDS,
+                    check=False,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                return None
+            if result.returncode != 0:
+                return None
+
+        if not tmp_path.exists() or tmp_path.stat().st_size == 0:
+            with suppress(OSError):
+                tmp_path.unlink()
+            return None
+
+        tmp_path.replace(proxy_path)
+        return proxy_path
+
+    @classmethod
+    async def resolve_source_preview_path(
+        cls,
+        source_path: Path,
+        *,
+        allow_generate: bool = True,
+    ) -> Path:
+        """
+        Resolve the best path to stream for browser preview.
+
+        Falls back to original source when proxy generation fails.
+        """
+        if allow_generate:
+            resolved = await asyncio.to_thread(cls.ensure_preview_proxy_sync, source_path)
+            return resolved if resolved is not None else source_path
+
+        compatible = await asyncio.to_thread(cls.is_browser_preview_compatible, source_path)
+        if compatible:
+            return source_path
+
+        proxy_path = await asyncio.to_thread(cls.get_preview_proxy_path, source_path)
+        if proxy_path.exists() and proxy_path.stat().st_size > 0:
+            return proxy_path
+        return source_path
+
+    @classmethod
+    async def trigger_preview_proxy_generation(cls, source_path: Path) -> None:
+        """Kick off proxy generation once per source path (non-blocking)."""
+        key = str(source_path.resolve())
+        lock = cls._get_preview_generation_lock()
+        async with lock:
+            if key in cls._preview_generation_inflight:
+                return
+            cls._preview_generation_inflight.add(key)
+
+        async def _run() -> None:
+            try:
+                await asyncio.to_thread(cls.ensure_preview_proxy_sync, source_path)
+            finally:
+                async with lock:
+                    cls._preview_generation_inflight.discard(key)
+
+        asyncio.create_task(_run())
+
+    @classmethod
+    async def wait_for_preview_proxy(
+        cls,
+        source_path: Path,
+        *,
+        timeout_seconds: float = 1.5,
+        poll_interval_seconds: float = 0.15,
+    ) -> Path | None:
+        """Wait briefly for a generated preview proxy to appear on disk."""
+        proxy_path = await asyncio.to_thread(cls.get_preview_proxy_path, source_path)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(timeout_seconds, 0.0)
+
+        while True:
+            exists = await asyncio.to_thread(
+                lambda: proxy_path.exists() and proxy_path.stat().st_size > 0
+            )
+            if exists:
+                return proxy_path
+            if loop.time() >= deadline:
+                return None
+            await asyncio.sleep(max(poll_interval_seconds, 0.05))
 
     @classmethod
     async def list_indexed_anime(cls) -> list[str]:
@@ -402,6 +647,7 @@ class AnimeLibraryService:
             return
 
         total_files = len(video_files)
+        prepared_files: list[Path] = []
 
         # Copy files if not already in library
         if dest_path != source_folder:
@@ -417,9 +663,10 @@ class AnimeLibraryService:
             # Copy/remux each file
             for i, video_file in enumerate(video_files):
                 is_mkv = video_file.suffix.lower() == ".mkv"
-                dest_file = dest_path / (video_file.stem + ".mp4" if is_mkv else video_file.name)
+                preferred_dest = dest_path / (video_file.stem + ".mp4" if is_mkv else video_file.name)
+                actual_dest = preferred_dest
 
-                if not dest_file.exists():
+                if not preferred_dest.exists():
                     if is_mkv:
                         # Remux MKV to MP4 (no re-encoding, fast)
                         yield IndexProgress(
@@ -435,7 +682,7 @@ class AnimeLibraryService:
                                 [
                                     "ffmpeg", "-y", "-i", str(video_file),
                                     "-c", "copy", "-movflags", "+faststart",
-                                    str(dest_file),
+                                    str(preferred_dest),
                                 ],
                                 timeout_seconds=cls.REMUX_TIMEOUT_SECONDS,
                             )
@@ -450,20 +697,27 @@ class AnimeLibraryService:
                                 fallback_dest = dest_path / video_file.name
                                 if not fallback_dest.exists():
                                     await asyncio.to_thread(shutil.copy2, video_file, fallback_dest)
+                                actual_dest = fallback_dest
                         except CommandTimeoutError:
                             import sys
                             print(f"[WARNING] ffmpeg remux timed out for {video_file.name}, falling back to copy", file=sys.stderr)
                             fallback_dest = dest_path / video_file.name
                             if not fallback_dest.exists():
                                 await asyncio.to_thread(shutil.copy2, video_file, fallback_dest)
+                            actual_dest = fallback_dest
                         except FileNotFoundError:
                             import sys
                             print("[WARNING] ffmpeg not found, falling back to copy", file=sys.stderr)
                             fallback_dest = dest_path / video_file.name
                             if not fallback_dest.exists():
                                 await asyncio.to_thread(shutil.copy2, video_file, fallback_dest)
+                            actual_dest = fallback_dest
                     else:
-                        await asyncio.to_thread(shutil.copy2, video_file, dest_file)
+                        await asyncio.to_thread(shutil.copy2, video_file, preferred_dest)
+                else:
+                    actual_dest = preferred_dest
+
+                prepared_files.append(actual_dest)
 
                 yield IndexProgress(
                     status="copying",
@@ -487,10 +741,7 @@ class AnimeLibraryService:
             await asyncio.sleep(1.0)
 
             # Verify each file is readable and has valid size
-            for video_file in video_files:
-                is_mkv = video_file.suffix.lower() == ".mkv"
-                dest_file = dest_path / (video_file.stem + ".mp4" if is_mkv else video_file.name)
-
+            for dest_file in prepared_files:
                 # Check if file exists and has size > 0
                 if not dest_file.exists():
                     yield IndexProgress(
@@ -506,6 +757,31 @@ class AnimeLibraryService:
                         error=f"Copied file is empty: {dest_file.name}",
                     )
                     return
+        else:
+            prepared_files = list(video_files)
+
+        # Build browser-safe preview proxies for files that need it.
+        # This keeps match validation video previews reliable across codecs.
+        yield IndexProgress(
+            status="copying",
+            message="Preparing browser preview proxies...",
+            progress=0.3,
+            total_files=len(prepared_files),
+        )
+        for i, prepared_file in enumerate(prepared_files):
+            try:
+                await asyncio.to_thread(cls.ensure_preview_proxy_sync, prepared_file)
+            except Exception:
+                # Preview proxy failures should not block indexing/matching.
+                pass
+            if prepared_files:
+                yield IndexProgress(
+                    status="copying",
+                    message=f"Preparing preview {prepared_file.name}",
+                    progress=0.3 + 0.05 * ((i + 1) / len(prepared_files)),
+                    total_files=len(prepared_files),
+                    completed_files=i + 1,
+                )
 
         if is_existing_series and abs(effective_fps - requested_fps) > 1e-9:
             yield IndexProgress(
@@ -514,7 +790,7 @@ class AnimeLibraryService:
                     f"{anime_name} already indexed at {effective_fps:g} fps; "
                     f"keeping existing FPS (requested {requested_fps:g} ignored)"
                 ),
-                progress=0.3,
+                progress=0.35,
                 total_files=total_files,
             )
 
@@ -522,7 +798,7 @@ class AnimeLibraryService:
         yield IndexProgress(
             status="indexing",
             message=f"Indexing {anime_name} at {effective_fps:g} fps",
-            progress=0.3,
+            progress=0.35,
             total_files=total_files,
         )
 
@@ -574,7 +850,7 @@ class AnimeLibraryService:
                     yield IndexProgress(
                         status="indexing",
                         message=line_str[:100],  # Truncate long messages
-                        progress=0.3 + 0.65 * (len(stdout_lines) / (total_files * 100)),  # Rough estimate
+                        progress=0.35 + 0.60 * (len(stdout_lines) / (total_files * 100)),  # Rough estimate
                         total_files=total_files,
                     )
 

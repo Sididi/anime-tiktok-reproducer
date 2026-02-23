@@ -165,8 +165,33 @@ async def get_source_video(
     if not source_path.exists():
         raise HTTPException(status_code=404, detail="Source file not found")
 
+    # Serve a browser-safe preview proxy when the source codec/container is not
+    # directly playable in the frontend video element.
+    stream_path = await AnimeLibraryService.resolve_source_preview_path(
+        source_path,
+        allow_generate=False,
+    )
+    if not stream_path.exists():
+        stream_path = source_path
+
+    # If we had to fall back to the original file for an unsupported source,
+    # trigger proxy generation in background so future requests are compatible.
+    if stream_path == source_path:
+        compatible = await asyncio.to_thread(
+            AnimeLibraryService.is_browser_preview_compatible,
+            source_path,
+        )
+        if not compatible:
+            await AnimeLibraryService.trigger_preview_proxy_generation(source_path)
+            ready_proxy = await AnimeLibraryService.wait_for_preview_proxy(
+                source_path,
+                timeout_seconds=1.5,
+            )
+            if ready_proxy is not None:
+                stream_path = ready_proxy
+
     # Determine media type based on extension
-    suffix = source_path.suffix.lower()
+    suffix = stream_path.suffix.lower()
     media_types = {
         ".mp4": "video/mp4",
         ".mkv": "video/x-matroska",
@@ -177,7 +202,7 @@ async def get_source_video(
     media_type = media_types.get(suffix, "video/mp4")
 
     return FileResponse(
-        source_path,
+        stream_path,
         media_type=media_type,
         headers={"Accept-Ranges": "bytes"},
     )

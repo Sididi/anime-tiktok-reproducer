@@ -298,6 +298,18 @@ class UpdateMatchRequest(BaseModel):
     confirmed: bool = True
 
 
+class BatchUpdateMatchItem(BaseModel):
+    scene_index: int
+    episode: str
+    start_time: float
+    end_time: float
+    confirmed: bool = True
+
+
+class BatchUpdateMatchesRequest(BaseModel):
+    updates: list[BatchUpdateMatchItem]
+
+
 @router.put("/matches/{scene_index}")
 async def update_match(project_id: str, scene_index: int, request: UpdateMatchRequest):
     """Update or confirm a match for a scene."""
@@ -338,6 +350,48 @@ async def update_match(project_id: str, scene_index: int, request: UpdateMatchRe
     ProjectService.save_matches(project_id, matches)
 
     return {"status": "ok", "match": match.model_dump()}
+
+
+@router.put("/matches")
+async def update_matches_batch(project_id: str, request: BatchUpdateMatchesRequest):
+    """Batch update multiple scene matches and persist once."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    matches = ProjectService.load_matches(project_id)
+    if not matches:
+        raise HTTPException(status_code=404, detail="No matches found")
+
+    scenes = ProjectService.load_scenes(project_id)
+    scene_by_index = {scene.index: scene for scene in scenes.scenes} if scenes else {}
+    match_by_scene_index = {match.scene_index: match for match in matches.matches}
+
+    for update in request.updates:
+        match = match_by_scene_index.get(update.scene_index)
+        if not match:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Match not found for scene {update.scene_index}",
+            )
+
+        match.episode = update.episode
+        match.start_time = update.start_time
+        match.end_time = update.end_time
+        match.confirmed = update.confirmed
+
+        if match.confidence == 0 and update.confirmed:
+            match.confidence = 1.0
+
+        scene = scene_by_index.get(update.scene_index)
+        if scene is not None:
+            scene_duration = scene.end_time - scene.start_time
+            source_duration = match.end_time - match.start_time
+            if source_duration > 0:
+                match.speed_ratio = scene_duration / source_duration
+
+    ProjectService.save_matches(project_id, matches)
+    return {"status": "ok", "matches": [m.model_dump() for m in matches.matches]}
 
 
 @router.post("/matches/undo-merge/{scene_index}")
