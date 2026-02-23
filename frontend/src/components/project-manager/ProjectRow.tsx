@@ -124,6 +124,21 @@ export function ProjectRow({
       {/* Actions */}
       <td className="py-3 pr-3">
         <div className="flex items-center gap-1.5">
+          {/* Video preview (always reserve space for alignment) */}
+          {row.drive_video_id ? (
+            <Button
+              size="icon"
+              variant="ghost"
+              onClick={() => onPreview(row.drive_video_id!)}
+              className="h-9 w-9 active:scale-95 transition-transform"
+              title="Preview video"
+            >
+              <Eye className="h-4 w-4" />
+            </Button>
+          ) : (
+            <div className="h-9 w-9" />
+          )}
+
           {/* Upload */}
           {uploadDisabledReason ? (
             <Tooltip text={uploadDisabledReason}>
@@ -161,19 +176,6 @@ export function ProjectRow({
               <Trash2 className="h-4 w-4" />
             )}
           </Button>
-
-          {/* Video preview */}
-          {row.drive_video_id && (
-            <Button
-              size="icon"
-              variant="ghost"
-              onClick={() => onPreview(row.drive_video_id!)}
-              className="h-9 w-9 active:scale-95 transition-transform"
-              title="Preview video"
-            >
-              <Eye className="h-4 w-4" />
-            </Button>
-          )}
         </div>
       </td>
     </tr>
