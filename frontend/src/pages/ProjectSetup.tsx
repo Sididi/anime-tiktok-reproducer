@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { Loader2, ChevronDown, Plus, FolderOpen, FolderPlus, FolderKanban } from "lucide-react";
 import { Button, Input } from "@/components/ui";
 import { FolderBrowserModal } from "@/components/FolderBrowserModal";
-import { ProjectManagerModal } from "@/components/ProjectManagerModal";
+import { ProjectManagerModal } from "@/components/project-manager";
 import { useProjectStore } from "@/stores";
 import { api } from "@/api/client";
 import { readSSEStream } from "@/utils/sse";

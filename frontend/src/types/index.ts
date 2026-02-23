@@ -64,6 +64,8 @@ export interface ProjectManagerRow {
   drive_video_web_url: string | null;
   drive_folder_id: string | null;
   drive_folder_url: string | null;
+  drive_video_id: string | null;
+  created_at: string | null;
   scheduled_at: string | null;
   scheduled_account_id: string | null;
 }

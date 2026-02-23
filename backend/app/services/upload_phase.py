@@ -218,6 +218,8 @@ class UploadPhaseService:
                 "drive_video_web_url": readiness.drive_video_web_url,
                 "drive_folder_id": readiness.drive_folder_id,
                 "drive_folder_url": readiness.drive_folder_url,
+                "drive_video_id": readiness.drive_video_id,
+                "created_at": project.created_at.isoformat() if project.created_at else None,
                 "scheduled_at": project.scheduled_at.isoformat() if project.scheduled_at else None,
                 "scheduled_account_id": project.scheduled_account_id,
             }
