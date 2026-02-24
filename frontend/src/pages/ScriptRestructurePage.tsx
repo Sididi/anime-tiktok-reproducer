@@ -17,8 +17,8 @@ import {
 import { Button } from "@/components/ui";
 import { useProjectStore, useSceneStore } from "@/stores";
 import { api } from "@/api/client";
-import type { Transcription, Project } from "@/types";
-import { ScriptEditorModal } from "@/components/script";
+import type { Transcription, Project, PlatformMetadata } from "@/types";
+import { ScriptEditorModal, MetadataEditorModal } from "@/components/script";
 
 // Upload mode types
 type UploadMode = "single" | "multiple";
@@ -273,11 +273,11 @@ function endsWithSentence(text: string): boolean {
 }
 
 // ElevenLabs optimal character range
-const ELEVENLABS_MIN = 800;
-const ELEVENLABS_MAX = 1000;
-const ELEVENLABS_SOFT_MIN = 700; // Fallback threshold when 800+ isn't possible
+const ELEVENLABS_MIN = 600;
+const ELEVENLABS_MAX = 800;
+const ELEVENLABS_SOFT_MIN = 500; // Fallback threshold when 600+ isn't possible
 const ELEVENLABS_HARD_LIMIT = 1800; // Force split to prevent runaway
-const ELEVENLABS_MIN_SPLIT = 500; // Avoid very short chunks when splitting
+const ELEVENLABS_MIN_SPLIT = 400; // Avoid very short chunks when splitting
 
 function getSegmentQualityScore(chars: number): number {
   if (chars >= ELEVENLABS_MIN && chars <= ELEVENLABS_MAX) {
@@ -549,6 +549,69 @@ function validateMetadataObject(
   return { valid: true, error: null };
 }
 
+function createEmptyMetadata(): PlatformMetadata {
+  return {
+    facebook: {
+      title: "",
+      description: "",
+      tags: [],
+    },
+    instagram: {
+      caption: "",
+    },
+    youtube: {
+      title: "",
+      description: "",
+      tags: [],
+    },
+    tiktok: {
+      description: "",
+    },
+  };
+}
+
+function coerceMetadataForEditor(payload: unknown): PlatformMetadata {
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+    return createEmptyMetadata();
+  }
+
+  const obj = payload as Record<string, unknown>;
+  const asRecord = (value: unknown): Record<string, unknown> =>
+    typeof value === "object" && value !== null && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+  const asString = (value: unknown): string =>
+    typeof value === "string" ? value : "";
+  const asStringArray = (value: unknown): string[] =>
+    Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === "string")
+      : [];
+
+  const facebook = asRecord(obj.facebook);
+  const instagram = asRecord(obj.instagram);
+  const youtube = asRecord(obj.youtube);
+  const tiktok = asRecord(obj.tiktok);
+
+  return {
+    facebook: {
+      title: asString(facebook.title),
+      description: asString(facebook.description),
+      tags: asStringArray(facebook.tags),
+    },
+    instagram: {
+      caption: asString(instagram.caption),
+    },
+    youtube: {
+      title: asString(youtube.title),
+      description: asString(youtube.description),
+      tags: asStringArray(youtube.tags),
+    },
+    tiktok: {
+      description: asString(tiktok.description),
+    },
+  };
+}
+
 export function ScriptRestructurePage() {
   const { projectId } = useParams<{ projectId: string }>();
   const navigate = useNavigate();
@@ -562,7 +625,8 @@ export function ScriptRestructurePage() {
   const [targetLanguage, setTargetLanguage] = useState<TargetLanguage>("fr");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [promptCopied, setPromptCopied] = useState(false);
+  const [promptCopiedIndicator, setPromptCopiedIndicator] = useState(false);
 
   // New script state
   const [newScriptJson, setNewScriptJson] = useState("");
@@ -588,6 +652,7 @@ export function ScriptRestructurePage() {
   const [copiedFullScript, setCopiedFullScript] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [scriptEditorOpen, setScriptEditorOpen] = useState(false);
+  const [metadataEditorOpen, setMetadataEditorOpen] = useState(false);
 
   // Parse scenes from JSON for segmentation
   const parsedScenes = useMemo(() => {
@@ -605,6 +670,18 @@ export function ScriptRestructurePage() {
     if (!parsedScenes) return [];
     return segmentScenes(parsedScenes);
   }, [parsedScenes]);
+
+  const metadataEditorValue = useMemo<PlatformMetadata>(() => {
+    if (!metadataJson.trim()) {
+      return createEmptyMetadata();
+    }
+
+    try {
+      return coerceMetadataForEditor(JSON.parse(metadataJson));
+    } catch {
+      return createEmptyMetadata();
+    }
+  }, [metadataJson]);
 
   // Load data
   useEffect(() => {
@@ -640,8 +717,9 @@ export function ScriptRestructurePage() {
     const prompt = generatePrompt(transcription, project, targetLanguage);
     try {
       await navigator.clipboard.writeText(prompt);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+      setPromptCopied(true);
+      setPromptCopiedIndicator(true);
+      setTimeout(() => setPromptCopiedIndicator(false), 1500);
     } catch {
       // Clipboard API may fail in insecure contexts
     }
@@ -701,6 +779,15 @@ export function ScriptRestructurePage() {
       setMetadataError(`Invalid JSON: ${(err as Error).message}`);
     }
   }, []);
+
+  const handleMetadataEditorSave = useCallback(
+    (metadata: PlatformMetadata) => {
+      const pretty = JSON.stringify(metadata, null, 2);
+      handleMetadataJsonChange(pretty);
+      setMetadataExpanded(true);
+    },
+    [handleMetadataJsonChange],
+  );
 
   const handleCopyMetadataPrompt = useCallback(async () => {
     if (!projectId || !jsonValid || !newScriptJson) return;
@@ -904,7 +991,7 @@ export function ScriptRestructurePage() {
 
   return (
     <div className="min-h-screen p-4">
-      <div className="max-w-4xl mx-auto space-y-6">
+      <div className="max-w-6xl mx-auto space-y-6">
         <header className="flex items-center justify-between">
           <div>
             <h1 className="text-xl font-bold flex items-center gap-2">
@@ -941,460 +1028,485 @@ export function ScriptRestructurePage() {
           </div>
         )}
 
-        {/* Language Selection */}
-        <div className="bg-[hsl(var(--card))] rounded-lg p-6 space-y-4">
-          <h2 className="font-semibold">Langue de sortie</h2>
-          <p className="text-sm text-[hsl(var(--muted-foreground))]">
-            Choisissez la langue cible pour le script restructuré.
-          </p>
-          <select
-            value={targetLanguage}
-            onChange={(e) => {
-              setTargetLanguage(e.target.value as TargetLanguage);
-              setCopied(false); // Reset copied state when language changes
-              setMetadataCopiedPrompt(false);
-            }}
-            className="w-full p-2 rounded-md border border-[hsl(var(--input))] bg-[hsl(var(--background))] text-sm"
-          >
-            {LANGUAGE_OPTIONS.map((opt) => (
-              <option key={opt.value} value={opt.value}>
-                {opt.label}
-              </option>
-            ))}
-          </select>
-        </div>
-
-        {/* Step 1: Copy Prompt */}
-        <div className="bg-[hsl(var(--card))] rounded-lg p-6 space-y-4">
-          <div className="flex items-center justify-between">
-            <h2 className="font-semibold">
-              Step 1: Copy Restructuration Prompt
-            </h2>
-            <Button variant="outline" size="sm" onClick={handleCopyPrompt}>
-              {copied ? (
-                <>
-                  <Check className="h-4 w-4 mr-2" />
-                  Copied!
-                </>
-              ) : (
-                <>
-                  <Copy className="h-4 w-4 mr-2" />
-                  Copy Prompt
-                </>
-              )}
-            </Button>
-          </div>
-          <p className="text-sm text-[hsl(var(--muted-foreground))]">
-            Use this prompt with an AI (Claude, ChatGPT, etc.) to generate a new{" "}
-            {LANGUAGE_OPTIONS.find((l) => l.value === targetLanguage)?.label}{" "}
-            script. The AI will return JSON that you can paste below.
-          </p>
-          <div className="max-h-48 overflow-y-auto bg-[hsl(var(--muted))] rounded-lg p-3">
-            <pre className="text-xs whitespace-pre-wrap font-mono">
-              {prompt}
-            </pre>
-          </div>
-        </div>
-
-        {/* Step 2: Paste New Script */}
-        <div className="bg-[hsl(var(--card))] rounded-lg p-6 space-y-4">
-          <div className="flex items-center justify-between">
-            <h2 className="font-semibold">Step 2: Paste New Script JSON</h2>
-            <div className="flex items-center gap-2">
-              {jsonValid && (
-                <>
-                  <span className="text-sm text-green-500 flex items-center gap-1">
-                    <Check className="h-4 w-4" />
-                    Valid JSON
-                  </span>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setScriptEditorOpen(true)}
-                  >
-                    <Pencil className="h-4 w-4 mr-1.5" />
-                    Edit Script
-                  </Button>
-                </>
-              )}
-            </div>
-          </div>
-          <p className="text-sm text-[hsl(var(--muted-foreground))]">
-            Paste the JSON response from the AI here. It should contain the
-            restructured script.
-          </p>
-          <textarea
-            value={newScriptJson}
-            onChange={(e) => handleJsonChange(e.target.value)}
-            placeholder='{"language": "fr", "scenes": [...]}'
-            className="w-full min-h-[200px] p-3 rounded-md border border-[hsl(var(--input))] bg-transparent font-mono text-sm resize-y"
-          />
-          {jsonError && (
-            <p className="text-sm text-[hsl(var(--destructive))]">
-              {jsonError}
-            </p>
-          )}
-        </div>
-
-        {/* Optional metadata step */}
-        <div className="bg-[hsl(var(--card))] rounded-lg p-6 space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="space-y-1">
-              <h2 className="font-semibold flex items-center gap-2">
-                <FileText className="h-4 w-4" />
-                Optional: Generate Platform Metadata
-                {metadataDone && (
-                  <span className="inline-flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-full bg-green-500/15 text-green-500">
-                    <Check className="h-3.5 w-3.5" />
-                    Ready
-                  </span>
-                )}
-              </h2>
+        <div className="lg:grid lg:grid-cols-[minmax(0,1fr)_280px] lg:gap-6">
+          <div className="space-y-6">
+            {/* Language Selection */}
+            <div className="bg-[hsl(var(--card))] rounded-lg p-6 space-y-4">
+              <h2 className="font-semibold">Langue de sortie</h2>
               <p className="text-sm text-[hsl(var(--muted-foreground))]">
-                Build JSON metadata for YouTube, Facebook, Instagram, and TikTok.
+                Choisissez la langue cible pour le script restructuré.
               </p>
+              <select
+                value={targetLanguage}
+                onChange={(e) => {
+                  setTargetLanguage(e.target.value as TargetLanguage);
+                  setPromptCopied(false);
+                  setPromptCopiedIndicator(false);
+                  setMetadataCopiedPrompt(false);
+                }}
+                className="w-full p-2 rounded-md border border-[hsl(var(--input))] bg-[hsl(var(--background))] text-sm"
+              >
+                {LANGUAGE_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
             </div>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setMetadataExpanded((prev) => !prev)}
-            >
-              {metadataExpanded ? (
-                <>
-                  Hide
-                  <ChevronUp className="h-4 w-4 ml-2" />
-                </>
-              ) : (
-                <>
-                  Show
-                  <ChevronDown className="h-4 w-4 ml-2" />
-                </>
-              )}
-            </Button>
-          </div>
 
-          {metadataExpanded && (
-            <div className="space-y-4">
+            {/* Step 1: Copy Prompt */}
+            <div className="bg-[hsl(var(--card))] rounded-lg p-6 space-y-4">
               <div className="flex items-center justify-between">
-                <p className="text-sm text-[hsl(var(--muted-foreground))]">
-                  Copy the metadata prompt, run it in your LLM, and paste the JSON response.
-                </p>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={handleCopyMetadataPrompt}
-                  disabled={!jsonValid || metadataPromptLoading}
-                >
-                  {metadataPromptLoading ? (
-                    <>
-                      <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                      Building...
-                    </>
-                  ) : metadataCopiedPrompt ? (
+                <h2 className="font-semibold">
+                  Step 1: Copy Restructuration Prompt
+                </h2>
+                <Button variant="outline" size="sm" onClick={handleCopyPrompt}>
+                  {promptCopiedIndicator ? (
                     <>
                       <Check className="h-4 w-4 mr-2" />
-                      Copied
+                      Copied!
                     </>
                   ) : (
                     <>
                       <Copy className="h-4 w-4 mr-2" />
-                      Copy Metadata Prompt
+                      Copy Prompt
                     </>
                   )}
                 </Button>
               </div>
+              <p className="text-sm text-[hsl(var(--muted-foreground))]">
+                Use this prompt with an AI (Claude, ChatGPT, etc.) to generate
+                a new{" "}
+                {LANGUAGE_OPTIONS.find((l) => l.value === targetLanguage)?.label}{" "}
+                script. The AI will return JSON that you can paste below.
+              </p>
+              <div className="max-h-48 overflow-y-auto bg-[hsl(var(--muted))] rounded-lg p-3">
+                <pre className="text-xs whitespace-pre-wrap font-mono">
+                  {prompt}
+                </pre>
+              </div>
+            </div>
 
-              {!jsonValid && (
-                <div className="p-3 rounded-md bg-[hsl(var(--muted))] text-sm text-[hsl(var(--muted-foreground))]">
-                  Validate script JSON in Step 2 first to enable metadata prompt generation.
+            {/* Step 2: Paste New Script */}
+            <div className="bg-[hsl(var(--card))] rounded-lg p-6 space-y-4">
+              <div className="flex items-center justify-between">
+                <h2 className="font-semibold">Step 2: Paste New Script JSON</h2>
+                <div className="flex items-center gap-2">
+                  {jsonValid && (
+                    <>
+                      <span className="text-sm text-green-500 flex items-center gap-1">
+                        <Check className="h-4 w-4" />
+                        Valid JSON
+                      </span>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setScriptEditorOpen(true)}
+                      >
+                        <Pencil className="h-4 w-4 mr-1.5" />
+                        Edit Script
+                      </Button>
+                    </>
+                  )}
                 </div>
-              )}
-
+              </div>
+              <p className="text-sm text-[hsl(var(--muted-foreground))]">
+                Paste the JSON response from the AI here. It should contain the
+                restructured script.
+              </p>
               <textarea
-                value={metadataJson}
-                onChange={(e) => handleMetadataJsonChange(e.target.value)}
-                placeholder='{"facebook": {...}, "instagram": {...}, "youtube": {...}, "tiktok": {...}}'
-                className="w-full min-h-[180px] p-3 rounded-md border border-[hsl(var(--input))] bg-transparent font-mono text-sm resize-y"
+                value={newScriptJson}
+                onChange={(e) => handleJsonChange(e.target.value)}
+                placeholder='{"language": "fr", "scenes": [...]}'
+                className="w-full min-h-[200px] p-3 rounded-md border border-[hsl(var(--input))] bg-transparent font-mono text-sm resize-y"
               />
-              {metadataError && (
-                <p className="text-sm text-[hsl(var(--destructive))]">{metadataError}</p>
+              {jsonError && (
+                <p className="text-sm text-[hsl(var(--destructive))]">
+                  {jsonError}
+                </p>
               )}
             </div>
-          )}
-        </div>
 
-        {/* Step 3: Upload Audio */}
-        <div className="bg-[hsl(var(--card))] rounded-lg p-6 space-y-4">
-          <h2 className="font-semibold">Step 3: Upload TTS Audio</h2>
-          <p className="text-sm text-[hsl(var(--muted-foreground))]">
-            Generate TTS audio from the new script (using ElevenLabs or similar)
-            and upload it here.
-          </p>
-
-          {/* Upload Mode Selector */}
-          <div className="flex items-center gap-2">
-            <select
-              value={uploadMode}
-              onChange={(e) => {
-                setUploadMode(e.target.value as UploadMode);
-                setAudioFile(null);
-                setSegmentFiles(new Map());
-              }}
-              className="p-2 rounded-md border border-[hsl(var(--input))] bg-[hsl(var(--background))] text-sm"
-            >
-              <option value="multiple">Multiple files (Recommended)</option>
-              <option value="single">Single file</option>
-            </select>
-            <span className="text-xs text-[hsl(var(--muted-foreground))]">
-              {uploadMode === "multiple"
-                ? "Split into segments for better ElevenLabs quality"
-                : "Upload one combined audio file"}
-            </span>
-          </div>
-
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="audio/*"
-            onChange={handleFileSelect}
-            className="hidden"
-          />
-
-          {uploadMode === "single" ? (
-            // Single file upload (original behavior)
-            <>
-              {jsonValid && parsedScenes && (
-                <div className="flex items-center justify-between p-2 bg-[hsl(var(--muted))] rounded-lg">
-                  <span className="text-xs text-[hsl(var(--muted-foreground))] truncate flex-1 mx-2 italic">
-                    "
-                    {parsedScenes
-                      .map((s) => s.text)
-                      .join(" ")
-                      .slice(0, 120)}
-                    ..."
-                  </span>
+            {/* Optional metadata step */}
+            <div className="bg-[hsl(var(--card))] rounded-lg p-6 space-y-4">
+              <div className="flex items-center justify-between gap-2">
+                <div className="space-y-1">
+                  <h2 className="font-semibold flex items-center gap-2">
+                    <FileText className="h-4 w-4" />
+                    Optional: Generate Platform Metadata
+                    {metadataDone && (
+                      <span className="inline-flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-full bg-green-500/15 text-green-500">
+                        <Check className="h-3.5 w-3.5" />
+                        Ready
+                      </span>
+                    )}
+                  </h2>
+                  <p className="text-sm text-[hsl(var(--muted-foreground))]">
+                    Build JSON metadata for YouTube, Facebook, Instagram, and
+                    TikTok.
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setMetadataExpanded(true);
+                      setMetadataEditorOpen(true);
+                    }}
+                  >
+                    <Pencil className="h-4 w-4 mr-1.5" />
+                    Edit Script
+                  </Button>
                   <Button
                     variant="ghost"
                     size="sm"
-                    onClick={handleCopyFullScript}
-                    className="h-7 px-2 shrink-0"
+                    onClick={() => setMetadataExpanded((prev) => !prev)}
                   >
-                    {copiedFullScript ? (
+                    {metadataExpanded ? (
                       <>
-                        <Check className="h-3 w-3 mr-1" />
-                        Copied
+                        Hide
+                        <ChevronUp className="h-4 w-4 ml-2" />
                       </>
                     ) : (
                       <>
-                        <Copy className="h-3 w-3 mr-1" />
-                        Copy text
+                        Show
+                        <ChevronDown className="h-4 w-4 ml-2" />
                       </>
                     )}
                   </Button>
                 </div>
-              )}
-              {audioFile ? (
-                <div
-                  className="flex items-center gap-3 p-3 bg-[hsl(var(--muted))] rounded-lg"
-                  onDrop={(e) => handleDrop(e, "single")}
-                  onDragOver={handleDragOver}
-                >
-                  <FileAudio className="h-8 w-8 text-[hsl(var(--primary))]" />
-                  <div className="flex-1 min-w-0">
-                    <p className="font-medium truncate">{audioFile.name}</p>
-                    <p className="text-xs text-[hsl(var(--muted-foreground))]">
-                      {(audioFile.size / (1024 * 1024)).toFixed(2)} MB
-                    </p>
-                  </div>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => fileInputRef.current?.click()}
-                  >
-                    Change
-                  </Button>
-                </div>
-              ) : (
-                <Button
-                  variant="outline"
-                  className="w-full h-24 border-dashed"
-                  onClick={() => fileInputRef.current?.click()}
-                  onDrop={(e) => handleDrop(e, "single")}
-                  onDragOver={handleDragOver}
-                >
-                  <Upload className="h-6 w-6 mr-2" />
-                  Drop or click to upload audio file
-                </Button>
-              )}
-            </>
-          ) : (
-            // Multiple files upload
-            <>
-              {!jsonValid ? (
-                <div className="p-4 bg-[hsl(var(--muted))] rounded-lg text-center">
-                  <Files className="h-8 w-8 mx-auto mb-2 text-[hsl(var(--muted-foreground))]" />
-                  <p className="text-sm text-[hsl(var(--muted-foreground))]">
-                    Paste valid JSON in Step 2 to see audio segments
-                  </p>
-                </div>
-              ) : audioSegments.length === 0 ? (
-                <div className="p-4 bg-[hsl(var(--muted))] rounded-lg text-center">
-                  <p className="text-sm text-[hsl(var(--muted-foreground))]">
-                    No segments generated from script
-                  </p>
-                </div>
-              ) : (
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between text-sm">
-                    <span className="text-[hsl(var(--muted-foreground))]">
-                      {audioSegments.length} segment
-                      {audioSegments.length > 1 ? "s" : ""} (800-1000 chars
-                      target for optimal quality)
-                    </span>
-                    <span className="text-[hsl(var(--muted-foreground))]">
-                      {uploadedSegmentsCount}/{audioSegments.length} uploaded
-                    </span>
-                  </div>
-                  {audioSegments.map((segment) => {
-                    const file = segmentFiles.get(segment.id);
-                    const inputId = `segment-file-${segment.id}`;
-                    return (
-                      <div
-                        key={segment.id}
-                        className="border border-[hsl(var(--border))] rounded-lg p-3 space-y-2"
-                      >
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-2">
-                            <span className="font-medium text-sm">
-                              Part {segment.id}
-                            </span>
-                            <span className="text-xs px-2 py-0.5 bg-[hsl(var(--muted))] rounded">
-                              Scenes{" "}
-                              {segment.sceneIndices.length === 1
-                                ? segment.sceneIndices[0]
-                                : `${segment.sceneIndices[0]}-${segment.sceneIndices[segment.sceneIndices.length - 1]}`}
-                            </span>
-                            <span className="text-xs text-[hsl(var(--muted-foreground))]">
-                              {segment.characterCount} chars
-                            </span>
-                          </div>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => handleCopySegment(segment)}
-                            className="h-7 px-2"
-                          >
-                            {copiedSegment === segment.id ? (
-                              <>
-                                <Check className="h-3 w-3 mr-1" />
-                                Copied
-                              </>
-                            ) : (
-                              <>
-                                <Copy className="h-3 w-3 mr-1" />
-                                Copy text
-                              </>
-                            )}
-                          </Button>
-                        </div>
-                        <div className="text-xs text-[hsl(var(--muted-foreground))] line-clamp-2 italic">
-                          "{segment.text.slice(0, 150)}
-                          {segment.text.length > 150 ? "..." : ""}"
-                        </div>
-                        <input
-                          id={inputId}
-                          type="file"
-                          accept="audio/*"
-                          onChange={(e) =>
-                            handleSegmentFileSelect(segment.id, e)
-                          }
-                          className="hidden"
-                        />
-                        {file ? (
-                          <div
-                            className="flex items-center gap-2 p-2 bg-[hsl(var(--muted))] rounded"
-                            onDrop={(e) => handleDrop(e, segment.id)}
-                            onDragOver={handleDragOver}
-                          >
-                            <FileAudio2 className="h-5 w-5 text-green-500" />
-                            <span className="text-xs truncate flex-1">
-                              {file.name}
-                            </span>
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="h-6 px-2 text-xs"
-                              onClick={() =>
-                                document.getElementById(inputId)?.click()
-                              }
-                            >
-                              Change
-                            </Button>
-                          </div>
-                        ) : (
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            className="w-full h-10 border-dashed"
-                            onClick={() =>
-                              document.getElementById(inputId)?.click()
-                            }
-                            onDrop={(e) => handleDrop(e, segment.id)}
-                            onDragOver={handleDragOver}
-                          >
-                            <Upload className="h-4 w-4 mr-2" />
-                            Drop or upload Part {segment.id}
-                          </Button>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </>
-          )}
-        </div>
+              </div>
 
-        {/* Summary */}
-        <div className="bg-[hsl(var(--muted))] rounded-lg p-4">
-          <h3 className="font-medium mb-2">Checklist</h3>
-          <ul className="space-y-1 text-sm">
-            <li className="flex items-center gap-2">
-              <div
-                className={`h-3 w-3 rounded-full ${copied ? "bg-green-500" : "bg-[hsl(var(--border))]"}`}
+              {metadataExpanded && (
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between">
+                    <p className="text-sm text-[hsl(var(--muted-foreground))]">
+                      Copy the metadata prompt, run it in your LLM, and paste
+                      the JSON response.
+                    </p>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleCopyMetadataPrompt}
+                      disabled={!jsonValid || metadataPromptLoading}
+                    >
+                      {metadataPromptLoading ? (
+                        <>
+                          <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                          Building...
+                        </>
+                      ) : metadataCopiedPrompt ? (
+                        <>
+                          <Check className="h-4 w-4 mr-2" />
+                          Copied
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="h-4 w-4 mr-2" />
+                          Copy Metadata Prompt
+                        </>
+                      )}
+                    </Button>
+                  </div>
+
+                  {!jsonValid && (
+                    <div className="p-3 rounded-md bg-[hsl(var(--muted))] text-sm text-[hsl(var(--muted-foreground))]">
+                      Validate script JSON in Step 2 first to enable metadata
+                      prompt generation.
+                    </div>
+                  )}
+
+                  <textarea
+                    value={metadataJson}
+                    onChange={(e) => handleMetadataJsonChange(e.target.value)}
+                    placeholder='{"facebook": {...}, "instagram": {...}, "youtube": {...}, "tiktok": {...}}'
+                    className="w-full min-h-[180px] p-3 rounded-md border border-[hsl(var(--input))] bg-transparent font-mono text-sm resize-y"
+                  />
+                  {metadataError && (
+                    <p className="text-sm text-[hsl(var(--destructive))]">
+                      {metadataError}
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Step 3: Upload Audio */}
+            <div className="bg-[hsl(var(--card))] rounded-lg p-6 space-y-4">
+              <h2 className="font-semibold">Step 3: Upload TTS Audio</h2>
+              <p className="text-sm text-[hsl(var(--muted-foreground))]">
+                Generate TTS audio from the new script (using ElevenLabs or
+                similar) and upload it here.
+              </p>
+
+              {/* Upload Mode Selector */}
+              <div className="flex items-center gap-2">
+                <select
+                  value={uploadMode}
+                  onChange={(e) => {
+                    setUploadMode(e.target.value as UploadMode);
+                    setAudioFile(null);
+                    setSegmentFiles(new Map());
+                  }}
+                  className="p-2 rounded-md border border-[hsl(var(--input))] bg-[hsl(var(--background))] text-sm"
+                >
+                  <option value="multiple">Multiple files (Recommended)</option>
+                  <option value="single">Single file</option>
+                </select>
+                <span className="text-xs text-[hsl(var(--muted-foreground))]">
+                  {uploadMode === "multiple"
+                    ? "Split into segments for better ElevenLabs quality"
+                    : "Upload one combined audio file"}
+                </span>
+              </div>
+
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="audio/*"
+                onChange={handleFileSelect}
+                className="hidden"
               />
-              Prompt copied
-            </li>
-            <li className="flex items-center gap-2">
-              <div
-                className={`h-3 w-3 rounded-full ${jsonValid ? "bg-green-500" : "bg-[hsl(var(--border))]"}`}
-              />
-              New script JSON validated
-            </li>
-            <li className="flex items-center gap-2">
-              <div
-                className={`h-3 w-3 rounded-full ${metadataDone ? "bg-green-500" : "bg-[hsl(var(--border))]"}`}
-              />
-              Optional metadata {metadataDone ? "ready" : "skipped"}
-            </li>
-            <li className="flex items-center gap-2">
-              <div
-                className={`h-3 w-3 rounded-full ${
-                  uploadMode === "single"
-                    ? audioFile
-                      ? "bg-green-500"
-                      : "bg-[hsl(var(--border))]"
-                    : uploadedSegmentsCount === audioSegments.length &&
-                        audioSegments.length > 0
-                      ? "bg-green-500"
-                      : "bg-[hsl(var(--border))]"
-                }`}
-              />
-              {uploadMode === "single"
-                ? "TTS audio uploaded"
-                : `TTS audio uploaded (${uploadedSegmentsCount}/${audioSegments.length} parts)`}
-            </li>
-          </ul>
+
+              {uploadMode === "single" ? (
+                // Single file upload (original behavior)
+                <>
+                  {jsonValid && parsedScenes && (
+                    <div className="flex items-center justify-between p-2 bg-[hsl(var(--muted))] rounded-lg">
+                      <span className="text-xs text-[hsl(var(--muted-foreground))] truncate flex-1 mx-2 italic">
+                        "
+                        {parsedScenes
+                          .map((s) => s.text)
+                          .join(" ")
+                          .slice(0, 120)}
+                        ..."
+                      </span>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={handleCopyFullScript}
+                        className="h-7 px-2 shrink-0"
+                      >
+                        {copiedFullScript ? (
+                          <>
+                            <Check className="h-3 w-3 mr-1" />
+                            Copied
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="h-3 w-3 mr-1" />
+                            Copy text
+                          </>
+                        )}
+                      </Button>
+                    </div>
+                  )}
+                  {audioFile ? (
+                    <div
+                      className="flex items-center gap-3 p-3 bg-[hsl(var(--muted))] rounded-lg"
+                      onDrop={(e) => handleDrop(e, "single")}
+                      onDragOver={handleDragOver}
+                    >
+                      <FileAudio className="h-8 w-8 text-[hsl(var(--primary))]" />
+                      <div className="flex-1 min-w-0">
+                        <p className="font-medium truncate">{audioFile.name}</p>
+                        <p className="text-xs text-[hsl(var(--muted-foreground))]">
+                          {(audioFile.size / (1024 * 1024)).toFixed(2)} MB
+                        </p>
+                      </div>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => fileInputRef.current?.click()}
+                      >
+                        Change
+                      </Button>
+                    </div>
+                  ) : (
+                    <Button
+                      variant="outline"
+                      className="w-full h-24 border-dashed"
+                      onClick={() => fileInputRef.current?.click()}
+                      onDrop={(e) => handleDrop(e, "single")}
+                      onDragOver={handleDragOver}
+                    >
+                      <Upload className="h-6 w-6 mr-2" />
+                      Drop or click to upload audio file
+                    </Button>
+                  )}
+                </>
+              ) : (
+                // Multiple files upload
+                <>
+                  {!jsonValid ? (
+                    <div className="p-4 bg-[hsl(var(--muted))] rounded-lg text-center">
+                      <Files className="h-8 w-8 mx-auto mb-2 text-[hsl(var(--muted-foreground))]" />
+                      <p className="text-sm text-[hsl(var(--muted-foreground))]">
+                        Paste valid JSON in Step 2 to see audio segments
+                      </p>
+                    </div>
+                  ) : audioSegments.length === 0 ? (
+                    <div className="p-4 bg-[hsl(var(--muted))] rounded-lg text-center">
+                      <p className="text-sm text-[hsl(var(--muted-foreground))]">
+                        No segments generated from script
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      <div className="flex items-center justify-between text-sm">
+                        <span className="text-[hsl(var(--muted-foreground))]">
+                          {audioSegments.length} segment
+                          {audioSegments.length > 1 ? "s" : ""} (600-800 chars
+                          target for optimal quality)
+                        </span>
+                        <span className="text-[hsl(var(--muted-foreground))]">
+                          {uploadedSegmentsCount}/{audioSegments.length} uploaded
+                        </span>
+                      </div>
+                      {audioSegments.map((segment) => {
+                        const file = segmentFiles.get(segment.id);
+                        const inputId = `segment-file-${segment.id}`;
+                        return (
+                          <div
+                            key={segment.id}
+                            className="border border-[hsl(var(--border))] rounded-lg p-3 space-y-2"
+                          >
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center gap-2">
+                                <span className="font-medium text-sm">
+                                  Part {segment.id}
+                                </span>
+                                <span className="text-xs px-2 py-0.5 bg-[hsl(var(--muted))] rounded">
+                                  Scenes{" "}
+                                  {segment.sceneIndices.length === 1
+                                    ? segment.sceneIndices[0]
+                                    : `${segment.sceneIndices[0]}-${segment.sceneIndices[segment.sceneIndices.length - 1]}`}
+                                </span>
+                                <span className="text-xs text-[hsl(var(--muted-foreground))]">
+                                  {segment.characterCount} chars
+                                </span>
+                              </div>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => handleCopySegment(segment)}
+                                className="h-7 px-2"
+                              >
+                                {copiedSegment === segment.id ? (
+                                  <>
+                                    <Check className="h-3 w-3 mr-1" />
+                                    Copied
+                                  </>
+                                ) : (
+                                  <>
+                                    <Copy className="h-3 w-3 mr-1" />
+                                    Copy text
+                                  </>
+                                )}
+                              </Button>
+                            </div>
+                            <div className="text-xs text-[hsl(var(--muted-foreground))] line-clamp-2 italic">
+                              "{segment.text.slice(0, 150)}
+                              {segment.text.length > 150 ? "..." : ""}"
+                            </div>
+                            <input
+                              id={inputId}
+                              type="file"
+                              accept="audio/*"
+                              onChange={(e) =>
+                                handleSegmentFileSelect(segment.id, e)
+                              }
+                              className="hidden"
+                            />
+                            {file ? (
+                              <div
+                                className="flex items-center gap-2 p-2 bg-[hsl(var(--muted))] rounded"
+                                onDrop={(e) => handleDrop(e, segment.id)}
+                                onDragOver={handleDragOver}
+                              >
+                                <FileAudio2 className="h-5 w-5 text-green-500" />
+                                <span className="text-xs truncate flex-1">
+                                  {file.name}
+                                </span>
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  className="h-6 px-2 text-xs"
+                                  onClick={() =>
+                                    document.getElementById(inputId)?.click()
+                                  }
+                                >
+                                  Change
+                                </Button>
+                              </div>
+                            ) : (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="w-full h-10 border-dashed"
+                                onClick={() =>
+                                  document.getElementById(inputId)?.click()
+                                }
+                                onDrop={(e) => handleDrop(e, segment.id)}
+                                onDragOver={handleDragOver}
+                              >
+                                <Upload className="h-4 w-4 mr-2" />
+                                Drop or upload Part {segment.id}
+                              </Button>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+
+          <aside className="mt-6 lg:mt-0">
+            <div className="bg-[hsl(var(--muted))] rounded-lg p-4 lg:sticky lg:top-4">
+              <h3 className="font-medium mb-2">Checklist</h3>
+              <ul className="space-y-1 text-sm">
+                <li className="flex items-center gap-2">
+                  <div
+                    className={`h-3 w-3 rounded-full ${promptCopied ? "bg-green-500" : "bg-[hsl(var(--border))]"}`}
+                  />
+                  Prompt copied
+                </li>
+                <li className="flex items-center gap-2">
+                  <div
+                    className={`h-3 w-3 rounded-full ${jsonValid ? "bg-green-500" : "bg-[hsl(var(--border))]"}`}
+                  />
+                  New script JSON validated
+                </li>
+                <li className="flex items-center gap-2">
+                  <div
+                    className={`h-3 w-3 rounded-full ${metadataDone ? "bg-green-500" : "bg-[hsl(var(--border))]"}`}
+                  />
+                  Optional metadata {metadataDone ? "ready" : "skipped"}
+                </li>
+                <li className="flex items-center gap-2">
+                  <div
+                    className={`h-3 w-3 rounded-full ${
+                      uploadMode === "single"
+                        ? audioFile
+                          ? "bg-green-500"
+                          : "bg-[hsl(var(--border))]"
+                        : uploadedSegmentsCount === audioSegments.length &&
+                            audioSegments.length > 0
+                          ? "bg-green-500"
+                          : "bg-[hsl(var(--border))]"
+                    }`}
+                  />
+                  {uploadMode === "single"
+                    ? "TTS audio uploaded"
+                    : `TTS audio uploaded (${uploadedSegmentsCount}/${audioSegments.length} parts)`}
+                </li>
+              </ul>
+            </div>
+          </aside>
         </div>
       </div>
 
@@ -1412,6 +1524,13 @@ export function ScriptRestructurePage() {
           targetLanguage={targetLanguage}
         />
       )}
+
+      <MetadataEditorModal
+        isOpen={metadataEditorOpen}
+        onClose={() => setMetadataEditorOpen(false)}
+        metadata={metadataEditorValue}
+        onSave={handleMetadataEditorSave}
+      />
     </div>
   );
 }
