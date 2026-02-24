@@ -361,7 +361,9 @@ export const api = {
     payload: {
       target_language: string;
       voice_key: string;
-      include_metadata: boolean;
+      existing_script_json?: Record<string, unknown>;
+      skip_metadata?: boolean;
+      skip_tts?: boolean;
     },
     signal?: AbortSignal,
   ) =>

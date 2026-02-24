@@ -383,7 +383,9 @@ class ScriptAutomationService:
         project_id: str,
         target_language: str,
         voice_key: str,
-        include_metadata: bool,
+        existing_script_json: dict[str, Any] | None = None,
+        skip_metadata: bool = False,
+        skip_tts: bool = False,
     ) -> AsyncIterator[dict[str, Any]]:
         try:
             if not settings.script_automate_enabled:
@@ -397,9 +399,9 @@ class ScriptAutomationService:
             if not transcription or not transcription.scenes:
                 raise RuntimeError("No transcription found for this project")
 
-            if not GeminiService.is_configured():
+            if existing_script_json is None and not GeminiService.is_configured():
                 raise RuntimeError("Gemini API key is missing (ATR_GEMINI_API_KEY)")
-            if not ElevenLabsService.is_configured():
+            if not skip_tts and not ElevenLabsService.is_configured():
                 raise RuntimeError("ElevenLabs API key is missing (ATR_ELEVENLABS_API_KEY)")
 
             voice = VoiceConfigService.get_voice(voice_key)
@@ -413,25 +415,35 @@ class ScriptAutomationService:
                 run_id=run_id,
             )
 
-            yield cls._event("llm_script", message="Generating script JSON with Gemini...")
-            prompt = cls._build_script_prompt(
-                project=project,
-                transcription=transcription,
-                target_language=target_language,
-            )
-            raw_script_payload = await asyncio.to_thread(
-                GeminiService.generate_json,
-                prompt,
-                response_json_schema=cls._script_response_schema(
+            # --- Script generation (or reuse existing) ---
+            if existing_script_json is not None:
+                yield cls._event("llm_script", message="Script JSON provided — skipping generation")
+                script_payload = cls._normalize_script_payload(
+                    payload=existing_script_json,
+                    transcription=transcription,
                     target_language=target_language,
-                    scene_count=len(transcription.scenes),
-                ),
-            )
-            script_payload = cls._normalize_script_payload(
-                payload=raw_script_payload,
-                transcription=transcription,
-                target_language=target_language,
-            )
+                )
+            else:
+                yield cls._event("llm_script", message="Generating script JSON with Gemini...")
+                prompt = cls._build_script_prompt(
+                    project=project,
+                    transcription=transcription,
+                    target_language=target_language,
+                )
+                raw_script_payload = await asyncio.to_thread(
+                    GeminiService.generate_json,
+                    prompt,
+                    response_json_schema=cls._script_response_schema(
+                        target_language=target_language,
+                        scene_count=len(transcription.scenes),
+                    ),
+                )
+                script_payload = cls._normalize_script_payload(
+                    payload=raw_script_payload,
+                    transcription=transcription,
+                    target_language=target_language,
+                )
+
             script_path = run_dir / "script.json"
             script_path.write_text(
                 json.dumps(script_payload, ensure_ascii=False, indent=2),
@@ -440,14 +452,17 @@ class ScriptAutomationService:
 
             yield cls._event(
                 "llm_script",
-                message="Script JSON generated",
+                message="Script JSON ready",
                 script_scene_count=len(script_payload.get("scenes", [])),
             )
 
+            # --- Metadata generation ---
             metadata_payload: dict[str, Any] | None = None
             metadata_warning: str | None = None
 
-            if include_metadata:
+            if skip_metadata:
+                yield cls._event("llm_metadata", message="Metadata generation skipped")
+            else:
                 yield cls._event("llm_metadata", message="Generating metadata JSON with Gemini...")
                 try:
                     metadata_prompt = MetadataService.build_prompt_from_script_json(
@@ -474,60 +489,63 @@ class ScriptAutomationService:
                         message=metadata_warning,
                         warning=metadata_warning,
                     )
-            else:
-                yield cls._event("llm_metadata", message="Metadata generation skipped")
 
-            full_text = cls._script_text_from_payload(script_payload)
-            if not full_text:
-                raise RuntimeError("Script JSON contains no text for TTS generation")
-
-            yield cls._event("tts_segmenting", message="Segmenting script for TTS...")
-            chunks = cls._segment_text_for_tts(full_text)
-            if not chunks:
-                raise RuntimeError("Failed to segment script text for TTS")
-
-            yield cls._event(
-                "tts_segmenting",
-                message=f"Prepared {len(chunks)} TTS segment(s)",
-                segment_count=len(chunks),
-            )
-
-            extension = cls._output_extension()
-            part_paths: list[Path] = []
+            # --- TTS generation ---
             parts: list[dict[str, Any]] = []
 
-            for idx, chunk in enumerate(chunks, start=1):
+            if skip_tts:
+                yield cls._event("tts_generating", message="TTS generation skipped")
+            else:
+                full_text = cls._script_text_from_payload(script_payload)
+                if not full_text:
+                    raise RuntimeError("Script JSON contains no text for TTS generation")
+
+                yield cls._event("tts_segmenting", message="Segmenting script for TTS...")
+                chunks = cls._segment_text_for_tts(full_text)
+                if not chunks:
+                    raise RuntimeError("Failed to segment script text for TTS")
+
                 yield cls._event(
-                    "tts_generating",
-                    message=f"Generating audio part {idx}/{len(chunks)}...",
-                    part_id=str(idx),
-                    part_index=idx,
-                    part_total=len(chunks),
-                    char_count=len(chunk),
+                    "tts_segmenting",
+                    message=f"Prepared {len(chunks)} TTS segment(s)",
+                    segment_count=len(chunks),
                 )
 
-                audio_bytes = await asyncio.to_thread(
-                    ElevenLabsService.synthesize,
-                    voice_id=voice.elevenlabs_voice_id,
-                    text=chunk,
-                    model_id=settings.elevenlabs_model_id,
-                    output_format=settings.elevenlabs_output_format,
-                    voice_settings=voice.voice_settings or None,
-                )
-                part_path = parts_dir / f"part_{idx}.{extension}"
-                part_path.write_bytes(audio_bytes)
-                part_paths.append(part_path)
+                extension = cls._output_extension()
+                part_paths: list[Path] = []
 
-                parts.append(
-                    {
-                        "id": str(idx),
-                        "char_count": len(chunk),
-                        "download_url": f"/api/projects/{project_id}/script/automate/runs/{run_id}/parts/{idx}",
-                    }
-                )
+                for idx, chunk in enumerate(chunks, start=1):
+                    yield cls._event(
+                        "tts_generating",
+                        message=f"Generating audio part {idx}/{len(chunks)}...",
+                        part_id=str(idx),
+                        part_index=idx,
+                        part_total=len(chunks),
+                        char_count=len(chunk),
+                    )
 
-            merged_path = run_dir / "merged.wav"
-            await asyncio.to_thread(cls._merge_parts_to_wav, part_paths, merged_path)
+                    audio_bytes = await asyncio.to_thread(
+                        ElevenLabsService.synthesize,
+                        voice_id=voice.elevenlabs_voice_id,
+                        text=chunk,
+                        model_id=settings.elevenlabs_model_id,
+                        output_format=settings.elevenlabs_output_format,
+                        voice_settings=voice.voice_settings or None,
+                    )
+                    part_path = parts_dir / f"part_{idx}.{extension}"
+                    part_path.write_bytes(audio_bytes)
+                    part_paths.append(part_path)
+
+                    parts.append(
+                        {
+                            "id": str(idx),
+                            "char_count": len(chunk),
+                            "download_url": f"/api/projects/{project_id}/script/automate/runs/{run_id}/parts/{idx}",
+                        }
+                    )
+
+                merged_path = run_dir / "merged.wav"
+                await asyncio.to_thread(cls._merge_parts_to_wav, part_paths, merged_path)
 
             complete_payload = cls._event(
                 "complete",

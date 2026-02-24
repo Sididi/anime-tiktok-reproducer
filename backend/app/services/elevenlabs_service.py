@@ -126,6 +126,15 @@ class ElevenLabsService:
         return response.content
 
     @classmethod
+    def get_preview_url_map(cls) -> dict[str, str | None]:
+        """Return {voice_id: preview_url} for all voices in one API call."""
+        try:
+            voices = cls.list_voices()
+            return {v["voice_id"]: v.get("preview_url") for v in voices if "voice_id" in v}
+        except Exception:
+            return {}
+
+    @classmethod
     def check_api_health(cls) -> dict[str, Any]:
         if not cls.is_configured():
             return {"status": "skipped", "detail": "ElevenLabs API key not configured"}

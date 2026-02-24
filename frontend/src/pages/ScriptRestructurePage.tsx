@@ -15,6 +15,8 @@ import {
   FileText,
   Bot,
   Square,
+  Play,
+  Pause,
 } from "lucide-react";
 import { Button } from "@/components/ui";
 import { useProjectStore, useSceneStore } from "@/stores";
@@ -607,13 +609,13 @@ export function ScriptRestructurePage() {
     string | null
   >(null);
   const [automationVoiceKey, setAutomationVoiceKey] = useState("");
-  const [automationIncludeMetadata, setAutomationIncludeMetadata] =
-    useState(true);
   const [automationRunning, setAutomationRunning] = useState(false);
   const [automationStep, setAutomationStep] = useState<string | null>(null);
   const [automationMessage, setAutomationMessage] = useState<string | null>(
     null,
   );
+  const [playingVoiceKey, setPlayingVoiceKey] = useState<string | null>(null);
+  const voiceAudioRef = useRef<HTMLAudioElement | null>(null);
 
   // Audio file state
   const [uploadMode, setUploadMode] = useState<UploadMode>("multiple");
@@ -840,6 +842,28 @@ export function ScriptRestructurePage() {
     setAutomationMessage("Automation cancelled");
   }, []);
 
+  const playVoicePreview = useCallback(
+    (url: string, voiceKey: string) => {
+      if (voiceAudioRef.current) {
+        voiceAudioRef.current.pause();
+        voiceAudioRef.current = null;
+      }
+      if (playingVoiceKey === voiceKey) {
+        setPlayingVoiceKey(null);
+        return;
+      }
+      const audio = new Audio(url);
+      voiceAudioRef.current = audio;
+      setPlayingVoiceKey(voiceKey);
+      audio.play().catch(() => {});
+      audio.onended = () => {
+        setPlayingVoiceKey(null);
+        voiceAudioRef.current = null;
+      };
+    },
+    [playingVoiceKey],
+  );
+
   const handleAutomate = useCallback(async () => {
     if (!projectId || !automationConfig) return;
     if (!automationConfig.enabled) {
@@ -856,9 +880,17 @@ export function ScriptRestructurePage() {
     setAutomationStep("starting");
     setAutomationMessage("Starting automation...");
     setAutomationRunning(true);
+    setPromptCopied(true);
 
     const controller = new AbortController();
     automationAbortRef.current = controller;
+
+    // Compute skip flags based on what's already filled
+    const skipScript = jsonValid && newScriptJson.trim() !== "";
+    const skipMetadata = metadataValid && metadataJson.trim() !== "";
+    const skipTts =
+      (uploadMode === "single" && audioFile !== null) ||
+      (uploadMode === "multiple" && segmentFiles.size > 0);
 
     try {
       const response = await api.automateScript(
@@ -866,7 +898,9 @@ export function ScriptRestructurePage() {
         {
           target_language: targetLanguage,
           voice_key: automationVoiceKey,
-          include_metadata: automationIncludeMetadata,
+          existing_script_json: skipScript ? JSON.parse(newScriptJson) : undefined,
+          skip_metadata: skipMetadata,
+          skip_tts: skipTts,
         },
         controller.signal,
       );
@@ -918,18 +952,18 @@ export function ScriptRestructurePage() {
       }
 
       const parts = finalEvent.parts || [];
-      if (parts.length === 0) {
-        throw new Error("Automation response did not include audio parts");
+      if (parts.length > 0) {
+        const files = await hydrateAutomationParts(finalEvent.run_id, parts);
+        setUploadMode("multiple");
+        setAudioFile(null);
+        setSegmentFiles(files);
+        setRequiredSegmentIds([...files.keys()].sort((a, b) => a - b));
+        setAutomationMessage(
+          `Automation complete (${parts.length} part${parts.length > 1 ? "s" : ""} loaded)`,
+        );
+      } else {
+        setAutomationMessage("Automation complete (audio kept as-is)");
       }
-
-      const files = await hydrateAutomationParts(finalEvent.run_id, parts);
-      setUploadMode("multiple");
-      setAudioFile(null);
-      setSegmentFiles(files);
-      setRequiredSegmentIds([...files.keys()].sort((a, b) => a - b));
-      setAutomationMessage(
-        `Automation complete (${parts.length} part${parts.length > 1 ? "s" : ""} loaded)`,
-      );
     } catch (err) {
       if ((err as Error).name === "AbortError") {
         return;
@@ -944,7 +978,13 @@ export function ScriptRestructurePage() {
     automationConfig,
     automationVoiceKey,
     targetLanguage,
-    automationIncludeMetadata,
+    jsonValid,
+    newScriptJson,
+    metadataValid,
+    metadataJson,
+    uploadMode,
+    audioFile,
+    segmentFiles,
     handleJsonChange,
     handleMetadataJsonChange,
     hydrateAutomationParts,
@@ -1128,6 +1168,15 @@ export function ScriptRestructurePage() {
   }
 
   const prompt = generatePrompt(transcription, project, targetLanguage);
+
+  const allFieldsFilled =
+    jsonValid &&
+    newScriptJson.trim() !== "" &&
+    metadataValid &&
+    metadataJson.trim() !== "" &&
+    ((uploadMode === "single" && audioFile !== null) ||
+      (uploadMode === "multiple" && segmentFiles.size > 0));
+
   const automationBlockedReason = automationConfigError
     ? `Automation config error: ${automationConfigError}`
     : !automationConfig
@@ -1142,7 +1191,9 @@ export function ScriptRestructurePage() {
               ? automationConfig.voice_config_error
               : !automationVoiceKey
                 ? "Select a voice to automate"
-                : null;
+                : allFieldsFilled
+                  ? "All fields already filled"
+                  : null;
   const canRunAutomation = automationBlockedReason === null && !automationRunning;
   const expectedSegmentOrder =
     requiredSegmentIds ?? audioSegments.map((seg) => seg.id);
@@ -1675,34 +1726,48 @@ export function ScriptRestructurePage() {
                   Préremplit script, metadata et audio via Gemini + ElevenLabs.
                 </p>
 
-                <label className="space-y-1 block">
+                <div className="space-y-1">
                   <span className="text-xs text-[hsl(var(--muted-foreground))]">
                     Voice
                   </span>
-                  <select
-                    value={automationVoiceKey}
-                    onChange={(e) => setAutomationVoiceKey(e.target.value)}
-                    disabled={!automationConfig || automationRunning}
-                    className="w-full p-2 rounded-md border border-[hsl(var(--input))] bg-[hsl(var(--background))] text-sm"
-                  >
+                  <div className="space-y-1">
                     {(automationConfig?.voices || []).map((voice) => (
-                      <option key={voice.key} value={voice.key}>
-                        {voice.display_name}
-                      </option>
+                      <div key={voice.key} className="flex items-center gap-2">
+                        <label className="flex items-center gap-2 flex-1 cursor-pointer min-w-0">
+                          <input
+                            type="radio"
+                            name="automation-voice"
+                            value={voice.key}
+                            checked={automationVoiceKey === voice.key}
+                            onChange={() => setAutomationVoiceKey(voice.key)}
+                            disabled={automationRunning}
+                            className="shrink-0"
+                          />
+                          <span className="text-sm truncate">
+                            {voice.display_name}
+                          </span>
+                        </label>
+                        {voice.preview_url && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              playVoicePreview(voice.preview_url!, voice.key)
+                            }
+                            disabled={automationRunning}
+                            className="shrink-0 p-1 rounded hover:bg-[hsl(var(--muted))] disabled:opacity-50"
+                            title="Preview voice"
+                          >
+                            {playingVoiceKey === voice.key ? (
+                              <Pause className="h-3 w-3" />
+                            ) : (
+                              <Play className="h-3 w-3" />
+                            )}
+                          </button>
+                        )}
+                      </div>
                     ))}
-                  </select>
-                </label>
-
-                <label className="flex items-center gap-2 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={automationIncludeMetadata}
-                    onChange={(e) => setAutomationIncludeMetadata(e.target.checked)}
-                    disabled={automationRunning}
-                    className="h-4 w-4 rounded border border-[hsl(var(--input))]"
-                  />
-                  Include metadata generation
-                </label>
+                  </div>
+                </div>
 
                 {automationMessage && (
                   <div className="text-sm p-3 rounded-md bg-[hsl(var(--muted))]">

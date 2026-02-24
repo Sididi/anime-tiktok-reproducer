@@ -40,7 +40,9 @@ class MetadataPromptRequest(BaseModel):
 class ScriptAutomateRequest(BaseModel):
     target_language: str = "fr"
     voice_key: str
-    include_metadata: bool = True
+    existing_script_json: dict | None = None
+    skip_metadata: bool = False
+    skip_tts: bool = False
 
 
 async def _write_upload_to_path(upload: UploadFile, destination: Path) -> None:
@@ -61,13 +63,20 @@ async def get_script_automation_config(project_id: str):
         raise HTTPException(status_code=404, detail="Project not found")
 
     voice_error: str | None = None
-    voices: list[dict[str, str]] = []
+    voices: list[dict] = []
     default_voice_key: str | None = None
 
     try:
         config = VoiceConfigService.get_config()
+        preview_url_map: dict[str, str | None] = {}
+        if ElevenLabsService.is_configured():
+            preview_url_map = await asyncio.to_thread(ElevenLabsService.get_preview_url_map)
         voices = [
-            {"key": entry.key, "display_name": entry.display_name}
+            {
+                "key": entry.key,
+                "display_name": entry.display_name,
+                "preview_url": preview_url_map.get(entry.elevenlabs_voice_id),
+            }
             for entry in config.voices.values()
         ]
         default_voice_key = config.default_voice_key
@@ -106,7 +115,9 @@ async def automate_script(project_id: str, request: ScriptAutomateRequest):
             project_id=project_id,
             target_language=request.target_language,
             voice_key=request.voice_key,
-            include_metadata=request.include_metadata,
+            existing_script_json=request.existing_script_json,
+            skip_metadata=request.skip_metadata,
+            skip_tts=request.skip_tts,
         ):
             yield f"data: {json.dumps(event)}\n\n"
 

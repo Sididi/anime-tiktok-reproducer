@@ -50,12 +50,17 @@ class GeminiService:
             "generationConfig": generation_config,
         }
 
-        response = requests.post(
-            f"{cls._BASE_URL}/models/{chosen_model}:generateContent",
-            params={"key": api_key},
-            json=payload,
-            timeout=120,
-        )
+        try:
+            response = requests.post(
+                f"{cls._BASE_URL}/models/{chosen_model}:generateContent",
+                params={"key": api_key},
+                json=payload,
+                timeout=(10, settings.gemini_timeout),
+            )
+        except requests.exceptions.Timeout:
+            raise RuntimeError(
+                f"Gemini API timeout after {settings.gemini_timeout}s — response too large or model slow"
+            )
 
         if response.status_code >= 400:
             detail = response.text

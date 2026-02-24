@@ -52,6 +52,7 @@ export interface PlatformMetadata {
 export interface ScriptAutomationVoice {
   key: string;
   display_name: string;
+  preview_url?: string;
 }
 
 export interface ScriptAutomationConfig {
