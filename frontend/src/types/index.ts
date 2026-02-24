@@ -49,6 +49,57 @@ export interface PlatformMetadata {
   };
 }
 
+export interface ScriptAutomationVoice {
+  key: string;
+  display_name: string;
+}
+
+export interface ScriptAutomationConfig {
+  enabled: boolean;
+  gemini: {
+    configured: boolean;
+    model: string;
+  };
+  elevenlabs: {
+    configured: boolean;
+    model_id: string;
+    output_format: string;
+  };
+  voices: ScriptAutomationVoice[];
+  default_voice_key: string | null;
+  voice_config_error: string | null;
+}
+
+export interface ScriptAutomationPart {
+  id: string;
+  char_count: number;
+  download_url: string;
+}
+
+export interface ScriptAutomationEvent {
+  event:
+    | "starting"
+    | "llm_script"
+    | "llm_metadata"
+    | "tts_segmenting"
+    | "tts_generating"
+    | "complete"
+    | "error";
+  status: string;
+  message: string;
+  error: string | null;
+  run_id?: string;
+  script_json?: Record<string, unknown>;
+  metadata_json?: PlatformMetadata | null;
+  metadata_warning?: string | null;
+  parts?: ScriptAutomationPart[];
+  warning?: string;
+  part_id?: string;
+  part_index?: number;
+  part_total?: number;
+  char_count?: number;
+}
+
 export interface ProjectManagerRow {
   project_id: string;
   anime_title: string | null;

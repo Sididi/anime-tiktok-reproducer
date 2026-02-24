@@ -13,12 +13,22 @@ import {
   ChevronDown,
   ChevronUp,
   FileText,
+  Bot,
+  Square,
 } from "lucide-react";
 import { Button } from "@/components/ui";
 import { useProjectStore, useSceneStore } from "@/stores";
 import { api } from "@/api/client";
-import type { Transcription, Project, PlatformMetadata } from "@/types";
+import type {
+  Transcription,
+  Project,
+  PlatformMetadata,
+  ScriptAutomationConfig,
+  ScriptAutomationEvent,
+  ScriptAutomationPart,
+} from "@/types";
 import { ScriptEditorModal, MetadataEditorModal } from "@/components/script";
+import { readSSEStream } from "@/utils/sse";
 
 // Upload mode types
 type UploadMode = "single" | "multiple";
@@ -269,62 +279,22 @@ type TargetLanguage = "fr" | "en" | "es";
 // Check if text ends with sentence-ending punctuation
 function endsWithSentence(text: string): boolean {
   const trimmed = text.trim();
-  return /[.!?]$/.test(trimmed);
+  return /[.!?…]["')\]]*$/.test(trimmed);
 }
 
-// ElevenLabs optimal character range
-const ELEVENLABS_MIN = 600;
-const ELEVENLABS_MAX = 800;
-const ELEVENLABS_SOFT_MIN = 500; // Fallback threshold when 600+ isn't possible
-const ELEVENLABS_HARD_LIMIT = 1800; // Force split to prevent runaway
-const ELEVENLABS_MIN_SPLIT = 400; // Avoid very short chunks when splitting
+const ELEVENLABS_TARGET = 300;
+const ELEVENLABS_MIN = 200;
+const ELEVENLABS_MAX = 400;
 
-function getSegmentQualityScore(chars: number): number {
-  if (chars >= ELEVENLABS_MIN && chars <= ELEVENLABS_MAX) {
-    return 6;
-  }
-  if (chars >= ELEVENLABS_SOFT_MIN && chars < ELEVENLABS_MIN) {
-    return 5;
-  }
-  if (chars >= ELEVENLABS_MIN_SPLIT && chars < ELEVENLABS_SOFT_MIN) {
-    return 4;
-  }
-  if (chars > ELEVENLABS_MAX && chars <= ELEVENLABS_HARD_LIMIT) {
-    return 2;
-  }
-  if (chars > ELEVENLABS_HARD_LIMIT) {
-    return 1;
-  }
-  return 0;
-}
-
-function scoreSplitCandidate(
-  currentChars: number,
-  remainingChars: number,
-): { score: number; imbalance: number } | null {
-  if (currentChars < ELEVENLABS_MIN_SPLIT || remainingChars <= 0) {
-    return null;
-  }
-
-  const imbalance = Math.abs(currentChars - remainingChars);
-  let score = getSegmentQualityScore(currentChars);
-
-  if (remainingChars < ELEVENLABS_MIN_SPLIT) {
-    score -= 5;
-  } else {
-    score += getSegmentQualityScore(remainingChars);
-  }
-
-  if (remainingChars <= ELEVENLABS_HARD_LIMIT) {
-    score += Math.max(0, 2 - imbalance / 300);
-  }
-
-  return { score, imbalance };
+function ensureSentenceEnd(text: string): string {
+  const cleaned = text.trim();
+  if (!cleaned) return cleaned;
+  if (endsWithSentence(cleaned)) return cleaned;
+  return `${cleaned}.`;
 }
 
 // Segment scenes into groups based on character limit for ElevenLabs
-// Splits only at sentence-ending boundaries (., !, ?)
-// Uses scoring to choose the best sentence boundary for balanced chunks
+// Target: ~300 chars, preferred range 200-400, always ending on sentence boundaries.
 function segmentScenes(
   scenes: Array<{ scene_index: number; text: string }>,
 ): AudioSegment[] {
@@ -333,9 +303,6 @@ function segmentScenes(
   }
 
   const segments: AudioSegment[] = [];
-  const totalCharacterCount = scenes.map((scene) => scene.text).join(" ").length;
-  let processedCharacterCount = 0;
-
   let currentSegment: AudioSegment = {
     id: 1,
     sceneIndices: [],
@@ -343,95 +310,82 @@ function segmentScenes(
     characterCount: 0,
   };
 
-  // Track split candidates at sentence boundaries only.
-  let bestSplit: {
-    sceneIndex: number;
-    segment: AudioSegment;
-    score: number;
-    imbalance: number;
-  } | null = null;
-
   for (let i = 0; i < scenes.length; i++) {
     const scene = scenes[i];
-    const sceneText = scene.text;
-    const separator = currentSegment.text ? " " : "";
-
-    // Add scene to current segment
-    currentSegment.sceneIndices.push(scene.scene_index);
-    currentSegment.text += separator + sceneText;
-    currentSegment.characterCount += separator.length + sceneText.length;
-
-    // Track globally processed chars based on the full script concatenation.
-    processedCharacterCount += sceneText.length + (i > 0 ? 1 : 0);
-    const remainingChars = totalCharacterCount - processedCharacterCount;
-    const isSentenceBoundary = endsWithSentence(currentSegment.text);
-
-    if (isSentenceBoundary) {
-      const candidate = scoreSplitCandidate(
-        currentSegment.characterCount,
-        remainingChars,
-      );
-
-      if (candidate !== null) {
-        const shouldReplaceBestSplit =
-          bestSplit === null ||
-          candidate.score > bestSplit.score ||
-          (Math.abs(candidate.score - bestSplit.score) < 0.01 &&
-            candidate.imbalance < bestSplit.imbalance);
-
-        if (shouldReplaceBestSplit) {
-          bestSplit = {
-            sceneIndex: i,
-            segment: {
-              ...currentSegment,
-              sceneIndices: [...currentSegment.sceneIndices], // Deep copy array
-            },
-            score: candidate.score,
-            imbalance: candidate.imbalance,
-          };
-        }
-      }
+    const sceneText = scene.text.trim();
+    if (!sceneText) {
+      continue;
     }
 
-    // Check if we should split
-    const exceededMax = currentSegment.characterCount > ELEVENLABS_MAX;
-    const exceededHardLimit =
-      currentSegment.characterCount >= ELEVENLABS_HARD_LIMIT;
+    const mergedText = currentSegment.text
+      ? `${currentSegment.text} ${sceneText}`
+      : sceneText;
+    currentSegment.sceneIndices.push(scene.scene_index);
+    currentSegment.text = mergedText;
+    currentSegment.characterCount = mergedText.length;
 
-    if (exceededMax || exceededHardLimit) {
-      if (bestSplit !== null) {
-        // Use the best split point we found
-        segments.push(bestSplit.segment);
+    const isLastScene = i === scenes.length - 1;
+    const sentenceBoundary = endsWithSentence(currentSegment.text);
+    if (!sentenceBoundary && !isLastScene) {
+      continue;
+    }
 
-        // Rebuild current segment with remaining scenes
-        const remainingStartIndex = bestSplit.sceneIndex + 1;
-        const remainingScenes = scenes.slice(remainingStartIndex, i + 1);
-        const remainingText = remainingScenes.map((s) => s.text).join(" ");
+    if (isLastScene) {
+      currentSegment.text = ensureSentenceEnd(currentSegment.text);
+      currentSegment.characterCount = currentSegment.text.length;
+      segments.push(currentSegment);
+      currentSegment = {
+        id: segments.length + 1,
+        sceneIndices: [],
+        text: "",
+        characterCount: 0,
+      };
+      continue;
+    }
 
-        currentSegment = {
-          id: segments.length + 1,
-          sceneIndices: remainingScenes.map((s) => s.scene_index),
-          text: remainingText,
-          characterCount: remainingText.length,
-        };
-        bestSplit = null;
-      } else if (endsWithSentence(currentSegment.text) || exceededHardLimit) {
-        // Safety fallback: always split at hard limit even if sentence isn't closed.
-        segments.push(currentSegment);
-        currentSegment = {
-          id: segments.length + 1,
-          sceneIndices: [],
-          text: "",
-          characterCount: 0,
-        };
-      }
-      // else: keep accumulating until we find a sentence end
+    const nextSceneText = (scenes[i + 1]?.text || "").trim();
+    const withNextLength = nextSceneText
+      ? `${currentSegment.text} ${nextSceneText}`.length
+      : currentSegment.characterCount;
+    const closeNow =
+      currentSegment.characterCount >= ELEVENLABS_MIN &&
+      (currentSegment.characterCount > ELEVENLABS_MAX ||
+        withNextLength > ELEVENLABS_MAX ||
+        Math.abs(currentSegment.characterCount - ELEVENLABS_TARGET) <=
+          Math.abs(withNextLength - ELEVENLABS_TARGET));
+
+    if (closeNow) {
+      currentSegment.text = ensureSentenceEnd(currentSegment.text);
+      currentSegment.characterCount = currentSegment.text.length;
+      segments.push(currentSegment);
+      currentSegment = {
+        id: segments.length + 1,
+        sceneIndices: [],
+        text: "",
+        characterCount: 0,
+      };
     }
   }
 
-  // Don't forget the last segment
   if (currentSegment.sceneIndices.length > 0) {
+    currentSegment.text = ensureSentenceEnd(currentSegment.text);
+    currentSegment.characterCount = currentSegment.text.length;
     segments.push(currentSegment);
+  }
+
+  if (segments.length >= 2) {
+    const last = segments[segments.length - 1];
+    if (last.characterCount < ELEVENLABS_MIN) {
+      const prev = segments[segments.length - 2];
+      prev.text = ensureSentenceEnd(`${prev.text} ${last.text}`);
+      prev.characterCount = prev.text.length;
+      prev.sceneIndices = [...prev.sceneIndices, ...last.sceneIndices];
+      segments.pop();
+    }
+  }
+
+  for (let i = 0; i < segments.length; i++) {
+    segments[i].id = i + 1;
   }
 
   return segments;
@@ -618,6 +572,7 @@ export function ScriptRestructurePage() {
   const { project, loadProject } = useProjectStore();
   const { loadScenes } = useSceneStore();
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const automationAbortRef = useRef<AbortController | null>(null);
 
   const [transcription, setTranscription] = useState<Transcription | null>(
     null,
@@ -641,12 +596,33 @@ export function ScriptRestructurePage() {
   const [metadataCopiedPrompt, setMetadataCopiedPrompt] = useState(false);
   const [metadataDetected, setMetadataDetected] = useState(false);
   const [metadataPromptLoading, setMetadataPromptLoading] = useState(false);
+  const [automationMetadataWarning, setAutomationMetadataWarning] = useState<
+    string | null
+  >(null);
+
+  // Script automation state
+  const [automationConfig, setAutomationConfig] =
+    useState<ScriptAutomationConfig | null>(null);
+  const [automationConfigError, setAutomationConfigError] = useState<
+    string | null
+  >(null);
+  const [automationVoiceKey, setAutomationVoiceKey] = useState("");
+  const [automationIncludeMetadata, setAutomationIncludeMetadata] =
+    useState(true);
+  const [automationRunning, setAutomationRunning] = useState(false);
+  const [automationStep, setAutomationStep] = useState<string | null>(null);
+  const [automationMessage, setAutomationMessage] = useState<string | null>(
+    null,
+  );
 
   // Audio file state
   const [uploadMode, setUploadMode] = useState<UploadMode>("multiple");
   const [audioFile, setAudioFile] = useState<File | null>(null);
   const [segmentFiles, setSegmentFiles] = useState<Map<number, File>>(
     new Map(),
+  );
+  const [requiredSegmentIds, setRequiredSegmentIds] = useState<number[] | null>(
+    null,
   );
   const [copiedSegment, setCopiedSegment] = useState<number | null>(null);
   const [copiedFullScript, setCopiedFullScript] = useState(false);
@@ -694,6 +670,18 @@ export function ScriptRestructurePage() {
         await loadScenes(projectId);
         const { transcription: loaded } = await api.getTranscription(projectId);
         setTranscription(loaded);
+        try {
+          const automation = await api.getScriptAutomationConfig(projectId);
+          setAutomationConfig(automation);
+          setAutomationConfigError(null);
+          setAutomationVoiceKey(
+            automation.default_voice_key || automation.voices[0]?.key || "",
+          );
+        } catch (automationErr) {
+          setAutomationConfig(null);
+          setAutomationConfigError((automationErr as Error).message);
+          setAutomationVoiceKey("");
+        }
         const metadataResult = await api.getProjectMetadata(projectId);
         if (metadataResult.exists && metadataResult.metadata) {
           const pretty = JSON.stringify(metadataResult.metadata, null, 2);
@@ -711,6 +699,12 @@ export function ScriptRestructurePage() {
     loadData();
   }, [projectId, loadProject, loadScenes]);
 
+  useEffect(() => {
+    return () => {
+      automationAbortRef.current?.abort();
+    };
+  }, []);
+
   const handleCopyPrompt = useCallback(async () => {
     if (!transcription) return;
 
@@ -727,6 +721,7 @@ export function ScriptRestructurePage() {
 
   const handleJsonChange = useCallback((value: string) => {
     setNewScriptJson(value);
+    setRequiredSegmentIds(null);
     setJsonError(null);
     setJsonValid(false);
 
@@ -806,6 +801,154 @@ export function ScriptRestructurePage() {
       setMetadataPromptLoading(false);
     }
   }, [projectId, jsonValid, newScriptJson, targetLanguage]);
+
+  const hydrateAutomationParts = useCallback(
+    async (runId: string, parts: ScriptAutomationPart[]): Promise<Map<number, File>> => {
+      if (!projectId) {
+        throw new Error("Missing project id");
+      }
+
+      const map = new Map<number, File>();
+      for (let i = 0; i < parts.length; i++) {
+        const part = parts[i];
+        const response = await api.downloadAutomationPart(projectId, runId, part.id);
+        if (!response.ok) {
+          throw new Error(`Failed to download audio part ${part.id}`);
+        }
+
+        const blob = await response.blob();
+        const contentDisposition = response.headers.get("Content-Disposition");
+        const fileNameMatch = contentDisposition?.match(/filename="?([^";]+)"?/i);
+        const fallbackExt = blob.type.includes("wav") ? "wav" : "mp3";
+        const fileName = fileNameMatch?.[1] || `part_${part.id}.${fallbackExt}`;
+        const file = new File([blob], fileName, {
+          type: blob.type || "audio/mpeg",
+        });
+
+        const parsedId = Number.parseInt(part.id, 10);
+        const segmentId = Number.isFinite(parsedId) && parsedId > 0 ? parsedId : i + 1;
+        map.set(segmentId, file);
+      }
+      return map;
+    },
+    [projectId],
+  );
+
+  const handleCancelAutomation = useCallback(() => {
+    automationAbortRef.current?.abort();
+    setAutomationRunning(false);
+    setAutomationMessage("Automation cancelled");
+  }, []);
+
+  const handleAutomate = useCallback(async () => {
+    if (!projectId || !automationConfig) return;
+    if (!automationConfig.enabled) {
+      setError("Automation is disabled on backend");
+      return;
+    }
+    if (!automationVoiceKey) {
+      setError("Please select a voice before starting automation");
+      return;
+    }
+
+    setError(null);
+    setAutomationMetadataWarning(null);
+    setAutomationStep("starting");
+    setAutomationMessage("Starting automation...");
+    setAutomationRunning(true);
+
+    const controller = new AbortController();
+    automationAbortRef.current = controller;
+
+    try {
+      const response = await api.automateScript(
+        projectId,
+        {
+          target_language: targetLanguage,
+          voice_key: automationVoiceKey,
+          include_metadata: automationIncludeMetadata,
+        },
+        controller.signal,
+      );
+
+      const finalEvent = await readSSEStream<ScriptAutomationEvent>(
+        response,
+        (event) => {
+          setAutomationStep(event.event);
+          setAutomationMessage(event.message || null);
+          if (event.warning) {
+            setAutomationMetadataWarning(event.warning);
+          }
+        },
+        controller.signal,
+      );
+
+      if (!finalEvent) {
+        if (controller.signal.aborted) return;
+        throw new Error("Automation ended without completion event");
+      }
+
+      if (finalEvent.event !== "complete") {
+        throw new Error(
+          finalEvent.error || finalEvent.message || "Automation failed before completion",
+        );
+      }
+
+      if (!finalEvent.script_json) {
+        throw new Error("Automation response did not include script_json");
+      }
+
+      const prettyScript = JSON.stringify(finalEvent.script_json, null, 2);
+      handleJsonChange(prettyScript);
+
+      if (finalEvent.metadata_json) {
+        const prettyMetadata = JSON.stringify(finalEvent.metadata_json, null, 2);
+        handleMetadataJsonChange(prettyMetadata);
+        setMetadataDetected(true);
+        setMetadataExpanded(true);
+      }
+
+      if (finalEvent.metadata_warning) {
+        setAutomationMetadataWarning(finalEvent.metadata_warning);
+        setMetadataExpanded(true);
+      }
+
+      if (!finalEvent.run_id) {
+        throw new Error("Automation response did not include run_id");
+      }
+
+      const parts = finalEvent.parts || [];
+      if (parts.length === 0) {
+        throw new Error("Automation response did not include audio parts");
+      }
+
+      const files = await hydrateAutomationParts(finalEvent.run_id, parts);
+      setUploadMode("multiple");
+      setAudioFile(null);
+      setSegmentFiles(files);
+      setRequiredSegmentIds([...files.keys()].sort((a, b) => a - b));
+      setAutomationMessage(
+        `Automation complete (${parts.length} part${parts.length > 1 ? "s" : ""} loaded)`,
+      );
+    } catch (err) {
+      if ((err as Error).name === "AbortError") {
+        return;
+      }
+      setError((err as Error).message);
+    } finally {
+      setAutomationRunning(false);
+      automationAbortRef.current = null;
+    }
+  }, [
+    projectId,
+    automationConfig,
+    automationVoiceKey,
+    targetLanguage,
+    automationIncludeMetadata,
+    handleJsonChange,
+    handleMetadataJsonChange,
+    hydrateAutomationParts,
+  ]);
 
   const handleFileSelect = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -899,9 +1042,11 @@ export function ScriptRestructurePage() {
     // Validate based on upload mode
     if (uploadMode === "single" && !audioFile) return;
     if (uploadMode === "multiple") {
-      const allSegmentsHaveFiles = audioSegments.every((seg) =>
-        segmentFiles.has(seg.id),
-      );
+      const expectedSegmentOrder =
+        requiredSegmentIds ?? audioSegments.map((seg) => seg.id);
+      const allSegmentsHaveFiles =
+        expectedSegmentOrder.length > 0 &&
+        expectedSegmentOrder.every((segmentId) => segmentFiles.has(segmentId));
       if (!allSegmentsHaveFiles) return;
     }
 
@@ -919,8 +1064,10 @@ export function ScriptRestructurePage() {
         formData.append("audio", audioFile!);
       } else {
         // Send multiple files in order
-        for (const segment of audioSegments) {
-          const file = segmentFiles.get(segment.id);
+        const expectedSegmentOrder =
+          requiredSegmentIds ?? audioSegments.map((seg) => seg.id);
+        for (const segmentId of expectedSegmentOrder) {
+          const file = segmentFiles.get(segmentId);
           if (file) {
             formData.append("audio_parts", file);
           }
@@ -956,6 +1103,7 @@ export function ScriptRestructurePage() {
     navigate,
     uploadMode,
     audioSegments,
+    requiredSegmentIds,
     segmentFiles,
     metadataValid,
     metadataJson,
@@ -980,13 +1128,42 @@ export function ScriptRestructurePage() {
   }
 
   const prompt = generatePrompt(transcription, project, targetLanguage);
+  const automationBlockedReason = automationConfigError
+    ? `Automation config error: ${automationConfigError}`
+    : !automationConfig
+      ? "Loading automation config..."
+      : !automationConfig.enabled
+        ? "Automation disabled on backend"
+        : !automationConfig.gemini.configured
+          ? "Gemini API key missing on backend"
+          : !automationConfig.elevenlabs.configured
+            ? "ElevenLabs API key missing on backend"
+            : automationConfig.voice_config_error
+              ? automationConfig.voice_config_error
+              : !automationVoiceKey
+                ? "Select a voice to automate"
+                : null;
+  const canRunAutomation = automationBlockedReason === null && !automationRunning;
+  const expectedSegmentOrder =
+    requiredSegmentIds ?? audioSegments.map((seg) => seg.id);
+  const displaySegments =
+    requiredSegmentIds && requiredSegmentIds.length !== audioSegments.length
+      ? requiredSegmentIds.map((id) => ({
+          id,
+          sceneIndices: [id],
+          text: "",
+          characterCount: 0,
+        }))
+      : audioSegments;
   const canContinue =
     jsonValid &&
     (uploadMode === "single"
       ? audioFile !== null
-      : audioSegments.length > 0 &&
-        audioSegments.every((seg) => segmentFiles.has(seg.id)));
-  const uploadedSegmentsCount = segmentFiles.size;
+      : expectedSegmentOrder.length > 0 &&
+        expectedSegmentOrder.every((segmentId) => segmentFiles.has(segmentId)));
+  const uploadedSegmentsCount = expectedSegmentOrder.filter((segmentId) =>
+    segmentFiles.has(segmentId),
+  ).length;
   const metadataDone = metadataValid || metadataDetected;
 
   return (
@@ -1248,6 +1425,7 @@ export function ScriptRestructurePage() {
                     setUploadMode(e.target.value as UploadMode);
                     setAudioFile(null);
                     setSegmentFiles(new Map());
+                    setRequiredSegmentIds(null);
                   }}
                   className="p-2 rounded-md border border-[hsl(var(--input))] bg-[hsl(var(--background))] text-sm"
                 >
@@ -1256,7 +1434,7 @@ export function ScriptRestructurePage() {
                 </select>
                 <span className="text-xs text-[hsl(var(--muted-foreground))]">
                   {uploadMode === "multiple"
-                    ? "Split into segments for better ElevenLabs quality"
+                    ? "Split into sentence-based parts (target ~300 chars)"
                     : "Upload one combined audio file"}
                 </span>
               </div>
@@ -1346,7 +1524,7 @@ export function ScriptRestructurePage() {
                         Paste valid JSON in Step 2 to see audio segments
                       </p>
                     </div>
-                  ) : audioSegments.length === 0 ? (
+                  ) : expectedSegmentOrder.length === 0 ? (
                     <div className="p-4 bg-[hsl(var(--muted))] rounded-lg text-center">
                       <p className="text-sm text-[hsl(var(--muted-foreground))]">
                         No segments generated from script
@@ -1356,15 +1534,15 @@ export function ScriptRestructurePage() {
                     <div className="space-y-3">
                       <div className="flex items-center justify-between text-sm">
                         <span className="text-[hsl(var(--muted-foreground))]">
-                          {audioSegments.length} segment
-                          {audioSegments.length > 1 ? "s" : ""} (600-800 chars
-                          target for optimal quality)
+                          {expectedSegmentOrder.length} segment
+                          {expectedSegmentOrder.length > 1 ? "s" : ""} (target
+                          200-400 chars, ideal ~300)
                         </span>
                         <span className="text-[hsl(var(--muted-foreground))]">
-                          {uploadedSegmentsCount}/{audioSegments.length} uploaded
+                          {uploadedSegmentsCount}/{expectedSegmentOrder.length} uploaded
                         </span>
                       </div>
-                      {audioSegments.map((segment) => {
+                      {displaySegments.map((segment) => {
                         const file = segmentFiles.get(segment.id);
                         const inputId = `segment-file-${segment.id}`;
                         return (
@@ -1466,45 +1644,130 @@ export function ScriptRestructurePage() {
           </div>
 
           <aside className="mt-6 lg:mt-0">
-            <div className="bg-[hsl(var(--muted))] rounded-lg p-4 lg:sticky lg:top-4">
-              <h3 className="font-medium mb-2">Checklist</h3>
-              <ul className="space-y-1 text-sm">
-                <li className="flex items-center gap-2">
-                  <div
-                    className={`h-3 w-3 rounded-full ${promptCopied ? "bg-green-500" : "bg-[hsl(var(--border))]"}`}
+            <div className="space-y-4 lg:sticky lg:top-4">
+              <div className="bg-[hsl(var(--card))] rounded-lg p-4 space-y-4">
+                <div className="flex items-center justify-between gap-3">
+                  <h2 className="font-semibold flex items-center gap-2">
+                    <Bot className="h-4 w-4" />
+                    Automate
+                  </h2>
+                  {automationRunning ? (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleCancelAutomation}
+                    >
+                      <Square className="h-4 w-4 mr-2" />
+                      Cancel
+                    </Button>
+                  ) : (
+                    <Button
+                      size="sm"
+                      onClick={handleAutomate}
+                      disabled={!canRunAutomation}
+                    >
+                      Automate
+                    </Button>
+                  )}
+                </div>
+
+                <p className="text-sm text-[hsl(var(--muted-foreground))]">
+                  Préremplit script, metadata et audio via Gemini + ElevenLabs.
+                </p>
+
+                <label className="space-y-1 block">
+                  <span className="text-xs text-[hsl(var(--muted-foreground))]">
+                    Voice
+                  </span>
+                  <select
+                    value={automationVoiceKey}
+                    onChange={(e) => setAutomationVoiceKey(e.target.value)}
+                    disabled={!automationConfig || automationRunning}
+                    className="w-full p-2 rounded-md border border-[hsl(var(--input))] bg-[hsl(var(--background))] text-sm"
+                  >
+                    {(automationConfig?.voices || []).map((voice) => (
+                      <option key={voice.key} value={voice.key}>
+                        {voice.display_name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={automationIncludeMetadata}
+                    onChange={(e) => setAutomationIncludeMetadata(e.target.checked)}
+                    disabled={automationRunning}
+                    className="h-4 w-4 rounded border border-[hsl(var(--input))]"
                   />
-                  Prompt copied
-                </li>
-                <li className="flex items-center gap-2">
-                  <div
-                    className={`h-3 w-3 rounded-full ${jsonValid ? "bg-green-500" : "bg-[hsl(var(--border))]"}`}
-                  />
-                  New script JSON validated
-                </li>
-                <li className="flex items-center gap-2">
-                  <div
-                    className={`h-3 w-3 rounded-full ${metadataDone ? "bg-green-500" : "bg-[hsl(var(--border))]"}`}
-                  />
-                  Optional metadata {metadataDone ? "ready" : "skipped"}
-                </li>
-                <li className="flex items-center gap-2">
-                  <div
-                    className={`h-3 w-3 rounded-full ${
-                      uploadMode === "single"
-                        ? audioFile
-                          ? "bg-green-500"
-                          : "bg-[hsl(var(--border))]"
-                        : uploadedSegmentsCount === audioSegments.length &&
-                            audioSegments.length > 0
-                          ? "bg-green-500"
-                          : "bg-[hsl(var(--border))]"
-                    }`}
-                  />
-                  {uploadMode === "single"
-                    ? "TTS audio uploaded"
-                    : `TTS audio uploaded (${uploadedSegmentsCount}/${audioSegments.length} parts)`}
-                </li>
-              </ul>
+                  Include metadata generation
+                </label>
+
+                {automationMessage && (
+                  <div className="text-sm p-3 rounded-md bg-[hsl(var(--muted))]">
+                    <p className="font-medium">
+                      {automationStep ? automationStep.replace("_", " ") : "automation"}
+                    </p>
+                    <p className="text-[hsl(var(--muted-foreground))]">
+                      {automationMessage}
+                    </p>
+                  </div>
+                )}
+
+                {automationMetadataWarning && (
+                  <div className="text-sm p-3 rounded-md bg-amber-500/10 text-amber-600">
+                    {automationMetadataWarning}
+                  </div>
+                )}
+
+                {automationBlockedReason && !automationRunning && (
+                  <p className="text-xs text-[hsl(var(--muted-foreground))]">
+                    {automationBlockedReason}
+                  </p>
+                )}
+              </div>
+
+              <div className="bg-[hsl(var(--muted))] rounded-lg p-4">
+                <h3 className="font-medium mb-2">Checklist</h3>
+                <ul className="space-y-1 text-sm">
+                  <li className="flex items-center gap-2">
+                    <div
+                      className={`h-3 w-3 rounded-full ${promptCopied ? "bg-green-500" : "bg-[hsl(var(--border))]"}`}
+                    />
+                    Prompt copied
+                  </li>
+                  <li className="flex items-center gap-2">
+                    <div
+                      className={`h-3 w-3 rounded-full ${jsonValid ? "bg-green-500" : "bg-[hsl(var(--border))]"}`}
+                    />
+                    New script JSON validated
+                  </li>
+                  <li className="flex items-center gap-2">
+                    <div
+                      className={`h-3 w-3 rounded-full ${metadataDone ? "bg-green-500" : "bg-[hsl(var(--border))]"}`}
+                    />
+                    Optional metadata {metadataDone ? "ready" : "skipped"}
+                  </li>
+                  <li className="flex items-center gap-2">
+                    <div
+                      className={`h-3 w-3 rounded-full ${
+                        uploadMode === "single"
+                          ? audioFile
+                            ? "bg-green-500"
+                            : "bg-[hsl(var(--border))]"
+                          : uploadedSegmentsCount === expectedSegmentOrder.length &&
+                              expectedSegmentOrder.length > 0
+                            ? "bg-green-500"
+                            : "bg-[hsl(var(--border))]"
+                      }`}
+                    />
+                    {uploadMode === "single"
+                      ? "TTS audio uploaded"
+                      : `TTS audio uploaded (${uploadedSegmentsCount}/${expectedSegmentOrder.length} parts)`}
+                  </li>
+                </ul>
+              </div>
             </div>
           </aside>
         </div>

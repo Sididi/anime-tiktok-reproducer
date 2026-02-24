@@ -1,6 +1,7 @@
 """Processing routes for script restructure and final export."""
 
 import asyncio
+import mimetypes
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, FileResponse
 from typing import Optional
@@ -11,6 +12,7 @@ from pydantic import BaseModel
 
 from pydub import AudioSegment
 
+from ...config import settings
 from ...models import ProjectPhase
 from ...services import (
     ProjectService,
@@ -18,6 +20,10 @@ from ...services import (
     MetadataService,
     ExportService,
     DiscordService,
+    GeminiService,
+    ElevenLabsService,
+    VoiceConfigService,
+    ScriptAutomationService,
 )
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["processing"])
@@ -31,6 +37,12 @@ class MetadataPromptRequest(BaseModel):
     target_language: str = "fr"
 
 
+class ScriptAutomateRequest(BaseModel):
+    target_language: str = "fr"
+    voice_key: str
+    include_metadata: bool = True
+
+
 async def _write_upload_to_path(upload: UploadFile, destination: Path) -> None:
     """Stream uploaded file to disk in chunks."""
     with destination.open("wb") as out:
@@ -39,6 +51,93 @@ async def _write_upload_to_path(upload: UploadFile, destination: Path) -> None:
             if not chunk:
                 break
             out.write(chunk)
+
+
+@router.get("/script/automation/config")
+async def get_script_automation_config(project_id: str):
+    """Return automation config and integration readiness for /script page."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    voice_error: str | None = None
+    voices: list[dict[str, str]] = []
+    default_voice_key: str | None = None
+
+    try:
+        config = VoiceConfigService.get_config()
+        voices = [
+            {"key": entry.key, "display_name": entry.display_name}
+            for entry in config.voices.values()
+        ]
+        default_voice_key = config.default_voice_key
+    except Exception as exc:
+        voice_error = str(exc)
+
+    return {
+        "enabled": settings.script_automate_enabled,
+        "gemini": {
+            "configured": GeminiService.is_configured(),
+            "model": settings.gemini_model,
+        },
+        "elevenlabs": {
+            "configured": ElevenLabsService.is_configured(),
+            "model_id": settings.elevenlabs_model_id,
+            "output_format": settings.elevenlabs_output_format,
+        },
+        "voices": voices,
+        "default_voice_key": default_voice_key,
+        "voice_config_error": voice_error,
+    }
+
+
+@router.post("/script/automate")
+async def automate_script(project_id: str, request: ScriptAutomateRequest):
+    """Automate /script generation: Gemini script -> optional metadata -> ElevenLabs parts."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if not settings.script_automate_enabled:
+        raise HTTPException(status_code=503, detail="Script automation is disabled")
+
+    async def stream_progress():
+        async for event in ScriptAutomationService.stream_automation(
+            project_id=project_id,
+            target_language=request.target_language,
+            voice_key=request.voice_key,
+            include_metadata=request.include_metadata,
+        ):
+            yield f"data: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(
+        stream_progress(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@router.get("/script/automate/runs/{run_id}/parts/{part_id}")
+async def download_automation_part(project_id: str, run_id: str, part_id: str):
+    """Download one generated TTS part from an automation run."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    try:
+        part_path = ScriptAutomationService.get_part_path(project_id, run_id, part_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    media_type = mimetypes.guess_type(part_path.name)[0] or "application/octet-stream"
+    return FileResponse(
+        path=part_path,
+        filename=part_path.name,
+        media_type=media_type,
+    )
 
 
 @router.post("/script/restructured")

@@ -1,0 +1,12 @@
+default_voice_key: victor
+
+voices:
+  victor:
+    display_name: "Victor"
+    elevenlabs_voice_id: "your_victor_voice_id"
+    voice_settings:
+      stability: 0.45
+      similarity_boost: 0.8
+      style: 0.0
+      speed: 1.0
+      use_speaker_boost: true

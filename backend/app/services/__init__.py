@@ -20,6 +20,10 @@ from .scheduling_service import SchedulingService
 from .upload_phase import UploadPhaseService
 from .meta_token_service import MetaTokenService
 from .integration_health_service import IntegrationHealthService
+from .gemini_service import GeminiService
+from .elevenlabs_service import ElevenLabsService
+from .voice_config_service import VoiceConfigService
+from .script_automation_service import ScriptAutomationService
 
 __all__ = [
     "AccountService",
@@ -32,4 +36,8 @@ __all__ = [
     "SocialUploadService", "PlatformUploadResult", "UploadPhaseService",
     "MetaTokenService",
     "IntegrationHealthService",
+    "GeminiService",
+    "ElevenLabsService",
+    "VoiceConfigService",
+    "ScriptAutomationService",
 ]

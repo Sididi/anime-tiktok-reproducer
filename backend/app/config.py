@@ -27,6 +27,7 @@ class Settings(BaseSettings):
 
     # Accounts
     accounts_config_path: Path = PROJECT_ROOT / "config" / "accounts" / "config.yaml"
+    voices_config_path: Path = PROJECT_ROOT / "config" / "voices" / "config.yaml"
 
     # CORS
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
@@ -36,6 +37,14 @@ class Settings(BaseSettings):
 
     # Discord webhook integration
     discord_webhook_url: str | None = None
+
+    # Script automation (Gemini + ElevenLabs)
+    script_automate_enabled: bool = True
+    gemini_api_key: str | None = None
+    gemini_model: str = "gemini-3.1-pro-preview"
+    elevenlabs_api_key: str | None = None
+    elevenlabs_model_id: str = "eleven_multilingual_v2"
+    elevenlabs_output_format: str = "mp3_44100_128"
 
     # Google OAuth shared credentials
     google_client_id: str | None = None

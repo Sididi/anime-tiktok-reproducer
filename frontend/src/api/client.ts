@@ -350,6 +350,34 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
+  // Script automation (Gemini + ElevenLabs)
+  getScriptAutomationConfig: (projectId: string) =>
+    request<import("@/types").ScriptAutomationConfig>(
+      `/projects/${projectId}/script/automation/config`,
+    ),
+
+  automateScript: (
+    projectId: string,
+    payload: {
+      target_language: string;
+      voice_key: string;
+      include_metadata: boolean;
+    },
+    signal?: AbortSignal,
+  ) =>
+    fetch(`${API_BASE}/projects/${projectId}/script/automate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal,
+    }),
+
+  downloadAutomationPart: (projectId: string, runId: string, partId: string) =>
+    fetch(
+      `${API_BASE}/projects/${projectId}/script/automate/runs/${encodeURIComponent(runId)}/parts/${encodeURIComponent(partId)}`,
+      { method: "GET" },
+    ),
+
   // Exports
   createBundleExport: (projectId: string) =>
     fetch(`${API_BASE}/projects/${projectId}/exports/bundle`, {
