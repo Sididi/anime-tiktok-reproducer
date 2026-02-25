@@ -1,0 +1,12 @@
+default_music_key: credits_song_death
+
+music:
+  credits_song_death:
+    display_name: "Credits song for my death"
+    file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/credits song for my death.wav"
+    volume_db: -23
+
+  credits_song_death_final_boss:
+    display_name: "Credits song for my death but im the final boss"
+    file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/credits song for my death but im the final boss.wav"
+    volume_db: -24
