@@ -628,43 +628,62 @@ class UploadPhaseService:
         if not project:
             raise ValueError("Project not found")
 
-        if project.final_upload_discord_message_id:
-            existing = DiscordService.get_message(project.final_upload_discord_message_id)
-            if existing:
-                content = existing.content
-                # Disable video embed by wrapping the direct download URL in angle brackets
-                direct_url = (project.upload_last_result or {}).get("direct_drive_download", "")
-                if direct_url and direct_url in content:
-                    content = content.replace(direct_url, f"<{direct_url}>")
-                # Strike through each line of the original content
-                struck_lines = [f"~~{line}~~" if line.strip() else "" for line in content.splitlines()]
-                DiscordService.edit_message(
-                    project.final_upload_discord_message_id,
-                    "\n".join(struck_lines),
-                )
-            else:
-                DiscordService.edit_message(
-                    project.final_upload_discord_message_id,
-                    "~~Upload removed~~",
-                )
-        elif project.generation_discord_message_id:
-            DiscordService.delete_message(project.generation_discord_message_id)
+        cleanup_warnings: list[str] = []
+        try:
+            if project.final_upload_discord_message_id:
+                existing = DiscordService.get_message(project.final_upload_discord_message_id)
+                if existing:
+                    content = existing.content
+                    # Disable video embed by wrapping the direct download URL in angle brackets
+                    direct_url = (project.upload_last_result or {}).get("direct_drive_download", "")
+                    if direct_url and direct_url in content:
+                        content = content.replace(direct_url, f"<{direct_url}>")
+                    # Strike through each line of the original content
+                    struck_lines = [f"~~{line}~~" if line.strip() else "" for line in content.splitlines()]
+                    DiscordService.edit_message(
+                        project.final_upload_discord_message_id,
+                        "\n".join(struck_lines),
+                    )
+                else:
+                    DiscordService.edit_message(
+                        project.final_upload_discord_message_id,
+                        "~~Upload removed~~",
+                    )
+            elif project.generation_discord_message_id:
+                DiscordService.delete_message(project.generation_discord_message_id)
+        except Exception as exc:
+            cleanup_warnings.append(f"discord cleanup failed: {exc}")
 
         drive_deleted = False
-        drive_folder_id = project.drive_folder_id
-        if not drive_folder_id:
-            found = GoogleDriveService.find_project_folder_by_name(ExportService.output_folder_name(project)) if GoogleDriveService.is_configured() else None
-            drive_folder_id = found["id"] if found else None
-        if drive_folder_id and GoogleDriveService.is_configured():
-            try:
+        try:
+            drive_folder_id = project.drive_folder_id
+            should_resolve_by_name = bool(
+                not drive_folder_id
+                and (
+                    project.upload_completed_at
+                    or project.upload_last_result
+                    or project.drive_folder_url
+                )
+            )
+            if should_resolve_by_name and GoogleDriveService.is_configured():
+                found = GoogleDriveService.find_project_folder_by_name(
+                    ExportService.output_folder_name(project)
+                )
+                drive_folder_id = found["id"] if found else None
+
+            if drive_folder_id and GoogleDriveService.is_configured():
                 GoogleDriveService.delete_folder(drive_folder_id)
                 drive_deleted = True
-            except Exception:
-                drive_deleted = False
+        except Exception as exc:
+            cleanup_warnings.append(f"drive cleanup failed: {exc}")
+            drive_deleted = False
 
         local_deleted = ProjectService.delete(project.id)
-        return {
+        result = {
             "status": "deleted" if local_deleted else "not_found",
             "local_deleted": local_deleted,
             "drive_deleted": drive_deleted,
         }
+        if cleanup_warnings:
+            result["cleanup_warnings"] = cleanup_warnings
+        return result

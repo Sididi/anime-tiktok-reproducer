@@ -112,11 +112,33 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
   const handleMultiDelete = async () => {
     setShowMultiDeleteConfirm(false);
     setMultiDeleting(true);
+    setError(null);
     const ids = Array.from(selectedProjectIds);
-    await Promise.all(ids.map((id) => api.deleteManagedProject(id).catch(() => {})));
-    setSelectedProjectIds(new Set());
-    setMultiDeleteMode(false);
-    setMultiDeleting(false);
+    const failedIds: string[] = [];
+
+    try {
+      for (const id of ids) {
+        try {
+          await api.deleteManagedProject(id);
+        } catch {
+          failedIds.push(id);
+        }
+      }
+    } finally {
+      setSelectedProjectIds(new Set());
+      setMultiDeleteMode(false);
+      setMultiDeleting(false);
+    }
+
+    if (failedIds.length > 0) {
+      const deletedCount = ids.length - failedIds.length;
+      setError(
+        deletedCount > 0
+          ? `Deleted ${deletedCount}/${ids.length} selected projects. ${failedIds.length} failed.`
+          : `Failed to delete ${failedIds.length} selected project${failedIds.length === 1 ? "" : "s"}.`,
+      );
+    }
+
     await loadData();
   };
 
