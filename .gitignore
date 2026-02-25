@@ -47,6 +47,9 @@ examples/source_anime/
 config/accounts/config.yaml
 config/accounts/avatars/
 
+# Worktrees
+.worktrees/
+
 # Local tooling
 .claude/
 .DS_Store
