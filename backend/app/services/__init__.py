@@ -24,6 +24,8 @@ from .gemini_service import GeminiService
 from .elevenlabs_service import ElevenLabsService
 from .voice_config_service import VoiceConfigService
 from .script_automation_service import ScriptAutomationService
+from .music_config_service import MusicConfigService
+from .audio_speed_service import AudioSpeedService
 
 __all__ = [
     "AccountService",
@@ -40,4 +42,6 @@ __all__ = [
     "ElevenLabsService",
     "VoiceConfigService",
     "ScriptAutomationService",
+    "MusicConfigService",
+    "AudioSpeedService",
 ]

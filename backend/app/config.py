@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     # Accounts
     accounts_config_path: Path = PROJECT_ROOT / "config" / "accounts" / "config.yaml"
     voices_config_path: Path = PROJECT_ROOT / "config" / "voices" / "config.yaml"
+    music_config_path: Path = PROJECT_ROOT / "config" / "music" / "config.yaml"
 
     # CORS
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
@@ -46,6 +47,7 @@ class Settings(BaseSettings):
     elevenlabs_api_key: str | None = None
     elevenlabs_model_id: str = "eleven_multilingual_v2"
     elevenlabs_output_format: str = "mp3_44100_128"
+    gemini_light_model: str = "gemini-2.5-flash"
 
     # Google OAuth shared credentials
     google_client_id: str | None = None

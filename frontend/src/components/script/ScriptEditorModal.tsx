@@ -136,7 +136,7 @@ export function ScriptEditorModal({
       }),
       SceneHeader,
     ],
-    content: parsedScript ? buildTipTapDoc(parsedScript.scenes) : "",
+    content: parsedScript && Array.isArray(parsedScript.scenes) ? buildTipTapDoc(parsedScript.scenes) : "",
     onUpdate: () => {
       setUpdateCounter((c) => c + 1);
     },
@@ -144,7 +144,7 @@ export function ScriptEditorModal({
 
   // Reset content when modal opens
   useEffect(() => {
-    if (isOpen && editor && parsedScript) {
+    if (isOpen && editor && parsedScript && Array.isArray(parsedScript.scenes)) {
       editor.commands.setContent(buildTipTapDoc(parsedScript.scenes));
       setUpdateCounter((c) => c + 1);
     }
@@ -174,7 +174,7 @@ export function ScriptEditorModal({
 
   // Live duration stats
   const sceneStats = useMemo(() => {
-    if (!editor || !parsedScript || !transcription) return [];
+    if (!editor || !parsedScript || !Array.isArray(parsedScript.scenes) || !transcription) return [];
 
     const editorJson = editor.getJSON();
     const texts = extractScenesFromEditor(editorJson as Record<string, unknown>);

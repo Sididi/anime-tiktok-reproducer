@@ -55,9 +55,23 @@ export interface ScriptAutomationVoice {
   preview_url?: string;
 }
 
+export interface ScriptAutomationMusic {
+  key: string;
+  display_name: string;
+}
+
+export interface VideoOverlay {
+  title: string;
+  category: string;
+}
+
 export interface ScriptAutomationConfig {
   enabled: boolean;
   gemini: {
+    configured: boolean;
+    model: string;
+  };
+  gemini_light?: {
     configured: boolean;
     model: string;
   };
@@ -69,6 +83,9 @@ export interface ScriptAutomationConfig {
   voices: ScriptAutomationVoice[];
   default_voice_key: string | null;
   voice_config_error: string | null;
+  musics: ScriptAutomationMusic[];
+  default_music_key: string | null;
+  music_config_error: string | null;
 }
 
 export interface ScriptAutomationPart {
@@ -82,6 +99,9 @@ export interface ScriptAutomationEvent {
     | "starting"
     | "llm_script"
     | "llm_metadata"
+    | "generating_overlay"
+    | "overlay_ready"
+    | "script_ready"
     | "tts_segmenting"
     | "tts_generating"
     | "complete"
@@ -93,6 +113,7 @@ export interface ScriptAutomationEvent {
   script_json?: Record<string, unknown>;
   metadata_json?: PlatformMetadata | null;
   metadata_warning?: string | null;
+  overlay_json?: VideoOverlay;
   parts?: ScriptAutomationPart[];
   warning?: string;
   part_id?: string;

@@ -364,6 +364,8 @@ export const api = {
       existing_script_json?: Record<string, unknown>;
       skip_metadata?: boolean;
       skip_tts?: boolean;
+      pause_after_script?: boolean;
+      skip_overlay?: boolean;
     },
     signal?: AbortSignal,
   ) =>
@@ -378,6 +380,53 @@ export const api = {
     fetch(
       `${API_BASE}/projects/${projectId}/script/automate/runs/${encodeURIComponent(runId)}/parts/${encodeURIComponent(partId)}`,
       { method: "GET" },
+    ),
+
+  // Music preview
+  previewMusicUrl: (projectId: string, musicKey: string) =>
+    `${API_BASE}/projects/${projectId}/music/${encodeURIComponent(musicKey)}/preview`,
+
+  // Script settings (TTS speed, music, overlay)
+  updateScriptSettings: (
+    projectId: string,
+    payload: {
+      tts_speed?: number;
+      music_key?: string | null;
+      video_overlay?: { title: string; category: string };
+    },
+  ) =>
+    request<{ status: string; tts_speed: number | null; music_key: string | null }>(
+      `/projects/${projectId}/script/settings`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(payload),
+      },
+    ),
+
+  // Video overlay
+  generateOverlay: (
+    projectId: string,
+    payload: { script_json: Record<string, unknown>; target_language: string },
+  ) =>
+    request<{ status: string; overlay: import("@/types").VideoOverlay }>(
+      `/projects/${projectId}/script/overlay/generate`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+    ),
+
+  // Preview audio
+  buildPreview: (
+    projectId: string,
+    payload: { run_id?: string | null; tts_speed: number; music_key?: string | null },
+  ) =>
+    request<{ preview_url: string; duration_seconds: number }>(
+      `/projects/${projectId}/script/preview/build`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
     ),
 
   // Exports

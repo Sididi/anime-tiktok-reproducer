@@ -47,6 +47,11 @@ class Project(BaseModel):
     upload_completed_at: datetime | None = None
     upload_last_result: dict[str, Any] | None = None
 
+    # Script phase settings
+    music_key: str | None = None
+    tts_speed: float | None = None
+    video_overlay: dict[str, Any] | None = None
+
     # Scheduling
     scheduled_at: datetime | None = None
     scheduled_account_id: str | None = None

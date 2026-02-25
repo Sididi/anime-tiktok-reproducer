@@ -24,6 +24,8 @@ from ...services import (
     ElevenLabsService,
     VoiceConfigService,
     ScriptAutomationService,
+    MusicConfigService,
+    AudioSpeedService,
 )
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["processing"])
@@ -43,6 +45,25 @@ class ScriptAutomateRequest(BaseModel):
     existing_script_json: dict | None = None
     skip_metadata: bool = False
     skip_tts: bool = False
+    pause_after_script: bool = False
+    skip_overlay: bool = False
+
+
+class ScriptSettingsRequest(BaseModel):
+    tts_speed: float | None = None
+    music_key: str | None = None
+    video_overlay: dict | None = None
+
+
+class OverlayGenerateRequest(BaseModel):
+    script_json: dict
+    target_language: str = "fr"
+
+
+class PreviewBuildRequest(BaseModel):
+    run_id: str | None = None
+    tts_speed: float = 1.0
+    music_key: str | None = None
 
 
 async def _write_upload_to_path(upload: UploadFile, destination: Path) -> None:
@@ -83,11 +104,28 @@ async def get_script_automation_config(project_id: str):
     except Exception as exc:
         voice_error = str(exc)
 
+    music_error: str | None = None
+    musics: list[dict] = []
+    default_music_key: str | None = None
+    try:
+        music_config = MusicConfigService.get_config()
+        musics = [
+            {"key": entry.key, "display_name": entry.display_name}
+            for entry in music_config.musics.values()
+        ]
+        default_music_key = music_config.default_music_key
+    except Exception as exc:
+        music_error = str(exc)
+
     return {
         "enabled": settings.script_automate_enabled,
         "gemini": {
             "configured": GeminiService.is_configured(),
             "model": settings.gemini_model,
+        },
+        "gemini_light": {
+            "configured": GeminiService.is_configured(),
+            "model": settings.gemini_light_model,
         },
         "elevenlabs": {
             "configured": ElevenLabsService.is_configured(),
@@ -97,6 +135,9 @@ async def get_script_automation_config(project_id: str):
         "voices": voices,
         "default_voice_key": default_voice_key,
         "voice_config_error": voice_error,
+        "musics": musics,
+        "default_music_key": default_music_key,
+        "music_config_error": music_error,
     }
 
 
@@ -118,6 +159,8 @@ async def automate_script(project_id: str, request: ScriptAutomateRequest):
             existing_script_json=request.existing_script_json,
             skip_metadata=request.skip_metadata,
             skip_tts=request.skip_tts,
+            pause_after_script=request.pause_after_script,
+            skip_overlay=request.skip_overlay,
         ):
             yield f"data: {json.dumps(event)}\n\n"
 
@@ -229,6 +272,17 @@ async def upload_restructured_script(
                     detail="Failed to process audio parts"
                 )
 
+    # Apply TTS speed if configured
+    tts_speed = project.tts_speed
+    if tts_speed is not None and tts_speed != 1.0:
+        tmp_audio = audio_path.with_suffix(".tmp.wav")
+        try:
+            await AudioSpeedService.apply_speed(audio_path, tmp_audio, tts_speed)
+            tmp_audio.rename(audio_path)
+        except Exception as exc:
+            tmp_audio.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail=f"Failed to apply TTS speed: {exc}")
+
     metadata_saved = False
     if metadata_json and metadata_json.strip():
         try:
@@ -237,6 +291,11 @@ async def upload_restructured_script(
             metadata_saved = True
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
+
+    # Save video overlay if present
+    if project.video_overlay:
+        overlay_path = project_dir / "video_overlay.json"
+        overlay_path.write_text(json.dumps(project.video_overlay, ensure_ascii=False, indent=2))
 
     if isinstance(script_data.get("language"), str):
         project.output_language = script_data["language"]
@@ -251,6 +310,164 @@ async def upload_restructured_script(
         "audio_path": str(audio_path),
         "metadata_saved": metadata_saved,
     }
+
+
+@router.get("/music/{music_key}/preview")
+async def preview_music(music_key: str):
+    """Serve a music file for preview playback."""
+    try:
+        music = MusicConfigService.get_music(music_key)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    file_path = Path(music.file_path)
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Music file not found on disk")
+
+    media_type = mimetypes.guess_type(file_path.name)[0] or "audio/mpeg"
+    return FileResponse(path=file_path, filename=file_path.name, media_type=media_type)
+
+
+@router.patch("/script/settings")
+async def update_script_settings(project_id: str, request: ScriptSettingsRequest):
+    """Update script phase settings (TTS speed, music key)."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if request.tts_speed is not None:
+        if request.tts_speed < AudioSpeedService.SPEED_MIN or request.tts_speed > AudioSpeedService.SPEED_MAX:
+            raise HTTPException(
+                status_code=400,
+                detail=f"tts_speed must be between {AudioSpeedService.SPEED_MIN} and {AudioSpeedService.SPEED_MAX}",
+            )
+        project.tts_speed = request.tts_speed
+
+    provided = request.model_dump(exclude_unset=True)
+    if "music_key" in provided:
+        if request.music_key is not None:
+            try:
+                MusicConfigService.get_music(request.music_key)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+        project.music_key = request.music_key
+
+    if "video_overlay" in provided:
+        project.video_overlay = request.video_overlay
+
+    ProjectService.save(project)
+    return {"status": "ok", "tts_speed": project.tts_speed, "music_key": project.music_key}
+
+
+@router.post("/script/overlay/generate")
+async def generate_overlay(project_id: str, request: OverlayGenerateRequest):
+    """Generate a video overlay (title + category) via Gemini light model."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if not GeminiService.is_configured():
+        raise HTTPException(status_code=503, detail="Gemini API key is missing")
+
+    try:
+        overlay = await asyncio.to_thread(
+            ScriptAutomationService.generate_video_overlay,
+            project=project,
+            script_payload=request.script_json,
+            target_language=request.target_language,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    project.video_overlay = overlay
+    ProjectService.save(project)
+    return {"status": "ok", "overlay": overlay}
+
+
+@router.post("/script/preview/build")
+async def build_preview(project_id: str, request: PreviewBuildRequest):
+    """Build a preview audio file with optional speed + music mixing."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project_dir = ProjectService.get_project_dir(project_id)
+
+    # Find source TTS audio
+    source_audio: Path | None = None
+    if request.run_id:
+        run_dir = project_dir / ScriptAutomationService.RUNS_DIR_NAME / request.run_id
+        merged = run_dir / "merged.wav"
+        if merged.exists():
+            source_audio = merged
+    if source_audio is None:
+        tts_path = project_dir / "new_tts.wav"
+        if tts_path.exists():
+            source_audio = tts_path
+    if source_audio is None:
+        raise HTTPException(status_code=400, detail="No TTS audio available for preview")
+
+    preview_path = project_dir / "preview.wav"
+
+    # Step 1: Apply speed
+    speed = request.tts_speed
+    if speed < AudioSpeedService.SPEED_MIN or speed > AudioSpeedService.SPEED_MAX:
+        speed = 1.0
+
+    if speed != 1.0:
+        speed_tmp = project_dir / "preview_speed_tmp.wav"
+        try:
+            await AudioSpeedService.apply_speed(source_audio, speed_tmp, speed)
+            tts_audio = AudioSegment.from_file(str(speed_tmp))
+        finally:
+            speed_tmp.unlink(missing_ok=True)
+    else:
+        tts_audio = AudioSegment.from_file(str(source_audio))
+
+    # Step 2: Mix music if requested
+    if request.music_key:
+        try:
+            music = MusicConfigService.get_music(request.music_key)
+            music_file = Path(music.file_path)
+            if music_file.exists():
+                music_audio = AudioSegment.from_file(str(music_file))
+                tts_len = len(tts_audio)
+                # Loop music to match TTS length
+                if len(music_audio) < tts_len:
+                    repeats = (tts_len // len(music_audio)) + 1
+                    music_audio = music_audio * repeats
+                music_audio = music_audio[:tts_len]
+                # Apply volume and fade
+                music_audio = music_audio + music.volume_db
+                music_audio = music_audio.fade_out(2000)
+                tts_audio = tts_audio.overlay(music_audio)
+        except ValueError:
+            pass  # Unknown music key, skip
+
+    def _export():
+        tts_audio.export(str(preview_path), format="wav")
+
+    await asyncio.to_thread(_export)
+    duration = len(tts_audio) / 1000.0
+
+    return {
+        "preview_url": f"/api/projects/{project_id}/script/preview/audio",
+        "duration_seconds": duration,
+    }
+
+
+@router.get("/script/preview/audio")
+async def get_preview_audio(project_id: str):
+    """Serve the built preview audio file."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    preview_path = ProjectService.get_project_dir(project_id) / "preview.wav"
+    if not preview_path.exists():
+        raise HTTPException(status_code=404, detail="Preview not built yet")
+
+    return FileResponse(path=preview_path, filename="preview.wav", media_type="audio/wav")
 
 
 @router.get("/metadata")

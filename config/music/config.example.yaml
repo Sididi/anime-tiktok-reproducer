@@ -1,0 +1,17 @@
+# Music library configuration
+# Copy this file to config.yaml and customize.
+
+# Default music key (null = no music by default)
+default_music_key: null
+
+# Available music tracks
+musics:
+  epic_battle:
+    display_name: "Epic Battle"
+    file_path: "/absolute/path/to/epic_battle.mp3"
+    volume_db: -12
+
+  chill_vibes:
+    display_name: "Chill Vibes"
+    file_path: "/absolute/path/to/chill_vibes.mp3"
+    volume_db: -14

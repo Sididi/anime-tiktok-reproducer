@@ -58,6 +58,53 @@ Ta mission: réécrire le script en langue cible avec un style narratif oral, pe
 {input_json}
 """
 
+_OVERLAY_PROMPT_FR = """Tu es un expert en marketing vidéo TikTok anime.
+Génère un titre clickbait et une catégorie pour cette vidéo.
+
+RÈGLES TITRE:
+- Maximum 38 caractères (STRICT, compte chaque caractère)
+- Style: phrases choc qui donnent envie de regarder
+- Ne JAMAIS citer le nom de l'anime
+- Exemples: "CET ANIME EST UNE DINGUERIE", "TU VAS PLEURER EN REGARDANT ÇA", "L'ANIME LE PLUS FOU DE 2025"
+
+RÈGLES CATÉGORIE:
+- Exactement 2 genres séparés par " • "
+- Choisis les genres les plus représentatifs et populaires
+- Exemples: "Action • Fantasy", "Romance • Slice of Life", "Shonen • Aventure"
+
+ANIME: {anime_name}
+SCRIPT: {script_summary}
+"""
+
+_OVERLAY_PROMPT_MULTI = """You are a TikTok anime video marketing expert.
+Generate a clickbait title and category for this video.
+
+TITLE RULES:
+- Maximum 38 characters (STRICT)
+- Language: {target_language_name}
+- Shocking/intriguing phrases that make viewers want to watch
+- NEVER mention the anime name
+- Examples (adapt to target language): "THIS ANIME IS INSANE", "YOU WILL CRY WATCHING THIS"
+
+CATEGORY RULES:
+- Exactly 2 genres separated by " • "
+- Pick the most representative and popular genres
+- Examples: "Action • Fantasy", "Romance • Slice of Life"
+
+ANIME: {anime_name}
+SCRIPT: {script_summary}
+"""
+
+_OVERLAY_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "category": {"type": "string"},
+    },
+    "required": ["title", "category"],
+    "additionalProperties": False,
+}
+
 _SENTENCE_END_RE = re.compile(r"[.!?…][\"')\]]*\s*$")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
 
@@ -377,6 +424,41 @@ class ScriptAutomationService:
         return matches[0]
 
     @classmethod
+    def generate_video_overlay(
+        cls,
+        *,
+        project: Project,
+        script_payload: dict[str, Any],
+        target_language: str,
+    ) -> dict[str, str]:
+        """Generate a video overlay (title + category) via Gemini light model."""
+        anime_name = project.anime_name or "Inconnu"
+        script_summary = cls._script_text_from_payload(script_payload)[:500]
+        target_language_code = target_language.strip().lower()
+
+        if target_language_code == "fr":
+            prompt = _OVERLAY_PROMPT_FR.format(
+                anime_name=anime_name,
+                script_summary=script_summary,
+            )
+        else:
+            target_language_name = _LANGUAGE_DISPLAY.get(target_language_code, target_language_code)
+            prompt = _OVERLAY_PROMPT_MULTI.format(
+                anime_name=anime_name,
+                script_summary=script_summary,
+                target_language_name=target_language_name,
+            )
+
+        result = GeminiService.generate_json(
+            prompt,
+            model=settings.gemini_light_model,
+            response_json_schema=_OVERLAY_RESPONSE_SCHEMA,
+        )
+        title = str(result.get("title", ""))
+        category = str(result.get("category", ""))
+        return {"title": title, "category": category}
+
+    @classmethod
     async def stream_automation(
         cls,
         *,
@@ -386,6 +468,8 @@ class ScriptAutomationService:
         existing_script_json: dict[str, Any] | None = None,
         skip_metadata: bool = False,
         skip_tts: bool = False,
+        pause_after_script: bool = False,
+        skip_overlay: bool = False,
     ) -> AsyncIterator[dict[str, Any]]:
         try:
             if not settings.script_automate_enabled:
@@ -490,6 +574,42 @@ class ScriptAutomationService:
                         warning=metadata_warning,
                     )
 
+            # --- Pause for validation ---
+            if pause_after_script:
+                yield cls._event(
+                    "script_ready",
+                    status="paused",
+                    message="Script ready for validation",
+                    run_id=run_id,
+                    script_json=script_payload,
+                    metadata_json=metadata_payload,
+                    metadata_warning=metadata_warning,
+                )
+                return
+
+            # --- Video overlay generation ---
+            overlay_json: dict[str, str] | None = None
+            if not skip_overlay and GeminiService.is_configured():
+                yield cls._event("generating_overlay", message="Generating video overlay...")
+                try:
+                    overlay_json = await asyncio.to_thread(
+                        cls.generate_video_overlay,
+                        project=project,
+                        script_payload=script_payload,
+                        target_language=target_language,
+                    )
+                    yield cls._event(
+                        "overlay_ready",
+                        message="Video overlay generated",
+                        overlay_json=overlay_json,
+                    )
+                except Exception as exc:
+                    yield cls._event(
+                        "overlay_ready",
+                        message=f"Overlay generation failed: {exc}",
+                        warning=f"Overlay generation failed: {exc}",
+                    )
+
             # --- TTS generation ---
             parts: list[dict[str, Any]] = []
 
@@ -555,6 +675,7 @@ class ScriptAutomationService:
                 script_json=script_payload,
                 metadata_json=metadata_payload,
                 metadata_warning=metadata_warning,
+                overlay_json=overlay_json,
                 parts=parts,
             )
             yield complete_payload

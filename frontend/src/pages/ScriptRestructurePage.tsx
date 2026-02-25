@@ -17,19 +17,24 @@ import {
   Square,
   Play,
   Pause,
+  Volume2,
+  Sparkles,
 } from "lucide-react";
-import { Button } from "@/components/ui";
+import { Button, SearchableSelect } from "@/components/ui";
+import type { SearchableSelectOption } from "@/components/ui";
 import { useProjectStore, useSceneStore } from "@/stores";
 import { api } from "@/api/client";
 import type {
   Transcription,
   Project,
   PlatformMetadata,
+  VideoOverlay,
   ScriptAutomationConfig,
   ScriptAutomationEvent,
   ScriptAutomationPart,
 } from "@/types";
 import { ScriptEditorModal, MetadataEditorModal } from "@/components/script";
+import { estimateTtsDuration } from "@/components/script/durationEstimation";
 import { readSSEStream } from "@/utils/sse";
 
 // Upload mode types
@@ -617,6 +622,30 @@ export function ScriptRestructurePage() {
   const [playingVoiceKey, setPlayingVoiceKey] = useState<string | null>(null);
   const voiceAudioRef = useRef<HTMLAudioElement | null>(null);
 
+  // Music selection state
+  const [automationMusicKey, setAutomationMusicKey] = useState<string | null>(null);
+
+  // TTS speed state
+  const [ttsSpeed, setTtsSpeed] = useState(1.0);
+  const ttsSpeedDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Video overlay state
+  const [overlayTitle, setOverlayTitle] = useState("");
+  const [overlayCategory, setOverlayCategory] = useState("");
+  const [overlayGenerating, setOverlayGenerating] = useState(false);
+
+  // Automation validation pause
+  const [validateBeforeTts, setValidateBeforeTts] = useState(true);
+  const [automationPhase, setAutomationPhase] = useState<"idle" | "phase1" | "validating" | "phase2">("idle");
+  const [currentRunId, setCurrentRunId] = useState<string | null>(null);
+
+  // Preview player state
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [previewDuration, setPreviewDuration] = useState<number | null>(null);
+  const [previewBuilding, setPreviewBuilding] = useState(false);
+  const previewDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [hasTtsAudio, setHasTtsAudio] = useState(false);
+
   // Audio file state
   const [uploadMode, setUploadMode] = useState<UploadMode>("multiple");
   const [audioFile, setAudioFile] = useState<File | null>(null);
@@ -679,6 +708,7 @@ export function ScriptRestructurePage() {
           setAutomationVoiceKey(
             automation.default_voice_key || automation.voices[0]?.key || "",
           );
+          setAutomationMusicKey(automation.default_music_key ?? null);
         } catch (automationErr) {
           setAutomationConfig(null);
           setAutomationConfigError((automationErr as Error).message);
@@ -864,6 +894,87 @@ export function ScriptRestructurePage() {
     [playingVoiceKey],
   );
 
+  // Debounced save TTS speed to backend
+  const saveTtsSpeed = useCallback(
+    (speed: number) => {
+      if (!projectId) return;
+      if (ttsSpeedDebounceRef.current) clearTimeout(ttsSpeedDebounceRef.current);
+      ttsSpeedDebounceRef.current = setTimeout(() => {
+        api.updateScriptSettings(projectId, { tts_speed: speed }).catch(() => {});
+      }, 500);
+    },
+    [projectId],
+  );
+
+  // Debounced save music key to backend
+  const saveMusicKey = useCallback(
+    (key: string | null) => {
+      if (!projectId) return;
+      api.updateScriptSettings(projectId, { music_key: key }).catch(() => {});
+    },
+    [projectId],
+  );
+
+  // Generate video overlay
+  const handleGenerateOverlay = useCallback(async () => {
+    if (!projectId || !jsonValid || !newScriptJson) return;
+    setOverlayGenerating(true);
+    try {
+      const parsed = JSON.parse(newScriptJson);
+      const result = await api.generateOverlay(projectId, {
+        script_json: parsed,
+        target_language: targetLanguage,
+      });
+      setOverlayTitle(result.overlay.title);
+      setOverlayCategory(result.overlay.category);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setOverlayGenerating(false);
+    }
+  }, [projectId, jsonValid, newScriptJson, targetLanguage]);
+
+  // Build preview audio
+  const buildPreview = useCallback(async () => {
+    if (!projectId || !hasTtsAudio) return;
+    setPreviewBuilding(true);
+    try {
+      const result = await api.buildPreview(projectId, {
+        run_id: currentRunId,
+        tts_speed: ttsSpeed,
+        music_key: automationMusicKey,
+      });
+      setPreviewUrl(result.preview_url + "?t=" + Date.now());
+      setPreviewDuration(result.duration_seconds);
+    } catch (err) {
+      setPreviewUrl(null);
+      setPreviewDuration(null);
+    } finally {
+      setPreviewBuilding(false);
+    }
+  }, [projectId, hasTtsAudio, currentRunId, ttsSpeed, automationMusicKey]);
+
+  // Auto-rebuild preview when speed or music changes
+  useEffect(() => {
+    if (!hasTtsAudio) return;
+    if (previewDebounceRef.current) clearTimeout(previewDebounceRef.current);
+    previewDebounceRef.current = setTimeout(() => {
+      buildPreview();
+    }, 500);
+    return () => {
+      if (previewDebounceRef.current) clearTimeout(previewDebounceRef.current);
+    };
+  }, [ttsSpeed, automationMusicKey, hasTtsAudio, buildPreview]);
+
+  // Estimated total TTS duration
+  const estimatedTtsDuration = useMemo(() => {
+    if (!parsedScenes) return 0;
+    return parsedScenes.reduce(
+      (sum, scene) => sum + estimateTtsDuration(scene.text, targetLanguage),
+      0,
+    );
+  }, [parsedScenes, targetLanguage]);
+
   const handleAutomate = useCallback(async () => {
     if (!projectId || !automationConfig) return;
     if (!automationConfig.enabled) {
@@ -881,6 +992,7 @@ export function ScriptRestructurePage() {
     setAutomationMessage("Starting automation...");
     setAutomationRunning(true);
     setPromptCopied(true);
+    setAutomationPhase("phase1");
 
     const controller = new AbortController();
     automationAbortRef.current = controller;
@@ -892,6 +1004,8 @@ export function ScriptRestructurePage() {
       (uploadMode === "single" && audioFile !== null) ||
       (uploadMode === "multiple" && segmentFiles.size > 0);
 
+    const shouldPause = validateBeforeTts && !skipScript;
+
     try {
       const response = await api.automateScript(
         projectId,
@@ -901,6 +1015,7 @@ export function ScriptRestructurePage() {
           existing_script_json: skipScript ? JSON.parse(newScriptJson) : undefined,
           skip_metadata: skipMetadata,
           skip_tts: skipTts,
+          pause_after_script: shouldPause,
         },
         controller.signal,
       );
@@ -913,6 +1028,9 @@ export function ScriptRestructurePage() {
           if (event.warning) {
             setAutomationMetadataWarning(event.warning);
           }
+          if (event.run_id) {
+            setCurrentRunId(event.run_id);
+          }
         },
         controller.signal,
       );
@@ -920,6 +1038,29 @@ export function ScriptRestructurePage() {
       if (!finalEvent) {
         if (controller.signal.aborted) return;
         throw new Error("Automation ended without completion event");
+      }
+
+      // Handle pause for validation
+      if (finalEvent.event === "script_ready") {
+        if (finalEvent.script_json) {
+          const prettyScript = JSON.stringify(finalEvent.script_json, null, 2);
+          handleJsonChange(prettyScript);
+        }
+        if (finalEvent.metadata_json) {
+          const prettyMetadata = JSON.stringify(finalEvent.metadata_json, null, 2);
+          handleMetadataJsonChange(prettyMetadata);
+          setMetadataDetected(true);
+          setMetadataExpanded(true);
+        }
+        if (finalEvent.metadata_warning) {
+          setAutomationMetadataWarning(finalEvent.metadata_warning);
+          setMetadataExpanded(true);
+        }
+        setAutomationPhase("validating");
+        setAutomationRunning(false);
+        setAutomationMessage("Script ready — validate and continue");
+        setScriptEditorOpen(true);
+        return;
       }
 
       if (finalEvent.event !== "complete") {
@@ -947,6 +1088,11 @@ export function ScriptRestructurePage() {
         setMetadataExpanded(true);
       }
 
+      if (finalEvent.overlay_json) {
+        setOverlayTitle(finalEvent.overlay_json.title);
+        setOverlayCategory(finalEvent.overlay_json.category);
+      }
+
       if (!finalEvent.run_id) {
         throw new Error("Automation response did not include run_id");
       }
@@ -958,17 +1104,20 @@ export function ScriptRestructurePage() {
         setAudioFile(null);
         setSegmentFiles(files);
         setRequiredSegmentIds([...files.keys()].sort((a, b) => a - b));
+        setHasTtsAudio(true);
         setAutomationMessage(
           `Automation complete (${parts.length} part${parts.length > 1 ? "s" : ""} loaded)`,
         );
       } else {
         setAutomationMessage("Automation complete (audio kept as-is)");
       }
+      setAutomationPhase("idle");
     } catch (err) {
       if ((err as Error).name === "AbortError") {
         return;
       }
       setError((err as Error).message);
+      setAutomationPhase("idle");
     } finally {
       setAutomationRunning(false);
       automationAbortRef.current = null;
@@ -987,6 +1136,91 @@ export function ScriptRestructurePage() {
     segmentFiles,
     handleJsonChange,
     handleMetadataJsonChange,
+    hydrateAutomationParts,
+    validateBeforeTts,
+  ]);
+
+  // Resume automation after validation pause (phase 2: overlay + TTS)
+  const handleResumeAfterValidation = useCallback(async () => {
+    if (!projectId || !automationConfig || !jsonValid) return;
+
+    setError(null);
+    setAutomationStep("starting");
+    setAutomationMessage("Resuming automation (overlay + TTS)...");
+    setAutomationRunning(true);
+    setAutomationPhase("phase2");
+
+    const controller = new AbortController();
+    automationAbortRef.current = controller;
+
+    try {
+      const response = await api.automateScript(
+        projectId,
+        {
+          target_language: targetLanguage,
+          voice_key: automationVoiceKey,
+          existing_script_json: JSON.parse(newScriptJson),
+          skip_metadata: true,
+          skip_tts: false,
+          pause_after_script: false,
+          skip_overlay: false,
+        },
+        controller.signal,
+      );
+
+      const finalEvent = await readSSEStream<ScriptAutomationEvent>(
+        response,
+        (event) => {
+          setAutomationStep(event.event);
+          setAutomationMessage(event.message || null);
+          if (event.run_id) setCurrentRunId(event.run_id);
+        },
+        controller.signal,
+      );
+
+      if (!finalEvent) {
+        if (controller.signal.aborted) return;
+        throw new Error("Automation ended without completion event");
+      }
+
+      if (finalEvent.event !== "complete") {
+        throw new Error(
+          finalEvent.error || finalEvent.message || "Automation failed",
+        );
+      }
+
+      if (finalEvent.overlay_json) {
+        setOverlayTitle(finalEvent.overlay_json.title);
+        setOverlayCategory(finalEvent.overlay_json.category);
+      }
+
+      const parts = finalEvent.parts || [];
+      if (parts.length > 0 && finalEvent.run_id) {
+        const files = await hydrateAutomationParts(finalEvent.run_id, parts);
+        setUploadMode("multiple");
+        setAudioFile(null);
+        setSegmentFiles(files);
+        setRequiredSegmentIds([...files.keys()].sort((a, b) => a - b));
+        setHasTtsAudio(true);
+        setAutomationMessage(
+          `Automation complete (${parts.length} part${parts.length > 1 ? "s" : ""} loaded)`,
+        );
+      }
+    } catch (err) {
+      if ((err as Error).name === "AbortError") return;
+      setError((err as Error).message);
+    } finally {
+      setAutomationRunning(false);
+      setAutomationPhase("idle");
+      automationAbortRef.current = null;
+    }
+  }, [
+    projectId,
+    automationConfig,
+    automationVoiceKey,
+    targetLanguage,
+    jsonValid,
+    newScriptJson,
     hydrateAutomationParts,
   ]);
 
@@ -1094,6 +1328,15 @@ export function ScriptRestructurePage() {
     setError(null);
 
     try {
+      // Save settings (speed, music, overlay) to project before submission
+      await api.updateScriptSettings(projectId, {
+        tts_speed: ttsSpeed,
+        music_key: automationMusicKey,
+        ...(overlayTitle || overlayCategory
+          ? { video_overlay: { title: overlayTitle, category: overlayCategory } }
+          : {}),
+      }).catch(() => {});
+
       const formData = new FormData();
       formData.append("script", newScriptJson);
       if (metadataValid && metadataJson.trim()) {
@@ -1147,6 +1390,10 @@ export function ScriptRestructurePage() {
     segmentFiles,
     metadataValid,
     metadataJson,
+    ttsSpeed,
+    automationMusicKey,
+    overlayTitle,
+    overlayCategory,
   ]);
 
   if (loading) {
@@ -1730,44 +1977,116 @@ export function ScriptRestructurePage() {
                   <span className="text-xs text-[hsl(var(--muted-foreground))]">
                     Voice
                   </span>
-                  <div className="space-y-1">
-                    {(automationConfig?.voices || []).map((voice) => (
-                      <div key={voice.key} className="flex items-center gap-2">
-                        <label className="flex items-center gap-2 flex-1 cursor-pointer min-w-0">
-                          <input
-                            type="radio"
-                            name="automation-voice"
-                            value={voice.key}
-                            checked={automationVoiceKey === voice.key}
-                            onChange={() => setAutomationVoiceKey(voice.key)}
-                            disabled={automationRunning}
-                            className="shrink-0"
-                          />
-                          <span className="text-sm truncate">
-                            {voice.display_name}
-                          </span>
-                        </label>
-                        {voice.preview_url && (
-                          <button
-                            type="button"
-                            onClick={() =>
-                              playVoicePreview(voice.preview_url!, voice.key)
-                            }
-                            disabled={automationRunning}
-                            className="shrink-0 p-1 rounded hover:bg-[hsl(var(--muted))] disabled:opacity-50"
-                            title="Preview voice"
-                          >
-                            {playingVoiceKey === voice.key ? (
-                              <Pause className="h-3 w-3" />
-                            ) : (
-                              <Play className="h-3 w-3" />
-                            )}
-                          </button>
-                        )}
-                      </div>
-                    ))}
-                  </div>
+                  <SearchableSelect
+                    options={(automationConfig?.voices || []).map((v) => ({
+                      key: v.key,
+                      label: v.display_name,
+                      previewUrl: v.preview_url,
+                    } as SearchableSelectOption))}
+                    value={automationVoiceKey || null}
+                    onChange={(key) => setAutomationVoiceKey(key || "")}
+                    placeholder="Select voice..."
+                    disabled={automationRunning}
+                    onPreview={(url, key) => playVoicePreview(url, key)}
+                    onPreviewStop={() => {
+                      if (voiceAudioRef.current) {
+                        voiceAudioRef.current.pause();
+                        voiceAudioRef.current = null;
+                      }
+                      setPlayingVoiceKey(null);
+                    }}
+                    previewingKey={playingVoiceKey}
+                  />
                 </div>
+
+                {/* Music selection */}
+                {automationConfig && automationConfig.musics.length > 0 && (
+                  <div className="space-y-1">
+                    <span className="text-xs text-[hsl(var(--muted-foreground))]">
+                      Music
+                    </span>
+                    <SearchableSelect
+                      options={automationConfig.musics.map((m) => ({
+                        key: m.key,
+                        label: m.display_name,
+                        previewUrl: projectId ? api.previewMusicUrl(projectId, m.key) : undefined,
+                      } as SearchableSelectOption))}
+                      value={automationMusicKey}
+                      onChange={(key) => {
+                        setAutomationMusicKey(key);
+                        saveMusicKey(key);
+                      }}
+                      placeholder="Select music..."
+                      allowNone
+                      noneLabel="None"
+                      disabled={automationRunning}
+                      onPreview={(url, key) => playVoicePreview(url, key)}
+                      onPreviewStop={() => {
+                        if (voiceAudioRef.current) {
+                          voiceAudioRef.current.pause();
+                          voiceAudioRef.current = null;
+                        }
+                        setPlayingVoiceKey(null);
+                      }}
+                      previewingKey={playingVoiceKey}
+                    />
+                  </div>
+                )}
+
+                {/* TTS Speed slider */}
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-[hsl(var(--muted-foreground))]">
+                      TTS Speed
+                    </span>
+                    <span className="text-xs font-mono">
+                      x{ttsSpeed.toFixed(2)}
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0.9}
+                    max={1.5}
+                    step={0.05}
+                    value={ttsSpeed}
+                    onChange={(e) => {
+                      const val = parseFloat(e.target.value);
+                      setTtsSpeed(val);
+                      saveTtsSpeed(val);
+                    }}
+                    disabled={automationRunning}
+                    className="w-full h-1.5 rounded-lg appearance-none cursor-pointer bg-[hsl(var(--border))] accent-[hsl(var(--primary))]"
+                  />
+                  {estimatedTtsDuration > 0 && (
+                    <p className="text-xs text-[hsl(var(--muted-foreground))]">
+                      Est. duration: {Math.floor(estimatedTtsDuration / ttsSpeed / 60)}m{" "}
+                      {Math.round((estimatedTtsDuration / ttsSpeed) % 60)}s
+                    </p>
+                  )}
+                </div>
+
+                {/* Validate before TTS checkbox */}
+                <label className="flex items-center gap-2 text-xs cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={validateBeforeTts}
+                    onChange={(e) => setValidateBeforeTts(e.target.checked)}
+                    disabled={automationRunning}
+                  />
+                  Validate script before TTS
+                </label>
+
+                {/* Resume button when in validation phase */}
+                {automationPhase === "validating" && !automationRunning && (
+                  <Button
+                    size="sm"
+                    className="w-full"
+                    onClick={handleResumeAfterValidation}
+                  >
+                    <Sparkles className="h-4 w-4 mr-2" />
+                    Continue (Overlay + TTS)
+                  </Button>
+                )}
 
                 {automationMessage && (
                   <div className="text-sm p-3 rounded-md bg-[hsl(var(--muted))]">
@@ -1793,6 +2112,93 @@ export function ScriptRestructurePage() {
                 )}
               </div>
 
+              {/* Preview Player */}
+              <div className="bg-[hsl(var(--card))] rounded-lg p-4">
+                <h3 className="font-medium text-sm flex items-center gap-2 mb-2">
+                  <Volume2 className="h-4 w-4" />
+                  Preview
+                </h3>
+                {previewBuilding ? (
+                  <div className="flex items-center gap-2 text-xs text-[hsl(var(--muted-foreground))]">
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                    Building preview...
+                  </div>
+                ) : previewUrl ? (
+                  <audio controls src={previewUrl} className="w-full h-8" key={previewUrl} />
+                ) : (
+                  <p className="text-xs text-[hsl(var(--muted-foreground))]">
+                    Generate TTS to enable preview
+                  </p>
+                )}
+                {previewDuration != null && (
+                  <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
+                    Duration: {Math.floor(previewDuration / 60)}m{" "}
+                    {Math.round(previewDuration % 60)}s
+                  </p>
+                )}
+              </div>
+
+              {/* Video Overlay */}
+              <div className="bg-[hsl(var(--card))] rounded-lg p-4 space-y-3">
+                <div className="flex items-center justify-between">
+                  <h3 className="font-medium text-sm flex items-center gap-2">
+                    <Sparkles className="h-4 w-4" />
+                    Video Overlay
+                  </h3>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleGenerateOverlay}
+                    disabled={!jsonValid || overlayGenerating}
+                    className="h-7 text-xs"
+                  >
+                    {overlayGenerating ? (
+                      <Loader2 className="h-3 w-3 animate-spin mr-1" />
+                    ) : (
+                      <Sparkles className="h-3 w-3 mr-1" />
+                    )}
+                    Generate
+                  </Button>
+                </div>
+                <div className="space-y-2">
+                  <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="text-xs text-[hsl(var(--muted-foreground))]">
+                        Title
+                      </label>
+                      <span
+                        className={`text-xs font-mono ${
+                          overlayTitle.length > 38
+                            ? "text-[hsl(var(--destructive))]"
+                            : "text-[hsl(var(--muted-foreground))]"
+                        }`}
+                      >
+                        {overlayTitle.length}/38
+                      </span>
+                    </div>
+                    <input
+                      type="text"
+                      value={overlayTitle}
+                      onChange={(e) => setOverlayTitle(e.target.value)}
+                      placeholder="Clickbait title..."
+                      className="w-full px-2 py-1.5 text-sm rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--background))]"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs text-[hsl(var(--muted-foreground))] mb-1 block">
+                      Category
+                    </label>
+                    <input
+                      type="text"
+                      value={overlayCategory}
+                      onChange={(e) => setOverlayCategory(e.target.value)}
+                      placeholder="Genre • Genre"
+                      className="w-full px-2 py-1.5 text-sm rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--background))]"
+                    />
+                  </div>
+                </div>
+              </div>
+
               <div className="bg-[hsl(var(--muted))] rounded-lg p-4">
                 <h3 className="font-medium mb-2">Checklist</h3>
                 <ul className="space-y-1 text-sm">
@@ -1813,6 +2219,16 @@ export function ScriptRestructurePage() {
                       className={`h-3 w-3 rounded-full ${metadataDone ? "bg-green-500" : "bg-[hsl(var(--border))]"}`}
                     />
                     Optional metadata {metadataDone ? "ready" : "skipped"}
+                  </li>
+                  <li className="flex items-center gap-2">
+                    <div
+                      className={`h-3 w-3 rounded-full ${
+                        overlayTitle || overlayCategory
+                          ? "bg-green-500"
+                          : "bg-[hsl(var(--border))]"
+                      }`}
+                    />
+                    Optional overlay {overlayTitle ? "ready" : "skipped"}
                   </li>
                   <li className="flex items-center gap-2">
                     <div
@@ -1842,10 +2258,21 @@ export function ScriptRestructurePage() {
       {transcription && (
         <ScriptEditorModal
           isOpen={scriptEditorOpen}
-          onClose={() => setScriptEditorOpen(false)}
+          onClose={() => {
+            setScriptEditorOpen(false);
+            // If closing during validation phase, trigger resume
+            if (automationPhase === "validating") {
+              handleResumeAfterValidation();
+            }
+          }}
           onSave={(updatedJson) => {
             handleJsonChange(updatedJson);
             setScriptEditorOpen(false);
+            // If saving during validation phase, trigger resume
+            if (automationPhase === "validating") {
+              // Small delay to let state update
+              setTimeout(() => handleResumeAfterValidation(), 100);
+            }
           }}
           scenesJson={newScriptJson}
           transcription={transcription}
