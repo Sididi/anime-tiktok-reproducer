@@ -43,7 +43,7 @@ class MusicConfigService:
         if default_key is not None and not isinstance(default_key, str):
             raise ValueError("default_music_key must be a string or null")
 
-        musics_raw = raw.get("musics")
+        musics_raw = raw.get("musics") or raw.get("music")
         if musics_raw is None:
             musics_raw = {}
         if not isinstance(musics_raw, dict):

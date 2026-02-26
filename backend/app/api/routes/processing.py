@@ -384,6 +384,48 @@ async def generate_overlay(project_id: str, request: OverlayGenerateRequest):
     return {"status": "ok", "overlay": overlay}
 
 
+@router.post("/script/preview/stage")
+async def stage_preview_audio(
+    project_id: str,
+    audio: Optional[UploadFile] = File(None),
+    audio_parts: Optional[list[UploadFile]] = File(None),
+):
+    """Stage uploaded audio files for preview playback before final submission."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if audio is None and (audio_parts is None or len(audio_parts) == 0):
+        raise HTTPException(status_code=400, detail="Either 'audio' or 'audio_parts' must be provided")
+
+    project_dir = ProjectService.get_project_dir(project_id)
+    staged_path = project_dir / "preview_staged.wav"
+
+    if audio is not None:
+        await _write_upload_to_path(audio, staged_path)
+    else:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            part_paths: list[Path] = []
+            for i, part in enumerate(audio_parts):
+                part_path = tmp_path / f"part_{i}{Path(part.filename or '.mp3').suffix}"
+                await _write_upload_to_path(part, part_path)
+                part_paths.append(part_path)
+
+            def _concat():
+                combined = AudioSegment.empty()
+                for p in part_paths:
+                    combined += AudioSegment.from_file(str(p))
+                combined.export(str(staged_path), format="wav")
+
+            try:
+                await asyncio.to_thread(_concat)
+            except Exception:
+                raise HTTPException(status_code=400, detail="Failed to process audio parts")
+
+    return {"staged": True}
+
+
 @router.post("/script/preview/build")
 async def build_preview(project_id: str, request: PreviewBuildRequest):
     """Build a preview audio file with optional speed + music mixing."""
@@ -404,6 +446,10 @@ async def build_preview(project_id: str, request: PreviewBuildRequest):
         tts_path = project_dir / "new_tts.wav"
         if tts_path.exists():
             source_audio = tts_path
+    if source_audio is None:
+        staged_path = project_dir / "preview_staged.wav"
+        if staged_path.exists():
+            source_audio = staged_path
     if source_audio is None:
         raise HTTPException(status_code=400, detail="No TTS audio available for preview")
 

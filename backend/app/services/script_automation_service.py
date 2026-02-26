@@ -106,7 +106,6 @@ _OVERLAY_RESPONSE_SCHEMA: dict[str, Any] = {
 }
 
 _SENTENCE_END_RE = re.compile(r"[.!?…][\"')\]]*\s*$")
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
 
 
 class ScriptAutomationService:
@@ -306,15 +305,6 @@ class ScriptAutomationService:
         }
 
     @classmethod
-    def _split_sentences(cls, text: str) -> list[str]:
-        cleaned = re.sub(r"\s+", " ", text).strip()
-        if not cleaned:
-            return []
-        if not _SENTENCE_END_RE.search(cleaned):
-            return [cleaned]
-        return [segment.strip() for segment in _SENTENCE_SPLIT_RE.split(cleaned) if segment.strip()]
-
-    @classmethod
     def _ensure_sentence_end(cls, text: str) -> str:
         cleaned = text.strip()
         if not cleaned:
@@ -324,51 +314,55 @@ class ScriptAutomationService:
         return f"{cleaned}."
 
     @classmethod
-    def _segment_text_for_tts(cls, text: str) -> list[str]:
-        sentences = cls._split_sentences(text)
-        if not sentences:
+    def _segment_scenes_for_tts(cls, script_payload: dict[str, Any]) -> list[str]:
+        """Segment script scenes for TTS, mirroring frontend segmentScenes logic."""
+        scenes = script_payload.get("scenes", [])
+        if not scenes:
             return []
 
         chunks: list[str] = []
-        current = ""
-        index = 0
+        current_text = ""
 
-        while index < len(sentences):
-            sentence = sentences[index]
-            if not current:
-                current = sentence
-                index += 1
+        for i, scene in enumerate(scenes):
+            scene_text = (scene.get("text") or "").strip()
+            if not scene_text:
                 continue
 
-            candidate = f"{current} {sentence}".strip()
-            current_len = len(current)
-            candidate_len = len(candidate)
+            merged = f"{current_text} {scene_text}".strip() if current_text else scene_text
+            current_text = merged
+            current_len = len(current_text)
 
-            if candidate_len <= cls.TTS_MAX:
-                # Close at the current sentence boundary if we are already in-range
-                # and adding one more sentence would move us further from the 300-char target.
-                close_now = current_len >= cls.TTS_MIN and abs(current_len - cls.TTS_TARGET) <= abs(candidate_len - cls.TTS_TARGET)
-                if close_now:
-                    chunks.append(cls._ensure_sentence_end(current))
-                    current = sentence
-                else:
-                    current = candidate
-                index += 1
+            is_last = i == len(scenes) - 1
+            ends_sentence = bool(_SENTENCE_END_RE.search(current_text))
+
+            if not ends_sentence and not is_last:
                 continue
 
-            # Candidate would exceed soft max.
-            if current_len >= cls.TTS_MIN:
-                chunks.append(cls._ensure_sentence_end(current))
-                current = ""
+            if is_last:
+                chunks.append(cls._ensure_sentence_end(current_text))
+                current_text = ""
                 continue
 
-            # Current chunk too short (<200): keep extending even above 400 to preserve sentence ending.
-            current = candidate
-            index += 1
+            next_text = (scenes[i + 1].get("text") or "").strip()
+            with_next_len = len(f"{current_text} {next_text}") if next_text else current_len
 
-        if current:
-            chunks.append(cls._ensure_sentence_end(current))
+            close_now = (
+                current_len >= cls.TTS_MIN
+                and (
+                    current_len > cls.TTS_MAX
+                    or with_next_len > cls.TTS_MAX
+                    or abs(current_len - cls.TTS_TARGET) <= abs(with_next_len - cls.TTS_TARGET)
+                )
+            )
 
+            if close_now:
+                chunks.append(cls._ensure_sentence_end(current_text))
+                current_text = ""
+
+        if current_text:
+            chunks.append(cls._ensure_sentence_end(current_text))
+
+        # Merge small final chunk
         if len(chunks) >= 2 and len(chunks[-1]) < cls.TTS_MIN:
             chunks[-2] = cls._ensure_sentence_end(f"{chunks[-2]} {chunks[-1]}")
             chunks.pop()
@@ -616,12 +610,8 @@ class ScriptAutomationService:
             if skip_tts:
                 yield cls._event("tts_generating", message="TTS generation skipped")
             else:
-                full_text = cls._script_text_from_payload(script_payload)
-                if not full_text:
-                    raise RuntimeError("Script JSON contains no text for TTS generation")
-
                 yield cls._event("tts_segmenting", message="Segmenting script for TTS...")
-                chunks = cls._segment_text_for_tts(full_text)
+                chunks = cls._segment_scenes_for_tts(script_payload)
                 if not chunks:
                     raise RuntimeError("Failed to segment script text for TTS")
 
@@ -651,6 +641,8 @@ class ScriptAutomationService:
                         model_id=settings.elevenlabs_model_id,
                         output_format=settings.elevenlabs_output_format,
                         voice_settings=voice.voice_settings or None,
+                        previous_text=chunks[idx - 2] if idx >= 2 else None,
+                        next_text=chunks[idx] if idx <= len(chunks) - 1 else None,
                     )
                     part_path = parts_dir / f"part_{idx}.{extension}"
                     part_path.write_bytes(audio_bytes)

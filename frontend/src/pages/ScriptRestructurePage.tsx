@@ -34,7 +34,6 @@ import type {
   ScriptAutomationPart,
 } from "@/types";
 import { ScriptEditorModal, MetadataEditorModal } from "@/components/script";
-import { estimateTtsDuration } from "@/components/script/durationEstimation";
 import { readSSEStream } from "@/utils/sse";
 
 // Upload mode types
@@ -641,7 +640,6 @@ export function ScriptRestructurePage() {
 
   // Preview player state
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const [previewDuration, setPreviewDuration] = useState<number | null>(null);
   const [previewBuilding, setPreviewBuilding] = useState(false);
   const previewDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [hasTtsAudio, setHasTtsAudio] = useState(false);
@@ -945,10 +943,8 @@ export function ScriptRestructurePage() {
         music_key: automationMusicKey,
       });
       setPreviewUrl(result.preview_url + "?t=" + Date.now());
-      setPreviewDuration(result.duration_seconds);
     } catch (err) {
       setPreviewUrl(null);
-      setPreviewDuration(null);
     } finally {
       setPreviewBuilding(false);
     }
@@ -965,15 +961,6 @@ export function ScriptRestructurePage() {
       if (previewDebounceRef.current) clearTimeout(previewDebounceRef.current);
     };
   }, [ttsSpeed, automationMusicKey, hasTtsAudio, buildPreview]);
-
-  // Estimated total TTS duration
-  const estimatedTtsDuration = useMemo(() => {
-    if (!parsedScenes) return 0;
-    return parsedScenes.reduce(
-      (sum, scene) => sum + estimateTtsDuration(scene.text, targetLanguage),
-      0,
-    );
-  }, [parsedScenes, targetLanguage]);
 
   const handleAutomate = useCallback(async () => {
     if (!projectId || !automationConfig) return;
@@ -1224,6 +1211,27 @@ export function ScriptRestructurePage() {
     hydrateAutomationParts,
   ]);
 
+  // Stage audio files for preview playback before final submission
+  const stagePreviewAudio = useCallback(
+    async (files: File | File[]) => {
+      if (!projectId) return;
+      const formData = new FormData();
+      if (Array.isArray(files)) {
+        for (const f of files) {
+          formData.append("audio_parts", f);
+        }
+      } else {
+        formData.append("audio", files);
+      }
+      try {
+        await api.stagePreviewAudio(projectId, formData);
+      } catch {
+        // Non-critical: preview just won't work until final submission
+      }
+    },
+    [projectId],
+  );
+
   const handleFileSelect = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
@@ -1234,10 +1242,12 @@ export function ScriptRestructurePage() {
           return;
         }
         setAudioFile(file);
+        setHasTtsAudio(true);
+        stagePreviewAudio(file);
         setError(null);
       }
     },
-    [],
+    [stagePreviewAudio],
   );
 
   const handleSegmentFileSelect = useCallback(
@@ -1251,12 +1261,18 @@ export function ScriptRestructurePage() {
         setSegmentFiles((prev) => {
           const next = new Map(prev);
           next.set(segmentId, file);
+          // Stage all current segment files for preview
+          const allFiles = [...next.values()];
+          if (allFiles.length > 0) {
+            setHasTtsAudio(true);
+            stagePreviewAudio(allFiles);
+          }
           return next;
         });
         setError(null);
       }
     },
-    [],
+    [stagePreviewAudio],
   );
 
   const handleCopySegment = useCallback(async (segment: AudioSegment) => {
@@ -1293,16 +1309,23 @@ export function ScriptRestructurePage() {
       }
       if (target === "single") {
         setAudioFile(file);
+        setHasTtsAudio(true);
+        stagePreviewAudio(file);
       } else {
         setSegmentFiles((prev) => {
           const next = new Map(prev);
           next.set(target, file);
+          const allFiles = [...next.values()];
+          if (allFiles.length > 0) {
+            setHasTtsAudio(true);
+            stagePreviewAudio(allFiles);
+          }
           return next;
         });
       }
       setError(null);
     },
-    [],
+    [stagePreviewAudio],
   );
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
@@ -2047,7 +2070,7 @@ export function ScriptRestructurePage() {
                     type="range"
                     min={0.9}
                     max={1.5}
-                    step={0.05}
+                    step={0.01}
                     value={ttsSpeed}
                     onChange={(e) => {
                       const val = parseFloat(e.target.value);
@@ -2057,12 +2080,6 @@ export function ScriptRestructurePage() {
                     disabled={automationRunning}
                     className="w-full h-1.5 rounded-lg appearance-none cursor-pointer bg-[hsl(var(--border))] accent-[hsl(var(--primary))]"
                   />
-                  {estimatedTtsDuration > 0 && (
-                    <p className="text-xs text-[hsl(var(--muted-foreground))]">
-                      Est. duration: {Math.floor(estimatedTtsDuration / ttsSpeed / 60)}m{" "}
-                      {Math.round((estimatedTtsDuration / ttsSpeed) % 60)}s
-                    </p>
-                  )}
                 </div>
 
                 {/* Validate before TTS checkbox */}
@@ -2128,12 +2145,6 @@ export function ScriptRestructurePage() {
                 ) : (
                   <p className="text-xs text-[hsl(var(--muted-foreground))]">
                     Generate TTS to enable preview
-                  </p>
-                )}
-                {previewDuration != null && (
-                  <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
-                    Duration: {Math.floor(previewDuration / 60)}m{" "}
-                    {Math.round(previewDuration % 60)}s
                   </p>
                 )}
               </div>

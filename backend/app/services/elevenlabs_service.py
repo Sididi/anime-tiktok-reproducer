@@ -79,6 +79,8 @@ class ElevenLabsService:
         model_id: str | None = None,
         output_format: str | None = None,
         voice_settings: dict[str, Any] | None = None,
+        previous_text: str | None = None,
+        next_text: str | None = None,
     ) -> bytes:
         if not voice_id.strip():
             raise ValueError("voice_id is required")
@@ -103,6 +105,10 @@ class ElevenLabsService:
                 "use_speaker_boost": True,
             },
         }
+        if previous_text:
+            body["previous_text"] = previous_text
+        if next_text:
+            body["next_text"] = next_text
 
         response = requests.post(
             f"{cls._BASE_URL}/text-to-speech/{voice_id}",

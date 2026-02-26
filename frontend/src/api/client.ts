@@ -416,6 +416,16 @@ export const api = {
       },
     ),
 
+  // Stage preview audio (upload files for preview before final submission)
+  stagePreviewAudio: (projectId: string, formData: FormData) =>
+    fetch(`${API_BASE}/projects/${projectId}/script/preview/stage`, {
+      method: "POST",
+      body: formData,
+    }).then((res) => {
+      if (!res.ok) throw new Error("Failed to stage preview audio");
+      return res.json() as Promise<{ staged: boolean }>;
+    }),
+
   // Preview audio
   buildPreview: (
     projectId: string,
