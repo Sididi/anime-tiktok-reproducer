@@ -1,6 +1,7 @@
 """Gap resolution routes for extending clips that hit the 75% speed floor."""
 
 import json
+from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from ...services import ProjectService
@@ -248,6 +249,20 @@ async def auto_fill_all_gaps(project_id: str) -> AutoFillResponse:
     skipped_count = 0
 
     candidates_by_scene = await GapResolutionService.generate_candidates_batch_dedup(gaps)
+    selected_by_scene: dict[int, Any] = {}
+    overlap_seconds_by_scene: dict[int, float] = {}
+    try:
+        selection_result = await GapResolutionService.select_autofill_candidates_overlap_aware(
+            matches=matches.matches,
+            gaps=gaps,
+            candidates_by_scene=candidates_by_scene,
+        )
+        selected_by_scene = selection_result.selected_candidates_by_scene
+        overlap_seconds_by_scene = selection_result.overlap_seconds_by_scene
+    except Exception:
+        # Keep legacy behavior if overlap-aware selection fails unexpectedly.
+        selected_by_scene = {}
+        overlap_seconds_by_scene = {}
 
     for gap in gaps:
         candidates = candidates_by_scene.get(gap.scene_index, [])
@@ -261,8 +276,11 @@ async def auto_fill_all_gaps(project_id: str) -> AutoFillResponse:
             skipped_count += 1
             continue
 
-        # Get the best candidate (first one, sorted by speed_diff)
-        best = candidates[0]
+        best = selected_by_scene.get(gap.scene_index)
+        used_overlap_aware = best is not None
+        if best is None:
+            # Fallback to legacy ranking if selection map is incomplete.
+            best = candidates[0]
 
         # Find and update the match
         for match in matches.matches:
@@ -274,6 +292,17 @@ async def auto_fill_all_gaps(project_id: str) -> AutoFillResponse:
                 match.confirmed = True
                 break
 
+        overlap_seconds = overlap_seconds_by_scene.get(gap.scene_index, 0.0)
+        if used_overlap_aware and overlap_seconds > 0:
+            message = (
+                f"Applied (overlap-aware, overlap unavoidable: {overlap_seconds:.3f}s): "
+                f"{best.snap_description}"
+            )
+        elif used_overlap_aware:
+            message = f"Applied (overlap-aware): {best.snap_description}"
+        else:
+            message = f"Applied: {best.snap_description}"
+
         results.append(AutoFillResult(
             scene_index=gap.scene_index,
             success=True,
@@ -281,7 +310,7 @@ async def auto_fill_all_gaps(project_id: str) -> AutoFillResponse:
             start_time=round(best.start_time, 6),
             end_time=round(best.end_time, 6),
             speed=round(float(best.effective_speed), 6),  # Convert Fraction to float
-            message=f"Applied: {best.snap_description}",
+            message=message,
         ))
         filled_count += 1
 

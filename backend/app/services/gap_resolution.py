@@ -114,6 +114,29 @@ class GapResolutionProgress:
         }
 
 
+@dataclass(frozen=True)
+class _AutoFillState:
+    """Internal candidate state used by overlap-aware autofill DP."""
+
+    scene_index: int
+    episode_key: str
+    start_time: float
+    end_time: float
+    speed_diff_micro: int
+    candidate_rank: int
+    candidate: GapCandidate | None
+
+
+@dataclass
+class AutoFillSelectionResult:
+    """Overlap-aware candidate selection output for autofill."""
+
+    selected_candidates_by_scene: dict[int, GapCandidate]
+    overlap_seconds_by_scene: dict[int, float]
+    total_overlap_count: int
+    total_overlap_seconds: float
+
+
 class GapResolutionService:
     """Service for resolving gaps in clips that hit the 75% speed floor.
 
@@ -154,6 +177,7 @@ class GapResolutionService:
     TIMELINE_RATE = FrameRateInfo(timebase=60, ntsc=False)
     # Default source rate (23.976fps for most anime)
     SOURCE_RATE = FrameRateInfo(timebase=24, ntsc=True)
+    OVERLAP_COST_SCALE = 1_000_000
 
     @classmethod
     async def detect_video_fps(cls, video_path: Path) -> Fraction:
@@ -667,6 +691,262 @@ class GapResolutionService:
             )
 
         return candidates_by_scene
+
+    @staticmethod
+    def _scene_episode_hint(match: SceneMatch, gap: GapInfo | None) -> str:
+        """Resolve the best available episode identifier for overlap checks."""
+        if gap and gap.episode:
+            return gap.episode
+        if match.episode:
+            return match.episode
+        alternative = next((alt for alt in match.alternatives if alt.episode), None)
+        return alternative.episode if alternative else ""
+
+    @classmethod
+    async def _normalize_episode_keys_for_overlap(
+        cls,
+        episode_hints: set[str],
+    ) -> dict[str, tuple[str, Path | None]]:
+        """Normalize episode hints to stable comparison keys.
+
+        Returns:
+            Mapping of raw episode hint -> (normalized_key, resolved_path_or_none).
+            - normalized_key is absolute path string when resolution succeeds.
+            - otherwise normalized_key falls back to the raw hint.
+        """
+        if not episode_hints:
+            return {}
+
+        try:
+            manifest = await AnimeLibraryService.ensure_episode_manifest()
+        except Exception:
+            manifest = {}
+
+        resolved_map: dict[str, tuple[str, Path | None]] = {}
+        unresolved: list[str] = []
+
+        for episode in sorted(episode_hints):
+            if not episode:
+                continue
+            resolved = AnimeLibraryService.resolve_episode_path(episode, manifest)
+            if resolved:
+                resolved_path = resolved.resolve()
+                resolved_map[episode] = (str(resolved_path), resolved_path)
+            else:
+                unresolved.append(episode)
+
+        if unresolved:
+            try:
+                refreshed_manifest = await AnimeLibraryService.ensure_episode_manifest(force_refresh=True)
+            except Exception:
+                refreshed_manifest = manifest
+            for episode in unresolved:
+                resolved = AnimeLibraryService.resolve_episode_path(episode, refreshed_manifest)
+                if resolved:
+                    resolved_path = resolved.resolve()
+                    resolved_map[episode] = (str(resolved_path), resolved_path)
+                else:
+                    resolved_map[episode] = (episode, None)
+
+        return resolved_map
+
+    @classmethod
+    async def select_autofill_candidates_overlap_aware(
+        cls,
+        matches: list[SceneMatch],
+        gaps: list[GapInfo],
+        candidates_by_scene: dict[int, list[GapCandidate]],
+    ) -> AutoFillSelectionResult:
+        """Pick one candidate per gap by minimizing overlaps first, speed second.
+
+        Objective order (lexicographic):
+        1) Number of overlaps across adjacent timeline scenes (same episode only)
+        2) Total overlap duration
+        3) Total speed diff from 100%
+        4) Candidate rank sum (stable deterministic tie-break)
+        """
+        if not matches:
+            return AutoFillSelectionResult(
+                selected_candidates_by_scene={},
+                overlap_seconds_by_scene={},
+                total_overlap_count=0,
+                total_overlap_seconds=0.0,
+            )
+
+        match_by_scene = {match.scene_index: match for match in matches}
+        if not match_by_scene:
+            return AutoFillSelectionResult(
+                selected_candidates_by_scene={},
+                overlap_seconds_by_scene={},
+                total_overlap_count=0,
+                total_overlap_seconds=0.0,
+            )
+
+        gap_by_scene = {gap.scene_index: gap for gap in gaps}
+        sorted_scene_indices = sorted(match_by_scene)
+
+        episode_hint_by_scene: dict[int, str] = {}
+        for scene_index in sorted_scene_indices:
+            match = match_by_scene[scene_index]
+            gap = gap_by_scene.get(scene_index)
+            episode_hint_by_scene[scene_index] = cls._scene_episode_hint(match, gap)
+
+        normalized_episode = await cls._normalize_episode_keys_for_overlap(
+            {episode for episode in episode_hint_by_scene.values() if episode}
+        )
+
+        default_tolerance = float(Fraction(1, 1) / cls.DEFAULT_FPS)
+        tolerance_by_episode: dict[str, float] = {}
+        for normalized_key, resolved_path in normalized_episode.values():
+            if normalized_key in tolerance_by_episode:
+                continue
+            fps_fraction = cls.DEFAULT_FPS
+            if resolved_path is not None:
+                try:
+                    fps_fraction = await cls.detect_video_fps(resolved_path)
+                except Exception:
+                    fps_fraction = cls.DEFAULT_FPS
+            fps = float(fps_fraction)
+            tolerance_by_episode[normalized_key] = (1.0 / fps) if fps > 0 else default_tolerance
+
+        states_by_scene: list[list[_AutoFillState]] = []
+        for scene_index in sorted_scene_indices:
+            match = match_by_scene[scene_index]
+            raw_episode = episode_hint_by_scene.get(scene_index, "")
+            if raw_episode:
+                episode_key = normalized_episode.get(raw_episode, (raw_episode, None))[0]
+            else:
+                # Unknown episode: isolate from overlap checks to avoid false positives.
+                episode_key = f"__unknown_scene_{scene_index}"
+
+            scene_candidates = candidates_by_scene.get(scene_index, [])
+            if gap_by_scene.get(scene_index) and scene_candidates:
+                scene_states = [
+                    _AutoFillState(
+                        scene_index=scene_index,
+                        episode_key=episode_key,
+                        start_time=candidate.start_time,
+                        end_time=candidate.end_time,
+                        speed_diff_micro=int(round(candidate.speed_diff * cls.OVERLAP_COST_SCALE)),
+                        candidate_rank=rank,
+                        candidate=candidate,
+                    )
+                    for rank, candidate in enumerate(scene_candidates)
+                ]
+            else:
+                scene_states = [
+                    _AutoFillState(
+                        scene_index=scene_index,
+                        episode_key=episode_key,
+                        start_time=match.start_time,
+                        end_time=match.end_time,
+                        speed_diff_micro=0,
+                        candidate_rank=0,
+                        candidate=None,
+                    )
+                ]
+
+            states_by_scene.append(scene_states)
+
+        def overlap_penalty(prev_state: _AutoFillState, next_state: _AutoFillState) -> tuple[int, int]:
+            if prev_state.episode_key != next_state.episode_key:
+                return (0, 0)
+            tolerance = tolerance_by_episode.get(prev_state.episode_key, default_tolerance)
+            overlap_raw = prev_state.end_time - next_state.start_time
+            overlap_effective = max(0.0, overlap_raw - tolerance)
+            if overlap_effective <= 0:
+                return (0, 0)
+            overlap_micro = max(1, int(round(overlap_effective * cls.OVERLAP_COST_SCALE)))
+            return (1, overlap_micro)
+
+        dp_costs: list[list[tuple[int, int, int, int] | None]] = [
+            [None for _ in scene_states] for scene_states in states_by_scene
+        ]
+        dp_prev: list[list[int | None]] = [
+            [None for _ in scene_states] for scene_states in states_by_scene
+        ]
+
+        for state_index, state in enumerate(states_by_scene[0]):
+            dp_costs[0][state_index] = (0, 0, state.speed_diff_micro, state.candidate_rank)
+
+        for scene_pos in range(1, len(states_by_scene)):
+            previous_states = states_by_scene[scene_pos - 1]
+            current_states = states_by_scene[scene_pos]
+            for current_index, current_state in enumerate(current_states):
+                best_cost: tuple[int, int, int, int] | None = None
+                best_previous_index: int | None = None
+                for previous_index, previous_state in enumerate(previous_states):
+                    previous_cost = dp_costs[scene_pos - 1][previous_index]
+                    if previous_cost is None:
+                        continue
+                    overlap_count, overlap_micro = overlap_penalty(previous_state, current_state)
+                    candidate_cost = (
+                        previous_cost[0] + overlap_count,
+                        previous_cost[1] + overlap_micro,
+                        previous_cost[2] + current_state.speed_diff_micro,
+                        previous_cost[3] + current_state.candidate_rank,
+                    )
+                    if best_cost is None or candidate_cost < best_cost:
+                        best_cost = candidate_cost
+                        best_previous_index = previous_index
+                dp_costs[scene_pos][current_index] = best_cost
+                dp_prev[scene_pos][current_index] = best_previous_index
+
+        last_costs = dp_costs[-1]
+        valid_last_indices = [index for index, cost in enumerate(last_costs) if cost is not None]
+        if not valid_last_indices:
+            return AutoFillSelectionResult(
+                selected_candidates_by_scene={},
+                overlap_seconds_by_scene={},
+                total_overlap_count=0,
+                total_overlap_seconds=0.0,
+            )
+        best_last_index = min(valid_last_indices, key=lambda index: last_costs[index])
+
+        chosen_state_indices: list[int | None] = [None] * len(states_by_scene)
+        current_index: int | None = best_last_index
+        for scene_pos in range(len(states_by_scene) - 1, -1, -1):
+            if current_index is None:
+                break
+            chosen_state_indices[scene_pos] = current_index
+            current_index = dp_prev[scene_pos][current_index]
+
+        selected_states: list[_AutoFillState] = []
+        for scene_pos, chosen_index in enumerate(chosen_state_indices):
+            if chosen_index is None:
+                chosen_index = 0
+            selected_states.append(states_by_scene[scene_pos][chosen_index])
+
+        selected_candidates: dict[int, GapCandidate] = {}
+        for state in selected_states:
+            if state.candidate is not None:
+                selected_candidates[state.scene_index] = state.candidate
+
+        overlap_seconds_by_scene: dict[int, float] = {}
+        total_overlap_count = 0
+        total_overlap_seconds = 0.0
+        for scene_pos in range(len(selected_states) - 1):
+            current_state = selected_states[scene_pos]
+            next_state = selected_states[scene_pos + 1]
+            overlap_count, overlap_micro = overlap_penalty(current_state, next_state)
+            if overlap_count == 0:
+                continue
+            overlap_seconds = overlap_micro / cls.OVERLAP_COST_SCALE
+            total_overlap_count += overlap_count
+            total_overlap_seconds += overlap_seconds
+            overlap_seconds_by_scene[current_state.scene_index] = (
+                overlap_seconds_by_scene.get(current_state.scene_index, 0.0) + overlap_seconds
+            )
+            overlap_seconds_by_scene[next_state.scene_index] = (
+                overlap_seconds_by_scene.get(next_state.scene_index, 0.0) + overlap_seconds
+            )
+
+        return AutoFillSelectionResult(
+            selected_candidates_by_scene=selected_candidates,
+            overlap_seconds_by_scene=overlap_seconds_by_scene,
+            total_overlap_count=total_overlap_count,
+            total_overlap_seconds=total_overlap_seconds,
+        )
 
     @classmethod
     def _generate_candidates_from_cuts(
