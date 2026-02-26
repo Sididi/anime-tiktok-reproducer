@@ -113,9 +113,10 @@ class ScriptAutomationService:
 
     RUNS_DIR_NAME = "script_automation_runs"
 
-    TTS_TARGET = 300
-    TTS_MIN = 200
-    TTS_MAX = 400
+    TTS_TARGET = 625
+    TTS_MIN = 500
+    TTS_SOFT_MAX = 750
+    TTS_HARD_MAX = 800
 
     @classmethod
     def _event(
@@ -311,7 +312,25 @@ class ScriptAutomationService:
             return cleaned
         if _SENTENCE_END_RE.search(cleaned):
             return cleaned
+        # Never add punctuation if it would violate hard cap.
+        if len(cleaned) >= cls.TTS_HARD_MAX:
+            return cleaned
         return f"{cleaned}."
+
+    @classmethod
+    def _split_at_hard_cap(cls, text: str, cap: int) -> tuple[str, str]:
+        """Split text at cap, preferring the last whitespace before cap."""
+        if len(text) <= cap:
+            return text, ""
+
+        split_index = text.rfind(" ", 0, cap)
+        if split_index > 0:
+            head = text[:split_index].rstrip()
+            tail = text[split_index + 1:].lstrip()
+            if head:
+                return head, tail
+
+        return text[:cap], text[cap:]
 
     @classmethod
     def _segment_scenes_for_tts(cls, script_payload: dict[str, Any]) -> list[str]:
@@ -330,6 +349,17 @@ class ScriptAutomationService:
 
             merged = f"{current_text} {scene_text}".strip() if current_text else scene_text
             current_text = merged
+
+            while len(current_text) > cls.TTS_HARD_MAX:
+                hard_chunk, remainder = cls._split_at_hard_cap(current_text, cls.TTS_HARD_MAX)
+                if not hard_chunk:
+                    break
+                chunks.append(hard_chunk)
+                current_text = remainder
+
+            if not current_text:
+                continue
+
             current_len = len(current_text)
 
             is_last = i == len(scenes) - 1
@@ -346,14 +376,15 @@ class ScriptAutomationService:
             next_text = (scenes[i + 1].get("text") or "").strip()
             with_next_len = len(f"{current_text} {next_text}") if next_text else current_len
 
-            close_now = (
-                current_len >= cls.TTS_MIN
-                and (
-                    current_len > cls.TTS_MAX
-                    or with_next_len > cls.TTS_MAX
+            if current_len >= cls.TTS_MIN:
+                close_now = (
+                    current_len >= cls.TTS_SOFT_MAX
+                    or with_next_len > cls.TTS_SOFT_MAX
                     or abs(current_len - cls.TTS_TARGET) <= abs(with_next_len - cls.TTS_TARGET)
                 )
-            )
+            else:
+                # Prefer short sentence-complete chunks over drifting toward hard cap.
+                close_now = with_next_len > cls.TTS_SOFT_MAX
 
             if close_now:
                 chunks.append(cls._ensure_sentence_end(current_text))
@@ -362,10 +393,12 @@ class ScriptAutomationService:
         if current_text:
             chunks.append(cls._ensure_sentence_end(current_text))
 
-        # Merge small final chunk
-        if len(chunks) >= 2 and len(chunks[-1]) < cls.TTS_MIN:
-            chunks[-2] = cls._ensure_sentence_end(f"{chunks[-2]} {chunks[-1]}")
-            chunks.pop()
+        # Merge small final chunk only when it keeps us within soft max and preserves sentence ending.
+        if len(chunks) >= 2 and len(chunks[-1]) < cls.TTS_MIN and _SENTENCE_END_RE.search(chunks[-1]):
+            merged = f"{chunks[-2]} {chunks[-1]}".strip()
+            if len(merged) <= cls.TTS_SOFT_MAX:
+                chunks[-2] = cls._ensure_sentence_end(merged)
+                chunks.pop()
 
         return chunks
 

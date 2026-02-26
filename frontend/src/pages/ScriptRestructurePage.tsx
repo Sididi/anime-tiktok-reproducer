@@ -15,8 +15,6 @@ import {
   FileText,
   Bot,
   Square,
-  Play,
-  Pause,
   Volume2,
   Sparkles,
 } from "lucide-react";
@@ -28,7 +26,6 @@ import type {
   Transcription,
   Project,
   PlatformMetadata,
-  VideoOverlay,
   ScriptAutomationConfig,
   ScriptAutomationEvent,
   ScriptAutomationPart,
@@ -288,19 +285,41 @@ function endsWithSentence(text: string): boolean {
   return /[.!?…]["')\]]*$/.test(trimmed);
 }
 
-const ELEVENLABS_TARGET = 300;
-const ELEVENLABS_MIN = 200;
-const ELEVENLABS_MAX = 400;
+const ELEVENLABS_TARGET = 625;
+const ELEVENLABS_MIN = 500;
+const ELEVENLABS_SOFT_MAX = 750;
+const ELEVENLABS_HARD_MAX = 800;
 
 function ensureSentenceEnd(text: string): string {
   const cleaned = text.trim();
   if (!cleaned) return cleaned;
   if (endsWithSentence(cleaned)) return cleaned;
+  if (cleaned.length >= ELEVENLABS_HARD_MAX) return cleaned;
   return `${cleaned}.`;
 }
 
+function splitAtHardCap(
+  text: string,
+  cap = ELEVENLABS_HARD_MAX,
+): { head: string; tail: string } {
+  if (text.length <= cap) {
+    return { head: text, tail: "" };
+  }
+
+  const splitIndex = text.lastIndexOf(" ", cap - 1);
+  if (splitIndex > 0) {
+    const head = text.slice(0, splitIndex).trimEnd();
+    const tail = text.slice(splitIndex + 1).trimStart();
+    if (head) {
+      return { head, tail };
+    }
+  }
+
+  return { head: text.slice(0, cap), tail: text.slice(cap) };
+}
+
 // Segment scenes into groups based on character limit for ElevenLabs
-// Target: ~300 chars, preferred range 200-400, always ending on sentence boundaries.
+// Target: 500-750 chars (~625), prefer sentence boundaries, hard cap at 800.
 function segmentScenes(
   scenes: Array<{ scene_index: number; text: string }>,
 ): AudioSegment[] {
@@ -308,13 +327,15 @@ function segmentScenes(
     return [];
   }
 
-  const segments: AudioSegment[] = [];
-  let currentSegment: AudioSegment = {
-    id: 1,
+  const createEmptySegment = (id: number): AudioSegment => ({
+    id,
     sceneIndices: [],
     text: "",
     characterCount: 0,
-  };
+  });
+
+  const segments: AudioSegment[] = [];
+  let currentSegment: AudioSegment = createEmptySegment(1);
 
   for (let i = 0; i < scenes.length; i++) {
     const scene = scenes[i];
@@ -330,6 +351,31 @@ function segmentScenes(
     currentSegment.text = mergedText;
     currentSegment.characterCount = mergedText.length;
 
+    while (currentSegment.characterCount > ELEVENLABS_HARD_MAX) {
+      const { head, tail } = splitAtHardCap(currentSegment.text);
+      if (!head) {
+        break;
+      }
+
+      segments.push({
+        id: segments.length + 1,
+        sceneIndices: [...currentSegment.sceneIndices],
+        text: head,
+        characterCount: head.length,
+      });
+
+      currentSegment = {
+        id: segments.length + 1,
+        sceneIndices: [...currentSegment.sceneIndices],
+        text: tail,
+        characterCount: tail.length,
+      };
+    }
+
+    if (!currentSegment.text) {
+      continue;
+    }
+
     const isLastScene = i === scenes.length - 1;
     const sentenceBoundary = endsWithSentence(currentSegment.text);
     if (!sentenceBoundary && !isLastScene) {
@@ -340,12 +386,7 @@ function segmentScenes(
       currentSegment.text = ensureSentenceEnd(currentSegment.text);
       currentSegment.characterCount = currentSegment.text.length;
       segments.push(currentSegment);
-      currentSegment = {
-        id: segments.length + 1,
-        sceneIndices: [],
-        text: "",
-        characterCount: 0,
-      };
+      currentSegment = createEmptySegment(segments.length + 1);
       continue;
     }
 
@@ -353,23 +394,20 @@ function segmentScenes(
     const withNextLength = nextSceneText
       ? `${currentSegment.text} ${nextSceneText}`.length
       : currentSegment.characterCount;
+
     const closeNow =
-      currentSegment.characterCount >= ELEVENLABS_MIN &&
-      (currentSegment.characterCount > ELEVENLABS_MAX ||
-        withNextLength > ELEVENLABS_MAX ||
-        Math.abs(currentSegment.characterCount - ELEVENLABS_TARGET) <=
-          Math.abs(withNextLength - ELEVENLABS_TARGET));
+      currentSegment.characterCount >= ELEVENLABS_MIN
+        ? currentSegment.characterCount >= ELEVENLABS_SOFT_MAX ||
+          withNextLength > ELEVENLABS_SOFT_MAX ||
+          Math.abs(currentSegment.characterCount - ELEVENLABS_TARGET) <=
+            Math.abs(withNextLength - ELEVENLABS_TARGET)
+        : withNextLength > ELEVENLABS_SOFT_MAX;
 
     if (closeNow) {
       currentSegment.text = ensureSentenceEnd(currentSegment.text);
       currentSegment.characterCount = currentSegment.text.length;
       segments.push(currentSegment);
-      currentSegment = {
-        id: segments.length + 1,
-        sceneIndices: [],
-        text: "",
-        characterCount: 0,
-      };
+      currentSegment = createEmptySegment(segments.length + 1);
     }
   }
 
@@ -381,12 +419,15 @@ function segmentScenes(
 
   if (segments.length >= 2) {
     const last = segments[segments.length - 1];
-    if (last.characterCount < ELEVENLABS_MIN) {
+    if (last.characterCount < ELEVENLABS_MIN && endsWithSentence(last.text)) {
       const prev = segments[segments.length - 2];
-      prev.text = ensureSentenceEnd(`${prev.text} ${last.text}`);
-      prev.characterCount = prev.text.length;
-      prev.sceneIndices = [...prev.sceneIndices, ...last.sceneIndices];
-      segments.pop();
+      const mergedText = `${prev.text} ${last.text}`.trim();
+      if (mergedText.length <= ELEVENLABS_SOFT_MAX) {
+        prev.text = ensureSentenceEnd(mergedText);
+        prev.characterCount = prev.text.length;
+        prev.sceneIndices = [...prev.sceneIndices, ...last.sceneIndices];
+        segments.pop();
+      }
     }
   }
 
@@ -1755,7 +1796,7 @@ export function ScriptRestructurePage() {
                 </select>
                 <span className="text-xs text-[hsl(var(--muted-foreground))]">
                   {uploadMode === "multiple"
-                    ? "Split into sentence-based parts (target ~300 chars)"
+                    ? "Split into sentence-based parts (target 500-750 chars, ideal ~625, hard cap 800)"
                     : "Upload one combined audio file"}
                 </span>
               </div>
@@ -1857,7 +1898,7 @@ export function ScriptRestructurePage() {
                         <span className="text-[hsl(var(--muted-foreground))]">
                           {expectedSegmentOrder.length} segment
                           {expectedSegmentOrder.length > 1 ? "s" : ""} (target
-                          200-400 chars, ideal ~300)
+                          500-750 chars, ideal ~625, hard cap 800)
                         </span>
                         <span className="text-[hsl(var(--muted-foreground))]">
                           {uploadedSegmentsCount}/{expectedSegmentOrder.length} uploaded
