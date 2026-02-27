@@ -4,6 +4,7 @@ from pydantic import BaseModel
 import json
 from pathlib import Path
 
+from ...config import settings
 from ...models import Scene, SceneList, ProjectPhase
 from ...services import ProjectService, SceneDetectorService
 
@@ -45,6 +46,16 @@ def to_response(scenes: SceneList) -> ScenesResponse:
             for s in scenes.scenes
         ]
     )
+
+
+@router.get("/config")
+async def get_scenes_config(project_id: str):
+    """Get scenes validation feature flags."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    return {"skip_ui_enabled": settings.scenes_skip_ui_enabled}
 
 
 @router.get("", response_model=ScenesResponse)

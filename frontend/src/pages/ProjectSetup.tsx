@@ -263,8 +263,20 @@ export function ProjectSetup() {
       const detectionSuccess = await handleSceneDetection(project.id);
       if (!detectionSuccess) return;
 
-      // Step 3: Navigate to scene validation (now with video and scenes ready)
-      navigate(`/project/${project.id}/scenes`);
+      // Step 3: Navigate to scenes, or skip directly to matches when configured
+      let skipScenesUi = false;
+      try {
+        const scenesConfig = await api.getScenesConfig(project.id);
+        skipScenesUi = Boolean(scenesConfig.skip_ui_enabled);
+      } catch {
+        skipScenesUi = false;
+      }
+
+      navigate(
+        skipScenesUi
+          ? `/project/${project.id}/matches`
+          : `/project/${project.id}/scenes`,
+      );
     } catch {
       // Error is handled in store
     }

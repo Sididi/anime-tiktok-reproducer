@@ -76,6 +76,7 @@ function SceneValidationContent() {
 
   const [detecting, setDetecting] = useState(false);
   const [detectionProgress, setDetectionProgress] = useState<DetectionProgress | null>(null);
+  const [skipUiEnabled, setSkipUiEnabled] = useState(false);
 
   const currentScene = getSceneAtTime(currentTime);
 
@@ -84,8 +85,17 @@ function SceneValidationContent() {
     if (projectId) {
       loadProject(projectId);
       loadScenes(projectId);
+      api
+        .getScenesConfig(projectId)
+        .then((config) => setSkipUiEnabled(Boolean(config.skip_ui_enabled)))
+        .catch(() => setSkipUiEnabled(false));
     }
   }, [projectId, loadProject, loadScenes]);
+
+  useEffect(() => {
+    if (!projectId || !skipUiEnabled || detecting || scenes.length === 0) return;
+    navigate(`/project/${projectId}/matches`, { replace: true });
+  }, [projectId, skipUiEnabled, detecting, scenes.length, navigate]);
 
   const handleDetectScenes = useCallback(async () => {
     if (!projectId) return;

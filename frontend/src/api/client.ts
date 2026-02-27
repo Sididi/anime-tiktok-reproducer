@@ -107,6 +107,11 @@ export const api = {
       `/projects/${projectId}/scenes`,
     ),
 
+  getScenesConfig: (projectId: string) =>
+    request<{ skip_ui_enabled: boolean }>(
+      `/projects/${projectId}/scenes/config`,
+    ),
+
   updateScenes: (projectId: string, scenes: import("@/types").Scene[]) =>
     request<{ scenes: import("@/types").Scene[] }>(
       `/projects/${projectId}/scenes`,

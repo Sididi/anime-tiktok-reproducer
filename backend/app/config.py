@@ -41,6 +41,7 @@ class Settings(BaseSettings):
 
     # Script automation (Gemini + ElevenLabs)
     script_automate_enabled: bool = True
+    scenes_skip_ui_enabled: bool = False
     transcription_full_auto_enabled: bool = False
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-3.1-pro-preview"
