@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -19,6 +20,9 @@ from .transcriber import TranscriberService
 from .otio_timing import OTIOTimingCalculator, FrameRateInfo
 from .gap_resolution import GapResolutionService
 from .export_service import ExportService
+from .project_service import ProjectService
+
+logger = logging.getLogger("uvicorn.error")
 
 
 # =============================================================================
@@ -2021,6 +2025,25 @@ class ProcessingService:
             srt_filename = ExportService.subtitle_filename(project)
             srt_path = output_dir / srt_filename
             srt_path.write_text(srt_content, encoding="utf-8")
+
+            # Step 5: Generate title overlay images (if video_overlay is set)
+            if project.video_overlay and project.video_overlay.get("title"):
+                from .title_image_generator import TitleImageGeneratorService
+
+                overlay_paths = TitleImageGeneratorService.generate(
+                    title=project.video_overlay["title"],
+                    category=project.video_overlay.get("category", ""),
+                    output_dir=output_dir,
+                )
+                logger.info(
+                    "Generated title overlays: %s",
+                    {k: str(v) for k, v in overlay_paths.items()},
+                )
+
+                # Store overlay image paths in project
+                project.video_overlay["title_image"] = str(overlay_paths["title"])
+                project.video_overlay["category_image"] = str(overlay_paths["category"])
+                ProjectService.save(project)
 
             # Clear processing state now that we're done
             cls.clear_processing_state(project.id)
