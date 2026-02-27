@@ -26,6 +26,7 @@ from .voice_config_service import VoiceConfigService
 from .script_automation_service import ScriptAutomationService
 from .music_config_service import MusicConfigService
 from .audio_speed_service import AudioSpeedService
+from .title_image_generator import TitleImageGeneratorService
 
 __all__ = [
     "AccountService",
@@ -44,4 +45,5 @@ __all__ = [
     "ScriptAutomationService",
     "MusicConfigService",
     "AudioSpeedService",
+    "TitleImageGeneratorService",
 ]
