@@ -483,6 +483,17 @@ class ScriptAutomationService:
         )
         title = str(result.get("title", ""))
         category = str(result.get("category", ""))
+
+        # Enforce title character limit — Gemini sometimes exceeds the prompt constraint
+        max_title_chars = 45
+        if len(title) > max_title_chars:
+            truncated = title[:max_title_chars]
+            last_space = truncated.rfind(" ")
+            if last_space > max_title_chars // 2:
+                title = truncated[:last_space]
+            else:
+                title = truncated
+
         return {"title": title, "category": category}
 
     @classmethod
