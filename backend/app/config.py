@@ -41,6 +41,7 @@ class Settings(BaseSettings):
 
     # Script automation (Gemini + ElevenLabs)
     script_automate_enabled: bool = True
+    transcription_full_auto_enabled: bool = False
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-3.1-pro-preview"
     gemini_timeout: int = 300  # seconds (read timeout for Gemini API; connect=10)

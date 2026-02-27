@@ -60,6 +60,11 @@ const INITIAL_STEPS: ProcessingStep[] = [
     label: "Creating subtitles with word timing",
     status: "pending",
   },
+  {
+    id: "overlay_image_generation",
+    label: "Generating video overlay images",
+    status: "pending",
+  },
 ];
 
 export function ProcessingPage() {
@@ -142,7 +147,7 @@ export function ProcessingPage() {
           if (step.id === "jsx_generation") {
             return { ...step, status: "processing", message: "Resuming..." };
           }
-          if (step.id === "srt_generation") {
+          if (step.id === "srt_generation" || step.id === "overlay_image_generation") {
             return { ...step, status: "pending" };
           }
           return { ...step, status: "complete" };
@@ -435,7 +440,7 @@ export function ProcessingPage() {
             </div>
             <p className="text-xs text-center text-[hsl(var(--muted-foreground))]">
               Drive and ZIP contain: JSX script, edited TTS audio, subtitles, metadata
-              files, assets, and source mapping.
+              files, overlay images, assets, and source mapping.
             </p>
             {driveFolderUrl && (
               <p className="text-xs text-center">

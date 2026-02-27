@@ -63,6 +63,8 @@ export interface ScriptAutomationMusic {
 export interface VideoOverlay {
   title: string;
   category: string;
+  title_image?: string;
+  category_image?: string;
 }
 
 export interface ScriptAutomationConfig {

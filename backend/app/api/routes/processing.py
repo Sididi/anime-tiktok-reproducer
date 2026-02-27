@@ -359,6 +359,20 @@ async def update_script_settings(project_id: str, request: ScriptSettingsRequest
     return {"status": "ok", "tts_speed": project.tts_speed, "music_key": project.music_key}
 
 
+@router.get("/script/settings")
+async def get_script_settings(project_id: str):
+    """Get script phase settings (TTS speed, music key, video overlay)."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    return {
+        "tts_speed": project.tts_speed,
+        "music_key": project.music_key,
+        "video_overlay": project.video_overlay,
+    }
+
+
 @router.post("/script/overlay/generate")
 async def generate_overlay(project_id: str, request: OverlayGenerateRequest):
     """Generate a video overlay (title + category) via Gemini light model."""

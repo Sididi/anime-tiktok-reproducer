@@ -241,6 +241,11 @@ export const api = {
       `/projects/${projectId}/transcription`,
     ),
 
+  getTranscriptionConfig: (projectId: string) =>
+    request<{ full_auto_enabled: boolean }>(
+      `/projects/${projectId}/transcription/config`,
+    ),
+
   updateTranscription: (
     projectId: string,
     scenes: { scene_index: number; text: string }[],
@@ -387,6 +392,13 @@ export const api = {
     `${API_BASE}/projects/${projectId}/music/${encodeURIComponent(musicKey)}/preview`,
 
   // Script settings (TTS speed, music, overlay)
+  getScriptSettings: (projectId: string) =>
+    request<{
+      tts_speed: number | null;
+      music_key: string | null;
+      video_overlay: import("@/types").VideoOverlay | null;
+    }>(`/projects/${projectId}/script/settings`),
+
   updateScriptSettings: (
     projectId: string,
     payload: {

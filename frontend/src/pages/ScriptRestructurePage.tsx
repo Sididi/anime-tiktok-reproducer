@@ -613,6 +613,10 @@ function coerceMetadataForEditor(payload: unknown): PlatformMetadata {
   };
 }
 
+function clampPreviewTtsSpeed(speed: number): number {
+  return Math.min(1.5, Math.max(0.9, speed));
+}
+
 export function ScriptRestructurePage() {
   const { projectId } = useParams<{ projectId: string }>();
   const navigate = useNavigate();
@@ -682,6 +686,9 @@ export function ScriptRestructurePage() {
   // Preview player state
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [previewBuilding, setPreviewBuilding] = useState(false);
+  const previewAudioRef = useRef<HTMLAudioElement | null>(null);
+  const wasPlayingBeforeRebuildRef = useRef(false);
+  const shouldAutoplayAfterRebuildRef = useRef(false);
   const previewDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [hasTtsAudio, setHasTtsAudio] = useState(false);
 
@@ -740,8 +747,10 @@ export function ScriptRestructurePage() {
         await loadScenes(projectId);
         const { transcription: loaded } = await api.getTranscription(projectId);
         setTranscription(loaded);
+        let loadedAutomation: ScriptAutomationConfig | null = null;
         try {
           const automation = await api.getScriptAutomationConfig(projectId);
+          loadedAutomation = automation;
           setAutomationConfig(automation);
           setAutomationConfigError(null);
           setAutomationVoiceKey(
@@ -753,6 +762,40 @@ export function ScriptRestructurePage() {
           setAutomationConfigError((automationErr as Error).message);
           setAutomationVoiceKey("");
         }
+
+        try {
+          const settingsResult = await api.getScriptSettings(projectId);
+          if (typeof settingsResult.tts_speed === "number") {
+            setTtsSpeed(clampPreviewTtsSpeed(settingsResult.tts_speed));
+          }
+
+          if (typeof settingsResult.music_key === "string") {
+            const availableMusicKeys = new Set(
+              (loadedAutomation?.musics || []).map((music) => music.key),
+            );
+            if (
+              availableMusicKeys.size > 0 &&
+              !availableMusicKeys.has(settingsResult.music_key)
+            ) {
+              setAutomationMusicKey(loadedAutomation?.default_music_key ?? null);
+            } else {
+              setAutomationMusicKey(settingsResult.music_key);
+            }
+          }
+
+          const overlay = settingsResult.video_overlay;
+          if (overlay) {
+            if (typeof overlay.title === "string") {
+              setOverlayTitle(overlay.title);
+            }
+            if (typeof overlay.category === "string") {
+              setOverlayCategory(overlay.category);
+            }
+          }
+        } catch {
+          // Non-critical: keep existing defaults from automation config
+        }
+
         const metadataResult = await api.getProjectMetadata(projectId);
         if (metadataResult.exists && metadataResult.metadata) {
           const pretty = JSON.stringify(metadataResult.metadata, null, 2);
@@ -911,26 +954,35 @@ export function ScriptRestructurePage() {
     setAutomationMessage("Automation cancelled");
   }, []);
 
-  const playVoicePreview = useCallback(
-    (url: string, voiceKey: string) => {
-      if (voiceAudioRef.current) {
-        voiceAudioRef.current.pause();
-        voiceAudioRef.current = null;
-      }
-      if (playingVoiceKey === voiceKey) {
-        setPlayingVoiceKey(null);
+  const stopPreviewAudio = useCallback(() => {
+    if (voiceAudioRef.current) {
+      voiceAudioRef.current.pause();
+      voiceAudioRef.current.currentTime = 0;
+      voiceAudioRef.current.onended = null;
+      voiceAudioRef.current = null;
+    }
+    setPlayingVoiceKey(null);
+  }, []);
+
+  const playOptionPreview = useCallback(
+    (url: string, key: string, volume = 1) => {
+      const isToggleStop = playingVoiceKey === key;
+      stopPreviewAudio();
+      if (isToggleStop) {
         return;
       }
+
       const audio = new Audio(url);
+      audio.volume = Math.max(0, Math.min(1, volume));
       voiceAudioRef.current = audio;
-      setPlayingVoiceKey(voiceKey);
+      setPlayingVoiceKey(key);
       audio.play().catch(() => {});
       audio.onended = () => {
         setPlayingVoiceKey(null);
         voiceAudioRef.current = null;
       };
     },
-    [playingVoiceKey],
+    [playingVoiceKey, stopPreviewAudio],
   );
 
   // Debounced save TTS speed to backend
@@ -976,6 +1028,14 @@ export function ScriptRestructurePage() {
   // Build preview audio
   const buildPreview = useCallback(async () => {
     if (!projectId || !hasTtsAudio) return;
+
+    const previewPlayer = previewAudioRef.current;
+    const wasPlaying = Boolean(
+      previewPlayer && !previewPlayer.paused && !previewPlayer.ended,
+    );
+    wasPlayingBeforeRebuildRef.current = wasPlaying;
+    shouldAutoplayAfterRebuildRef.current = wasPlaying;
+
     setPreviewBuilding(true);
     try {
       const result = await api.buildPreview(projectId, {
@@ -985,6 +1045,7 @@ export function ScriptRestructurePage() {
       });
       setPreviewUrl(result.preview_url + "?t=" + Date.now());
     } catch (err) {
+      shouldAutoplayAfterRebuildRef.current = false;
       setPreviewUrl(null);
     } finally {
       setPreviewBuilding(false);
@@ -1002,6 +1063,21 @@ export function ScriptRestructurePage() {
       if (previewDebounceRef.current) clearTimeout(previewDebounceRef.current);
     };
   }, [ttsSpeed, automationMusicKey, hasTtsAudio, buildPreview]);
+
+  useEffect(() => {
+    if (
+      !previewUrl ||
+      !wasPlayingBeforeRebuildRef.current ||
+      !shouldAutoplayAfterRebuildRef.current
+    ) {
+      return;
+    }
+    const audio = previewAudioRef.current;
+    if (!audio) return;
+    wasPlayingBeforeRebuildRef.current = false;
+    shouldAutoplayAfterRebuildRef.current = false;
+    audio.play().catch(() => {});
+  }, [previewUrl]);
 
   const handleAutomate = useCallback(async () => {
     if (!projectId || !automationConfig) return;
@@ -2051,14 +2127,8 @@ export function ScriptRestructurePage() {
                     onChange={(key) => setAutomationVoiceKey(key || "")}
                     placeholder="Select voice..."
                     disabled={automationRunning}
-                    onPreview={(url, key) => playVoicePreview(url, key)}
-                    onPreviewStop={() => {
-                      if (voiceAudioRef.current) {
-                        voiceAudioRef.current.pause();
-                        voiceAudioRef.current = null;
-                      }
-                      setPlayingVoiceKey(null);
-                    }}
+                    onPreview={(url, key) => playOptionPreview(url, key, 1)}
+                    onPreviewStop={stopPreviewAudio}
                     previewingKey={playingVoiceKey}
                   />
                 </div>
@@ -2084,14 +2154,8 @@ export function ScriptRestructurePage() {
                       allowNone
                       noneLabel="None"
                       disabled={automationRunning}
-                      onPreview={(url, key) => playVoicePreview(url, key)}
-                      onPreviewStop={() => {
-                        if (voiceAudioRef.current) {
-                          voiceAudioRef.current.pause();
-                          voiceAudioRef.current = null;
-                        }
-                        setPlayingVoiceKey(null);
-                      }}
+                      onPreview={(url, key) => playOptionPreview(url, key, 0.1)}
+                      onPreviewStop={stopPreviewAudio}
                       previewingKey={playingVoiceKey}
                     />
                   </div>
@@ -2182,7 +2246,13 @@ export function ScriptRestructurePage() {
                     Building preview...
                   </div>
                 ) : previewUrl ? (
-                  <audio controls src={previewUrl} className="w-full h-8" key={previewUrl} />
+                  <audio
+                    ref={previewAudioRef}
+                    controls
+                    src={previewUrl}
+                    className="w-full h-8"
+                    key={previewUrl}
+                  />
                 ) : (
                   <p className="text-xs text-[hsl(var(--muted-foreground))]">
                     Generate TTS to enable preview

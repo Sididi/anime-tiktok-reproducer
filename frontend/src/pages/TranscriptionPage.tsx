@@ -34,6 +34,7 @@ export function TranscriptionPage() {
   const [transcription, setTranscription] = useState<Transcription | null>(
     null,
   );
+  const [fullAutoEnabled, setFullAutoEnabled] = useState(false);
   const [loading, setLoading] = useState(true);
   const [transcribing, setTranscribing] = useState(false);
   const [progress, setProgress] = useState<TranscriptionProgress | null>(null);
@@ -44,6 +45,7 @@ export function TranscriptionPage() {
   const [autoScroll, setAutoScroll] = useState(true);
   const sceneRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const autoScrollRef = useRef(true);
+  const autoStartAttemptedRef = useRef(false);
   autoScrollRef.current = autoScroll;
 
   const handleSceneChange = useCallback((index: number) => {
@@ -62,6 +64,7 @@ export function TranscriptionPage() {
   // Load data
   useEffect(() => {
     if (!projectId) return;
+    autoStartAttemptedRef.current = false;
 
     const loadData = async () => {
       setLoading(true);
@@ -70,6 +73,12 @@ export function TranscriptionPage() {
         await loadScenes(projectId);
         const { transcription: loaded } = await api.getTranscription(projectId);
         setTranscription(loaded);
+        try {
+          const config = await api.getTranscriptionConfig(projectId);
+          setFullAutoEnabled(Boolean(config.full_auto_enabled));
+        } catch {
+          setFullAutoEnabled(false);
+        }
         if (loaded) {
           // Initialize edited texts
           const texts: Record<number, string> = {};
@@ -88,8 +97,9 @@ export function TranscriptionPage() {
     loadData();
   }, [projectId, loadProject, loadScenes]);
 
-  const handleStartTranscription = useCallback(async () => {
+  const handleStartTranscription = useCallback(async (forcedLanguage?: string) => {
     if (!projectId) return;
+    const selectedLanguage = forcedLanguage ?? language;
 
     setTranscribing(true);
     setProgress({
@@ -101,9 +111,9 @@ export function TranscriptionPage() {
     setError(null);
 
     try {
-      const response = await api.startTranscription(projectId, language);
+      const response = await api.startTranscription(projectId, selectedLanguage);
 
-      await readSSEStream<TranscriptionProgress>(response, (data) => {
+      const finalEvent = await readSSEStream<TranscriptionProgress>(response, (data) => {
         setProgress(data);
 
         if (data.status === "complete" && data.transcription) {
@@ -115,12 +125,45 @@ export function TranscriptionPage() {
           setEditedTexts(texts);
         }
       });
+
+      if (
+        fullAutoEnabled &&
+        finalEvent?.status === "complete" &&
+        finalEvent.transcription
+      ) {
+        await api.confirmTranscription(projectId);
+        navigate(`/project/${projectId}/script`);
+      }
     } catch (err) {
       setError((err as Error).message);
     } finally {
       setTranscribing(false);
     }
-  }, [projectId, language]);
+  }, [projectId, language, fullAutoEnabled, navigate]);
+
+  useEffect(() => {
+    if (
+      !projectId ||
+      loading ||
+      transcribing ||
+      transcription ||
+      !fullAutoEnabled ||
+      autoStartAttemptedRef.current
+    ) {
+      return;
+    }
+
+    autoStartAttemptedRef.current = true;
+    setLanguage("auto");
+    handleStartTranscription("auto");
+  }, [
+    projectId,
+    loading,
+    transcribing,
+    transcription,
+    fullAutoEnabled,
+    handleStartTranscription,
+  ]);
 
   const handleTextChange = (sceneIndex: number, text: string) => {
     setEditedTexts((prev) => ({ ...prev, [sceneIndex]: text }));
@@ -230,7 +273,7 @@ export function TranscriptionPage() {
             )}
 
             <Button
-              onClick={handleStartTranscription}
+              onClick={() => handleStartTranscription()}
               disabled={transcribing}
               className="w-full"
             >

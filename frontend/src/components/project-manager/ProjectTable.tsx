@@ -23,7 +23,7 @@ interface ProjectTableProps {
 }
 
 const COLUMNS: { key: SortColumn | null; label: string; className: string }[] = [
-  { key: "uploaded",        label: "Status",       className: "w-10" },
+  { key: "uploaded",        label: "Status",       className: "w-20" },
   { key: "anime_title",     label: "Anime Title",  className: "" },       // takes remaining space
   { key: null,              label: "Account",      className: "w-28" },
   { key: "language",        label: "Lang",         className: "w-12" },
@@ -90,18 +90,18 @@ export function ProjectTable({
       <thead>
         <tr className="border-b border-[hsl(var(--border))] text-left">
           {COLUMNS.map((col) => (
-            <th key={col.label} className={`py-2 pr-3 ${col.className}`}>
+            <th key={col.label} className={`py-2 pr-3 whitespace-nowrap ${col.className}`}>
               {col.key ? (
                 <button
                   type="button"
-                  className="font-medium hover:text-[hsl(var(--primary))] transition-colors"
+                  className="font-medium hover:text-[hsl(var(--primary))] transition-colors whitespace-nowrap"
                   onClick={() => onToggleSort(col.key!)}
                 >
                   {col.label}
                   <SortArrow column={col.key} sortColumn={sortColumn} sortDirection={sortDirection} />
                 </button>
               ) : (
-                <span className="font-medium">{col.label}</span>
+                <span className="font-medium whitespace-nowrap">{col.label}</span>
               )}
             </th>
           ))}

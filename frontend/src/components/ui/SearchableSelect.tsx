@@ -46,17 +46,22 @@ export function SearchableSelect({
       )
     : options;
 
+  const closeDropdown = useCallback(() => {
+    setOpen(false);
+    setFilter("");
+    onPreviewStop?.();
+  }, [onPreviewStop]);
+
   useEffect(() => {
     if (!open) return;
     const handleClick = (e: MouseEvent) => {
       if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
-        setOpen(false);
-        setFilter("");
+        closeDropdown();
       }
     };
     document.addEventListener("mousedown", handleClick);
     return () => document.removeEventListener("mousedown", handleClick);
-  }, [open]);
+  }, [open, closeDropdown]);
 
   useEffect(() => {
     if (open) {
@@ -67,10 +72,9 @@ export function SearchableSelect({
   const handleSelect = useCallback(
     (key: string | null) => {
       onChange(key);
-      setOpen(false);
-      setFilter("");
+      closeDropdown();
     },
-    [onChange],
+    [onChange, closeDropdown],
   );
 
   const handlePreviewClick = useCallback(
@@ -90,7 +94,13 @@ export function SearchableSelect({
       <button
         type="button"
         disabled={disabled}
-        onClick={() => setOpen(!open)}
+        onClick={() => {
+          if (open) {
+            closeDropdown();
+            return;
+          }
+          setOpen(true);
+        }}
         className="w-full flex items-center justify-between gap-2 px-2.5 py-1.5 text-sm rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--background))] hover:bg-[hsl(var(--muted))] disabled:opacity-50 disabled:cursor-not-allowed text-left"
       >
         <span className={`truncate ${!selectedOption && !allowNone ? "text-[hsl(var(--muted-foreground))]" : ""}`}>

@@ -2028,6 +2028,12 @@ class ProcessingService:
 
             # Step 5: Generate title overlay images (if video_overlay is set)
             if project.video_overlay and project.video_overlay.get("title"):
+                yield ProcessingProgress(
+                    "processing",
+                    "overlay_image_generation",
+                    0.8,
+                    "Generating title overlay images...",
+                )
                 from .title_image_generator import TitleImageGeneratorService
 
                 overlay_paths = TitleImageGeneratorService.generate(
@@ -2044,13 +2050,20 @@ class ProcessingService:
                 project.video_overlay["title_image"] = str(overlay_paths["title"])
                 project.video_overlay["category_image"] = str(overlay_paths["category"])
                 ProjectService.save(project)
+            else:
+                yield ProcessingProgress(
+                    "processing",
+                    "overlay_image_generation",
+                    0.8,
+                    "Skipping title overlay image generation (no overlay configured)",
+                )
 
             # Clear processing state now that we're done
             cls.clear_processing_state(project.id)
 
             yield ProcessingProgress(
                 "complete",
-                "srt_generation",
+                "overlay_image_generation",
                 1.0,
                 "Processing complete!",
             )

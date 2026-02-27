@@ -3,6 +3,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import json
 
+from ...config import settings
 from ...models import ProjectPhase, Transcription, SceneTranscription
 from ...services import ProjectService, TranscriberService
 
@@ -15,6 +16,16 @@ class StartTranscriptionRequest(BaseModel):
 
 class UpdateTranscriptionRequest(BaseModel):
     scenes: list[dict]  # scene_index, text pairs
+
+
+@router.get("/config")
+async def get_transcription_config(project_id: str):
+    """Get transcription page feature flags."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    return {"full_auto_enabled": settings.transcription_full_auto_enabled}
 
 
 @router.post("/start")
