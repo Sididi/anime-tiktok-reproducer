@@ -197,7 +197,9 @@ class GeminiService:
         if not cls.is_configured():
             return {"status": "skipped", "detail": "Gemini API key not configured"}
         try:
-            reply = cls.generate_text("Reply with exactly: pong", max_output_tokens=8)
+            # Avoid overly strict output caps that can yield non-text candidates
+            # on some Gemini model revisions and create false negatives.
+            reply = cls.generate_text("Reply with exactly: pong")
             return {
                 "status": "ok",
                 "detail": f"Gemini API reachable (model={settings.gemini_model})",
