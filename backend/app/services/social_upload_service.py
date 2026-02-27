@@ -6,6 +6,7 @@ from pathlib import Path
 import json
 import logging
 import subprocess
+import tempfile
 import time
 from typing import Callable, Any
 
@@ -32,6 +33,22 @@ class PlatformUploadResult:
     resource_id: str | None = None
     detail: str | None = None
     quota_exceeded: bool = False
+
+
+@dataclass
+class FacebookMediaProbe:
+    duration_seconds: float | None
+    has_audio: bool
+
+
+@dataclass
+class FacebookVideoPreparation:
+    status: str  # ready | skip | error
+    video_path: Path | None = None
+    detail: str | None = None
+    transcoded: bool = False
+    original_duration_seconds: float | None = None
+    speed_factor: float | None = None
 
 
 def _extract_http_error_detail(exc: HttpError) -> str:
@@ -120,6 +137,9 @@ class SocialUploadService:
     _MAX_REQUEST_ATTEMPTS = 4
     _RETRY_BASE_DELAY_SECONDS = 1.0
     _SUPPORTED_YOUTUBE_LANGUAGES = {"fr", "en", "es"}
+    _FACEBOOK_MAX_DURATION_SECONDS = 90.0
+    _FACEBOOK_MAX_SPEED_FACTOR = 1.10
+    _FACEBOOK_MAX_ACCEL_PERCENT = 10.0
 
     @classmethod
     def _graph_base(cls) -> str:
@@ -441,6 +461,252 @@ class SocialUploadService:
             )
 
     @classmethod
+    def _probe_facebook_media(
+        cls,
+        *,
+        video_path: Path,
+    ) -> tuple[FacebookMediaProbe | None, str | None]:
+        try:
+            probe = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-show_entries",
+                    "stream=codec_type",
+                    "-of",
+                    "json",
+                    str(video_path),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except FileNotFoundError:
+            return None, "ffprobe is not available on the server."
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or "").strip()
+            detail = stderr[:300] if stderr else str(exc)
+            return None, f"ffprobe failed: {detail}"
+        except Exception as exc:
+            return None, f"ffprobe failed: {exc}"
+
+        try:
+            payload = json.loads(probe.stdout or "{}")
+        except Exception:
+            return None, "ffprobe returned invalid JSON."
+
+        duration_seconds: float | None = None
+        fmt = payload.get("format")
+        if isinstance(fmt, dict):
+            try:
+                duration_seconds = float(fmt.get("duration")) if fmt.get("duration") is not None else None
+            except Exception:
+                duration_seconds = None
+
+        has_audio = False
+        streams = payload.get("streams")
+        if isinstance(streams, list):
+            for stream in streams:
+                if not isinstance(stream, dict):
+                    continue
+                codec_type = str(stream.get("codec_type") or "").strip().lower()
+                if codec_type == "audio":
+                    has_audio = True
+                    break
+
+        return FacebookMediaProbe(duration_seconds=duration_seconds, has_audio=has_audio), None
+
+    @classmethod
+    def _transcode_facebook_video_to_limit(
+        cls,
+        *,
+        input_path: Path,
+        output_path: Path,
+        speed_factor: float,
+        has_audio: bool,
+    ) -> str | None:
+        speed_value = f"{speed_factor:.6f}"
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_path),
+            "-map",
+            "0:v:0",
+            "-filter:v",
+            f"setpts=PTS/{speed_value}",
+        ]
+        if has_audio:
+            cmd.extend(
+                [
+                    "-map",
+                    "0:a:0?",
+                    "-filter:a",
+                    f"atempo={speed_value}",
+                ]
+            )
+        else:
+            cmd.extend(["-an"])
+
+        cmd.extend(
+            [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "slow",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+            ]
+        )
+        if has_audio:
+            cmd.extend(
+                [
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-ac",
+                    "2",
+                    "-ar",
+                    "48000",
+                ]
+            )
+        cmd.extend(
+            [
+                "-movflags",
+                "+faststart",
+                "-t",
+                f"{int(cls._FACEBOOK_MAX_DURATION_SECONDS)}",
+                str(output_path),
+            ]
+        )
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            return "ffmpeg is not available on the server."
+        except Exception as exc:
+            return f"ffmpeg transcoding failed: {exc}"
+
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "unknown ffmpeg error").strip()
+            return f"ffmpeg transcoding failed: {detail[:300]}"
+        if not output_path.exists() or output_path.stat().st_size <= 0:
+            return "ffmpeg transcoding produced an empty output file."
+        return None
+
+    @classmethod
+    def _prepare_facebook_video_for_upload(
+        cls,
+        *,
+        source_video_path: Path,
+        work_dir: Path,
+    ) -> FacebookVideoPreparation:
+        probe, probe_error = cls._probe_facebook_media(video_path=source_video_path)
+        if probe_error:
+            return FacebookVideoPreparation(
+                status="error",
+                detail=f"Facebook video preparation failed: {probe_error}",
+            )
+        if probe is None or probe.duration_seconds is None or probe.duration_seconds <= 0:
+            return FacebookVideoPreparation(
+                status="error",
+                detail=(
+                    "Facebook video preparation failed: "
+                    "unable to detect a valid video duration via ffprobe."
+                ),
+            )
+
+        duration_seconds = probe.duration_seconds
+        if duration_seconds <= cls._FACEBOOK_MAX_DURATION_SECONDS + 0.01:
+            return FacebookVideoPreparation(
+                status="ready",
+                video_path=source_video_path,
+                transcoded=False,
+                original_duration_seconds=duration_seconds,
+                speed_factor=1.0,
+            )
+
+        speed_factor = duration_seconds / cls._FACEBOOK_MAX_DURATION_SECONDS
+        accel_percent = (speed_factor - 1.0) * 100.0
+        if speed_factor - cls._FACEBOOK_MAX_SPEED_FACTOR > 1e-6:
+            return FacebookVideoPreparation(
+                status="skip",
+                detail=(
+                    "Refus volontaire: vidéo trop longue "
+                    f"({duration_seconds:.2f}s). "
+                    f"Accélération requise +{accel_percent:.1f}% "
+                    f"(>{cls._FACEBOOK_MAX_ACCEL_PERCENT:.0f}% max)."
+                ),
+                original_duration_seconds=duration_seconds,
+                speed_factor=speed_factor,
+            )
+
+        work_dir.mkdir(parents=True, exist_ok=True)
+        output_path = work_dir / f"{source_video_path.stem}.facebook_90s.mp4"
+        transcode_error = cls._transcode_facebook_video_to_limit(
+            input_path=source_video_path,
+            output_path=output_path,
+            speed_factor=speed_factor,
+            has_audio=probe.has_audio,
+        )
+        if transcode_error:
+            return FacebookVideoPreparation(
+                status="error",
+                detail=f"Facebook video preparation failed: {transcode_error}",
+                original_duration_seconds=duration_seconds,
+                speed_factor=speed_factor,
+            )
+
+        output_probe, output_probe_error = cls._probe_facebook_media(video_path=output_path)
+        if output_probe_error:
+            return FacebookVideoPreparation(
+                status="error",
+                detail=f"Facebook video preparation failed: {output_probe_error}",
+                original_duration_seconds=duration_seconds,
+                speed_factor=speed_factor,
+            )
+        output_duration = output_probe.duration_seconds if output_probe else None
+        if output_duration is None or output_duration <= 0:
+            return FacebookVideoPreparation(
+                status="error",
+                detail=(
+                    "Facebook video preparation failed: "
+                    "unable to detect transcoded video duration."
+                ),
+                original_duration_seconds=duration_seconds,
+                speed_factor=speed_factor,
+            )
+        if output_duration > cls._FACEBOOK_MAX_DURATION_SECONDS + 0.2:
+            return FacebookVideoPreparation(
+                status="error",
+                detail=(
+                    "Facebook video preparation failed: "
+                    f"transcoded video is still too long ({output_duration:.2f}s)."
+                ),
+                original_duration_seconds=duration_seconds,
+                speed_factor=speed_factor,
+            )
+
+        return FacebookVideoPreparation(
+            status="ready",
+            video_path=output_path,
+            transcoded=True,
+            original_duration_seconds=duration_seconds,
+            speed_factor=speed_factor,
+        )
+
+    @classmethod
     def upload_facebook(
         cls,
         *,
@@ -490,78 +756,98 @@ class SocialUploadService:
         base = cls._graph_base()
 
         try:
-            with requests.Session() as session:
-                source_mode = "local"
-                video_id: str | None = None
-
-                # Fast path: let Meta ingest directly from the public Drive URL.
-                if video_url:
-                    url_resp = cls._request_with_retries(
-                        lambda: session.post(
-                            f"{base}/{page_id}/videos",
-                            data={
-                                "title": metadata.facebook.title,
-                                "description": metadata.facebook.description,
-                                "published": "true",
-                                "access_token": token,
-                                "file_url": video_url,
-                            },
-                            timeout=120,
-                        ),
-                        max_attempts=3,
+            with tempfile.TemporaryDirectory(prefix="atr-fb-upload-") as prep_dir:
+                prep = cls._prepare_facebook_video_for_upload(
+                    source_video_path=video_path,
+                    work_dir=Path(prep_dir),
+                )
+                if prep.status == "skip":
+                    return PlatformUploadResult(
+                        platform="facebook",
+                        status="skipped",
+                        detail=prep.detail,
                     )
-                    if url_resp.status_code < 400:
-                        payload = url_resp.json()
-                        candidate = payload.get("id")
-                        if candidate:
-                            video_id = str(candidate)
-                            source_mode = "drive_url"
+                if prep.status == "error" or prep.video_path is None:
+                    return PlatformUploadResult(
+                        platform="facebook",
+                        status="failed",
+                        detail=prep.detail or "Facebook video preparation failed.",
+                    )
+                prepared_video_path = prep.video_path
+                allow_drive_url_fast_path = bool(video_url and not prep.transcoded)
 
-                # Fallback path: upload bytes from local file.
-                if not video_id:
-                    def _upload_video_once() -> requests.Response:
-                        with video_path.open("rb") as source:
-                            return session.post(
+                with requests.Session() as session:
+                    source_mode = "local"
+                    video_id: str | None = None
+
+                    # Fast path: let Meta ingest directly from the public Drive URL.
+                    if allow_drive_url_fast_path and video_url:
+                        url_resp = cls._request_with_retries(
+                            lambda: session.post(
                                 f"{base}/{page_id}/videos",
                                 data={
                                     "title": metadata.facebook.title,
                                     "description": metadata.facebook.description,
                                     "published": "true",
                                     "access_token": token,
+                                    "file_url": video_url,
                                 },
-                                files={"source": source},
-                                timeout=1200,
-                            )
-
-                    resp = cls._request_with_retries(_upload_video_once, max_attempts=3)
-                    if resp.status_code >= 400:
-                        detail = _extract_graph_error(resp)
-                        if cls._is_page_token_required_error(resp):
-                            detail = (
-                                f"{detail} "
-                                "(configured token is not page-scoped for video publishing; "
-                                "provide a real page access token or allow derivation from page fields)."
-                            )
-                        return PlatformUploadResult(
-                            platform="facebook",
-                            status="failed",
-                            detail=f"Video upload failed: {detail}",
+                                timeout=120,
+                            ),
+                            max_attempts=3,
                         )
-                    payload = resp.json()
-                    candidate = payload.get("id")
-                    if not candidate:
-                        raise RuntimeError(f"Unexpected Facebook response: {payload}")
-                    video_id = str(candidate)
+                        if url_resp.status_code < 400:
+                            payload = url_resp.json()
+                            candidate = payload.get("id")
+                            if candidate:
+                                video_id = str(candidate)
+                                source_mode = "drive_url"
 
-                # Caption upload (required for platform success in this workflow).
-                cap_resp = cls._upload_facebook_caption_with_wait(
-                    session=session,
-                    base=base,
-                    video_id=video_id,
-                    token=token,
-                    subtitle_path=subtitle_path,
-                    subtitle_locale=subtitle_locale,
-                )
+                    # Fallback path: upload bytes from local file.
+                    if not video_id:
+                        def _upload_video_once() -> requests.Response:
+                            with prepared_video_path.open("rb") as source:
+                                return session.post(
+                                    f"{base}/{page_id}/videos",
+                                    data={
+                                        "title": metadata.facebook.title,
+                                        "description": metadata.facebook.description,
+                                        "published": "true",
+                                        "access_token": token,
+                                    },
+                                    files={"source": source},
+                                    timeout=1200,
+                                )
+
+                        resp = cls._request_with_retries(_upload_video_once, max_attempts=3)
+                        if resp.status_code >= 400:
+                            detail = _extract_graph_error(resp)
+                            if cls._is_page_token_required_error(resp):
+                                detail = (
+                                    f"{detail} "
+                                    "(configured token is not page-scoped for video publishing; "
+                                    "provide a real page access token or allow derivation from page fields)."
+                                )
+                            return PlatformUploadResult(
+                                platform="facebook",
+                                status="failed",
+                                detail=f"Video upload failed: {detail}",
+                            )
+                        payload = resp.json()
+                        candidate = payload.get("id")
+                        if not candidate:
+                            raise RuntimeError(f"Unexpected Facebook response: {payload}")
+                        video_id = str(candidate)
+
+                    # Caption upload (required for platform success in this workflow).
+                    cap_resp = cls._upload_facebook_caption_with_wait(
+                        session=session,
+                        base=base,
+                        video_id=video_id,
+                        token=token,
+                        subtitle_path=subtitle_path,
+                        subtitle_locale=subtitle_locale,
+                    )
 
             if cap_resp.status_code >= 400:
                 # If subtitle upload is unavailable, this platform is skipped by policy.
@@ -682,21 +968,6 @@ class SocialUploadService:
                     status="failed",
                     detail=f"Facebook reel source video does not exist: {video_path}",
                 )
-            file_size = video_path.stat().st_size
-            if file_size <= 0:
-                return PlatformUploadResult(
-                    platform="facebook",
-                    status="failed",
-                    detail="Facebook reel source video is empty (0 bytes).",
-                )
-            media_validation_error = cls._validate_facebook_reel_media(video_path=video_path)
-            if media_validation_error:
-                return PlatformUploadResult(
-                    platform="facebook",
-                    status="failed",
-                    detail=media_validation_error,
-                )
-
             scheduled_utc = (
                 scheduled_at.replace(tzinfo=timezone.utc)
                 if scheduled_at.tzinfo is None
@@ -725,206 +996,240 @@ class SocialUploadService:
                 )
             scheduled_epoch = str(int(scheduled_utc.timestamp()))
 
-            last_retryable_finish_error: str | None = None
-            for flow_attempt in range(1, max_flow_attempts + 1):
-                with requests.Session() as session:
-                    # Phase 1: Start — initialize upload session
-                    start_resp = cls._request_with_retries(
-                        lambda: session.post(
-                            f"{base}/{page_id}/video_reels",
-                            data={
-                                "upload_phase": "start",
-                                "access_token": token,
-                            },
-                            timeout=60,
-                        ),
-                        max_attempts=3,
+            with tempfile.TemporaryDirectory(prefix="atr-fb-reel-") as prep_dir:
+                prep = cls._prepare_facebook_video_for_upload(
+                    source_video_path=video_path,
+                    work_dir=Path(prep_dir),
+                )
+                if prep.status == "skip":
+                    return PlatformUploadResult(
+                        platform="facebook",
+                        status="skipped",
+                        detail=prep.detail,
                     )
-                    if start_resp.status_code >= 400:
-                        return PlatformUploadResult(
-                            platform="facebook",
-                            status="failed",
-                            detail=f"Reel start phase failed: {_extract_graph_error(start_resp)}",
-                        )
-                    start_payload = start_resp.json()
-                    video_id = start_payload.get("video_id")
-                    upload_url = start_payload.get("upload_url")
-                    if not video_id:
-                        return PlatformUploadResult(
-                            platform="facebook",
-                            status="failed",
-                            detail=f"Reel start phase returned no video_id: {start_payload}",
-                        )
-                    if not upload_url:
-                        return PlatformUploadResult(
-                            platform="facebook",
-                            status="failed",
-                            detail=f"Reel start phase returned no upload_url: {start_payload}",
-                        )
+                if prep.status == "error" or prep.video_path is None:
+                    return PlatformUploadResult(
+                        platform="facebook",
+                        status="failed",
+                        detail=prep.detail or "Facebook video preparation failed.",
+                    )
+                prepared_video_path = prep.video_path
 
-                    # Phase 2: Upload binary to rupload endpoint using the exact upload_url from START.
-                    upload_resp = cls._upload_facebook_reel_binary(
-                        session=session,
-                        upload_url=str(upload_url),
-                        token=token,
-                        video_path=video_path,
-                        file_size=file_size,
-                        offset=0,
-                        max_attempts=2,
+                file_size = prepared_video_path.stat().st_size
+                if file_size <= 0:
+                    return PlatformUploadResult(
+                        platform="facebook",
+                        status="failed",
+                        detail="Facebook reel source video is empty (0 bytes).",
                     )
-                    if upload_resp.status_code >= 400:
-                        return PlatformUploadResult(
-                            platform="facebook",
-                            status="failed",
-                            detail=f"Reel upload phase failed ({upload_resp.status_code}): {upload_resp.text[:300]}",
-                        )
-                    upload_problem = cls._facebook_reel_upload_response_problem(upload_resp)
-                    if upload_problem:
-                        return PlatformUploadResult(
-                            platform="facebook",
-                            status="failed",
-                            detail=f"Reel upload phase returned an invalid payload: {upload_problem}",
-                        )
+                media_validation_error = cls._validate_facebook_reel_media(video_path=prepared_video_path)
+                if media_validation_error:
+                    return PlatformUploadResult(
+                        platform="facebook",
+                        status="failed",
+                        detail=media_validation_error,
+                    )
 
-                    # Facebook docs recommend checking /{video-id}?fields=status and resuming interrupted uploads.
-                    upload_ready, upload_ready_detail = cls._ensure_facebook_reel_upload_ready_for_finish(
-                        session=session,
-                        base=base,
-                        video_id=str(video_id),
-                        upload_url=str(upload_url),
-                        token=token,
-                        video_path=video_path,
-                        file_size=file_size,
-                    )
-                    if not upload_ready:
-                        if flow_attempt < max_flow_attempts:
-                            last_retryable_finish_error = upload_ready_detail
-                            logger.warning(
-                                "Facebook reel upload not ready for finish on attempt %s/%s (video_id=%s): %s. "
-                                "Retrying with a fresh START session.",
-                                flow_attempt,
-                                max_flow_attempts,
-                                video_id,
-                                upload_ready_detail,
+                last_retryable_finish_error: str | None = None
+                for flow_attempt in range(1, max_flow_attempts + 1):
+                    with requests.Session() as session:
+                        # Phase 1: Start — initialize upload session
+                        start_resp = cls._request_with_retries(
+                            lambda: session.post(
+                                f"{base}/{page_id}/video_reels",
+                                data={
+                                    "upload_phase": "start",
+                                    "access_token": token,
+                                },
+                                timeout=60,
+                            ),
+                            max_attempts=3,
+                        )
+                        if start_resp.status_code >= 400:
+                            return PlatformUploadResult(
+                                platform="facebook",
+                                status="failed",
+                                detail=f"Reel start phase failed: {_extract_graph_error(start_resp)}",
                             )
-                            cls._cleanup_failed_facebook_video(
+                        start_payload = start_resp.json()
+                        video_id = start_payload.get("video_id")
+                        upload_url = start_payload.get("upload_url")
+                        if not video_id:
+                            return PlatformUploadResult(
+                                platform="facebook",
+                                status="failed",
+                                detail=f"Reel start phase returned no video_id: {start_payload}",
+                            )
+                        if not upload_url:
+                            return PlatformUploadResult(
+                                platform="facebook",
+                                status="failed",
+                                detail=f"Reel start phase returned no upload_url: {start_payload}",
+                            )
+
+                        # Phase 2: Upload binary to rupload endpoint using the exact upload_url from START.
+                        upload_resp = cls._upload_facebook_reel_binary(
+                            session=session,
+                            upload_url=str(upload_url),
+                            token=token,
+                            video_path=prepared_video_path,
+                            file_size=file_size,
+                            offset=0,
+                            max_attempts=2,
+                        )
+                        if upload_resp.status_code >= 400:
+                            return PlatformUploadResult(
+                                platform="facebook",
+                                status="failed",
+                                detail=f"Reel upload phase failed ({upload_resp.status_code}): {upload_resp.text[:300]}",
+                            )
+                        upload_problem = cls._facebook_reel_upload_response_problem(upload_resp)
+                        if upload_problem:
+                            return PlatformUploadResult(
+                                platform="facebook",
+                                status="failed",
+                                detail=f"Reel upload phase returned an invalid payload: {upload_problem}",
+                            )
+
+                        # Facebook docs recommend checking /{video-id}?fields=status and resuming interrupted uploads.
+                        upload_ready, upload_ready_detail = cls._ensure_facebook_reel_upload_ready_for_finish(
+                            session=session,
+                            base=base,
+                            video_id=str(video_id),
+                            upload_url=str(upload_url),
+                            token=token,
+                            video_path=prepared_video_path,
+                            file_size=file_size,
+                        )
+                        if not upload_ready:
+                            if flow_attempt < max_flow_attempts:
+                                last_retryable_finish_error = upload_ready_detail
+                                logger.warning(
+                                    "Facebook reel upload not ready for finish on attempt %s/%s (video_id=%s): %s. "
+                                    "Retrying with a fresh START session.",
+                                    flow_attempt,
+                                    max_flow_attempts,
+                                    video_id,
+                                    upload_ready_detail,
+                                )
+                                cls._cleanup_failed_facebook_video(
+                                    session=session,
+                                    base=base,
+                                    token=token,
+                                    video_id=str(video_id),
+                                )
+                                time.sleep(min(30, 5 * flow_attempt))
+                                continue
+                            return PlatformUploadResult(
+                                platform="facebook",
+                                status="failed",
+                                detail=f"Reel upload did not reach a finishable state: {upload_ready_detail}",
+                            )
+
+                        # Phase 3: Finish with video_state=SCHEDULED
+                        finish_resp = cls._request_with_retries(
+                            lambda: session.post(
+                                f"{base}/{page_id}/video_reels",
+                                data={
+                                    "upload_phase": "finish",
+                                    "video_id": video_id,
+                                    "access_token": token,
+                                    "video_state": "SCHEDULED",
+                                    "scheduled_publish_time": scheduled_epoch,
+                                    "title": metadata.facebook.title,
+                                    "description": metadata.facebook.description,
+                                },
+                                timeout=120,
+                            ),
+                            max_attempts=3,
+                        )
+                        if finish_resp.status_code >= 400:
+                            finish_error = _extract_graph_error(finish_resp)
+                            status_payload = cls._get_facebook_video_status_payload(
                                 session=session,
                                 base=base,
-                                token=token,
                                 video_id=str(video_id),
+                                token=token,
                             )
-                            time.sleep(min(30, 5 * flow_attempt))
-                            continue
-                        return PlatformUploadResult(
-                            platform="facebook",
-                            status="failed",
-                            detail=f"Reel upload did not reach a finishable state: {upload_ready_detail}",
-                        )
+                            if status_payload:
+                                finish_error = (
+                                    f"{finish_error} | "
+                                    f"video_status={cls._summarize_facebook_video_status(status_payload)}"
+                                )
+                            if (
+                                flow_attempt < max_flow_attempts
+                                and cls._is_facebook_reel_finish_retryable_error(finish_resp)
+                            ):
+                                last_retryable_finish_error = finish_error
+                                logger.warning(
+                                    "Facebook reel finish transient failure on attempt %s/%s (video_id=%s): %s. Retrying full flow.",
+                                    flow_attempt,
+                                    max_flow_attempts,
+                                    video_id,
+                                    finish_error,
+                                )
+                                cls._cleanup_failed_facebook_video(
+                                    session=session,
+                                    base=base,
+                                    token=token,
+                                    video_id=str(video_id),
+                                )
+                                time.sleep(min(30, 5 * flow_attempt))
+                                continue
+                            return PlatformUploadResult(
+                                platform="facebook",
+                                status="failed",
+                                detail=f"Reel finish phase failed: {finish_error}",
+                            )
 
-                    # Phase 3: Finish with video_state=SCHEDULED
-                    finish_resp = cls._request_with_retries(
-                        lambda: session.post(
-                            f"{base}/{page_id}/video_reels",
-                            data={
-                                "upload_phase": "finish",
-                                "video_id": video_id,
-                                "access_token": token,
-                                "video_state": "SCHEDULED",
-                                "scheduled_publish_time": scheduled_epoch,
-                                "title": metadata.facebook.title,
-                                "description": metadata.facebook.description,
-                            },
-                            timeout=120,
-                        ),
-                        max_attempts=3,
-                    )
-                    if finish_resp.status_code >= 400:
-                        finish_error = _extract_graph_error(finish_resp)
-                        status_payload = cls._get_facebook_video_status_payload(
+                        finish_payload = finish_resp.json()
+                        if not cls._is_facebook_reel_finish_payload_valid(
+                            finish_payload=finish_payload,
+                            expected_video_id=str(video_id),
+                        ):
+                            return PlatformUploadResult(
+                                platform="facebook",
+                                status="failed",
+                                detail=f"Reel finish phase returned ambiguous payload: {finish_payload}",
+                            )
+
+                        # Upload captions (non-fatal for the reel itself)
+                        cap_resp = cls._upload_facebook_caption_with_wait(
                             session=session,
                             base=base,
                             video_id=str(video_id),
                             token=token,
+                            subtitle_path=subtitle_path,
+                            subtitle_locale=subtitle_locale,
                         )
-                        if status_payload:
-                            finish_error = (
-                                f"{finish_error} | "
-                                f"video_status={cls._summarize_facebook_video_status(status_payload)}"
-                            )
-                        if (
-                            flow_attempt < max_flow_attempts
-                            and cls._is_facebook_reel_finish_retryable_error(finish_resp)
-                        ):
-                            last_retryable_finish_error = finish_error
+                        caption_detail = ""
+                        if cap_resp.status_code >= 400:
                             logger.warning(
-                                "Facebook reel finish transient failure on attempt %s/%s (video_id=%s): %s. Retrying full flow.",
-                                flow_attempt,
-                                max_flow_attempts,
+                                "Facebook scheduled captions failed for video_id=%s status=%s error=%s",
                                 video_id,
-                                finish_error,
+                                cap_resp.status_code,
+                                _extract_graph_error(cap_resp),
                             )
-                            cls._cleanup_failed_facebook_video(
-                                session=session,
-                                base=base,
-                                token=token,
-                                video_id=str(video_id),
-                            )
-                            time.sleep(min(30, 5 * flow_attempt))
-                            continue
+                            caption_detail = f"; captions failed: {_extract_graph_error(cap_resp)}"
+
                         return PlatformUploadResult(
                             platform="facebook",
-                            status="failed",
-                            detail=f"Reel finish phase failed: {finish_error}",
+                            status="uploaded",
+                            url=f"https://www.facebook.com/reel/{video_id}",
+                            resource_id=str(video_id),
+                            detail=f"Reel scheduled for {scheduled_at.isoformat()}{caption_detail}",
                         )
 
-                    finish_payload = finish_resp.json()
-                    if not cls._is_facebook_reel_finish_payload_valid(
-                        finish_payload=finish_payload,
-                        expected_video_id=str(video_id),
-                    ):
-                        return PlatformUploadResult(
-                            platform="facebook",
-                            status="failed",
-                            detail=f"Reel finish phase returned ambiguous payload: {finish_payload}",
-                        )
-
-                    # Upload captions (non-fatal for the reel itself)
-                    cap_resp = cls._upload_facebook_caption_with_wait(
-                        session=session,
-                        base=base,
-                        video_id=str(video_id),
-                        token=token,
-                        subtitle_path=subtitle_path,
-                        subtitle_locale=subtitle_locale,
-                    )
-                    caption_detail = ""
-                    if cap_resp.status_code >= 400:
-                        logger.warning(
-                            "Facebook scheduled captions failed for video_id=%s status=%s error=%s",
-                            video_id,
-                            cap_resp.status_code,
-                            _extract_graph_error(cap_resp),
-                        )
-                        caption_detail = f"; captions failed: {_extract_graph_error(cap_resp)}"
-
+                retry_detail = (
+                    f"Reel finish phase failed after retries: {last_retryable_finish_error}"
+                    if last_retryable_finish_error
+                    else "Reel finish phase failed after retries"
+                )
                 return PlatformUploadResult(
                     platform="facebook",
-                    status="uploaded",
-                    url=f"https://www.facebook.com/reel/{video_id}",
-                    resource_id=str(video_id),
-                    detail=f"Reel scheduled for {scheduled_at.isoformat()}{caption_detail}",
+                    status="failed",
+                    detail=retry_detail,
                 )
-
-            retry_detail = (
-                f"Reel finish phase failed after retries: {last_retryable_finish_error}"
-                if last_retryable_finish_error
-                else "Reel finish phase failed after retries"
-            )
-            return PlatformUploadResult(
-                platform="facebook",
-                status="failed",
-                detail=retry_detail,
-            )
         except Exception as exc:
             return PlatformUploadResult(
                 platform="facebook",
