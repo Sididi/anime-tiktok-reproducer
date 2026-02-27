@@ -4,9 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
-
-from ..config import settings
+from PIL import Image, ImageDraw, ImageFont
 
 # --- Layout constants (1080x1920 TikTok vertical) ---
 WIDTH = 1080
