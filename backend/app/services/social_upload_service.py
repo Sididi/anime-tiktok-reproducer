@@ -138,8 +138,8 @@ class SocialUploadService:
     _RETRY_BASE_DELAY_SECONDS = 1.0
     _SUPPORTED_YOUTUBE_LANGUAGES = {"fr", "en", "es"}
     _FACEBOOK_MAX_DURATION_SECONDS = 90.0
-    _FACEBOOK_MAX_SPEED_FACTOR = 1.10
-    _FACEBOOK_MAX_ACCEL_PERCENT = 10.0
+    _FACEBOOK_MAX_SPEED_FACTOR = 1.40
+    _FACEBOOK_MAX_ACCEL_PERCENT = 40.0
 
     @classmethod
     def _graph_base(cls) -> str:
@@ -606,6 +606,46 @@ class SocialUploadService:
         return None
 
     @classmethod
+    def _cut_facebook_video(
+        cls,
+        *,
+        input_path: Path,
+        output_path: Path,
+    ) -> str | None:
+        """Hard-cut a video at the Facebook max duration (stream copy, no re-encode)."""
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_path),
+            "-t",
+            f"{int(cls._FACEBOOK_MAX_DURATION_SECONDS)}",
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            return "ffmpeg is not available on the server."
+        except Exception as exc:
+            return f"ffmpeg cut failed: {exc}"
+
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "unknown ffmpeg error").strip()
+            return f"ffmpeg cut failed: {detail[:300]}"
+        if not output_path.exists() or output_path.stat().st_size <= 0:
+            return "ffmpeg cut produced an empty output file."
+        return None
+
+    @classmethod
     def _prepare_facebook_video_for_upload(
         cls,
         *,
@@ -718,7 +758,18 @@ class SocialUploadService:
         page_id: str | None = None,
         page_access_token: str | None = None,
         scheduled_at: datetime | None = None,
+        facebook_strategy: str | None = None,
+        facebook_prep_dir: Path | None = None,
     ) -> PlatformUploadResult:
+        # Handle explicit user strategy choice
+        strategy = (facebook_strategy or "auto").strip().lower()
+        if strategy == "skip":
+            return PlatformUploadResult(
+                platform="facebook",
+                status="skipped",
+                detail="Refus volontaire par l'utilisateur: vidéo trop longue pour Facebook.",
+            )
+
         # Use explicit per-account credentials if provided, else fall back to global
         if page_id and page_access_token:
             token = page_access_token
@@ -750,6 +801,8 @@ class SocialUploadService:
                 page_id=page_id,
                 token=token,
                 scheduled_at=scheduled_at,
+                facebook_strategy=strategy,
+                facebook_prep_dir=facebook_prep_dir,
             )
 
         # Immediate publish: use standard /videos endpoint
@@ -757,24 +810,64 @@ class SocialUploadService:
 
         try:
             with tempfile.TemporaryDirectory(prefix="atr-fb-upload-") as prep_dir:
-                prep = cls._prepare_facebook_video_for_upload(
-                    source_video_path=video_path,
-                    work_dir=Path(prep_dir),
-                )
-                if prep.status == "skip":
-                    return PlatformUploadResult(
-                        platform="facebook",
-                        status="skipped",
-                        detail=prep.detail,
+                # Apply user strategy (cut / sped_up / auto)
+                if strategy == "cut":
+                    cut_output = Path(prep_dir) / f"{video_path.stem}.facebook_cut.mp4"
+                    cut_error = cls._cut_facebook_video(
+                        input_path=video_path,
+                        output_path=cut_output,
                     )
-                if prep.status == "error" or prep.video_path is None:
-                    return PlatformUploadResult(
-                        platform="facebook",
-                        status="failed",
-                        detail=prep.detail or "Facebook video preparation failed.",
+                    if cut_error:
+                        return PlatformUploadResult(
+                            platform="facebook",
+                            status="failed",
+                            detail=f"Facebook cut failed: {cut_error}",
+                        )
+                    prepared_video_path = cut_output
+                    allow_drive_url_fast_path = False
+                elif strategy == "sped_up":
+                    # Try to reuse pre-cached sped up file from facebook-check
+                    cached = (
+                        facebook_prep_dir / "sped_up.mp4"
+                        if facebook_prep_dir and (facebook_prep_dir / "sped_up.mp4").exists()
+                        else None
                     )
-                prepared_video_path = prep.video_path
-                allow_drive_url_fast_path = bool(video_url and not prep.transcoded)
+                    if cached:
+                        prepared_video_path = cached
+                    else:
+                        # Fallback: transcode on the fly
+                        prep = cls._prepare_facebook_video_for_upload(
+                            source_video_path=video_path,
+                            work_dir=Path(prep_dir),
+                        )
+                        if prep.status != "ready" or prep.video_path is None:
+                            return PlatformUploadResult(
+                                platform="facebook",
+                                status="failed",
+                                detail=prep.detail or "Facebook sped-up transcoding failed.",
+                            )
+                        prepared_video_path = prep.video_path
+                    allow_drive_url_fast_path = False
+                else:
+                    # "auto" — original behaviour
+                    prep = cls._prepare_facebook_video_for_upload(
+                        source_video_path=video_path,
+                        work_dir=Path(prep_dir),
+                    )
+                    if prep.status == "skip":
+                        return PlatformUploadResult(
+                            platform="facebook",
+                            status="skipped",
+                            detail=prep.detail,
+                        )
+                    if prep.status == "error" or prep.video_path is None:
+                        return PlatformUploadResult(
+                            platform="facebook",
+                            status="failed",
+                            detail=prep.detail or "Facebook video preparation failed.",
+                        )
+                    prepared_video_path = prep.video_path
+                    allow_drive_url_fast_path = bool(video_url and not prep.transcoded)
 
                 with requests.Session() as session:
                     source_mode = "local"
@@ -956,6 +1049,8 @@ class SocialUploadService:
         page_id: str,
         token: str,
         scheduled_at: datetime,
+        facebook_strategy: str = "auto",
+        facebook_prep_dir: Path | None = None,
     ) -> PlatformUploadResult:
         """Schedule a Facebook Reel via 3-phase Reels API (video_state=SCHEDULED)."""
         base = cls._graph_base()
@@ -997,23 +1092,59 @@ class SocialUploadService:
             scheduled_epoch = str(int(scheduled_utc.timestamp()))
 
             with tempfile.TemporaryDirectory(prefix="atr-fb-reel-") as prep_dir:
-                prep = cls._prepare_facebook_video_for_upload(
-                    source_video_path=video_path,
-                    work_dir=Path(prep_dir),
-                )
-                if prep.status == "skip":
-                    return PlatformUploadResult(
-                        platform="facebook",
-                        status="skipped",
-                        detail=prep.detail,
+                # Apply user strategy (cut / sped_up / auto)
+                if facebook_strategy == "cut":
+                    cut_output = Path(prep_dir) / f"{video_path.stem}.facebook_cut.mp4"
+                    cut_error = cls._cut_facebook_video(
+                        input_path=video_path,
+                        output_path=cut_output,
                     )
-                if prep.status == "error" or prep.video_path is None:
-                    return PlatformUploadResult(
-                        platform="facebook",
-                        status="failed",
-                        detail=prep.detail or "Facebook video preparation failed.",
+                    if cut_error:
+                        return PlatformUploadResult(
+                            platform="facebook",
+                            status="failed",
+                            detail=f"Facebook cut failed: {cut_error}",
+                        )
+                    prepared_video_path = cut_output
+                elif facebook_strategy == "sped_up":
+                    cached = (
+                        facebook_prep_dir / "sped_up.mp4"
+                        if facebook_prep_dir and (facebook_prep_dir / "sped_up.mp4").exists()
+                        else None
                     )
-                prepared_video_path = prep.video_path
+                    if cached:
+                        prepared_video_path = cached
+                    else:
+                        prep = cls._prepare_facebook_video_for_upload(
+                            source_video_path=video_path,
+                            work_dir=Path(prep_dir),
+                        )
+                        if prep.status != "ready" or prep.video_path is None:
+                            return PlatformUploadResult(
+                                platform="facebook",
+                                status="failed",
+                                detail=prep.detail or "Facebook sped-up transcoding failed.",
+                            )
+                        prepared_video_path = prep.video_path
+                else:
+                    # "auto" — original behaviour
+                    prep = cls._prepare_facebook_video_for_upload(
+                        source_video_path=video_path,
+                        work_dir=Path(prep_dir),
+                    )
+                    if prep.status == "skip":
+                        return PlatformUploadResult(
+                            platform="facebook",
+                            status="skipped",
+                            detail=prep.detail,
+                        )
+                    if prep.status == "error" or prep.video_path is None:
+                        return PlatformUploadResult(
+                            platform="facebook",
+                            status="failed",
+                            detail=prep.detail or "Facebook video preparation failed.",
+                        )
+                    prepared_video_path = prep.video_path
 
                 file_size = prepared_video_path.stat().st_size
                 if file_size <= 0:

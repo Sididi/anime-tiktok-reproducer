@@ -145,6 +145,13 @@ export interface ProjectManagerRow {
   scheduled_account_id: string | null;
 }
 
+export interface FacebookCheckResult {
+  needed: boolean;
+  duration_seconds: number;
+  speed_factor: number;
+  sped_up_available: boolean;
+}
+
 export interface Account {
   id: string;
   name: string;

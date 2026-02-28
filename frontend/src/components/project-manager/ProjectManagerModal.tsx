@@ -6,11 +6,12 @@ import { api } from "@/api/client";
 import { readSSEStream } from "@/utils/sse";
 import { AccountSelectorDropdown } from "./AccountSelectorDropdown";
 import { AccountPickerPopup } from "./AccountPickerPopup";
+import { FacebookDurationModal } from "./FacebookDurationModal";
 import { ScheduledDeleteConfirm } from "./ScheduledDeleteConfirm";
 import { VideoPreviewModal } from "./VideoPreviewModal";
 import { ProjectTable } from "./ProjectTable";
 import type { SortColumn, SortDirection } from "./types";
-import type { ProjectManagerRow, Account } from "@/types";
+import type { ProjectManagerRow, Account, FacebookCheckResult } from "@/types";
 
 interface ProjectManagerModalProps {
   open: boolean;
@@ -37,6 +38,13 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
   const [accountPickerForProject, setAccountPickerForProject] = useState<string | null>(null);
   const [deleteConfirmRow, setDeleteConfirmRow] = useState<ProjectManagerRow | null>(null);
   const [previewVideoId, setPreviewVideoId] = useState<string | null>(null);
+
+  // Facebook duration check state
+  const [facebookCheck, setFacebookCheck] = useState<{
+    projectId: string;
+    accountId?: string;
+    result: FacebookCheckResult;
+  } | null>(null);
 
   // Multi-delete state
   const [multiDeleteMode, setMultiDeleteMode] = useState(false);
@@ -195,12 +203,12 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
 
   /* ── Upload ── */
   const runUpload = useCallback(
-    async (projectId: string, accountId?: string) => {
+    async (projectId: string, accountId?: string, facebookStrategy?: string) => {
       setActiveUploadId(projectId);
       setUploadMessage("Starting upload...");
       setError(null);
       try {
-        const response = await api.runProjectUpload(projectId, accountId);
+        const response = await api.runProjectUpload(projectId, accountId, facebookStrategy);
         await readSSEStream(response, (event) => {
           if (event.message) setUploadMessage(event.message);
         });
@@ -215,17 +223,56 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
     [loadData],
   );
 
+  const startUploadWithFbCheck = useCallback(
+    async (projectId: string, accountId?: string) => {
+      setError(null);
+      setActiveUploadId(projectId);
+      setUploadMessage("Vérification de la durée Facebook...");
+      try {
+        const result = await api.checkFacebookDuration(projectId, accountId);
+        if (result.needed) {
+          // Show modal for user choice — release the upload lock while user decides
+          setFacebookCheck({ projectId, accountId, result });
+          setUploadMessage(null);
+          setActiveUploadId(null);
+        } else {
+          // Video fits, proceed directly
+          setUploadMessage(null);
+          setActiveUploadId(null);
+          runUpload(projectId, accountId);
+        }
+      } catch (err) {
+        // If check fails, proceed with auto strategy (fallback to existing behaviour)
+        console.warn("Facebook check failed, proceeding with auto:", err);
+        setUploadMessage(null);
+        setActiveUploadId(null);
+        runUpload(projectId, accountId);
+      }
+    },
+    [runUpload],
+  );
+
+  const handleFacebookChoice = useCallback(
+    (strategy: "cut" | "sped_up" | "skip") => {
+      if (!facebookCheck) return;
+      const { projectId, accountId } = facebookCheck;
+      setFacebookCheck(null);
+      runUpload(projectId, accountId, strategy);
+    },
+    [facebookCheck, runUpload],
+  );
+
   const handleUploadClick = useCallback(
     (row: ProjectManagerRow) => {
       if (selectedAccountId) {
-        runUpload(row.project_id, selectedAccountId);
+        startUploadWithFbCheck(row.project_id, selectedAccountId);
       } else if (accounts.length > 0) {
         setAccountPickerForProject(row.project_id);
       } else {
-        runUpload(row.project_id);
+        startUploadWithFbCheck(row.project_id);
       }
     },
-    [selectedAccountId, accounts, runUpload],
+    [selectedAccountId, accounts, startUploadWithFbCheck],
   );
 
   const compatibleAccounts = useMemo(() => {
@@ -438,9 +485,20 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
             onPick={(accountId) => {
               const projectId = accountPickerForProject!;
               setAccountPickerForProject(null);
-              runUpload(projectId, accountId);
+              startUploadWithFbCheck(projectId, accountId);
             }}
             onClose={() => setAccountPickerForProject(null)}
+          />
+
+          {/* Facebook duration modal */}
+          <FacebookDurationModal
+            open={!!facebookCheck}
+            projectId={facebookCheck?.projectId ?? ""}
+            durationSeconds={facebookCheck?.result.duration_seconds ?? 0}
+            speedFactor={facebookCheck?.result.speed_factor ?? 1}
+            spedUpAvailable={facebookCheck?.result.sped_up_available ?? false}
+            onChoice={handleFacebookChoice}
+            onClose={() => setFacebookCheck(null)}
           />
 
           {/* Scheduled delete confirmation */}

@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
+import shutil
 import tempfile
 import os
 
@@ -20,6 +22,8 @@ from .metadata import MetadataService
 from .project_service import ProjectService
 from .scheduling_service import SchedulingService
 from .social_upload_service import PlatformUploadResult, SocialUploadService
+
+logger = logging.getLogger("uvicorn.error")
 
 
 @dataclass
@@ -338,6 +342,7 @@ class UploadPhaseService:
         project_id: str,
         account_id: str | None = None,
         platforms: list[str] | None = None,
+        facebook_strategy: str | None = None,
     ) -> dict[str, Any]:
         project = ProjectService.load(project_id)
         if not project:
@@ -421,6 +426,8 @@ class UploadPhaseService:
                 meta_creds = AccountService.get_meta_credentials(account_id)
 
                 if "facebook" in requested_platforms:
+                    _fb_strategy = facebook_strategy  # capture for lambda
+                    _fb_prep_dir = cls._facebook_prep_dir(project_id)
                     jobs["facebook"] = lambda: SocialUploadService.upload_facebook(
                         video_path=local_video_path,
                         subtitle_path=subtitle_path,
@@ -430,6 +437,8 @@ class UploadPhaseService:
                         page_id=meta_creds.page_id,
                         page_access_token=meta_creds.facebook_page_access_token,
                         scheduled_at=scheduled_at,
+                        facebook_strategy=_fb_strategy,
+                        facebook_prep_dir=_fb_prep_dir,
                     )
 
                 # Instagram: disabled when n8n webhook is not configured.
@@ -454,12 +463,16 @@ class UploadPhaseService:
             elif not account:
                 # Global (backwards compat)
                 if "facebook" in requested_platforms:
+                    _fb_strategy_global = facebook_strategy
+                    _fb_prep_dir_global = cls._facebook_prep_dir(project_id)
                     jobs["facebook"] = lambda: SocialUploadService.upload_facebook(
                         video_path=local_video_path,
                         subtitle_path=subtitle_path,
                         subtitle_locale=subtitle_locale,
                         metadata=metadata,
                         video_url=direct_drive_download,
+                        facebook_strategy=_fb_strategy_global,
+                        facebook_prep_dir=_fb_prep_dir_global,
                     )
                 if "instagram" in requested_platforms and instagram_enabled:
                     jobs["instagram"] = lambda: SocialUploadService.upload_instagram(
@@ -548,6 +561,9 @@ class UploadPhaseService:
 
         ProjectService.save(project)
 
+        # Cleanup facebook prep cache after upload
+        cls.cleanup_facebook_prep(project_id)
+
         return {
             "platform_results": [asdict(item) for item in platform_results],
             "requested_platforms": list(requested_platforms),
@@ -621,6 +637,129 @@ class UploadPhaseService:
             payload=payload,
             success_detail=f"Deferred to n8n; scheduled for {scheduled_at.isoformat()}",
         )
+
+    # ── Facebook duration check (pre-upload) ──────────────────────────────
+
+    _FACEBOOK_PREP_CACHE_DIR = Path("backend/data/cache/facebook_prep")
+    _FACEBOOK_PREP_MAX_AGE_SECONDS = 7200  # 2 hours
+
+    @classmethod
+    def _facebook_prep_dir(cls, project_id: str) -> Path:
+        return cls._FACEBOOK_PREP_CACHE_DIR / project_id
+
+    @classmethod
+    def cleanup_facebook_prep(cls, project_id: str) -> None:
+        prep_dir = cls._facebook_prep_dir(project_id)
+        if prep_dir.exists():
+            shutil.rmtree(prep_dir, ignore_errors=True)
+
+    @classmethod
+    def cleanup_stale_facebook_prep(cls) -> None:
+        """Remove cache entries older than the max age."""
+        if not cls._FACEBOOK_PREP_CACHE_DIR.exists():
+            return
+        import time as _time
+        now = _time.time()
+        for entry in cls._FACEBOOK_PREP_CACHE_DIR.iterdir():
+            if not entry.is_dir():
+                continue
+            try:
+                age = now - entry.stat().st_mtime
+                if age > cls._FACEBOOK_PREP_MAX_AGE_SECONDS:
+                    shutil.rmtree(entry, ignore_errors=True)
+            except OSError:
+                continue
+
+    @classmethod
+    def check_facebook_duration(
+        cls,
+        project_id: str,
+        account_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Check if the project video exceeds Facebook's 90s Reel limit.
+
+        Downloads the Drive video, probes its duration, and optionally
+        transcodes a sped-up version so that the frontend can preview
+        both options (hard-cut vs speed-up) before the real upload starts.
+
+        Returns a dict with:
+          - needed (bool): whether the modal should be shown
+          - duration_seconds (float): original video duration
+          - speed_factor (float): factor required to reach 90s
+          - sped_up_available (bool): whether speed-up is within the x1.40 limit
+        """
+        # Cleanup stale cache entries opportunistically
+        cls.cleanup_stale_facebook_prep()
+
+        project = ProjectService.load(project_id)
+        if not project:
+            raise ValueError("Project not found")
+
+        # Verify Facebook is configured for the account when one is provided
+        if account_id:
+            account = AccountService.get_account(account_id)
+            if not account:
+                raise ValueError(f"Account '{account_id}' not found")
+
+        readiness = cls.compute_readiness(project)
+        if readiness.status != "green" or not readiness.drive_video_id:
+            raise ValueError(f"Project is not ready for upload: {', '.join(readiness.reasons)}")
+
+        # Prepare cache directory
+        prep_dir = cls._facebook_prep_dir(project_id)
+        prep_dir.mkdir(parents=True, exist_ok=True)
+
+        # Download video from Drive into the cache dir
+        video_name = readiness.drive_video_name or "final_video.mp4"
+        original_path = prep_dir / video_name
+        if not original_path.exists():
+            GoogleDriveService.download_file(readiness.drive_video_id, original_path)
+
+        # Probe duration
+        probe, probe_error = SocialUploadService._probe_facebook_media(video_path=original_path)
+        if probe_error or probe is None or probe.duration_seconds is None:
+            raise ValueError(f"Unable to probe video duration: {probe_error or 'unknown'}")
+
+        duration_seconds = probe.duration_seconds
+        max_duration = SocialUploadService._FACEBOOK_MAX_DURATION_SECONDS
+
+        if duration_seconds <= max_duration + 0.01:
+            # Video fits within 90s – no modal needed
+            return {
+                "needed": False,
+                "duration_seconds": round(duration_seconds, 2),
+                "speed_factor": 1.0,
+                "sped_up_available": False,
+            }
+
+        speed_factor = duration_seconds / max_duration
+        max_speed = SocialUploadService._FACEBOOK_MAX_SPEED_FACTOR
+        sped_up_available = speed_factor <= max_speed + 1e-6
+
+        # Transcode sped-up version if within limits
+        if sped_up_available:
+            sped_up_path = prep_dir / "sped_up.mp4"
+            if not sped_up_path.exists():
+                logger.info(
+                    "Facebook check: transcoding sped-up version for project %s (x%.2f)",
+                    project_id, speed_factor,
+                )
+                error = SocialUploadService._transcode_facebook_video_to_limit(
+                    input_path=original_path,
+                    output_path=sped_up_path,
+                    speed_factor=speed_factor,
+                    has_audio=probe.has_audio,
+                )
+                if error:
+                    logger.warning("Facebook check: sped-up transcoding failed: %s", error)
+                    sped_up_available = False
+
+        return {
+            "needed": True,
+            "duration_seconds": round(duration_seconds, 2),
+            "speed_factor": round(speed_factor, 4),
+            "sped_up_available": sped_up_available,
+        }
 
     @classmethod
     def managed_delete(cls, project_id: str) -> dict[str, Any]:

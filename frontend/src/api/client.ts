@@ -82,12 +82,27 @@ export const api = {
       "/project-manager/projects",
     ),
 
-  runProjectUpload: (projectId: string, accountId?: string) =>
+  runProjectUpload: (projectId: string, accountId?: string, facebookStrategy?: string) =>
     fetch(`${API_BASE}/project-manager/projects/${projectId}/upload`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ account_id: accountId ?? null }),
+      body: JSON.stringify({
+        account_id: accountId ?? null,
+        facebook_strategy: facebookStrategy ?? null,
+      }),
     }),
+
+  checkFacebookDuration: (projectId: string, accountId?: string) =>
+    request<import("@/types").FacebookCheckResult>(
+      `/project-manager/projects/${projectId}/facebook-check`,
+      {
+        method: "POST",
+        body: JSON.stringify({ account_id: accountId ?? null }),
+      },
+    ),
+
+  getFacebookPreviewUrl: (projectId: string, version: "original" | "sped_up") =>
+    `${API_BASE}/project-manager/projects/${projectId}/facebook-preview/${version}`,
 
   deleteManagedProject: (projectId: string) =>
     request<{ status: string; local_deleted: boolean; drive_deleted: boolean }>(
