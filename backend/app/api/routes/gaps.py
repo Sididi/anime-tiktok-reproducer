@@ -4,11 +4,23 @@ import json
 from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+from ...config import Settings
 from ...services import ProjectService
 from ...services.gap_resolution import GapResolutionService
 from ...utils.timing import compute_adjusted_scene_end_times
 
 router = APIRouter(prefix="/projects/{project_id}/gaps", tags=["gap-resolution"])
+settings = Settings()
+
+
+@router.get("/config")
+async def get_gaps_config(project_id: str):
+    """Get gaps feature flags."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    return {"full_auto_enabled": settings.gaps_full_auto_enabled}
 
 
 class GapsResponse(BaseModel):

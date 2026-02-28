@@ -74,17 +74,22 @@ export function ProcessingPage() {
   const { loadProject } = useProjectStore();
   const hasStartedProcessing = useRef(false);
   const resumeAfterGapsRef = useRef(false);
+  const gapsAutoEnabledRef = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [processing, setProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [gapsDetected, setGapsDetected] = useState(false);
+  const [gapsAutoEnabled, setGapsAutoEnabled] = useState(false);
   const [gapInfo, setGapInfo] = useState<{
     count: number;
     duration: number;
   } | null>(null);
   const [steps, setSteps] = useState<ProcessingStep[]>(INITIAL_STEPS);
+
+  // Keep ref in sync for use inside SSE callback
+  gapsAutoEnabledRef.current = gapsAutoEnabled;
   const [processingComplete, setProcessingComplete] = useState(false);
 
   const [bundleLoading, setBundleLoading] = useState(false);
@@ -101,6 +106,12 @@ export function ProcessingPage() {
       setLoading(true);
       try {
         await loadProject(projectId);
+        try {
+          const gapsConfig = await api.getGapsConfig(projectId);
+          setGapsAutoEnabled(Boolean(gapsConfig.full_auto_enabled));
+        } catch {
+          setGapsAutoEnabled(false);
+        }
       } catch (err) {
         setError((err as Error).message);
       } finally {
@@ -147,7 +158,10 @@ export function ProcessingPage() {
           if (step.id === "jsx_generation") {
             return { ...step, status: "processing", message: "Resuming..." };
           }
-          if (step.id === "srt_generation" || step.id === "overlay_image_generation") {
+          if (
+            step.id === "srt_generation" ||
+            step.id === "overlay_image_generation"
+          ) {
             return { ...step, status: "pending" };
           }
           return { ...step, status: "complete" };
@@ -161,59 +175,77 @@ export function ProcessingPage() {
         method: "POST",
       });
 
-      await readSSEStream<ProcessingProgress>(response, (data) => {
-        if (data.status === "gaps_detected" && data.gaps_detected) {
-          setGapsDetected(true);
-          setGapInfo({
-            count: data.gap_count || 0,
-            duration: data.total_gap_duration || 0,
-          });
-          setSteps((prev) =>
-            prev.map((step) => {
-              if (step.id === "gap_detection") {
-                return {
-                  ...step,
-                  status: "paused",
-                  message: data.message,
-                };
-              }
-              const stepIndex = prev.findIndex((s) => s.id === step.id);
-              const currentIndex = prev.findIndex((s) => s.id === "gap_detection");
-              if (stepIndex < currentIndex) {
-                return { ...step, status: "complete" };
-              }
-              return step;
-            }),
-          );
-          return;
-        }
+      await readSSEStream<ProcessingProgress>(
+        response,
+        (data) => {
+          if (data.status === "gaps_detected" && data.gaps_detected) {
+            setGapsDetected(true);
+            setGapInfo({
+              count: data.gap_count || 0,
+              duration: data.total_gap_duration || 0,
+            });
+            setSteps((prev) =>
+              prev.map((step) => {
+                if (step.id === "gap_detection") {
+                  return {
+                    ...step,
+                    status: "paused",
+                    message: data.message,
+                  };
+                }
+                const stepIndex = prev.findIndex((s) => s.id === step.id);
+                const currentIndex = prev.findIndex(
+                  (s) => s.id === "gap_detection",
+                );
+                if (stepIndex < currentIndex) {
+                  return { ...step, status: "complete" };
+                }
+                return step;
+              }),
+            );
 
-        if (data.step) {
-          setSteps((prev) =>
-            prev.map((step) => {
-              const stepIndex = prev.findIndex((s) => s.id === step.id);
-              const currentIndex = prev.findIndex((s) => s.id === data.step);
-              if (stepIndex < currentIndex) {
-                return { ...step, status: "complete" };
-              }
-              if (step.id === data.step) {
-                return {
-                  ...step,
-                  status: data.status === "error" ? "error" : "processing",
-                  message: data.message,
-                };
-              }
-              return step;
-            }),
-          );
-        }
+            // Auto-navigate to gaps page when gapsAutoEnabled
+            if (gapsAutoEnabledRef.current && projectId) {
+              navigate(`/project/${projectId}/gaps`, {
+                state: { autoResolve: true },
+              });
+            }
 
-        if (data.status === "complete") {
-          setSteps((prev) => prev.map((step) => ({ ...step, status: "complete" })));
-          setProcessingComplete(true);
-          setActionMessage("Processing complete. Choose download or Drive upload.");
-        }
-      }, controller.signal);
+            return;
+          }
+
+          if (data.step) {
+            setSteps((prev) =>
+              prev.map((step) => {
+                const stepIndex = prev.findIndex((s) => s.id === step.id);
+                const currentIndex = prev.findIndex((s) => s.id === data.step);
+                if (stepIndex < currentIndex) {
+                  return { ...step, status: "complete" };
+                }
+                if (step.id === data.step) {
+                  return {
+                    ...step,
+                    status: data.status === "error" ? "error" : "processing",
+                    message: data.message,
+                  };
+                }
+                return step;
+              }),
+            );
+          }
+
+          if (data.status === "complete") {
+            setSteps((prev) =>
+              prev.map((step) => ({ ...step, status: "complete" })),
+            );
+            setProcessingComplete(true);
+            setActionMessage(
+              "Processing complete. Choose download or Drive upload.",
+            );
+          }
+        },
+        controller.signal,
+      );
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -235,7 +267,14 @@ export function ProcessingPage() {
     }
     hasStartedProcessing.current = true;
     startProcessing();
-  }, [projectId, loading, processing, processingComplete, gapsDetected, startProcessing]);
+  }, [
+    projectId,
+    loading,
+    processing,
+    processingComplete,
+    gapsDetected,
+    startProcessing,
+  ]);
 
   const handleBuildAndDownload = useCallback(async () => {
     if (!projectId || bundleLoading || driveLoading) return;
@@ -245,9 +284,12 @@ export function ProcessingPage() {
 
     try {
       const response = await api.createBundleExport(projectId);
-      const finalEvent = await readSSEStream<ProcessingProgress>(response, (data) => {
-        if (data.message) setActionMessage(data.message);
-      });
+      const finalEvent = await readSSEStream<ProcessingProgress>(
+        response,
+        (data) => {
+          if (data.message) setActionMessage(data.message);
+        },
+      );
       const downloadUrl = finalEvent?.download_url;
       if (!downloadUrl) {
         throw new Error("Bundle endpoint did not return a download URL");
@@ -269,9 +311,12 @@ export function ProcessingPage() {
 
     try {
       const response = await api.uploadExportToGDrive(projectId);
-      const finalEvent = await readSSEStream<ProcessingProgress>(response, (data) => {
-        if (data.message) setActionMessage(data.message);
-      });
+      const finalEvent = await readSSEStream<ProcessingProgress>(
+        response,
+        (data) => {
+          if (data.message) setActionMessage(data.message);
+        },
+      );
       if (finalEvent?.folder_url) {
         setDriveFolderUrl(finalEvent.folder_url);
         setDriveUploaded(true);
@@ -340,12 +385,13 @@ export function ProcessingPage() {
               <AlertTriangle className="h-5 w-5 text-amber-500 shrink-0 mt-0.5" />
               <div className="space-y-2 flex-1">
                 <p className="text-sm font-medium">
-                  {gapInfo.count} clip{gapInfo.count !== 1 ? "s" : ""} hit the 75%
-                  speed floor
+                  {gapInfo.count} clip{gapInfo.count !== 1 ? "s" : ""} hit the
+                  75% speed floor
                 </p>
                 <p className="text-xs text-[hsl(var(--muted-foreground))]">
                   Total gap duration: {gapInfo.duration.toFixed(2)}s. You can
-                  extend these clips to fill the gaps, or skip to keep them as-is.
+                  extend these clips to fill the gaps, or skip to keep them
+                  as-is.
                 </p>
                 <Button onClick={handleResolveGaps} className="w-full mt-2">
                   <AlertTriangle className="h-4 w-4 mr-2" />
@@ -439,8 +485,8 @@ export function ProcessingPage() {
               </Button>
             </div>
             <p className="text-xs text-center text-[hsl(var(--muted-foreground))]">
-              Drive and ZIP contain: JSX script, edited TTS audio, subtitles, metadata
-              files, overlay images, assets, and source mapping.
+              Drive and ZIP contain: JSX script, edited TTS audio, subtitles,
+              metadata files, overlay images, assets, and source mapping.
             </p>
             {driveFolderUrl && (
               <p className="text-xs text-center">
@@ -471,7 +517,7 @@ export function ProcessingPage() {
 
         {actionMessage && (
           <div className="flex items-center justify-center gap-2 text-sm text-[hsl(var(--muted-foreground))]">
-            {(processing || bundleLoading || driveLoading) ? (
+            {processing || bundleLoading || driveLoading ? (
               <Loader2 className="h-4 w-4 animate-spin" />
             ) : (
               <Package className="h-4 w-4" />

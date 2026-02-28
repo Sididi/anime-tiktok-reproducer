@@ -338,6 +338,11 @@ export const api = {
     }>(`/anime/browse${path ? `?path=${encodeURIComponent(path)}` : ""}`),
 
   // Gap Resolution
+  getGapsConfig: (projectId: string) =>
+    request<{ full_auto_enabled: boolean }>(
+      `/projects/${projectId}/gaps/config`,
+    ),
+
   getGaps: (projectId: string) =>
     request<{ has_gaps: boolean; gaps: GapInfo[]; total_gap_duration: number }>(
       `/projects/${projectId}/gaps`,

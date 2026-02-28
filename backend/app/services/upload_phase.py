@@ -247,8 +247,8 @@ class UploadPhaseService:
     _FRENCH_MONTHS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"]
     _PLATFORM_DISPLAY = {
         "youtube": "__Youtube__",
-        "facebook": "__Facebook:__",
-        "instagram": "__*Instagram:*__",
+        "facebook": "__Facebook__",
+        "instagram": "__Instagram__",
     }
 
     @classmethod

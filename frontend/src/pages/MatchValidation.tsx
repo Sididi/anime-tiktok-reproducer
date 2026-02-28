@@ -65,108 +65,133 @@ interface MatchCardHandle {
   stop: () => void;
 }
 
-const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(function MatchCard(
-  {
-    scene,
-    match,
-    projectId,
-    episodes,
-    isActive = false,
-    playbackRate = 1,
-    onManualMatch,
-    onUndoMerge,
-  },
-  ref,
-) {
-  const [showManualModal, setShowManualModal] = useState(false);
-  const tiktokPlayerRef = useRef<ClippedVideoPlayerHandle>(null);
-  const sourcePlayerRef = useRef<ClippedVideoPlayerHandle>(null);
-  const pendingResolverRef = useRef<(() => void) | null>(null);
-  const endedRef = useRef({ tiktok: false, source: false });
-  const primedForFastWatchRef = useRef(false);
-  const loadFailureRef = useRef(false);
-
-  const tiktokVideoUrl = api.getVideoUrl(projectId);
-  const hasMatch = Boolean(match.confidence > 0 && match.episode);
-  const sourceVideoUrl = hasMatch
-    ? api.getSourceVideoUrl(projectId, match.episode)
-    : null;
-
-  // Calculate durations
-  const tiktokDuration = scene.end_time - scene.start_time;
-  const sourceDuration = hasMatch ? match.end_time - match.start_time : 0;
-  const fastWatchMinReadyState =
-    playbackRate >= 3
-      ? HTMLMediaElement.HAVE_FUTURE_DATA
-      : HTMLMediaElement.HAVE_CURRENT_DATA;
-  const fastWatchReadyTimeoutMs = playbackRate >= 4 ? 9000 : 7000;
-
-  const handleManualSave = useCallback(
-    (episode: string, startTime: number, endTime: number) => {
-      onManualMatch(scene.index, episode, startTime, endTime);
+const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
+  function MatchCard(
+    {
+      scene,
+      match,
+      projectId,
+      episodes,
+      isActive = false,
+      playbackRate = 1,
+      onManualMatch,
+      onUndoMerge,
     },
-    [scene.index, onManualMatch],
-  );
+    ref,
+  ) {
+    const [showManualModal, setShowManualModal] = useState(false);
+    const tiktokPlayerRef = useRef<ClippedVideoPlayerHandle>(null);
+    const sourcePlayerRef = useRef<ClippedVideoPlayerHandle>(null);
+    const pendingResolverRef = useRef<(() => void) | null>(null);
+    const endedRef = useRef({ tiktok: false, source: false });
+    const primedForFastWatchRef = useRef(false);
+    const loadFailureRef = useRef(false);
 
-  const hasPairLoadError = useCallback(() => {
-    const tiktok = tiktokPlayerRef.current;
-    const source = sourcePlayerRef.current;
-    if (!tiktok || !source) return true;
-    return tiktok.hasLoadError() || source.hasLoadError();
-  }, []);
+    const tiktokVideoUrl = api.getVideoUrl(projectId);
+    const hasMatch = Boolean(match.confidence > 0 && match.episode);
+    const sourceVideoUrl = hasMatch
+      ? api.getSourceVideoUrl(projectId, match.episode)
+      : null;
 
-  const warmupPair = useCallback(
-    async (timeoutMs: number): Promise<boolean> => {
+    // Calculate durations
+    const tiktokDuration = scene.end_time - scene.start_time;
+    const sourceDuration = hasMatch ? match.end_time - match.start_time : 0;
+    const fastWatchMinReadyState =
+      playbackRate >= 3
+        ? HTMLMediaElement.HAVE_FUTURE_DATA
+        : HTMLMediaElement.HAVE_CURRENT_DATA;
+    const fastWatchReadyTimeoutMs = playbackRate >= 4 ? 9000 : 7000;
+
+    const handleManualSave = useCallback(
+      (episode: string, startTime: number, endTime: number) => {
+        onManualMatch(scene.index, episode, startTime, endTime);
+      },
+      [scene.index, onManualMatch],
+    );
+
+    const hasPairLoadError = useCallback(() => {
+      const tiktok = tiktokPlayerRef.current;
+      const source = sourcePlayerRef.current;
+      if (!tiktok || !source) return true;
+      return tiktok.hasLoadError() || source.hasLoadError();
+    }, []);
+
+    const warmupPair = useCallback(
+      async (timeoutMs: number): Promise<boolean> => {
+        const tiktok = tiktokPlayerRef.current;
+        const source = sourcePlayerRef.current;
+        if (!tiktok || !source) return false;
+
+        await Promise.all([
+          tiktok.waitUntilReady({
+            minReadyState: fastWatchMinReadyState,
+            timeoutMs,
+          }),
+          source.waitUntilReady({
+            minReadyState: fastWatchMinReadyState,
+            timeoutMs,
+          }),
+        ]);
+        if (hasPairLoadError()) {
+          return false;
+        }
+
+        await Promise.all([tiktok.seekToStart(), source.seekToStart()]);
+        return !hasPairLoadError();
+      },
+      [fastWatchMinReadyState, hasPairLoadError],
+    );
+
+    const recoverPairLoadOnce = useCallback(async (): Promise<boolean> => {
       const tiktok = tiktokPlayerRef.current;
       const source = sourcePlayerRef.current;
       if (!tiktok || !source) return false;
 
+      await Promise.all([tiktok.retryLoad(), source.retryLoad()]);
+      const recoveryTimeout = Math.max(fastWatchReadyTimeoutMs + 1500, 9000);
+      return warmupPair(recoveryTimeout);
+    }, [fastWatchReadyTimeoutMs, warmupPair]);
+
+    // Sync play both videos simultaneously using refs
+    // Two-phase: seek both first, then play together for precise sync
+    const playBothFromStart = useCallback(async () => {
+      if (!hasMatch) return;
+
+      const tiktok = tiktokPlayerRef.current;
+      const source = sourcePlayerRef.current;
+      if (!tiktok || !source) {
+        tiktok?.playFromStart();
+        source?.playFromStart();
+        return;
+      }
+
+      endedRef.current = { tiktok: false, source: false };
+      if (primedForFastWatchRef.current) {
+        primedForFastWatchRef.current = false;
+        if (hasPairLoadError()) {
+          loadFailureRef.current = true;
+          return;
+        }
+        loadFailureRef.current = false;
+        tiktok.play();
+        source.play();
+        return;
+      }
       await Promise.all([
         tiktok.waitUntilReady({
           minReadyState: fastWatchMinReadyState,
-          timeoutMs,
+          timeoutMs: fastWatchReadyTimeoutMs,
         }),
         source.waitUntilReady({
           minReadyState: fastWatchMinReadyState,
-          timeoutMs,
+          timeoutMs: fastWatchReadyTimeoutMs,
         }),
       ]);
       if (hasPairLoadError()) {
-        return false;
+        loadFailureRef.current = true;
+        return;
       }
-
       await Promise.all([tiktok.seekToStart(), source.seekToStart()]);
-      return !hasPairLoadError();
-    },
-    [fastWatchMinReadyState, hasPairLoadError],
-  );
-
-  const recoverPairLoadOnce = useCallback(async (): Promise<boolean> => {
-    const tiktok = tiktokPlayerRef.current;
-    const source = sourcePlayerRef.current;
-    if (!tiktok || !source) return false;
-
-    await Promise.all([tiktok.retryLoad(), source.retryLoad()]);
-    const recoveryTimeout = Math.max(fastWatchReadyTimeoutMs + 1500, 9000);
-    return warmupPair(recoveryTimeout);
-  }, [fastWatchReadyTimeoutMs, warmupPair]);
-
-  // Sync play both videos simultaneously using refs
-  // Two-phase: seek both first, then play together for precise sync
-  const playBothFromStart = useCallback(async () => {
-    if (!hasMatch) return;
-
-    const tiktok = tiktokPlayerRef.current;
-    const source = sourcePlayerRef.current;
-    if (!tiktok || !source) {
-      tiktok?.playFromStart();
-      source?.playFromStart();
-      return;
-    }
-
-    endedRef.current = { tiktok: false, source: false };
-    if (primedForFastWatchRef.current) {
-      primedForFastWatchRef.current = false;
       if (hasPairLoadError()) {
         loadFailureRef.current = true;
         return;
@@ -174,92 +199,62 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(function MatchCard
       loadFailureRef.current = false;
       tiktok.play();
       source.play();
-      return;
-    }
-    await Promise.all([
-      tiktok.waitUntilReady({
-        minReadyState: fastWatchMinReadyState,
-        timeoutMs: fastWatchReadyTimeoutMs,
-      }),
-      source.waitUntilReady({
-        minReadyState: fastWatchMinReadyState,
-        timeoutMs: fastWatchReadyTimeoutMs,
-      }),
+    }, [
+      hasMatch,
+      fastWatchMinReadyState,
+      fastWatchReadyTimeoutMs,
+      hasPairLoadError,
     ]);
-    if (hasPairLoadError()) {
-      loadFailureRef.current = true;
-      return;
-    }
-    await Promise.all([tiktok.seekToStart(), source.seekToStart()]);
-    if (hasPairLoadError()) {
-      loadFailureRef.current = true;
-      return;
-    }
-    loadFailureRef.current = false;
-    tiktok.play();
-    source.play();
-  }, [
-    hasMatch,
-    fastWatchMinReadyState,
-    fastWatchReadyTimeoutMs,
-    hasPairLoadError,
-  ]);
 
-  const prepareForAutoplay = useCallback(async () => {
-    if (!hasMatch) return true;
+    const prepareForAutoplay = useCallback(async () => {
+      if (!hasMatch) return true;
 
-    const tiktok = tiktokPlayerRef.current;
-    const source = sourcePlayerRef.current;
-    if (!tiktok || !source) {
-      loadFailureRef.current = true;
-      return false;
-    }
+      const tiktok = tiktokPlayerRef.current;
+      const source = sourcePlayerRef.current;
+      if (!tiktok || !source) {
+        loadFailureRef.current = true;
+        return false;
+      }
 
-    tiktok.forceLoad();
-    source.forceLoad();
+      tiktok.forceLoad();
+      source.forceLoad();
 
-    // First attempt: normal preload path.
-    let prepared = await warmupPair(fastWatchReadyTimeoutMs);
-    // Recovery attempt: retry source loads once with cache-busting.
-    if (!prepared) {
-      prepared = await recoverPairLoadOnce();
-    }
-    if (!prepared) {
-      loadFailureRef.current = true;
+      // First attempt: normal preload path.
+      let prepared = await warmupPair(fastWatchReadyTimeoutMs);
+      // Recovery attempt: retry source loads once with cache-busting.
+      if (!prepared) {
+        prepared = await recoverPairLoadOnce();
+      }
+      if (!prepared) {
+        loadFailureRef.current = true;
+        primedForFastWatchRef.current = false;
+        return false;
+      }
+
+      loadFailureRef.current = false;
+      primedForFastWatchRef.current = true;
+      return true;
+    }, [hasMatch, fastWatchReadyTimeoutMs, warmupPair, recoverPairLoadOnce]);
+
+    const releasePreload = useCallback(() => {
       primedForFastWatchRef.current = false;
-      return false;
-    }
+      loadFailureRef.current = false;
+      tiktokPlayerRef.current?.releaseLoad();
+      sourcePlayerRef.current?.releaseLoad();
+    }, []);
 
-    loadFailureRef.current = false;
-    primedForFastWatchRef.current = true;
-    return true;
-  }, [
-    hasMatch,
-    fastWatchReadyTimeoutMs,
-    warmupPair,
-    recoverPairLoadOnce,
-  ]);
+    const stop = useCallback(() => {
+      primedForFastWatchRef.current = false;
+      loadFailureRef.current = false;
+      tiktokPlayerRef.current?.pause();
+      sourcePlayerRef.current?.pause();
+      if (pendingResolverRef.current) {
+        pendingResolverRef.current();
+        pendingResolverRef.current = null;
+      }
+    }, []);
 
-  const releasePreload = useCallback(() => {
-    primedForFastWatchRef.current = false;
-    loadFailureRef.current = false;
-    tiktokPlayerRef.current?.releaseLoad();
-    sourcePlayerRef.current?.releaseLoad();
-  }, []);
-
-  const stop = useCallback(() => {
-    primedForFastWatchRef.current = false;
-    loadFailureRef.current = false;
-    tiktokPlayerRef.current?.pause();
-    sourcePlayerRef.current?.pause();
-    if (pendingResolverRef.current) {
-      pendingResolverRef.current();
-      pendingResolverRef.current = null;
-    }
-  }, []);
-
-  const onClipEnded = useCallback(
-    (player: "tiktok" | "source") => {
+    const onClipEnded = useCallback((player: "tiktok" | "source") => {
       endedRef.current[player] = true;
       if (endedRef.current.tiktok && endedRef.current.source) {
         if (pendingResolverRef.current) {
@@ -267,256 +262,258 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(function MatchCard
           pendingResolverRef.current = null;
         }
       }
-    },
-    [],
-  );
+    }, []);
 
-  const playBothAndWait = useCallback(async () => {
-    if (!hasMatch) return;
-    if (loadFailureRef.current) return;
+    const playBothAndWait = useCallback(async () => {
+      if (!hasMatch) return;
+      if (loadFailureRef.current) return;
 
-    await playBothFromStart();
-    if (loadFailureRef.current) return;
+      await playBothFromStart();
+      if (loadFailureRef.current) return;
 
-    await new Promise<void>((resolve) => {
-      const finalize = () => {
-        pendingResolverRef.current = null;
-        window.clearTimeout(hardTimeoutId);
-        window.clearInterval(stallGuardId);
-        resolve();
-      };
-
-      if (endedRef.current.tiktok && endedRef.current.source) {
-        resolve();
-        return;
-      }
-
-      pendingResolverRef.current = resolve;
-      const startedAt = Date.now();
-      const stallGuardId = window.setInterval(() => {
-        if (pendingResolverRef.current !== resolve) {
+      await new Promise<void>((resolve) => {
+        const finalize = () => {
+          pendingResolverRef.current = null;
+          window.clearTimeout(hardTimeoutId);
           window.clearInterval(stallGuardId);
+          resolve();
+        };
+
+        if (endedRef.current.tiktok && endedRef.current.source) {
+          resolve();
           return;
         }
 
-        const tiktok = tiktokPlayerRef.current;
-        const source = sourcePlayerRef.current;
-        if (!tiktok || !source) {
-          loadFailureRef.current = true;
-          finalize();
-          return;
+        pendingResolverRef.current = resolve;
+        const startedAt = Date.now();
+        const stallGuardId = window.setInterval(() => {
+          if (pendingResolverRef.current !== resolve) {
+            window.clearInterval(stallGuardId);
+            return;
+          }
+
+          const tiktok = tiktokPlayerRef.current;
+          const source = sourcePlayerRef.current;
+          if (!tiktok || !source) {
+            loadFailureRef.current = true;
+            finalize();
+            return;
+          }
+
+          if (tiktok.hasLoadError() || source.hasLoadError()) {
+            loadFailureRef.current = true;
+            finalize();
+            return;
+          }
+
+          // If playback did not actually start shortly after trigger, skip
+          // the scene to preserve Fast Watch continuity.
+          if (
+            Date.now() - startedAt > 1400 &&
+            !tiktok.isPlaying() &&
+            !source.isPlaying()
+          ) {
+            loadFailureRef.current = true;
+            finalize();
+          }
+        }, 200);
+
+        // Fallback to avoid deadlock if browser misses an ended callback.
+        const hardTimeoutId = window.setTimeout(() => {
+          if (pendingResolverRef.current === resolve) {
+            loadFailureRef.current = true;
+            finalize();
+          }
+        }, 15000);
+      });
+    }, [hasMatch, playBothFromStart]);
+
+    useImperativeHandle(
+      ref,
+      () => ({
+        playBothAndWait,
+        prepareForAutoplay,
+        releasePreload,
+        stop,
+      }),
+      [playBothAndWait, prepareForAutoplay, releasePreload, stop],
+    );
+
+    useEffect(() => {
+      return () => {
+        primedForFastWatchRef.current = false;
+        loadFailureRef.current = false;
+        if (pendingResolverRef.current) {
+          pendingResolverRef.current();
+          pendingResolverRef.current = null;
         }
+      };
+    }, []);
 
-        if (tiktok.hasLoadError() || source.hasLoadError()) {
-          loadFailureRef.current = true;
-          finalize();
-          return;
-        }
-
-        // If playback did not actually start shortly after trigger, skip
-        // the scene to preserve Fast Watch continuity.
-        if (
-          Date.now() - startedAt > 1400 &&
-          !tiktok.isPlaying() &&
-          !source.isPlaying()
-        ) {
-          loadFailureRef.current = true;
-          finalize();
-        }
-      }, 200);
-
-      // Fallback to avoid deadlock if browser misses an ended callback.
-      const hardTimeoutId = window.setTimeout(() => {
-        if (pendingResolverRef.current === resolve) {
-          loadFailureRef.current = true;
-          finalize();
-        }
-      }, 15000);
-    });
-  }, [hasMatch, playBothFromStart]);
-
-  useImperativeHandle(
-    ref,
-    () => ({
-      playBothAndWait,
-      prepareForAutoplay,
-      releasePreload,
-      stop,
-    }),
-    [playBothAndWait, prepareForAutoplay, releasePreload, stop],
-  );
-
-  useEffect(() => {
-    return () => {
-      primedForFastWatchRef.current = false;
-      loadFailureRef.current = false;
-      if (pendingResolverRef.current) {
-        pendingResolverRef.current();
-        pendingResolverRef.current = null;
-      }
-    };
-  }, []);
-
-  return (
-    <div
-      className={cn(
-        "bg-[hsl(var(--card))] rounded-lg p-4 space-y-4",
-        isActive && "ring-2 ring-[hsl(var(--primary))]",
-      )}
-      data-scene-index={scene.index}
-    >
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <h3 className="font-semibold">Scene {scene.index + 1}</h3>
-          {match.was_no_match && !match.merged_from && (
-            <span className="flex items-center gap-1 text-xs px-1.5 py-0.5 rounded bg-purple-500/10 text-purple-500 border border-purple-500/20">
-              <Sparkles className="h-3 w-3" />
-              manually set
-            </span>
-          )}
-          {match.merged_from && (
-            <span className="flex items-center gap-1 text-xs px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-500 border border-blue-500/20">
-              <Merge className="h-3 w-3" />
-              Merged (was scenes {match.merged_from.map((i) => i + 1).join("+")})
-            </span>
-          )}
-          {match.merged_from && onUndoMerge && (
-            <button
-              onClick={() => onUndoMerge(scene.index)}
-              className="flex items-center gap-1 text-xs px-1.5 py-0.5 rounded hover:bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))] transition-colors"
-              title="Undo merge and restore original scenes"
-            >
-              <Undo2 className="h-3 w-3" />
-              Undo
-            </button>
-          )}
-        </div>
-        {hasMatch ? (
-          <span className="flex items-center gap-1 text-sm text-emerald-500">
-            <Check className="h-4 w-4" />
-            {Math.round(match.confidence * 100)}% match
-          </span>
-        ) : (
-          <span className="flex items-center gap-1 text-sm text-amber-500">
-            <AlertCircle className="h-4 w-4" />
-            No match found
-          </span>
+    return (
+      <div
+        className={cn(
+          "bg-[hsl(var(--card))] rounded-lg p-4 space-y-4",
+          isActive && "ring-2 ring-[hsl(var(--primary))]",
         )}
-      </div>
-
-      <div className="grid grid-cols-2 gap-4">
-        {/* TikTok clip */}
-        <div data-video-type="tiktok">
-          <p className="text-xs text-[hsl(var(--muted-foreground))] mb-2">
-            TikTok Clip
-          </p>
-          <div className="aspect-[9/16] bg-black rounded overflow-hidden">
-            <ClippedVideoPlayer
-              ref={tiktokPlayerRef}
-              src={tiktokVideoUrl}
-              startTime={scene.start_time}
-              endTime={scene.end_time}
-              onClipEnded={() => onClipEnded("tiktok")}
-              playbackRate={playbackRate}
-              className="w-full h-full"
-            />
-          </div>
-          <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
-            {formatTime(scene.start_time)} - {formatTime(scene.end_time)} (
-            <strong>{formatTime(tiktokDuration)}</strong>)
-          </p>
-        </div>
-
-        {/* Source clip */}
-        <div data-video-type="source">
-          <p
-            className="text-xs text-[hsl(var(--muted-foreground))] mb-2 truncate"
-            title={match.episode || "Not found"}
-          >
-            Source:{" "}
-            {match.episode ? match.episode.split("/").pop() : "Not found"}
-          </p>
-          <div className="aspect-[9/16] bg-black rounded overflow-hidden flex items-center justify-center">
-            {hasMatch && sourceVideoUrl ? (
-              <ClippedVideoPlayer
-                ref={sourcePlayerRef}
-                src={sourceVideoUrl}
-                startTime={match.start_time}
-                endTime={match.end_time}
-                onClipEnded={() => onClipEnded("source")}
-                playbackRate={playbackRate}
-                className="w-full h-full"
-              />
-            ) : (
-              <div className="flex flex-col items-center gap-2 text-[hsl(var(--muted-foreground))] p-4">
-                <AlertCircle className="h-8 w-8 text-amber-500 mb-2" />
-                <p className="text-xs text-center">No automatic match found</p>
-                <p className="text-xs text-center opacity-60">
-                  {match.alternatives?.length || 0} AI candidates available
-                </p>
-                {episodes.length > 0 && (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setShowManualModal(true)}
-                    className="w-full mt-2"
-                  >
-                    <Edit className="h-3 w-3 mr-1" />
-                    Find Match
-                  </Button>
-                )}
-              </div>
+        data-scene-index={scene.index}
+      >
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <h3 className="font-semibold">Scene {scene.index + 1}</h3>
+            {match.was_no_match && !match.merged_from && (
+              <span className="flex items-center gap-1 text-xs px-1.5 py-0.5 rounded bg-purple-500/10 text-purple-500 border border-purple-500/20">
+                <Sparkles className="h-3 w-3" />
+                manually set
+              </span>
+            )}
+            {match.merged_from && (
+              <span className="flex items-center gap-1 text-xs px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-500 border border-blue-500/20">
+                <Merge className="h-3 w-3" />
+                Merged (was scenes{" "}
+                {match.merged_from.map((i) => i + 1).join("+")})
+              </span>
+            )}
+            {match.merged_from && onUndoMerge && (
+              <button
+                onClick={() => onUndoMerge(scene.index)}
+                className="flex items-center gap-1 text-xs px-1.5 py-0.5 rounded hover:bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))] transition-colors"
+                title="Undo merge and restore original scenes"
+              >
+                <Undo2 className="h-3 w-3" />
+                Undo
+              </button>
             )}
           </div>
           {hasMatch ? (
-            <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
-              {formatTime(match.start_time)} - {formatTime(match.end_time)} (
-              <strong>{formatTime(sourceDuration)}</strong> ~
-              {match.speed_ratio.toFixed(2)}x speed)
-            </p>
+            <span className="flex items-center gap-1 text-sm text-emerald-500">
+              <Check className="h-4 w-4" />
+              {Math.round(match.confidence * 100)}% match
+            </span>
           ) : (
-            <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
-              &nbsp;
-            </p>
+            <span className="flex items-center gap-1 text-sm text-amber-500">
+              <AlertCircle className="h-4 w-4" />
+              No match found
+            </span>
           )}
         </div>
-      </div>
 
-      {/* Action buttons for matched scenes */}
-      {hasMatch && (
-        <div className="flex gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            className="flex-1"
-            onClick={playBothFromStart}
-          >
-            <Play className="h-4 w-4 mr-2" />
-            Play Both
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setShowManualModal(true)}
-          >
-            <Edit className="h-4 w-4" />
-          </Button>
+        <div className="grid grid-cols-2 gap-4">
+          {/* TikTok clip */}
+          <div data-video-type="tiktok">
+            <p className="text-xs text-[hsl(var(--muted-foreground))] mb-2">
+              TikTok Clip
+            </p>
+            <div className="aspect-[9/16] bg-black rounded overflow-hidden">
+              <ClippedVideoPlayer
+                ref={tiktokPlayerRef}
+                src={tiktokVideoUrl}
+                startTime={scene.start_time}
+                endTime={scene.end_time}
+                onClipEnded={() => onClipEnded("tiktok")}
+                playbackRate={playbackRate}
+                className="w-full h-full"
+              />
+            </div>
+            <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
+              {formatTime(scene.start_time)} - {formatTime(scene.end_time)} (
+              <strong>{formatTime(tiktokDuration)}</strong>)
+            </p>
+          </div>
+
+          {/* Source clip */}
+          <div data-video-type="source">
+            <p
+              className="text-xs text-[hsl(var(--muted-foreground))] mb-2 truncate"
+              title={match.episode || "Not found"}
+            >
+              Source:{" "}
+              {match.episode ? match.episode.split("/").pop() : "Not found"}
+            </p>
+            <div className="aspect-[9/16] bg-black rounded overflow-hidden flex items-center justify-center">
+              {hasMatch && sourceVideoUrl ? (
+                <ClippedVideoPlayer
+                  ref={sourcePlayerRef}
+                  src={sourceVideoUrl}
+                  startTime={match.start_time}
+                  endTime={match.end_time}
+                  onClipEnded={() => onClipEnded("source")}
+                  playbackRate={playbackRate}
+                  className="w-full h-full"
+                />
+              ) : (
+                <div className="flex flex-col items-center gap-2 text-[hsl(var(--muted-foreground))] p-4">
+                  <AlertCircle className="h-8 w-8 text-amber-500 mb-2" />
+                  <p className="text-xs text-center">
+                    No automatic match found
+                  </p>
+                  <p className="text-xs text-center opacity-60">
+                    {match.alternatives?.length || 0} AI candidates available
+                  </p>
+                  {episodes.length > 0 && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setShowManualModal(true)}
+                      className="w-full mt-2"
+                    >
+                      <Edit className="h-3 w-3 mr-1" />
+                      Find Match
+                    </Button>
+                  )}
+                </div>
+              )}
+            </div>
+            {hasMatch ? (
+              <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
+                {formatTime(match.start_time)} - {formatTime(match.end_time)} (
+                <strong>{formatTime(sourceDuration)}</strong> ~
+                {match.speed_ratio.toFixed(2)}x speed)
+              </p>
+            ) : (
+              <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
+                &nbsp;
+              </p>
+            )}
+          </div>
         </div>
-      )}
 
-      {/* Manual match modal */}
-      <ManualMatchModal
-        isOpen={showManualModal}
-        onClose={() => setShowManualModal(false)}
-        scene={scene}
-        match={match}
-        projectId={projectId}
-        episodes={episodes}
-        onSave={handleManualSave}
-      />
-    </div>
-  );
-});
+        {/* Action buttons for matched scenes */}
+        {hasMatch && (
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              className="flex-1"
+              onClick={playBothFromStart}
+            >
+              <Play className="h-4 w-4 mr-2" />
+              Play Both
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setShowManualModal(true)}
+            >
+              <Edit className="h-4 w-4" />
+            </Button>
+          </div>
+        )}
+
+        {/* Manual match modal */}
+        <ManualMatchModal
+          isOpen={showManualModal}
+          onClose={() => setShowManualModal(false)}
+          scene={scene}
+          match={match}
+          projectId={projectId}
+          episodes={episodes}
+          onSave={handleManualSave}
+        />
+      </div>
+    );
+  },
+);
 
 const MemoizedMatchCard = memo(MatchCard);
 
@@ -535,6 +532,9 @@ export function MatchValidation() {
   );
   const [error, setError] = useState<string | null>(null);
   const [mergeContinuous, setMergeContinuous] = useState(true);
+  const [skipUiEnabled, setSkipUiEnabled] = useState(false);
+  const skipUiEnabledRef = useRef(false);
+  const autoMatchAttemptedRef = useRef(false);
   const [activeSceneIndex, setActiveSceneIndex] = useState(-1);
   const [autoScroll, setAutoScroll] = useState(true);
   const [fastWatchPlaying, setFastWatchPlaying] = useState(false);
@@ -653,7 +653,9 @@ export function MatchValidation() {
         preparedScenesRef.current.delete(preparedSceneIndex);
       }
 
-      for (const failedSceneIndex of Array.from(failedPreparedScenesRef.current)) {
+      for (const failedSceneIndex of Array.from(
+        failedPreparedScenesRef.current,
+      )) {
         if (keepSceneIndices.has(failedSceneIndex)) continue;
         cardRefs.current.get(failedSceneIndex)?.releasePreload();
         failedPreparedScenesRef.current.delete(failedSceneIndex);
@@ -689,10 +691,15 @@ export function MatchValidation() {
       setFastWatchPlaying(true);
       clearFastWatchBuffers();
 
-      const startPos = scenes.findIndex((scene) => scene.index === startSceneIndex);
+      const startPos = scenes.findIndex(
+        (scene) => scene.index === startSceneIndex,
+      );
       const orderedScenes = startPos >= 0 ? scenes.slice(startPos) : scenes;
       const initialWindow = orderedScenes.slice(0, fastWatchPrefetchAhead + 1);
-      const mandatoryWarmup = initialWindow.slice(0, Math.min(2, initialWindow.length));
+      const mandatoryWarmup = initialWindow.slice(
+        0,
+        Math.min(2, initialWindow.length),
+      );
       for (const scene of mandatoryWarmup) {
         await ensureScenePrepared(scene.index, token);
         if (autoplayTokenRef.current !== token) {
@@ -742,7 +749,9 @@ export function MatchValidation() {
       if (autoplayTokenRef.current === token) {
         autoplayTokenRef.current = token + 1;
         setFastWatchPlaying(false);
-        for (const preparedSceneIndex of Array.from(preparedScenesRef.current)) {
+        for (const preparedSceneIndex of Array.from(
+          preparedScenesRef.current,
+        )) {
           cardRefs.current.get(preparedSceneIndex)?.releasePreload();
         }
         clearFastWatchBuffers();
@@ -778,6 +787,16 @@ export function MatchValidation() {
         // Load available episodes for manual matching
         const { episodes: loadedEpisodes } = await api.getEpisodes(projectId);
         setEpisodes(loadedEpisodes);
+        // Check if scene UI skip is enabled (auto-match + auto-continue)
+        try {
+          const scenesConfig = await api.getScenesConfig(projectId);
+          const skip = Boolean(scenesConfig.skip_ui_enabled);
+          setSkipUiEnabled(skip);
+          skipUiEnabledRef.current = skip;
+        } catch {
+          setSkipUiEnabled(false);
+          skipUiEnabledRef.current = false;
+        }
       } catch (err) {
         setError((err as Error).message);
       } finally {
@@ -826,7 +845,11 @@ export function MatchValidation() {
     });
 
     try {
-      const response = await api.findMatches(projectId, undefined, mergeContinuous);
+      const response = await api.findMatches(
+        projectId,
+        undefined,
+        mergeContinuous,
+      );
 
       await readSSEStream<MatchProgress>(response, async (data) => {
         setMatchProgress(data);
@@ -835,14 +858,17 @@ export function MatchValidation() {
           const matchesData = data.matches as unknown as {
             matches: SceneMatch[];
           };
-          const matchesWithTracking = (matchesData.matches || []).map(
-            (m) => ({
-              ...m,
-              was_no_match: m.was_no_match ?? (m.confidence === 0 && !m.episode),
-            }),
-          );
+          const matchesWithTracking = (matchesData.matches || []).map((m) => ({
+            ...m,
+            was_no_match: m.was_no_match ?? (m.confidence === 0 && !m.episode),
+          }));
           setMatches(matchesWithTracking);
           await loadScenes(projectId);
+
+          // Auto-continue to transcription when skipUiEnabled
+          if (skipUiEnabledRef.current) {
+            navigate(`/project/${projectId}/transcription`);
+          }
         }
       });
     } catch (err) {
@@ -851,7 +877,30 @@ export function MatchValidation() {
     } finally {
       setMatching(false);
     }
-  }, [projectId, mergeContinuous, loadScenes, stopFastWatch]);
+  }, [projectId, mergeContinuous, loadScenes, stopFastWatch, navigate]);
+
+  // Auto-start matching when skipUiEnabled and no matches exist
+  useEffect(() => {
+    if (
+      !projectId ||
+      loading ||
+      matching ||
+      !skipUiEnabled ||
+      matches.length > 0 ||
+      autoMatchAttemptedRef.current
+    ) {
+      return;
+    }
+    autoMatchAttemptedRef.current = true;
+    handleFindMatches();
+  }, [
+    projectId,
+    loading,
+    matching,
+    skipUiEnabled,
+    matches.length,
+    handleFindMatches,
+  ]);
 
   const handleManualMatch = useCallback(
     async (

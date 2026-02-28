@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import { useParams, useNavigate, useLocation } from "react-router-dom";
 import {
   Check,
   Loader2,
@@ -408,8 +408,15 @@ function GapCard({
 export function GapResolutionPage() {
   const { projectId } = useParams<{ projectId: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
   const { loadProject } = useProjectStore();
   const { scenes, loadScenes } = useSceneStore();
+
+  const autoResolveRequested = Boolean(
+    (location.state as { autoResolve?: boolean } | null)?.autoResolve,
+  );
+  const [autoResolving, setAutoResolving] = useState(autoResolveRequested);
+  const autoResolveAttemptedRef = useRef(false);
 
   const [gaps, setGaps] = useState<GapInfo[]>([]);
   const [episodes, setEpisodes] = useState<string[]>([]);
@@ -652,6 +659,58 @@ export function GapResolutionPage() {
     }
   }, [projectId, resolvedGaps, skippedGaps]);
 
+  // Auto-resolve: when autoResolve is requested, wait for data, auto-fill, then auto-continue
+  useEffect(() => {
+    if (
+      !autoResolving ||
+      !projectId ||
+      loading ||
+      loadingCandidates ||
+      autoResolveAttemptedRef.current
+    ) {
+      return;
+    }
+
+    autoResolveAttemptedRef.current = true;
+
+    const runAutoResolve = async () => {
+      try {
+        if (gaps.length === 0) {
+          // No gaps — mark resolved and go back
+          await fetch(`/api/projects/${projectId}/gaps/mark-resolved`, {
+            method: "POST",
+          });
+          navigate(`/project/${projectId}/processing`, {
+            state: { resumeAfterGaps: true },
+          });
+          return;
+        }
+
+        // Step 1: Auto-fill all gaps
+        const response = await fetch(
+          `/api/projects/${projectId}/gaps/auto-fill`,
+          { method: "POST" },
+        );
+        if (!response.ok) {
+          throw new Error("Failed to auto-fill gaps");
+        }
+
+        // Step 2: Mark gaps as resolved and navigate back
+        await fetch(`/api/projects/${projectId}/gaps/mark-resolved`, {
+          method: "POST",
+        });
+        navigate(`/project/${projectId}/processing`, {
+          state: { resumeAfterGaps: true },
+        });
+      } catch (err) {
+        setError((err as Error).message);
+        setAutoResolving(false);
+      }
+    };
+
+    runAutoResolve();
+  }, [autoResolving, projectId, loading, loadingCandidates, gaps, navigate]);
+
   // Count resolved + skipped
   const handledCount = resolvedGaps.size + skippedGaps.size;
   const totalGaps = gaps.length;
@@ -660,10 +719,17 @@ export function GapResolutionPage() {
   // Count skipped that still have warnings
   const warningCount = skippedGaps.size;
 
-  if (loading) {
+  if (loading || autoResolving) {
     return (
       <div className="min-h-screen flex items-center justify-center">
-        <Loader2 className="h-8 w-8 animate-spin text-[hsl(var(--muted-foreground))]" />
+        <div className="flex flex-col items-center gap-3">
+          <Loader2 className="h-8 w-8 animate-spin text-[hsl(var(--muted-foreground))]" />
+          {autoResolving && (
+            <p className="text-sm text-[hsl(var(--muted-foreground))]">
+              Auto-resolving gaps...
+            </p>
+          )}
+        </div>
       </div>
     );
   }

@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     script_automate_enabled: bool = True
     scenes_skip_ui_enabled: bool = False
     transcription_full_auto_enabled: bool = False
+    gaps_full_auto_enabled: bool = False
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-3.1-pro-preview"
     gemini_timeout: int = 300  # seconds (read timeout for Gemini API; connect=10)
