@@ -143,31 +143,102 @@ class TitleImageGeneratorService:
         img.save(output_path, "PNG")
 
     @classmethod
+    def _draw_outlined_text(
+        cls,
+        draw: ImageDraw.ImageDraw,
+        xy: tuple[int, int],
+        text: str,
+        font: ImageFont.FreeTypeFont,
+        fill: tuple,
+        outline_fill: tuple,
+        outline_width: int,
+    ) -> None:
+        """Draw text with circular outline stroke."""
+        x, y = xy
+        ow = outline_width
+        for dx in range(-ow, ow + 1):
+            for dy in range(-ow, ow + 1):
+                if dx * dx + dy * dy <= ow * ow:
+                    draw.text((x + dx, y + dy), text, font=font, fill=outline_fill)
+        draw.text((x, y), text, fill=fill, font=font)
+
+    @classmethod
     def _render_category(cls, category: str, output_path: Path) -> None:
-        """Render uppercase category text with black outline to transparent PNG."""
+        """Render uppercase category text with black outline to transparent PNG.
+
+        The bullet separator is drawn as a filled circle vertically centered
+        with the uppercase text, since the font's '•' glyph sits too low.
+        """
         font = cls._load_font(CAT_FONT_SIZE)
         img = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
 
         text = category.upper()
-        cat_bbox = font.getbbox(text)
-        cat_w = cat_bbox[2] - cat_bbox[0]
-        cat_x = (WIDTH - cat_w) // 2
         cat_y = CENTER_FRAME_BOT + CAT_GAP_BELOW_CENTER
 
-        # Draw black outline (circular stroke)
-        ow = CAT_OUTLINE_WIDTH
-        for dx in range(-ow, ow + 1):
-            for dy in range(-ow, ow + 1):
-                if dx * dx + dy * dy <= ow * ow:
-                    draw.text(
-                        (cat_x + dx, cat_y + dy),
-                        text,
-                        font=font,
-                        fill=CAT_OUTLINE_COLOR,
-                    )
+        # Split at bullet separator to draw it as a centered circle
+        separator = " \u2022 "  # " • "
+        if separator in text:
+            parts = text.split(separator)
+            left, right = parts[0].strip(), parts[1].strip()
+            space_w = font.getbbox(" ")[2] - font.getbbox(" ")[0]
+            bullet_radius = 6
+            bullet_gap = space_w  # space on each side of the circle
 
-        # Draw white text on top
-        draw.text((cat_x, cat_y), text, fill=CAT_TEXT_COLOR, font=font)
+            left_w = font.getbbox(left)[2] - font.getbbox(left)[0]
+            right_w = font.getbbox(right)[2] - font.getbbox(right)[0]
+            total_w = left_w + bullet_gap + bullet_radius * 2 + bullet_gap + right_w
+
+            start_x = (WIDTH - total_w) // 2
+
+            # Draw left text
+            cls._draw_outlined_text(
+                draw, (start_x, cat_y), left, font,
+                CAT_TEXT_COLOR, CAT_OUTLINE_COLOR, CAT_OUTLINE_WIDTH,
+            )
+
+            # Draw bullet circle at vertical center of uppercase text
+            caps_bbox = font.getbbox("A")
+            caps_center_y = cat_y + (caps_bbox[1] + caps_bbox[3]) // 2
+            bullet_cx = start_x + left_w + bullet_gap + bullet_radius
+            bullet_cy = caps_center_y
+
+            # Outline for bullet
+            ow = CAT_OUTLINE_WIDTH
+            draw.ellipse(
+                [
+                    bullet_cx - bullet_radius - ow,
+                    bullet_cy - bullet_radius - ow,
+                    bullet_cx + bullet_radius + ow,
+                    bullet_cy + bullet_radius + ow,
+                ],
+                fill=CAT_OUTLINE_COLOR,
+            )
+            # White bullet
+            draw.ellipse(
+                [
+                    bullet_cx - bullet_radius,
+                    bullet_cy - bullet_radius,
+                    bullet_cx + bullet_radius,
+                    bullet_cy + bullet_radius,
+                ],
+                fill=CAT_TEXT_COLOR,
+            )
+
+            # Draw right text
+            right_x = start_x + left_w + bullet_gap + bullet_radius * 2 + bullet_gap
+            cls._draw_outlined_text(
+                draw, (right_x, cat_y), right, font,
+                CAT_TEXT_COLOR, CAT_OUTLINE_COLOR, CAT_OUTLINE_WIDTH,
+            )
+        else:
+            # No separator — render as single text
+            cat_bbox = font.getbbox(text)
+            cat_w = cat_bbox[2] - cat_bbox[0]
+            cat_x = (WIDTH - cat_w) // 2
+            cls._draw_outlined_text(
+                draw, (cat_x, cat_y), text, font,
+                CAT_TEXT_COLOR, CAT_OUTLINE_COLOR, CAT_OUTLINE_WIDTH,
+            )
 
         img.save(output_path, "PNG")

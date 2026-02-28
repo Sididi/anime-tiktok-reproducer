@@ -65,7 +65,8 @@ RÈGLES TITRE:
 - Maximum 45 caractères (STRICT, compte chaque caractère)
 - Style: phrases choc qui donnent envie de regarder
 - Ne JAMAIS citer le nom de l'anime
-- Exemples: "CET ANIME EST UNE DINGUERIE", "TU VAS PLEURER EN REGARDANT ÇA", "L'ANIME LE PLUS FOU DE 2025"
+- Typographie française OBLIGATOIRE: toujours un espace AVANT les ? ! : ; (ex: "MOT !" et non "MOT!")
+- Exemples: "CET ANIME EST UNE DINGUERIE", "TU VAS PLEURER EN REGARDANT ÇA !", "L'ANIME LE PLUS FOU DE 2025"
 
 RÈGLES CATÉGORIE:
 - Exactement 2 genres séparés par " • "
