@@ -74,7 +74,10 @@ export function FacebookDurationModal({
         >
           <motion.div
             className="bg-[hsl(var(--card))] border border-[hsl(var(--border))] rounded-xl p-6 shadow-2xl flex flex-col gap-5"
-            style={{ maxWidth: spedUpAvailable ? "56rem" : "30rem", width: "100%" }}
+            style={{
+              maxWidth: spedUpAvailable ? "56rem" : "30rem",
+              width: "100%",
+            }}
             initial={{ scale: 0.95, opacity: 0 }}
             animate={{ scale: 1, opacity: 1 }}
             exit={{ scale: 0.95, opacity: 0 }}
@@ -84,18 +87,29 @@ export function FacebookDurationModal({
             {/* Header */}
             <div className="flex items-center justify-between">
               <div>
-                <h3 className="text-lg font-semibold">Vidéo trop longue pour Facebook</h3>
+                <h3 className="text-lg font-semibold">
+                  Vidéo trop longue pour Facebook
+                </h3>
                 <p className="text-sm text-[hsl(var(--muted-foreground))] mt-1">
-                  Durée originale : <strong>{formatDuration(durationSeconds)}</strong> — Facebook limite les Reels à <strong>1:30</strong>.
+                  Durée originale :{" "}
+                  <strong>{formatDuration(durationSeconds)}</strong> — Facebook
+                  limite les Reels à <strong>1:30</strong>.
                 </p>
               </div>
-              <Button variant="ghost" size="icon" onClick={onClose} className="shrink-0">
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={onClose}
+                className="shrink-0"
+              >
                 <X className="h-4 w-4" />
               </Button>
             </div>
 
             {/* Previews */}
-            <div className={`grid gap-4 ${spedUpAvailable ? "grid-cols-2" : "grid-cols-1"}`}>
+            <div
+              className={`grid gap-4 ${spedUpAvailable ? "grid-cols-2" : "grid-cols-1"}`}
+            >
               {/* Cut preview */}
               <div className="flex flex-col gap-3">
                 <div className="relative bg-black rounded-lg overflow-hidden aspect-9/16 max-h-[55vh]">
@@ -115,7 +129,8 @@ export function FacebookDurationModal({
                 </div>
                 <div className="text-center">
                   <p className="text-sm text-[hsl(var(--muted-foreground))]">
-                    Les {formatDuration(durationSeconds - maxDuration)} restantes seront supprimées
+                    Les {formatDuration(durationSeconds - maxDuration)}{" "}
+                    restantes seront supprimées
                   </p>
                   <Button
                     size="sm"
@@ -131,7 +146,7 @@ export function FacebookDurationModal({
               {/* Sped up preview */}
               {spedUpAvailable && (
                 <div className="flex flex-col gap-3">
-                    <div className="relative bg-black rounded-lg overflow-hidden aspect-9/16 max-h-[55vh]">
+                  <div className="relative bg-black rounded-lg overflow-hidden aspect-9/16 max-h-[55vh]">
                     <video
                       ref={spedUpVideoRef}
                       src={spedUpUrl}
@@ -147,7 +162,8 @@ export function FacebookDurationModal({
                   </div>
                   <div className="text-center">
                     <p className="text-sm text-[hsl(var(--muted-foreground))]">
-                      Toute la vidéo est conservée, accélérée de +{accelPercent}%
+                      Toute la vidéo est conservée, accélérée de +{accelPercent}
+                      %
                     </p>
                     <Button
                       size="sm"

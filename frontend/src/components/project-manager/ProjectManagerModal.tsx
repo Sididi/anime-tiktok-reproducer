@@ -18,7 +18,10 @@ interface ProjectManagerModalProps {
   onClose: () => void;
 }
 
-export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps) {
+export function ProjectManagerModal({
+  open,
+  onClose,
+}: ProjectManagerModalProps) {
   const [rows, setRows] = useState<ProjectManagerRow[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [loading, setLoading] = useState(false);
@@ -26,7 +29,9 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
   const [sortColumn, setSortColumn] = useState<SortColumn>("created_at");
   const [sortDirection, setSortDirection] = useState<SortDirection>("desc");
 
-  const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
+  const [selectedAccountId, setSelectedAccountId] = useState<string | null>(
+    null,
+  );
   const [accountDropdownOpen, setAccountDropdownOpen] = useState(false);
 
   const [activeUploadId, setActiveUploadId] = useState<string | null>(null);
@@ -35,8 +40,11 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
   const [holdingDeleteId, setHoldingDeleteId] = useState<string | null>(null);
   const holdTimerRef = useRef<number | null>(null);
 
-  const [accountPickerForProject, setAccountPickerForProject] = useState<string | null>(null);
-  const [deleteConfirmRow, setDeleteConfirmRow] = useState<ProjectManagerRow | null>(null);
+  const [accountPickerForProject, setAccountPickerForProject] = useState<
+    string | null
+  >(null);
+  const [deleteConfirmRow, setDeleteConfirmRow] =
+    useState<ProjectManagerRow | null>(null);
   const [previewVideoId, setPreviewVideoId] = useState<string | null>(null);
 
   // Facebook duration check state
@@ -48,7 +56,9 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
 
   // Multi-delete state
   const [multiDeleteMode, setMultiDeleteMode] = useState(false);
-  const [selectedProjectIds, setSelectedProjectIds] = useState<Set<string>>(new Set());
+  const [selectedProjectIds, setSelectedProjectIds] = useState<Set<string>>(
+    new Set(),
+  );
   const [showMultiDeleteConfirm, setShowMultiDeleteConfirm] = useState(false);
   const [multiDeleting, setMultiDeleting] = useState(false);
 
@@ -60,7 +70,10 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
   /* ── Data loading (accounts fast, projects slow) ── */
   const loadData = useCallback(async () => {
     setError(null);
-    api.listAccounts().then((res) => setAccounts(res.accounts)).catch(() => {});
+    api
+      .listAccounts()
+      .then((res) => setAccounts(res.accounts))
+      .catch(() => {});
     setLoading(true);
     try {
       const projectsRes = await api.listProjectManagerProjects();
@@ -82,7 +95,10 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         if (previewVideoId) return;
-        if (multiDeleteMode) { exitMultiDeleteMode(); return; }
+        if (multiDeleteMode) {
+          exitMultiDeleteMode();
+          return;
+        }
         onClose();
       }
     };
@@ -154,7 +170,8 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
   const filteredRows = useMemo(() => {
     if (!selectedAccount) return rows;
     return rows.filter((r) => {
-      if (r.uploaded || r.scheduled_at) return r.scheduled_account_id === selectedAccount.id;
+      if (r.uploaded || r.scheduled_at)
+        return r.scheduled_account_id === selectedAccount.id;
       return r.language === selectedAccount.language;
     });
   }, [rows, selectedAccount]);
@@ -203,12 +220,20 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
 
   /* ── Upload ── */
   const runUpload = useCallback(
-    async (projectId: string, accountId?: string, facebookStrategy?: string) => {
+    async (
+      projectId: string,
+      accountId?: string,
+      facebookStrategy?: string,
+    ) => {
       setActiveUploadId(projectId);
       setUploadMessage("Starting upload...");
       setError(null);
       try {
-        const response = await api.runProjectUpload(projectId, accountId, facebookStrategy);
+        const response = await api.runProjectUpload(
+          projectId,
+          accountId,
+          facebookStrategy,
+        );
         await readSSEStream(response, (event) => {
           if (event.message) setUploadMessage(event.message);
         });
@@ -382,7 +407,9 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
                       <Button
                         variant="destructive"
                         size="sm"
-                        disabled={selectedProjectIds.size === 0 || multiDeleting}
+                        disabled={
+                          selectedProjectIds.size === 0 || multiDeleting
+                        }
                         onClick={() => setShowMultiDeleteConfirm(true)}
                         className="active:scale-95 transition-transform"
                       >
@@ -391,7 +418,10 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
                         ) : (
                           <Trash2 className="h-4 w-4 mr-1.5" />
                         )}
-                        Delete{selectedProjectIds.size > 0 ? ` (${selectedProjectIds.size})` : ""}
+                        Delete
+                        {selectedProjectIds.size > 0
+                          ? ` (${selectedProjectIds.size})`
+                          : ""}
                       </Button>
                       <Button
                         variant="ghost"
@@ -430,7 +460,11 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
                   disabled={loading}
                   className="active:scale-95 transition-transform"
                 >
-                  {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                  {loading ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <RefreshCw className="h-4 w-4" />
+                  )}
                 </Button>
                 <Button
                   variant="ghost"
@@ -532,16 +566,26 @@ export function ProjectManagerModal({ open, onClose }: ProjectManagerModalProps)
                   onClick={(e) => e.stopPropagation()}
                 >
                   <h3 className="font-semibold mb-2">
-                    Delete {selectedProjectIds.size} project{selectedProjectIds.size !== 1 ? "s" : ""}?
+                    Delete {selectedProjectIds.size} project
+                    {selectedProjectIds.size !== 1 ? "s" : ""}?
                   </h3>
                   <p className="text-sm text-[hsl(var(--muted-foreground))] mb-4">
-                    This will permanently delete all selected projects. This action cannot be undone.
+                    This will permanently delete all selected projects. This
+                    action cannot be undone.
                   </p>
                   <div className="flex justify-end gap-2">
-                    <Button variant="ghost" size="sm" onClick={() => setShowMultiDeleteConfirm(false)}>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setShowMultiDeleteConfirm(false)}
+                    >
                       Cancel
                     </Button>
-                    <Button variant="destructive" size="sm" onClick={handleMultiDelete}>
+                    <Button
+                      variant="destructive"
+                      size="sm"
+                      onClick={handleMultiDelete}
+                    >
                       Delete All
                     </Button>
                   </div>

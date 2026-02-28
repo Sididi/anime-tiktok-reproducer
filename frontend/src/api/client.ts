@@ -82,7 +82,11 @@ export const api = {
       "/project-manager/projects",
     ),
 
-  runProjectUpload: (projectId: string, accountId?: string, facebookStrategy?: string) =>
+  runProjectUpload: (
+    projectId: string,
+    accountId?: string,
+    facebookStrategy?: string,
+  ) =>
     fetch(`${API_BASE}/project-manager/projects/${projectId}/upload`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -188,11 +192,18 @@ export const api = {
   getEpisodes: (projectId: string) =>
     request<{ episodes: string[] }>(`/projects/${projectId}/sources/episodes`),
 
-  findMatches: (projectId: string, sourcePath?: string, mergeContinuous = true) => {
+  findMatches: (
+    projectId: string,
+    sourcePath?: string,
+    mergeContinuous = true,
+  ) => {
     return fetch(`${API_BASE}/projects/${projectId}/matches/find`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ source_path: sourcePath, merge_continuous: mergeContinuous }),
+      body: JSON.stringify({
+        source_path: sourcePath,
+        merge_continuous: mergeContinuous,
+      }),
     });
   },
 
@@ -238,10 +249,12 @@ export const api = {
     ),
 
   undoMerge: (projectId: string, sceneIndex: number) =>
-    request<{ scenes: import("@/types").Scene[]; matches: import("@/types").SceneMatch[] }>(
-      `/projects/${projectId}/matches/undo-merge/${sceneIndex}`,
-      { method: "POST" },
-    ),
+    request<{
+      scenes: import("@/types").Scene[];
+      matches: import("@/types").SceneMatch[];
+    }>(`/projects/${projectId}/matches/undo-merge/${sceneIndex}`, {
+      method: "POST",
+    }),
 
   // Source video
   getSourceVideoUrl: (projectId: string, episodePath: string) =>
@@ -316,7 +329,12 @@ export const api = {
     request<{
       current_path: string;
       parent_path: string | null;
-      entries: { name: string; path: string; is_dir: boolean; has_videos: boolean }[];
+      entries: {
+        name: string;
+        path: string;
+        is_dir: boolean;
+        has_videos: boolean;
+      }[];
     }>(`/anime/browse${path ? `?path=${encodeURIComponent(path)}` : ""}`),
 
   // Gap Resolution
@@ -362,9 +380,10 @@ export const api = {
 
   // Metadata
   getProjectMetadata: (projectId: string) =>
-    request<{ exists: boolean; metadata: import("@/types").PlatformMetadata | null }>(
-      `/projects/${projectId}/metadata`,
-    ),
+    request<{
+      exists: boolean;
+      metadata: import("@/types").PlatformMetadata | null;
+    }>(`/projects/${projectId}/metadata`),
 
   buildMetadataPrompt: (
     projectId: string,
@@ -427,13 +446,14 @@ export const api = {
       video_overlay?: { title: string; category: string };
     },
   ) =>
-    request<{ status: string; tts_speed: number | null; music_key: string | null }>(
-      `/projects/${projectId}/script/settings`,
-      {
-        method: "PATCH",
-        body: JSON.stringify(payload),
-      },
-    ),
+    request<{
+      status: string;
+      tts_speed: number | null;
+      music_key: string | null;
+    }>(`/projects/${projectId}/script/settings`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
 
   // Video overlay
   generateOverlay: (
@@ -461,7 +481,11 @@ export const api = {
   // Preview audio
   buildPreview: (
     projectId: string,
-    payload: { run_id?: string | null; tts_speed: number; music_key?: string | null },
+    payload: {
+      run_id?: string | null;
+      tts_speed: number;
+      music_key?: string | null;
+    },
   ) =>
     request<{ preview_url: string; duration_seconds: number }>(
       `/projects/${projectId}/script/preview/build`,
