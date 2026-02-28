@@ -2290,12 +2290,12 @@ export function ScriptRestructurePage() {
                       </label>
                       <span
                         className={`text-xs font-mono ${
-                          overlayTitle.length > 38
+                          overlayTitle.length > 45
                             ? "text-[hsl(var(--destructive))]"
                             : "text-[hsl(var(--muted-foreground))]"
                         }`}
                       >
-                        {overlayTitle.length}/38
+                        {overlayTitle.length}/45
                       </span>
                     </div>
                     <input

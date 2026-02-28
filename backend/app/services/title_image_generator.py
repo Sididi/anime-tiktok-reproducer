@@ -19,8 +19,8 @@ TITLE_PAD_V = 24
 TITLE_TEXT_COLOR = (0, 0, 0)  # black
 TITLE_PANEL_COLOR = (255, 255, 255, 245)  # white, nearly opaque
 TITLE_PANEL_RADIUS = 8
+TITLE_PAD_H = TITLE_PAD_V  # same as vertical for coherent box
 TITLE_GAP_ABOVE_CENTER = 40  # px between panel bottom and center frame top
-TITLE_MARGIN_SHRINK = 0.8  # panel-to-edge margin is 80% of natural (20% less gap)
 TITLE_MAX_LINES = 2
 
 # --- Category style ---
@@ -120,12 +120,7 @@ class TitleImageGeneratorService:
         text_w = max(
             font.getbbox(line)[2] - font.getbbox(line)[0] for line in lines
         )
-        # Expand panel: reduce margin to screen edge by 20%
-        tight_pad_h = 29
-        old_panel_w = text_w + tight_pad_h * 2
-        old_margin = (WIDTH - old_panel_w) / 2
-        new_margin = old_margin * TITLE_MARGIN_SHRINK
-        panel_w = int(WIDTH - 2 * new_margin)
+        panel_w = text_w + TITLE_PAD_H * 2
 
         panel_x = (WIDTH - panel_w) // 2
         panel_y = CENTER_FRAME_TOP - TITLE_GAP_ABOVE_CENTER - panel_h

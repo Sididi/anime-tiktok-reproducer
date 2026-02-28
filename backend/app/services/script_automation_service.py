@@ -62,7 +62,7 @@ _OVERLAY_PROMPT_FR = """Tu es un expert en marketing vidéo TikTok anime.
 Génère un titre clickbait et une catégorie pour cette vidéo.
 
 RÈGLES TITRE:
-- Maximum 38 caractères (STRICT, compte chaque caractère)
+- Maximum 45 caractères (STRICT, compte chaque caractère)
 - Style: phrases choc qui donnent envie de regarder
 - Ne JAMAIS citer le nom de l'anime
 - Exemples: "CET ANIME EST UNE DINGUERIE", "TU VAS PLEURER EN REGARDANT ÇA", "L'ANIME LE PLUS FOU DE 2025"
@@ -80,7 +80,7 @@ _OVERLAY_PROMPT_MULTI = """You are a TikTok anime video marketing expert.
 Generate a clickbait title and category for this video.
 
 TITLE RULES:
-- Maximum 38 characters (STRICT)
+- Maximum 45 characters (STRICT)
 - Language: {target_language_name}
 - Shocking/intriguing phrases that make viewers want to watch
 - NEVER mention the anime name
