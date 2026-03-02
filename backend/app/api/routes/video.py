@@ -175,20 +175,28 @@ async def get_source_video(
         stream_path = source_path
 
     # If we had to fall back to the original file for an unsupported source,
-    # trigger proxy generation in background so future requests are compatible.
+    # generate a preview proxy synchronously. If generation fails, return a
+    # clear 415 instead of serving an unsupported stream that black-screens.
     if stream_path == source_path:
         compatible = await asyncio.to_thread(
             AnimeLibraryService.is_browser_preview_compatible,
             source_path,
         )
         if not compatible:
-            await AnimeLibraryService.trigger_preview_proxy_generation(source_path)
-            ready_proxy = await AnimeLibraryService.wait_for_preview_proxy(
+            generated = await asyncio.to_thread(
+                AnimeLibraryService.ensure_preview_proxy_sync,
                 source_path,
-                timeout_seconds=1.5,
             )
-            if ready_proxy is not None:
-                stream_path = ready_proxy
+            if generated is not None and generated.exists():
+                stream_path = generated
+            else:
+                raise HTTPException(
+                    status_code=415,
+                    detail=(
+                        "Source video codec is not browser-compatible and preview "
+                        "proxy generation failed"
+                    ),
+                )
 
     # Determine media type based on extension
     suffix = stream_path.suffix.lower()

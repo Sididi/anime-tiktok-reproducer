@@ -212,6 +212,44 @@ export const api = {
       `/projects/${projectId}/matches`,
     ),
 
+  prepareMatchesPlayback: (projectId: string, force = false) =>
+    fetch(`${API_BASE}/projects/${projectId}/matches/playback/prepare`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ force }),
+    }),
+
+  prepareMatchesPlaybackScene: (
+    projectId: string,
+    sceneIndex: number,
+    force = false,
+  ) =>
+    fetch(
+      `${API_BASE}/projects/${projectId}/matches/playback/prepare-scene/${sceneIndex}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ force }),
+      },
+    ),
+
+  getMatchesPlaybackManifest: (projectId: string) =>
+    request<import("@/types").MatchesPlaybackManifest>(
+      `/projects/${projectId}/matches/playback/manifest`,
+    ),
+
+  getMatchesPlaybackClipUrl: (
+    projectId: string,
+    sceneIndex: number,
+    track: "tiktok" | "source",
+    fingerprint?: string,
+  ) => {
+    const suffix = fingerprint
+      ? `?fingerprint=${encodeURIComponent(fingerprint)}`
+      : "";
+    return `${API_BASE}/projects/${projectId}/matches/playback/clip/${sceneIndex}/${track}${suffix}`;
+  },
+
   updateMatch: (
     projectId: string,
     sceneIndex: number,

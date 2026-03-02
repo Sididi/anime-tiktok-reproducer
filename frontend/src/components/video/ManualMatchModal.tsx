@@ -1,10 +1,26 @@
-import { useState, useCallback, useRef, useEffect } from "react";
-import { X, Play, Pause, Check, Sparkles } from "lucide-react";
+import { useState, useCallback, useRef, useEffect, useMemo } from "react";
+import { createPortal } from "react-dom";
+import { X, Play, Pause, Check, Sparkles, AlertTriangle } from "lucide-react";
 import { Button, Input } from "@/components/ui";
 import { ClippedVideoPlayer } from "./ClippedVideoPlayer";
 import { formatTime, parseTime } from "@/utils";
 import { api } from "@/api/client";
 import type { Scene, SceneMatch, AlternativeMatch } from "@/types";
+
+const ANOMALY_MIN_SPEED = 0.35;
+const ANOMALY_MAX_SPEED = 2.5;
+const ANOMALY_MAX_SOURCE_DURATION = 60;
+
+export interface ManualMatchSaveMeta {
+  anomalous: boolean;
+  sourceDuration: number;
+  speedRatio: number;
+}
+
+interface CandidateWithMeta {
+  candidate: AlternativeMatch;
+  meta: ManualMatchSaveMeta;
+}
 
 interface ManualMatchModalProps {
   isOpen: boolean;
@@ -13,7 +29,32 @@ interface ManualMatchModalProps {
   match?: SceneMatch;
   projectId: string;
   episodes: string[];
-  onSave: (episode: string, startTime: number, endTime: number) => void;
+  onSave: (
+    episode: string,
+    startTime: number,
+    endTime: number,
+    meta: ManualMatchSaveMeta,
+  ) => Promise<void> | void;
+}
+
+function evaluateSelection(
+  sceneDuration: number,
+  startTime: number,
+  endTime: number,
+): ManualMatchSaveMeta {
+  const sourceDuration = Math.max(0, endTime - startTime);
+  const speedRatio =
+    sourceDuration > 0 ? sceneDuration / sourceDuration : Number.POSITIVE_INFINITY;
+  const anomalous =
+    sourceDuration > ANOMALY_MAX_SOURCE_DURATION ||
+    speedRatio < ANOMALY_MIN_SPEED ||
+    speedRatio > ANOMALY_MAX_SPEED;
+
+  return {
+    anomalous,
+    sourceDuration,
+    speedRatio,
+  };
 }
 
 export function ManualMatchModal({
@@ -27,7 +68,6 @@ export function ManualMatchModal({
 }: ManualMatchModalProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
 
-  // Initialize with existing match data if available
   const initialEpisode =
     match?.episode && match.confidence > 0
       ? episodes.find(
@@ -54,42 +94,76 @@ export function ManualMatchModal({
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [sourceRetryCount, setSourceRetryCount] = useState(0);
+  const [sourceHasError, setSourceHasError] = useState(false);
 
-  // Calculate scene duration for reference
   const sceneDuration = scene.end_time - scene.start_time;
-
-  // Get alternatives from match
   const alternatives = match?.alternatives || [];
 
-  // Reset when modal opens or episode changes
-  useEffect(() => {
-    if (isOpen) {
-      // Reset to match data if available
-      if (match?.confidence && match.confidence > 0 && match.episode) {
-        const matchEpisode = episodes.find(
-          (ep) =>
-            ep.includes(match.episode) ||
-            match.episode.includes(ep.split("/").pop() || ""),
-        );
-        if (matchEpisode) {
-          setSelectedEpisode(matchEpisode);
-        }
-        setStartTime(formatTime(match.start_time));
-        setEndTime(formatTime(match.end_time));
+  const resetSourcePlaybackState = useCallback(() => {
+    setSourceRetryCount(0);
+    setSourceHasError(false);
+    setIsPlaying(false);
+    setCurrentTime(0);
+    setDuration(0);
+  }, []);
+
+  const { normalAlternatives, riskyAlternatives } = useMemo(() => {
+    const normal: CandidateWithMeta[] = [];
+    const risky: CandidateWithMeta[] = [];
+
+    for (const candidate of alternatives) {
+      const meta = evaluateSelection(
+        sceneDuration,
+        candidate.start_time,
+        candidate.end_time,
+      );
+      const withMeta = { candidate, meta };
+      if (meta.anomalous) {
+        risky.push(withMeta);
       } else {
-        setStartTime("00:00.00");
-        setEndTime(formatTime(sceneDuration));
+        normal.push(withMeta);
       }
     }
-  }, [isOpen, match, episodes, sceneDuration]);
 
-  // Seek to start time when video loads and we have a match
+    return {
+      normalAlternatives: normal,
+      riskyAlternatives: risky,
+    };
+  }, [alternatives, sceneDuration]);
+
+  /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
-    if (videoRef.current && match?.confidence && match.confidence > 0) {
-      videoRef.current.currentTime = match.start_time;
-      setCurrentTime(match.start_time);
+    if (!isOpen) return;
+
+    if (match?.confidence && match.confidence > 0 && match.episode) {
+      const matchEpisode = episodes.find(
+        (ep) =>
+          ep.includes(match.episode) ||
+          match.episode.includes(ep.split("/").pop() || ""),
+      );
+      if (matchEpisode) {
+        setSelectedEpisode(matchEpisode);
+      }
+      setStartTime(formatTime(match.start_time));
+      setEndTime(formatTime(match.end_time));
+    } else {
+      setStartTime("00:00.00");
+      setEndTime(formatTime(sceneDuration));
     }
-  }, [selectedEpisode, match]);
+
+    resetSourcePlaybackState();
+  }, [isOpen, match, episodes, sceneDuration, resetSourcePlaybackState]);
+  /* eslint-enable react-hooks/set-state-in-effect */
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [isOpen]);
 
   const handleTimeUpdate = useCallback(() => {
     if (videoRef.current) {
@@ -98,10 +172,24 @@ export function ManualMatchModal({
   }, []);
 
   const handleLoadedMetadata = useCallback(() => {
-    if (videoRef.current) {
-      setDuration(videoRef.current.duration);
-    }
-  }, []);
+    const video = videoRef.current;
+    if (!video) return;
+
+    setDuration(video.duration);
+    setSourceHasError(false);
+
+    const parsedStart = parseTime(startTime);
+    const preferredStart =
+      match?.confidence && match.confidence > 0
+        ? match.start_time
+        : parsedStart ?? 0;
+    const boundedStart = Number.isFinite(video.duration)
+      ? Math.min(Math.max(preferredStart, 0), video.duration)
+      : Math.max(preferredStart, 0);
+
+    video.currentTime = boundedStart;
+    setCurrentTime(boundedStart);
+  }, [match, startTime]);
 
   const handleSetStart = useCallback(() => {
     setStartTime(formatTime(currentTime));
@@ -120,22 +208,23 @@ export function ManualMatchModal({
   }, []);
 
   const handlePlayPause = useCallback(() => {
-    if (videoRef.current) {
-      if (videoRef.current.paused) {
-        videoRef.current.play();
-        setIsPlaying(true);
-      } else {
-        videoRef.current.pause();
-        setIsPlaying(false);
-      }
+    if (!videoRef.current) return;
+
+    if (videoRef.current.paused) {
+      void videoRef.current.play();
+      setIsPlaying(true);
+      return;
     }
+
+    videoRef.current.pause();
+    setIsPlaying(false);
   }, []);
 
   const handlePreview = useCallback(() => {
     const start = parseTime(startTime);
     if (videoRef.current && start !== null) {
       videoRef.current.currentTime = start;
-      videoRef.current.play();
+      void videoRef.current.play();
       setIsPlaying(true);
     }
   }, [startTime]);
@@ -143,16 +232,17 @@ export function ManualMatchModal({
   const handleSave = useCallback(() => {
     const start = parseTime(startTime);
     const end = parseTime(endTime);
-    if (start !== null && end !== null && selectedEpisode) {
-      onSave(selectedEpisode, start, end);
-      onClose();
+    if (start === null || end === null || !selectedEpisode) {
+      return;
     }
-  }, [startTime, endTime, selectedEpisode, onSave, onClose]);
 
-  // Handle selecting a candidate - auto-populate fields and start playback
+    const meta = evaluateSelection(sceneDuration, start, end);
+    void onSave(selectedEpisode, start, end, meta);
+    onClose();
+  }, [startTime, endTime, selectedEpisode, sceneDuration, onSave, onClose]);
+
   const handleSelectCandidate = useCallback(
     (candidate: AlternativeMatch) => {
-      // Find matching episode in episodes list
       const matchingEpisode = episodes.find(
         (ep) =>
           ep.includes(candidate.episode) ||
@@ -161,35 +251,67 @@ export function ManualMatchModal({
 
       if (matchingEpisode) {
         setSelectedEpisode(matchingEpisode);
+        resetSourcePlaybackState();
       }
 
       setStartTime(formatTime(candidate.start_time));
       setEndTime(formatTime(candidate.end_time));
 
-      // Wait for video to update then seek and play
-      setTimeout(() => {
+      window.setTimeout(() => {
         if (videoRef.current) {
           videoRef.current.currentTime = candidate.start_time;
-          videoRef.current.play();
+          void videoRef.current.play();
           setIsPlaying(true);
         }
       }, 100);
     },
-    [episodes],
+    [episodes, resetSourcePlaybackState],
   );
 
   const sourceVideoUrl = selectedEpisode
-    ? api.getSourceVideoUrl(projectId, selectedEpisode)
+    ? (() => {
+        const base = api.getSourceVideoUrl(projectId, selectedEpisode);
+        if (sourceRetryCount === 0) return base;
+        return `${base}&_retry=${sourceRetryCount}`;
+      })()
     : "";
 
   const tiktokVideoUrl = api.getVideoUrl(projectId);
 
-  if (!isOpen) return null;
+  const renderCandidateButton = (item: CandidateWithMeta) => {
+    const { candidate, meta } = item;
+    return (
+      <button
+        key={`${candidate.algorithm ?? "candidate"}-${candidate.episode}-${candidate.start_time}-${candidate.end_time}`}
+        onClick={() => handleSelectCandidate(candidate)}
+        className="flex items-center justify-between w-full px-3 py-2 bg-[hsl(var(--background))] hover:bg-[hsl(var(--accent))] rounded text-sm text-left transition-colors"
+      >
+        <div className="flex-1 min-w-0">
+          <div className="font-medium truncate text-xs">
+            {candidate.episode.split("/").pop()}
+          </div>
+          <div className="text-xs text-[hsl(var(--muted-foreground))]">
+            {formatTime(candidate.start_time)} - {formatTime(candidate.end_time)}
+            {candidate.algorithm && (
+              <span className="ml-1 opacity-60">[{candidate.algorithm}]</span>
+            )}
+          </div>
+          {meta.anomalous && (
+            <div className="mt-1 text-[10px] text-amber-500">
+              Risky: {formatTime(meta.sourceDuration)} source ({meta.speedRatio.toFixed(2)}x)
+            </div>
+          )}
+        </div>
+        <div className="ml-2 text-xs font-mono text-emerald-500">
+          {Math.round(candidate.confidence * 100)}%
+        </div>
+      </button>
+    );
+  };
 
-  return (
-    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/70 p-4">
+  const modalContent = (
+    <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/70 p-4">
       <div className="bg-[hsl(var(--card))] rounded-lg w-full max-w-7xl max-h-[95vh] overflow-hidden flex flex-col">
-        {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-[hsl(var(--border))]">
           <h2 className="text-lg font-semibold">
             Manual Match Selection - Scene {scene.index + 1}
@@ -202,12 +324,9 @@ export function ManualMatchModal({
           </button>
         </div>
 
-        {/* Content - Two column layout */}
         <div className="flex-1 overflow-y-auto p-4">
           <div className="grid grid-cols-[320px_1fr] gap-6 h-full">
-            {/* Left Column - TikTok video and AI candidates */}
             <div className="space-y-4">
-              {/* TikTok Scene Preview */}
               <div>
                 <h3 className="text-sm font-medium mb-2 text-[hsl(var(--muted-foreground))]">
                   TikTok Scene ({formatTime(sceneDuration)})
@@ -217,59 +336,51 @@ export function ManualMatchModal({
                     src={tiktokVideoUrl}
                     startTime={scene.start_time}
                     endTime={scene.end_time}
+                    eager
                     className="w-full h-full"
                   />
                 </div>
               </div>
 
-              {/* AI Candidates suggestion */}
-              {alternatives.length > 0 && (
-                <div className="bg-[hsl(var(--muted))] rounded-lg p-3">
-                  <div className="flex items-center gap-2 mb-2">
+              {(normalAlternatives.length > 0 || riskyAlternatives.length > 0) && (
+                <div className="bg-[hsl(var(--muted))] rounded-lg p-3 space-y-3">
+                  <div className="flex items-center gap-2">
                     <Sparkles className="h-4 w-4 text-amber-500" />
                     <span className="text-sm font-medium">AI Candidates</span>
                   </div>
-                  <div className="space-y-2 max-h-48 overflow-y-auto">
-                    {alternatives.map((alt, idx) => (
-                      <button
-                        key={idx}
-                        onClick={() => handleSelectCandidate(alt)}
-                        className="flex items-center justify-between w-full px-3 py-2 bg-[hsl(var(--background))] hover:bg-[hsl(var(--accent))] rounded text-sm text-left transition-colors"
-                      >
-                        <div className="flex-1 min-w-0">
-                          <div className="font-medium truncate text-xs">
-                            {alt.episode.split("/").pop()}
-                          </div>
-                          <div className="text-xs text-[hsl(var(--muted-foreground))]">
-                            {formatTime(alt.start_time)} -{" "}
-                            {formatTime(alt.end_time)}
-                            {alt.algorithm && (
-                              <span className="ml-1 opacity-60">
-                                [{alt.algorithm}]
-                              </span>
-                            )}
-                          </div>
-                        </div>
-                        <div className="ml-2 text-xs font-mono text-emerald-500">
-                          {Math.round(alt.confidence * 100)}%
-                        </div>
-                      </button>
-                    ))}
-                  </div>
+
+                  {normalAlternatives.length > 0 && (
+                    <div className="space-y-2 max-h-44 overflow-y-auto">
+                      {normalAlternatives.map(renderCandidateButton)}
+                    </div>
+                  )}
+
+                  {riskyAlternatives.length > 0 && (
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-1 text-xs text-amber-500">
+                        <AlertTriangle className="h-3 w-3" />
+                        Risky candidates
+                      </div>
+                      <div className="space-y-2 max-h-36 overflow-y-auto">
+                        {riskyAlternatives.map(renderCandidateButton)}
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
 
-            {/* Right Column - Source video selection and controls */}
             <div className="space-y-4">
-              {/* Episode selector */}
               <div>
                 <label className="block text-sm font-medium mb-1">
                   Select Episode
                 </label>
                 <select
                   value={selectedEpisode}
-                  onChange={(e) => setSelectedEpisode(e.target.value)}
+                  onChange={(e) => {
+                    setSelectedEpisode(e.target.value);
+                    resetSourcePlaybackState();
+                  }}
                   className="w-full p-2 bg-[hsl(var(--input))] border border-[hsl(var(--border))] rounded text-sm"
                 >
                   {episodes.map((ep) => (
@@ -280,23 +391,44 @@ export function ManualMatchModal({
                 </select>
               </div>
 
-              {/* Video preview */}
               {selectedEpisode && (
                 <div className="space-y-2">
-                  <div className="aspect-video bg-black rounded overflow-hidden">
+                  <div className="relative aspect-video bg-black rounded overflow-hidden">
                     <video
+                      key={sourceVideoUrl}
                       ref={videoRef}
                       src={sourceVideoUrl}
                       className="w-full h-full object-contain"
                       onTimeUpdate={handleTimeUpdate}
                       onLoadedMetadata={handleLoadedMetadata}
+                      onCanPlay={() => setSourceHasError(false)}
                       onPlay={() => setIsPlaying(true)}
                       onPause={() => setIsPlaying(false)}
+                      onError={() => {
+                        setSourceHasError(true);
+                        setIsPlaying(false);
+                      }}
                       muted
+                      playsInline
+                      preload="auto"
                     />
+                    {sourceHasError && (
+                      <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-black/80 text-white">
+                        <span className="text-xs">Failed to load source</span>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => {
+                            setSourceHasError(false);
+                            setSourceRetryCount((value) => value + 1);
+                          }}
+                        >
+                          Retry
+                        </Button>
+                      </div>
+                    )}
                   </div>
 
-                  {/* Video controls */}
                   <div className="flex items-center gap-2">
                     <Button
                       variant="ghost"
@@ -325,7 +457,6 @@ export function ManualMatchModal({
                 </div>
               )}
 
-              {/* Time inputs */}
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="block text-sm font-medium mb-1">
@@ -365,7 +496,6 @@ export function ManualMatchModal({
                 </div>
               </div>
 
-              {/* Preview button */}
               <Button
                 variant="outline"
                 onClick={handlePreview}
@@ -378,7 +508,6 @@ export function ManualMatchModal({
           </div>
         </div>
 
-        {/* Footer */}
         <div className="flex justify-end gap-2 p-4 border-t border-[hsl(var(--border))]">
           <Button variant="outline" onClick={onClose}>
             Cancel
@@ -391,4 +520,7 @@ export function ManualMatchModal({
       </div>
     </div>
   );
+
+  if (!isOpen) return null;
+  return createPortal(modalContent, document.body);
 }

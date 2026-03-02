@@ -5,6 +5,7 @@ import hashlib
 import json
 import subprocess
 import shutil
+import threading
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -60,6 +61,8 @@ class AnimeLibraryService:
     _episode_manifest_lock: asyncio.Lock | None = None
     _preview_generation_lock: asyncio.Lock | None = None
     _preview_generation_inflight: set[str] = set()
+    _preview_proxy_locks_guard = threading.Lock()
+    _preview_proxy_locks: dict[str, threading.Lock] = {}
 
     @staticmethod
     def get_library_path() -> Path:
@@ -157,6 +160,17 @@ class AnimeLibraryService:
         if cls._preview_generation_lock is None:
             cls._preview_generation_lock = asyncio.Lock()
         return cls._preview_generation_lock
+
+    @classmethod
+    def _get_preview_proxy_lock(cls, source_path: Path) -> threading.Lock:
+        """Return a per-source lock to serialize sync preview proxy generation."""
+        key = str(source_path.resolve())
+        with cls._preview_proxy_locks_guard:
+            lock = cls._preview_proxy_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                cls._preview_proxy_locks[key] = lock
+            return lock
 
     @classmethod
     def _scan_library_episodes_sync(cls) -> dict:
@@ -326,6 +340,59 @@ class AnimeLibraryService:
         stream = streams[0]
         return stream if isinstance(stream, dict) else None
 
+    @staticmethod
+    def _probe_video_duration_sync(video_path: Path) -> float | None:
+        """Return video duration in seconds when ffprobe can parse the container."""
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(video_path),
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+
+        if result.returncode != 0:
+            return None
+
+        raw = result.stdout.strip()
+        if not raw:
+            return None
+        try:
+            duration = float(raw)
+        except ValueError:
+            return None
+        return duration if duration > 0 else None
+
+    @classmethod
+    def _is_valid_preview_proxy_sync(cls, proxy_path: Path) -> bool:
+        """Validate that a preview proxy is browser-safe and structurally readable."""
+        if not proxy_path.exists() or proxy_path.stat().st_size <= 0:
+            return False
+        stream = cls._probe_video_stream_sync(proxy_path)
+        if stream is None:
+            return False
+        codec = str(stream.get("codec_name", "")).strip().lower()
+        pix_fmt = str(stream.get("pix_fmt", "")).strip().lower()
+        duration = cls._probe_video_duration_sync(proxy_path)
+        return (
+            codec == "h264"
+            and pix_fmt in {"yuv420p", "yuvj420p"}
+            and duration is not None
+        )
+
     @classmethod
     def get_primary_video_codec_sync(cls, video_path: Path) -> str | None:
         """Return normalized codec name for the first video stream."""
@@ -372,7 +439,9 @@ class AnimeLibraryService:
                 cls.GPU_H264_ENCODER,
                 "-preset",
                 "p5",
-                "-cq",
+                "-rc",
+                "constqp",
+                "-qp",
                 "23",
                 "-b:v",
                 "0",
@@ -383,6 +452,28 @@ class AnimeLibraryService:
             ]
         )
         return cmd
+
+    @classmethod
+    def _build_cpu_h264_base_cmd(cls, source_path: Path) -> list[str]:
+        """Build a deterministic CPU ffmpeg command for H.264 MP4 output."""
+        return [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(source_path),
+            "-map",
+            "0:v:0",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+        ]
 
     @classmethod
     def is_browser_preview_compatible(cls, source_path: Path) -> bool:
@@ -423,68 +514,126 @@ class AnimeLibraryService:
         preview_dir = cls.get_preview_proxy_dir()
         preview_dir.mkdir(parents=True, exist_ok=True)
         proxy_path = cls.get_preview_proxy_path(source_path)
-        if proxy_path.exists() and proxy_path.stat().st_size > 0:
-            return proxy_path
-
         tmp_path = proxy_path.with_suffix(".tmp.mp4")
-        source_codec = cls.get_primary_video_codec_sync(source_path)
-        base_cmd = cls._build_gpu_h264_base_cmd(
-            source_path,
-            source_codec=source_codec,
-        )
-        cmd_with_audio_copy = base_cmd + [
-            "-map",
-            "0:a:0?",
-            "-c:a",
-            "copy",
-            str(tmp_path),
-        ]
-        cmd_with_audio_aac = base_cmd + [
-            "-map",
-            "0:a:0?",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            "-ac",
-            "2",
-            "-ar",
-            "48000",
-            str(tmp_path),
-        ]
+        lock = cls._get_preview_proxy_lock(source_path)
+        with lock:
+            if proxy_path.exists():
+                if cls._is_valid_preview_proxy_sync(proxy_path):
+                    return proxy_path
+                with suppress(OSError):
+                    proxy_path.unlink()
 
-        try:
-            result = subprocess.run(
-                cmd_with_audio_copy,
-                capture_output=True,
-                text=True,
-                timeout=cls.PREVIEW_PROXY_TIMEOUT_SECONDS,
-                check=False,
+            if tmp_path.exists():
+                with suppress(OSError):
+                    tmp_path.unlink()
+
+            source_codec = cls.get_primary_video_codec_sync(source_path)
+            base_cmd = cls._build_gpu_h264_base_cmd(
+                source_path,
+                source_codec=source_codec,
             )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return None
+            cmd_with_audio_copy = base_cmd + [
+                "-map",
+                "0:a:0?",
+                "-c:a",
+                "copy",
+                str(tmp_path),
+            ]
+            cmd_with_audio_aac = base_cmd + [
+                "-map",
+                "0:a:0?",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-ac",
+                "2",
+                "-ar",
+                "48000",
+                str(tmp_path),
+            ]
 
-        if result.returncode != 0:
             try:
                 result = subprocess.run(
-                    cmd_with_audio_aac,
+                    cmd_with_audio_copy,
                     capture_output=True,
                     text=True,
                     timeout=cls.PREVIEW_PROXY_TIMEOUT_SECONDS,
                     check=False,
                 )
             except (FileNotFoundError, subprocess.TimeoutExpired):
-                return None
-            if result.returncode != 0:
+                result = None
+
+            if result is None or result.returncode != 0:
+                try:
+                    result = subprocess.run(
+                        cmd_with_audio_aac,
+                        capture_output=True,
+                        text=True,
+                        timeout=cls.PREVIEW_PROXY_TIMEOUT_SECONDS,
+                        check=False,
+                    )
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    result = None
+
+            # Fallback to deterministic CPU path when GPU pipeline is unavailable.
+            if result is None or result.returncode != 0:
+                base_cmd = cls._build_cpu_h264_base_cmd(source_path)
+                cmd_with_audio_copy = base_cmd + [
+                    "-map",
+                    "0:a:0?",
+                    "-c:a",
+                    "copy",
+                    str(tmp_path),
+                ]
+                cmd_with_audio_aac = base_cmd + [
+                    "-map",
+                    "0:a:0?",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "128k",
+                    "-ac",
+                    "2",
+                    "-ar",
+                    "48000",
+                    str(tmp_path),
+                ]
+                try:
+                    result = subprocess.run(
+                        cmd_with_audio_copy,
+                        capture_output=True,
+                        text=True,
+                        timeout=cls.PREVIEW_PROXY_TIMEOUT_SECONDS,
+                        check=False,
+                    )
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    return None
+                if result.returncode != 0:
+                    try:
+                        result = subprocess.run(
+                            cmd_with_audio_aac,
+                            capture_output=True,
+                            text=True,
+                            timeout=cls.PREVIEW_PROXY_TIMEOUT_SECONDS,
+                            check=False,
+                        )
+                    except (FileNotFoundError, subprocess.TimeoutExpired):
+                        return None
+                    if result.returncode != 0:
+                        return None
+
+            if not cls._is_valid_preview_proxy_sync(tmp_path):
+                with suppress(OSError):
+                    tmp_path.unlink()
                 return None
 
-        if not tmp_path.exists() or tmp_path.stat().st_size == 0:
-            with suppress(OSError):
-                tmp_path.unlink()
-            return None
-
-        tmp_path.replace(proxy_path)
-        return proxy_path
+            tmp_path.replace(proxy_path)
+            if not cls._is_valid_preview_proxy_sync(proxy_path):
+                with suppress(OSError):
+                    proxy_path.unlink()
+                return None
+            return proxy_path
 
     @classmethod
     async def resolve_source_preview_path(
@@ -507,8 +656,16 @@ class AnimeLibraryService:
             return source_path
 
         proxy_path = await asyncio.to_thread(cls.get_preview_proxy_path, source_path)
-        if proxy_path.exists() and proxy_path.stat().st_size > 0:
+        proxy_is_valid = await asyncio.to_thread(
+            cls._is_valid_preview_proxy_sync,
+            proxy_path,
+        )
+        if proxy_is_valid:
             return proxy_path
+        if proxy_path.exists():
+            await asyncio.to_thread(
+                lambda: proxy_path.unlink(missing_ok=True),
+            )
         return source_path
 
     @classmethod

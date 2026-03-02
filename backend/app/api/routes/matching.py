@@ -1,6 +1,6 @@
 import asyncio
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 import json
 from pathlib import Path
@@ -9,6 +9,7 @@ import re
 from ...config import settings
 from ...models import ProjectPhase, MatchList, SceneMatch, Scene, SceneList
 from ...services import ProjectService, AnimeMatcherService, SceneMergerService, AnimeLibraryService
+from ...services.match_playback_service import MatchPlaybackService
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["matching"])
 
@@ -20,6 +21,14 @@ class SetSourcesRequest(BaseModel):
 class FindMatchesRequest(BaseModel):
     source_path: str | None = None  # Optional, defaults to anime_library_path
     merge_continuous: bool = True  # Auto-merge continuous anime scenes
+
+
+class PreparePlaybackRequest(BaseModel):
+    force: bool = False
+
+
+class PrepareScenePlaybackRequest(BaseModel):
+    force: bool = False
 
 
 def _normalize_name(value: str) -> str:
@@ -277,6 +286,102 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
     )
 
 
+@router.post("/matches/playback/prepare")
+async def prepare_matches_playback(project_id: str, request: PreparePlaybackRequest):
+    """Prepare browser-safe clips for /matches playback and Fast Watch."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    async def stream_progress():
+        async for progress in MatchPlaybackService.prepare_playback(
+            project_id,
+            force=request.force,
+        ):
+            yield f"data: {json.dumps(progress.to_dict())}\n\n"
+
+    return StreamingResponse(
+        stream_progress(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@router.post("/matches/playback/prepare-scene/{scene_index}")
+async def prepare_matches_playback_scene(
+    project_id: str,
+    scene_index: int,
+    request: PrepareScenePlaybackRequest,
+):
+    """Prepare playback clip assets for one scene after manual match updates."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    async def stream_progress():
+        async for progress in MatchPlaybackService.prepare_scene_playback(
+            project_id,
+            scene_index=scene_index,
+            force=request.force,
+        ):
+            yield f"data: {json.dumps(progress.to_dict())}\n\n"
+
+    return StreamingResponse(
+        stream_progress(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@router.get("/matches/playback/manifest")
+async def get_matches_playback_manifest(project_id: str):
+    """Get the current prepared playback manifest for /matches."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    return MatchPlaybackService.get_manifest(project_id)
+
+
+@router.get("/matches/playback/clip/{scene_index}/{track}")
+async def get_matches_playback_clip(
+    project_id: str,
+    scene_index: int,
+    track: str,
+    fingerprint: str | None = Query(default=None),
+):
+    """Serve one prepared playback clip."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if track not in {"tiktok", "source"}:
+        raise HTTPException(status_code=400, detail="Invalid track")
+    track_name = "tiktok" if track == "tiktok" else "source"
+
+    try:
+        clip_path = MatchPlaybackService.get_clip_path(
+            project_id,
+            scene_index=scene_index,
+            track=track_name,
+            fingerprint=fingerprint,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    return FileResponse(
+        path=clip_path,
+        media_type="video/mp4",
+        headers={"Accept-Ranges": "bytes"},
+    )
+
+
 @router.get("/matches")
 async def get_matches(project_id: str):
     """Get all matches for a project."""
@@ -338,14 +443,15 @@ async def update_match(project_id: str, scene_index: int, request: UpdateMatchRe
         match.confidence = 1.0
         # was_no_match should already be set, but ensure it's preserved
 
-    # Recalculate speed ratio
+    # Recalculate speed ratio using scene index mapping (not positional offset).
     scenes = ProjectService.load_scenes(project_id)
-    if scenes and scene_index < len(scenes.scenes):
-        scene = scenes.scenes[scene_index]
-        scene_duration = scene.end_time - scene.start_time
-        source_duration = match.end_time - match.start_time
-        if source_duration > 0:
-            match.speed_ratio = scene_duration / source_duration
+    if scenes:
+        scene = next((s for s in scenes.scenes if s.index == scene_index), None)
+        if scene is not None:
+            scene_duration = scene.end_time - scene.start_time
+            source_duration = match.end_time - match.start_time
+            if source_duration > 0:
+                match.speed_ratio = scene_duration / source_duration
 
     ProjectService.save_matches(project_id, matches)
 

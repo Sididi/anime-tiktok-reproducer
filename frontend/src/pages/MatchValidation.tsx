@@ -25,13 +25,19 @@ import {
   Merge,
 } from "lucide-react";
 import { Button } from "@/components/ui";
-import { ClippedVideoPlayer, ManualMatchModal } from "@/components/video";
-import type { ClippedVideoPlayerHandle } from "@/components/video/ClippedVideoPlayer";
+import { MatchesClipPlayer, ManualMatchModal } from "@/components/video";
+import type { MatchesClipPlayerHandle } from "@/components/video/MatchesClipPlayer";
+import type { ManualMatchSaveMeta } from "@/components/video/ManualMatchModal";
 import { useProjectStore, useSceneStore } from "@/stores";
 import { api } from "@/api/client";
 import { readSSEStream } from "@/utils/sse";
 import { cn, formatTime } from "@/utils";
-import type { SceneMatch, Scene } from "@/types";
+import type {
+  MatchesPlaybackManifest,
+  SceneMatch,
+  Scene,
+  ScenePlaybackSceneAsset,
+} from "@/types";
 
 interface MatchProgress {
   status: string;
@@ -42,19 +48,41 @@ interface MatchProgress {
   matches?: SceneMatch[];
 }
 
+interface PlaybackPrepareProgress {
+  status: string;
+  progress: number;
+  message: string;
+  scene_index?: number;
+  total_scenes?: number;
+  error?: string | null;
+  manifest?: MatchesPlaybackManifest;
+  cached?: boolean;
+  track?: "tiktok" | "source";
+  scene_asset?: ScenePlaybackSceneAsset;
+}
+
 interface MatchCardProps {
   scene: Scene;
   match: SceneMatch;
   projectId: string;
   episodes: string[];
+  playbackAsset: ScenePlaybackSceneAsset | null;
   isActive?: boolean;
   playbackRate?: number;
+  controlsDisabled?: boolean;
+  preloadMode?: "metadata" | "auto";
   onManualMatch: (
     sceneIndex: number,
     episode: string,
     startTime: number,
     endTime: number,
+    meta: ManualMatchSaveMeta,
   ) => void;
+  pendingUpdate?: {
+    phase: "saving" | "preparing";
+    message: string;
+  } | null;
+  warningMessage?: string | null;
   onUndoMerge?: (sceneIndex: number) => void;
 }
 
@@ -72,30 +100,38 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
       match,
       projectId,
       episodes,
+      playbackAsset,
       isActive = false,
       playbackRate = 1,
+      controlsDisabled = false,
+      preloadMode = "metadata",
       onManualMatch,
+      pendingUpdate = null,
+      warningMessage = null,
       onUndoMerge,
     },
     ref,
   ) {
     const [showManualModal, setShowManualModal] = useState(false);
-    const tiktokPlayerRef = useRef<ClippedVideoPlayerHandle>(null);
-    const sourcePlayerRef = useRef<ClippedVideoPlayerHandle>(null);
+    const tiktokPlayerRef = useRef<MatchesClipPlayerHandle>(null);
+    const sourcePlayerRef = useRef<MatchesClipPlayerHandle>(null);
     const pendingResolverRef = useRef<(() => void) | null>(null);
     const endedRef = useRef({ tiktok: false, source: false });
     const primedForFastWatchRef = useRef(false);
     const loadFailureRef = useRef(false);
 
-    const tiktokVideoUrl = api.getVideoUrl(projectId);
-    const hasMatch = Boolean(match.confidence > 0 && match.episode);
-    const sourceVideoUrl = hasMatch
-      ? api.getSourceVideoUrl(projectId, match.episode)
+    const tiktokVideoUrl = playbackAsset?.tiktok.url ?? null;
+    const hasMatchedScene = Boolean(match.confidence > 0 && match.episode);
+    const sourceVideoUrl = hasMatchedScene
+      ? playbackAsset?.source?.url ?? null
       : null;
+    const hasMatch = Boolean(hasMatchedScene && sourceVideoUrl);
 
     // Calculate durations
     const tiktokDuration = scene.end_time - scene.start_time;
-    const sourceDuration = hasMatch ? match.end_time - match.start_time : 0;
+    const sourceDuration = hasMatchedScene
+      ? match.end_time - match.start_time
+      : 0;
     const fastWatchMinReadyState =
       playbackRate >= 3
         ? HTMLMediaElement.HAVE_FUTURE_DATA
@@ -103,8 +139,13 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
     const fastWatchReadyTimeoutMs = playbackRate >= 4 ? 9000 : 7000;
 
     const handleManualSave = useCallback(
-      (episode: string, startTime: number, endTime: number) => {
-        onManualMatch(scene.index, episode, startTime, endTime);
+      async (
+        episode: string,
+        startTime: number,
+        endTime: number,
+        meta: ManualMatchSaveMeta,
+      ) => {
+        await onManualMatch(scene.index, episode, startTime, endTime, meta);
       },
       [scene.index, onManualMatch],
     );
@@ -133,6 +174,16 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
           }),
         ]);
         if (hasPairLoadError()) {
+          return false;
+        }
+
+        // waitUntilReady resolves on timeout too — verify we actually reached
+        // the required readyState. Without this, a timeout is treated as
+        // "ready" which causes black/stalled playback.
+        if (
+          tiktok.getReadyState() < fastWatchMinReadyState ||
+          source.getReadyState() < fastWatchMinReadyState
+        ) {
           return false;
         }
 
@@ -385,7 +436,7 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
               </button>
             )}
           </div>
-          {hasMatch ? (
+          {hasMatchedScene ? (
             <span className="flex items-center gap-1 text-sm text-emerald-500">
               <Check className="h-4 w-4" />
               {Math.round(match.confidence * 100)}% match
@@ -404,16 +455,23 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
             <p className="text-xs text-[hsl(var(--muted-foreground))] mb-2">
               TikTok Clip
             </p>
-            <div className="aspect-[9/16] bg-black rounded overflow-hidden">
-              <ClippedVideoPlayer
-                ref={tiktokPlayerRef}
-                src={tiktokVideoUrl}
-                startTime={scene.start_time}
-                endTime={scene.end_time}
-                onClipEnded={() => onClipEnded("tiktok")}
-                playbackRate={playbackRate}
-                className="w-full h-full"
-              />
+            <div className="aspect-[9/16] bg-black rounded overflow-hidden flex items-center justify-center">
+              {tiktokVideoUrl ? (
+                <MatchesClipPlayer
+                  ref={tiktokPlayerRef}
+                  src={tiktokVideoUrl}
+                  onClipEnded={() => onClipEnded("tiktok")}
+                  playbackRate={playbackRate}
+                  controls
+                  preloadMode={preloadMode}
+                  disableInteraction={controlsDisabled}
+                  className="w-full h-full"
+                />
+              ) : (
+                <div className="text-xs text-[hsl(var(--muted-foreground))]">
+                  Preparing clip...
+                </div>
+              )}
             </div>
             <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
               {formatTime(scene.start_time)} - {formatTime(scene.end_time)} (
@@ -431,16 +489,26 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
               {match.episode ? match.episode.split("/").pop() : "Not found"}
             </p>
             <div className="aspect-[9/16] bg-black rounded overflow-hidden flex items-center justify-center">
-              {hasMatch && sourceVideoUrl ? (
-                <ClippedVideoPlayer
+              {pendingUpdate ? (
+                <div className="flex flex-col items-center gap-2 text-[hsl(var(--muted-foreground))] p-4">
+                  <Loader2 className="h-6 w-6 animate-spin text-[hsl(var(--primary))]" />
+                  <p className="text-xs text-center">{pendingUpdate.message}</p>
+                </div>
+              ) : hasMatch && sourceVideoUrl ? (
+                <MatchesClipPlayer
                   ref={sourcePlayerRef}
                   src={sourceVideoUrl}
-                  startTime={match.start_time}
-                  endTime={match.end_time}
                   onClipEnded={() => onClipEnded("source")}
                   playbackRate={playbackRate}
+                  controls
+                  preloadMode={preloadMode}
+                  disableInteraction={controlsDisabled}
                   className="w-full h-full"
                 />
+              ) : hasMatchedScene && !sourceVideoUrl ? (
+                <div className="text-xs text-[hsl(var(--muted-foreground))]">
+                  Preparing source clip...
+                </div>
               ) : (
                 <div className="flex flex-col items-center gap-2 text-[hsl(var(--muted-foreground))] p-4">
                   <AlertCircle className="h-8 w-8 text-amber-500 mb-2" />
@@ -464,7 +532,7 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
                 </div>
               )}
             </div>
-            {hasMatch ? (
+            {hasMatchedScene ? (
               <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
                 {formatTime(match.start_time)} - {formatTime(match.end_time)} (
                 <strong>{formatTime(sourceDuration)}</strong> ~
@@ -474,6 +542,9 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
               <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
                 &nbsp;
               </p>
+            )}
+            {warningMessage && (
+              <p className="text-xs text-amber-500 mt-1">{warningMessage}</p>
             )}
           </div>
         </div>
@@ -486,6 +557,7 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
               size="sm"
               className="flex-1"
               onClick={playBothFromStart}
+              disabled={Boolean(pendingUpdate)}
             >
               <Play className="h-4 w-4 mr-2" />
               Play Both
@@ -494,6 +566,7 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
               variant="outline"
               size="sm"
               onClick={() => setShowManualModal(true)}
+              disabled={Boolean(pendingUpdate)}
             >
               <Edit className="h-4 w-4" />
             </Button>
@@ -530,7 +603,24 @@ export function MatchValidation() {
   const [matchProgress, setMatchProgress] = useState<MatchProgress | null>(
     null,
   );
+  const [playbackPreparing, setPlaybackPreparing] = useState(false);
+  const [playbackProgress, setPlaybackProgress] =
+    useState<PlaybackPrepareProgress | null>(null);
+  const [playbackManifest, setPlaybackManifest] =
+    useState<MatchesPlaybackManifest | null>(null);
+  const [playbackError, setPlaybackError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [pendingSceneUpdates, setPendingSceneUpdates] = useState<
+    Record<number, { phase: "saving" | "preparing"; message: string }>
+  >({});
+  const [sceneWarnings, setSceneWarnings] = useState<Record<number, string>>(
+    {},
+  );
+  const [toast, setToast] = useState<{
+    id: number;
+    type: "error" | "warning" | "success";
+    message: string;
+  } | null>(null);
   const [mergeContinuous, setMergeContinuous] = useState(true);
   const [skipUiEnabled, setSkipUiEnabled] = useState(false);
   const skipUiEnabledRef = useRef(false);
@@ -546,12 +636,15 @@ export function MatchValidation() {
   const failedPreparedScenesRef = useRef<Set<number>>(new Set());
   const preparingScenesRef = useRef<Map<number, Promise<void>>>(new Map());
   const prefetchQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const preparePlaybackInFlightRef = useRef<Promise<void> | null>(null);
   const autoScrollRef = useRef(true);
+  const toastCounterRef = useRef(0);
   autoScrollRef.current = autoScroll;
 
   const fastWatchPrefetchAhead = useMemo(() => {
-    if (playbackRate >= 5) return 4;
-    if (playbackRate >= 3) return 3;
+    // At high speeds clips are very short (~0.3-0.6s effective).
+    // More prefetch = more concurrent connections which saturate the pool.
+    // 2 ahead is optimal: leaves time to load while current plays.
     if (playbackRate >= 2) return 2;
     return 1;
   }, [playbackRate]);
@@ -562,6 +655,28 @@ export function MatchValidation() {
     preparingScenesRef.current.clear();
     prefetchQueueRef.current = Promise.resolve();
   }, []);
+
+  const showToast = useCallback(
+    (type: "error" | "warning" | "success", message: string) => {
+      toastCounterRef.current += 1;
+      setToast({
+        id: toastCounterRef.current,
+        type,
+        message,
+      });
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!toast) return;
+    const timeout = window.setTimeout(() => {
+      setToast((current) => (current?.id === toast.id ? null : current));
+    }, 4500);
+    return () => {
+      window.clearTimeout(timeout);
+    };
+  }, [toast]);
 
   const ensureScenePrepared = useCallback(
     (sceneIndex: number, token: number): Promise<void> => {
@@ -632,7 +747,9 @@ export function MatchValidation() {
 
   const releaseOutsideFastWatchWindow = useCallback(
     (orderedScenes: Scene[], currentOffset: number) => {
-      const keepBehind = playbackRate >= 3 ? 0 : 1;
+      // Always release scenes behind — they have no utility in Fast Watch
+      // and consume connection pool slots.
+      const keepBehind = 0;
       const keepStart = Math.max(0, currentOffset - keepBehind);
       const keepEnd = Math.min(
         orderedScenes.length - 1,
@@ -661,7 +778,7 @@ export function MatchValidation() {
         failedPreparedScenesRef.current.delete(failedSceneIndex);
       }
     },
-    [fastWatchPrefetchAhead, playbackRate],
+    [fastWatchPrefetchAhead],
   );
 
   const stopFastWatch = useCallback(() => {
@@ -768,6 +885,109 @@ export function MatchValidation() {
     ],
   );
 
+  const patchPlaybackSceneAsset = useCallback(
+    (sceneIndex: number, sceneAsset: ScenePlaybackSceneAsset) => {
+      setPlaybackManifest((prev) => {
+        if (!prev) return prev;
+        const scenesPayload = prev.scenes.map((asset) =>
+          asset.scene_index === sceneIndex ? sceneAsset : asset,
+        );
+        return {
+          ...prev,
+          scenes: scenesPayload,
+          scene_status: {
+            ...(prev.scene_status || {}),
+            [String(sceneIndex)]: sceneAsset.status,
+          },
+        };
+      });
+    },
+    [],
+  );
+
+  const preparePlaybackClips = useCallback(
+    async (force = false) => {
+      if (!projectId) return;
+
+      const pending = preparePlaybackInFlightRef.current;
+      if (pending) {
+        if (!force) {
+          await pending;
+          return;
+        }
+        await pending;
+      }
+
+      const run = (async () => {
+        setPlaybackPreparing(true);
+        setPlaybackError(null);
+        setPlaybackProgress({
+          status: "scanning",
+          progress: 0,
+          message: "Preparing playback clips...",
+        });
+
+        try {
+          const response = await api.prepareMatchesPlayback(projectId, force);
+          const lastEvent = await readSSEStream<PlaybackPrepareProgress>(
+            response,
+            (data) => {
+              setPlaybackProgress(data);
+              if (data.status === "complete" && data.manifest) {
+                setPlaybackManifest(data.manifest);
+              }
+            },
+          );
+
+          if (!lastEvent || lastEvent.status !== "complete") {
+            const manifest = await api.getMatchesPlaybackManifest(projectId);
+            if (!manifest.ready) {
+              throw new Error(
+                lastEvent?.error ||
+                  "Playback preparation did not complete successfully",
+              );
+            }
+            setPlaybackManifest(manifest);
+            setPlaybackProgress({
+              status: "complete",
+              progress: 1,
+              message: "Playback clips ready",
+            });
+            return;
+          }
+
+          if (lastEvent.manifest) {
+            setPlaybackManifest(lastEvent.manifest);
+            return;
+          }
+
+          const manifest = await api.getMatchesPlaybackManifest(projectId);
+          if (!manifest.ready) {
+            throw new Error(
+              lastEvent.error || "Playback manifest is not ready after prepare",
+            );
+          }
+          setPlaybackManifest(manifest);
+        } catch (err) {
+          setPlaybackManifest(null);
+          setPlaybackError((err as Error).message);
+        } finally {
+          setPlaybackPreparing(false);
+        }
+      })();
+
+      preparePlaybackInFlightRef.current = run;
+      try {
+        await run;
+      } finally {
+        if (preparePlaybackInFlightRef.current === run) {
+          preparePlaybackInFlightRef.current = null;
+        }
+      }
+    },
+    [projectId],
+  );
+
   // Load data
   useEffect(() => {
     if (!projectId) return;
@@ -775,6 +995,9 @@ export function MatchValidation() {
     const loadData = async () => {
       setLoading(true);
       try {
+        setPendingSceneUpdates({});
+        setSceneWarnings({});
+        setToast(null);
         await loadProject(projectId);
         await loadScenes(projectId);
         const { matches: loadedMatches } = await api.getMatches(projectId);
@@ -784,6 +1007,13 @@ export function MatchValidation() {
           was_no_match: m.was_no_match ?? (m.confidence === 0 && !m.episode),
         }));
         setMatches(matchesWithTracking);
+        if (matchesWithTracking.length > 0) {
+          void preparePlaybackClips(false);
+        } else {
+          setPlaybackManifest(null);
+          setPlaybackProgress(null);
+          setPlaybackError(null);
+        }
         // Load available episodes for manual matching
         const { episodes: loadedEpisodes } = await api.getEpisodes(projectId);
         setEpisodes(loadedEpisodes);
@@ -805,7 +1035,7 @@ export function MatchValidation() {
     };
 
     loadData();
-  }, [projectId, loadProject, loadScenes]);
+  }, [projectId, loadProject, loadScenes, preparePlaybackClips]);
 
   useEffect(() => {
     if (scenes.length === 0) {
@@ -820,6 +1050,13 @@ export function MatchValidation() {
       return scenes[0].index;
     });
   }, [scenes]);
+
+  useEffect(() => {
+    if (matches.length > 0) return;
+    setPlaybackManifest(null);
+    setPlaybackProgress(null);
+    setPlaybackError(null);
+  }, [matches.length]);
 
   useEffect(() => {
     const cards = cardRefs.current;
@@ -837,7 +1074,13 @@ export function MatchValidation() {
     if (!projectId) return;
 
     stopFastWatch();
+    setPendingSceneUpdates({});
+    setSceneWarnings({});
+    setToast(null);
     setMatching(true);
+    setPlaybackManifest(null);
+    setPlaybackProgress(null);
+    setPlaybackError(null);
     setMatchProgress({
       status: "starting",
       progress: 0,
@@ -864,6 +1107,13 @@ export function MatchValidation() {
           }));
           setMatches(matchesWithTracking);
           await loadScenes(projectId);
+          if (matchesWithTracking.length > 0) {
+            await preparePlaybackClips(true);
+          } else {
+            setPlaybackManifest(null);
+            setPlaybackProgress(null);
+            setPlaybackError(null);
+          }
 
           // Auto-continue to transcription when skipUiEnabled
           if (skipUiEnabledRef.current) {
@@ -877,7 +1127,14 @@ export function MatchValidation() {
     } finally {
       setMatching(false);
     }
-  }, [projectId, mergeContinuous, loadScenes, stopFastWatch, navigate]);
+  }, [
+    projectId,
+    mergeContinuous,
+    loadScenes,
+    stopFastWatch,
+    navigate,
+    preparePlaybackClips,
+  ]);
 
   // Auto-start matching when skipUiEnabled and no matches exist
   useEffect(() => {
@@ -908,8 +1165,65 @@ export function MatchValidation() {
       episode: string,
       startTime: number,
       endTime: number,
+      meta: ManualMatchSaveMeta,
     ) => {
       if (!projectId) return;
+
+      const previousMatch = matches.find((m) => m.scene_index === sceneIndex) || null;
+      if (!previousMatch) return;
+      const previousPlaybackAsset =
+        playbackManifest?.scenes?.find(
+          (asset) => asset.scene_index === sceneIndex,
+        ) ?? null;
+      const previousWarning = sceneWarnings[sceneIndex] || null;
+      const targetScene = scenes.find((scene) => scene.index === sceneIndex) || null;
+      const targetSceneDuration = targetScene
+        ? Math.max(0, targetScene.end_time - targetScene.start_time)
+        : Math.max(0, endTime - startTime);
+      const computedSpeedRatio =
+        meta.sourceDuration > 0 ? targetSceneDuration / meta.sourceDuration : 1;
+      const optimisticSpeedRatio = Number.isFinite(computedSpeedRatio)
+        ? computedSpeedRatio
+        : previousMatch.speed_ratio;
+
+      const optimisticMatch: SceneMatch = {
+        ...previousMatch,
+        episode,
+        start_time: startTime,
+        end_time: endTime,
+        confidence:
+          previousMatch.confidence > 0
+            ? previousMatch.confidence
+            : Math.max(previousMatch.confidence, 0.01),
+        speed_ratio: optimisticSpeedRatio,
+        confirmed: true,
+      };
+
+      const warningMessage = meta.anomalous
+        ? "Long source clip; preparation may take longer."
+        : "";
+
+      setPendingSceneUpdates((prev) => ({
+        ...prev,
+        [sceneIndex]: {
+          phase: "saving",
+          message: "Saving manual match...",
+        },
+      }));
+      setMatches((prev) =>
+        prev.map((match) =>
+          match.scene_index === sceneIndex ? optimisticMatch : match,
+        ),
+      );
+      setSceneWarnings((prev) => {
+        const next = { ...prev };
+        if (warningMessage) {
+          next[sceneIndex] = warningMessage;
+        } else {
+          delete next[sceneIndex];
+        }
+        return next;
+      });
 
       try {
         stopFastWatch();
@@ -927,7 +1241,6 @@ export function MatchValidation() {
         setMatches((prev) =>
           prev.map((m) => {
             if (m.scene_index === sceneIndex) {
-              // Preserve the was_no_match flag if it was true
               const wasNoMatch = m.confidence === 0 && !m.episode;
               return {
                 ...updatedMatch,
@@ -937,11 +1250,106 @@ export function MatchValidation() {
             return m;
           }),
         );
+
+        setPendingSceneUpdates((prev) => ({
+          ...prev,
+          [sceneIndex]: {
+            phase: "preparing",
+            message: "Preparing source clip...",
+          },
+        }));
+
+        const response = await api.prepareMatchesPlaybackScene(
+          projectId,
+          sceneIndex,
+          false,
+        );
+        const lastEvent = await readSSEStream<PlaybackPrepareProgress>(
+          response,
+          (data) => {
+            if (data.status === "encoding_source") {
+              setPendingSceneUpdates((prev) => ({
+                ...prev,
+                [sceneIndex]: {
+                  phase: "preparing",
+                  message: data.message || "Preparing source clip...",
+                },
+              }));
+            }
+            if (data.status === "complete" && data.scene_asset) {
+              patchPlaybackSceneAsset(sceneIndex, data.scene_asset);
+            }
+          },
+        );
+
+        const completedAsset =
+          lastEvent?.scene_asset ||
+          lastEvent?.manifest?.scenes?.find(
+            (asset) => asset.scene_index === sceneIndex,
+          ) ||
+          null;
+        if (!completedAsset) {
+          const refreshedManifest = await api.getMatchesPlaybackManifest(projectId);
+          const refreshedAsset =
+            refreshedManifest.scenes.find(
+              (asset) => asset.scene_index === sceneIndex,
+            ) || null;
+          if (!refreshedAsset) {
+            throw new Error("Scene playback asset missing after preparation");
+          }
+          patchPlaybackSceneAsset(sceneIndex, refreshedAsset);
+        } else {
+          patchPlaybackSceneAsset(sceneIndex, completedAsset);
+        }
+
+        setPlaybackError(null);
+        setPendingSceneUpdates((prev) => {
+          const next = { ...prev };
+          delete next[sceneIndex];
+          return next;
+        });
       } catch (err) {
-        setError((err as Error).message);
+        setPendingSceneUpdates((prev) => {
+          const next = { ...prev };
+          delete next[sceneIndex];
+          return next;
+        });
+        setMatches((prev) =>
+          prev.map((match) =>
+            match.scene_index === sceneIndex && previousMatch
+              ? previousMatch
+              : match,
+          ),
+        );
+        if (previousPlaybackAsset) {
+          patchPlaybackSceneAsset(sceneIndex, previousPlaybackAsset);
+        }
+        setSceneWarnings((prev) => {
+          const next = { ...prev };
+          if (previousWarning) {
+            next[sceneIndex] = previousWarning;
+          } else {
+            delete next[sceneIndex];
+          }
+          return next;
+        });
+        showToast(
+          "error",
+          `Manual save failed for scene ${sceneIndex + 1}. Previous match restored.`,
+        );
+        return;
       }
     },
-    [projectId, stopFastWatch],
+    [
+      projectId,
+      matches,
+      playbackManifest,
+      sceneWarnings,
+      scenes,
+      stopFastWatch,
+      patchPlaybackSceneAsset,
+      showToast,
+    ],
   );
 
   const handleBackToScenes = () => {
@@ -953,7 +1361,12 @@ export function MatchValidation() {
   const handleRecomputeMatches = async () => {
     // Clear existing matches and recompute
     stopFastWatch();
+    setPendingSceneUpdates({});
+    setSceneWarnings({});
     setMatches([]);
+    setPlaybackManifest(null);
+    setPlaybackProgress(null);
+    setPlaybackError(null);
     await handleFindMatches();
   };
 
@@ -962,6 +1375,7 @@ export function MatchValidation() {
 
     try {
       stopFastWatch();
+      setPendingSceneUpdates({});
       // Find all scenes with no match
       const noMatchScenes = matches.filter(
         (m) => m.confidence === 0 && !m.episode && m.alternatives?.length > 0,
@@ -1028,16 +1442,20 @@ export function MatchValidation() {
           };
         }),
       );
+      await preparePlaybackClips(true);
+      setSceneWarnings({});
     } catch (err) {
       setError((err as Error).message);
     }
-  }, [projectId, matches, stopFastWatch]);
+  }, [projectId, matches, stopFastWatch, preparePlaybackClips]);
 
   const handleUndoMerge = useCallback(
     async (sceneIndex: number) => {
       if (!projectId) return;
       try {
         stopFastWatch();
+        setPendingSceneUpdates({});
+        setSceneWarnings({});
         const result = await api.undoMerge(projectId, sceneIndex);
         // Reload scenes and matches after undo
         await loadScenes(projectId);
@@ -1046,11 +1464,18 @@ export function MatchValidation() {
           was_no_match: m.was_no_match ?? (m.confidence === 0 && !m.episode),
         }));
         setMatches(matchesWithTracking);
+        if (matchesWithTracking.length > 0) {
+          await preparePlaybackClips(true);
+        } else {
+          setPlaybackManifest(null);
+          setPlaybackProgress(null);
+          setPlaybackError(null);
+        }
       } catch (err) {
         setError((err as Error).message);
       }
     },
-    [projectId, loadScenes, stopFastWatch],
+    [projectId, loadScenes, stopFastWatch, preparePlaybackClips],
   );
 
   // Count confirmed matches (those with valid match data)
@@ -1081,9 +1506,21 @@ export function MatchValidation() {
     return new Map(matches.map((match) => [match.scene_index, match]));
   }, [matches]);
 
+  const isPlaybackReady = Boolean(playbackManifest?.ready);
+
+  const playbackBySceneIndex = useMemo(() => {
+    if (!playbackManifest?.scenes) return new Map<number, ScenePlaybackSceneAsset>();
+    return new Map(
+      playbackManifest.scenes.map((asset) => [asset.scene_index, asset]),
+    );
+  }, [playbackManifest]);
+
   const handleToggleFastWatch = useCallback(() => {
     if (fastWatchPlaying) {
       stopFastWatch();
+      return;
+    }
+    if (!isPlaybackReady) {
       return;
     }
 
@@ -1098,6 +1535,7 @@ export function MatchValidation() {
     activeSceneIndex,
     scenes,
     playFastWatchFromScene,
+    isPlaybackReady,
   ]);
 
   const handleTimelineSeek = useCallback(
@@ -1269,9 +1707,49 @@ export function MatchValidation() {
           </div>
         )}
 
+        {/* Playback warmup */}
+        {matches.length > 0 && (playbackPreparing || !isPlaybackReady || playbackError) && (
+          <div className="bg-[hsl(var(--card))] rounded-lg p-8 text-center space-y-4 border border-[hsl(var(--border))]">
+            <Loader2 className="h-10 w-10 mx-auto animate-spin text-[hsl(var(--primary))]" />
+            <div>
+              <h2 className="text-lg font-semibold">Preparing Video Playback</h2>
+              <p className="text-sm text-[hsl(var(--muted-foreground))]">
+                {playbackProgress?.message || "Building browser-safe clips for all scenes..."}
+              </p>
+              {playbackProgress?.scene_index !== undefined && (
+                <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
+                  Scene {playbackProgress.scene_index + 1} / {playbackProgress.total_scenes || scenes.length}
+                </p>
+              )}
+              {playbackError && (
+                <p className="text-xs text-[hsl(var(--destructive))] mt-2">
+                  {playbackError}
+                </p>
+              )}
+            </div>
+            <div className="h-2 bg-[hsl(var(--muted))] rounded-full overflow-hidden max-w-md mx-auto">
+              <div
+                className="h-full bg-[hsl(var(--primary))] transition-all duration-300"
+                style={{ width: `${Math.max(0, Math.min(1, playbackProgress?.progress ?? 0)) * 100}%` }}
+              />
+            </div>
+            {playbackError && (
+              <Button
+                variant="outline"
+                onClick={() => {
+                  void preparePlaybackClips(true);
+                }}
+              >
+                Retry Warmup
+              </Button>
+            )}
+          </div>
+        )}
+
         {/* Show matches */}
-        <div className="space-y-4">
-          {scenes.map((scene) => {
+        {isPlaybackReady && (
+          <div className="space-y-4">
+          {scenes.map((scene, scenePosition) => {
             const match = matchesBySceneIndex.get(scene.index);
             if (!match) return null;
 
@@ -1293,18 +1771,28 @@ export function MatchValidation() {
                   match={match}
                   projectId={projectId!}
                   episodes={episodes}
+                  playbackAsset={playbackBySceneIndex.get(scene.index) ?? null}
                   isActive={activeSceneIndex === scene.index}
                   playbackRate={playbackRate}
+                  controlsDisabled={fastWatchPlaying}
+                  preloadMode={
+                    Math.abs(scenePosition - activeScenePosition) <= 2
+                      ? "auto"
+                      : "metadata"
+                  }
                   onManualMatch={handleManualMatch}
+                  pendingUpdate={pendingSceneUpdates[scene.index] || null}
+                  warningMessage={sceneWarnings[scene.index] || null}
                   onUndoMerge={handleUndoMerge}
                 />
               </div>
             );
           })}
-        </div>
+          </div>
+        )}
       </div>
 
-      {matches.length > 0 && scenes.length > 0 && (
+      {matches.length > 0 && scenes.length > 0 && isPlaybackReady && (
         <div className="fixed bottom-0 left-0 right-0 z-50 bg-[hsl(var(--card))] border-t border-[hsl(var(--border))] shadow-lg">
           <div className="max-w-4xl mx-auto px-4 py-2 space-y-2">
             <div className="flex items-center gap-3">
@@ -1312,7 +1800,7 @@ export function MatchValidation() {
                 variant={fastWatchPlaying ? "default" : "outline"}
                 size="sm"
                 onClick={handleToggleFastWatch}
-                disabled={!hasAnyMatch}
+                disabled={!hasAnyMatch || playbackPreparing || !isPlaybackReady}
               >
                 {fastWatchPlaying ? (
                   <>
@@ -1370,6 +1858,24 @@ export function MatchValidation() {
               className="w-full h-1 accent-[hsl(var(--primary))]"
               title="Timeline scroller"
             />
+          </div>
+        </div>
+      )}
+
+      {toast && (
+        <div className="fixed top-4 right-4 z-[140]">
+          <div
+            className={cn(
+              "rounded-md border px-4 py-3 text-sm shadow-lg max-w-sm",
+              toast.type === "error" &&
+                "border-red-500/30 bg-red-500/10 text-red-200",
+              toast.type === "warning" &&
+                "border-amber-500/30 bg-amber-500/10 text-amber-100",
+              toast.type === "success" &&
+                "border-emerald-500/30 bg-emerald-500/10 text-emerald-100",
+            )}
+          >
+            {toast.message}
           </div>
         </div>
       )}

@@ -9,6 +9,7 @@ import {
 } from "react";
 import { RotateCcw, Play, Loader2 } from "lucide-react";
 import { cn } from "@/utils";
+import { acquire, acquirePriority } from "@/utils/videoConnectionPool";
 
 interface ClippedVideoPlayerProps {
   src: string;
@@ -18,6 +19,7 @@ interface ClippedVideoPlayerProps {
   muted?: boolean;
   playbackRate?: number;
   onClipEnded?: () => void;
+  eager?: boolean;
 }
 
 export interface ClippedVideoPlayerHandle {
@@ -28,6 +30,7 @@ export interface ClippedVideoPlayerHandle {
   waitUntilReady: (options?: WaitUntilReadyOptions) => Promise<void>;
   hasLoadError: () => boolean;
   isPlaying: () => boolean;
+  getReadyState: () => number;
   retryLoad: () => Promise<void>;
   forceLoad: () => void;
   releaseLoad: () => void;
@@ -56,7 +59,16 @@ export const ClippedVideoPlayer = forwardRef<
   ClippedVideoPlayerHandle,
   ClippedVideoPlayerProps
 >(function ClippedVideoPlayer(
-  { src, startTime, endTime, className, muted = true, playbackRate = 1, onClipEnded },
+  {
+    src,
+    startTime,
+    endTime,
+    className,
+    muted = true,
+    playbackRate = 1,
+    onClipEnded,
+    eager = false,
+  },
   ref,
 ) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -67,19 +79,24 @@ export const ClippedVideoPlayer = forwardRef<
   const forceLoadedRef = useRef(false);
   const isIntersectingRef = useRef(false);
   const hasErrorRef = useRef(false);
-  const [isVisible, setIsVisible] = useState(false);
+  const poolReleaseRef = useRef<(() => void) | null>(null);
+  const poolPendingRef = useRef(false);
+  const [isVisible, setIsVisible] = useState(eager);
   const [isLoaded, setIsLoaded] = useState(false);
   const [isEnded, setIsEnded] = useState(false);
   const [hasError, setHasError] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
   const [isRetrying, setIsRetrying] = useState(false);
-  const [preloadMode, setPreloadMode] = useState<"metadata" | "auto">("metadata");
+  const [preloadMode, setPreloadMode] = useState<"metadata" | "auto">(
+    "metadata",
+  );
 
   const resolveReadyWaiters = useCallback((force = false) => {
     const waiters = readyWaitersRef.current;
     if (waiters.length === 0) return;
 
-    const readyState = videoRef.current?.readyState ?? HTMLMediaElement.HAVE_NOTHING;
+    const readyState =
+      videoRef.current?.readyState ?? HTMLMediaElement.HAVE_NOTHING;
     const remainingWaiters: ReadyWaiter[] = [];
     for (const waiter of waiters) {
       if (force || hasErrorRef.current || readyState >= waiter.minReadyState) {
@@ -211,7 +228,11 @@ export const ClippedVideoPlayer = forwardRef<
             options?.minReadyState ?? HTMLMediaElement.HAVE_CURRENT_DATA;
           const timeoutMs = options?.timeoutMs ?? 6000;
           const video = videoRef.current;
-          if (!video || hasErrorRef.current || video.readyState >= minReadyState) {
+          if (
+            !video ||
+            hasErrorRef.current ||
+            video.readyState >= minReadyState
+          ) {
             resolve();
             return;
           }
@@ -240,17 +261,43 @@ export const ClippedVideoPlayer = forwardRef<
         if (!video) return false;
         return !video.paused && !video.ended;
       },
+      getReadyState: () => {
+        return videoRef.current?.readyState ?? HTMLMediaElement.HAVE_NOTHING;
+      },
       retryLoad: async () => {
         await triggerRetryLoad();
       },
       forceLoad: () => {
         forceLoadedRef.current = true;
         setPreloadMode("auto");
-        setIsVisible(true);
+        // Use priority acquire for Fast Watch preloads
+        if (!poolReleaseRef.current && !poolPendingRef.current) {
+          poolPendingRef.current = true;
+          acquirePriority().then((release) => {
+            poolPendingRef.current = false;
+            poolReleaseRef.current = release;
+            // Only set visible if still force-loaded (not cancelled in the meantime)
+            if (forceLoadedRef.current) {
+              setIsVisible(true);
+            } else {
+              release();
+              poolReleaseRef.current = null;
+            }
+          });
+        } else if (poolReleaseRef.current) {
+          // Already have a slot, just make visible
+          setIsVisible(true);
+        }
       },
       releaseLoad: () => {
         forceLoadedRef.current = false;
         if (isIntersectingRef.current) return;
+        // Aggressively release the video connection
+        if (videoRef.current) {
+          videoRef.current.pause();
+          videoRef.current.removeAttribute("src");
+          videoRef.current.load();
+        }
         setIsVisible(false);
         setIsLoaded(false);
         setHasError(false);
@@ -258,6 +305,11 @@ export const ClippedVideoPlayer = forwardRef<
         resetClipEndedState();
         setPreloadMode("metadata");
         resolveReadyWaiters(true);
+        // Release pool slot
+        if (poolReleaseRef.current) {
+          poolReleaseRef.current();
+          poolReleaseRef.current = null;
+        }
       },
     }),
     [
@@ -272,6 +324,10 @@ export const ClippedVideoPlayer = forwardRef<
   // Videos are loaded when entering viewport and unloaded when leaving
   // This prevents too many concurrent video connections which causes failures
   useEffect(() => {
+    if (eager) {
+      return;
+    }
+
     const container = containerRef.current;
     if (!container) return;
 
@@ -280,13 +336,33 @@ export const ClippedVideoPlayer = forwardRef<
         entries.forEach((entry) => {
           isIntersectingRef.current = entry.isIntersecting;
           if (entry.isIntersecting) {
-            // Video is entering viewport - load it
-            setIsVisible(true);
+            // Video is entering viewport - acquire a pool slot then load
+            if (!poolReleaseRef.current && !poolPendingRef.current) {
+              poolPendingRef.current = true;
+              acquire().then((release) => {
+                poolPendingRef.current = false;
+                poolReleaseRef.current = release;
+                // Only set visible if still intersecting (not scrolled away while waiting)
+                if (isIntersectingRef.current || forceLoadedRef.current) {
+                  setIsVisible(true);
+                } else {
+                  release();
+                  poolReleaseRef.current = null;
+                }
+              });
+            } else if (poolReleaseRef.current) {
+              setIsVisible(true);
+            }
           } else {
             if (forceLoadedRef.current) {
               return;
             }
-            // Video is leaving viewport - unload it to free connections
+            // Video is leaving viewport - aggressively unload to free connections
+            if (videoRef.current) {
+              videoRef.current.pause();
+              videoRef.current.removeAttribute("src");
+              videoRef.current.load();
+            }
             setIsVisible(false);
             setIsLoaded(false);
             setHasError(false);
@@ -294,6 +370,11 @@ export const ClippedVideoPlayer = forwardRef<
             resetClipEndedState();
             setPreloadMode("metadata");
             resolveReadyWaiters(true);
+            // Release pool slot
+            if (poolReleaseRef.current) {
+              poolReleaseRef.current();
+              poolReleaseRef.current = null;
+            }
             // Don't reset retryCount - keep it so next load uses fresh URL if needed
           }
         });
@@ -309,11 +390,16 @@ export const ClippedVideoPlayer = forwardRef<
     return () => {
       observer.disconnect();
     };
-  }, [resolveReadyWaiters, resetClipEndedState]);
+  }, [eager, resolveReadyWaiters, resetClipEndedState]);
 
   useEffect(() => {
     return () => {
       resolveReadyWaiters(true);
+      // Release pool slot on unmount
+      if (poolReleaseRef.current) {
+        poolReleaseRef.current();
+        poolReleaseRef.current = null;
+      }
     };
   }, [resolveReadyWaiters]);
 
@@ -445,16 +531,9 @@ export const ClippedVideoPlayer = forwardRef<
         </div>
       )}
 
-      {/* Loading indicator while video is loading */}
-      {isVisible && !isLoaded && !hasError && !isRetrying && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black/50 z-10">
-          <Loader2 className="h-8 w-8 animate-spin text-white" />
-        </div>
-      )}
-
-      {/* Retrying state */}
-      {isRetrying && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black/50 z-10">
+      {/* Loading indicator while video is loading or retrying */}
+      {((isVisible && !isLoaded && !hasError) || isRetrying) && (
+        <div className="absolute inset-0 flex items-center justify-center bg-black z-10">
           <Loader2 className="h-8 w-8 animate-spin text-white" />
         </div>
       )}

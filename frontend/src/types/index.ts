@@ -208,6 +208,41 @@ export interface SceneMatch {
   merged_from?: number[] | null; // Original scene indices before merge
 }
 
+export interface ScenePlaybackClip {
+  scene_index: number;
+  track: "tiktok" | "source";
+  url: string;
+  duration: number;
+  ready: boolean;
+  clip_id: string;
+  status: "ready" | "preparing" | "error";
+  profile: "tiktok_fast" | "source_fast" | "source_ultra_long";
+}
+
+export interface ScenePlaybackSceneAsset {
+  scene_index: number;
+  has_match: boolean;
+  status: "ready" | "preparing" | "error";
+  error?: string | null;
+  tiktok: ScenePlaybackClip;
+  source?: ScenePlaybackClip | null;
+}
+
+export interface MatchesPlaybackManifest {
+  ready: boolean;
+  fingerprint: string | null;
+  generated_at: string | null;
+  encode_profile?: string;
+  manifest_version?: string;
+  clip_store_stats?: {
+    reused_count: number;
+    encoded_count: number;
+    total_clips: number;
+  };
+  scene_status?: Record<string, "ready" | "preparing" | "error">;
+  scenes: ScenePlaybackSceneAsset[];
+}
+
 export interface Word {
   text: string;
   start: number;
