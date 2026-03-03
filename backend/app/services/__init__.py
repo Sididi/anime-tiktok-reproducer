@@ -27,6 +27,7 @@ from .script_automation_service import ScriptAutomationService
 from .music_config_service import MusicConfigService
 from .audio_speed_service import AudioSpeedService
 from .title_image_generator import TitleImageGeneratorService
+from .premiere_subtitle_baker import PremiereSubtitleBakerService
 
 __all__ = [
     "AccountService",
@@ -46,4 +47,5 @@ __all__ = [
     "MusicConfigService",
     "AudioSpeedService",
     "TitleImageGeneratorService",
+    "PremiereSubtitleBakerService",
 ]

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 import zipfile
 from dataclasses import dataclass
@@ -10,6 +9,7 @@ from typing import Any
 from ..models import Project, SceneMatch
 from .gap_resolution import GapResolutionService
 from .google_drive_service import GoogleDriveService
+from .music_config_service import MusicConfigService
 from .project_service import ProjectService
 
 
@@ -23,6 +23,13 @@ class ManifestEntry:
 
 class ExportService:
     VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
+    BAKED_SUBTITLE_RE = re.compile(r"^subtitle_(\d+)\.mogrt$", re.IGNORECASE)
+    REQUIRED_IMPORT_ASSETS = (
+        "TikTok60fps.sqpreset",
+        "White border 10px.mogrt",
+        "SPM Anime Background.prfpset",
+        "SPM Anime Foreground.prfpset",
+    )
     _LANG_TO_LOCALE = {
         "fr": "fr_FR",
         "en": "en_GB",
@@ -77,10 +84,10 @@ class ExportService:
         cls,
         *,
         project: Project,
-        source_mapping: dict[str, str],
+        source_items: list[str],
         subtitle_filename: str,
     ) -> str:
-        episode_list = "\n".join(f"  - {Path(bundle_item).name}" for bundle_item in source_mapping.values()) or "  - (none)"
+        source_list = "\n".join(f"  - {name}" for name in source_items) or "  - (none)"
         return f"""Anime TikTok Reproducer - Project Bundle
 =========================================
 
@@ -94,11 +101,71 @@ tts_edited.wav          - Processed TTS audio
 {subtitle_filename}     - Captions file
 metadata/               - Generated metadata files (optional)
 assets/                 - Required import assets
-sources/                - Source episode files
+sources/                - Source episodes + overlays + optional music
+subtitles/              - Baked subtitle MOGRT files
 
-=== SOURCE EPISODES ===
-{episode_list}
+=== SOURCES ===
+{source_list}
 """
+
+    @classmethod
+    def _validate_expected_filename(cls, path: Path, expected_name: str) -> None:
+        if path.name != expected_name:
+            raise ValueError(
+                f"Asset filename mismatch: expected '{expected_name}', got '{path.name}'"
+            )
+        expected_suffix = Path(expected_name).suffix.lower()
+        if expected_suffix and path.suffix.lower() != expected_suffix:
+            raise ValueError(
+                f"Asset extension mismatch for '{expected_name}': got '{path.suffix}'"
+            )
+
+    @classmethod
+    def _collect_episode_sources(cls, matches: list[SceneMatch]) -> list[Path]:
+        seen: set[str] = set()
+        sources: list[Path] = []
+        for match in matches:
+            if not match.episode:
+                continue
+            resolved = GapResolutionService.resolve_episode_path(match.episode)
+            if not resolved or not resolved.exists():
+                continue
+            key = str(resolved.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            sources.append(resolved)
+        return sources
+
+    @classmethod
+    def _resolve_selected_music_path(cls, project: Project) -> Path | None:
+        if not project.music_key:
+            return None
+        try:
+            music = MusicConfigService.get_music(project.music_key)
+        except ValueError:
+            return None
+        music_path = Path(music.file_path)
+        if not music_path.exists():
+            return None
+        return music_path
+
+    @classmethod
+    def _collect_baked_subtitle_files(cls, output_dir: Path) -> list[Path]:
+        subtitles_dir = output_dir / "subtitles"
+        if not subtitles_dir.exists():
+            return []
+
+        sortable: list[tuple[int, Path]] = []
+        for path in subtitles_dir.iterdir():
+            if not path.is_file():
+                continue
+            m = cls.BAKED_SUBTITLE_RE.match(path.name)
+            if not m:
+                continue
+            sortable.append((int(m.group(1)), path))
+        sortable.sort(key=lambda item: (item[0], item[1].name.lower()))
+        return [path for _, path in sortable]
 
     @classmethod
     def build_manifest(cls, project: Project, matches: list[SceneMatch]) -> tuple[str, list[ManifestEntry]]:
@@ -115,6 +182,10 @@ sources/                - Source episode files
             raise FileNotFoundError("Missing output file: tts_edited.wav")
         if not subtitle_path.exists():
             raise FileNotFoundError("Missing subtitle file. Run processing first.")
+
+        baked_subtitles = cls._collect_baked_subtitle_files(output_dir)
+        if not baked_subtitles:
+            raise FileNotFoundError("Missing baked subtitle MOGRT files in output/subtitles.")
 
         folder = cls.output_folder_name(project)
         subtitle_name = subtitle_path.name
@@ -145,46 +216,59 @@ sources/                - Source episode files
             )
 
         assets_dir = cls.get_assets_dir()
-        for asset_name in ("TikTok60fps.sqpreset", "White border 5px.mogrt"):
+        for asset_name in cls.REQUIRED_IMPORT_ASSETS:
             asset = assets_dir / asset_name
-            if asset.exists():
-                entries.append(
-                    ManifestEntry(relative_path=f"{folder}/assets/{asset_name}", source_path=asset)
-                )
+            if not asset.exists():
+                raise FileNotFoundError(f"Missing required asset file: {asset_name}")
+            cls._validate_expected_filename(asset, asset_name)
+            entries.append(
+                ManifestEntry(relative_path=f"{folder}/assets/{asset_name}", source_path=asset)
+            )
 
         launcher = assets_dir / "run_in_premiere.bat"
         if launcher.exists():
             entries.append(ManifestEntry(relative_path=f"{folder}/run_in_premiere.bat", source_path=launcher))
 
-        source_mapping: dict[str, str] = {}
-        seen: set[str] = set()
-        for match in matches:
-            if not match.episode:
-                continue
-            resolved = GapResolutionService.resolve_episode_path(match.episode)
-            if not resolved or not resolved.exists():
-                continue
-            key = str(resolved.resolve())
-            if key in seen:
-                continue
-            seen.add(key)
-            destination = f"{folder}/sources/{resolved.name}"
-            source_mapping[key] = destination
-            entries.append(ManifestEntry(relative_path=destination, source_path=resolved))
+        source_items: list[str] = []
+        source_name_to_path: dict[str, Path] = {}
 
-        entries.append(
-            ManifestEntry(
-                relative_path=f"{folder}/source_mapping.json",
-                inline_content=json.dumps(source_mapping, indent=2).encode("utf-8"),
-                mime_type="application/json",
+        def _add_source_file(path: Path) -> None:
+            name = path.name
+            existing = source_name_to_path.get(name)
+            if existing is not None:
+                if existing.resolve() != path.resolve():
+                    raise ValueError(f"Conflicting source filename in bundle: {name}")
+                return
+            source_name_to_path[name] = path
+            source_items.append(name)
+            entries.append(ManifestEntry(relative_path=f"{folder}/sources/{name}", source_path=path))
+
+        for source_path in cls._collect_episode_sources(matches):
+            _add_source_file(source_path)
+
+        for overlay_name in ("title_overlay.png", "category_overlay.png"):
+            overlay_path = output_dir / overlay_name
+            if overlay_path.exists():
+                _add_source_file(overlay_path)
+
+        music_path = cls._resolve_selected_music_path(project)
+        if music_path is not None:
+            _add_source_file(music_path)
+
+        for subtitle_mogrt in baked_subtitles:
+            entries.append(
+                ManifestEntry(
+                    relative_path=f"{folder}/subtitles/{subtitle_mogrt.name}",
+                    source_path=subtitle_mogrt,
+                )
             )
-        )
+
         entries.append(
             ManifestEntry(
                 relative_path=f"{folder}/README.txt",
                 inline_content=cls._build_readme(
                     project=project,
-                    source_mapping=source_mapping,
+                    source_items=sorted(source_items),
                     subtitle_filename=subtitle_name,
                 ).encode("utf-8"),
                 mime_type="text/plain",
@@ -249,20 +333,30 @@ sources/                - Source episode files
                 # Preserve sub-directory architecture inside the Drive root folder.
                 parent = _resolve_parent(parts[:-1])
             if entry.source_path is not None:
-                GoogleDriveService.upload_local_file(
+                uploaded = GoogleDriveService.upload_local_file(
                     parent_id=parent,
                     filename=filename,
                     local_path=entry.source_path,
                     drive=drive,
                 )
+                uploaded_name = str(uploaded.get("name") or "")
+                if uploaded_name != filename:
+                    raise RuntimeError(
+                        f"Drive upload renamed file unexpectedly: expected '{filename}', got '{uploaded_name}'"
+                    )
             else:
-                GoogleDriveService.upload_bytes(
+                uploaded = GoogleDriveService.upload_bytes(
                     parent_id=parent,
                     filename=filename,
                     content=entry.inline_content or b"",
                     mime_type=entry.mime_type,
                     drive=drive,
                 )
+                uploaded_name = str(uploaded.get("name") or "")
+                if uploaded_name != filename:
+                    raise RuntimeError(
+                        f"Drive upload renamed file unexpectedly: expected '{filename}', got '{uploaded_name}'"
+                    )
 
         return {
             "folder_id": folder_id,

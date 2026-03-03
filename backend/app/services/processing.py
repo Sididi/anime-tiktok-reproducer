@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -20,6 +21,8 @@ from .transcriber import TranscriberService
 from .otio_timing import OTIOTimingCalculator, FrameRateInfo
 from .gap_resolution import GapResolutionService
 from .export_service import ExportService
+from .music_config_service import MusicConfigService
+from .premiere_subtitle_baker import PremiereSubtitleBakerService
 from .project_service import ProjectService
 
 logger = logging.getLogger("uvicorn.error")
@@ -152,6 +155,9 @@ class ProcessingService:
     FFPROBE_TIMEOUT_SECONDS = 30.0
     FFMPEG_TIMEOUT_SECONDS = 1200.0
     AUTO_EDITOR_TIMEOUT_SECONDS = 1800.0
+    PREMIERE_JSX_TEMPLATE_PATH = (
+        Path(__file__).resolve().parent / "templates" / "premiere_import_project_v77.jsx"
+    )
     _gap_candidate_prewarm_tasks: dict[str, asyncio.Task[None]] = {}
 
     @classmethod
@@ -616,11 +622,14 @@ class ProcessingService:
         transcription: Transcription,
         matches: list[SceneMatch],
         source_fps: Fraction | None = None,
+        subtitle_filename: str = "subtitles.srt",
+        music_filename: str = "",
+        music_gain_db: float = -24.0,
     ) -> str:
         """
         Generate a production-ready Premiere Pro 2025 ExtendScript (.jsx) file.
 
-        This generates a script matching the working_script.jsx v7.1 format exactly.
+        This generates a script matching the canonical v7.7 template.
         Uses the QE (Quality Engineering) DOM for reliable:
         - 60fps vertical sequence creation via .sqpreset
         - Speed adjustments via qeItem.setSpeed()
@@ -638,6 +647,9 @@ class ProcessingService:
             matches: Scene matches with source timing
             source_fps: Source video frame rate as Fraction (e.g., 24000/1001 for 23.976)
                         If None, defaults to 23.976fps
+            subtitle_filename: Root-level SRT filename to reference in JSX
+            music_filename: Optional music filename placed in /sources
+            music_gain_db: Music gain in dB (used only when music_filename is set)
 
         Returns:
             The generated JSX script content (ES3 compatible)
@@ -778,760 +790,103 @@ class ProcessingService:
                           f"between scenes {issue.between_scenes[0]} and {issue.between_scenes[1]} "
                           f"at {issue.position_seconds:.3f}s", file=sys.stderr)
 
-        # Generate scenes JSON with proper indentation
+        return cls._render_jsx_from_template(
+            scenes=scenes,
+            source_fps_num=source_rate.rate.numerator,
+            source_fps_den=source_rate.rate.denominator,
+            subtitle_filename=subtitle_filename,
+            music_filename=music_filename,
+            music_gain_db=music_gain_db,
+        )
+
+    @classmethod
+    def _replace_template_once(
+        cls,
+        content: str,
+        pattern: str,
+        replacement: str,
+        *,
+        flags: int = 0,
+        label: str,
+    ) -> str:
+        updated, count = re.subn(pattern, replacement, content, count=1, flags=flags)
+        if count != 1:
+            raise RuntimeError(f"Failed to patch JSX template section: {label}")
+        return updated
+
+    @staticmethod
+    def _escape_js_string(value: str) -> str:
+        return (
+            value.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\r", "\\r")
+            .replace("\n", "\\n")
+        )
+
+    @classmethod
+    def _render_jsx_from_template(
+        cls,
+        *,
+        scenes: list[dict],
+        source_fps_num: int,
+        source_fps_den: int,
+        subtitle_filename: str,
+        music_filename: str,
+        music_gain_db: float,
+    ) -> str:
+        template_path = cls.PREMIERE_JSX_TEMPLATE_PATH
+        if not template_path.exists():
+            raise FileNotFoundError(f"Missing Premiere JSX template: {template_path}")
+
+        content = template_path.read_text(encoding="utf-8")
+
         scenes_json = json.dumps(scenes, indent=4, ensure_ascii=False)
-        # Indent each line for proper JSX formatting
         scenes_json_indented = "\n".join("  " + line for line in scenes_json.split("\n"))
 
-        jsx_content = f'''/**
- * Anime TikTok Reproducer - Premiere Pro 2025 Automation Script (v7.1 - CLEANED)
- *
- * CHANGES from v6:
- * - 4-Track Structure: V4(Subtitles - Reserved), V3(Main), V2(Border), V1(Background).
- * - Interleaved Speed & Placement for V1 and V3.
- * - Scaling: V1 (183%), V3 (68%).
- * - Audio: Cleans A2 before placing TTS.
- */
-
-(function () {{
-  // ========================================================================
-  // 1. CONFIGURATION
-  // ========================================================================
-  var SCRIPT_FILE = new File($.fileName);
-  var ROOT_DIR = SCRIPT_FILE.parent.fsName;
-  var ASSETS_DIR = ROOT_DIR + "/assets";
-  var SOURCES_DIR = ROOT_DIR + "/sources";
-
-  var SEQUENCE_PRESET_PATH = ASSETS_DIR + "/TikTok60fps.sqpreset";
-  var BORDER_MOGRT_PATH = ASSETS_DIR + "/White border 5px.mogrt";
-  var AUDIO_FILENAME = "tts_edited.wav";
-
-  // --- SCENES DATA ---
-  var scenes =
-{scenes_json_indented};
-
-  // ========================================================================
-  // 2. LOGGING & UTILS
-  // ========================================================================
-  function log(msg) {{
-    $.writeln("[ATR] " + msg);
-  }}
-  function sleep(ms) {{
-    $.sleep(ms);
-  }}
-  var TICKS_PER_SECOND = 254016000000; // Premiere Pro timebase constant
-  var SEQ_FPS = 60; // TikTok preset is 60fps
-  var SOURCE_FPS_NUM = {source_rate.rate.numerator};
-  var SOURCE_FPS_DEN = {source_rate.rate.denominator};
-  var TICKS_PER_FRAME = TICKS_PER_SECOND / SEQ_FPS;
-
-  function snapSecondsToFrame(sec) {{
-    // Add small epsilon to prevent floating-point rounding errors
-    // Values like 17.583333 (representing 1055/60) become 1054.99998 due to float precision
-    // Without epsilon, this can cause 1-frame drift when truncated elsewhere
-    return Math.round(sec * SEQ_FPS + 0.0001) / SEQ_FPS;
-  }}
-
-  function secondsToTicks(sec) {{
-    // Snap to frame boundaries to avoid 1-frame drift
-    // Add small epsilon to prevent floating-point rounding errors (same as snapSecondsToFrame)
-    return Math.round(sec * SEQ_FPS + 0.0001) * TICKS_PER_FRAME;
-  }}
-
-  function secondsToRawTicks(sec) {{
-    // Raw tick conversion (no sequence-frame snap), used for source in/out.
-    return Math.round(sec * TICKS_PER_SECOND);
-  }}
-
-  function sourceFramesToRawTicks(frame) {{
-    // Exact source frame -> ticks conversion (avoids decimal precision drift).
-    return Math.round((frame * TICKS_PER_SECOND * SOURCE_FPS_DEN) / SOURCE_FPS_NUM);
-  }}
-
-  function sourceFrameDurationTicks() {{
-    return (TICKS_PER_SECOND * SOURCE_FPS_DEN) / SOURCE_FPS_NUM;
-  }}
-
-  function buildSequenceTimeFromSeconds(sec) {{
-    var t = new Time();
-    try {{
-      // 2025: ticks might need to be a String or Number.
-      // Safe to assign Number, PPro handles it.
-      t.ticks = secondsToTicks(sec).toString();
-    }} catch (e) {{
-      t.seconds = sec;
-    }}
-    return t;
-  }}
-
-  function buildRawTimeFromSeconds(sec) {{
-    var t = new Time();
-    try {{
-      t.ticks = secondsToRawTicks(sec).toString();
-    }} catch (e) {{
-      t.seconds = sec;
-    }}
-    return t;
-  }}
-
-  function buildRawTimeFromSourceFrame(frame, centerInFrame) {{
-    var t = new Time();
-    var center = !!centerInFrame;
-    var frameTicks = sourceFrameDurationTicks();
-    var targetTicks = sourceFramesToRawTicks(frame) + (center ? Math.floor(frameTicks / 2) : 0);
-    try {{
-      t.ticks = Math.round(targetTicks).toString();
-    }} catch (e) {{
-      // Fallback should be unreachable with valid frame numbers.
-      t.ticks = secondsToRawTicks((frame * SOURCE_FPS_DEN) / SOURCE_FPS_NUM).toString();
-    }}
-    return t;
-  }}
-
-  function getStartTicks(item) {{
-    if (!item || !item.start) return null;
-    // PPro 2024/2025: .ticks is often a String. Parse it!
-    if (item.start.ticks !== undefined) {{
-      var val = parseInt(item.start.ticks, 10);
-      if (!isNaN(val)) return val;
-    }}
-    // Fallback
-    if (typeof item.start.seconds === "number") {{
-      return secondsToTicks(item.start.seconds);
-    }}
-    return null;
-  }}
-
-  function findTrackItemAtStart(track, startSeconds, nameRef) {{
-    if (!track || !track.clips) return null;
-
-    var targetTicks = secondsToTicks(startSeconds);
-    // Relaxed tolerance
-    var toleranceTicks = secondsToTicks(0.1);
-
-    var bestItem = null;
-    var minDiff = toleranceTicks + 1;
-
-    for (var i = 0; i < track.clips.numItems; i++) {{
-      var item = track.clips[i];
-      if (!item) continue;
-
-      var itemTicks = getStartTicks(item);
-      if (itemTicks === null) continue;
-
-      var diff = Math.abs(itemTicks - targetTicks);
-
-      if (diff <= toleranceTicks) {{
-        // Name Check
-        if (nameRef) {{
-          var itemName = item.name ? item.name.toString() : "";
-          if (itemName.replace(/\\s/g, "") !== "") {{
-            // Check containment both ways
-            if (
-              itemName.indexOf(nameRef) === -1 &&
-              nameRef.indexOf(itemName) === -1
-            ) {{
-              continue;
-            }}
-          }}
-        }}
-
-        // We found a candidate. Is it the best one?
-        if (diff < minDiff) {{
-          minDiff = diff;
-          bestItem = item;
-        }}
-      }}
-    }}
-    return bestItem;
-  }}
-
-  function setTrackItemInOut(track, startSeconds, inSeconds, outSeconds, nameRef, inFrame, outFrame) {{
-    var item = findTrackItemAtStart(track, startSeconds, nameRef);
-    if (!item) return null;
-    try {{
-      if (typeof inFrame === "number" && typeof outFrame === "number") {{
-        // In-point is nudged to frame center to avoid boundary rounding to previous frame.
-        item.inPoint = buildRawTimeFromSourceFrame(inFrame, true);
-        // Out-point stays on frame boundary (exclusive end frame).
-        item.outPoint = buildRawTimeFromSourceFrame(outFrame, false);
-      }} else {{
-        item.inPoint = buildRawTimeFromSeconds(inSeconds);
-        item.outPoint = buildRawTimeFromSeconds(outSeconds);
-      }}
-    }} catch (e) {{
-      log("Warning: Failed to set in/out for item at " + startSeconds);
-    }}
-    return item;
-  }}
-
-  function logClipDuration(item, targetSeconds, label) {{
-    if (!item || !label) return;
-    try {{
-      var dur = null;
-      if (item.duration && typeof item.duration.seconds === "number") {{
-        dur = item.duration.seconds;
-      }} else if (item.duration && typeof item.duration.ticks === "number") {{
-        dur = item.duration.ticks / TICKS_PER_SECOND;
-      }}
-      if (typeof dur === "number") {{
-        log(
-          label +
-            " duration " +
-            dur.toFixed(4) +
-            "s (target " +
-            targetSeconds.toFixed(4) +
-            "s)"
-        );
-      }}
-    }} catch (e) {{}}
-  }}
-
-  function findProjectItem(name) {{
-    var findInBin = function (bin) {{
-      for (var i = 0; i < bin.children.numItems; i++) {{
-        var item = bin.children[i];
-        if (item.name === name) return item;
-        if (item.type === ProjectItemType.BIN) {{
-          var found = findInBin(item);
-          if (found) return found;
-        }}
-      }}
-      return null;
-    }};
-    return findInBin(app.project.rootItem);
-  }}
-
-  function getOrImportClip(clipName) {{
-    var cleanName = clipName.replace(/^\\s+|\\s+$/g, "");
-    var nameNoExt = cleanName.replace(/\\.[^\\.]+$/, "");
-
-    var item = findProjectItem(cleanName);
-    if (item) return item;
-    item = findProjectItem(nameNoExt);
-    if (item) return item;
-
-    var searchPaths = [
-      ROOT_DIR + "/" + cleanName,
-      ROOT_DIR + "/" + cleanName + ".wav",
-      SOURCES_DIR + "/" + cleanName,
-      SOURCES_DIR + "/" + nameNoExt + ".mkv",
-      SOURCES_DIR + "/" + nameNoExt + ".mp4",
-    ];
-
-    for (var i = 0; i < searchPaths.length; i++) {{
-      var f = new File(searchPaths[i]);
-      if (f.exists) {{
-        app.project.importFiles([f.fsName], true, app.project.rootItem, false);
-        item = findProjectItem(f.name);
-        if (!item) item = findProjectItem(f.displayName);
-        if (!item) item = findProjectItem(nameNoExt);
-        return item;
-      }}
-    }}
-    log("Error: Clip not found: " + cleanName);
-    return null;
-  }}
-
-  // ========================================================================
-  // 3. MAIN LOGIC
-  // ========================================================================
-  function main() {{
-    app.enableQE();
-    if (!app.project) {{
-      alert("Open a project.");
-      return;
-    }}
-
-    var seqName = "ATR_Layered_" + Math.floor(Math.random() * 9999);
-    var presetFile = new File(SEQUENCE_PRESET_PATH);
-    var sequence;
-
-    if (presetFile.exists) {{
-      qe.project.newSequence(seqName, presetFile.fsName);
-      sequence = app.project.activeSequence;
-    }} else {{
-      sequence = app.project.createNewSequence(seqName, "ID_1");
-    }}
-
-    // --- ENSURE TRACKS (V=4, A=2) ---
-    ensureVideoTracks(sequence, 4);
-    ensureAudioTracks(sequence, 2);
-
-    // Mapping Tracks
-    // V1: Index 0 (Back)
-    // V2: Index 1 (Border)
-    // V3: Index 2 (Main)
-    // V4: Index 3 (Subs)
-
-    var v1 = sequence.videoTracks[0];
-    var v2 =
-      sequence.videoTracks.numTracks > 1 ? sequence.videoTracks[1] : null;
-    var v3 =
-      sequence.videoTracks.numTracks > 2 ? sequence.videoTracks[2] : null;
-    var v4 =
-      sequence.videoTracks.numTracks > 3 ? sequence.videoTracks[3] : null;
-
-    var a1 = sequence.audioTracks[0];
-    var a2 = sequence.audioTracks.numTracks > 1 ? sequence.audioTracks[1] : a1;
-
-    // --- MUTE A1 (Clip Audio) ---
-    try {{
-      a1.setMute(1);
-    }} catch (e) {{}}
-
-    // --- MARKERS ---
-    log("Creating Markers...");
-    for (var i = 0; i < scenes.length; i++) {{
-      var mStart = snapSecondsToFrame(scenes[i].start);
-      var mEnd = snapSecondsToFrame(scenes[i].end);
-      var m = sequence.markers.createMarker(mStart);
-      m.name = "Scene " + scenes[i].scene_index;
-      m.duration = mEnd - mStart;
-    }}
-
-    // --- INTERLEAVED PROCESSING (V1 & V3) ---
-    // V1 (Background) & V3 (Main)
-    log("Processing Scenes (Layering & Speed)...");
-    var nameCleaner = function (n) {{
-      return n.replace(/\\.[^\\.]+$/, "");
-    }}; // Helper
-
-    for (var i = 0; i < scenes.length; i++) {{
-      var s = scenes[i];
-      var startSec = snapSecondsToFrame(s.start);
-      var clip = getOrImportClip(s.clipName);
-      var cleanName = nameCleaner(s.clipName);
-
-      if (clip) {{
-        // 1. PLACE ON V3 (Main)
-        if (v3) v3.overwriteClip(clip, startSec);
-
-        // 2. PLACE ON V1 (Background)
-        if (v1) v1.overwriteClip(clip, startSec);
-
-        // 2b. SET PER-INSTANCE IN/OUT (TrackItem) TO AVOID UNIT AMBIGUITY
-        sleep(200);
-        var v3Item = null;
-        var v1Item = null;
-        var a1Item = null;
-        var a2Item = null;
-        if (v3) {{
-          v3Item = setTrackItemInOut(
-            v3,
-            startSec,
-            s.source_in,
-            s.source_out,
-            cleanName,
-            s.source_in_frame,
-            s.source_out_frame
-          );
-          if (!v3Item) {{
-            sleep(200);
-            v3Item = setTrackItemInOut(
-              v3,
-              startSec,
-              s.source_in,
-              s.source_out,
-              cleanName,
-              s.source_in_frame,
-              s.source_out_frame
-            );
-          }}
-        }}
-        if (v1) {{
-          v1Item = setTrackItemInOut(
-            v1,
-            startSec,
-            s.source_in,
-            s.source_out,
-            cleanName,
-            s.source_in_frame,
-            s.source_out_frame
-          );
-          if (!v1Item) {{
-            sleep(200);
-            v1Item = setTrackItemInOut(
-              v1,
-              startSec,
-              s.source_in,
-              s.source_out,
-              cleanName,
-              s.source_in_frame,
-              s.source_out_frame
-            );
-          }}
-        }}
-        if (a1) {{
-          a1Item = setTrackItemInOut(
-            a1,
-            startSec,
-            s.source_in,
-            s.source_out,
-            cleanName,
-            s.source_in_frame,
-            s.source_out_frame
-          );
-          if (!a1Item) {{
-            sleep(200);
-            a1Item = setTrackItemInOut(
-              a1,
-              startSec,
-              s.source_in,
-              s.source_out,
-              cleanName,
-              s.source_in_frame,
-              s.source_out_frame
-            );
-          }}
-        }}
-        if (a2 && a2 !== a1) {{
-          a2Item = setTrackItemInOut(
-            a2,
-            startSec,
-            s.source_in,
-            s.source_out,
-            cleanName,
-            s.source_in_frame,
-            s.source_out_frame
-          );
-          if (!a2Item) {{
-            sleep(200);
-            a2Item = setTrackItemInOut(
-              a2,
-              startSec,
-              s.source_in,
-              s.source_out,
-              cleanName,
-              s.source_in_frame,
-              s.source_out_frame
-            );
-          }}
-        }}
-
-        // Force backend update & clear selection to avoid "Invalid TrackItem" assertion
-        // The assertion often happens if a previous selection is invalid.
-        sleep(1000);
-        clearSelection(sequence);
-        sleep(200);
-
-        // 3. ENFORCE DURATION (ALL SPEEDS)
-        // Always enforce the target timeline duration, even at 1.0x.
-        // If in/out fails or speed is exactly 1.0, this prevents huge clip lengths.
-        var newDurationSeconds = snapSecondsToFrame(s.clip_duration / s.effective_speed);
-        if (v3Item) {{ try {{ var newEnd = v3Item.start.seconds + newDurationSeconds; v3Item.end = buildSequenceTimeFromSeconds(newEnd); }} catch (e) {{}} }}
-        if (v1Item) {{ try {{ var newEnd = v1Item.start.seconds + newDurationSeconds; v1Item.end = buildSequenceTimeFromSeconds(newEnd); }} catch (e) {{}} }}
-        if (a1Item) {{ try {{ var newEnd = a1Item.start.seconds + newDurationSeconds; a1Item.end = buildSequenceTimeFromSeconds(newEnd); }} catch (e) {{}} }}
-        if (a2Item) {{ try {{ var newEnd = a2Item.start.seconds + newDurationSeconds; a2Item.end = buildSequenceTimeFromSeconds(newEnd); }} catch (e) {{}} }}
-
-        // 4. APPLY SPEED (Both V1, V3, A1, A2)
-        // QE setSpeed often fails to ripple-edit duration for speedups, so we pre-resize above.
-        if (Math.abs(s.effective_speed - 1.0) > 0.01) {{
-          if (v3)
-            safeApplySpeedQE(startSec, s.effective_speed, 2, "Video", cleanName);
-          if (v1)
-            safeApplySpeedQE(startSec, s.effective_speed, 0, "Video", cleanName);
-          if (a1 && a1Item)
-            safeApplySpeedQE(startSec, s.effective_speed, 0, "Audio", cleanName);
-          if (a2 && a2Item && a2 !== a1)
-            safeApplySpeedQE(startSec, s.effective_speed, 1, "Audio", cleanName);
-        }}
-
-        // 4. APPLY SCALE (Standard API)
-        // Need to find the items we just placed.
-        if (v3) setScaleAndPosition(v3, startSec, 68); // Main Scaled Down
-        if (v1) setScaleAndPosition(v1, startSec, 183); // Background Scaled Up
-
-        sleep(200);
-        if (v3) {{
-          var v3ItemForLog = findTrackItemAtStart(v3, startSec, cleanName);
-          if (v3ItemForLog)
-            logClipDuration(v3ItemForLog, s.target_duration, "Scene " + s.scene_index);
-        }}
-      }}
-    }}
-
-    // --- V2: BORDER MOGRT ---
-    if (v2 && new File(BORDER_MOGRT_PATH).exists) {{
-      log("Adding Border Mogrt to V2...");
-      try {{
-        // Insert once at 0
-        var totalDuration =
-          scenes.length > 0 ? snapSecondsToFrame(scenes[scenes.length - 1].end) : 0;
-        if (totalDuration > 0) {{
-          var mgt = sequence.importMGT(BORDER_MOGRT_PATH, 0, 1, 0); // Index 1 starts V2 ?? Wait, numTracks test used sequence.videoTracks[1]?
-          // No, importMGT(path, time, videoTrackIndex, audioTrackIndex)
-          // The script previously used index 1.
-          if (mgt) {{
-            mgt.end = totalDuration;
-            log("Border Mogrt inserted. Duration: " + totalDuration);
-          }}
-        }}
-      }} catch (e) {{
-        log("Border Mogrt Error: " + e.message);
-      }}
-    }}
-
-    // --- IMPORT TTS (A2) & CLEANUP A3 ---
-    log("Importing TTS to A2...");
-    if (a2) {{
-      var ttsItem = getOrImportClip(AUDIO_FILENAME);
-      if (ttsItem) {{
-        a2.overwriteClip(ttsItem, 0);
-      }}
-    }}
-    // Cleanup all audio tracks except A1 and A2 (TTS)
-    cleanupAudioTracks(a2, 1, AUDIO_FILENAME);
-
-    // --- V4: SUBTITLES (Reserved) ---
-    // Subtitles will be added manually later.
-    // Logic removed as requested.
-
-    alert("Script Complete (v7 Layered - Fixes Applied).");
-  }}
-
-  // ========================================================================
-  // 4. HELPERS
-  // ========================================================================
-
-  function clearSelection(sequence) {{
-    if (!sequence) return;
-    try {{
-      var tracks = sequence.videoTracks;
-      for (var i = 0; i < tracks.numTracks; i++) {{
-        var track = tracks[i];
-        for (var j = 0; j < track.clips.numItems; j++) {{
-          track.clips[j].setSelected(false, true);
-        }}
-      }}
-      // Clear Audio as well if needed? Usually audio tracks are less prone to this crash but good practice.
-      // Skipping to save time/performance unless necessary.
-    }} catch (e) {{}}
-  }}
-
-  function safeApplySpeedQE(
-    startTime,
-    speed,
-    trackIndex,
-    trackType,
-    clipNameRef
-  ) {{
-    try {{
-      var qeSeq = qe.project.getActiveSequence();
-      if (!qeSeq) return;
-      var qeTrack;
-      if (trackType === "Audio") qeTrack = qeSeq.getAudioTrackAt(trackIndex);
-      else qeTrack = qeSeq.getVideoTrackAt(trackIndex);
-      if (!qeTrack) return;
-
-      // Search for the item with Name validation and Time tolerance
-      // Iterate ALL items to find the best match or correct item
-      for (var i = 0; i < qeTrack.numItems; i++) {{
-        try {{
-          var item = qeTrack.getItemAt(i);
-          // Defensive: access properties safely
-          if (!item || typeof item.start === "undefined") continue;
-
-          // Time Check using Ticks (Robust)
-          var startTicks = null;
-          // 1. Try Ticks (String or Number)
-          try {{
-            if (item.start.ticks !== undefined) {{
-              startTicks = parseInt(item.start.ticks, 10);
-            }}
-          }} catch (e0) {{}}
-
-          // 2. Fallback to Seconds
-          if (isNaN(startTicks) || startTicks === null) {{
-            try {{
-              if (typeof item.start.seconds === "number")
-                startTicks = secondsToTicks(item.start.seconds);
-              else if (typeof item.start.secs === "number")
-                startTicks = secondsToTicks(item.start.secs);
-            }} catch (e1) {{}}
-          }}
-
-          var matchTime = false;
-          if (typeof startTicks === "number" && !isNaN(startTicks)) {{
-            // Use relaxed tolerance (0.2s)
-            matchTime =
-              Math.abs(startTicks - secondsToTicks(startTime)) <
-              secondsToTicks(0.2);
-          }} else {{
-            // Last resort fallback
-            try {{
-              matchTime = Math.abs(item.start.secs - startTime) < 0.2;
-            }} catch (e3) {{}}
-          }}
-
-          if (matchTime) {{
-            // Name Check (if ref provided)
-            if (clipNameRef) {{
-              var itemName = item.name ? item.name.toString() : "";
-
-              // CRITICAL FIX: Ignore empty names which passed checks previously
-              if (itemName.replace(/\\s/g, "") === "") {{
-                // log("Skipping item with empty name at " + startTime);
-                continue;
-              }}
-
-              // Check if one contains the other (handle extensions)
-              // clipNameRef is "cleanName" (no extension). itemName might have extension.
-              // We need to be careful: "clip" vs "clip.mp4"
-              var match = false;
-
-              // 1. Exact or Substring match
-              if (itemName.indexOf(clipNameRef) !== -1) match = true;
-              if (clipNameRef.indexOf(itemName) !== -1) match = true;
-
-              if (!match) {{
-                // log("Skipping speed on mismatch: '" + itemName + "' vs '" + clipNameRef + "'");
-                continue;
-              }}
-            }}
-
-            try {{
-              // args: speed, stretch, reverse, ripple, flicker
-              item.setSpeed(speed, "", false, false, false);
-              // log("Speed Applied: " + (speed*100).toFixed(1) + "% to " + item.name + " at " + startTime);
-            }} catch (err) {{
-              log("Speed Apply Error: " + err.message);
-            }}
-            return; // Done
-          }}
-        }} catch (e) {{}} // Ignore individual item access errors
-      }}
-      log(
-        "Warning: Could not find clip at " +
-          startTime +
-          " (" +
-          clipNameRef +
-          ") for Speed change."
-      );
-    }} catch (e) {{
-      log("QE Speed Fail: " + e.message);
-    }}
-  }}
-
-  function setScaleAndPosition(track, startTime, scaleVal) {{
-    // Find item in Track (Standard API)
-    for (var i = 0; i < track.clips.numItems; i++) {{
-      var item = track.clips[i];
-      // Standard API timings are in seconds (usually) or ticks.
-      // item.start.seconds is available in 2025?
-      // Use ticks if needed, but 'seconds' property usually works.
-      var itemStartTicks = getStartTicks(item);
-      if (
-        (typeof itemStartTicks === "number" &&
-          Math.abs(itemStartTicks - secondsToTicks(startTime)) <
-            secondsToTicks(0.2)) ||
-        (item.start &&
-          typeof item.start.seconds === "number" &&
-          Math.abs(item.start.seconds - startTime) < 0.2)
-      ) {{
-        var m = item.components[1]; // Motion is usually index 1 (Opacity is 0 or 2?)
-        // Actually index varies. Search for "Motion" or "Trajectoire"
-        for (var c = 0; c < item.components.numItems; c++) {{
-          if (
-            item.components[c].displayName === "Motion" ||
-            item.components[c].displayName === "Trajectoire"
-          ) {{
-            m = item.components[c];
-            break;
-          }}
-        }}
-        if (m) {{
-          // Scale is usually prop 0 or 1.
-          // Position is usually prop 0. Scale prop 1.
-          // "Scale" or "Echelle"
-          for (var p = 0; p < m.properties.numItems; p++) {{
-            var prop = m.properties[p];
-            if (
-              prop.displayName === "Scale" ||
-              prop.displayName === "Echelle" ||
-              prop.displayName === "\\u00c9chelle"
-            ) {{
-              prop.setValue(scaleVal, true);
-              break;
-            }}
-          }}
-        }}
-        return;
-      }}
-    }}
-  }}
-
-  function ensureVideoTracks(sequence, desiredCount) {{
-    if (!sequence || !sequence.videoTracks) return;
-    var existing = sequence.videoTracks.numTracks;
-    if (existing >= desiredCount) return;
-
-    app.enableQE();
-    var qeSeq = qe.project.getActiveSequence();
-    if (!qeSeq) return;
-    var toAdd = desiredCount - existing;
-    try {{
-      // addTracks(videoCount, insertAfterVideoIdx, audioCount)
-      qeSeq.addTracks(toAdd, Math.max(0, existing - 1), 0);
-    }} catch (e) {{
-      // fallback
-      for (var i = 0; i < toAdd; i++) {{
-        try {{
-          qeSeq.addTracks(1, Math.max(0, existing - 1 + i), 0);
-        }} catch (e2) {{}}
-      }}
-    }}
-  }}
-
-  function ensureAudioTracks(sequence, desiredCount) {{
-    if (!sequence || !sequence.audioTracks) return;
-    var existing = sequence.audioTracks.numTracks;
-    if (existing >= desiredCount) return;
-
-    app.enableQE();
-    var qeSeq = qe.project.getActiveSequence();
-    if (!qeSeq) return;
-    var toAdd = desiredCount - existing;
-    try {{
-      // addTracks(video, insertAfterVideo, audio, insertAfterAudio)
-      qeSeq.addTracks(0, 0, toAdd, Math.max(0, existing - 1));
-    }} catch (e) {{
-      for (var i = 0; i < toAdd; i++) {{
-        try {{
-          qeSeq.addTracks(0);
-        }} catch (e2) {{}}
-      }}
-    }}
-  }}
-
-  function cleanupAudioTracks(ttsTrack, ttsTrackIndex, ttsName) {{
-    var seq = app.project.activeSequence;
-    if (!seq || !seq.audioTracks) return;
-    for (var i = 0; i < seq.audioTracks.numTracks; i++) {{
-      if (i === 0) continue; // keep A1
-      var track = seq.audioTracks[i];
-      if (!track || !track.clips) continue;
-      for (var j = track.clips.numItems - 1; j >= 0; j--) {{
-        var clip = track.clips[j];
-        var nm = clip && clip.projectItem ? clip.projectItem.name : "";
-        var keep = i === ttsTrackIndex && nm === ttsName;
-        if (!keep) {{
-          try {{
-            clip.remove(false, true);
-          }} catch (e1) {{
-            try {{
-              clip.remove();
-            }} catch (e2) {{}}
-          }}
-        }}
-      }}
-    }}
-  }}
-
-  main();
-}})();
-'''
-        return jsx_content
+        content = cls._replace_template_once(
+            content,
+            r"var scenes = \[[\s\S]*?\];",
+            "var scenes =\n" + scenes_json_indented + ";",
+            flags=re.MULTILINE,
+            label="scenes",
+        )
+        content = cls._replace_template_once(
+            content,
+            r"var SOURCE_FPS_NUM = \d+;",
+            f"var SOURCE_FPS_NUM = {source_fps_num};",
+            label="SOURCE_FPS_NUM",
+        )
+        content = cls._replace_template_once(
+            content,
+            r"var SOURCE_FPS_DEN = \d+;",
+            f"var SOURCE_FPS_DEN = {source_fps_den};",
+            label="SOURCE_FPS_DEN",
+        )
+        content = cls._replace_template_once(
+            content,
+            r'var MUSIC_FILENAME = "[^"]*";',
+            f'var MUSIC_FILENAME = "{cls._escape_js_string(music_filename)}";',
+            label="MUSIC_FILENAME",
+        )
+        content = cls._replace_template_once(
+            content,
+            r"var MUSIC_GAIN_DB = -?\d+(?:\.\d+)?;",
+            f"var MUSIC_GAIN_DB = {music_gain_db};",
+            label="MUSIC_GAIN_DB",
+        )
+        content = cls._replace_template_once(
+            content,
+            r'var SUBTITLE_SRT_PATH = ROOT_DIR \+ "[^"]*";',
+            f'var SUBTITLE_SRT_PATH = ROOT_DIR + "/{cls._escape_js_string(subtitle_filename)}";',
+            label="SUBTITLE_SRT_PATH",
+        )
+        content = cls._replace_template_once(
+            content,
+            r"var SUBTITLE_MOGRT_DIR = [^;]+;",
+            'var SUBTITLE_MOGRT_DIR = ROOT_DIR + "/subtitles";',
+            label="SUBTITLE_MOGRT_DIR",
+        )
+        return content
 
     @classmethod
     def generate_srt(
@@ -2006,9 +1361,36 @@ class ProcessingService:
                         source_fps = await cls.detect_video_fps(episode_path)
                         break  # Use first valid episode's FPS
 
-            # Step 4: Generate JSX script (v7.1 format - matching working_script.jsx)
+            srt_filename = ExportService.subtitle_filename(project)
+
+            # Resolve optional music settings for Premiere automation.
+            music_filename = ""
+            music_gain_db = -24.0
+            if project.music_key:
+                try:
+                    music = MusicConfigService.get_music(project.music_key)
+                except ValueError as exc:
+                    logger.warning("Unknown music key '%s': %s", project.music_key, exc)
+                else:
+                    music_path = Path(music.file_path)
+                    if music_path.exists():
+                        music_filename = music_path.name
+                        music_gain_db = float(music.volume_db)
+                    else:
+                        logger.warning(
+                            "Configured music file is missing on disk: %s",
+                            music_path,
+                        )
+
+            # Step 4: Generate JSX script from canonical v7.7 template
             jsx_content = cls.generate_jsx_script(
-                project, new_transcription, matches, source_fps=source_fps
+                project,
+                new_transcription,
+                matches,
+                source_fps=source_fps,
+                subtitle_filename=srt_filename,
+                music_filename=music_filename,
+                music_gain_db=music_gain_db,
             )
             jsx_path = output_dir / "import_project.jsx"
             jsx_path.write_text(jsx_content, encoding="utf-8")
@@ -2022,16 +1404,37 @@ class ProcessingService:
 
             # Step 4: Generate SRT subtitles (aggressive Hormozi style)
             srt_content = cls.generate_srt(new_transcription, language=new_transcription.language)
-            srt_filename = ExportService.subtitle_filename(project)
             srt_path = output_dir / srt_filename
             srt_path.write_text(srt_content, encoding="utf-8")
+
+            yield ProcessingProgress(
+                "processing",
+                "subtitle_mogrt_bake",
+                0.7,
+                "Baking subtitle MOGRT files...",
+            )
+
+            subtitle_template_path = Path(__file__).resolve().parents[3] / "assets" / "SPM_Anime_Subtitle.mogrt"
+            subtitles_output_dir = output_dir / "subtitles"
+            bake_result = PremiereSubtitleBakerService.bake_from_srt(
+                template_mogrt_path=subtitle_template_path,
+                srt_path=srt_path,
+                output_dir=subtitles_output_dir,
+            )
+            if bake_result.generated_count != bake_result.entries_count:
+                raise RuntimeError(
+                    "Subtitle MOGRT bake mismatch: "
+                    f"{bake_result.generated_count} generated for {bake_result.entries_count} SRT entries"
+                )
+            if bake_result.entries_count <= 0:
+                raise RuntimeError("Subtitle MOGRT bake produced no entries.")
 
             # Step 5: Generate title overlay images (if video_overlay is set)
             if project.video_overlay and project.video_overlay.get("title"):
                 yield ProcessingProgress(
                     "processing",
                     "overlay_image_generation",
-                    0.8,
+                    0.82,
                     "Generating title overlay images...",
                 )
                 from .title_image_generator import TitleImageGeneratorService
@@ -2054,7 +1457,7 @@ class ProcessingService:
                 yield ProcessingProgress(
                     "processing",
                     "overlay_image_generation",
-                    0.8,
+                    0.82,
                     "Skipping title overlay image generation (no overlay configured)",
                 )
 
