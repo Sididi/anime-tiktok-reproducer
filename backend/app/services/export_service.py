@@ -29,6 +29,7 @@ class ExportService:
         "White border 10px.mogrt",
         "SPM Anime Background.prfpset",
         "SPM Anime Foreground.prfpset",
+        "SPM Anime Category Title.prfpset",
     )
     _LANG_TO_LOCALE = {
         "fr": "fr_FR",

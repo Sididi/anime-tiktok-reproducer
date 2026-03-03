@@ -66,6 +66,41 @@ class PreviewBuildRequest(BaseModel):
     music_key: str | None = None
 
 
+def _notify_drive_upload_complete(project_id: str, folder_url: str) -> None:
+    """
+    Best-effort Discord notification executed outside request critical path.
+
+    This must never raise, otherwise it can leak task exceptions.
+    """
+    try:
+        project = ProjectService.load(project_id)
+        if not project:
+            return
+
+        if project.generation_discord_message_id:
+            try:
+                DiscordService.delete_message(project.generation_discord_message_id)
+            except Exception:
+                pass
+            project.generation_discord_message_id = None
+
+        anime_title = project.anime_name or "Inconnu"
+        discord_message = DiscordService.post_message(
+            "\n".join(
+                [
+                    f"**{anime_title}**: Génération terminée pour le projet `{project.id}`.",
+                    f"Dossier Google Drive: <{folder_url}>",
+                ]
+            )
+        )
+        if discord_message:
+            project.generation_discord_message_id = discord_message.id
+        ProjectService.save(project)
+    except Exception:
+        # Notification must not impact API completion semantics.
+        pass
+
+
 async def _write_upload_to_path(upload: UploadFile, destination: Path) -> None:
     """Stream uploaded file to disk in chunks."""
     with destination.open("wb") as out:
@@ -684,27 +719,16 @@ async def upload_to_gdrive(project_id: str):
             project.drive_folder_url = result["folder_url"]
             ProjectService.save(project)
 
-            try:
-                if project.generation_discord_message_id:
-                    DiscordService.delete_message(project.generation_discord_message_id)
-                    project.generation_discord_message_id = None
-
-                anime_title = project.anime_name or "Inconnu"
-                discord_message = DiscordService.post_message(
-                    "\n".join(
-                        [
-                            f"**{anime_title}**: Génération terminée pour le projet `{project.id}`.",
-                            f"Dossier Google Drive: <{result['folder_url']}>",
-                        ]
-                    )
-                )
-                if discord_message:
-                    project.generation_discord_message_id = discord_message.id
-                ProjectService.save(project)
-            except Exception:
-                pass
-
             yield f"data: {json.dumps({'status': 'complete', 'step': 'gdrive', 'progress': 1.0, 'message': 'Upload complete', 'folder_url': result['folder_url'], 'folder_id': result['folder_id']})}\n\n"
+
+            # Do not block SSE completion on webhook network calls.
+            asyncio.create_task(
+                asyncio.to_thread(
+                    _notify_drive_upload_complete,
+                    project_id,
+                    result["folder_url"],
+                )
+            )
         except Exception as exc:
             yield f"data: {json.dumps({'status': 'error', 'step': 'gdrive', 'progress': 0.0, 'error': str(exc), 'message': 'Drive upload failed'})}\n\n"
 

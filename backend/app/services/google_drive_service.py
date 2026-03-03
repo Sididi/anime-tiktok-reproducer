@@ -16,6 +16,7 @@ from ..config import settings
 
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
+FORCE_BINARY_UPLOAD_SUFFIXES = {".sqpreset", ".prfpset", ".mogrt"}
 
 
 def _escape_query_value(s: str) -> str:
@@ -245,7 +246,11 @@ class GoogleDriveService:
         drive=None,
     ) -> dict[str, Any]:
         drive = drive or cls._client()
-        mime, _ = mimetypes.guess_type(str(local_path))
+        suffix = local_path.suffix.lower()
+        if suffix in FORCE_BINARY_UPLOAD_SUFFIXES:
+            mime = "application/octet-stream"
+        else:
+            mime, _ = mimetypes.guess_type(str(local_path))
         file_size = local_path.stat().st_size
         resumable = file_size > cls._SMALL_FILE_BYTES
         media = MediaFileUpload(

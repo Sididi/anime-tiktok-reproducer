@@ -29,6 +29,9 @@
   var FOREGROUND_PRESET_NAME = "SPM Anime Foreground";
   var FOREGROUND_PRESET_FILE_PATH =
     ASSETS_DIR + "/" + FOREGROUND_PRESET_NAME + ".prfpset";
+  var CATEGORY_TITLE_PRESET_NAME = "SPM Anime Category Title";
+  var CATEGORY_TITLE_PRESET_FILE_PATH =
+    ASSETS_DIR + "/" + CATEGORY_TITLE_PRESET_NAME + ".prfpset";
   var SUBTITLE_MOGRT_DIR = ROOT_DIR + "/subtitles";
   var SUBTITLE_SRT_PATH = ROOT_DIR + "/subtitles.srt";
 
@@ -127,6 +130,65 @@
     ".aiff": true,
     ".aif": true,
   };
+  var PERF_PROFILE_ENABLED = true;
+  var PERF_LOG_EACH_SUBTITLE_BATCH = 20;
+  var ENABLE_IMPORTMGT_SECONDS_FALLBACK = true;
+  var MUTATE_TRANSIENT_A2_SCENE_AUDIO = false;
+  var PERF_TIMERS = {};
+  var PERF_PHASE_TOTALS = {};
+  var QE_TRACK_RESOLVE_CACHE = {};
+  var QE_TRACK_ITEM_HINTS = {};
+
+  function perfNowMs() {
+    return new Date().getTime();
+  }
+
+  function perfStart(key) {
+    if (!PERF_PROFILE_ENABLED || !key) return;
+    PERF_TIMERS[key] = perfNowMs();
+  }
+
+  function perfEnd(key, label) {
+    if (!PERF_PROFILE_ENABLED || !key) return 0;
+    var start = PERF_TIMERS[key];
+    if (typeof start !== "number") return 0;
+    var elapsed = perfNowMs() - start;
+    delete PERF_TIMERS[key];
+
+    if (PERF_PHASE_TOTALS[key] === undefined) PERF_PHASE_TOTALS[key] = 0;
+    PERF_PHASE_TOTALS[key] += elapsed;
+    if (label) {
+      log("[PERF] " + label + ": " + elapsed + " ms");
+    }
+    return elapsed;
+  }
+
+  function perfLogSummary() {
+    if (!PERF_PROFILE_ENABLED) return;
+    var order = [
+      "total",
+      "purge",
+      "preload",
+      "scenes",
+      "scenes_placement",
+      "scenes_speed",
+      "scenes_scale",
+      "music",
+      "presets",
+      "presets_v1",
+      "presets_v3",
+      "presets_v5",
+      "subtitles",
+    ];
+    log("----- PERF SUMMARY -----");
+    for (var i = 0; i < order.length; i++) {
+      var k = order[i];
+      if (PERF_PHASE_TOTALS[k] !== undefined) {
+        log("[PERF] " + k + ": " + PERF_PHASE_TOTALS[k] + " ms");
+      }
+    }
+    log("------------------------");
+  }
 
   function snapSecondsToFrame(sec) {
     // Add small epsilon to prevent floating-point rounding errors
@@ -379,6 +441,30 @@
     return findTrackItemAtStart(track, startSeconds, nameRef);
   }
 
+  function resolvePlacedItemFast(track, startSeconds, nameRef, maxWaitMs) {
+    if (!track || !track.clips || track.clips.numItems <= 0) {
+      return waitForTrackItemAtStart(track, startSeconds, nameRef, maxWaitMs);
+    }
+    var targetTicks = secondsToTicks(startSeconds);
+    var toleranceTicks = secondsToTicks(0.2);
+    var lastIdx = track.clips.numItems - 1;
+
+    var lastItem = track.clips[lastIdx];
+    if (isTrackItemMatch(lastItem, targetTicks, toleranceTicks, nameRef)) {
+      return lastItem;
+    }
+
+    var tailWindow = 8;
+    var stopIdx = Math.max(0, lastIdx - tailWindow + 1);
+    for (var i = lastIdx - 1; i >= stopIdx; i--) {
+      var item = track.clips[i];
+      if (isTrackItemMatch(item, targetTicks, toleranceTicks, nameRef)) {
+        return item;
+      }
+    }
+    return waitForTrackItemAtStart(track, startSeconds, nameRef, maxWaitMs);
+  }
+
   function setTrackItemInOutFromItem(
     item,
     inSeconds,
@@ -582,6 +668,136 @@
     return findInBin(app.project.rootItem);
   }
 
+  function resolveClipFilePath(cleanName, nameNoExt) {
+    var searchPaths = [
+      ROOT_DIR + "/" + cleanName,
+      ROOT_DIR + "/" + nameNoExt,
+      ROOT_DIR + "/" + cleanName + ".wav",
+      SOURCES_DIR + "/" + cleanName,
+      SOURCES_DIR + "/" + nameNoExt,
+      SOURCES_DIR + "/" + nameNoExt + ".mkv",
+      SOURCES_DIR + "/" + nameNoExt + ".mp4",
+      SOURCES_DIR + "/" + nameNoExt + ".mov",
+      SOURCES_DIR + "/" + nameNoExt + ".avi",
+      SOURCES_DIR + "/" + nameNoExt + ".webm",
+      SOURCES_DIR + "/" + nameNoExt + ".m4v",
+      SOURCES_DIR + "/" + nameNoExt + ".wav",
+      SOURCES_DIR + "/" + nameNoExt + ".mp3",
+    ];
+    for (var i = 0; i < searchPaths.length; i++) {
+      var f = new File(searchPaths[i]);
+      if (f.exists) return f;
+    }
+    return null;
+  }
+
+  function hasProjectItemForName(name) {
+    if (!name) return false;
+    var cleanName = name.toString().replace(/^\s+|\s+$/g, "");
+    if (!cleanName) return false;
+    var nameNoExt = stripKnownExtension(cleanName);
+    return !!(
+      getCachedProjectItem(cleanName) || getCachedProjectItem(nameNoExt)
+    );
+  }
+
+  function preloadProjectItemsBatch(nameMap) {
+    var stats = {
+      requested: 0,
+      importBatchCount: 0,
+      resolved: 0,
+      unresolved: 0,
+    };
+    if (!nameMap) return stats;
+
+    var pending = [];
+    var importPaths = [];
+    var seenPaths = {};
+
+    for (var nm in nameMap) {
+      if (!nameMap.hasOwnProperty(nm)) continue;
+      stats.requested++;
+      var cleanName = nm.toString().replace(/^\s+|\s+$/g, "");
+      var nameNoExt = stripKnownExtension(cleanName);
+
+      var item =
+        getCachedProjectItem(cleanName) ||
+        getCachedProjectItem(nameNoExt) ||
+        findProjectItem(cleanName) ||
+        findProjectItem(nameNoExt) ||
+        findProjectItemLoose(cleanName) ||
+        findProjectItemLoose(nameNoExt);
+      if (item) {
+        cacheProjectItem(item);
+        cacheProjectItemByName(cleanName, item);
+        cacheProjectItemByName(nameNoExt, item);
+        stats.resolved++;
+        continue;
+      }
+
+      var f = resolveClipFilePath(cleanName, nameNoExt);
+      if (!f) {
+        stats.unresolved++;
+        continue;
+      }
+
+      pending.push({
+        cleanName: cleanName,
+        nameNoExt: nameNoExt,
+        fileName: f.name,
+        displayName: f.displayName,
+      });
+
+      if (!seenPaths[f.fsName]) {
+        seenPaths[f.fsName] = true;
+        importPaths.push(f.fsName);
+      }
+    }
+
+    if (importPaths.length > 0) {
+      app.project.importFiles(importPaths, true, app.project.rootItem, false);
+      stats.importBatchCount = importPaths.length;
+    }
+
+    // Re-cache once after batch import for faster lookups.
+    PROJECT_ITEM_CACHE_WARMED = false;
+    warmProjectItemCache();
+
+    for (var i = 0; i < pending.length; i++) {
+      var p = pending[i];
+      var item = null;
+      var retries = 0;
+      while (!item && retries < 4) {
+        item =
+          getCachedProjectItem(p.cleanName) ||
+          getCachedProjectItem(p.nameNoExt) ||
+          findProjectItem(p.fileName) ||
+          findProjectItem(p.displayName) ||
+          findProjectItem(p.cleanName) ||
+          findProjectItem(p.nameNoExt) ||
+          findProjectItem(stripKnownExtension(p.fileName)) ||
+          findProjectItemLoose(p.fileName) ||
+          findProjectItemLoose(p.displayName) ||
+          findProjectItemLoose(p.cleanName) ||
+          findProjectItemLoose(p.nameNoExt);
+        if (!item) {
+          sleep(20);
+          retries++;
+        }
+      }
+      if (item) {
+        cacheProjectItem(item);
+        cacheProjectItemByName(p.cleanName, item);
+        cacheProjectItemByName(p.nameNoExt, item);
+        stats.resolved++;
+      } else {
+        stats.unresolved++;
+      }
+    }
+
+    return stats;
+  }
+
   function getOrImportClip(clipName) {
     var cleanName = clipName.replace(/^\s+|\s+$/g, "");
     var nameNoExt = stripKnownExtension(cleanName);
@@ -600,49 +816,31 @@
     item = findProjectItemLoose(nameNoExt);
     if (item) return item;
 
-    var searchPaths = [
-      ROOT_DIR + "/" + cleanName,
-      ROOT_DIR + "/" + nameNoExt,
-      ROOT_DIR + "/" + cleanName + ".wav",
-      SOURCES_DIR + "/" + cleanName,
-      SOURCES_DIR + "/" + nameNoExt,
-      SOURCES_DIR + "/" + nameNoExt + ".mkv",
-      SOURCES_DIR + "/" + nameNoExt + ".mp4",
-      SOURCES_DIR + "/" + nameNoExt + ".mov",
-      SOURCES_DIR + "/" + nameNoExt + ".avi",
-      SOURCES_DIR + "/" + nameNoExt + ".webm",
-      SOURCES_DIR + "/" + nameNoExt + ".m4v",
-      SOURCES_DIR + "/" + nameNoExt + ".wav",
-      SOURCES_DIR + "/" + nameNoExt + ".mp3",
-    ];
-
-    for (var i = 0; i < searchPaths.length; i++) {
-      var f = new File(searchPaths[i]);
-      if (f.exists) {
-        app.project.importFiles([f.fsName], true, app.project.rootItem, false);
-        // Small bounded retry; import indexing can be async.
-        var retries = 0;
-        while (!item && retries < 8) {
-          item = findProjectItem(f.name);
-          if (!item) item = findProjectItem(f.displayName);
-          if (!item) item = findProjectItem(nameNoExt);
-          if (!item) item = findProjectItem(stripKnownExtension(f.name));
-          if (!item) item = findProjectItemLoose(f.name);
-          if (!item) item = findProjectItemLoose(f.displayName);
-          if (!item) item = findProjectItemLoose(cleanName);
-          if (!item) item = findProjectItemLoose(nameNoExt);
-          if (!item) {
-            sleep(40);
-            retries++;
-          }
+    var f = resolveClipFilePath(cleanName, nameNoExt);
+    if (f) {
+      app.project.importFiles([f.fsName], true, app.project.rootItem, false);
+      // Small bounded retry; import indexing can be async.
+      var retries = 0;
+      while (!item && retries < 8) {
+        item = findProjectItem(f.name);
+        if (!item) item = findProjectItem(f.displayName);
+        if (!item) item = findProjectItem(nameNoExt);
+        if (!item) item = findProjectItem(stripKnownExtension(f.name));
+        if (!item) item = findProjectItemLoose(f.name);
+        if (!item) item = findProjectItemLoose(f.displayName);
+        if (!item) item = findProjectItemLoose(cleanName);
+        if (!item) item = findProjectItemLoose(nameNoExt);
+        if (!item) {
+          sleep(40);
+          retries++;
         }
-        if (item) {
-          cacheProjectItem(item);
-          cacheProjectItemByName(cleanName, item);
-          cacheProjectItemByName(nameNoExt, item);
-        }
-        return item;
       }
+      if (item) {
+        cacheProjectItem(item);
+        cacheProjectItemByName(cleanName, item);
+        cacheProjectItemByName(nameNoExt, item);
+      }
+      return item;
     }
     log("Error: Clip not found: " + cleanName);
     return null;
@@ -652,16 +850,25 @@
   // 3. MAIN LOGIC
   // ========================================================================
   function main() {
+    PERF_TIMERS = {};
+    PERF_PHASE_TOTALS = {};
+    QE_TRACK_RESOLVE_CACHE = {};
+    QE_TRACK_ITEM_HINTS = {};
+    perfStart("total");
+
     app.enableQE();
     if (!app.project) {
       alert("Open a project.");
       return;
     }
     log("Purging project to start fresh...");
+    perfStart("purge");
     if (!purgeProjectCompletely()) {
+      perfEnd("purge", "Purge");
       alert("Error: Could not fully purge the project. Aborting.");
       return;
     }
+    perfEnd("purge", "Purge");
 
     var seqName = "ATR_Layered_" + Math.floor(Math.random() * 9999);
     var presetFile = new File(SEQUENCE_PRESET_PATH);
@@ -677,6 +884,11 @@
     // --- ENSURE TRACKS (V=6, A=3) ---
     ensureVideoTracks(sequence, 6);
     ensureAudioTracks(sequence, 3);
+    var qeSeq = null;
+    try {
+      qeSeq = qe.project.getActiveSequence();
+    } catch (eQe) {}
+    var qeTrackCache = {};
 
     // Mapping Tracks
     // V1: Index 0 (Back)
@@ -711,6 +923,7 @@
     } catch (e) {}
 
     // Warm cache once, then preload only the source clips we will use.
+    perfStart("preload");
     warmProjectItemCache();
     var preloadNames = {};
     for (var i = 0; i < scenes.length; i++) {
@@ -722,11 +935,28 @@
     if (trimSpaces(MUSIC_FILENAME) !== "") {
       preloadNames[MUSIC_FILENAME] = true;
     }
+    var preloadStats = preloadProjectItemsBatch(preloadNames);
     for (var preloadName in preloadNames) {
       if (preloadNames.hasOwnProperty(preloadName)) {
-        getOrImportClip(preloadName);
+        if (!hasProjectItemForName(preloadName)) {
+          getOrImportClip(preloadName);
+        }
       }
     }
+    if (PERF_PROFILE_ENABLED) {
+      log(
+        "[PERF] Preload batch: requested " +
+          preloadStats.requested +
+          ", imported " +
+          preloadStats.importBatchCount +
+          ", resolved " +
+          preloadStats.resolved +
+          ", unresolved " +
+          preloadStats.unresolved +
+          ".",
+      );
+    }
+    perfEnd("preload", "Preload");
 
     // --- MARKERS ---
     log("Creating Markers...");
@@ -741,6 +971,7 @@
     // --- INTERLEAVED PROCESSING (V1 & V3) ---
     // V1 (Background) & V3 (Main)
     log("Processing Scenes (Layering & Speed)...");
+    perfStart("scenes");
     var nameCleaner = function (n) {
       return stripKnownExtension(n);
     }; // Helper
@@ -752,6 +983,7 @@
       var cleanName = nameCleaner(s.clipName);
 
       if (clip) {
+        perfStart("scenes_placement");
         // 1. PLACE ON V3 (Main)
         if (v3) v3.overwriteClip(clip, startSec);
 
@@ -764,7 +996,7 @@
         var a1Item = null;
         var a2Item = null;
         if (v3) {
-          v3Item = waitForTrackItemAtStart(
+          v3Item = resolvePlacedItemFast(
             v3,
             startSec,
             cleanName,
@@ -779,7 +1011,7 @@
           );
         }
         if (v1) {
-          v1Item = waitForTrackItemAtStart(
+          v1Item = resolvePlacedItemFast(
             v1,
             startSec,
             cleanName,
@@ -794,7 +1026,7 @@
           );
         }
         if (a1) {
-          a1Item = waitForTrackItemAtStart(
+          a1Item = resolvePlacedItemFast(
             a1,
             startSec,
             cleanName,
@@ -808,8 +1040,8 @@
             s.source_out_frame,
           );
         }
-        if (a2 && a2 !== a1) {
-          a2Item = waitForTrackItemAtStart(
+        if (MUTATE_TRANSIENT_A2_SCENE_AUDIO && a2 && a2 !== a1) {
+          a2Item = resolvePlacedItemFast(
             a2,
             startSec,
             cleanName,
@@ -823,6 +1055,7 @@
             s.source_out_frame,
           );
         }
+        perfEnd("scenes_placement");
 
         // 3. ENFORCE DURATION (ALL SPEEDS)
         // Always enforce the target timeline duration, even at 1.0x.
@@ -833,11 +1066,14 @@
         enforceTrackItemDuration(v3Item, newDurationSeconds);
         enforceTrackItemDuration(v1Item, newDurationSeconds);
         enforceTrackItemDuration(a1Item, newDurationSeconds);
-        enforceTrackItemDuration(a2Item, newDurationSeconds);
+        if (MUTATE_TRANSIENT_A2_SCENE_AUDIO) {
+          enforceTrackItemDuration(a2Item, newDurationSeconds);
+        }
 
         // 4. APPLY SPEED (Both V1, V3, A1, A2)
         // QE setSpeed often fails to ripple-edit duration for speedups, so we pre-resize above.
         if (Math.abs(s.effective_speed - 1.0) > 0.01) {
+          perfStart("scenes_speed");
           if (v3)
             safeApplySpeedQE(
               startSec,
@@ -846,6 +1082,9 @@
               "Video",
               cleanName,
               sequence,
+              qeSeq,
+              qeTrackCache,
+              QE_TRACK_ITEM_HINTS,
             );
           if (v1)
             safeApplySpeedQE(
@@ -855,6 +1094,9 @@
               "Video",
               cleanName,
               sequence,
+              qeSeq,
+              qeTrackCache,
+              QE_TRACK_ITEM_HINTS,
             );
           if (a1 && a1Item)
             safeApplySpeedQE(
@@ -864,8 +1106,11 @@
               "Audio",
               cleanName,
               sequence,
+              qeSeq,
+              qeTrackCache,
+              QE_TRACK_ITEM_HINTS,
             );
-          if (a2 && a2Item && a2 !== a1)
+          if (MUTATE_TRANSIENT_A2_SCENE_AUDIO && a2 && a2Item && a2 !== a1)
             safeApplySpeedQE(
               startSec,
               s.effective_speed,
@@ -873,14 +1118,20 @@
               "Audio",
               cleanName,
               sequence,
+              qeSeq,
+              qeTrackCache,
+              QE_TRACK_ITEM_HINTS,
             );
+          perfEnd("scenes_speed");
         }
 
         // 4. APPLY SCALE (Standard API)
+        perfStart("scenes_scale");
         if (!setScaleOnItem(v3Item, 75) && v3)
           setScaleAndPosition(v3, startSec, 75); // Main Scaled Down
         if (!setScaleOnItem(v1Item, 183) && v1)
           setScaleAndPosition(v1, startSec, 183); // Background Scaled Up
+        perfEnd("scenes_scale");
 
         if (v3Item) {
           logClipDuration(v3Item, s.target_duration, "Scene " + s.scene_index);
@@ -896,6 +1147,7 @@
         }
       }
     }
+    perfEnd("scenes", "Scenes");
 
     // --- V2: BORDER MOGRT ---
     if (v2 && new File(BORDER_MOGRT_PATH).exists) {
@@ -934,8 +1186,8 @@
 
     var ttsNameNoExt = stripKnownExtension(AUDIO_FILENAME);
     var ttsTrackItem =
-      waitForTrackItemAtStart(a2, 0, ttsNameNoExt, TRACK_ITEM_WAIT_MAX_MS) ||
-      waitForTrackItemAtStart(a2, 0, AUDIO_FILENAME, TRACK_ITEM_WAIT_MAX_MS) ||
+      resolvePlacedItemFast(a2, 0, ttsNameNoExt, TRACK_ITEM_WAIT_MAX_MS) ||
+      resolvePlacedItemFast(a2, 0, AUDIO_FILENAME, TRACK_ITEM_WAIT_MAX_MS) ||
       findTrackItemAtStart(a2, 0, null);
     var ttsEndSec = ttsTrackItem ? getTrackItemEndSeconds(ttsTrackItem) : null;
     if (typeof ttsEndSec !== "number" || !(ttsEndSec > 0)) {
@@ -967,10 +1219,12 @@
               musicFilenameTrimmed +
               "' not found. Skipping music bed.",
           );
-        } else if (
-          !buildLoopedMusicBed(a3, musicItem, ttsEndSec, MUSIC_GAIN_DB)
-        ) {
-          log("Warning: Could not fully build looped music bed.");
+        } else {
+          perfStart("music");
+          if (!buildLoopedMusicBed(a3, musicItem, ttsEndSec, MUSIC_GAIN_DB)) {
+            log("Warning: Could not fully build looped music bed.");
+          }
+          perfEnd("music", "Music");
         }
       }
     } else {
@@ -978,27 +1232,52 @@
     }
 
     // --- APPLY VIDEO PRESETS ---
+    perfStart("presets");
     log("Applying Background preset on V1...");
+    perfStart("presets_v1");
     applyVideoPresetToTrackItems(
       0,
       BACKGROUND_PRESET_NAME,
       BACKGROUND_PRESET_FILE_PATH,
+      qeSeq,
+      QE_TRACK_RESOLVE_CACHE,
     );
+    perfEnd("presets_v1");
     log("Applying Foreground preset on V3...");
+    perfStart("presets_v3");
     applyVideoPresetToTrackItems(
       2,
       FOREGROUND_PRESET_NAME,
       FOREGROUND_PRESET_FILE_PATH,
+      qeSeq,
+      QE_TRACK_RESOLVE_CACHE,
     );
+    perfEnd("presets_v3");
+    log("Applying Category Title preset on V5...");
+    perfStart("presets_v5");
+    applyVideoPresetToTrackItems(
+      4,
+      CATEGORY_TITLE_PRESET_NAME,
+      CATEGORY_TITLE_PRESET_FILE_PATH,
+      qeSeq,
+      QE_TRACK_RESOLVE_CACHE,
+    );
+    perfEnd("presets_v5");
+    perfEnd("presets", "Presets");
 
     // --- V4: SUBTITLES (SRT timings + external MOGRT files) ---
     log("Loading subtitle MOGRT files to V4...");
+    perfStart("subtitles");
     importSubtitleMogrtsFromFolder(
       sequence,
       3,
       SUBTITLE_MOGRT_DIR,
       SUBTITLE_SRT_PATH,
+      ENABLE_IMPORTMGT_SECONDS_FALLBACK,
     );
+    perfEnd("subtitles", "Subtitles");
+    perfEnd("total");
+    perfLogSummary();
 
     alert(
       "Script Complete (v7.7 Layered - Presets + External Subtitle MOGRTs).",
@@ -1138,6 +1417,7 @@
     videoTrackIndex,
     subtitleDirPath,
     srtPath,
+    enableSecondsFallback,
   ) {
     var stats = {
       timings: 0,
@@ -1196,34 +1476,43 @@
       );
     }
 
+    var pairs = [];
     for (var k = 0; k < pairCount; k++) {
       var entry = entries[k];
       var mogrtFile = mogrtFiles[k];
-      if (!mogrtFile || !mogrtFile.exists) {
-        stats.insertFailed++;
-        continue;
-      }
-
       var startSec = snapSecondsToFrame(entry.start);
       var endSec = snapSecondsToFrame(entry.end);
       if (endSec <= startSec) {
         endSec = snapSecondsToFrame(startSec + 1 / SEQ_FPS);
       }
+      pairs.push({
+        idx: k + 1,
+        mogrtPath: mogrtFile.fsName,
+        startSec: startSec,
+        startTicksStr: secondsToTicks(startSec).toString(),
+        endSec: endSec,
+        endTimeObj: buildSequenceTimeFromSeconds(endSec),
+      });
+    }
+
+    var useSecondsFallback = enableSecondsFallback !== false;
+    for (var p = 0; p < pairs.length; p++) {
+      var pair = pairs[p];
 
       var mogrtItem = null;
       try {
         mogrtItem = sequence.importMGT(
-          mogrtFile.fsName,
-          secondsToTicks(startSec).toString(),
+          pair.mogrtPath,
+          pair.startTicksStr,
           videoTrackIndex,
           0,
         );
       } catch (e0) {}
-      if (!mogrtItem) {
+      if (!mogrtItem && useSecondsFallback) {
         try {
           mogrtItem = sequence.importMGT(
-            mogrtFile.fsName,
-            startSec,
+            pair.mogrtPath,
+            pair.startSec,
             videoTrackIndex,
             0,
           );
@@ -1236,11 +1525,29 @@
 
       stats.inserted++;
       try {
-        mogrtItem.end = endSec;
+        mogrtItem.end = pair.endTimeObj;
       } catch (e2) {
         try {
-          mogrtItem.end = buildSequenceTimeFromSeconds(endSec);
+          mogrtItem.end = pair.endSec;
         } catch (e3) {}
+      }
+
+      if (
+        PERF_PROFILE_ENABLED &&
+        PERF_LOG_EACH_SUBTITLE_BATCH > 0 &&
+        ((p + 1) % PERF_LOG_EACH_SUBTITLE_BATCH === 0 || p === pairs.length - 1)
+      ) {
+        log(
+          "[PERF] Subtitles progress: " +
+            (p + 1) +
+            "/" +
+            pairs.length +
+            " (inserted " +
+            stats.inserted +
+            ", failed " +
+            stats.insertFailed +
+            ").",
+        );
       }
     }
 
@@ -1280,6 +1587,31 @@
     } catch (e) {}
   }
 
+  function getQETrackCacheKey(trackType, trackIndex) {
+    return (trackType === "Audio" ? "A" : "V") + ":" + trackIndex;
+  }
+
+  function getCachedQETrack(qeSeq, trackType, trackIndex, qeTrackCache) {
+    var key = getQETrackCacheKey(trackType, trackIndex);
+    var cache = qeTrackCache || {};
+    var cached = cache[key];
+    if (cached) {
+      try {
+        var _ = cached.numItems;
+        return cached;
+      } catch (e0) {
+        cache[key] = null;
+      }
+    }
+    var track = null;
+    try {
+      if (trackType === "Audio") track = qeSeq.getAudioTrackAt(trackIndex);
+      else track = qeSeq.getVideoTrackAt(trackIndex);
+    } catch (e1) {}
+    if (track) cache[key] = track;
+    return track;
+  }
+
   function safeApplySpeedQE(
     startTime,
     speed,
@@ -1287,96 +1619,116 @@
     trackType,
     clipNameRef,
     sequence,
+    qeSeq,
+    qeTrackCache,
+    qeHints,
   ) {
     try {
-      var qeSeq = qe.project.getActiveSequence();
+      if (!qeSeq) {
+        qeSeq = qe.project.getActiveSequence();
+      }
       if (!qeSeq) return false;
-      var qeTrack;
-      if (trackType === "Audio") qeTrack = qeSeq.getAudioTrackAt(trackIndex);
-      else qeTrack = qeSeq.getVideoTrackAt(trackIndex);
+      var qeTrack = getCachedQETrack(
+        qeSeq,
+        trackType,
+        trackIndex,
+        qeTrackCache,
+      );
       if (!qeTrack) return false;
 
       var targetTicks = secondsToTicks(startTime);
       var toleranceTicks = secondsToTicks(0.2);
       var retriedAfterReset = false;
+      var hintMap = qeHints || {};
+      var hintKey = getQETrackCacheKey(trackType, trackIndex);
 
-      // Search for the item with Name validation and Time tolerance
-      // Iterate ALL items to find the best match or correct item
+      var itemMatches = function (item) {
+        if (!item || typeof item.start === "undefined") return false;
+        var startTicks = getQEItemStartTicks(item);
+        var matchTime = false;
+
+        if (typeof startTicks === "number" && !isNaN(startTicks)) {
+          matchTime = Math.abs(startTicks - targetTicks) < toleranceTicks;
+        } else {
+          try {
+            matchTime = Math.abs(item.start.secs - startTime) < 0.2;
+          } catch (e0) {
+            matchTime = false;
+          }
+        }
+        if (!matchTime) return false;
+
+        if (clipNameRef) {
+          var itemName = item.name ? item.name.toString() : "";
+          if (!isItemNameMatch(itemName, clipNameRef)) return false;
+        }
+        return true;
+      };
+
+      var applyOnItem = function (item, idx) {
+        try {
+          // args: speed, stretch, reverse, ripple, flicker
+          item.setSpeed(speed, "", false, false, false);
+          hintMap[hintKey] = idx;
+          return true;
+        } catch (err) {
+          var errMsg = err && err.message ? err.message.toString() : "";
+          if (
+            !retriedAfterReset &&
+            errMsg.toLowerCase().indexOf("invalid trackitem") !== -1
+          ) {
+            retriedAfterReset = true;
+            clearSelection(sequence || app.project.activeSequence, false);
+            sleep(SPEED_RETRY_WAIT_MS);
+            try {
+              item.setSpeed(speed, "", false, false, false);
+              hintMap[hintKey] = idx;
+              return true;
+            } catch (err2) {
+              log(
+                "Speed Apply Retry Error: " +
+                  (err2 && err2.message ? err2.message : err2),
+              );
+            }
+          } else {
+            log("Speed Apply Error: " + errMsg);
+          }
+        }
+        return false;
+      };
+
+      var hintIdx = hintMap[hintKey];
+      if (
+        typeof hintIdx === "number" &&
+        hintIdx >= 0 &&
+        hintIdx < qeTrack.numItems
+      ) {
+        try {
+          var hinted = qeTrack.getItemAt(hintIdx);
+          if (itemMatches(hinted)) {
+            return applyOnItem(hinted, hintIdx);
+          }
+        } catch (eHint) {}
+      }
+
+      var tailWindow = 12;
+      var startIdx = qeTrack.numItems - 1;
+      var stopIdx = Math.max(0, startIdx - tailWindow + 1);
+      for (var ti = startIdx; ti >= stopIdx; ti--) {
+        try {
+          var tailItem = qeTrack.getItemAt(ti);
+          if (!itemMatches(tailItem)) continue;
+          return applyOnItem(tailItem, ti);
+        } catch (eTail) {}
+      }
+
+      // Full fallback search.
       for (var i = qeTrack.numItems - 1; i >= 0; i--) {
         try {
           var item = qeTrack.getItemAt(i);
-          // Defensive: access properties safely
-          if (!item || typeof item.start === "undefined") continue;
-
-          // Time Check using Ticks (Robust)
-          var startTicks = null;
-          // 1. Try Ticks (String or Number)
-          try {
-            if (item.start.ticks !== undefined) {
-              startTicks = parseInt(item.start.ticks, 10);
-            }
-          } catch (e0) {}
-
-          // 2. Fallback to Seconds
-          if (isNaN(startTicks) || startTicks === null) {
-            try {
-              if (typeof item.start.seconds === "number")
-                startTicks = secondsToTicks(item.start.seconds);
-              else if (typeof item.start.secs === "number")
-                startTicks = secondsToTicks(item.start.secs);
-            } catch (e1) {}
-          }
-
-          var matchTime = false;
-          if (typeof startTicks === "number" && !isNaN(startTicks)) {
-            // Use relaxed tolerance (0.2s)
-            matchTime = Math.abs(startTicks - targetTicks) < toleranceTicks;
-          } else {
-            // Last resort fallback
-            try {
-              matchTime = Math.abs(item.start.secs - startTime) < 0.2;
-            } catch (e3) {}
-          }
-
-          if (matchTime) {
-            // Name Check (if ref provided)
-            if (clipNameRef) {
-              var itemName = item.name ? item.name.toString() : "";
-              if (!isItemNameMatch(itemName, clipNameRef)) {
-                continue;
-              }
-            }
-
-            try {
-              // args: speed, stretch, reverse, ripple, flicker
-              item.setSpeed(speed, "", false, false, false);
-              // log("Speed Applied: " + (speed*100).toFixed(1) + "% to " + item.name + " at " + startTime);
-              return true;
-            } catch (err) {
-              var errMsg = err && err.message ? err.message.toString() : "";
-              if (
-                !retriedAfterReset &&
-                errMsg.toLowerCase().indexOf("invalid trackitem") !== -1
-              ) {
-                retriedAfterReset = true;
-                clearSelection(sequence || app.project.activeSequence, false);
-                sleep(SPEED_RETRY_WAIT_MS);
-                try {
-                  item.setSpeed(speed, "", false, false, false);
-                  return true;
-                } catch (err2) {
-                  log(
-                    "Speed Apply Retry Error: " +
-                      (err2 && err2.message ? err2.message : err2),
-                  );
-                }
-              } else {
-                log("Speed Apply Error: " + errMsg);
-              }
-            }
-            return false;
-          }
-        } catch (e) {} // Ignore individual item access errors
+          if (!itemMatches(item)) continue;
+          return applyOnItem(item, i);
+        } catch (eFull) {}
       }
       log(
         "Warning: Could not find clip at " +
@@ -1471,6 +1823,69 @@
     var n = parseFloat(txt);
     if (!isNaN(n) && /^[-+0-9.]+$/.test(txt)) return n;
     return null;
+  }
+
+  function parsePresetStartKeyframeValue(rawStartKeyframe) {
+    if (rawStartKeyframe === null || rawStartKeyframe === undefined)
+      return null;
+    var txt = rawStartKeyframe.toString().replace(/^\s+|\s+$/g, "");
+    if (!txt) return null;
+    var parts = txt.split(",");
+    if (!parts || parts.length < 2) return null;
+    return parsePresetScalarValue(parts[1]);
+  }
+
+  function extractPresetEffectParamValue(node) {
+    if (!node) return null;
+
+    var currentValue = null;
+    var currMatch = /<CurrentValue>([\s\S]*?)<\/CurrentValue>/.exec(node);
+    if (currMatch && currMatch.length >= 2) {
+      currentValue = parsePresetScalarValue(currMatch[1]);
+    }
+
+    var startValue = null;
+    var startMatch = /<StartKeyframe>([\s\S]*?)<\/StartKeyframe>/.exec(node);
+    if (startMatch && startMatch.length >= 2) {
+      startValue = parsePresetStartKeyframeValue(startMatch[1]);
+    }
+
+    if (currentValue === null) return startValue;
+    if (
+      typeof currentValue === "number" &&
+      Math.abs(currentValue) <= 0.000001 &&
+      typeof startValue === "number" &&
+      Math.abs(startValue) > 0.000001
+    ) {
+      return startValue;
+    }
+    if (
+      typeof currentValue === "boolean" &&
+      currentValue === false &&
+      typeof startValue === "boolean" &&
+      startValue === true
+    ) {
+      return startValue;
+    }
+    return currentValue;
+  }
+
+  function extractPresetEffectParamValuePreferStart(node) {
+    if (!node) return null;
+
+    var startValue = null;
+    var startMatch = /<StartKeyframe>([\s\S]*?)<\/StartKeyframe>/.exec(node);
+    if (startMatch && startMatch.length >= 2) {
+      startValue = parsePresetStartKeyframeValue(startMatch[1]);
+    }
+    if (startValue !== null) return startValue;
+
+    var currentValue = null;
+    var currMatch = /<CurrentValue>([\s\S]*?)<\/CurrentValue>/.exec(node);
+    if (currMatch && currMatch.length >= 2) {
+      currentValue = parsePresetScalarValue(currMatch[1]);
+    }
+    return currentValue;
   }
 
   function decodeBase64ToBytes(base64Text) {
@@ -1672,9 +2087,7 @@
     while ((mNode = reParamNode.exec(content)) !== null) {
       var objectId = mNode[1];
       var node = mNode[0];
-      var currMatch = /<CurrentValue>([\s\S]*?)<\/CurrentValue>/.exec(node);
-      if (!currMatch || currMatch.length < 2) continue;
-      var value = parsePresetScalarValue(currMatch[1]);
+      var value = extractPresetEffectParamValue(node);
       if (value === null) continue;
 
       var nameMatch = /<Name>([\s\S]*?)<\/Name>/.exec(node);
@@ -1866,9 +2279,7 @@
     while ((mNode = reParamNode.exec(content)) !== null) {
       var objectId = mNode[1];
       var node = mNode[0];
-      var currMatch = /<CurrentValue>([\s\S]*?)<\/CurrentValue>/.exec(node);
-      if (!currMatch || currMatch.length < 2) continue;
-      var value = parsePresetScalarValue(currMatch[1]);
+      var value = extractPresetEffectParamValuePreferStart(node);
       if (value === null) continue;
 
       var nameMatch = /<Name>([\s\S]*?)<\/Name>/.exec(node);
@@ -2076,19 +2487,6 @@
     return null;
   }
 
-  function getTrackItemStartSeconds(item) {
-    if (!item || !item.start) return null;
-    try {
-      if (typeof item.start.seconds === "number") return item.start.seconds;
-    } catch (e0) {}
-
-    var ticks = getStartTicks(item);
-    if (typeof ticks === "number" && !isNaN(ticks)) {
-      return ticks / TICKS_PER_SECOND;
-    }
-    return null;
-  }
-
   function getTrackItemComponentsCount(item) {
     try {
       if (item && item.components) return item.components.numItems;
@@ -2117,6 +2515,72 @@
         if (!isItemNameMatch(qeName, nameRef)) continue;
       }
       return qeItem;
+    }
+    return null;
+  }
+
+  function buildQETrackItemIndex(qeTrack) {
+    var index = {
+      byTicks: {},
+      byTicksName: {},
+    };
+    if (!qeTrack) return index;
+
+    for (var i = qeTrack.numItems - 1; i >= 0; i--) {
+      var qeItem = null;
+      try {
+        qeItem = qeTrack.getItemAt(i);
+      } catch (e0) {}
+      if (!qeItem) continue;
+
+      var startTicks = getQEItemStartTicks(qeItem);
+      if (startTicks === null) continue;
+
+      var nameNorm = normalizeNameKey(
+        qeItem.name ? qeItem.name.toString() : "",
+      );
+      var tickKey = startTicks.toString();
+      var tickNameKey = tickKey + "|" + nameNorm;
+
+      if (!index.byTicks[tickKey]) index.byTicks[tickKey] = [];
+      index.byTicks[tickKey].push(qeItem);
+
+      if (!index.byTicksName[tickNameKey]) index.byTicksName[tickNameKey] = [];
+      index.byTicksName[tickNameKey].push(qeItem);
+    }
+    return index;
+  }
+
+  function findQETrackItemAtStartInIndex(index, startSeconds, nameRef) {
+    if (!index) return null;
+    var targetTicks = secondsToTicks(startSeconds);
+    var targetNameKey = normalizeNameKey(nameRef || "");
+
+    // Exact (ticks + name)
+    if (targetNameKey) {
+      var exactKey = targetTicks.toString() + "|" + targetNameKey;
+      var exactItems = index.byTicksName[exactKey];
+      if (exactItems && exactItems.length > 0) return exactItems[0];
+    }
+
+    // Fuzzy scan in +/- tolerance frames on indexed buckets.
+    var toleranceFrames = Math.ceil(0.2 * SEQ_FPS);
+    for (var frameOff = 0; frameOff <= toleranceFrames; frameOff++) {
+      var offsets = frameOff === 0 ? [0] : [frameOff, -frameOff];
+      for (var oi = 0; oi < offsets.length; oi++) {
+        var ticks = targetTicks + offsets[oi] * TICKS_PER_FRAME;
+        var key = ticks.toString();
+        var items = index.byTicks[key];
+        if (!items || items.length <= 0) continue;
+        if (!nameRef) return items[0];
+        for (var ii = 0; ii < items.length; ii++) {
+          var item = items[ii];
+          var itemName = item && item.name ? item.name.toString() : "";
+          if (isItemNameMatch(itemName, nameRef)) {
+            return item;
+          }
+        }
+      }
     }
     return null;
   }
@@ -2150,7 +2614,7 @@
             ? stdItem.projectItem.name.toString()
             : "";
       } catch (e0) {}
-      nm = nm ? nm.replace(/\.[^\.]+$/, "") : "";
+      nm = nm ? stripKnownExtension(nm) : "";
       if (findQETrackItemAtStartInTrack(qeTrack, startSec, nm)) {
         score.matches++;
       }
@@ -2181,7 +2645,12 @@
     return { track: bestTrack, index: bestIdx, score: bestScore };
   }
 
-  function applyQEEffectToTrackWithVerification(stdTrack, qeTrack, effectObj) {
+  function applyQEEffectToTrackWithVerification(
+    stdTrack,
+    qeTrack,
+    effectObj,
+    qeItemIndex,
+  ) {
     var stats = {
       totalClips: 0,
       matchedQEItems: 0,
@@ -2210,11 +2679,13 @@
       } catch (e0) {}
       var cleanNameRef = nameRef ? stripKnownExtension(nameRef) : "";
 
-      var qeItem = findQETrackItemAtStartInTrack(
-        qeTrack,
+      var qeItem = findQETrackItemAtStartInIndex(
+        qeItemIndex,
         startSec,
         cleanNameRef,
       );
+      if (!qeItem)
+        qeItem = findQETrackItemAtStartInTrack(qeTrack, startSec, cleanNameRef);
       if (!qeItem && nameRef)
         qeItem = findQETrackItemAtStartInTrack(qeTrack, startSec, nameRef);
       if (!qeItem)
@@ -2232,8 +2703,16 @@
         continue;
       }
 
-      sleep(10);
       var after = getTrackItemComponentsCount(stdItem);
+      if (!(before >= 0 && after > before)) {
+        var waitedMs = 0;
+        while (waitedMs < 20) {
+          sleep(5);
+          waitedMs += 5;
+          after = getTrackItemComponentsCount(stdItem);
+          if (before >= 0 && after > before) break;
+        }
+      }
       if (before >= 0 && after > before) stats.verifiedChanges++;
       else stats.noChange++;
     }
@@ -2244,6 +2723,8 @@
     videoTrackIndex,
     presetName,
     presetFilePath,
+    qeSeqOverride,
+    qeTrackResolveCache,
   ) {
     var sequence = app.project ? app.project.activeSequence : null;
     if (
@@ -2273,10 +2754,12 @@
     }
 
     app.enableQE();
-    var qeSeq = null;
-    try {
-      qeSeq = qe.project.getActiveSequence();
-    } catch (e0) {}
+    var qeSeq = qeSeqOverride || null;
+    if (!qeSeq) {
+      try {
+        qeSeq = qe.project.getActiveSequence();
+      } catch (e0) {}
+    }
     if (!qeSeq) {
       log(
         "Warning: Cannot apply preset '" +
@@ -2286,11 +2769,26 @@
       return false;
     }
 
-    var qeTrackInfo = resolveBestQEVideoTrackForStandardTrack(
-      qeSeq,
-      stdTrack,
-      videoTrackIndex,
-    );
+    var resolveCache = qeTrackResolveCache || QE_TRACK_RESOLVE_CACHE;
+    var resolveKey = "v" + videoTrackIndex;
+    var qeTrackInfo = resolveCache[resolveKey];
+    var useCachedTrack = false;
+    if (qeTrackInfo && qeTrackInfo.track) {
+      try {
+        var _ = qeTrackInfo.track.numItems;
+        useCachedTrack = true;
+      } catch (eCached) {
+        useCachedTrack = false;
+      }
+    }
+    if (!useCachedTrack) {
+      qeTrackInfo = resolveBestQEVideoTrackForStandardTrack(
+        qeSeq,
+        stdTrack,
+        videoTrackIndex,
+      );
+      resolveCache[resolveKey] = qeTrackInfo;
+    }
     if (!qeTrackInfo.track) {
       log(
         "Warning: Cannot apply preset '" +
@@ -2312,6 +2810,7 @@
           ").",
       );
     }
+    var qeItemIndex = buildQETrackItemIndex(qeTrackInfo.track);
 
     var totalVerified = 0;
     var anyApplied = false;
@@ -2349,6 +2848,7 @@
             stdTrack,
             qeTrackInfo.track,
             effectCandidate,
+            qeItemIndex,
           );
           if (st.applyCalls > 0) anyApplied = true;
           log(
@@ -2513,13 +3013,8 @@
 
     var filenameNoExt = stripKnownExtension(filename);
     var item =
-      waitForTrackItemAtStart(
-        track,
-        0,
-        filenameNoExt,
-        TRACK_ITEM_WAIT_MAX_MS,
-      ) ||
-      waitForTrackItemAtStart(track, 0, filename, TRACK_ITEM_WAIT_MAX_MS) ||
+      resolvePlacedItemFast(track, 0, filenameNoExt, TRACK_ITEM_WAIT_MAX_MS) ||
+      resolvePlacedItemFast(track, 0, filename, TRACK_ITEM_WAIT_MAX_MS) ||
       findTrackItemAtStart(track, 0, null);
 
     if (!item) {
@@ -2619,7 +3114,7 @@
     }
 
     var clipName = musicItem.name ? musicItem.name.toString() : "";
-    var clipNameNoExt = clipName.replace(/\.[^\.]+$/, "");
+    var clipNameNoExt = stripKnownExtension(clipName);
     var minStep = 1 / SEQ_FPS;
     var cursor = 0;
     var maxLoops = 2000;
@@ -2635,13 +3130,13 @@
       }
 
       var placedItem =
-        waitForTrackItemAtStart(
+        resolvePlacedItemFast(
           track,
           cursor,
           clipNameNoExt,
           TRACK_ITEM_WAIT_MAX_MS,
         ) ||
-        waitForTrackItemAtStart(
+        resolvePlacedItemFast(
           track,
           cursor,
           clipName,
