@@ -13,24 +13,27 @@ CENTER_FRAME_TOP = 580
 CENTER_FRAME_BOT = 1340
 
 # --- Title style ---
-TITLE_FONT_SIZE = 54
-TITLE_LINE_HEIGHT = 64
+TITLE_FONT_SIZE = 59
+TITLE_LINE_HEIGHT = 70
 TITLE_PAD_V = 24
 TITLE_TEXT_COLOR = (0, 0, 0)  # black
 TITLE_PANEL_COLOR = (255, 255, 255, 245)  # white, nearly opaque
-TITLE_PANEL_RADIUS = 8
-TITLE_PAD_H = TITLE_PAD_V  # same as vertical for coherent box
-TITLE_GAP_ABOVE_CENTER = 40  # px between panel bottom and center frame top
+TITLE_PANEL_RADIUS = 16
+TITLE_PAD_H = 32
+TITLE_SCREEN_MARGIN = 60  # min px from screen edge to panel edge
+TITLE_GAP_ABOVE_CENTER = 80  # px between panel bottom and center frame top
 TITLE_MAX_LINES = 2
 
 # --- Category style ---
-CAT_FONT_SIZE = 38
+CAT_FONT_SIZE = 76
 CAT_TEXT_COLOR = (255, 255, 255)  # white
 CAT_OUTLINE_COLOR = (0, 0, 0)  # black
-CAT_OUTLINE_WIDTH = 5
-CAT_GAP_BELOW_CENTER = 40  # px between center frame bottom and category text top
+CAT_OUTLINE_WIDTH = 2
+CAT_GAP_BELOW_CENTER = 104  # px between center frame bottom and category text top
 
-FONT_PATH = Path(__file__).resolve().parents[3] / "assets" / "fonts" / "Inter-Black.ttf"
+FONT_DIR = Path(__file__).resolve().parents[3] / "assets" / "fonts"
+TITLE_FONT_PATH = FONT_DIR / "Inter-BlackItalic.ttf"
+CAT_FONT_PATH = FONT_DIR / "Inter-Black.ttf"
 
 
 class TitleImageGeneratorService:
@@ -58,9 +61,9 @@ class TitleImageGeneratorService:
         return {"title": title_path, "category": category_path}
 
     @classmethod
-    def _load_font(cls, size: int) -> ImageFont.FreeTypeFont:
-        if FONT_PATH.exists():
-            return ImageFont.truetype(str(FONT_PATH), size)
+    def _load_font(cls, size: int, path: Path | None = None) -> ImageFont.FreeTypeFont:
+        if path and path.exists():
+            return ImageFont.truetype(str(path), size)
         # Fallback: try system fonts
         for fallback in [
             "/usr/share/fonts/noto/NotoSans-ExtraBold.ttf",
@@ -106,11 +109,11 @@ class TitleImageGeneratorService:
     @classmethod
     def _render_title(cls, title: str, output_path: Path) -> None:
         """Render title text on white panel to transparent PNG."""
-        font = cls._load_font(TITLE_FONT_SIZE)
+        font = cls._load_font(TITLE_FONT_SIZE, TITLE_FONT_PATH)
         img = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
 
-        max_text_width = WIDTH - 160  # margin for text wrapping calculation
+        max_text_width = WIDTH - 2 * (TITLE_SCREEN_MARGIN + TITLE_PAD_H)
         lines = cls._wrap_text(title, font, max_text_width)
 
         # Calculate panel dimensions
@@ -169,7 +172,7 @@ class TitleImageGeneratorService:
         The bullet separator is drawn as a filled circle vertically centered
         with the uppercase text, since the font's '•' glyph sits too low.
         """
-        font = cls._load_font(CAT_FONT_SIZE)
+        font = cls._load_font(CAT_FONT_SIZE, CAT_FONT_PATH)
         img = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
 
@@ -182,7 +185,7 @@ class TitleImageGeneratorService:
             parts = text.split(separator)
             left, right = parts[0].strip(), parts[1].strip()
             space_w = font.getbbox(" ")[2] - font.getbbox(" ")[0]
-            bullet_radius = 6
+            bullet_radius = 12
             bullet_gap = space_w  # space on each side of the circle
 
             left_w = font.getbbox(left)[2] - font.getbbox(left)[0]
