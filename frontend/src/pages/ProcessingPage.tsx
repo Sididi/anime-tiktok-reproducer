@@ -28,6 +28,8 @@ interface ProcessingProgress {
   error: string | null;
   download_url?: string;
   folder_url?: string;
+  folder_id?: string;
+  error_code?: string;
   // Gap detection fields
   gaps_detected?: boolean;
   gap_count?: number;
@@ -66,6 +68,8 @@ const INITIAL_STEPS: ProcessingStep[] = [
     status: "pending",
   },
 ];
+
+const DRIVE_UPLOAD_STREAM_TIMEOUT_MS = 20 * 60 * 1000;
 
 export function ProcessingPage() {
   const { projectId } = useParams<{ projectId: string }>();
@@ -308,23 +312,64 @@ export function ProcessingPage() {
     setDriveLoading(true);
     setError(null);
     setActionMessage("Uploading project to Google Drive...");
+    const controller = new AbortController();
+    let timedOut = false;
+    const timeoutId = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, DRIVE_UPLOAD_STREAM_TIMEOUT_MS);
 
     try {
       const response = await api.uploadExportToGDrive(projectId);
+      let sawComplete = false;
       const finalEvent = await readSSEStream<ProcessingProgress>(
         response,
         (data) => {
           if (data.message) setActionMessage(data.message);
+          if (data.status === "complete") {
+            sawComplete = true;
+            controller.abort();
+          }
         },
+        controller.signal,
       );
-      if (finalEvent?.folder_url) {
-        setDriveFolderUrl(finalEvent.folder_url);
+
+      if (
+        !sawComplete ||
+        finalEvent?.status !== "complete" ||
+        !finalEvent.folder_url
+      ) {
+        const latestProject = await api.getProject(projectId).catch(() => null);
+        const recoveredFolderUrl = latestProject?.drive_folder_url;
+        if (!recoveredFolderUrl) {
+          throw new Error(
+            "Drive upload stream ended unexpectedly before completion.",
+          );
+        }
+        setDriveFolderUrl(recoveredFolderUrl);
         setDriveUploaded(true);
+        setActionMessage("Google Drive upload finished on server.");
+        return;
       }
+      setDriveFolderUrl(finalEvent.folder_url);
+      setDriveUploaded(true);
       setActionMessage("Google Drive upload complete.");
     } catch (err) {
-      setError((err as Error).message);
+      const message = (err as Error).message;
+      if (timedOut) {
+        setError(
+          "Drive upload timed out while waiting for stream completion. Please retry.",
+        );
+      } else if (
+        message === "Upload already in progress for this project" ||
+        message === "Drive upload already running for this project"
+      ) {
+        setError("Drive upload is already running for this project.");
+      } else {
+        setError(message);
+      }
     } finally {
+      window.clearTimeout(timeoutId);
       setDriveLoading(false);
     }
   }, [projectId, driveLoading, bundleLoading]);

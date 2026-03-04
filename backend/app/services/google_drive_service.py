@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 import io
 import mimetypes
 from pathlib import Path
-from threading import Lock
+from threading import Lock, local
 from typing import Iterable, Any
 
 from google.auth.transport.requests import Request
@@ -28,8 +28,7 @@ class GoogleDriveService:
     """Google Drive utilities for project-level folder and file management."""
     _lock = Lock()
     _credentials_cache: Credentials | None = None
-    _client_cache = None
-    _client_creds_ref: Credentials | None = None
+    _client_local = local()
 
     _SMALL_FILE_BYTES = 8 * 1024 * 1024
 
@@ -89,13 +88,18 @@ class GoogleDriveService:
 
     @classmethod
     def client(cls):
-        """Return a cached Drive API client bound to refreshed credentials."""
+        """Return a thread-local Drive API client bound to refreshed credentials."""
         creds = cls._credentials()
-        with cls._lock:
-            if cls._client_cache is None or cls._client_creds_ref is not creds:
-                cls._client_cache = build("drive", "v3", credentials=creds, cache_discovery=False)
-                cls._client_creds_ref = creds
-            return cls._client_cache
+        cached_client = getattr(cls._client_local, "client", None)
+        cached_creds_ref = getattr(cls._client_local, "creds_ref", None)
+
+        # googleapiclient uses httplib2 under the hood; sharing one service object
+        # across threads can crash the interpreter in concurrent network calls.
+        if cached_client is None or cached_creds_ref is not creds:
+            cached_client = build("drive", "v3", credentials=creds, cache_discovery=False)
+            cls._client_local.client = cached_client
+            cls._client_local.creds_ref = creds
+        return cached_client
 
     @classmethod
     def _client(cls):

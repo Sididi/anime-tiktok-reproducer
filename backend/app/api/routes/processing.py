@@ -8,6 +8,7 @@ from typing import Optional, Any
 import json
 import tempfile
 from pathlib import Path
+from threading import Lock
 from pydantic import BaseModel
 
 from pydub import AudioSegment
@@ -32,6 +33,12 @@ router = APIRouter(prefix="/projects/{project_id}", tags=["processing"])
 
 
 UPLOAD_CHUNK_SIZE = 1024 * 1024
+_gdrive_upload_locks_guard = Lock()
+_gdrive_upload_locks: dict[str, Lock] = {}
+
+
+class DriveUploadInProgressError(RuntimeError):
+    """Raised when an upload is already active for the same project."""
 
 
 class MetadataPromptRequest(BaseModel):
@@ -73,9 +80,9 @@ class PreviewBuildRequest(BaseModel):
 
 def _notify_drive_upload_complete(project_id: str, _folder_url: str) -> None:
     """
-    Best-effort Discord notification executed outside request critical path.
+    Best-effort Discord notification after Drive export.
 
-    This must never raise, otherwise it can leak task exceptions.
+    This must never raise.
     """
     try:
         project = ProjectService.load(project_id)
@@ -105,6 +112,36 @@ def _notify_drive_upload_complete(project_id: str, _folder_url: str) -> None:
     except Exception:
         # Notification must not impact API completion semantics.
         pass
+
+
+def _get_gdrive_upload_lock(project_id: str) -> Lock:
+    with _gdrive_upload_locks_guard:
+        existing = _gdrive_upload_locks.get(project_id)
+        if existing is not None:
+            return existing
+        lock = Lock()
+        _gdrive_upload_locks[project_id] = lock
+        return lock
+
+
+def _upload_manifest_and_finalize(
+    project_id: str,
+    project,
+    matches,
+) -> dict[str, Any]:
+    """Run upload + persistence + Discord notification under a project lock."""
+    lock = _get_gdrive_upload_lock(project_id)
+    if not lock.acquire(blocking=False):
+        raise DriveUploadInProgressError("Upload already in progress for this project")
+    try:
+        result = ExportService.upload_manifest_to_drive(project, matches)
+        project.drive_folder_id = result["folder_id"]
+        project.drive_folder_url = result["folder_url"]
+        ProjectService.save(project)
+        _notify_drive_upload_complete(project_id, result["folder_url"])
+        return result
+    finally:
+        lock.release()
 
 
 async def _write_upload_to_path(upload: UploadFile, destination: Path) -> None:
@@ -749,21 +786,16 @@ async def upload_to_gdrive(project_id: str):
     async def stream_progress():
         yield f"data: {json.dumps({'status': 'processing', 'step': 'gdrive', 'progress': 0.1, 'message': 'Uploading project to Google Drive...'})}\n\n"
         try:
-            result = await asyncio.to_thread(ExportService.upload_manifest_to_drive, project, matches.matches)
-            project.drive_folder_id = result["folder_id"]
-            project.drive_folder_url = result["folder_url"]
-            ProjectService.save(project)
+            result = await asyncio.to_thread(
+                _upload_manifest_and_finalize,
+                project_id,
+                project,
+                matches.matches,
+            )
 
             yield f"data: {json.dumps({'status': 'complete', 'step': 'gdrive', 'progress': 1.0, 'message': 'Upload complete', 'folder_url': result['folder_url'], 'folder_id': result['folder_id']})}\n\n"
-
-            # Do not block SSE completion on webhook network calls.
-            asyncio.create_task(
-                asyncio.to_thread(
-                    _notify_drive_upload_complete,
-                    project_id,
-                    result["folder_url"],
-                )
-            )
+        except DriveUploadInProgressError as exc:
+            yield f"data: {json.dumps({'status': 'error', 'step': 'gdrive', 'progress': 0.0, 'error': str(exc), 'error_code': 'upload_in_progress', 'message': 'Drive upload already running for this project'})}\n\n"
         except Exception as exc:
             yield f"data: {json.dumps({'status': 'error', 'step': 'gdrive', 'progress': 0.0, 'error': str(exc), 'message': 'Drive upload failed'})}\n\n"
 

@@ -25,31 +25,43 @@ export async function readSSEStream<T extends { status?: string; error?: string 
   let buffer = "";
   let lastEvent: T | null = null;
 
+  const processBufferedEvents = (flush: boolean) => {
+    buffer = buffer.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    const splitTarget = flush ? `${buffer}\n\n` : buffer;
+    const chunks = splitTarget.split("\n\n");
+    buffer = flush ? "" : chunks.pop() || "";
+
+    for (const chunk of chunks) {
+      const dataLine = chunk
+        .split("\n")
+        .find((line) => line.startsWith("data: "));
+      if (!dataLine) continue;
+      try {
+        const data = JSON.parse(dataLine.slice(6)) as T;
+        lastEvent = data;
+        onEvent(data);
+        if (data.status === "error") {
+          throw new Error(data.error || data.message || "Request failed");
+        }
+      } catch (e) {
+        if (e instanceof SyntaxError) continue;
+        throw e;
+      }
+    }
+  };
+
   try {
     while (true) {
       if (signal?.aborted) break;
 
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) {
+        processBufferedEvents(true);
+        break;
+      }
 
       buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        if (!line.startsWith("data: ")) continue;
-        try {
-          const data = JSON.parse(line.slice(6)) as T;
-          lastEvent = data;
-          onEvent(data);
-          if (data.status === "error") {
-            throw new Error(data.error || data.message || "Request failed");
-          }
-        } catch (e) {
-          if (e instanceof SyntaxError) continue;
-          throw e;
-        }
-      }
+      processBufferedEvents(false);
     }
   } finally {
     try {
