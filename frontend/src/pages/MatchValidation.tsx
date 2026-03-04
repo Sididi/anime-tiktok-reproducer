@@ -1093,11 +1093,16 @@ export function MatchValidation() {
         undefined,
         mergeContinuous,
       );
+      let completeHandled = false;
 
       await readSSEStream<MatchProgress>(response, async (data) => {
         setMatchProgress(data);
 
         if (data.status === "complete" && data.matches) {
+          if (completeHandled) {
+            return;
+          }
+          completeHandled = true;
           const matchesData = data.matches as unknown as {
             matches: SceneMatch[];
           };

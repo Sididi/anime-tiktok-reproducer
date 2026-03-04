@@ -53,6 +53,133 @@ def _resolve_anime_source_dir(library_root: Path, anime_name: str) -> Path | Non
     return None
 
 
+def _path_is_under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _is_allowed_source_path(path: Path, source_dirs: list[Path]) -> bool:
+    for src_path in source_dirs:
+        if src_path.is_dir():
+            if _path_is_under(path, src_path):
+                return True
+        elif path.resolve() == src_path.resolve():
+            return True
+    return False
+
+
+def _search_episode_sync(
+    episode_name: str,
+    source_dirs: list[Path],
+    video_extensions: set[str],
+) -> Path | None:
+    for src_path in source_dirs:
+        if src_path.is_dir():
+            # Try direct child first
+            for ext in video_extensions:
+                candidate = src_path / f"{episode_name}{ext}"
+                if candidate.exists():
+                    return candidate
+            # Then recursive search
+            for ext in video_extensions:
+                for match in src_path.rglob(f"*{ext}"):
+                    if match.stem == episode_name:
+                        return match
+        elif src_path.is_file() and src_path.stem == episode_name:
+            return src_path
+    return None
+
+
+def _get_project_source_dirs(project) -> list[Path]:
+    if project.source_paths:
+        return [Path(src) for src in project.source_paths]
+    if settings.anime_library_path and settings.anime_library_path.exists():
+        return [settings.anime_library_path]
+    return []
+
+
+async def _resolve_episode_source_path(project, episode_value: str) -> Path:
+    decoded_path = episode_value
+    source_path = Path(decoded_path)
+    video_extensions = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".m4v"}
+    source_dirs = _get_project_source_dirs(project)
+
+    if not source_dirs:
+        raise RuntimeError("No source paths configured")
+
+    is_valid = (
+        source_path.is_absolute()
+        and source_path.exists()
+        and _is_allowed_source_path(source_path, source_dirs)
+    )
+    if is_valid:
+        return source_path
+
+    found_path: Path | None = None
+    if settings.anime_library_path and settings.anime_library_path.exists():
+        manifest = await AnimeLibraryService.ensure_episode_manifest()
+        candidate = AnimeLibraryService.resolve_episode_path(decoded_path, manifest)
+        if candidate and _is_allowed_source_path(candidate, source_dirs):
+            found_path = candidate
+
+    if found_path is None:
+        found_path = await asyncio.to_thread(
+            _search_episode_sync,
+            decoded_path,
+            source_dirs,
+            video_extensions,
+        )
+
+    if found_path is None or not found_path.exists():
+        raise RuntimeError(f"Source episode not found: {decoded_path}")
+    return found_path
+
+
+def _collect_unique_matched_episodes(matches: MatchList) -> list[str]:
+    return sorted(
+        {
+            match.episode
+            for match in matches.matches
+            if match.confidence > 0 and bool(match.episode)
+        }
+    )
+
+
+async def _prepare_episode_preview_proxy(project, episode: str) -> tuple[str, str | None]:
+    try:
+        source_path = await _resolve_episode_source_path(project, episode)
+    except RuntimeError:
+        return "failed", None
+
+    try:
+        compatible = await asyncio.to_thread(
+            AnimeLibraryService.is_browser_preview_compatible,
+            source_path,
+        )
+    except Exception:
+        return "failed", source_path.name
+
+    if compatible:
+        return "skipped", source_path.name
+
+    try:
+        proxy = await asyncio.to_thread(
+            AnimeLibraryService.ensure_preview_proxy_sync,
+            source_path,
+        )
+    except Exception:
+        return "failed", source_path.name
+
+    if proxy is None:
+        return "failed", source_path.name
+    if proxy == source_path:
+        return "skipped", source_path.name
+    return "prepared", source_path.name
+
+
 @router.post("/sources")
 async def set_sources(project_id: str, request: SetSourcesRequest):
     """Set source episode paths for the project."""
@@ -192,89 +319,226 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
             anime_name=anime_name,
             pass_label=first_pass_label,
         ):
-            yield f"data: {json.dumps(progress.to_dict())}\n\n"
-
             if progress.status == "complete" and progress.matches:
                 first_pass_matches = progress.matches
-            elif progress.status == "error":
+                continue
+
+            yield f"data: {json.dumps(progress.to_dict())}\n\n"
+            if progress.status == "error":
                 project.phase = ProjectPhase.SCENE_VALIDATION
                 ProjectService.save(project)
                 return
 
         if not first_pass_matches:
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "status": "error",
+                        "progress": 0.0,
+                        "message": "",
+                        "current_scene": 0,
+                        "total_scenes": len(scenes.scenes),
+                        "error": "Matching completed without results",
+                    }
+                )
+                + "\n\n"
+            )
+            project.phase = ProjectPhase.SCENE_VALIDATION
+            ProjectService.save(project)
             return
 
-        # If merge disabled or no matches, save and finish
+        final_matches = first_pass_matches
+        total_scenes_for_progress = len(scenes.scenes)
+
+        # If merge disabled, keep first pass output.
         if not merge_continuous:
-            ProjectService.save_matches(project_id, first_pass_matches)
-            project.phase = ProjectPhase.MATCH_VALIDATION
-            ProjectService.save(project)
-            return
+            pass
+        else:
+            # === CONTINUITY DETECTION ===
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "status": "matching",
+                        "progress": 0.5,
+                        "message": "Detecting continuous scenes...",
+                        "current_scene": 0,
+                        "total_scenes": len(scenes.scenes),
+                        "error": None,
+                    }
+                )
+                + "\n\n"
+            )
 
-        # === CONTINUITY DETECTION ===
-        yield f"data: {json.dumps({'status': 'matching', 'progress': 0.5, 'message': 'Detecting continuous scenes...', 'current_scene': 0, 'total_scenes': len(scenes.scenes), 'error': None})}\n\n"
+            pairs = SceneMergerService.detect_continuous_pairs(scenes, first_pass_matches)
+            chains = SceneMergerService.build_merge_chains(pairs, scenes, first_pass_matches) if pairs else []
 
-        pairs = SceneMergerService.detect_continuous_pairs(scenes, first_pass_matches)
+            if chains:
+                # === MERGE ===
+                merged_count = sum(len(c) for c in chains)
+                group_count = len(chains)
+                merged_scenes, merged_matches, backup = SceneMergerService.merge_scenes_and_matches(
+                    scenes, first_pass_matches, chains,
+                )
 
-        if not pairs:
-            # No continuous scenes found, save first pass results
-            ProjectService.save_matches(project_id, first_pass_matches)
-            project.phase = ProjectPhase.MATCH_VALIDATION
-            ProjectService.save(project)
-            yield f"data: {json.dumps({'status': 'complete', 'progress': 1.0, 'message': f'Matched {len(first_pass_matches.matches)} scenes (no continuous scenes found)', 'current_scene': len(scenes.scenes), 'total_scenes': len(scenes.scenes), 'error': None, 'matches': first_pass_matches.model_dump()})}\n\n"
-            return
+                SceneMergerService.save_pre_merge_backup(project_id, backup)
+                ProjectService.save_scenes(project_id, merged_scenes)
 
-        chains = SceneMergerService.build_merge_chains(pairs, scenes, first_pass_matches)
+                total_scenes_for_progress = len(merged_scenes.scenes)
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "status": "matching",
+                            "progress": 0.6,
+                            "message": (
+                                f"Merged {merged_count} scenes into {group_count} groups. "
+                                "Re-matching..."
+                            ),
+                            "current_scene": 0,
+                            "total_scenes": total_scenes_for_progress,
+                            "error": None,
+                        }
+                    )
+                    + "\n\n"
+                )
 
-        if not chains:
-            ProjectService.save_matches(project_id, first_pass_matches)
-            project.phase = ProjectPhase.MATCH_VALIDATION
-            ProjectService.save(project)
-            yield f"data: {json.dumps({'status': 'complete', 'progress': 1.0, 'message': f'Matched {len(first_pass_matches.matches)} scenes', 'current_scene': len(scenes.scenes), 'total_scenes': len(scenes.scenes), 'error': None, 'matches': first_pass_matches.model_dump()})}\n\n"
-            return
+                # === PASS 2: Re-match only merged scenes ===
+                merged_indices = [
+                    i for i, m in enumerate(merged_matches.matches)
+                    if m.merged_from is not None
+                ]
 
-        # === MERGE ===
-        merged_count = sum(len(c) for c in chains)
-        group_count = len(chains)
-        merged_scenes, merged_matches, backup = SceneMergerService.merge_scenes_and_matches(
-            scenes, first_pass_matches, chains,
+                pass2_matches: MatchList | None = None
+                async for progress in AnimeMatcherService.match_scenes(
+                    video_path, merged_scenes, source_path,
+                    anime_name=anime_name,
+                    scene_indices_to_match=merged_indices,
+                    existing_matches=merged_matches,
+                    pass_label="Pass 2: ",
+                ):
+                    if progress.status == "complete" and progress.matches:
+                        # Preserve merged_from metadata on re-matched scenes.
+                        for i in merged_indices:
+                            if i < len(progress.matches.matches) and i < len(merged_matches.matches):
+                                progress.matches.matches[i].merged_from = (
+                                    merged_matches.matches[i].merged_from
+                                )
+                        pass2_matches = progress.matches
+                        continue
+
+                    yield f"data: {json.dumps(progress.to_dict())}\n\n"
+                    if progress.status == "error":
+                        # On pass 2 error, still save what we have from pass 1 merge.
+                        ProjectService.save_matches(project_id, merged_matches)
+                        project.phase = ProjectPhase.MATCH_VALIDATION
+                        ProjectService.save(project)
+                        return
+
+                final_matches = pass2_matches or merged_matches
+
+        ProjectService.save_matches(project_id, final_matches)
+        project.phase = ProjectPhase.MATCH_VALIDATION
+        ProjectService.save(project)
+
+        matched_episodes = _collect_unique_matched_episodes(final_matches)
+        prepared = 0
+        skipped = 0
+        failed = 0
+
+        if matched_episodes:
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "status": "matching",
+                        "progress": 0.92,
+                        "message": "Preparing browser preview proxies...",
+                        "current_scene": 0,
+                        "total_scenes": len(matched_episodes),
+                        "error": None,
+                    }
+                )
+                + "\n\n"
+            )
+
+            semaphore = asyncio.Semaphore(4)
+
+            async def _run_episode(episode: str) -> tuple[str, str | None]:
+                async with semaphore:
+                    return await _prepare_episode_preview_proxy(project, episode)
+
+            tasks = [asyncio.create_task(_run_episode(episode)) for episode in matched_episodes]
+            total = len(tasks)
+            for idx, task in enumerate(asyncio.as_completed(tasks), start=1):
+                status, episode_name = await task
+                if status == "prepared":
+                    prepared += 1
+                elif status == "skipped":
+                    skipped += 1
+                else:
+                    failed += 1
+
+                label = episode_name or f"Episode {idx}"
+                if status == "prepared":
+                    step_message = f"Prepared preview proxy for {label}"
+                elif status == "skipped":
+                    step_message = f"Skipped preview proxy for {label} (already compatible)"
+                else:
+                    step_message = f"Preview proxy failed for {label}"
+
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "status": "matching",
+                            "progress": 0.92 + (0.07 * (idx / total)),
+                            "message": (
+                                f"{step_message} "
+                                f"({idx}/{total}, prepared={prepared}, skipped={skipped}, failed={failed})"
+                            ),
+                            "current_scene": idx,
+                            "total_scenes": total,
+                            "error": None,
+                        }
+                    )
+                    + "\n\n"
+                )
+        else:
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "status": "matching",
+                        "progress": 0.99,
+                        "message": "No matched episodes require preview proxy preparation.",
+                        "current_scene": 0,
+                        "total_scenes": 0,
+                        "error": None,
+                    }
+                )
+                + "\n\n"
+            )
+
+        summary = (
+            f"Preview proxies: {prepared} prepared, {skipped} skipped, {failed} failed."
         )
-
-        SceneMergerService.save_pre_merge_backup(project_id, backup)
-        ProjectService.save_scenes(project_id, merged_scenes)
-
-        yield f"data: {json.dumps({'status': 'matching', 'progress': 0.6, 'message': f'Merged {merged_count} scenes into {group_count} groups. Re-matching...', 'current_scene': 0, 'total_scenes': len(merged_scenes.scenes), 'error': None})}\n\n"
-
-        # === PASS 2: Re-match only merged scenes ===
-        merged_indices = [
-            i for i, m in enumerate(merged_matches.matches)
-            if m.merged_from is not None
-        ]
-
-        async for progress in AnimeMatcherService.match_scenes(
-            video_path, merged_scenes, source_path,
-            anime_name=anime_name,
-            scene_indices_to_match=merged_indices,
-            existing_matches=merged_matches,
-            pass_label="Pass 2: ",
-        ):
-            if progress.status == "complete" and progress.matches:
-                # Preserve merged_from metadata on re-matched scenes
-                for i in merged_indices:
-                    if i < len(progress.matches.matches) and i < len(merged_matches.matches):
-                        progress.matches.matches[i].merged_from = merged_matches.matches[i].merged_from
-
-                ProjectService.save_matches(project_id, progress.matches)
-                project.phase = ProjectPhase.MATCH_VALIDATION
-                ProjectService.save(project)
-
-            yield f"data: {json.dumps(progress.to_dict())}\n\n"
-
-            if progress.status == "error":
-                # On pass 2 error, still save what we have from pass 1
-                ProjectService.save_matches(project_id, merged_matches)
-                project.phase = ProjectPhase.MATCH_VALIDATION
-                ProjectService.save(project)
+        yield (
+            "data: "
+            + json.dumps(
+                {
+                    "status": "complete",
+                    "progress": 1.0,
+                    "message": f"Matched {len(final_matches.matches)} scenes. {summary}",
+                    "current_scene": len(final_matches.matches),
+                    "total_scenes": total_scenes_for_progress,
+                    "error": None,
+                    "matches": final_matches.model_dump(),
+                }
+            )
+            + "\n\n"
+        )
 
     return StreamingResponse(
         stream_progress(),
@@ -454,6 +718,19 @@ async def update_match(project_id: str, scene_index: int, request: UpdateMatchRe
                 match.speed_ratio = scene_duration / source_duration
 
     ProjectService.save_matches(project_id, matches)
+
+    # Best-effort warmup for manual overrides so future source preview opens faster.
+    # Run fully in background to keep manual save non-blocking.
+    if request.episode:
+        async def _warmup_preview_proxy() -> None:
+            try:
+                source_path = await _resolve_episode_source_path(project, request.episode)
+                await AnimeLibraryService.trigger_preview_proxy_generation(source_path)
+            except Exception:
+                # Never fail manual save if warmup cannot be scheduled.
+                return
+
+        asyncio.create_task(_warmup_preview_proxy())
 
     return {"status": "ok", "match": match.model_dump()}
 

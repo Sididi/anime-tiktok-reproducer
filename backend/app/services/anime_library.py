@@ -1092,37 +1092,6 @@ class AnimeLibraryService:
                 )
                 return
 
-        # Build browser-safe preview proxies only for files still incompatible.
-        preview_candidates: list[Path] = []
-        for prepared_file in prepared_files:
-            compatible = await asyncio.to_thread(
-                cls.is_browser_preview_compatible,
-                prepared_file,
-            )
-            if not compatible:
-                preview_candidates.append(prepared_file)
-
-        if preview_candidates:
-            yield IndexProgress(
-                status="copying",
-                message="Preparing browser preview proxies...",
-                progress=0.3,
-                total_files=len(preview_candidates),
-            )
-            for i, prepared_file in enumerate(preview_candidates):
-                try:
-                    await asyncio.to_thread(cls.ensure_preview_proxy_sync, prepared_file)
-                except Exception:
-                    # Preview proxy failures should not block indexing/matching.
-                    pass
-                yield IndexProgress(
-                    status="copying",
-                    message=f"Preparing preview {prepared_file.name}",
-                    progress=0.3 + 0.05 * ((i + 1) / len(preview_candidates)),
-                    total_files=len(preview_candidates),
-                    completed_files=i + 1,
-                )
-
         if is_existing_series and abs(effective_fps - requested_fps) > 1e-9:
             yield IndexProgress(
                 status="indexing",
