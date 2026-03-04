@@ -327,7 +327,12 @@ class ProcessingService:
         try:
             await cls.convert_audio_for_auto_editor(audio_path, converted_audio_path)
 
-            # Common auto-editor settings
+            # Common auto-editor settings.
+            # NOTE: this flow is audio-only + timeline XML export (no video render),
+            # so there is no meaningful GPU acceleration path to enable here.
+            logger.debug(
+                "auto-editor GPU acceleration is not applied for audio/XML-only runs."
+            )
             base_args = [
                 "--edit", "audio",
                 "--no-open",

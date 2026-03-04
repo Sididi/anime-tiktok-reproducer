@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 import json
 import logging
 import subprocess
@@ -140,6 +141,33 @@ class SocialUploadService:
     _FACEBOOK_MAX_DURATION_SECONDS = 90.0
     _FACEBOOK_MAX_SPEED_FACTOR = 1.40
     _FACEBOOK_MAX_ACCEL_PERCENT = 40.0
+    _FRENCH_DAYS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+    _FRENCH_MONTHS = [
+        "janvier",
+        "février",
+        "mars",
+        "avril",
+        "mai",
+        "juin",
+        "juillet",
+        "août",
+        "septembre",
+        "octobre",
+        "novembre",
+        "décembre",
+    ]
+    _FRENCH_TZ = ZoneInfo("Europe/Paris")
+
+    @classmethod
+    def _format_french_datetime(cls, dt: datetime) -> str:
+        aware = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+        french_dt = aware.astimezone(cls._FRENCH_TZ)
+        day_name = cls._FRENCH_DAYS[french_dt.weekday()]
+        month_name = cls._FRENCH_MONTHS[french_dt.month - 1]
+        return (
+            f"{day_name} {french_dt.day} {month_name} {french_dt.year} "
+            f"à {french_dt.strftime('%H:%M')}"
+        )
 
     @classmethod
     def _graph_base(cls) -> str:
@@ -429,7 +457,9 @@ class SocialUploadService:
 
             detail_parts = []
             if scheduled_at:
-                detail_parts.append(f"Scheduled for {scheduled_at.isoformat()}")
+                detail_parts.append(
+                    f"Programmé le {cls._format_french_datetime(scheduled_at)}"
+                )
 
             return PlatformUploadResult(
                 platform="youtube",
@@ -1348,7 +1378,11 @@ class SocialUploadService:
                             status="uploaded",
                             url=f"https://www.facebook.com/reel/{video_id}",
                             resource_id=str(video_id),
-                            detail=f"Reel scheduled for {scheduled_at.isoformat()}{caption_detail}",
+                            detail=(
+                                "Reel programmé le "
+                                f"{cls._format_french_datetime(scheduled_at)}"
+                                f"{caption_detail}"
+                            ),
                         )
 
                 retry_detail = (

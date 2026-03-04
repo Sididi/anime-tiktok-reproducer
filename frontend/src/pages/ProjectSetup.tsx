@@ -175,8 +175,44 @@ export function ProjectSetup() {
     [],
   );
 
-  const handleIndexAnime = useCallback(async (overrideName?: string, overrideFps?: number): Promise<boolean> => {
-    if (!newAnimePath.trim()) return false;
+  const runProjectPipeline = useCallback(
+    async (url: string, animeName: string): Promise<boolean> => {
+      try {
+        const project = await createProject(url, undefined, animeName);
+
+        // Step 1: Download video
+        const downloadSuccess = await handleDownload(project.id, url);
+        if (!downloadSuccess) return false;
+
+        // Step 2: Run scene detection
+        const detectionSuccess = await handleSceneDetection(project.id);
+        if (!detectionSuccess) return false;
+
+        // Step 3: Navigate to scenes, or skip directly to matches when configured
+        let skipScenesUi = false;
+        try {
+          const scenesConfig = await api.getScenesConfig(project.id);
+          skipScenesUi = Boolean(scenesConfig.skip_ui_enabled);
+        } catch {
+          skipScenesUi = false;
+        }
+
+        navigate(
+          skipScenesUi
+            ? `/project/${project.id}/matches`
+            : `/project/${project.id}/scenes`,
+        );
+        return true;
+      } catch {
+        // Error is handled in store
+        return false;
+      }
+    },
+    [createProject, handleDownload, handleSceneDetection, navigate],
+  );
+
+  const handleIndexAnime = useCallback(async (overrideName?: string, overrideFps?: number): Promise<string | null> => {
+    if (!newAnimePath.trim()) return null;
 
     setIndexing(true);
     setIndexProgress({
@@ -210,10 +246,10 @@ export function ProjectSetup() {
         setNewAnimeName("");
         setNewAnimeFps(2);
         setIndexProgress(null);
-        return true;
+        return finalAnimeName;
       }
 
-      return false;
+      return null;
     } catch (err) {
       setIndexProgress({
         status: "error",
@@ -222,7 +258,7 @@ export function ProjectSetup() {
         message: "",
         error: (err as Error).message,
       });
-      return false;
+      return null;
     } finally {
       setIndexing(false);
     }
@@ -230,56 +266,30 @@ export function ProjectSetup() {
 
   const handleUpdateAnime = async () => {
     if (!updateAnimeName || !newAnimePath.trim()) return;
-    await handleIndexAnime(updateAnimeName, 2);
+    const finalAnimeName = await handleIndexAnime(updateAnimeName, 2);
+    if (!finalAnimeName) return;
+
+    const trimmedTikTokUrl = tiktokUrl.trim();
+    if (!trimmedTikTokUrl) return;
+
+    await runProjectPipeline(trimmedTikTokUrl, finalAnimeName);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
     // Validate
-    if (!tiktokUrl.trim()) return;
+    const trimmedTikTokUrl = tiktokUrl.trim();
+    if (!trimmedTikTokUrl) return;
 
-    // If indexing new anime, do that first
+    let animeName = selectedAnime;
     if (indexNewMode) {
-      const success = await handleIndexAnime();
-      if (!success) return;
+      animeName = await handleIndexAnime();
     }
-
-    // Need anime selected
-    const animeName = indexNewMode
-      ? newAnimeName.trim() || newAnimePath.split("/").pop() || null
-      : selectedAnime;
 
     if (!animeName) return;
 
-    try {
-      const project = await createProject(tiktokUrl, undefined, animeName);
-
-      // Step 1: Download video
-      const downloadSuccess = await handleDownload(project.id, tiktokUrl);
-      if (!downloadSuccess) return;
-
-      // Step 2: Run scene detection
-      const detectionSuccess = await handleSceneDetection(project.id);
-      if (!detectionSuccess) return;
-
-      // Step 3: Navigate to scenes, or skip directly to matches when configured
-      let skipScenesUi = false;
-      try {
-        const scenesConfig = await api.getScenesConfig(project.id);
-        skipScenesUi = Boolean(scenesConfig.skip_ui_enabled);
-      } catch {
-        skipScenesUi = false;
-      }
-
-      navigate(
-        skipScenesUi
-          ? `/project/${project.id}/matches`
-          : `/project/${project.id}/scenes`,
-      );
-    } catch {
-      // Error is handled in store
-    }
+    await runProjectPipeline(trimmedTikTokUrl, animeName);
   };
 
   const selectAnime = (anime: string) => {

@@ -1017,7 +1017,7 @@ export function MatchValidation() {
         // Load available episodes for manual matching
         const { episodes: loadedEpisodes } = await api.getEpisodes(projectId);
         setEpisodes(loadedEpisodes);
-        // Check if scene UI skip is enabled (auto-match + auto-continue)
+        // Check if scene UI skip is enabled (auto-match only)
         try {
           const scenesConfig = await api.getScenesConfig(projectId);
           const skip = Boolean(scenesConfig.skip_ui_enabled);
@@ -1120,10 +1120,7 @@ export function MatchValidation() {
             setPlaybackError(null);
           }
 
-          // Auto-continue to transcription when skipUiEnabled
-          if (skipUiEnabledRef.current) {
-            navigate(`/project/${projectId}/transcription`);
-          }
+          // Keep /matches visible so the user can manually continue.
         }
       });
     } catch (err) {
@@ -1137,7 +1134,6 @@ export function MatchValidation() {
     mergeContinuous,
     loadScenes,
     stopFastWatch,
-    navigate,
     preparePlaybackClips,
   ]);
 
@@ -1313,7 +1309,7 @@ export function MatchValidation() {
           delete next[sceneIndex];
           return next;
         });
-      } catch (err) {
+      } catch {
         setPendingSceneUpdates((prev) => {
           const next = { ...prev };
           delete next[sceneIndex];
@@ -1844,7 +1840,7 @@ export function MatchValidation() {
               <input
                 type="range"
                 min="0.5"
-                max="6"
+                max="12"
                 step="0.25"
                 value={playbackRate}
                 onChange={(e) => setPlaybackRate(parseFloat(e.target.value))}

@@ -1,10 +1,19 @@
-import { useEffect, useState, useCallback, useRef } from "react";
+import {
+  useEffect,
+  useState,
+  useCallback,
+  useRef,
+  useMemo,
+  forwardRef,
+  useImperativeHandle,
+} from "react";
 import { useParams, useNavigate, useLocation } from "react-router-dom";
 import {
   Check,
   Loader2,
   AlertTriangle,
   Play,
+  Pause,
   ArrowLeft,
   SkipForward,
   Sparkles,
@@ -17,7 +26,7 @@ import { ClippedVideoPlayer, ManualMatchModal } from "@/components/video";
 import type { ClippedVideoPlayerHandle } from "@/components/video/ClippedVideoPlayer";
 import { useProjectStore, useSceneStore } from "@/stores";
 import { api } from "@/api/client";
-import { formatTime } from "@/utils";
+import { cn, formatTime } from "@/utils";
 import type { Scene } from "@/types";
 
 interface GapInfo {
@@ -56,6 +65,10 @@ interface GapCardProps {
   resolvedTiming: { start: number; end: number; speed: number } | null;
   candidates: GapCandidate[];
   loadingCandidates: boolean;
+  isActive?: boolean;
+  playbackRate?: number;
+  controlsDisabled?: boolean;
+  preloadMode?: "metadata" | "auto";
   onUpdate: (
     sceneIndex: number,
     startTime: number,
@@ -65,25 +78,43 @@ interface GapCardProps {
   onSkip: (sceneIndex: number) => void;
 }
 
-function GapCard({
-  gap,
-  scene,
-  projectId,
-  episodes,
-  isResolved,
-  isSkipped,
-  resolvedTiming,
-  candidates,
-  loadingCandidates,
-  onUpdate,
-  onSkip,
-}: GapCardProps) {
+interface GapCardHandle {
+  playBothAndWait: () => Promise<void>;
+  prepareForAutoplay: () => Promise<boolean>;
+  releasePreload: () => void;
+  stop: () => void;
+}
+
+const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
+  {
+    gap,
+    scene,
+    projectId,
+    episodes,
+    isResolved,
+    isSkipped,
+    resolvedTiming,
+    candidates,
+    loadingCandidates,
+    isActive = false,
+    playbackRate = 1,
+    controlsDisabled = false,
+    preloadMode = "metadata",
+    onUpdate,
+    onSkip,
+  },
+  ref,
+) {
   const [showManualModal, setShowManualModal] = useState(false);
   const tiktokPlayerRef = useRef<ClippedVideoPlayerHandle>(null);
   const sourcePlayerRef = useRef<ClippedVideoPlayerHandle>(null);
+  const pendingResolverRef = useRef<(() => void) | null>(null);
+  const pendingTimeoutRef = useRef<number | null>(null);
+  const endedRef = useRef({ tiktok: false, source: false });
 
   const tiktokVideoUrl = api.getVideoUrl(projectId);
   const sourceVideoUrl = api.getSourceVideoUrl(projectId, gap.episode);
+  const hasPlayableScene = Boolean(scene);
 
   // Use resolved timing if available, otherwise current
   const displayStart = resolvedTiming?.start ?? gap.current_start;
@@ -92,6 +123,163 @@ function GapCard({
 
   // Calculate if still has gap after resolution
   const hasGapAfterResolution = displaySpeed < 0.75;
+
+  const fastWatchMinReadyState =
+    playbackRate >= 3
+      ? HTMLMediaElement.HAVE_FUTURE_DATA
+      : HTMLMediaElement.HAVE_CURRENT_DATA;
+  const fastWatchReadyTimeoutMs = playbackRate >= 4 ? 9000 : 7000;
+
+  const resolvePendingPlayback = useCallback(() => {
+    if (pendingTimeoutRef.current !== null) {
+      window.clearTimeout(pendingTimeoutRef.current);
+      pendingTimeoutRef.current = null;
+    }
+    const resolver = pendingResolverRef.current;
+    pendingResolverRef.current = null;
+    resolver?.();
+  }, []);
+
+  const handleClipEnded = useCallback(
+    (track: "tiktok" | "source") => {
+      endedRef.current[track] = true;
+      if (endedRef.current.tiktok && endedRef.current.source) {
+        resolvePendingPlayback();
+      }
+    },
+    [resolvePendingPlayback],
+  );
+
+  const warmupPair = useCallback(
+    async (timeoutMs: number): Promise<boolean> => {
+      if (!hasPlayableScene) return false;
+      const tiktok = tiktokPlayerRef.current;
+      const source = sourcePlayerRef.current;
+      if (!tiktok || !source) return false;
+
+      await Promise.all([
+        tiktok.waitUntilReady({
+          minReadyState: fastWatchMinReadyState,
+          timeoutMs,
+        }),
+        source.waitUntilReady({
+          minReadyState: fastWatchMinReadyState,
+          timeoutMs,
+        }),
+      ]);
+
+      if (tiktok.hasLoadError() || source.hasLoadError()) {
+        return false;
+      }
+
+      if (
+        tiktok.getReadyState() < fastWatchMinReadyState ||
+        source.getReadyState() < fastWatchMinReadyState
+      ) {
+        return false;
+      }
+
+      await Promise.all([tiktok.seekToStart(), source.seekToStart()]);
+      return !(tiktok.hasLoadError() || source.hasLoadError());
+    },
+    [fastWatchMinReadyState, hasPlayableScene],
+  );
+
+  const recoverPairLoadOnce = useCallback(async (): Promise<boolean> => {
+    if (!hasPlayableScene) return false;
+    const tiktok = tiktokPlayerRef.current;
+    const source = sourcePlayerRef.current;
+    if (!tiktok || !source) return false;
+
+    await Promise.all([tiktok.retryLoad(), source.retryLoad()]);
+    const recoveryTimeout = Math.max(fastWatchReadyTimeoutMs + 1500, 9000);
+    return warmupPair(recoveryTimeout);
+  }, [fastWatchReadyTimeoutMs, hasPlayableScene, warmupPair]);
+
+  const playBothFromStart = useCallback(async () => {
+    if (!hasPlayableScene) return;
+
+    const tiktok = tiktokPlayerRef.current;
+    const source = sourcePlayerRef.current;
+    if (!tiktok || !source) {
+      tiktok?.playFromStart();
+      source?.playFromStart();
+      return;
+    }
+
+    endedRef.current = { tiktok: false, source: false };
+    await Promise.all([tiktok.seekToStart(), source.seekToStart()]);
+    tiktok.play();
+    source.play();
+  }, [hasPlayableScene]);
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      playBothAndWait: async () => {
+        if (!hasPlayableScene || !scene) {
+          return;
+        }
+
+        resolvePendingPlayback();
+        await new Promise<void>((resolve) => {
+          pendingResolverRef.current = resolve;
+          const clipDurationSeconds =
+            Math.max(0.1, scene.end_time - scene.start_time) /
+            Math.max(playbackRate, 0.1);
+          pendingTimeoutRef.current = window.setTimeout(
+            () => resolvePendingPlayback(),
+            clipDurationSeconds * 1000 + 6000,
+          );
+          void playBothFromStart().catch(() => {
+            resolvePendingPlayback();
+          });
+        });
+      },
+      prepareForAutoplay: async () => {
+        if (!hasPlayableScene) return false;
+
+        const tiktok = tiktokPlayerRef.current;
+        const source = sourcePlayerRef.current;
+        if (!tiktok || !source) return false;
+
+        tiktok.forceLoad();
+        source.forceLoad();
+
+        const warmed = await warmupPair(fastWatchReadyTimeoutMs);
+        if (warmed) {
+          return true;
+        }
+
+        return recoverPairLoadOnce();
+      },
+      releasePreload: () => {
+        tiktokPlayerRef.current?.releaseLoad();
+        sourcePlayerRef.current?.releaseLoad();
+      },
+      stop: () => {
+        tiktokPlayerRef.current?.pause();
+        sourcePlayerRef.current?.pause();
+        resolvePendingPlayback();
+      },
+    }),
+    [
+      fastWatchReadyTimeoutMs,
+      hasPlayableScene,
+      playbackRate,
+      playBothFromStart,
+      recoverPairLoadOnce,
+      resolvePendingPlayback,
+      scene,
+      warmupPair,
+    ],
+  );
+
+  useEffect(() => {
+    return () => {
+      resolvePendingPlayback();
+    };
+  }, [resolvePendingPlayback]);
 
   const handleSelectCandidate = useCallback(
     async (candidate: GapCandidate) => {
@@ -103,7 +291,7 @@ function GapCard({
       );
 
       // Reset and auto-play both previews after a short delay for state update
-      setTimeout(() => {
+      window.setTimeout(() => {
         tiktokPlayerRef.current?.playFromStart();
         sourcePlayerRef.current?.playFromStart();
       }, 100);
@@ -124,17 +312,8 @@ function GapCard({
   );
 
   const handleSyncPlay = useCallback(async () => {
-    const tiktok = tiktokPlayerRef.current;
-    const source = sourcePlayerRef.current;
-    if (!tiktok || !source) {
-      tiktok?.playFromStart();
-      source?.playFromStart();
-      return;
-    }
-    await Promise.all([tiktok.seekToStart(), source.seekToStart()]);
-    tiktok.play();
-    source.play();
-  }, []);
+    await playBothFromStart();
+  }, [playBothFromStart]);
 
   const formatSpeed = (speed: number) => {
     return `${Math.round(speed * 100)}%`;
@@ -142,11 +321,13 @@ function GapCard({
 
   return (
     <div
-      className={`bg-[hsl(var(--card))] rounded-lg p-4 space-y-4 ${
+      className={cn(
+        "bg-[hsl(var(--card))] rounded-lg p-4 space-y-4",
         isResolved
           ? "border-2 border-green-500/30"
-          : "border-2 border-amber-500/30"
-      }`}
+          : "border-2 border-amber-500/30",
+        isActive && "ring-2 ring-[hsl(var(--primary))]/50",
+      )}
     >
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
@@ -184,7 +365,13 @@ function GapCard({
                 src={tiktokVideoUrl}
                 startTime={scene.start_time}
                 endTime={scene.end_time}
-                className="w-full h-full"
+                className={cn(
+                  "w-full h-full",
+                  controlsDisabled && "pointer-events-none",
+                )}
+                playbackRate={playbackRate}
+                eager={preloadMode === "auto"}
+                onClipEnded={() => handleClipEnded("tiktok")}
               />
             )}
           </div>
@@ -209,7 +396,13 @@ function GapCard({
               src={sourceVideoUrl}
               startTime={displayStart}
               endTime={displayEnd}
-              className="w-full h-full"
+              className={cn(
+                "w-full h-full",
+                controlsDisabled && "pointer-events-none",
+              )}
+              playbackRate={playbackRate}
+              eager={preloadMode === "auto"}
+              onClipEnded={() => handleClipEnded("source")}
             />
           </div>
           <div className="flex items-center justify-between mt-1">
@@ -350,6 +543,7 @@ function GapCard({
           size="sm"
           className="flex-1"
           onClick={handleSyncPlay}
+          disabled={controlsDisabled}
         >
           <Play className="h-4 w-4 mr-2" />
           Play Both
@@ -358,6 +552,7 @@ function GapCard({
           variant="outline"
           size="sm"
           onClick={() => setShowManualModal(true)}
+          disabled={controlsDisabled}
         >
           <Clock className="h-4 w-4 mr-1" />
           Manual
@@ -403,7 +598,7 @@ function GapCard({
       )}
     </div>
   );
-}
+});
 
 export function GapResolutionPage() {
   const { projectId } = useParams<{ projectId: string }>();
@@ -431,6 +626,284 @@ export function GapResolutionPage() {
     Record<number, GapCandidate[]>
   >({});
   const [loadingCandidates, setLoadingCandidates] = useState(false);
+  const [activeSceneIndex, setActiveSceneIndex] = useState(-1);
+  const [autoScroll, setAutoScroll] = useState(true);
+  const [fastWatchPlaying, setFastWatchPlaying] = useState(false);
+  const [playbackRate, setPlaybackRate] = useState(1);
+  const gapRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const cardRefs = useRef<Map<number, GapCardHandle>>(new Map());
+  const autoplayTokenRef = useRef(0);
+  const preparedScenesRef = useRef<Set<number>>(new Set());
+  const failedPreparedScenesRef = useRef<Set<number>>(new Set());
+  const preparingScenesRef = useRef<Map<number, Promise<void>>>(new Map());
+  const prefetchQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const autoScrollRef = useRef(true);
+  autoScrollRef.current = autoScroll;
+
+  const sortedGaps = useMemo(
+    () => [...gaps].sort((a, b) => a.scene_index - b.scene_index),
+    [gaps],
+  );
+
+  const fastWatchPrefetchAhead = useMemo(() => {
+    if (playbackRate >= 2) return 2;
+    return 1;
+  }, [playbackRate]);
+
+  const clearFastWatchBuffers = useCallback(() => {
+    preparedScenesRef.current.clear();
+    failedPreparedScenesRef.current.clear();
+    preparingScenesRef.current.clear();
+    prefetchQueueRef.current = Promise.resolve();
+  }, []);
+
+  const stopFastWatch = useCallback(() => {
+    autoplayTokenRef.current += 1;
+    setFastWatchPlaying(false);
+    cardRefs.current.forEach((card) => {
+      card.stop();
+      card.releasePreload();
+    });
+    clearFastWatchBuffers();
+  }, [clearFastWatchBuffers]);
+
+  const scrollToScene = useCallback((sceneIndex: number, force = false) => {
+    if (!force && !autoScrollRef.current) return;
+    const el = gapRefs.current.get(sceneIndex);
+    if (el) {
+      el.scrollIntoView({ behavior: "instant", block: "center" });
+    }
+  }, []);
+
+  const ensureScenePrepared = useCallback(
+    (sceneIndex: number, token: number): Promise<void> => {
+      if (autoplayTokenRef.current !== token) {
+        return Promise.resolve();
+      }
+      if (failedPreparedScenesRef.current.has(sceneIndex)) {
+        return Promise.resolve();
+      }
+      if (preparedScenesRef.current.has(sceneIndex)) {
+        return Promise.resolve();
+      }
+
+      const existing = preparingScenesRef.current.get(sceneIndex);
+      if (existing) {
+        return existing;
+      }
+
+      const card = cardRefs.current.get(sceneIndex);
+      if (!card) {
+        return Promise.resolve();
+      }
+
+      const promise = card
+        .prepareForAutoplay()
+        .then((isPrepared) => {
+          if (autoplayTokenRef.current !== token) {
+            card.releasePreload();
+            return;
+          }
+          if (!isPrepared) {
+            failedPreparedScenesRef.current.add(sceneIndex);
+            preparedScenesRef.current.delete(sceneIndex);
+            return;
+          }
+          failedPreparedScenesRef.current.delete(sceneIndex);
+          preparedScenesRef.current.add(sceneIndex);
+        })
+        .catch(() => {
+          failedPreparedScenesRef.current.add(sceneIndex);
+        })
+        .finally(() => {
+          preparingScenesRef.current.delete(sceneIndex);
+        });
+
+      preparingScenesRef.current.set(sceneIndex, promise);
+      return promise;
+    },
+    [],
+  );
+
+  const scheduleScenePreparation = useCallback(
+    (sceneIndex: number, token: number) => {
+      if (autoplayTokenRef.current !== token) return;
+      if (failedPreparedScenesRef.current.has(sceneIndex)) return;
+      if (preparedScenesRef.current.has(sceneIndex)) return;
+      if (preparingScenesRef.current.has(sceneIndex)) return;
+
+      prefetchQueueRef.current = prefetchQueueRef.current
+        .then(() => ensureScenePrepared(sceneIndex, token))
+        .catch(() => {
+          // Keep queue alive even if one preparation fails.
+        });
+    },
+    [ensureScenePrepared],
+  );
+
+  const releaseOutsideFastWatchWindow = useCallback(
+    (orderedGaps: GapInfo[], currentOffset: number) => {
+      const keepBehind = 0;
+      const keepStart = Math.max(0, currentOffset - keepBehind);
+      const keepEnd = Math.min(
+        orderedGaps.length - 1,
+        currentOffset + fastWatchPrefetchAhead,
+      );
+      const keepSceneIndices = new Set<number>();
+
+      for (let i = keepStart; i <= keepEnd; i += 1) {
+        const gap = orderedGaps[i];
+        if (gap) {
+          keepSceneIndices.add(gap.scene_index);
+        }
+      }
+
+      for (const preparedSceneIndex of Array.from(preparedScenesRef.current)) {
+        if (keepSceneIndices.has(preparedSceneIndex)) continue;
+        cardRefs.current.get(preparedSceneIndex)?.releasePreload();
+        preparedScenesRef.current.delete(preparedSceneIndex);
+      }
+
+      for (const failedSceneIndex of Array.from(
+        failedPreparedScenesRef.current,
+      )) {
+        if (keepSceneIndices.has(failedSceneIndex)) continue;
+        cardRefs.current.get(failedSceneIndex)?.releasePreload();
+        failedPreparedScenesRef.current.delete(failedSceneIndex);
+      }
+    },
+    [fastWatchPrefetchAhead],
+  );
+
+  const playFastWatchFromScene = useCallback(
+    async (startSceneIndex: number) => {
+      if (!sortedGaps.length) return;
+
+      const token = autoplayTokenRef.current + 1;
+      autoplayTokenRef.current = token;
+      setFastWatchPlaying(true);
+      clearFastWatchBuffers();
+
+      const startPos = sortedGaps.findIndex(
+        (gap) => gap.scene_index === startSceneIndex,
+      );
+      const orderedGaps = startPos >= 0 ? sortedGaps.slice(startPos) : sortedGaps;
+      const initialWindow = orderedGaps.slice(0, fastWatchPrefetchAhead + 1);
+      const mandatoryWarmup = initialWindow.slice(
+        0,
+        Math.min(2, initialWindow.length),
+      );
+
+      for (const gap of mandatoryWarmup) {
+        await ensureScenePrepared(gap.scene_index, token);
+        if (autoplayTokenRef.current !== token) {
+          return;
+        }
+      }
+
+      for (const gap of initialWindow.slice(mandatoryWarmup.length)) {
+        scheduleScenePreparation(gap.scene_index, token);
+      }
+
+      if (autoplayTokenRef.current !== token) {
+        return;
+      }
+
+      for (let i = 0; i < orderedGaps.length; i += 1) {
+        if (autoplayTokenRef.current !== token) {
+          return;
+        }
+
+        const gap = orderedGaps[i];
+        const card = cardRefs.current.get(gap.scene_index);
+        if (!card) {
+          continue;
+        }
+
+        await ensureScenePrepared(gap.scene_index, token);
+        if (autoplayTokenRef.current !== token) {
+          return;
+        }
+
+        if (failedPreparedScenesRef.current.has(gap.scene_index)) {
+          setActiveSceneIndex(gap.scene_index);
+          scrollToScene(gap.scene_index);
+          releaseOutsideFastWatchWindow(orderedGaps, i + 1);
+          continue;
+        }
+
+        for (let offset = 1; offset <= fastWatchPrefetchAhead; offset += 1) {
+          const nextGap = orderedGaps[i + offset];
+          if (!nextGap) break;
+          scheduleScenePreparation(nextGap.scene_index, token);
+        }
+
+        setActiveSceneIndex(gap.scene_index);
+        const playback = card.playBothAndWait();
+        scrollToScene(gap.scene_index);
+        await playback;
+        releaseOutsideFastWatchWindow(orderedGaps, i + 1);
+      }
+
+      if (autoplayTokenRef.current === token) {
+        autoplayTokenRef.current = token + 1;
+        setFastWatchPlaying(false);
+        for (const preparedSceneIndex of Array.from(
+          preparedScenesRef.current,
+        )) {
+          cardRefs.current.get(preparedSceneIndex)?.releasePreload();
+        }
+        clearFastWatchBuffers();
+      }
+    },
+    [
+      sortedGaps,
+      clearFastWatchBuffers,
+      fastWatchPrefetchAhead,
+      ensureScenePrepared,
+      scheduleScenePreparation,
+      scrollToScene,
+      releaseOutsideFastWatchWindow,
+    ],
+  );
+
+  const handleToggleFastWatch = useCallback(() => {
+    if (fastWatchPlaying) {
+      stopFastWatch();
+      return;
+    }
+
+    const startSceneIndex =
+      activeSceneIndex >= 0
+        ? activeSceneIndex
+        : sortedGaps.length > 0
+          ? sortedGaps[0].scene_index
+          : undefined;
+    if (startSceneIndex === undefined) return;
+
+    void playFastWatchFromScene(startSceneIndex);
+  }, [
+    fastWatchPlaying,
+    stopFastWatch,
+    activeSceneIndex,
+    sortedGaps,
+    playFastWatchFromScene,
+  ]);
+
+  const handleTimelineSeek = useCallback(
+    (position: number) => {
+      const targetGap = sortedGaps[position];
+      if (!targetGap) return;
+
+      setActiveSceneIndex(targetGap.scene_index);
+      scrollToScene(targetGap.scene_index, true);
+
+      if (fastWatchPlaying) {
+        void playFastWatchFromScene(targetGap.scene_index);
+      }
+    },
+    [sortedGaps, scrollToScene, fastWatchPlaying, playFastWatchFromScene],
+  );
 
   // Load data
   useEffect(() => {
@@ -481,6 +954,32 @@ export function GapResolutionPage() {
     loadData();
   }, [projectId, loadProject, loadScenes]);
 
+  useEffect(() => {
+    if (sortedGaps.length === 0) {
+      setActiveSceneIndex(-1);
+      return;
+    }
+
+    setActiveSceneIndex((prev) => {
+      if (sortedGaps.some((gap) => gap.scene_index === prev)) {
+        return prev;
+      }
+      return sortedGaps[0].scene_index;
+    });
+  }, [sortedGaps]);
+
+  useEffect(() => {
+    const cards = cardRefs.current;
+    return () => {
+      autoplayTokenRef.current += 1;
+      cards.forEach((card) => {
+        card.stop();
+        card.releasePreload();
+      });
+      clearFastWatchBuffers();
+    };
+  }, [clearFastWatchBuffers]);
+
   const handleUpdateGap = useCallback(
     async (
       sceneIndex: number,
@@ -490,6 +989,7 @@ export function GapResolutionPage() {
     ) => {
       if (!projectId) return;
 
+      stopFastWatch();
       try {
         // Update on backend
         await fetch(`/api/projects/${projectId}/gaps/${sceneIndex}`, {
@@ -519,16 +1019,17 @@ export function GapResolutionPage() {
         setError((err as Error).message);
       }
     },
-    [projectId],
+    [projectId, stopFastWatch],
   );
 
   const handleSkipGap = useCallback(
     async (sceneIndex: number) => {
       if (!projectId) return;
 
+      stopFastWatch();
       try {
         // Find the gap
-        const gap = gaps.find((g) => g.scene_index === sceneIndex);
+        const gap = sortedGaps.find((g) => g.scene_index === sceneIndex);
         if (!gap) return;
 
         // Update on backend with original timing (skipped=true)
@@ -559,12 +1060,13 @@ export function GapResolutionPage() {
         setError((err as Error).message);
       }
     },
-    [projectId, gaps],
+    [projectId, sortedGaps, stopFastWatch],
   );
 
   const handleContinue = useCallback(async () => {
     if (!projectId) return;
 
+    stopFastWatch();
     setSaving(true);
     try {
       // Mark gaps as resolved
@@ -581,7 +1083,7 @@ export function GapResolutionPage() {
     } finally {
       setSaving(false);
     }
-  }, [projectId, navigate]);
+  }, [projectId, navigate, stopFastWatch]);
 
   const [resetting, setResetting] = useState(false);
   const handleReset = useCallback(async () => {
@@ -595,6 +1097,7 @@ export function GapResolutionPage() {
       return;
     }
 
+    stopFastWatch();
     setResetting(true);
     try {
       await fetch(`/api/projects/${projectId}/gaps/reset`, {
@@ -610,12 +1113,13 @@ export function GapResolutionPage() {
     } finally {
       setResetting(false);
     }
-  }, [projectId, navigate]);
+  }, [projectId, navigate, stopFastWatch]);
 
   const [autoFilling, setAutoFilling] = useState(false);
   const handleAutoFill = useCallback(async () => {
     if (!projectId) return;
 
+    stopFastWatch();
     setAutoFilling(true);
     try {
       const response = await fetch(
@@ -657,7 +1161,7 @@ export function GapResolutionPage() {
     } finally {
       setAutoFilling(false);
     }
-  }, [projectId, resolvedGaps, skippedGaps]);
+  }, [projectId, resolvedGaps, skippedGaps, stopFastWatch]);
 
   // Auto-resolve: when autoResolve is requested, wait for data, auto-fill, then auto-continue
   useEffect(() => {
@@ -675,7 +1179,7 @@ export function GapResolutionPage() {
 
     const runAutoResolve = async () => {
       try {
-        if (gaps.length === 0) {
+        if (sortedGaps.length === 0) {
           // No gaps — mark resolved and go back
           await fetch(`/api/projects/${projectId}/gaps/mark-resolved`, {
             method: "POST",
@@ -709,15 +1213,23 @@ export function GapResolutionPage() {
     };
 
     runAutoResolve();
-  }, [autoResolving, projectId, loading, loadingCandidates, gaps, navigate]);
+  }, [autoResolving, projectId, loading, loadingCandidates, sortedGaps, navigate]);
 
   // Count resolved + skipped
   const handledCount = resolvedGaps.size + skippedGaps.size;
-  const totalGaps = gaps.length;
+  const totalGaps = sortedGaps.length;
   const allHandled = handledCount === totalGaps;
 
   // Count skipped that still have warnings
   const warningCount = skippedGaps.size;
+
+  const activeScenePosition = useMemo(() => {
+    if (sortedGaps.length === 0) return 0;
+    const index = sortedGaps.findIndex(
+      (gap) => gap.scene_index === activeSceneIndex,
+    );
+    return index >= 0 ? index : 0;
+  }, [sortedGaps, activeSceneIndex]);
 
   if (loading || autoResolving) {
     return (
@@ -743,7 +1255,7 @@ export function GapResolutionPage() {
   }
 
   return (
-    <div className="min-h-screen p-4">
+    <div className="min-h-screen p-4 pb-28">
       <div className="max-w-4xl mx-auto space-y-6">
         <header className="space-y-4">
           <div className="flex items-center justify-between">
@@ -834,31 +1346,121 @@ export function GapResolutionPage() {
 
         {/* Gap cards */}
         <div className="space-y-4">
-          {gaps.map((gap) => {
+          {sortedGaps.map((gap, gapPosition) => {
             const scene = scenes.find((s) => s.index === gap.scene_index);
             const isResolved = resolvedGaps.has(gap.scene_index);
             const isSkipped = skippedGaps.has(gap.scene_index);
             const resolvedTiming = resolvedGaps.get(gap.scene_index) || null;
 
             return (
-              <GapCard
+              <div
                 key={gap.scene_index}
-                gap={gap}
-                scene={scene}
-                projectId={projectId!}
-                episodes={episodes}
-                isResolved={isResolved || isSkipped}
-                isSkipped={isSkipped}
-                resolvedTiming={resolvedTiming}
-                candidates={candidatesByScene[gap.scene_index] || []}
-                loadingCandidates={loadingCandidates}
-                onUpdate={handleUpdateGap}
-                onSkip={handleSkipGap}
-              />
+                className="[content-visibility:auto] [contain-intrinsic-size:960px]"
+                ref={(el) => {
+                  if (el) gapRefs.current.set(gap.scene_index, el);
+                  else gapRefs.current.delete(gap.scene_index);
+                }}
+              >
+                <GapCard
+                  ref={(card) => {
+                    if (card) cardRefs.current.set(gap.scene_index, card);
+                    else cardRefs.current.delete(gap.scene_index);
+                  }}
+                  gap={gap}
+                  scene={scene}
+                  projectId={projectId!}
+                  episodes={episodes}
+                  isResolved={isResolved || isSkipped}
+                  isSkipped={isSkipped}
+                  resolvedTiming={resolvedTiming}
+                  candidates={candidatesByScene[gap.scene_index] || []}
+                  loadingCandidates={loadingCandidates}
+                  isActive={activeSceneIndex === gap.scene_index}
+                  playbackRate={playbackRate}
+                  controlsDisabled={fastWatchPlaying}
+                  preloadMode={
+                    Math.abs(gapPosition - activeScenePosition) <= 2
+                      ? "auto"
+                      : "metadata"
+                  }
+                  onUpdate={handleUpdateGap}
+                  onSkip={handleSkipGap}
+                />
+              </div>
             );
           })}
         </div>
       </div>
+
+      {totalGaps > 0 && (
+        <div className="fixed bottom-0 left-0 right-0 z-50 bg-[hsl(var(--card))] border-t border-[hsl(var(--border))] shadow-lg">
+          <div className="max-w-4xl mx-auto px-4 py-2 space-y-2">
+            <div className="flex items-center gap-3">
+              <Button
+                variant={fastWatchPlaying ? "default" : "outline"}
+                size="sm"
+                onClick={handleToggleFastWatch}
+                disabled={loadingCandidates || totalGaps === 0}
+              >
+                {fastWatchPlaying ? (
+                  <>
+                    <Pause className="h-4 w-4 mr-1" />
+                    Pause
+                  </>
+                ) : (
+                  <>
+                    <Play className="h-4 w-4 mr-1" />
+                    Fast Watch
+                  </>
+                )}
+              </Button>
+
+              <span className="text-xs text-[hsl(var(--muted-foreground))] min-w-[100px]">
+                Gap {activeScenePosition + 1} / {totalGaps}
+              </span>
+
+              <label className="flex items-center gap-1.5 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={autoScroll}
+                  onChange={(e) => setAutoScroll(e.target.checked)}
+                  className="accent-[hsl(var(--primary))] h-3.5 w-3.5"
+                />
+                <span className="text-xs text-[hsl(var(--muted-foreground))]">
+                  Scroll
+                </span>
+              </label>
+
+              <div className="flex-1" />
+
+              <span className="text-xs font-mono text-[hsl(var(--muted-foreground))] min-w-[34px] text-right">
+                {playbackRate}x
+              </span>
+              <input
+                type="range"
+                min="0.5"
+                max="12"
+                step="0.25"
+                value={playbackRate}
+                onChange={(e) => setPlaybackRate(parseFloat(e.target.value))}
+                className="w-24 h-1 accent-[hsl(var(--primary))]"
+                title={`Playback speed: ${playbackRate}x`}
+              />
+            </div>
+
+            <input
+              type="range"
+              min={0}
+              max={Math.max(0, totalGaps - 1)}
+              step={1}
+              value={activeScenePosition}
+              onChange={(e) => handleTimelineSeek(parseInt(e.target.value, 10))}
+              className="w-full h-1 accent-[hsl(var(--primary))]"
+              title="Timeline scroller"
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }

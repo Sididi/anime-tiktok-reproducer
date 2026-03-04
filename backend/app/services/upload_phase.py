@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from zoneinfo import ZoneInfo
 import logging
 import shutil
 import tempfile
@@ -75,6 +76,7 @@ def _dir_size(path: Path) -> int:
 class UploadPhaseService:
     """Project manager view, upload execution, and managed delete flow."""
     _SUPPORTED_PLATFORMS = ("youtube", "facebook", "instagram")
+    _FRENCH_TZ = ZoneInfo("Europe/Paris")
 
     @classmethod
     def _resolve_drive_folder(
@@ -253,9 +255,14 @@ class UploadPhaseService:
 
     @classmethod
     def _format_french_datetime(cls, dt: datetime) -> str:
-        day_name = cls._FRENCH_DAYS[dt.weekday()]
-        month_name = cls._FRENCH_MONTHS[dt.month - 1]
-        return f"{day_name} {dt.day} {month_name} {dt.year} à {dt.strftime('%H:%M')}"
+        aware = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+        french_dt = aware.astimezone(cls._FRENCH_TZ)
+        day_name = cls._FRENCH_DAYS[french_dt.weekday()]
+        month_name = cls._FRENCH_MONTHS[french_dt.month - 1]
+        return (
+            f"{day_name} {french_dt.day} {month_name} {french_dt.year} "
+            f"à {french_dt.strftime('%H:%M')}"
+        )
 
     @classmethod
     def _format_upload_discord_message(
@@ -635,7 +642,10 @@ class UploadPhaseService:
         return cls._send_n8n_payload(
             platform="instagram",
             payload=payload,
-            success_detail=f"Deferred to n8n; scheduled for {scheduled_at.isoformat()}",
+            success_detail=(
+                f"Deferred to n8n; scheduled for "
+                f"{cls._format_french_datetime(scheduled_at)}"
+            ),
         )
 
     # ── Facebook duration check (pre-upload) ──────────────────────────────
