@@ -111,6 +111,12 @@ def strip_punctuation(text: str) -> str:
 # Sentence-ending punctuation that should trigger a subtitle break
 SENTENCE_ENDING_PUNCT = {'.', '!', '?', '…', ':', ';'}
 
+# Guardrail for low-confidence single-word subtitles.
+LOW_CONF_THRESHOLD = 0.05
+LOW_CONF_SINGLE_WORD_MIN_DURATION_SEC = 0.22
+MIN_GAP_FOR_EXTENSION_SEC = 0.30
+NEXT_WORD_SAFETY_SEC = 1.0 / 60.0
+
 
 def has_sentence_ending(text: str) -> bool:
     """Check if a word ends with sentence-ending punctuation."""
@@ -990,21 +996,40 @@ class ProcessingService:
 
             # Create the SRT block (only if we have words)
             if current_block:
+                next_word = all_words[i] if i < len(all_words) else None
+
                 # Determine end time:
                 # - If there's a next word, check for gap
                 # - If gap > 0.3s (obvious silence), use current block's last word end
                 # - Otherwise, extend to next word's start (no temporal gap)
-                if i < len(all_words):
-                    gap = all_words[i].start - current_block[-1].end
+                if next_word:
+                    gap = next_word.start - current_block[-1].end
                     if gap > 0.3:
                         # Obvious silence - don't force continuity
                         end_time = current_block[-1].end
                     else:
                         # Continuity: extend to next word's start
-                        end_time = all_words[i].start
+                        end_time = next_word.start
                 else:
                     # Last block - use natural end
                     end_time = current_block[-1].end
+
+                # Guardrail: when a single low-confidence word is followed by a
+                # clear silence, avoid extremely short flashes by extending up to
+                # a minimum duration, while keeping a frame of safety.
+                if next_word and len(current_block) == 1:
+                    block_word = current_block[0]
+                    block_duration = end_time - block_word.start
+                    gap_to_next = next_word.start - block_word.end
+                    if (
+                        block_word.confidence <= LOW_CONF_THRESHOLD
+                        and block_duration < LOW_CONF_SINGLE_WORD_MIN_DURATION_SEC
+                        and gap_to_next > MIN_GAP_FOR_EXTENSION_SEC
+                    ):
+                        target_end = block_word.start + LOW_CONF_SINGLE_WORD_MIN_DURATION_SEC
+                        max_allowed_end = next_word.start - NEXT_WORD_SAFETY_SEC
+                        if max_allowed_end > end_time:
+                            end_time = min(max(target_end, end_time), max_allowed_end)
 
                 block = cls._create_srt_block_aggressive(
                     block_index, current_block, end_time
