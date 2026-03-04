@@ -21,15 +21,15 @@ TITLE_PANEL_COLOR = (255, 255, 255, 245)  # white, nearly opaque
 TITLE_PANEL_RADIUS = 16
 TITLE_PAD_H = 32
 TITLE_SCREEN_MARGIN = 60  # min px from screen edge to panel edge
-TITLE_GAP_ABOVE_CENTER = 80  # px between panel bottom and center frame top
+TITLE_GAP_ABOVE_CENTER = 90  # px between panel bottom and center frame top
 TITLE_MAX_LINES = 2
 
 # --- Category style ---
-CAT_FONT_SIZE = 76
+CAT_FONT_SIZE = 58
 CAT_TEXT_COLOR = (255, 255, 255)  # white
 CAT_OUTLINE_COLOR = (0, 0, 0)  # black
-CAT_OUTLINE_WIDTH = 2
-CAT_GAP_BELOW_CENTER = 104  # px between center frame bottom and category text top
+CAT_OUTLINE_WIDTH = 4
+CAT_GAP_BELOW_CENTER = 90  # px between center frame bottom and category text top (matches title gap)
 
 FONT_DIR = Path(__file__).resolve().parents[3] / "assets" / "fonts"
 TITLE_FONT_PATH = FONT_DIR / "Inter-BlackItalic.ttf"
@@ -75,6 +75,21 @@ class TitleImageGeneratorService:
         return ImageFont.load_default()
 
     @classmethod
+    def _merge_french_punctuation(cls, words: list[str]) -> list[str]:
+        """Merge standalone French punctuation (? ! : ;) with preceding word.
+
+        In French typography, these punctuation marks have a space before them
+        but must not be separated from the previous word during line wrapping.
+        """
+        merged: list[str] = []
+        for word in words:
+            if word in ("?", "!", ":", ";") and merged:
+                merged[-1] = merged[-1] + " " + word
+            else:
+                merged.append(word)
+        return merged
+
+    @classmethod
     def _wrap_text(
         cls, text: str, font: ImageFont.FreeTypeFont, max_width: int
     ) -> list[str]:
@@ -83,7 +98,7 @@ class TitleImageGeneratorService:
         if bbox[2] - bbox[0] <= max_width:
             return [text]
 
-        words = text.split()
+        words = cls._merge_french_punctuation(text.split())
         if len(words) < 2:
             # Single long word — force it (will overflow but can't split)
             return [text]
@@ -114,7 +129,7 @@ class TitleImageGeneratorService:
         draw = ImageDraw.Draw(img)
 
         max_text_width = WIDTH - 2 * (TITLE_SCREEN_MARGIN + TITLE_PAD_H)
-        lines = cls._wrap_text(title, font, max_text_width)
+        lines = cls._wrap_text(title.upper(), font, max_text_width)
 
         # Calculate panel dimensions
         total_text_h = TITLE_LINE_HEIGHT * len(lines)
@@ -185,7 +200,7 @@ class TitleImageGeneratorService:
             parts = text.split(separator)
             left, right = parts[0].strip(), parts[1].strip()
             space_w = font.getbbox(" ")[2] - font.getbbox(" ")[0]
-            bullet_radius = 12
+            bullet_radius = 9
             bullet_gap = space_w  # space on each side of the circle
 
             left_w = font.getbbox(left)[2] - font.getbbox(left)[0]
