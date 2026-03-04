@@ -12,6 +12,7 @@ _LANGUAGE_DISPLAY = {
     "fr": "Français",
     "en": "English",
     "es": "Español",
+    "de": "Deutsch",
 }
 
 _PROMPT_TEMPLATE = """# Role & Objectif

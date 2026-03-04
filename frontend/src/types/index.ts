@@ -96,6 +96,19 @@ export interface ScriptAutomationPart {
   download_url: string;
 }
 
+export interface ScriptTtsPreparedSegment {
+  id: number;
+  scene_indices: number[];
+  text: string;
+  character_count: number;
+}
+
+export interface ScriptTtsPrepareResponse {
+  language: string;
+  normalized_full_text: string;
+  segments: ScriptTtsPreparedSegment[];
+}
+
 export interface ScriptAutomationEvent {
   event:
     | "starting"

@@ -15,6 +15,7 @@ from .elevenlabs_service import ElevenLabsService
 from .gemini_service import GeminiService
 from .metadata import MetadataService
 from .project_service import ProjectService
+from .tts_text_normalizer import TtsTextNormalizer
 from .voice_config_service import VoiceConfigService
 
 
@@ -22,6 +23,7 @@ _LANGUAGE_DISPLAY = {
     "fr": "Français",
     "en": "English",
     "es": "Español",
+    "de": "Deutsch",
 }
 
 _SCRIPT_AUTOMATION_PROMPT = """# ROLE
@@ -228,6 +230,65 @@ class ScriptAutomationService:
         return " ".join(parts).strip()
 
     @classmethod
+    def _resolve_tts_language(
+        cls,
+        *,
+        script_payload: dict[str, Any],
+        target_language: str | None,
+    ) -> str:
+        candidate = (target_language or "").strip().lower()
+        if not candidate:
+            payload_language = script_payload.get("language")
+            if isinstance(payload_language, str):
+                candidate = payload_language.strip().lower()
+        if not candidate:
+            candidate = "fr"
+        return TtsTextNormalizer.resolve_language(candidate)
+
+    @classmethod
+    def prepare_tts_payload(
+        cls,
+        *,
+        script_payload: dict[str, Any],
+        target_language: str | None = None,
+    ) -> dict[str, Any]:
+        scenes = script_payload.get("scenes")
+        if not isinstance(scenes, list) or not scenes:
+            raise RuntimeError("Script JSON must contain a non-empty 'scenes' array")
+
+        language = cls._resolve_tts_language(script_payload=script_payload, target_language=target_language)
+        normalized_scenes: list[dict[str, Any]] = []
+        for idx, item in enumerate(scenes):
+            if not isinstance(item, dict):
+                raise RuntimeError(f"Scene at position {idx} is not an object")
+
+            raw_text = item.get("text")
+            if not isinstance(raw_text, str):
+                raise RuntimeError(f"Scene at position {idx} must contain a 'text' string")
+
+            scene_index_raw = item.get("scene_index")
+            scene_index = scene_index_raw if isinstance(scene_index_raw, int) else idx + 1
+            normalized_text = TtsTextNormalizer.normalize_text(raw_text, language=language).strip()
+            normalized_scenes.append(
+                {
+                    "scene_index": scene_index,
+                    "text": normalized_text,
+                }
+            )
+
+        normalized_payload = {
+            "language": language,
+            "scenes": normalized_scenes,
+        }
+        segments = cls._segment_scenes_for_tts_payload(normalized_payload)
+        normalized_full_text = " ".join(scene["text"] for scene in normalized_scenes if scene["text"]).strip()
+        return {
+            "language": language,
+            "normalized_full_text": normalized_full_text,
+            "segments": segments,
+        }
+
+    @classmethod
     def _script_response_schema(
         cls,
         *,
@@ -334,48 +395,78 @@ class ScriptAutomationService:
         return text[:cap], text[cap:]
 
     @classmethod
-    def _segment_scenes_for_tts(cls, script_payload: dict[str, Any]) -> list[str]:
-        """Segment script scenes for TTS, mirroring frontend segmentScenes logic."""
+    def _segment_scenes_for_tts_payload(cls, script_payload: dict[str, Any]) -> list[dict[str, Any]]:
+        """Segment script scenes for TTS and keep scene index mapping."""
         scenes = script_payload.get("scenes", [])
-        if not scenes:
+        if not isinstance(scenes, list) or not scenes:
             return []
 
-        chunks: list[str] = []
-        current_text = ""
+        def _create_empty_segment(segment_id: int) -> dict[str, Any]:
+            return {
+                "id": segment_id,
+                "scene_indices": [],
+                "text": "",
+                "character_count": 0,
+            }
+
+        segments: list[dict[str, Any]] = []
+        current_segment = _create_empty_segment(1)
 
         for i, scene in enumerate(scenes):
-            scene_text = (scene.get("text") or "").strip()
+            if not isinstance(scene, dict):
+                continue
+            scene_text = str(scene.get("text") or "").strip()
             if not scene_text:
                 continue
 
-            merged = f"{current_text} {scene_text}".strip() if current_text else scene_text
-            current_text = merged
+            scene_index_raw = scene.get("scene_index")
+            scene_index = scene_index_raw if isinstance(scene_index_raw, int) else i + 1
+            merged_text = f"{current_segment['text']} {scene_text}".strip() if current_segment["text"] else scene_text
+            current_segment["scene_indices"] = [*current_segment["scene_indices"], scene_index]
+            current_segment["text"] = merged_text
+            current_segment["character_count"] = len(merged_text)
 
-            while len(current_text) > cls.TTS_HARD_MAX:
-                hard_chunk, remainder = cls._split_at_hard_cap(current_text, cls.TTS_HARD_MAX)
+            while int(current_segment["character_count"]) > cls.TTS_HARD_MAX:
+                hard_chunk, remainder = cls._split_at_hard_cap(str(current_segment["text"]), cls.TTS_HARD_MAX)
                 if not hard_chunk:
                     break
-                chunks.append(hard_chunk)
-                current_text = remainder
+                segments.append(
+                    {
+                        "id": len(segments) + 1,
+                        "scene_indices": [*current_segment["scene_indices"]],
+                        "text": hard_chunk,
+                        "character_count": len(hard_chunk),
+                    }
+                )
+                current_segment = {
+                    "id": len(segments) + 1,
+                    "scene_indices": [*current_segment["scene_indices"]],
+                    "text": remainder,
+                    "character_count": len(remainder),
+                }
 
-            if not current_text:
+            if not current_segment["text"]:
                 continue
 
-            current_len = len(current_text)
+            current_len = int(current_segment["character_count"])
 
             is_last = i == len(scenes) - 1
-            ends_sentence = bool(_SENTENCE_END_RE.search(current_text))
+            ends_sentence = bool(_SENTENCE_END_RE.search(str(current_segment["text"])))
 
             if not ends_sentence and not is_last:
                 continue
 
             if is_last:
-                chunks.append(cls._ensure_sentence_end(current_text))
-                current_text = ""
+                normalized = cls._ensure_sentence_end(str(current_segment["text"]))
+                current_segment["text"] = normalized
+                current_segment["character_count"] = len(normalized)
+                segments.append(current_segment)
+                current_segment = _create_empty_segment(len(segments) + 1)
                 continue
 
-            next_text = (scenes[i + 1].get("text") or "").strip()
-            with_next_len = len(f"{current_text} {next_text}") if next_text else current_len
+            next_scene = scenes[i + 1] if i + 1 < len(scenes) and isinstance(scenes[i + 1], dict) else {}
+            next_text = str(next_scene.get("text") or "").strip()
+            with_next_len = len(f"{current_segment['text']} {next_text}") if next_text else current_len
 
             if current_len >= cls.TTS_MIN:
                 close_now = (
@@ -388,20 +479,39 @@ class ScriptAutomationService:
                 close_now = with_next_len > cls.TTS_SOFT_MAX
 
             if close_now:
-                chunks.append(cls._ensure_sentence_end(current_text))
-                current_text = ""
+                normalized = cls._ensure_sentence_end(str(current_segment["text"]))
+                current_segment["text"] = normalized
+                current_segment["character_count"] = len(normalized)
+                segments.append(current_segment)
+                current_segment = _create_empty_segment(len(segments) + 1)
 
-        if current_text:
-            chunks.append(cls._ensure_sentence_end(current_text))
+        if current_segment["scene_indices"]:
+            normalized = cls._ensure_sentence_end(str(current_segment["text"]))
+            current_segment["text"] = normalized
+            current_segment["character_count"] = len(normalized)
+            segments.append(current_segment)
 
         # Merge small final chunk only when it keeps us within soft max and preserves sentence ending.
-        if len(chunks) >= 2 and len(chunks[-1]) < cls.TTS_MIN and _SENTENCE_END_RE.search(chunks[-1]):
-            merged = f"{chunks[-2]} {chunks[-1]}".strip()
+        if (
+            len(segments) >= 2
+            and int(segments[-1]["character_count"]) < cls.TTS_MIN
+            and _SENTENCE_END_RE.search(str(segments[-1]["text"]))
+        ):
+            merged = f"{segments[-2]['text']} {segments[-1]['text']}".strip()
             if len(merged) <= cls.TTS_SOFT_MAX:
-                chunks[-2] = cls._ensure_sentence_end(merged)
-                chunks.pop()
+                segments[-2]["text"] = cls._ensure_sentence_end(merged)
+                segments[-2]["character_count"] = len(str(segments[-2]["text"]))
+                segments[-2]["scene_indices"] = [*segments[-2]["scene_indices"], *segments[-1]["scene_indices"]]
+                segments.pop()
 
-        return chunks
+        for i, segment in enumerate(segments):
+            segment["id"] = i + 1
+
+        return segments
+
+    @classmethod
+    def _segment_scenes_for_tts(cls, script_payload: dict[str, Any]) -> list[str]:
+        return [str(segment.get("text", "")).strip() for segment in cls._segment_scenes_for_tts_payload(script_payload)]
 
     @classmethod
     def _output_extension(cls) -> str:
@@ -656,7 +766,9 @@ class ScriptAutomationService:
                 yield cls._event("tts_generating", message="TTS generation skipped")
             else:
                 yield cls._event("tts_segmenting", message="Segmenting script for TTS...")
-                chunks = cls._segment_scenes_for_tts(script_payload)
+                prepared_tts = cls.prepare_tts_payload(script_payload=script_payload, target_language=target_language)
+                segments = prepared_tts.get("segments", [])
+                chunks = [str(segment.get("text", "")).strip() for segment in segments]
                 if not chunks:
                     raise RuntimeError("Failed to segment script text for TTS")
 
@@ -670,13 +782,18 @@ class ScriptAutomationService:
                 part_paths: list[Path] = []
 
                 for idx, chunk in enumerate(chunks, start=1):
+                    segment_char_count = len(chunk)
+                    if idx - 1 < len(segments):
+                        raw_count = segments[idx - 1].get("character_count")
+                        if isinstance(raw_count, int):
+                            segment_char_count = raw_count
                     yield cls._event(
                         "tts_generating",
                         message=f"Generating audio part {idx}/{len(chunks)}...",
                         part_id=str(idx),
                         part_index=idx,
                         part_total=len(chunks),
-                        char_count=len(chunk),
+                        char_count=segment_char_count,
                     )
 
                     audio_bytes = await asyncio.to_thread(
@@ -696,7 +813,7 @@ class ScriptAutomationService:
                     parts.append(
                         {
                             "id": str(idx),
-                            "char_count": len(chunk),
+                            "char_count": segment_char_count,
                             "download_url": f"/api/projects/{project_id}/script/automate/runs/{run_id}/parts/{idx}",
                         }
                     )

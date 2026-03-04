@@ -61,6 +61,7 @@ es-core-news-sm = { url = "https://github.com/explosion/spacy-models/releases/do
 
 # YAML config parsing
 pyyaml = ">=6.0"
+num2words = ">=0.5.14"
 
 # External platform integrations
 google-api-python-client = ">=2.173.0"

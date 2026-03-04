@@ -29,6 +29,7 @@ import type {
   ScriptAutomationConfig,
   ScriptAutomationEvent,
   ScriptAutomationPart,
+  ScriptTtsPrepareResponse,
 } from "@/types";
 import { ScriptEditorModal, MetadataEditorModal } from "@/components/script";
 import { readSSEStream } from "@/utils/sse";
@@ -279,163 +280,14 @@ const LANGUAGE_DISPLAY_NAMES: Record<string, string> = {
 
 type TargetLanguage = "fr" | "en" | "es";
 
-// Check if text ends with sentence-ending punctuation
-function endsWithSentence(text: string): boolean {
-  const trimmed = text.trim();
-  return /[.!?…]["')\]]*$/.test(trimmed);
-}
-
-const ELEVENLABS_TARGET = 625;
-const ELEVENLABS_MIN = 500;
-const ELEVENLABS_SOFT_MAX = 750;
-const ELEVENLABS_HARD_MAX = 800;
-
-function ensureSentenceEnd(text: string): string {
-  const cleaned = text.trim();
-  if (!cleaned) return cleaned;
-  if (endsWithSentence(cleaned)) return cleaned;
-  if (cleaned.length >= ELEVENLABS_HARD_MAX) return cleaned;
-  return `${cleaned}.`;
-}
-
-function splitAtHardCap(
-  text: string,
-  cap = ELEVENLABS_HARD_MAX,
-): { head: string; tail: string } {
-  if (text.length <= cap) {
-    return { head: text, tail: "" };
-  }
-
-  const splitIndex = text.lastIndexOf(" ", cap - 1);
-  if (splitIndex > 0) {
-    const head = text.slice(0, splitIndex).trimEnd();
-    const tail = text.slice(splitIndex + 1).trimStart();
-    if (head) {
-      return { head, tail };
-    }
-  }
-
-  return { head: text.slice(0, cap), tail: text.slice(cap) };
-}
-
-// Segment scenes into groups based on character limit for ElevenLabs
-// Target: 500-750 chars (~625), prefer sentence boundaries, hard cap at 800.
-function segmentScenes(
-  scenes: Array<{ scene_index: number; text: string }>,
-): AudioSegment[] {
-  if (scenes.length === 0) {
-    return [];
-  }
-
-  const createEmptySegment = (id: number): AudioSegment => ({
-    id,
-    sceneIndices: [],
-    text: "",
-    characterCount: 0,
-  });
-
-  const segments: AudioSegment[] = [];
-  let currentSegment: AudioSegment = createEmptySegment(1);
-
-  for (let i = 0; i < scenes.length; i++) {
-    const scene = scenes[i];
-    const sceneText = scene.text.trim();
-    if (!sceneText) {
-      continue;
-    }
-
-    const mergedText = currentSegment.text
-      ? `${currentSegment.text} ${sceneText}`
-      : sceneText;
-    currentSegment.sceneIndices.push(scene.scene_index);
-    currentSegment.text = mergedText;
-    currentSegment.characterCount = mergedText.length;
-
-    while (currentSegment.characterCount > ELEVENLABS_HARD_MAX) {
-      const { head, tail } = splitAtHardCap(currentSegment.text);
-      if (!head) {
-        break;
-      }
-
-      segments.push({
-        id: segments.length + 1,
-        sceneIndices: [...currentSegment.sceneIndices],
-        text: head,
-        characterCount: head.length,
-      });
-
-      currentSegment = {
-        id: segments.length + 1,
-        sceneIndices: [...currentSegment.sceneIndices],
-        text: tail,
-        characterCount: tail.length,
-      };
-    }
-
-    if (!currentSegment.text) {
-      continue;
-    }
-
-    const isLastScene = i === scenes.length - 1;
-    const sentenceBoundary = endsWithSentence(currentSegment.text);
-    if (!sentenceBoundary && !isLastScene) {
-      continue;
-    }
-
-    if (isLastScene) {
-      currentSegment.text = ensureSentenceEnd(currentSegment.text);
-      currentSegment.characterCount = currentSegment.text.length;
-      segments.push(currentSegment);
-      currentSegment = createEmptySegment(segments.length + 1);
-      continue;
-    }
-
-    const nextSceneText = (scenes[i + 1]?.text || "").trim();
-    const withNextLength = nextSceneText
-      ? `${currentSegment.text} ${nextSceneText}`.length
-      : currentSegment.characterCount;
-
-    const closeNow =
-      currentSegment.characterCount >= ELEVENLABS_MIN
-        ? currentSegment.characterCount >= ELEVENLABS_SOFT_MAX ||
-          withNextLength > ELEVENLABS_SOFT_MAX ||
-          Math.abs(currentSegment.characterCount - ELEVENLABS_TARGET) <=
-            Math.abs(withNextLength - ELEVENLABS_TARGET)
-        : withNextLength > ELEVENLABS_SOFT_MAX;
-
-    if (closeNow) {
-      currentSegment.text = ensureSentenceEnd(currentSegment.text);
-      currentSegment.characterCount = currentSegment.text.length;
-      segments.push(currentSegment);
-      currentSegment = createEmptySegment(segments.length + 1);
-    }
-  }
-
-  if (currentSegment.sceneIndices.length > 0) {
-    currentSegment.text = ensureSentenceEnd(currentSegment.text);
-    currentSegment.characterCount = currentSegment.text.length;
-    segments.push(currentSegment);
-  }
-
-  if (segments.length >= 2) {
-    const last = segments[segments.length - 1];
-    if (last.characterCount < ELEVENLABS_MIN && endsWithSentence(last.text)) {
-      const prev = segments[segments.length - 2];
-      const mergedText = `${prev.text} ${last.text}`.trim();
-      if (mergedText.length <= ELEVENLABS_SOFT_MAX) {
-        prev.text = ensureSentenceEnd(mergedText);
-        prev.characterCount = prev.text.length;
-        prev.sceneIndices = [...prev.sceneIndices, ...last.sceneIndices];
-        segments.pop();
-      }
-    }
-  }
-
-  for (let i = 0; i < segments.length; i++) {
-    segments[i].id = i + 1;
-  }
-
-  return segments;
+function mapPreparedSegments(payload: ScriptTtsPrepareResponse | null): AudioSegment[] {
+  if (!payload) return [];
+  return payload.segments.map((segment) => ({
+    id: segment.id,
+    sceneIndices: segment.scene_indices,
+    text: segment.text,
+    characterCount: segment.character_count,
+  }));
 }
 
 function generatePrompt(
@@ -698,6 +550,12 @@ export function ScriptRestructurePage() {
   const [segmentFiles, setSegmentFiles] = useState<Map<number, File>>(
     new Map(),
   );
+  const [ttsPreparedPayload, setTtsPreparedPayload] =
+    useState<ScriptTtsPrepareResponse | null>(null);
+  const [ttsPrepareError, setTtsPrepareError] = useState<string | null>(null);
+  const [ttsPreparing, setTtsPreparing] = useState(false);
+  const ttsPrepareDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const ttsPrepareRequestRef = useRef(0);
   const [requiredSegmentIds, setRequiredSegmentIds] = useState<number[] | null>(
     null,
   );
@@ -707,22 +565,29 @@ export function ScriptRestructurePage() {
   const [scriptEditorOpen, setScriptEditorOpen] = useState(false);
   const [metadataEditorOpen, setMetadataEditorOpen] = useState(false);
 
-  // Parse scenes from JSON for segmentation
-  const parsedScenes = useMemo(() => {
+  const parsedScriptPayload = useMemo<Record<string, unknown> | null>(() => {
     if (!jsonValid || !newScriptJson) return null;
     try {
       const parsed = JSON.parse(newScriptJson);
-      return parsed.scenes as Array<{ scene_index: number; text: string }>;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+      return parsed as Record<string, unknown>;
     } catch {
       return null;
     }
   }, [jsonValid, newScriptJson]);
 
-  // Compute segments when JSON is valid
+  // Parse scenes from valid JSON for display and copy fallbacks
+  const parsedScenes = useMemo(() => {
+    if (!parsedScriptPayload) return null;
+    const rawScenes = parsedScriptPayload.scenes;
+    if (!Array.isArray(rawScenes)) return null;
+    return rawScenes as Array<{ scene_index: number; text: string }>;
+  }, [parsedScriptPayload]);
+
+  // TTS segments are prepared by backend to keep manual/API paths aligned.
   const audioSegments = useMemo(() => {
-    if (!parsedScenes) return [];
-    return segmentScenes(parsedScenes);
-  }, [parsedScenes]);
+    return mapPreparedSegments(ttsPreparedPayload);
+  }, [ttsPreparedPayload]);
 
   const metadataEditorValue = useMemo<PlatformMetadata>(() => {
     if (!metadataJson.trim()) {
@@ -818,6 +683,61 @@ export function ScriptRestructurePage() {
       automationAbortRef.current?.abort();
     };
   }, []);
+
+  useEffect(() => {
+    return () => {
+      if (ttsPrepareDebounceRef.current) {
+        clearTimeout(ttsPrepareDebounceRef.current);
+      }
+      ttsPrepareRequestRef.current += 1;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (ttsPrepareDebounceRef.current) {
+      clearTimeout(ttsPrepareDebounceRef.current);
+    }
+
+    if (!projectId || !parsedScriptPayload) {
+      ttsPrepareRequestRef.current += 1;
+      setTtsPreparedPayload(null);
+      setTtsPrepareError(null);
+      setTtsPreparing(false);
+      return;
+    }
+
+    const requestId = ttsPrepareRequestRef.current + 1;
+    ttsPrepareRequestRef.current = requestId;
+    setTtsPreparing(true);
+    setTtsPrepareError(null);
+
+    ttsPrepareDebounceRef.current = setTimeout(() => {
+      api.prepareScriptTts(projectId, {
+        script_json: parsedScriptPayload,
+        target_language: targetLanguage,
+      })
+        .then((payload) => {
+          if (ttsPrepareRequestRef.current !== requestId) return;
+          setTtsPreparedPayload(payload);
+          setTtsPrepareError(null);
+        })
+        .catch((err) => {
+          if (ttsPrepareRequestRef.current !== requestId) return;
+          setTtsPreparedPayload(null);
+          setTtsPrepareError((err as Error).message);
+        })
+        .finally(() => {
+          if (ttsPrepareRequestRef.current !== requestId) return;
+          setTtsPreparing(false);
+        });
+    }, 300);
+
+    return () => {
+      if (ttsPrepareDebounceRef.current) {
+        clearTimeout(ttsPrepareDebounceRef.current);
+      }
+    };
+  }, [projectId, parsedScriptPayload, targetLanguage]);
 
   const handleCopyPrompt = useCallback(async () => {
     if (!transcription) return;
@@ -1403,8 +1323,10 @@ export function ScriptRestructurePage() {
   }, []);
 
   const handleCopyFullScript = useCallback(async () => {
-    if (!parsedScenes) return;
-    const fullText = parsedScenes.map((s) => s.text).join(" ");
+    const normalizedText = ttsPreparedPayload?.normalized_full_text?.trim() || "";
+    const fallbackText = parsedScenes ? parsedScenes.map((s) => s.text).join(" ").trim() : "";
+    const fullText = normalizedText || fallbackText;
+    if (!fullText) return;
     try {
       await navigator.clipboard.writeText(fullText);
       setCopiedFullScript(true);
@@ -1412,7 +1334,7 @@ export function ScriptRestructurePage() {
     } catch {
       // Clipboard API may fail in insecure contexts
     }
-  }, [parsedScenes]);
+  }, [parsedScenes, ttsPreparedPayload]);
 
   const handleDrop = useCallback(
     (e: React.DragEvent, target: "single" | number) => {
@@ -1582,6 +1504,9 @@ export function ScriptRestructurePage() {
                   ? "All fields already filled"
                   : null;
   const canRunAutomation = automationBlockedReason === null && !automationRunning;
+  const normalizedFullText = ttsPreparedPayload?.normalized_full_text?.trim() || "";
+  const fullScriptPreview =
+    normalizedFullText || parsedScenes?.map((scene) => scene.text).join(" ").trim() || "";
   const expectedSegmentOrder =
     requiredSegmentIds ?? audioSegments.map((seg) => seg.id);
   const displaySegments =
@@ -1877,6 +1802,12 @@ export function ScriptRestructurePage() {
                 </span>
               </div>
 
+              {jsonValid && ttsPrepareError && (
+                <p className="text-sm text-[hsl(var(--destructive))]">
+                  Failed to prepare normalized TTS text: {ttsPrepareError}
+                </p>
+              )}
+
               <input
                 ref={fileInputRef}
                 type="file"
@@ -1888,14 +1819,11 @@ export function ScriptRestructurePage() {
               {uploadMode === "single" ? (
                 // Single file upload (original behavior)
                 <>
-                  {jsonValid && parsedScenes && (
+                  {jsonValid && fullScriptPreview && (
                     <div className="flex items-center justify-between p-2 bg-[hsl(var(--muted))] rounded-lg">
                       <span className="text-xs text-[hsl(var(--muted-foreground))] truncate flex-1 mx-2 italic">
                         "
-                        {parsedScenes
-                          .map((s) => s.text)
-                          .join(" ")
-                          .slice(0, 120)}
+                        {fullScriptPreview.slice(0, 120)}
                         ..."
                       </span>
                       <Button
@@ -1960,6 +1888,19 @@ export function ScriptRestructurePage() {
                       <Files className="h-8 w-8 mx-auto mb-2 text-[hsl(var(--muted-foreground))]" />
                       <p className="text-sm text-[hsl(var(--muted-foreground))]">
                         Paste valid JSON in Step 2 to see audio segments
+                      </p>
+                    </div>
+                  ) : ttsPreparing ? (
+                    <div className="p-4 bg-[hsl(var(--muted))] rounded-lg text-center">
+                      <Loader2 className="h-5 w-5 mx-auto mb-2 animate-spin text-[hsl(var(--muted-foreground))]" />
+                      <p className="text-sm text-[hsl(var(--muted-foreground))]">
+                        Preparing normalized TTS segments...
+                      </p>
+                    </div>
+                  ) : ttsPrepareError ? (
+                    <div className="p-4 bg-[hsl(var(--destructive))]/10 rounded-lg text-center">
+                      <p className="text-sm text-[hsl(var(--destructive))]">
+                        Failed to prepare TTS segments: {ttsPrepareError}
                       </p>
                     </div>
                   ) : expectedSegmentOrder.length === 0 ? (

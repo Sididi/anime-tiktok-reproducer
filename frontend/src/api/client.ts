@@ -463,6 +463,21 @@ export const api = {
       signal,
     }),
 
+  prepareScriptTts: (
+    projectId: string,
+    payload: {
+      script_json: Record<string, unknown>;
+      target_language?: string;
+    },
+  ) =>
+    request<import("@/types").ScriptTtsPrepareResponse>(
+      `/projects/${projectId}/script/tts/prepare`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+    ),
+
   downloadAutomationPart: (projectId: string, runId: string, partId: string) =>
     fetch(
       `${API_BASE}/projects/${projectId}/script/automate/runs/${encodeURIComponent(runId)}/parts/${encodeURIComponent(partId)}`,

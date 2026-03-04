@@ -4,7 +4,7 @@ import asyncio
 import mimetypes
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, FileResponse
-from typing import Optional
+from typing import Optional, Any
 import json
 import tempfile
 from pathlib import Path
@@ -47,6 +47,11 @@ class ScriptAutomateRequest(BaseModel):
     skip_tts: bool = False
     pause_after_script: bool = False
     skip_overlay: bool = False
+
+
+class ScriptTtsPrepareRequest(BaseModel):
+    script_json: dict[str, Any]
+    target_language: str | None = None
 
 
 class ScriptSettingsRequest(BaseModel):
@@ -208,6 +213,35 @@ async def automate_script(project_id: str, request: ScriptAutomateRequest):
             "Connection": "keep-alive",
         },
     )
+
+
+@router.post("/script/tts/prepare")
+async def prepare_script_tts(project_id: str, request: ScriptTtsPrepareRequest):
+    """Prepare normalized TTS text segments from a script JSON payload."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    scenes = request.script_json.get("scenes")
+    if not isinstance(scenes, list) or not scenes:
+        raise HTTPException(status_code=400, detail="script_json must contain a non-empty 'scenes' array")
+
+    for idx, scene in enumerate(scenes):
+        if not isinstance(scene, dict):
+            raise HTTPException(status_code=400, detail=f"Scene at position {idx} is not an object")
+        if not isinstance(scene.get("text"), str):
+            raise HTTPException(status_code=400, detail=f"Scene at position {idx} must contain a 'text' string")
+
+    try:
+        prepared_payload = await asyncio.to_thread(
+            ScriptAutomationService.prepare_tts_payload,
+            script_payload=request.script_json,
+            target_language=request.target_language,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return prepared_payload
 
 
 @router.get("/script/automate/runs/{run_id}/parts/{part_id}")
