@@ -20,8 +20,8 @@
   var AUDIO_FILENAME = "tts_edited.wav";
   var CATEGORY_OVERLAY_FILENAME = "category_overlay.png";
   var TITLE_OVERLAY_FILENAME = "title_overlay.png";
-  var MUSIC_FILENAME = "credits song for my death.mp3";
-  var MUSIC_GAIN_DB = -32;
+  var MUSIC_FILENAME = "credits song for my death.wav";
+  var MUSIC_GAIN_DB = -23.0;
   var PROJECT_PURGE_BIN_NAME = "__ATR_PURGE__";
   var BACKGROUND_PRESET_NAME = "SPM Anime Background";
   var BACKGROUND_PRESET_FILE_PATH =
@@ -33,58 +33,619 @@
   var CATEGORY_TITLE_PRESET_FILE_PATH =
     ASSETS_DIR + "/" + CATEGORY_TITLE_PRESET_NAME + ".prfpset";
   var SUBTITLE_MOGRT_DIR = ROOT_DIR + "/subtitles";
-  var SUBTITLE_SRT_PATH = ROOT_DIR + "/subtitles.srt";
+  var SUBTITLE_SRT_PATH = ROOT_DIR + "/let_this_grieving_soul_retire.fr_FR.srt";
 
   // --- SCENES DATA ---
   var scenes = [
     {
       scene_index: 0,
       start: 0.0,
-      end: 2.216667,
-      text: "Ce type a décidé d'épouser une femme robot.",
-      clipName: "[EMBER] Boku no Tsuma wa Kanjou ga Nai - 06",
-      source_in_frame: 25523,
-      source_out_frame: 25576,
-      source_in: 1064.521792,
-      source_out: 1066.732333,
-      clip_duration: 2.2105,
-      target_duration: 2.2167,
-      speed_ratio: 0.9972,
-      effective_speed: 0.9972,
+      end: 1.75,
+      text: "À la base, ce type était super faible,",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 13936,
+      source_out_frame: 14002,
+      source_in: 581.247333,
+      source_out: 584.000083,
+      clip_duration: 2.7527,
+      target_duration: 1.75,
+      speed_ratio: 1.573,
+      effective_speed: 1.573,
       leaves_gap: false,
       used_alternative: false,
     },
     {
       scene_index: 1,
-      start: 2.216667,
-      end: 4.15,
-      text: "Ils ont même fini par avoir un gosse ensemble.",
-      clipName: "[EMBER] Boku no Tsuma wa Kanjou ga Nai - 08",
-      source_in_frame: 10566,
-      source_out_frame: 10634,
-      source_in: 440.69025,
-      source_out: 443.526417,
-      clip_duration: 2.8362,
-      target_duration: 1.9333,
-      speed_ratio: 1.467,
-      effective_speed: 1.467,
+      start: 1.75,
+      end: 3.333333,
+      text: "mais il possédait des dizaines de bagues",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 5935,
+      source_out_frame: 5972,
+      source_in: 247.538958,
+      source_out: 249.082167,
+      clip_duration: 1.5432,
+      target_duration: 1.5833,
+      speed_ratio: 0.9747,
+      effective_speed: 0.9747,
       leaves_gap: false,
       used_alternative: false,
     },
     {
       scene_index: 2,
-      start: 4.15,
-      end: 5.716667,
-      text: "Mais il ne s'attendait pas à un truc :",
-      clipName: "[EMBER] Boku no Tsuma wa Kanjou ga Nai - 08",
-      source_in_frame: 8308,
-      source_out_frame: 8346,
-      source_in: 346.512833,
-      source_out: 348.09775,
-      clip_duration: 1.5849,
-      target_duration: 1.5667,
-      speed_ratio: 1.0116,
-      effective_speed: 1.0116,
+      start: 3.333333,
+      end: 5.616667,
+      text: "capables de résister aux attaques les plus mortelles.",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 5995,
+      source_out_frame: 6050,
+      source_in: 250.041458,
+      source_out: 252.335417,
+      clip_duration: 2.294,
+      target_duration: 2.2833,
+      speed_ratio: 1.0047,
+      effective_speed: 1.0047,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 3,
+      start: 5.616667,
+      end: 8.116667,
+      text: "Du coup, aucune attaque ne pouvait le blesser, même pas un peu.",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 9459,
+      source_out_frame: 9507,
+      source_in: 394.519125,
+      source_out: 396.521125,
+      clip_duration: 2.002,
+      target_duration: 2.5,
+      speed_ratio: 0.8008,
+      effective_speed: 0.8008,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 4,
+      start: 8.116667,
+      end: 10.85,
+      text: "Ce qui donnait l'impression aux autres qu'il avait une force terrifiante.",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 1582,
+      source_out_frame: 1648,
+      source_in: 65.982583,
+      source_out: 68.735333,
+      clip_duration: 2.7528,
+      target_duration: 2.7333,
+      speed_ratio: 1.0071,
+      effective_speed: 1.0071,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 5,
+      start: 10.85,
+      end: 14.35,
+      text: "Un jour, le président de l'Association des Explorateurs l'a averti en privé.",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 5239,
+      source_out_frame: 5347,
+      source_in: 218.509958,
+      source_out: 223.014458,
+      clip_duration: 4.5045,
+      target_duration: 3.5,
+      speed_ratio: 1.287,
+      effective_speed: 1.287,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 6,
+      start: 14.35,
+      end: 16.816667,
+      text: "Un explorateur de niveau 7 était en route pour l'Empire,",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 5107,
+      source_out_frame: 5155,
+      source_in: 213.004458,
+      source_out: 215.006458,
+      clip_duration: 2.002,
+      target_duration: 2.4667,
+      speed_ratio: 0.8116,
+      effective_speed: 0.8116,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 7,
+      start: 16.816667,
+      end: 20.016667,
+      text: "et le président espérait qu'il éviterait tout conflit avec cet individu.",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 5407,
+      source_out_frame: 5492,
+      source_in: 225.516958,
+      source_out: 229.062167,
+      clip_duration: 3.5452,
+      target_duration: 3.2,
+      speed_ratio: 1.1079,
+      effective_speed: 1.1079,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 8,
+      start: 20.016667,
+      end: 21.65,
+      text: "Après tout, c'était un vrai poids lourd,",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 12816,
+      source_out_frame: 12862,
+      source_in: 534.534,
+      source_out: 536.452583,
+      clip_duration: 1.9186,
+      target_duration: 1.6333,
+      speed_ratio: 1.1746,
+      effective_speed: 1.1746,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 9,
+      start: 21.65,
+      end: 23.783333,
+      text: "doté de la force des Chroniques du Tueur de Dragons.",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 12864,
+      source_out_frame: 12912,
+      source_in: 536.536,
+      source_out: 538.538,
+      clip_duration: 2.002,
+      target_duration: 2.1333,
+      speed_ratio: 0.9384,
+      effective_speed: 0.9384,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 10,
+      start: 23.783333,
+      end: 27.166667,
+      text: "Pourtant, notre héros a répondu qu'il n'avait jamais entendu parler de lui.",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 5563,
+      source_out_frame: 5635,
+      source_in: 232.023458,
+      source_out: 235.026458,
+      clip_duration: 3.003,
+      target_duration: 3.3833,
+      speed_ratio: 0.8876,
+      effective_speed: 0.8876,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 11,
+      start: 27.166667,
+      end: 30.15,
+      text: "Mais sa réponse directe a été mal interprétée par le président.",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 5659,
+      source_out_frame: 5738,
+      source_in: 236.027458,
+      source_out: 239.322417,
+      clip_duration: 3.295,
+      target_duration: 2.9833,
+      speed_ratio: 1.1045,
+      effective_speed: 1.1045,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 12,
+      start: 30.15,
+      end: 36.6,
+      text: "Car il était reconnu comme le seul surpuissant de niveau 8. Alors le président l'a giflé. La gifle en elle-même n'était pas si grave.",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 5743,
+      source_out_frame: 5863,
+      source_in: 239.530958,
+      source_out: 244.535958,
+      clip_duration: 5.005,
+      target_duration: 6.45,
+      speed_ratio: 0.776,
+      effective_speed: 0.776,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 13,
+      start: 36.6,
+      end: 38.5,
+      text: "Mais elle a fait voler en éclats ses bagues.",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 5923,
+      source_out_frame: 5972,
+      source_in: 247.038458,
+      source_out: 249.082167,
+      clip_duration: 2.0437,
+      target_duration: 1.9,
+      speed_ratio: 1.0756,
+      effective_speed: 1.0756,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 14,
+      start: 38.5,
+      end: 41.116667,
+      text: "Bien sûr, sa propre faiblesse en était l'une des raisons.",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 5983,
+      source_out_frame: 6030,
+      source_in: 249.540958,
+      source_out: 251.50125,
+      clip_duration: 1.9603,
+      target_duration: 2.6167,
+      speed_ratio: 0.7492,
+      effective_speed: 0.75,
+      leaves_gap: true,
+      used_alternative: false,
+    },
+    {
+      scene_index: 15,
+      start: 41.116667,
+      end: 45.0,
+      text: "Et le président était lui-même un ancien et puissant explorateur de niveau 7.",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 02",
+      source_in_frame: 33950,
+      source_out_frame: 34044,
+      source_in: 1415.997917,
+      source_out: 1419.9185,
+      clip_duration: 3.9206,
+      target_duration: 3.8833,
+      speed_ratio: 1.0096,
+      effective_speed: 1.0096,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 16,
+      start: 45.0,
+      end: 48.416667,
+      text: "Mais notre héros avait déjà vécu ce genre de situation de nombreuses fois.",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 6056,
+      source_out_frame: 6158,
+      source_in: 252.585667,
+      source_out: 256.839917,
+      clip_duration: 4.2542,
+      target_duration: 3.4167,
+      speed_ratio: 1.2451,
+      effective_speed: 1.2451,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 17,
+      start: 48.416667,
+      end: 50.433333,
+      text: "Après ça, il est allé voir son amie d'enfance.",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 8272,
+      source_out_frame: 8320,
+      source_in: 345.011333,
+      source_out: 347.013333,
+      clip_duration: 2.002,
+      target_duration: 2.0167,
+      speed_ratio: 0.9927,
+      effective_speed: 0.9927,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 18,
+      start: 50.433333,
+      end: 54.133333,
+      text: "Comme convenu, il lui a rapporté tout le matériel de recherche dont elle avait besoin,",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 8344,
+      source_out_frame: 8416,
+      source_in: 348.014333,
+      source_out: 351.017333,
+      clip_duration: 3.003,
+      target_duration: 3.7,
+      speed_ratio: 0.8116,
+      effective_speed: 0.8116,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 19,
+      start: 54.133333,
+      end: 56.35,
+      text: "même s'il n'avait aucune idée de ce qu'il y avait dedans.",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 8500,
+      source_out_frame: 8548,
+      source_in: 354.520833,
+      source_out: 356.522833,
+      clip_duration: 2.002,
+      target_duration: 2.2167,
+      speed_ratio: 0.9032,
+      effective_speed: 0.9032,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 20,
+      start: 56.35,
+      end: 58.766667,
+      text: "Quand son amie a retiré le tissu qui recouvrait le tout,",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 8956,
+      source_out_frame: 9039,
+      source_in: 373.539833,
+      source_out: 377.001625,
+      clip_duration: 3.4618,
+      target_duration: 2.4167,
+      speed_ratio: 1.4325,
+      effective_speed: 1.4325,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 21,
+      start: 58.766667,
+      end: 62.833333,
+      text: "il a été choqué de découvrir que c'était en fait un familier de dévoreur malveillant.",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 8828,
+      source_out_frame: 8932,
+      source_in: 368.201167,
+      source_out: 372.538833,
+      clip_duration: 4.3377,
+      target_duration: 4.0667,
+      speed_ratio: 1.0666,
+      effective_speed: 1.0666,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 22,
+      start: 62.833333,
+      end: 64.183333,
+      text: "Mais ce à quoi il ne s'attendait pas,",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 9075,
+      source_out_frame: 9111,
+      source_in: 378.503125,
+      source_out: 380.004625,
+      clip_duration: 1.5015,
+      target_duration: 1.35,
+      speed_ratio: 1.1122,
+      effective_speed: 1.1122,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 23,
+      start: 64.183333,
+      end: 66.55,
+      text: "c'est que ce n'était qu'un déguisement pour le dévoreur.",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 9159,
+      source_out_frame: 9207,
+      source_in: 382.006625,
+      source_out: 384.008625,
+      clip_duration: 2.002,
+      target_duration: 2.3667,
+      speed_ratio: 0.8459,
+      effective_speed: 0.8459,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 24,
+      start: 66.55,
+      end: 71.016667,
+      text: "Même s'il était petit, le dévoreur avait la force d'une créature de niveau 6 maximal.",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 9244,
+      source_out_frame: 9351,
+      source_in: 385.551833,
+      source_out: 390.014625,
+      clip_duration: 4.4628,
+      target_duration: 4.4667,
+      speed_ratio: 0.9991,
+      effective_speed: 0.9991,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 25,
+      start: 71.016667,
+      end: 74.716667,
+      text: "Ce n'est qu'en le prenant dans ses bras qu'il a compris que quelque chose n'allait pas.",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 9364,
+      source_out_frame: 9454,
+      source_in: 390.556833,
+      source_out: 394.310583,
+      clip_duration: 3.7537,
+      target_duration: 3.7,
+      speed_ratio: 1.0145,
+      effective_speed: 1.0145,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 26,
+      start: 74.716667,
+      end: 80.616667,
+      text: "Le dévoreur secouait juste la queue pour jouer, mais pour une raison inconnue, chaque mouvement activait ses bagues sans causer de dégâts.",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 9495,
+      source_out_frame: 9615,
+      source_in: 396.020625,
+      source_out: 401.025625,
+      clip_duration: 5.005,
+      target_duration: 5.9,
+      speed_ratio: 0.8483,
+      effective_speed: 0.8483,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 27,
+      start: 80.616667,
+      end: 82.8,
+      text: "Heureusement, son amie le lui a vite repris des mains,",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 9628,
+      source_out_frame: 9687,
+      source_in: 401.567833,
+      source_out: 404.028625,
+      clip_duration: 2.4608,
+      target_duration: 2.1833,
+      speed_ratio: 1.1271,
+      effective_speed: 1.1271,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 28,
+      start: 82.8,
+      end: 86.883333,
+      text: "lui permettant de s'en sortir avant que ses bagues ne soient complètement vidées de leur énergie.",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 9706,
+      source_out_frame: 9796,
+      source_in: 404.821083,
+      source_out: 408.574833,
+      clip_duration: 3.7537,
+      target_duration: 4.0833,
+      speed_ratio: 0.9193,
+      effective_speed: 0.9193,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 29,
+      start: 86.883333,
+      end: 88.833333,
+      text: "Même si ses bagues n'étaient pas à usage unique,",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 9795,
+      source_out_frame: 9843,
+      source_in: 408.533125,
+      source_out: 410.535125,
+      clip_duration: 2.002,
+      target_duration: 1.95,
+      speed_ratio: 1.0267,
+      effective_speed: 1.0267,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 30,
+      start: 88.833333,
+      end: 94.25,
+      text: "elles devaient être rechargées en pouvoir magique pour fonctionner. Et la quantité de magie nécessaire était colossale.",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 10018,
+      source_out_frame: 10130,
+      source_in: 417.834083,
+      source_out: 422.505417,
+      clip_duration: 4.6713,
+      target_duration: 5.4167,
+      speed_ratio: 0.8624,
+      effective_speed: 0.8624,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 31,
+      start: 94.25,
+      end: 98.133333,
+      text: "Si son autre amie d'enfance était encore là, ça n'aurait été qu'une formalité.",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 10310,
+      source_out_frame: 10418,
+      source_in: 430.012917,
+      source_out: 434.517417,
+      clip_duration: 4.5045,
+      target_duration: 3.8833,
+      speed_ratio: 1.16,
+      effective_speed: 1.16,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 32,
+      start: 98.133333,
+      end: 99.55,
+      text: "Mais vu la tournure des événements,",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 10564,
+      source_out_frame: 10598,
+      source_in: 440.606833,
+      source_out: 442.024917,
+      clip_duration: 1.4181,
+      target_duration: 1.4167,
+      speed_ratio: 1.001,
+      effective_speed: 1.001,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 33,
+      start: 99.55,
+      end: 102.466667,
+      text: "il craignait de ne pas pouvoir tenir jusqu'à son retour.",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 10802,
+      source_out_frame: 10886,
+      source_in: 450.533417,
+      source_out: 454.036917,
+      clip_duration: 3.5035,
+      target_duration: 2.9167,
+      speed_ratio: 1.2012,
+      effective_speed: 1.2012,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 34,
+      start: 102.466667,
+      end: 104.45,
+      text: "Alors qu'il était complètement désemparé,",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 11569,
+      source_out_frame: 11605,
+      source_in: 482.523708,
+      source_out: 484.025208,
+      clip_duration: 1.5015,
+      target_duration: 1.9833,
+      speed_ratio: 0.7571,
+      effective_speed: 0.7571,
+      leaves_gap: false,
+      used_alternative: false,
+    },
+    {
+      scene_index: 35,
+      start: 104.45,
+      end: 106.133333,
+      text: "son amie a eu une idée pour l'aider.",
+      clipName: "[EMBER] Nageki no Bourei wa Intai shitai - 10",
+      source_in_frame: 11768,
+      source_out_frame: 11809,
+      source_in: 490.823667,
+      source_out: 492.533708,
+      clip_duration: 1.71,
+      target_duration: 1.6833,
+      speed_ratio: 1.0159,
+      effective_speed: 1.0159,
       leaves_gap: false,
       used_alternative: false,
     },
@@ -104,16 +665,21 @@
   var SOURCE_FPS_NUM = 24000;
   var SOURCE_FPS_DEN = 1001;
   var TICKS_PER_FRAME = TICKS_PER_SECOND / SEQ_FPS;
-  var TRACK_ITEM_WAIT_STEP_MS = 25;
-  var TRACK_ITEM_WAIT_MAX_MS = 400;
-  var SPEED_RETRY_WAIT_MS = 60;
+  var TRACK_ITEM_WAIT_STEP_MS = 15;
+  var TRACK_ITEM_WAIT_MAX_STEP_MS = 45;
+  var TRACK_ITEM_WAIT_STEP_BACKOFF_MS = 10;
+  var TRACK_ITEM_WAIT_MAX_MS = 180;
+  var SPEED_RETRY_FAST_WAIT_MS = 12;
+  var SPEED_RETRY_LONG_WAIT_MS = 60;
   var PROJECT_ITEM_CACHE = {};
   var PROJECT_ITEM_CACHE_WARMED = false;
   var PRESET_FILE_TEXT_CACHE = {};
+  var PRESET_PARSED_DATA_CACHE = {};
   var PRESET_EFFECT_VALUE_ENTRIES_CACHE = {};
   var LUMETRI_PRESET_VALUES_CACHE = {};
   var LUMETRI_PRESET_ARB_STRINGS_CACHE = {};
   var LUMETRI_LOOK_PATH_CACHE = {};
+  var VIDEO_EFFECT_RESOLVE_CACHE = {};
   var KNOWN_MEDIA_EXTENSIONS = {
     ".mkv": true,
     ".mp4": true,
@@ -131,11 +697,17 @@
     ".aif": true,
   };
   var PERF_PROFILE_ENABLED = true;
-  var PERF_LOG_EACH_SUBTITLE_BATCH = 20;
-  var ENABLE_IMPORTMGT_SECONDS_FALLBACK = true;
+  var PERF_LOG_EACH_SUBTITLE_BATCH = 50;
   var MUTATE_TRANSIENT_A2_SCENE_AUDIO = false;
+  var AUDIO_GAIN_RAW_REFERENCE_AT_0DB = null;
+  var AUDIO_GAIN_RAW_FALLBACK_AT_0DB = 0.1778279410038923;
+  var SETVALUE_UPDATE_UI = false;
+  var QE_EFFECT_VERIFY_SAMPLE_CLIPS = 3;
+  var QE_EFFECT_VERIFY_WAIT_STEP_MS = 5;
+  var QE_EFFECT_VERIFY_WAIT_MAX_MS = 10;
   var PERF_TIMERS = {};
   var PERF_PHASE_TOTALS = {};
+  var PERF_COUNTERS = {};
   var QE_TRACK_RESOLVE_CACHE = {};
   var QE_TRACK_ITEM_HINTS = {};
 
@@ -163,6 +735,13 @@
     return elapsed;
   }
 
+  function perfCounterInc(key, amount) {
+    if (!PERF_PROFILE_ENABLED || !key) return;
+    var delta = typeof amount === "number" ? amount : 1;
+    if (PERF_COUNTERS[key] === undefined) PERF_COUNTERS[key] = 0;
+    PERF_COUNTERS[key] += delta;
+  }
+
   function perfLogSummary() {
     if (!PERF_PROFILE_ENABLED) return;
     var order = [
@@ -185,6 +764,26 @@
       var k = order[i];
       if (PERF_PHASE_TOTALS[k] !== undefined) {
         log("[PERF] " + k + ": " + PERF_PHASE_TOTALS[k] + " ms");
+      }
+    }
+    var counterOrder = [
+      "qeEffectApplyCalls",
+      "qeEffectApplyFailures",
+      "qeEffectFallbackSearches",
+      "qeEffectVerifySleepMs",
+      "qeEffectPreMappedItems",
+      "qeEffectContextReusedItems",
+      "importMGTCalls",
+      "speedApplyCalls",
+      "speedApplyFullScans",
+      "clearSelectionSelectionItems",
+      "clearSelectionFallbackTrackScans",
+    ];
+    log("----- PERF COUNTERS -----");
+    for (var j = 0; j < counterOrder.length; j++) {
+      var cKey = counterOrder[j];
+      if (PERF_COUNTERS[cKey] !== undefined) {
+        log("[PERF] " + cKey + ": " + PERF_COUNTERS[cKey]);
       }
     }
     log("------------------------");
@@ -427,16 +1026,25 @@
     var timeout =
       typeof maxWaitMs === "number" ? maxWaitMs : TRACK_ITEM_WAIT_MAX_MS;
     var waited = 0;
+    var waitStep = TRACK_ITEM_WAIT_STEP_MS;
     var item = findRecentTrackItemAtStart(track, startSeconds, nameRef);
     if (item) return item;
     item = findTrackItemAtStart(track, startSeconds, nameRef);
     if (item) return item;
 
     while (waited < timeout) {
-      sleep(TRACK_ITEM_WAIT_STEP_MS);
-      waited += TRACK_ITEM_WAIT_STEP_MS;
+      var sleepMs = Math.min(waitStep, timeout - waited);
+      if (sleepMs <= 0) break;
+      sleep(sleepMs);
+      waited += sleepMs;
       item = findRecentTrackItemAtStart(track, startSeconds, nameRef);
       if (item) return item;
+      if (waitStep < TRACK_ITEM_WAIT_MAX_STEP_MS) {
+        waitStep = Math.min(
+          TRACK_ITEM_WAIT_MAX_STEP_MS,
+          waitStep + TRACK_ITEM_WAIT_STEP_BACKOFF_MS,
+        );
+      }
     }
     return findTrackItemAtStart(track, startSeconds, nameRef);
   }
@@ -579,6 +1187,31 @@
     return fallback || null;
   }
 
+  function setPropertyValueFast(prop, value) {
+    if (!prop || !prop.setValue) return false;
+    try {
+      prop.setValue(value, SETVALUE_UPDATE_UI ? 1 : 0);
+      return true;
+    } catch (e0) {}
+    try {
+      prop.setValue(value);
+      return true;
+    } catch (e1) {}
+    return false;
+  }
+
+  function refreshSequenceUI(sequence) {
+    if (SETVALUE_UPDATE_UI || !sequence) return;
+    try {
+      if (sequence.getPlayerPosition && sequence.setPlayerPosition) {
+        var pos = sequence.getPlayerPosition();
+        if (pos && pos.ticks !== undefined) {
+          sequence.setPlayerPosition(pos.ticks.toString());
+        }
+      }
+    } catch (e0) {}
+  }
+
   function setScaleOnItem(item, scaleVal) {
     if (!item) return false;
     var motion = getMotionComponent(item);
@@ -591,12 +1224,10 @@
         prop.displayName === "Echelle" ||
         prop.displayName === "\u00c9chelle"
       ) {
-        try {
-          prop.setValue(scaleVal, true);
+        if (setPropertyValueFast(prop, scaleVal)) {
           return true;
-        } catch (e) {
-          return false;
         }
+        return false;
       }
     }
     return false;
@@ -852,6 +1483,9 @@
   function main() {
     PERF_TIMERS = {};
     PERF_PHASE_TOTALS = {};
+    PERF_COUNTERS = {};
+    PRESET_PARSED_DATA_CACHE = {};
+    VIDEO_EFFECT_RESOLVE_CACHE = {};
     QE_TRACK_RESOLVE_CACHE = {};
     QE_TRACK_ITEM_HINTS = {};
     perfStart("total");
@@ -1273,9 +1907,9 @@
       3,
       SUBTITLE_MOGRT_DIR,
       SUBTITLE_SRT_PATH,
-      ENABLE_IMPORTMGT_SECONDS_FALLBACK,
     );
     perfEnd("subtitles", "Subtitles");
+    refreshSequenceUI(sequence);
     perfEnd("total");
     perfLogSummary();
 
@@ -1417,7 +2051,6 @@
     videoTrackIndex,
     subtitleDirPath,
     srtPath,
-    enableSecondsFallback,
   ) {
     var stats = {
       timings: 0,
@@ -1476,7 +2109,6 @@
       );
     }
 
-    var pairs = [];
     for (var k = 0; k < pairCount; k++) {
       var entry = entries[k];
       var mogrtFile = mogrtFiles[k];
@@ -1485,39 +2117,21 @@
       if (endSec <= startSec) {
         endSec = snapSecondsToFrame(startSec + 1 / SEQ_FPS);
       }
-      pairs.push({
-        idx: k + 1,
-        mogrtPath: mogrtFile.fsName,
-        startSec: startSec,
-        startTicksStr: secondsToTicks(startSec).toString(),
-        endSec: endSec,
-        endTimeObj: buildSequenceTimeFromSeconds(endSec),
-      });
-    }
-
-    var useSecondsFallback = enableSecondsFallback !== false;
-    for (var p = 0; p < pairs.length; p++) {
-      var pair = pairs[p];
+      var endTimeObj = buildSequenceTimeFromSeconds(endSec);
+      var mogrtPath = mogrtFile.fsName;
+      var startTicksStr = secondsToTicks(startSec).toString();
 
       var mogrtItem = null;
       try {
+        perfCounterInc("importMGTCalls");
         mogrtItem = sequence.importMGT(
-          pair.mogrtPath,
-          pair.startTicksStr,
+          mogrtPath,
+          startTicksStr,
           videoTrackIndex,
           0,
         );
       } catch (e0) {}
-      if (!mogrtItem && useSecondsFallback) {
-        try {
-          mogrtItem = sequence.importMGT(
-            pair.mogrtPath,
-            pair.startSec,
-            videoTrackIndex,
-            0,
-          );
-        } catch (e1) {}
-      }
+
       if (!mogrtItem) {
         stats.insertFailed++;
         continue;
@@ -1525,23 +2139,23 @@
 
       stats.inserted++;
       try {
-        mogrtItem.end = pair.endTimeObj;
+        mogrtItem.end = endTimeObj;
       } catch (e2) {
         try {
-          mogrtItem.end = pair.endSec;
+          mogrtItem.end = endSec;
         } catch (e3) {}
       }
 
       if (
         PERF_PROFILE_ENABLED &&
         PERF_LOG_EACH_SUBTITLE_BATCH > 0 &&
-        ((p + 1) % PERF_LOG_EACH_SUBTITLE_BATCH === 0 || p === pairs.length - 1)
+        ((k + 1) % PERF_LOG_EACH_SUBTITLE_BATCH === 0 || k === pairCount - 1)
       ) {
         log(
           "[PERF] Subtitles progress: " +
-            (p + 1) +
+            (k + 1) +
             "/" +
-            pairs.length +
+            pairCount +
             " (inserted " +
             stats.inserted +
             ", failed " +
@@ -1574,14 +2188,50 @@
   function clearSelection(sequence, updateUI) {
     if (!sequence) return;
     var uiRefresh = !!updateUI;
+    var clearedViaSelection = 0;
     try {
-      var tracks = sequence.videoTracks;
-      for (var i = 0; i < tracks.numTracks; i++) {
-        var track = tracks[i];
-        for (var j = 0; j < track.clips.numItems; j++) {
-          track.clips[j].setSelected(false, uiRefresh);
+      if (sequence.getSelection) {
+        var selection = sequence.getSelection();
+        if (selection) {
+          var selectionCount = 0;
+          if (selection.length !== undefined) {
+            selectionCount = selection.length;
+          } else if (selection.numItems !== undefined) {
+            selectionCount = selection.numItems;
+          }
+          for (var si = 0; si < selectionCount; si++) {
+            var selectedItem = selection[si];
+            if (!selectedItem && selection.getItemAt) {
+              try {
+                selectedItem = selection.getItemAt(si);
+              } catch (eGetItem) {}
+            }
+            if (!selectedItem || !selectedItem.setSelected) continue;
+            try {
+              selectedItem.setSelected(false, uiRefresh);
+              clearedViaSelection++;
+            } catch (eSetSelected) {}
+          }
         }
       }
+    } catch (e0) {}
+    if (clearedViaSelection > 0) {
+      perfCounterInc("clearSelectionSelectionItems", clearedViaSelection);
+      return;
+    }
+    try {
+      var tracks = sequence.videoTracks;
+      var trackCount = tracks ? tracks.numTracks : 0;
+      for (var i = 0; i < trackCount; i++) {
+        var track = tracks[i];
+        if (!track || !track.clips) continue;
+        var clips = track.clips;
+        var clipCount = clips.numItems;
+        for (var j = 0; j < clipCount; j++) {
+          clips[j].setSelected(false, uiRefresh);
+        }
+      }
+      perfCounterInc("clearSelectionFallbackTrackScans");
       // Clear Audio as well if needed? Usually audio tracks are less prone to this crash but good practice.
       // Skipping to save time/performance unless necessary.
     } catch (e) {}
@@ -1668,6 +2318,7 @@
       var applyOnItem = function (item, idx) {
         try {
           // args: speed, stretch, reverse, ripple, flicker
+          perfCounterInc("speedApplyCalls");
           item.setSpeed(speed, "", false, false, false);
           hintMap[hintKey] = idx;
           return true;
@@ -1679,16 +2330,31 @@
           ) {
             retriedAfterReset = true;
             clearSelection(sequence || app.project.activeSequence, false);
-            sleep(SPEED_RETRY_WAIT_MS);
+            sleep(SPEED_RETRY_FAST_WAIT_MS);
             try {
+              perfCounterInc("speedApplyCalls");
               item.setSpeed(speed, "", false, false, false);
               hintMap[hintKey] = idx;
               return true;
             } catch (err2) {
-              log(
-                "Speed Apply Retry Error: " +
-                  (err2 && err2.message ? err2.message : err2),
-              );
+              var err2Msg = err2 && err2.message ? err2.message.toString() : "";
+              if (err2Msg.toLowerCase().indexOf("invalid trackitem") !== -1) {
+                // Keep the long retry only for repeated invalid-trackitem failures.
+                sleep(SPEED_RETRY_LONG_WAIT_MS);
+                try {
+                  perfCounterInc("speedApplyCalls");
+                  item.setSpeed(speed, "", false, false, false);
+                  hintMap[hintKey] = idx;
+                  return true;
+                } catch (err3) {
+                  log(
+                    "Speed Apply Retry Error: " +
+                      (err3 && err3.message ? err3.message : err3),
+                  );
+                }
+              } else {
+                log("Speed Apply Retry Error: " + err2Msg);
+              }
             }
           } else {
             log("Speed Apply Error: " + errMsg);
@@ -1723,6 +2389,7 @@
       }
 
       // Full fallback search.
+      perfCounterInc("speedApplyFullScans");
       for (var i = qeTrack.numItems - 1; i >= 0; i--) {
         try {
           var item = qeTrack.getItemAt(i);
@@ -1748,10 +2415,15 @@
     if (!effectName) return null;
     var name = effectName.toString().replace(/^\s+|\s+$/g, "");
     if (!name) return null;
+    if (VIDEO_EFFECT_RESOLVE_CACHE[name] !== undefined) {
+      return VIDEO_EFFECT_RESOLVE_CACHE[name];
+    }
+    var resolved = null;
     try {
-      return qe.project.getVideoEffectByName(name);
+      resolved = qe.project.getVideoEffectByName(name);
     } catch (e) {}
-    return null;
+    VIDEO_EFFECT_RESOLVE_CACHE[name] = resolved;
+    return resolved;
   }
 
   function pushUnique(arr, value) {
@@ -1936,7 +2608,7 @@
 
   function extractLumetriArbStringsByIndex(filePath) {
     if (!filePath) return {};
-    if (LUMETRI_PRESET_ARB_STRINGS_CACHE[filePath]) {
+    if (LUMETRI_PRESET_ARB_STRINGS_CACHE[filePath] !== undefined) {
       return LUMETRI_PRESET_ARB_STRINGS_CACHE[filePath];
     }
 
@@ -2050,7 +2722,7 @@
 
   function extractLumetriPresetValuesByIndex(filePath) {
     if (!filePath) return [];
-    if (LUMETRI_PRESET_VALUES_CACHE[filePath]) {
+    if (LUMETRI_PRESET_VALUES_CACHE[filePath] !== undefined) {
       return LUMETRI_PRESET_VALUES_CACHE[filePath];
     }
     var content = readPresetFileText(filePath);
@@ -2150,7 +2822,12 @@
     return null;
   }
 
-  function applyLumetriPresetValuesToTrack(stdTrack, presetFilePath) {
+  function applyLumetriPresetValuesToTrack(
+    stdTrack,
+    presetFilePath,
+    presetData,
+    trackClipContexts,
+  ) {
     var stats = {
       settingsApplied: 0,
       clipsWithLumetri: 0,
@@ -2160,37 +2837,31 @@
     };
     if (!stdTrack || !stdTrack.clips) return stats;
 
-    var allValues = extractLumetriPresetValuesByIndex(presetFilePath);
-    if (!allValues || allValues.length <= 0) return stats;
-
-    var values = [];
-    for (var i = 0; i < allValues.length; i++) {
-      if (isMeaningfulLumetriValue(allValues[i].value)) {
-        values.push(allValues[i]);
-      }
-    }
+    var parsed = presetData || getPresetParsedData(presetFilePath);
+    var values = parsed && parsed.lumetriValues ? parsed.lumetriValues : [];
     if (values.length <= 0) return stats;
     stats.settingsApplied = values.length;
 
-    for (var ci = 0; ci < stdTrack.clips.numItems; ci++) {
-      var clip = stdTrack.clips[ci];
-      if (!clip) continue;
-      var lumetri = getLumetriComponent(clip);
+    var contexts = trackClipContexts || buildTrackClipContexts(stdTrack);
+    for (var ci = 0; ci < contexts.length; ci++) {
+      var context = contexts[ci];
+      if (!context || !context.clip) continue;
+      var lumetri = getTrackClipLumetriComponent(context);
       if (!lumetri || !lumetri.properties) continue;
       stats.clipsWithLumetri++;
 
       var clipWrites = 0;
+      var properties = lumetri.properties;
+      var propCount = properties.numItems;
       for (var vi = 0; vi < values.length; vi++) {
         var setting = values[vi];
-        if (setting.index < 0 || setting.index >= lumetri.properties.numItems)
-          continue;
-        var prop = lumetri.properties[setting.index];
+        if (setting.index < 0 || setting.index >= propCount) continue;
+        var prop = properties[setting.index];
         if (!prop) continue;
-        try {
-          prop.setValue(setting.value, true);
+        if (setPropertyValueFast(prop, setting.value)) {
           stats.propWrites++;
           clipWrites++;
-        } catch (e1) {
+        } else {
           stats.propFails++;
         }
       }
@@ -2199,7 +2870,12 @@
     return stats;
   }
 
-  function applyLumetriLookPathToTrack(stdTrack, presetFilePath) {
+  function applyLumetriLookPathToTrack(
+    stdTrack,
+    presetFilePath,
+    presetData,
+    trackClipContexts,
+  ) {
     var stats = {
       resolvedPath: "",
       candidateCount: 0,
@@ -2211,30 +2887,36 @@
     };
     if (!stdTrack || !stdTrack.clips) return stats;
 
-    var resolvedPath = resolveLumetriLookPathForPreset(presetFilePath);
+    var parsed = presetData || getPresetParsedData(presetFilePath);
+    var resolvedPath =
+      parsed && parsed.lumetriLookPath !== undefined
+        ? parsed.lumetriLookPath
+        : resolveLumetriLookPathForPreset(presetFilePath);
     stats.resolvedPath = resolvedPath;
     var candidates = buildLookPathCandidates(resolvedPath);
     stats.candidateCount = candidates.length;
     if (candidates.length <= 0) return stats;
 
     var targetIndexes = [32, 33];
-    for (var ci = 0; ci < stdTrack.clips.numItems; ci++) {
-      var clip = stdTrack.clips[ci];
-      if (!clip) continue;
-      var lumetri = getLumetriComponent(clip);
+    var contexts = trackClipContexts || buildTrackClipContexts(stdTrack);
+    for (var ci = 0; ci < contexts.length; ci++) {
+      var context = contexts[ci];
+      if (!context || !context.clip) continue;
+      var lumetri = getTrackClipLumetriComponent(context);
       if (!lumetri || !lumetri.properties) continue;
       stats.clipsWithLumetri++;
 
       var clipApplied = false;
+      var properties = lumetri.properties;
+      var propCount = properties.numItems;
       for (var pi = 0; pi < candidates.length && !clipApplied; pi++) {
         var pathCandidate = candidates[pi];
         for (var ti = 0; ti < targetIndexes.length; ti++) {
           var idx = targetIndexes[ti];
-          if (idx < 0 || idx >= lumetri.properties.numItems) continue;
-          var prop = lumetri.properties[idx];
+          if (idx < 0 || idx >= propCount) continue;
+          var prop = properties[idx];
           if (!prop) continue;
-          try {
-            prop.setValue(pathCandidate, true);
+          if (setPropertyValueFast(prop, pathCandidate)) {
             stats.propWrites++;
             clipApplied = true;
             if (!stats.pathUsed) {
@@ -2243,7 +2925,7 @@
               stats.pathUsed = "mixed";
             }
             break;
-          } catch (e0) {
+          } else {
             stats.propFails++;
           }
         }
@@ -2262,7 +2944,7 @@
 
   function extractPresetEffectValueEntries(filePath) {
     if (!filePath) return [];
-    if (PRESET_EFFECT_VALUE_ENTRIES_CACHE[filePath]) {
+    if (PRESET_EFFECT_VALUE_ENTRIES_CACHE[filePath] !== undefined) {
       return PRESET_EFFECT_VALUE_ENTRIES_CACHE[filePath];
     }
 
@@ -2345,20 +3027,261 @@
     return entries;
   }
 
+  function getPresetParsedData(filePath) {
+    var cacheKey = filePath || "__missing_preset__";
+    if (PRESET_PARSED_DATA_CACHE[cacheKey] !== undefined) {
+      return PRESET_PARSED_DATA_CACHE[cacheKey];
+    }
+
+    var filterEntries = extractVideoFilterEntriesFromPresetFile(filePath);
+    var effectEntries = extractPresetEffectValueEntries(filePath);
+
+    var nonLumetriEffectEntries = [];
+    for (var i = 0; i < effectEntries.length; i++) {
+      var entry = effectEntries[i];
+      if (!entry || !entry.values || entry.values.length <= 0) continue;
+      if (isLumetriMatchName(entry.matchName)) continue;
+      nonLumetriEffectEntries.push(entry);
+    }
+
+    var lumetriRawValues = extractLumetriPresetValuesByIndex(filePath);
+    var lumetriValues = [];
+    for (var vi = 0; vi < lumetriRawValues.length; vi++) {
+      var rawValue = lumetriRawValues[vi];
+      if (rawValue && isMeaningfulLumetriValue(rawValue.value)) {
+        lumetriValues.push(rawValue);
+      }
+    }
+
+    var parsed = {
+      filterEntries: filterEntries,
+      effectEntries: effectEntries,
+      nonLumetriEffectEntries: nonLumetriEffectEntries,
+      lumetriValues: lumetriValues,
+      lumetriLookPath: resolveLumetriLookPathForPreset(filePath),
+    };
+    PRESET_PARSED_DATA_CACHE[cacheKey] = parsed;
+    return parsed;
+  }
+
+  function buildEffectEntriesWithCandidates(entries) {
+    var prepared = [];
+    if (!entries) return prepared;
+    for (var i = 0; i < entries.length; i++) {
+      var entry = entries[i];
+      if (!entry) continue;
+      var candidates = getFallbackEffectNameCandidates(
+        entry.matchName,
+        entry.displayName,
+      );
+      var candidatesLower = [];
+      for (var c = 0; c < candidates.length; c++) {
+        var candidate = candidates[c];
+        if (!candidate) continue;
+        candidatesLower.push(candidate.toString().toLowerCase());
+      }
+      prepared.push({
+        entry: entry,
+        label: entry.displayName || entry.matchName || "Effect " + (i + 1),
+        candidates: candidates,
+        candidatesLower: candidatesLower,
+      });
+    }
+    return prepared;
+  }
+
+  function buildTrackClipContexts(stdTrack) {
+    var contexts = [];
+    if (!stdTrack || !stdTrack.clips) return contexts;
+    var clips = stdTrack.clips;
+    var clipCount = clips.numItems;
+    for (var i = 0; i < clipCount; i++) {
+      var clip = clips[i];
+      if (!clip) continue;
+
+      var nameRef = "";
+      try {
+        if (clip.projectItem && clip.projectItem.name) {
+          nameRef = clip.projectItem.name.toString();
+        } else if (clip.name) {
+          nameRef = clip.name.toString();
+        }
+      } catch (e0) {}
+      var cleanNameRef = nameRef ? stripKnownExtension(nameRef) : "";
+
+      var componentNameMap = {};
+      var lumetriComponent = null;
+      try {
+        if (clip.components) {
+          var components = clip.components;
+          var compCount = components.numItems;
+          for (var c = 0; c < compCount; c++) {
+            var comp = components[c];
+            if (!comp || !comp.displayName) continue;
+            var compName = comp.displayName.toString();
+            if (!compName) continue;
+            var lowerName = compName.toLowerCase();
+            if (componentNameMap[lowerName] === undefined) {
+              componentNameMap[lowerName] = comp;
+            }
+            if (
+              !lumetriComponent &&
+              (compName === "Couleur Lumetri" ||
+                compName === "Lumetri Color" ||
+                lowerName.indexOf("lumetri") !== -1)
+            ) {
+              lumetriComponent = comp;
+            }
+          }
+        }
+      } catch (e1) {}
+
+      contexts.push({
+        clipIndex: i,
+        clip: clip,
+        startSec: getTrackItemStartSeconds(clip),
+        nameRef: nameRef,
+        cleanNameRef: cleanNameRef,
+        componentNameMap: componentNameMap,
+        lumetriComponent: lumetriComponent,
+        qeItem: null,
+        qeResolvedAttempted: false,
+      });
+    }
+    return contexts;
+  }
+
+  function getTrackClipLumetriComponent(context) {
+    if (!context) return null;
+    var lumetri = context.lumetriComponent;
+    if (lumetri) {
+      try {
+        var _ = lumetri.properties;
+        return lumetri;
+      } catch (e0) {
+        lumetri = null;
+      }
+    }
+    lumetri = getLumetriComponent(context.clip);
+    if (!lumetri) return null;
+    context.lumetriComponent = lumetri;
+    try {
+      if (lumetri.displayName && context.componentNameMap) {
+        context.componentNameMap[lumetri.displayName.toString().toLowerCase()] =
+          lumetri;
+      }
+    } catch (e1) {}
+    return lumetri;
+  }
+
+  function findComponentByEffectEntryFromContext(context, entry, candidates) {
+    if (!context || !entry) return null;
+    var nameMap = context.componentNameMap || null;
+    if (nameMap && candidates && candidates.length > 0) {
+      for (var c = 0; c < candidates.length; c++) {
+        var candidate = candidates[c];
+        if (!candidate) continue;
+        var mapped = nameMap[candidate.toString().toLowerCase()];
+        if (mapped) return mapped;
+      }
+    }
+    var resolved = findComponentByEffectEntry(context.clip, entry, candidates);
+    if (resolved && resolved.displayName && nameMap) {
+      try {
+        nameMap[resolved.displayName.toString().toLowerCase()] = resolved;
+      } catch (e0) {}
+    }
+    return resolved;
+  }
+
+  function resolveQEItemForTrackContext(context, qeTrack, qeItemIndex) {
+    if (!context || !qeTrack) return null;
+    if (context.qeResolvedAttempted && !context.qeItem) return null;
+    if (context.qeItem) {
+      try {
+        var _ = context.qeItem.start;
+        perfCounterInc("qeEffectContextReusedItems");
+        return context.qeItem;
+      } catch (e0) {
+        context.qeItem = null;
+        context.qeResolvedAttempted = false;
+      }
+    }
+    if (typeof context.startSec !== "number") {
+      context.qeResolvedAttempted = true;
+      return null;
+    }
+
+    var qeItem = findQETrackItemAtStartInIndex(
+      qeItemIndex,
+      context.startSec,
+      context.cleanNameRef,
+    );
+    if (!qeItem) {
+      perfCounterInc("qeEffectFallbackSearches");
+      qeItem = findQETrackItemAtStartInTrack(
+        qeTrack,
+        context.startSec,
+        context.cleanNameRef,
+      );
+    }
+    if (!qeItem && context.nameRef) {
+      perfCounterInc("qeEffectFallbackSearches");
+      qeItem = findQETrackItemAtStartInTrack(
+        qeTrack,
+        context.startSec,
+        context.nameRef,
+      );
+    }
+    if (!qeItem) {
+      perfCounterInc("qeEffectFallbackSearches");
+      qeItem = findQETrackItemAtStartInTrack(qeTrack, context.startSec, null);
+    }
+
+    if (qeItem) {
+      context.qeItem = qeItem;
+    }
+    context.qeResolvedAttempted = true;
+    return qeItem;
+  }
+
+  function buildQEMatchMapForTrack(trackClipContexts, qeTrack, qeItemIndex) {
+    var stats = {
+      totalClips: 0,
+      matchedQEItems: 0,
+      unmatchedQEItems: 0,
+    };
+    if (!trackClipContexts || !qeTrack) return stats;
+    for (var i = 0; i < trackClipContexts.length; i++) {
+      var context = trackClipContexts[i];
+      if (!context || !context.clip) continue;
+      stats.totalClips++;
+      var qeItem = resolveQEItemForTrackContext(context, qeTrack, qeItemIndex);
+      if (qeItem) {
+        stats.matchedQEItems++;
+        perfCounterInc("qeEffectPreMappedItems");
+      } else {
+        stats.unmatchedQEItems++;
+      }
+    }
+    return stats;
+  }
+
   function equalsIgnoreCase(a, b) {
     if (a === null || a === undefined || b === null || b === undefined)
       return false;
     return a.toString().toLowerCase() === b.toString().toLowerCase();
   }
 
-  function findComponentByEffectEntry(clip, entry) {
+  function findComponentByEffectEntry(clip, entry, precomputedCandidates) {
     if (!clip || !clip.components || !entry) return null;
-    var candidates = getFallbackEffectNameCandidates(
-      entry.matchName,
-      entry.displayName,
-    );
-    for (var i = 0; i < clip.components.numItems; i++) {
-      var comp = clip.components[i];
+    var candidates =
+      precomputedCandidates ||
+      getFallbackEffectNameCandidates(entry.matchName, entry.displayName);
+    var components = clip.components;
+    var compCount = components.numItems;
+    for (var i = 0; i < compCount; i++) {
+      var comp = components[i];
       if (!comp || !comp.displayName) continue;
       var compName = comp.displayName.toString();
       for (var c = 0; c < candidates.length; c++) {
@@ -2370,7 +3293,13 @@
     return null;
   }
 
-  function applyNonLumetriPresetValuesToTrack(stdTrack, presetFilePath) {
+  function applyNonLumetriPresetValuesToTrack(
+    stdTrack,
+    presetFilePath,
+    presetData,
+    trackClipContexts,
+    preparedEntries,
+  ) {
     var stats = {
       effectsWithValues: 0,
       clipsWithComponents: 0,
@@ -2380,45 +3309,46 @@
     };
     if (!stdTrack || !stdTrack.clips) return stats;
 
-    var effectEntries = extractPresetEffectValueEntries(presetFilePath);
-    if (!effectEntries || effectEntries.length <= 0) return stats;
+    var parsed = presetData || getPresetParsedData(presetFilePath);
+    var entries = parsed ? parsed.nonLumetriEffectEntries : [];
+    if (!entries || entries.length <= 0) return stats;
 
-    var entries = [];
-    for (var i = 0; i < effectEntries.length; i++) {
-      var e = effectEntries[i];
-      if (!e || !e.values || e.values.length <= 0) continue;
-      if (isLumetriMatchName(e.matchName)) continue;
-      entries.push(e);
-    }
-    if (entries.length <= 0) return stats;
-    stats.effectsWithValues = entries.length;
+    var prepared =
+      preparedEntries && preparedEntries.length > 0
+        ? preparedEntries
+        : buildEffectEntriesWithCandidates(entries);
+    if (prepared.length <= 0) return stats;
+    stats.effectsWithValues = prepared.length;
 
-    for (var ci = 0; ci < stdTrack.clips.numItems; ci++) {
-      var clip = stdTrack.clips[ci];
-      if (!clip) continue;
+    var contexts = trackClipContexts || buildTrackClipContexts(stdTrack);
+    for (var ci = 0; ci < contexts.length; ci++) {
+      var context = contexts[ci];
+      if (!context || !context.clip) continue;
       var clipWrites = 0;
       var hadComponent = false;
 
-      for (var ei = 0; ei < entries.length; ei++) {
-        var entry = entries[ei];
-        var component = findComponentByEffectEntry(clip, entry);
+      for (var ei = 0; ei < prepared.length; ei++) {
+        var preparedEntry = prepared[ei];
+        var entry = preparedEntry.entry;
+        var component = findComponentByEffectEntryFromContext(
+          context,
+          entry,
+          preparedEntry.candidates,
+        );
         if (!component || !component.properties) continue;
         hadComponent = true;
 
+        var properties = component.properties;
+        var propCount = properties.numItems;
         for (var vi = 0; vi < entry.values.length; vi++) {
           var setting = entry.values[vi];
-          if (
-            setting.index < 0 ||
-            setting.index >= component.properties.numItems
-          )
-            continue;
-          var prop = component.properties[setting.index];
+          if (setting.index < 0 || setting.index >= propCount) continue;
+          var prop = properties[setting.index];
           if (!prop) continue;
-          try {
-            prop.setValue(setting.value, true);
+          if (setPropertyValueFast(prop, setting.value)) {
             stats.propWrites++;
             clipWrites++;
-          } catch (e0) {
+          } else {
             stats.propFails++;
           }
         }
@@ -2650,71 +3580,81 @@
     qeTrack,
     effectObj,
     qeItemIndex,
+    trackClipContexts,
   ) {
     var stats = {
       totalClips: 0,
       matchedQEItems: 0,
       applyCalls: 0,
       verifiedChanges: 0,
+      assumedChanges: 0,
+      sampledVerifications: 0,
+      strictFallbackMode: false,
       noChange: 0,
       failedCalls: 0,
     };
     if (!stdTrack || !stdTrack.clips || !qeTrack || !effectObj) return stats;
 
-    for (var i = 0; i < stdTrack.clips.numItems; i++) {
-      var stdItem = stdTrack.clips[i];
+    var contexts = trackClipContexts || buildTrackClipContexts(stdTrack);
+    var forceStrictVerification = false;
+    for (var i = 0; i < contexts.length; i++) {
+      var context = contexts[i];
+      if (!context) continue;
+      var stdItem = context.clip;
       if (!stdItem) continue;
       stats.totalClips++;
 
-      var startSec = getTrackItemStartSeconds(stdItem);
-      if (typeof startSec !== "number") continue;
-
-      var nameRef = "";
-      try {
-        if (stdItem.projectItem && stdItem.projectItem.name) {
-          nameRef = stdItem.projectItem.name.toString();
-        } else if (stdItem.name) {
-          nameRef = stdItem.name.toString();
-        }
-      } catch (e0) {}
-      var cleanNameRef = nameRef ? stripKnownExtension(nameRef) : "";
-
-      var qeItem = findQETrackItemAtStartInIndex(
-        qeItemIndex,
-        startSec,
-        cleanNameRef,
-      );
-      if (!qeItem)
-        qeItem = findQETrackItemAtStartInTrack(qeTrack, startSec, cleanNameRef);
-      if (!qeItem && nameRef)
-        qeItem = findQETrackItemAtStartInTrack(qeTrack, startSec, nameRef);
-      if (!qeItem)
-        qeItem = findQETrackItemAtStartInTrack(qeTrack, startSec, null);
+      var qeItem = resolveQEItemForTrackContext(context, qeTrack, qeItemIndex);
       if (!qeItem) continue;
 
       stats.matchedQEItems++;
-      var before = getTrackItemComponentsCount(stdItem);
+      var shouldVerify =
+        forceStrictVerification ||
+        stats.sampledVerifications < QE_EFFECT_VERIFY_SAMPLE_CLIPS;
+      var before = shouldVerify ? getTrackItemComponentsCount(stdItem) : -1;
 
       try {
+        perfCounterInc("qeEffectApplyCalls");
         qeItem.addVideoEffect(effectObj);
         stats.applyCalls++;
       } catch (e1) {
         stats.failedCalls++;
+        perfCounterInc("qeEffectApplyFailures");
+        context.qeItem = null;
+        context.qeResolvedAttempted = false;
         continue;
       }
 
+      if (!shouldVerify || before < 0) {
+        stats.assumedChanges++;
+        continue;
+      }
+
+      stats.sampledVerifications++;
       var after = getTrackItemComponentsCount(stdItem);
       if (!(before >= 0 && after > before)) {
         var waitedMs = 0;
-        while (waitedMs < 20) {
-          sleep(5);
-          waitedMs += 5;
+        while (waitedMs < QE_EFFECT_VERIFY_WAIT_MAX_MS) {
+          var waitChunk = Math.min(
+            QE_EFFECT_VERIFY_WAIT_STEP_MS,
+            QE_EFFECT_VERIFY_WAIT_MAX_MS - waitedMs,
+          );
+          if (waitChunk <= 0) break;
+          sleep(waitChunk);
+          waitedMs += waitChunk;
+          perfCounterInc("qeEffectVerifySleepMs", waitChunk);
           after = getTrackItemComponentsCount(stdItem);
           if (before >= 0 && after > before) break;
         }
       }
       if (before >= 0 && after > before) stats.verifiedChanges++;
-      else stats.noChange++;
+      else {
+        stats.noChange++;
+        if (!forceStrictVerification) {
+          forceStrictVerification = true;
+          stats.strictFallbackMode = true;
+        }
+      }
     }
     return stats;
   }
@@ -2811,11 +3751,31 @@
       );
     }
     var qeItemIndex = buildQETrackItemIndex(qeTrackInfo.track);
+    var presetData = getPresetParsedData(presetFilePath);
+    var trackClipContexts = buildTrackClipContexts(stdTrack);
+    var qeMatchStats = buildQEMatchMapForTrack(
+      trackClipContexts,
+      qeTrackInfo.track,
+      qeItemIndex,
+    );
+    if (qeMatchStats.unmatchedQEItems > 0) {
+      log(
+        "Info: QE pre-map matched " +
+          qeMatchStats.matchedQEItems +
+          "/" +
+          qeMatchStats.totalClips +
+          " clips for '" +
+          presetName +
+          "'.",
+      );
+    }
 
     var totalVerified = 0;
+    var totalAssumed = 0;
     var anyApplied = false;
     var unresolvedEffects = 0;
-    var filterEntries = extractVideoFilterEntriesFromPresetFile(presetFilePath);
+    var filterEntries = presetData ? presetData.filterEntries : [];
+    var preparedFilterEntries = buildEffectEntriesWithCandidates(filterEntries);
     if (filterEntries.length <= 0) {
       var hint = "";
       try {
@@ -2828,14 +3788,10 @@
         "Warning: Fallback unavailable for preset '" + presetName + "'." + hint,
       );
     } else {
-      for (var eIdx = 0; eIdx < filterEntries.length; eIdx++) {
-        var entry = filterEntries[eIdx];
-        var label =
-          entry.displayName || entry.matchName || "Effect " + (eIdx + 1);
-        var candidates = getFallbackEffectNameCandidates(
-          entry.matchName,
-          entry.displayName,
-        );
+      for (var eIdx = 0; eIdx < preparedFilterEntries.length; eIdx++) {
+        var preparedEffect = preparedFilterEntries[eIdx];
+        var label = preparedEffect.label;
+        var candidates = preparedEffect.candidates;
         var effectAppliedForEntry = false;
 
         for (var c = 0; c < candidates.length; c++) {
@@ -2849,6 +3805,7 @@
             qeTrackInfo.track,
             effectCandidate,
             qeItemIndex,
+            trackClipContexts,
           );
           if (st.applyCalls > 0) anyApplied = true;
           log(
@@ -2860,11 +3817,19 @@
               st.verifiedChanges +
               "/" +
               st.totalClips +
-              " clip(s).",
+              " clip(s), assumed " +
+              st.assumedChanges +
+              ", sampled checks " +
+              st.sampledVerifications +
+              (st.strictFallbackMode ? ", strict fallback enabled." : "."),
           );
 
-          if (st.verifiedChanges > 0) {
+          if (
+            st.verifiedChanges > 0 ||
+            (st.assumedChanges > 0 && st.failedCalls === 0 && st.noChange === 0)
+          ) {
             totalVerified += st.verifiedChanges;
+            totalAssumed += st.assumedChanges;
             effectAppliedForEntry = true;
             break;
           }
@@ -2877,9 +3842,15 @@
       }
     }
 
+    var preparedNonLumetriEntries = buildEffectEntriesWithCandidates(
+      presetData ? presetData.nonLumetriEffectEntries : [],
+    );
     var nonLumetriSync = applyNonLumetriPresetValuesToTrack(
       stdTrack,
       presetFilePath,
+      presetData,
+      trackClipContexts,
+      preparedNonLumetriEntries,
     );
     var nonLumetriWrites = nonLumetriSync.propWrites;
     if (
@@ -2899,7 +3870,12 @@
       );
     }
 
-    var lumetriSync = applyLumetriPresetValuesToTrack(stdTrack, presetFilePath);
+    var lumetriSync = applyLumetriPresetValuesToTrack(
+      stdTrack,
+      presetFilePath,
+      presetData,
+      trackClipContexts,
+    );
     var lumetriWrites = lumetriSync.propWrites;
     if (lumetriSync.settingsApplied > 0 && lumetriSync.clipsWithLumetri > 0) {
       log(
@@ -2915,7 +3891,12 @@
       );
     }
 
-    var lookPathSync = applyLumetriLookPathToTrack(stdTrack, presetFilePath);
+    var lookPathSync = applyLumetriLookPathToTrack(
+      stdTrack,
+      presetFilePath,
+      presetData,
+      trackClipContexts,
+    );
     var lookPathWrites = lookPathSync.propWrites;
     if (lookPathSync.resolvedPath) {
       log("Lumetri Look path resolved: " + lookPathSync.resolvedPath);
@@ -2942,6 +3923,7 @@
 
     if (
       totalVerified > 0 ||
+      totalAssumed > 0 ||
       nonLumetriWrites > 0 ||
       lumetriWrites > 0 ||
       lookPathWrites > 0
@@ -2953,6 +3935,8 @@
           (videoTrackIndex + 1) +
           " (verified component changes: " +
           totalVerified +
+          ", assumed component changes: " +
+          totalAssumed +
           ", non-Lumetri writes: " +
           nonLumetriWrites +
           ", lumetri writes: " +
@@ -3039,10 +4023,47 @@
     return true;
   }
 
+  function scoreAudioGainProperty(prop) {
+    if (!prop) return -1;
+    var propName = prop.displayName
+      ? prop.displayName.toString().toLowerCase()
+      : "";
+    var propMatch = prop.matchName
+      ? prop.matchName.toString().toLowerCase()
+      : "";
+
+    if (
+      propName.indexOf("mute") !== -1 ||
+      propName.indexOf("muet") !== -1 ||
+      propName.indexOf("sourdine") !== -1 ||
+      propName.indexOf("bypass") !== -1 ||
+      propMatch.indexOf("mute") !== -1 ||
+      propMatch.indexOf("bypass") !== -1
+    ) {
+      return -1;
+    }
+
+    if (propName === "level" || propName === "niveau") return 100;
+    if (propName === "volume level" || propName === "gain") return 95;
+    if (propName.indexOf("volume level") !== -1) return 90;
+    if (
+      propName.indexOf("level") !== -1 ||
+      propName.indexOf("niveau") !== -1 ||
+      propName.indexOf("gain") !== -1
+    ) {
+      return 80;
+    }
+    if (propMatch.indexOf("level") !== -1 || propMatch.indexOf("gain") !== -1) {
+      return 70;
+    }
+    return -1;
+  }
+
   function applyTrackItemGainDb(trackItem, gainDb) {
     if (!trackItem || typeof gainDb !== "number" || !trackItem.components)
       return false;
 
+    var itemName = trackItem.name ? trackItem.name.toString() : "audio-item";
     var volumeComponent = null;
     for (var c = 0; c < trackItem.components.numItems; c++) {
       var comp = trackItem.components[c];
@@ -3061,46 +4082,109 @@
         break;
       }
     }
-    if (!volumeComponent || !volumeComponent.properties) return false;
+    if (!volumeComponent || !volumeComponent.properties) {
+      log(
+        "Warning: Music gain skipped for '" +
+          itemName +
+          "' (no Volume component).",
+      );
+      return false;
+    }
 
-    var levelProp = null;
+    var targetProp = null;
+    var targetScore = -1;
     for (var p = 0; p < volumeComponent.properties.numItems; p++) {
       var prop = volumeComponent.properties[p];
       if (!prop) continue;
-      var propName = prop.displayName
-        ? prop.displayName.toString().toLowerCase()
-        : "";
-      var propMatch = prop.matchName
-        ? prop.matchName.toString().toLowerCase()
-        : "";
-      if (
-        propName === "level" ||
-        propName === "niveau" ||
-        propName.indexOf("level") !== -1 ||
-        propName.indexOf("niveau") !== -1 ||
-        propMatch.indexOf("level") !== -1
-      ) {
-        levelProp = prop;
-        break;
+      var score = scoreAudioGainProperty(prop);
+      if (score > targetScore) {
+        targetScore = score;
+        targetProp = prop;
       }
     }
 
-    if (levelProp) {
-      try {
-        levelProp.setValue(gainDb, true);
-        return true;
-      } catch (e0) {}
+    if (!targetProp || targetScore < 0) {
+      log(
+        "Warning: Music gain skipped for '" +
+          itemName +
+          "' (no safe Level/Gain property found).",
+      );
+      return false;
     }
 
-    for (var p2 = 0; p2 < volumeComponent.properties.numItems; p2++) {
-      var fallbackProp = volumeComponent.properties[p2];
-      if (!fallbackProp) continue;
+    var refRaw = AUDIO_GAIN_RAW_REFERENCE_AT_0DB;
+    if (!(typeof refRaw === "number" && isFinite(refRaw) && refRaw > 0)) {
       try {
-        fallbackProp.setValue(gainDb, true);
-        return true;
-      } catch (e1) {}
+        if (targetProp.getValue) {
+          var rawCandidate = targetProp.getValue();
+          if (typeof rawCandidate === "string") {
+            rawCandidate = parseFloat(rawCandidate);
+          }
+          if (
+            typeof rawCandidate === "number" &&
+            isFinite(rawCandidate) &&
+            rawCandidate > 0
+          ) {
+            refRaw = rawCandidate;
+          }
+        }
+      } catch (eRefRead) {}
     }
-    return false;
+    if (!(typeof refRaw === "number" && isFinite(refRaw) && refRaw > 0)) {
+      refRaw = AUDIO_GAIN_RAW_FALLBACK_AT_0DB;
+    }
+    AUDIO_GAIN_RAW_REFERENCE_AT_0DB = refRaw;
+
+    var rawTarget = refRaw * Math.pow(10, gainDb / 20);
+    if (
+      !(typeof rawTarget === "number" && isFinite(rawTarget) && rawTarget > 0)
+    ) {
+      log(
+        "Warning: Music gain skipped for '" +
+          itemName +
+          "' (invalid raw target from " +
+          gainDb +
+          " dB).",
+      );
+      return false;
+    }
+
+    if (!setPropertyValueFast(targetProp, rawTarget)) {
+      var targetName = targetProp.displayName
+        ? targetProp.displayName.toString()
+        : "unknown-property";
+      log(
+        "Warning: Music gain write failed on '" +
+          itemName +
+          "' property '" +
+          targetName +
+          "'.",
+      );
+      return false;
+    }
+
+    try {
+      if (targetProp.getValue) {
+        var readBack = targetProp.getValue();
+        if (typeof readBack === "string") {
+          readBack = parseFloat(readBack);
+        }
+        if (
+          typeof readBack !== "number" ||
+          !isFinite(readBack) ||
+          readBack <= 0
+        ) {
+          log(
+            "Warning: Music gain readback looks invalid on '" +
+              itemName +
+              "' after write (value: " +
+              readBack +
+              ").",
+          );
+        }
+      }
+    } catch (eReadBack) {}
+    return true;
   }
 
   function buildLoopedMusicBed(track, musicItem, targetEndSec, gainDb) {
@@ -3153,7 +4237,11 @@
         log(
           "Warning: Could not set music gain to " +
             gainDb +
-            " dB on one segment.",
+            " dB on segment at " +
+            cursor.toFixed(3) +
+            "s for '" +
+            (clipNameNoExt || clipName || "music") +
+            "'.",
         );
       }
 
