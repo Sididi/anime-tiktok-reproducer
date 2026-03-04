@@ -1,3 +1,4 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
 
@@ -38,6 +39,7 @@ class Settings(BaseSettings):
 
     # Discord webhook integration
     discord_webhook_url: str | None = None
+    cep_trigger_url_template: str = "http://localhost:48653/p/{project_id}"
 
     # Script automation (Gemini + ElevenLabs)
     script_automate_enabled: bool = True
@@ -122,6 +124,13 @@ class Settings(BaseSettings):
     @property
     def youtube_google_token_uri(self) -> str:
         return self.google_token_uri
+
+    @field_validator("cep_trigger_url_template")
+    @classmethod
+    def _validate_cep_trigger_url_template(cls, value: str) -> str:
+        if "{project_id}" not in value:
+            raise ValueError("ATR_CEP_TRIGGER_URL_TEMPLATE must contain '{project_id}'")
+        return value
 
 settings = Settings()
 

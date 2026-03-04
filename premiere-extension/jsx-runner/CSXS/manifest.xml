@@ -40,12 +40,12 @@
                     <Menu>JSX Runner</Menu>
                     <Geometry>
                         <Size>
-                            <Height>400</Height>
-                            <Width>300</Width>
+                            <Height>760</Height>
+                            <Width>520</Width>
                         </Size>
                         <MinSize>
-                            <Height>200</Height>
-                            <Width>200</Width>
+                            <Height>360</Height>
+                            <Width>380</Width>
                         </MinSize>
                     </Geometry>
                 </UI>

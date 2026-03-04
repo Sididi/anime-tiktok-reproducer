@@ -126,6 +126,12 @@ Environment variables or defaults in `backend/app/config.py`:
 | `ANIME_SEARCHER_PATH` | `modules/anime_searcher`         | Path to anime_searcher module |
 | `SSCD_MODEL_PATH`     | Auto-detected                    | Path to SSCD model file       |
 
+Additional integration variables (see `.env.example`):
+
+- `ATR_DISCORD_WEBHOOK_URL`: Discord webhook for generation/upload notifications
+- `ATR_CEP_TRIGGER_URL_TEMPLATE`: Local CEP trigger URL template used in generation-complete message (must include `{project_id}`), default:
+  - `http://localhost:48653/p/{project_id}`
+
 ## Usage
 
 ### Starting the Application
@@ -278,6 +284,17 @@ pixi run anime-search search /path/to/library image.png --flip --series "Anime N
 | ------ | ---------------------------------------- | ---------------------------- |
 | POST   | `/api/projects/{id}/processing/start`    | Start final processing (SSE) |
 | GET    | `/api/projects/{id}/processing/download` | Download output archive      |
+
+### CEP Automation Trigger
+
+When Drive export completes (`/api/projects/{id}/exports/gdrive`), backend posts a Discord message using `ATR_CEP_TRIGGER_URL_TEMPLATE`, for example:
+
+`http://localhost:48653/p/{project_id}`
+
+The Premiere CEP extension (`premiere-extension/`) hosts this local endpoint and automates:
+1. Drive folder download (`SPM_*_{project_id}` under configured parent folder)
+2. `import_project.jsx` execution
+3. `output.mp4` detection and resumable upload back to Drive root
 
 ## Project Data Structure
 

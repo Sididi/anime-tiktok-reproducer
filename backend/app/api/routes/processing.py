@@ -66,7 +66,7 @@ class PreviewBuildRequest(BaseModel):
     music_key: str | None = None
 
 
-def _notify_drive_upload_complete(project_id: str, folder_url: str) -> None:
+def _notify_drive_upload_complete(project_id: str, _folder_url: str) -> None:
     """
     Best-effort Discord notification executed outside request critical path.
 
@@ -85,11 +85,12 @@ def _notify_drive_upload_complete(project_id: str, folder_url: str) -> None:
             project.generation_discord_message_id = None
 
         anime_title = project.anime_name or "Inconnu"
+        trigger_url = settings.cep_trigger_url_template.format(project_id=project.id)
         discord_message = DiscordService.post_message(
             "\n".join(
                 [
                     f"**{anime_title}**: Génération terminée pour le projet `{project.id}`.",
-                    f"Dossier Google Drive: <{folder_url}>",
+                    f"Dossier Google Drive: <{trigger_url}>",
                 ]
             )
         )

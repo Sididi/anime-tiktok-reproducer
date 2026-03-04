@@ -9,23 +9,84 @@
     <div id="app">
         <div id="header">
             <h1>JSX Runner</h1>
-            <div id="status-indicator" class="idle" title="Watching for scripts"></div>
+            <div id="status-indicator" class="idle" title="Not watching"></div>
         </div>
 
-        <button id="btn-browse" title="Browse for a .jsx script to run">Browse &amp; Run</button>
-
-        <div id="recent-section">
-            <h2>Recent Scripts</h2>
-            <ul id="recent-list"></ul>
+        <div class="button-row">
+            <button id="btn-browse" title="Browse for a .jsx script to run">Browse &amp; Run</button>
+            <button id="btn-export-project" title="Export selected project to output.mp4 via AME">Export via CEP</button>
         </div>
 
-        <div id="log-section">
+        <div class="control-grid">
+            <label>
+                Project
+                <select id="project-select"></select>
+            </label>
+            <label class="checkbox-row">
+                <input type="checkbox" id="chk-delete-after-upload" checked>
+                <span>Delete local folder after successful upload</span>
+            </label>
+        </div>
+
+        <div id="settings-section" class="panel-section is-collapsed">
+            <button id="settings-toggle" class="section-toggle" type="button" aria-expanded="false">
+                <span class="section-title">Automation Settings</span>
+                <span class="section-chevron">▸</span>
+            </button>
+            <div id="settings-content">
+                <div class="settings-grid">
+                    <label>
+                        Drive Client ID
+                        <input id="setting-client-id" type="text" autocomplete="off">
+                    </label>
+                    <label>
+                        Drive Client Secret
+                        <input id="setting-client-secret" type="password" autocomplete="off">
+                    </label>
+                    <label>
+                        Drive Refresh Token
+                        <input id="setting-refresh-token" type="password" autocomplete="off">
+                    </label>
+                    <label>
+                        Drive Parent Folder ID
+                        <input id="setting-parent-folder-id" type="text" autocomplete="off">
+                    </label>
+                    <label>
+                        Local Server Port
+                        <input id="setting-port" type="number" min="1" max="65535" step="1">
+                    </label>
+                    <label>
+                        AME Preset (.epr)
+                        <div class="inline-input">
+                            <input id="setting-preset-epr" type="text" autocomplete="off">
+                            <button id="btn-browse-preset" type="button">Browse</button>
+                        </div>
+                    </label>
+                </div>
+                <div class="button-row settings-actions">
+                    <button id="btn-save-settings" type="button">Save Settings</button>
+                    <button id="btn-test-drive" type="button">Test Drive</button>
+                    <span id="settings-status"></span>
+                </div>
+            </div>
+        </div>
+
+        <div id="queue-section" class="panel-section">
+            <h2>Job Queue</h2>
+            <ul id="queue-list"></ul>
+        </div>
+
+        <div id="project-status-section" class="panel-section">
+            <h2>Project Status</h2>
+            <ul id="project-status-list"></ul>
+        </div>
+
+        <div id="log-section" class="panel-section">
             <h2>Log</h2>
             <div id="log"></div>
         </div>
     </div>
 
-    <!-- CSInterface library (bundled with CEP runtime) -->
     <script src="CSInterface.js"></script>
     <script src="main.js"></script>
 </body>

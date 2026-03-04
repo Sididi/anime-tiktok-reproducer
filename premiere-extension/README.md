@@ -1,82 +1,91 @@
 # JSX Runner - CEP Extension for Premiere Pro 2025
 
-A lightweight CEP panel that lets you run `.jsx` automation scripts in Premiere Pro 2025 by double-clicking a `.bat` file from Windows Explorer, or by browsing from within Premiere Pro.
+CEP panel for Premiere Pro 25.x with:
+- classic `.trigger` / `Browse & Run` JSX execution,
+- local HTTP trigger server (`localhost`),
+- automated Google Drive download + `import_project.jsx` launch,
+- `output.mp4` watch and automatic Drive upload (resumable),
+- optional managed AME export from panel with encoder job tracking.
 
-## How It Works
+## One-time Installation
 
-```
-Double-click run_in_premiere.bat (from extracted project .zip)
-  -> .bat writes the .jsx path to a trigger file in a "hot folder"
-  -> CEP panel's Node.js watcher detects the trigger file
-  -> Panel calls $.evalFile() via csInterface.evalScript()
-  -> ExtendScript executes in PPro's engine (full QE DOM access)
-  -> Panel shows success/error status
-```
-
-## Prerequisites
-
-- Adobe Premiere Pro 2025 (v25.x)
-- Windows 10/11
-
-## Installation (one-time)
-
-1. Double-click `install_extension.bat`
+1. Run `premiere-extension/install_extension.bat`
 2. Restart Premiere Pro 2025
-3. Verify: `Window > Extensions > JSX Runner` panel appears with a green status dot
+3. Open `Window > Extensions > JSX Runner`
 
-The installer:
-- Copies the extension to `%APPDATA%\Adobe\CEP\extensions\jsx-runner\`
-- Sets the `PlayerDebugMode` registry key to allow unsigned extensions
-- Creates the hot folder at `%APPDATA%\Adobe\JSXRunner\inbox\`
+## One-time Setup (inside panel)
 
-## Usage
+Fill and save in **Automation Settings**:
+- `Drive Client ID`
+- `Drive Client Secret`
+- `Drive Refresh Token`
+- `Drive Parent Folder ID`
+- `Local Server Port` (default: `48653`)
+- `AME Preset (.epr)` path (required for **Export via CEP**)
 
-### From Windows Explorer (primary)
+Then click **Test Drive**.
 
-1. Extract a project `.zip` to a folder
-2. Make sure Premiere Pro is running with the JSX Runner panel loaded
-3. Double-click `run_in_premiere.bat`
-4. Check the JSX Runner panel for execution status
+## Trigger Contract (Discord -> CEP)
 
-### From within Premiere Pro (fallback)
+Backend sends links in this format:
 
-1. Open the JSX Runner panel (`Window > Extensions > JSX Runner`)
-2. Click **Browse & Run**
-3. Select the `import_project.jsx` file
+`http://localhost:{PORT}/p/{project_id}`
 
-### Recent Scripts
+The panel runs a local server bound to `127.0.0.1` with endpoints:
+- `GET /health`
+- `GET /p/{project_id}`
+- `GET /status/{project_id}`
 
-The panel remembers the last 8 scripts you ran. Click any entry in the "Recent Scripts" list to re-run it.
+On `/p/{project_id}`:
+1. resolve Drive folder `SPM_*_{project_id}` under configured parent,
+2. download folder recursively,
+3. write `.atr_project_context.json`,
+4. auto-run `import_project.jsx`,
+5. arm `output.mp4` monitor.
+
+## Export and Upload Flow
+
+### Manual export (recommended baseline)
+
+Export path must be:
+
+`<downloaded_project_folder>/output.mp4`
+
+When file is stable for 10s, panel uploads it automatically to the same Drive folder root as `output.mp4` (overwrite/update behavior).
+
+### Managed export via panel
+
+Select tracked project and click **Export via CEP**.
+The panel starts AME export with configured `.epr`, tracks encoder job events, then triggers upload when export completes.
+
+## Cleanup option
+
+Checkbox **Delete local folder after successful upload** is enabled by default.
+Deletion happens only after a confirmed successful Drive upload.
+
+## Reliability / Recovery
+
+State is persisted in:
+
+`%APPDATA%\Adobe\JSXRunner\state\`
+
+Files:
+- `settings.json`
+- `jobs.json`
+- `projects/<project_id>.json`
+- `upload_sessions/<project_id>.json` (resumable upload session)
+
+After Premiere restart, queued/in-progress jobs are resumed and export monitors are re-armed.
+
+## Legacy trigger still supported
+
+The historical flow still works:
+- `.bat` writes `.trigger` in `%APPDATA%\Adobe\JSXRunner\inbox`
+- panel watches inbox and runs referenced `.jsx`
 
 ## Troubleshooting
 
-**Panel doesn't appear in Window > Extensions**
-- Make sure you ran `install_extension.bat` and restarted Premiere Pro
-- Check that `%APPDATA%\Adobe\CEP\extensions\jsx-runner\CSXS\manifest.xml` exists
-- Verify the registry key: `HKCU\Software\Adobe\CSXS.12\PlayerDebugMode` = `"1"`
-
-**Status dot is grey (not green)**
-- The hot folder may not have been created. Run `install_extension.bat` again.
-
-**Script not executing after double-clicking .bat**
-- Premiere Pro must be running with the JSX Runner panel open
-- If you closed the panel, reopen it from `Window > Extensions > JSX Runner`
-- Check the panel's log for error messages
-
-**"EvalScript error" in the log**
-- The .jsx script has a syntax or runtime error
-- Open the script in a text editor and check for issues
-- Paths with special characters may need escaping
-
-## Technical Notes
-
-- CEP (Common Extension Platform) is supported in Premiere Pro 2025 through at least September 2026
-- The panel uses Node.js (enabled via CEP manifest) for file system watching
-- `AutoVisible=true` ensures the panel loads automatically when Premiere Pro starts
-- If Adobe deprecates CEP, a UXP migration would be needed
-
-## Uninstalling
-
-1. Delete `%APPDATA%\Adobe\CEP\extensions\jsx-runner\`
-2. Optionally delete `%APPDATA%\Adobe\JSXRunner\`
-3. Optionally remove the registry key: `HKCU\Software\Adobe\CSXS.12\PlayerDebugMode`
+- **Port already in use**: panel logs an explicit error and does not auto-switch port.
+- **Drive ambiguous match**: if multiple `SPM_*_{project_id}` folders match, job is rejected.
+- **No upload after export**: verify export path is exactly `output.mp4` in downloaded project root.
+- **Managed export unavailable**: check `.epr` path exists and active Premiere sequence is open.
