@@ -320,7 +320,7 @@ class UploadPhaseService:
             lines.append("```")
 
         lines.append("")
-        lines.append("TikTok metadata:")
+        lines.append("TikTok description:")
         lines.append(f"`{tiktok_description}`")
         return "\n".join(lines)
 

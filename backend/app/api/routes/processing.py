@@ -102,7 +102,7 @@ def _notify_drive_upload_complete(project_id: str, _folder_url: str) -> None:
             "\n".join(
                 [
                     f"**{anime_title}**: Génération terminée pour le projet `{project.id}`.",
-                    f"Dossier Google Drive: <{trigger_url}>",
+                    f"Lien de génération: <{trigger_url}>",
                 ]
             )
         )
