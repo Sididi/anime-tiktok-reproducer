@@ -19,13 +19,14 @@ TITLE_PAD_V = 24
 TITLE_TEXT_COLOR = (0, 0, 0)  # black
 TITLE_PANEL_COLOR = (255, 255, 255, 245)  # white, nearly opaque
 TITLE_PANEL_RADIUS = 16
-TITLE_PAD_H = 32
+TITLE_PAD_H = 38
 TITLE_SCREEN_MARGIN = 60  # min px from screen edge to panel edge
 TITLE_GAP_ABOVE_CENTER = 90  # px between panel bottom and center frame top
+TITLE_LETTER_SPACING = -1.5  # px offset between characters (negative = tighter)
 TITLE_MAX_LINES = 2
 
 # --- Category style ---
-CAT_FONT_SIZE = 58
+CAT_FONT_SIZE = 50
 CAT_TEXT_COLOR = (255, 255, 255)  # white
 CAT_OUTLINE_COLOR = (0, 0, 0)  # black
 CAT_OUTLINE_WIDTH = 4
@@ -90,17 +91,50 @@ class TitleImageGeneratorService:
         return merged
 
     @classmethod
+    def _measure_text(
+        cls, text: str, font: ImageFont.FreeTypeFont, letter_spacing: float = 0
+    ) -> float:
+        """Measure text width accounting for optional letter spacing."""
+        if not text:
+            return 0
+        if letter_spacing == 0:
+            return font.getlength(text)
+        # Sum advance widths with custom spacing
+        total = 0.0
+        for i, ch in enumerate(text):
+            total += font.getlength(ch)
+            if i < len(text) - 1:
+                total += letter_spacing
+        return total
+
+    @classmethod
+    def _draw_spaced_text(
+        cls,
+        draw: ImageDraw.ImageDraw,
+        xy: tuple[float, float],
+        text: str,
+        font: ImageFont.FreeTypeFont,
+        fill: tuple,
+        letter_spacing: float,
+    ) -> None:
+        """Draw text character by character with custom letter spacing."""
+        x, y = xy
+        for i, ch in enumerate(text):
+            draw.text((x, y), ch, fill=fill, font=font)
+            if i < len(text) - 1:
+                x += font.getlength(ch) + letter_spacing
+
+    @classmethod
     def _wrap_text(
-        cls, text: str, font: ImageFont.FreeTypeFont, max_width: int
+        cls, text: str, font: ImageFont.FreeTypeFont, max_width: int,
+        letter_spacing: float = 0,
     ) -> list[str]:
         """Word-wrap text to fit max_width, max 2 lines. Balanced split."""
-        bbox = font.getbbox(text)
-        if bbox[2] - bbox[0] <= max_width:
+        if cls._measure_text(text, font, letter_spacing) <= max_width:
             return [text]
 
         words = cls._merge_french_punctuation(text.split())
         if len(words) < 2:
-            # Single long word — force it (will overflow but can't split)
             return [text]
 
         best_split = len(words) // 2
@@ -109,8 +143,8 @@ class TitleImageGeneratorService:
         for i in range(1, len(words)):
             line1 = " ".join(words[:i])
             line2 = " ".join(words[i:])
-            w1 = font.getbbox(line1)[2] - font.getbbox(line1)[0]
-            w2 = font.getbbox(line2)[2] - font.getbbox(line2)[0]
+            w1 = cls._measure_text(line1, font, letter_spacing)
+            w2 = cls._measure_text(line2, font, letter_spacing)
             if w1 <= max_width and w2 <= max_width:
                 diff = abs(w1 - w2)
                 if diff < best_diff:
@@ -128,17 +162,16 @@ class TitleImageGeneratorService:
         img = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
 
+        ls = TITLE_LETTER_SPACING
         max_text_width = WIDTH - 2 * (TITLE_SCREEN_MARGIN + TITLE_PAD_H)
-        lines = cls._wrap_text(title.upper(), font, max_text_width)
+        lines = cls._wrap_text(title.upper(), font, max_text_width, ls)
 
         # Calculate panel dimensions
         total_text_h = TITLE_LINE_HEIGHT * len(lines)
         panel_h = total_text_h + TITLE_PAD_V * 2
 
-        text_w = max(
-            font.getbbox(line)[2] - font.getbbox(line)[0] for line in lines
-        )
-        panel_w = text_w + TITLE_PAD_H * 2
+        text_w = max(cls._measure_text(line, font, ls) for line in lines)
+        panel_w = int(text_w) + TITLE_PAD_H * 2
 
         panel_x = (WIDTH - panel_w) // 2
         panel_y = CENTER_FRAME_TOP - TITLE_GAP_ABOVE_CENTER - panel_h
@@ -152,11 +185,10 @@ class TitleImageGeneratorService:
 
         # Draw text lines centered in panel
         for i, line in enumerate(lines):
-            bbox = font.getbbox(line)
-            tw = bbox[2] - bbox[0]
-            tx = (WIDTH - tw) // 2
+            tw = cls._measure_text(line, font, ls)
+            tx = (WIDTH - tw) / 2
             ty = panel_y + TITLE_PAD_V + i * TITLE_LINE_HEIGHT
-            draw.text((tx, ty), line, fill=TITLE_TEXT_COLOR, font=font)
+            cls._draw_spaced_text(draw, (tx, ty), line, font, TITLE_TEXT_COLOR, ls)
 
         img.save(output_path, "PNG")
 
@@ -200,7 +232,7 @@ class TitleImageGeneratorService:
             parts = text.split(separator)
             left, right = parts[0].strip(), parts[1].strip()
             space_w = font.getbbox(" ")[2] - font.getbbox(" ")[0]
-            bullet_radius = 9
+            bullet_radius = 8
             bullet_gap = space_w  # space on each side of the circle
 
             left_w = font.getbbox(left)[2] - font.getbbox(left)[0]

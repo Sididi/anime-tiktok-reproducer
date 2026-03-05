@@ -116,6 +116,7 @@ LOW_CONF_THRESHOLD = 0.05
 LOW_CONF_SINGLE_WORD_MIN_DURATION_SEC = 0.22
 MIN_GAP_FOR_EXTENSION_SEC = 0.30
 NEXT_WORD_SAFETY_SEC = 1.0 / 60.0
+SRT_OBVIOUS_SILENCE_GAP_SEC = 0.5
 
 
 def has_sentence_ending(text: str) -> bool:
@@ -936,7 +937,7 @@ class ProcessingService:
         - Max 3 words ONLY if total length < 12 characters
         - Max 20 characters per subtitle (spaces included)
         - Single line only (never 2 lines)
-        - No temporal gaps: end of block N = start of block N+1 (except obvious silence > 0.3s)
+        - No temporal gaps: end of block N = start of block N+1 (except obvious silence > 0.5s)
         - Never isolate a determiner at the end of a block
 
         Args:
@@ -1028,11 +1029,11 @@ class ProcessingService:
 
                 # Determine end time:
                 # - If there's a next word, check for gap
-                # - If gap > 0.3s (obvious silence), use current block's last word end
+                # - If gap > SRT_OBVIOUS_SILENCE_GAP_SEC (obvious silence), use current block's last word end
                 # - Otherwise, extend to next word's start (no temporal gap)
                 if next_word:
                     gap = next_word.start - current_block[-1].end
-                    if gap > 0.3:
+                    if gap > SRT_OBVIOUS_SILENCE_GAP_SEC:
                         # Obvious silence - don't force continuity
                         end_time = current_block[-1].end
                     else:
