@@ -1849,6 +1849,17 @@ export function MatchValidation() {
               />
             </div>
 
+            <div className="flex items-center justify-end">
+              <Button
+                size="sm"
+                onClick={handleContinue}
+                disabled={!allConfirmed}
+                className="w-full sm:w-auto"
+              >
+                Continue to Transcription
+              </Button>
+            </div>
+
             <input
               type="range"
               min={0}
