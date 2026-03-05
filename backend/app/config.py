@@ -66,6 +66,9 @@ class Settings(BaseSettings):
 
     # Google Drive config
     google_drive_parent_folder_id: str | None = None
+    drive_upload_max_parallel: int = 4
+    drive_delete_max_parallel: int = 8
+    drive_upload_chunk_mb: int = 16
 
     # YouTube upload defaults
     youtube_category_id: str = "22"
@@ -131,6 +134,21 @@ class Settings(BaseSettings):
         if "{project_id}" not in value:
             raise ValueError("ATR_CEP_TRIGGER_URL_TEMPLATE must contain '{project_id}'")
         return value
+
+    @field_validator("drive_upload_max_parallel")
+    @classmethod
+    def _clamp_drive_upload_max_parallel(cls, value: int) -> int:
+        return max(1, min(16, value))
+
+    @field_validator("drive_delete_max_parallel")
+    @classmethod
+    def _clamp_drive_delete_max_parallel(cls, value: int) -> int:
+        return max(1, min(32, value))
+
+    @field_validator("drive_upload_chunk_mb")
+    @classmethod
+    def _clamp_drive_upload_chunk_mb(cls, value: int) -> int:
+        return max(4, min(64, value))
 
 settings = Settings()
 

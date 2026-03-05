@@ -2051,6 +2051,7 @@
     videoTrackIndex,
     subtitleDirPath,
     srtPath,
+    enableSecondsFallback,
   ) {
     var stats = {
       timings: 0,
@@ -2109,6 +2110,7 @@
       );
     }
 
+    var pairs = [];
     for (var k = 0; k < pairCount; k++) {
       var entry = entries[k];
       var mogrtFile = mogrtFiles[k];
@@ -2117,45 +2119,77 @@
       if (endSec <= startSec) {
         endSec = snapSecondsToFrame(startSec + 1 / SEQ_FPS);
       }
-      var endTimeObj = buildSequenceTimeFromSeconds(endSec);
-      var mogrtPath = mogrtFile.fsName;
-      var startTicksStr = secondsToTicks(startSec).toString();
+      pairs.push({
+        idx: k + 1,
+        mogrtPath: mogrtFile.fsName,
+        startSec: startSec,
+        startTicksStr: secondsToTicks(startSec).toString(),
+        endSec: endSec,
+        endTimeObj: buildSequenceTimeFromSeconds(endSec),
+      });
+    }
+
+    var useSecondsFallback = enableSecondsFallback !== false;
+    for (var p = 0; p < pairs.length; p++) {
+      var pair = pairs[p];
 
       var mogrtItem = null;
       try {
         perfCounterInc("importMGTCalls");
         mogrtItem = sequence.importMGT(
-          mogrtPath,
-          startTicksStr,
+          pair.mogrtPath,
+          pair.startTicksStr,
           videoTrackIndex,
           0,
         );
       } catch (e0) {}
+      if (!mogrtItem && useSecondsFallback) {
+        try {
+          perfCounterInc("importMGTCalls");
+          mogrtItem = sequence.importMGT(
+            pair.mogrtPath,
+            pair.startSec,
+            videoTrackIndex,
+            0,
+          );
+        } catch (e1) {}
+      }
 
       if (!mogrtItem) {
         stats.insertFailed++;
+        if (stats.insertFailed <= 10 || stats.insertFailed % 25 === 0) {
+          log(
+            "Warning: Subtitle import failed #" +
+              pair.idx +
+              " at " +
+              pair.startSec +
+              "s (" +
+              pair.mogrtPath +
+              ").",
+          );
+        }
         continue;
       }
 
       stats.inserted++;
       try {
-        mogrtItem.end = endTimeObj;
+        mogrtItem.end = pair.endTimeObj;
       } catch (e2) {
         try {
-          mogrtItem.end = endSec;
+          mogrtItem.end = pair.endSec;
         } catch (e3) {}
       }
 
       if (
         PERF_PROFILE_ENABLED &&
         PERF_LOG_EACH_SUBTITLE_BATCH > 0 &&
-        ((k + 1) % PERF_LOG_EACH_SUBTITLE_BATCH === 0 || k === pairCount - 1)
+        ((p + 1) % PERF_LOG_EACH_SUBTITLE_BATCH === 0 || p === pairs.length - 1)
       ) {
         log(
           "[PERF] Subtitles progress: " +
-            (k + 1) +
+            (p + 1) +
             "/" +
-            pairCount +
+            pairs.length +
             " (inserted " +
             stats.inserted +
             ", failed " +

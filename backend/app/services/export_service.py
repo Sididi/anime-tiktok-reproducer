@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
 import re
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..config import settings
 from ..models import Project, SceneMatch
 from .gap_resolution import GapResolutionService
 from .google_drive_service import GoogleDriveService
 from .music_config_service import MusicConfigService
 from .project_service import ProjectService
+
+logger = logging.getLogger("uvicorn.error")
 
 
 @dataclass
@@ -294,6 +300,7 @@ subtitles/              - Baked subtitle MOGRT files
         if not GoogleDriveService.is_configured():
             raise RuntimeError("Google Drive integration is not configured")
 
+        started_at = time.perf_counter()
         drive = GoogleDriveService.client()
         folder_name = cls.output_folder_name(project)
         _, entries = cls.build_manifest(project, matches)
@@ -302,12 +309,29 @@ subtitles/              - Baked subtitle MOGRT files
             existing_folder_id=project.drive_folder_id,
             drive=drive,
         )
+        total_bytes = sum(
+            (entry.source_path.stat().st_size if entry.source_path is not None else len(entry.inline_content or b""))
+            for entry in entries
+        )
+        upload_workers = max(1, min(settings.drive_upload_max_parallel, len(entries))) if entries else 1
+        logger.info(
+            "Drive manifest upload starting: project_id=%s folder_id=%s files=%d total_bytes=%d upload_workers=%d delete_workers=%d",
+            project.id,
+            folder_id,
+            len(entries),
+            total_bytes,
+            upload_workers,
+            settings.drive_delete_max_parallel,
+        )
 
         # Keep drive folder architecture exactly in sync with the export manifest.
+        clear_started_at = time.perf_counter()
         GoogleDriveService.clear_folder(folder_id, drive=drive)
+        clear_duration = time.perf_counter() - clear_started_at
 
         # Cache parent folder IDs by relative path to avoid repeated Drive queries.
         parent_cache: dict[tuple[str, ...], str] = {tuple(): folder_id}
+        upload_jobs: list[tuple[str, str, ManifestEntry]] = []
 
         def _resolve_parent(parts: list[str]) -> str:
             parent = folder_id
@@ -333,31 +357,71 @@ subtitles/              - Baked subtitle MOGRT files
             if len(parts) > 1:
                 # Preserve sub-directory architecture inside the Drive root folder.
                 parent = _resolve_parent(parts[:-1])
+            upload_jobs.append((parent, filename, entry))
+
+        chunk_bytes = settings.drive_upload_chunk_mb * 1024 * 1024
+
+        def _upload_job(job: tuple[str, str, ManifestEntry]) -> None:
+            parent, filename, entry = job
             if entry.source_path is not None:
                 uploaded = GoogleDriveService.upload_local_file(
                     parent_id=parent,
                     filename=filename,
                     local_path=entry.source_path,
-                    drive=drive,
+                    chunksize=chunk_bytes,
                 )
-                uploaded_name = str(uploaded.get("name") or "")
-                if uploaded_name != filename:
-                    raise RuntimeError(
-                        f"Drive upload renamed file unexpectedly: expected '{filename}', got '{uploaded_name}'"
-                    )
             else:
                 uploaded = GoogleDriveService.upload_bytes(
                     parent_id=parent,
                     filename=filename,
                     content=entry.inline_content or b"",
                     mime_type=entry.mime_type,
-                    drive=drive,
                 )
-                uploaded_name = str(uploaded.get("name") or "")
-                if uploaded_name != filename:
-                    raise RuntimeError(
-                        f"Drive upload renamed file unexpectedly: expected '{filename}', got '{uploaded_name}'"
-                    )
+            uploaded_name = str(uploaded.get("name") or "")
+            if uploaded_name != filename:
+                raise RuntimeError(
+                    f"Drive upload renamed file unexpectedly: expected '{filename}', got '{uploaded_name}'"
+                )
+
+        upload_started_at = time.perf_counter()
+        max_workers = max(1, min(settings.drive_upload_max_parallel, len(upload_jobs))) if upload_jobs else 1
+        if upload_jobs:
+            failure: RuntimeError | None = None
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_job = {
+                    executor.submit(_upload_job, job): job
+                    for job in upload_jobs
+                }
+                for future in as_completed(future_to_job):
+                    job = future_to_job[future]
+                    _, _, entry = job
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        failure = RuntimeError(f"Drive upload failed for '{entry.relative_path}': {exc}")
+                        for other in future_to_job:
+                            if other is not future:
+                                other.cancel()
+                        break
+            if failure is not None:
+                raise failure
+        upload_duration = time.perf_counter() - upload_started_at
+        total_duration = time.perf_counter() - started_at
+        uploaded_files = len(upload_jobs)
+        files_per_second = uploaded_files / upload_duration if upload_duration > 0 else 0.0
+        mb_per_second = (total_bytes / (1024 * 1024)) / upload_duration if upload_duration > 0 else 0.0
+        logger.info(
+            "Drive manifest upload completed: project_id=%s folder_id=%s files=%d total_bytes=%d clear_seconds=%.2f upload_seconds=%.2f total_seconds=%.2f files_per_second=%.2f mb_per_second=%.2f",
+            project.id,
+            folder_id,
+            uploaded_files,
+            total_bytes,
+            clear_duration,
+            upload_duration,
+            total_duration,
+            files_per_second,
+            mb_per_second,
+        )
 
         return {
             "folder_id": folder_id,

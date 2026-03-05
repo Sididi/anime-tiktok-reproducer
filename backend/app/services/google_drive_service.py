@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 import io
+import logging
 import mimetypes
 from pathlib import Path
+import random
 from threading import Lock, local
-from typing import Iterable, Any
+import time
+from typing import Callable, Iterable, Any, TypeVar
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload, MediaIoBaseDownload
 
 from ..config import settings
@@ -17,6 +22,9 @@ from ..config import settings
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
 FORCE_BINARY_UPLOAD_SUFFIXES = {".sqpreset", ".prfpset", ".mogrt"}
+TRANSIENT_HTTP_STATUS_CODES = {429, 500, 502, 503, 504}
+logger = logging.getLogger("uvicorn.error")
+_RequestResultT = TypeVar("_RequestResultT")
 
 
 def _escape_query_value(s: str) -> str:
@@ -104,6 +112,52 @@ class GoogleDriveService:
     @classmethod
     def _client(cls):
         return cls.client()
+
+    @staticmethod
+    def _http_error_status_code(exc: Exception) -> int | None:
+        if not isinstance(exc, HttpError):
+            return None
+        status = getattr(getattr(exc, "resp", None), "status", None)
+        try:
+            return int(status) if status is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _execute_with_retries(
+        cls,
+        request_fn: Callable[[], _RequestResultT],
+        *,
+        max_attempts: int = 5,
+        operation: str = "drive_request",
+    ) -> _RequestResultT:
+        attempt = 1
+        while True:
+            try:
+                result = request_fn()
+                if attempt > 1:
+                    logger.info(
+                        "Drive request succeeded after retries: operation=%s attempts=%d",
+                        operation,
+                        attempt,
+                    )
+                return result
+            except Exception as exc:
+                status_code = cls._http_error_status_code(exc)
+                should_retry = status_code in TRANSIENT_HTTP_STATUS_CODES
+                if not should_retry or attempt >= max_attempts:
+                    raise
+                backoff_seconds = min(8.0, 0.5 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.25)
+                logger.warning(
+                    "Transient Drive error; retrying request: operation=%s status=%s attempt=%d/%d backoff_seconds=%.2f",
+                    operation,
+                    status_code,
+                    attempt,
+                    max_attempts,
+                    backoff_seconds,
+                )
+                time.sleep(backoff_seconds)
+                attempt += 1
 
     @classmethod
     def _query_files(
@@ -212,8 +266,50 @@ class GoogleDriveService:
     @classmethod
     def clear_folder(cls, folder_id: str, *, drive=None) -> None:
         drive = drive or cls._client()
-        for item in cls.list_children(folder_id, drive=drive):
-            drive.files().delete(fileId=item["id"], supportsAllDrives=True).execute()
+        items = cls.list_children(folder_id, drive=drive)
+        if not items:
+            return
+
+        max_workers = max(1, min(settings.drive_delete_max_parallel, len(items)))
+        started_at = time.perf_counter()
+
+        def _delete_item(file_id: str) -> None:
+            delete_drive = cls.client()
+
+            def _delete() -> None:
+                delete_drive.files().delete(fileId=file_id, supportsAllDrives=True).execute()
+
+            cls._execute_with_retries(_delete, operation=f"drive_delete:{file_id}")
+
+        failures: list[tuple[str, Exception]] = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_file_id = {
+                executor.submit(_delete_item, str(item["id"])): str(item["id"])
+                for item in items
+                if item.get("id")
+            }
+            for future in as_completed(future_to_file_id):
+                file_id = future_to_file_id[future]
+                try:
+                    future.result()
+                except Exception as exc:  # pragma: no cover - defensive; exercised in tests
+                    failures.append((file_id, exc))
+
+        duration = time.perf_counter() - started_at
+        logger.info(
+            "Drive folder clear finished: folder_id=%s items=%d workers=%d duration_seconds=%.2f failures=%d",
+            folder_id,
+            len(items),
+            max_workers,
+            duration,
+            len(failures),
+        )
+        if failures:
+            failed_ids = ",".join(file_id for file_id, _ in failures[:3])
+            raise RuntimeError(
+                f"Failed to clear Drive folder '{folder_id}': {len(failures)} item(s) could not be deleted"
+                + (f" (examples: {failed_ids})" if failed_ids else "")
+            )
 
     @classmethod
     def ensure_subfolder(cls, parent_id: str, name: str, *, drive=None) -> str:
@@ -247,6 +343,7 @@ class GoogleDriveService:
         parent_id: str,
         filename: str,
         local_path: Path,
+        chunksize: int | None = None,
         drive=None,
     ) -> dict[str, Any]:
         drive = drive or cls._client()
@@ -257,17 +354,23 @@ class GoogleDriveService:
             mime, _ = mimetypes.guess_type(str(local_path))
         file_size = local_path.stat().st_size
         resumable = file_size > cls._SMALL_FILE_BYTES
-        media = MediaFileUpload(
-            str(local_path),
-            mimetype=mime or "application/octet-stream",
-            resumable=resumable,
-        )
-        created = drive.files().create(
-            body={"name": filename, "parents": [parent_id]},
-            media_body=media,
-            fields="id,name,webViewLink",
-            supportsAllDrives=True,
-        ).execute()
+        request_chunk_size = chunksize if resumable and chunksize is not None else -1
+
+        def _create() -> dict[str, Any]:
+            media = MediaFileUpload(
+                str(local_path),
+                mimetype=mime or "application/octet-stream",
+                resumable=resumable,
+                chunksize=request_chunk_size,
+            )
+            return drive.files().create(
+                body={"name": filename, "parents": [parent_id]},
+                media_body=media,
+                fields="id,name,webViewLink",
+                supportsAllDrives=True,
+            ).execute()
+
+        created = cls._execute_with_retries(_create, operation=f"drive_upload_file:{filename}")
         return created
 
     @classmethod
@@ -281,13 +384,17 @@ class GoogleDriveService:
         drive=None,
     ) -> dict[str, Any]:
         drive = drive or cls._client()
-        media = MediaIoBaseUpload(io.BytesIO(content), mimetype=mime_type, resumable=False)
-        created = drive.files().create(
-            body={"name": filename, "parents": [parent_id]},
-            media_body=media,
-            fields="id,name,webViewLink",
-            supportsAllDrives=True,
-        ).execute()
+
+        def _create() -> dict[str, Any]:
+            media = MediaIoBaseUpload(io.BytesIO(content), mimetype=mime_type, resumable=False)
+            return drive.files().create(
+                body={"name": filename, "parents": [parent_id]},
+                media_body=media,
+                fields="id,name,webViewLink",
+                supportsAllDrives=True,
+            ).execute()
+
+        created = cls._execute_with_retries(_create, operation=f"drive_upload_bytes:{filename}")
         return created
 
     @classmethod
