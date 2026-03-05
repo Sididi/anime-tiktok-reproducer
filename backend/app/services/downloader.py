@@ -8,6 +8,10 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from ..config import settings
+from ..utils.media_binaries import (
+    get_ytdlp_ffmpeg_location,
+    is_media_binary_override_error,
+)
 from ..utils.subprocess_runner import CommandTimeoutError, run_command, terminate_process
 
 
@@ -40,6 +44,37 @@ class DownloaderService:
         """Get the output path for a downloaded video."""
         return settings.projects_dir / project_id / "tiktok.mp4"
 
+    @classmethod
+    def _build_download_command(cls, url: str, output_path: Path) -> list[str]:
+        format_selector = (
+            "bv*[ext=mp4]+ba[ext=m4a]/"
+            "bv*+ba/"
+            "b[ext=mp4][acodec!=none]/"
+            "b[acodec!=none]/"
+            "bv*[ext=mp4]/"
+            "bv*/"
+            "b"
+        )
+        cmd = [
+            "yt-dlp",
+            "--no-warnings",
+            "--progress",
+            "--newline",
+            "--no-playlist",
+            "-f",
+            format_selector,
+            "--merge-output-format",
+            "mp4",
+            "-o",
+            str(output_path),
+            "--force-overwrites",
+        ]
+        ffmpeg_location = get_ytdlp_ffmpeg_location()
+        if ffmpeg_location is not None:
+            cmd.extend(["--ffmpeg-location", ffmpeg_location])
+        cmd.append(url)
+        return cmd
+
     @staticmethod
     async def _has_audio_stream(video_path: Path) -> bool | None:
         """Return whether a media file contains at least one audio stream."""
@@ -57,7 +92,11 @@ class DownloaderService:
         ]
         try:
             result = await run_command(cmd, timeout_seconds=DownloaderService.FFPROBE_TIMEOUT_SECONDS)
-        except (CommandTimeoutError, FileNotFoundError):
+        except CommandTimeoutError:
+            return None
+        except FileNotFoundError as exc:
+            if is_media_binary_override_error(exc):
+                raise
             return None
 
         if result.returncode != 0:
@@ -88,29 +127,7 @@ class DownloaderService:
 
         # yt-dlp command with progress output.
         # Format selector prefers audio+video but falls back to video-only if needed.
-        format_selector = (
-            "bv*[ext=mp4]+ba[ext=m4a]/"
-            "bv*+ba/"
-            "b[ext=mp4][acodec!=none]/"
-            "b[acodec!=none]/"
-            "bv*[ext=mp4]/"
-            "bv*/"
-            "b"
-        )
-        cmd = [
-            "yt-dlp",
-            "--no-warnings",
-            "--progress",
-            "--newline",
-            "--no-playlist",
-            "-f",
-            format_selector,
-            "--merge-output-format",
-            "mp4",
-            "-o", str(output_path),
-            "--force-overwrites",
-            url,
-        ]
+        cmd = cls._build_download_command(url, output_path)
 
         process: asyncio.subprocess.Process | None = None
         stderr_task: asyncio.Task[bytes] | None = None
@@ -292,5 +309,9 @@ class DownloaderService:
                 "height": video_stream.get("height"),
             }
 
+        except FileNotFoundError as exc:
+            if is_media_binary_override_error(exc):
+                raise
+            return {}
         except Exception:
             return {}

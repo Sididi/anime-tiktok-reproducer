@@ -12,6 +12,7 @@ from typing import AsyncIterator
 
 from ..models import Word, SceneTranscription, Transcription, SceneList
 from ..services import ProjectService
+from ..utils.media_binaries import rewrite_media_command
 from ..utils.process_cleanup import shutdown_torch_compile_workers
 
 
@@ -205,6 +206,7 @@ class TranscriberService:
             "-of", "csv=p=0",
             str(media_path),
         ]
+        cmd = rewrite_media_command(cmd)
         try:
             result = subprocess.run(
                 cmd,
@@ -240,6 +242,7 @@ class TranscriberService:
             "pcm_s16le",
             str(output_wav),
         ]
+        cmd = rewrite_media_command(cmd)
         try:
             result = subprocess.run(
                 cmd,

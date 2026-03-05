@@ -14,6 +14,7 @@ import spacy
 from ..config import settings
 from ..models import Project, Transcription, SceneMatch
 from ..models.transcription import Word
+from ..utils.media_binaries import is_media_binary_override_error
 from ..utils.subprocess_runner import CommandTimeoutError, run_command
 from ..utils.timing import compute_adjusted_scene_end_times
 from .anime_library import AnimeLibraryService
@@ -246,8 +247,12 @@ class ProcessingService:
 
         try:
             result = await run_command(cmd, timeout_seconds=ProcessingService.FFPROBE_TIMEOUT_SECONDS)
-        except (CommandTimeoutError, FileNotFoundError):
+        except CommandTimeoutError:
             # Default to 24fps if detection fails
+            return Fraction(24, 1)
+        except FileNotFoundError as exc:
+            if is_media_binary_override_error(exc):
+                raise
             return Fraction(24, 1)
 
         if result.returncode != 0:

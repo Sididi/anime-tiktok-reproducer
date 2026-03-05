@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     data_dir: Path = Path(__file__).parent.parent / "data"
     projects_dir: Path = Path(__file__).parent.parent / "data" / "projects"
     cache_dir: Path = Path(__file__).parent.parent / "data" / "cache"
+    ffmpeg_binary: str | None = None
+    ffprobe_binary: str | None = None
 
     # anime_searcher
     anime_searcher_path: Path = Path(__file__).parent.parent.parent / "modules" / "anime_searcher"
@@ -142,6 +144,14 @@ class Settings(BaseSettings):
         if "{project_id}" not in value:
             raise ValueError("ATR_CEP_TRIGGER_URL_TEMPLATE must contain '{project_id}'")
         return value
+
+    @field_validator("ffmpeg_binary", "ffprobe_binary")
+    @classmethod
+    def _empty_binary_override_to_none(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
 
     @field_validator("drive_upload_max_parallel")
     @classmethod

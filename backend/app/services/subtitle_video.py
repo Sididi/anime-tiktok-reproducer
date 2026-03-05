@@ -15,6 +15,7 @@ from ..models.subtitle import (
     SubtitleWord,
 )
 from ..models import Transcription
+from ..utils.media_binaries import rewrite_media_command
 from .subtitle_renderer import SubtitleFrameRenderer
 from .subtitle_styles import get_style, list_styles
 from .project_service import ProjectService
@@ -151,6 +152,8 @@ class SubtitleVideoService:
             ]
         else:
             raise ValueError(f"Unsupported output format: {output_format}")
+
+        cmd = rewrite_media_command(cmd)
 
         # Use asyncio.create_subprocess_exec for safe command execution
         # All arguments are passed as separate list elements (no shell injection)

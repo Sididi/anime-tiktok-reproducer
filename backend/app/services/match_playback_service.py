@@ -13,6 +13,7 @@ from typing import AsyncIterator, Literal
 
 from ..config import settings
 from ..models import MatchList, Project, SceneList
+from ..utils.media_binaries import rewrite_media_command
 from .anime_library import AnimeLibraryService
 from .project_service import ProjectService
 
@@ -450,18 +451,20 @@ class MatchPlaybackService:
 
     @staticmethod
     def _probe_clip_sync(path: Path) -> dict:
-        cmd = [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "stream=codec_name,pix_fmt",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "json",
-            str(path),
-        ]
+        cmd = rewrite_media_command(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_name,pix_fmt",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "json",
+                str(path),
+            ]
+        )
         result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=30)
         if result.returncode != 0:
             raise RuntimeError(f"ffprobe failed for {path.name}: {result.stderr.strip()}")
@@ -563,9 +566,10 @@ class MatchPlaybackService:
             return cls._nvenc_available
 
         cls._nvenc_checked = True
+        cmd = rewrite_media_command(["ffmpeg", "-hide_banner", "-encoders"])
         try:
             result = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-encoders"],
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=20,
@@ -590,7 +594,8 @@ class MatchPlaybackService:
         vf: str,
         output_path: Path,
     ) -> list[str]:
-        return [
+        return rewrite_media_command(
+            [
             "ffmpeg",
             "-y",
             "-v",
@@ -623,7 +628,8 @@ class MatchPlaybackService:
             "-movflags",
             "+faststart",
             str(output_path),
-        ]
+            ]
+        )
 
     @classmethod
     def _build_cpu_command_sync(
@@ -635,7 +641,8 @@ class MatchPlaybackService:
         vf: str,
         output_path: Path,
     ) -> list[str]:
-        return [
+        return rewrite_media_command(
+            [
             "ffmpeg",
             "-y",
             "-v",
@@ -664,7 +671,8 @@ class MatchPlaybackService:
             "-movflags",
             "+faststart",
             str(output_path),
-        ]
+            ]
+        )
 
     @classmethod
     def _encode_clip_sync(

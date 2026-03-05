@@ -43,6 +43,9 @@ from pathlib import Path
 
 import yaml
 
+from _env import load_dotenv
+from _media_binaries import get_ffmpeg_binary, get_ffprobe_binary, rewrite_media_command
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -106,20 +109,32 @@ def _mark_processed(audio_path: Path, trimmed_ms: float) -> None:
 # ---------------------------------------------------------------------------
 
 def _check_ffmpeg() -> None:
-    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+    try:
+        ffmpeg_binary = get_ffmpeg_binary()
+        ffprobe_binary = get_ffprobe_binary()
+    except FileNotFoundError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if (ffmpeg_binary == "ffmpeg" and not shutil.which("ffmpeg")) or (
+        ffprobe_binary == "ffprobe" and not shutil.which("ffprobe")
+    ):
         print("[ERROR] ffmpeg / ffprobe not found in PATH.", file=sys.stderr)
         sys.exit(1)
 
 
 def _probe_duration_ms(path: Path) -> float:
     """Return duration in milliseconds via ffprobe."""
-    result = subprocess.run(
+    cmd = rewrite_media_command(
         [
             "ffprobe", "-v", "error",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
             str(path),
-        ],
+        ]
+    )
+    result = subprocess.run(
+        cmd,
         capture_output=True,
         text=True,
     )
@@ -135,12 +150,15 @@ def _detect_leading_silence_ms(path: Path, threshold: str) -> float:
     Uses ffmpeg's silencedetect filter and parses its output to find the
     first 'silence_end' timestamp, which marks where audio actually starts.
     """
-    result = subprocess.run(
+    cmd = rewrite_media_command(
         [
             "ffmpeg", "-i", str(path),
             "-af", f"silencedetect=noise={threshold}:duration=0.01",
             "-f", "null", "-",
-        ],
+        ]
+    )
+    result = subprocess.run(
+        cmd,
         capture_output=True,
         text=True,
     )
@@ -178,6 +196,7 @@ def _trim_audio(
         ),
         str(output_path),
     ]
+    cmd = rewrite_media_command(cmd)
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg silenceremove failed:\n{result.stderr.strip()}")
@@ -372,6 +391,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    load_dotenv(str(REPO_ROOT / ".env"))
     _check_ffmpeg()
     parser = build_parser()
     args = parser.parse_args()

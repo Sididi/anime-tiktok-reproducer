@@ -20,6 +20,7 @@ from googleapiclient.http import MediaFileUpload
 
 from ..config import settings
 from ..models import VideoMetadataPayload
+from ..utils.media_binaries import rewrite_media_command
 from ..utils.meta_graph import extract_graph_error as _extract_graph_error
 from .meta_token_service import MetaTokenService
 
@@ -566,20 +567,23 @@ class SocialUploadService:
         *,
         video_path: Path,
     ) -> tuple[MediaProbe | None, str | None]:
+        cmd = rewrite_media_command(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "json",
+                str(video_path),
+            ]
+        )
         try:
             probe = subprocess.run(
-                [
-                    "ffprobe",
-                    "-v",
-                    "error",
-                    "-show_entries",
-                    "format=duration",
-                    "-show_entries",
-                    "stream=codec_type",
-                    "-of",
-                    "json",
-                    str(video_path),
-                ],
+                cmd,
                 capture_output=True,
                 text=True,
                 check=True,
@@ -646,16 +650,18 @@ class SocialUploadService:
         max_duration_seconds: float,
     ) -> str | None:
         speed_value = f"{speed_factor:.6f}"
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(input_path),
-            "-map",
-            "0:v:0",
-            "-filter:v",
-            f"setpts=PTS/{speed_value}",
-        ]
+        cmd = rewrite_media_command(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(input_path),
+                "-map",
+                "0:v:0",
+                "-filter:v",
+                f"setpts=PTS/{speed_value}",
+            ]
+        )
         if has_audio:
             cmd.extend(
                 [
@@ -765,19 +771,21 @@ class SocialUploadService:
         max_duration_seconds: float,
     ) -> str | None:
         """Hard-cut a video at a max duration (stream copy, no re-encode)."""
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(input_path),
-            "-t",
-            f"{int(max_duration_seconds)}",
-            "-c",
-            "copy",
-            "-movflags",
-            "+faststart",
-            str(output_path),
-        ]
+        cmd = rewrite_media_command(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(input_path),
+                "-t",
+                f"{int(max_duration_seconds)}",
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ]
+        )
         try:
             result = subprocess.run(
                 cmd,
@@ -1648,22 +1656,25 @@ class SocialUploadService:
         Best-effort validation against documented Reels media constraints.
         If ffprobe is unavailable, validation is skipped.
         """
+        cmd = rewrite_media_command(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height,r_frame_rate",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "json",
+                str(video_path),
+            ]
+        )
         try:
             probe = subprocess.run(
-                [
-                    "ffprobe",
-                    "-v",
-                    "error",
-                    "-select_streams",
-                    "v:0",
-                    "-show_entries",
-                    "stream=width,height,r_frame_rate",
-                    "-show_entries",
-                    "format=duration",
-                    "-of",
-                    "json",
-                    str(video_path),
-                ],
+                cmd,
                 capture_output=True,
                 text=True,
                 check=True,

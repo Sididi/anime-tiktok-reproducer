@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from ..config import settings
+from ..utils.media_binaries import (
+    is_media_binary_override_error,
+    rewrite_media_command,
+)
 from ..utils.subprocess_runner import CommandTimeoutError, run_command, terminate_process
 
 
@@ -303,18 +307,20 @@ class AnimeLibraryService:
     @staticmethod
     def _probe_video_stream_sync(video_path: Path) -> dict | None:
         """Return ffprobe stream info for the first video stream."""
-        cmd = [
-            "ffprobe",
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=codec_name,pix_fmt",
-            "-of",
-            "json",
-            str(video_path),
-        ]
+        cmd = rewrite_media_command(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name,pix_fmt",
+                "-of",
+                "json",
+                str(video_path),
+            ]
+        )
         try:
             result = subprocess.run(
                 cmd,
@@ -343,16 +349,18 @@ class AnimeLibraryService:
     @staticmethod
     def _probe_video_duration_sync(video_path: Path) -> float | None:
         """Return video duration in seconds when ffprobe can parse the container."""
-        cmd = [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(video_path),
-        ]
+        cmd = rewrite_media_command(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(video_path),
+            ]
+        )
         try:
             result = subprocess.run(
                 cmd,
@@ -532,26 +540,32 @@ class AnimeLibraryService:
                 source_path,
                 source_codec=source_codec,
             )
-            cmd_with_audio_copy = base_cmd + [
-                "-map",
-                "0:a:0?",
-                "-c:a",
-                "copy",
-                str(tmp_path),
-            ]
-            cmd_with_audio_aac = base_cmd + [
-                "-map",
-                "0:a:0?",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "128k",
-                "-ac",
-                "2",
-                "-ar",
-                "48000",
-                str(tmp_path),
-            ]
+            cmd_with_audio_copy = rewrite_media_command(
+                base_cmd
+                + [
+                    "-map",
+                    "0:a:0?",
+                    "-c:a",
+                    "copy",
+                    str(tmp_path),
+                ]
+            )
+            cmd_with_audio_aac = rewrite_media_command(
+                base_cmd
+                + [
+                    "-map",
+                    "0:a:0?",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "128k",
+                    "-ac",
+                    "2",
+                    "-ar",
+                    "48000",
+                    str(tmp_path),
+                ]
+            )
 
             try:
                 result = subprocess.run(
@@ -579,26 +593,32 @@ class AnimeLibraryService:
             # Fallback to deterministic CPU path when GPU pipeline is unavailable.
             if result is None or result.returncode != 0:
                 base_cmd = cls._build_cpu_h264_base_cmd(source_path)
-                cmd_with_audio_copy = base_cmd + [
-                    "-map",
-                    "0:a:0?",
-                    "-c:a",
-                    "copy",
-                    str(tmp_path),
-                ]
-                cmd_with_audio_aac = base_cmd + [
-                    "-map",
-                    "0:a:0?",
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "128k",
-                    "-ac",
-                    "2",
-                    "-ar",
-                    "48000",
-                    str(tmp_path),
-                ]
+                cmd_with_audio_copy = rewrite_media_command(
+                    base_cmd
+                    + [
+                        "-map",
+                        "0:a:0?",
+                        "-c:a",
+                        "copy",
+                        str(tmp_path),
+                    ]
+                )
+                cmd_with_audio_aac = rewrite_media_command(
+                    base_cmd
+                    + [
+                        "-map",
+                        "0:a:0?",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "128k",
+                        "-ac",
+                        "2",
+                        "-ar",
+                        "48000",
+                        str(tmp_path),
+                    ]
+                )
                 try:
                     result = subprocess.run(
                         cmd_with_audio_copy,
@@ -902,7 +922,9 @@ class AnimeLibraryService:
                     f"GPU AV1 transcode timed out for {source_file.name} after "
                     f"{int(cls.TRANSCODE_TIMEOUT_SECONDS)}s"
                 )
-            except FileNotFoundError:
+            except FileNotFoundError as exc:
+                if is_media_binary_override_error(exc):
+                    raise
                 return "ffmpeg is required for GPU AV1 transcode"
 
             if result.returncode != 0:
@@ -916,7 +938,9 @@ class AnimeLibraryService:
                         f"GPU AV1 transcode timed out for {source_file.name} after "
                         f"{int(cls.TRANSCODE_TIMEOUT_SECONDS)}s"
                     )
-                except FileNotFoundError:
+                except FileNotFoundError as exc:
+                    if is_media_binary_override_error(exc):
+                        raise
                     return "ffmpeg is required for GPU AV1 transcode"
                 if result.returncode != 0:
                     return (
@@ -1030,7 +1054,9 @@ class AnimeLibraryService:
                         if fallback_dest != video_file and not fallback_dest.exists():
                             await asyncio.to_thread(shutil.copy2, video_file, fallback_dest)
                         actual_dest = fallback_dest
-                    except FileNotFoundError:
+                    except FileNotFoundError as exc:
+                        if is_media_binary_override_error(exc):
+                            raise
                         import sys
                         print("[WARNING] ffmpeg not found, falling back to copy", file=sys.stderr)
                         fallback_dest = dest_path / video_file.name

@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from ..config import settings
+from ..utils.media_binaries import rewrite_media_command
 from .anime_library import AnimeLibraryService
 
 
@@ -65,18 +66,20 @@ class SourceChunkStreamingService:
 
     @staticmethod
     def _probe_stream_sync(video_path: Path) -> dict | None:
-        cmd = [
-            "ffprobe",
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=codec_name,pix_fmt",
-            "-of",
-            "json",
-            str(video_path),
-        ]
+        cmd = rewrite_media_command(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name,pix_fmt",
+                "-of",
+                "json",
+                str(video_path),
+            ]
+        )
         try:
             result = subprocess.run(
                 cmd,
@@ -104,16 +107,18 @@ class SourceChunkStreamingService:
 
     @staticmethod
     def _probe_duration_sync(video_path: Path) -> float | None:
-        cmd = [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(video_path),
-        ]
+        cmd = rewrite_media_command(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(video_path),
+            ]
+        )
         try:
             result = subprocess.run(
                 cmd,
@@ -154,9 +159,10 @@ class SourceChunkStreamingService:
             return cls._nvenc_available
 
         cls._nvenc_checked = True
+        cmd = rewrite_media_command(["ffmpeg", "-hide_banner", "-encoders"])
         try:
             result = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-encoders"],
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=20,
@@ -253,7 +259,8 @@ class SourceChunkStreamingService:
     ) -> list[str]:
         source_codec = AnimeLibraryService.get_primary_video_codec_sync(source_path)
 
-        cmd = [
+        cmd = rewrite_media_command(
+            [
             "ffmpeg",
             "-y",
             "-v",
@@ -262,7 +269,8 @@ class SourceChunkStreamingService:
             "cuda",
             "-hwaccel_output_format",
             "cuda",
-        ]
+            ]
+        )
 
         codec = (source_codec or "").lower().strip()
         if codec == "av1":
@@ -316,7 +324,8 @@ class SourceChunkStreamingService:
         chunk_duration: float,
         output_path: Path,
     ) -> list[str]:
-        return [
+        return rewrite_media_command(
+            [
             "ffmpeg",
             "-y",
             "-v",
@@ -343,7 +352,8 @@ class SourceChunkStreamingService:
             "-movflags",
             "+faststart",
             str(output_path),
-        ]
+            ]
+        )
 
     @classmethod
     def _validate_chunk_sync(cls, path: Path) -> bool:

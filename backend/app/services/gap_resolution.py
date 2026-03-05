@@ -20,6 +20,7 @@ from scenedetect import open_video, SceneManager, ContentDetector
 
 from ..config import settings
 from ..models import SceneMatch
+from ..utils.media_binaries import is_media_binary_override_error
 from ..utils.timing import compute_adjusted_scene_end_times
 from ..utils.subprocess_runner import CommandTimeoutError, run_command
 from .anime_library import AnimeLibraryService
@@ -206,7 +207,11 @@ class GapResolutionService:
 
         try:
             result = await run_command(cmd, timeout_seconds=30.0)
-        except (CommandTimeoutError, FileNotFoundError):
+        except CommandTimeoutError:
+            result = Fraction(24, 1)
+        except FileNotFoundError as exc:
+            if is_media_binary_override_error(exc):
+                raise
             result = Fraction(24, 1)
         else:
             if result.returncode != 0:

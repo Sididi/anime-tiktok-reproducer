@@ -125,12 +125,31 @@ Environment variables or defaults in `backend/app/config.py`:
 | `ANIME_LIBRARY_PATH`  | `modules/anime_searcher/library` | Indexed anime library path    |
 | `ANIME_SEARCHER_PATH` | `modules/anime_searcher`         | Path to anime_searcher module |
 | `SSCD_MODEL_PATH`     | Auto-detected                    | Path to SSCD model file       |
+| `FFMPEG_BINARY`       | Auto-detected                    | Override `ffmpeg` binary path |
+| `FFPROBE_BINARY`      | Auto-detected                    | Override `ffprobe` binary path |
 
 Additional integration variables (see `.env.example`):
 
 - `ATR_DISCORD_WEBHOOK_URL`: Discord webhook for generation/upload notifications
 - `ATR_CEP_TRIGGER_URL_TEMPLATE`: Local CEP trigger URL template used in generation-complete message (must include `{project_id}`), default:
   - `http://localhost:48653/p/{project_id}`
+
+### FFmpeg on Arch Linux
+
+For Arch Linux with NVIDIA GPU acceleration, prefer the system FFmpeg build:
+
+```bash
+export ATR_FFMPEG_BINARY=/usr/bin/ffmpeg
+export ATR_FFPROBE_BINARY=/usr/bin/ffprobe
+```
+
+Resolution order when these overrides are unset:
+
+1. Binary next to the current Python executable (active pixi env)
+2. `./.pixi/envs/default/bin/ffmpeg` and `ffprobe`
+3. `PATH`
+
+This preserves the historical pixi fallback. If the pixi build lacks NVENC/NVDEC, GPU-only flows will continue to fail there until you point the app to the Arch system binaries.
 
 ## Usage
 

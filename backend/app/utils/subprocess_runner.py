@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from .media_binaries import rewrite_media_command
+
 
 @dataclass
 class CommandResult:
@@ -59,8 +61,9 @@ async def run_command(
     timeout_seconds: float | None = None,
 ) -> CommandResult:
     """Run a command and capture both stdout/stderr safely."""
+    resolved_cmd = rewrite_media_command(cmd)
     process = await asyncio.create_subprocess_exec(
-        *cmd,
+        *resolved_cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=str(cwd) if cwd is not None else None,
@@ -76,7 +79,7 @@ async def run_command(
     except asyncio.TimeoutError as exc:
         await terminate_process(process)
         raise CommandTimeoutError(
-            f"Command timed out after {timeout_seconds:.1f}s: {' '.join(cmd)}"
+            f"Command timed out after {timeout_seconds:.1f}s: {' '.join(resolved_cmd)}"
         ) from exc
     except asyncio.CancelledError:
         await terminate_process(process)
