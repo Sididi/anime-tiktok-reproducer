@@ -148,7 +148,8 @@ class GeminiService:
                 response_json_schema=response_json_schema,
             )
         except RuntimeError as exc:
-            # Some model revisions or API surfaces may reject schema fields.
+            # Some model revisions or API surfaces may reject schema fields or
+            # fail to serve overly complex schemas.
             lower = str(exc).lower()
             schema_not_supported = (
                 response_json_schema is not None
@@ -156,6 +157,8 @@ class GeminiService:
                     "responsejsonschema" in lower
                     or "responseschema" in lower
                     or "unknown name" in lower
+                    or "too many states" in lower
+                    or "schema produces a constraint" in lower
                 )
             )
             if not schema_not_supported:

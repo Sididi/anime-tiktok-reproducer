@@ -295,25 +295,22 @@ class ScriptAutomationService:
         target_language: str,
         scene_count: int,
     ) -> dict[str, Any]:
+        # Keep schema intentionally lightweight: strict scene count and index checks
+        # are enforced later by _normalize_script_payload.
         return {
             "type": "object",
             "properties": {
                 "language": {
                     "type": "string",
-                    "enum": [target_language.strip().lower()],
                 },
                 "scenes": {
                     "type": "array",
-                    "minItems": scene_count,
-                    "maxItems": scene_count,
                     "items": {
                         "type": "object",
                         "properties": {
-                            "scene_index": {"type": "integer"},
                             "text": {"type": "string"},
                         },
-                        "required": ["scene_index", "text"],
-                        "additionalProperties": False,
+                        "required": ["text"],
                     },
                 },
             },
