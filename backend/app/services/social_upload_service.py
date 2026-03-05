@@ -37,19 +37,23 @@ class PlatformUploadResult:
 
 
 @dataclass
-class FacebookMediaProbe:
+class MediaProbe:
     duration_seconds: float | None
     has_audio: bool
 
 
 @dataclass
-class FacebookVideoPreparation:
+class LimitedDurationVideoPreparation:
     status: str  # ready | skip | error
     video_path: Path | None = None
     detail: str | None = None
     transcoded: bool = False
     original_duration_seconds: float | None = None
     speed_factor: float | None = None
+
+
+FacebookMediaProbe = MediaProbe
+FacebookVideoPreparation = LimitedDurationVideoPreparation
 
 
 def _extract_http_error_detail(exc: HttpError) -> str:
@@ -141,6 +145,9 @@ class SocialUploadService:
     _FACEBOOK_MAX_DURATION_SECONDS = 90.0
     _FACEBOOK_MAX_SPEED_FACTOR = 1.40
     _FACEBOOK_MAX_ACCEL_PERCENT = 40.0
+    _YOUTUBE_MAX_DURATION_SECONDS = 180.0
+    _YOUTUBE_MAX_SPEED_FACTOR = 1.40
+    _YOUTUBE_MAX_ACCEL_PERCENT = 40.0
     _FRENCH_DAYS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
     _FRENCH_MONTHS = [
         "janvier",
@@ -370,104 +377,167 @@ class SocialUploadService:
         scheduled_at: datetime | None = None,
         category_id: str | None = None,
         channel_id: str | None = None,
+        youtube_strategy: str | None = None,
+        youtube_prep_dir: Path | None = None,
     ) -> PlatformUploadResult:
-        try:
-            creds = credentials if credentials is not None else cls._google_credentials()
-            if credentials is not None:
-                from google.auth.transport.requests import Request as _Request
-                creds.refresh(_Request())
-            youtube = build("youtube", "v3", credentials=creds, cache_discovery=False)
-            if channel_id is not None:
-                expected_channel_id = channel_id or None
-            else:
-                expected_channel_id, channel_error = cls._validate_youtube_target_channel(youtube)
-                if channel_error:
-                    return PlatformUploadResult(
-                        platform="youtube",
-                        status="failed",
-                        detail=channel_error,
-                    )
-            youtube_language = cls._youtube_language_code(
-                target_language=target_language,
-                subtitle_locale=subtitle_locale,
-            )
-
-            effective_category = category_id or settings.youtube_category_id
-
-            if scheduled_at:
-                privacy_status = "private"
-                publish_at = scheduled_at.isoformat()
-            else:
-                privacy_status = "public"
-                publish_at = None
-
-            status_body: dict[str, Any] = {
-                "privacyStatus": privacy_status,
-                "selfDeclaredMadeForKids": False,
-                "containsSyntheticMedia": False,
-            }
-            if publish_at:
-                status_body["publishAt"] = publish_at
-
-            upload_request = youtube.videos().insert(
-                part="snippet,status",
-                body={
-                    "snippet": {
-                        "title": metadata.youtube.title,
-                        "description": metadata.youtube.description,
-                        "tags": metadata.youtube.tags,
-                        "categoryId": effective_category,
-                        "defaultLanguage": youtube_language,
-                        "defaultAudioLanguage": youtube_language,
-                    },
-                    "status": status_body,
-                },
-                media_body=MediaFileUpload(str(video_path), chunksize=-1, resumable=True),
-            )
-            response = upload_request.execute()
-            video_id = response["id"]
-            if expected_channel_id:
-                actual_channel_id = cls._uploaded_video_channel_id(youtube, video_id)
-                if actual_channel_id != expected_channel_id:
-                    try:
-                        youtube.videos().delete(id=video_id).execute()
-                    except Exception:
-                        pass
-                    return PlatformUploadResult(
-                        platform="youtube",
-                        status="failed",
-                        detail=(
-                            "YouTube upload was created under an unexpected channel and has been deleted. "
-                            f"Expected={expected_channel_id}, actual={actual_channel_id or 'unknown'}"
-                        ),
-                    )
-
-            youtube.captions().insert(
-                part="snippet",
-                body={
-                    "snippet": {
-                        "videoId": video_id,
-                        "language": youtube_language,
-                        "name": youtube_language,
-                        "isDraft": False,
-                    }
-                },
-                media_body=MediaFileUpload(str(subtitle_path), mimetype="application/octet-stream"),
-            ).execute()
-
-            detail_parts = []
-            if scheduled_at:
-                detail_parts.append(
-                    f"Programmé le {cls._format_french_datetime(scheduled_at)}"
-                )
-
+        strategy = (youtube_strategy or "auto").strip().lower()
+        if strategy == "skip":
             return PlatformUploadResult(
                 platform="youtube",
-                status="uploaded",
-                url=f"https://youtu.be/{video_id}",
-                resource_id=video_id,
-                detail="; ".join(detail_parts) if detail_parts else None,
+                status="skipped",
+                detail="Refus volontaire par l'utilisateur: vidéo trop longue pour YouTube.",
             )
+        try:
+            with tempfile.TemporaryDirectory(prefix="atr-yt-upload-") as prep_dir:
+                if strategy == "cut":
+                    cut_output = Path(prep_dir) / f"{video_path.stem}.youtube_cut.mp4"
+                    cut_error = cls._cut_youtube_video(
+                        input_path=video_path,
+                        output_path=cut_output,
+                    )
+                    if cut_error:
+                        return PlatformUploadResult(
+                            platform="youtube",
+                            status="failed",
+                            detail=f"YouTube cut failed: {cut_error}",
+                        )
+                    prepared_video_path = cut_output
+                elif strategy == "sped_up":
+                    cached = (
+                        youtube_prep_dir / "sped_up.mp4"
+                        if youtube_prep_dir and (youtube_prep_dir / "sped_up.mp4").exists()
+                        else None
+                    )
+                    if cached:
+                        prepared_video_path = cached
+                    else:
+                        prep = cls._prepare_youtube_video_for_upload(
+                            source_video_path=video_path,
+                            work_dir=Path(prep_dir),
+                        )
+                        if prep.status != "ready" or prep.video_path is None:
+                            return PlatformUploadResult(
+                                platform="youtube",
+                                status="failed",
+                                detail=prep.detail or "YouTube sped-up transcoding failed.",
+                            )
+                        prepared_video_path = prep.video_path
+                else:
+                    prep = cls._prepare_youtube_video_for_upload(
+                        source_video_path=video_path,
+                        work_dir=Path(prep_dir),
+                    )
+                    if prep.status == "skip":
+                        return PlatformUploadResult(
+                            platform="youtube",
+                            status="skipped",
+                            detail=prep.detail,
+                        )
+                    if prep.status == "error" or prep.video_path is None:
+                        return PlatformUploadResult(
+                            platform="youtube",
+                            status="failed",
+                            detail=prep.detail or "YouTube video preparation failed.",
+                        )
+                    prepared_video_path = prep.video_path
+
+                creds = credentials if credentials is not None else cls._google_credentials()
+                if credentials is not None:
+                    from google.auth.transport.requests import Request as _Request
+
+                    creds.refresh(_Request())
+                youtube = build("youtube", "v3", credentials=creds, cache_discovery=False)
+                if channel_id is not None:
+                    expected_channel_id = channel_id or None
+                else:
+                    expected_channel_id, channel_error = cls._validate_youtube_target_channel(youtube)
+                    if channel_error:
+                        return PlatformUploadResult(
+                            platform="youtube",
+                            status="failed",
+                            detail=channel_error,
+                        )
+                youtube_language = cls._youtube_language_code(
+                    target_language=target_language,
+                    subtitle_locale=subtitle_locale,
+                )
+
+                effective_category = category_id or settings.youtube_category_id
+
+                if scheduled_at:
+                    privacy_status = "private"
+                    publish_at = scheduled_at.isoformat()
+                else:
+                    privacy_status = "public"
+                    publish_at = None
+
+                status_body: dict[str, Any] = {
+                    "privacyStatus": privacy_status,
+                    "selfDeclaredMadeForKids": False,
+                    "containsSyntheticMedia": False,
+                }
+                if publish_at:
+                    status_body["publishAt"] = publish_at
+
+                upload_request = youtube.videos().insert(
+                    part="snippet,status",
+                    body={
+                        "snippet": {
+                            "title": metadata.youtube.title,
+                            "description": metadata.youtube.description,
+                            "tags": metadata.youtube.tags,
+                            "categoryId": effective_category,
+                            "defaultLanguage": youtube_language,
+                            "defaultAudioLanguage": youtube_language,
+                        },
+                        "status": status_body,
+                    },
+                    media_body=MediaFileUpload(str(prepared_video_path), chunksize=-1, resumable=True),
+                )
+                response = upload_request.execute()
+                video_id = response["id"]
+                if expected_channel_id:
+                    actual_channel_id = cls._uploaded_video_channel_id(youtube, video_id)
+                    if actual_channel_id != expected_channel_id:
+                        try:
+                            youtube.videos().delete(id=video_id).execute()
+                        except Exception:
+                            pass
+                        return PlatformUploadResult(
+                            platform="youtube",
+                            status="failed",
+                            detail=(
+                                "YouTube upload was created under an unexpected channel and has been deleted. "
+                                f"Expected={expected_channel_id}, actual={actual_channel_id or 'unknown'}"
+                            ),
+                        )
+
+                youtube.captions().insert(
+                    part="snippet",
+                    body={
+                        "snippet": {
+                            "videoId": video_id,
+                            "language": youtube_language,
+                            "name": youtube_language,
+                            "isDraft": False,
+                        }
+                    },
+                    media_body=MediaFileUpload(str(subtitle_path), mimetype="application/octet-stream"),
+                ).execute()
+
+                detail_parts = []
+                if scheduled_at:
+                    detail_parts.append(
+                        f"Programmé le {cls._format_french_datetime(scheduled_at)}"
+                    )
+
+                return PlatformUploadResult(
+                    platform="youtube",
+                    status="uploaded",
+                    url=f"https://youtu.be/{video_id}",
+                    resource_id=video_id,
+                    detail="; ".join(detail_parts) if detail_parts else None,
+                )
         except HttpError as exc:
             quota_exceeded = _is_youtube_quota_error(exc)
             detail = _extract_http_error_detail(exc)
@@ -491,11 +561,11 @@ class SocialUploadService:
             )
 
     @classmethod
-    def _probe_facebook_media(
+    def _probe_media(
         cls,
         *,
         video_path: Path,
-    ) -> tuple[FacebookMediaProbe | None, str | None]:
+    ) -> tuple[MediaProbe | None, str | None]:
         try:
             probe = subprocess.run(
                 [
@@ -547,16 +617,33 @@ class SocialUploadService:
                     has_audio = True
                     break
 
-        return FacebookMediaProbe(duration_seconds=duration_seconds, has_audio=has_audio), None
+        return MediaProbe(duration_seconds=duration_seconds, has_audio=has_audio), None
 
     @classmethod
-    def _transcode_facebook_video_to_limit(
+    def _probe_facebook_media(
+        cls,
+        *,
+        video_path: Path,
+    ) -> tuple[MediaProbe | None, str | None]:
+        return cls._probe_media(video_path=video_path)
+
+    @classmethod
+    def _probe_youtube_media(
+        cls,
+        *,
+        video_path: Path,
+    ) -> tuple[MediaProbe | None, str | None]:
+        return cls._probe_media(video_path=video_path)
+
+    @classmethod
+    def _transcode_video_to_duration_limit(
         cls,
         *,
         input_path: Path,
         output_path: Path,
         speed_factor: float,
         has_audio: bool,
+        max_duration_seconds: float,
     ) -> str | None:
         speed_value = f"{speed_factor:.6f}"
         cmd = [
@@ -611,7 +698,7 @@ class SocialUploadService:
                 "-movflags",
                 "+faststart",
                 "-t",
-                f"{int(cls._FACEBOOK_MAX_DURATION_SECONDS)}",
+                f"{int(max_duration_seconds)}",
                 str(output_path),
             ]
         )
@@ -636,20 +723,55 @@ class SocialUploadService:
         return None
 
     @classmethod
-    def _cut_facebook_video(
+    def _transcode_facebook_video_to_limit(
         cls,
         *,
         input_path: Path,
         output_path: Path,
+        speed_factor: float,
+        has_audio: bool,
     ) -> str | None:
-        """Hard-cut a video at the Facebook max duration (stream copy, no re-encode)."""
+        return cls._transcode_video_to_duration_limit(
+            input_path=input_path,
+            output_path=output_path,
+            speed_factor=speed_factor,
+            has_audio=has_audio,
+            max_duration_seconds=cls._FACEBOOK_MAX_DURATION_SECONDS,
+        )
+
+    @classmethod
+    def _transcode_youtube_video_to_limit(
+        cls,
+        *,
+        input_path: Path,
+        output_path: Path,
+        speed_factor: float,
+        has_audio: bool,
+    ) -> str | None:
+        return cls._transcode_video_to_duration_limit(
+            input_path=input_path,
+            output_path=output_path,
+            speed_factor=speed_factor,
+            has_audio=has_audio,
+            max_duration_seconds=cls._YOUTUBE_MAX_DURATION_SECONDS,
+        )
+
+    @classmethod
+    def _cut_video_to_duration_limit(
+        cls,
+        *,
+        input_path: Path,
+        output_path: Path,
+        max_duration_seconds: float,
+    ) -> str | None:
+        """Hard-cut a video at a max duration (stream copy, no re-encode)."""
         cmd = [
             "ffmpeg",
             "-y",
             "-i",
             str(input_path),
             "-t",
-            f"{int(cls._FACEBOOK_MAX_DURATION_SECONDS)}",
+            f"{int(max_duration_seconds)}",
             "-c",
             "copy",
             "-movflags",
@@ -676,30 +798,61 @@ class SocialUploadService:
         return None
 
     @classmethod
-    def _prepare_facebook_video_for_upload(
+    def _cut_facebook_video(
+        cls,
+        *,
+        input_path: Path,
+        output_path: Path,
+    ) -> str | None:
+        return cls._cut_video_to_duration_limit(
+            input_path=input_path,
+            output_path=output_path,
+            max_duration_seconds=cls._FACEBOOK_MAX_DURATION_SECONDS,
+        )
+
+    @classmethod
+    def _cut_youtube_video(
+        cls,
+        *,
+        input_path: Path,
+        output_path: Path,
+    ) -> str | None:
+        return cls._cut_video_to_duration_limit(
+            input_path=input_path,
+            output_path=output_path,
+            max_duration_seconds=cls._YOUTUBE_MAX_DURATION_SECONDS,
+        )
+
+    @classmethod
+    def _prepare_video_for_limited_duration_upload(
         cls,
         *,
         source_video_path: Path,
         work_dir: Path,
-    ) -> FacebookVideoPreparation:
-        probe, probe_error = cls._probe_facebook_media(video_path=source_video_path)
+        platform_label: str,
+        max_duration_seconds: float,
+        max_speed_factor: float,
+        max_accel_percent: float,
+        output_suffix: str,
+    ) -> LimitedDurationVideoPreparation:
+        probe, probe_error = cls._probe_media(video_path=source_video_path)
         if probe_error:
-            return FacebookVideoPreparation(
+            return LimitedDurationVideoPreparation(
                 status="error",
-                detail=f"Facebook video preparation failed: {probe_error}",
+                detail=f"{platform_label} video preparation failed: {probe_error}",
             )
         if probe is None or probe.duration_seconds is None or probe.duration_seconds <= 0:
-            return FacebookVideoPreparation(
+            return LimitedDurationVideoPreparation(
                 status="error",
                 detail=(
-                    "Facebook video preparation failed: "
+                    f"{platform_label} video preparation failed: "
                     "unable to detect a valid video duration via ffprobe."
                 ),
             )
 
         duration_seconds = probe.duration_seconds
-        if duration_seconds <= cls._FACEBOOK_MAX_DURATION_SECONDS + 0.01:
-            return FacebookVideoPreparation(
+        if duration_seconds <= max_duration_seconds + 0.01:
+            return LimitedDurationVideoPreparation(
                 status="ready",
                 video_path=source_video_path,
                 transcoded=False,
@@ -707,73 +860,108 @@ class SocialUploadService:
                 speed_factor=1.0,
             )
 
-        speed_factor = duration_seconds / cls._FACEBOOK_MAX_DURATION_SECONDS
+        speed_factor = duration_seconds / max_duration_seconds
         accel_percent = (speed_factor - 1.0) * 100.0
-        if speed_factor - cls._FACEBOOK_MAX_SPEED_FACTOR > 1e-6:
-            return FacebookVideoPreparation(
+        if speed_factor - max_speed_factor > 1e-6:
+            return LimitedDurationVideoPreparation(
                 status="skip",
                 detail=(
                     "Refus volontaire: vidéo trop longue "
                     f"({duration_seconds:.2f}s). "
                     f"Accélération requise +{accel_percent:.1f}% "
-                    f"(>{cls._FACEBOOK_MAX_ACCEL_PERCENT:.0f}% max)."
+                    f"(>{max_accel_percent:.0f}% max)."
                 ),
                 original_duration_seconds=duration_seconds,
                 speed_factor=speed_factor,
             )
 
         work_dir.mkdir(parents=True, exist_ok=True)
-        output_path = work_dir / f"{source_video_path.stem}.facebook_90s.mp4"
-        transcode_error = cls._transcode_facebook_video_to_limit(
+        output_path = work_dir / f"{source_video_path.stem}.{output_suffix}.mp4"
+        transcode_error = cls._transcode_video_to_duration_limit(
             input_path=source_video_path,
             output_path=output_path,
             speed_factor=speed_factor,
             has_audio=probe.has_audio,
+            max_duration_seconds=max_duration_seconds,
         )
         if transcode_error:
-            return FacebookVideoPreparation(
+            return LimitedDurationVideoPreparation(
                 status="error",
-                detail=f"Facebook video preparation failed: {transcode_error}",
+                detail=f"{platform_label} video preparation failed: {transcode_error}",
                 original_duration_seconds=duration_seconds,
                 speed_factor=speed_factor,
             )
 
-        output_probe, output_probe_error = cls._probe_facebook_media(video_path=output_path)
+        output_probe, output_probe_error = cls._probe_media(video_path=output_path)
         if output_probe_error:
-            return FacebookVideoPreparation(
+            return LimitedDurationVideoPreparation(
                 status="error",
-                detail=f"Facebook video preparation failed: {output_probe_error}",
+                detail=f"{platform_label} video preparation failed: {output_probe_error}",
                 original_duration_seconds=duration_seconds,
                 speed_factor=speed_factor,
             )
         output_duration = output_probe.duration_seconds if output_probe else None
         if output_duration is None or output_duration <= 0:
-            return FacebookVideoPreparation(
+            return LimitedDurationVideoPreparation(
                 status="error",
                 detail=(
-                    "Facebook video preparation failed: "
+                    f"{platform_label} video preparation failed: "
                     "unable to detect transcoded video duration."
                 ),
                 original_duration_seconds=duration_seconds,
                 speed_factor=speed_factor,
             )
-        if output_duration > cls._FACEBOOK_MAX_DURATION_SECONDS + 0.2:
-            return FacebookVideoPreparation(
+        if output_duration > max_duration_seconds + 0.2:
+            return LimitedDurationVideoPreparation(
                 status="error",
                 detail=(
-                    "Facebook video preparation failed: "
+                    f"{platform_label} video preparation failed: "
                     f"transcoded video is still too long ({output_duration:.2f}s)."
                 ),
                 original_duration_seconds=duration_seconds,
                 speed_factor=speed_factor,
             )
 
-        return FacebookVideoPreparation(
+        return LimitedDurationVideoPreparation(
             status="ready",
             video_path=output_path,
             transcoded=True,
             original_duration_seconds=duration_seconds,
             speed_factor=speed_factor,
+        )
+
+    @classmethod
+    def _prepare_facebook_video_for_upload(
+        cls,
+        *,
+        source_video_path: Path,
+        work_dir: Path,
+    ) -> LimitedDurationVideoPreparation:
+        return cls._prepare_video_for_limited_duration_upload(
+            source_video_path=source_video_path,
+            work_dir=work_dir,
+            platform_label="Facebook",
+            max_duration_seconds=cls._FACEBOOK_MAX_DURATION_SECONDS,
+            max_speed_factor=cls._FACEBOOK_MAX_SPEED_FACTOR,
+            max_accel_percent=cls._FACEBOOK_MAX_ACCEL_PERCENT,
+            output_suffix="facebook_90s",
+        )
+
+    @classmethod
+    def _prepare_youtube_video_for_upload(
+        cls,
+        *,
+        source_video_path: Path,
+        work_dir: Path,
+    ) -> LimitedDurationVideoPreparation:
+        return cls._prepare_video_for_limited_duration_upload(
+            source_video_path=source_video_path,
+            work_dir=work_dir,
+            platform_label="YouTube",
+            max_duration_seconds=cls._YOUTUBE_MAX_DURATION_SECONDS,
+            max_speed_factor=cls._YOUTUBE_MAX_SPEED_FACTOR,
+            max_accel_percent=cls._YOUTUBE_MAX_ACCEL_PERCENT,
+            output_suffix="youtube_180s",
         )
 
     @classmethod

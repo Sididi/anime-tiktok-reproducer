@@ -158,7 +158,16 @@ export interface ProjectManagerRow {
   scheduled_account_id: string | null;
 }
 
+export type UploadDurationStrategy = "cut" | "sped_up" | "skip";
+
 export interface FacebookCheckResult {
+  needed: boolean;
+  duration_seconds: number;
+  speed_factor: number;
+  sped_up_available: boolean;
+}
+
+export interface YouTubeCheckResult {
   needed: boolean;
   duration_seconds: number;
   speed_factor: number;

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from zoneinfo import ZoneInfo
 import logging
@@ -20,6 +20,7 @@ from .discord_service import DiscordService
 from .export_service import ExportService
 from .google_drive_service import GoogleDriveService
 from .metadata import MetadataService
+from .meta_token_service import MetaTokenService
 from .project_service import ProjectService
 from .scheduling_service import SchedulingService
 from .social_upload_service import PlatformUploadResult, SocialUploadService
@@ -350,6 +351,7 @@ class UploadPhaseService:
         account_id: str | None = None,
         platforms: list[str] | None = None,
         facebook_strategy: str | None = None,
+        youtube_strategy: str | None = None,
     ) -> dict[str, Any]:
         project = ProjectService.load(project_id)
         if not project:
@@ -405,6 +407,8 @@ class UploadPhaseService:
             if "youtube" in requested_platforms and account and account.youtube and account_id:
                 yt_creds = AccountService.get_youtube_credentials(account_id)
                 yt_config = account.youtube
+                _yt_strategy = youtube_strategy
+                _yt_prep_dir = cls._youtube_prep_dir(project_id)
                 jobs["youtube"] = lambda: SocialUploadService.upload_youtube(
                     video_path=local_video_path,
                     subtitle_path=subtitle_path,
@@ -415,15 +419,21 @@ class UploadPhaseService:
                     scheduled_at=scheduled_at,
                     category_id=yt_config.category_id,
                     channel_id=yt_config.channel_id,
+                    youtube_strategy=_yt_strategy,
+                    youtube_prep_dir=_yt_prep_dir,
                 )
             elif "youtube" in requested_platforms and not account:
                 # Global (backwards compat)
+                _yt_strategy_global = youtube_strategy
+                _yt_prep_dir_global = cls._youtube_prep_dir(project_id)
                 jobs["youtube"] = lambda: SocialUploadService.upload_youtube(
                     video_path=local_video_path,
                     subtitle_path=subtitle_path,
                     subtitle_locale=subtitle_locale,
                     target_language=project.output_language,
                     metadata=metadata,
+                    youtube_strategy=_yt_strategy_global,
+                    youtube_prep_dir=_yt_prep_dir_global,
                 )
 
             # Facebook + Instagram jobs
@@ -568,8 +578,9 @@ class UploadPhaseService:
 
         ProjectService.save(project)
 
-        # Cleanup facebook prep cache after upload
+        # Cleanup upload prep caches after upload
         cls.cleanup_facebook_prep(project_id)
+        cls.cleanup_youtube_prep(project_id)
 
         return {
             "platform_results": [asdict(item) for item in platform_results],
@@ -648,93 +659,138 @@ class UploadPhaseService:
             ),
         )
 
-    # ── Facebook duration check (pre-upload) ──────────────────────────────
+    # ── Platform duration checks (pre-upload) ─────────────────────────────
 
     _FACEBOOK_PREP_CACHE_DIR = Path("backend/data/cache/facebook_prep")
     _FACEBOOK_PREP_MAX_AGE_SECONDS = 7200  # 2 hours
+    _YOUTUBE_PREP_CACHE_DIR = Path("backend/data/cache/youtube_prep")
+    _YOUTUBE_PREP_MAX_AGE_SECONDS = 7200  # 2 hours
 
     @classmethod
     def _facebook_prep_dir(cls, project_id: str) -> Path:
         return cls._FACEBOOK_PREP_CACHE_DIR / project_id
 
     @classmethod
-    def cleanup_facebook_prep(cls, project_id: str) -> None:
-        prep_dir = cls._facebook_prep_dir(project_id)
+    def _youtube_prep_dir(cls, project_id: str) -> Path:
+        return cls._YOUTUBE_PREP_CACHE_DIR / project_id
+
+    @classmethod
+    def _cleanup_prep_dir(cls, prep_dir: Path) -> None:
         if prep_dir.exists():
             shutil.rmtree(prep_dir, ignore_errors=True)
 
     @classmethod
-    def cleanup_stale_facebook_prep(cls) -> None:
-        """Remove cache entries older than the max age."""
-        if not cls._FACEBOOK_PREP_CACHE_DIR.exists():
+    def cleanup_facebook_prep(cls, project_id: str) -> None:
+        cls._cleanup_prep_dir(cls._facebook_prep_dir(project_id))
+
+    @classmethod
+    def cleanup_youtube_prep(cls, project_id: str) -> None:
+        cls._cleanup_prep_dir(cls._youtube_prep_dir(project_id))
+
+    @classmethod
+    def _cleanup_stale_prep_cache(cls, cache_dir: Path, max_age_seconds: int) -> None:
+        if not cache_dir.exists():
             return
+
         import time as _time
+
         now = _time.time()
-        for entry in cls._FACEBOOK_PREP_CACHE_DIR.iterdir():
+        for entry in cache_dir.iterdir():
             if not entry.is_dir():
                 continue
             try:
                 age = now - entry.stat().st_mtime
-                if age > cls._FACEBOOK_PREP_MAX_AGE_SECONDS:
+                if age > max_age_seconds:
                     shutil.rmtree(entry, ignore_errors=True)
             except OSError:
                 continue
 
     @classmethod
-    def check_facebook_duration(
+    def cleanup_stale_facebook_prep(cls) -> None:
+        cls._cleanup_stale_prep_cache(
+            cls._FACEBOOK_PREP_CACHE_DIR,
+            cls._FACEBOOK_PREP_MAX_AGE_SECONDS,
+        )
+
+    @classmethod
+    def cleanup_stale_youtube_prep(cls) -> None:
+        cls._cleanup_stale_prep_cache(
+            cls._YOUTUBE_PREP_CACHE_DIR,
+            cls._YOUTUBE_PREP_MAX_AGE_SECONDS,
+        )
+
+    @classmethod
+    def _neutral_duration_check_result(cls) -> dict[str, Any]:
+        return {
+            "needed": False,
+            "duration_seconds": 0.0,
+            "speed_factor": 1.0,
+            "sped_up_available": False,
+        }
+
+    @classmethod
+    def _facebook_upload_enabled(cls, account_id: str | None) -> bool:
+        if account_id:
+            account = AccountService.get_account(account_id)
+            if not account:
+                raise ValueError(f"Account '{account_id}' not found")
+            return bool(account.meta)
+        try:
+            creds = MetaTokenService.get_upload_credentials()
+        except Exception:
+            return False
+        return bool(creds.page_id and creds.facebook_page_access_token)
+
+    @classmethod
+    def _youtube_upload_enabled(cls, account_id: str | None) -> bool:
+        if account_id:
+            account = AccountService.get_account(account_id)
+            if not account:
+                raise ValueError(f"Account '{account_id}' not found")
+            return bool(account.youtube)
+        return SocialUploadService.is_youtube_configured()
+
+    @classmethod
+    def _check_platform_duration(
         cls,
         project_id: str,
-        account_id: str | None = None,
+        account_id: str | None,
+        *,
+        platform_label: str,
+        prep_dir: Path,
+        cleanup_stale: Callable[[], None],
+        is_enabled: Callable[[str | None], bool],
+        probe_media: Callable[..., Any],
+        transcode_to_limit: Callable[..., Any],
+        max_duration: float,
+        max_speed: float,
     ) -> dict[str, Any]:
-        """Check if the project video exceeds Facebook's 90s Reel limit.
-
-        Downloads the Drive video, probes its duration, and optionally
-        transcodes a sped-up version so that the frontend can preview
-        both options (hard-cut vs speed-up) before the real upload starts.
-
-        Returns a dict with:
-          - needed (bool): whether the modal should be shown
-          - duration_seconds (float): original video duration
-          - speed_factor (float): factor required to reach 90s
-          - sped_up_available (bool): whether speed-up is within the x1.40 limit
-        """
-        # Cleanup stale cache entries opportunistically
-        cls.cleanup_stale_facebook_prep()
+        cleanup_stale()
 
         project = ProjectService.load(project_id)
         if not project:
             raise ValueError("Project not found")
 
-        # Verify Facebook is configured for the account when one is provided
-        if account_id:
-            account = AccountService.get_account(account_id)
-            if not account:
-                raise ValueError(f"Account '{account_id}' not found")
+        if not is_enabled(account_id):
+            return cls._neutral_duration_check_result()
 
         readiness = cls.compute_readiness(project)
         if readiness.status != "green" or not readiness.drive_video_id:
             raise ValueError(f"Project is not ready for upload: {', '.join(readiness.reasons)}")
 
-        # Prepare cache directory
-        prep_dir = cls._facebook_prep_dir(project_id)
         prep_dir.mkdir(parents=True, exist_ok=True)
 
-        # Download video from Drive into the cache dir
         video_name = readiness.drive_video_name or "final_video.mp4"
         original_path = prep_dir / video_name
         if not original_path.exists():
             GoogleDriveService.download_file(readiness.drive_video_id, original_path)
 
-        # Probe duration
-        probe, probe_error = SocialUploadService._probe_facebook_media(video_path=original_path)
+        probe, probe_error = probe_media(video_path=original_path)
         if probe_error or probe is None or probe.duration_seconds is None:
             raise ValueError(f"Unable to probe video duration: {probe_error or 'unknown'}")
 
         duration_seconds = probe.duration_seconds
-        max_duration = SocialUploadService._FACEBOOK_MAX_DURATION_SECONDS
-
         if duration_seconds <= max_duration + 0.01:
-            # Video fits within 90s – no modal needed
             return {
                 "needed": False,
                 "duration_seconds": round(duration_seconds, 2),
@@ -743,25 +799,25 @@ class UploadPhaseService:
             }
 
         speed_factor = duration_seconds / max_duration
-        max_speed = SocialUploadService._FACEBOOK_MAX_SPEED_FACTOR
         sped_up_available = speed_factor <= max_speed + 1e-6
 
-        # Transcode sped-up version if within limits
         if sped_up_available:
             sped_up_path = prep_dir / "sped_up.mp4"
             if not sped_up_path.exists():
                 logger.info(
-                    "Facebook check: transcoding sped-up version for project %s (x%.2f)",
-                    project_id, speed_factor,
+                    "%s check: transcoding sped-up version for project %s (x%.2f)",
+                    platform_label,
+                    project_id,
+                    speed_factor,
                 )
-                error = SocialUploadService._transcode_facebook_video_to_limit(
+                error = transcode_to_limit(
                     input_path=original_path,
                     output_path=sped_up_path,
                     speed_factor=speed_factor,
                     has_audio=probe.has_audio,
                 )
                 if error:
-                    logger.warning("Facebook check: sped-up transcoding failed: %s", error)
+                    logger.warning("%s check: sped-up transcoding failed: %s", platform_label, error)
                     sped_up_available = False
 
         return {
@@ -770,6 +826,44 @@ class UploadPhaseService:
             "speed_factor": round(speed_factor, 4),
             "sped_up_available": sped_up_available,
         }
+
+    @classmethod
+    def check_facebook_duration(
+        cls,
+        project_id: str,
+        account_id: str | None = None,
+    ) -> dict[str, Any]:
+        return cls._check_platform_duration(
+            project_id,
+            account_id,
+            platform_label="Facebook",
+            prep_dir=cls._facebook_prep_dir(project_id),
+            cleanup_stale=cls.cleanup_stale_facebook_prep,
+            is_enabled=cls._facebook_upload_enabled,
+            probe_media=SocialUploadService._probe_facebook_media,
+            transcode_to_limit=SocialUploadService._transcode_facebook_video_to_limit,
+            max_duration=SocialUploadService._FACEBOOK_MAX_DURATION_SECONDS,
+            max_speed=SocialUploadService._FACEBOOK_MAX_SPEED_FACTOR,
+        )
+
+    @classmethod
+    def check_youtube_duration(
+        cls,
+        project_id: str,
+        account_id: str | None = None,
+    ) -> dict[str, Any]:
+        return cls._check_platform_duration(
+            project_id,
+            account_id,
+            platform_label="YouTube",
+            prep_dir=cls._youtube_prep_dir(project_id),
+            cleanup_stale=cls.cleanup_stale_youtube_prep,
+            is_enabled=cls._youtube_upload_enabled,
+            probe_media=SocialUploadService._probe_youtube_media,
+            transcode_to_limit=SocialUploadService._transcode_youtube_video_to_limit,
+            max_duration=SocialUploadService._YOUTUBE_MAX_DURATION_SECONDS,
+            max_speed=SocialUploadService._YOUTUBE_MAX_SPEED_FACTOR,
+        )
 
     @classmethod
     def managed_delete(cls, project_id: str) -> dict[str, Any]:

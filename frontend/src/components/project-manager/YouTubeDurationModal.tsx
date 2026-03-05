@@ -5,7 +5,7 @@ import { Button } from "@/components/ui";
 import { api } from "@/api/client";
 import type { UploadDurationStrategy } from "@/types";
 
-interface FacebookDurationModalProps {
+interface YouTubeDurationModalProps {
   open: boolean;
   projectId: string;
   durationSeconds: number;
@@ -21,7 +21,7 @@ function formatDuration(seconds: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-export function FacebookDurationModal({
+export function YouTubeDurationModal({
   open,
   projectId,
   durationSeconds,
@@ -29,12 +29,11 @@ export function FacebookDurationModal({
   spedUpAvailable,
   onChoice,
   onClose,
-}: FacebookDurationModalProps) {
+}: YouTubeDurationModalProps) {
   const cutVideoRef = useRef<HTMLVideoElement>(null);
   const spedUpVideoRef = useRef<HTMLVideoElement>(null);
-  const maxDuration = 90;
+  const maxDuration = 180;
 
-  // Pause cut preview at 1:30
   const handleCutTimeUpdate = useCallback(() => {
     const video = cutVideoRef.current;
     if (video && video.currentTime >= maxDuration) {
@@ -43,7 +42,6 @@ export function FacebookDurationModal({
     }
   }, []);
 
-  // Escape key closes the modal
   useEffect(() => {
     if (!open) return;
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -56,9 +54,8 @@ export function FacebookDurationModal({
     return () => document.removeEventListener("keydown", handleKeyDown, true);
   }, [open, onClose]);
 
-  const originalUrl = api.getFacebookPreviewUrl(projectId, "original");
-  const spedUpUrl = api.getFacebookPreviewUrl(projectId, "sped_up");
-
+  const originalUrl = api.getYouTubePreviewUrl(projectId, "original");
+  const spedUpUrl = api.getYouTubePreviewUrl(projectId, "sped_up");
   const accelPercent = ((speedFactor - 1) * 100).toFixed(0);
 
   return (
@@ -83,16 +80,14 @@ export function FacebookDurationModal({
             transition={{ duration: 0.2 }}
             onClick={(e) => e.stopPropagation()}
           >
-            {/* Header */}
             <div className="flex items-center justify-between">
               <div>
                 <h3 className="text-lg font-semibold">
-                  Vidéo trop longue pour Facebook
+                  Vidéo trop longue pour YouTube
                 </h3>
                 <p className="text-sm text-[hsl(var(--muted-foreground))] mt-1">
-                  Durée originale :{" "}
-                  <strong>{formatDuration(durationSeconds)}</strong> — Facebook
-                  limite les Reels à <strong>1:30</strong>.
+                  Durée originale : <strong>{formatDuration(durationSeconds)}</strong>
+                  {" "}— YouTube limite ce flux à <strong>3:00</strong>.
                 </p>
               </div>
               <Button
@@ -105,11 +100,9 @@ export function FacebookDurationModal({
               </Button>
             </div>
 
-            {/* Previews */}
             <div
               className={`grid gap-4 ${spedUpAvailable ? "grid-cols-2" : "grid-cols-1"}`}
             >
-              {/* Cut preview */}
               <div className="flex flex-col gap-3">
                 <div className="relative bg-black rounded-lg overflow-hidden aspect-9/16 max-h-[55vh]">
                   <video
@@ -120,16 +113,15 @@ export function FacebookDurationModal({
                     preload="metadata"
                     onTimeUpdate={handleCutTimeUpdate}
                   />
-                  {/* Badge */}
                   <div className="absolute top-2 left-2 bg-black/70 text-white text-xs font-medium px-2 py-1 rounded-md flex items-center gap-1.5">
                     <Scissors className="h-3 w-3" />
-                    Coupée à 1:30
+                    Coupée à 3:00
                   </div>
                 </div>
                 <div className="text-center">
                   <p className="text-sm text-[hsl(var(--muted-foreground))]">
-                    Les {formatDuration(durationSeconds - maxDuration)}{" "}
-                    restantes seront supprimées
+                    Les {formatDuration(durationSeconds - maxDuration)} restantes
+                    {" "}seront supprimées
                   </p>
                   <Button
                     size="sm"
@@ -137,12 +129,11 @@ export function FacebookDurationModal({
                     onClick={() => onChoice("cut")}
                   >
                     <Scissors className="h-4 w-4 mr-1.5" />
-                    Couper à 1:30
+                    Couper à 3:00
                   </Button>
                 </div>
               </div>
 
-              {/* Sped up preview */}
               {spedUpAvailable && (
                 <div className="flex flex-col gap-3">
                   <div className="relative bg-black rounded-lg overflow-hidden aspect-9/16 max-h-[55vh]">
@@ -153,7 +144,6 @@ export function FacebookDurationModal({
                       controls
                       preload="metadata"
                     />
-                    {/* Badge */}
                     <div className="absolute top-2 left-2 bg-black/70 text-white text-xs font-medium px-2 py-1 rounded-md flex items-center gap-1.5">
                       <Zap className="h-3 w-3" />
                       Accélérée x{speedFactor.toFixed(2)} (+{accelPercent}%)
@@ -161,8 +151,7 @@ export function FacebookDurationModal({
                   </div>
                   <div className="text-center">
                     <p className="text-sm text-[hsl(var(--muted-foreground))]">
-                      Toute la vidéo est conservée, accélérée de +{accelPercent}
-                      %
+                      Toute la vidéo est conservée, accélérée de +{accelPercent}%
                     </p>
                     <Button
                       size="sm"
@@ -177,7 +166,6 @@ export function FacebookDurationModal({
               )}
             </div>
 
-            {/* Skip button */}
             <div className="flex justify-center pt-1">
               <Button
                 variant="outline"
@@ -186,7 +174,7 @@ export function FacebookDurationModal({
                 className="active:scale-95 transition-transform text-[hsl(var(--muted-foreground))]"
               >
                 <Ban className="h-4 w-4 mr-1.5" />
-                Ne pas uploader sur Facebook
+                Ne pas uploader sur YouTube
               </Button>
             </div>
           </motion.div>

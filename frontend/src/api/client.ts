@@ -86,6 +86,7 @@ export const api = {
     projectId: string,
     accountId?: string,
     facebookStrategy?: string,
+    youtubeStrategy?: string,
   ) =>
     fetch(`${API_BASE}/project-manager/projects/${projectId}/upload`, {
       method: "POST",
@@ -93,6 +94,7 @@ export const api = {
       body: JSON.stringify({
         account_id: accountId ?? null,
         facebook_strategy: facebookStrategy ?? null,
+        youtube_strategy: youtubeStrategy ?? null,
       }),
     }),
 
@@ -107,6 +109,18 @@ export const api = {
 
   getFacebookPreviewUrl: (projectId: string, version: "original" | "sped_up") =>
     `${API_BASE}/project-manager/projects/${projectId}/facebook-preview/${version}`,
+
+  checkYouTubeDuration: (projectId: string, accountId?: string) =>
+    request<import("@/types").YouTubeCheckResult>(
+      `/project-manager/projects/${projectId}/youtube-check`,
+      {
+        method: "POST",
+        body: JSON.stringify({ account_id: accountId ?? null }),
+      },
+    ),
+
+  getYouTubePreviewUrl: (projectId: string, version: "original" | "sped_up") =>
+    `${API_BASE}/project-manager/projects/${projectId}/youtube-preview/${version}`,
 
   deleteManagedProject: (projectId: string) =>
     request<{ status: string; local_deleted: boolean; drive_deleted: boolean }>(

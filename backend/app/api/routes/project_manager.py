@@ -17,9 +17,14 @@ class UploadProjectRequest(BaseModel):
     account_id: str | None = None
     platforms: list[Literal["youtube", "facebook", "instagram"]] | None = None
     facebook_strategy: Literal["auto", "cut", "sped_up", "skip"] | None = None
+    youtube_strategy: Literal["auto", "cut", "sped_up", "skip"] | None = None
 
 
 class FacebookCheckRequest(BaseModel):
+    account_id: str | None = None
+
+
+class YouTubeCheckRequest(BaseModel):
     account_id: str | None = None
 
 
@@ -46,8 +51,10 @@ async def run_upload_phase(
             result = await asyncio.to_thread(
                 UploadPhaseService.execute_upload,
                 project_id,
-                req.account_id,
-                req.platforms,
+                account_id=req.account_id,
+                platforms=req.platforms,
+                facebook_strategy=req.facebook_strategy,
+                youtube_strategy=req.youtube_strategy,
             )
             yield f"data: {json.dumps({'status': 'complete', 'step': 'complete', 'progress': 1.0, 'message': 'Upload phase complete', 'result': result})}\n\n"
         except Exception as exc:
@@ -108,6 +115,55 @@ async def facebook_preview_video(
         video_path = prep_dir / "sped_up.mp4"
     else:
         # Original: find the first .mp4 that isn't the sped_up file
+        video_path = None
+        for f in sorted(prep_dir.iterdir()):
+            if f.suffix.lower() == ".mp4" and f.name != "sped_up.mp4":
+                video_path = f
+                break
+
+    if video_path is None or not video_path.exists():
+        raise HTTPException(status_code=404, detail=f"Preview version '{version}' not found")
+
+    return FileResponse(
+        path=video_path,
+        media_type="video/mp4",
+        filename=f"{project_id}_{version}.mp4",
+    )
+
+
+@router.post("/projects/{project_id}/youtube-check")
+async def youtube_duration_check(
+    project_id: str,
+    payload: YouTubeCheckRequest | None = Body(default=None),
+):
+    """Check if the project video exceeds YouTube's 180s limit."""
+    req = payload or YouTubeCheckRequest()
+    try:
+        result = await asyncio.to_thread(
+            UploadPhaseService.check_youtube_duration,
+            project_id,
+            req.account_id,
+        )
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/projects/{project_id}/youtube-preview/{version}")
+async def youtube_preview_video(
+    project_id: str,
+    version: Literal["original", "sped_up"],
+):
+    """Serve a cached video file for YouTube duration preview."""
+    prep_dir = UploadPhaseService._youtube_prep_dir(project_id)
+    if not prep_dir.exists():
+        raise HTTPException(status_code=404, detail="No YouTube preview cached for this project")
+
+    if version == "sped_up":
+        video_path = prep_dir / "sped_up.mp4"
+    else:
         video_path = None
         for f in sorted(prep_dir.iterdir()):
             if f.suffix.lower() == ".mp4" and f.name != "sped_up.mp4":

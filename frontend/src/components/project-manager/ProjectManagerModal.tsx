@@ -10,12 +10,26 @@ import { FacebookDurationModal } from "./FacebookDurationModal";
 import { ScheduledDeleteConfirm } from "./ScheduledDeleteConfirm";
 import { VideoPreviewModal } from "./VideoPreviewModal";
 import { ProjectTable } from "./ProjectTable";
+import { YouTubeDurationModal } from "./YouTubeDurationModal";
 import type { SortColumn, SortDirection } from "./types";
-import type { ProjectManagerRow, Account, FacebookCheckResult } from "@/types";
+import type {
+  ProjectManagerRow,
+  Account,
+  FacebookCheckResult,
+  YouTubeCheckResult,
+  UploadDurationStrategy,
+} from "@/types";
 
 interface ProjectManagerModalProps {
   open: boolean;
   onClose: () => void;
+}
+
+interface PendingUploadContext {
+  projectId: string;
+  accountId?: string;
+  facebookStrategy?: UploadDurationStrategy;
+  youtubeStrategy?: UploadDurationStrategy;
 }
 
 export function ProjectManagerModal({
@@ -49,10 +63,15 @@ export function ProjectManagerModal({
 
   // Facebook duration check state
   const [facebookCheck, setFacebookCheck] = useState<{
-    projectId: string;
-    accountId?: string;
+    context: PendingUploadContext;
     result: FacebookCheckResult;
   } | null>(null);
+  const [youtubeCheck, setYouTubeCheck] = useState<{
+    context: PendingUploadContext;
+    result: YouTubeCheckResult;
+  } | null>(null);
+  const [pendingUpload, setPendingUpload] =
+    useState<PendingUploadContext | null>(null);
 
   // Multi-delete state
   const [multiDeleteMode, setMultiDeleteMode] = useState(false);
@@ -112,6 +131,16 @@ export function ProjectManagerModal({
     },
     [],
   );
+
+  useEffect(() => {
+    if (!open) {
+      setFacebookCheck(null);
+      setYouTubeCheck(null);
+      setPendingUpload(null);
+      setUploadMessage(null);
+      setActiveUploadId(null);
+    }
+  }, [open]);
 
   /* ── Multi-delete ── */
   const exitMultiDeleteMode = () => {
@@ -223,7 +252,8 @@ export function ProjectManagerModal({
     async (
       projectId: string,
       accountId?: string,
-      facebookStrategy?: string,
+      facebookStrategy?: UploadDurationStrategy,
+      youtubeStrategy?: UploadDurationStrategy,
     ) => {
       setActiveUploadId(projectId);
       setUploadMessage("Starting upload...");
@@ -233,6 +263,7 @@ export function ProjectManagerModal({
           projectId,
           accountId,
           facebookStrategy,
+          youtubeStrategy,
         );
         await readSSEStream(response, (event) => {
           if (event.message) setUploadMessage(event.message);
@@ -248,57 +279,131 @@ export function ProjectManagerModal({
     [loadData],
   );
 
-  const startUploadWithFbCheck = useCallback(
-    async (projectId: string, accountId?: string) => {
+  const clearPendingUploadFlow = useCallback(() => {
+    setFacebookCheck(null);
+    setYouTubeCheck(null);
+    setPendingUpload(null);
+    setUploadMessage(null);
+    setActiveUploadId(null);
+  }, []);
+
+  const finalizeUpload = useCallback(
+    (context: PendingUploadContext) => {
+      setFacebookCheck(null);
+      setYouTubeCheck(null);
+      setPendingUpload(null);
+      runUpload(
+        context.projectId,
+        context.accountId,
+        context.facebookStrategy,
+        context.youtubeStrategy,
+      );
+    },
+    [runUpload],
+  );
+
+  const continueUploadAfterFacebook = useCallback(
+    async (context: PendingUploadContext) => {
       setError(null);
+      setPendingUpload(context);
+      setActiveUploadId(context.projectId);
+      setUploadMessage("Vérification de la durée YouTube...");
+      try {
+        const result = await api.checkYouTubeDuration(
+          context.projectId,
+          context.accountId,
+        );
+        if (result.needed) {
+          setYouTubeCheck({ context, result });
+          setUploadMessage(null);
+          setActiveUploadId(null);
+        } else {
+          setUploadMessage(null);
+          setActiveUploadId(null);
+          finalizeUpload(context);
+        }
+      } catch (err) {
+        console.warn("YouTube check failed, proceeding with auto:", err);
+        setUploadMessage(null);
+        setActiveUploadId(null);
+        finalizeUpload(context);
+      }
+    },
+    [finalizeUpload],
+  );
+
+  const startUploadWithChecks = useCallback(
+    async (projectId: string, accountId?: string) => {
+      const context: PendingUploadContext = { projectId, accountId };
+      setError(null);
+      setPendingUpload(context);
       setActiveUploadId(projectId);
       setUploadMessage("Vérification de la durée Facebook...");
       try {
         const result = await api.checkFacebookDuration(projectId, accountId);
         if (result.needed) {
-          // Show modal for user choice — release the upload lock while user decides
-          setFacebookCheck({ projectId, accountId, result });
+          setFacebookCheck({ context, result });
           setUploadMessage(null);
           setActiveUploadId(null);
         } else {
-          // Video fits, proceed directly
           setUploadMessage(null);
           setActiveUploadId(null);
-          runUpload(projectId, accountId);
+          continueUploadAfterFacebook(context);
         }
       } catch (err) {
-        // If check fails, proceed with auto strategy (fallback to existing behaviour)
         console.warn("Facebook check failed, proceeding with auto:", err);
         setUploadMessage(null);
         setActiveUploadId(null);
-        runUpload(projectId, accountId);
+        continueUploadAfterFacebook(context);
       }
     },
-    [runUpload],
+    [continueUploadAfterFacebook],
   );
 
   const handleFacebookChoice = useCallback(
-    (strategy: "cut" | "sped_up" | "skip") => {
+    (strategy: UploadDurationStrategy) => {
       if (!facebookCheck) return;
-      const { projectId, accountId } = facebookCheck;
+      const context: PendingUploadContext = {
+        ...facebookCheck.context,
+        facebookStrategy: strategy,
+      };
       setFacebookCheck(null);
-      runUpload(projectId, accountId, strategy);
+      continueUploadAfterFacebook(context);
     },
-    [facebookCheck, runUpload],
+    [facebookCheck, continueUploadAfterFacebook],
+  );
+
+  const handleYouTubeChoice = useCallback(
+    (strategy: UploadDurationStrategy) => {
+      if (!youtubeCheck) return;
+      finalizeUpload({
+        ...youtubeCheck.context,
+        youtubeStrategy: strategy,
+      });
+    },
+    [finalizeUpload, youtubeCheck],
   );
 
   const handleUploadClick = useCallback(
     (row: ProjectManagerRow) => {
       if (selectedAccountId) {
-        startUploadWithFbCheck(row.project_id, selectedAccountId);
+        startUploadWithChecks(row.project_id, selectedAccountId);
       } else if (accounts.length > 0) {
         setAccountPickerForProject(row.project_id);
       } else {
-        startUploadWithFbCheck(row.project_id);
+        startUploadWithChecks(row.project_id);
       }
     },
-    [selectedAccountId, accounts, startUploadWithFbCheck],
+    [selectedAccountId, accounts, startUploadWithChecks],
   );
+
+  const handleDurationModalClose = useCallback(() => {
+    if (pendingUpload) {
+      clearPendingUploadFlow();
+      return;
+    }
+    clearPendingUploadFlow();
+  }, [clearPendingUploadFlow, pendingUpload]);
 
   const compatibleAccounts = useMemo(() => {
     if (!accountPickerForProject) return [];
@@ -519,7 +624,7 @@ export function ProjectManagerModal({
             onPick={(accountId) => {
               const projectId = accountPickerForProject!;
               setAccountPickerForProject(null);
-              startUploadWithFbCheck(projectId, accountId);
+              startUploadWithChecks(projectId, accountId);
             }}
             onClose={() => setAccountPickerForProject(null)}
           />
@@ -527,12 +632,23 @@ export function ProjectManagerModal({
           {/* Facebook duration modal */}
           <FacebookDurationModal
             open={!!facebookCheck}
-            projectId={facebookCheck?.projectId ?? ""}
+            projectId={facebookCheck?.context.projectId ?? ""}
             durationSeconds={facebookCheck?.result.duration_seconds ?? 0}
             speedFactor={facebookCheck?.result.speed_factor ?? 1}
             spedUpAvailable={facebookCheck?.result.sped_up_available ?? false}
             onChoice={handleFacebookChoice}
-            onClose={() => setFacebookCheck(null)}
+            onClose={handleDurationModalClose}
+          />
+
+          {/* YouTube duration modal */}
+          <YouTubeDurationModal
+            open={!!youtubeCheck}
+            projectId={youtubeCheck?.context.projectId ?? ""}
+            durationSeconds={youtubeCheck?.result.duration_seconds ?? 0}
+            speedFactor={youtubeCheck?.result.speed_factor ?? 1}
+            spedUpAvailable={youtubeCheck?.result.sped_up_available ?? false}
+            onChoice={handleYouTubeChoice}
+            onClose={handleDurationModalClose}
           />
 
           {/* Scheduled delete confirmation */}
