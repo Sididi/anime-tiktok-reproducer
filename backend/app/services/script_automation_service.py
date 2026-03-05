@@ -109,6 +109,7 @@ _OVERLAY_RESPONSE_SCHEMA: dict[str, Any] = {
 }
 
 _SENTENCE_END_RE = re.compile(r"[.!?…][\"')\]]*\s*$")
+_SENTENCE_BOUNDARY_RE = re.compile(r"[.!?…][\"')\]]*(?:\s+|$)")
 
 
 class ScriptAutomationService:
@@ -377,10 +378,20 @@ class ScriptAutomationService:
         return f"{cleaned}."
 
     @classmethod
-    def _split_at_hard_cap(cls, text: str, cap: int) -> tuple[str, str]:
-        """Split text at cap, preferring the last whitespace before cap."""
+    def _split_at_preferred_tts_boundary(cls, text: str, cap: int) -> tuple[str, str]:
+        """Split text at cap, preferring a sentence boundary before whitespace fallback."""
         if len(text) <= cap:
             return text, ""
+
+        last_sentence_boundary: int | None = None
+        for match in _SENTENCE_BOUNDARY_RE.finditer(text[:cap]):
+            last_sentence_boundary = match.end()
+
+        if last_sentence_boundary is not None:
+            head = text[:last_sentence_boundary].rstrip()
+            tail = text[last_sentence_boundary:].lstrip()
+            if head:
+                return head, tail
 
         split_index = text.rfind(" ", 0, cap)
         if split_index > 0:
@@ -424,7 +435,10 @@ class ScriptAutomationService:
             current_segment["character_count"] = len(merged_text)
 
             while int(current_segment["character_count"]) > cls.TTS_HARD_MAX:
-                hard_chunk, remainder = cls._split_at_hard_cap(str(current_segment["text"]), cls.TTS_HARD_MAX)
+                hard_chunk, remainder = cls._split_at_preferred_tts_boundary(
+                    str(current_segment["text"]),
+                    cls.TTS_HARD_MAX,
+                )
                 if not hard_chunk:
                     break
                 segments.append(
