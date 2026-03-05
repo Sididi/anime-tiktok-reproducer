@@ -105,21 +105,14 @@ class TranscriberService:
             cls.unload_models()
 
     @classmethod
-    def unload_models(cls) -> None:
-        """Release cached WhisperX models and free GPU/CPU memory.
-
-        Should be called after transcription is no longer needed (e.g. after
-        the processing pipeline's alignment step) so that VRAM held by the
-        large-v3 ASR model, alignment models, and associated CUDA tensors is
-        returned to the system.
-        """
+    def _unload_cached_models(cls, force: bool = False) -> None:
         import gc
         import logging
 
         logger = logging.getLogger(__name__)
 
         with cls._model_lock:
-            if cls._active_transcriptions > 0:
+            if cls._active_transcriptions > 0 and not force:
                 cls._unload_requested = True
                 return
 
@@ -177,6 +170,17 @@ class TranscriberService:
                     "PyTorch VRAM after empty_cache: %.0f MiB",
                     had_asr, had_align, vram_mib,
                 )
+
+    @classmethod
+    def unload_models(cls) -> None:
+        """Release cached WhisperX models and free GPU/CPU memory.
+
+        Should be called after transcription is no longer needed (e.g. after
+        the processing pipeline's alignment step) so that VRAM held by the
+        large-v3 ASR model, alignment models, and associated CUDA tensors is
+        returned to the system.
+        """
+        cls._unload_cached_models(force=False)
 
     @staticmethod
     def _get_device() -> str:
@@ -268,8 +272,70 @@ class TranscriberService:
         )
 
     @staticmethod
-    def _get_compute_type(device: str) -> str:
-        return "float16" if device == "cuda" else "int8"
+    def _is_cuda_oom(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return any(
+            token in msg
+            for token in (
+                "cuda failed with error out of memory",
+                "cuda out of memory",
+                "cudnn_status_alloc_failed",
+                "out of memory",
+                "failed to allocate memory",
+                "not enough memory",
+            )
+        )
+
+    @staticmethod
+    def _model_size_fallbacks(model_size: str) -> list[str]:
+        primary_model = model_size or "large-v3"
+        model = primary_model.lower()
+        if model.startswith("large"):
+            return [primary_model, "medium", "small"]
+        if model == "medium":
+            return ["medium", "small", "base"]
+        if model == "small":
+            return ["small", "base", "tiny"]
+        return [primary_model]
+
+    @classmethod
+    def _candidate_transcribe_profiles(cls, model_size: str) -> list[tuple[str, str, int, str]]:
+        """
+        Return ordered ASR profiles as tuples:
+        (device, compute_type, batch_size, model_size)
+        """
+        sizes = cls._model_size_fallbacks(model_size)
+        profiles: list[tuple[str, str, int, str]] = []
+
+        if cls._get_device() == "cuda":
+            # Keep a fast default first, then progressively reduce VRAM pressure.
+            profiles.extend([
+                ("cuda", "float16", 8, sizes[0]),
+                ("cuda", "float16", 4, sizes[0]),
+                ("cuda", "int8_float16", 4, sizes[0]),
+            ])
+            for fallback_size in sizes[1:]:
+                profiles.append(("cuda", "int8_float16", 4, fallback_size))
+
+        # Last-resort CPU fallback for reliability.
+        profiles.append(("cpu", "int8", 2, sizes[min(1, len(sizes) - 1)]))
+
+        # Deduplicate while preserving order.
+        unique: list[tuple[str, str, int, str]] = []
+        seen: set[tuple[str, str, int, str]] = set()
+        for profile in profiles:
+            if profile in seen:
+                continue
+            seen.add(profile)
+            unique.append(profile)
+        return unique
+
+    @staticmethod
+    def _clear_cuda_cache() -> None:
+        with suppress(Exception):
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     @classmethod
     def _load_asr_model(cls, model_size: str, device: str, compute_type: str):
@@ -369,10 +435,6 @@ class TranscriberService:
         try:
             import whisperx
 
-            device = cls._get_device()
-            compute_type = cls._get_compute_type(device)
-            batch_size = 16 if device == "cuda" else 4
-
             has_audio = cls._has_audio_stream(audio_path)
             if has_audio is False:
                 raise ValueError(
@@ -399,27 +461,55 @@ class TranscriberService:
                     ) from exc
                 raise
 
-            model = cls._load_asr_model(model_size, device, compute_type)
-            result = model.transcribe(
-                audio,
-                batch_size=batch_size,
-                num_workers=0,
-                language=language,
-            )
+            attempts = cls._candidate_transcribe_profiles(model_size)
+            last_exc: Exception | None = None
 
-            detected_language = result.get("language") or (language or "en")
-            segments = result.get("segments") or []
+            for device, compute_type, batch_size, profile_model_size in attempts:
+                if device == "cuda":
+                    cls._clear_cuda_cache()
 
-            try:
-                model_a, metadata = cls._load_align_model(detected_language, device)
-                aligned = whisperx.align(segments, model_a, metadata, audio, device)
-                segments = aligned.get("segments") or segments
-            except Exception:
-                # If alignment fails, fall back to segment-level timings.
-                pass
+                try:
+                    model = cls._load_asr_model(profile_model_size, device, compute_type)
+                    result = model.transcribe(
+                        audio,
+                        batch_size=batch_size,
+                        num_workers=0,
+                        language=language,
+                    )
+                except Exception as exc:
+                    last_exc = exc
+                    if device == "cuda" and cls._is_cuda_oom(exc):
+                        with suppress(Exception):
+                            cls._unload_cached_models(force=True)
+                        cls._clear_cuda_cache()
+                        continue
+                    raise
 
-            words = cls._extract_words_from_segments(segments)
-            return words, detected_language
+                detected_language = result.get("language") or (language or "en")
+                segments = result.get("segments") or []
+
+                align_device = device
+                try:
+                    model_a, metadata = cls._load_align_model(detected_language, align_device)
+                    aligned = whisperx.align(segments, model_a, metadata, audio, align_device)
+                    segments = aligned.get("segments") or segments
+                except Exception as exc:
+                    # Retry alignment on CPU when GPU memory is tight.
+                    if align_device == "cuda" and cls._is_cuda_oom(exc):
+                        try:
+                            model_a, metadata = cls._load_align_model(detected_language, "cpu")
+                            aligned = whisperx.align(segments, model_a, metadata, audio, "cpu")
+                            segments = aligned.get("segments") or segments
+                        except Exception:
+                            pass
+                    # If alignment fails, fall back to segment-level timings.
+
+                words = cls._extract_words_from_segments(segments)
+                return words, detected_language
+
+            if last_exc is not None:
+                raise last_exc
+            raise RuntimeError("Transcription failed: no ASR profile could be executed")
         finally:
             if temp_audio_path and temp_audio_path.exists():
                 temp_audio_path.unlink(missing_ok=True)
