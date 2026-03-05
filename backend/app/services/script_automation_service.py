@@ -693,7 +693,7 @@ class ScriptAutomationService:
             metadata_payload: dict[str, Any] | None = None
             metadata_warning: str | None = None
 
-            if skip_metadata:
+            if skip_metadata or not settings.automate_metadata_overlay_enabled:
                 yield cls._event("llm_metadata", message="Metadata generation skipped")
             else:
                 yield cls._event("llm_metadata", message="Generating metadata JSON with Gemini...")
@@ -738,7 +738,7 @@ class ScriptAutomationService:
 
             # --- Video overlay generation ---
             overlay_json: dict[str, str] | None = None
-            if not skip_overlay and GeminiService.is_configured():
+            if not skip_overlay and settings.automate_metadata_overlay_enabled and GeminiService.is_configured():
                 yield cls._event("generating_overlay", message="Generating video overlay...")
                 try:
                     overlay_json = await asyncio.to_thread(

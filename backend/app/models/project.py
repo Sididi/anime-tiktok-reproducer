@@ -42,6 +42,7 @@ class Project(BaseModel):
     output_language: str | None = None
     drive_folder_id: str | None = None
     drive_folder_url: str | None = None
+    drive_export_uploaded_once: bool = False
     generation_discord_message_id: str | None = None
     final_upload_discord_message_id: str | None = None
     upload_completed_at: datetime | None = None

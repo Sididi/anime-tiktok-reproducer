@@ -30,6 +30,7 @@ interface ProcessingProgress {
   folder_url?: string;
   folder_id?: string;
   error_code?: string;
+  skipped_auto?: boolean;
   // Gap detection fields
   gaps_detected?: boolean;
   gap_count?: number;
@@ -77,6 +78,7 @@ export function ProcessingPage() {
   const location = useLocation();
   const { loadProject } = useProjectStore();
   const hasStartedProcessing = useRef(false);
+  const autoUploadAttemptedRef = useRef(false);
   const resumeAfterGapsRef = useRef(false);
   const gapsAutoEnabledRef = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
@@ -86,6 +88,7 @@ export function ProcessingPage() {
   const [error, setError] = useState<string | null>(null);
   const [gapsDetected, setGapsDetected] = useState(false);
   const [gapsAutoEnabled, setGapsAutoEnabled] = useState(false);
+  const [gdriveAutoEnabled, setGdriveAutoEnabled] = useState(false);
   const [gapInfo, setGapInfo] = useState<{
     count: number;
     duration: number;
@@ -116,6 +119,14 @@ export function ProcessingPage() {
         } catch {
           setGapsAutoEnabled(false);
         }
+        try {
+          const processingConfig = await api.getProcessingConfig(projectId);
+          setGdriveAutoEnabled(
+            Boolean(processingConfig.gdrive_full_auto_enabled),
+          );
+        } catch {
+          setGdriveAutoEnabled(false);
+        }
       } catch (err) {
         setError((err as Error).message);
       } finally {
@@ -130,6 +141,7 @@ export function ProcessingPage() {
   useEffect(() => {
     abortRef.current?.abort();
     hasStartedProcessing.current = false;
+    autoUploadAttemptedRef.current = false;
     resumeAfterGapsRef.current = Boolean(
       (location.state as { resumeAfterGaps?: boolean } | null)?.resumeAfterGaps,
     );
@@ -307,11 +319,16 @@ export function ProcessingPage() {
     }
   }, [projectId, bundleLoading, driveLoading]);
 
-  const handleUploadDrive = useCallback(async () => {
+  const handleUploadDrive = useCallback(async (options?: { auto?: boolean }) => {
+    const autoUpload = Boolean(options?.auto);
     if (!projectId || driveLoading || bundleLoading) return;
     setDriveLoading(true);
     setError(null);
-    setActionMessage("Uploading project to Google Drive...");
+    setActionMessage(
+      autoUpload
+        ? "Auto-uploading project to Google Drive..."
+        : "Uploading project to Google Drive...",
+    );
     const controller = new AbortController();
     let timedOut = false;
     const timeoutId = window.setTimeout(() => {
@@ -320,7 +337,9 @@ export function ProcessingPage() {
     }, DRIVE_UPLOAD_STREAM_TIMEOUT_MS);
 
     try {
-      const response = await api.uploadExportToGDrive(projectId);
+      const response = await api.uploadExportToGDrive(projectId, {
+        auto: autoUpload,
+      });
       let sawComplete = false;
       const finalEvent = await readSSEStream<ProcessingProgress>(
         response,
@@ -333,6 +352,20 @@ export function ProcessingPage() {
         },
         controller.signal,
       );
+
+      if (sawComplete && finalEvent?.status === "complete" && finalEvent.skipped_auto) {
+        if (finalEvent.folder_url) {
+          setDriveFolderUrl(finalEvent.folder_url);
+        } else {
+          const latestProject = await api.getProject(projectId).catch(() => null);
+          if (latestProject?.drive_folder_url) {
+            setDriveFolderUrl(latestProject.drive_folder_url);
+          }
+        }
+        setDriveUploaded(true);
+        setActionMessage("Auto-upload skipped: project already uploaded once.");
+        return;
+      }
 
       if (
         !sawComplete ||
@@ -373,6 +406,35 @@ export function ProcessingPage() {
       setDriveLoading(false);
     }
   }, [projectId, driveLoading, bundleLoading]);
+
+  useEffect(() => {
+    if (
+      !projectId ||
+      loading ||
+      processing ||
+      gapsDetected ||
+      !processingComplete ||
+      !gdriveAutoEnabled ||
+      driveLoading ||
+      bundleLoading ||
+      autoUploadAttemptedRef.current
+    ) {
+      return;
+    }
+
+    autoUploadAttemptedRef.current = true;
+    handleUploadDrive({ auto: true });
+  }, [
+    projectId,
+    loading,
+    processing,
+    gapsDetected,
+    processingComplete,
+    gdriveAutoEnabled,
+    driveLoading,
+    bundleLoading,
+    handleUploadDrive,
+  ]);
 
   const handleResolveGaps = () => {
     if (projectId) {
@@ -494,8 +556,8 @@ export function ProcessingPage() {
             <div className="flex items-center gap-3">
               <Button
                 className="flex-1 h-12"
-                onClick={handleUploadDrive}
-                disabled={driveLoading || bundleLoading || driveUploaded}
+                onClick={() => void handleUploadDrive()}
+                disabled={driveLoading || bundleLoading}
               >
                 {driveLoading ? (
                   <>
@@ -504,8 +566,8 @@ export function ProcessingPage() {
                   </>
                 ) : driveUploaded ? (
                   <>
-                    <Check className="h-5 w-5 mr-2" />
-                    Uploaded to Drive
+                    <CloudUpload className="h-5 w-5 mr-2" />
+                    Re-upload to Google Drive
                   </>
                 ) : (
                   <>

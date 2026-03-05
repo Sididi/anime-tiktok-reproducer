@@ -30,13 +30,25 @@ class ManifestEntry:
 class ExportService:
     VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
     BAKED_SUBTITLE_RE = re.compile(r"^subtitle_(\d+)\.mogrt$", re.IGNORECASE)
-    REQUIRED_IMPORT_ASSETS = (
-        "TikTok60fps.sqpreset",
-        "White border 10px.mogrt",
-        "SPM Anime Background.prfpset",
-        "SPM Anime Foreground.prfpset",
-        "SPM Anime Category Title.prfpset",
-    )
+
+    @classmethod
+    def get_required_import_assets(cls) -> tuple[str, ...]:
+        """Return the tuple of asset filenames to bundle in the export ZIP.
+
+        The border mogrt varies depending on ``grand_mode_enabled``:
+        - grand_mode=True  → White border 10px.mogrt
+        - grand_mode=False → White border 5px.mogrt
+        """
+        border_mogrt = (
+            "White border 10px.mogrt" if settings.grand_mode_enabled else "White border 5px.mogrt"
+        )
+        return (
+            "TikTok60fps.sqpreset",
+            border_mogrt,
+            "SPM Anime Background.prfpset",
+            "SPM Anime Foreground.prfpset",
+            "SPM Anime Category Title.prfpset",
+        )
     _LANG_TO_LOCALE = {
         "fr": "fr_FR",
         "en": "en_GB",
@@ -223,7 +235,7 @@ subtitles/              - Baked subtitle MOGRT files
             )
 
         assets_dir = cls.get_assets_dir()
-        for asset_name in cls.REQUIRED_IMPORT_ASSETS:
+        for asset_name in cls.get_required_import_assets():
             asset = assets_dir / asset_name
             if not asset.exists():
                 raise FileNotFoundError(f"Missing required asset file: {asset_name}")

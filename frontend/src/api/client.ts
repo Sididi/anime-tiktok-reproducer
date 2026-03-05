@@ -317,6 +317,11 @@ export const api = {
       `/projects/${projectId}/transcription/config`,
     ),
 
+  getProcessingConfig: (projectId: string) =>
+    request<{ gdrive_full_auto_enabled: boolean }>(
+      `/projects/${projectId}/config`,
+    ),
+
   updateTranscription: (
     projectId: string,
     scenes: { scene_index: number; text: string }[],
@@ -559,8 +564,20 @@ export const api = {
       method: "POST",
     }),
 
-  uploadExportToGDrive: (projectId: string) =>
-    fetch(`${API_BASE}/projects/${projectId}/exports/gdrive`, {
-      method: "POST",
-    }),
+  uploadExportToGDrive: (
+    projectId: string,
+    options?: { auto?: boolean },
+  ) => {
+    const params = new URLSearchParams();
+    if (options?.auto) {
+      params.set("auto", "true");
+    }
+    const query = params.toString();
+    return fetch(
+      `${API_BASE}/projects/${projectId}/exports/gdrive${query ? `?${query}` : ""}`,
+      {
+        method: "POST",
+      },
+    );
+  },
 };

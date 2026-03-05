@@ -43,9 +43,15 @@ class Settings(BaseSettings):
 
     # Script automation (Gemini + ElevenLabs)
     script_automate_enabled: bool = True
+    # When False, metadata and video overlay generation are skipped entirely during Automate.
+    automate_metadata_overlay_enabled: bool = False
+    # When True, "grand" mode: uses White border 10px mogrt and V3 scale 75%.
+    # When False (default), uses White border 5px and V3 scale 68%.
+    grand_mode_enabled: bool = False
     scenes_skip_ui_enabled: bool = False
     transcription_full_auto_enabled: bool = False
     gaps_full_auto_enabled: bool = False
+    processing_gdrive_full_auto_enabled: bool = False
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-3.1-pro-preview"
     gemini_timeout: int = 300  # seconds (read timeout for Gemini API; connect=10)

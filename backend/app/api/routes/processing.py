@@ -137,6 +137,7 @@ def _upload_manifest_and_finalize(
         result = ExportService.upload_manifest_to_drive(project, matches)
         project.drive_folder_id = result["folder_id"]
         project.drive_folder_url = result["folder_url"]
+        project.drive_export_uploaded_once = True
         ProjectService.save(project)
         _notify_drive_upload_complete(project_id, result["folder_url"])
         return result
@@ -217,6 +218,16 @@ async def get_script_automation_config(project_id: str):
         "default_music_key": default_music_key,
         "music_config_error": music_error,
     }
+
+
+@router.get("/config")
+async def get_processing_config(project_id: str):
+    """Get processing page feature flags."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    return {"gdrive_full_auto_enabled": settings.processing_gdrive_full_auto_enabled}
 
 
 @router.post("/script/automate")
@@ -773,11 +784,26 @@ async def create_bundle(project_id: str):
 
 
 @router.post("/exports/gdrive")
-async def upload_to_gdrive(project_id: str):
+async def upload_to_gdrive(project_id: str, auto: bool = False):
     """Upload the project export tree to Google Drive and notify via Discord webhook."""
     project = ProjectService.load(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    if auto and project.drive_export_uploaded_once:
+        folder_id = project.drive_folder_id
+        folder_url = project.drive_folder_url
+        if not folder_url and folder_id:
+            folder_url = f"https://drive.google.com/drive/folders/{folder_id}"
+
+        async def stream_skipped_auto():
+            yield f"data: {json.dumps({'status': 'complete', 'step': 'gdrive', 'progress': 1.0, 'message': 'Auto-upload skipped: project already uploaded once.', 'folder_url': folder_url, 'folder_id': folder_id, 'skipped_auto': True})}\n\n"
+
+        return StreamingResponse(
+            stream_skipped_auto(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
 
     matches = ProjectService.load_matches(project_id)
     if not matches:
