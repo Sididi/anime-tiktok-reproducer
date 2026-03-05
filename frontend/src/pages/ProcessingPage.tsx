@@ -70,7 +70,7 @@ const INITIAL_STEPS: ProcessingStep[] = [
   },
 ];
 
-const DRIVE_UPLOAD_STREAM_TIMEOUT_MS = 20 * 60 * 1000;
+const DRIVE_UPLOAD_STREAM_TIMEOUT_MS = 10 * 60 * 1000;
 
 export function ProcessingPage() {
   const { projectId } = useParams<{ projectId: string }>();
@@ -340,49 +340,37 @@ export function ProcessingPage() {
       const response = await api.uploadExportToGDrive(projectId, {
         auto: autoUpload,
       });
-      let sawComplete = false;
       const finalEvent = await readSSEStream<ProcessingProgress>(
         response,
         (data) => {
           if (data.message) setActionMessage(data.message);
-          if (data.status === "complete") {
-            sawComplete = true;
-            controller.abort();
-          }
         },
-        controller.signal,
+        {
+          signal: controller.signal,
+          stopWhen: (event) => event.status === "complete",
+        },
       );
 
-      if (sawComplete && finalEvent?.status === "complete" && finalEvent.skipped_auto) {
-        if (finalEvent.folder_url) {
-          setDriveFolderUrl(finalEvent.folder_url);
-        } else {
-          const latestProject = await api.getProject(projectId).catch(() => null);
-          if (latestProject?.drive_folder_url) {
-            setDriveFolderUrl(latestProject.drive_folder_url);
-          }
+      if (!finalEvent || finalEvent.status !== "complete") {
+        throw new Error("Drive upload stream ended unexpectedly before completion.");
+      }
+
+      if (finalEvent.skipped_auto) {
+        const folderUrl =
+          finalEvent.folder_url ??
+          (finalEvent.folder_id
+            ? `https://drive.google.com/drive/folders/${finalEvent.folder_id}`
+            : null);
+        if (folderUrl) {
+          setDriveFolderUrl(folderUrl);
         }
         setDriveUploaded(true);
         setActionMessage("Auto-upload skipped: project already uploaded once.");
         return;
       }
 
-      if (
-        !sawComplete ||
-        finalEvent?.status !== "complete" ||
-        !finalEvent.folder_url
-      ) {
-        const latestProject = await api.getProject(projectId).catch(() => null);
-        const recoveredFolderUrl = latestProject?.drive_folder_url;
-        if (!recoveredFolderUrl) {
-          throw new Error(
-            "Drive upload stream ended unexpectedly before completion.",
-          );
-        }
-        setDriveFolderUrl(recoveredFolderUrl);
-        setDriveUploaded(true);
-        setActionMessage("Google Drive upload finished on server.");
-        return;
+      if (!finalEvent.folder_url) {
+        throw new Error("Drive upload completed but no folder URL was returned.");
       }
       setDriveFolderUrl(finalEvent.folder_url);
       setDriveUploaded(true);

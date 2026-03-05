@@ -124,12 +124,12 @@ def _get_gdrive_upload_lock(project_id: str) -> Lock:
         return lock
 
 
-def _upload_manifest_and_finalize(
+def _upload_manifest_and_persist(
     project_id: str,
     project,
     matches,
 ) -> dict[str, Any]:
-    """Run upload + persistence + Discord notification under a project lock."""
+    """Run upload + persistence under a project lock."""
     lock = _get_gdrive_upload_lock(project_id)
     if not lock.acquire(blocking=False):
         raise DriveUploadInProgressError("Upload already in progress for this project")
@@ -139,7 +139,6 @@ def _upload_manifest_and_finalize(
         project.drive_folder_url = result["folder_url"]
         project.drive_export_uploaded_once = True
         ProjectService.save(project)
-        _notify_drive_upload_complete(project_id, result["folder_url"])
         return result
     finally:
         lock.release()
@@ -813,10 +812,17 @@ async def upload_to_gdrive(project_id: str, auto: bool = False):
         yield f"data: {json.dumps({'status': 'processing', 'step': 'gdrive', 'progress': 0.1, 'message': 'Uploading project to Google Drive...'})}\n\n"
         try:
             result = await asyncio.to_thread(
-                _upload_manifest_and_finalize,
+                _upload_manifest_and_persist,
                 project_id,
                 project,
                 matches.matches,
+            )
+            asyncio.create_task(
+                asyncio.to_thread(
+                    _notify_drive_upload_complete,
+                    project_id,
+                    result["folder_url"],
+                )
             )
 
             yield f"data: {json.dumps({'status': 'complete', 'step': 'gdrive', 'progress': 1.0, 'message': 'Upload complete', 'folder_url': result['folder_url'], 'folder_id': result['folder_id']})}\n\n"

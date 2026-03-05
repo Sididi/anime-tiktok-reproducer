@@ -7,10 +7,15 @@
  * Returns the last successfully parsed event, or `null` if the stream was
  * empty or aborted before any events arrived.
  */
+interface ReadSSEStreamOptions<T> {
+  signal?: AbortSignal;
+  stopWhen?: (data: T) => boolean;
+}
+
 export async function readSSEStream<T extends { status?: string; error?: string | null; message?: string | null }>(
   response: Response,
   onEvent: (data: T) => void,
-  signal?: AbortSignal,
+  signalOrOptions?: AbortSignal | ReadSSEStreamOptions<T>,
 ): Promise<T | null> {
   if (!response.ok) {
     throw new Error(`SSE request failed with status ${response.status}`);
@@ -24,6 +29,13 @@ export async function readSSEStream<T extends { status?: string; error?: string 
   const decoder = new TextDecoder();
   let buffer = "";
   let lastEvent: T | null = null;
+  let shouldStop = false;
+  const options: ReadSSEStreamOptions<T> =
+    signalOrOptions && "aborted" in signalOrOptions
+      ? { signal: signalOrOptions }
+      : (signalOrOptions ?? {});
+  const signal = options.signal;
+  const stopWhen = options.stopWhen;
 
   const processBufferedEvents = (flush: boolean) => {
     buffer = buffer.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
@@ -32,16 +44,28 @@ export async function readSSEStream<T extends { status?: string; error?: string 
     buffer = flush ? "" : chunks.pop() || "";
 
     for (const chunk of chunks) {
-      const dataLine = chunk
+      const dataLines = chunk
         .split("\n")
-        .find((line) => line.startsWith("data: "));
-      if (!dataLine) continue;
+        .filter((line) => line.startsWith("data:"));
+      if (dataLines.length === 0) continue;
       try {
-        const data = JSON.parse(dataLine.slice(6)) as T;
+        const payload = dataLines
+          .map((line) => line.slice(5).trimStart())
+          .join("\n");
+        const data = JSON.parse(payload) as T;
         lastEvent = data;
         onEvent(data);
         if (data.status === "error") {
           throw new Error(data.error || data.message || "Request failed");
+        }
+        if (stopWhen?.(data)) {
+          shouldStop = true;
+          try {
+            reader.cancel();
+          } catch {
+            // Ignore cancel errors on already-closed readers
+          }
+          break;
         }
       } catch (e) {
         if (e instanceof SyntaxError) continue;
@@ -50,9 +74,25 @@ export async function readSSEStream<T extends { status?: string; error?: string 
     }
   };
 
+  const handleAbort = () => {
+    shouldStop = true;
+    try {
+      reader.cancel();
+    } catch {
+      // Ignore cancel errors on already-closed readers
+    }
+  };
+  if (signal) {
+    if (signal.aborted) {
+      handleAbort();
+    } else {
+      signal.addEventListener("abort", handleAbort, { once: true });
+    }
+  }
+
   try {
     while (true) {
-      if (signal?.aborted) break;
+      if (shouldStop || signal?.aborted) break;
 
       const { done, value } = await reader.read();
       if (done) {
@@ -64,6 +104,9 @@ export async function readSSEStream<T extends { status?: string; error?: string 
       processBufferedEvents(false);
     }
   } finally {
+    if (signal) {
+      signal.removeEventListener("abort", handleAbort);
+    }
     try {
       reader.cancel();
     } catch {
