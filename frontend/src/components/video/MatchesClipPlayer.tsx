@@ -9,6 +9,7 @@ import {
 } from "react";
 import { Loader2 } from "lucide-react";
 import { cn } from "@/utils";
+import { acquire, acquirePriority } from "@/utils/videoConnectionPool";
 
 export interface MatchesClipWaitUntilReadyOptions {
   minReadyState?: number;
@@ -36,7 +37,7 @@ interface MatchesClipPlayerProps {
   playbackRate?: number;
   onClipEnded?: () => void;
   controls?: boolean;
-  preloadMode?: "metadata" | "auto";
+  preloadMode?: "none" | "metadata" | "auto";
   disableInteraction?: boolean;
 }
 
@@ -58,14 +59,20 @@ export const MatchesClipPlayer = forwardRef<
 ) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const endNotifiedRef = useRef(false);
+  const poolReleaseRef = useRef<(() => void) | null>(null);
+  const poolPendingRef = useRef(false);
   const [hasError, setHasError] = useState(false);
   const [isLoaded, setIsLoaded] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
   const [preloadOverride, setPreloadOverride] = useState<
-    "metadata" | "auto" | null
+    "none" | "metadata" | "auto" | null
   >(null);
+  const [isSourceAttached, setIsSourceAttached] = useState(
+    preloadMode !== "none",
+  );
 
   const effectivePreload = preloadOverride ?? preloadMode;
+  const shouldLoad = effectivePreload !== "none";
 
   const videoSrc = useMemo(() => {
     if (retryCount === 0) return src;
@@ -83,18 +90,100 @@ export const MatchesClipPlayer = forwardRef<
     onClipEnded?.();
   }, [onClipEnded]);
 
+  const releasePoolSlot = useCallback(() => {
+    if (poolReleaseRef.current) {
+      poolReleaseRef.current();
+      poolReleaseRef.current = null;
+    }
+    poolPendingRef.current = false;
+  }, []);
+
+  const detachSource = useCallback(() => {
+    const video = videoRef.current;
+    if (video) {
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+    }
+    setIsSourceAttached(false);
+    setIsLoaded(false);
+    setHasError(false);
+    resetEndState();
+  }, [resetEndState]);
+
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
     video.playbackRate = playbackRate;
   }, [playbackRate]);
 
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!shouldLoad) {
+      detachSource();
+      releasePoolSlot();
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    if (isSourceAttached || poolPendingRef.current || poolReleaseRef.current) {
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    poolPendingRef.current = true;
+    const acquireFn = effectivePreload === "auto" ? acquirePriority : acquire;
+    void acquireFn()
+      .then((release) => {
+        if (cancelled) {
+          release();
+          return;
+        }
+        poolPendingRef.current = false;
+        poolReleaseRef.current = release;
+        setIsSourceAttached(true);
+      })
+      .catch(() => {
+        poolPendingRef.current = false;
+        setHasError(true);
+        setIsLoaded(true);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    detachSource,
+    effectivePreload,
+    isSourceAttached,
+    releasePoolSlot,
+    shouldLoad,
+  ]);
+
+  useEffect(() => {
+    return () => {
+      releasePoolSlot();
+      const video = videoRef.current;
+      if (video) {
+        video.pause();
+        video.removeAttribute("src");
+        video.load();
+      }
+    };
+  }, [releasePoolSlot]);
+
   useImperativeHandle(
     ref,
     () => ({
       playFromStart: () => {
         const video = videoRef.current;
-        if (!video) return;
+        if (!video) {
+          setPreloadOverride("auto");
+          return;
+        }
         video.currentTime = 0;
         video.playbackRate = playbackRate;
         resetEndState();
@@ -139,7 +228,10 @@ export const MatchesClipPlayer = forwardRef<
       },
       play: () => {
         const video = videoRef.current;
-        if (!video) return;
+        if (!video) {
+          setPreloadOverride("auto");
+          return;
+        }
         video.playbackRate = playbackRate;
         resetEndState();
         void video.play().catch(() => {
@@ -195,16 +287,19 @@ export const MatchesClipPlayer = forwardRef<
       retryLoad: async () => {
         setHasError(false);
         setIsLoaded(false);
+        setPreloadOverride("auto");
         setRetryCount((value) => value + 1);
       },
       forceLoad: () => {
         setPreloadOverride("auto");
       },
       releaseLoad: () => {
+        detachSource();
+        releasePoolSlot();
         setPreloadOverride(null);
       },
     }),
-    [hasError, playbackRate, resetEndState],
+    [detachSource, hasError, playbackRate, releasePoolSlot, resetEndState],
   );
 
   const handleLoadStart = useCallback(() => {
@@ -247,11 +342,12 @@ export const MatchesClipPlayer = forwardRef<
     setRetryCount((value) => value + 1);
     setHasError(false);
     setIsLoaded(false);
+    setPreloadOverride("auto");
   }, []);
 
   return (
     <div className={cn("relative bg-black", className)}>
-      {!isLoaded && !hasError && (
+      {shouldLoad && !isLoaded && !hasError && (
         <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/80">
           <Loader2 className="h-7 w-7 animate-spin text-white" />
         </div>
@@ -271,25 +367,29 @@ export const MatchesClipPlayer = forwardRef<
         </div>
       )}
 
-      <video
-        key={`${src}-${retryCount}`}
-        ref={videoRef}
-        src={videoSrc}
-        className={cn(
-          "h-full w-full object-contain",
-          disableInteraction && "pointer-events-none",
-        )}
-        onLoadStart={handleLoadStart}
-        onLoadedMetadata={handleLoadedMetadata}
-        onCanPlay={() => setIsLoaded(true)}
-        onError={handleError}
-        onEnded={handleEnded}
-        onSeeking={handleSeeking}
-        muted={muted}
-        controls={controls}
-        playsInline
-        preload={effectivePreload}
-      />
+      {isSourceAttached ? (
+        <video
+          key={`${src}-${retryCount}`}
+          ref={videoRef}
+          src={videoSrc}
+          className={cn(
+            "h-full w-full object-contain",
+            disableInteraction && "pointer-events-none",
+          )}
+          onLoadStart={handleLoadStart}
+          onLoadedMetadata={handleLoadedMetadata}
+          onCanPlay={() => setIsLoaded(true)}
+          onError={handleError}
+          onEnded={handleEnded}
+          onSeeking={handleSeeking}
+          muted={muted}
+          controls={controls}
+          playsInline
+          preload={effectivePreload === "none" ? "metadata" : effectivePreload}
+        />
+      ) : (
+        <div className="h-full w-full bg-black" />
+      )}
     </div>
   );
 });

@@ -36,6 +36,8 @@ class Settings(BaseSettings):
 
     # Video settings
     default_fps: float = 30.0
+    match_playback_max_workers: int = 4
+    match_playback_max_workers_per_episode: int = 1
 
     # Discord webhook integration
     discord_webhook_url: str | None = None
@@ -155,6 +157,16 @@ class Settings(BaseSettings):
     @classmethod
     def _clamp_drive_upload_chunk_mb(cls, value: int) -> int:
         return max(4, min(64, value))
+
+    @field_validator("match_playback_max_workers")
+    @classmethod
+    def _clamp_match_playback_max_workers(cls, value: int) -> int:
+        return max(1, min(8, value))
+
+    @field_validator("match_playback_max_workers_per_episode")
+    @classmethod
+    def _clamp_match_playback_max_workers_per_episode(cls, value: int) -> int:
+        return max(1, min(4, value))
 
 settings = Settings()
 

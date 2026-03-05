@@ -6,6 +6,7 @@ import json
 from ...config import settings
 from ...models import ProjectPhase, Transcription, SceneTranscription
 from ...services import ProjectService, TranscriberService
+from ...services.match_playback_service import MatchPlaybackService
 
 router = APIRouter(prefix="/projects/{project_id}/transcription", tags=["transcription"])
 
@@ -34,6 +35,15 @@ async def start_transcription(project_id: str, request: StartTranscriptionReques
     project = ProjectService.load(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    if MatchPlaybackService.is_prepare_running(project_id):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Playback preparation is still running for this project. "
+                "Wait for /matches warmup to complete before starting transcription."
+            ),
+        )
 
     # Update phase
     project.phase = ProjectPhase.TRANSCRIPTION

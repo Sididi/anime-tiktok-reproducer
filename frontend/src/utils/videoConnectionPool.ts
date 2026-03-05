@@ -6,14 +6,14 @@
  * dev-server proxy makes all /api requests same-origin, video fetches compete
  * with regular API calls for the same 6-connection pool.
  *
- * We cap active video loads to MAX_CONCURRENT (4) so that 2 connections remain
- * available for API calls (match data, SSE streams, etc.).
+ * We cap active video loads to MAX_CONCURRENT (5) so at least one connection
+ * remains available for API calls while leveraging higher local hardware headroom.
  *
  * Priority support: Fast Watch preloads use `acquirePriority()` which jumps
  * ahead of regular IntersectionObserver-triggered loads in the queue.
  */
 
-const MAX_CONCURRENT = 4;
+const MAX_CONCURRENT = 5;
 
 interface QueueEntry {
   resolve: () => void;

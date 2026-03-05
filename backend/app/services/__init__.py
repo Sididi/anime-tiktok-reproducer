@@ -28,6 +28,7 @@ from .music_config_service import MusicConfigService
 from .audio_speed_service import AudioSpeedService
 from .title_image_generator import TitleImageGeneratorService
 from .premiere_subtitle_baker import PremiereSubtitleBakerService
+from .source_chunk_streaming_service import SourceChunkStreamingService
 
 __all__ = [
     "AccountService",
@@ -48,4 +49,5 @@ __all__ = [
     "AudioSpeedService",
     "TitleImageGeneratorService",
     "PremiereSubtitleBakerService",
+    "SourceChunkStreamingService",
 ]

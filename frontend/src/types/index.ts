@@ -188,6 +188,16 @@ export interface VideoInfo {
   path: string | null;
 }
 
+export interface SourceStreamDescriptor {
+  mode: "passthrough" | "chunked";
+  duration: number;
+  codec: string;
+  pix_fmt: string;
+  chunk_duration: number;
+  chunk_step: number;
+  seek_guard_seconds: number;
+}
+
 export interface MatchCandidate {
   episode: string;
   timestamp: number;

@@ -5,11 +5,17 @@ import { Button, Input } from "@/components/ui";
 import { ClippedVideoPlayer } from "./ClippedVideoPlayer";
 import { formatTime, parseTime } from "@/utils";
 import { api } from "@/api/client";
-import type { Scene, SceneMatch, AlternativeMatch } from "@/types";
+import type {
+  Scene,
+  SceneMatch,
+  AlternativeMatch,
+  SourceStreamDescriptor,
+} from "@/types";
 
 const ANOMALY_MIN_SPEED = 0.35;
 const ANOMALY_MAX_SPEED = 2.5;
 const ANOMALY_MAX_SOURCE_DURATION = 60;
+const MAX_DYNAMIC_CHUNK_SECONDS = 120;
 
 export interface ManualMatchSaveMeta {
   anomalous: boolean;
@@ -67,6 +73,8 @@ export function ManualMatchModal({
   onSave,
 }: ManualMatchModalProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const pendingSeekTimeRef = useRef<number | null>(null);
+  const resumePlaybackAfterLoadRef = useRef(false);
 
   const initialEpisode =
     match?.episode && match.confidence > 0
@@ -96,9 +104,19 @@ export function ManualMatchModal({
   const [isPlaying, setIsPlaying] = useState(false);
   const [sourceRetryCount, setSourceRetryCount] = useState(0);
   const [sourceHasError, setSourceHasError] = useState(false);
+  const [sourceDescriptor, setSourceDescriptor] =
+    useState<SourceStreamDescriptor | null>(null);
+  const [sourceDescriptorLoading, setSourceDescriptorLoading] = useState(false);
+  const [sourceChunkStart, setSourceChunkStart] = useState(0);
+  const [sourceChunkDuration, setSourceChunkDuration] = useState(0);
 
   const sceneDuration = scene.end_time - scene.start_time;
-  const alternatives = match?.alternatives || [];
+
+  const isChunkedSource = sourceDescriptor?.mode === "chunked";
+  const effectiveChunkDuration =
+    sourceChunkDuration > 0
+      ? sourceChunkDuration
+      : (sourceDescriptor?.chunk_duration ?? 0);
 
   const resetSourcePlaybackState = useCallback(() => {
     setSourceRetryCount(0);
@@ -106,13 +124,141 @@ export function ManualMatchModal({
     setIsPlaying(false);
     setCurrentTime(0);
     setDuration(0);
+    setSourceDescriptor(null);
+    setSourceChunkStart(0);
+    setSourceChunkDuration(0);
+    pendingSeekTimeRef.current = null;
+    resumePlaybackAfterLoadRef.current = false;
   }, []);
+
+  const clampGlobalTime = useCallback(
+    (value: number) => {
+      const maxDuration = sourceDescriptor?.duration ?? duration;
+      if (maxDuration > 0) {
+        return Math.min(Math.max(value, 0), maxDuration);
+      }
+      return Math.max(value, 0);
+    },
+    [duration, sourceDescriptor],
+  );
+
+  const getChunkWindowStart = useCallback(
+    (
+      targetTime: number,
+      descriptor: SourceStreamDescriptor,
+      windowDuration: number,
+    ) => {
+      const boundedDuration = Math.min(
+        Math.max(windowDuration, descriptor.chunk_duration),
+        MAX_DYNAMIC_CHUNK_SECONDS,
+      );
+      const maxStart = Math.max((descriptor.duration || 0) - boundedDuration, 0);
+      const boundedTarget = clampGlobalTime(targetTime);
+      const centered = Math.max(boundedTarget - boundedDuration / 2, 0);
+      const step = Math.max(descriptor.chunk_step || 0.001, 0.001);
+      const snapped = Math.floor(centered / step) * step;
+      return Math.min(Math.max(snapped, 0), maxStart);
+    },
+    [clampGlobalTime],
+  );
+
+  const setChunkWindowAround = useCallback(
+    (targetTime: number, requestedDuration?: number): boolean => {
+      if (!sourceDescriptor || sourceDescriptor.mode !== "chunked") {
+        return false;
+      }
+
+      const nextDuration = Math.min(
+        Math.max(
+          requestedDuration ?? sourceDescriptor.chunk_duration,
+          sourceDescriptor.chunk_duration,
+        ),
+        MAX_DYNAMIC_CHUNK_SECONDS,
+      );
+      const nextStart = getChunkWindowStart(
+        targetTime,
+        sourceDescriptor,
+        nextDuration,
+      );
+
+      const changed =
+        Math.abs(nextStart - sourceChunkStart) > 0.001 ||
+        Math.abs(nextDuration - sourceChunkDuration) > 0.001;
+
+      if (changed) {
+        setSourceChunkStart(nextStart);
+        setSourceChunkDuration(nextDuration);
+      }
+
+      return changed;
+    },
+    [
+      getChunkWindowStart,
+      sourceChunkDuration,
+      sourceChunkStart,
+      sourceDescriptor,
+    ],
+  );
+
+  const seekSourceGlobal = useCallback(
+    (targetTime: number, autoplay: boolean, requestedChunkDuration?: number) => {
+      const video = videoRef.current;
+      if (!video) return;
+
+      const bounded = clampGlobalTime(targetTime);
+      if (!isChunkedSource || !sourceDescriptor) {
+        video.currentTime = bounded;
+        setCurrentTime(bounded);
+        if (autoplay) {
+          void video.play();
+          setIsPlaying(true);
+        }
+        return;
+      }
+
+      const windowDuration =
+        sourceChunkDuration > 0 ? sourceChunkDuration : sourceDescriptor.chunk_duration;
+      const guard = sourceDescriptor.seek_guard_seconds;
+      const safeStart = sourceChunkStart + guard;
+      const safeEnd = sourceChunkStart + windowDuration - guard;
+
+      if (bounded >= safeStart && bounded <= safeEnd && windowDuration > 0) {
+        video.currentTime = Math.max(bounded - sourceChunkStart, 0);
+        setCurrentTime(bounded);
+        if (autoplay) {
+          void video.play();
+          setIsPlaying(true);
+        }
+        return;
+      }
+
+      pendingSeekTimeRef.current = bounded;
+      resumePlaybackAfterLoadRef.current = autoplay;
+      const changed = setChunkWindowAround(bounded, requestedChunkDuration);
+      if (!changed) {
+        video.currentTime = Math.max(bounded - sourceChunkStart, 0);
+        setCurrentTime(bounded);
+        if (autoplay) {
+          void video.play();
+          setIsPlaying(true);
+        }
+      }
+    },
+    [
+      clampGlobalTime,
+      isChunkedSource,
+      setChunkWindowAround,
+      sourceChunkDuration,
+      sourceChunkStart,
+      sourceDescriptor,
+    ],
+  );
 
   const { normalAlternatives, riskyAlternatives } = useMemo(() => {
     const normal: CandidateWithMeta[] = [];
     const risky: CandidateWithMeta[] = [];
 
-    for (const candidate of alternatives) {
+    for (const candidate of match?.alternatives ?? []) {
       const meta = evaluateSelection(
         sceneDuration,
         candidate.start_time,
@@ -130,7 +276,7 @@ export function ManualMatchModal({
       normalAlternatives: normal,
       riskyAlternatives: risky,
     };
-  }, [alternatives, sceneDuration]);
+  }, [match?.alternatives, sceneDuration]);
 
   /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
@@ -156,6 +302,73 @@ export function ManualMatchModal({
   }, [isOpen, match, episodes, sceneDuration, resetSourcePlaybackState]);
   /* eslint-enable react-hooks/set-state-in-effect */
 
+  /* eslint-disable react-hooks/set-state-in-effect */
+  useEffect(() => {
+    if (!isOpen || !selectedEpisode) return;
+
+    let active = true;
+    setSourceDescriptorLoading(true);
+    setSourceHasError(false);
+
+    const preferredStart =
+      match?.confidence && match.confidence > 0
+        ? match.start_time
+        : 0;
+
+    void api
+      .getSourceDescriptor(projectId, selectedEpisode)
+      .then((descriptor) => {
+        if (!active) return;
+
+        setSourceDescriptor(descriptor);
+        setDuration(descriptor.duration || 0);
+
+        if (descriptor.mode === "chunked") {
+          const dynamicDuration = Math.min(
+            Math.max(
+              descriptor.chunk_duration,
+              sceneDuration + descriptor.seek_guard_seconds * 2,
+            ),
+            MAX_DYNAMIC_CHUNK_SECONDS,
+          );
+          const nextStart = getChunkWindowStart(
+            preferredStart,
+            descriptor,
+            dynamicDuration,
+          );
+          setSourceChunkDuration(dynamicDuration);
+          setSourceChunkStart(nextStart);
+          pendingSeekTimeRef.current = clampGlobalTime(preferredStart);
+        } else {
+          setSourceChunkDuration(0);
+          setSourceChunkStart(0);
+          pendingSeekTimeRef.current = clampGlobalTime(preferredStart);
+        }
+      })
+      .catch(() => {
+        if (!active) return;
+        setSourceDescriptor(null);
+        setSourceHasError(true);
+      })
+      .finally(() => {
+        if (!active) return;
+        setSourceDescriptorLoading(false);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [
+    clampGlobalTime,
+    getChunkWindowStart,
+    isOpen,
+    match,
+    projectId,
+    sceneDuration,
+    selectedEpisode,
+  ]);
+  /* eslint-enable react-hooks/set-state-in-effect */
+
   useEffect(() => {
     if (!isOpen) return;
     const previousOverflow = document.body.style.overflow;
@@ -166,30 +379,91 @@ export function ManualMatchModal({
   }, [isOpen]);
 
   const handleTimeUpdate = useCallback(() => {
-    if (videoRef.current) {
-      setCurrentTime(videoRef.current.currentTime);
+    const video = videoRef.current;
+    if (!video) return;
+
+    const globalTime = isChunkedSource
+      ? sourceChunkStart + video.currentTime
+      : video.currentTime;
+    setCurrentTime(globalTime);
+
+    if (
+      isChunkedSource &&
+      sourceDescriptor &&
+      !video.paused
+    ) {
+      const guard = sourceDescriptor.seek_guard_seconds;
+      const windowDuration =
+        sourceChunkDuration > 0
+          ? sourceChunkDuration
+          : sourceDescriptor.chunk_duration;
+      const safeEnd = sourceChunkStart + windowDuration - guard;
+      if (globalTime >= safeEnd) {
+        pendingSeekTimeRef.current = globalTime;
+        resumePlaybackAfterLoadRef.current = true;
+        setChunkWindowAround(globalTime, windowDuration);
+      }
     }
-  }, []);
+  }, [
+    isChunkedSource,
+    setChunkWindowAround,
+    sourceChunkDuration,
+    sourceChunkStart,
+    sourceDescriptor,
+  ]);
 
   const handleLoadedMetadata = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
 
-    setDuration(video.duration);
     setSourceHasError(false);
 
     const parsedStart = parseTime(startTime);
-    const preferredStart =
+    const fallbackStart =
       match?.confidence && match.confidence > 0
         ? match.start_time
         : parsedStart ?? 0;
-    const boundedStart = Number.isFinite(video.duration)
-      ? Math.min(Math.max(preferredStart, 0), video.duration)
-      : Math.max(preferredStart, 0);
+    const requestedGlobalTime = pendingSeekTimeRef.current ?? fallbackStart;
 
-    video.currentTime = boundedStart;
-    setCurrentTime(boundedStart);
-  }, [match, startTime]);
+    if (isChunkedSource && sourceDescriptor) {
+      const globalDuration = sourceDescriptor.duration || duration;
+      if (globalDuration > 0) {
+        setDuration(globalDuration);
+      }
+
+      const boundedGlobal = globalDuration > 0
+        ? Math.min(Math.max(requestedGlobalTime, 0), globalDuration)
+        : Math.max(requestedGlobalTime, 0);
+      const localTime = Math.max(
+        0,
+        Math.min(video.duration || 0, boundedGlobal - sourceChunkStart),
+      );
+      video.currentTime = localTime;
+      setCurrentTime(sourceChunkStart + localTime);
+    } else {
+      setDuration(video.duration);
+      const boundedStart = Number.isFinite(video.duration)
+        ? Math.min(Math.max(requestedGlobalTime, 0), video.duration)
+        : Math.max(requestedGlobalTime, 0);
+      video.currentTime = boundedStart;
+      setCurrentTime(boundedStart);
+    }
+
+    pendingSeekTimeRef.current = null;
+
+    if (resumePlaybackAfterLoadRef.current) {
+      resumePlaybackAfterLoadRef.current = false;
+      void video.play();
+      setIsPlaying(true);
+    }
+  }, [
+    duration,
+    isChunkedSource,
+    match,
+    sourceChunkStart,
+    sourceDescriptor,
+    startTime,
+  ]);
 
   const handleSetStart = useCallback(() => {
     setStartTime(formatTime(currentTime));
@@ -199,35 +473,55 @@ export function ManualMatchModal({
     setEndTime(formatTime(currentTime));
   }, [currentTime]);
 
-  const handleSeek = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    const time = parseFloat(e.target.value);
-    if (videoRef.current) {
-      videoRef.current.currentTime = time;
-      setCurrentTime(time);
-    }
-  }, []);
+  const handleSeek = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const time = parseFloat(e.target.value);
+      if (!Number.isFinite(time)) return;
+      seekSourceGlobal(time, false);
+    },
+    [seekSourceGlobal],
+  );
 
   const handlePlayPause = useCallback(() => {
     if (!videoRef.current) return;
 
     if (videoRef.current.paused) {
-      void videoRef.current.play();
-      setIsPlaying(true);
+      seekSourceGlobal(currentTime, true);
       return;
     }
 
     videoRef.current.pause();
     setIsPlaying(false);
-  }, []);
+  }, [currentTime, seekSourceGlobal]);
 
   const handlePreview = useCallback(() => {
     const start = parseTime(startTime);
-    if (videoRef.current && start !== null) {
-      videoRef.current.currentTime = start;
-      void videoRef.current.play();
-      setIsPlaying(true);
+    if (start === null) return;
+
+    const end = parseTime(endTime);
+    if (isChunkedSource && sourceDescriptor) {
+      const requestedDuration =
+        end !== null && end > start
+          ? Math.min(
+              Math.max(
+                sourceDescriptor.chunk_duration,
+                end - start + sourceDescriptor.seek_guard_seconds * 2,
+              ),
+              MAX_DYNAMIC_CHUNK_SECONDS,
+            )
+          : sourceDescriptor.chunk_duration;
+      seekSourceGlobal(start, true, requestedDuration);
+      return;
     }
-  }, [startTime]);
+
+    seekSourceGlobal(start, true);
+  }, [
+    endTime,
+    isChunkedSource,
+    seekSourceGlobal,
+    sourceDescriptor,
+    startTime,
+  ]);
 
   const handleSave = useCallback(() => {
     const start = parseTime(startTime);
@@ -256,23 +550,30 @@ export function ManualMatchModal({
 
       setStartTime(formatTime(candidate.start_time));
       setEndTime(formatTime(candidate.end_time));
+      pendingSeekTimeRef.current = candidate.start_time;
+      resumePlaybackAfterLoadRef.current = true;
 
       window.setTimeout(() => {
-        if (videoRef.current) {
-          videoRef.current.currentTime = candidate.start_time;
-          void videoRef.current.play();
-          setIsPlaying(true);
-        }
-      }, 100);
+        seekSourceGlobal(candidate.start_time, true);
+      }, 120);
     },
-    [episodes, resetSourcePlaybackState],
+    [episodes, resetSourcePlaybackState, seekSourceGlobal],
   );
 
   const sourceVideoUrl = selectedEpisode
     ? (() => {
-        const base = api.getSourceVideoUrl(projectId, selectedEpisode);
+        const base = isChunkedSource
+          ? api.getSourceChunkUrl(
+              projectId,
+              selectedEpisode,
+              sourceChunkStart,
+              effectiveChunkDuration || undefined,
+            )
+          : api.getSourceVideoUrl(projectId, selectedEpisode);
+
         if (sourceRetryCount === 0) return base;
-        return `${base}&_retry=${sourceRetryCount}`;
+        const separator = base.includes("?") ? "&" : "?";
+        return `${base}${separator}_retry=${sourceRetryCount}`;
       })()
     : "";
 
@@ -394,24 +695,35 @@ export function ManualMatchModal({
               {selectedEpisode && (
                 <div className="space-y-2">
                   <div className="relative aspect-video bg-black rounded overflow-hidden">
-                    <video
-                      key={sourceVideoUrl}
-                      ref={videoRef}
-                      src={sourceVideoUrl}
-                      className="w-full h-full object-contain"
-                      onTimeUpdate={handleTimeUpdate}
-                      onLoadedMetadata={handleLoadedMetadata}
-                      onCanPlay={() => setSourceHasError(false)}
-                      onPlay={() => setIsPlaying(true)}
-                      onPause={() => setIsPlaying(false)}
-                      onError={() => {
-                        setSourceHasError(true);
-                        setIsPlaying(false);
-                      }}
-                      muted
-                      playsInline
-                      preload="auto"
-                    />
+                    {!sourceDescriptorLoading && sourceDescriptor?.mode === "chunked" && (
+                      <div className="absolute top-2 right-2 z-10 text-[10px] px-1.5 py-0.5 rounded bg-black/60 text-white">
+                        Chunked preview
+                      </div>
+                    )}
+                    {sourceDescriptorLoading ? (
+                      <div className="absolute inset-0 flex items-center justify-center text-xs text-white/80">
+                        Preparing source stream...
+                      </div>
+                    ) : (
+                      <video
+                        key={sourceVideoUrl}
+                        ref={videoRef}
+                        src={sourceVideoUrl}
+                        className="w-full h-full object-contain"
+                        onTimeUpdate={handleTimeUpdate}
+                        onLoadedMetadata={handleLoadedMetadata}
+                        onCanPlay={() => setSourceHasError(false)}
+                        onPlay={() => setIsPlaying(true)}
+                        onPause={() => setIsPlaying(false)}
+                        onError={() => {
+                          setSourceHasError(true);
+                          setIsPlaying(false);
+                        }}
+                        muted
+                        playsInline
+                        preload="auto"
+                      />
+                    )}
                     {sourceHasError && (
                       <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-black/80 text-white">
                         <span className="text-xs">Failed to load source</span>
@@ -434,6 +746,7 @@ export function ManualMatchModal({
                       variant="ghost"
                       size="icon"
                       onClick={handlePlayPause}
+                      disabled={sourceDescriptorLoading}
                     >
                       {isPlaying ? (
                         <Pause className="h-4 w-4" />
@@ -449,6 +762,7 @@ export function ManualMatchModal({
                       value={currentTime}
                       onChange={handleSeek}
                       className="flex-1"
+                      disabled={sourceDescriptorLoading}
                     />
                     <span className="text-sm font-mono w-28 text-right">
                       {formatTime(currentTime)} / {formatTime(duration)}
@@ -500,6 +814,7 @@ export function ManualMatchModal({
                 variant="outline"
                 onClick={handlePreview}
                 className="w-full"
+                disabled={sourceDescriptorLoading}
               >
                 <Play className="h-4 w-4 mr-2" />
                 Preview from Start Time

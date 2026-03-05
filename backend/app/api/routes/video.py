@@ -1,11 +1,16 @@
 import asyncio
-from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import FileResponse
 from pathlib import Path
 from urllib.parse import unquote
 
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import FileResponse
+
 from ...config import settings
-from ...services import ProjectService, AnimeLibraryService
+from ...services import (
+    AnimeLibraryService,
+    ProjectService,
+    SourceChunkStreamingService,
+)
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["video"])
 
@@ -31,12 +36,10 @@ def _is_path_allowed(path: Path, source_dirs: list[Path]) -> bool:
 def _search_episode_sync(episode_name: str, source_dirs: list[Path], video_extensions: set[str]) -> Path | None:
     for src_path in source_dirs:
         if src_path.is_dir():
-            # Try direct child first
             for ext in video_extensions:
                 candidate = src_path / f"{episode_name}{ext}"
                 if candidate.exists():
                     return candidate
-            # Then recursive search
             for ext in video_extensions:
                 for match in src_path.rglob(f"*{ext}"):
                     if match.stem == episode_name:
@@ -44,6 +47,62 @@ def _search_episode_sync(episode_name: str, source_dirs: list[Path], video_exten
         elif src_path.is_file() and src_path.stem == episode_name:
             return src_path
     return None
+
+
+def _build_source_dirs(project) -> list[Path]:
+    if project.source_paths:
+        return [Path(src) for src in project.source_paths]
+    if settings.anime_library_path and settings.anime_library_path.exists():
+        return [settings.anime_library_path]
+    return []
+
+
+async def _resolve_source_path(project, raw_path: str) -> Path:
+    decoded_path = unquote(raw_path)
+    source_path = Path(decoded_path)
+
+    video_extensions = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".m4v"}
+    source_dirs = _build_source_dirs(project)
+
+    if not source_dirs:
+        raise HTTPException(status_code=400, detail="No source paths configured")
+
+    if source_path.is_absolute() and source_path.exists() and _is_path_allowed(source_path, source_dirs):
+        return source_path
+
+    found_path: Path | None = None
+
+    if settings.anime_library_path and settings.anime_library_path.exists():
+        manifest = await AnimeLibraryService.ensure_episode_manifest()
+        candidate = AnimeLibraryService.resolve_episode_path(decoded_path, manifest)
+        if candidate and _is_path_allowed(candidate, source_dirs):
+            found_path = candidate
+
+    if found_path is None:
+        found_path = await asyncio.to_thread(
+            _search_episode_sync,
+            decoded_path,
+            source_dirs,
+            video_extensions,
+        )
+
+    if found_path is None or not found_path.exists():
+        raise HTTPException(status_code=404, detail=f"Source file not found: {decoded_path}")
+
+    return found_path
+
+
+def _media_type_for_path(path: Path) -> str:
+    suffix = path.suffix.lower()
+    media_types = {
+        ".mp4": "video/mp4",
+        ".mkv": "video/x-matroska",
+        ".avi": "video/x-msvideo",
+        ".webm": "video/webm",
+        ".mov": "video/quicktime",
+        ".m4v": "video/mp4",
+    }
+    return media_types.get(suffix, "video/mp4")
 
 
 @router.get("/video")
@@ -83,134 +142,95 @@ async def get_video_info(project_id: str) -> dict:
     }
 
 
+@router.get("/video/source/descriptor")
+async def get_source_video_descriptor(
+    project_id: str,
+    path: str = Query(..., description="Path to the source episode file"),
+) -> dict[str, object]:
+    """Return source streaming descriptor for manual preview workflows."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    source_path = await _resolve_source_path(project, path)
+    return await SourceChunkStreamingService.get_descriptor(source_path)
+
+
+@router.get("/video/source/chunk")
+async def get_source_video_chunk(
+    project_id: str,
+    path: str = Query(..., description="Path to the source episode file"),
+    chunk_start: float = Query(..., ge=0.0, description="Chunk start time in seconds"),
+    chunk_duration: float | None = Query(
+        default=None,
+        gt=0.0,
+        description="Optional chunk duration in seconds",
+    ),
+) -> FileResponse:
+    """Serve one browser-safe source chunk for preview streaming."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    source_path = await _resolve_source_path(project, path)
+    descriptor = await SourceChunkStreamingService.get_descriptor(source_path)
+
+    if descriptor.get("mode") == "passthrough":
+        raise HTTPException(
+            status_code=400,
+            detail="Source is browser-compatible. Use /video/source for direct passthrough.",
+        )
+
+    try:
+        chunk_path = await SourceChunkStreamingService.get_chunk(
+            source_path=source_path,
+            chunk_start=chunk_start,
+            chunk_duration=chunk_duration,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return FileResponse(
+        chunk_path,
+        media_type="video/mp4",
+        headers={
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "public, max-age=86400, immutable",
+        },
+    )
+
+
 @router.get("/video/source")
 async def get_source_video(
     project_id: str,
     path: str = Query(..., description="Path to the source episode file"),
 ) -> FileResponse:
     """
-    Stream a source anime episode file.
+    Stream a source anime episode file when browser-compatible.
 
-    The path can be either:
-    - A full path that matches one of the source_paths or anime_library_path
-    - A short episode name (stem) that will be searched for in source_paths/anime_library_path
+    For non-compatible sources, clients must use the descriptor/chunk endpoints.
     """
     project = ProjectService.load(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # Decode the path
-    decoded_path = unquote(path)
-    source_path = Path(decoded_path)
+    source_path = await _resolve_source_path(project, path)
 
-    VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm", ".mov"}
-
-    # Build list of allowed source directories
-    # Use project source_paths if configured, otherwise fall back to anime_library_path
-    source_dirs: list[Path] = []
-    if project.source_paths:
-        source_dirs = [Path(src) for src in project.source_paths]
-    elif settings.anime_library_path and settings.anime_library_path.exists():
-        source_dirs = [settings.anime_library_path]
-
-    if not source_dirs:
-        raise HTTPException(status_code=400, detail="No source paths configured")
-
-    # First, check if this is a full path that exists and is valid
-    is_valid = False
-    if source_path.is_absolute() and source_path.exists():
-        for src_path in source_dirs:
-            if src_path.is_dir():
-                try:
-                    source_path.relative_to(src_path)
-                    is_valid = True
-                    break
-                except ValueError:
-                    continue
-            elif source_path == src_path:
-                is_valid = True
-                break
-
-    # If not a valid full path, treat as an episode name and search for it
-    if not is_valid:
-        episode_name = decoded_path  # e.g., "[9volt] Hanebado! - 03 [D0B8F455]"
-        found_path = None
-
-        # Fast-path through indexed manifest for anime library lookups.
-        if settings.anime_library_path and settings.anime_library_path.exists():
-            manifest = await AnimeLibraryService.ensure_episode_manifest()
-            candidate = AnimeLibraryService.resolve_episode_path(episode_name, manifest)
-            if candidate and _is_path_allowed(candidate, source_dirs):
-                found_path = candidate
-
-        # Fallback for non-library custom source directories.
-        if found_path is None:
-            found_path = await asyncio.to_thread(
-                _search_episode_sync,
-                episode_name,
-                source_dirs,
-                VIDEO_EXTENSIONS,
-            )
-
-        if found_path:
-            source_path = found_path
-            is_valid = True
-
-    if not is_valid:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Source file not found: {decoded_path}"
-        )
-
-    if not source_path.exists():
-        raise HTTPException(status_code=404, detail="Source file not found")
-
-    # Serve a browser-safe preview proxy when the source codec/container is not
-    # directly playable in the frontend video element.
-    stream_path = await AnimeLibraryService.resolve_source_preview_path(
+    compatible = await asyncio.to_thread(
+        AnimeLibraryService.is_browser_preview_compatible,
         source_path,
-        allow_generate=False,
     )
-    if not stream_path.exists():
-        stream_path = source_path
-
-    # If we had to fall back to the original file for an unsupported source,
-    # generate a preview proxy synchronously. If generation fails, return a
-    # clear 415 instead of serving an unsupported stream that black-screens.
-    if stream_path == source_path:
-        compatible = await asyncio.to_thread(
-            AnimeLibraryService.is_browser_preview_compatible,
-            source_path,
+    if not compatible:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                "Source video is not browser-compatible. "
+                "Use /video/source/descriptor and /video/source/chunk for chunked streaming."
+            ),
         )
-        if not compatible:
-            generated = await asyncio.to_thread(
-                AnimeLibraryService.ensure_preview_proxy_sync,
-                source_path,
-            )
-            if generated is not None and generated.exists():
-                stream_path = generated
-            else:
-                raise HTTPException(
-                    status_code=415,
-                    detail=(
-                        "Source video codec is not browser-compatible and preview "
-                        "proxy generation failed"
-                    ),
-                )
-
-    # Determine media type based on extension
-    suffix = stream_path.suffix.lower()
-    media_types = {
-        ".mp4": "video/mp4",
-        ".mkv": "video/x-matroska",
-        ".avi": "video/x-msvideo",
-        ".webm": "video/webm",
-        ".mov": "video/quicktime",
-    }
-    media_type = media_types.get(suffix, "video/mp4")
 
     return FileResponse(
-        stream_path,
-        media_type=media_type,
+        source_path,
+        media_type=_media_type_for_path(source_path),
         headers={"Accept-Ranges": "bytes"},
     )

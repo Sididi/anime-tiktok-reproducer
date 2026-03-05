@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import math
 import os
 import shutil
 import subprocess
@@ -101,7 +100,11 @@ class MatchPlaybackService:
     FFMPEG_TIMEOUT_SECONDS = 300
     CLIP_ID_TIME_PRECISION = 3
     ULTRA_LONG_SOURCE_SECONDS = 60.0
+    CLIP_STORE_MAX_BYTES = 8 * 1024 * 1024 * 1024
+    CLIP_STORE_STALE_SECONDS = 7 * 24 * 3600
     _prepare_locks: dict[str, asyncio.Lock] = {}
+    _nvenc_checked = False
+    _nvenc_available = False
 
     _PROFILE_MAP: dict[str, _ClipProfile] = {
         "tiktok_fast": _ClipProfile(
@@ -162,6 +165,11 @@ class MatchPlaybackService:
             lock = asyncio.Lock()
             cls._prepare_locks[project_id] = lock
         return lock
+
+    @classmethod
+    def is_prepare_running(cls, project_id: str) -> bool:
+        """Return whether a playback prepare job is currently running."""
+        return cls._get_prepare_lock(project_id).locked()
 
     @staticmethod
     def _dump_json_stable(payload: object) -> str:
@@ -550,30 +558,84 @@ class MatchPlaybackService:
         return duration
 
     @classmethod
-    def _encode_clip_sync(
+    def _is_nvenc_available_sync(cls) -> bool:
+        if cls._nvenc_checked:
+            return cls._nvenc_available
+
+        cls._nvenc_checked = True
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-encoders"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            cls._nvenc_available = False
+            return False
+
+        cls._nvenc_available = (
+            result.returncode == 0 and "h264_nvenc" in result.stdout
+        )
+        return cls._nvenc_available
+
+    @classmethod
+    def _build_nvenc_command_sync(
         cls,
         *,
-        project_id: str,
         plan: _ClipPlan,
-    ) -> float:
-        if plan.end_time <= plan.start_time:
-            raise RuntimeError("Invalid clip timing: end_time <= start_time")
+        profile: _ClipProfile,
+        duration: float,
+        vf: str,
+        output_path: Path,
+    ) -> list[str]:
+        return [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-ss",
+            f"{plan.start_time:.6f}",
+            "-i",
+            str(plan.input_path),
+            "-t",
+            f"{duration:.6f}",
+            "-map",
+            "0:v:0",
+            "-an",
+            "-sn",
+            "-dn",
+            "-vf",
+            vf,
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p5",
+            "-rc",
+            "constqp",
+            "-qp",
+            str(profile.crf),
+            "-profile:v",
+            "high",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
 
-        profile = cls._PROFILE_MAP[plan.profile]
-        output_path = cls._clip_file(project_id, plan.clip_id)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        duration = plan.end_time - plan.start_time
-        tmp_path = output_path.with_suffix(".tmp.mp4")
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
-
-        vf = (
-            f"scale=w={profile.width}:h={profile.height}:"
-            f"force_original_aspect_ratio=decrease,fps={profile.fps}"
-        )
-
-        cmd = [
+    @classmethod
+    def _build_cpu_command_sync(
+        cls,
+        *,
+        plan: _ClipPlan,
+        profile: _ClipProfile,
+        duration: float,
+        vf: str,
+        output_path: Path,
+    ) -> list[str]:
+        return [
             "ffmpeg",
             "-y",
             "-v",
@@ -601,20 +663,81 @@ class MatchPlaybackService:
             "yuv420p",
             "-movflags",
             "+faststart",
-            str(tmp_path),
+            str(output_path),
         ]
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=cls.FFMPEG_TIMEOUT_SECONDS,
+    @classmethod
+    def _encode_clip_sync(
+        cls,
+        *,
+        project_id: str,
+        plan: _ClipPlan,
+    ) -> float:
+        if plan.end_time <= plan.start_time:
+            raise RuntimeError("Invalid clip timing: end_time <= start_time")
+
+        profile = cls._PROFILE_MAP[plan.profile]
+        output_path = cls._clip_file(project_id, plan.clip_id)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        duration = plan.end_time - plan.start_time
+        tmp_path = output_path.with_suffix(".tmp.mp4")
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+        vf = (
+            f"scale=w={profile.width}:h={profile.height}:"
+            f"force_original_aspect_ratio=decrease,fps={profile.fps}"
         )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"ffmpeg failed for {plan.clip_id}: {result.stderr.strip() or 'unknown error'}"
+
+        error_details: list[str] = []
+        encoded = False
+
+        if cls._is_nvenc_available_sync():
+            nvenc_cmd = cls._build_nvenc_command_sync(
+                plan=plan,
+                profile=profile,
+                duration=duration,
+                vf=vf,
+                output_path=tmp_path,
             )
+            result = subprocess.run(
+                nvenc_cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=cls.FFMPEG_TIMEOUT_SECONDS,
+            )
+            if result.returncode == 0:
+                encoded = True
+            else:
+                error_details.append(
+                    f"nvenc: {result.stderr.strip() or 'unknown error'}"
+                )
+                tmp_path.unlink(missing_ok=True)
+
+        if not encoded:
+            cpu_cmd = cls._build_cpu_command_sync(
+                plan=plan,
+                profile=profile,
+                duration=duration,
+                vf=vf,
+                output_path=tmp_path,
+            )
+            result = subprocess.run(
+                cpu_cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=cls.FFMPEG_TIMEOUT_SECONDS,
+            )
+            if result.returncode != 0:
+                error_details.append(
+                    f"cpu: {result.stderr.strip() or 'unknown error'}"
+                )
+                raise RuntimeError(
+                    f"ffmpeg failed for {plan.clip_id}: {' | '.join(error_details)}"
+                )
 
         tmp_path.replace(output_path)
         validated_duration = cls._validate_clip_sync(output_path)
@@ -731,9 +854,9 @@ class MatchPlaybackService:
             reverse=True,
         )
 
-        # Keep active/current plus two recent manifests for safe fingerprint transition.
+        # Keep active/current plus one recent manifest for safer transition.
         keep_manifest_names: set[str] = {f"{fingerprint}.json" for fingerprint in keep_fingerprints}
-        for path in manifest_files[:2]:
+        for path in manifest_files[:1]:
             keep_manifest_names.add(path.name)
 
         for path in manifest_files:
@@ -742,12 +865,16 @@ class MatchPlaybackService:
             path.unlink(missing_ok=True)
 
         referenced_clip_ids: set[str] = set()
+        active_clip_ids: set[str] = set()
         for path in manifests_dir.glob("*.json"):
             try:
                 manifest = json.loads(path.read_text())
             except (OSError, json.JSONDecodeError):
                 continue
-            referenced_clip_ids.update(cls._collect_clip_ids_from_manifest(manifest))
+            manifest_clip_ids = cls._collect_clip_ids_from_manifest(manifest)
+            referenced_clip_ids.update(manifest_clip_ids)
+            if path.stem in keep_fingerprints:
+                active_clip_ids.update(manifest_clip_ids)
 
         for clip_path in clip_dir.glob("*.mp4"):
             clip_id = clip_path.stem
@@ -756,6 +883,52 @@ class MatchPlaybackService:
             clip_path.unlink(missing_ok=True)
             meta_path = cls._clip_meta_file(project_id, clip_id)
             meta_path.unlink(missing_ok=True)
+
+        remaining_entries: list[tuple[Path, os.stat_result]] = []
+        total_size = 0
+        for clip_path in clip_dir.glob("*.mp4"):
+            try:
+                stat = clip_path.stat()
+            except OSError:
+                continue
+            remaining_entries.append((clip_path, stat))
+            total_size += stat.st_size
+
+        stale_cutoff = datetime.now(timezone.utc).timestamp() - cls.CLIP_STORE_STALE_SECONDS
+        for clip_path, stat in list(remaining_entries):
+            clip_id = clip_path.stem
+            atime = stat.st_atime if stat.st_atime > 0 else stat.st_mtime
+            if clip_id in active_clip_ids or atime >= stale_cutoff:
+                continue
+            clip_path.unlink(missing_ok=True)
+            cls._clip_meta_file(project_id, clip_id).unlink(missing_ok=True)
+
+        remaining_entries = []
+        total_size = 0
+        for clip_path in clip_dir.glob("*.mp4"):
+            try:
+                stat = clip_path.stat()
+            except OSError:
+                continue
+            remaining_entries.append((clip_path, stat))
+            total_size += stat.st_size
+
+        if total_size <= cls.CLIP_STORE_MAX_BYTES:
+            return
+
+        # Evict least-recently-used non-active clips if cache exceeds cap.
+        evictable_entries = [
+            (clip_path, stat)
+            for clip_path, stat in remaining_entries
+            if clip_path.stem not in active_clip_ids
+        ]
+        evictable_entries.sort(key=lambda item: item[1].st_atime)
+        for clip_path, stat in evictable_entries:
+            if total_size <= cls.CLIP_STORE_MAX_BYTES:
+                break
+            clip_path.unlink(missing_ok=True)
+            cls._clip_meta_file(project_id, clip_path.stem).unlink(missing_ok=True)
+            total_size -= stat.st_size
 
     @classmethod
     async def _run_clip_jobs(
@@ -772,20 +945,29 @@ class MatchPlaybackService:
         for plan in clip_plans:
             unique_plans.setdefault(plan.clip_id, plan)
 
-        global_sem = asyncio.Semaphore(max_workers)
+        ordered_plans = sorted(
+            unique_plans.values(),
+            key=lambda plan: (
+                0 if plan.track == "tiktok" else 1,
+                plan.source_key or "",
+                plan.scene_index,
+            ),
+        )
+
+        global_sem = asyncio.Semaphore(max(1, max_workers))
         episode_sems: dict[str, asyncio.Semaphore] = {}
+        per_episode_limit = max(1, int(settings.match_playback_max_workers_per_episode))
 
         async def run_one(plan: _ClipPlan) -> _ClipJobResult:
             output_path = cls._clip_file(project_id, plan.clip_id)
 
             async with global_sem:
                 source_sem: asyncio.Semaphore | None = None
-                if (
-                    plan.track == "source"
-                    and plan.duration > cls.ULTRA_LONG_SOURCE_SECONDS
-                    and plan.source_key
-                ):
-                    source_sem = episode_sems.setdefault(plan.source_key, asyncio.Semaphore(1))
+                if plan.track == "source" and plan.source_key:
+                    source_sem = episode_sems.setdefault(
+                        plan.source_key,
+                        asyncio.Semaphore(per_episode_limit),
+                    )
 
                 if source_sem:
                     await source_sem.acquire()
@@ -811,7 +993,7 @@ class MatchPlaybackService:
                     if source_sem:
                         source_sem.release()
 
-        tasks = [asyncio.create_task(run_one(plan)) for plan in unique_plans.values()]
+        tasks = [asyncio.create_task(run_one(plan)) for plan in ordered_plans]
         for completed in asyncio.as_completed(tasks):
             yield await completed
 
@@ -1079,8 +1261,11 @@ class MatchPlaybackService:
         scene_status_map: dict[int, str] = {scene.index: "ready" for scene in scenes.scenes}
         scene_error_map: dict[int, str | None] = {scene.index: None for scene in scenes.scenes}
 
-        worker_count = min(4, max(2, math.floor((os.cpu_count() or 2) / 2)))
         total_missing = len(missing_plans)
+        worker_count = min(
+            max(1, int(settings.match_playback_max_workers)),
+            max(total_missing, 1),
+        )
         completed_missing = 0
 
         async for job in cls._run_clip_jobs(
@@ -1358,7 +1543,10 @@ class MatchPlaybackService:
 
         total_missing = len(missing_target)
         completed_missing = 0
-        worker_count = 1 if total_missing <= 1 else 2
+        worker_count = min(
+            max(1, int(settings.match_playback_max_workers)),
+            max(total_missing, 1),
+        )
 
         async for job in cls._run_clip_jobs(
             project_id,

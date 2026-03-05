@@ -27,7 +27,7 @@ import type { ClippedVideoPlayerHandle } from "@/components/video/ClippedVideoPl
 import { useProjectStore, useSceneStore } from "@/stores";
 import { api } from "@/api/client";
 import { cn, formatTime } from "@/utils";
-import type { Scene } from "@/types";
+import type { Scene, SourceStreamDescriptor } from "@/types";
 
 interface GapInfo {
   scene_index: number;
@@ -54,6 +54,7 @@ interface GapCandidate {
 }
 
 const CANDIDATE_MATCH_EPSILON = 1e-4;
+const MAX_DYNAMIC_CHUNK_SECONDS = 120;
 
 interface GapCardProps {
   gap: GapInfo;
@@ -111,18 +112,168 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
   const pendingResolverRef = useRef<(() => void) | null>(null);
   const pendingTimeoutRef = useRef<number | null>(null);
   const endedRef = useRef({ tiktok: false, source: false });
+  const [sourceDescriptor, setSourceDescriptor] =
+    useState<SourceStreamDescriptor | null>(null);
+  const [sourceDescriptorLoading, setSourceDescriptorLoading] = useState(false);
+  const [sourceChunkStart, setSourceChunkStart] = useState(0);
+  const [sourceChunkDuration, setSourceChunkDuration] = useState(0);
 
   const tiktokVideoUrl = api.getVideoUrl(projectId);
-  const sourceVideoUrl = api.getSourceVideoUrl(projectId, gap.episode);
   const hasPlayableScene = Boolean(scene);
 
   // Use resolved timing if available, otherwise current
   const displayStart = resolvedTiming?.start ?? gap.current_start;
   const displayEnd = resolvedTiming?.end ?? gap.current_end;
   const displaySpeed = resolvedTiming?.speed ?? gap.effective_speed;
+  const sourceClipDuration = Math.max(0.1, displayEnd - displayStart);
 
   // Calculate if still has gap after resolution
   const hasGapAfterResolution = displaySpeed < 0.75;
+  const isChunkedSource = sourceDescriptor?.mode === "chunked";
+
+  const getChunkWindowStart = useCallback(
+    (
+      targetTime: number,
+      descriptor: SourceStreamDescriptor,
+      windowDuration: number,
+    ): number => {
+      const boundedDuration = Math.min(
+        Math.max(windowDuration, descriptor.chunk_duration),
+        MAX_DYNAMIC_CHUNK_SECONDS,
+      );
+      const maxStart = Math.max((descriptor.duration || 0) - boundedDuration, 0);
+      const boundedTarget = Math.min(
+        Math.max(targetTime, 0),
+        descriptor.duration || targetTime,
+      );
+      const centered = Math.max(boundedTarget - boundedDuration / 2, 0);
+      const step = Math.max(descriptor.chunk_step || 0.001, 0.001);
+      const snapped = Math.floor(centered / step) * step;
+      return Math.min(Math.max(snapped, 0), maxStart);
+    },
+    [],
+  );
+
+  /* eslint-disable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
+  useEffect(() => {
+    let active = true;
+    setSourceDescriptorLoading(true);
+
+    void api
+      .getSourceDescriptor(projectId, gap.episode)
+      .then((descriptor) => {
+        if (!active) return;
+        setSourceDescriptor(descriptor);
+
+        if (descriptor.mode === "chunked") {
+          const desiredDuration = Math.min(
+            Math.max(
+              descriptor.chunk_duration,
+              sourceClipDuration + descriptor.seek_guard_seconds * 2,
+            ),
+            MAX_DYNAMIC_CHUNK_SECONDS,
+          );
+          const centeredTarget = (displayStart + displayEnd) / 2;
+          setSourceChunkDuration(desiredDuration);
+          setSourceChunkStart(
+            getChunkWindowStart(centeredTarget, descriptor, desiredDuration),
+          );
+        } else {
+          setSourceChunkDuration(0);
+          setSourceChunkStart(0);
+        }
+      })
+      .catch(() => {
+        if (!active) return;
+        setSourceDescriptor(null);
+      })
+      .finally(() => {
+        if (!active) return;
+        setSourceDescriptorLoading(false);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [
+    gap.episode,
+    getChunkWindowStart,
+    projectId,
+  ]);
+
+  useEffect(() => {
+    if (!sourceDescriptor || sourceDescriptor.mode !== "chunked") return;
+
+    const duration =
+      sourceChunkDuration > 0 ? sourceChunkDuration : sourceDescriptor.chunk_duration;
+    const guard = sourceDescriptor.seek_guard_seconds;
+    const safeStart = sourceChunkStart + guard;
+    const safeEnd = sourceChunkStart + duration - guard;
+
+    if (displayStart >= safeStart && displayEnd <= safeEnd) {
+      return;
+    }
+
+    const requestedDuration = Math.min(
+      Math.max(
+        sourceDescriptor.chunk_duration,
+        sourceClipDuration + guard * 2,
+      ),
+      MAX_DYNAMIC_CHUNK_SECONDS,
+    );
+    const centeredTarget = (displayStart + displayEnd) / 2;
+    setSourceChunkDuration(requestedDuration);
+    setSourceChunkStart(
+      getChunkWindowStart(centeredTarget, sourceDescriptor, requestedDuration),
+    );
+  }, [
+    displayEnd,
+    displayStart,
+    getChunkWindowStart,
+    sourceChunkDuration,
+    sourceChunkStart,
+    sourceClipDuration,
+    sourceDescriptor,
+  ]);
+  /* eslint-enable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
+
+  const sourceVideoUrl = useMemo(() => {
+    if (isChunkedSource && sourceDescriptor) {
+      const duration =
+        sourceChunkDuration > 0
+          ? sourceChunkDuration
+          : sourceDescriptor.chunk_duration;
+      return api.getSourceChunkUrl(
+        projectId,
+        gap.episode,
+        sourceChunkStart,
+        duration,
+      );
+    }
+    return api.getSourceVideoUrl(projectId, gap.episode);
+  }, [
+    gap.episode,
+    isChunkedSource,
+    projectId,
+    sourceChunkDuration,
+    sourceChunkStart,
+    sourceDescriptor,
+  ]);
+
+  const sourceStartForPlayer = isChunkedSource
+    ? Math.max(0, displayStart - sourceChunkStart)
+    : displayStart;
+  const sourceEndForPlayer = isChunkedSource
+    ? Math.max(
+        sourceStartForPlayer + 0.05,
+        Math.min(
+          displayEnd - sourceChunkStart,
+          (sourceChunkDuration > 0
+            ? sourceChunkDuration
+            : sourceDescriptor?.chunk_duration || displayEnd),
+        ),
+      )
+    : displayEnd;
 
   const fastWatchMinReadyState =
     playbackRate >= 3
@@ -391,19 +542,26 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
             Source: {gap.episode.split("/").pop()}
           </p>
           <div className="aspect-9/16 bg-black rounded overflow-hidden">
-            <ClippedVideoPlayer
-              ref={sourcePlayerRef}
-              src={sourceVideoUrl}
-              startTime={displayStart}
-              endTime={displayEnd}
-              className={cn(
-                "w-full h-full",
-                controlsDisabled && "pointer-events-none",
-              )}
-              playbackRate={playbackRate}
-              eager={preloadMode === "auto"}
-              onClipEnded={() => handleClipEnded("source")}
-            />
+            {sourceDescriptorLoading ? (
+              <div className="w-full h-full flex items-center justify-center text-xs text-white/70">
+                <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                Preparing source stream...
+              </div>
+            ) : (
+              <ClippedVideoPlayer
+                ref={sourcePlayerRef}
+                src={sourceVideoUrl}
+                startTime={sourceStartForPlayer}
+                endTime={sourceEndForPlayer}
+                className={cn(
+                  "w-full h-full",
+                  controlsDisabled && "pointer-events-none",
+                )}
+                playbackRate={playbackRate}
+                eager={preloadMode === "auto"}
+                onClipEnded={() => handleClipEnded("source")}
+              />
+            )}
           </div>
           <div className="flex items-center justify-between mt-1">
             <p className="text-xs text-[hsl(var(--muted-foreground))]">

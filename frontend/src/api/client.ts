@@ -298,6 +298,27 @@ export const api = {
   getSourceVideoUrl: (projectId: string, episodePath: string) =>
     `${API_BASE}/projects/${projectId}/video/source?path=${encodeURIComponent(episodePath)}`,
 
+  getSourceDescriptor: (projectId: string, episodePath: string) =>
+    request<import("@/types").SourceStreamDescriptor>(
+      `/projects/${projectId}/video/source/descriptor?path=${encodeURIComponent(episodePath)}`,
+    ),
+
+  getSourceChunkUrl: (
+    projectId: string,
+    episodePath: string,
+    chunkStart: number,
+    chunkDuration?: number,
+  ) => {
+    const params = new URLSearchParams({
+      path: episodePath,
+      chunk_start: String(chunkStart),
+    });
+    if (chunkDuration !== undefined) {
+      params.set("chunk_duration", String(chunkDuration));
+    }
+    return `${API_BASE}/projects/${projectId}/video/source/chunk?${params.toString()}`;
+  },
+
   // Transcription
   startTranscription: (projectId: string, language = "auto") => {
     return fetch(`${API_BASE}/projects/${projectId}/transcription/start`, {

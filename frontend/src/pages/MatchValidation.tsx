@@ -68,9 +68,10 @@ interface MatchCardProps {
   episodes: string[];
   playbackAsset: ScenePlaybackSceneAsset | null;
   isActive?: boolean;
+  mediaEnabled?: boolean;
   playbackRate?: number;
   controlsDisabled?: boolean;
-  preloadMode?: "metadata" | "auto";
+  preloadMode?: "none" | "metadata" | "auto";
   onManualMatch: (
     sceneIndex: number,
     episode: string,
@@ -85,6 +86,9 @@ interface MatchCardProps {
   warningMessage?: string | null;
   onUndoMerge?: (sceneIndex: number) => void;
 }
+
+const MAX_MEDIA_SCENES = 16;
+const MEDIA_OBSERVER_ROOT_MARGIN = "600px";
 
 interface MatchCardHandle {
   playBothAndWait: () => Promise<void>;
@@ -102,6 +106,7 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
       episodes,
       playbackAsset,
       isActive = false,
+      mediaEnabled = true,
       playbackRate = 1,
       controlsDisabled = false,
       preloadMode = "metadata",
@@ -258,7 +263,7 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
     ]);
 
     const prepareForAutoplay = useCallback(async () => {
-      if (!hasMatch) return true;
+      if (!hasMatch || !mediaEnabled) return false;
 
       const tiktok = tiktokPlayerRef.current;
       const source = sourcePlayerRef.current;
@@ -285,7 +290,13 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
       loadFailureRef.current = false;
       primedForFastWatchRef.current = true;
       return true;
-    }, [hasMatch, fastWatchReadyTimeoutMs, warmupPair, recoverPairLoadOnce]);
+    }, [
+      hasMatch,
+      mediaEnabled,
+      fastWatchReadyTimeoutMs,
+      warmupPair,
+      recoverPairLoadOnce,
+    ]);
 
     const releasePreload = useCallback(() => {
       primedForFastWatchRef.current = false;
@@ -316,7 +327,7 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
     }, []);
 
     const playBothAndWait = useCallback(async () => {
-      if (!hasMatch) return;
+      if (!hasMatch || !mediaEnabled) return;
       if (loadFailureRef.current) return;
 
       await playBothFromStart();
@@ -377,7 +388,7 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
           }
         }, 15000);
       });
-    }, [hasMatch, playBothFromStart]);
+    }, [hasMatch, mediaEnabled, playBothFromStart]);
 
     useImperativeHandle(
       ref,
@@ -456,7 +467,11 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
               TikTok Clip
             </p>
             <div className="aspect-[9/16] bg-black rounded overflow-hidden flex items-center justify-center">
-              {tiktokVideoUrl ? (
+              {!mediaEnabled ? (
+                <div className="text-xs text-[hsl(var(--muted-foreground))] text-center px-3">
+                  Media deferred (lazy window)
+                </div>
+              ) : tiktokVideoUrl ? (
                 <MatchesClipPlayer
                   ref={tiktokPlayerRef}
                   src={tiktokVideoUrl}
@@ -493,6 +508,10 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
                 <div className="flex flex-col items-center gap-2 text-[hsl(var(--muted-foreground))] p-4">
                   <Loader2 className="h-6 w-6 animate-spin text-[hsl(var(--primary))]" />
                   <p className="text-xs text-center">{pendingUpdate.message}</p>
+                </div>
+              ) : !mediaEnabled && hasMatch ? (
+                <div className="text-xs text-[hsl(var(--muted-foreground))] text-center px-3">
+                  Media deferred (lazy window)
                 </div>
               ) : hasMatch && sourceVideoUrl ? (
                 <MatchesClipPlayer
@@ -608,6 +627,7 @@ export function MatchValidation() {
     useState<PlaybackPrepareProgress | null>(null);
   const [playbackManifest, setPlaybackManifest] =
     useState<MatchesPlaybackManifest | null>(null);
+  const isPlaybackReady = Boolean(playbackManifest?.ready);
   const [playbackError, setPlaybackError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pendingSceneUpdates, setPendingSceneUpdates] = useState<
@@ -629,12 +649,16 @@ export function MatchValidation() {
   const [autoScroll, setAutoScroll] = useState(true);
   const [fastWatchPlaying, setFastWatchPlaying] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1);
+  const [visibleSceneIndices, setVisibleSceneIndices] = useState<Set<number>>(
+    () => new Set(),
+  );
   const sceneRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const cardRefs = useRef<Map<number, MatchCardHandle>>(new Map());
   const autoplayTokenRef = useRef(0);
   const preparedScenesRef = useRef<Set<number>>(new Set());
   const failedPreparedScenesRef = useRef<Set<number>>(new Set());
   const preparingScenesRef = useRef<Map<number, Promise<void>>>(new Map());
+  const mediaEnabledSceneIndicesRef = useRef<Set<number>>(new Set());
   const prefetchQueueRef = useRef<Promise<void>>(Promise.resolve());
   const preparePlaybackInFlightRef = useRef<Promise<void> | null>(null);
   const autoScrollRef = useRef(true);
@@ -683,6 +707,9 @@ export function MatchValidation() {
       if (autoplayTokenRef.current !== token) {
         return Promise.resolve();
       }
+      if (!mediaEnabledSceneIndicesRef.current.has(sceneIndex)) {
+        return Promise.resolve();
+      }
       if (failedPreparedScenesRef.current.has(sceneIndex)) {
         return Promise.resolve();
       }
@@ -703,8 +730,13 @@ export function MatchValidation() {
       const promise = card
         .prepareForAutoplay()
         .then((isPrepared) => {
-          if (autoplayTokenRef.current !== token) {
+          if (
+            autoplayTokenRef.current !== token ||
+            !mediaEnabledSceneIndicesRef.current.has(sceneIndex)
+          ) {
             card.releasePreload();
+            preparedScenesRef.current.delete(sceneIndex);
+            failedPreparedScenesRef.current.delete(sceneIndex);
             return;
           }
           if (!isPrepared) {
@@ -919,15 +951,35 @@ export function MatchValidation() {
       }
 
       const run = (async () => {
-        setPlaybackPreparing(true);
         setPlaybackError(null);
-        setPlaybackProgress({
-          status: "scanning",
-          progress: 0,
-          message: "Preparing playback clips...",
-        });
-
         try {
+          if (!force) {
+            let existingManifest: MatchesPlaybackManifest | null = null;
+            try {
+              existingManifest = await api.getMatchesPlaybackManifest(projectId);
+            } catch {
+              existingManifest = null;
+            }
+            if (existingManifest?.ready) {
+              setPlaybackManifest(existingManifest);
+              setPlaybackProgress({
+                status: "complete",
+                progress: 1,
+                message: "Playback clips ready",
+                manifest: existingManifest,
+                cached: true,
+              });
+              return;
+            }
+          }
+
+          setPlaybackPreparing(true);
+          setPlaybackProgress({
+            status: "scanning",
+            progress: 0,
+            message: "Preparing playback clips...",
+          });
+
           const response = await api.prepareMatchesPlayback(projectId, force);
           const lastEvent = await readSSEStream<PlaybackPrepareProgress>(
             response,
@@ -1008,7 +1060,24 @@ export function MatchValidation() {
         }));
         setMatches(matchesWithTracking);
         if (matchesWithTracking.length > 0) {
-          void preparePlaybackClips(false);
+          try {
+            const manifest = await api.getMatchesPlaybackManifest(projectId);
+            if (manifest.ready) {
+              setPlaybackManifest(manifest);
+              setPlaybackError(null);
+              setPlaybackProgress({
+                status: "complete",
+                progress: 1,
+                message: "Playback clips ready",
+                manifest,
+                cached: true,
+              });
+            } else {
+              void preparePlaybackClips(false);
+            }
+          } catch {
+            void preparePlaybackClips(false);
+          }
         } else {
           setPlaybackManifest(null);
           setPlaybackProgress(null);
@@ -1050,6 +1119,107 @@ export function MatchValidation() {
       return scenes[0].index;
     });
   }, [scenes]);
+
+  useEffect(() => {
+    if (!isPlaybackReady || scenes.length === 0) {
+      setVisibleSceneIndices(() => new Set());
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        setVisibleSceneIndices((prev) => {
+          const next = new Set(prev);
+          let changed = false;
+          for (const entry of entries) {
+            const rawSceneIndex = (entry.target as HTMLElement).dataset.sceneIndex;
+            if (!rawSceneIndex) continue;
+            const sceneIndex = Number(rawSceneIndex);
+            if (!Number.isFinite(sceneIndex)) continue;
+
+            if (entry.isIntersecting) {
+              if (!next.has(sceneIndex)) {
+                next.add(sceneIndex);
+                changed = true;
+              }
+            } else if (next.delete(sceneIndex)) {
+              changed = true;
+            }
+          }
+          return changed ? next : prev;
+        });
+      },
+      {
+        root: null,
+        rootMargin: MEDIA_OBSERVER_ROOT_MARGIN,
+        threshold: 0.01,
+      },
+    );
+
+    for (const element of sceneRefs.current.values()) {
+      observer.observe(element);
+    }
+
+    return () => {
+      observer.disconnect();
+    };
+  }, [isPlaybackReady, scenes]);
+
+  useEffect(() => {
+    if (!isPlaybackReady || fastWatchPlaying || scenes.length === 0) {
+      return;
+    }
+
+    let rafId: number | null = null;
+    const viewportBufferPx = 220;
+
+    const syncActiveSceneFromViewport = () => {
+      rafId = null;
+      const viewportCenter = window.innerHeight / 2;
+      let bestSceneIndex: number | null = null;
+      let bestDistance = Number.POSITIVE_INFINITY;
+
+      for (const [sceneIndex, element] of sceneRefs.current.entries()) {
+        const rect = element.getBoundingClientRect();
+        if (
+          rect.bottom < -viewportBufferPx ||
+          rect.top > window.innerHeight + viewportBufferPx
+        ) {
+          continue;
+        }
+
+        const sceneCenter = (rect.top + rect.bottom) / 2;
+        const distance = Math.abs(sceneCenter - viewportCenter);
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          bestSceneIndex = sceneIndex;
+        }
+      }
+
+      if (bestSceneIndex !== null) {
+        setActiveSceneIndex((previous) =>
+          previous === bestSceneIndex ? previous : bestSceneIndex,
+        );
+      }
+    };
+
+    const requestSync = () => {
+      if (rafId !== null) return;
+      rafId = window.requestAnimationFrame(syncActiveSceneFromViewport);
+    };
+
+    requestSync();
+    window.addEventListener("scroll", requestSync, { passive: true });
+    window.addEventListener("resize", requestSync);
+
+    return () => {
+      if (rafId !== null) {
+        window.cancelAnimationFrame(rafId);
+      }
+      window.removeEventListener("scroll", requestSync);
+      window.removeEventListener("resize", requestSync);
+    };
+  }, [isPlaybackReady, fastWatchPlaying, scenes]);
 
   useEffect(() => {
     if (matches.length > 0) return;
@@ -1485,18 +1655,112 @@ export function MatchValidation() {
   ).length;
   const totalCount = matches.length;
   const allConfirmed = totalCount > 0 && confirmedCount === totalCount;
+  const canContinueToTranscription =
+    allConfirmed && isPlaybackReady && !playbackPreparing && !playbackError;
 
   const handleContinue = () => {
+    if (!canContinueToTranscription) {
+      return;
+    }
     if (projectId) {
       navigate(`/project/${projectId}/transcription`);
     }
   };
 
+  const scenePositionByIndex = useMemo(() => {
+    const map = new Map<number, number>();
+    scenes.forEach((scene, position) => {
+      map.set(scene.index, position);
+    });
+    return map;
+  }, [scenes]);
+
   const activeScenePosition = useMemo(() => {
     if (scenes.length === 0) return 0;
-    const index = scenes.findIndex((scene) => scene.index === activeSceneIndex);
+    const index = scenePositionByIndex.get(activeSceneIndex) ?? -1;
     return index >= 0 ? index : 0;
-  }, [scenes, activeSceneIndex]);
+  }, [scenes, scenePositionByIndex, activeSceneIndex]);
+
+  const mediaEnabledSceneIndices = useMemo(() => {
+    const enabled = new Set<number>();
+    if (!isPlaybackReady || scenes.length === 0) {
+      return enabled;
+    }
+
+    const maxEnabledScenes = Math.min(MAX_MEDIA_SCENES, scenes.length);
+    const activePosition =
+      activeSceneIndex >= 0
+        ? (scenePositionByIndex.get(activeSceneIndex) ?? 0)
+        : 0;
+
+    const addScene = (sceneIndex?: number) => {
+      if (sceneIndex === undefined) return;
+      if (scenePositionByIndex.has(sceneIndex)) {
+        enabled.add(sceneIndex);
+      }
+    };
+
+    if (activeSceneIndex >= 0) {
+      addScene(activeSceneIndex);
+    } else {
+      addScene(scenes[0]?.index);
+    }
+
+    if (fastWatchPlaying) {
+      for (let offset = 0; offset <= fastWatchPrefetchAhead; offset += 1) {
+        addScene(scenes[activePosition + offset]?.index);
+      }
+    }
+
+    const visibleOrdered = Array.from(visibleSceneIndices).sort((left, right) => {
+      const leftPos = scenePositionByIndex.get(left) ?? Number.MAX_SAFE_INTEGER;
+      const rightPos =
+        scenePositionByIndex.get(right) ?? Number.MAX_SAFE_INTEGER;
+      const leftDistance = Math.abs(leftPos - activePosition);
+      const rightDistance = Math.abs(rightPos - activePosition);
+      if (leftDistance !== rightDistance) {
+        return leftDistance - rightDistance;
+      }
+      return leftPos - rightPos;
+    });
+
+    for (const sceneIndex of visibleOrdered) {
+      if (enabled.size >= maxEnabledScenes) break;
+      addScene(sceneIndex);
+    }
+
+    for (
+      let radius = 0;
+      radius < scenes.length && enabled.size < maxEnabledScenes;
+      radius += 1
+    ) {
+      addScene(scenes[activePosition - radius]?.index);
+      if (enabled.size >= maxEnabledScenes) break;
+      if (radius > 0) {
+        addScene(scenes[activePosition + radius]?.index);
+      }
+    }
+
+    return enabled;
+  }, [
+    activeSceneIndex,
+    fastWatchPlaying,
+    fastWatchPrefetchAhead,
+    isPlaybackReady,
+    scenePositionByIndex,
+    scenes,
+    visibleSceneIndices,
+  ]);
+  mediaEnabledSceneIndicesRef.current = mediaEnabledSceneIndices;
+
+  useEffect(() => {
+    for (const [sceneIndex, card] of cardRefs.current.entries()) {
+      if (mediaEnabledSceneIndices.has(sceneIndex)) continue;
+      card.releasePreload();
+      preparedScenesRef.current.delete(sceneIndex);
+      failedPreparedScenesRef.current.delete(sceneIndex);
+    }
+  }, [mediaEnabledSceneIndices]);
 
   const hasAnyMatch = useMemo(
     () => matches.some((match) => match.confidence > 0 && match.episode),
@@ -1506,8 +1770,6 @@ export function MatchValidation() {
   const matchesBySceneIndex = useMemo(() => {
     return new Map(matches.map((match) => [match.scene_index, match]));
   }, [matches]);
-
-  const isPlaybackReady = Boolean(playbackManifest?.ready);
 
   const playbackBySceneIndex = useMemo(() => {
     if (!playbackManifest?.scenes) return new Map<number, ScenePlaybackSceneAsset>();
@@ -1642,7 +1904,10 @@ export function MatchValidation() {
                   );
                 })()}
               </div>
-              <Button onClick={handleContinue} disabled={!allConfirmed}>
+              <Button
+                onClick={handleContinue}
+                disabled={!canContinueToTranscription}
+              >
                 Continue to Transcription
               </Button>
             </div>
@@ -1753,11 +2018,13 @@ export function MatchValidation() {
           {scenes.map((scene, scenePosition) => {
             const match = matchesBySceneIndex.get(scene.index);
             if (!match) return null;
+            const mediaEnabled = mediaEnabledSceneIndices.has(scene.index);
 
             return (
               <div
                 key={scene.index}
                 className="[content-visibility:auto] [contain-intrinsic-size:960px]"
+                data-scene-index={scene.index}
                 ref={(el) => {
                   if (el) sceneRefs.current.set(scene.index, el);
                   else sceneRefs.current.delete(scene.index);
@@ -1774,10 +2041,13 @@ export function MatchValidation() {
                   episodes={episodes}
                   playbackAsset={playbackBySceneIndex.get(scene.index) ?? null}
                   isActive={activeSceneIndex === scene.index}
+                  mediaEnabled={mediaEnabled}
                   playbackRate={playbackRate}
                   controlsDisabled={fastWatchPlaying}
                   preloadMode={
-                    Math.abs(scenePosition - activeScenePosition) <= 2
+                    !mediaEnabled
+                      ? "none"
+                      : Math.abs(scenePosition - activeScenePosition) <= 2
                       ? "auto"
                       : "metadata"
                   }
@@ -1853,7 +2123,7 @@ export function MatchValidation() {
               <Button
                 size="sm"
                 onClick={handleContinue}
-                disabled={!allConfirmed}
+                disabled={!canContinueToTranscription}
                 className="w-full sm:w-auto"
               >
                 Continue to Transcription
