@@ -14,7 +14,7 @@ A web application to remaster TikTok videos featuring anime content for other sh
 6. **Match Validation** - Side-by-side comparison of TikTok and source clips
 7. **Transcription** - Word-level transcription using WhisperX
 8. **Script Restructure** - AI-assisted script rewriting with duration constraints
-9. **Processing** - Auto-editor silence removal and Premiere Pro project generation
+9. **Processing** - Auto-editor silence removal and Premiere Pro JSX project generation
 
 ### Key Components
 
@@ -326,9 +326,10 @@ Each project is stored in `backend/data/projects/{project_id}/`:
 ├── matches.json          # Anime match results
 ├── transcription.json    # Transcription data
 ├── video.mp4             # Downloaded TikTok
-├── tts_processed.wav     # Processed TTS audio
+├── new_tts.wav           # Merged TTS audio uploaded for final processing
 └── output/               # Generated output files
-    ├── project.jsx       # Premiere Pro script
+    ├── tts_edited.wav    # Auto-edited TTS audio used for alignment/import
+    ├── import_project.jsx # Premiere Pro automation script
     ├── subtitles.srt     # Generated subtitles
     └── assets/           # Required media files
 ```
@@ -352,12 +353,28 @@ Each project is stored in `backend/data/projects/{project_id}/`:
 
 ### Auto-Editor Parameters
 
-Optimized for ElevenLabs TTS audio:
+The processing pipeline runs `auto-editor` once, directly on the native
+`new_tts.wav` source. It does not pre-convert the file to 48 kHz stereo and it
+does not generate Premiere XML anymore. Final stereo playback is handled by the
+Premiere sequence/export path.
+
+Baseline production profile:
 
 ```
---edit audio:threshold=0.05,stream=all
---margin 0.04sec,0.04sec
+--edit audio:threshold=0.080,stream=all
+--margin 0.04sec,0.24sec
 --silent-speed 99999
+--no-open
+```
+
+This `auto-editor` flow is audio-only, so there is no meaningful GPU
+acceleration path to enable for it. GPU acceleration in this repo still matters
+for WhisperX and FFmpeg/NVENC-based video flows.
+
+To render tuning previews for a project:
+
+```bash
+pixi run --locked -- python scripts/generate_auto_editor_previews.py 01bef85b71c5
 ```
 
 ## Troubleshooting

@@ -25,6 +25,7 @@ from .export_service import ExportService
 from .music_config_service import MusicConfigService
 from .premiere_subtitle_baker import PremiereSubtitleBakerService
 from .project_service import ProjectService
+from .auto_editor_profiles import PRODUCTION_AUTO_EDITOR_PROFILE
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -161,7 +162,6 @@ class ProcessingService:
     """Service for processing the final video generation pipeline."""
 
     FFPROBE_TIMEOUT_SECONDS = 30.0
-    FFMPEG_TIMEOUT_SECONDS = 1200.0
     AUTO_EDITOR_TIMEOUT_SECONDS = 1800.0
     PREMIERE_JSX_TEMPLATE_PATH = (
         Path(__file__).resolve().parent / "templates" / "premiere_import_project_v77.jsx"
@@ -276,361 +276,41 @@ class ProcessingService:
                 return Fraction(int(round(fps_float)), 1)
 
     @classmethod
-    async def convert_audio_for_auto_editor(
-        cls,
-        input_path: Path,
-        output_path: Path,
-    ) -> Path:
-        """
-        Convert audio to a format compatible with auto-editor (48kHz stereo).
-
-        Auto-editor has issues with some audio formats (e.g., 24kHz mono TTS audio).
-        This converts to a standard 48kHz stereo WAV format.
-
-        Args:
-            input_path: Path to input audio file
-            output_path: Path for converted audio file
-
-        Returns:
-            Path to converted audio file
-        """
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", str(input_path),
-            "-ar", "48000",  # 48kHz sample rate
-            "-ac", "2",       # Stereo
-            str(output_path),
-        ]
-
-        result = await run_command(cmd, timeout_seconds=cls.FFMPEG_TIMEOUT_SECONDS)
-        if result.returncode != 0:
-            raise RuntimeError(f"Audio conversion failed: {result.stderr.decode()}")
-
-        return output_path
-
-    @classmethod
     async def run_auto_editor(
         cls,
         audio_path: Path,
         audio_output_path: Path,
-        xml_output_path: Path,
     ) -> bool:
         """
-        Run auto-editor on TTS audio twice:
-        1. Export as audio file (for WhisperX transcription)
-        2. Export as XML (lossless reference for timing)
+        Run auto-editor on TTS audio and export the edited waveform.
 
         Args:
             audio_path: Path to input audio file
             audio_output_path: Path for output audio file
-            xml_output_path: Path for output Premiere XML file
 
         Returns:
             True if successful
         """
-        # Convert audio to compatible format first (auto-editor has issues with some formats)
-        converted_audio_path = audio_path.parent / "tts_converted.wav"
-        try:
-            await cls.convert_audio_for_auto_editor(audio_path, converted_audio_path)
+        # This flow only edits audio; there is no meaningful GPU acceleration path
+        # to enable for auto-editor here.
+        logger.debug("auto-editor GPU acceleration is not applied for audio-only runs.")
+        audio_cmd = [
+            "pixi", "run", "--locked", "--",
+            "auto-editor",
+            str(audio_path),
+            *PRODUCTION_AUTO_EDITOR_PROFILE.command_args(),
+            "-o", str(audio_output_path),
+        ]
 
-            # Common auto-editor settings.
-            # NOTE: this flow is audio-only + timeline XML export (no video render),
-            # so there is no meaningful GPU acceleration path to enable here.
-            logger.debug(
-                "auto-editor GPU acceleration is not applied for audio/XML-only runs."
-            )
-            base_args = [
-                "--edit", "audio",
-                "--no-open",
-            ]
-
-            # Run 1: Export as audio file for WhisperX transcription
-            audio_cmd = [
-                "pixi", "run", "--locked", "--",
-                "auto-editor",
-                str(converted_audio_path),
-                *base_args,
-                "-o", str(audio_output_path),
-            ]
-
-            audio_result = await run_command(
-                audio_cmd,
-                timeout_seconds=cls.AUTO_EDITOR_TIMEOUT_SECONDS,
-            )
-            if audio_result.returncode != 0:
-                raise RuntimeError(f"auto-editor (audio export) failed: {audio_result.stderr.decode()}")
-
-            # Run 2: Export as Premiere XML for lossless timing reference
-            xml_cmd = [
-                "pixi", "run", "--locked", "--",
-                "auto-editor",
-                str(converted_audio_path),
-                *base_args,
-                "--export", "premiere",
-                "-o", str(xml_output_path),
-            ]
-
-            xml_result = await run_command(
-                xml_cmd,
-                timeout_seconds=cls.AUTO_EDITOR_TIMEOUT_SECONDS,
-            )
-            if xml_result.returncode != 0:
-                raise RuntimeError(f"auto-editor (XML export) failed: {xml_result.stderr.decode()}")
-            return True
-        finally:
-            if converted_audio_path.exists():
-                converted_audio_path.unlink()
-
-    @classmethod
-    def generate_fcp_xml(
-        cls,
-        project: Project,
-        transcription: Transcription,
-        matches: list[SceneMatch],
-        audio_filename: str,
-        srt_filename: str,
-        sources_dir: str = "sources",
-    ) -> str:
-        """
-        Generate a Final Cut Pro 7 XML file for Premiere Pro import.
-
-        NOTE: This generates a reference XML that places clips at approximate positions.
-        The ExtendScript (.jsx) file should be used for proper import with speed adjustments,
-        as FCP XML speed filters don't import correctly into Premiere Pro.
-
-        Args:
-            project: Project data
-            transcription: Transcription with word timings from edited TTS audio
-            matches: Scene matches with source timing
-            audio_filename: Name of the edited TTS audio file
-            srt_filename: Name of the SRT subtitle file
-            sources_dir: Folder name for source video files
-
-        Returns:
-            The generated FCP XML content
-        """
-        import xml.etree.ElementTree as ET
-        from xml.dom import minidom
-
-        # Use 23.976 fps for compatibility (most anime source fps)
-        # This is also a common timeline fps for video editing
-        sequence_fps = 23.976
-        source_fps = 23.976  # Most anime is 23.976fps
-
-        # Calculate total duration from transcription (in frames)
-        total_duration_secs = 0.0
-        if transcription.scenes:
-            last_scene = transcription.scenes[-1]
-            if last_scene.words:
-                total_duration_secs = last_scene.words[-1].end
-        total_duration_frames = int(total_duration_secs * sequence_fps)
-
-        # Compute adjusted end times to eliminate gaps between scenes
-        # Each scene's end is extended to the next scene's start
-        adjusted_ends = compute_adjusted_scene_end_times(
-            scenes=transcription.scenes,
-            get_scene_index=lambda s: s.scene_index,
-            get_first_word_start=lambda s: s.words[0].start if s.words else None,
-            get_last_word_end=lambda s: s.words[-1].end if s.words else None,
+        audio_result = await run_command(
+            audio_cmd,
+            timeout_seconds=cls.AUTO_EDITOR_TIMEOUT_SECONDS,
         )
-
-        # Build clip data with timing from transcription
-        clips = []
-        for i, scene_trans in enumerate(transcription.scenes):
-            if not scene_trans.words:
-                continue
-
-            # Find corresponding match
-            match = next(
-                (m for m in matches if m.scene_index == scene_trans.scene_index),
-                None,
+        if audio_result.returncode != 0:
+            raise RuntimeError(
+                f"auto-editor (audio export) failed: {audio_result.stderr.decode()}"
             )
-            if not match or not match.episode:
-                continue
-
-            # Timeline position from transcription words (seconds)
-            # Use adjusted end time to eliminate gaps between scenes
-            timeline_start = scene_trans.words[0].start
-            timeline_end = adjusted_ends.get(scene_trans.scene_index, scene_trans.words[-1].end)
-            target_duration = timeline_end - timeline_start
-
-            # Source timing from match (seconds)
-            source_in = match.start_time
-            source_out = match.end_time
-            source_duration = source_out - source_in
-
-            # Calculate speed factor (source_duration / target_duration)
-            # If source is 2s and target is 3s, speed = 0.667 (slow down to 66.7%)
-            speed = source_duration / target_duration if target_duration > 0 else 1.0
-
-            clips.append({
-                "scene_index": scene_trans.scene_index,
-                "source_path": match.episode,
-                "source_filename": Path(match.episode).name,
-                "source_in": source_in,
-                "source_out": source_out,
-                "source_duration": source_duration,
-                "timeline_start": timeline_start,
-                "timeline_end": timeline_end,
-                "target_duration": target_duration,
-                "speed": speed,
-            })
-
-        def seconds_to_frames(secs: float, fps: float = sequence_fps) -> int:
-            return int(secs * fps)
-
-        # Build XML structure
-        root = ET.Element("xmeml", version="4")
-        sequence = ET.SubElement(root, "sequence", id="sequence-1")
-
-        ET.SubElement(sequence, "name").text = f"ATR_{project.id}"
-        ET.SubElement(sequence, "duration").text = str(total_duration_frames)
-
-        rate = ET.SubElement(sequence, "rate")
-        ET.SubElement(rate, "timebase").text = str(int(sequence_fps))
-        ET.SubElement(rate, "ntsc").text = "TRUE" if abs(sequence_fps - 23.976) < 0.01 else "FALSE"
-
-        # Timecode
-        timecode = ET.SubElement(sequence, "timecode")
-        tc_rate = ET.SubElement(timecode, "rate")
-        ET.SubElement(tc_rate, "timebase").text = str(int(sequence_fps))
-        ET.SubElement(tc_rate, "ntsc").text = "TRUE" if abs(sequence_fps - 23.976) < 0.01 else "FALSE"
-        ET.SubElement(timecode, "string").text = "00:00:00:00"
-        ET.SubElement(timecode, "frame").text = "0"
-        ET.SubElement(timecode, "displayformat").text = "NDF"
-
-        media = ET.SubElement(sequence, "media")
-
-        # Video tracks
-        video = ET.SubElement(media, "video")
-
-        video_format = ET.SubElement(video, "format")
-        video_sample = ET.SubElement(video_format, "samplecharacteristics")
-        ET.SubElement(video_sample, "width").text = "1080"
-        ET.SubElement(video_sample, "height").text = "1920"
-        ET.SubElement(video_sample, "pixelaspectratio").text = "square"
-        sample_rate = ET.SubElement(video_sample, "rate")
-        ET.SubElement(sample_rate, "timebase").text = str(int(sequence_fps))
-        ET.SubElement(sample_rate, "ntsc").text = "TRUE" if abs(sequence_fps - 23.976) < 0.01 else "FALSE"
-
-        video_track = ET.SubElement(video, "track")
-
-        # Track source files to avoid duplicates
-        file_refs = {}
-
-        for idx, clip in enumerate(clips):
-            clipitem = ET.SubElement(video_track, "clipitem", id=f"clipitem-{idx + 1}")
-
-            ET.SubElement(clipitem, "name").text = f"Scene {clip['scene_index'] + 1}"
-
-            clip_rate = ET.SubElement(clipitem, "rate")
-            ET.SubElement(clip_rate, "timebase").text = str(int(sequence_fps))
-            ET.SubElement(clip_rate, "ntsc").text = "TRUE" if abs(sequence_fps - 23.976) < 0.01 else "FALSE"
-
-            # Timeline position in SEQUENCE frames
-            start_frame = seconds_to_frames(clip["timeline_start"], sequence_fps)
-            end_frame = seconds_to_frames(clip["timeline_end"], sequence_fps)
-
-            ET.SubElement(clipitem, "start").text = str(start_frame)
-            ET.SubElement(clipitem, "end").text = str(end_frame)
-
-            # Source in/out points in SOURCE frames (using source fps)
-            in_frame = seconds_to_frames(clip["source_in"], source_fps)
-            out_frame = seconds_to_frames(clip["source_out"], source_fps)
-
-            ET.SubElement(clipitem, "in").text = str(in_frame)
-            ET.SubElement(clipitem, "out").text = str(out_frame)
-
-            # File reference
-            filename = clip["source_filename"]
-            file_id = f"file-{filename.replace('.', '-').replace(' ', '_')}"
-
-            if file_id not in file_refs:
-                file_elem = ET.SubElement(clipitem, "file", id=file_id)
-                ET.SubElement(file_elem, "name").text = filename
-                ET.SubElement(file_elem, "pathurl").text = f"{sources_dir}/{filename}"
-
-                file_rate = ET.SubElement(file_elem, "rate")
-                ET.SubElement(file_rate, "timebase").text = str(int(source_fps))
-                ET.SubElement(file_rate, "ntsc").text = "TRUE" if abs(source_fps - 23.976) < 0.01 else "FALSE"
-
-                # Assume source is 1 hour long (will be read from actual file)
-                ET.SubElement(file_elem, "duration").text = str(int(source_fps * 3600))
-
-                file_media = ET.SubElement(file_elem, "media")
-                file_video = ET.SubElement(file_media, "video")
-                file_sample = ET.SubElement(file_video, "samplecharacteristics")
-                ET.SubElement(file_sample, "width").text = "1920"
-                ET.SubElement(file_sample, "height").text = "1080"
-
-                file_refs[file_id] = True
-            else:
-                # Reference existing file
-                ET.SubElement(clipitem, "file", id=file_id)
-
-            # NOTE: We don't add speed filter here because FCP XML speed filters
-            # don't import correctly into Premiere Pro. Use the ExtendScript instead.
-            # Add a comment marker with speed info for reference
-            speed_pct = clip["speed"] * 100
-            marker = ET.SubElement(clipitem, "marker")
-            ET.SubElement(marker, "name").text = f"Speed: {speed_pct:.0f}% (use JSX script)"
-            ET.SubElement(marker, "in").text = str(in_frame)
-            ET.SubElement(marker, "out").text = str(in_frame)
-
-        # Audio tracks
-        audio = ET.SubElement(media, "audio")
-
-        audio_format = ET.SubElement(audio, "format")
-        audio_sample = ET.SubElement(audio_format, "samplecharacteristics")
-        ET.SubElement(audio_sample, "samplerate").text = "48000"
-        ET.SubElement(audio_sample, "depth").text = "16"
-
-        audio_track = ET.SubElement(audio, "track")
-
-        # TTS Audio clip
-        audio_clipitem = ET.SubElement(audio_track, "clipitem", id="audio-tts")
-        ET.SubElement(audio_clipitem, "name").text = "TTS Audio"
-
-        audio_clip_rate = ET.SubElement(audio_clipitem, "rate")
-        ET.SubElement(audio_clip_rate, "timebase").text = str(int(sequence_fps))
-        ET.SubElement(audio_clip_rate, "ntsc").text = "TRUE" if abs(sequence_fps - 23.976) < 0.01 else "FALSE"
-
-        ET.SubElement(audio_clipitem, "start").text = "0"
-        ET.SubElement(audio_clipitem, "end").text = str(total_duration_frames)
-        ET.SubElement(audio_clipitem, "in").text = "0"
-        ET.SubElement(audio_clipitem, "out").text = str(total_duration_frames)
-
-        audio_file = ET.SubElement(audio_clipitem, "file", id="file-tts-audio")
-        ET.SubElement(audio_file, "name").text = audio_filename
-        ET.SubElement(audio_file, "pathurl").text = audio_filename
-        ET.SubElement(audio_file, "duration").text = str(total_duration_frames)
-
-        audio_file_media = ET.SubElement(audio_file, "media")
-        audio_file_audio = ET.SubElement(audio_file_media, "audio")
-        audio_file_sample = ET.SubElement(audio_file_audio, "samplecharacteristics")
-        ET.SubElement(audio_file_sample, "samplerate").text = "48000"
-        ET.SubElement(audio_file_sample, "depth").text = "16"
-
-        # Add sequence markers for each scene
-        markers_elem = ET.SubElement(sequence, "marker")
-        for scene_trans in transcription.scenes:
-            if scene_trans.words:
-                marker = ET.SubElement(markers_elem, "marker")
-                frame = seconds_to_frames(scene_trans.words[0].start, sequence_fps)
-                ET.SubElement(marker, "name").text = f"Scene {scene_trans.scene_index + 1}"
-                ET.SubElement(marker, "in").text = str(frame)
-                ET.SubElement(marker, "out").text = str(frame)
-
-        # Convert to pretty XML string
-        rough_string = ET.tostring(root, encoding="unicode")
-        reparsed = minidom.parseString(rough_string)
-        xml_content = reparsed.toprettyxml(indent="  ")
-
-        # Add DOCTYPE
-        lines = xml_content.split("\n")
-        lines.insert(1, "<!DOCTYPE xmeml>")
-
-        return "\n".join(lines)
+        return True
 
     @classmethod
     def generate_jsx_script(
@@ -1228,7 +908,7 @@ class ProcessingService:
 
         Generates core project output files:
         - JSX automation script (v7.1 format matching working_script.jsx)
-        - Processed TTS audio with auto-editor cuts
+        - Processed TTS audio with auto-editor silence removal
         - SRT subtitles
 
         Bundling and cloud export are handled by export routes/services.
@@ -1302,8 +982,7 @@ class ProcessingService:
             if not resuming_after_gaps:
                 # Step 1: Auto-editor (generates edited audio with silences removed)
                 edited_audio_path = output_dir / "tts_edited.wav"
-                auto_editor_xml_path = output_dir / "auto_editor_cuts.xml"
-                await cls.run_auto_editor(audio_path, edited_audio_path, auto_editor_xml_path)
+                await cls.run_auto_editor(audio_path, edited_audio_path)
 
                 yield ProcessingProgress(
                     "processing",

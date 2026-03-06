@@ -2,6 +2,7 @@
 
 import asyncio
 import mimetypes
+import shutil
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, FileResponse
 from typing import Optional, Any
@@ -9,6 +10,7 @@ import json
 import tempfile
 from pathlib import Path
 from threading import Lock
+import wave
 from pydantic import BaseModel
 
 from pydub import AudioSegment
@@ -152,6 +154,26 @@ async def _write_upload_to_path(upload: UploadFile, destination: Path) -> None:
             if not chunk:
                 break
             out.write(chunk)
+
+
+def _is_wave_file(path: Path) -> bool:
+    """Return True when the file is already a valid WAV container."""
+    try:
+        with wave.open(str(path), "rb") as wav_file:
+            wav_file.getparams()
+        return True
+    except (wave.Error, EOFError):
+        return False
+
+
+def _normalize_audio_file_to_wav(input_path: Path, output_path: Path) -> None:
+    """Copy WAV uploads as-is or transcode other audio formats to a real WAV file."""
+    if _is_wave_file(input_path):
+        shutil.copy2(input_path, output_path)
+        return
+
+    audio = AudioSegment.from_file(str(input_path))
+    audio.export(str(output_path), format="wav")
 
 
 @router.get("/script/automation/config")
@@ -355,8 +377,19 @@ async def upload_restructured_script(
     audio_path = project_dir / "new_tts.wav"
 
     if audio is not None:
-        # Single file upload
-        await _write_upload_to_path(audio, audio_path)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            suffix = Path(audio.filename or "").suffix or ".bin"
+            uploaded_audio_path = tmp_path / f"upload{suffix}"
+            await _write_upload_to_path(audio, uploaded_audio_path)
+            try:
+                await asyncio.to_thread(
+                    _normalize_audio_file_to_wav,
+                    uploaded_audio_path,
+                    audio_path,
+                )
+            except Exception:
+                raise HTTPException(status_code=400, detail="Failed to process audio file")
     else:
         # Multiple files - concatenate them
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -533,7 +566,19 @@ async def stage_preview_audio(
     staged_path = project_dir / "preview_staged.wav"
 
     if audio is not None:
-        await _write_upload_to_path(audio, staged_path)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            suffix = Path(audio.filename or "").suffix or ".bin"
+            uploaded_audio_path = tmp_path / f"preview_upload{suffix}"
+            await _write_upload_to_path(audio, uploaded_audio_path)
+            try:
+                await asyncio.to_thread(
+                    _normalize_audio_file_to_wav,
+                    uploaded_audio_path,
+                    staged_path,
+                )
+            except Exception:
+                raise HTTPException(status_code=400, detail="Failed to process audio file")
     else:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
