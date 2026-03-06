@@ -9,6 +9,7 @@ from typing import AsyncIterator
 
 from ..config import settings
 from ..utils.media_binaries import (
+    get_media_subprocess_env,
     get_ytdlp_ffmpeg_location,
     is_media_binary_override_error,
 )
@@ -134,10 +135,16 @@ class DownloaderService:
         aborted = False
 
         try:
+            ffmpeg_location: str | None = None
+            if "--ffmpeg-location" in cmd:
+                location_index = cmd.index("--ffmpeg-location") + 1
+                if location_index < len(cmd):
+                    ffmpeg_location = cmd[location_index]
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=get_media_subprocess_env(cmd, extra_binary=ffmpeg_location),
             )
             stderr_task = asyncio.create_task(
                 process.stderr.read() if process.stderr is not None else asyncio.sleep(0, result=b"")

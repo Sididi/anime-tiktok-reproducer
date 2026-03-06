@@ -8,7 +8,9 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from ..config import PROJECT_ROOT, settings
+from ..config import PROCESS_START_ENV, PROJECT_ROOT, settings
+
+_MEDIA_BINARY_NAMES = {"ffmpeg", "ffprobe"}
 
 
 def _normalize_override(value: str | None) -> str | None:
@@ -69,6 +71,76 @@ def _find_default_binary(binary_name: str) -> str | None:
     return shutil.which(binary_name)
 
 
+def _managed_env_prefixes() -> list[Path]:
+    prefixes: list[Path] = []
+    seen: set[Path] = set()
+    candidates = [
+        PROCESS_START_ENV.get("CONDA_PREFIX"),
+        os.environ.get("CONDA_PREFIX"),
+        str(Path(sys.executable).resolve().parent.parent),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            resolved = Path(candidate).expanduser().resolve(strict=False)
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        prefixes.append(resolved)
+    return prefixes
+
+
+def _is_within_prefix(path_value: str, prefix: Path) -> bool:
+    try:
+        candidate = Path(path_value).expanduser().resolve(strict=False)
+    except OSError:
+        return False
+    try:
+        return candidate.is_relative_to(prefix)
+    except ValueError:
+        return False
+
+
+def _is_media_binary(binary_value: str | None) -> bool:
+    return bool(binary_value) and Path(binary_value).name in _MEDIA_BINARY_NAMES
+
+
+def _is_managed_binary(binary_value: str) -> bool:
+    candidate = binary_value
+    if not Path(candidate).is_absolute():
+        resolved = shutil.which(candidate)
+        if resolved is None:
+            return False
+        candidate = resolved
+
+    return any(
+        _is_within_prefix(candidate, prefix)
+        for prefix in _managed_env_prefixes()
+    )
+
+
+def _sanitize_ld_library_path() -> str | None:
+    entries: list[str] = []
+    managed_prefixes = _managed_env_prefixes()
+    for raw_value in (
+        PROCESS_START_ENV.get("LD_LIBRARY_PATH"),
+        os.environ.get("LD_LIBRARY_PATH"),
+    ):
+        if not raw_value:
+            continue
+        for entry in raw_value.split(os.pathsep):
+            if not entry:
+                continue
+            if any(_is_within_prefix(entry, prefix) for prefix in managed_prefixes):
+                continue
+            if entry not in entries:
+                entries.append(entry)
+    return os.pathsep.join(entries) if entries else None
+
+
 def _resolve_binary(
     *,
     binary_name: str,
@@ -114,6 +186,26 @@ def rewrite_media_command(cmd: Sequence[str]) -> list[str]:
     elif rewritten[0] == "ffprobe":
         rewritten[0] = get_ffprobe_binary()
     return rewritten
+
+
+def get_media_subprocess_env(
+    cmd: Sequence[str],
+    *,
+    extra_binary: str | None = None,
+) -> dict[str, str] | None:
+    binary = cmd[0] if cmd and _is_media_binary(cmd[0]) else None
+    if binary is None and _is_media_binary(extra_binary):
+        binary = extra_binary
+    if binary is None or _is_managed_binary(binary):
+        return None
+
+    env = dict(os.environ)
+    sanitized_ld_library_path = _sanitize_ld_library_path()
+    if sanitized_ld_library_path is None:
+        env.pop("LD_LIBRARY_PATH", None)
+    else:
+        env["LD_LIBRARY_PATH"] = sanitized_ld_library_path
+    return env
 
 
 def get_ytdlp_ffmpeg_location() -> str | None:

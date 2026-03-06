@@ -15,7 +15,7 @@ from ..models.subtitle import (
     SubtitleWord,
 )
 from ..models import Transcription
-from ..utils.media_binaries import rewrite_media_command
+from ..utils.media_binaries import get_media_subprocess_env, rewrite_media_command
 from .subtitle_renderer import SubtitleFrameRenderer
 from .subtitle_styles import get_style, list_styles
 from .project_service import ProjectService
@@ -161,6 +161,7 @@ class SubtitleVideoService:
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=get_media_subprocess_env(cmd),
         )
 
         _, stderr = await process.communicate()

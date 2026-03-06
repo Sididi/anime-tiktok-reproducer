@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from ..config import settings
-from ..utils.media_binaries import rewrite_media_command
+from ..utils.media_binaries import get_media_subprocess_env, rewrite_media_command
 from .anime_library import AnimeLibraryService
 
 
@@ -87,6 +87,7 @@ class SourceChunkStreamingService:
                 text=True,
                 timeout=30,
                 check=False,
+                env=get_media_subprocess_env(cmd),
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return None
@@ -126,6 +127,7 @@ class SourceChunkStreamingService:
                 text=True,
                 timeout=30,
                 check=False,
+                env=get_media_subprocess_env(cmd),
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return None
@@ -167,6 +169,7 @@ class SourceChunkStreamingService:
                 text=True,
                 timeout=20,
                 check=False,
+                env=get_media_subprocess_env(cmd),
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
             cls._nvenc_available = False
@@ -393,6 +396,7 @@ class SourceChunkStreamingService:
                     text=True,
                     timeout=cls.ENCODE_TIMEOUT_SECONDS,
                     check=False,
+                    env=get_media_subprocess_env(gpu_cmd),
                 )
                 if result.returncode == 0:
                     return True
@@ -411,6 +415,7 @@ class SourceChunkStreamingService:
             text=True,
             timeout=cls.ENCODE_TIMEOUT_SECONDS,
             check=False,
+            env=get_media_subprocess_env(cpu_cmd),
         )
         return result.returncode == 0
 

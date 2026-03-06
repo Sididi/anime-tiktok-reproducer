@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import sys
 
 import pytest
@@ -60,7 +61,9 @@ def test_get_ffprobe_binary_falls_back_to_repo_pixi_default_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo_root = tmp_path / "repo"
-    repo_pixi_ffprobe = _make_executable(repo_root / ".pixi" / "envs" / "default" / "bin" / "ffprobe")
+    repo_pixi_ffprobe = _make_executable(
+        repo_root / ".pixi" / "envs" / "default" / "bin" / "ffprobe"
+    )
     python_binary = _make_executable(tmp_path / "other-env" / "bin" / "python")
 
     monkeypatch.setattr(settings, "ffprobe_binary", None)
@@ -89,3 +92,51 @@ def test_rewrite_media_command_only_rewrites_ffmpeg_and_ffprobe(
         "yt-dlp",
         "--help",
     ]
+
+
+def test_get_media_subprocess_env_sanitizes_ld_library_path_for_system_binary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        media_binaries,
+        "PROCESS_START_ENV",
+        {
+            "CONDA_PREFIX": "/repo/.pixi/envs/dev",
+            "LD_LIBRARY_PATH": "/repo/.pixi/envs/dev/lib:/usr/lib",
+        },
+    )
+    monkeypatch.setattr(
+        media_binaries.sys,
+        "executable",
+        "/repo/.pixi/envs/dev/bin/python",
+    )
+    monkeypatch.setenv("CONDA_PREFIX", "/repo/.pixi/envs/dev")
+    monkeypatch.setenv(
+        "LD_LIBRARY_PATH",
+        "/repo/.pixi/envs/dev/lib:/usr/lib:/custom/lib",
+    )
+
+    env = media_binaries.get_media_subprocess_env(["/usr/bin/ffmpeg", "-version"])
+
+    assert env is not None
+    assert env["LD_LIBRARY_PATH"] == os.pathsep.join(["/usr/lib", "/custom/lib"])
+
+
+def test_get_media_subprocess_env_returns_none_for_managed_binary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        media_binaries,
+        "PROCESS_START_ENV",
+        {"CONDA_PREFIX": "/repo/.pixi/envs/dev"},
+    )
+    monkeypatch.setattr(
+        media_binaries.sys,
+        "executable",
+        "/repo/.pixi/envs/dev/bin/python",
+    )
+    monkeypatch.setenv("CONDA_PREFIX", "/repo/.pixi/envs/dev")
+
+    assert media_binaries.get_media_subprocess_env(
+        ["/repo/.pixi/envs/dev/bin/ffmpeg", "-version"]
+    ) is None

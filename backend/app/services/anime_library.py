@@ -14,6 +14,7 @@ from typing import AsyncIterator
 
 from ..config import settings
 from ..utils.media_binaries import (
+    get_media_subprocess_env,
     is_media_binary_override_error,
     rewrite_media_command,
 )
@@ -55,7 +56,6 @@ class AnimeLibraryService:
     LIST_TIMEOUT_SECONDS = 120.0
     SEARCH_TIMEOUT_SECONDS = 120.0
     REMUX_TIMEOUT_SECONDS = 600.0
-    TRANSCODE_TIMEOUT_SECONDS = 3600.0
     INDEX_TIMEOUT_SECONDS = 7200.0
     PREVIEW_PROXY_TIMEOUT_SECONDS = 3600.0
     GPU_HWACCEL = "cuda"
@@ -322,12 +322,14 @@ class AnimeLibraryService:
             ]
         )
         try:
+            env = get_media_subprocess_env(cmd)
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
                 timeout=30,
                 check=False,
+                env=env,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return None
@@ -362,12 +364,14 @@ class AnimeLibraryService:
             ]
         )
         try:
+            env = get_media_subprocess_env(cmd)
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
                 timeout=30,
                 check=False,
+                env=env,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return None
@@ -568,24 +572,28 @@ class AnimeLibraryService:
             )
 
             try:
+                env = get_media_subprocess_env(cmd_with_audio_copy)
                 result = subprocess.run(
                     cmd_with_audio_copy,
                     capture_output=True,
                     text=True,
                     timeout=cls.PREVIEW_PROXY_TIMEOUT_SECONDS,
                     check=False,
+                    env=env,
                 )
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 result = None
 
             if result is None or result.returncode != 0:
                 try:
+                    env = get_media_subprocess_env(cmd_with_audio_aac)
                     result = subprocess.run(
                         cmd_with_audio_aac,
                         capture_output=True,
                         text=True,
                         timeout=cls.PREVIEW_PROXY_TIMEOUT_SECONDS,
                         check=False,
+                        env=env,
                     )
                 except (FileNotFoundError, subprocess.TimeoutExpired):
                     result = None
@@ -620,23 +628,27 @@ class AnimeLibraryService:
                     ]
                 )
                 try:
+                    env = get_media_subprocess_env(cmd_with_audio_copy)
                     result = subprocess.run(
                         cmd_with_audio_copy,
                         capture_output=True,
                         text=True,
                         timeout=cls.PREVIEW_PROXY_TIMEOUT_SECONDS,
                         check=False,
+                        env=env,
                     )
                 except (FileNotFoundError, subprocess.TimeoutExpired):
                     return None
                 if result.returncode != 0:
                     try:
+                        env = get_media_subprocess_env(cmd_with_audio_aac)
                         result = subprocess.run(
                             cmd_with_audio_aac,
                             capture_output=True,
                             text=True,
                             timeout=cls.PREVIEW_PROXY_TIMEOUT_SECONDS,
                             check=False,
+                            env=env,
                         )
                     except (FileNotFoundError, subprocess.TimeoutExpired):
                         return None
@@ -810,9 +822,9 @@ class AnimeLibraryService:
         """
         Copy anime folder to library and index it.
 
-        This method ensures all file copy/remux/transcode operations complete
-        and files are verified before starting the indexing process to
-        prevent race conditions.
+        This method ensures all file copy/remux operations complete and files
+        are verified before starting the indexing process to prevent race
+        conditions.
 
         Args:
             source_folder: Path to folder containing episodes.
@@ -880,84 +892,6 @@ class AnimeLibraryService:
         total_files = len(video_files)
         prepared_files: list[Path] = []
 
-        async def _transcode_av1_to_mp4(source_file: Path, destination_file: Path) -> str | None:
-            """Transcode AV1 source to browser-safe H.264 MP4 using GPU-only path."""
-            destination_file.parent.mkdir(parents=True, exist_ok=True)
-            tmp_dest = destination_file.with_suffix(".tmp.mp4")
-            with suppress(OSError):
-                tmp_dest.unlink()
-
-            base_cmd = cls._build_gpu_h264_base_cmd(
-                source_file,
-                source_codec="av1",
-            )
-            cmd_with_audio_copy = base_cmd + [
-                "-map",
-                "0:a:0?",
-                "-c:a",
-                "copy",
-                str(tmp_dest),
-            ]
-            cmd_with_audio_aac = base_cmd + [
-                "-map",
-                "0:a:0?",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "128k",
-                "-ac",
-                "2",
-                "-ar",
-                "48000",
-                str(tmp_dest),
-            ]
-
-            try:
-                result = await run_command(
-                    cmd_with_audio_copy,
-                    timeout_seconds=cls.TRANSCODE_TIMEOUT_SECONDS,
-                )
-            except CommandTimeoutError:
-                return (
-                    f"GPU AV1 transcode timed out for {source_file.name} after "
-                    f"{int(cls.TRANSCODE_TIMEOUT_SECONDS)}s"
-                )
-            except FileNotFoundError as exc:
-                if is_media_binary_override_error(exc):
-                    raise
-                return "ffmpeg is required for GPU AV1 transcode"
-
-            if result.returncode != 0:
-                try:
-                    result = await run_command(
-                        cmd_with_audio_aac,
-                        timeout_seconds=cls.TRANSCODE_TIMEOUT_SECONDS,
-                    )
-                except CommandTimeoutError:
-                    return (
-                        f"GPU AV1 transcode timed out for {source_file.name} after "
-                        f"{int(cls.TRANSCODE_TIMEOUT_SECONDS)}s"
-                    )
-                except FileNotFoundError as exc:
-                    if is_media_binary_override_error(exc):
-                        raise
-                    return "ffmpeg is required for GPU AV1 transcode"
-                if result.returncode != 0:
-                    return (
-                        f"GPU AV1 transcode failed for {source_file.name}: "
-                        f"{result.stderr.decode()[:220]}"
-                    )
-
-            if not tmp_dest.exists():
-                return f"Transcode output missing for {source_file.name}"
-            if tmp_dest.stat().st_size == 0:
-                with suppress(OSError):
-                    tmp_dest.unlink()
-                return f"Transcode output is empty for {source_file.name}"
-
-            tmp_dest.replace(destination_file)
-            return None
-
         if dest_path != source_folder:
             yield IndexProgress(
                 status="copying",
@@ -972,33 +906,22 @@ class AnimeLibraryService:
                 total_files=total_files,
             )
 
-        # Copy/remux/transcode each file.
+        # Copy or remux each file depending on the source container/codec.
         for i, video_file in enumerate(video_files):
             source_codec = await asyncio.to_thread(cls.get_primary_video_codec_sync, video_file)
             is_av1 = source_codec == "av1"
-            is_mkv = video_file.suffix.lower() == ".mkv"
-            requires_mp4 = is_av1 or is_mkv
-            preferred_dest = dest_path / (video_file.stem + ".mp4" if requires_mp4 else video_file.name)
+            should_remux_mkv = video_file.suffix.lower() == ".mkv" and not is_av1
+            preferred_dest = dest_path / (
+                video_file.stem + ".mp4" if should_remux_mkv else video_file.name
+            )
             actual_dest = preferred_dest
 
-            existing_ready = False
-            if preferred_dest.exists():
-                if is_av1:
-                    existing_codec = await asyncio.to_thread(
-                        cls.get_primary_video_codec_sync,
-                        preferred_dest,
-                    )
-                    existing_ready = (
-                        preferred_dest.suffix.lower() == ".mp4"
-                        and existing_codec == "h264"
-                    )
-                else:
-                    existing_ready = True
+            existing_ready = preferred_dest.exists()
 
             action = "Copying"
             if is_av1:
-                action = "Transcoding AV1"
-            elif is_mkv:
+                action = "Copying AV1 source"
+            elif should_remux_mkv:
                 action = "Remuxing"
 
             if not existing_ready:
@@ -1011,12 +934,7 @@ class AnimeLibraryService:
                     completed_files=i,
                 )
 
-                if is_av1:
-                    error = await _transcode_av1_to_mp4(video_file, preferred_dest)
-                    if error is not None:
-                        yield IndexProgress(status="error", error=error)
-                        return
-                elif is_mkv:
+                if should_remux_mkv:
                     try:
                         remux_result = await run_command(
                             [
@@ -1155,6 +1073,7 @@ class AnimeLibraryService:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(searcher_path),
+            env=get_media_subprocess_env(cmd),
         )
 
         # Read output progressively

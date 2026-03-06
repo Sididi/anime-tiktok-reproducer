@@ -12,7 +12,7 @@ from typing import AsyncIterator
 
 from ..models import Word, SceneTranscription, Transcription, SceneList
 from ..services import ProjectService
-from ..utils.media_binaries import rewrite_media_command
+from ..utils.media_binaries import get_media_subprocess_env, rewrite_media_command
 from ..utils.process_cleanup import shutdown_torch_compile_workers
 
 
@@ -208,12 +208,14 @@ class TranscriberService:
         ]
         cmd = rewrite_media_command(cmd)
         try:
+            env = get_media_subprocess_env(cmd)
             result = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 check=False,
+                env=env,
             )
         except FileNotFoundError:
             return None
@@ -244,12 +246,14 @@ class TranscriberService:
         ]
         cmd = rewrite_media_command(cmd)
         try:
+            env = get_media_subprocess_env(cmd)
             result = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 check=False,
+                env=env,
             )
         except FileNotFoundError as exc:
             raise RuntimeError("ffmpeg is required to extract audio for transcription.") from exc

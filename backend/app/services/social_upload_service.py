@@ -20,7 +20,7 @@ from googleapiclient.http import MediaFileUpload
 
 from ..config import settings
 from ..models import VideoMetadataPayload
-from ..utils.media_binaries import rewrite_media_command
+from ..utils.media_binaries import get_media_subprocess_env, rewrite_media_command
 from ..utils.meta_graph import extract_graph_error as _extract_graph_error
 from .meta_token_service import MetaTokenService
 
@@ -587,6 +587,7 @@ class SocialUploadService:
                 capture_output=True,
                 text=True,
                 check=True,
+                env=get_media_subprocess_env(cmd),
             )
         except FileNotFoundError:
             return None, "ffprobe is not available on the server."
@@ -715,6 +716,7 @@ class SocialUploadService:
                 capture_output=True,
                 text=True,
                 check=False,
+                env=get_media_subprocess_env(cmd),
             )
         except FileNotFoundError:
             return "ffmpeg is not available on the server."
@@ -792,6 +794,7 @@ class SocialUploadService:
                 capture_output=True,
                 text=True,
                 check=False,
+                env=get_media_subprocess_env(cmd),
             )
         except FileNotFoundError:
             return "ffmpeg is not available on the server."
@@ -1678,6 +1681,7 @@ class SocialUploadService:
                 capture_output=True,
                 text=True,
                 check=True,
+                env=get_media_subprocess_env(cmd),
             )
         except FileNotFoundError:
             logger.warning("ffprobe is not available; skipping Facebook reel media validation.")

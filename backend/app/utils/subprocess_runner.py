@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from .media_binaries import rewrite_media_command
+from .media_binaries import get_media_subprocess_env, rewrite_media_command
 
 
 @dataclass
@@ -62,11 +62,13 @@ async def run_command(
 ) -> CommandResult:
     """Run a command and capture both stdout/stderr safely."""
     resolved_cmd = rewrite_media_command(cmd)
+    env = get_media_subprocess_env(resolved_cmd)
     process = await asyncio.create_subprocess_exec(
         *resolved_cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=str(cwd) if cwd is not None else None,
+        env=env,
     )
 
     try:

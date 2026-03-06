@@ -44,7 +44,12 @@ from pathlib import Path
 import yaml
 
 from _env import load_dotenv
-from _media_binaries import get_ffmpeg_binary, get_ffprobe_binary, rewrite_media_command
+from _media_binaries import (
+    get_ffmpeg_binary,
+    get_ffprobe_binary,
+    get_media_subprocess_env,
+    rewrite_media_command,
+)
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -137,6 +142,7 @@ def _probe_duration_ms(path: Path) -> float:
         cmd,
         capture_output=True,
         text=True,
+        env=get_media_subprocess_env(cmd),
     )
     if result.returncode != 0:
         raise RuntimeError(f"ffprobe failed: {result.stderr.strip()}")
@@ -161,6 +167,7 @@ def _detect_leading_silence_ms(path: Path, threshold: str) -> float:
         cmd,
         capture_output=True,
         text=True,
+        env=get_media_subprocess_env(cmd),
     )
     # silencedetect writes to stderr
     output = result.stderr
@@ -197,7 +204,12 @@ def _trim_audio(
         str(output_path),
     ]
     cmd = rewrite_media_command(cmd)
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        env=get_media_subprocess_env(cmd),
+    )
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg silenceremove failed:\n{result.stderr.strip()}")
 

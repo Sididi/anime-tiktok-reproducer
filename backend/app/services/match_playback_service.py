@@ -13,7 +13,7 @@ from typing import AsyncIterator, Literal
 
 from ..config import settings
 from ..models import MatchList, Project, SceneList
-from ..utils.media_binaries import rewrite_media_command
+from ..utils.media_binaries import get_media_subprocess_env, rewrite_media_command
 from .anime_library import AnimeLibraryService
 from .project_service import ProjectService
 
@@ -465,7 +465,14 @@ class MatchPlaybackService:
                 str(path),
             ]
         )
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=30)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+            env=get_media_subprocess_env(cmd),
+        )
         if result.returncode != 0:
             raise RuntimeError(f"ffprobe failed for {path.name}: {result.stderr.strip()}")
 
@@ -574,6 +581,7 @@ class MatchPlaybackService:
                 text=True,
                 timeout=20,
                 check=False,
+                env=get_media_subprocess_env(cmd),
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
             cls._nvenc_available = False
@@ -715,6 +723,7 @@ class MatchPlaybackService:
                 text=True,
                 check=False,
                 timeout=cls.FFMPEG_TIMEOUT_SECONDS,
+                env=get_media_subprocess_env(nvenc_cmd),
             )
             if result.returncode == 0:
                 encoded = True
@@ -738,6 +747,7 @@ class MatchPlaybackService:
                 text=True,
                 check=False,
                 timeout=cls.FFMPEG_TIMEOUT_SECONDS,
+                env=get_media_subprocess_env(cpu_cmd),
             )
             if result.returncode != 0:
                 error_details.append(
