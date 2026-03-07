@@ -653,6 +653,7 @@ class ProcessingService:
         i = 0
         while i < len(all_words):
             current_block = []
+            current_block_indices: list[int] = []
             current_len = 0
 
             while i < len(all_words):
@@ -692,6 +693,7 @@ class ProcessingService:
                         confidence=word.confidence,
                     )
                     current_block.append(word_copy)
+                    current_block_indices.append(i)
                     current_len = new_len
                     i += 1
 
@@ -706,9 +708,11 @@ class ProcessingService:
                     if len(current_block) >= 2:
                         last_word_text = current_block[-1].text
                         if is_clause_starter(last_word_text, language):
-                            # Pop the clause starter - it will start the next block
-                            i -= 1  # Rewind to re-process it
+                            # Rewind to the popped word's original index so we do not
+                            # accidentally land on trailing punctuation and skip it.
+                            rewind_index = current_block_indices.pop()
                             current_block.pop()
+                            i = rewind_index
                             # Recalculate current_len using cleaned text
                             current_len = sum(len(w.text) for w in current_block)
                             if len(current_block) > 1:

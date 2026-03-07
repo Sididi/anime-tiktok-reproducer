@@ -144,9 +144,17 @@ class SocialUploadService:
     _RETRY_BASE_DELAY_SECONDS = 1.0
     _SUPPORTED_YOUTUBE_LANGUAGES = {"fr", "en", "es"}
     _FACEBOOK_MAX_DURATION_SECONDS = 90.0
+    _FACEBOOK_DURATION_SAFETY_BUFFER_SECONDS = 0.01
+    _FACEBOOK_UPLOAD_TARGET_DURATION_SECONDS = (
+        _FACEBOOK_MAX_DURATION_SECONDS - _FACEBOOK_DURATION_SAFETY_BUFFER_SECONDS
+    )
     _FACEBOOK_MAX_SPEED_FACTOR = 1.40
     _FACEBOOK_MAX_ACCEL_PERCENT = 40.0
     _YOUTUBE_MAX_DURATION_SECONDS = 180.0
+    _YOUTUBE_DURATION_SAFETY_BUFFER_SECONDS = 0.01
+    _YOUTUBE_UPLOAD_TARGET_DURATION_SECONDS = (
+        _YOUTUBE_MAX_DURATION_SECONDS - _YOUTUBE_DURATION_SAFETY_BUFFER_SECONDS
+    )
     _YOUTUBE_MAX_SPEED_FACTOR = 1.40
     _YOUTUBE_MAX_ACCEL_PERCENT = 40.0
     _FRENCH_DAYS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
@@ -640,6 +648,10 @@ class SocialUploadService:
     ) -> tuple[MediaProbe | None, str | None]:
         return cls._probe_media(video_path=video_path)
 
+    @staticmethod
+    def _format_ffmpeg_duration_seconds(duration_seconds: float) -> str:
+        return f"{duration_seconds:.2f}".rstrip("0").rstrip(".")
+
     @classmethod
     def _transcode_video_to_duration_limit(
         cls,
@@ -705,7 +717,7 @@ class SocialUploadService:
                 "-movflags",
                 "+faststart",
                 "-t",
-                f"{int(max_duration_seconds)}",
+                cls._format_ffmpeg_duration_seconds(max_duration_seconds),
                 str(output_path),
             ]
         )
@@ -744,7 +756,7 @@ class SocialUploadService:
             output_path=output_path,
             speed_factor=speed_factor,
             has_audio=has_audio,
-            max_duration_seconds=cls._FACEBOOK_MAX_DURATION_SECONDS,
+            max_duration_seconds=cls._FACEBOOK_UPLOAD_TARGET_DURATION_SECONDS,
         )
 
     @classmethod
@@ -761,7 +773,7 @@ class SocialUploadService:
             output_path=output_path,
             speed_factor=speed_factor,
             has_audio=has_audio,
-            max_duration_seconds=cls._YOUTUBE_MAX_DURATION_SECONDS,
+            max_duration_seconds=cls._YOUTUBE_UPLOAD_TARGET_DURATION_SECONDS,
         )
 
     @classmethod
@@ -780,7 +792,7 @@ class SocialUploadService:
                 "-i",
                 str(input_path),
                 "-t",
-                f"{int(max_duration_seconds)}",
+                cls._format_ffmpeg_duration_seconds(max_duration_seconds),
                 "-c",
                 "copy",
                 "-movflags",
@@ -815,10 +827,29 @@ class SocialUploadService:
         input_path: Path,
         output_path: Path,
     ) -> str | None:
-        return cls._cut_video_to_duration_limit(
+        cut_error = cls._cut_video_to_duration_limit(
             input_path=input_path,
             output_path=output_path,
-            max_duration_seconds=cls._FACEBOOK_MAX_DURATION_SECONDS,
+            max_duration_seconds=cls._FACEBOOK_UPLOAD_TARGET_DURATION_SECONDS,
+        )
+        if cut_error:
+            return cut_error
+
+        output_probe, output_probe_error = cls._probe_facebook_media(video_path=output_path)
+        if output_probe_error is None and output_probe and output_probe.duration_seconds is not None:
+            if output_probe.duration_seconds <= cls._FACEBOOK_MAX_DURATION_SECONDS:
+                return None
+
+        source_probe, source_probe_error = cls._probe_facebook_media(video_path=input_path)
+        if source_probe_error:
+            return source_probe_error
+
+        return cls._transcode_video_to_duration_limit(
+            input_path=input_path,
+            output_path=output_path,
+            speed_factor=1.0,
+            has_audio=bool(source_probe and source_probe.has_audio),
+            max_duration_seconds=cls._FACEBOOK_UPLOAD_TARGET_DURATION_SECONDS,
         )
 
     @classmethod
@@ -828,10 +859,29 @@ class SocialUploadService:
         input_path: Path,
         output_path: Path,
     ) -> str | None:
-        return cls._cut_video_to_duration_limit(
+        cut_error = cls._cut_video_to_duration_limit(
             input_path=input_path,
             output_path=output_path,
-            max_duration_seconds=cls._YOUTUBE_MAX_DURATION_SECONDS,
+            max_duration_seconds=cls._YOUTUBE_UPLOAD_TARGET_DURATION_SECONDS,
+        )
+        if cut_error:
+            return cut_error
+
+        output_probe, output_probe_error = cls._probe_youtube_media(video_path=output_path)
+        if output_probe_error is None and output_probe and output_probe.duration_seconds is not None:
+            if output_probe.duration_seconds <= cls._YOUTUBE_MAX_DURATION_SECONDS:
+                return None
+
+        source_probe, source_probe_error = cls._probe_youtube_media(video_path=input_path)
+        if source_probe_error:
+            return source_probe_error
+
+        return cls._transcode_video_to_duration_limit(
+            input_path=input_path,
+            output_path=output_path,
+            speed_factor=1.0,
+            has_audio=bool(source_probe and source_probe.has_audio),
+            max_duration_seconds=cls._YOUTUBE_UPLOAD_TARGET_DURATION_SECONDS,
         )
 
     @classmethod
