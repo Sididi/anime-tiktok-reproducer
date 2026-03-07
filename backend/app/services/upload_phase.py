@@ -661,18 +661,54 @@ class UploadPhaseService:
 
     # ── Platform duration checks (pre-upload) ─────────────────────────────
 
-    _FACEBOOK_PREP_CACHE_DIR = Path("backend/data/cache/facebook_prep")
+    _FACEBOOK_PREP_CACHE_DIR = settings.cache_dir / "facebook_prep"
     _FACEBOOK_PREP_MAX_AGE_SECONDS = 7200  # 2 hours
-    _YOUTUBE_PREP_CACHE_DIR = Path("backend/data/cache/youtube_prep")
+    _LEGACY_FACEBOOK_PREP_CACHE_DIR = (
+        settings.data_dir.parent / "backend" / "data" / "cache" / "facebook_prep"
+    )
+    _YOUTUBE_PREP_CACHE_DIR = settings.cache_dir / "youtube_prep"
     _YOUTUBE_PREP_MAX_AGE_SECONDS = 7200  # 2 hours
+    _LEGACY_YOUTUBE_PREP_CACHE_DIR = (
+        settings.data_dir.parent / "backend" / "data" / "cache" / "youtube_prep"
+    )
+
+    @classmethod
+    def _normalize_legacy_prep_cache_dir(cls, cache_dir: Path, legacy_cache_dir: Path) -> Path:
+        if not legacy_cache_dir.exists() or cache_dir.resolve() == legacy_cache_dir.resolve():
+            return cache_dir
+
+        cache_dir.parent.mkdir(parents=True, exist_ok=True)
+
+        if not cache_dir.exists():
+            shutil.move(str(legacy_cache_dir), str(cache_dir))
+            return cache_dir
+
+        for legacy_entry in legacy_cache_dir.iterdir():
+            destination = cache_dir / legacy_entry.name
+            if destination.exists():
+                continue
+            shutil.move(str(legacy_entry), str(destination))
+
+        try:
+            legacy_cache_dir.rmdir()
+        except OSError:
+            pass
+
+        return cache_dir
 
     @classmethod
     def _facebook_prep_dir(cls, project_id: str) -> Path:
-        return cls._FACEBOOK_PREP_CACHE_DIR / project_id
+        return cls._normalize_legacy_prep_cache_dir(
+            cls._FACEBOOK_PREP_CACHE_DIR,
+            cls._LEGACY_FACEBOOK_PREP_CACHE_DIR,
+        ) / project_id
 
     @classmethod
     def _youtube_prep_dir(cls, project_id: str) -> Path:
-        return cls._YOUTUBE_PREP_CACHE_DIR / project_id
+        return cls._normalize_legacy_prep_cache_dir(
+            cls._YOUTUBE_PREP_CACHE_DIR,
+            cls._LEGACY_YOUTUBE_PREP_CACHE_DIR,
+        ) / project_id
 
     @classmethod
     def _cleanup_prep_dir(cls, prep_dir: Path) -> None:
@@ -708,14 +744,20 @@ class UploadPhaseService:
     @classmethod
     def cleanup_stale_facebook_prep(cls) -> None:
         cls._cleanup_stale_prep_cache(
-            cls._FACEBOOK_PREP_CACHE_DIR,
+            cls._normalize_legacy_prep_cache_dir(
+                cls._FACEBOOK_PREP_CACHE_DIR,
+                cls._LEGACY_FACEBOOK_PREP_CACHE_DIR,
+            ),
             cls._FACEBOOK_PREP_MAX_AGE_SECONDS,
         )
 
     @classmethod
     def cleanup_stale_youtube_prep(cls) -> None:
         cls._cleanup_stale_prep_cache(
-            cls._YOUTUBE_PREP_CACHE_DIR,
+            cls._normalize_legacy_prep_cache_dir(
+                cls._YOUTUBE_PREP_CACHE_DIR,
+                cls._LEGACY_YOUTUBE_PREP_CACHE_DIR,
+            ),
             cls._YOUTUBE_PREP_MAX_AGE_SECONDS,
         )
 
