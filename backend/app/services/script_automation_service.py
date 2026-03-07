@@ -484,6 +484,49 @@ class ScriptAutomationService:
         return {"title": title, "category": category}
 
     @classmethod
+    def get_latest_run(cls, project_id: str) -> dict[str, Any] | None:
+        """Return the latest automation run with its script.json and TTS parts."""
+        project_dir = ProjectService.get_project_dir(project_id)
+        runs_dir = project_dir / cls.RUNS_DIR_NAME
+        if not runs_dir.is_dir():
+            return None
+
+        subdirs = [d for d in runs_dir.iterdir() if d.is_dir()]
+        if not subdirs:
+            return None
+
+        # Pick the most recently modified run directory
+        latest = max(subdirs, key=lambda d: d.stat().st_mtime)
+        run_id = latest.name
+
+        script_path = latest / "script.json"
+        if not script_path.exists():
+            return None
+
+        script_json = json.loads(script_path.read_text(encoding="utf-8"))
+
+        parts: list[dict[str, Any]] = []
+        parts_dir = latest / "parts"
+        if parts_dir.is_dir():
+            part_files = sorted(parts_dir.glob("part_*.*"))
+            for pf in part_files:
+                # Extract part id from filename like part_1.mp3
+                stem = pf.stem  # e.g. "part_1"
+                part_id_str = stem.split("_", 1)[1] if "_" in stem else None
+                if part_id_str and part_id_str.isdigit():
+                    parts.append({
+                        "id": part_id_str,
+                        "char_count": 0,
+                        "download_url": f"/api/projects/{project_id}/script/automate/runs/{run_id}/parts/{part_id_str}",
+                    })
+
+        return {
+            "run_id": run_id,
+            "script_json": script_json,
+            "parts": parts,
+        }
+
+    @classmethod
     async def stream_automation(
         cls,
         *,

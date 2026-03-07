@@ -17,6 +17,7 @@ import {
   Square,
   Volume2,
   Sparkles,
+  Trash2,
 } from "lucide-react";
 import { Button, SearchableSelect } from "@/components/ui";
 import type { SearchableSelectOption } from "@/components/ui";
@@ -492,6 +493,34 @@ export function ScriptRestructurePage() {
           setMetadataJson(pretty);
           setMetadataValid(true);
           setMetadataDetected(true);
+        }
+
+        // Load latest script generation + TTS audio
+        try {
+          const latestGen = await api.getLatestGeneration(projectId);
+          if (latestGen.exists && latestGen.script_json) {
+            const prettyScript = JSON.stringify(latestGen.script_json, null, 2);
+            setNewScriptJson(prettyScript);
+            const validation = validateScriptPayload(latestGen.script_json, loaded);
+            if (validation.valid) {
+              setJsonValid(true);
+              setJsonError(null);
+            }
+            setPromptCopied(true);
+
+            // Hydrate TTS parts if from automation run
+            if (latestGen.source === "automation_run" && latestGen.run_id && latestGen.parts.length > 0) {
+              const files = await hydrateAutomationParts(latestGen.run_id, latestGen.parts);
+              setUploadMode("multiple");
+              setAudioFile(null);
+              setSegmentFiles(files);
+              setRequiredSegmentIds([...files.keys()].sort((a, b) => a - b));
+              setHasTtsAudio(true);
+              setCurrentRunId(latestGen.run_id);
+            }
+          }
+        } catch {
+          // Non-critical
         }
       } catch (err) {
         setError((err as Error).message);
@@ -1779,6 +1808,17 @@ export function ScriptRestructurePage() {
                       >
                         Change
                       </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="text-[hsl(var(--destructive))]"
+                        onClick={() => {
+                          setAudioFile(null);
+                          setHasTtsAudio(false);
+                        }}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
                     </div>
                   ) : (
                     <Button
@@ -1909,6 +1949,21 @@ export function ScriptRestructurePage() {
                                   }
                                 >
                                   Change
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  className="h-6 px-2 text-xs text-[hsl(var(--destructive))]"
+                                  onClick={() => {
+                                    setSegmentFiles((prev) => {
+                                      const next = new Map(prev);
+                                      next.delete(segment.id);
+                                      if (next.size === 0) setHasTtsAudio(false);
+                                      return next;
+                                    });
+                                  }}
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" />
                                 </Button>
                               </div>
                             ) : (
@@ -2136,7 +2191,11 @@ export function ScriptRestructurePage() {
                     variant="outline"
                     size="sm"
                     onClick={handleGenerateOverlay}
-                    disabled={!jsonValid || overlayGenerating}
+                    disabled={
+                      !jsonValid ||
+                      overlayGenerating ||
+                      !!(overlayTitle || overlayCategory)
+                    }
                     className="h-7 text-xs"
                   >
                     {overlayGenerating ? (

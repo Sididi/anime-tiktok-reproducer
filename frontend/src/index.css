@@ -55,3 +55,12 @@ body {
   margin: 0;
   line-height: 1.6;
 }
+
+/* Gray out paragraph content that follows a locked raw scene header */
+.tiptap-editor .tiptap [data-is-raw="true"] + p {
+  opacity: 0.35;
+  pointer-events: none;
+  user-select: none;
+  font-style: italic;
+  color: hsl(var(--muted-foreground));
+}

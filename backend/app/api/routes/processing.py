@@ -267,6 +267,46 @@ async def get_script_automation_config(project_id: str):
     }
 
 
+@router.get("/script/latest-generation")
+async def get_latest_generation(project_id: str):
+    """Return the latest script generation (automation run or project root fallback)."""
+    project_dir = ProjectService.get_project_dir(project_id)
+    if not project_dir.exists():
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    latest = ScriptAutomationService.get_latest_run(project_id)
+    if latest and latest.get("script_json"):
+        return {
+            "exists": True,
+            "source": "automation_run",
+            "run_id": latest["run_id"],
+            "script_json": latest["script_json"],
+            "parts": latest["parts"],
+        }
+
+    fallback_path = project_dir / "new_script.json"
+    if fallback_path.exists():
+        try:
+            script_json = json.loads(fallback_path.read_text(encoding="utf-8"))
+            return {
+                "exists": True,
+                "source": "project_root",
+                "run_id": None,
+                "script_json": script_json,
+                "parts": [],
+            }
+        except Exception:
+            pass
+
+    return {
+        "exists": False,
+        "source": None,
+        "run_id": None,
+        "script_json": None,
+        "parts": [],
+    }
+
+
 @router.get("/script/prompt")
 async def get_script_prompt(project_id: str, target_language: str = "fr"):
     """Build the canonical script prompt from the project's transcription."""

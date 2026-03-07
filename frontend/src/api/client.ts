@@ -558,6 +558,15 @@ export const api = {
       { method: "GET" },
     ),
 
+  getLatestGeneration: (projectId: string) =>
+    request<{
+      exists: boolean;
+      source: "automation_run" | "project_root" | null;
+      run_id: string | null;
+      script_json: Record<string, unknown> | null;
+      parts: import("@/types").ScriptAutomationPart[];
+    }>(`/projects/${projectId}/script/latest-generation`),
+
   // Music preview
   previewMusicUrl: (projectId: string, musicKey: string) =>
     `${API_BASE}/projects/${projectId}/music/${encodeURIComponent(musicKey)}/preview`,
