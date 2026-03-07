@@ -24,7 +24,6 @@ import { useProjectStore, useSceneStore } from "@/stores";
 import { api } from "@/api/client";
 import type {
   Transcription,
-  Project,
   PlatformMetadata,
   ScriptAutomationConfig,
   ScriptAutomationEvent,
@@ -45,225 +44,6 @@ interface AudioSegment {
   characterCount: number;
 }
 
-// French-only prompt template (when target is French)
-const PROMPT_FR_TEMPLATE = `# RÔLE
-
-Tu es un Expert en Adaptation de Scripts Vidéo (Post-Synchro).
-Ta mission : Réécrire un script de [SOURCE] vers Français pour un format vidéo court (TikTok).
-Le but est d'obtenir un texte **indétectable comme copie (anti-plagiat)**, fluide à l'oreille, et parfaitement synchronisé temporellement.
-
-# CONTEXTE
-
-Titre de l'œuvre : [OEUVRE]
-_Instruction : Utilise ce titre pour comprendre le contexte et le vocabulaire spécifique (sport, magie, scifi...), mais NE CITE JAMAIS ce titre ni les noms des personnages dans le script final._
-
-# DONNÉES D'ENTRÉE
-
-Tu reçois un JSON contenant des scènes. Chaque scène possède :
-
-- \`text\` : Le script original.
-- \`duration_seconds\` : La durée stricte de la scène.
-- \`estimated_word_count\` : Indication de la densité originale.
-
-# RÈGLES D'EXÉCUTION (Priorité Absolue)
-
-### 1. LA "RÈGLE DU HOOK" (Première phrase - Exception)
-
-- La **première phrase** est l'accroche virale. Tu dois la **garder telle quelle** et la **traduire** le plus fidèlement possible. Fais une traduction contextuelle (plus naturel).
-
-### 2. FLUIDITÉ & RESTRUCTURATION (Anti-Plagiat)
-
-- **Ne traduis jamais phrase par phrase.** Lis le script par blocs pour comprendre le sens global et identifier les scènes (Règle 7).
-- **Reformulation totalement :** Modifie la structure syntaxique pour éviter le plagiat. Utilise des verbes forts et des synonymes percutants.
-- **Voix Active :** Pour le dynamisme TikTok, privilégie la voix active.
-  - _Mauvais :_ "Il a été surpris par l'attaque."
-  - _Bon :_ "L'attaque l'a surpris."
-- **Objectif :** Le texte français doit sembler avoir été écrit nativement, pas traduit.
-
-### 3. LA "RÈGLE DU CAFÉ" (Ton & Registre)
-
-- **Ton :** Tu ne rédiges pas un livre, tu racontes une histoire à un pote dans un café. C'est du "Storytime".
-- **Vocabulaire :** BANNIS le langage soutenu ("Néanmoins", "Cependant", "Demeurer", "Auparavant", "Impérial", "Dédain").
-  - _Remplace par :_ "Mais", "Juste avant", "Incroyable", "Mépris".
-- **Expressions Datées/Ringardes :** BANNIS les expressions idiomatiques vieillottes comme "Faire le pied de grue", "En mettre plein la vue", "Tomber des nues", "Prendre ses jambes à son cou".
-  - _Remplace par du concret/visuel :_ Au lieu de "Faire le pied de grue", dis "Rester planté là". Au lieu de "10 points dans la vue", dis "10 points d'écart" ou "Se prendre 10 points".
-- **Les Transitions (Crucial) :** Remplace les connecteurs écrits ("Par conséquent", "Ensuite") par des connecteurs oraux fluides : **"Du coup", "Alors", "Et là", "Bref", "Au final".**
-- **Structure :** Fais des phrases courtes et directes (Sujet + Verbe + Complément).
-- **Interdit :** Pas de passé simple (sauf effet dramatique), pas d'inversion sujet-verbe complexe. Ça doit sonner parlé.
-
-### 4. GESTION DES PRÉNOMS (Anonymisation)
-
-- **Suppression Totale :** Aucun prénom ne doit apparaître.
-- **L'introduction :** À la première apparition, remplace le nom par une description naturelle (ex: "La jeune prodige", "Le nouvel élève").
-- **Ensuite :** Utilise STRICTEMENT des pronoms (Elle, Il, Lui, Son) pour 90% des cas. Ne réutilise une description ("La fille") que si l'ambiguïté est totale.
-- **La Règle de Clarté (IMPORTANT) :**
-  - _Cas simple (Genres différents ou personnage seul) :_ Utilise massivement les pronoms (Il, Elle, Lui) pour la fluidité.
-  - _Cas complexe (Même genre) :_ Si l'action implique deux hommes (ou deux femmes), **l'utilisation seule de "Il" est interdite** car elle crée la confusion. Tu dois alterner les pronoms avec des **désignations fonctionnelles** (ex: "L'agresseur", "La victime", "Le coach", "Son frère").
-- **Critère de réussite :** On doit savoir INSTANTANÉMENT qui fait l'action, sans avoir l'image.
-
-### 5. SYNCHRONISATION, DENSITÉ & FLEXIBILITÉ TEMPORELLE (Calcul Technique)
-
-Le français est plus long, MAIS notre voix TTS parle vite (x1.15) et la vidéo est "élastique" (on peut la ralentir/accélérer au montage).
-
-- **La Règle d'Or du débit :** Vise une moyenne de **3 à 4 mots par seconde** de \`duration_seconds\`.
-  - *Exemple :* Si une scène dure 2.0s, tu as la place pour 6 à 8 mots.
-- **Priorité à l'Impact :** Ne cherche pas à "remplir" le temps si ce n'est pas nécessaire. Une phrase courte et tranchante ("Il est mort.") est meilleure qu'une phrase longue, car on peut accélérer la vidéo (cut) massivement.
-- **Gestion du débordement :** Tu as le droit de déborder légèrement de la durée théorique ou d'être plus court. Ce qui compte, c'est que le texte soit percutant.
-
-### 6. STRUCTURE DE RÉTENTION
-
-Si possible, chaque séquence (aggrégat de plans de coupe) doit suivre au moins une de ces logiques :
-
-## Curiosity
-Créer une attente :
-- “Sauf que…”
-- “Le problème, c’est que…”
-- “Il ne le sait pas encore, mais…”
-
-## Escalade
-Chaque séquence doit :
-- augmenter le danger
-- ou augmenter l’enjeu
-- ou révéler une info clé
-
-## Payoff visuel
-Quand une action arrive à l’écran :
-- elle doit être annoncée
-- puis livrée
-
-### 7. PRINCIPE DE "MACRO-SÉQUENCE" & ANCRAGE VISUEL
-
-Ton input JSON découpe la vidéo en "plans de coupe" (cuts) très courts. Ne traduis pas cut par cut, cela rendrait le texte robotique.
-
-1. **Regroupement (Macro-Séquence) :** Identifie des groupes de 2 à 5 cuts qui forment une idée narrative complète. Écris ta phrase française sur l'ensemble de ce groupe pour qu'elle soit fluide.
-2. **Redistribution :** Découpe ensuite cette phrase pour la répartir dans les objets JSON correspondants.
-3. **L'Ancrage Visuel (IMPÉRATIF) :** C'est ta seule contrainte rigide lors de la redistribution.
-   - Si la scène X montre une action spécifique (ex: un coup de poing), le mot correspondant ("frappe", "cogne") DOIT être dans l'objet JSON de la scène X.
-   - *Méthode :* Écris l'histoire fluide, puis "épingle" les mots-clés sur les bons index temporels.
-
-### 8. FORMATTAGE AUDIO
-
-- Le texte est destiné à un TTS (Text-To-Speech).
-- Utilise une ponctuation rythmique (virgule, point d'exclamation, point d'interrogation) pour guider l'IA vocale.
-
-# FORMAT DE SORTIE
-
-- Retourne **UNIQUEMENT** un JSON valide.
-- Garde **STRICTEMENT** la même structure (mêmes clés, même nombre d'objets).
-- Ne mets aucun markdown (pas de \`\`\`json), pas d'intro, pas de conclusion. Juste le raw JSON string.
-
-DONNÉES D'ENTRÉE :
-`;
-
-// Multilingual prompt template (when target is not French)
-const PROMPT_MULTILINGUAL_TEMPLATE = `# RÔLE
-
-Tu es un Expert en Adaptation de Scripts Vidéo (Post-Synchro).
-Ta mission : Réécrire un script de [SOURCE] vers [TARGET] pour un format vidéo court (TikTok/Reels).
-Le but est d'obtenir un texte **indétectable comme copie (anti-plagiat)**, fluide à l'oreille, et parfaitement synchronisé temporellement.
-
-# CONTEXTE
-
-Titre de l'œuvre : [OEUVRE]
-_Instruction : Utilise ce titre pour comprendre le contexte et le vocabulaire spécifique (sport, magie, scifi...), mais NE CITE JAMAIS ce titre ni les noms des personnages dans le script final._
-
-# DONNÉES D'ENTRÉE
-
-Tu reçois un JSON contenant des scènes. Chaque scène possède :
-
-- \`text\` : Le script original en [SOURCE].
-- \`duration_seconds\` : La durée stricte de la scène.
-- \`estimated_word_count\` : Indication de la densité originale.
-
-# RÈGLES D'EXÉCUTION (Priorité Absolue)
-
-### 1. LA "RÈGLE DU HOOK" (Première phrase - Exception)
-
-- La **première phrase** est l'accroche virale. Tu dois la **garder telle quelle** sur le fond mais la **traduire** en [TARGET] le plus fidèlement possible. Fais une traduction contextuelle (plus naturel).
-
-### 2. FLUIDITÉ & RESTRUCTURATION (Anti-Plagiat)
-
-- **Ne traduis jamais phrase par phrase.** Lis le script par blocs pour comprendre le sens global et identifier les scènes (Règle 7).
-- **Reformulation totale :** Modifie la structure syntaxique pour éviter le calque de la langue [SOURCE]. Utilise des verbes forts et des synonymes percutants propres à la langue [TARGET].
-- **Voix Active :** Pour le dynamisme TikTok, privilégie la voix active.
-- **Objectif :** Le texte en [TARGET] doit sembler avoir été écrit nativement, pas traduit.
-
-### 3. LA "RÈGLE DU CAFÉ" (Ton & Registre)
-
-- **Ton :** Tu ne rédiges pas un livre, tu racontes une histoire à un pote dans un café. C'est du "Storytime".
-- **Vocabulaire :** BANNIS le langage soutenu, académique ou littéraire de la langue [TARGET].
-  - _Exemple de logique :_ Ne dis pas "Néanmoins" ou "Cependant", dis "Mais" ou "Pourtant" (utilise les équivalents oraux de [TARGET]).
-- **Expressions Datées/Ringardes :** BANNIS les idiomes vieillots.
-  - _Remplace par du concret/visuel :_ Utilise le langage courant et moderne parlé actuellement par les jeunes adultes natifs en [TARGET].
-- **Les Transitions (Crucial) :** Remplace les connecteurs écrits par des connecteurs oraux fluides typiques de [TARGET] (équivalents de "Du coup", "Alors", "Bref", "Au final").
-- **Structure :** Fais des phrases courtes et directes.
-- **Interdit :** Pas de temps verbaux purement littéraires (comme le Passé Simple en français), sauf effet dramatique. Ça doit sonner parlé.
-
-### 4. GESTION DES PRÉNOMS (Anonymisation)
-
-- **Suppression Totale :** Aucun prénom ne doit apparaître.
-- **L'introduction :** À la première apparition, remplace le nom par une description naturelle (ex: "La jeune prodige", "Le nouvel élève").
-- **Ensuite :** Utilise STRICTEMENT des pronoms de la langue [TARGET] pour 90% des cas. Ne réutilise une description que si l'ambiguïté est totale.
-- **La Règle de Clarté (IMPORTANT) :**
-  - _Cas simple (Genres différents ou personnage seul) :_ Utilise massivement les pronoms pour la fluidité.
-  - _Cas complexe (Même genre) :_ Si l'action implique deux personnages du même genre, l'utilisation seule du pronom est interdite car elle crée la confusion. Tu dois alterner les pronoms avec des **désignations fonctionnelles** (ex: "L'agresseur", "La victime", "Le coach", "Son frère").
-- **Critère de réussite :** On doit savoir INSTANTANÉMENT qui fait l'action, sans avoir l'image.
-
-### 5. SYNCHRONISATION, DENSITÉ & FLEXIBILITÉ TEMPORELLE
-
-La langue [TARGET] peut avoir une densité syllabique différente de la langue [SOURCE].
-
-- **La Règle d'Or du débit :** Vise une moyenne de **3 à 4 mots par seconde** de \`duration_seconds\` (à ajuster légèrement selon la rapidité naturelle de la langue [TARGET]).
-  - *Exemple :* Si une scène dure 2.0s, tu as la place pour environ 6 à 8 mots.
-- **Priorité à l'Impact :** Ne cherche pas à "remplir" le temps si ce n'est pas nécessaire. Une phrase courte et tranchante est meilleure qu'une phrase longue.
-- **Gestion du débordement :** Tu as le droit de déborder légèrement de la durée théorique ou d'être plus court. Ce qui compte, c'est que le texte soit percutant.
-
-### 6. STRUCTURE DE RÉTENTION
-
-Si possible, chaque séquence (aggrégat de plans de coupe) doit suivre au moins une de ces logiques :
-
-## Curiosity
-Créer une attente (utilisant les formulations typiques de [TARGET] pour le suspense) :
-- “Sauf que…”
-- “Le problème, c’est que…”
-- “Il ne le sait pas encore, mais…”
-
-## Escalade
-Chaque séquence doit :
-- augmenter le danger
-- ou augmenter l’enjeu
-- ou révéler une info clé
-
-## Payoff visuel
-Quand une action arrive à l’écran :
-- elle doit être annoncée
-- puis livrée
-
-### 7. PRINCIPE DE "MACRO-SÉQUENCE" & ANCRAGE VISUEL
-
-Ton input JSON découpe la vidéo en "plans de coupe" (cuts) très courts. Ne traduis pas cut par cut, cela rendrait le texte robotique.
-
-1. **Regroupement (Macro-Séquence) :** Identifie des groupes de 2 à 5 cuts qui forment une idée narrative complète. Écris ta phrase en [TARGET] sur l'ensemble de ce groupe pour qu'elle soit fluide.
-2. **Redistribution :** Découpe ensuite cette phrase pour la répartir dans les objets JSON correspondants.
-3. **L'Ancrage Visuel (IMPÉRATIF) :** C'est ta seule contrainte rigide lors de la redistribution.
-   - Si la scène X montre une action spécifique (ex: un coup de poing), le mot correspondant en [TARGET] DOIT être dans l'objet JSON de la scène X.
-   - *Méthode :* Écris l'histoire fluide, puis "épingle" les mots-clés sur les bons index temporels.
-
-### 8. FORMATTAGE AUDIO
-
-- Le texte est destiné à un TTS (Text-To-Speech) en langue [TARGET].
-- Utilise une ponctuation rythmique (virgule, point d'exclamation, point d'interrogation) pour guider l'IA vocale.
-
-# FORMAT DE SORTIE
-
-- Retourne **UNIQUEMENT** un JSON valide.
-- Garde **STRICTEMENT** la même structure (mêmes clés, même nombre d'objets).
-- Change la valeur de la clé \`"language"\` pour le code ISO de [TARGET] (ex: "fr", "es", "de").
-- Ne mets aucun markdown (pas de \`\`\`json), pas d'intro, pas de conclusion. Juste le raw JSON string.
-
-DONNÉES D'ENTRÉE :
-`;
-
 // Language options for the selector
 const LANGUAGE_OPTIONS = [
   { value: "fr", label: "Francais" },
@@ -271,16 +51,11 @@ const LANGUAGE_OPTIONS = [
   { value: "es", label: "Espagnol" },
 ] as const;
 
-// Display names for languages (used in prompts)
-const LANGUAGE_DISPLAY_NAMES: Record<string, string> = {
-  en: "Anglais",
-  fr: "Francais",
-  es: "Espagnol",
-};
-
 type TargetLanguage = "fr" | "en" | "es";
 
-function mapPreparedSegments(payload: ScriptTtsPrepareResponse | null): AudioSegment[] {
+function mapPreparedSegments(
+  payload: ScriptTtsPrepareResponse | null,
+): AudioSegment[] {
   if (!payload) return [];
   return payload.segments.map((segment) => ({
     id: segment.id,
@@ -290,59 +65,89 @@ function mapPreparedSegments(payload: ScriptTtsPrepareResponse | null): AudioSeg
   }));
 }
 
-function generatePrompt(
+function validateScriptPayload(
+  payload: unknown,
   transcription: Transcription,
-  project: Project | null,
-  targetLang: TargetLanguage,
-): string {
-  // Choose the right template based on target language
-  const template =
-    targetLang === "fr" ? PROMPT_FR_TEMPLATE : PROMPT_MULTILINGUAL_TEMPLATE;
-
-  // Source language from transcription
-  const sourceLanguage =
-    LANGUAGE_DISPLAY_NAMES[transcription.language] || transcription.language;
-  const targetLanguage = LANGUAGE_DISPLAY_NAMES[targetLang];
-
-  // Get anime name from project
-  const animeName = project?.anime_name || "Inconnu";
-
-  // Replace template variables
-  let prompt = template
-    .replace(/\[SOURCE\]/g, sourceLanguage)
-    .replace(/\[OEUVRE\]/g, animeName);
-
-  // For multilingual template, also replace [TARGET]
-  if (targetLang !== "fr") {
-    prompt = prompt.replace(/\[TARGET\]/g, targetLanguage);
+): { valid: boolean; error: string | null } {
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    Array.isArray(payload)
+  ) {
+    return { valid: false, error: "Script JSON root must be an object" };
   }
 
-  // Build scene data for JSON
-  const sceneData = transcription.scenes.map((scene) => ({
-    scene_index: scene.scene_index,
-    text: scene.text,
-    duration_seconds: (scene.end_time - scene.start_time).toFixed(2),
-    estimated_word_count: scene.text.split(/\s+/).filter((w) => w).length,
-  }));
+  const obj = payload as Record<string, unknown>;
+  const rawScenes = obj.scenes;
+  if (!Array.isArray(rawScenes) || rawScenes.length === 0) {
+    return { valid: false, error: 'JSON must contain a non-empty "scenes" array' };
+  }
 
-  // Append JSON data
-  return (
-    prompt +
-    JSON.stringify(
-      {
-        language: targetLang,
-        scenes: sceneData,
-      },
-      null,
-      2,
-    )
-  );
+  if (rawScenes.length !== transcription.scenes.length) {
+    return {
+      valid: false,
+      error: `Scene count mismatch: expected ${transcription.scenes.length}, got ${rawScenes.length}`,
+    };
+  }
+
+  for (let i = 0; i < rawScenes.length; i += 1) {
+    const scene = rawScenes[i];
+    const expected = transcription.scenes[i];
+    if (
+      typeof scene !== "object" ||
+      scene === null ||
+      Array.isArray(scene)
+    ) {
+      return { valid: false, error: `Scene at position ${i} must be an object` };
+    }
+
+    const sceneObj = scene as Record<string, unknown>;
+    if (typeof sceneObj.scene_index !== "number") {
+      return {
+        valid: false,
+        error: `Scene at position ${i} must have a numeric "scene_index"`,
+      };
+    }
+    if (sceneObj.scene_index !== expected.scene_index) {
+      return {
+        valid: false,
+        error: `Scene index mismatch at position ${i}: expected ${expected.scene_index}, got ${sceneObj.scene_index}`,
+      };
+    }
+    if (typeof sceneObj.text !== "string") {
+      return {
+        valid: false,
+        error: `Scene ${expected.scene_index} must have a "text" string`,
+      };
+    }
+
+    const trimmedText = sceneObj.text.trim();
+    if (expected.is_raw && trimmedText) {
+      return {
+        valid: false,
+        error: `Scene ${expected.scene_index} is raw and must keep an empty text`,
+      };
+    }
+    if (!expected.is_raw && !trimmedText) {
+      return {
+        valid: false,
+        error: `Scene ${expected.scene_index} must contain non-empty text`,
+      };
+    }
+  }
+
+  return { valid: true, error: null };
 }
 
-function validateMetadataObject(
-  payload: unknown,
-): { valid: boolean; error: string | null } {
-  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+function validateMetadataObject(payload: unknown): {
+  valid: boolean;
+  error: string | null;
+} {
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    Array.isArray(payload)
+  ) {
     return { valid: false, error: "Metadata JSON must be an object" };
   }
   const obj = payload as Record<string, unknown>;
@@ -424,7 +229,11 @@ function createEmptyMetadata(): PlatformMetadata {
 }
 
 function coerceMetadataForEditor(payload: unknown): PlatformMetadata {
-  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    Array.isArray(payload)
+  ) {
     return createEmptyMetadata();
   }
 
@@ -472,7 +281,7 @@ function clampPreviewTtsSpeed(speed: number): number {
 export function ScriptRestructurePage() {
   const { projectId } = useParams<{ projectId: string }>();
   const navigate = useNavigate();
-  const { project, loadProject } = useProjectStore();
+  const { loadProject } = useProjectStore();
   const { loadScenes } = useSceneStore();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const automationAbortRef = useRef<AbortController | null>(null);
@@ -485,6 +294,11 @@ export function ScriptRestructurePage() {
   const [error, setError] = useState<string | null>(null);
   const [promptCopied, setPromptCopied] = useState(false);
   const [promptCopiedIndicator, setPromptCopiedIndicator] = useState(false);
+  const [scriptPrompt, setScriptPrompt] = useState("");
+  const [scriptPromptLoading, setScriptPromptLoading] = useState(false);
+  const [scriptPromptError, setScriptPromptError] = useState<string | null>(
+    null,
+  );
 
   // New script state
   const [newScriptJson, setNewScriptJson] = useState("");
@@ -519,11 +333,15 @@ export function ScriptRestructurePage() {
   const voiceAudioRef = useRef<HTMLAudioElement | null>(null);
 
   // Music selection state
-  const [automationMusicKey, setAutomationMusicKey] = useState<string | null>(null);
+  const [automationMusicKey, setAutomationMusicKey] = useState<string | null>(
+    null,
+  );
 
   // TTS speed state
   const [ttsSpeed, setTtsSpeed] = useState(1.0);
-  const ttsSpeedDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const ttsSpeedDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
 
   // Video overlay state
   const [overlayTitle, setOverlayTitle] = useState("");
@@ -532,7 +350,9 @@ export function ScriptRestructurePage() {
 
   // Automation validation pause
   const [validateBeforeTts, setValidateBeforeTts] = useState(true);
-  const [automationPhase, setAutomationPhase] = useState<"idle" | "phase1" | "validating" | "phase2">("idle");
+  const [automationPhase, setAutomationPhase] = useState<
+    "idle" | "phase1" | "validating" | "phase2"
+  >("idle");
   const [currentRunId, setCurrentRunId] = useState<string | null>(null);
 
   // Preview player state
@@ -554,7 +374,9 @@ export function ScriptRestructurePage() {
     useState<ScriptTtsPrepareResponse | null>(null);
   const [ttsPrepareError, setTtsPrepareError] = useState<string | null>(null);
   const [ttsPreparing, setTtsPreparing] = useState(false);
-  const ttsPrepareDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const ttsPrepareDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
   const ttsPrepareRequestRef = useRef(0);
   const [requiredSegmentIds, setRequiredSegmentIds] = useState<number[] | null>(
     null,
@@ -569,7 +391,8 @@ export function ScriptRestructurePage() {
     if (!jsonValid || !newScriptJson) return null;
     try {
       const parsed = JSON.parse(newScriptJson);
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+        return null;
       return parsed as Record<string, unknown>;
     } catch {
       return null;
@@ -642,7 +465,9 @@ export function ScriptRestructurePage() {
               availableMusicKeys.size > 0 &&
               !availableMusicKeys.has(settingsResult.music_key)
             ) {
-              setAutomationMusicKey(loadedAutomation?.default_music_key ?? null);
+              setAutomationMusicKey(
+                loadedAutomation?.default_music_key ?? null,
+              );
             } else {
               setAutomationMusicKey(settingsResult.music_key);
             }
@@ -685,6 +510,39 @@ export function ScriptRestructurePage() {
   }, []);
 
   useEffect(() => {
+    if (!projectId || !transcription) {
+      setScriptPrompt("");
+      setScriptPromptError(null);
+      setScriptPromptLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setScriptPromptLoading(true);
+    setScriptPromptError(null);
+
+    api
+      .getScriptPrompt(projectId, targetLanguage)
+      .then((result) => {
+        if (cancelled) return;
+        setScriptPrompt(result.prompt);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setScriptPrompt("");
+        setScriptPromptError((err as Error).message);
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setScriptPromptLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, transcription, targetLanguage]);
+
+  useEffect(() => {
     return () => {
       if (ttsPrepareDebounceRef.current) {
         clearTimeout(ttsPrepareDebounceRef.current);
@@ -712,10 +570,11 @@ export function ScriptRestructurePage() {
     setTtsPrepareError(null);
 
     ttsPrepareDebounceRef.current = setTimeout(() => {
-      api.prepareScriptTts(projectId, {
-        script_json: parsedScriptPayload,
-        target_language: targetLanguage,
-      })
+      api
+        .prepareScriptTts(projectId, {
+          script_json: parsedScriptPayload,
+          target_language: targetLanguage,
+        })
         .then((payload) => {
           if (ttsPrepareRequestRef.current !== requestId) return;
           setTtsPreparedPayload(payload);
@@ -740,18 +599,16 @@ export function ScriptRestructurePage() {
   }, [projectId, parsedScriptPayload, targetLanguage]);
 
   const handleCopyPrompt = useCallback(async () => {
-    if (!transcription) return;
-
-    const prompt = generatePrompt(transcription, project, targetLanguage);
+    if (!scriptPrompt) return;
     try {
-      await navigator.clipboard.writeText(prompt);
+      await navigator.clipboard.writeText(scriptPrompt);
       setPromptCopied(true);
       setPromptCopiedIndicator(true);
       setTimeout(() => setPromptCopiedIndicator(false), 1500);
     } catch {
       // Clipboard API may fail in insecure contexts
     }
-  }, [transcription, project, targetLanguage]);
+  }, [scriptPrompt]);
 
   const handleJsonChange = useCallback((value: string) => {
     setNewScriptJson(value);
@@ -763,30 +620,24 @@ export function ScriptRestructurePage() {
       return;
     }
 
+    if (!transcription) {
+      setJsonError("Transcription unavailable.");
+      return;
+    }
+
     try {
       const parsed = JSON.parse(value);
-      // Validate structure
-      if (!parsed.scenes || !Array.isArray(parsed.scenes)) {
-        setJsonError('JSON must contain a "scenes" array');
+      const validation = validateScriptPayload(parsed, transcription);
+      if (!validation.valid) {
+        setJsonError(validation.error);
         return;
-      }
-
-      for (const scene of parsed.scenes) {
-        if (typeof scene.scene_index !== "number") {
-          setJsonError('Each scene must have a numeric "scene_index"');
-          return;
-        }
-        if (typeof scene.text !== "string") {
-          setJsonError('Each scene must have a "text" string');
-          return;
-        }
       }
 
       setJsonValid(true);
     } catch (e) {
       setJsonError(`Invalid JSON: ${(e as Error).message}`);
     }
-  }, []);
+  }, [transcription]);
 
   const handleMetadataJsonChange = useCallback((value: string) => {
     setMetadataJson(value);
@@ -837,7 +688,10 @@ export function ScriptRestructurePage() {
   }, [projectId, jsonValid, newScriptJson, targetLanguage]);
 
   const hydrateAutomationParts = useCallback(
-    async (runId: string, parts: ScriptAutomationPart[]): Promise<Map<number, File>> => {
+    async (
+      runId: string,
+      parts: ScriptAutomationPart[],
+    ): Promise<Map<number, File>> => {
       if (!projectId) {
         throw new Error("Missing project id");
       }
@@ -845,14 +699,20 @@ export function ScriptRestructurePage() {
       const map = new Map<number, File>();
       for (let i = 0; i < parts.length; i++) {
         const part = parts[i];
-        const response = await api.downloadAutomationPart(projectId, runId, part.id);
+        const response = await api.downloadAutomationPart(
+          projectId,
+          runId,
+          part.id,
+        );
         if (!response.ok) {
           throw new Error(`Failed to download audio part ${part.id}`);
         }
 
         const blob = await response.blob();
         const contentDisposition = response.headers.get("Content-Disposition");
-        const fileNameMatch = contentDisposition?.match(/filename="?([^";]+)"?/i);
+        const fileNameMatch = contentDisposition?.match(
+          /filename="?([^";]+)"?/i,
+        );
         const fallbackExt = blob.type.includes("wav") ? "wav" : "mp3";
         const fileName = fileNameMatch?.[1] || `part_${part.id}.${fallbackExt}`;
         const file = new File([blob], fileName, {
@@ -860,7 +720,8 @@ export function ScriptRestructurePage() {
         });
 
         const parsedId = Number.parseInt(part.id, 10);
-        const segmentId = Number.isFinite(parsedId) && parsedId > 0 ? parsedId : i + 1;
+        const segmentId =
+          Number.isFinite(parsedId) && parsedId > 0 ? parsedId : i + 1;
         map.set(segmentId, file);
       }
       return map;
@@ -909,9 +770,12 @@ export function ScriptRestructurePage() {
   const saveTtsSpeed = useCallback(
     (speed: number) => {
       if (!projectId) return;
-      if (ttsSpeedDebounceRef.current) clearTimeout(ttsSpeedDebounceRef.current);
+      if (ttsSpeedDebounceRef.current)
+        clearTimeout(ttsSpeedDebounceRef.current);
       ttsSpeedDebounceRef.current = setTimeout(() => {
-        api.updateScriptSettings(projectId, { tts_speed: speed }).catch(() => {});
+        api
+          .updateScriptSettings(projectId, { tts_speed: speed })
+          .catch(() => {});
       }, 500);
     },
     [projectId],
@@ -1036,7 +900,9 @@ export function ScriptRestructurePage() {
         {
           target_language: targetLanguage,
           voice_key: automationVoiceKey,
-          existing_script_json: skipScript ? JSON.parse(newScriptJson) : undefined,
+          existing_script_json: skipScript
+            ? JSON.parse(newScriptJson)
+            : undefined,
           skip_metadata: skipMetadata,
           skip_tts: skipTts,
           pause_after_script: shouldPause,
@@ -1071,7 +937,11 @@ export function ScriptRestructurePage() {
           handleJsonChange(prettyScript);
         }
         if (finalEvent.metadata_json) {
-          const prettyMetadata = JSON.stringify(finalEvent.metadata_json, null, 2);
+          const prettyMetadata = JSON.stringify(
+            finalEvent.metadata_json,
+            null,
+            2,
+          );
           handleMetadataJsonChange(prettyMetadata);
           setMetadataDetected(true);
           setMetadataExpanded(true);
@@ -1089,7 +959,9 @@ export function ScriptRestructurePage() {
 
       if (finalEvent.event !== "complete") {
         throw new Error(
-          finalEvent.error || finalEvent.message || "Automation failed before completion",
+          finalEvent.error ||
+            finalEvent.message ||
+            "Automation failed before completion",
         );
       }
 
@@ -1101,7 +973,11 @@ export function ScriptRestructurePage() {
       handleJsonChange(prettyScript);
 
       if (finalEvent.metadata_json) {
-        const prettyMetadata = JSON.stringify(finalEvent.metadata_json, null, 2);
+        const prettyMetadata = JSON.stringify(
+          finalEvent.metadata_json,
+          null,
+          2,
+        );
         handleMetadataJsonChange(prettyMetadata);
         setMetadataDetected(true);
         setMetadataExpanded(true);
@@ -1323,8 +1199,14 @@ export function ScriptRestructurePage() {
   }, []);
 
   const handleCopyFullScript = useCallback(async () => {
-    const normalizedText = ttsPreparedPayload?.normalized_full_text?.trim() || "";
-    const fallbackText = parsedScenes ? parsedScenes.map((s) => s.text).join(" ").trim() : "";
+    const normalizedText =
+      ttsPreparedPayload?.normalized_full_text?.trim() || "";
+    const fallbackText = parsedScenes
+      ? parsedScenes
+          .map((s) => s.text)
+          .join(" ")
+          .trim()
+      : "";
     const fullText = normalizedText || fallbackText;
     if (!fullText) return;
     try {
@@ -1391,13 +1273,20 @@ export function ScriptRestructurePage() {
 
     try {
       // Save settings (speed, music, overlay) to project before submission
-      await api.updateScriptSettings(projectId, {
-        tts_speed: ttsSpeed,
-        music_key: automationMusicKey,
-        ...(overlayTitle || overlayCategory
-          ? { video_overlay: { title: overlayTitle, category: overlayCategory } }
-          : {}),
-      }).catch(() => {});
+      await api
+        .updateScriptSettings(projectId, {
+          tts_speed: ttsSpeed,
+          music_key: automationMusicKey,
+          ...(overlayTitle || overlayCategory
+            ? {
+                video_overlay: {
+                  title: overlayTitle,
+                  category: overlayCategory,
+                },
+              }
+            : {}),
+        })
+        .catch(() => {});
 
       const formData = new FormData();
       formData.append("script", newScriptJson);
@@ -1476,8 +1365,6 @@ export function ScriptRestructurePage() {
     );
   }
 
-  const prompt = generatePrompt(transcription, project, targetLanguage);
-
   const allFieldsFilled =
     jsonValid &&
     newScriptJson.trim() !== "" &&
@@ -1503,10 +1390,17 @@ export function ScriptRestructurePage() {
                 : allFieldsFilled
                   ? "All fields already filled"
                   : null;
-  const canRunAutomation = automationBlockedReason === null && !automationRunning;
-  const normalizedFullText = ttsPreparedPayload?.normalized_full_text?.trim() || "";
+  const canRunAutomation =
+    automationBlockedReason === null && !automationRunning;
+  const normalizedFullText =
+    ttsPreparedPayload?.normalized_full_text?.trim() || "";
   const fullScriptPreview =
-    normalizedFullText || parsedScenes?.map((scene) => scene.text).join(" ").trim() || "";
+    normalizedFullText ||
+    parsedScenes
+      ?.map((scene) => scene.text)
+      .join(" ")
+      .trim() ||
+    "";
   const expectedSegmentOrder =
     requiredSegmentIds ?? audioSegments.map((seg) => seg.id);
   const displaySegments =
@@ -1600,11 +1494,21 @@ export function ScriptRestructurePage() {
                 <h2 className="font-semibold">
                   Step 1: Copy Restructuration Prompt
                 </h2>
-                <Button variant="outline" size="sm" onClick={handleCopyPrompt}>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleCopyPrompt}
+                  disabled={!scriptPrompt || scriptPromptLoading}
+                >
                   {promptCopiedIndicator ? (
                     <>
                       <Check className="h-4 w-4 mr-2" />
                       Copied!
+                    </>
+                  ) : scriptPromptLoading ? (
+                    <>
+                      <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                      Loading...
                     </>
                   ) : (
                     <>
@@ -1615,14 +1519,24 @@ export function ScriptRestructurePage() {
                 </Button>
               </div>
               <p className="text-sm text-[hsl(var(--muted-foreground))]">
-                Use this prompt with an AI (Claude, ChatGPT, etc.) to generate
-                a new{" "}
-                {LANGUAGE_OPTIONS.find((l) => l.value === targetLanguage)?.label}{" "}
+                Use this prompt with an AI (Claude, ChatGPT, etc.) to generate a
+                new{" "}
+                {
+                  LANGUAGE_OPTIONS.find((l) => l.value === targetLanguage)
+                    ?.label
+                }{" "}
                 script. The AI will return JSON that you can paste below.
               </p>
+              {scriptPromptError && (
+                <div className="text-sm text-[hsl(var(--destructive))]">
+                  {scriptPromptError}
+                </div>
+              )}
               <div className="max-h-48 overflow-y-auto bg-[hsl(var(--muted))] rounded-lg p-3">
                 <pre className="text-xs whitespace-pre-wrap font-mono">
-                  {prompt}
+                  {scriptPromptLoading
+                    ? "Loading prompt..."
+                    : scriptPrompt || "Prompt unavailable"}
                 </pre>
               </div>
             </div>
@@ -1822,8 +1736,7 @@ export function ScriptRestructurePage() {
                   {jsonValid && fullScriptPreview && (
                     <div className="flex items-center justify-between p-2 bg-[hsl(var(--muted))] rounded-lg">
                       <span className="text-xs text-[hsl(var(--muted-foreground))] truncate flex-1 mx-2 italic">
-                        "
-                        {fullScriptPreview.slice(0, 120)}
+                        "{fullScriptPreview.slice(0, 120)}
                         ..."
                       </span>
                       <Button
@@ -1918,7 +1831,8 @@ export function ScriptRestructurePage() {
                           500-750 chars, ideal ~625, hard cap 800)
                         </span>
                         <span className="text-[hsl(var(--muted-foreground))]">
-                          {uploadedSegmentsCount}/{expectedSegmentOrder.length} uploaded
+                          {uploadedSegmentsCount}/{expectedSegmentOrder.length}{" "}
+                          uploaded
                         </span>
                       </div>
                       {displaySegments.map((segment) => {
@@ -2059,11 +1973,14 @@ export function ScriptRestructurePage() {
                     Voice
                   </span>
                   <SearchableSelect
-                    options={(automationConfig?.voices || []).map((v) => ({
-                      key: v.key,
-                      label: v.display_name,
-                      previewUrl: v.preview_url,
-                    } as SearchableSelectOption))}
+                    options={(automationConfig?.voices || []).map(
+                      (v) =>
+                        ({
+                          key: v.key,
+                          label: v.display_name,
+                          previewUrl: v.preview_url,
+                        }) as SearchableSelectOption,
+                    )}
                     value={automationVoiceKey || null}
                     onChange={(key) => setAutomationVoiceKey(key || "")}
                     placeholder="Select voice..."
@@ -2081,11 +1998,16 @@ export function ScriptRestructurePage() {
                       Music
                     </span>
                     <SearchableSelect
-                      options={automationConfig.musics.map((m) => ({
-                        key: m.key,
-                        label: m.display_name,
-                        previewUrl: projectId ? api.previewMusicUrl(projectId, m.key) : undefined,
-                      } as SearchableSelectOption))}
+                      options={automationConfig.musics.map(
+                        (m) =>
+                          ({
+                            key: m.key,
+                            label: m.display_name,
+                            previewUrl: projectId
+                              ? api.previewMusicUrl(projectId, m.key)
+                              : undefined,
+                          }) as SearchableSelectOption,
+                      )}
                       value={automationMusicKey}
                       onChange={(key) => {
                         setAutomationMusicKey(key);
@@ -2154,7 +2076,9 @@ export function ScriptRestructurePage() {
                 {automationMessage && (
                   <div className="text-sm p-3 rounded-md bg-[hsl(var(--muted))]">
                     <p className="font-medium">
-                      {automationStep ? automationStep.replace("_", " ") : "automation"}
+                      {automationStep
+                        ? automationStep.replace("_", " ")
+                        : "automation"}
                     </p>
                     <p className="text-[hsl(var(--muted-foreground))]">
                       {automationMessage}
@@ -2300,7 +2224,8 @@ export function ScriptRestructurePage() {
                           ? audioFile
                             ? "bg-green-500"
                             : "bg-[hsl(var(--border))]"
-                          : uploadedSegmentsCount === expectedSegmentOrder.length &&
+                          : uploadedSegmentsCount ===
+                                expectedSegmentOrder.length &&
                               expectedSegmentOrder.length > 0
                             ? "bg-green-500"
                             : "bg-[hsl(var(--border))]"

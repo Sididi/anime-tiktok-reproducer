@@ -6,105 +6,11 @@ from pydantic import ValidationError
 
 from ..models import VideoMetadataPayload
 from .project_service import ProjectService
-
-
-_LANGUAGE_DISPLAY = {
-    "fr": "Français",
-    "en": "English",
-    "es": "Español",
-    "de": "Deutsch",
-}
-
-_PROMPT_TEMPLATE = """# Role & Objectif
-
-Tu es un expert en SEO social media spécialisé dans la niche "Anime/Manga". Ta mission est de générer les métadonnées virales (Titres, Descriptions, Tags) pour des vidéos format court (Shorts/Reels/TikTok) à partir d'un script vidéo et du nom de l'œuvre.
-
-# Règle D'Or : Le Gatekeeping (IMPORTANT)
-
-- Tu ne dois JAMAIS mentionner {NOM_OEUVRE} dans les Titres, Descriptions ou Légendes. Jamais. Le titre n'apparaît que dans les TAGS cachés.
-- Tu ne dois JAMAIS utiliser les noms propres des personnages présents dans {NOM_OEUVRE}.
-- Tu dois REMPLACER les noms par des descriptions contextuelles ou des archétypes (ex: au lieu de "Naruto", dis "ce ninja blond" ou "le gamin maudit" ; au lieu de "Luffy", dis "le capitaine élastique").
-
-# Identité & Tonalité
-
-- **Langage :** Français standard mais dynamique. Tutoiement.
-- **Argot autorisé :** Utilise des termes comme "Dinguerie", "Banger", "Masterclass", "Pépite".
-- **Argot INTERDIT :** Ne jamais utiliser "Wesh", "Frérot", ou de langage trop "quartier/gamin".
-- **Style :** Phrases très courtes. Hachées. Impactantes.
-- **Emojis :** Minimaliste (1 ou 2 max par texte). Juste pour accentuer une émotion (🔥, 💀, 😱).
-- **Humour & Hook :** Pour l'accroche, cherche l'élément le plus absurde ou choquant du script et tourne-le en ridicule ou en affirmation choc (ex: Si le perso épouse un robot, dis "Il s'est marié avec son aspirateur ?!"). Ne mens pas, mais exagère le trait pour le comique.
-
-# Instructions par Plateforme
-
-## 1. YOUTUBE (Shorts)
-
-- **Titre :** Clickbait pur. Doit faire moins de 60 caractères. Doit choquer ou poser une question intrigante.
-- **Description :** Résumé ultra-condensé (2 phrases max).
-- **Tags :** {NOM_OEUVRE} + "anime", "manga", "recommandation", "résumé".
-
-## 2. TIKTOK
-
-- **Description :** Une phrase d'accroche très courte issue du script ou une réaction à chaud.
-- **Hashtags :** OBLIGATOIREMENT et UNIQUEMENT : #animefyp #animerecommendations #anime
-
-## 3. INSTAGRAM (Reels)
-
-- **Caption :** - Ligne 1 : Une phrase "Titre" (pas de majuscules forcées) qui sert d'accroche.
-  - Ligne 2 : Un saut de ligne.
-  - Ligne 3 : Hashtags pertinents liés au genre de l'anime (ex: #shonen #romance #action) collés après le texte.
-
-## 4. FACEBOOK (Reels)
-
-- **Titre :** Hook style (comme YouTube).
-- **Description :** Un peu plus narratif que les autres. Raconte l'histoire en 3-4 phrases courtes en gardant le mystère.
-- **CTA :** Finir impérativement par : "Abonne toi pour plus de présentations d'anime"
-- **Hashtags :** 3-4 hashtags pertinents à la fin.
-- **Tags :** {NOM_OEUVRE}, Anime, Manga, Otaku, Recommandation Anime, Scène Culte, Meilleur Anime.
-
-# Output Format
-
-Tu dois fournir EXCLUSIVEMENT un objet JSON valide, sans texte avant ni après (pas de markdown ```json, juste le code brut).
-
-Structure du JSON :
-{
-"facebook": {
-"title": "String",
-"description": "String (Description + CTA + Hashtags)",
-"tags": ["String"]
-},
-"instagram": {
-"caption": "String (Titre + Saut de ligne + Hashtags)"
-},
-"youtube": {
-"title": "String",
-"description": "String",
-"tags": ["String"]
-},
-"tiktok": {
-"description": "String (Description + Tags obligatoires)"
-}
-}
-
-# Données d'entrée
-
-1. Le titre de l'anime est : {NOM_OEUVRE}
-
-2. La narration complète de la vidéo (script) est : {SCRIPT}
-"""
+from .script_phase_prompt_service import ScriptPhasePromptService
 
 
 class MetadataService:
     """Metadata prompt generation, validation and persistence."""
-
-    @classmethod
-    def _language_block(cls, target_language: str) -> str:
-        display = _LANGUAGE_DISPLAY.get(target_language, target_language)
-        return (
-            "\n\n# Consigne supplémentaire (langue cible)\n\n"
-            f"- Toutes les valeurs textuelles de sortie doivent être écrites en {display}.\n"
-            "- Ne mélange pas les langues.\n"
-            "- Garde strictement le même format JSON demandé.\n"
-        )
 
     @classmethod
     def build_prompt(
@@ -113,11 +19,30 @@ class MetadataService:
         script_text: str,
         target_language: str = "fr",
     ) -> str:
-        prompt = _PROMPT_TEMPLATE
-        prompt = prompt.replace("{NOM_OEUVRE}", anime_name).replace("{SCRIPT}", script_text)
-        if target_language != "fr":
-            prompt += cls._language_block(target_language)
-        return prompt
+        return ScriptPhasePromptService.build_metadata_prompt(
+            anime_name=anime_name,
+            script_text=script_text,
+            target_language=target_language,
+        )
+
+    @classmethod
+    def build_prompt_from_script_payload(
+        cls,
+        anime_name: str,
+        script_payload: dict[str, Any],
+        target_language: str = "fr",
+    ) -> str:
+        scenes = script_payload.get("scenes", [])
+        script_text = " ".join(
+            scene.get("text", "").strip()
+            for scene in scenes
+            if isinstance(scene, dict) and isinstance(scene.get("text"), str)
+        ).strip()
+        return cls.build_prompt(
+            anime_name=anime_name,
+            script_text=script_text,
+            target_language=target_language,
+        )
 
     @classmethod
     def build_prompt_from_script_json(
@@ -127,13 +52,11 @@ class MetadataService:
         target_language: str = "fr",
     ) -> str:
         payload = json.loads(script_json)
-        scenes = payload.get("scenes", [])
-        script_text = " ".join(
-            scene.get("text", "").strip()
-            for scene in scenes
-            if isinstance(scene, dict) and isinstance(scene.get("text"), str)
-        ).strip()
-        return cls.build_prompt(anime_name=anime_name, script_text=script_text, target_language=target_language)
+        return cls.build_prompt_from_script_payload(
+            anime_name=anime_name,
+            script_payload=payload,
+            target_language=target_language,
+        )
 
     @classmethod
     def validate_payload(cls, payload: dict[str, Any]) -> VideoMetadataPayload:

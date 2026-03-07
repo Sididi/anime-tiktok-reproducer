@@ -684,7 +684,14 @@ class TranscriberService:
         cls,
         script: dict,
         timed_words: list[dict],
+        reference_transcription: Transcription | None = None,
     ) -> list[SceneTranscription]:
+        reference_by_index = {}
+        if reference_transcription is not None:
+            reference_by_index = {
+                scene.scene_index: scene for scene in reference_transcription.scenes
+            }
+
         script_entries: list[dict] = []
         for scene_data in script.get("scenes", []):
             scene_index = scene_data.get("scene_index", 0)
@@ -753,9 +760,23 @@ class TranscriberService:
             scene_index = scene_data.get("scene_index", 0)
             scene_text = scene_data.get("text", "")
             words = scene_word_map.get(scene_index, [])
+            reference_scene = reference_by_index.get(scene_index)
+            is_raw = bool(scene_data.get("is_raw"))
+            if reference_scene is not None:
+                is_raw = is_raw or reference_scene.is_raw
+
             if words:
                 start_time = words[0].start
                 end_time = words[-1].end
+            elif is_raw:
+                raw_start = scene_data.get("start_time")
+                raw_end = scene_data.get("end_time")
+                if reference_scene is not None:
+                    start_time = reference_scene.start_time
+                    end_time = reference_scene.end_time
+                else:
+                    start_time = float(raw_start) if isinstance(raw_start, (int, float)) else 0.0
+                    end_time = float(raw_end) if isinstance(raw_end, (int, float)) else 0.0
             else:
                 start_time = 0.0
                 end_time = 0.0
@@ -766,6 +787,7 @@ class TranscriberService:
                 words=words,
                 start_time=start_time,
                 end_time=end_time,
+                is_raw=is_raw,
             ))
 
         return scene_transcriptions
@@ -996,6 +1018,7 @@ class TranscriberService:
         cls,
         audio_path: Path,
         script: dict,
+        reference_transcription: Transcription | None = None,
         model_size: str = "large-v3",
     ) -> Transcription:
         """
@@ -1022,7 +1045,11 @@ class TranscriberService:
         words, detected_lang = cls._transcribe_sync(audio_path, lang_code, model_size)
 
         # Align script text to timed words
-        scene_transcriptions = cls._align_script_to_words(script, words)
+        scene_transcriptions = cls._align_script_to_words(
+            script,
+            words,
+            reference_transcription=reference_transcription,
+        )
 
         return Transcription(
             language=script.get("language", detected_lang),

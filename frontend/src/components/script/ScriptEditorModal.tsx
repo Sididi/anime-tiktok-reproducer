@@ -1,9 +1,6 @@
-import { useState, useEffect, useMemo, useCallback, useRef } from "react";
-import { X } from "lucide-react";
-import { useEditor, EditorContent } from "@tiptap/react";
-import StarterKit from "@tiptap/starter-kit";
+import { useState, useEffect, useMemo, useCallback } from "react";
+import { Lock, X } from "lucide-react";
 import { Button } from "@/components/ui";
-import { SceneHeader } from "./SceneHeaderExtension";
 import {
   estimateTtsDuration,
   getSpeedCategory,
@@ -23,8 +20,8 @@ interface ScriptEditorModalProps {
 interface SceneJsonEntry {
   scene_index: number;
   text: string;
-  duration_seconds: string;
-  estimated_word_count: number;
+  duration_seconds?: string;
+  estimated_word_count?: number;
   [key: string]: unknown;
 }
 
@@ -34,68 +31,10 @@ interface ParsedScript {
   [key: string]: unknown;
 }
 
-/**
- * Build a TipTap-compatible JSON document from parsed scene data.
- * Alternates sceneHeader nodes with paragraph nodes containing the scene text.
- */
-function buildTipTapDoc(scenes: SceneJsonEntry[]) {
-  const content: Record<string, unknown>[] = [];
-
-  for (const scene of scenes) {
-    content.push({
-      type: "sceneHeader",
-      attrs: { sceneIndex: scene.scene_index },
-    });
-    content.push({
-      type: "paragraph",
-      content: scene.text
-        ? [{ type: "text", text: scene.text }]
-        : [],
-    });
-  }
-
-  return { type: "doc", content };
-}
-
-/**
- * Extract scene texts from the TipTap editor JSON.
- * Collects all paragraph text between consecutive sceneHeader nodes.
- */
-function extractScenesFromEditor(
-  editorJson: Record<string, unknown>,
-): string[] {
-  const content = editorJson.content as Array<Record<string, unknown>>;
-  if (!content) return [];
-
-  const scenes: string[] = [];
-  let currentTexts: string[] = [];
-  let inScene = false;
-
-  for (const node of content) {
-    if (node.type === "sceneHeader") {
-      if (inScene) {
-        scenes.push(currentTexts.join(" ").trim());
-      }
-      currentTexts = [];
-      inScene = true;
-    } else if (inScene && node.type === "paragraph") {
-      const nodeContent = node.content as Array<Record<string, unknown>> | undefined;
-      if (nodeContent) {
-        const text = nodeContent
-          .filter((c) => c.type === "text")
-          .map((c) => c.text as string)
-          .join("");
-        if (text) currentTexts.push(text);
-      }
-    }
-  }
-
-  // Last scene
-  if (inScene) {
-    scenes.push(currentTexts.join(" ").trim());
-  }
-
-  return scenes;
+interface SceneDraft {
+  scene_index: number;
+  text: string;
+  isRaw: boolean;
 }
 
 export function ScriptEditorModal({
@@ -106,11 +45,8 @@ export function ScriptEditorModal({
   transcription,
   targetLanguage,
 }: ScriptEditorModalProps) {
-  const [updateCounter, setUpdateCounter] = useState(0);
-  const scrollContainerRef = useRef<HTMLDivElement>(null);
-  const [scenePositions, setScenePositions] = useState<number[]>([]);
+  const [drafts, setDrafts] = useState<SceneDraft[]>([]);
 
-  // Parse the incoming JSON
   const parsedScript = useMemo<ParsedScript | null>(() => {
     try {
       return JSON.parse(scenesJson);
@@ -119,131 +55,117 @@ export function ScriptEditorModal({
     }
   }, [scenesJson]);
 
-  const editor = useEditor({
-    extensions: [
-      StarterKit.configure({
-        heading: false,
-        bulletList: false,
-        orderedList: false,
-        listItem: false,
-        codeBlock: false,
-        code: false,
-        blockquote: false,
-        horizontalRule: false,
-        bold: false,
-        italic: false,
-        strike: false,
-      }),
-      SceneHeader,
-    ],
-    content: parsedScript && Array.isArray(parsedScript.scenes) ? buildTipTapDoc(parsedScript.scenes) : "",
-    onUpdate: () => {
-      setUpdateCounter((c) => c + 1);
-    },
-  });
+  const transcriptionByIndex = useMemo(
+    () =>
+      new Map(transcription.scenes.map((scene) => [scene.scene_index, scene])),
+    [transcription],
+  );
 
-  // Reset content when modal opens
   useEffect(() => {
-    if (isOpen && editor && parsedScript && Array.isArray(parsedScript.scenes)) {
-      editor.commands.setContent(buildTipTapDoc(parsedScript.scenes));
-      setUpdateCounter((c) => c + 1);
+    if (!isOpen || !parsedScript || !Array.isArray(parsedScript.scenes)) {
+      return;
     }
-  }, [isOpen, editor, parsedScript]);
+    setDrafts(
+      parsedScript.scenes.map((scene) => {
+        const transcriptionScene = transcriptionByIndex.get(scene.scene_index);
+        return {
+          scene_index: scene.scene_index,
+          text: scene.text,
+          isRaw: Boolean(transcriptionScene?.is_raw),
+        };
+      }),
+    );
+  }, [isOpen, parsedScript, transcriptionByIndex]);
 
-  // Measure scene header chip positions for aligning stats
-  useEffect(() => {
-    if (!isOpen || !editor) return;
-
-    const measure = () => {
-      const container = scrollContainerRef.current;
-      if (!container) return;
-
-      const chips = container.querySelectorAll(".scene-header-chip");
-      if (chips.length === 0) return;
-
-      const containerRect = container.getBoundingClientRect();
-      const positions = Array.from(chips).map((chip) => {
-        const chipRect = chip.getBoundingClientRect();
-        return chipRect.top - containerRect.top + container.scrollTop;
-      });
-      setScenePositions(positions);
-    };
-
-    requestAnimationFrame(measure);
-  }, [updateCounter, isOpen, editor]);
-
-  // Live duration stats
   const sceneStats = useMemo(() => {
-    if (!editor || !parsedScript || !Array.isArray(parsedScript.scenes) || !transcription) return [];
+    return drafts.map((draft) => {
+      const originalScene = transcriptionByIndex.get(draft.scene_index);
+      const originalDuration = originalScene
+        ? originalScene.end_time - originalScene.start_time
+        : 0;
 
-    const editorJson = editor.getJSON();
-    const texts = extractScenesFromEditor(editorJson as Record<string, unknown>);
+      if (draft.isRaw) {
+        return {
+          sceneIndex: draft.scene_index,
+          isRaw: true,
+          estimatedDuration: 0,
+          originalDuration,
+          deltaPct: 0,
+          category: "green" as const,
+        };
+      }
 
-    return parsedScript.scenes.map((scene, i) => {
-      const newText = texts[i] || "";
-      const estimatedDuration = estimateTtsDuration(newText, targetLanguage);
-
-      // Original duration from transcription
-      const origScene = transcription.scenes[i];
-      const originalDuration = origScene
-        ? origScene.end_time - origScene.start_time
-        : parseFloat(scene.duration_seconds) || 0;
-
+      const estimatedDuration = estimateTtsDuration(draft.text, targetLanguage);
       const speedRatio =
         originalDuration > 0 ? estimatedDuration / originalDuration : 1;
-      const deltaPct = (speedRatio - 1) * 100;
-      const category = getSpeedCategory(speedRatio);
 
       return {
-        sceneIndex: scene.scene_index,
+        sceneIndex: draft.scene_index,
+        isRaw: false,
         estimatedDuration,
         originalDuration,
-        deltaPct,
-        category,
+        deltaPct: (speedRatio - 1) * 100,
+        category: getSpeedCategory(speedRatio),
       };
     });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [updateCounter, parsedScript, transcription, targetLanguage, editor]);
+  }, [drafts, targetLanguage, transcriptionByIndex]);
 
   const totals = useMemo(() => {
-    const totalEstimated = sceneStats.reduce((s, x) => s + x.estimatedDuration, 0);
-    const totalOriginal = sceneStats.reduce((s, x) => s + x.originalDuration, 0);
-    return { totalEstimated, totalOriginal };
+    const editableStats = sceneStats.filter((stat) => !stat.isRaw);
+    return {
+      totalEstimated: editableStats.reduce((sum, stat) => sum + stat.estimatedDuration, 0),
+      totalOriginal: editableStats.reduce((sum, stat) => sum + stat.originalDuration, 0),
+    };
   }, [sceneStats]);
 
+  const handleTextChange = useCallback((sceneIndex: number, text: string) => {
+    setDrafts((prev) =>
+      prev.map((draft) =>
+        draft.scene_index === sceneIndex ? { ...draft, text } : draft,
+      ),
+    );
+  }, []);
+
   const handleSave = useCallback(() => {
-    if (!editor || !parsedScript) return;
+    if (!parsedScript) return;
 
-    const editorJson = editor.getJSON();
-    const texts = extractScenesFromEditor(editorJson as Record<string, unknown>);
-
+    const draftByIndex = new Map(drafts.map((draft) => [draft.scene_index, draft]));
     const updatedScript: ParsedScript = {
       ...parsedScript,
-      scenes: parsedScript.scenes.map((scene, i) => ({
-        ...scene,
-        text: texts[i] || "",
-        estimated_word_count: (texts[i] || "")
-          .trim()
-          .split(/\s+/)
-          .filter(Boolean).length,
-      })),
+      scenes: parsedScript.scenes.map((scene) => {
+        const draft = draftByIndex.get(scene.scene_index);
+        const nextText = draft?.isRaw ? "" : draft?.text ?? scene.text;
+        return {
+          ...scene,
+          text: nextText,
+          estimated_word_count: nextText.trim()
+            ? nextText.trim().split(/\s+/).filter(Boolean).length
+            : 0,
+        };
+      }),
     };
 
     onSave(JSON.stringify(updatedScript, null, 2));
     onClose();
-  }, [editor, parsedScript, onSave, onClose]);
+  }, [drafts, onClose, onSave, parsedScript]);
 
-  if (!isOpen) return null;
+  if (!isOpen || !parsedScript) return null;
 
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
-      onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
     >
       <div className="bg-[hsl(var(--card))] rounded-lg w-full max-w-6xl max-h-[90vh] overflow-hidden flex flex-col">
-        {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-[hsl(var(--border))]">
-          <h2 className="text-lg font-semibold">Edit Script</h2>
+          <div>
+            <h2 className="text-lg font-semibold">Edit Script</h2>
+            <p className="text-sm text-[hsl(var(--muted-foreground))]">
+              Raw scenes are locked and kept empty.
+            </p>
+          </div>
           <button
             onClick={onClose}
             className="p-1 hover:bg-[hsl(var(--muted))] rounded"
@@ -252,47 +174,73 @@ export function ScriptEditorModal({
           </button>
         </div>
 
-        {/* Content — single scroll container for linked scroll */}
-        <div ref={scrollContainerRef} className="flex-1 overflow-y-auto min-h-0">
-          <div className="flex">
-            {/* Editor panel */}
-            <div className="flex-[7] p-4 border-r border-[hsl(var(--border))]">
-              <EditorContent
-                editor={editor}
-                className="tiptap-editor prose prose-invert max-w-none min-h-[300px]"
-              />
-            </div>
-
-            {/* Stats panel — absolutely positioned per-scene, aligned with editor */}
-            <div className="flex-[3] relative">
-              {scenePositions.length > 0 &&
-                sceneStats.map((stat, i) => (
-                  <div
-                    key={stat.sceneIndex}
-                    className="absolute left-0 right-0 px-4 font-mono text-xs whitespace-nowrap"
-                    style={{ top: scenePositions[i] ?? 0 }}
-                  >
-                    <span>~{stat.estimatedDuration.toFixed(1)}s</span>
-                    <span className="text-[hsl(var(--muted-foreground))]">
-                      {" / "}
-                      {stat.originalDuration.toFixed(1)}s
+        <div className="flex-1 overflow-y-auto min-h-0 p-4 space-y-4">
+          {drafts.map((draft) => {
+            const stat = sceneStats.find(
+              (entry) => entry.sceneIndex === draft.scene_index,
+            );
+            return (
+              <div
+                key={draft.scene_index}
+                className="border border-[hsl(var(--border))] rounded-lg bg-[hsl(var(--background))]"
+              >
+                <div className="flex items-center justify-between gap-4 border-b border-[hsl(var(--border))] px-4 py-3">
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-semibold">
+                      Scene {draft.scene_index + 1}
                     </span>
-                    <span
-                      className={`ml-1.5 font-semibold ${DELTA_COLORS[stat.category]}`}
-                    >
-                      {stat.deltaPct >= 0 ? "+" : ""}
-                      {stat.deltaPct.toFixed(0)}%
-                    </span>
+                    {draft.isRaw && (
+                      <span className="inline-flex items-center gap-1 rounded-full bg-[hsl(var(--muted))] px-2 py-0.5 text-xs text-[hsl(var(--muted-foreground))]">
+                        <Lock className="h-3.5 w-3.5" />
+                        Locked raw
+                      </span>
+                    )}
                   </div>
-                ))}
-            </div>
-          </div>
+                  {stat &&
+                    (stat.isRaw ? (
+                      <span className="text-xs font-mono text-[hsl(var(--muted-foreground))]">
+                        locked
+                      </span>
+                    ) : (
+                      <div className="text-xs font-mono whitespace-nowrap">
+                        <span>~{stat.estimatedDuration.toFixed(1)}s</span>
+                        <span className="text-[hsl(var(--muted-foreground))]">
+                          {" / "}
+                          {stat.originalDuration.toFixed(1)}s
+                        </span>
+                        <span
+                          className={`ml-1.5 font-semibold ${DELTA_COLORS[stat.category]}`}
+                        >
+                          {stat.deltaPct >= 0 ? "+" : ""}
+                          {stat.deltaPct.toFixed(0)}%
+                        </span>
+                      </div>
+                    ))}
+                </div>
+                <div className="p-4">
+                  {draft.isRaw ? (
+                    <div className="rounded-md border border-dashed border-[hsl(var(--border))] bg-[hsl(var(--muted))] px-4 py-3 text-sm text-[hsl(var(--muted-foreground))]">
+                      Raw scene. No narration is allowed here.
+                    </div>
+                  ) : (
+                    <textarea
+                      value={draft.text}
+                      onChange={(e) =>
+                        handleTextChange(draft.scene_index, e.target.value)
+                      }
+                      rows={4}
+                      className="w-full resize-y rounded-md border border-[hsl(var(--input))] bg-[hsl(var(--background))] p-3 text-sm"
+                    />
+                  )}
+                </div>
+              </div>
+            );
+          })}
         </div>
 
-        {/* Footer — totals + actions */}
         <div className="flex items-center justify-between p-4 border-t border-[hsl(var(--border))]">
           <div className="text-sm font-mono text-[hsl(var(--muted-foreground))]">
-            Total: {totals.totalEstimated.toFixed(1)}s
+            Total editable scenes: {totals.totalEstimated.toFixed(1)}s
             {" / "}
             {totals.totalOriginal.toFixed(1)}s
           </div>

@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from ...models import MatchList, ProjectPhase, SceneTranscription, Transcription
+from ...models import MatchList, ProjectPhase, SceneMatch, SceneTranscription, Transcription
 from ...models.raw_scene import RawSceneDetectionResult
 from ...services import ProjectService
 
@@ -52,6 +52,8 @@ async def validate_raw_scenes(project_id: str, request: ValidateRequest):
     transcription = ProjectService.load_transcription(project_id)
     if not transcription:
         raise HTTPException(status_code=404, detail="No transcription found")
+    original_scenes = [scene.model_copy(deep=True) for scene in transcription.scenes]
+    match_list = ProjectService.load_matches(project_id)
 
     # Build lookup of validations
     validation_map = {v.scene_index: v for v in request.validations}
@@ -76,6 +78,14 @@ async def validate_raw_scenes(project_id: str, request: ValidateRequest):
     # Merge invalidated raw scenes into adjacent TTS scenes
     transcription.scenes = _merge_invalidated_scenes(transcription.scenes)
 
+    if match_list and _scene_structure_changed(original_scenes, transcription.scenes):
+        match_list.matches = _remap_matches_after_scene_structure_change(
+            before_scenes=original_scenes,
+            after_scenes=transcription.scenes,
+            matches=match_list.matches,
+        )
+        ProjectService.save_matches(project_id, match_list)
+
     ProjectService.save_transcription(project_id, transcription)
     return {"status": "ok", "transcription": transcription.model_dump()}
 
@@ -86,22 +96,6 @@ async def confirm_raw_scenes(project_id: str):
     project = ProjectService.load(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-
-    # Update matches to reflect final scene indices
-    transcription = ProjectService.load_transcription(project_id)
-    if transcription:
-        match_list = ProjectService.load_matches(project_id)
-        if match_list:
-            # Re-map match scene_index to match current transcription scene indices
-            matches_by_index = {m.scene_index: m for m in match_list.matches}
-            updated = []
-            for scene in transcription.scenes:
-                m = matches_by_index.get(scene.scene_index)
-                if m:
-                    updated.append(m)
-            if updated:
-                match_list.matches = updated
-                ProjectService.save_matches(project_id, match_list)
 
     project.phase = ProjectPhase.SCRIPT_RESTRUCTURE
     ProjectService.save(project)
@@ -181,3 +175,64 @@ def _merge_invalidated_scenes(scenes: list[SceneTranscription]) -> list[SceneTra
         s.scene_index = idx
 
     return result
+
+
+def _scene_structure_changed(
+    before_scenes: list[SceneTranscription],
+    after_scenes: list[SceneTranscription],
+) -> bool:
+    if len(before_scenes) != len(after_scenes):
+        return True
+    for before, after in zip(before_scenes, after_scenes):
+        if before.scene_index != after.scene_index:
+            return True
+        if abs(before.start_time - after.start_time) > 1e-6:
+            return True
+        if abs(before.end_time - after.end_time) > 1e-6:
+            return True
+    return False
+
+
+def _scene_overlap(a: SceneTranscription, b: SceneTranscription) -> float:
+    return max(0.0, min(a.end_time, b.end_time) - max(a.start_time, b.start_time))
+
+
+def _remap_matches_after_scene_structure_change(
+    *,
+    before_scenes: list[SceneTranscription],
+    after_scenes: list[SceneTranscription],
+    matches: list[SceneMatch],
+) -> list[SceneMatch]:
+    matches_by_index = {match.scene_index: match for match in matches}
+    remapped_matches = []
+
+    for after_scene in after_scenes:
+        best_scene = None
+        best_key = None
+        for before_scene in before_scenes:
+            match = matches_by_index.get(before_scene.scene_index)
+            if match is None:
+                continue
+            overlap = _scene_overlap(before_scene, after_scene)
+            if overlap <= 0:
+                continue
+
+            key = (0 if before_scene.is_raw else 1, overlap)
+            if best_key is None or key > best_key:
+                best_key = key
+                best_scene = before_scene
+
+        selected_match = None
+        if best_scene is not None:
+            selected_match = matches_by_index.get(best_scene.scene_index)
+        elif after_scene.scene_index in matches_by_index:
+            selected_match = matches_by_index.get(after_scene.scene_index)
+
+        if selected_match is None:
+            continue
+
+        remapped_matches.append(
+            selected_match.model_copy(update={"scene_index": after_scene.scene_index})
+        )
+
+    return remapped_matches

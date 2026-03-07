@@ -512,6 +512,11 @@ export const api = {
       `/projects/${projectId}/script/automation/config`,
     ),
 
+  getScriptPrompt: (projectId: string, targetLanguage: string) =>
+    request<{ prompt: string }>(
+      `/projects/${projectId}/script/prompt?target_language=${encodeURIComponent(targetLanguage)}`,
+    ),
+
   automateScript: (
     projectId: string,
     payload: {

@@ -24,6 +24,8 @@ from .gemini_service import GeminiService
 from .elevenlabs_service import ElevenLabsService
 from .voice_config_service import VoiceConfigService
 from .script_automation_service import ScriptAutomationService
+from .script_payload_service import ScriptPayloadService
+from .script_phase_prompt_service import ScriptPhasePromptService
 from .music_config_service import MusicConfigService
 from .audio_speed_service import AudioSpeedService
 from .title_image_generator import TitleImageGeneratorService
@@ -46,6 +48,8 @@ __all__ = [
     "ElevenLabsService",
     "VoiceConfigService",
     "ScriptAutomationService",
+    "ScriptPayloadService",
+    "ScriptPhasePromptService",
     "MusicConfigService",
     "AudioSpeedService",
     "TitleImageGeneratorService",

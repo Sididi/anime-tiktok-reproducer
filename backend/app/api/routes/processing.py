@@ -27,6 +27,8 @@ from ...services import (
     ElevenLabsService,
     VoiceConfigService,
     ScriptAutomationService,
+    ScriptPayloadService,
+    ScriptPhasePromptService,
     MusicConfigService,
     AudioSpeedService,
 )
@@ -78,6 +80,30 @@ class PreviewBuildRequest(BaseModel):
     run_id: str | None = None
     tts_speed: float = 1.0
     music_key: str | None = None
+
+
+def _load_transcription_for_script(project_id: str):
+    transcription = ProjectService.load_transcription(project_id)
+    if not transcription or not transcription.scenes:
+        raise HTTPException(status_code=400, detail="No transcription found for this project")
+    return transcription
+
+
+def _normalize_script_payload_or_400(
+    project_id: str,
+    payload: dict[str, Any],
+    *,
+    target_language: str | None = None,
+):
+    transcription = _load_transcription_for_script(project_id)
+    try:
+        return ScriptPayloadService.normalize(
+            payload=payload,
+            transcription=transcription,
+            target_language=target_language,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 def _notify_drive_upload_complete(project_id: str, _folder_url: str) -> None:
@@ -241,6 +267,22 @@ async def get_script_automation_config(project_id: str):
     }
 
 
+@router.get("/script/prompt")
+async def get_script_prompt(project_id: str, target_language: str = "fr"):
+    """Build the canonical script prompt from the project's transcription."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    transcription = _load_transcription_for_script(project_id)
+    prompt = ScriptPhasePromptService.build_script_prompt(
+        project=project,
+        transcription=transcription,
+        target_language=target_language,
+    )
+    return {"prompt": prompt}
+
+
 @router.get("/config")
 async def get_processing_config(project_id: str):
     """Get processing page feature flags."""
@@ -290,21 +332,16 @@ async def prepare_script_tts(project_id: str, request: ScriptTtsPrepareRequest):
     project = ProjectService.load(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-
-    scenes = request.script_json.get("scenes")
-    if not isinstance(scenes, list) or not scenes:
-        raise HTTPException(status_code=400, detail="script_json must contain a non-empty 'scenes' array")
-
-    for idx, scene in enumerate(scenes):
-        if not isinstance(scene, dict):
-            raise HTTPException(status_code=400, detail=f"Scene at position {idx} is not an object")
-        if not isinstance(scene.get("text"), str):
-            raise HTTPException(status_code=400, detail=f"Scene at position {idx} must contain a 'text' string")
+    normalized = _normalize_script_payload_or_400(
+        project_id,
+        request.script_json,
+        target_language=request.target_language,
+    )
 
     try:
         prepared_payload = await asyncio.to_thread(
             ScriptAutomationService.prepare_tts_payload,
-            script_payload=request.script_json,
+            script_payload=normalized.public_payload,
             target_language=request.target_language,
         )
     except Exception as exc:
@@ -361,17 +398,16 @@ async def upload_restructured_script(
     # Validate JSON
     try:
         script_data = json.loads(script)
-        if "scenes" not in script_data:
-            raise ValueError("Script must contain 'scenes' array")
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    normalized_script = _normalize_script_payload_or_400(project_id, script_data)
 
     # Save script
     project_dir = ProjectService.get_project_dir(project_id)
     script_path = project_dir / "new_script.json"
-    script_path.write_text(json.dumps(script_data, indent=2))
+    script_path.write_text(
+        json.dumps(normalized_script.public_payload, ensure_ascii=False, indent=2)
+    )
 
     # Handle audio file(s)
     audio_path = project_dir / "new_tts.wav"
@@ -447,8 +483,8 @@ async def upload_restructured_script(
         overlay_path = project_dir / "video_overlay.json"
         overlay_path.write_text(json.dumps(project.video_overlay, ensure_ascii=False, indent=2))
 
-    if isinstance(script_data.get("language"), str):
-        project.output_language = script_data["language"]
+    if isinstance(normalized_script.public_payload.get("language"), str):
+        project.output_language = normalized_script.public_payload["language"]
 
     # Update phase
     project.phase = ProjectPhase.PROCESSING
@@ -533,11 +569,17 @@ async def generate_overlay(project_id: str, request: OverlayGenerateRequest):
     if not GeminiService.is_configured():
         raise HTTPException(status_code=503, detail="Gemini API key is missing")
 
+    normalized = _normalize_script_payload_or_400(
+        project_id,
+        request.script_json,
+        target_language=request.target_language,
+    )
+
     try:
         overlay = await asyncio.to_thread(
             ScriptAutomationService.generate_video_overlay,
             project=project,
-            script_payload=request.script_json,
+            script_payload=normalized.public_payload,
             target_language=request.target_language,
         )
     except Exception as exc:
@@ -721,9 +763,20 @@ async def build_metadata_prompt(project_id: str, request: MetadataPromptRequest)
         raise HTTPException(status_code=404, detail="Project not found")
 
     try:
-        prompt = MetadataService.build_prompt_from_script_json(
+        script_payload = json.loads(request.script)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {exc}")
+
+    normalized = _normalize_script_payload_or_400(
+        project_id,
+        script_payload,
+        target_language=request.target_language,
+    )
+
+    try:
+        prompt = MetadataService.build_prompt_from_script_payload(
             anime_name=project.anime_name or "Inconnu",
-            script_json=request.script,
+            script_payload=normalized.public_payload,
             target_language=request.target_language,
         )
     except Exception as exc:
@@ -750,6 +803,8 @@ async def process_project(project_id: str):
         raise HTTPException(status_code=400, detail="New TTS audio not uploaded")
 
     new_script = json.loads(script_path.read_text())
+    normalized_script = _normalize_script_payload_or_400(project_id, new_script)
+    reference_transcription = _load_transcription_for_script(project_id)
 
     # Load matches
     matches = ProjectService.load_matches(project_id)
@@ -759,9 +814,10 @@ async def process_project(project_id: str):
     async def stream_progress():
         async for progress in ProcessingService.process(
             project,
-            new_script,
+            normalized_script.internal_payload,
             audio_path,
             matches.matches,
+            reference_transcription=reference_transcription,
         ):
             yield f"data: {json.dumps(progress.to_dict())}\n\n"
 

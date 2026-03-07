@@ -15,88 +15,10 @@ from .elevenlabs_service import ElevenLabsService
 from .gemini_service import GeminiService
 from .metadata import MetadataService
 from .project_service import ProjectService
+from .script_payload_service import ScriptPayloadService
+from .script_phase_prompt_service import ScriptPhasePromptService
 from .tts_text_normalizer import TtsTextNormalizer
 from .voice_config_service import VoiceConfigService
-
-
-_LANGUAGE_DISPLAY = {
-    "fr": "Français",
-    "en": "English",
-    "es": "Español",
-    "de": "Deutsch",
-}
-
-_SCRIPT_AUTOMATION_PROMPT = """# ROLE
-
-Tu es un expert en adaptation de scripts vidéo court format.
-Ta mission: réécrire le script en langue cible avec un style narratif oral, percutant, anti-plagiat.
-
-# OBJECTIFS
-
-- Conserver le sens narratif des scènes.
-- Garder la première phrase comme hook (fidèle sur le fond, naturelle dans la langue cible).
-- Éviter les prénoms de personnages.
-- Style conversationnel storytime, pas littéraire.
-- Phrases claires et fluides pour TTS.
-
-# CONTRAINTES DE SORTIE (OBLIGATOIRE)
-
-- Retourne UNIQUEMENT un JSON valide.
-- Garde exactement le même nombre de scènes.
-- Même structure racine: {{"language": "...", "scenes": [...]}}
-- Chaque scène doit contenir: scene_index (int) et text (string).
-- Aucun markdown, aucun commentaire, aucun texte hors JSON.
-
-# LANGUE CIBLE
-
-{target_language_display} ({target_language_code})
-
-# TITRE CONTEXTE
-
-{anime_name}
-
-# DONNÉES D'ENTRÉE
-
-{input_json}
-"""
-
-_OVERLAY_PROMPT_FR = """Tu es un expert en marketing vidéo TikTok anime.
-Génère un titre clickbait et une catégorie pour cette vidéo.
-
-RÈGLES TITRE:
-- Maximum 45 caractères (STRICT, compte chaque caractère)
-- Style: phrases choc qui donnent envie de regarder
-- Ne JAMAIS citer le nom de l'anime
-- Typographie française OBLIGATOIRE: toujours un espace AVANT les ? ! : ; (ex: "MOT !" et non "MOT!")
-- Exemples: "CET ANIME EST UNE DINGUERIE", "TU VAS PLEURER EN REGARDANT ÇA !", "L'ANIME LE PLUS FOU DE 2025"
-
-RÈGLES CATÉGORIE:
-- Exactement 2 genres séparés par " • "
-- Choisis les genres les plus représentatifs et populaires
-- Exemples: "Action • Fantasy", "Romance • Slice of Life", "Shonen • Aventure"
-
-ANIME: {anime_name}
-SCRIPT: {script_summary}
-"""
-
-_OVERLAY_PROMPT_MULTI = """You are a TikTok anime video marketing expert.
-Generate a clickbait title and category for this video.
-
-TITLE RULES:
-- Maximum 45 characters (STRICT)
-- Language: {target_language_name}
-- Shocking/intriguing phrases that make viewers want to watch
-- NEVER mention the anime name
-- Examples (adapt to target language): "THIS ANIME IS INSANE", "YOU WILL CRY WATCHING THIS"
-
-CATEGORY RULES:
-- Exactly 2 genres separated by " • "
-- Pick the most representative and popular genres
-- Examples: "Action • Fantasy", "Romance • Slice of Life"
-
-ANIME: {anime_name}
-SCRIPT: {script_summary}
-"""
 
 _OVERLAY_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -148,36 +70,10 @@ class ScriptAutomationService:
         transcription: Transcription,
         target_language: str,
     ) -> str:
-        target_language_code = target_language.strip().lower()
-        target_language_display = _LANGUAGE_DISPLAY.get(target_language_code, target_language_code)
-        anime_name = project.anime_name or "Inconnu"
-
-        # Filter out raw scenes — LLM only processes TTS scenes
-        scenes_payload = [
-            {
-                "scene_index": scene.scene_index,
-                "text": scene.text,
-                "duration_seconds": f"{max(scene.end_time - scene.start_time, 0):.2f}",
-                "estimated_word_count": len([token for token in scene.text.split() if token.strip()]),
-            }
-            for scene in transcription.scenes
-            if not scene.is_raw
-        ]
-
-        input_json = json.dumps(
-            {
-                "language": target_language_code,
-                "scenes": scenes_payload,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-
-        return _SCRIPT_AUTOMATION_PROMPT.format(
-            target_language_display=target_language_display,
-            target_language_code=target_language_code,
-            anime_name=anime_name,
-            input_json=input_json,
+        return ScriptPhasePromptService.build_script_prompt(
+            project=project,
+            transcription=transcription,
+            target_language=target_language,
         )
 
     @classmethod
@@ -188,48 +84,12 @@ class ScriptAutomationService:
         transcription: Transcription,
         target_language: str,
     ) -> dict[str, Any]:
-        scenes = payload.get("scenes")
-        if not isinstance(scenes, list) or not scenes:
-            raise RuntimeError("Script JSON must contain a non-empty 'scenes' array")
-
-        # Only count non-raw scenes for validation (LLM doesn't see raw scenes)
-        non_raw_scenes = [s for s in transcription.scenes if not s.is_raw]
-        if len(scenes) != len(non_raw_scenes):
-            raise RuntimeError(
-                f"Script scene count mismatch: expected {len(non_raw_scenes)}, got {len(scenes)}"
-            )
-
-        # Build normalized scenes from LLM output (non-raw only)
-        normalized_scenes: list[dict[str, Any]] = []
-        for idx, item in enumerate(scenes):
-            if not isinstance(item, dict):
-                raise RuntimeError(f"Scene at position {idx} is not an object")
-
-            raw_text = item.get("text")
-            if not isinstance(raw_text, str) or not raw_text.strip():
-                raise RuntimeError(f"Scene at position {idx} must contain non-empty text")
-
-            expected_scene_index = non_raw_scenes[idx].scene_index
-            normalized_scenes.append(
-                {
-                    "scene_index": expected_scene_index,
-                    "text": raw_text.strip(),
-                }
-            )
-
-        # Re-insert raw scenes with empty text at their correct positions
-        raw_scenes = [
-            {"scene_index": s.scene_index, "text": "", "is_raw": True}
-            for s in transcription.scenes
-            if s.is_raw
-        ]
-        all_scenes = normalized_scenes + raw_scenes
-        all_scenes.sort(key=lambda s: s["scene_index"])
-
-        return {
-            "language": target_language.strip().lower(),
-            "scenes": all_scenes,
-        }
+        normalized = ScriptPayloadService.normalize(
+            payload=payload,
+            transcription=transcription,
+            target_language=target_language,
+        )
+        return normalized.public_payload
 
     @classmethod
     def _script_text_from_payload(cls, script_payload: dict[str, Any]) -> str:
@@ -251,14 +111,10 @@ class ScriptAutomationService:
         script_payload: dict[str, Any],
         target_language: str | None,
     ) -> str:
-        candidate = (target_language or "").strip().lower()
-        if not candidate:
-            payload_language = script_payload.get("language")
-            if isinstance(payload_language, str):
-                candidate = payload_language.strip().lower()
-        if not candidate:
-            candidate = "fr"
-        return TtsTextNormalizer.resolve_language(candidate)
+        return ScriptPayloadService.resolve_language(
+            payload=script_payload,
+            target_language=target_language,
+        )
 
     @classmethod
     def prepare_tts_payload(
@@ -277,10 +133,6 @@ class ScriptAutomationService:
             if not isinstance(item, dict):
                 raise RuntimeError(f"Scene at position {idx} is not an object")
 
-            # Skip raw scenes — they have no TTS text
-            if item.get("is_raw"):
-                continue
-
             raw_text = item.get("text")
             if not isinstance(raw_text, str):
                 raise RuntimeError(f"Scene at position {idx} must contain a 'text' string")
@@ -288,6 +140,8 @@ class ScriptAutomationService:
             scene_index_raw = item.get("scene_index")
             scene_index = scene_index_raw if isinstance(scene_index_raw, int) else idx + 1
             normalized_text = TtsTextNormalizer.normalize_text(raw_text, language=language).strip()
+            if not normalized_text:
+                continue
             normalized_scenes.append(
                 {
                     "scene_index": scene_index,
@@ -314,8 +168,6 @@ class ScriptAutomationService:
         target_language: str,
         scene_count: int,
     ) -> dict[str, Any]:
-        # Keep schema intentionally lightweight: strict scene count and index checks
-        # are enforced later by _normalize_script_payload.
         return {
             "type": "object",
             "properties": {
@@ -324,12 +176,16 @@ class ScriptAutomationService:
                 },
                 "scenes": {
                     "type": "array",
+                    "minItems": scene_count,
+                    "maxItems": scene_count,
                     "items": {
                         "type": "object",
                         "properties": {
+                            "scene_index": {"type": "integer"},
                             "text": {"type": "string"},
                         },
-                        "required": ["text"],
+                        "required": ["scene_index", "text"],
+                        "additionalProperties": False,
                     },
                 },
             },
@@ -601,20 +457,11 @@ class ScriptAutomationService:
         """Generate a video overlay (title + category) via Gemini light model."""
         anime_name = project.anime_name or "Inconnu"
         script_summary = cls._script_text_from_payload(script_payload)[:500]
-        target_language_code = target_language.strip().lower()
-
-        if target_language_code == "fr":
-            prompt = _OVERLAY_PROMPT_FR.format(
-                anime_name=anime_name,
-                script_summary=script_summary,
-            )
-        else:
-            target_language_name = _LANGUAGE_DISPLAY.get(target_language_code, target_language_code)
-            prompt = _OVERLAY_PROMPT_MULTI.format(
-                anime_name=anime_name,
-                script_summary=script_summary,
-                target_language_name=target_language_name,
-            )
+        prompt = ScriptPhasePromptService.build_overlay_prompt(
+            anime_name=anime_name,
+            script_summary=script_summary,
+            target_language=target_language,
+        )
 
         result = GeminiService.generate_json(
             prompt,
@@ -692,13 +539,12 @@ class ScriptAutomationService:
                     transcription=transcription,
                     target_language=target_language,
                 )
-                non_raw_count = sum(1 for s in transcription.scenes if not s.is_raw)
                 raw_script_payload = await asyncio.to_thread(
                     GeminiService.generate_json,
                     prompt,
                     response_json_schema=cls._script_response_schema(
                         target_language=target_language,
-                        scene_count=non_raw_count,
+                        scene_count=len(transcription.scenes),
                     ),
                 )
                 script_payload = cls._normalize_script_payload(
@@ -728,9 +574,9 @@ class ScriptAutomationService:
             else:
                 yield cls._event("llm_metadata", message="Generating metadata JSON with Gemini...")
                 try:
-                    metadata_prompt = MetadataService.build_prompt_from_script_json(
+                    metadata_prompt = MetadataService.build_prompt_from_script_payload(
                         anime_name=project.anime_name or "Inconnu",
-                        script_json=json.dumps(script_payload, ensure_ascii=False),
+                        script_payload=script_payload,
                         target_language=target_language,
                     )
                     raw_metadata_payload = await asyncio.to_thread(

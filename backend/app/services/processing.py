@@ -909,6 +909,8 @@ class ProcessingService:
         new_script: dict,
         audio_path: Path,
         matches: list[SceneMatch],
+        *,
+        reference_transcription: Transcription,
     ) -> AsyncIterator[ProcessingProgress]:
         """
         Run the full processing pipeline.
@@ -933,6 +935,8 @@ class ProcessingService:
             new_script: New restructured script JSON
             audio_path: Path to uploaded TTS audio
             matches: Scene matches with source timings
+            reference_transcription: Final validated transcription used as the
+                raw-scene timing/source-of-truth reference
 
         Yields:
             ProcessingProgress updates
@@ -963,8 +967,9 @@ class ProcessingService:
                         scene_index=s["scene_index"],
                         text=s["text"],
                         words=[Word(**w) for w in s["words"]],
-                        start_time=s["words"][0]["start"] if s["words"] else 0.0,
-                        end_time=s["words"][-1]["end"] if s["words"] else 0.0,
+                        start_time=float(s.get("start_time", s["words"][0]["start"] if s["words"] else 0.0)),
+                        end_time=float(s.get("end_time", s["words"][-1]["end"] if s["words"] else 0.0)),
+                        is_raw=bool(s.get("is_raw", False)),
                     )
                     for s in transcription_data["scenes"]
                 ],
@@ -1009,6 +1014,7 @@ class ProcessingService:
                         transcriber.transcribe_with_alignment,
                         edited_audio_path,
                         new_script,
+                        reference_transcription,
                     )
                     cls.normalize_transcription_timings(new_transcription)
                 finally:
@@ -1024,6 +1030,9 @@ class ProcessingService:
                             "scene_index": s.scene_index,
                             "text": s.text,
                             "words": [{"text": w.text, "start": w.start, "end": w.end, "confidence": w.confidence} for w in s.words],
+                            "start_time": s.start_time,
+                            "end_time": s.end_time,
+                            "is_raw": s.is_raw,
                         }
                         for s in new_transcription.scenes
                     ]
