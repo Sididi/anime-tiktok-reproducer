@@ -15,6 +15,7 @@ class ProjectPhase(str, Enum):
     MATCHING = "matching"
     MATCH_VALIDATION = "match_validation"
     TRANSCRIPTION = "transcription"
+    RAW_SCENE_VALIDATION = "raw_scene_validation"
     SCRIPT_RESTRUCTURE = "script_restructure"
     PROCESSING = "processing"
     COMPLETE = "complete"

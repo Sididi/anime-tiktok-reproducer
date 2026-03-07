@@ -54,6 +54,18 @@ async def start_transcription(project_id: str, request: StartTranscriptionReques
             yield f"data: {json.dumps(progress.to_dict())}\n\n"
 
             if progress.status == "complete":
+                # Check if raw scenes were detected
+                detection_file = ProjectService.get_project_dir(project_id) / "raw_scene_detection.json"
+                if detection_file.exists():
+                    from ...models.raw_scene import RawSceneDetectionResult
+                    detection = RawSceneDetectionResult.model_validate_json(
+                        detection_file.read_text()
+                    )
+                    if detection.has_raw_scenes:
+                        project.phase = ProjectPhase.RAW_SCENE_VALIDATION
+                        ProjectService.save(project)
+                        continue
+
                 project.phase = ProjectPhase.SCRIPT_RESTRUCTURE
                 ProjectService.save(project)
 
@@ -119,7 +131,17 @@ async def confirm_transcription(project_id: str):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    # Check if raw scenes were detected — route to validation if so
+    detection_file = ProjectService.get_project_dir(project_id) / "raw_scene_detection.json"
+    if detection_file.exists():
+        from ...models.raw_scene import RawSceneDetectionResult
+        detection = RawSceneDetectionResult.model_validate_json(detection_file.read_text())
+        if detection.has_raw_scenes:
+            project.phase = ProjectPhase.RAW_SCENE_VALIDATION
+            ProjectService.save(project)
+            return {"status": "ok", "next_phase": "raw_scene_validation"}
+
     project.phase = ProjectPhase.SCRIPT_RESTRUCTURE
     ProjectService.save(project)
 
-    return {"status": "ok"}
+    return {"status": "ok", "next_phase": "script_restructure"}

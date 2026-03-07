@@ -383,7 +383,7 @@ class ProcessingService:
         matches_by_scene = {m.scene_index: m for m in matches}
 
         for scene_trans in transcription.scenes:
-            if not scene_trans.words:
+            if not scene_trans.words and not scene_trans.is_raw:
                 continue
 
             # Find corresponding match (fallback to best alternative if missing)
@@ -417,12 +417,16 @@ class ProcessingService:
             source_in_sec = source_rate.seconds_from_frames(source_in_frames)
             source_out_sec = source_rate.seconds_from_frames(source_out_frames)
 
-            # Timeline position from TTS transcription words (seconds)
-            # Use adjusted end time to eliminate gaps between scenes
-            timeline_start_raw = scene_trans.words[0].start
-            timeline_end_raw = adjusted_ends_jsx.get(
-                scene_trans.scene_index, scene_trans.words[-1].end
-            )
+            # Timeline position: raw scenes use start_time/end_time directly,
+            # TTS scenes use word timings with adjusted ends
+            if scene_trans.is_raw:
+                timeline_start_raw = scene_trans.start_time
+                timeline_end_raw = scene_trans.end_time
+            else:
+                timeline_start_raw = scene_trans.words[0].start
+                timeline_end_raw = adjusted_ends_jsx.get(
+                    scene_trans.scene_index, scene_trans.words[-1].end
+                )
 
             # Snap timeline positions to 60fps frame grid BEFORE speed calculation
             # This keeps speed and placement perfectly aligned to frame boundaries
@@ -468,6 +472,7 @@ class ProcessingService:
                 "effective_speed": round(float(clip_timing.effective_speed), 4),
                 "leaves_gap": clip_timing.leaves_gap,  # True if 75% floor hit
                 "used_alternative": used_alternative,
+                "is_raw": scene_trans.is_raw,
             })
 
         # Validate continuity - log warnings for intentional gaps
@@ -635,9 +640,11 @@ class ProcessingService:
         srt_blocks = []
         block_index = 1
 
-        # Collect all words with timings across all scenes
+        # Collect all words with timings across all scenes (skip raw scenes)
         all_words = []
         for scene_trans in transcription.scenes:
+            if scene_trans.is_raw:
+                continue
             all_words.extend(scene_trans.words)
 
         if not all_words:
@@ -1047,41 +1054,92 @@ class ProcessingService:
                     gaps = GapResolutionService.calculate_gaps(matches, transcription_data["scenes"])
 
                 if gaps:
-                    # Gaps detected - pause processing for user to resolve
                     total_gap_duration = sum(g.gap_duration for g in gaps)
 
-                    # Prewarm scene-cut/fps analysis in background so /gaps loads faster.
-                    cls.schedule_gap_candidate_prewarm(project.id, gaps)
+                    if settings.gaps_full_auto_enabled:
+                        # Resolve gaps inline without frontend round trip
+                        yield ProcessingProgress(
+                            "processing",
+                            "gap_detection",
+                            0.36,
+                            f"Auto-resolving {len(gaps)} gap(s)...",
+                        )
 
-                    # Backup current matches before gap resolution modifies them
-                    # This allows the user to reset and start over
-                    matches_backup_path = project_dir / "matches_before_gaps.json"
-                    if not matches_backup_path.exists():
-                        # Only backup if we haven't already (avoid overwriting with modified matches)
-                        matches_path = project_dir / "matches.json"
-                        if matches_path.exists():
-                            import shutil
-                            shutil.copy(matches_path, matches_backup_path)
+                        # Backup current matches before modification
+                        matches_backup_path = project_dir / "matches_before_gaps.json"
+                        if not matches_backup_path.exists():
+                            from ..models import MatchList
+                            matches_path = project_dir / "matches.json"
+                            if matches_path.exists():
+                                import shutil
+                                shutil.copy(matches_path, matches_backup_path)
 
-                    # Save current processing state so we can resume later
-                    processing_state = {
-                        "step": "gap_detection",
-                        "edited_audio_path": str(edited_audio_path),
-                        "transcription_path": str(transcription_timing_path),
-                    }
-                    state_path = output_dir / "processing_state.json"
-                    state_path.write_text(json.dumps(processing_state, indent=2))
+                        candidates_by_scene = await GapResolutionService.generate_candidates_batch_dedup(gaps)
+                        selection_result = await GapResolutionService.select_autofill_candidates_overlap_aware(
+                            matches=matches,
+                            gaps=gaps,
+                            candidates_by_scene=candidates_by_scene,
+                        )
 
-                    yield ProcessingProgress(
-                        "gaps_detected",
-                        "gap_detection",
-                        0.4,
-                        f"Found {len(gaps)} clip(s) with gaps that need resolution",
-                        gaps_detected=True,
-                        gap_count=len(gaps),
-                        total_gap_duration=total_gap_duration,
-                    )
-                    return  # Stop processing here - frontend will redirect to gap resolution
+                        for gap in gaps:
+                            best = selection_result.selected_candidates_by_scene.get(gap.scene_index)
+                            if best is None:
+                                candidates = candidates_by_scene.get(gap.scene_index, [])
+                                if candidates:
+                                    best = candidates[0]
+                            if best:
+                                for match in matches:
+                                    if match.scene_index == gap.scene_index:
+                                        match.start_time = best.start_time
+                                        match.end_time = best.end_time
+                                        match.speed_ratio = float(best.effective_speed)
+                                        match.confirmed = True
+                                        break
+
+                        # Save updated matches
+                        from ..models import MatchList
+                        ProjectService.save_matches(project.id, MatchList(matches=matches))
+                        (project_dir / "gaps_resolved.flag").touch()
+
+                        yield ProcessingProgress(
+                            "processing",
+                            "gap_detection",
+                            0.4,
+                            f"Auto-resolved {len(gaps)} gap(s)",
+                        )
+                        # Continue to JSX generation (don't return)
+                    else:
+                        # Manual flow: pause processing for user to resolve
+                        # Prewarm scene-cut/fps analysis in background so /gaps loads faster.
+                        cls.schedule_gap_candidate_prewarm(project.id, gaps)
+
+                        # Backup current matches before gap resolution modifies them
+                        matches_backup_path = project_dir / "matches_before_gaps.json"
+                        if not matches_backup_path.exists():
+                            matches_path = project_dir / "matches.json"
+                            if matches_path.exists():
+                                import shutil
+                                shutil.copy(matches_path, matches_backup_path)
+
+                        # Save current processing state so we can resume later
+                        processing_state = {
+                            "step": "gap_detection",
+                            "edited_audio_path": str(edited_audio_path),
+                            "transcription_path": str(transcription_timing_path),
+                        }
+                        state_path = output_dir / "processing_state.json"
+                        state_path.write_text(json.dumps(processing_state, indent=2))
+
+                        yield ProcessingProgress(
+                            "gaps_detected",
+                            "gap_detection",
+                            0.4,
+                            f"Found {len(gaps)} clip(s) with gaps that need resolution",
+                            gaps_detected=True,
+                            gap_count=len(gaps),
+                            total_gap_duration=total_gap_duration,
+                        )
+                        return  # Stop processing here - frontend will redirect to gap resolution
 
                 yield ProcessingProgress(
                     "processing",

@@ -336,6 +336,21 @@ async def auto_fill_all_gaps(project_id: str) -> AutoFillResponse:
     )
 
 
+@router.post("/auto-fill-and-resolve")
+async def auto_fill_and_resolve(project_id: str) -> AutoFillResponse:
+    """Auto-fill all gaps and mark as resolved in a single request.
+
+    Combines auto-fill + mark-resolved to save an HTTP round trip.
+    """
+    result = await auto_fill_all_gaps(project_id)
+
+    # Mark gaps as resolved
+    project_dir = ProjectService.get_project_dir(project_id)
+    (project_dir / "gaps_resolved.flag").touch()
+
+    return result
+
+
 @router.put("/{scene_index}")
 async def update_gap_timing(
     project_id: str,

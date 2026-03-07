@@ -10,7 +10,8 @@ from contextlib import suppress
 from pathlib import Path
 from typing import AsyncIterator
 
-from ..models import Word, SceneTranscription, Transcription, SceneList
+from ..models import Word, SceneTranscription, Transcription, SceneList, SceneMatch, MatchList
+from ..models.raw_scene import RawSceneDetectionResult
 from ..services import ProjectService
 from ..utils.media_binaries import get_media_subprocess_env, rewrite_media_command
 from ..utils.process_cleanup import shutdown_torch_compile_workers
@@ -804,6 +805,63 @@ class TranscriberService:
 
         return scene_transcriptions
 
+    @staticmethod
+    def split_scene_matches(
+        original_scenes: list[SceneTranscription],
+        updated_scenes: list[SceneTranscription],
+        matches: list[SceneMatch],
+    ) -> list[SceneMatch]:
+        """Re-map matches when scenes have been split by raw scene detection.
+
+        For split scenes, the parent's match is shared with proportionally
+        adjusted source in/out times. Non-split scenes keep their original match.
+        """
+        matches_by_index = {m.scene_index: m for m in matches}
+        original_by_index = {s.scene_index: s for s in original_scenes}
+
+        new_matches: list[SceneMatch] = []
+        for new_scene in updated_scenes:
+            # Find which original scene this came from (by time overlap)
+            best_original = None
+            best_overlap = 0.0
+            for orig in original_scenes:
+                overlap = max(0.0, min(new_scene.end_time, orig.end_time) - max(new_scene.start_time, orig.start_time))
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_original = orig
+
+            if best_original is None:
+                continue
+
+            parent_match = matches_by_index.get(best_original.scene_index)
+            if parent_match is None:
+                continue
+
+            orig_dur = best_original.end_time - best_original.start_time
+            if orig_dur <= 0:
+                new_matches.append(parent_match.model_copy(
+                    update={"scene_index": new_scene.scene_index}
+                ))
+                continue
+
+            # Calculate proportion of the original scene this sub-scene covers
+            new_dur = new_scene.end_time - new_scene.start_time
+            offset_start = max(0.0, new_scene.start_time - best_original.start_time)
+            ratio_start = offset_start / orig_dur
+            ratio_end = min(1.0, (offset_start + new_dur) / orig_dur)
+
+            source_dur = parent_match.end_time - parent_match.start_time
+            new_source_start = parent_match.start_time + ratio_start * source_dur
+            new_source_end = parent_match.start_time + ratio_end * source_dur
+
+            new_matches.append(parent_match.model_copy(update={
+                "scene_index": new_scene.scene_index,
+                "start_time": round(new_source_start, 6),
+                "end_time": round(new_source_end, 6),
+            }))
+
+        return new_matches
+
     @classmethod
     async def transcribe(
         cls,
@@ -827,6 +885,12 @@ class TranscriberService:
 
             video_path = Path(project.video_path)
 
+            # Extract WAV to project dir (reused by diarization)
+            project_dir = ProjectService.get_project_dir(project_id)
+            wav_path = project_dir / "audio_16khz.wav"
+            if not wav_path.exists():
+                cls._extract_audio_for_whisper(video_path, wav_path)
+
             yield TranscriptionProgress("starting", 0.1, "Loading transcription model...")
 
             # Map language
@@ -835,10 +899,11 @@ class TranscriberService:
             yield TranscriptionProgress("transcribing", 0.2, "Transcribing audio (this may take a while)...")
 
             # Run transcription in thread pool (use large-v3 for original TikTok video)
+            # Pass the pre-extracted WAV directly so WhisperX doesn't create a temp copy
             loop = asyncio.get_event_loop()
             words, detected_lang = await loop.run_in_executor(
                 None,
-                lambda: cls._transcribe_sync(video_path, lang_code, "large-v3"),
+                lambda: cls._transcribe_sync(wav_path, lang_code, "large-v3"),
             )
 
             yield TranscriptionProgress("processing", 0.8, "Assigning words to scenes...")
@@ -854,9 +919,65 @@ class TranscriberService:
             # Save transcription
             ProjectService.save_transcription(project_id, transcription)
 
-            # Free WhisperX models and GPU VRAM — the user will interact with
-            # scenes/matches/script before transcription is needed again.
+            # Free WhisperX models and GPU VRAM before diarization
             cls.unload_models()
+
+            # --- Raw scene detection (pyannote diarization) ---
+            from ..config import settings as _settings
+            detection_result: RawSceneDetectionResult | None = None
+
+            if _settings.hf_token:
+                yield TranscriptionProgress(
+                    "processing", 0.85,
+                    "Detecting raw scenes (speaker diarization)...",
+                )
+
+                from .raw_scene_detector import RawSceneDetectorService
+
+                updated_scenes, detection_result = await loop.run_in_executor(
+                    None,
+                    lambda: RawSceneDetectorService.detect(
+                        wav_path, list(transcription.scenes),
+                    ),
+                )
+
+                if detection_result and detection_result.has_raw_scenes:
+                    # Mark raw scenes and clear their text
+                    raw_indices = {c.scene_index for c in detection_result.candidates}
+                    for s in updated_scenes:
+                        if s.scene_index in raw_indices:
+                            s.is_raw = True
+                            s.text = ""
+                            s.words = []
+
+                    # Split matches if scenes were split
+                    original_scenes = list(scene_transcriptions)
+                    match_list = ProjectService.load_matches(project_id)
+                    if match_list and len(updated_scenes) != len(original_scenes):
+                        new_matches = cls.split_scene_matches(
+                            original_scenes, updated_scenes, match_list.matches,
+                        )
+                        match_list.matches = new_matches
+                        ProjectService.save_matches(project_id, match_list)
+
+                    transcription.scenes = updated_scenes
+                    ProjectService.save_transcription(project_id, transcription)
+
+                    # Save backup for reset (post-detection, pre-validation)
+                    (project_dir / "transcription_raw_backup.json").write_text(
+                        transcription.model_dump_json(indent=2)
+                    )
+                    backup_matches = ProjectService.load_matches(project_id)
+                    if backup_matches:
+                        (project_dir / "matches_raw_backup.json").write_text(
+                            backup_matches.model_dump_json(indent=2)
+                        )
+
+                    # Save detection result
+                    detection_file = project_dir / "raw_scene_detection.json"
+                    detection_file.write_text(
+                        detection_result.model_dump_json(indent=2)
+                    )
 
             yield TranscriptionProgress(
                 "complete",

@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     discord_webhook_url: str | None = None
     cep_trigger_url_template: str = "http://localhost:48653/p/{project_id}"
 
+    # HuggingFace (pyannote diarization for raw scene detection)
+    hf_token: str | None = None
+
     # Script automation (Gemini + ElevenLabs)
     script_automate_enabled: bool = True
     # When False, metadata and video overlay generation are skipped entirely during Automate.

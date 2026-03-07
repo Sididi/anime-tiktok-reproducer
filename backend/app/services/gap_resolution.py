@@ -165,9 +165,8 @@ class GapResolutionService:
     # 2) `_scene_cut_semaphore` limits concurrent heavy scene detections globally.
     _scene_cut_inflight: dict[str, asyncio.Task[list[float]]] = {}
     _scene_cut_inflight_lock = asyncio.Lock()
-    _scene_cut_semaphore = asyncio.Semaphore(2)
+    _scene_cut_semaphore = asyncio.Semaphore(6)
     _scene_cut_cache: dict[str, list[float]] = {}
-    _episode_analysis_semaphore = asyncio.Semaphore(4)
     _candidate_batch_inflight: dict[str, asyncio.Task[dict[int, list["GapCandidate"]]]] = {}
     _candidate_batch_lock = asyncio.Lock()
 
@@ -580,11 +579,10 @@ class GapResolutionService:
     @classmethod
     async def _analyze_episode(cls, episode_path: Path) -> tuple[list[float], float]:
         """Load per-episode analysis data once (scene cuts + frame offset)."""
-        async with cls._episode_analysis_semaphore:
-            cuts, frame_offset = await asyncio.gather(
-                cls.detect_scene_cuts(str(episode_path)),
-                cls.get_frame_offset(episode_path),
-            )
+        cuts, frame_offset = await asyncio.gather(
+            cls.detect_scene_cuts(str(episode_path)),
+            cls.get_frame_offset(episode_path),
+        )
         return cuts, frame_offset
 
     @classmethod

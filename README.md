@@ -119,13 +119,13 @@ npm install
 
 Environment variables or defaults in `backend/app/config.py`:
 
-| Setting               | Default                          | Description                   |
-| --------------------- | -------------------------------- | ----------------------------- |
-| `DATA_DIR`            | `backend/data`                   | Data storage directory        |
-| `ANIME_LIBRARY_PATH`  | `modules/anime_searcher/library` | Indexed anime library path    |
-| `ANIME_SEARCHER_PATH` | `modules/anime_searcher`         | Path to anime_searcher module |
-| `SSCD_MODEL_PATH`     | Auto-detected                    | Path to SSCD model file       |
-| `FFMPEG_BINARY`       | Auto-detected                    | Override `ffmpeg` binary path |
+| Setting               | Default                          | Description                    |
+| --------------------- | -------------------------------- | ------------------------------ |
+| `DATA_DIR`            | `backend/data`                   | Data storage directory         |
+| `ANIME_LIBRARY_PATH`  | `modules/anime_searcher/library` | Indexed anime library path     |
+| `ANIME_SEARCHER_PATH` | `modules/anime_searcher`         | Path to anime_searcher module  |
+| `SSCD_MODEL_PATH`     | Auto-detected                    | Path to SSCD model file        |
+| `FFMPEG_BINARY`       | Auto-detected                    | Override `ffmpeg` binary path  |
 | `FFPROBE_BINARY`      | Auto-detected                    | Override `ffprobe` binary path |
 
 Additional integration variables (see `.env.example`):
@@ -311,6 +311,7 @@ When Drive export completes (`/api/projects/{id}/exports/gdrive`), backend posts
 `http://localhost:48653/p/{project_id}`
 
 The Premiere CEP extension (`premiere-extension/`) hosts this local endpoint and automates:
+
 1. Drive folder download (`SPM_*_{project_id}` under configured parent folder)
 2. `import_project.jsx` execution
 3. `output.mp4` detection and resumable upload back to Drive root

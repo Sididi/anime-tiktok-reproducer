@@ -152,6 +152,7 @@ class ScriptAutomationService:
         target_language_display = _LANGUAGE_DISPLAY.get(target_language_code, target_language_code)
         anime_name = project.anime_name or "Inconnu"
 
+        # Filter out raw scenes — LLM only processes TTS scenes
         scenes_payload = [
             {
                 "scene_index": scene.scene_index,
@@ -160,6 +161,7 @@ class ScriptAutomationService:
                 "estimated_word_count": len([token for token in scene.text.split() if token.strip()]),
             }
             for scene in transcription.scenes
+            if not scene.is_raw
         ]
 
         input_json = json.dumps(
@@ -190,11 +192,14 @@ class ScriptAutomationService:
         if not isinstance(scenes, list) or not scenes:
             raise RuntimeError("Script JSON must contain a non-empty 'scenes' array")
 
-        if len(scenes) != len(transcription.scenes):
+        # Only count non-raw scenes for validation (LLM doesn't see raw scenes)
+        non_raw_scenes = [s for s in transcription.scenes if not s.is_raw]
+        if len(scenes) != len(non_raw_scenes):
             raise RuntimeError(
-                f"Script scene count mismatch: expected {len(transcription.scenes)}, got {len(scenes)}"
+                f"Script scene count mismatch: expected {len(non_raw_scenes)}, got {len(scenes)}"
             )
 
+        # Build normalized scenes from LLM output (non-raw only)
         normalized_scenes: list[dict[str, Any]] = []
         for idx, item in enumerate(scenes):
             if not isinstance(item, dict):
@@ -204,7 +209,7 @@ class ScriptAutomationService:
             if not isinstance(raw_text, str) or not raw_text.strip():
                 raise RuntimeError(f"Scene at position {idx} must contain non-empty text")
 
-            expected_scene_index = transcription.scenes[idx].scene_index
+            expected_scene_index = non_raw_scenes[idx].scene_index
             normalized_scenes.append(
                 {
                     "scene_index": expected_scene_index,
@@ -212,9 +217,18 @@ class ScriptAutomationService:
                 }
             )
 
+        # Re-insert raw scenes with empty text at their correct positions
+        raw_scenes = [
+            {"scene_index": s.scene_index, "text": "", "is_raw": True}
+            for s in transcription.scenes
+            if s.is_raw
+        ]
+        all_scenes = normalized_scenes + raw_scenes
+        all_scenes.sort(key=lambda s: s["scene_index"])
+
         return {
             "language": target_language.strip().lower(),
-            "scenes": normalized_scenes,
+            "scenes": all_scenes,
         }
 
     @classmethod
@@ -262,6 +276,10 @@ class ScriptAutomationService:
         for idx, item in enumerate(scenes):
             if not isinstance(item, dict):
                 raise RuntimeError(f"Scene at position {idx} is not an object")
+
+            # Skip raw scenes — they have no TTS text
+            if item.get("is_raw"):
+                continue
 
             raw_text = item.get("text")
             if not isinstance(raw_text, str):
@@ -674,12 +692,13 @@ class ScriptAutomationService:
                     transcription=transcription,
                     target_language=target_language,
                 )
+                non_raw_count = sum(1 for s in transcription.scenes if not s.is_raw)
                 raw_script_payload = await asyncio.to_thread(
                     GeminiService.generate_json,
                     prompt,
                     response_json_schema=cls._script_response_schema(
                         target_language=target_language,
-                        scene_count=len(transcription.scenes),
+                        scene_count=non_raw_count,
                     ),
                 )
                 script_payload = cls._normalize_script_payload(

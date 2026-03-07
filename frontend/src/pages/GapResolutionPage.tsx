@@ -1081,7 +1081,8 @@ export function GapResolutionPage() {
           setGaps(loadedGaps);
 
           // Batch-fetch all candidates in a single request
-          if (loadedGaps.length > 0) {
+          // Skip when auto-resolving: auto-fill generates candidates internally
+          if (loadedGaps.length > 0 && !autoResolveRequested) {
             setLoadingCandidates(true);
             try {
               const candidatesResponse = await fetch(
@@ -1327,7 +1328,6 @@ export function GapResolutionPage() {
       !autoResolving ||
       !projectId ||
       loading ||
-      loadingCandidates ||
       autoResolveAttemptedRef.current
     ) {
       return;
@@ -1348,19 +1348,15 @@ export function GapResolutionPage() {
           return;
         }
 
-        // Step 1: Auto-fill all gaps
+        // Auto-fill all gaps and mark resolved in a single request
         const response = await fetch(
-          `/api/projects/${projectId}/gaps/auto-fill`,
+          `/api/projects/${projectId}/gaps/auto-fill-and-resolve`,
           { method: "POST" },
         );
         if (!response.ok) {
           throw new Error("Failed to auto-fill gaps");
         }
 
-        // Step 2: Mark gaps as resolved and navigate back
-        await fetch(`/api/projects/${projectId}/gaps/mark-resolved`, {
-          method: "POST",
-        });
         navigate(`/project/${projectId}/processing`, {
           state: { resumeAfterGaps: true },
         });
@@ -1371,7 +1367,7 @@ export function GapResolutionPage() {
     };
 
     runAutoResolve();
-  }, [autoResolving, projectId, loading, loadingCandidates, sortedGaps, navigate]);
+  }, [autoResolving, projectId, loading, sortedGaps, navigate]);
 
   // Count resolved + skipped
   const handledCount = resolvedGaps.size + skippedGaps.size;

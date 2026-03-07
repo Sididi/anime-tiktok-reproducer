@@ -1515,9 +1515,10 @@
       sequence = app.project.createNewSequence(seqName, "ID_1");
     }
 
-    // --- ENSURE TRACKS (V=6, A=3) ---
+    // --- ENSURE TRACKS (V=6, A=4) ---
+    // A4 is used for raw scene audio (active, not muted)
     ensureVideoTracks(sequence, 6);
-    ensureAudioTracks(sequence, 3);
+    ensureAudioTracks(sequence, 4);
     var qeSeq = null;
     try {
       qeSeq = qe.project.getActiveSequence();
@@ -1533,7 +1534,8 @@
     // V6: Index 5 (Reserved)
     // A1: Index 0 (Source audio muted)
     // A2: Index 1 (TTS)
-    // A3: Index 2 (Reserved)
+    // A3: Index 2 (Music bed)
+    // A4: Index 3 (Raw scene audio - active)
 
     var v1 = sequence.videoTracks[0];
     var v2 =
@@ -1550,6 +1552,8 @@
     var a2 = sequence.audioTracks.numTracks > 1 ? sequence.audioTracks[1] : a1;
     var a3 =
       sequence.audioTracks.numTracks > 2 ? sequence.audioTracks[2] : null;
+    var a4 =
+      sequence.audioTracks.numTracks > 3 ? sequence.audioTracks[3] : null;
 
     // --- MUTE A1 (Clip Audio) ---
     try {
@@ -1629,6 +1633,7 @@
         var v1Item = null;
         var a1Item = null;
         var a2Item = null;
+        var a4Item = null;
         if (v3) {
           v3Item = resolvePlacedItemFast(
             v3,
@@ -1689,6 +1694,23 @@
             s.source_out_frame,
           );
         }
+        // A4: Raw scene audio (active, not muted) — duplicate of source audio
+        if (s.is_raw && a4 && clip) {
+          a4.overwriteClip(clip, startSec);
+          a4Item = resolvePlacedItemFast(
+            a4,
+            startSec,
+            cleanName,
+            TRACK_ITEM_WAIT_MAX_MS,
+          );
+          a4Item = setTrackItemInOutFromItem(
+            a4Item,
+            s.source_in,
+            s.source_out,
+            s.source_in_frame,
+            s.source_out_frame,
+          );
+        }
         perfEnd("scenes_placement");
 
         // 3. ENFORCE DURATION (ALL SPEEDS)
@@ -1703,8 +1725,11 @@
         if (MUTATE_TRANSIENT_A2_SCENE_AUDIO) {
           enforceTrackItemDuration(a2Item, newDurationSeconds);
         }
+        if (s.is_raw && a4Item) {
+          enforceTrackItemDuration(a4Item, newDurationSeconds);
+        }
 
-        // 4. APPLY SPEED (Both V1, V3, A1, A2)
+        // 4. APPLY SPEED (Both V1, V3, A1, A2, and A4 for raw scenes)
         // QE setSpeed often fails to ripple-edit duration for speedups, so we pre-resize above.
         if (Math.abs(s.effective_speed - 1.0) > 0.01) {
           perfStart("scenes_speed");
@@ -1749,6 +1774,18 @@
               startSec,
               s.effective_speed,
               1,
+              "Audio",
+              cleanName,
+              sequence,
+              qeSeq,
+              qeTrackCache,
+              QE_TRACK_ITEM_HINTS,
+            );
+          if (s.is_raw && a4 && a4Item)
+            safeApplySpeedQE(
+              startSec,
+              s.effective_speed,
+              3,
               "Audio",
               cleanName,
               sequence,
@@ -4494,7 +4531,8 @@
     var seq = app.project.activeSequence;
     if (!seq || !seq.audioTracks) return;
     for (var i = 0; i < seq.audioTracks.numTracks; i++) {
-      if (i === 0) continue; // keep A1
+      if (i === 0) continue; // keep A1 (source audio, muted)
+      if (i === 3) continue; // keep A4 (raw scene audio, active)
       var track = seq.audioTracks[i];
       if (!track || !track.clips) continue;
       for (var j = track.clips.numItems - 1; j >= 0; j--) {

@@ -59,6 +59,9 @@ fr-core-news-sm = { url = "https://github.com/explosion/spacy-models/releases/do
 en-core-web-sm = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }
 es-core-news-sm = { url = "https://github.com/explosion/spacy-models/releases/download/es_core_news_sm-3.8.0/es_core_news_sm-3.8.0-py3-none-any.whl" }
 
+# Speaker diarization for raw scene detection
+pyannote-audio = ">=3.3.0"
+
 # YAML config parsing
 pyyaml = ">=6.0"
 num2words = ">=0.5.14"
