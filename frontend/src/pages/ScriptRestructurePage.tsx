@@ -81,7 +81,10 @@ function validateScriptPayload(
   const obj = payload as Record<string, unknown>;
   const rawScenes = obj.scenes;
   if (!Array.isArray(rawScenes) || rawScenes.length === 0) {
-    return { valid: false, error: 'JSON must contain a non-empty "scenes" array' };
+    return {
+      valid: false,
+      error: 'JSON must contain a non-empty "scenes" array',
+    };
   }
 
   if (rawScenes.length !== transcription.scenes.length) {
@@ -94,12 +97,11 @@ function validateScriptPayload(
   for (let i = 0; i < rawScenes.length; i += 1) {
     const scene = rawScenes[i];
     const expected = transcription.scenes[i];
-    if (
-      typeof scene !== "object" ||
-      scene === null ||
-      Array.isArray(scene)
-    ) {
-      return { valid: false, error: `Scene at position ${i} must be an object` };
+    if (typeof scene !== "object" || scene === null || Array.isArray(scene)) {
+      return {
+        valid: false,
+        error: `Scene at position ${i} must be an object`,
+      };
     }
 
     const sceneObj = scene as Record<string, unknown>;
@@ -501,7 +503,10 @@ export function ScriptRestructurePage() {
           if (latestGen.exists && latestGen.script_json) {
             const prettyScript = JSON.stringify(latestGen.script_json, null, 2);
             setNewScriptJson(prettyScript);
-            const validation = validateScriptPayload(latestGen.script_json, loaded);
+            const validation = validateScriptPayload(
+              latestGen.script_json,
+              loaded,
+            );
             if (validation.valid) {
               setJsonValid(true);
               setJsonError(null);
@@ -509,8 +514,15 @@ export function ScriptRestructurePage() {
             setPromptCopied(true);
 
             // Hydrate TTS parts if from automation run
-            if (latestGen.source === "automation_run" && latestGen.run_id && latestGen.parts.length > 0) {
-              const files = await hydrateAutomationParts(latestGen.run_id, latestGen.parts);
+            if (
+              latestGen.source === "automation_run" &&
+              latestGen.run_id &&
+              latestGen.parts.length > 0
+            ) {
+              const files = await hydrateAutomationParts(
+                latestGen.run_id,
+                latestGen.parts,
+              );
               setUploadMode("multiple");
               setAudioFile(null);
               setSegmentFiles(files);
@@ -639,34 +651,37 @@ export function ScriptRestructurePage() {
     }
   }, [scriptPrompt]);
 
-  const handleJsonChange = useCallback((value: string) => {
-    setNewScriptJson(value);
-    setRequiredSegmentIds(null);
-    setJsonError(null);
-    setJsonValid(false);
+  const handleJsonChange = useCallback(
+    (value: string) => {
+      setNewScriptJson(value);
+      setRequiredSegmentIds(null);
+      setJsonError(null);
+      setJsonValid(false);
 
-    if (!value.trim()) {
-      return;
-    }
-
-    if (!transcription) {
-      setJsonError("Transcription unavailable.");
-      return;
-    }
-
-    try {
-      const parsed = JSON.parse(value);
-      const validation = validateScriptPayload(parsed, transcription);
-      if (!validation.valid) {
-        setJsonError(validation.error);
+      if (!value.trim()) {
         return;
       }
 
-      setJsonValid(true);
-    } catch (e) {
-      setJsonError(`Invalid JSON: ${(e as Error).message}`);
-    }
-  }, [transcription]);
+      if (!transcription) {
+        setJsonError("Transcription unavailable.");
+        return;
+      }
+
+      try {
+        const parsed = JSON.parse(value);
+        const validation = validateScriptPayload(parsed, transcription);
+        if (!validation.valid) {
+          setJsonError(validation.error);
+          return;
+        }
+
+        setJsonValid(true);
+      } catch (e) {
+        setJsonError(`Invalid JSON: ${(e as Error).message}`);
+      }
+    },
+    [transcription],
+  );
 
   const handleMetadataJsonChange = useCallback((value: string) => {
     setMetadataJson(value);
@@ -1958,7 +1973,8 @@ export function ScriptRestructurePage() {
                                     setSegmentFiles((prev) => {
                                       const next = new Map(prev);
                                       next.delete(segment.id);
-                                      if (next.size === 0) setHasTtsAudio(false);
+                                      if (next.size === 0)
+                                        setHasTtsAudio(false);
                                       return next;
                                     });
                                   }}

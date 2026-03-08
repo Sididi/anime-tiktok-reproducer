@@ -26,6 +26,7 @@ from .music_config_service import MusicConfigService
 from .premiere_subtitle_baker import PremiereSubtitleBakerService
 from .project_service import ProjectService
 from .auto_editor_profiles import PRODUCTION_AUTO_EDITOR_PROFILE
+from .forced_alignment import ForcedAlignmentService, PreparedAlignmentAudio
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -998,7 +999,25 @@ class ProcessingService:
             if not resuming_after_gaps:
                 # Step 1: Auto-editor (generates edited audio with silences removed)
                 edited_audio_path = output_dir / "tts_edited.wav"
-                await cls.run_auto_editor(audio_path, edited_audio_path)
+                upload_manifest = ForcedAlignmentService.load_upload_manifest(project.id)
+                if upload_manifest and upload_manifest.get("mode") == "audio_parts":
+                    prepared_audio = await ForcedAlignmentService.prepare_audio_from_parts(
+                        project_id=project.id,
+                        output_dir=output_dir,
+                        tts_speed=float(project.tts_speed or 1.0),
+                        auto_editor_runner=cls.run_auto_editor,
+                    )
+                    edited_audio_path = prepared_audio.edited_audio_path
+                else:
+                    await cls.run_auto_editor(audio_path, edited_audio_path)
+                    prepared_audio = PreparedAlignmentAudio(
+                        mode="single_audio",
+                        edited_audio_path=edited_audio_path,
+                        segment_audio_paths=[],
+                        manifest=upload_manifest or ForcedAlignmentService.build_single_audio_manifest(
+                            script_payload=new_script,
+                        ),
+                    )
 
                 yield ProcessingProgress(
                     "processing",
@@ -1007,19 +1026,20 @@ class ProcessingService:
                     "Extracting word timings from audio...",
                 )
 
-                # Step 2: Transcribe edited audio for timings
-                transcriber = TranscriberService()
-
-                # Run transcription in thread pool
+                # Step 2: Run forced alignment in a worker thread
                 loop = asyncio.get_event_loop()
                 try:
-                    new_transcription = await loop.run_in_executor(
+                    alignment_result = await loop.run_in_executor(
                         None,
-                        transcriber.transcribe_with_alignment,
-                        edited_audio_path,
-                        new_script,
-                        reference_transcription,
+                        lambda: ForcedAlignmentService.align_known_script(
+                            project_id=project.id,
+                            script_payload=new_script,
+                            reference_transcription=reference_transcription,
+                            prepared_audio=prepared_audio,
+                            output_dir=output_dir,
+                        ),
                     )
+                    new_transcription = alignment_result.transcription
                     cls.normalize_transcription_timings(new_transcription)
                 finally:
                     # Always attempt model unload, including failure paths.
@@ -1162,6 +1182,31 @@ class ProcessingService:
                 )
 
             # Step 3: Detect source FPS from first available episode
+            alignment_issues = ForcedAlignmentService.validate_transcription_basics(new_transcription)
+            if alignment_issues:
+                existing_report = ForcedAlignmentService.report_path(output_dir)
+                if existing_report.exists():
+                    try:
+                        report_payload = json.loads(existing_report.read_text(encoding="utf-8"))
+                    except Exception:
+                        report_payload = {}
+                else:
+                    report_payload = {}
+                report_payload = {
+                    **report_payload,
+                    "status": "error",
+                    "mode": report_payload.get("mode") or "unknown",
+                    "global_issues": [
+                        *list(report_payload.get("global_issues") or []),
+                        *alignment_issues,
+                    ],
+                }
+                ForcedAlignmentService.write_alignment_report(output_dir, report_payload)
+                raise RuntimeError(
+                    "Aligned transcription failed validation: "
+                    + "; ".join(alignment_issues[:5])
+                )
+
             source_fps = None
             for match in matches:
                 if match.episode:

@@ -12,13 +12,18 @@ export const SceneHeader = Node.create({
     return {
       sceneIndex: {
         default: 0,
-        parseHTML: (element) => parseInt(element.getAttribute("data-scene-index") || "0"),
-        renderHTML: (attributes) => ({ "data-scene-index": attributes.sceneIndex }),
+        parseHTML: (element) =>
+          parseInt(element.getAttribute("data-scene-index") || "0"),
+        renderHTML: (attributes) => ({
+          "data-scene-index": attributes.sceneIndex,
+        }),
       },
       isRaw: {
         default: false,
         parseHTML: (element) => element.getAttribute("data-is-raw") === "true",
-        renderHTML: (attributes) => ({ "data-is-raw": attributes.isRaw ? "true" : "false" }),
+        renderHTML: (attributes) => ({
+          "data-is-raw": attributes.isRaw ? "true" : "false",
+        }),
       },
     };
   },

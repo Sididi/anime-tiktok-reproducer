@@ -38,7 +38,10 @@ interface ParsedScript {
  * Build a TipTap-compatible JSON document from parsed scene data.
  * Alternates sceneHeader nodes with paragraph nodes containing the scene text.
  */
-function buildTipTapDoc(scenes: SceneJsonEntry[], rawSceneIndices: Set<number>) {
+function buildTipTapDoc(
+  scenes: SceneJsonEntry[],
+  rawSceneIndices: Set<number>,
+) {
   const content: Record<string, unknown>[] = [];
 
   for (const scene of scenes) {
@@ -51,9 +54,7 @@ function buildTipTapDoc(scenes: SceneJsonEntry[], rawSceneIndices: Set<number>) 
     });
     content.push({
       type: "paragraph",
-      content: scene.text
-        ? [{ type: "text", text: scene.text }]
-        : [],
+      content: scene.text ? [{ type: "text", text: scene.text }] : [],
     });
   }
 
@@ -88,7 +89,9 @@ function extractScenesFromEditor(
       inScene = true;
     } else if (inScene && node.type === "paragraph") {
       if (!currentIsRaw) {
-        const nodeContent = node.content as Array<Record<string, unknown>> | undefined;
+        const nodeContent = node.content as
+          | Array<Record<string, unknown>>
+          | undefined;
         if (nodeContent) {
           const text = nodeContent
             .filter((c) => c.type === "text")
@@ -131,7 +134,10 @@ export function ScriptEditorModal({
 
   // Set of scene indices that are raw (locked)
   const rawSceneIndices = useMemo(
-    () => new Set(transcription.scenes.filter((s) => s.is_raw).map((s) => s.scene_index)),
+    () =>
+      new Set(
+        transcription.scenes.filter((s) => s.is_raw).map((s) => s.scene_index),
+      ),
     [transcription],
   );
 
@@ -152,9 +158,10 @@ export function ScriptEditorModal({
       }),
       SceneHeader,
     ],
-    content: parsedScript && Array.isArray(parsedScript.scenes)
-      ? buildTipTapDoc(parsedScript.scenes, rawSceneIndices)
-      : "",
+    content:
+      parsedScript && Array.isArray(parsedScript.scenes)
+        ? buildTipTapDoc(parsedScript.scenes, rawSceneIndices)
+        : "",
     onUpdate: () => {
       setUpdateCounter((c) => c + 1);
     },
@@ -162,8 +169,15 @@ export function ScriptEditorModal({
 
   // Reset content when modal opens
   useEffect(() => {
-    if (isOpen && editor && parsedScript && Array.isArray(parsedScript.scenes)) {
-      editor.commands.setContent(buildTipTapDoc(parsedScript.scenes, rawSceneIndices));
+    if (
+      isOpen &&
+      editor &&
+      parsedScript &&
+      Array.isArray(parsedScript.scenes)
+    ) {
+      editor.commands.setContent(
+        buildTipTapDoc(parsedScript.scenes, rawSceneIndices),
+      );
       setUpdateCounter((c) => c + 1);
     }
   }, [isOpen, editor, parsedScript, rawSceneIndices]);
@@ -192,10 +206,19 @@ export function ScriptEditorModal({
 
   // Live duration stats
   const sceneStats = useMemo(() => {
-    if (!editor || !parsedScript || !Array.isArray(parsedScript.scenes) || !transcription) return [];
+    if (
+      !editor ||
+      !parsedScript ||
+      !Array.isArray(parsedScript.scenes) ||
+      !transcription
+    )
+      return [];
 
     const editorJson = editor.getJSON();
-    const texts = extractScenesFromEditor(editorJson as Record<string, unknown>, rawSceneIndices);
+    const texts = extractScenesFromEditor(
+      editorJson as Record<string, unknown>,
+      rawSceneIndices,
+    );
 
     return parsedScript.scenes.map((scene, i) => {
       const isRaw = rawSceneIndices.has(scene.scene_index);
@@ -217,7 +240,8 @@ export function ScriptEditorModal({
 
       const newText = texts[i] || "";
       const estimatedDuration = estimateTtsDuration(newText, targetLanguage);
-      const speedRatio = originalDuration > 0 ? estimatedDuration / originalDuration : 1;
+      const speedRatio =
+        originalDuration > 0 ? estimatedDuration / originalDuration : 1;
       const deltaPct = (speedRatio - 1) * 100;
       const category = getSpeedCategory(speedRatio);
 
@@ -231,12 +255,25 @@ export function ScriptEditorModal({
       };
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [updateCounter, parsedScript, transcription, targetLanguage, editor, rawSceneIndices]);
+  }, [
+    updateCounter,
+    parsedScript,
+    transcription,
+    targetLanguage,
+    editor,
+    rawSceneIndices,
+  ]);
 
   const totals = useMemo(() => {
     const nonRawStats = sceneStats.filter((s) => !s.isRaw);
-    const totalEstimated = nonRawStats.reduce((s, x) => s + x.estimatedDuration, 0);
-    const totalOriginal = nonRawStats.reduce((s, x) => s + x.originalDuration, 0);
+    const totalEstimated = nonRawStats.reduce(
+      (s, x) => s + x.estimatedDuration,
+      0,
+    );
+    const totalOriginal = nonRawStats.reduce(
+      (s, x) => s + x.originalDuration,
+      0,
+    );
     return { totalEstimated, totalOriginal };
   }, [sceneStats]);
 
@@ -244,7 +281,10 @@ export function ScriptEditorModal({
     if (!editor || !parsedScript) return;
 
     const editorJson = editor.getJSON();
-    const texts = extractScenesFromEditor(editorJson as Record<string, unknown>, rawSceneIndices);
+    const texts = extractScenesFromEditor(
+      editorJson as Record<string, unknown>,
+      rawSceneIndices,
+    );
 
     const updatedScript: ParsedScript = {
       ...parsedScript,
@@ -267,7 +307,9 @@ export function ScriptEditorModal({
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
-      onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
     >
       <div className="bg-[hsl(var(--card))] rounded-lg w-full max-w-6xl max-h-[90vh] overflow-hidden flex flex-col">
         {/* Header */}
@@ -282,7 +324,10 @@ export function ScriptEditorModal({
         </div>
 
         {/* Content — single scroll container for linked scroll */}
-        <div ref={scrollContainerRef} className="flex-1 overflow-y-auto min-h-0">
+        <div
+          ref={scrollContainerRef}
+          className="flex-1 overflow-y-auto min-h-0"
+        >
           <div className="flex">
             {/* Editor panel */}
             <div className="flex-[7] p-4 border-r border-[hsl(var(--border))]">
@@ -329,8 +374,7 @@ export function ScriptEditorModal({
         {/* Footer — totals + actions */}
         <div className="flex items-center justify-between p-4 border-t border-[hsl(var(--border))]">
           <div className="text-sm font-mono text-[hsl(var(--muted-foreground))]">
-            Total: {totals.totalEstimated.toFixed(1)}s
-            {" / "}
+            Total: {totals.totalEstimated.toFixed(1)}s{" / "}
             {totals.totalOriginal.toFixed(1)}s
           </div>
           <div className="flex gap-2">

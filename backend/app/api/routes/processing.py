@@ -32,6 +32,7 @@ from ...services import (
     MusicConfigService,
     AudioSpeedService,
 )
+from ...services.forced_alignment import ForcedAlignmentService
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["processing"])
 
@@ -441,6 +442,13 @@ async def upload_restructured_script(
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
     normalized_script = _normalize_script_payload_or_400(project_id, script_data)
+    try:
+        prepared_tts = ScriptAutomationService.prepare_tts_payload(
+            script_payload=normalized_script.public_payload,
+            target_language=normalized_script.language,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
     # Save script
     project_dir = ProjectService.get_project_dir(project_id)
@@ -453,6 +461,7 @@ async def upload_restructured_script(
     audio_path = project_dir / "new_tts.wav"
 
     if audio is not None:
+        ForcedAlignmentService.clear_upload_artifacts(project_id)
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             suffix = Path(audio.filename or "").suffix or ".bin"
@@ -466,21 +475,52 @@ async def upload_restructured_script(
                 )
             except Exception:
                 raise HTTPException(status_code=400, detail="Failed to process audio file")
+        ForcedAlignmentService.save_upload_manifest(
+            project_id,
+            script_payload=normalized_script.public_payload,
+            mode="single_audio",
+        )
     else:
+        expected_segment_count = len(prepared_tts.get("segments") or [])
+        actual_segment_count = len(audio_parts or [])
+        if actual_segment_count != expected_segment_count:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "audio_parts count does not match expected TTS segments "
+                    f"({actual_segment_count} != {expected_segment_count})"
+                ),
+            )
+
+        ForcedAlignmentService.clear_upload_artifacts(project_id)
+        parts_dir = ForcedAlignmentService.parts_dir(project_id)
+        parts_dir.mkdir(parents=True, exist_ok=True)
+
         # Multiple files - concatenate them
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
-            part_paths: list[Path] = []
+            stored_part_paths: list[Path] = []
 
             for i, part in enumerate(audio_parts):
-                # Save each part temporarily
-                part_path = tmp_path / f"part_{i}{Path(part.filename or '.mp3').suffix}"
-                await _write_upload_to_path(part, part_path)
-                part_paths.append(part_path)
+                uploaded_path = tmp_path / f"part_{i}{Path(part.filename or '.mp3').suffix}"
+                await _write_upload_to_path(part, uploaded_path)
+                normalized_part_path = parts_dir / f"part_{i + 1:04d}.wav"
+                try:
+                    await asyncio.to_thread(
+                        _normalize_audio_file_to_wav,
+                        uploaded_path,
+                        normalized_part_path,
+                    )
+                except Exception:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Failed to process audio part {i + 1}",
+                    )
+                stored_part_paths.append(normalized_part_path)
 
             def _concat_parts_to_wav() -> None:
                 combined_audio: Optional[AudioSegment] = None
-                for part_path in part_paths:
+                for part_path in stored_part_paths:
                     segment = AudioSegment.from_file(str(part_path))
                     if combined_audio is None:
                         combined_audio = segment
@@ -497,6 +537,16 @@ async def upload_restructured_script(
                     status_code=400,
                     detail="Failed to process audio parts"
                 )
+
+        ForcedAlignmentService.save_upload_manifest(
+            project_id,
+            script_payload=normalized_script.public_payload,
+            mode="audio_parts",
+            stored_part_paths=[
+                str(path.relative_to(project_dir))
+                for path in stored_part_paths
+            ],
+        )
 
     # Apply TTS speed if configured
     tts_speed = project.tts_speed
