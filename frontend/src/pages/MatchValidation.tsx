@@ -645,6 +645,9 @@ export function MatchValidation() {
   const [skipUiEnabled, setSkipUiEnabled] = useState(false);
   const skipUiEnabledRef = useRef(false);
   const autoMatchAttemptedRef = useRef(false);
+  const [matchesAutoEnabled, setMatchesAutoEnabled] = useState(false);
+  const matchesAutoFillTriggeredRef = useRef(false);
+  const [gapsFillCount, setGapsFillCount] = useState<number | null>(null);
   const [activeSceneIndex, setActiveSceneIndex] = useState(-1);
   const [autoScroll, setAutoScroll] = useState(true);
   const [fastWatchPlaying, setFastWatchPlaying] = useState(false);
@@ -1095,6 +1098,20 @@ export function MatchValidation() {
         } catch {
           setSkipUiEnabled(false);
           skipUiEnabledRef.current = false;
+        }
+        // Check if matches auto-fill is enabled
+        try {
+          const matchesConfig = await api.getMatchesConfig(projectId);
+          setMatchesAutoEnabled(Boolean(matchesConfig.full_auto_enabled));
+        } catch {
+          setMatchesAutoEnabled(false);
+        }
+        // Load gaps fill stats for informative display
+        try {
+          const fillStats = await api.getGapsFillStats(projectId);
+          setGapsFillCount(fillStats.filled_count ?? null);
+        } catch {
+          setGapsFillCount(null);
         }
       } catch (err) {
         setError((err as Error).message);
@@ -1620,6 +1637,31 @@ export function MatchValidation() {
     }
   }, [projectId, matches, stopFastWatch, preparePlaybackClips]);
 
+  // Auto-fill best candidates when ATR_MATCHES_FULL_AUTO_ENABLED is set
+  useEffect(() => {
+    if (
+      !projectId ||
+      loading ||
+      matching ||
+      !matchesAutoEnabled ||
+      !mergeContinuous ||
+      matches.length === 0 ||
+      matchesAutoFillTriggeredRef.current
+    ) {
+      return;
+    }
+    matchesAutoFillTriggeredRef.current = true;
+    handleAutoFillBestCandidates();
+  }, [
+    projectId,
+    loading,
+    matching,
+    matchesAutoEnabled,
+    mergeContinuous,
+    matches.length,
+    handleAutoFillBestCandidates,
+  ]);
+
   const handleUndoMerge = useCallback(
     async (sceneIndex: number) => {
       if (!projectId) return;
@@ -1887,6 +1929,17 @@ export function MatchValidation() {
                       !m.episode &&
                       m.alternatives?.length > 0,
                   ).length;
+                  if (gapsFillCount !== null) {
+                    return (
+                      <div
+                        className="flex items-center gap-1 px-2 py-1 rounded border border-purple-500/30 bg-purple-500/10 text-purple-500 text-xs"
+                        title={`${gapsFillCount} scene${gapsFillCount !== 1 ? "s" : ""} were auto-filled during the gaps phase`}
+                      >
+                        <Wand2 className="h-4 w-4" />
+                        <span>{gapsFillCount} filled in gaps</span>
+                      </div>
+                    );
+                  }
                   return (
                     noMatchCount > 0 && (
                       <Button

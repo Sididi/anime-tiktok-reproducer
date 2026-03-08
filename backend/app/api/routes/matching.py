@@ -14,6 +14,15 @@ from ...services.match_playback_service import MatchPlaybackService
 router = APIRouter(prefix="/projects/{project_id}", tags=["matching"])
 
 
+@router.get("/matches/config")
+async def get_matches_config(project_id: str):
+    """Get matches feature flags."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return {"full_auto_enabled": settings.matches_full_auto_enabled}
+
+
 class SetSourcesRequest(BaseModel):
     paths: list[str]
 

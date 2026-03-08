@@ -60,6 +60,7 @@ class Settings(BaseSettings):
     scenes_skip_ui_enabled: bool = False
     transcription_full_auto_enabled: bool = False
     gaps_full_auto_enabled: bool = False
+    matches_full_auto_enabled: bool = False
     processing_gdrive_full_auto_enabled: bool = False
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-3.1-pro-preview"

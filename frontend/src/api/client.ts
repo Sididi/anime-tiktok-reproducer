@@ -226,6 +226,11 @@ export const api = {
       `/projects/${projectId}/matches`,
     ),
 
+  getMatchesConfig: (projectId: string) =>
+    request<{ full_auto_enabled: boolean }>(
+      `/projects/${projectId}/matches/config`,
+    ),
+
   prepareMatchesPlayback: (projectId: string, force = false) =>
     fetch(`${API_BASE}/projects/${projectId}/matches/playback/prepare`, {
       method: "POST",
@@ -448,6 +453,11 @@ export const api = {
   getGapsConfig: (projectId: string) =>
     request<{ full_auto_enabled: boolean }>(
       `/projects/${projectId}/gaps/config`,
+    ),
+
+  getGapsFillStats: (projectId: string) =>
+    request<{ filled_count: number | null }>(
+      `/projects/${projectId}/gaps/fill-stats`,
     ),
 
   getGaps: (projectId: string) =>
