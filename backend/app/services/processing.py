@@ -118,6 +118,33 @@ SENTENCE_ENDING_PUNCT = {'.', '!', '?', '…', ':', ';'}
 LOW_CONF_THRESHOLD = 0.05
 LOW_CONF_SINGLE_WORD_MIN_DURATION_SEC = 0.22
 MIN_GAP_FOR_EXTENSION_SEC = 0.30
+
+KNOWN_MEDIA_EXTENSIONS = (
+    ".mkv",
+    ".mp4",
+    ".mov",
+    ".avi",
+    ".webm",
+    ".m4v",
+    ".wav",
+    ".mp3",
+    ".m4a",
+    ".aac",
+    ".flac",
+    ".ogg",
+    ".aiff",
+    ".aif",
+)
+
+
+def _strip_known_media_extension(name: str) -> str:
+    """Strip only supported media extensions, not arbitrary dotted suffixes."""
+    clean_name = str(name or "").strip()
+    lower_name = clean_name.lower()
+    for ext in KNOWN_MEDIA_EXTENSIONS:
+        if lower_name.endswith(ext):
+            return clean_name[:-len(ext)]
+    return clean_name
 NEXT_WORD_SAFETY_SEC = 1.0 / 60.0
 SRT_OBVIOUS_SILENCE_GAP_SEC = 0.5
 
@@ -168,6 +195,19 @@ class ProcessingService:
         Path(__file__).resolve().parent / "templates" / "premiere_import_project_v77.jsx"
     )
     _gap_candidate_prewarm_tasks: dict[str, asyncio.Task[None]] = {}
+
+    @classmethod
+    def _resolve_source_reference(cls, episode: str) -> tuple[Path, str]:
+        """Resolve a match episode to a source path and Premiere-safe clip name."""
+        resolved_path = GapResolutionService.resolve_episode_path(episode)
+        if resolved_path and resolved_path.exists():
+            return resolved_path, resolved_path.stem
+
+        fallback_path = Path(episode)
+        if fallback_path.exists():
+            return fallback_path, _strip_known_media_extension(fallback_path.name)
+
+        return fallback_path, _strip_known_media_extension(episode)
 
     @classmethod
     def schedule_gap_candidate_prewarm(cls, project_id: str, gaps: list) -> None:
@@ -408,6 +448,8 @@ class ProcessingService:
                 else:
                     continue
 
+            source_path, clip_name = cls._resolve_source_reference(episode)
+
             # Snap source in/out to source-frame boundaries using "at-or-after" semantics.
             # This matches what users validate in browser playback at non-frame timestamps.
             source_in_frames = source_rate.frames_from_seconds_at_or_after(source_in_raw_sec)
@@ -443,8 +485,8 @@ class ProcessingService:
             # Calculate frame-perfect timing using OTIO
             clip_timing = calculator.calculate_clip_timing(
                 scene_index=scene_trans.scene_index,
-                source_path=Path(episode),
-                bundle_filename=Path(episode).stem,
+                source_path=source_path,
+                bundle_filename=clip_name,
                 source_in_seconds=source_in_sec,
                 source_out_seconds=source_out_sec,
                 timeline_start_seconds=timeline_start_snapped,
@@ -462,7 +504,7 @@ class ProcessingService:
                 "start": round(timeline_start_snapped, 6),  # Frame-snapped, more precision
                 "end": round(timeline_end_snapped, 6),
                 "text": subtitle_text,
-                "clipName": Path(episode).stem,
+                "clipName": clip_name,
                 "source_in_frame": source_in_frames,
                 "source_out_frame": source_out_frames,
                 "source_in": round(clip_timing.source_in_seconds, 6),
@@ -1210,7 +1252,7 @@ class ProcessingService:
             source_fps = None
             for match in matches:
                 if match.episode:
-                    episode_path = Path(match.episode)
+                    episode_path, _ = cls._resolve_source_reference(match.episode)
                     if episode_path.exists():
                         source_fps = await cls.detect_video_fps(episode_path)
                         break  # Use first valid episode's FPS
