@@ -157,13 +157,18 @@ def _upload_manifest_and_persist(
     project_id: str,
     project,
     matches,
+    progress_callback=None,
 ) -> dict[str, Any]:
     """Run upload + persistence under a project lock."""
     lock = _get_gdrive_upload_lock(project_id)
     if not lock.acquire(blocking=False):
         raise DriveUploadInProgressError("Upload already in progress for this project")
     try:
-        result = ExportService.upload_manifest_to_drive(project, matches)
+        result = ExportService.upload_manifest_to_drive(
+            project,
+            matches,
+            progress_callback=progress_callback,
+        )
         project.drive_folder_id = result["folder_id"]
         project.drive_folder_url = result["folder_url"]
         project.drive_export_uploaded_once = True
@@ -999,15 +1004,86 @@ async def upload_to_gdrive(project_id: str, auto: bool = False):
     if not matches:
         raise HTTPException(status_code=400, detail="No matches found")
 
+    def _gdrive_progress_to_fraction(payload: dict[str, Any]) -> float:
+        phase = str(payload.get("phase") or "")
+        if phase == "manifest":
+            return 0.12
+        if phase == "clear":
+            total = int(payload.get("clear_item_count") or 0)
+            completed = int(payload.get("clear_items_completed") or 0)
+            if total <= 0:
+                return 0.25
+            return min(0.3, 0.15 + (completed / total) * 0.15)
+        if phase == "upload":
+            total_bytes = int(payload.get("total_bytes") or 0)
+            uploaded_bytes = int(payload.get("uploaded_bytes") or 0)
+            if total_bytes <= 0:
+                return 0.35
+            return min(0.96, 0.3 + (uploaded_bytes / total_bytes) * 0.65)
+        if phase == "persist":
+            return 0.98
+        return 0.1
+
+    def _gdrive_progress_to_sse_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        message = str(payload.get("message") or "Uploading project to Google Drive...")
+        return {
+            "status": "processing",
+            "step": "gdrive",
+            "progress": _gdrive_progress_to_fraction(payload),
+            "message": message,
+            "phase": payload.get("phase"),
+            "file_count": payload.get("file_count"),
+            "files_completed": payload.get("files_completed"),
+            "total_bytes": payload.get("total_bytes"),
+            "uploaded_bytes": payload.get("uploaded_bytes"),
+            "current_file": payload.get("current_file"),
+            "clear_item_count": payload.get("clear_item_count"),
+            "clear_items_completed": payload.get("clear_items_completed"),
+            "elapsed_ms": payload.get("elapsed_ms"),
+            "throughput_mb_per_sec": payload.get("throughput_mb_per_sec"),
+        }
+
     async def stream_progress():
-        yield f"data: {json.dumps({'status': 'processing', 'step': 'gdrive', 'progress': 0.1, 'message': 'Uploading project to Google Drive...'})}\n\n"
-        try:
-            result = await asyncio.to_thread(
-                _upload_manifest_and_persist,
-                project_id,
-                project,
-                matches.matches,
+        yield (
+            "data: "
+            + json.dumps(
+                {
+                    "status": "processing",
+                    "step": "gdrive",
+                    "progress": 0.1,
+                    "message": "Preparing Drive upload...",
+                    "phase": "manifest",
+                }
             )
+            + "\n\n"
+        )
+        try:
+            loop = asyncio.get_running_loop()
+            progress_queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
+            sentinel = object()
+
+            def _progress_callback(payload: dict[str, Any]) -> None:
+                loop.call_soon_threadsafe(progress_queue.put_nowait, payload)
+
+            def _run_upload():
+                try:
+                    return _upload_manifest_and_persist(
+                        project_id,
+                        project,
+                        matches.matches,
+                        _progress_callback,
+                    )
+                finally:
+                    loop.call_soon_threadsafe(progress_queue.put_nowait, sentinel)
+
+            worker = asyncio.create_task(asyncio.to_thread(_run_upload))
+            while True:
+                payload = await progress_queue.get()
+                if payload is sentinel:
+                    break
+                yield f"data: {json.dumps(_gdrive_progress_to_sse_payload(payload))}\n\n"
+
+            result = await worker
             asyncio.create_task(
                 asyncio.to_thread(
                     _notify_drive_upload_complete,
@@ -1016,7 +1092,25 @@ async def upload_to_gdrive(project_id: str, auto: bool = False):
                 )
             )
 
-            yield f"data: {json.dumps({'status': 'complete', 'step': 'gdrive', 'progress': 1.0, 'message': 'Upload complete', 'folder_url': result['folder_url'], 'folder_id': result['folder_id']})}\n\n"
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "status": "complete",
+                        "step": "gdrive",
+                        "progress": 1.0,
+                        "message": "Upload complete",
+                        "phase": "complete",
+                        "folder_url": result["folder_url"],
+                        "folder_id": result["folder_id"],
+                        "file_count": result.get("file_count"),
+                        "files_completed": result.get("file_count"),
+                        "total_bytes": result.get("total_bytes"),
+                        "uploaded_bytes": result.get("total_bytes"),
+                    }
+                )
+                + "\n\n"
+            )
         except DriveUploadInProgressError as exc:
             yield f"data: {json.dumps({'status': 'error', 'step': 'gdrive', 'progress': 0.0, 'error': str(exc), 'error_code': 'upload_in_progress', 'message': 'Drive upload already running for this project'})}\n\n"
         except Exception as exc:

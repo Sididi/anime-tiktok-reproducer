@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import re
@@ -7,7 +8,8 @@ import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from threading import Lock
+from typing import Any, Callable
 
 from ..config import settings
 from ..models import Project, SceneMatch
@@ -17,6 +19,7 @@ from .music_config_service import MusicConfigService
 from .project_service import ProjectService
 
 logger = logging.getLogger("uvicorn.error")
+DriveUploadProgressCallback = Callable[[dict[str, Any]], None]
 
 
 @dataclass
@@ -25,6 +28,172 @@ class ManifestEntry:
     source_path: Path | None = None
     inline_content: bytes | None = None
     mime_type: str = "application/octet-stream"
+
+
+@dataclass(frozen=True)
+class UploadJob:
+    parent_id: str
+    filename: str
+    entry: ManifestEntry
+    size_bytes: int
+
+
+class _DriveUploadProgressTracker:
+    _UPLOAD_PROGRESS_EMIT_INTERVAL_SECONDS = 0.25
+    _UPLOAD_PROGRESS_EMIT_MIN_DELTA_BYTES = 4 * 1024 * 1024
+
+    def __init__(
+        self,
+        *,
+        callback: DriveUploadProgressCallback | None,
+        file_count: int,
+        total_bytes: int,
+    ) -> None:
+        self._callback = callback
+        self._lock = Lock()
+        self._started_at = time.perf_counter()
+        self._upload_started_at: float | None = None
+        self._last_upload_emit_at = 0.0
+        self._last_upload_emit_bytes = 0
+        self.file_count = file_count
+        self.files_completed = 0
+        self.total_bytes = total_bytes
+        self.uploaded_bytes = 0
+        self.current_file: str | None = None
+        self.clear_item_count = 0
+        self.clear_items_completed = 0
+        self._bytes_by_file: dict[str, int] = {}
+        self._completed_files: set[str] = set()
+
+    def emit_manifest(self) -> None:
+        with self._lock:
+            self._emit_locked(
+                phase="manifest",
+                message=(
+                    f"Preparing Drive manifest ({self.file_count} files, "
+                    f"{self._format_bytes(self.total_bytes)})"
+                ),
+                force=True,
+            )
+
+    def start_clear(self, item_count: int) -> None:
+        with self._lock:
+            self.clear_item_count = item_count
+            self.clear_items_completed = 0
+            message = (
+                "Drive folder is already empty."
+                if item_count == 0
+                else f"Clearing existing Drive folder (0/{item_count})"
+            )
+            self._emit_locked(phase="clear", message=message, force=True)
+
+    def update_clear(self, completed: int, *, current_item: str | None = None) -> None:
+        with self._lock:
+            self.clear_items_completed = completed
+            self.current_file = current_item
+            total = self.clear_item_count
+            if total == 0:
+                message = "Drive folder is already empty."
+            else:
+                message = f"Clearing existing Drive folder ({completed}/{total})"
+            self._emit_locked(phase="clear", message=message, force=True)
+
+    def start_upload(self) -> None:
+        with self._lock:
+            if self._upload_started_at is None:
+                self._upload_started_at = time.perf_counter()
+            self.current_file = None
+            self._emit_locked(
+                phase="upload",
+                message=self._upload_message_locked(),
+                force=True,
+            )
+
+    def update_upload(
+        self,
+        relative_path: str,
+        uploaded_bytes_for_file: int,
+        *,
+        completed: bool,
+    ) -> None:
+        with self._lock:
+            if self._upload_started_at is None:
+                self._upload_started_at = time.perf_counter()
+            previous = self._bytes_by_file.get(relative_path, 0)
+            current = max(previous, uploaded_bytes_for_file)
+            self._bytes_by_file[relative_path] = current
+            self.uploaded_bytes += current - previous
+            self.current_file = relative_path
+            if completed and relative_path not in self._completed_files:
+                self._completed_files.add(relative_path)
+                self.files_completed += 1
+            force = completed
+            if not force and not self._should_emit_upload_locked():
+                return
+            self._emit_locked(
+                phase="upload",
+                message=self._upload_message_locked(),
+                force=force,
+            )
+
+    def emit_persist(self) -> None:
+        with self._lock:
+            self.current_file = None
+            self._emit_locked(
+                phase="persist",
+                message="Finishing upload metadata",
+                force=True,
+            )
+
+    def _should_emit_upload_locked(self) -> bool:
+        now = time.perf_counter()
+        if now - self._last_upload_emit_at >= self._UPLOAD_PROGRESS_EMIT_INTERVAL_SECONDS:
+            return True
+        return self.uploaded_bytes - self._last_upload_emit_bytes >= self._UPLOAD_PROGRESS_EMIT_MIN_DELTA_BYTES
+
+    def _emit_locked(self, *, phase: str, message: str, force: bool) -> None:
+        if self._callback is None:
+            return
+        elapsed_ms = int((time.perf_counter() - self._started_at) * 1000)
+        throughput_mb_per_sec = 0.0
+        if self._upload_started_at is not None:
+            upload_elapsed = max(time.perf_counter() - self._upload_started_at, 0.001)
+            throughput_mb_per_sec = (self.uploaded_bytes / (1024 * 1024)) / upload_elapsed
+        payload = {
+            "phase": phase,
+            "message": message,
+            "file_count": self.file_count,
+            "files_completed": self.files_completed,
+            "total_bytes": self.total_bytes,
+            "uploaded_bytes": self.uploaded_bytes,
+            "current_file": self.current_file,
+            "clear_item_count": self.clear_item_count,
+            "clear_items_completed": self.clear_items_completed,
+            "elapsed_ms": elapsed_ms,
+            "throughput_mb_per_sec": round(throughput_mb_per_sec, 3),
+        }
+        self._callback(payload)
+        if phase == "upload":
+            self._last_upload_emit_at = time.perf_counter()
+            self._last_upload_emit_bytes = self.uploaded_bytes
+
+    def _upload_message_locked(self) -> str:
+        return (
+            f"Uploading {self.files_completed}/{self.file_count} files "
+            f"({self._format_bytes(self.uploaded_bytes)} / {self._format_bytes(self.total_bytes)})"
+        )
+
+    @staticmethod
+    def _format_bytes(value: int) -> str:
+        units = ("B", "KB", "MB", "GB", "TB")
+        size = float(max(0, value))
+        unit = units[0]
+        for unit in units:
+            if size < 1024.0 or unit == units[-1]:
+                break
+            size /= 1024.0
+        decimals = 0 if unit == "B" else 1
+        return f"{size:.{decimals}f} {unit}"
 
 
 class ExportService:
@@ -308,7 +477,44 @@ subtitles/              - Baked subtitle MOGRT files
         return bundle_path
 
     @classmethod
-    def upload_manifest_to_drive(cls, project: Project, matches: list[SceneMatch]) -> dict[str, Any]:
+    def _entry_size_bytes(cls, entry: ManifestEntry) -> int:
+        return (
+            entry.source_path.stat().st_size
+            if entry.source_path is not None
+            else len(entry.inline_content or b"")
+        )
+
+    @classmethod
+    def _build_manifest_diagnostics(cls, entries: list[ManifestEntry]) -> dict[str, Any]:
+        bytes_by_root: dict[str, int] = defaultdict(int)
+        largest_files: list[tuple[int, str]] = []
+        total_bytes = 0
+        for entry in entries:
+            size_bytes = cls._entry_size_bytes(entry)
+            total_bytes += size_bytes
+            rel_parts = Path(entry.relative_path).parts
+            payload_parts = rel_parts[1:] if len(rel_parts) > 1 else rel_parts
+            top_level = payload_parts[0] if payload_parts else entry.relative_path
+            bytes_by_root[top_level] += size_bytes
+            largest_files.append((size_bytes, entry.relative_path))
+        largest_files.sort(key=lambda item: (-item[0], item[1]))
+        return {
+            "total_bytes": total_bytes,
+            "bytes_by_root": dict(sorted(bytes_by_root.items(), key=lambda item: (-item[1], item[0]))),
+            "largest_files": [
+                {"relative_path": relative_path, "bytes": size_bytes}
+                for size_bytes, relative_path in largest_files[:5]
+            ],
+        }
+
+    @classmethod
+    def upload_manifest_to_drive(
+        cls,
+        project: Project,
+        matches: list[SceneMatch],
+        *,
+        progress_callback: DriveUploadProgressCallback | None = None,
+    ) -> dict[str, Any]:
         if not GoogleDriveService.is_configured():
             raise RuntimeError("Google Drive integration is not configured")
 
@@ -316,34 +522,63 @@ subtitles/              - Baked subtitle MOGRT files
         drive = GoogleDriveService.client()
         folder_name = cls.output_folder_name(project)
         _, entries = cls.build_manifest(project, matches)
+        diagnostics = cls._build_manifest_diagnostics(entries)
+        progress = _DriveUploadProgressTracker(
+            callback=progress_callback,
+            file_count=len(entries),
+            total_bytes=diagnostics["total_bytes"],
+        )
+        progress.emit_manifest()
         folder_id, folder_url = GoogleDriveService.ensure_project_folder(
             folder_name,
             existing_folder_id=project.drive_folder_id,
             drive=drive,
         )
-        total_bytes = sum(
-            (entry.source_path.stat().st_size if entry.source_path is not None else len(entry.inline_content or b""))
-            for entry in entries
-        )
+        total_bytes = diagnostics["total_bytes"]
         upload_workers = max(1, min(settings.drive_upload_max_parallel, len(entries))) if entries else 1
         logger.info(
-            "Drive manifest upload starting: project_id=%s folder_id=%s files=%d total_bytes=%d upload_workers=%d delete_workers=%d",
+            "Drive manifest upload starting: project_id=%s folder_id=%s files=%d total_bytes=%d upload_workers=%d delete_workers=%d bytes_by_root=%s largest_files=%s",
             project.id,
             folder_id,
             len(entries),
             total_bytes,
             upload_workers,
             settings.drive_delete_max_parallel,
+            diagnostics["bytes_by_root"],
+            diagnostics["largest_files"],
         )
 
         # Keep drive folder architecture exactly in sync with the export manifest.
         clear_started_at = time.perf_counter()
-        GoogleDriveService.clear_folder(folder_id, drive=drive)
+        clear_progress_started = False
+
+        def _handle_clear_progress(payload: dict[str, Any]) -> None:
+            nonlocal clear_progress_started
+            item_count = int(payload.get("item_count") or 0)
+            if not clear_progress_started:
+                progress.start_clear(item_count)
+                clear_progress_started = True
+            completed = int(payload.get("items_completed") or 0)
+            current_item = str(payload.get("current_item") or "") or None
+            if completed == 0 and current_item is None:
+                return
+            progress.update_clear(
+                completed,
+                current_item=current_item,
+            )
+
+        cleared_items = GoogleDriveService.clear_folder(
+            folder_id,
+            drive=drive,
+            progress_callback=_handle_clear_progress,
+        )
+        if not clear_progress_started:
+            progress.start_clear(cleared_items)
         clear_duration = time.perf_counter() - clear_started_at
 
         # Cache parent folder IDs by relative path to avoid repeated Drive queries.
         parent_cache: dict[tuple[str, ...], str] = {tuple(): folder_id}
-        upload_jobs: list[tuple[str, str, ManifestEntry]] = []
+        upload_jobs: list[UploadJob] = []
 
         def _resolve_parent(parts: list[str]) -> str:
             parent = folder_id
@@ -369,30 +604,51 @@ subtitles/              - Baked subtitle MOGRT files
             if len(parts) > 1:
                 # Preserve sub-directory architecture inside the Drive root folder.
                 parent = _resolve_parent(parts[:-1])
-            upload_jobs.append((parent, filename, entry))
+            upload_jobs.append(
+                UploadJob(
+                    parent_id=parent,
+                    filename=filename,
+                    entry=entry,
+                    size_bytes=cls._entry_size_bytes(entry),
+                )
+            )
+
+        upload_jobs.sort(key=lambda job: (-job.size_bytes, job.entry.relative_path))
 
         chunk_bytes = settings.drive_upload_chunk_mb * 1024 * 1024
 
-        def _upload_job(job: tuple[str, str, ManifestEntry]) -> None:
-            parent, filename, entry = job
+        progress.start_upload()
+
+        def _upload_job(job: UploadJob) -> None:
+            entry = job.entry
+
+            def _handle_upload_progress(file_progress: dict[str, Any]) -> None:
+                progress.update_upload(
+                    entry.relative_path,
+                    int(file_progress.get("uploaded_bytes") or 0),
+                    completed=bool(file_progress.get("completed")),
+                )
+
             if entry.source_path is not None:
                 uploaded = GoogleDriveService.upload_local_file(
-                    parent_id=parent,
-                    filename=filename,
+                    parent_id=job.parent_id,
+                    filename=job.filename,
                     local_path=entry.source_path,
                     chunksize=chunk_bytes,
+                    progress_callback=_handle_upload_progress,
                 )
             else:
                 uploaded = GoogleDriveService.upload_bytes(
-                    parent_id=parent,
-                    filename=filename,
+                    parent_id=job.parent_id,
+                    filename=job.filename,
                     content=entry.inline_content or b"",
                     mime_type=entry.mime_type,
+                    progress_callback=_handle_upload_progress,
                 )
             uploaded_name = str(uploaded.get("name") or "")
-            if uploaded_name != filename:
+            if uploaded_name != job.filename:
                 raise RuntimeError(
-                    f"Drive upload renamed file unexpectedly: expected '{filename}', got '{uploaded_name}'"
+                    f"Drive upload renamed file unexpectedly: expected '{job.filename}', got '{uploaded_name}'"
                 )
 
         upload_started_at = time.perf_counter()
@@ -406,17 +662,19 @@ subtitles/              - Baked subtitle MOGRT files
                 }
                 for future in as_completed(future_to_job):
                     job = future_to_job[future]
-                    _, _, entry = job
                     try:
                         future.result()
                     except Exception as exc:
-                        failure = RuntimeError(f"Drive upload failed for '{entry.relative_path}': {exc}")
+                        failure = RuntimeError(
+                            f"Drive upload failed for '{job.entry.relative_path}': {exc}"
+                        )
                         for other in future_to_job:
                             if other is not future:
                                 other.cancel()
                         break
             if failure is not None:
                 raise failure
+        progress.emit_persist()
         upload_duration = time.perf_counter() - upload_started_at
         total_duration = time.perf_counter() - started_at
         uploaded_files = len(upload_jobs)
@@ -439,6 +697,7 @@ subtitles/              - Baked subtitle MOGRT files
             "folder_id": folder_id,
             "folder_url": folder_url,
             "file_count": len(entries),
+            "total_bytes": total_bytes,
         }
 
     @classmethod

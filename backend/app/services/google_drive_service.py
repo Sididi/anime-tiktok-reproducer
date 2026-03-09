@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 import io
+import json
 import logging
 import mimetypes
 from pathlib import Path
@@ -23,6 +24,11 @@ from ..config import settings
 FOLDER_MIME = "application/vnd.google-apps.folder"
 FORCE_BINARY_UPLOAD_SUFFIXES = {".sqpreset", ".prfpset", ".mogrt"}
 TRANSIENT_HTTP_STATUS_CODES = {429, 500, 502, 503, 504}
+RETRYABLE_403_REASONS = {
+    "rateLimitExceeded",
+    "userRateLimitExceeded",
+    "sharingRateLimitExceeded",
+}
 logger = logging.getLogger("uvicorn.error")
 _RequestResultT = TypeVar("_RequestResultT")
 
@@ -123,6 +129,45 @@ class GoogleDriveService:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _http_error_reason_codes(exc: Exception) -> set[str]:
+        if not isinstance(exc, HttpError):
+            return set()
+        content = getattr(exc, "content", b"")
+        if isinstance(content, bytes):
+            raw = content.decode("utf-8", errors="ignore")
+        else:
+            raw = str(content or "")
+        if not raw:
+            return set()
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return set()
+        error = payload.get("error", {})
+        reasons: set[str] = set()
+        if isinstance(error, dict):
+            errors = error.get("errors", [])
+            if isinstance(errors, list):
+                for item in errors:
+                    if isinstance(item, dict):
+                        reason = item.get("reason")
+                        if isinstance(reason, str) and reason:
+                            reasons.add(reason)
+            reason = error.get("status")
+            if isinstance(reason, str) and reason:
+                reasons.add(reason)
+        return reasons
+
+    @classmethod
+    def _is_retryable_http_error(cls, exc: Exception) -> bool:
+        status_code = cls._http_error_status_code(exc)
+        if status_code in TRANSIENT_HTTP_STATUS_CODES:
+            return True
+        if status_code == 403 and cls._http_error_reason_codes(exc) & RETRYABLE_403_REASONS:
+            return True
+        return False
+
     @classmethod
     def _execute_with_retries(
         cls,
@@ -144,14 +189,15 @@ class GoogleDriveService:
                 return result
             except Exception as exc:
                 status_code = cls._http_error_status_code(exc)
-                should_retry = status_code in TRANSIENT_HTTP_STATUS_CODES
+                should_retry = cls._is_retryable_http_error(exc)
                 if not should_retry or attempt >= max_attempts:
                     raise
                 backoff_seconds = min(8.0, 0.5 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.25)
                 logger.warning(
-                    "Transient Drive error; retrying request: operation=%s status=%s attempt=%d/%d backoff_seconds=%.2f",
+                    "Transient Drive error; retrying request: operation=%s status=%s reasons=%s attempt=%d/%d backoff_seconds=%.2f",
                     operation,
                     status_code,
+                    sorted(cls._http_error_reason_codes(exc)),
                     attempt,
                     max_attempts,
                     backoff_seconds,
@@ -264,14 +310,30 @@ class GoogleDriveService:
         return cls._query_files(q, drive=drive)
 
     @classmethod
-    def clear_folder(cls, folder_id: str, *, drive=None) -> None:
+    def clear_folder(
+        cls,
+        folder_id: str,
+        *,
+        drive=None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> int:
         drive = drive or cls._client()
         items = cls.list_children(folder_id, drive=drive)
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "item_count": len(items),
+                    "items_completed": 0,
+                    "current_item": None,
+                }
+            )
         if not items:
-            return
+            return 0
 
         max_workers = max(1, min(settings.drive_delete_max_parallel, len(items)))
         started_at = time.perf_counter()
+        progress_lock = Lock()
+        completed_items = 0
 
         def _delete_item(file_id: str) -> None:
             delete_drive = cls.client()
@@ -284,14 +346,25 @@ class GoogleDriveService:
         failures: list[tuple[str, Exception]] = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_file_id = {
-                executor.submit(_delete_item, str(item["id"])): str(item["id"])
+                executor.submit(_delete_item, str(item["id"])): item
                 for item in items
                 if item.get("id")
             }
             for future in as_completed(future_to_file_id):
-                file_id = future_to_file_id[future]
+                item = future_to_file_id[future]
+                file_id = str(item["id"])
                 try:
                     future.result()
+                    if progress_callback is not None:
+                        with progress_lock:
+                            completed_items += 1
+                            progress_callback(
+                                {
+                                    "item_count": len(items),
+                                    "items_completed": completed_items,
+                                    "current_item": str(item.get("name") or ""),
+                                }
+                            )
                 except Exception as exc:  # pragma: no cover - defensive; exercised in tests
                     failures.append((file_id, exc))
 
@@ -310,6 +383,79 @@ class GoogleDriveService:
                 f"Failed to clear Drive folder '{folder_id}': {len(failures)} item(s) could not be deleted"
                 + (f" (examples: {failed_ids})" if failed_ids else "")
             )
+        return len(items)
+
+    @staticmethod
+    def _align_chunksize(chunksize: int) -> int:
+        quantum = 256 * 1024
+        return max(quantum, ((chunksize + quantum - 1) // quantum) * quantum)
+
+    @classmethod
+    def _effective_resumable_chunksize(cls, file_size: int, requested_chunksize: int | None) -> int:
+        base = requested_chunksize or (16 * 1024 * 1024)
+        if file_size >= 1024 * 1024 * 1024:
+            base = max(base, 64 * 1024 * 1024)
+        elif file_size >= 256 * 1024 * 1024:
+            base = max(base, 32 * 1024 * 1024)
+        return cls._align_chunksize(base)
+
+    @classmethod
+    def _upload_resumable_request(
+        cls,
+        request,
+        *,
+        file_size: int,
+        operation: str,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        max_attempts: int = 5,
+    ) -> dict[str, Any]:
+        attempt = 1
+        response = None
+        while response is None:
+            try:
+                status, response = request.next_chunk(num_retries=0)
+                attempt = 1
+            except Exception as exc:
+                status_code = cls._http_error_status_code(exc)
+                should_retry = cls._is_retryable_http_error(exc)
+                if not should_retry or attempt >= max_attempts:
+                    raise
+                backoff_seconds = min(8.0, 0.5 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.25)
+                logger.warning(
+                    "Transient Drive upload chunk error; retrying request: operation=%s status=%s reasons=%s attempt=%d/%d backoff_seconds=%.2f",
+                    operation,
+                    status_code,
+                    sorted(cls._http_error_reason_codes(exc)),
+                    attempt,
+                    max_attempts,
+                    backoff_seconds,
+                )
+                time.sleep(backoff_seconds)
+                attempt += 1
+                continue
+
+            if status is not None and progress_callback is not None:
+                uploaded_bytes = min(
+                    file_size,
+                    int(getattr(status, "resumable_progress", 0) or 0),
+                )
+                progress_callback(
+                    {
+                        "uploaded_bytes": uploaded_bytes,
+                        "total_bytes": file_size,
+                        "completed": False,
+                    }
+                )
+
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "uploaded_bytes": file_size,
+                    "total_bytes": file_size,
+                    "completed": True,
+                }
+            )
+        return response
 
     @classmethod
     def ensure_subfolder(cls, parent_id: str, name: str, *, drive=None) -> str:
@@ -345,6 +491,7 @@ class GoogleDriveService:
         local_path: Path,
         chunksize: int | None = None,
         drive=None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         drive = drive or cls._client()
         suffix = local_path.suffix.lower()
@@ -354,7 +501,11 @@ class GoogleDriveService:
             mime, _ = mimetypes.guess_type(str(local_path))
         file_size = local_path.stat().st_size
         resumable = file_size > cls._SMALL_FILE_BYTES
-        request_chunk_size = chunksize if resumable and chunksize is not None else -1
+        request_chunk_size = (
+            cls._effective_resumable_chunksize(file_size, chunksize)
+            if resumable
+            else -1
+        )
 
         def _create() -> dict[str, Any]:
             media = MediaFileUpload(
@@ -370,8 +521,36 @@ class GoogleDriveService:
                 supportsAllDrives=True,
             ).execute()
 
-        created = cls._execute_with_retries(_create, operation=f"drive_upload_file:{filename}")
-        return created
+        if not resumable:
+            created = cls._execute_with_retries(_create, operation=f"drive_upload_file:{filename}")
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "uploaded_bytes": file_size,
+                        "total_bytes": file_size,
+                        "completed": True,
+                    }
+                )
+            return created
+
+        media = MediaFileUpload(
+            str(local_path),
+            mimetype=mime or "application/octet-stream",
+            resumable=True,
+            chunksize=request_chunk_size,
+        )
+        request = drive.files().create(
+            body={"name": filename, "parents": [parent_id]},
+            media_body=media,
+            fields="id,name,webViewLink",
+            supportsAllDrives=True,
+        )
+        return cls._upload_resumable_request(
+            request,
+            file_size=file_size,
+            operation=f"drive_upload_file:{filename}",
+            progress_callback=progress_callback,
+        )
 
     @classmethod
     def upload_bytes(
@@ -382,6 +561,7 @@ class GoogleDriveService:
         content: bytes,
         mime_type: str = "text/plain",
         drive=None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         drive = drive or cls._client()
 
@@ -395,6 +575,14 @@ class GoogleDriveService:
             ).execute()
 
         created = cls._execute_with_retries(_create, operation=f"drive_upload_bytes:{filename}")
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "uploaded_bytes": len(content),
+                    "total_bytes": len(content),
+                    "completed": True,
+                }
+            )
         return created
 
     @classmethod

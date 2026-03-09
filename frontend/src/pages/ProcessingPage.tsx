@@ -11,6 +11,7 @@ import {
 import { Button } from "@/components/ui";
 import { useProjectStore } from "@/stores";
 import { api } from "@/api/client";
+import { formatDriveUploadMessage } from "@/utils/driveUploadProgress";
 import { readSSEStream } from "@/utils/sse";
 
 interface ProcessingStep {
@@ -31,6 +32,16 @@ interface ProcessingProgress {
   folder_id?: string;
   error_code?: string;
   skipped_auto?: boolean;
+  phase?: string;
+  file_count?: number;
+  files_completed?: number;
+  total_bytes?: number;
+  uploaded_bytes?: number;
+  current_file?: string | null;
+  clear_item_count?: number;
+  clear_items_completed?: number;
+  elapsed_ms?: number;
+  throughput_mb_per_sec?: number;
   // Gap detection fields
   gaps_detected?: boolean;
   gap_count?: number;
@@ -343,7 +354,8 @@ export function ProcessingPage() {
       const finalEvent = await readSSEStream<ProcessingProgress>(
         response,
         (data) => {
-          if (data.message) setActionMessage(data.message);
+          const nextMessage = formatDriveUploadMessage(data);
+          if (nextMessage) setActionMessage(nextMessage);
         },
         {
           signal: controller.signal,
