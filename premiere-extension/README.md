@@ -1,4 +1,4 @@
-# JSX Runner - CEP Extension for Premiere Pro 2025
+# Tiktok Reproducer - CEP Extension for Premiere Pro 2025
 
 CEP panel for Premiere Pro 25.x with:
 - classic `.trigger` / `Browse & Run` JSX execution,
@@ -11,7 +11,7 @@ CEP panel for Premiere Pro 25.x with:
 
 1. Run `premiere-extension/install_extension.bat`
 2. Restart Premiere Pro 2025
-3. Open `Window > Extensions > JSX Runner`
+3. Open `Window > Extensions > Tiktok Reproducer`
 
 ## One-time Setup (inside panel)
 
@@ -61,13 +61,18 @@ The panel starts AME export with configured `.epr`, tracks encoder job events, t
 ## Cleanup option
 
 Checkbox **Delete local folder after successful upload** is enabled by default.
-Deletion happens only after a confirmed successful Drive upload.
+Deletion happens only after:
+- a confirmed successful Drive upload,
+- Premiere project cleanup reports no remaining imported items,
+- the local downloaded folder is fully removed.
 
 ## Reliability / Recovery
 
 State is persisted in:
 
-`%APPDATA%\Adobe\JSXRunner\state\`
+`%APPDATA%\Adobe\TiktokReproducer\state\`
+
+Legacy `%APPDATA%\Adobe\JSXRunner\...` state is migrated automatically on first run when possible.
 
 Files:
 - `settings.json`
@@ -80,7 +85,7 @@ After Premiere restart, queued/in-progress jobs are resumed and export monitors 
 ## Legacy trigger still supported
 
 The historical flow still works:
-- `.bat` writes `.trigger` in `%APPDATA%\Adobe\JSXRunner\inbox`
+- `.bat` writes `.trigger` in `%APPDATA%\Adobe\TiktokReproducer\inbox`
 - panel watches inbox and runs referenced `.jsx`
 
 ## Troubleshooting

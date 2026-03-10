@@ -1,5 +1,5 @@
 /**
- * JSX Runner - CEP Panel for Premiere Pro 2025
+ * Tiktok Reproducer - CEP Panel for Premiere Pro 2025
  *
  * Features:
  * - Hot-folder .trigger watcher + manual Browse & Run
@@ -22,7 +22,8 @@
     var childProcess = require("child_process");
 
     var APPDATA = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
-    var BASE_DIR = path.join(APPDATA, "Adobe", "JSXRunner");
+    var LEGACY_BASE_DIR = path.join(APPDATA, "Adobe", "JSXRunner");
+    var BASE_DIR = path.join(APPDATA, "Adobe", "TiktokReproducer");
     var INBOX_DIR = path.join(BASE_DIR, "inbox");
     var STATE_DIR = path.join(BASE_DIR, "state");
     var PROJECTS_STATE_DIR = path.join(STATE_DIR, "projects");
@@ -74,6 +75,8 @@
     var settingsStatus = document.getElementById("settings-status");
     var settingsSection = document.getElementById("settings-section");
     var settingsToggle = document.getElementById("settings-toggle");
+    var latestProjectsSection = document.getElementById("latest-projects-section");
+    var latestProjectsToggle = document.getElementById("latest-projects-toggle");
 
     var queueList = document.getElementById("queue-list");
     var projectStatusList = document.getElementById("project-status-list");
@@ -141,6 +144,80 @@
             fs.mkdirSync(dirPath, { recursive: true });
         } catch (e) {
             // ignore
+        }
+    }
+
+    function pathExists(targetPath) {
+        try {
+            return fs.existsSync(targetPath);
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function copyDirRecursive(sourceDir, targetDir) {
+        ensureDir(targetDir);
+        fs.readdirSync(sourceDir).forEach(function (entryName) {
+            var sourcePath = path.join(sourceDir, entryName);
+            var targetPath = path.join(targetDir, entryName);
+            var stat = fs.statSync(sourcePath);
+            if (stat.isDirectory()) {
+                copyDirRecursive(sourcePath, targetPath);
+                return;
+            }
+            fs.copyFileSync(sourcePath, targetPath);
+        });
+    }
+
+    function mergeDirRecursive(sourceDir, targetDir) {
+        ensureDir(targetDir);
+        fs.readdirSync(sourceDir).forEach(function (entryName) {
+            var sourcePath = path.join(sourceDir, entryName);
+            var targetPath = path.join(targetDir, entryName);
+            var stat = fs.statSync(sourcePath);
+            if (stat.isDirectory()) {
+                mergeDirRecursive(sourcePath, targetPath);
+                return;
+            }
+            if (!pathExists(targetPath)) {
+                fs.copyFileSync(sourcePath, targetPath);
+            }
+        });
+    }
+
+    function migrateLegacyBaseDir() {
+        if (!pathExists(LEGACY_BASE_DIR)) {
+            return;
+        }
+
+        if (pathExists(BASE_DIR)) {
+            try {
+                mergeDirRecursive(LEGACY_BASE_DIR, BASE_DIR);
+                log("Legacy JSX Runner state merged into Tiktok Reproducer", "info");
+                return;
+            } catch (mergeErr) {
+                log("Legacy state migration failed: " + mergeErr.message, "warn");
+                return;
+            }
+        }
+
+        try {
+            fs.renameSync(LEGACY_BASE_DIR, BASE_DIR);
+            log("Legacy JSX Runner state migrated to Tiktok Reproducer", "info");
+            return;
+        } catch (renameErr) {
+            try {
+                copyDirRecursive(LEGACY_BASE_DIR, BASE_DIR);
+                try {
+                    fs.rmSync(LEGACY_BASE_DIR, { recursive: true, force: true });
+                } catch (cleanupErr) {
+                    // ignore best-effort legacy cleanup
+                }
+                log("Legacy JSX Runner state copied to Tiktok Reproducer", "info");
+                return;
+            } catch (copyErr) {
+                log("Legacy state migration failed: " + copyErr.message, "warn");
+            }
         }
     }
 
@@ -439,25 +516,41 @@
         settingsStatus.className = isError ? "status-error" : "status-ok";
     }
 
-    function setSettingsSectionCollapsed(collapsed) {
-        if (!settingsSection || !settingsToggle) {
+    function setSectionCollapsed(sectionEl, toggleEl, collapsed) {
+        if (!sectionEl || !toggleEl) {
             return;
         }
 
         if (collapsed) {
-            settingsSection.classList.add("is-collapsed");
-            settingsToggle.setAttribute("aria-expanded", "false");
+            sectionEl.classList.add("is-collapsed");
+            toggleEl.setAttribute("aria-expanded", "false");
         } else {
-            settingsSection.classList.remove("is-collapsed");
-            settingsToggle.setAttribute("aria-expanded", "true");
+            sectionEl.classList.remove("is-collapsed");
+            toggleEl.setAttribute("aria-expanded", "true");
         }
     }
 
-    function toggleSettingsSection() {
-        if (!settingsSection) {
+    function toggleSection(sectionEl, toggleEl) {
+        if (!sectionEl || !toggleEl) {
             return;
         }
-        setSettingsSectionCollapsed(!settingsSection.classList.contains("is-collapsed"));
+        setSectionCollapsed(sectionEl, toggleEl, !sectionEl.classList.contains("is-collapsed"));
+    }
+
+    function setSettingsSectionCollapsed(collapsed) {
+        setSectionCollapsed(settingsSection, settingsToggle, collapsed);
+    }
+
+    function toggleSettingsSection() {
+        toggleSection(settingsSection, settingsToggle);
+    }
+
+    function setLatestProjectsSectionCollapsed(collapsed) {
+        setSectionCollapsed(latestProjectsSection, latestProjectsToggle, collapsed);
+    }
+
+    function toggleLatestProjectsSection() {
+        toggleSection(latestProjectsSection, latestProjectsToggle);
     }
 
     function isDriveConfigured() {
@@ -548,18 +641,18 @@
                 parsed = null;
             }
 
-            if (parsed && parsed.ok === false) {
-                throw new Error(String(parsed.error || "Host cleanup failed"));
-            }
-
             var summary = parsed || { ok: true, raw: raw };
-            if (!quiet && summary && summary.ok) {
+            if (!quiet && summary) {
                 var timelineRemoved = Number(summary.timeline_removed || 0);
-                var projectItemsRemoved = Number(summary.project_items_removed || 0);
+                var remainingItems = Number(summary.project_items_remaining || 0);
+                var deletedLeaves = Number(summary.leaf_items_deleted || 0);
+                var deletedBins = Number(summary.bins_deleted || 0);
                 log(
                     "Premiere cleanup for " + projectId
                     + ": timeline=" + timelineRemoved
-                    + ", projectItems=" + projectItemsRemoved,
+                    + ", bins=" + deletedBins
+                    + ", leafItems=" + deletedLeaves
+                    + ", remaining=" + remainingItems,
                     "info"
                 );
             }
@@ -677,6 +770,8 @@
             export_job_id: null,
             encoder_progress: 0,
             upload_pending: false,
+            completion_notified_status: null,
+            completion_notified_at: null,
         });
 
         log("Project reset: " + id + (removedJobs > 0 ? " (removed " + removedJobs + " queued job(s))" : ""), "success");
@@ -706,6 +801,62 @@
             message += " | Remaining: " + remaining.join(", ");
         }
         return message;
+    }
+
+    function buildHostCleanupErrorDetail(hostSummary) {
+        if (!hostSummary) {
+            return "Premiere cleanup incomplete";
+        }
+
+        var parts = [];
+        if (hostSummary.error) {
+            parts.push(String(hostSummary.error));
+        } else {
+            parts.push("Premiere cleanup incomplete");
+        }
+
+        parts.push("Remaining Premiere items: " + Number(hostSummary.project_items_remaining || 0));
+        parts.push("Deleted bins: " + Number(hostSummary.bins_deleted || 0));
+        parts.push("Deleted leaf items: " + Number(hostSummary.leaf_items_deleted || 0));
+
+        var timelineRemoved = Number(hostSummary.timeline_removed || 0);
+        if (timelineRemoved > 0) {
+            parts.push("Timeline removed: " + timelineRemoved);
+        }
+
+        return parts.join(" | ");
+    }
+
+    function maybeNotifyProjectCompletion(state) {
+        if (!state || !state.project_id) {
+            return state;
+        }
+
+        var status = String(state.status || "");
+        if (status !== "uploaded" && status !== "uploaded_cleaned") {
+            return state;
+        }
+        if (state.completion_notified_status === status) {
+            return state;
+        }
+
+        var message;
+        if (status === "uploaded_cleaned") {
+            message = "Tiktok Reproducer finished project " + state.project_id + ": generation, upload, and cleanup are complete.";
+        } else {
+            message = "Tiktok Reproducer finished project " + state.project_id + ": generation and upload are complete.";
+        }
+
+        try {
+            window.alert(message);
+        } catch (e) {
+            log("Completion alert failed for " + state.project_id + ": " + e.message, "warn");
+        }
+
+        return upsertProjectState(state.project_id, {
+            completion_notified_status: status,
+            completion_notified_at: nowIso(),
+        });
     }
 
     function scheduleCleanupRetry(projectId, delayMs) {
@@ -755,21 +906,61 @@
                 host_cleanup_result: hostSummary || null,
                 host_cleanup_error: null,
             });
-            return null;
-        }).catch(function (hostErr) {
-            upsertProjectState(id, {
-                host_cleanup_error: hostErr.message,
-            });
-            log("Premiere cleanup warning for " + id + " during retry: " + hostErr.message, "warn");
-            return null;
-        }).then(function () {
+            if (hostSummary && hostSummary.ok === false) {
+                var hostDetail = buildHostCleanupErrorDetail(hostSummary);
+                var nextRetryCount = retryCount + 1;
+                var canRetryHost = nextRetryCount < CLEANUP_RETRYABLE_MAX_PASSES;
+                if (canRetryHost) {
+                    var nextRetryAt = new Date(Date.now() + CLEANUP_RETRY_DELAY_MS).toISOString();
+                    upsertProjectState(id, {
+                        status: "cleanup_pending",
+                        cleanup_error: hostDetail,
+                        cleanup_retryable: true,
+                        cleanup_retry_count: nextRetryCount,
+                        cleanup_next_retry_at: nextRetryAt,
+                    });
+                    log(
+                        "Premiere cleanup incomplete for " + id
+                        + " (attempt " + nextRetryCount + "/" + CLEANUP_RETRYABLE_MAX_PASSES + "), retrying in "
+                        + Math.round(CLEANUP_RETRY_DELAY_MS / 1000) + "s",
+                        "warn"
+                    );
+                    scheduleCleanupRetry(id, CLEANUP_RETRY_DELAY_MS);
+                    return false;
+                }
+
+                clearCleanupRetry(id);
+                upsertProjectState(id, {
+                    status: "cleanup_failed",
+                    cleanup_error: hostDetail,
+                    cleanup_retryable: false,
+                    cleanup_retry_count: nextRetryCount,
+                    cleanup_next_retry_at: null,
+                });
+                log("Premiere cleanup failed for " + id + ": " + hostDetail, "warn");
+                return false;
+            }
             return removePathSafe(state.local_root, {
                 maxAttempts: CLEANUP_BACKGROUND_MAX_ATTEMPTS,
             });
+        }).catch(function (hostErr) {
+            clearCleanupRetry(id);
+            upsertProjectState(id, {
+                host_cleanup_error: hostErr.message,
+                status: "cleanup_failed",
+                cleanup_error: hostErr.message,
+                cleanup_retryable: false,
+                cleanup_next_retry_at: null,
+            });
+            log("Premiere cleanup warning for " + id + " during retry: " + hostErr.message, "warn");
+            return false;
         }).then(function (cleanupResult) {
+            if (cleanupResult === false) {
+                return false;
+            }
             if (cleanupResult.ok) {
                 clearCleanupRetry(id);
-                upsertProjectState(id, {
+                var cleanedState = upsertProjectState(id, {
                     status: "uploaded_cleaned",
                     cleanup_deleted: true,
                     cleanup_error: null,
@@ -778,6 +969,7 @@
                     cleanup_next_retry_at: null,
                 });
                 log("Cleanup succeeded for " + id + " after retry (" + source + ")", "success");
+                maybeNotifyProjectCompletion(cleanedState);
                 return true;
             }
 
@@ -1053,6 +1245,15 @@
         upsertProjectState(projectId, {
             status: "downloading",
             last_error: null,
+            cleanup_deleted: false,
+            cleanup_error: null,
+            host_cleanup_error: null,
+            host_cleanup_result: null,
+            cleanup_retryable: false,
+            cleanup_retry_count: 0,
+            cleanup_next_retry_at: null,
+            completion_notified_status: null,
+            completion_notified_at: null,
         });
 
         var downloadPayload = buildDrivePayloadBase();
@@ -1143,6 +1344,13 @@
             upload_reason: reason,
             output_path: selectedOutputPath,
             last_error: null,
+            cleanup_deleted: false,
+            cleanup_error: null,
+            host_cleanup_error: null,
+            host_cleanup_result: null,
+            cleanup_retryable: false,
+            cleanup_retry_count: 0,
+            cleanup_next_retry_at: null,
         });
 
         var uploadPayload = buildDrivePayloadBase();
@@ -1190,20 +1398,43 @@
                         host_cleanup_result: hostSummary || null,
                         host_cleanup_error: null,
                     });
-                    return hostSummary;
-                }).catch(function (hostErr) {
-                    upsertProjectState(projectId, {
-                        host_cleanup_error: hostErr.message,
-                    });
-                    log("Premiere cleanup warning for " + projectId + ": " + hostErr.message, "warn");
-                    return null;
-                }).then(function () {
+                    if (hostSummary && hostSummary.ok === false) {
+                        var hostDetail = buildHostCleanupErrorDetail(hostSummary);
+                        upsertProjectState(projectId, {
+                            status: "cleanup_pending",
+                            cleanup_error: hostDetail,
+                            cleanup_retryable: true,
+                            cleanup_retry_count: 1,
+                            cleanup_next_retry_at: new Date(Date.now() + CLEANUP_RETRY_DELAY_MS).toISOString(),
+                        });
+                        log(
+                            "Upload succeeded but Premiere cleanup is pending for " + projectId
+                            + ". Retrying automatically.",
+                            "warn"
+                        );
+                        scheduleCleanupRetry(projectId, CLEANUP_RETRY_DELAY_MS);
+                        return null;
+                    }
                     return removePathSafe(newState.local_root, {
                         maxAttempts: CLEANUP_IMMEDIATE_MAX_ATTEMPTS,
                     });
+                }).catch(function (hostErr) {
+                    upsertProjectState(projectId, {
+                        host_cleanup_error: hostErr.message,
+                        status: "cleanup_failed",
+                        cleanup_error: hostErr.message,
+                        cleanup_retryable: false,
+                        cleanup_retry_count: 1,
+                        cleanup_next_retry_at: null,
+                    });
+                    log("Premiere cleanup warning for " + projectId + ": " + hostErr.message, "warn");
+                    return null;
                 }).then(function (cleanupResult) {
+                    if (!cleanupResult) {
+                        return;
+                    }
                     if (cleanupResult.ok) {
-                        upsertProjectState(projectId, {
+                        var cleanedState = upsertProjectState(projectId, {
                             status: "uploaded_cleaned",
                             cleanup_deleted: true,
                             cleanup_error: null,
@@ -1212,6 +1443,7 @@
                             cleanup_next_retry_at: null,
                         });
                         log("Local folder removed for " + projectId, "info");
+                        maybeNotifyProjectCompletion(cleanedState);
                         return;
                     }
 
@@ -1244,6 +1476,7 @@
                 });
             }
             armExportMonitor(projectId);
+            maybeNotifyProjectCompletion(newState);
             return null;
         }).catch(function (err) {
             upsertProjectState(projectId, {
@@ -1273,6 +1506,15 @@
             status: "queued_download",
             enqueue_source: source || "manual",
             upload_pending: false,
+            cleanup_deleted: false,
+            cleanup_error: null,
+            host_cleanup_error: null,
+            host_cleanup_result: null,
+            cleanup_retryable: false,
+            cleanup_retry_count: 0,
+            cleanup_next_retry_at: null,
+            completion_notified_status: null,
+            completion_notified_at: null,
         });
 
         return true;
@@ -1627,12 +1869,12 @@
     function renderProjectStates() {
         clearChildren(projectStatusList);
 
-        var states = Object.keys(projectStates).map(function (id) { return projectStates[id]; }).sort(projectStateSort);
+        var states = Object.keys(projectStates).map(function (id) { return projectStates[id]; }).sort(projectStateSort).slice(0, 3);
 
         if (states.length === 0) {
             var empty = document.createElement("li");
             empty.className = "empty-msg";
-            empty.textContent = "No project state yet";
+            empty.textContent = "No recent project yet";
             projectStatusList.appendChild(empty);
             return;
         }
@@ -1767,7 +2009,7 @@
     function buildTriggerAcceptedHtml(projectId, queued) {
         var queuedText = queued ? "true" : "false";
         return [
-            "<!doctype html><html><head><meta charset='utf-8'><title>JSX Runner Trigger</title></head><body>",
+            "<!doctype html><html><head><meta charset='utf-8'><title>Tiktok Reproducer Trigger</title></head><body>",
             "<h3>Job recu</h3>",
             "<p>Projet: <code>", projectId, "</code></p>",
             "<p>Queued: ", queuedText, "</p>",
@@ -2260,6 +2502,7 @@
     // --- Bootstrap ---
 
     function init() {
+        migrateLegacyBaseDir();
         ensureDir(INBOX_DIR);
         ensureDir(STATE_DIR);
         ensureDir(PROJECTS_STATE_DIR);
@@ -2270,6 +2513,7 @@
         projectStates = loadProjectStates();
 
         setSettingsSectionCollapsed(true);
+        setLatestProjectsSectionCollapsed(true);
         renderSettingsForm();
         renderQueue();
         renderProjectSelect();
@@ -2283,6 +2527,9 @@
         projectStatusList.addEventListener("click", handleProjectStatusClick);
         if (settingsToggle) {
             settingsToggle.addEventListener("click", toggleSettingsSection);
+        }
+        if (latestProjectsToggle) {
+            latestProjectsToggle.addEventListener("click", toggleLatestProjectsSection);
         }
 
         deleteAfterUploadCheckbox.addEventListener("change", function () {
@@ -2319,7 +2566,7 @@
         armMonitorsForRecoveredStates();
         processJobQueue();
 
-        log("JSX Runner automation initialized", "info");
+        log("Tiktok Reproducer automation initialized", "info");
         updateGlobalStatus();
     }
 

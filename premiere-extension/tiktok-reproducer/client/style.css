@@ -194,15 +194,15 @@ select:focus {
     transition: transform 0.12s ease-in-out;
 }
 
-#settings-section.is-collapsed .section-chevron {
+.panel-section.is-collapsed .section-chevron {
     transform: rotate(0deg);
 }
 
-#settings-content {
+.section-content {
     margin-top: 8px;
 }
 
-#settings-section.is-collapsed #settings-content {
+.panel-section.is-collapsed .section-content {
     display: none;
 }
 

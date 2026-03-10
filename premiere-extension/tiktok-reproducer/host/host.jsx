@@ -1,14 +1,15 @@
 /**
- * JSX Runner - ExtendScript Host
+ * Tiktok Reproducer - ExtendScript Host
  *
  * Runs in Premiere Pro's ExtendScript engine.
  * Called from the CEP panel via csInterface.evalScript().
  */
 
-var ATR_EXTENSION_ID = "com.animetiktok.jsxrunner.panel";
+var ATR_EXTENSION_ID = "com.animetiktok.tiktokreproducer.panel";
 var __atrEncoderEvents = [];
 var __atrEncoderJobProjectMap = {};
 var __atrEncoderCallbacksBound = false;
+var __atrCleanupMaxBinPasses = 5;
 
 function __atrSafeString(value) {
     if (value === undefined || value === null) {
@@ -55,33 +56,162 @@ function __atrGetProjectItemMediaPath(projectItem) {
     }
 }
 
-function __atrCollectImportedProjectItems(containerItem, normalizedRootPath, outItems) {
-    if (!containerItem || !containerItem.children || !outItems) {
-        return;
+function __atrGetProjectItemChildCount(projectItem) {
+    if (!projectItem || !projectItem.children) {
+        return 0;
     }
-    var count = 0;
+
     try {
-        count = Number(containerItem.children.numItems || 0);
-    } catch (eCount) {
-        count = 0;
+        return Number(projectItem.children.numItems || 0);
+    } catch (e) {
+        return 0;
     }
-    for (var i = 0; i < count; i += 1) {
+}
+
+function __atrInspectImportedSubtree(containerItem, normalizedRootPath, depth, report) {
+    var importedLeaves = 0;
+    var foreignLeaves = 0;
+    var childCount = __atrGetProjectItemChildCount(containerItem);
+
+    for (var i = 0; i < childCount; i += 1) {
         var child = containerItem.children[i];
         if (!child) {
             continue;
         }
 
-        var mediaPath = __atrGetProjectItemMediaPath(child);
-        if (mediaPath && __atrPathStartsWith(mediaPath, normalizedRootPath)) {
-            outItems.push(child);
+        var nestedCount = __atrGetProjectItemChildCount(child);
+        if (nestedCount > 0) {
+            var subtree = __atrInspectImportedSubtree(child, normalizedRootPath, depth + 1, report);
+            if (subtree.imported_leaves > 0 && subtree.foreign_leaves === 0) {
+                report.deletable_bins.push({
+                    item: child,
+                    depth: depth + 1
+                });
+            }
+            importedLeaves += Number(subtree.imported_leaves || 0);
+            foreignLeaves += Number(subtree.foreign_leaves || 0);
+            continue;
         }
 
-        try {
-            if (child.children && Number(child.children.numItems || 0) > 0) {
-                __atrCollectImportedProjectItems(child, normalizedRootPath, outItems);
-            }
-        } catch (eChild) {}
+        var mediaPath = __atrGetProjectItemMediaPath(child);
+        if (mediaPath && __atrPathStartsWith(mediaPath, normalizedRootPath)) {
+            report.imported_leaf_items.push(child);
+            importedLeaves += 1;
+        } else {
+            foreignLeaves += 1;
+        }
     }
+
+    return {
+        imported_leaves: importedLeaves,
+        foreign_leaves: foreignLeaves
+    };
+}
+
+function __atrBuildImportedCleanupScan(normalizedRootPath) {
+    var report = {
+        imported_leaf_items: [],
+        deletable_bins: []
+    };
+
+    if (!app || !app.project || !app.project.rootItem) {
+        return report;
+    }
+
+    __atrInspectImportedSubtree(app.project.rootItem, normalizedRootPath, 0, report);
+
+    report.deletable_bins.sort(function (a, b) {
+        return Number(b.depth || 0) - Number(a.depth || 0);
+    });
+
+    return report;
+}
+
+function __atrDeleteBinItem(projectItem) {
+    if (!projectItem || !projectItem.deleteBin) {
+        return false;
+    }
+
+    try {
+        return !!projectItem.deleteBin();
+    } catch (e) {
+        return false;
+    }
+}
+
+function __atrDeleteLeafProjectItem(projectItem) {
+    if (!projectItem || !projectItem.select || !app || !app.project || !app.project.deleteSelection) {
+        return false;
+    }
+
+    try {
+        projectItem.select();
+        return !!app.project.deleteSelection();
+    } catch (e) {
+        return false;
+    }
+}
+
+function __atrDeleteImportedProjectItems(normalizedRootPath) {
+    var binsDeleted = 0;
+    var leafDeleted = 0;
+    var failed = 0;
+    var passesExecuted = 0;
+    var fallbackBins = [];
+    var scan = __atrBuildImportedCleanupScan(normalizedRootPath);
+
+    while (passesExecuted < __atrCleanupMaxBinPasses && scan.deletable_bins.length > 0) {
+        passesExecuted += 1;
+        var passDeleted = 0;
+        fallbackBins = scan.deletable_bins.slice(0);
+
+        for (var i = 0; i < scan.deletable_bins.length; i += 1) {
+            var binRecord = scan.deletable_bins[i];
+            if (__atrDeleteBinItem(binRecord.item)) {
+                binsDeleted += 1;
+                passDeleted += 1;
+            } else {
+                failed += 1;
+            }
+        }
+
+        if (passDeleted <= 0) {
+            break;
+        }
+
+        scan = __atrBuildImportedCleanupScan(normalizedRootPath);
+    }
+
+    if (scan.imported_leaf_items.length > 0) {
+        for (var leafIndex = scan.imported_leaf_items.length - 1; leafIndex >= 0; leafIndex -= 1) {
+            var leafItem = scan.imported_leaf_items[leafIndex];
+            if (__atrDeleteLeafProjectItem(leafItem)) {
+                leafDeleted += 1;
+            } else {
+                failed += 1;
+            }
+        }
+
+        if (fallbackBins.length > 0) {
+            for (var retryIndex = 0; retryIndex < fallbackBins.length; retryIndex += 1) {
+                if (__atrDeleteBinItem(fallbackBins[retryIndex].item)) {
+                    binsDeleted += 1;
+                }
+            }
+        }
+    }
+
+    scan = __atrBuildImportedCleanupScan(normalizedRootPath);
+
+    return {
+        ok: scan.imported_leaf_items.length === 0,
+        bins_deleted: binsDeleted,
+        leaf_items_deleted: leafDeleted,
+        project_items_failed: failed,
+        project_items_remaining: Number(scan.imported_leaf_items.length || 0),
+        project_items_considered: Number(scan.imported_leaf_items.length || 0) + leafDeleted,
+        passes_executed: passesExecuted
+    };
 }
 
 function __atrRemoveImportedTimelineClips(normalizedRootPath) {
@@ -167,61 +297,6 @@ function __atrRemoveImportedTimelineClips(normalizedRootPath) {
         removed: removed,
         failed: failed,
         sequences: sequenceCount
-    };
-}
-
-function __atrDeleteImportedProjectItems(normalizedRootPath) {
-    var targets = [];
-    var removed = 0;
-    var failed = 0;
-
-    if (!app || !app.project || !app.project.rootItem) {
-        return {
-            removed: 0,
-            failed: 0,
-            considered: 0
-        };
-    }
-
-    __atrCollectImportedProjectItems(app.project.rootItem, normalizedRootPath, targets);
-
-    for (var i = targets.length - 1; i >= 0; i -= 1) {
-        var item = targets[i];
-        if (!item) {
-            continue;
-        }
-
-        var deleted = false;
-        try {
-            if (item.deleteBin) {
-                deleted = !!item.deleteBin();
-            }
-        } catch (eDeleteBin) {
-            deleted = false;
-        }
-
-        if (!deleted) {
-            try {
-                if (item.select && app.project.deleteSelection) {
-                    item.select();
-                    deleted = !!app.project.deleteSelection();
-                }
-            } catch (eDeleteSelection) {
-                deleted = false;
-            }
-        }
-
-        if (deleted) {
-            removed += 1;
-        } else {
-            failed += 1;
-        }
-    }
-
-    return {
-        removed: removed,
-        failed: failed,
-        considered: targets.length
     };
 }
 
@@ -370,7 +445,6 @@ function startManagedExport(projectId, outputPath, presetPath) {
                 1
             );
         } catch (eFive) {
-            // Some builds expose a 4-argument signature.
             try {
                 jobID = app.encoder.encodeSequence(
                     app.project.activeSequence,
@@ -418,7 +492,7 @@ function pullEncoderEvents() {
 }
 
 /**
- * Remove imported assets (timeline + project panel) tied to a local project root.
+ * Remove imported assets (project panel + timeline fallback) tied to a local project root.
  *
  * @param {string} localRootPath
  * @returns {string} JSON result or ERROR
@@ -430,18 +504,24 @@ function cleanupImportedProjectMedia(localRootPath) {
             return "ERROR: Missing local root path";
         }
 
-        var timeline = __atrRemoveImportedTimelineClips(normalizedRootPath);
         var projectItems = __atrDeleteImportedProjectItems(normalizedRootPath);
-
+        var timeline = __atrRemoveImportedTimelineClips(normalizedRootPath);
         var result = {
-            ok: true,
+            ok: !!projectItems.ok,
             local_root: normalizedRootPath,
+            bins_deleted: Number(projectItems.bins_deleted || 0),
+            leaf_items_deleted: Number(projectItems.leaf_items_deleted || 0),
+            project_items_failed: Number(projectItems.project_items_failed || 0),
+            project_items_remaining: Number(projectItems.project_items_remaining || 0),
+            project_items_considered: Number(projectItems.project_items_considered || 0),
+            cleanup_passes_executed: Number(projectItems.passes_executed || 0),
             timeline_removed: Number(timeline.removed || 0),
-            timeline_failed: Number(timeline.failed || 0),
-            project_items_removed: Number(projectItems.removed || 0),
-            project_items_failed: Number(projectItems.failed || 0),
-            project_items_considered: Number(projectItems.considered || 0)
+            timeline_failed: Number(timeline.failed || 0)
         };
+
+        if (!result.ok) {
+            result.error = "Imported Premiere project items remain after cleanup";
+        }
 
         if (JSON && JSON.stringify) {
             return JSON.stringify(result);

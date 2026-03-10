@@ -2,19 +2,20 @@
 setlocal
 
 echo ============================================
-echo   JSX Runner - CEP Extension Installer
+echo   Tiktok Reproducer - CEP Extension Installer
 echo   For Adobe Premiere Pro 2025
 echo ============================================
 echo.
 
 :: Target directories
-set "EXT_DIR=%APPDATA%\Adobe\CEP\extensions\jsx-runner"
-set "INBOX_DIR=%APPDATA%\Adobe\JSXRunner\inbox"
-set "SOURCE_DIR=%~dp0jsx-runner"
+set "LEGACY_EXT_DIR=%APPDATA%\Adobe\CEP\extensions\jsx-runner"
+set "EXT_DIR=%APPDATA%\Adobe\CEP\extensions\tiktok-reproducer"
+set "INBOX_DIR=%APPDATA%\Adobe\TiktokReproducer\inbox"
+set "SOURCE_DIR=%~dp0tiktok-reproducer"
 
 :: Check source exists
 if not exist "%SOURCE_DIR%\CSXS\manifest.xml" (
-    echo ERROR: Cannot find jsx-runner folder next to this script.
+    echo ERROR: Cannot find tiktok-reproducer folder next to this script.
     echo Make sure install_extension.bat is in the premiere-extension folder.
     pause
     exit /b 1
@@ -26,6 +27,10 @@ echo       %EXT_DIR%
 if exist "%EXT_DIR%" (
     echo       Removing previous installation...
     rmdir /s /q "%EXT_DIR%"
+)
+if exist "%LEGACY_EXT_DIR%" (
+    echo       Removing legacy JSX Runner installation...
+    rmdir /s /q "%LEGACY_EXT_DIR%"
 )
 xcopy "%SOURCE_DIR%" "%EXT_DIR%" /e /i /q >nul
 if errorlevel 1 (
@@ -58,7 +63,7 @@ echo   Installation complete!
 echo.
 echo   Next steps:
 echo   1. Restart Adobe Premiere Pro 2025
-echo   2. Go to Window ^> Extensions ^> JSX Runner
+echo   2. Go to Window ^> Extensions ^> Tiktok Reproducer
 echo   3. The panel should appear with a green dot
 echo ============================================
 echo.

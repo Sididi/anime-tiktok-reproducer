@@ -649,10 +649,7 @@ export const api = {
       method: "POST",
     }),
 
-  uploadExportToGDrive: (
-    projectId: string,
-    options?: { auto?: boolean },
-  ) => {
+  uploadExportToGDrive: (projectId: string, options?: { auto?: boolean }) => {
     const params = new URLSearchParams();
     if (options?.auto) {
       params.set("auto", "true");

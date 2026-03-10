@@ -2198,7 +2198,10 @@ export function MatchValidation() {
             />
           </div>
 
-          <div className="fixed bottom-0 right-4 z-[60] h-full flex items-center pointer-events-none" style={{ height: 'var(--panel-height, 76px)' }}>
+          <div
+            className="fixed bottom-0 right-4 z-[60] h-full flex items-center pointer-events-none"
+            style={{ height: "var(--panel-height, 76px)" }}
+          >
             <Button
               size="sm"
               onClick={handleContinue}

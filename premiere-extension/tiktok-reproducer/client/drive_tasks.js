@@ -614,7 +614,7 @@ function downloadFileWithResume(auth, fileId, destinationPath, expectedSize, onP
 function pickTargetBasePaths(folderName, appDataPath) {
   var home = process.env.USERPROFILE || os.homedir();
   var desktopParent = path.join(home, "Desktop");
-  var fallbackParent = path.join(appDataPath || path.join(home, "AppData", "Roaming"), "Adobe", "JSXRunner", "downloads");
+  var fallbackParent = path.join(appDataPath || path.join(home, "AppData", "Roaming"), "Adobe", "TiktokReproducer", "downloads");
 
   try {
     ensureDir(desktopParent);

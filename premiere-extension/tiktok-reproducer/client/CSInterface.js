@@ -1,7 +1,7 @@
 /**
  * CSInterface - Adobe CEP 12.x
  *
- * Minimal implementation covering the APIs used by JSX Runner.
+ * Minimal implementation covering the APIs used by Tiktok Reproducer.
  * Based on Adobe's open-source CSInterface.js from CEP-Resources.
  * See: https://github.com/Adobe-CEP/CEP-Resources/tree/master/CEP_12.x
  *

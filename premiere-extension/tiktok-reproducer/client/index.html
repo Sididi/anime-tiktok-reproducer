@@ -2,13 +2,13 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>JSX Runner</title>
+    <title>Tiktok Reproducer</title>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
     <div id="app">
         <div id="header">
-            <h1>JSX Runner</h1>
+            <h1>Tiktok Reproducer</h1>
             <div id="status-indicator" class="idle" title="Not watching"></div>
         </div>
 
@@ -33,7 +33,7 @@
                 <span class="section-title">Automation Settings</span>
                 <span class="section-chevron">▸</span>
             </button>
-            <div id="settings-content">
+            <div id="settings-content" class="section-content">
                 <div class="settings-grid">
                     <label>
                         Drive Client ID
@@ -76,9 +76,14 @@
             <ul id="queue-list"></ul>
         </div>
 
-        <div id="project-status-section" class="panel-section">
-            <h2>Project Status</h2>
-            <ul id="project-status-list"></ul>
+        <div id="latest-projects-section" class="panel-section is-collapsed">
+            <button id="latest-projects-toggle" class="section-toggle" type="button" aria-expanded="false">
+                <span class="section-title">Latest Projects</span>
+                <span class="section-chevron">▸</span>
+            </button>
+            <div id="latest-projects-content" class="section-content">
+                <ul id="project-status-list"></ul>
+            </div>
         </div>
 
         <div id="log-section" class="panel-section">
