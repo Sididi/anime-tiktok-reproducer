@@ -378,6 +378,42 @@ To render tuning previews for a project:
 pixi run --locked -- python scripts/generate_auto_editor_previews.py 01bef85b71c5
 ```
 
+To sweep a single audio file and generate a large set of sharp-cut listening variants:
+
+```bash
+pixi run --locked -- python scripts/generate_auto_editor_audio_variants.py /path/to/input.wav
+```
+
+This tuner writes one run directory under `/tmp` by default and includes:
+
+- `variants/*.wav`
+- `logs/<variant>.log`
+- `comparison.json`
+- `comparison.md`
+- `ranked_playlist.m3u`
+
+Default `sharp_tiktok` sweep:
+
+- Base grid: thresholds `0.055`, `0.065`, `0.075`, `0.085`, `0.095`
+- Base grid margins: `0.02sec,0.12sec`, `0.03sec,0.14sec`, `0.04sec,0.16sec`, `0.04sec,0.20sec`
+- Extra sharp presets: `mincut` / `minclip` variants on top of the base grid
+- Forced `--time-base 30` so advanced cut controls stay consistent on audio-only runs
+
+Useful flags:
+
+```bash
+pixi run --locked -- python scripts/generate_auto_editor_audio_variants.py /path/to/input.wav --dry-run
+pixi run --locked -- python scripts/generate_auto_editor_audio_variants.py /path/to/input.wav --output-dir /tmp/my-run
+pixi run --locked -- python scripts/generate_auto_editor_audio_variants.py /path/to/input.wav --threshold 0.070 --threshold 0.080 --margin 0.03sec,0.14sec
+pixi run --locked -- python scripts/generate_auto_editor_audio_variants.py /path/to/input.wav --no-sharp-presets
+```
+
+Beyond `threshold` and `margin`, the most useful knobs to evaluate for ElevenLabs voices are:
+
+- `mincut`: avoid hyper-short silent gaps creating choppy micro-cuts
+- `minclip`: avoid keeping ultra-short voiced fragments that sound twitchy
+- `audio-normalize`: worth testing only when source voices have noticeably different loudness; it is not enabled by default
+
 ## Troubleshooting
 
 ### Common Issues
