@@ -54,6 +54,7 @@ export interface ScriptAutomationVoice {
   key: string;
   display_name: string;
   preview_url?: string;
+  languages?: string[] | null;
 }
 
 export interface ScriptAutomationMusic {

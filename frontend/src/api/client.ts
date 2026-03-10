@@ -587,6 +587,7 @@ export const api = {
       tts_speed: number | null;
       music_key: string | null;
       video_overlay: import("@/types").VideoOverlay | null;
+      voice_key: string | null;
     }>(`/projects/${projectId}/script/settings`),
 
   updateScriptSettings: (
@@ -595,6 +596,7 @@ export const api = {
       tts_speed?: number;
       music_key?: string | null;
       video_overlay?: { title: string; category: string };
+      voice_key?: string | null;
     },
   ) =>
     request<{

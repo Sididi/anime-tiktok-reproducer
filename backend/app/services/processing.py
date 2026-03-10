@@ -25,8 +25,9 @@ from .export_service import ExportService
 from .music_config_service import MusicConfigService
 from .premiere_subtitle_baker import PremiereSubtitleBakerService
 from .project_service import ProjectService
-from .auto_editor_profiles import PRODUCTION_AUTO_EDITOR_PROFILE
+from .auto_editor_profiles import AutoEditorProfile, PRODUCTION_AUTO_EDITOR_PROFILE
 from .forced_alignment import ForcedAlignmentService, PreparedAlignmentAudio
+from .voice_config_service import VoiceConfigService
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -321,6 +322,7 @@ class ProcessingService:
         cls,
         audio_path: Path,
         audio_output_path: Path,
+        profile: AutoEditorProfile | None = None,
     ) -> bool:
         """
         Run auto-editor on TTS audio and export the edited waveform.
@@ -328,18 +330,18 @@ class ProcessingService:
         Args:
             audio_path: Path to input audio file
             audio_output_path: Path for output audio file
+            profile: Optional auto-editor profile (defaults to PRODUCTION)
 
         Returns:
             True if successful
         """
-        # This flow only edits audio; there is no meaningful GPU acceleration path
-        # to enable for auto-editor here.
+        effective_profile = profile or PRODUCTION_AUTO_EDITOR_PROFILE
         logger.debug("auto-editor GPU acceleration is not applied for audio-only runs.")
         audio_cmd = [
             "pixi", "run", "--locked", "--",
             "auto-editor",
             str(audio_path),
-            *PRODUCTION_AUTO_EDITOR_PROFILE.command_args(),
+            *effective_profile.command_args(),
             "-o", str(audio_output_path),
         ]
 
@@ -1039,19 +1041,29 @@ class ProcessingService:
 
         try:
             if not resuming_after_gaps:
+                # Resolve auto-editor profile from voice_key if available
+                auto_editor_profile = PRODUCTION_AUTO_EDITOR_PROFILE
+                if project.voice_key:
+                    try:
+                        auto_editor_profile = VoiceConfigService.get_auto_editor_profile(project.voice_key)
+                    except ValueError:
+                        pass  # voice no longer in config, use default
+
                 # Step 1: Auto-editor (generates edited audio with silences removed)
                 edited_audio_path = output_dir / "tts_edited.wav"
                 upload_manifest = ForcedAlignmentService.load_upload_manifest(project.id)
                 if upload_manifest and upload_manifest.get("mode") == "audio_parts":
+                    from functools import partial
+                    runner = partial(cls.run_auto_editor, profile=auto_editor_profile)
                     prepared_audio = await ForcedAlignmentService.prepare_audio_from_parts(
                         project_id=project.id,
                         output_dir=output_dir,
                         tts_speed=float(project.tts_speed or 1.0),
-                        auto_editor_runner=cls.run_auto_editor,
+                        auto_editor_runner=runner,
                     )
                     edited_audio_path = prepared_audio.edited_audio_path
                 else:
-                    await cls.run_auto_editor(audio_path, edited_audio_path)
+                    await cls.run_auto_editor(audio_path, edited_audio_path, profile=auto_editor_profile)
                     prepared_audio = PreparedAlignmentAudio(
                         mode="single_audio",
                         edited_audio_path=edited_audio_path,

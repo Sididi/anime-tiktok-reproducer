@@ -128,7 +128,7 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
     const tiktokVideoUrl = playbackAsset?.tiktok.url ?? null;
     const hasMatchedScene = Boolean(match.confidence > 0 && match.episode);
     const sourceVideoUrl = hasMatchedScene
-      ? playbackAsset?.source?.url ?? null
+      ? (playbackAsset?.source?.url ?? null)
       : null;
     const hasMatch = Boolean(hasMatchedScene && sourceVideoUrl);
 
@@ -959,7 +959,8 @@ export function MatchValidation() {
           if (!force) {
             let existingManifest: MatchesPlaybackManifest | null = null;
             try {
-              existingManifest = await api.getMatchesPlaybackManifest(projectId);
+              existingManifest =
+                await api.getMatchesPlaybackManifest(projectId);
             } catch {
               existingManifest = null;
             }
@@ -1149,7 +1150,8 @@ export function MatchValidation() {
           const next = new Set(prev);
           let changed = false;
           for (const entry of entries) {
-            const rawSceneIndex = (entry.target as HTMLElement).dataset.sceneIndex;
+            const rawSceneIndex = (entry.target as HTMLElement).dataset
+              .sceneIndex;
             if (!rawSceneIndex) continue;
             const sceneIndex = Number(rawSceneIndex);
             if (!Number.isFinite(sceneIndex)) continue;
@@ -1357,14 +1359,16 @@ export function MatchValidation() {
     ) => {
       if (!projectId) return;
 
-      const previousMatch = matches.find((m) => m.scene_index === sceneIndex) || null;
+      const previousMatch =
+        matches.find((m) => m.scene_index === sceneIndex) || null;
       if (!previousMatch) return;
       const previousPlaybackAsset =
         playbackManifest?.scenes?.find(
           (asset) => asset.scene_index === sceneIndex,
         ) ?? null;
       const previousWarning = sceneWarnings[sceneIndex] || null;
-      const targetScene = scenes.find((scene) => scene.index === sceneIndex) || null;
+      const targetScene =
+        scenes.find((scene) => scene.index === sceneIndex) || null;
       const targetSceneDuration = targetScene
         ? Math.max(0, targetScene.end_time - targetScene.start_time)
         : Math.max(0, endTime - startTime);
@@ -1477,7 +1481,8 @@ export function MatchValidation() {
           ) ||
           null;
         if (!completedAsset) {
-          const refreshedManifest = await api.getMatchesPlaybackManifest(projectId);
+          const refreshedManifest =
+            await api.getMatchesPlaybackManifest(projectId);
           const refreshedAsset =
             refreshedManifest.scenes.find(
               (asset) => asset.scene_index === sceneIndex,
@@ -1755,17 +1760,20 @@ export function MatchValidation() {
       return enabled;
     }
 
-    const visibleOrdered = Array.from(visibleSceneIndices).sort((left, right) => {
-      const leftPos = scenePositionByIndex.get(left) ?? Number.MAX_SAFE_INTEGER;
-      const rightPos =
-        scenePositionByIndex.get(right) ?? Number.MAX_SAFE_INTEGER;
-      const leftDistance = Math.abs(leftPos - activePosition);
-      const rightDistance = Math.abs(rightPos - activePosition);
-      if (leftDistance !== rightDistance) {
-        return leftDistance - rightDistance;
-      }
-      return leftPos - rightPos;
-    });
+    const visibleOrdered = Array.from(visibleSceneIndices).sort(
+      (left, right) => {
+        const leftPos =
+          scenePositionByIndex.get(left) ?? Number.MAX_SAFE_INTEGER;
+        const rightPos =
+          scenePositionByIndex.get(right) ?? Number.MAX_SAFE_INTEGER;
+        const leftDistance = Math.abs(leftPos - activePosition);
+        const rightDistance = Math.abs(rightPos - activePosition);
+        if (leftDistance !== rightDistance) {
+          return leftDistance - rightDistance;
+        }
+        return leftPos - rightPos;
+      },
+    );
 
     for (const sceneIndex of visibleOrdered) {
       if (enabled.size >= maxEnabledScenes) break;
@@ -1815,7 +1823,8 @@ export function MatchValidation() {
   }, [matches]);
 
   const playbackBySceneIndex = useMemo(() => {
-    if (!playbackManifest?.scenes) return new Map<number, ScenePlaybackSceneAsset>();
+    if (!playbackManifest?.scenes)
+      return new Map<number, ScenePlaybackSceneAsset>();
     return new Map(
       playbackManifest.scenes.map((asset) => [asset.scene_index, asset]),
     );
@@ -2028,91 +2037,100 @@ export function MatchValidation() {
         )}
 
         {/* Playback warmup */}
-        {matches.length > 0 && (playbackPreparing || !isPlaybackReady || playbackError) && (
-          <div className="bg-[hsl(var(--card))] rounded-lg p-8 text-center space-y-4 border border-[hsl(var(--border))]">
-            <Loader2 className="h-10 w-10 mx-auto animate-spin text-[hsl(var(--primary))]" />
-            <div>
-              <h2 className="text-lg font-semibold">Preparing Video Playback</h2>
-              <p className="text-sm text-[hsl(var(--muted-foreground))]">
-                {playbackProgress?.message || "Building browser-safe clips for all scenes..."}
-              </p>
-              {playbackProgress?.scene_index !== undefined && (
-                <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
-                  Scene {playbackProgress.scene_index + 1} / {playbackProgress.total_scenes || scenes.length}
+        {matches.length > 0 &&
+          (playbackPreparing || !isPlaybackReady || playbackError) && (
+            <div className="bg-[hsl(var(--card))] rounded-lg p-8 text-center space-y-4 border border-[hsl(var(--border))]">
+              <Loader2 className="h-10 w-10 mx-auto animate-spin text-[hsl(var(--primary))]" />
+              <div>
+                <h2 className="text-lg font-semibold">
+                  Preparing Video Playback
+                </h2>
+                <p className="text-sm text-[hsl(var(--muted-foreground))]">
+                  {playbackProgress?.message ||
+                    "Building browser-safe clips for all scenes..."}
                 </p>
-              )}
+                {playbackProgress?.scene_index !== undefined && (
+                  <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
+                    Scene {playbackProgress.scene_index + 1} /{" "}
+                    {playbackProgress.total_scenes || scenes.length}
+                  </p>
+                )}
+                {playbackError && (
+                  <p className="text-xs text-[hsl(var(--destructive))] mt-2">
+                    {playbackError}
+                  </p>
+                )}
+              </div>
+              <div className="h-2 bg-[hsl(var(--muted))] rounded-full overflow-hidden max-w-md mx-auto">
+                <div
+                  className="h-full bg-[hsl(var(--primary))] transition-all duration-300"
+                  style={{
+                    width: `${Math.max(0, Math.min(1, playbackProgress?.progress ?? 0)) * 100}%`,
+                  }}
+                />
+              </div>
               {playbackError && (
-                <p className="text-xs text-[hsl(var(--destructive))] mt-2">
-                  {playbackError}
-                </p>
+                <Button
+                  variant="outline"
+                  onClick={() => {
+                    void preparePlaybackClips(true);
+                  }}
+                >
+                  Retry Warmup
+                </Button>
               )}
             </div>
-            <div className="h-2 bg-[hsl(var(--muted))] rounded-full overflow-hidden max-w-md mx-auto">
-              <div
-                className="h-full bg-[hsl(var(--primary))] transition-all duration-300"
-                style={{ width: `${Math.max(0, Math.min(1, playbackProgress?.progress ?? 0)) * 100}%` }}
-              />
-            </div>
-            {playbackError && (
-              <Button
-                variant="outline"
-                onClick={() => {
-                  void preparePlaybackClips(true);
-                }}
-              >
-                Retry Warmup
-              </Button>
-            )}
-          </div>
-        )}
+          )}
 
         {/* Show matches */}
         {isPlaybackReady && (
           <div className="space-y-4">
-          {scenes.map((scene, scenePosition) => {
-            const match = matchesBySceneIndex.get(scene.index);
-            if (!match) return null;
-            const mediaEnabled = mediaEnabledSceneIndices.has(scene.index);
+            {scenes.map((scene, scenePosition) => {
+              const match = matchesBySceneIndex.get(scene.index);
+              if (!match) return null;
+              const mediaEnabled = mediaEnabledSceneIndices.has(scene.index);
 
-            return (
-              <div
-                key={scene.index}
-                className="[content-visibility:auto] [contain-intrinsic-size:960px]"
-                data-scene-index={scene.index}
-                ref={(el) => {
-                  if (el) sceneRefs.current.set(scene.index, el);
-                  else sceneRefs.current.delete(scene.index);
-                }}
-              >
-                <MemoizedMatchCard
-                  ref={(card) => {
-                    if (card) cardRefs.current.set(scene.index, card);
-                    else cardRefs.current.delete(scene.index);
+              return (
+                <div
+                  key={scene.index}
+                  className="[content-visibility:auto] [contain-intrinsic-size:960px]"
+                  data-scene-index={scene.index}
+                  ref={(el) => {
+                    if (el) sceneRefs.current.set(scene.index, el);
+                    else sceneRefs.current.delete(scene.index);
                   }}
-                  scene={scene}
-                  match={match}
-                  projectId={projectId!}
-                  episodes={episodes}
-                  playbackAsset={playbackBySceneIndex.get(scene.index) ?? null}
-                  isActive={activeSceneIndex === scene.index}
-                  mediaEnabled={mediaEnabled}
-                  playbackRate={playbackRate}
-                  controlsDisabled={fastWatchPlaying}
-                  preloadMode={
-                    !mediaEnabled
-                      ? "none"
-                      : Math.abs(scenePosition - activeScenePosition) <= 2
-                      ? "auto"
-                      : "metadata"
-                  }
-                  onManualMatch={handleManualMatch}
-                  pendingUpdate={pendingSceneUpdates[scene.index] || null}
-                  warningMessage={sceneWarnings[scene.index] || null}
-                  onUndoMerge={handleUndoMerge}
-                />
-              </div>
-            );
-          })}
+                >
+                  <MemoizedMatchCard
+                    ref={(card) => {
+                      if (card) cardRefs.current.set(scene.index, card);
+                      else cardRefs.current.delete(scene.index);
+                    }}
+                    scene={scene}
+                    match={match}
+                    projectId={projectId!}
+                    episodes={episodes}
+                    playbackAsset={
+                      playbackBySceneIndex.get(scene.index) ?? null
+                    }
+                    isActive={activeSceneIndex === scene.index}
+                    mediaEnabled={mediaEnabled}
+                    playbackRate={playbackRate}
+                    controlsDisabled={fastWatchPlaying}
+                    preloadMode={
+                      !mediaEnabled
+                        ? "none"
+                        : Math.abs(scenePosition - activeScenePosition) <= 2
+                          ? "auto"
+                          : "metadata"
+                    }
+                    onManualMatch={handleManualMatch}
+                    pendingUpdate={pendingSceneUpdates[scene.index] || null}
+                    warningMessage={sceneWarnings[scene.index] || null}
+                    onUndoMerge={handleUndoMerge}
+                  />
+                </div>
+              );
+            })}
           </div>
         )}
       </div>

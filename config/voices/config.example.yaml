@@ -4,9 +4,14 @@ voices:
   victor:
     display_name: "Victor"
     elevenlabs_voice_id: "your_victor_voice_id"
+    model_id: "eleven_v3"                    # optional, defaults to global elevenlabs_model_id
+    languages: ["fr"]                         # optional, omit = available for all languages
     voice_settings:
       stability: 0.45
       similarity_boost: 0.8
       style: 0.0
       speed: 1.0
       use_speaker_boost: true
+    auto_editor_overrides:                    # optional, overrides production auto-editor profile
+      threshold: "0.060"
+      margin: "0.04sec,0.20sec"

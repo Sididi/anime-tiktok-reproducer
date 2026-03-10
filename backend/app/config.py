@@ -67,7 +67,7 @@ class Settings(BaseSettings):
     gemini_timeout: int = 300  # seconds (read timeout for Gemini API; connect=10)
     elevenlabs_api_key: str | None = None
     elevenlabs_model_id: str = "eleven_multilingual_v2"
-    elevenlabs_output_format: str = "mp3_44100_128"
+    elevenlabs_output_format: str = "pcm_44100"
     gemini_light_model: str = "gemini-2.5-flash"
 
     # Google OAuth shared credentials

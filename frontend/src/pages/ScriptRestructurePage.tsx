@@ -29,6 +29,7 @@ import type {
   ScriptAutomationConfig,
   ScriptAutomationEvent,
   ScriptAutomationPart,
+  ScriptAutomationVoice,
   ScriptTtsPrepareResponse,
 } from "@/types";
 import { ScriptEditorModal, MetadataEditorModal } from "@/components/script";
@@ -473,6 +474,15 @@ export function ScriptRestructurePage() {
               );
             } else {
               setAutomationMusicKey(settingsResult.music_key);
+            }
+          }
+
+          if (typeof settingsResult.voice_key === "string") {
+            const availableVoiceKeys = new Set(
+              (loadedAutomation?.voices || []).map((v) => v.key),
+            );
+            if (availableVoiceKeys.has(settingsResult.voice_key)) {
+              setAutomationVoiceKey(settingsResult.voice_key);
             }
           }
 
@@ -1316,11 +1326,12 @@ export function ScriptRestructurePage() {
     setError(null);
 
     try {
-      // Save settings (speed, music, overlay) to project before submission
+      // Save settings (speed, music, overlay, voice) to project before submission
       await api
         .updateScriptSettings(projectId, {
           tts_speed: ttsSpeed,
           music_key: automationMusicKey,
+          voice_key: automationVoiceKey || null,
           ...(overlayTitle || overlayCategory
             ? {
                 video_overlay: {
@@ -1416,6 +1427,24 @@ export function ScriptRestructurePage() {
     metadataJson.trim() !== "" &&
     ((uploadMode === "single" && audioFile !== null) ||
       (uploadMode === "multiple" && segmentFiles.size > 0));
+
+  const filteredVoices: ScriptAutomationVoice[] = useMemo(() => {
+    if (!automationConfig?.voices) return [];
+    return automationConfig.voices.filter(
+      (v) => !v.languages || v.languages.includes(targetLanguage),
+    );
+  }, [automationConfig?.voices, targetLanguage]);
+
+  // Reset voice selection when current voice is no longer available after language change
+  useEffect(() => {
+    if (!automationVoiceKey) return;
+    const stillAvailable = filteredVoices.some(
+      (v) => v.key === automationVoiceKey,
+    );
+    if (!stillAvailable) {
+      setAutomationVoiceKey(filteredVoices[0]?.key || "");
+    }
+  }, [filteredVoices, automationVoiceKey]);
 
   const automationBlockedReason = automationConfigError
     ? `Automation config error: ${automationConfigError}`
@@ -2044,7 +2073,7 @@ export function ScriptRestructurePage() {
                     Voice
                   </span>
                   <SearchableSelect
-                    options={(automationConfig?.voices || []).map(
+                    options={filteredVoices.map(
                       (v) =>
                         ({
                           key: v.key,

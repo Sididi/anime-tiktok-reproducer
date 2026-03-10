@@ -16,6 +16,9 @@ class VoiceEntry:
     display_name: str
     elevenlabs_voice_id: str
     voice_settings: dict[str, Any]
+    model_id: str | None = None
+    languages: tuple[str, ...] | None = None
+    auto_editor_overrides: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -122,12 +125,52 @@ class VoiceConfigService:
                 value.get("voice_settings"),
             )
 
+            # model_id (optional)
+            model_id = value.get("model_id")
+            if model_id is not None:
+                if not isinstance(model_id, str) or not model_id.strip():
+                    raise ValueError(f"Voice '{key}' model_id must be a non-empty string")
+                model_id = model_id.strip()
+
+            # languages (optional)
+            languages_raw = value.get("languages")
+            languages: tuple[str, ...] | None = None
+            if languages_raw is not None:
+                if not isinstance(languages_raw, list):
+                    raise ValueError(f"Voice '{key}' languages must be a list")
+                for lang in languages_raw:
+                    if not isinstance(lang, str) or not lang.strip():
+                        raise ValueError(f"Voice '{key}' languages entries must be non-empty strings")
+                languages = tuple(lang.strip() for lang in languages_raw)
+
+            # auto_editor_overrides (optional)
+            auto_editor_overrides: dict[str, str] | None = None
+            ae_raw = value.get("auto_editor_overrides")
+            if ae_raw is not None:
+                if not isinstance(ae_raw, dict):
+                    raise ValueError(f"Voice '{key}' auto_editor_overrides must be a mapping")
+                allowed_ae_keys = {"threshold", "margin"}
+                extra_ae = set(ae_raw.keys()) - allowed_ae_keys
+                if extra_ae:
+                    raise ValueError(
+                        f"Voice '{key}' auto_editor_overrides has unsupported keys: {', '.join(sorted(extra_ae))}"
+                    )
+                for ae_key, ae_val in ae_raw.items():
+                    if not isinstance(ae_val, str) or not ae_val.strip():
+                        raise ValueError(
+                            f"Voice '{key}' auto_editor_overrides.{ae_key} must be a non-empty string"
+                        )
+                auto_editor_overrides = {k: str(v).strip() for k, v in ae_raw.items()}
+
             normalized_key = key.strip()
             voices[normalized_key] = VoiceEntry(
                 key=normalized_key,
                 display_name=display_name.strip(),
                 elevenlabs_voice_id=voice_id.strip(),
                 voice_settings=voice_settings,
+                model_id=model_id,
+                languages=languages,
+                auto_editor_overrides=auto_editor_overrides,
             )
 
         default_key = default_key.strip()
@@ -172,3 +215,16 @@ class VoiceConfigService:
         if voice is None:
             raise ValueError(f"Unknown voice key '{voice_key}'")
         return voice
+
+    @classmethod
+    def get_auto_editor_profile(cls, voice_key: str):
+        from .auto_editor_profiles import PRODUCTION_AUTO_EDITOR_PROFILE, AutoEditorProfile
+
+        voice = cls.get_voice(voice_key)
+        if not voice.auto_editor_overrides:
+            return PRODUCTION_AUTO_EDITOR_PROFILE
+        return AutoEditorProfile(
+            id=f"voice_{voice_key}_custom",
+            threshold=voice.auto_editor_overrides.get("threshold", PRODUCTION_AUTO_EDITOR_PROFILE.threshold),
+            margin=voice.auto_editor_overrides.get("margin", PRODUCTION_AUTO_EDITOR_PROFILE.margin),
+        )

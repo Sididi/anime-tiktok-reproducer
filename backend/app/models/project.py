@@ -53,6 +53,7 @@ class Project(BaseModel):
     music_key: str | None = None
     tts_speed: float | None = None
     video_overlay: dict[str, Any] | None = None
+    voice_key: str | None = None
 
     # Scheduling
     scheduled_at: datetime | None = None

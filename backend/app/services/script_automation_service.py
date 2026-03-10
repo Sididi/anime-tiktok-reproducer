@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import re
 import uuid
+import wave
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -410,6 +412,26 @@ class ScriptAutomationService:
         return "bin"
 
     @classmethod
+    def _is_pcm_format(cls) -> bool:
+        return (settings.elevenlabs_output_format or "").strip().lower().startswith("pcm")
+
+    @staticmethod
+    def _wrap_pcm_as_wav(
+        pcm_data: bytes,
+        *,
+        sample_rate: int = 44100,
+        sample_width: int = 2,
+        channels: int = 1,
+    ) -> bytes:
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(channels)
+            wf.setsampwidth(sample_width)
+            wf.setframerate(sample_rate)
+            wf.writeframes(pcm_data)
+        return buf.getvalue()
+
+    @classmethod
     def _run_dir(cls, project_id: str, run_id: str) -> Path:
         project_dir = ProjectService.get_project_dir(project_id)
         return project_dir / cls.RUNS_DIR_NAME / run_id
@@ -719,12 +741,14 @@ class ScriptAutomationService:
                         ElevenLabsService.synthesize,
                         voice_id=voice.elevenlabs_voice_id,
                         text=chunk,
-                        model_id=settings.elevenlabs_model_id,
+                        model_id=voice.model_id or settings.elevenlabs_model_id,
                         output_format=settings.elevenlabs_output_format,
                         voice_settings=voice.voice_settings or None,
                         previous_text=chunks[idx - 2] if idx >= 2 else None,
                         next_text=chunks[idx] if idx <= len(chunks) - 1 else None,
                     )
+                    if cls._is_pcm_format():
+                        audio_bytes = cls._wrap_pcm_as_wav(audio_bytes)
                     part_path = parts_dir / f"part_{idx}.{extension}"
                     part_path.write_bytes(audio_bytes)
                     part_paths.append(part_path)

@@ -70,6 +70,7 @@ class ScriptSettingsRequest(BaseModel):
     tts_speed: float | None = None
     music_key: str | None = None
     video_overlay: dict | None = None
+    voice_key: str | None = None
 
 
 class OverlayGenerateRequest(BaseModel):
@@ -229,6 +230,7 @@ async def get_script_automation_config(project_id: str):
                 "key": entry.key,
                 "display_name": entry.display_name,
                 "preview_url": preview_url_map.get(entry.elevenlabs_voice_id),
+                "languages": list(entry.languages) if entry.languages else None,
             }
             for entry in config.voices.values()
         ]
@@ -636,6 +638,14 @@ async def update_script_settings(project_id: str, request: ScriptSettingsRequest
     if "video_overlay" in provided:
         project.video_overlay = request.video_overlay
 
+    if "voice_key" in provided:
+        if request.voice_key is not None:
+            try:
+                VoiceConfigService.get_voice(request.voice_key)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+        project.voice_key = request.voice_key
+
     ProjectService.save(project)
     return {"status": "ok", "tts_speed": project.tts_speed, "music_key": project.music_key}
 
@@ -651,6 +661,7 @@ async def get_script_settings(project_id: str):
         "tts_speed": project.tts_speed,
         "music_key": project.music_key,
         "video_overlay": project.video_overlay,
+        "voice_key": project.voice_key,
     }
 
 
