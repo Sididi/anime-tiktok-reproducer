@@ -1402,6 +1402,24 @@ export function ScriptRestructurePage() {
     overlayCategory,
   ]);
 
+  const filteredVoices: ScriptAutomationVoice[] = useMemo(() => {
+    if (!automationConfig?.voices) return [];
+    return automationConfig.voices.filter(
+      (v) => !v.languages || v.languages.includes(targetLanguage),
+    );
+  }, [automationConfig?.voices, targetLanguage]);
+
+  // Reset voice selection when current voice is no longer available after language change
+  useEffect(() => {
+    if (!automationVoiceKey) return;
+    const stillAvailable = filteredVoices.some(
+      (v) => v.key === automationVoiceKey,
+    );
+    if (!stillAvailable) {
+      setAutomationVoiceKey(filteredVoices[0]?.key || "");
+    }
+  }, [filteredVoices, automationVoiceKey]);
+
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center">
@@ -1427,24 +1445,6 @@ export function ScriptRestructurePage() {
     metadataJson.trim() !== "" &&
     ((uploadMode === "single" && audioFile !== null) ||
       (uploadMode === "multiple" && segmentFiles.size > 0));
-
-  const filteredVoices: ScriptAutomationVoice[] = useMemo(() => {
-    if (!automationConfig?.voices) return [];
-    return automationConfig.voices.filter(
-      (v) => !v.languages || v.languages.includes(targetLanguage),
-    );
-  }, [automationConfig?.voices, targetLanguage]);
-
-  // Reset voice selection when current voice is no longer available after language change
-  useEffect(() => {
-    if (!automationVoiceKey) return;
-    const stillAvailable = filteredVoices.some(
-      (v) => v.key === automationVoiceKey,
-    );
-    if (!stillAvailable) {
-      setAutomationVoiceKey(filteredVoices[0]?.key || "");
-    }
-  }, [filteredVoices, automationVoiceKey]);
 
   const automationBlockedReason = automationConfigError
     ? `Automation config error: ${automationConfigError}`
