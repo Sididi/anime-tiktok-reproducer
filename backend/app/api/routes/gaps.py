@@ -23,23 +23,6 @@ async def get_gaps_config(project_id: str):
     return {"full_auto_enabled": settings.gaps_full_auto_enabled}
 
 
-@router.get("/fill-stats")
-async def get_gaps_fill_stats(project_id: str):
-    """Get stats about auto-filled gaps for this project (set after /gaps auto-fill)."""
-    project = ProjectService.load(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    project_dir = ProjectService.get_project_dir(project_id)
-    stats_path = project_dir / "gaps_auto_fill_stats.json"
-    if not stats_path.exists():
-        return {"filled_count": None}
-    try:
-        data = json.loads(stats_path.read_text())
-        return {"filled_count": data.get("filled_count")}
-    except (json.JSONDecodeError, KeyError):
-        return {"filled_count": None}
-
 
 class GapsResponse(BaseModel):
     """Response containing gaps that need resolution."""
@@ -346,12 +329,6 @@ async def auto_fill_all_gaps(project_id: str) -> AutoFillResponse:
 
     # Save updated matches
     ProjectService.save_matches(project_id, matches)
-
-    # Persist fill stats so /matches page can display how many gaps were auto-filled
-    project_dir = ProjectService.get_project_dir(project_id)
-    (project_dir / "gaps_auto_fill_stats.json").write_text(
-        json.dumps({"filled_count": filled_count})
-    )
 
     return AutoFillResponse(
         filled_count=filled_count,

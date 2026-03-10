@@ -455,11 +455,6 @@ export const api = {
       `/projects/${projectId}/gaps/config`,
     ),
 
-  getGapsFillStats: (projectId: string) =>
-    request<{ filled_count: number | null }>(
-      `/projects/${projectId}/gaps/fill-stats`,
-    ),
-
   getGaps: (projectId: string) =>
     request<{ has_gaps: boolean; gaps: GapInfo[]; total_gap_duration: number }>(
       `/projects/${projectId}/gaps`,

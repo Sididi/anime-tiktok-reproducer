@@ -647,7 +647,6 @@ export function MatchValidation() {
   const autoMatchAttemptedRef = useRef(false);
   const [matchesAutoEnabled, setMatchesAutoEnabled] = useState(false);
   const matchesAutoFillTriggeredRef = useRef(false);
-  const [gapsFillCount, setGapsFillCount] = useState<number | null>(null);
   const [activeSceneIndex, setActiveSceneIndex] = useState(-1);
   const [autoScroll, setAutoScroll] = useState(true);
   const [fastWatchPlaying, setFastWatchPlaying] = useState(false);
@@ -1106,13 +1105,6 @@ export function MatchValidation() {
           setMatchesAutoEnabled(Boolean(matchesConfig.full_auto_enabled));
         } catch {
           setMatchesAutoEnabled(false);
-        }
-        // Load gaps fill stats for informative display
-        try {
-          const fillStats = await api.getGapsFillStats(projectId);
-          setGapsFillCount(fillStats.filled_count ?? null);
-        } catch {
-          setGapsFillCount(null);
         }
       } catch (err) {
         setError((err as Error).message);
@@ -1933,20 +1925,23 @@ export function MatchValidation() {
                   Merge continuous
                 </label>
                 {(() => {
+                  const filledCount = matches.filter(
+                    (m) => m.was_no_match && m.confirmed,
+                  ).length;
                   const noMatchCount = matches.filter(
                     (m) =>
                       m.confidence === 0 &&
                       !m.episode &&
                       m.alternatives?.length > 0,
                   ).length;
-                  if (gapsFillCount !== null) {
+                  if (filledCount > 0) {
                     return (
                       <div
-                        className="flex items-center gap-1 px-2 py-1 rounded border border-purple-500/30 bg-purple-500/10 text-purple-500 text-xs"
-                        title={`${gapsFillCount} scene${gapsFillCount !== 1 ? "s" : ""} were auto-filled during the gaps phase`}
+                        className="flex items-center gap-1 text-purple-500 text-xs"
+                        title={`${filledCount} scene${filledCount !== 1 ? "s" : ""} were auto-filled with best candidate`}
                       >
                         <Wand2 className="h-4 w-4" />
-                        <span>{gapsFillCount} filled in gaps</span>
+                        <span>{filledCount} filled</span>
                       </div>
                     );
                   }
@@ -2137,7 +2132,7 @@ export function MatchValidation() {
 
       {matches.length > 0 && scenes.length > 0 && isPlaybackReady && (
         <div className="fixed bottom-0 left-0 right-0 z-50 bg-[hsl(var(--card))] border-t border-[hsl(var(--border))] shadow-lg">
-          <div className="max-w-4xl mx-auto px-4 py-2 space-y-2">
+          <div className="max-w-4xl mx-auto px-4 py-2 space-y-2 relative">
             <div className="flex items-center gap-3">
               <Button
                 variant={fastWatchPlaying ? "default" : "outline"}
@@ -2189,14 +2184,6 @@ export function MatchValidation() {
                 className="w-24 h-1 accent-[hsl(var(--primary))]"
                 title={`Playback speed: ${playbackRate}x`}
               />
-
-              <Button
-                size="sm"
-                onClick={handleContinue}
-                disabled={!canContinueToTranscription}
-              >
-                Continue to Transcription
-              </Button>
             </div>
 
             <input
@@ -2209,6 +2196,17 @@ export function MatchValidation() {
               className="w-full h-1 accent-[hsl(var(--primary))]"
               title="Timeline scroller"
             />
+          </div>
+
+          <div className="fixed bottom-0 right-4 z-[60] h-full flex items-center pointer-events-none" style={{ height: 'var(--panel-height, 76px)' }}>
+            <Button
+              size="sm"
+              onClick={handleContinue}
+              disabled={!canContinueToTranscription}
+              className="pointer-events-auto"
+            >
+              Continue to Transcription
+            </Button>
           </div>
         </div>
       )}

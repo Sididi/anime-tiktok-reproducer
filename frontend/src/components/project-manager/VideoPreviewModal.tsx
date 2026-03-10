@@ -30,7 +30,10 @@ export function VideoPreviewModal({ driveVideoId, onClose }: VideoPreviewModalPr
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
           transition={{ duration: 0.15 }}
-          onClick={onClose}
+          onClick={(e) => {
+            e.stopPropagation();
+            if (e.target === e.currentTarget) onClose();
+          }}
         >
           {/* Vertical (9:16) container — max 80vh tall */}
           <motion.div
