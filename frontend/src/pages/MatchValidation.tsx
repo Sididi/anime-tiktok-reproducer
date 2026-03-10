@@ -2171,14 +2171,11 @@ export function MatchValidation() {
                 className="w-24 h-1 accent-[hsl(var(--primary))]"
                 title={`Playback speed: ${playbackRate}x`}
               />
-            </div>
 
-            <div className="flex items-center justify-end">
               <Button
                 size="sm"
                 onClick={handleContinue}
                 disabled={!canContinueToTranscription}
-                className="w-full sm:w-auto"
               >
                 Continue to Transcription
               </Button>
