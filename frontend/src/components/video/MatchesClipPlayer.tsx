@@ -70,6 +70,7 @@ export const MatchesClipPlayer = forwardRef<
   const [isSourceAttached, setIsSourceAttached] = useState(
     preloadMode !== "none",
   );
+  const hasErrorRef = useRef(false);
 
   const effectivePreload = preloadOverride ?? preloadMode;
   const shouldLoad = effectivePreload !== "none";
@@ -89,6 +90,10 @@ export const MatchesClipPlayer = forwardRef<
     endNotifiedRef.current = true;
     onClipEnded?.();
   }, [onClipEnded]);
+
+  useEffect(() => {
+    hasErrorRef.current = hasError;
+  }, [hasError]);
 
   const releasePoolSlot = useCallback(() => {
     if (poolReleaseRef.current) {
@@ -246,33 +251,65 @@ export const MatchesClipPlayer = forwardRef<
           const minReadyState =
             options?.minReadyState ?? HTMLMediaElement.HAVE_CURRENT_DATA;
           const timeoutMs = options?.timeoutMs ?? 6000;
-          const video = videoRef.current;
-          if (!video || video.error || video.readyState >= minReadyState) {
-            resolve();
-            return;
-          }
-
           let done = false;
+          let watchedVideo: HTMLVideoElement | null = null;
+          let pollId = 0;
           const finalize = () => {
             if (done) return;
             done = true;
-            video.removeEventListener("canplay", onReady);
-            video.removeEventListener("loadeddata", onReady);
-            video.removeEventListener("error", onError);
+            if (watchedVideo) {
+              watchedVideo.removeEventListener("canplay", onReady);
+              watchedVideo.removeEventListener("loadeddata", onReady);
+              watchedVideo.removeEventListener("error", onError);
+            }
+            window.clearInterval(pollId);
             window.clearTimeout(timeoutId);
             resolve();
           };
           const onReady = () => {
+            const video = videoRef.current;
+            if (!video || video !== watchedVideo) {
+              return;
+            }
             if (video.readyState >= minReadyState) {
               finalize();
             }
           };
           const onError = () => finalize();
+          const syncWatchedVideo = () => {
+            const nextVideo = videoRef.current;
+            if (nextVideo === watchedVideo) {
+              return nextVideo;
+            }
+            if (watchedVideo) {
+              watchedVideo.removeEventListener("canplay", onReady);
+              watchedVideo.removeEventListener("loadeddata", onReady);
+              watchedVideo.removeEventListener("error", onError);
+            }
+            watchedVideo = nextVideo;
+            if (watchedVideo) {
+              watchedVideo.addEventListener("canplay", onReady);
+              watchedVideo.addEventListener("loadeddata", onReady);
+              watchedVideo.addEventListener("error", onError);
+            }
+            return watchedVideo;
+          };
+          const pollReadyState = () => {
+            if (hasErrorRef.current) {
+              finalize();
+              return;
+            }
+            const video = syncWatchedVideo();
+            if (!video || video.error) {
+              return;
+            }
+            if (video.readyState >= minReadyState) {
+              finalize();
+            }
+          };
           const timeoutId = window.setTimeout(finalize, timeoutMs);
-
-          video.addEventListener("canplay", onReady);
-          video.addEventListener("loadeddata", onReady);
-          video.addEventListener("error", onError);
+          pollId = window.setInterval(pollReadyState, 50);
+          pollReadyState();
         });
       },
       hasLoadError: () => hasError,

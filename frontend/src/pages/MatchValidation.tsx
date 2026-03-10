@@ -1752,6 +1752,7 @@ export function MatchValidation() {
       for (let offset = 0; offset <= fastWatchPrefetchAhead; offset += 1) {
         addScene(scenes[activePosition + offset]?.index);
       }
+      return enabled;
     }
 
     const visibleOrdered = Array.from(visibleSceneIndices).sort((left, right) => {
