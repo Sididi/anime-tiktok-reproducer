@@ -767,13 +767,13 @@ async def build_preview(project_id: str, request: PreviewBuildRequest):
         if merged.exists():
             source_audio = merged
     if source_audio is None:
-        tts_path = project_dir / "new_tts.wav"
-        if tts_path.exists():
-            source_audio = tts_path
-    if source_audio is None:
         staged_path = project_dir / "preview_staged.wav"
         if staged_path.exists():
             source_audio = staged_path
+    if source_audio is None:
+        tts_path = project_dir / "new_tts.wav"
+        if tts_path.exists():
+            source_audio = tts_path
     if source_audio is None:
         raise HTTPException(status_code=400, detail="No TTS audio available for preview")
 

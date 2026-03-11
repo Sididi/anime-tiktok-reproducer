@@ -366,7 +366,6 @@ export function ScriptRestructurePage() {
   const wasPlayingBeforeRebuildRef = useRef(false);
   const shouldAutoplayAfterRebuildRef = useRef(false);
   const previewDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [hasTtsAudio, setHasTtsAudio] = useState(false);
 
   // Audio file state
   const [uploadMode, setUploadMode] = useState<UploadMode>("multiple");
@@ -416,6 +415,22 @@ export function ScriptRestructurePage() {
     return mapPreparedSegments(ttsPreparedPayload);
   }, [ttsPreparedPayload]);
 
+  const expectedSegmentOrder = useMemo(
+    () => requiredSegmentIds ?? audioSegments.map((seg) => seg.id),
+    [requiredSegmentIds, audioSegments],
+  );
+  const uploadedSegmentsCount = useMemo(
+    () =>
+      expectedSegmentOrder.filter((segmentId) => segmentFiles.has(segmentId))
+        .length,
+    [expectedSegmentOrder, segmentFiles],
+  );
+  const previewReady =
+    uploadMode === "single"
+      ? audioFile !== null
+      : expectedSegmentOrder.length > 0 &&
+        expectedSegmentOrder.every((segmentId) => segmentFiles.has(segmentId));
+
   const metadataEditorValue = useMemo<PlatformMetadata>(() => {
     if (!metadataJson.trim()) {
       return createEmptyMetadata();
@@ -428,6 +443,48 @@ export function ScriptRestructurePage() {
     }
   }, [metadataJson]);
 
+  const hydrateAutomationParts = useCallback(
+    async (
+      runId: string,
+      parts: ScriptAutomationPart[],
+    ): Promise<Map<number, File>> => {
+      if (!projectId) {
+        throw new Error("Missing project id");
+      }
+
+      const map = new Map<number, File>();
+      for (let i = 0; i < parts.length; i++) {
+        const part = parts[i];
+        const response = await api.downloadAutomationPart(
+          projectId,
+          runId,
+          part.id,
+        );
+        if (!response.ok) {
+          throw new Error(`Failed to download audio part ${part.id}`);
+        }
+
+        const blob = await response.blob();
+        const contentDisposition = response.headers.get("Content-Disposition");
+        const fileNameMatch = contentDisposition?.match(
+          /filename="?([^";]+)"?/i,
+        );
+        const fallbackExt = blob.type.includes("wav") ? "wav" : "mp3";
+        const fileName = fileNameMatch?.[1] || `part_${part.id}.${fallbackExt}`;
+        const file = new File([blob], fileName, {
+          type: blob.type || "audio/mpeg",
+        });
+
+        const parsedId = Number.parseInt(part.id, 10);
+        const segmentId =
+          Number.isFinite(parsedId) && parsedId > 0 ? parsedId : i + 1;
+        map.set(segmentId, file);
+      }
+      return map;
+    },
+    [projectId],
+  );
+
   // Load data
   useEffect(() => {
     if (!projectId) return;
@@ -438,6 +495,11 @@ export function ScriptRestructurePage() {
         await loadProject(projectId); // Stores project in Zustand store
         await loadScenes(projectId);
         const { transcription: loaded } = await api.getTranscription(projectId);
+        if (!loaded) {
+          setTranscription(null);
+          setError("No transcription found for this project");
+          return;
+        }
         setTranscription(loaded);
         let loadedAutomation: ScriptAutomationConfig | null = null;
         try {
@@ -537,7 +599,6 @@ export function ScriptRestructurePage() {
               setAudioFile(null);
               setSegmentFiles(files);
               setRequiredSegmentIds([...files.keys()].sort((a, b) => a - b));
-              setHasTtsAudio(true);
               setCurrentRunId(latestGen.run_id);
             }
           }
@@ -552,7 +613,7 @@ export function ScriptRestructurePage() {
     };
 
     loadData();
-  }, [projectId, loadProject, loadScenes]);
+  }, [projectId, loadProject, loadScenes, hydrateAutomationParts]);
 
   useEffect(() => {
     return () => {
@@ -741,48 +802,6 @@ export function ScriptRestructurePage() {
     }
   }, [projectId, jsonValid, newScriptJson, targetLanguage]);
 
-  const hydrateAutomationParts = useCallback(
-    async (
-      runId: string,
-      parts: ScriptAutomationPart[],
-    ): Promise<Map<number, File>> => {
-      if (!projectId) {
-        throw new Error("Missing project id");
-      }
-
-      const map = new Map<number, File>();
-      for (let i = 0; i < parts.length; i++) {
-        const part = parts[i];
-        const response = await api.downloadAutomationPart(
-          projectId,
-          runId,
-          part.id,
-        );
-        if (!response.ok) {
-          throw new Error(`Failed to download audio part ${part.id}`);
-        }
-
-        const blob = await response.blob();
-        const contentDisposition = response.headers.get("Content-Disposition");
-        const fileNameMatch = contentDisposition?.match(
-          /filename="?([^";]+)"?/i,
-        );
-        const fallbackExt = blob.type.includes("wav") ? "wav" : "mp3";
-        const fileName = fileNameMatch?.[1] || `part_${part.id}.${fallbackExt}`;
-        const file = new File([blob], fileName, {
-          type: blob.type || "audio/mpeg",
-        });
-
-        const parsedId = Number.parseInt(part.id, 10);
-        const segmentId =
-          Number.isFinite(parsedId) && parsedId > 0 ? parsedId : i + 1;
-        map.set(segmentId, file);
-      }
-      return map;
-    },
-    [projectId],
-  );
-
   const handleCancelAutomation = useCallback(() => {
     automationAbortRef.current?.abort();
     setAutomationRunning(false);
@@ -864,43 +883,49 @@ export function ScriptRestructurePage() {
   }, [projectId, jsonValid, newScriptJson, targetLanguage]);
 
   // Build preview audio
-  const buildPreview = useCallback(async () => {
-    if (!projectId || !hasTtsAudio) return;
+  const buildPreview = useCallback(
+    async (runIdOverride?: string | null, force = false) => {
+      if (!projectId || (!previewReady && !force)) return;
 
-    const previewPlayer = previewAudioRef.current;
-    const wasPlaying = Boolean(
-      previewPlayer && !previewPlayer.paused && !previewPlayer.ended,
-    );
-    wasPlayingBeforeRebuildRef.current = wasPlaying;
-    shouldAutoplayAfterRebuildRef.current = wasPlaying;
+      const effectiveRunId =
+        runIdOverride === undefined ? currentRunId : runIdOverride;
 
-    setPreviewBuilding(true);
-    try {
-      const result = await api.buildPreview(projectId, {
-        run_id: currentRunId,
-        tts_speed: ttsSpeed,
-        music_key: automationMusicKey,
-      });
-      setPreviewUrl(result.preview_url + "?t=" + Date.now());
-    } catch (err) {
-      shouldAutoplayAfterRebuildRef.current = false;
-      setPreviewUrl(null);
-    } finally {
-      setPreviewBuilding(false);
-    }
-  }, [projectId, hasTtsAudio, currentRunId, ttsSpeed, automationMusicKey]);
+      const previewPlayer = previewAudioRef.current;
+      const wasPlaying = Boolean(
+        previewPlayer && !previewPlayer.paused && !previewPlayer.ended,
+      );
+      wasPlayingBeforeRebuildRef.current = wasPlaying;
+      shouldAutoplayAfterRebuildRef.current = wasPlaying;
+
+      setPreviewBuilding(true);
+      try {
+        const result = await api.buildPreview(projectId, {
+          run_id: effectiveRunId,
+          tts_speed: ttsSpeed,
+          music_key: automationMusicKey,
+        });
+        setPreviewUrl(result.preview_url + "?t=" + Date.now());
+      } catch {
+        shouldAutoplayAfterRebuildRef.current = false;
+        setPreviewUrl(null);
+      } finally {
+        setPreviewBuilding(false);
+      }
+    },
+    [projectId, previewReady, currentRunId, ttsSpeed, automationMusicKey],
+  );
 
   // Auto-rebuild preview when speed or music changes
   useEffect(() => {
-    if (!hasTtsAudio) return;
+    if (!previewReady) return;
     if (previewDebounceRef.current) clearTimeout(previewDebounceRef.current);
     previewDebounceRef.current = setTimeout(() => {
-      buildPreview();
+      void buildPreview();
     }, 500);
     return () => {
       if (previewDebounceRef.current) clearTimeout(previewDebounceRef.current);
     };
-  }, [ttsSpeed, automationMusicKey, hasTtsAudio, buildPreview]);
+  }, [ttsSpeed, automationMusicKey, previewReady, buildPreview]);
 
   useEffect(() => {
     if (
@@ -916,6 +941,12 @@ export function ScriptRestructurePage() {
     shouldAutoplayAfterRebuildRef.current = false;
     audio.play().catch(() => {});
   }, [previewUrl]);
+
+  const clearPreview = useCallback(() => {
+    shouldAutoplayAfterRebuildRef.current = false;
+    wasPlayingBeforeRebuildRef.current = false;
+    setPreviewUrl(null);
+  }, []);
 
   const handleAutomate = useCallback(async () => {
     if (!projectId || !automationConfig) return;
@@ -1058,7 +1089,6 @@ export function ScriptRestructurePage() {
         setAudioFile(null);
         setSegmentFiles(files);
         setRequiredSegmentIds([...files.keys()].sort((a, b) => a - b));
-        setHasTtsAudio(true);
         setAutomationMessage(
           `Automation complete (${parts.length} part${parts.length > 1 ? "s" : ""} loaded)`,
         );
@@ -1095,93 +1125,117 @@ export function ScriptRestructurePage() {
   ]);
 
   // Resume automation after validation pause (phase 2: overlay + TTS)
-  const handleResumeAfterValidation = useCallback(async () => {
-    if (!projectId || !automationConfig || !jsonValid) return;
+  const handleResumeAfterValidation = useCallback(
+    async (scriptJsonOverride?: string) => {
+      if (!projectId || !automationConfig || !automationVoiceKey) return;
 
-    setError(null);
-    setAutomationStep("starting");
-    setAutomationMessage("Resuming automation (overlay + TTS)...");
-    setAutomationRunning(true);
-    setAutomationPhase("phase2");
+      const effectiveScriptJson = scriptJsonOverride ?? newScriptJson;
+      if (!effectiveScriptJson.trim()) return;
 
-    const controller = new AbortController();
-    automationAbortRef.current = controller;
-
-    try {
-      const response = await api.automateScript(
-        projectId,
-        {
-          target_language: targetLanguage,
-          voice_key: automationVoiceKey,
-          existing_script_json: JSON.parse(newScriptJson),
-          skip_metadata: true,
-          skip_tts: false,
-          pause_after_script: false,
-          skip_overlay: false,
-        },
-        controller.signal,
-      );
-
-      const finalEvent = await readSSEStream<ScriptAutomationEvent>(
-        response,
-        (event) => {
-          setAutomationStep(event.event);
-          setAutomationMessage(event.message || null);
-          if (event.run_id) setCurrentRunId(event.run_id);
-        },
-        controller.signal,
-      );
-
-      if (!finalEvent) {
-        if (controller.signal.aborted) return;
-        throw new Error("Automation ended without completion event");
+      if (!transcription) {
+        setError("Transcription unavailable.");
+        return;
       }
 
-      if (finalEvent.event !== "complete") {
-        throw new Error(
-          finalEvent.error || finalEvent.message || "Automation failed",
+      let parsedScriptJson: Record<string, unknown>;
+      try {
+        const parsed = JSON.parse(effectiveScriptJson);
+        const validation = validateScriptPayload(parsed, transcription);
+        if (!validation.valid) {
+          setError(validation.error || "Invalid script JSON");
+          return;
+        }
+        parsedScriptJson = parsed as Record<string, unknown>;
+      } catch (err) {
+        setError(`Invalid JSON: ${(err as Error).message}`);
+        return;
+      }
+
+      setError(null);
+      setAutomationStep("starting");
+      setAutomationMessage("Resuming automation (overlay + TTS)...");
+      setAutomationRunning(true);
+      setAutomationPhase("phase2");
+
+      const controller = new AbortController();
+      automationAbortRef.current = controller;
+
+      try {
+        const response = await api.automateScript(
+          projectId,
+          {
+            target_language: targetLanguage,
+            voice_key: automationVoiceKey,
+            existing_script_json: parsedScriptJson,
+            skip_metadata: true,
+            skip_tts: false,
+            pause_after_script: false,
+            skip_overlay: false,
+          },
+          controller.signal,
         );
-      }
 
-      if (finalEvent.overlay_json) {
-        setOverlayTitle(finalEvent.overlay_json.title);
-        setOverlayCategory(finalEvent.overlay_json.category);
-      }
-
-      const parts = finalEvent.parts || [];
-      if (parts.length > 0 && finalEvent.run_id) {
-        const files = await hydrateAutomationParts(finalEvent.run_id, parts);
-        setUploadMode("multiple");
-        setAudioFile(null);
-        setSegmentFiles(files);
-        setRequiredSegmentIds([...files.keys()].sort((a, b) => a - b));
-        setHasTtsAudio(true);
-        setAutomationMessage(
-          `Automation complete (${parts.length} part${parts.length > 1 ? "s" : ""} loaded)`,
+        const finalEvent = await readSSEStream<ScriptAutomationEvent>(
+          response,
+          (event) => {
+            setAutomationStep(event.event);
+            setAutomationMessage(event.message || null);
+            if (event.run_id) setCurrentRunId(event.run_id);
+          },
+          controller.signal,
         );
+
+        if (!finalEvent) {
+          if (controller.signal.aborted) return;
+          throw new Error("Automation ended without completion event");
+        }
+
+        if (finalEvent.event !== "complete") {
+          throw new Error(
+            finalEvent.error || finalEvent.message || "Automation failed",
+          );
+        }
+
+        if (finalEvent.overlay_json) {
+          setOverlayTitle(finalEvent.overlay_json.title);
+          setOverlayCategory(finalEvent.overlay_json.category);
+        }
+
+        const parts = finalEvent.parts || [];
+        if (parts.length > 0 && finalEvent.run_id) {
+          const files = await hydrateAutomationParts(finalEvent.run_id, parts);
+          setUploadMode("multiple");
+          setAudioFile(null);
+          setSegmentFiles(files);
+          setRequiredSegmentIds([...files.keys()].sort((a, b) => a - b));
+          setAutomationMessage(
+            `Automation complete (${parts.length} part${parts.length > 1 ? "s" : ""} loaded)`,
+          );
+        }
+      } catch (err) {
+        if ((err as Error).name === "AbortError") return;
+        setError((err as Error).message);
+      } finally {
+        setAutomationRunning(false);
+        setAutomationPhase("idle");
+        automationAbortRef.current = null;
       }
-    } catch (err) {
-      if ((err as Error).name === "AbortError") return;
-      setError((err as Error).message);
-    } finally {
-      setAutomationRunning(false);
-      setAutomationPhase("idle");
-      automationAbortRef.current = null;
-    }
-  }, [
-    projectId,
-    automationConfig,
-    automationVoiceKey,
-    targetLanguage,
-    jsonValid,
-    newScriptJson,
-    hydrateAutomationParts,
-  ]);
+    },
+    [
+      projectId,
+      automationConfig,
+      automationVoiceKey,
+      targetLanguage,
+      newScriptJson,
+      transcription,
+      hydrateAutomationParts,
+    ],
+  );
 
   // Stage audio files for preview playback before final submission
   const stagePreviewAudio = useCallback(
-    async (files: File | File[]) => {
-      if (!projectId) return;
+    async (files: File | File[]): Promise<boolean> => {
+      if (!projectId) return false;
       const formData = new FormData();
       if (Array.isArray(files)) {
         for (const f of files) {
@@ -1192,11 +1246,38 @@ export function ScriptRestructurePage() {
       }
       try {
         await api.stagePreviewAudio(projectId, formData);
+        return true;
       } catch {
         // Non-critical: preview just won't work until final submission
+        return false;
       }
     },
     [projectId],
+  );
+
+  const getOrderedSegmentFiles = useCallback(
+    (files: Map<number, File>): File[] => {
+      const segmentOrder = requiredSegmentIds ?? audioSegments.map((seg) => seg.id);
+      if (segmentOrder.length > 0) {
+        return segmentOrder
+          .map((segmentId) => files.get(segmentId))
+          .filter((file): file is File => Boolean(file));
+      }
+      return [...files.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([, file]) => file);
+    },
+    [requiredSegmentIds, audioSegments],
+  );
+
+  const stageAndBuildPreview = useCallback(
+    async (files: File | File[], runIdOverride: string | null) => {
+      clearPreview();
+      const staged = await stagePreviewAudio(files);
+      if (!staged) return;
+      await buildPreview(runIdOverride, true);
+    },
+    [clearPreview, stagePreviewAudio, buildPreview],
   );
 
   const handleFileSelect = useCallback(
@@ -1209,12 +1290,12 @@ export function ScriptRestructurePage() {
           return;
         }
         setAudioFile(file);
-        setHasTtsAudio(true);
-        stagePreviewAudio(file);
+        setCurrentRunId(null);
+        void stageAndBuildPreview(file, null);
         setError(null);
       }
     },
-    [stagePreviewAudio],
+    [stageAndBuildPreview],
   );
 
   const handleSegmentFileSelect = useCallback(
@@ -1225,21 +1306,28 @@ export function ScriptRestructurePage() {
           setError("Please select an audio file");
           return;
         }
-        setSegmentFiles((prev) => {
-          const next = new Map(prev);
-          next.set(segmentId, file);
-          // Stage all current segment files for preview
-          const allFiles = [...next.values()];
-          if (allFiles.length > 0) {
-            setHasTtsAudio(true);
-            stagePreviewAudio(allFiles);
-          }
-          return next;
-        });
+        const next = new Map(segmentFiles);
+        next.set(segmentId, file);
+        setSegmentFiles(next);
+        setCurrentRunId(null);
+        const multipartReady =
+          expectedSegmentOrder.length > 0 &&
+          expectedSegmentOrder.every((requiredId) => next.has(requiredId));
+        if (multipartReady) {
+          void stageAndBuildPreview(getOrderedSegmentFiles(next), null);
+        } else {
+          clearPreview();
+        }
         setError(null);
       }
     },
-    [stagePreviewAudio],
+    [
+      segmentFiles,
+      expectedSegmentOrder,
+      getOrderedSegmentFiles,
+      stageAndBuildPreview,
+      clearPreview,
+    ],
   );
 
   const handleCopySegment = useCallback(async (segment: AudioSegment) => {
@@ -1284,23 +1372,31 @@ export function ScriptRestructurePage() {
       }
       if (target === "single") {
         setAudioFile(file);
-        setHasTtsAudio(true);
-        stagePreviewAudio(file);
+        setCurrentRunId(null);
+        void stageAndBuildPreview(file, null);
       } else {
-        setSegmentFiles((prev) => {
-          const next = new Map(prev);
-          next.set(target, file);
-          const allFiles = [...next.values()];
-          if (allFiles.length > 0) {
-            setHasTtsAudio(true);
-            stagePreviewAudio(allFiles);
-          }
-          return next;
-        });
+        const next = new Map(segmentFiles);
+        next.set(target, file);
+        setSegmentFiles(next);
+        setCurrentRunId(null);
+        const multipartReady =
+          expectedSegmentOrder.length > 0 &&
+          expectedSegmentOrder.every((requiredId) => next.has(requiredId));
+        if (multipartReady) {
+          void stageAndBuildPreview(getOrderedSegmentFiles(next), null);
+        } else {
+          clearPreview();
+        }
       }
       setError(null);
     },
-    [stagePreviewAudio],
+    [
+      segmentFiles,
+      expectedSegmentOrder,
+      getOrderedSegmentFiles,
+      stageAndBuildPreview,
+      clearPreview,
+    ],
   );
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
@@ -1400,6 +1496,7 @@ export function ScriptRestructurePage() {
     automationMusicKey,
     overlayTitle,
     overlayCategory,
+    automationVoiceKey,
   ]);
 
   const filteredVoices: ScriptAutomationVoice[] = useMemo(() => {
@@ -1443,8 +1540,7 @@ export function ScriptRestructurePage() {
     newScriptJson.trim() !== "" &&
     metadataValid &&
     metadataJson.trim() !== "" &&
-    ((uploadMode === "single" && audioFile !== null) ||
-      (uploadMode === "multiple" && segmentFiles.size > 0));
+    previewReady;
 
   const automationBlockedReason = automationConfigError
     ? `Automation config error: ${automationConfigError}`
@@ -1474,8 +1570,6 @@ export function ScriptRestructurePage() {
       .join(" ")
       .trim() ||
     "";
-  const expectedSegmentOrder =
-    requiredSegmentIds ?? audioSegments.map((seg) => seg.id);
   const displaySegments =
     requiredSegmentIds && requiredSegmentIds.length !== audioSegments.length
       ? requiredSegmentIds.map((id) => ({
@@ -1485,15 +1579,7 @@ export function ScriptRestructurePage() {
           characterCount: 0,
         }))
       : audioSegments;
-  const canContinue =
-    jsonValid &&
-    (uploadMode === "single"
-      ? audioFile !== null
-      : expectedSegmentOrder.length > 0 &&
-        expectedSegmentOrder.every((segmentId) => segmentFiles.has(segmentId)));
-  const uploadedSegmentsCount = expectedSegmentOrder.filter((segmentId) =>
-    segmentFiles.has(segmentId),
-  ).length;
+  const canContinue = jsonValid && previewReady;
   const metadataDone = metadataValid || metadataDetected;
 
   return (
@@ -1769,16 +1855,18 @@ export function ScriptRestructurePage() {
 
               {/* Upload Mode Selector */}
               <div className="flex items-center gap-2">
-                <select
-                  value={uploadMode}
-                  onChange={(e) => {
-                    setUploadMode(e.target.value as UploadMode);
-                    setAudioFile(null);
-                    setSegmentFiles(new Map());
-                    setRequiredSegmentIds(null);
-                  }}
-                  className="p-2 rounded-md border border-[hsl(var(--input))] bg-[hsl(var(--background))] text-sm"
-                >
+                  <select
+                    value={uploadMode}
+                    onChange={(e) => {
+                      setUploadMode(e.target.value as UploadMode);
+                      setAudioFile(null);
+                      setSegmentFiles(new Map());
+                      setRequiredSegmentIds(null);
+                      setCurrentRunId(null);
+                      clearPreview();
+                    }}
+                    className="p-2 rounded-md border border-[hsl(var(--input))] bg-[hsl(var(--background))] text-sm"
+                  >
                   <option value="multiple">Multiple files (Recommended)</option>
                   <option value="single">Single file</option>
                 </select>
@@ -1858,7 +1946,8 @@ export function ScriptRestructurePage() {
                         className="text-[hsl(var(--destructive))]"
                         onClick={() => {
                           setAudioFile(null);
-                          setHasTtsAudio(false);
+                          setCurrentRunId(null);
+                          clearPreview();
                         }}
                       >
                         <Trash2 className="h-4 w-4" />
@@ -1999,13 +2088,11 @@ export function ScriptRestructurePage() {
                                   size="sm"
                                   className="h-6 px-2 text-xs text-[hsl(var(--destructive))]"
                                   onClick={() => {
-                                    setSegmentFiles((prev) => {
-                                      const next = new Map(prev);
-                                      next.delete(segment.id);
-                                      if (next.size === 0)
-                                        setHasTtsAudio(false);
-                                      return next;
-                                    });
+                                    const next = new Map(segmentFiles);
+                                    next.delete(segment.id);
+                                    setSegmentFiles(next);
+                                    setCurrentRunId(null);
+                                    clearPreview();
                                   }}
                                 >
                                   <Trash2 className="h-3.5 w-3.5" />
@@ -2166,7 +2253,9 @@ export function ScriptRestructurePage() {
                   <Button
                     size="sm"
                     className="w-full"
-                    onClick={handleResumeAfterValidation}
+                    onClick={() => {
+                      void handleResumeAfterValidation();
+                    }}
                   >
                     <Sparkles className="h-4 w-4 mr-2" />
                     Continue (Overlay + TTS)
@@ -2205,12 +2294,12 @@ export function ScriptRestructurePage() {
                   <Volume2 className="h-4 w-4" />
                   Preview
                 </h3>
-                {previewBuilding ? (
+                {previewReady && previewBuilding ? (
                   <div className="flex items-center gap-2 text-xs text-[hsl(var(--muted-foreground))]">
                     <Loader2 className="h-3 w-3 animate-spin" />
                     Building preview...
                   </div>
-                ) : previewUrl ? (
+                ) : previewReady && previewUrl ? (
                   <audio
                     ref={previewAudioRef}
                     controls
@@ -2220,7 +2309,11 @@ export function ScriptRestructurePage() {
                   />
                 ) : (
                   <p className="text-xs text-[hsl(var(--muted-foreground))]">
-                    Generate TTS to enable preview
+                    {uploadMode === "multiple" &&
+                    expectedSegmentOrder.length > 0 &&
+                    uploadedSegmentsCount < expectedSegmentOrder.length
+                      ? "Upload all parts to enable preview"
+                      : "Generate TTS to enable preview"}
                   </p>
                 )}
               </div>
@@ -2354,7 +2447,7 @@ export function ScriptRestructurePage() {
             setScriptEditorOpen(false);
             // If closing during validation phase, trigger resume
             if (automationPhase === "validating") {
-              handleResumeAfterValidation();
+              void handleResumeAfterValidation();
             }
           }}
           onSave={(updatedJson) => {
@@ -2362,8 +2455,7 @@ export function ScriptRestructurePage() {
             setScriptEditorOpen(false);
             // If saving during validation phase, trigger resume
             if (automationPhase === "validating") {
-              // Small delay to let state update
-              setTimeout(() => handleResumeAfterValidation(), 100);
+              void handleResumeAfterValidation(updatedJson);
             }
           }}
           scenesJson={newScriptJson}
