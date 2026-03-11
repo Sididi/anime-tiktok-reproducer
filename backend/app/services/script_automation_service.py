@@ -737,15 +737,18 @@ class ScriptAutomationService:
                         char_count=segment_char_count,
                     )
 
+                    effective_model = voice.model_id or settings.elevenlabs_model_id
+                    # eleven_v3 does not support previous_text/next_text
+                    supports_context = not effective_model.startswith("eleven_v3")
                     audio_bytes = await asyncio.to_thread(
                         ElevenLabsService.synthesize,
                         voice_id=voice.elevenlabs_voice_id,
                         text=chunk,
-                        model_id=voice.model_id or settings.elevenlabs_model_id,
+                        model_id=effective_model,
                         output_format=settings.elevenlabs_output_format,
                         voice_settings=voice.voice_settings or None,
-                        previous_text=chunks[idx - 2] if idx >= 2 else None,
-                        next_text=chunks[idx] if idx <= len(chunks) - 1 else None,
+                        previous_text=(chunks[idx - 2] if idx >= 2 else None) if supports_context else None,
+                        next_text=(chunks[idx] if idx <= len(chunks) - 1 else None) if supports_context else None,
                     )
                     if cls._is_pcm_format():
                         audio_bytes = cls._wrap_pcm_as_wav(audio_bytes)
