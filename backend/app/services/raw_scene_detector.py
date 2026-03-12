@@ -263,6 +263,7 @@ class RawSceneDetectorService:
                     new_scenes.append(scene_second)
 
                     # Determine which sub-scene is raw
+                    added_as_candidate: set[int] = set()
                     for sub_scene in [scene_first, scene_second]:
                         sub_raw_overlap = sum(
                             _overlap(sub_scene.start_time, sub_scene.end_time, r_start, r_end)
@@ -276,6 +277,21 @@ class RawSceneDetectorService:
                                 end_time=sub_scene.end_time,
                                 confidence=round(sub_raw_overlap / sub_dur, 3),
                                 reason="non_tts_speaker",
+                                was_split=True,
+                                original_scene_index=scene.scene_index,
+                            ))
+                            added_as_candidate.add(id(sub_scene))
+
+                    # Fallback: empty sub-scenes from a split are gaps in TTS
+                    # that may not meet the >50% raw overlap threshold.
+                    for sub_scene in [scene_first, scene_second]:
+                        if id(sub_scene) not in added_as_candidate and not sub_scene.text.strip():
+                            candidates.append(RawSceneCandidate(
+                                scene_index=sub_scene.scene_index,
+                                start_time=sub_scene.start_time,
+                                end_time=sub_scene.end_time,
+                                confidence=0.0,
+                                reason="empty_split_gap",
                                 was_split=True,
                                 original_scene_index=scene.scene_index,
                             ))

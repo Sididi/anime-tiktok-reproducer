@@ -10,7 +10,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import AsyncIterator
 
-from ..models import Word, SceneTranscription, Transcription, SceneList, SceneMatch, MatchList
+from ..models import Word, SceneTranscription, Transcription, Scene, SceneList, SceneMatch, MatchList
 from ..models.raw_scene import RawSceneDetectionResult
 from ..services import ProjectService
 from ..utils.media_binaries import get_media_subprocess_env, rewrite_media_command
@@ -60,6 +60,10 @@ LANGUAGE_MAP = {
 VIDEO_EXTENSIONS = {
     ".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".3gp", ".ts", ".m2ts",
 }
+
+# Words longer than this (in seconds) are likely WhisperX alignment artifacts
+# where trailing silence inflates the end time.  Use start time for assignment.
+MAX_WORD_DURATION = 1.0
 
 
 class TranscriberService:
@@ -806,8 +810,14 @@ class TranscriberService:
             scene_text_parts = []
 
             for word in words:
-                # Word belongs to scene if its midpoint is within scene bounds
-                word_mid = (word["start"] + word["end"]) / 2
+                # Word belongs to scene if its assignment point is within scene bounds.
+                # For normal words, use midpoint.  For abnormally long words (WhisperX
+                # artifact with trailing silence), use start time as the reliable point.
+                word_duration = word["end"] - word["start"]
+                if word_duration > MAX_WORD_DURATION:
+                    word_mid = word["start"]
+                else:
+                    word_mid = (word["start"] + word["end"]) / 2
                 if scene.start_time <= word_mid < scene.end_time:
                     scene_words.append(Word(
                         text=word["text"],
@@ -972,15 +982,27 @@ class TranscriberService:
                             s.text = ""
                             s.words = []
 
-                    # Split matches if scenes were split
+                    # Sync matches and scenes.json when scenes were split
                     original_scenes = list(scene_transcriptions)
-                    match_list = ProjectService.load_matches(project_id)
-                    if match_list and len(updated_scenes) != len(original_scenes):
-                        new_matches = cls.split_scene_matches(
-                            original_scenes, updated_scenes, match_list.matches,
+                    if len(updated_scenes) != len(original_scenes):
+                        # Split matches if they exist
+                        match_list = ProjectService.load_matches(project_id)
+                        if match_list:
+                            new_matches = cls.split_scene_matches(
+                                original_scenes, updated_scenes, match_list.matches,
+                            )
+                            match_list.matches = new_matches
+                            ProjectService.save_matches(project_id, match_list)
+
+                        # Sync scenes.json with updated scene structure
+                        updated_scene_list = SceneList(scenes=[
+                            Scene(index=s.scene_index, start_time=s.start_time, end_time=s.end_time)
+                            for s in updated_scenes
+                        ])
+                        ProjectService.save_scenes(project_id, updated_scene_list)
+                        (project_dir / "scenes_raw_backup.json").write_text(
+                            updated_scene_list.model_dump_json(indent=2)
                         )
-                        match_list.matches = new_matches
-                        ProjectService.save_matches(project_id, match_list)
 
                     transcription.scenes = updated_scenes
                     ProjectService.save_transcription(project_id, transcription)

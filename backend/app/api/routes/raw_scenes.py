@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from ...models import MatchList, ProjectPhase, SceneMatch, SceneTranscription, Transcription
+from ...models import MatchList, ProjectPhase, Scene, SceneList, SceneMatch, SceneTranscription, Transcription
 from ...models.raw_scene import RawSceneDetectionResult
 from ...services import ProjectService
 
@@ -87,6 +87,13 @@ async def validate_raw_scenes(project_id: str, request: ValidateRequest):
         ProjectService.save_matches(project_id, match_list)
 
     ProjectService.save_transcription(project_id, transcription)
+
+    # Sync scenes.json with current scene structure
+    ProjectService.save_scenes(project_id, SceneList(scenes=[
+        Scene(index=s.scene_index, start_time=s.start_time, end_time=s.end_time)
+        for s in transcription.scenes
+    ]))
+
     return {"status": "ok", "transcription": transcription.model_dump()}
 
 
@@ -125,6 +132,12 @@ async def reset_raw_scenes(project_id: str):
     if backup_matches.exists():
         match_list = MatchList.model_validate_json(backup_matches.read_text())
         ProjectService.save_matches(project_id, match_list)
+
+    # Restore scenes.json from backup if available
+    backup_scenes = project_dir / "scenes_raw_backup.json"
+    if backup_scenes.exists():
+        scene_list = SceneList.model_validate_json(backup_scenes.read_text())
+        ProjectService.save_scenes(project_id, scene_list)
 
     # Set phase back to raw scene validation
     project.phase = ProjectPhase.RAW_SCENE_VALIDATION

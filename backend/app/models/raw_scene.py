@@ -8,7 +8,7 @@ class RawSceneCandidate(BaseModel):
     start_time: float
     end_time: float
     confidence: float
-    reason: str  # "no_speech" | "non_tts_speaker"
+    reason: str  # "no_speech" | "non_tts_speaker" | "empty_split_gap"
     was_split: bool = False
     original_scene_index: int | None = None
 
