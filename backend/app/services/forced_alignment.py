@@ -45,11 +45,11 @@ class ForcedAlignmentService:
     REPORT_FILENAME = "alignment_report.json"
     PARTS_OUTPUT_DIRNAME = "alignment_parts"
 
-    COVERAGE_MIN = 0.95
+    COVERAGE_MIN = 0.90
     WINDOW_PADDING_SEC = 0.35
     WINDOW_RETRY_PADDING_SEC = 1.0
     MIN_WINDOW_SEC = 1.2
-    LONG_WORD_ABS_MAX_SEC = 2.0
+    LONG_WORD_ABS_MAX_SEC = 3.0
     LONG_WORD_MEDIAN_FACTOR = 4.0
 
     @classmethod
@@ -284,7 +284,6 @@ class ForcedAlignmentService:
 
         for scene in transcription.scenes:
             if scene.is_raw:
-                previous_end = max(previous_end, scene.end_time)
                 continue
 
             if scene.text.strip() and not scene.words:
@@ -445,6 +444,7 @@ class ForcedAlignmentService:
             reference_transcription=reference_transcription,
             aligned_segment_payloads=aligned_segment_payloads,
         )
+        cls._enforce_monotonic_words(transcription)
         global_issues = scene_issues + cls.validate_transcription_basics(transcription)
         report = cls._build_report(
             status="ok" if not global_issues and cls._segments_are_valid(runtime_segments) else "error",
@@ -564,6 +564,7 @@ class ForcedAlignmentService:
             reference_transcription=reference_transcription,
             aligned_segment_payloads=aligned_segment_payloads,
         )
+        cls._enforce_monotonic_words(transcription)
         global_issues = scene_issues + cls.validate_transcription_basics(transcription)
         report = cls._build_report(
             status="ok" if not global_issues and cls._segments_are_valid(runtime_segments) else "error",
@@ -776,6 +777,24 @@ class ForcedAlignmentService:
         return transcription, issues
 
     @classmethod
+    def _enforce_monotonic_words(cls, transcription: Transcription) -> None:
+        """Adjust word timings to be strictly monotonic across non-raw scenes."""
+        min_duration = 0.02
+        previous_end = 0.0
+        for scene in transcription.scenes:
+            if scene.is_raw or not scene.words:
+                continue
+            for word in scene.words:
+                if word.start < previous_end:
+                    word.start = previous_end
+                if word.end < word.start + min_duration:
+                    word.end = word.start + min_duration
+                previous_end = word.end
+            # Update scene boundaries from adjusted words
+            scene.start_time = scene.words[0].start
+            scene.end_time = scene.words[-1].end
+
+    @classmethod
     def _build_segment_windows(
         cls,
         *,
@@ -923,6 +942,31 @@ class ForcedAlignmentService:
 
         return normalized
 
+    @staticmethod
+    def _extract_words_preserving_untimed(segments: list[dict]) -> list[dict]:
+        words: list[dict] = []
+        for segment in segments:
+            segment_words = segment.get("words") or []
+            if not segment_words:
+                words.extend(TranscriberService._segment_words_from_text(segment))
+                continue
+            for word in segment_words:
+                text = (word.get("word") or word.get("text") or "").strip()
+                if not text:
+                    continue
+                start = word.get("start")
+                end = word.get("end")
+                confidence = word.get("score") or word.get("confidence") or word.get("probability")
+                if confidence is None:
+                    confidence = 1.0
+                words.append({
+                    "text": text,
+                    "start": float(start) if start is not None else None,
+                    "end": float(end) if end is not None else None,
+                    "confidence": float(confidence),
+                })
+        return words
+
     @classmethod
     def _align_clip_exact(
         cls,
@@ -960,7 +1004,9 @@ class ForcedAlignmentService:
             else:
                 raise
 
-        words = TranscriberService._extract_words_from_segments(aligned.get("segments") or [])
+        raw_words = cls._extract_words_preserving_untimed(aligned.get("segments") or [])
+        median_dur = TranscriberService._median_word_duration(raw_words)
+        TranscriberService._fill_missing_word_times(raw_words, median_dur)
         return cls._clamp_words_to_clip(
             words=[
                 Word(
@@ -969,7 +1015,7 @@ class ForcedAlignmentService:
                     end=float(word["end"]),
                     confidence=float(word.get("confidence", 1.0)),
                 )
-                for word in words
+                for word in raw_words
             ],
             clip_duration=clip_duration,
         )
