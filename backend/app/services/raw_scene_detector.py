@@ -301,12 +301,30 @@ class RawSceneDetectorService:
             s.scene_index = idx
 
         # Update candidate scene_index to match new indices
+        candidate_times: set[tuple[float, float]] = set()
         for cand in candidates:
             for s in new_scenes:
                 if (abs(s.start_time - cand.start_time) < 0.01
                         and abs(s.end_time - cand.end_time) < 0.01):
                     cand.scene_index = s.scene_index
                     break
+            candidate_times.add((round(cand.start_time, 2), round(cand.end_time, 2)))
+
+        # Fallback: scenes with no text/words are definitively not TTS,
+        # even if diarization didn't produce a raw region covering them
+        # (e.g. trailing silence/music at the end of the audio).
+        for s in new_scenes:
+            key = (round(s.start_time, 2), round(s.end_time, 2))
+            if key not in candidate_times and not s.text.strip() and not s.words:
+                candidates.append(RawSceneCandidate(
+                    scene_index=s.scene_index,
+                    start_time=s.start_time,
+                    end_time=s.end_time,
+                    confidence=0.0,
+                    reason="empty_no_tts",
+                    was_split=False,
+                    original_scene_index=s.scene_index,
+                ))
 
         return new_scenes, candidates
 
