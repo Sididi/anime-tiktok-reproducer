@@ -356,6 +356,16 @@ subtitles/              - Baked subtitle MOGRT files
         return [path for _, path in sortable]
 
     @classmethod
+    def _collect_raw_scene_subtitle_files(cls, output_dir: Path) -> list[Path]:
+        raw_dir = output_dir / "raw_scene_subtitles"
+        if not raw_dir.exists():
+            return []
+        return sorted(
+            [path for path in raw_dir.rglob("*") if path.is_file()],
+            key=lambda path: str(path.relative_to(raw_dir)).lower(),
+        )
+
+    @classmethod
     def build_manifest(cls, project: Project, matches: list[SceneMatch]) -> tuple[str, list[ManifestEntry]]:
         output_dir = cls.get_output_dir(project.id)
         if not output_dir.exists():
@@ -372,8 +382,7 @@ subtitles/              - Baked subtitle MOGRT files
             raise FileNotFoundError("Missing subtitle file. Run processing first.")
 
         baked_subtitles = cls._collect_baked_subtitle_files(output_dir)
-        if not baked_subtitles:
-            raise FileNotFoundError("Missing baked subtitle MOGRT files in output/subtitles.")
+        raw_scene_subtitle_files = cls._collect_raw_scene_subtitle_files(output_dir)
 
         folder = cls.output_folder_name(project)
         subtitle_name = subtitle_path.name
@@ -448,6 +457,16 @@ subtitles/              - Baked subtitle MOGRT files
                 ManifestEntry(
                     relative_path=f"{folder}/subtitles/{subtitle_mogrt.name}",
                     source_path=subtitle_mogrt,
+                )
+            )
+
+        raw_scene_subtitle_root = output_dir / "raw_scene_subtitles"
+        for raw_scene_subtitle_file in raw_scene_subtitle_files:
+            relative = raw_scene_subtitle_file.relative_to(raw_scene_subtitle_root).as_posix()
+            entries.append(
+                ManifestEntry(
+                    relative_path=f"{folder}/raw_scene_subtitles/{relative}",
+                    source_path=raw_scene_subtitle_file,
                 )
             )
 

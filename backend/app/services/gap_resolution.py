@@ -429,7 +429,9 @@ class GapResolutionService:
 
         Args:
             matches: Scene matches with source timings
-            scene_timings: Scene timings from TTS transcription (each has scene_index, words)
+            scene_timings: Authoritative playback scene timings. When present,
+                start_time/end_time are preferred over word-derived timing,
+                including for raw scenes.
 
         Returns:
             List of GapInfo for scenes that have gaps
@@ -442,8 +444,7 @@ class GapResolutionService:
             source_rate=cls.SOURCE_RATE,
         )
 
-        # Compute adjusted end times to eliminate gaps between scenes
-        # Each scene's end is extended to the next scene's start
+        # Older saved states may not have authoritative scene bounds yet.
         adjusted_ends = compute_adjusted_scene_end_times(
             scenes=scene_timings,
             get_scene_index=lambda s: s.get("scene_index"),
@@ -470,13 +471,28 @@ class GapResolutionService:
                 (s for s in scene_timings if s.get("scene_index") == match.scene_index),
                 None,
             )
-            if not scene_timing or not scene_timing.get("words"):
+            if not scene_timing:
                 continue
 
-            words = scene_timing["words"]
-            timeline_start_raw = words[0]["start"]
-            # Use adjusted end time to eliminate gaps between scenes
-            timeline_end_raw = adjusted_ends.get(match.scene_index, words[-1]["end"])
+            timeline_start_raw = scene_timing.get("start_time")
+            timeline_end_raw = scene_timing.get("end_time")
+
+            has_authoritative_bounds = (
+                isinstance(timeline_start_raw, (int, float))
+                and isinstance(timeline_end_raw, (int, float))
+                and float(timeline_end_raw) > float(timeline_start_raw)
+            )
+
+            if has_authoritative_bounds:
+                timeline_start_raw = float(timeline_start_raw)
+                timeline_end_raw = float(timeline_end_raw)
+            else:
+                words = scene_timing.get("words") or []
+                if not words:
+                    continue
+                timeline_start_raw = words[0]["start"]
+                # Use adjusted end time to eliminate gaps between scenes
+                timeline_end_raw = adjusted_ends.get(match.scene_index, words[-1]["end"])
 
             # Snap timeline positions to 60fps frame grid (matching processing.py)
             # This ensures we use the exact same values as JSX generation

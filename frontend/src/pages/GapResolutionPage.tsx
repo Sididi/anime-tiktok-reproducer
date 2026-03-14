@@ -61,6 +61,9 @@ interface GapCardProps {
   scene: Scene | undefined;
   projectId: string;
   episodes: string[];
+  getSourceDescriptor: (
+    episode: string,
+  ) => Promise<SourceStreamDescriptor | null>;
   isResolved: boolean;
   isSkipped: boolean;
   resolvedTiming: { start: number; end: number; speed: number } | null;
@@ -92,6 +95,7 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
     scene,
     projectId,
     episodes,
+    getSourceDescriptor,
     isResolved,
     isSkipped,
     resolvedTiming,
@@ -159,13 +163,12 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
     let active = true;
     setSourceDescriptorLoading(true);
 
-    void api
-      .getSourceDescriptor(projectId, gap.episode)
+    void getSourceDescriptor(gap.episode)
       .then((descriptor) => {
         if (!active) return;
         setSourceDescriptor(descriptor);
 
-        if (descriptor.mode === "chunked") {
+        if (descriptor?.mode === "chunked") {
           const desiredDuration = Math.min(
             Math.max(
               descriptor.chunk_duration,
@@ -197,8 +200,8 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
     };
   }, [
     gap.episode,
+    getSourceDescriptor,
     getChunkWindowStart,
-    projectId,
   ]);
 
   useEffect(() => {
@@ -472,6 +475,7 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
 
   return (
     <div
+      data-gap-scene-index={gap.scene_index}
       className={cn(
         "bg-[hsl(var(--card))] rounded-lg p-4 space-y-4",
         isResolved
@@ -790,6 +794,12 @@ export function GapResolutionPage() {
   const [playbackRate, setPlaybackRate] = useState(1);
   const gapRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const cardRefs = useRef<Map<number, GapCardHandle>>(new Map());
+  const descriptorCacheRef = useRef<Map<string, SourceStreamDescriptor | null>>(
+    new Map(),
+  );
+  const descriptorRequestsRef = useRef<
+    Map<string, Promise<SourceStreamDescriptor | null>>
+  >(new Map());
   const autoplayTokenRef = useRef(0);
   const preparedScenesRef = useRef<Set<number>>(new Set());
   const failedPreparedScenesRef = useRef<Set<number>>(new Set());
@@ -807,6 +817,48 @@ export function GapResolutionPage() {
     if (playbackRate >= 2) return 2;
     return 1;
   }, [playbackRate]);
+
+  const getSourceDescriptorCached = useCallback(
+    (episode: string): Promise<SourceStreamDescriptor | null> => {
+      if (!projectId) {
+        return Promise.resolve(null);
+      }
+
+      if (descriptorCacheRef.current.has(episode)) {
+        return Promise.resolve(
+          descriptorCacheRef.current.get(episode) ?? null,
+        );
+      }
+
+      const existing = descriptorRequestsRef.current.get(episode);
+      if (existing) {
+        return existing;
+      }
+
+      const request = api
+        .getSourceDescriptor(projectId, episode)
+        .then((descriptor) => {
+          descriptorCacheRef.current.set(episode, descriptor);
+          return descriptor;
+        })
+        .catch(() => {
+          descriptorCacheRef.current.set(episode, null);
+          return null;
+        })
+        .finally(() => {
+          descriptorRequestsRef.current.delete(episode);
+        });
+
+      descriptorRequestsRef.current.set(episode, request);
+      return request;
+    },
+    [projectId],
+  );
+
+  useEffect(() => {
+    descriptorCacheRef.current.clear();
+    descriptorRequestsRef.current.clear();
+  }, [projectId]);
 
   const clearFastWatchBuffers = useCallback(() => {
     preparedScenesRef.current.clear();
@@ -1111,7 +1163,7 @@ export function GapResolutionPage() {
     };
 
     loadData();
-  }, [projectId, loadProject, loadScenes]);
+  }, [autoResolveRequested, projectId, loadProject, loadScenes]);
 
   useEffect(() => {
     if (sortedGaps.length === 0) {
@@ -1524,6 +1576,7 @@ export function GapResolutionPage() {
                   scene={scene}
                   projectId={projectId!}
                   episodes={episodes}
+                  getSourceDescriptor={getSourceDescriptorCached}
                   isResolved={isResolved || isSkipped}
                   isSkipped={isSkipped}
                   resolvedTiming={resolvedTiming}
@@ -1533,6 +1586,7 @@ export function GapResolutionPage() {
                   playbackRate={playbackRate}
                   controlsDisabled={fastWatchPlaying}
                   preloadMode={
+                    fastWatchPlaying &&
                     Math.abs(gapPosition - activeScenePosition) <= 2
                       ? "auto"
                       : "metadata"

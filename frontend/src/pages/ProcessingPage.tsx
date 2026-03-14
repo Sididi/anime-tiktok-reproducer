@@ -65,6 +65,11 @@ const INITIAL_STEPS: ProcessingStep[] = [
     status: "pending",
   },
   {
+    id: "source_normalization",
+    label: "Normalizing source episodes for Premiere Pro",
+    status: "pending",
+  },
+  {
     id: "jsx_generation",
     label: "Generating Premiere Pro JSX script",
     status: "pending",
@@ -182,10 +187,11 @@ export function ProcessingPage() {
     if (resumeAfterGapsRef.current) {
       setSteps((prev) =>
         prev.map((step) => {
-          if (step.id === "jsx_generation") {
+          if (step.id === "source_normalization") {
             return { ...step, status: "processing", message: "Resuming..." };
           }
           if (
+            step.id === "jsx_generation" ||
             step.id === "srt_generation" ||
             step.id === "overlay_image_generation"
           ) {

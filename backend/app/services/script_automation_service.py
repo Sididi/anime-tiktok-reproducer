@@ -296,6 +296,15 @@ class ScriptAutomationService:
         segments: list[dict[str, Any]] = []
         current_segment = _create_empty_segment(1)
 
+        # Build scene text lookup for accurate index partitioning during hard splits
+        scene_text_by_index: dict[int, str] = {}
+        for j, sc in enumerate(scenes):
+            if not isinstance(sc, dict):
+                continue
+            si_raw = sc.get("scene_index")
+            si = si_raw if isinstance(si_raw, int) else j + 1
+            scene_text_by_index[si] = str(sc.get("text") or "").strip()
+
         for i, scene in enumerate(scenes):
             if not isinstance(scene, dict):
                 continue
@@ -317,17 +326,40 @@ class ScriptAutomationService:
                 )
                 if not hard_chunk:
                     break
+
+                # Partition scene_indices: walk scenes, accumulate text length
+                all_indices = current_segment["scene_indices"]
+                head_len = len(hard_chunk)
+                char_pos = 0
+                split_at = len(all_indices)  # default: all in head
+                for j, si in enumerate(all_indices):
+                    st = scene_text_by_index.get(si, "")
+                    if char_pos > 0:
+                        char_pos += 1  # space separator
+                    if char_pos + len(st) > head_len:
+                        split_at = j
+                        break
+                    char_pos += len(st)
+
+                head_indices = all_indices[:split_at]
+                tail_indices = all_indices[split_at:]
+
+                # Safety: if head has text but no scenes, assign first scene to head
+                if not head_indices and all_indices:
+                    head_indices = [all_indices[0]]
+                    tail_indices = all_indices[1:]
+
                 segments.append(
                     {
                         "id": len(segments) + 1,
-                        "scene_indices": [*current_segment["scene_indices"]],
+                        "scene_indices": head_indices,
                         "text": hard_chunk,
                         "character_count": len(hard_chunk),
                     }
                 )
                 current_segment = {
                     "id": len(segments) + 1,
-                    "scene_indices": [*current_segment["scene_indices"]],
+                    "scene_indices": tail_indices,
                     "text": remainder,
                     "character_count": len(remainder),
                 }

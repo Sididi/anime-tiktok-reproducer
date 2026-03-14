@@ -155,28 +155,35 @@ class RawSceneDetectorService:
         raw_regions: list[tuple[float, float]],
         tts_speaker: str,
         segments: list[tuple[float, float, str]],
-    ) -> tuple[list[SceneTranscription], list[RawSceneCandidate]]:
+    ) -> tuple[list[SceneTranscription], list[RawSceneCandidate], list[int]]:
         """Map raw regions onto scene boundaries, splitting scenes as needed.
 
-        Returns (updated_scenes, raw_candidates).
+        Returns (updated_scenes, raw_candidates, scene_parent_indices).
         """
         if not raw_regions:
-            return scenes, []
+            return (
+                [scene.model_copy(deep=True) for scene in scenes],
+                [],
+                [scene.scene_index for scene in scenes],
+            )
 
         def _overlap(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
             """Calculate overlap duration between two intervals."""
             return max(0.0, min(a_end, b_end) - max(a_start, b_start))
 
         new_scenes: list[SceneTranscription] = []
+        scene_parent_indices: list[int] = []
         candidates: list[RawSceneCandidate] = []
 
         for scene in scenes:
             s_start = scene.start_time
             s_end = scene.end_time
             s_dur = s_end - s_start
+            parent_scene_index = scene.scene_index
 
             if s_dur <= 0:
-                new_scenes.append(scene)
+                new_scenes.append(scene.model_copy(deep=True))
+                scene_parent_indices.append(parent_scene_index)
                 continue
 
             # Calculate total overlap with raw regions
@@ -188,10 +195,12 @@ class RawSceneDetectorService:
 
             if raw_fraction < 0.1:
                 # Less than 10% raw — treat as TTS scene
-                new_scenes.append(scene)
+                new_scenes.append(scene.model_copy(deep=True))
+                scene_parent_indices.append(parent_scene_index)
             elif raw_fraction > 0.8:
                 # More than 80% raw — whole scene is raw
-                new_scenes.append(scene)
+                new_scenes.append(scene.model_copy(deep=True))
+                scene_parent_indices.append(parent_scene_index)
 
                 # Compute confidence from non-TTS speaker segments in this range
                 non_tts_dur = sum(
@@ -208,7 +217,7 @@ class RawSceneDetectorService:
                     confidence=round(confidence, 3),
                     reason="non_tts_speaker" if non_tts_dur > 0 else "no_speech",
                     was_split=False,
-                    original_scene_index=scene.scene_index,
+                    original_scene_index=parent_scene_index,
                 ))
             else:
                 # Partial overlap — split at first raw boundary
@@ -224,7 +233,8 @@ class RawSceneDetectorService:
 
                 if split_point is None or (split_point - s_start) < 0.3 or (s_end - split_point) < 0.3:
                     # Can't split meaningfully — classify based on majority
-                    new_scenes.append(scene)
+                    new_scenes.append(scene.model_copy(deep=True))
+                    scene_parent_indices.append(parent_scene_index)
                     if raw_fraction > 0.5:
                         candidates.append(RawSceneCandidate(
                             scene_index=scene.scene_index,
@@ -233,7 +243,7 @@ class RawSceneDetectorService:
                             confidence=round(raw_fraction, 3),
                             reason="non_tts_speaker",
                             was_split=False,
-                            original_scene_index=scene.scene_index,
+                            original_scene_index=parent_scene_index,
                         ))
                 else:
                     # Split into two sub-scenes
@@ -243,9 +253,10 @@ class RawSceneDetectorService:
                     scene_first = SceneTranscription(
                         scene_index=scene.scene_index,  # temp, re-indexed later
                         text=first_text,
-                        words=first_words,
+                        words=[word.model_copy(deep=True) for word in first_words],
                         start_time=s_start,
                         end_time=split_point,
+                        is_raw=scene.is_raw,
                     )
 
                     # Second part: split_point → s_end
@@ -254,13 +265,16 @@ class RawSceneDetectorService:
                     scene_second = SceneTranscription(
                         scene_index=scene.scene_index + 1,  # temp
                         text=second_text,
-                        words=second_words,
+                        words=[word.model_copy(deep=True) for word in second_words],
                         start_time=split_point,
                         end_time=s_end,
+                        is_raw=scene.is_raw,
                     )
 
                     new_scenes.append(scene_first)
                     new_scenes.append(scene_second)
+                    scene_parent_indices.append(parent_scene_index)
+                    scene_parent_indices.append(parent_scene_index)
 
                     # Determine which sub-scene is raw
                     added_as_candidate: set[int] = set()
@@ -278,7 +292,7 @@ class RawSceneDetectorService:
                                 confidence=round(sub_raw_overlap / sub_dur, 3),
                                 reason="non_tts_speaker",
                                 was_split=True,
-                                original_scene_index=scene.scene_index,
+                                original_scene_index=parent_scene_index,
                             ))
                             added_as_candidate.add(id(sub_scene))
 
@@ -293,7 +307,7 @@ class RawSceneDetectorService:
                                 confidence=0.0,
                                 reason="empty_split_gap",
                                 was_split=True,
-                                original_scene_index=scene.scene_index,
+                                original_scene_index=parent_scene_index,
                             ))
 
         # Re-index all scenes sequentially
@@ -316,6 +330,7 @@ class RawSceneDetectorService:
         for s in new_scenes:
             key = (round(s.start_time, 2), round(s.end_time, 2))
             if key not in candidate_times and not s.text.strip() and not s.words:
+                parent_scene_index = scene_parent_indices[s.scene_index]
                 candidates.append(RawSceneCandidate(
                     scene_index=s.scene_index,
                     start_time=s.start_time,
@@ -323,10 +338,10 @@ class RawSceneDetectorService:
                     confidence=0.0,
                     reason="empty_no_tts",
                     was_split=False,
-                    original_scene_index=s.scene_index,
+                    original_scene_index=parent_scene_index,
                 ))
 
-        return new_scenes, candidates
+        return new_scenes, candidates, scene_parent_indices
 
     @classmethod
     def _get_audio_duration(cls, wav_path: Path) -> float:
@@ -381,7 +396,7 @@ class RawSceneDetectorService:
                 speaker_count=len(speaker_durations),
             )
 
-        updated_scenes, candidates = cls._map_raw_regions_to_scenes(
+        updated_scenes, candidates, scene_parent_indices = cls._map_raw_regions_to_scenes(
             scenes, raw_regions, tts_speaker, segments,
         )
 
@@ -390,6 +405,7 @@ class RawSceneDetectorService:
             candidates=candidates,
             tts_speaker_id=tts_speaker,
             speaker_count=len(speaker_durations),
+            scene_parent_indices=scene_parent_indices,
         )
 
         return updated_scenes, result

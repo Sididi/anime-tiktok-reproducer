@@ -20,3 +20,5 @@ class RawSceneDetectionResult(BaseModel):
     candidates: list[RawSceneCandidate] = []
     tts_speaker_id: str = ""
     speaker_count: int = 0
+    # Indexed by updated scene position; value is the pre-split parent scene index.
+    scene_parent_indices: list[int] = []

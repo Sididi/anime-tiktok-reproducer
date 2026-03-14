@@ -97,6 +97,8 @@ interface MatchCardHandle {
   stop: () => void;
 }
 
+const autoStartedMatchProjects = new Set<string>();
+
 const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
   function MatchCard(
     {
@@ -644,7 +646,6 @@ export function MatchValidation() {
   const [mergeContinuous, setMergeContinuous] = useState(true);
   const [skipUiEnabled, setSkipUiEnabled] = useState(false);
   const skipUiEnabledRef = useRef(false);
-  const autoMatchAttemptedRef = useRef(false);
   const [matchesAutoEnabled, setMatchesAutoEnabled] = useState(false);
   const matchesAutoFillTriggeredRef = useRef(false);
   const [activeSceneIndex, setActiveSceneIndex] = useState(-1);
@@ -1326,11 +1327,11 @@ export function MatchValidation() {
       matching ||
       !skipUiEnabled ||
       matches.length > 0 ||
-      autoMatchAttemptedRef.current
+      autoStartedMatchProjects.has(projectId)
     ) {
       return;
     }
-    autoMatchAttemptedRef.current = true;
+    autoStartedMatchProjects.add(projectId);
     handleFindMatches();
   }, [
     projectId,

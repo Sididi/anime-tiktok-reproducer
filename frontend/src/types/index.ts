@@ -308,6 +308,7 @@ export interface RawSceneDetectionResult {
   candidates: RawSceneCandidate[];
   tts_speaker_id: string;
   speaker_count: number;
+  scene_parent_indices: number[];
 }
 
 export interface Transcription {

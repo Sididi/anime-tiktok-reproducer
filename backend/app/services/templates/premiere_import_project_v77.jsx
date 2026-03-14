@@ -34,6 +34,8 @@
     ASSETS_DIR + "/" + CATEGORY_TITLE_PRESET_NAME + ".prfpset";
   var SUBTITLE_MOGRT_DIR = ROOT_DIR + "/subtitles";
   var SUBTITLE_SRT_PATH = ROOT_DIR + "/let_this_grieving_soul_retire.fr_FR.srt";
+  var RAW_SCENE_SUBTITLE_MANIFEST_PATH =
+    ROOT_DIR + "/raw_scene_subtitles/manifest.json";
 
   // --- SCENES DATA ---
   var scenes = [
@@ -1477,6 +1479,74 @@
     return null;
   }
 
+  function buildRawAudioSubclipName(scene) {
+    if (!scene) return "";
+    return (
+      "__ATR_RAW_AUDIO__" +
+      scene.scene_index +
+      "__" +
+      scene.source_in_frame +
+      "_" +
+      scene.source_out_frame
+    );
+  }
+
+  function getOrCreateRawAudioSubclip(scene) {
+    if (!scene || !scene.is_raw) return null;
+    var subclipName = buildRawAudioSubclipName(scene);
+    if (!subclipName) return null;
+
+    var existing =
+      getCachedProjectItem(subclipName) ||
+      findProjectItem(subclipName) ||
+      findProjectItemLoose(subclipName);
+    if (existing) {
+      cacheProjectItem(existing);
+      cacheProjectItemByName(subclipName, existing);
+      return existing;
+    }
+
+    var sourceItem = getOrImportClip(scene.clipName);
+    if (!sourceItem || !sourceItem.createSubClip) {
+      return null;
+    }
+
+    var startTicks =
+      typeof scene.source_in_frame === "number"
+        ? Math.round(sourceFramesToRawTicks(scene.source_in_frame))
+        : Math.round(secondsToRawTicks(scene.source_in));
+    var endTicks =
+      typeof scene.source_out_frame === "number"
+        ? Math.round(sourceFramesToRawTicks(scene.source_out_frame))
+        : Math.round(secondsToRawTicks(scene.source_out));
+    if (!(endTicks > startTicks)) {
+      endTicks = startTicks + Math.round(sourceFrameDurationTicks());
+    }
+
+    var subclip = null;
+    try {
+      // ProjectItem.createSubClip(name, startTicks, endTicks, hasHardBoundaries, takeVideo, takeAudio)
+      subclip = sourceItem.createSubClip(
+        subclipName,
+        startTicks.toString(),
+        endTicks.toString(),
+        1,
+        0,
+        1,
+      );
+    } catch (e0) {}
+
+    if (!subclip) {
+      subclip =
+        findProjectItem(subclipName) || findProjectItemLoose(subclipName);
+    }
+    if (subclip) {
+      cacheProjectItem(subclip);
+      cacheProjectItemByName(subclipName, subclip);
+    }
+    return subclip;
+  }
+
   // ========================================================================
   // 3. MAIN LOGIC
   // ========================================================================
@@ -1633,7 +1703,6 @@
         var v1Item = null;
         var a1Item = null;
         var a2Item = null;
-        var a4Item = null;
         if (v3) {
           v3Item = resolvePlacedItemFast(
             v3,
@@ -1694,44 +1763,22 @@
             s.source_out_frame,
           );
         }
-        // A4: Raw scene audio (active, not muted) — duplicate of source audio
-        if (s.is_raw && a4 && clip) {
-          a4.overwriteClip(clip, startSec);
-          a4Item = resolvePlacedItemFast(
-            a4,
-            startSec,
-            cleanName,
-            TRACK_ITEM_WAIT_MAX_MS,
-          );
-          a4Item = setTrackItemInOutFromItem(
-            a4Item,
-            s.source_in,
-            s.source_out,
-            s.source_in_frame,
-            s.source_out_frame,
-          );
-        }
         perfEnd("scenes_placement");
 
-        // 3. ENFORCE DURATION (ALL SPEEDS)
-        // Always enforce the target timeline duration, even at 1.0x.
-        // If in/out fails or speed is exactly 1.0, this prevents huge clip lengths.
-        var newDurationSeconds = snapSecondsToFrame(
-          s.clip_duration / s.effective_speed,
-        );
+        // 3. ENFORCE DURATION
+        // Raw scenes stay at native speed but still need an explicit timeline
+        // duration so trailing raw clips do not extend past final playback.
+        var newDurationSeconds = snapSecondsToFrame(s.target_duration);
         enforceTrackItemDuration(v3Item, newDurationSeconds);
         enforceTrackItemDuration(v1Item, newDurationSeconds);
         enforceTrackItemDuration(a1Item, newDurationSeconds);
         if (MUTATE_TRANSIENT_A2_SCENE_AUDIO) {
           enforceTrackItemDuration(a2Item, newDurationSeconds);
         }
-        if (s.is_raw && a4Item) {
-          enforceTrackItemDuration(a4Item, newDurationSeconds);
-        }
 
-        // 4. APPLY SPEED (Both V1, V3, A1, A2, and A4 for raw scenes)
+        // 4. APPLY SPEED (Both V1, V3, A1, and optionally A2)
         // QE setSpeed often fails to ripple-edit duration for speedups, so we pre-resize above.
-        if (Math.abs(s.effective_speed - 1.0) > 0.01) {
+        if (!s.is_raw && Math.abs(s.effective_speed - 1.0) > 0.01) {
           perfStart("scenes_speed");
           if (v3)
             safeApplySpeedQE(
@@ -1781,18 +1828,6 @@
               qeTrackCache,
               QE_TRACK_ITEM_HINTS,
             );
-          if (s.is_raw && a4 && a4Item)
-            safeApplySpeedQE(
-              startSec,
-              s.effective_speed,
-              3,
-              "Audio",
-              cleanName,
-              sequence,
-              qeSeq,
-              qeTrackCache,
-              QE_TRACK_ITEM_HINTS,
-            );
           perfEnd("scenes_speed");
         }
 
@@ -1820,29 +1855,6 @@
     }
     perfEnd("scenes", "Scenes");
 
-    // --- V2: BORDER MOGRT ---
-    if (v2 && new File(BORDER_MOGRT_PATH).exists) {
-      log("Adding Border Mogrt to V2...");
-      try {
-        // Insert once at 0
-        var totalDuration =
-          scenes.length > 0
-            ? snapSecondsToFrame(scenes[scenes.length - 1].end)
-            : 0;
-        if (totalDuration > 0) {
-          var mgt = sequence.importMGT(BORDER_MOGRT_PATH, 0, 1, 0); // Index 1 starts V2 ?? Wait, numTracks test used sequence.videoTracks[1]?
-          // No, importMGT(path, time, videoTrackIndex, audioTrackIndex)
-          // The script previously used index 1.
-          if (mgt) {
-            mgt.end = totalDuration;
-            log("Border Mogrt inserted. Duration: " + totalDuration);
-          }
-        }
-      } catch (e) {
-        log("Border Mogrt Error: " + e.message);
-      }
-    }
-
     // --- IMPORT TTS (A2), THEN BUILD OVERLAYS + MUSIC FROM TTS DURATION ---
     log("Importing TTS to A2...");
     var ttsItem = getOrImportClip(AUDIO_FILENAME);
@@ -1869,11 +1881,31 @@
     }
     ttsEndSec = snapSecondsToFrame(ttsEndSec);
 
+    var sequenceEndSec = ttsEndSec;
+
+    // --- V2: BORDER MOGRT ---
+    if (v2 && new File(BORDER_MOGRT_PATH).exists) {
+      log("Adding Border Mogrt to V2...");
+      try {
+        if (sequenceEndSec > 0) {
+          var mgt = sequence.importMGT(BORDER_MOGRT_PATH, 0, 1, 0);
+          if (mgt) {
+            setTrackItemEndSeconds(mgt, sequenceEndSec);
+            log("Border Mogrt inserted. Duration: " + sequenceEndSec);
+          }
+        }
+      } catch (e) {
+        log("Border Mogrt Error: " + e.message);
+      }
+    }
+
+    duplicateRawSceneAudioToTrack(a4, scenes);
+
     log("Adding overlays on V5 and V6...");
-    if (!placeOverlayOnTrack(v5, CATEGORY_OVERLAY_FILENAME, ttsEndSec)) {
+    if (!placeOverlayOnTrack(v5, CATEGORY_OVERLAY_FILENAME, sequenceEndSec)) {
       log("Warning: Failed to place " + CATEGORY_OVERLAY_FILENAME + " on V5.");
     }
-    if (!placeOverlayOnTrack(v6, TITLE_OVERLAY_FILENAME, ttsEndSec)) {
+    if (!placeOverlayOnTrack(v6, TITLE_OVERLAY_FILENAME, sequenceEndSec)) {
       log("Warning: Failed to place " + TITLE_OVERLAY_FILENAME + " on V6.");
     }
 
@@ -1892,7 +1924,7 @@
           );
         } else {
           perfStart("music");
-          if (!buildLoopedMusicBed(a3, musicItem, ttsEndSec, MUSIC_GAIN_DB)) {
+          if (!buildLoopedMusicBed(a3, musicItem, sequenceEndSec, MUSIC_GAIN_DB)) {
             log("Warning: Could not fully build looped music bed.");
           }
           perfEnd("music", "Music");
@@ -1939,11 +1971,12 @@
     // --- V4: SUBTITLES (SRT timings + external MOGRT files) ---
     log("Loading subtitle MOGRT files to V4...");
     perfStart("subtitles");
-    importSubtitleMogrtsFromFolder(
+    importUnifiedSubtitles(
       sequence,
       3,
       SUBTITLE_MOGRT_DIR,
       SUBTITLE_SRT_PATH,
+      RAW_SCENE_SUBTITLE_MANIFEST_PATH,
     );
     perfEnd("subtitles", "Subtitles");
     refreshSequenceUI(sequence);
@@ -2083,20 +2116,284 @@
     return result;
   }
 
-  function importSubtitleMogrtsFromFolder(
+  function readJsonFile(filePath) {
+    if (!filePath) return null;
+    var f = new File(filePath);
+    if (!f.exists || !f.open("r")) return null;
+    var content = "";
+    try {
+      content = f.read();
+    } catch (e0) {
+      content = "";
+    }
+    f.close();
+    if (!content) return null;
+    try {
+      return JSON.parse(content);
+    } catch (e1) {
+      return null;
+    }
+  }
+
+  function buildClassicSubtitlePlacements(subtitleDirPath, srtPath) {
+    var stats = {
+      timings: 0,
+      mogrtsFound: 0,
+      timingsUnused: 0,
+      mogrtsUnused: 0,
+    };
+    var placements = [];
+
+    var entries = parseSrtEntries(srtPath);
+    stats.timings = entries.length;
+    if (entries.length <= 0) {
+      return {
+        stats: stats,
+        placements: placements,
+      };
+    }
+
+    var subtitleDir = new Folder(subtitleDirPath);
+    if (!subtitleDir.exists) {
+      return {
+        stats: stats,
+        placements: placements,
+      };
+    }
+
+    var mogrtFiles = listSubtitleMogrtFilesSorted(subtitleDirPath);
+    stats.mogrtsFound = mogrtFiles.length;
+    if (stats.mogrtsFound <= 0) {
+      return {
+        stats: stats,
+        placements: placements,
+      };
+    }
+
+    var pairCount = Math.min(stats.timings, stats.mogrtsFound);
+    stats.timingsUnused = stats.timings - pairCount;
+    stats.mogrtsUnused = stats.mogrtsFound - pairCount;
+
+    for (var k = 0; k < pairCount; k++) {
+      var entry = entries[k];
+      var mogrtFile = mogrtFiles[k];
+      var startSec = snapSecondsToFrame(entry.start);
+      var endSec = snapSecondsToFrame(entry.end);
+      if (endSec <= startSec) {
+        endSec = snapSecondsToFrame(startSec + 1 / SEQ_FPS);
+      }
+      placements.push({
+        kind: "classic",
+        idx: k + 1,
+        mogrtPath: mogrtFile.fsName,
+        startSec: startSec,
+        startTicksStr: secondsToTicks(startSec).toString(),
+        endSec: endSec,
+        endTimeObj: buildSequenceTimeFromSeconds(endSec),
+      });
+    }
+
+    return {
+      stats: stats,
+      placements: placements,
+    };
+  }
+
+  function loadRawSceneSubtitleImagePlacements(manifestPath) {
+    var stats = {
+      entries: 0,
+      skipped: 0,
+    };
+    var placements = [];
+
+    var payload = readJsonFile(manifestPath);
+    if (!payload || !payload.entries || !payload.entries.length) {
+      return {
+        stats: stats,
+        placements: placements,
+      };
+    }
+
+    stats.entries = payload.entries.length;
+    for (var i = 0; i < payload.entries.length; i++) {
+      var entry = payload.entries[i];
+      if (!entry) continue;
+      var relativeAssetPath = trimSpaces(entry.relative_asset_path);
+      if (!relativeAssetPath) {
+        stats.skipped++;
+        continue;
+      }
+
+      var startSec = snapSecondsToFrame(entry.start);
+      var endSec = snapSecondsToFrame(entry.end);
+      if (endSec <= startSec) {
+        endSec = snapSecondsToFrame(startSec + 1 / SEQ_FPS);
+      }
+      placements.push({
+        kind: "raw",
+        idx: i + 1,
+        relativeAssetPath: relativeAssetPath,
+        startSec: startSec,
+        endSec: endSec,
+      });
+    }
+
+    placements.sort(function (a, b) {
+      if (a.startSec !== b.startSec) return a.startSec - b.startSec;
+      if (a.endSec !== b.endSec) return a.endSec - b.endSec;
+      return a.idx - b.idx;
+    });
+
+    return {
+      stats: stats,
+      placements: placements,
+    };
+  }
+
+  function compareSubtitlePlacementOrder(a, b, frameDurationSec) {
+    var delta = a.startSec - b.startSec;
+    if (
+      a.kind !== b.kind &&
+      Math.abs(delta) <= frameDurationSec
+    ) {
+      return a.kind === "classic" ? -1 : 1;
+    }
+    if (delta !== 0) return delta < 0 ? -1 : 1;
+    if (a.kind !== b.kind) return a.kind === "classic" ? -1 : 1;
+    if (a.endSec !== b.endSec) return a.endSec < b.endSec ? -1 : 1;
+    return (a.idx || 0) - (b.idx || 0);
+  }
+
+  function clampRawSubtitlePlacementsAgainstClassic(
+    rawPlacements,
+    classicPlacements,
+    frameDurationSec,
+  ) {
+    var result = {
+      placements: [],
+      dropped: 0,
+      trimmed: 0,
+    };
+    if (!rawPlacements || rawPlacements.length <= 0) return result;
+
+    var classics = classicPlacements ? classicPlacements.slice(0) : [];
+    classics.sort(function (a, b) {
+      if (a.startSec !== b.startSec) return a.startSec - b.startSec;
+      return a.endSec - b.endSec;
+    });
+
+    for (var i = 0; i < rawPlacements.length; i++) {
+      var raw = rawPlacements[i];
+      if (!raw || !(raw.endSec > raw.startSec)) {
+        result.dropped++;
+        continue;
+      }
+
+      var overlaps = [];
+      for (var c = 0; c < classics.length; c++) {
+        var classic = classics[c];
+        if (!classic) continue;
+        if (classic.endSec <= raw.startSec || classic.startSec >= raw.endSec) {
+          continue;
+        }
+        overlaps.push(classic);
+      }
+
+      if (overlaps.length <= 0) {
+        result.placements.push(raw);
+        continue;
+      }
+
+      overlaps.sort(function (a, b) {
+        if (a.startSec !== b.startSec) return a.startSec - b.startSec;
+        return a.endSec - b.endSec;
+      });
+
+      var firstOverlap = overlaps[0];
+      var lastOverlap = overlaps[overlaps.length - 1];
+      var beforeStart = raw.startSec;
+      var beforeEnd = Math.min(firstOverlap.startSec, raw.endSec);
+      var afterStart = Math.max(lastOverlap.endSec, raw.startSec);
+      var afterEnd = raw.endSec;
+      var beforeDuration = beforeEnd - beforeStart;
+      var afterDuration = afterEnd - afterStart;
+
+      var newStart = null;
+      var newEnd = null;
+      if (beforeDuration > frameDurationSec && afterDuration <= frameDurationSec) {
+        newStart = beforeStart;
+        newEnd = beforeEnd;
+      } else if (
+        afterDuration > frameDurationSec &&
+        beforeDuration <= frameDurationSec
+      ) {
+        newStart = afterStart;
+        newEnd = afterEnd;
+      } else {
+        result.dropped++;
+        continue;
+      }
+
+      if (!(newEnd - newStart > frameDurationSec)) {
+        result.dropped++;
+        continue;
+      }
+
+      result.placements.push({
+        kind: raw.kind,
+        idx: raw.idx,
+        relativeAssetPath: raw.relativeAssetPath,
+        startSec: snapSecondsToFrame(newStart),
+        endSec: snapSecondsToFrame(newEnd),
+      });
+      result.trimmed++;
+    }
+    return result;
+  }
+
+  function buildMergedSubtitlePlacementSchedule(
+    classicPlacements,
+    rawPlacements,
+    frameDurationSec,
+  ) {
+    var merge = {
+      placements: [],
+      rawDropped: 0,
+      rawTrimmed: 0,
+    };
+    var clampedRaw = clampRawSubtitlePlacementsAgainstClassic(
+      rawPlacements,
+      classicPlacements,
+      frameDurationSec,
+    );
+    merge.rawDropped = clampedRaw.dropped;
+    merge.rawTrimmed = clampedRaw.trimmed;
+    merge.placements = classicPlacements.slice(0).concat(clampedRaw.placements);
+    merge.placements.sort(function (a, b) {
+      return compareSubtitlePlacementOrder(a, b, frameDurationSec);
+    });
+    return merge;
+  }
+
+  function importUnifiedSubtitles(
     sequence,
     videoTrackIndex,
     subtitleDirPath,
     srtPath,
+    rawManifestPath,
     enableSecondsFallback,
   ) {
     var stats = {
-      timings: 0,
-      mogrtsFound: 0,
+      classicTimings: 0,
+      classicMogrtsFound: 0,
+      classicUnusedTimings: 0,
+      classicUnusedMogrts: 0,
+      rawEntries: 0,
+      rawDropped: 0,
+      rawTrimmed: 0,
+      scheduled: 0,
       inserted: 0,
-      insertFailed: 0,
-      timingsUnused: 0,
-      mogrtsUnused: 0,
+      failed: 0,
     };
 
     if (
@@ -2112,145 +2409,156 @@
       return stats;
     }
 
-    var entries = parseSrtEntries(srtPath);
-    stats.timings = entries.length;
-    if (entries.length <= 0) {
-      log("Warning: No subtitle entries parsed from " + srtPath);
-      return stats;
-    }
-
-    var subtitleDir = new Folder(subtitleDirPath);
-    if (!subtitleDir.exists) {
-      log("Warning: Subtitle MOGRT folder not found: " + subtitleDirPath);
-      return stats;
-    }
-
-    var mogrtFiles = listSubtitleMogrtFilesSorted(subtitleDirPath);
-    stats.mogrtsFound = mogrtFiles.length;
-    if (stats.mogrtsFound <= 0) {
-      log("Warning: No subtitle MOGRT files found in " + subtitleDirPath + ".");
-      return stats;
-    }
-
-    var pairCount = Math.min(stats.timings, stats.mogrtsFound);
-    stats.timingsUnused = stats.timings - pairCount;
-    stats.mogrtsUnused = stats.mogrtsFound - pairCount;
-    if (stats.timingsUnused > 0 || stats.mogrtsUnused > 0) {
-      log(
-        "Warning: Subtitle timing/MOGRT count mismatch (timings: " +
-          stats.timings +
-          ", mogrts: " +
-          stats.mogrtsFound +
-          "). Inserting " +
-          pairCount +
-          ".",
-      );
-    }
-
-    var pairs = [];
-    for (var k = 0; k < pairCount; k++) {
-      var entry = entries[k];
-      var mogrtFile = mogrtFiles[k];
-      var startSec = snapSecondsToFrame(entry.start);
-      var endSec = snapSecondsToFrame(entry.end);
-      if (endSec <= startSec) {
-        endSec = snapSecondsToFrame(startSec + 1 / SEQ_FPS);
-      }
-      pairs.push({
-        idx: k + 1,
-        mogrtPath: mogrtFile.fsName,
-        startSec: startSec,
-        startTicksStr: secondsToTicks(startSec).toString(),
-        endSec: endSec,
-        endTimeObj: buildSequenceTimeFromSeconds(endSec),
-      });
-    }
-
+    var classicResult = buildClassicSubtitlePlacements(subtitleDirPath, srtPath);
+    var rawResult = loadRawSceneSubtitleImagePlacements(rawManifestPath);
+    var frameDurationSec = 1 / SEQ_FPS;
+    var schedule = buildMergedSubtitlePlacementSchedule(
+      classicResult.placements,
+      rawResult.placements,
+      frameDurationSec,
+    );
+    var track = sequence.videoTracks[videoTrackIndex];
     var useSecondsFallback = enableSecondsFallback !== false;
-    for (var p = 0; p < pairs.length; p++) {
-      var pair = pairs[p];
 
-      var mogrtItem = null;
-      try {
-        perfCounterInc("importMGTCalls");
-        mogrtItem = sequence.importMGT(
-          pair.mogrtPath,
-          pair.startTicksStr,
-          videoTrackIndex,
-          0,
-        );
-      } catch (e0) {}
-      if (!mogrtItem && useSecondsFallback) {
+    stats.classicTimings = classicResult.stats.timings;
+    stats.classicMogrtsFound = classicResult.stats.mogrtsFound;
+    stats.classicUnusedTimings = classicResult.stats.timingsUnused;
+    stats.classicUnusedMogrts = classicResult.stats.mogrtsUnused;
+    stats.rawEntries = rawResult.stats.entries;
+    stats.rawDropped = schedule.rawDropped;
+    stats.rawTrimmed = schedule.rawTrimmed;
+    stats.scheduled = schedule.placements.length;
+
+    if (stats.classicTimings <= 0 && stats.rawEntries <= 0) {
+      return stats;
+    }
+    if (stats.classicTimings > 0 && stats.classicMogrtsFound <= 0) {
+      log("Warning: No subtitle MOGRT files found in " + subtitleDirPath + ".");
+    }
+
+    for (var p = 0; p < schedule.placements.length; p++) {
+      var placement = schedule.placements[p];
+      if (!placement) continue;
+
+      if (placement.kind === "classic") {
+        var mogrtItem = null;
         try {
           perfCounterInc("importMGTCalls");
           mogrtItem = sequence.importMGT(
-            pair.mogrtPath,
-            pair.startSec,
+            placement.mogrtPath,
+            placement.startTicksStr,
             videoTrackIndex,
             0,
           );
-        } catch (e1) {}
-      }
-
-      if (!mogrtItem) {
-        stats.insertFailed++;
-        if (stats.insertFailed <= 10 || stats.insertFailed % 25 === 0) {
-          log(
-            "Warning: Subtitle import failed #" +
-              pair.idx +
-              " at " +
-              pair.startSec +
-              "s (" +
-              pair.mogrtPath +
-              ").",
-          );
+        } catch (e0) {}
+        if (!mogrtItem && useSecondsFallback) {
+          try {
+            perfCounterInc("importMGTCalls");
+            mogrtItem = sequence.importMGT(
+              placement.mogrtPath,
+              placement.startSec,
+              videoTrackIndex,
+              0,
+            );
+          } catch (e1) {}
         }
-        continue;
-      }
-
-      stats.inserted++;
-      try {
-        mogrtItem.end = pair.endTimeObj;
-      } catch (e2) {
+        if (!mogrtItem) {
+          stats.failed++;
+          continue;
+        }
         try {
-          mogrtItem.end = pair.endSec;
-        } catch (e3) {}
+          mogrtItem.end = placement.endTimeObj;
+        } catch (e2) {
+          try {
+            mogrtItem.end = placement.endSec;
+          } catch (e3) {
+            stats.failed++;
+            continue;
+          }
+        }
+        stats.inserted++;
+      } else {
+        var clip = getOrImportClip(placement.relativeAssetPath);
+        if (!clip) {
+          stats.failed++;
+          continue;
+        }
+        try {
+          track.overwriteClip(clip, placement.startSec);
+        } catch (e4) {
+          stats.failed++;
+          continue;
+        }
+
+        var assetName = placement.relativeAssetPath;
+        assetName = assetName.replace(/^.*[\\\/]/, "");
+        var assetNameNoExt = stripKnownExtension(assetName);
+        var item =
+          resolvePlacedItemFast(
+            track,
+            placement.startSec,
+            assetNameNoExt,
+            TRACK_ITEM_WAIT_MAX_MS,
+          ) ||
+          resolvePlacedItemFast(
+            track,
+            placement.startSec,
+            assetName,
+            TRACK_ITEM_WAIT_MAX_MS,
+          ) ||
+          findTrackItemAtStart(track, placement.startSec, assetNameNoExt) ||
+          findTrackItemAtStart(track, placement.startSec, assetName) ||
+          findTrackItemAtStart(track, placement.startSec, null);
+        if (!item || !setTrackItemEndSeconds(item, placement.endSec)) {
+          stats.failed++;
+          continue;
+        }
+        stats.inserted++;
       }
 
       if (
         PERF_PROFILE_ENABLED &&
         PERF_LOG_EACH_SUBTITLE_BATCH > 0 &&
-        ((p + 1) % PERF_LOG_EACH_SUBTITLE_BATCH === 0 || p === pairs.length - 1)
+        ((p + 1) % PERF_LOG_EACH_SUBTITLE_BATCH === 0 ||
+          p === schedule.placements.length - 1)
       ) {
         log(
           "[PERF] Subtitles progress: " +
             (p + 1) +
             "/" +
-            pairs.length +
+            schedule.placements.length +
             " (inserted " +
             stats.inserted +
             ", failed " +
-            stats.insertFailed +
+            stats.failed +
             ").",
         );
       }
     }
 
     log(
-      "Subtitles (MOGRT load-only) on V" +
+      "Subtitles on V" +
         (videoTrackIndex + 1) +
-        ": timings " +
-        stats.timings +
-        ", mogrts found " +
-        stats.mogrtsFound +
+        ": classic timings " +
+        stats.classicTimings +
+        ", classic mogrts " +
+        stats.classicMogrtsFound +
+        ", raw entries " +
+        stats.rawEntries +
+        ", raw trimmed " +
+        stats.rawTrimmed +
+        ", raw dropped " +
+        stats.rawDropped +
+        ", scheduled " +
+        stats.scheduled +
         ", inserted " +
         stats.inserted +
-        ", insert failed " +
-        stats.insertFailed +
-        ", timings unused " +
-        stats.timingsUnused +
-        ", mogrts unused " +
-        stats.mogrtsUnused +
+        ", failed " +
+        stats.failed +
+        ", classic timings unused " +
+        stats.classicUnusedTimings +
+        ", classic mogrts unused " +
+        stats.classicUnusedMogrts +
         ".",
     );
     return stats;
@@ -4092,6 +4400,55 @@
       return false;
     }
     return true;
+  }
+
+  function duplicateRawSceneAudioToTrack(
+    a4,
+    scenes,
+  ) {
+    if (!a4 || !scenes || scenes.length <= 0) return;
+
+    log("Duplicating raw scene audio to A4...");
+    for (var i = 0; i < scenes.length; i++) {
+      var s = scenes[i];
+      if (!s || !s.is_raw) continue;
+
+      var startSec = snapSecondsToFrame(s.start);
+      var subclipName = buildRawAudioSubclipName(s);
+      var subclip = getOrCreateRawAudioSubclip(s);
+      if (!subclip) {
+        log(
+          "Warning: Could not resolve raw audio source for scene " +
+            s.scene_index +
+            ".",
+        );
+        continue;
+      }
+
+      try {
+        a4.overwriteClip(subclip, startSec);
+      } catch (eOverwrite) {
+        log(
+          "Warning: Failed to place raw audio on A4 for scene " +
+            s.scene_index +
+            ": " +
+            (eOverwrite && eOverwrite.message ? eOverwrite.message : eOverwrite),
+        );
+        continue;
+      }
+
+      var a4Item =
+        resolvePlacedItemFast(a4, startSec, subclipName, TRACK_ITEM_WAIT_MAX_MS) ||
+        findTrackItemAtStart(a4, startSec, subclipName) ||
+        findTrackItemAtStart(a4, startSec, null);
+      if (!a4Item) {
+        log(
+          "Warning: Could not resolve raw audio clip on A4 for scene " +
+            s.scene_index +
+            ".",
+        );
+      }
+    }
   }
 
   function scoreAudioGainProperty(prop) {

@@ -12,7 +12,7 @@ from ...services import AnimeLibraryService, AnimeMatcherService
 
 router = APIRouter(prefix="/anime", tags=["anime"])
 
-VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".webm"}
+VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".webm", ".mov"}
 
 
 @router.get("/browse")

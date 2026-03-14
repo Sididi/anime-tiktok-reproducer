@@ -25,6 +25,8 @@ const LANGUAGES = [
   { value: "es", label: "Español" },
 ];
 
+const autoStartedTranscriptionProjects = new Set<string>();
+
 export function TranscriptionPage() {
   const { projectId } = useParams<{ projectId: string }>();
   const navigate = useNavigate();
@@ -45,7 +47,6 @@ export function TranscriptionPage() {
   const [autoScroll, setAutoScroll] = useState(true);
   const sceneRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const autoScrollRef = useRef(true);
-  const autoStartAttemptedRef = useRef(false);
   autoScrollRef.current = autoScroll;
 
   const handleSceneChange = useCallback((index: number) => {
@@ -64,7 +65,6 @@ export function TranscriptionPage() {
   // Load data
   useEffect(() => {
     if (!projectId) return;
-    autoStartAttemptedRef.current = false;
 
     const loadData = async () => {
       setLoading(true);
@@ -152,12 +152,12 @@ export function TranscriptionPage() {
       transcribing ||
       transcription ||
       !fullAutoEnabled ||
-      autoStartAttemptedRef.current
+      autoStartedTranscriptionProjects.has(projectId)
     ) {
       return;
     }
 
-    autoStartAttemptedRef.current = true;
+    autoStartedTranscriptionProjects.add(projectId);
     setLanguage("auto");
     handleStartTranscription("auto");
   }, [

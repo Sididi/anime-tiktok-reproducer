@@ -40,6 +40,7 @@ class Settings(BaseSettings):
 
     # Video settings
     default_fps: float = 30.0
+    source_normalization_profile: str = "h264_mp4_aac"
     match_playback_max_workers: int = 4
     match_playback_max_workers_per_episode: int = 1
 

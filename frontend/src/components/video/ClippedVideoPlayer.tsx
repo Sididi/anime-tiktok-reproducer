@@ -47,6 +47,8 @@ interface ReadyWaiter {
   timeoutId: number;
 }
 
+const INTENTIONAL_UNLOAD_SUPPRESSION_MS = 250;
+
 /**
  * A video player that strictly clips playback between startTime and endTime.
  * Uses Intersection Observer for lazy loading to prevent loading too many videos at once.
@@ -74,14 +76,23 @@ export const ClippedVideoPlayer = forwardRef<
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const readyWaitersRef = useRef<ReadyWaiter[]>([]);
+  const isMountedRef = useRef(false);
   const endNotifiedRef = useRef(false);
   const isClipEndedRef = useRef(false);
   const forceLoadedRef = useRef(false);
   const isIntersectingRef = useRef(false);
   const hasErrorRef = useRef(false);
+  const loadRequestedRef = useRef(eager);
+  const sourceAttachedRef = useRef(false);
   const poolReleaseRef = useRef<(() => void) | null>(null);
-  const poolPendingRef = useRef(false);
-  const [isVisible, setIsVisible] = useState(eager);
+  const nextAcquireIdRef = useRef(0);
+  const pendingAcquireIdRef = useRef<number | null>(null);
+  const pendingAcquirePriorityRef = useRef(false);
+  const suppressMediaErrorsRef = useRef(false);
+  const suppressMediaErrorsTimerRef = useRef<number | null>(null);
+  const [loadRequested, setLoadRequested] = useState(eager);
+  const [hasSlot, setHasSlot] = useState(false);
+  const [isSourceAttached, setIsSourceAttached] = useState(false);
   const [isLoaded, setIsLoaded] = useState(false);
   const [isEnded, setIsEnded] = useState(false);
   const [hasError, setHasError] = useState(false);
@@ -113,6 +124,16 @@ export const ClippedVideoPlayer = forwardRef<
   // HTML video seeks to nearest keyframe which can be before the target time
   // Adding ~2 frames (at 30fps = 0.067s) ensures we land on correct frame
   const adjustedStartTime = startTime + 0.067;
+
+  const setLoadRequestedState = useCallback((value: boolean) => {
+    loadRequestedRef.current = value;
+    setLoadRequested(value);
+  }, []);
+
+  const setSourceAttachedState = useCallback((value: boolean) => {
+    sourceAttachedRef.current = value;
+    setIsSourceAttached(value);
+  }, []);
 
   const resetClipEndedState = useCallback(() => {
     endNotifiedRef.current = false;
@@ -147,14 +168,134 @@ export const ClippedVideoPlayer = forwardRef<
     return `${src}${separator}_retry=${retryCount}`;
   }, [src, retryCount]);
 
+  const clearIntentionalUnloadSuppression = useCallback(() => {
+    suppressMediaErrorsRef.current = false;
+    if (suppressMediaErrorsTimerRef.current !== null) {
+      window.clearTimeout(suppressMediaErrorsTimerRef.current);
+      suppressMediaErrorsTimerRef.current = null;
+    }
+  }, []);
+
+  const suppressIntentionalUnloadErrors = useCallback(() => {
+    suppressMediaErrorsRef.current = true;
+    if (suppressMediaErrorsTimerRef.current !== null) {
+      window.clearTimeout(suppressMediaErrorsTimerRef.current);
+    }
+    suppressMediaErrorsTimerRef.current = window.setTimeout(() => {
+      suppressMediaErrorsRef.current = false;
+      suppressMediaErrorsTimerRef.current = null;
+    }, INTENTIONAL_UNLOAD_SUPPRESSION_MS);
+  }, []);
+
+  const cancelPendingAcquire = useCallback(() => {
+    pendingAcquireIdRef.current = null;
+    pendingAcquirePriorityRef.current = false;
+  }, []);
+
+  const releasePoolSlot = useCallback(() => {
+    const release = poolReleaseRef.current;
+    poolReleaseRef.current = null;
+    if (release) {
+      release();
+    }
+    if (isMountedRef.current) {
+      setHasSlot(false);
+    }
+  }, []);
+
+  const detachActiveSource = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    suppressIntentionalUnloadErrors();
+    video.pause();
+    video.removeAttribute("src");
+    video.load();
+  }, [suppressIntentionalUnloadErrors]);
+
+  const resetLoadState = useCallback(
+    (
+      options: {
+        clearError?: boolean;
+        resetPreload?: boolean;
+      } = {},
+    ) => {
+      if (!isMountedRef.current) return;
+      setIsLoaded(false);
+      if (options.clearError ?? true) {
+        setHasError(false);
+        hasErrorRef.current = false;
+      }
+      resetClipEndedState();
+      resolveReadyWaiters(true);
+      if (options.resetPreload ?? true) {
+        setPreloadMode("metadata");
+      }
+    },
+    [resolveReadyWaiters, resetClipEndedState],
+  );
+
+  const requestPoolSlot = useCallback(
+    (priority: boolean) => {
+      if (poolReleaseRef.current) {
+        if (isMountedRef.current) {
+          setHasSlot(true);
+        }
+        return;
+      }
+      if (
+        pendingAcquireIdRef.current !== null &&
+        (!priority || pendingAcquirePriorityRef.current)
+      ) {
+        return;
+      }
+
+      const acquireId = nextAcquireIdRef.current + 1;
+      nextAcquireIdRef.current = acquireId;
+      pendingAcquireIdRef.current = acquireId;
+      pendingAcquirePriorityRef.current = priority;
+      const acquireFn = priority ? acquirePriority : acquire;
+
+      void acquireFn()
+        .then((release) => {
+          const isLatest = pendingAcquireIdRef.current === acquireId;
+          if (!isLatest || !isMountedRef.current || !loadRequestedRef.current) {
+            release();
+            return;
+          }
+
+          pendingAcquireIdRef.current = null;
+          pendingAcquirePriorityRef.current = false;
+          poolReleaseRef.current = release;
+          setHasSlot(true);
+          setSourceAttachedState(true);
+        })
+        .catch(() => {
+          if (pendingAcquireIdRef.current !== acquireId || !isMountedRef.current) {
+            return;
+          }
+          pendingAcquireIdRef.current = null;
+          pendingAcquirePriorityRef.current = false;
+          setHasError(true);
+          hasErrorRef.current = true;
+          setIsLoaded(true);
+          notifyClipCompleted();
+          resolveReadyWaiters(true);
+        });
+    },
+    [notifyClipCompleted, resolveReadyWaiters, setSourceAttachedState],
+  );
+
   const triggerRetryLoad = useCallback(() => {
     return new Promise<void>((resolve) => {
       setIsRetrying(true);
+      setLoadRequestedState(true);
       setHasError(false);
       hasErrorRef.current = false;
       setIsLoaded(false);
       setPreloadMode("auto");
       resolveReadyWaiters(true);
+      setSourceAttachedState(false);
+      detachActiveSource();
 
       // Small delay to ensure video element is unmounted before creating new one
       window.setTimeout(() => {
@@ -163,7 +304,12 @@ export const ClippedVideoPlayer = forwardRef<
         resolve();
       }, 100);
     });
-  }, [resolveReadyWaiters]);
+  }, [
+    detachActiveSource,
+    resolveReadyWaiters,
+    setLoadRequestedState,
+    setSourceAttachedState,
+  ]);
 
   // Expose playback control methods to parent
   useImperativeHandle(
@@ -270,64 +416,57 @@ export const ClippedVideoPlayer = forwardRef<
       forceLoad: () => {
         forceLoadedRef.current = true;
         setPreloadMode("auto");
-        // Use priority acquire for Fast Watch preloads
-        if (!poolReleaseRef.current && !poolPendingRef.current) {
-          poolPendingRef.current = true;
-          acquirePriority().then((release) => {
-            poolPendingRef.current = false;
-            poolReleaseRef.current = release;
-            // Only set visible if still force-loaded (not cancelled in the meantime)
-            if (forceLoadedRef.current) {
-              setIsVisible(true);
-            } else {
-              release();
-              poolReleaseRef.current = null;
-            }
-          });
-        } else if (poolReleaseRef.current) {
-          // Already have a slot, just make visible
-          setIsVisible(true);
-        }
+        setLoadRequestedState(true);
+        requestPoolSlot(true);
       },
       releaseLoad: () => {
         forceLoadedRef.current = false;
-        if (isIntersectingRef.current) return;
-        // Aggressively release the video connection
-        if (videoRef.current) {
-          videoRef.current.pause();
-          videoRef.current.removeAttribute("src");
-          videoRef.current.load();
+        if (eager || isIntersectingRef.current) {
+          if (!eager) {
+            setPreloadMode("metadata");
+          }
+          return;
         }
-        setIsVisible(false);
-        setIsLoaded(false);
-        setHasError(false);
-        hasErrorRef.current = false;
-        resetClipEndedState();
-        setPreloadMode("metadata");
-        resolveReadyWaiters(true);
-        // Release pool slot
-        if (poolReleaseRef.current) {
-          poolReleaseRef.current();
-          poolReleaseRef.current = null;
-        }
+        setLoadRequestedState(false);
       },
     }),
     [
+      eager,
       adjustedStartTime,
-      resolveReadyWaiters,
+      requestPoolSlot,
       resetClipEndedState,
+      setLoadRequestedState,
       triggerRetryLoad,
     ],
   );
 
+  useEffect(() => {
+    isMountedRef.current = true;
+    const video = videoRef.current;
+    return () => {
+      isMountedRef.current = false;
+      cancelPendingAcquire();
+      clearIntentionalUnloadSuppression();
+      if (video) {
+        video.pause();
+        video.removeAttribute("src");
+        video.load();
+      }
+      resolveReadyWaiters(true);
+      releasePoolSlot();
+    };
+  }, [
+    cancelPendingAcquire,
+    clearIntentionalUnloadSuppression,
+    releasePoolSlot,
+    resolveReadyWaiters,
+  ]);
+
+  /* eslint-disable react-hooks/set-state-in-effect */
   // Intersection Observer for lazy loading AND unloading
   // Videos are loaded when entering viewport and unloaded when leaving
   // This prevents too many concurrent video connections which causes failures
   useEffect(() => {
-    if (eager) {
-      return;
-    }
-
     const container = containerRef.current;
     if (!container) return;
 
@@ -335,48 +474,9 @@ export const ClippedVideoPlayer = forwardRef<
       (entries) => {
         entries.forEach((entry) => {
           isIntersectingRef.current = entry.isIntersecting;
-          if (entry.isIntersecting) {
-            // Video is entering viewport - acquire a pool slot then load
-            if (!poolReleaseRef.current && !poolPendingRef.current) {
-              poolPendingRef.current = true;
-              acquire().then((release) => {
-                poolPendingRef.current = false;
-                poolReleaseRef.current = release;
-                // Only set visible if still intersecting (not scrolled away while waiting)
-                if (isIntersectingRef.current || forceLoadedRef.current) {
-                  setIsVisible(true);
-                } else {
-                  release();
-                  poolReleaseRef.current = null;
-                }
-              });
-            } else if (poolReleaseRef.current) {
-              setIsVisible(true);
-            }
-          } else {
-            if (forceLoadedRef.current) {
-              return;
-            }
-            // Video is leaving viewport - aggressively unload to free connections
-            if (videoRef.current) {
-              videoRef.current.pause();
-              videoRef.current.removeAttribute("src");
-              videoRef.current.load();
-            }
-            setIsVisible(false);
-            setIsLoaded(false);
-            setHasError(false);
-            hasErrorRef.current = false;
-            resetClipEndedState();
-            setPreloadMode("metadata");
-            resolveReadyWaiters(true);
-            // Release pool slot
-            if (poolReleaseRef.current) {
-              poolReleaseRef.current();
-              poolReleaseRef.current = null;
-            }
-            // Don't reset retryCount - keep it so next load uses fresh URL if needed
-          }
+          setLoadRequestedState(
+            eager || entry.isIntersecting || forceLoadedRef.current,
+          );
         });
       },
       {
@@ -390,20 +490,70 @@ export const ClippedVideoPlayer = forwardRef<
     return () => {
       observer.disconnect();
     };
-  }, [eager, resolveReadyWaiters, resetClipEndedState]);
+  }, [eager, setLoadRequestedState]);
 
   useEffect(() => {
-    return () => {
-      resolveReadyWaiters(true);
-      // Release pool slot on unmount
-      if (poolReleaseRef.current) {
-        poolReleaseRef.current();
-        poolReleaseRef.current = null;
+    if (eager) {
+      setPreloadMode("auto");
+      setLoadRequestedState(true);
+      requestPoolSlot(true);
+      return;
+    }
+
+    if (!forceLoadedRef.current) {
+      setPreloadMode("metadata");
+      setLoadRequestedState(isIntersectingRef.current);
+    }
+  }, [eager, requestPoolSlot, setLoadRequestedState]);
+
+  useEffect(() => {
+    if (!loadRequested) {
+      cancelPendingAcquire();
+      setSourceAttachedState(false);
+      detachActiveSource();
+      resetLoadState();
+      releasePoolSlot();
+      return;
+    }
+
+    if (isRetrying) {
+      return;
+    }
+
+    if (poolReleaseRef.current) {
+      if (!hasSlot) {
+        setHasSlot(true);
       }
-    };
-  }, [resolveReadyWaiters]);
+      if (!sourceAttachedRef.current) {
+        setSourceAttachedState(true);
+      }
+      return;
+    }
+
+    requestPoolSlot(preloadMode === "auto");
+  }, [
+    cancelPendingAcquire,
+    detachActiveSource,
+    hasSlot,
+    isRetrying,
+    loadRequested,
+    preloadMode,
+    releasePoolSlot,
+    requestPoolSlot,
+    resetLoadState,
+    setSourceAttachedState,
+  ]);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   // Set initial time when video loads
+  const handleLoadStart = useCallback(() => {
+    clearIntentionalUnloadSuppression();
+    setIsLoaded(false);
+    setHasError(false);
+    hasErrorRef.current = false;
+    resetClipEndedState();
+  }, [clearIntentionalUnloadSuppression, resetClipEndedState]);
+
   const handleLoadedMetadata = useCallback(() => {
     if (videoRef.current) {
       videoRef.current.currentTime = adjustedStartTime;
@@ -425,6 +575,13 @@ export const ClippedVideoPlayer = forwardRef<
 
   const handleError = useCallback(
     (e: React.SyntheticEvent<HTMLVideoElement>) => {
+      if (
+        suppressMediaErrorsRef.current ||
+        !sourceAttachedRef.current ||
+        !loadRequestedRef.current
+      ) {
+        return;
+      }
       const video = e.currentTarget;
       const errorCode = video.error?.code;
       const errorMessage = video.error?.message || "Unknown error";
@@ -522,7 +679,7 @@ export const ClippedVideoPlayer = forwardRef<
       className={cn("relative group bg-black", className)}
     >
       {/* Loading placeholder before video is visible */}
-      {!isVisible && (
+      {!loadRequested && (
         <div className="absolute inset-0 flex items-center justify-center bg-[hsl(var(--muted))]">
           <div className="flex flex-col items-center gap-2 text-[hsl(var(--muted-foreground))]">
             <Play className="h-8 w-8" />
@@ -532,7 +689,7 @@ export const ClippedVideoPlayer = forwardRef<
       )}
 
       {/* Loading indicator while video is loading or retrying */}
-      {((isVisible && !isLoaded && !hasError) || isRetrying) && (
+      {((loadRequested && !isLoaded && !hasError) || isRetrying) && (
         <div className="absolute inset-0 flex items-center justify-center bg-black z-10">
           <Loader2 className="h-8 w-8 animate-spin text-white" />
         </div>
@@ -554,12 +711,13 @@ export const ClippedVideoPlayer = forwardRef<
       )}
 
       {/* Video element - only render when visible and not retrying */}
-      {isVisible && !isRetrying && (
+      {isSourceAttached && !isRetrying && (
         <video
           key={`${src}-${retryCount}`}
           ref={videoRef}
           src={videoSrc}
           className="w-full h-full object-contain"
+          onLoadStart={handleLoadStart}
           onLoadedMetadata={handleLoadedMetadata}
           onLoadedData={handleCanPlay}
           onCanPlay={handleCanPlay}

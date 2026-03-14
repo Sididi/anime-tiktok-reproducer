@@ -838,10 +838,92 @@ class TranscriberService:
         return scene_transcriptions
 
     @staticmethod
+    def build_scene_parent_indices(
+        original_scenes: list[SceneTranscription],
+        updated_scenes: list[SceneTranscription],
+    ) -> list[int]:
+        """Map each updated scene to its pre-split parent scene by overlap."""
+        parent_scene_indices: list[int] = []
+
+        for updated_scene in updated_scenes:
+            best_original = None
+            best_overlap = 0.0
+            for original_scene in original_scenes:
+                overlap = max(
+                    0.0,
+                    min(updated_scene.end_time, original_scene.end_time)
+                    - max(updated_scene.start_time, original_scene.start_time),
+                )
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_original = original_scene
+
+            if best_original is None:
+                raise ValueError(
+                    "Unable to determine parent scene for "
+                    f"updated scene {updated_scene.scene_index}"
+                )
+
+            parent_scene_indices.append(best_original.scene_index)
+
+        return parent_scene_indices
+
+    @staticmethod
+    def validate_match_snapshot_alignment(
+        original_scenes: list[SceneTranscription],
+        matches: list[SceneMatch],
+    ) -> None:
+        """Ensure a match snapshot still maps 1:1 to the original scene list."""
+        original_indices = [scene.scene_index for scene in original_scenes]
+        match_indices = [match.scene_index for match in matches]
+
+        if len(match_indices) != len(original_indices):
+            raise ValueError(
+                "Pre-raw match snapshot does not align with original scenes: "
+                f"{len(match_indices)} matches for {len(original_indices)} scenes"
+            )
+
+        if match_indices != original_indices:
+            raise ValueError(
+                "Pre-raw match snapshot does not align with original scenes: "
+                "scene indices diverged before raw-scene splitting"
+            )
+
+    @classmethod
+    def remap_raw_scene_match_snapshot(
+        cls,
+        original_scenes: list[SceneTranscription],
+        updated_scenes: list[SceneTranscription],
+        match_snapshot: MatchList | None,
+        parent_scene_indices: list[int] | None = None,
+    ) -> MatchList | None:
+        """Re-map a captured pre-raw match snapshot onto updated raw-scene splits."""
+        if match_snapshot is None:
+            return None
+
+        cls.validate_match_snapshot_alignment(original_scenes, match_snapshot.matches)
+
+        effective_parent_indices = parent_scene_indices or cls.build_scene_parent_indices(
+            original_scenes,
+            updated_scenes,
+        )
+        remapped_matches = cls.split_scene_matches(
+            original_scenes,
+            updated_scenes,
+            match_snapshot.matches,
+            parent_scene_indices=effective_parent_indices,
+            require_complete=True,
+        )
+        return MatchList(matches=remapped_matches)
+
+    @staticmethod
     def split_scene_matches(
         original_scenes: list[SceneTranscription],
         updated_scenes: list[SceneTranscription],
         matches: list[SceneMatch],
+        parent_scene_indices: list[int] | None = None,
+        *,
+        require_complete: bool = False,
     ) -> list[SceneMatch]:
         """Re-map matches when scenes have been split by raw scene detection.
 
@@ -850,23 +932,34 @@ class TranscriberService:
         """
         matches_by_index = {m.scene_index: m for m in matches}
         original_by_index = {s.scene_index: s for s in original_scenes}
+        effective_parent_indices = parent_scene_indices or TranscriberService.build_scene_parent_indices(
+            original_scenes, updated_scenes,
+        )
+        if len(effective_parent_indices) != len(updated_scenes):
+            raise ValueError(
+                "Raw scene parent mapping length mismatch: "
+                f"{len(effective_parent_indices)} parents for {len(updated_scenes)} scenes"
+            )
 
         new_matches: list[SceneMatch] = []
-        for new_scene in updated_scenes:
-            # Find which original scene this came from (by time overlap)
-            best_original = None
-            best_overlap = 0.0
-            for orig in original_scenes:
-                overlap = max(0.0, min(new_scene.end_time, orig.end_time) - max(new_scene.start_time, orig.start_time))
-                if overlap > best_overlap:
-                    best_overlap = overlap
-                    best_original = orig
-
+        for idx, new_scene in enumerate(updated_scenes):
+            parent_scene_index = effective_parent_indices[idx]
+            best_original = original_by_index.get(parent_scene_index)
             if best_original is None:
+                if require_complete:
+                    raise ValueError(
+                        "Missing original parent scene "
+                        f"{parent_scene_index} for updated scene {new_scene.scene_index}"
+                    )
                 continue
 
-            parent_match = matches_by_index.get(best_original.scene_index)
+            parent_match = matches_by_index.get(parent_scene_index)
             if parent_match is None:
+                if require_complete:
+                    raise ValueError(
+                        "Missing parent match for original scene "
+                        f"{parent_scene_index} while remapping updated scene {new_scene.scene_index}"
+                    )
                 continue
 
             orig_dur = best_original.end_time - best_original.start_time
@@ -892,6 +985,12 @@ class TranscriberService:
                 "end_time": round(new_source_end, 6),
             }))
 
+        if require_complete and len(new_matches) != len(updated_scenes):
+            raise ValueError(
+                "Raw scene match remap produced "
+                f"{len(new_matches)} matches for {len(updated_scenes)} scenes"
+            )
+
         return new_matches
 
     @classmethod
@@ -916,6 +1015,9 @@ class TranscriberService:
                 return
 
             video_path = Path(project.video_path)
+            pre_raw_match_snapshot = ProjectService.load_matches(project_id)
+            if pre_raw_match_snapshot is not None:
+                pre_raw_match_snapshot = pre_raw_match_snapshot.model_copy(deep=True)
 
             # Extract WAV to project dir (reused by diarization)
             project_dir = ProjectService.get_project_dir(project_id)
@@ -959,6 +1061,8 @@ class TranscriberService:
             detection_result: RawSceneDetectionResult | None = None
 
             if _settings.hf_token:
+                original_scenes = [scene.model_copy(deep=True) for scene in scene_transcriptions]
+
                 yield TranscriptionProgress(
                     "processing", 0.85,
                     "Detecting raw scenes (speaker diarization)...",
@@ -969,11 +1073,18 @@ class TranscriberService:
                 updated_scenes, detection_result = await loop.run_in_executor(
                     None,
                     lambda: RawSceneDetectorService.detect(
-                        wav_path, list(transcription.scenes),
+                        wav_path,
+                        [scene.model_copy(deep=True) for scene in original_scenes],
                     ),
                 )
 
                 if detection_result and detection_result.has_raw_scenes:
+                    matches_for_raw_backup = (
+                        pre_raw_match_snapshot.model_copy(deep=True)
+                        if pre_raw_match_snapshot is not None
+                        else None
+                    )
+
                     # Mark raw scenes and clear their text
                     raw_indices = {c.scene_index for c in detection_result.candidates}
                     for s in updated_scenes:
@@ -983,16 +1094,16 @@ class TranscriberService:
                             s.words = []
 
                     # Sync matches and scenes.json when scenes were split
-                    original_scenes = list(scene_transcriptions)
                     if len(updated_scenes) != len(original_scenes):
-                        # Split matches if they exist
-                        match_list = ProjectService.load_matches(project_id)
-                        if match_list:
-                            new_matches = cls.split_scene_matches(
-                                original_scenes, updated_scenes, match_list.matches,
-                            )
-                            match_list.matches = new_matches
-                            ProjectService.save_matches(project_id, match_list)
+                        remapped_match_list = cls.remap_raw_scene_match_snapshot(
+                            original_scenes,
+                            updated_scenes,
+                            pre_raw_match_snapshot,
+                            parent_scene_indices=detection_result.scene_parent_indices,
+                        )
+                        if remapped_match_list is not None:
+                            matches_for_raw_backup = remapped_match_list.model_copy(deep=True)
+                            ProjectService.save_matches(project_id, remapped_match_list)
 
                         # Sync scenes.json with updated scene structure
                         updated_scene_list = SceneList(scenes=[
@@ -1011,10 +1122,9 @@ class TranscriberService:
                     (project_dir / "transcription_raw_backup.json").write_text(
                         transcription.model_dump_json(indent=2)
                     )
-                    backup_matches = ProjectService.load_matches(project_id)
-                    if backup_matches:
+                    if matches_for_raw_backup is not None:
                         (project_dir / "matches_raw_backup.json").write_text(
-                            backup_matches.model_dump_json(indent=2)
+                            matches_for_raw_backup.model_dump_json(indent=2)
                         )
 
                     # Save detection result
