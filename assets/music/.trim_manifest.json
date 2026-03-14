@@ -1,10 +1,30 @@
 {
   "credits song for my death.wav": {
-    "md5": "9f5b6a7c212b6a18109845a1988384e7",
-    "trimmed_ms": 280.17
+    "md5": "4fdd8e987d1fcbefaeb58e5ed3e27ab7",
+    "trimmed_ms": 3640.31
   },
   "credits song for my death but im the final boss.wav": {
     "md5": "7665369e8a5e0686c76a032b10ae00f1",
     "trimmed_ms": 64.14
+  },
+  "la lecon particuliere.wav": {
+    "md5": "c6cb42985b96949c3da47bcc741883c4",
+    "trimmed_ms": 3398.81
+  },
+  "royalty.wav": {
+    "md5": "14b17a131d8bbcbbca5b263f55ef9560",
+    "trimmed_ms": 0.0
+  },
+  "girl a full small loop.wav": {
+    "md5": "fc59b2313853b758e21d19776ea364d5",
+    "trimmed_ms": 144.27
+  },
+  "girl a cut super slowed.wav": {
+    "md5": "c52912ae1b97def8045215805e96aea8",
+    "trimmed_ms": 266.98
+  },
+  "carol of the bells.wav": {
+    "md5": "96a7301f334f329584f2751380d6824c",
+    "trimmed_ms": 506.67
   }
 }

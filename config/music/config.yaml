@@ -1,4 +1,4 @@
-default_music_key: credits_song_death
+default_music_key: carol_of_the_bells
 
 music:
   credits_song_death:
@@ -6,7 +6,32 @@ music:
     file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/credits song for my death.wav"
     volume_db: -30
 
-  credits_song_death_final_boss:
-    display_name: "Credits song for my death but im the final boss"
-    file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/credits song for my death but im the final boss.wav"
+  # credits_song_death_final_boss:
+  #   display_name: "Credits song for my death but im the final boss"
+  #   file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/credits song for my death but im the final boss.wav"
+  #   volume_db: -30
+
+  lecon_particuliere:
+    display_name: "La leçon particulière"
+    file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/la lecon particuliere.wav"
+    volume_db: -30
+
+  royalty:
+    display_name: "Royalty"
+    file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/royalty.wav"
+    volume_db: -30
+
+  girl_a_full_small_loop:
+    display_name: "Girl A Full - Small Loop"
+    file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/girl a full small loop.wav"
+    volume_db: -30
+
+  girl_a_cut_super_slowed:
+    display_name: "Girl A Cut - Super Slowed"
+    file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/girl a cut super slowed.wav"
+    volume_db: -30
+
+  carol_of_the_bells:
+    display_name: "Carol of the Bells"
+    file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/carol of the bells.wav"
     volume_db: -30

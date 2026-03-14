@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-trim_silence.py — Remove leading silence from audio files using ffmpeg.
+trim_silence.py — Remove leading and trailing silence from audio files using ffmpeg.
 
 Usage examples
 --------------
 # Analyse only (no modification)
-  python trim_silence.py audio.wav --check
+  python trim_silence.py --check audio.wav
 
 # In-place trim (creates a .bak backup by default)
   python trim_silence.py audio.wav
@@ -33,6 +33,7 @@ Usage examples
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import json
 import shutil
@@ -58,6 +59,30 @@ from _media_binaries import (
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MUSIC_CONFIG_PATH = REPO_ROOT / "config" / "music" / "config.yaml"
 MANIFEST_FILENAME = ".trim_manifest.json"
+SILENCE_DETECT_DURATION_S = 0.01
+EDGE_EPSILON_S = 0.001
+
+
+@dataclass(frozen=True)
+class SilenceWindow:
+    start_s: float
+    end_s: float
+
+
+@dataclass(frozen=True)
+class TrimAnalysis:
+    duration_ms: float
+    leading_ms: float
+    trailing_ms: float
+
+    @property
+    def total_trim_ms(self) -> float:
+        return self.leading_ms + self.trailing_ms
+
+    @property
+    def content_end_ms(self) -> float:
+        return max(self.leading_ms, self.duration_ms - self.trailing_ms)
+
 
 # ---------------------------------------------------------------------------
 # Manifest helpers  (tracks already-processed files via their MD5)
@@ -149,17 +174,12 @@ def _probe_duration_ms(path: Path) -> float:
     return float(result.stdout.strip()) * 1000.0
 
 
-def _detect_leading_silence_ms(path: Path, threshold: str) -> float:
-    """
-    Return the duration of leading silence in milliseconds.
-
-    Uses ffmpeg's silencedetect filter and parses its output to find the
-    first 'silence_end' timestamp, which marks where audio actually starts.
-    """
+def _run_silencedetect(path: Path, threshold: str) -> str:
+    """Run ffmpeg silencedetect and return stderr output."""
     cmd = rewrite_media_command(
         [
             "ffmpeg", "-i", str(path),
-            "-af", f"silencedetect=noise={threshold}:duration=0.01",
+            "-af", f"silencedetect=noise={threshold}:duration={SILENCE_DETECT_DURATION_S}",
             "-f", "null", "-",
         ]
     )
@@ -169,25 +189,85 @@ def _detect_leading_silence_ms(path: Path, threshold: str) -> float:
         text=True,
         env=get_media_subprocess_env(cmd),
     )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg silencedetect failed:\n{result.stderr.strip()}")
     # silencedetect writes to stderr
-    output = result.stderr
+    return result.stderr
+
+
+def _parse_silence_windows(output: str, duration_ms: float) -> list[SilenceWindow]:
+    """Parse ffmpeg silencedetect output into silence windows."""
+    windows: list[SilenceWindow] = []
+    current_start: float | None = None
+
     for line in output.splitlines():
-        if "silence_end" in line:
-            # format: "silence_end: 0.234 | silence_duration: 0.234"
-            parts = line.split("silence_end:")
-            if len(parts) > 1:
-                end_str = parts[1].split("|")[0].strip()
-                return float(end_str) * 1000.0
-    return 0.0
+        if "silence_start:" in line:
+            start_str = line.split("silence_start:", 1)[1].strip()
+            current_start = float(start_str)
+            continue
+
+        if "silence_end:" in line:
+            end_str = line.split("silence_end:", 1)[1].split("|", 1)[0].strip()
+            end_s = float(end_str)
+            start_s = current_start if current_start is not None else 0.0
+            windows.append(
+                SilenceWindow(
+                    start_s=max(0.0, start_s),
+                    end_s=max(start_s, end_s),
+                )
+            )
+            current_start = None
+
+    if current_start is not None:
+        windows.append(
+            SilenceWindow(
+                start_s=max(0.0, current_start),
+                end_s=duration_ms / 1000.0,
+            )
+        )
+
+    return windows
+
+
+def _analyze_trim(path: Path, threshold: str) -> TrimAnalysis:
+    """Return trim bounds for leading and trailing silence only."""
+    duration_ms = _probe_duration_ms(path)
+    output = _run_silencedetect(path, threshold)
+    windows = _parse_silence_windows(output, duration_ms)
+
+    leading_ms = 0.0
+    if windows and windows[0].start_s <= EDGE_EPSILON_S:
+        leading_ms = min(duration_ms, windows[0].end_s * 1000.0)
+
+    content_end_ms = duration_ms
+    if windows and (duration_ms / 1000.0 - windows[-1].end_s) <= EDGE_EPSILON_S:
+        content_end_ms = max(leading_ms, windows[-1].start_s * 1000.0)
+
+    trailing_ms = max(0.0, duration_ms - content_end_ms)
+    return TrimAnalysis(
+        duration_ms=duration_ms,
+        leading_ms=leading_ms,
+        trailing_ms=trailing_ms,
+    )
+
+
+def _format_trim_parts(analysis: TrimAnalysis) -> str:
+    """Format per-edge trim details for CLI output."""
+    parts: list[str] = []
+    if analysis.leading_ms > 0:
+        parts.append(f"{analysis.leading_ms:.1f} ms leading")
+    if analysis.trailing_ms > 0:
+        parts.append(f"{analysis.trailing_ms:.1f} ms trailing")
+    return " + ".join(parts)
 
 
 def _trim_audio(
     input_path: Path,
     output_path: Path,
-    threshold: str,
+    analysis: TrimAnalysis,
 ) -> float:
     """
-    Run ffmpeg silenceremove on start periods only.
+    Trim only the leading/trailing silence bounds detected by _analyze_trim.
     Returns the actual number of ms trimmed (estimated via duration delta).
     """
     duration_before = _probe_duration_ms(input_path)
@@ -195,11 +275,12 @@ def _trim_audio(
     cmd = [
         "ffmpeg", "-y",
         "-i", str(input_path),
-        "-af", (
-            f"silenceremove="
-            f"start_periods=1:"
-            f"start_duration=0:"
-            f"start_threshold={threshold}"
+        "-af",
+        (
+            f"atrim="
+            f"start={analysis.leading_ms / 1000.0:.6f}:"
+            f"end={analysis.content_end_ms / 1000.0:.6f},"
+            f"asetpts=PTS-STARTPTS"
         ),
         str(output_path),
     ]
@@ -211,7 +292,7 @@ def _trim_audio(
         env=get_media_subprocess_env(cmd),
     )
     if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg silenceremove failed:\n{result.stderr.strip()}")
+        raise RuntimeError(f"ffmpeg trim failed:\n{result.stderr.strip()}")
 
     duration_after = _probe_duration_ms(output_path)
     return max(0.0, duration_before - duration_after)
@@ -222,18 +303,22 @@ def _trim_audio(
 # ---------------------------------------------------------------------------
 
 def check_file(path: Path, threshold: str) -> None:
-    """Analyse leading silence without touching the file."""
+    """Analyse leading/trailing silence without touching the file."""
     path = path.resolve()
     if not path.exists():
         print(f"[ERROR] File not found: {path}", file=sys.stderr)
         sys.exit(1)
 
     print(f"Analysing: {path.name}")
-    silence_ms = _detect_leading_silence_ms(path, threshold)
-    if silence_ms > 0:
-        print(f"  → Leading silence detected: {silence_ms:.1f} ms  (threshold {threshold})")
+    analysis = _analyze_trim(path, threshold)
+    if analysis.total_trim_ms > 0:
+        trim_parts = _format_trim_parts(analysis)
+        print(
+            f"  → Silence detected: {trim_parts} "
+            f"({analysis.total_trim_ms:.1f} ms total, threshold {threshold})"
+        )
     else:
-        print(f"  → No leading silence detected at threshold {threshold}")
+        print(f"  → No leading/trailing silence detected at threshold {threshold}")
     already = _is_already_processed(path)
     print(f"  → Already trimmed (manifest): {already}")
 
@@ -260,15 +345,19 @@ def trim_file(
         return
 
     # --- Quick silence check ---
-    silence_ms = _detect_leading_silence_ms(input_path, threshold)
-    if silence_ms == 0:
-        print(f"[OK]   {input_path.name} — no leading silence detected, nothing to do")
+    analysis = _analyze_trim(input_path, threshold)
+    if analysis.total_trim_ms == 0:
+        print(f"[OK]   {input_path.name} — no leading/trailing silence detected, nothing to do")
         if in_place and not _is_already_processed(input_path):
             if not dry_run:
                 _mark_processed(input_path, 0.0)
         return
 
-    print(f"[TRIM] {input_path.name} — {silence_ms:.1f} ms of leading silence to remove")
+    trim_parts = _format_trim_parts(analysis)
+    print(
+        f"[TRIM] {input_path.name} — {trim_parts} "
+        f"({analysis.total_trim_ms:.1f} ms total) to remove"
+    )
 
     if dry_run:
         print("       (dry-run: no file written)")
@@ -283,7 +372,7 @@ def trim_file(
             tmp_path = Path(tmp.name)
 
         try:
-            trimmed_ms = _trim_audio(input_path, tmp_path, threshold)
+            trimmed_ms = _trim_audio(input_path, tmp_path, analysis)
             if backup:
                 bak_path = input_path.with_suffix(input_path.suffix + ".bak")
                 shutil.copy2(input_path, bak_path)
@@ -296,7 +385,7 @@ def trim_file(
         _mark_processed(input_path, trimmed_ms)
         print(f"       Done — {trimmed_ms:.1f} ms removed  ✓")
     else:
-        trimmed_ms = _trim_audio(input_path, effective_output, threshold)
+        trimmed_ms = _trim_audio(input_path, effective_output, analysis)
         print(f"       Done — {trimmed_ms:.1f} ms removed → {effective_output}  ✓")
 
 
@@ -335,7 +424,7 @@ def trim_all(threshold: str, force: bool, dry_run: bool, config_path: Path) -> N
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="trim_silence",
-        description="Remove leading silence from audio files using ffmpeg.",
+        description="Remove leading and trailing silence from audio files using ffmpeg.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -358,7 +447,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--check",
         type=Path,
         metavar="FILE",
-        help="Analyse leading silence without modifying the file.",
+        help="Analyse leading/trailing silence without modifying the file.",
     )
 
     # --- Output ---
