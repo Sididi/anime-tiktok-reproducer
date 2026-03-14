@@ -1227,6 +1227,71 @@ class ProcessingService:
         return entries
 
     @classmethod
+    async def _build_raw_scene_image_render_plan(
+        cls,
+        project: Project,
+        transcription: Transcription,
+        resolved_scene_sources: dict[int, ResolvedSceneSource],
+    ) -> dict[Path, dict[int, list[tuple[float, float]]]]:
+        raw_scenes = [scene for scene in transcription.scenes if scene.is_raw]
+        if not raw_scenes:
+            return {}
+
+        target_language = AnimeLibraryService.normalize_stream_language(
+            project.output_language or transcription.language
+        )
+        probe_cache: dict[str, Any] = {}
+        render_plan: dict[Path, dict[int, list[tuple[float, float]]]] = {}
+
+        for scene in raw_scenes:
+            resolved_source = resolved_scene_sources.get(scene.scene_index)
+            if resolved_source is None:
+                continue
+
+            source_key = str(resolved_source.source_path.resolve())
+            probe = probe_cache.get(source_key)
+            if probe is None:
+                probe = await asyncio.to_thread(
+                    AnimeLibraryService.probe_source_media_sync,
+                    resolved_source.source_path,
+                )
+                probe_cache[source_key] = probe
+            if probe is None or not probe.subtitle_streams:
+                continue
+
+            synthetic_entries = [
+                SubtitleSidecarEntry(
+                    stream_index=stream.index,
+                    stream_position=stream.stream_position,
+                    codec_name=stream.codec_name,
+                    language=stream.language,
+                    raw_language=stream.raw_language,
+                    title=stream.title,
+                    kind=AnimeLibraryService._subtitle_kind_for_codec(stream.codec_name),
+                    asset_filename="planned",
+                )
+                for stream in probe.subtitle_streams
+            ]
+            selected_entry = AnimeLibraryService.select_preferred_subtitle_entry(
+                synthetic_entries,
+                target_language=target_language,
+            )
+            if selected_entry is None or selected_entry.kind != "image":
+                continue
+
+            render_plan.setdefault(resolved_source.source_path, {}).setdefault(
+                selected_entry.stream_position,
+                [],
+            ).append(
+                (
+                    resolved_source.source_in_seconds,
+                    resolved_source.source_out_seconds,
+                )
+            )
+
+        return render_plan
+
+    @classmethod
     async def _collect_raw_scene_source_subtitles(
         cls,
         project: Project,
@@ -1249,6 +1314,7 @@ class ProcessingService:
         image_entries: list[RawSceneSubtitleImageEntry] = []
         parsed_text_cache: dict[str, list[Any]] = {}
         parsed_cue_cache: dict[str, list[dict[str, Any]]] = {}
+        rendered_cue_cache: dict[tuple[str, int], Path | None] = {}
 
         for scene in raw_scenes:
             resolved_source = resolved_scene_sources.get(scene.scene_index)
@@ -1317,6 +1383,10 @@ class ProcessingService:
 
             for cue_idx, cue in enumerate(cue_entries, start=1):
                 try:
+                    cue_index = int(cue.get("cue_index", cue_idx))
+                except (TypeError, ValueError):
+                    cue_index = cue_idx
+                try:
                     cue_start = float(cue.get("start"))
                     cue_end = float(cue.get("end"))
                 except (TypeError, ValueError):
@@ -1326,14 +1396,29 @@ class ProcessingService:
                 if clipped_end <= clipped_start:
                     continue
                 cue_asset_filename = str(cue.get("asset_filename", "")).strip()
-                if not cue_asset_filename:
-                    continue
-                source_cue_asset_path = cue_manifest_path.parent / cue_asset_filename
-                if not source_cue_asset_path.exists():
+                source_cue_asset_path: Path | None = None
+                if cue_asset_filename:
+                    candidate_asset_path = cue_manifest_path.parent / cue_asset_filename
+                    if candidate_asset_path.exists():
+                        source_cue_asset_path = candidate_asset_path
+                if source_cue_asset_path is None:
+                    cache_entry_key = (cache_key, cue_index)
+                    if cache_entry_key not in rendered_cue_cache:
+                        rendered_cue_cache[cache_entry_key] = (
+                            await AnimeLibraryService.ensure_subtitle_sidecar_cue_asset(
+                                resolved_source.source_path,
+                                selected_entry,
+                                cue_index=cue_index,
+                                cue_start=cue_start,
+                                cue_end=cue_end,
+                            )
+                        )
+                    source_cue_asset_path = rendered_cue_cache[cache_entry_key]
+                if source_cue_asset_path is None or not source_cue_asset_path.exists():
                     continue
                 raw_output_dir.mkdir(parents=True, exist_ok=True)
                 target_name = (
-                    f"scene_{scene.scene_index:04d}_cue_{cue_idx:04d}{source_cue_asset_path.suffix.lower()}"
+                    f"scene_{scene.scene_index:04d}_cue_{cue_index:04d}{source_cue_asset_path.suffix.lower()}"
                 )
                 target_path = raw_output_dir / target_name
                 if not target_path.exists():
@@ -1800,6 +1885,12 @@ class ProcessingService:
                         return  # Stop processing here - frontend will redirect to gap resolution
 
             # Step 3: Normalize only the source episodes used by final matches.
+            playback_scene_sources = cls.resolve_scene_sources(matches, source_rate)
+            raw_scene_image_render_plan = await cls._build_raw_scene_image_render_plan(
+                project,
+                new_transcription,
+                playback_scene_sources,
+            )
             source_groups = await cls._collect_required_source_groups(matches)
             total_source_groups = len(source_groups)
             matches_updated = False
@@ -1823,7 +1914,10 @@ class ProcessingService:
                         f"{resolved_source_path.name}",
                     )
                     normalization_result = await AnimeLibraryService.normalize_source_for_processing(
-                        resolved_source_path
+                        resolved_source_path,
+                        subtitle_image_render_windows=raw_scene_image_render_plan.get(
+                            resolved_source_path,
+                        ),
                     )
                     if cls._update_absolute_match_episode_hints(
                         source_matches,

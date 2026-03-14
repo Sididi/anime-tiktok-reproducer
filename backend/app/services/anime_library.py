@@ -987,6 +987,96 @@ class AnimeLibraryService:
         return cls.get_subtitle_sidecar_dir(source_path) / entry.cue_manifest_filename
 
     @classmethod
+    def load_subtitle_sidecar_manifest(
+        cls,
+        source_path: Path,
+    ) -> dict[str, Any] | None:
+        manifest_path = cls.get_subtitle_sidecar_manifest_path(source_path)
+        if not manifest_path.exists():
+            return None
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    @classmethod
+    def get_subtitle_sidecar_generated_from_path(
+        cls,
+        source_path: Path,
+    ) -> Path | None:
+        payload = cls.load_subtitle_sidecar_manifest(source_path)
+        if not payload:
+            return None
+        generated_from_raw = str(payload.get("generated_from", "")).strip()
+        if not generated_from_raw:
+            return None
+        return Path(generated_from_raw)
+
+    @staticmethod
+    def _cue_overlaps_any_window(
+        cue_start: float,
+        cue_end: float,
+        windows: list[tuple[float, float]],
+    ) -> bool:
+        return any(cue_end > window_start and cue_start < window_end for window_start, window_end in windows)
+
+    @staticmethod
+    def _sidecar_cue_asset_relative_path(
+        entry: SubtitleSidecarEntry,
+        cue_index: int,
+    ) -> str:
+        asset_stem = Path(entry.asset_filename or "subtitle_stream").stem
+        return f"{asset_stem}_cues/cue_{cue_index:04d}.png"
+
+    @classmethod
+    def _write_sidecar_cue_manifest(
+        cls,
+        cue_manifest_path: Path,
+        cues: list[dict[str, Any]],
+    ) -> None:
+        cue_manifest_path.write_text(
+            json.dumps({"cues": cues}, indent=2),
+            encoding="utf-8",
+        )
+
+    @classmethod
+    def _update_sidecar_cue_manifest_asset(
+        cls,
+        cue_manifest_path: Path,
+        *,
+        cue_index: int,
+        asset_filename: str,
+    ) -> None:
+        if not cue_manifest_path.exists():
+            return
+        try:
+            payload = json.loads(cue_manifest_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return
+        raw_cues = payload.get("cues", []) if isinstance(payload, dict) else []
+        if not isinstance(raw_cues, list):
+            return
+
+        updated = False
+        for idx, cue in enumerate(raw_cues, start=1):
+            if not isinstance(cue, dict):
+                continue
+            try:
+                entry_index = int(cue.get("cue_index", idx))
+            except (TypeError, ValueError):
+                entry_index = idx
+            if entry_index != cue_index:
+                continue
+            cue["asset_filename"] = asset_filename
+            cue["cue_index"] = cue_index
+            updated = True
+            break
+
+        if updated:
+            cls._write_sidecar_cue_manifest(cue_manifest_path, raw_cues)
+
+    @classmethod
     def load_subtitle_sidecar_entries(
         cls,
         source_path: Path,
@@ -1212,6 +1302,55 @@ class AnimeLibraryService:
 
         return False
 
+    @classmethod
+    async def ensure_subtitle_sidecar_cue_asset(
+        cls,
+        source_path: Path,
+        entry: SubtitleSidecarEntry,
+        *,
+        cue_index: int,
+        cue_start: float,
+        cue_end: float,
+    ) -> Path | None:
+        sidecar_asset_path = cls.get_subtitle_sidecar_asset_path(source_path, entry)
+        cue_manifest_path = cls.get_subtitle_sidecar_cue_manifest_path(source_path, entry)
+        if sidecar_asset_path is None or cue_manifest_path is None:
+            return None
+
+        cue_relative_path = cls._sidecar_cue_asset_relative_path(entry, cue_index)
+        cue_asset_path = cue_manifest_path.parent / cue_relative_path
+        if cue_asset_path.exists():
+            if cls._png_has_visible_alpha(cue_asset_path):
+                cls._update_sidecar_cue_manifest_asset(
+                    cue_manifest_path,
+                    cue_index=cue_index,
+                    asset_filename=cue_relative_path,
+                )
+                return cue_asset_path
+            with suppress(FileNotFoundError):
+                cue_asset_path.unlink()
+
+        generated_from_path = cls.get_subtitle_sidecar_generated_from_path(source_path)
+        if generated_from_path is None or not generated_from_path.exists():
+            return None
+
+        rendered = await cls._render_pgs_cue_png_from_source(
+            source_path=generated_from_path,
+            stream_position=entry.stream_position,
+            cue_start=cue_start,
+            cue_end=cue_end,
+            output_path=cue_asset_path,
+        )
+        if not rendered or not cue_asset_path.exists():
+            return None
+
+        cls._update_sidecar_cue_manifest_asset(
+            cue_manifest_path,
+            cue_index=cue_index,
+            asset_filename=cue_relative_path,
+        )
+        return cue_asset_path
+
     @staticmethod
     def _png_has_visible_alpha(path: Path) -> bool:
         try:
@@ -1228,6 +1367,7 @@ class AnimeLibraryService:
         source_path: Path,
         normalized_target_path: Path,
         probe: SourceMediaProbe,
+        subtitle_image_render_windows: dict[int, list[tuple[float, float]]] | None = None,
     ) -> None:
         if not probe.subtitle_streams:
             return
@@ -1239,6 +1379,7 @@ class AnimeLibraryService:
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
         manifest_entries: list[dict[str, Any]] = []
+        render_windows = subtitle_image_render_windows or {}
         for stream in probe.subtitle_streams:
             kind = cls._subtitle_kind_for_codec(stream.codec_name)
             entry_payload: dict[str, Any] = {
@@ -1302,35 +1443,54 @@ class AnimeLibraryService:
 
                     cues = await cls._probe_pgs_cues_from_sup(asset_path)
                     if cues:
-                        cue_dir_name = asset_path.stem + "_cues"
-                        cue_dir = tmp_dir / cue_dir_name
-                        cue_dir.mkdir(parents=True, exist_ok=True)
                         cue_manifest_name = asset_path.stem + ".cues.json"
                         cue_manifest_entries: list[dict[str, Any]] = []
+                        requested_windows = render_windows.get(stream.stream_position, [])
                         for cue_idx, cue in enumerate(cues, start=1):
-                            cue_png_name = f"cue_{cue_idx:04d}.png"
-                            cue_png_path = cue_dir / cue_png_name
-                            rendered = await cls._render_pgs_cue_png_from_source(
-                                source_path=source_path,
-                                stream_position=stream.stream_position,
-                                cue_start=float(cue["start"]),
-                                cue_end=float(cue["end"]),
-                                output_path=cue_png_path,
-                            )
-                            if not rendered:
-                                continue
-                            cue_manifest_entries.append(
-                                {
-                                    "start": float(cue["start"]),
-                                    "end": float(cue["end"]),
-                                    "asset_filename": f"{cue_dir_name}/{cue_png_name}",
-                                }
-                            )
+                            cue_start = float(cue["start"])
+                            cue_end = float(cue["end"])
+                            cue_entry: dict[str, Any] = {
+                                "cue_index": cue_idx,
+                                "start": cue_start,
+                                "end": cue_end,
+                            }
+                            if requested_windows and cls._cue_overlaps_any_window(
+                                cue_start,
+                                cue_end,
+                                requested_windows,
+                            ):
+                                cue_relative_path = cls._sidecar_cue_asset_relative_path(
+                                    SubtitleSidecarEntry(
+                                        stream_index=stream.index,
+                                        stream_position=stream.stream_position,
+                                        codec_name=stream.codec_name,
+                                        language=stream.language,
+                                        raw_language=stream.raw_language,
+                                        title=stream.title,
+                                        kind=kind,
+                                        asset_filename=asset_name,
+                                    ),
+                                    cue_idx,
+                                )
+                                cue_png_path = tmp_dir / cue_relative_path
+                                rendered = await cls._render_pgs_cue_png_from_source(
+                                    source_path=source_path,
+                                    stream_position=stream.stream_position,
+                                    cue_start=cue_start,
+                                    cue_end=cue_end,
+                                    output_path=cue_png_path,
+                                )
+                                if rendered:
+                                    cue_entry["asset_filename"] = cue_relative_path
+                                elif cue_png_path.exists():
+                                    with suppress(FileNotFoundError):
+                                        cue_png_path.unlink()
+                            cue_manifest_entries.append(cue_entry)
                         if cue_manifest_entries:
                             cue_manifest_path = tmp_dir / cue_manifest_name
-                            cue_manifest_path.write_text(
-                                json.dumps({"cues": cue_manifest_entries}, indent=2),
-                                encoding="utf-8",
+                            cls._write_sidecar_cue_manifest(
+                                cue_manifest_path,
+                                cue_manifest_entries,
                             )
                             entry_payload["cue_manifest_filename"] = cue_manifest_name
                 else:
@@ -1403,6 +1563,8 @@ class AnimeLibraryService:
     async def normalize_source_for_processing(
         cls,
         source_path: Path,
+        *,
+        subtitle_image_render_windows: dict[int, list[tuple[float, float]]] | None = None,
     ) -> SourceNormalizationResult:
         """Normalize one source episode to Premiere-safe H.264 MP4 + AAC when needed."""
         if not source_path.exists() or not source_path.is_file():
@@ -1428,6 +1590,7 @@ class AnimeLibraryService:
                         source_path=plan.source_path,
                         normalized_target_path=target_path,
                         probe=plan.probe,
+                        subtitle_image_render_windows=subtitle_image_render_windows,
                     )
                 except Exception as exc:
                     logger.warning(
@@ -1541,6 +1704,7 @@ class AnimeLibraryService:
                     source_path=plan.source_path,
                     normalized_target_path=target_path,
                     probe=plan.probe,
+                    subtitle_image_render_windows=subtitle_image_render_windows,
                 )
             except Exception as exc:
                 logger.warning(
