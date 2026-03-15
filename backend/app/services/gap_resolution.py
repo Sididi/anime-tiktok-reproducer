@@ -89,6 +89,10 @@ class GapCandidate:
     added_duration: float = 0.0
     detector_threshold: float | None = None
     direction_priority: int = 0
+    clearance_side: str | None = None
+    side_clearance_seconds: float | None = None
+    continuation_priority: int = 1
+    continuation_bias_applied: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -106,6 +110,14 @@ class GapCandidate:
             "added_duration": round(self.added_duration, 6),
             "detector_threshold": self.detector_threshold,
             "direction_priority": self.direction_priority,
+            "clearance_side": self.clearance_side,
+            "side_clearance_seconds": (
+                None
+                if self.side_clearance_seconds is None
+                else round(self.side_clearance_seconds, 6)
+            ),
+            "continuation_priority": self.continuation_priority,
+            "continuation_bias_applied": self.continuation_bias_applied,
         }
 
 
@@ -138,6 +150,7 @@ class _AutoFillState:
     start_time: float
     end_time: float
     cut_penalty: int
+    continuation_penalty: int
     added_duration_micro: int
     candidate_rank: int
     candidate: GapCandidate | None
@@ -159,6 +172,14 @@ class _NeighborContext:
 
     previous: _NeighborWindow | None = None
     next: _NeighborWindow | None = None
+
+
+@dataclass(frozen=True)
+class _SideClearance:
+    """Nearest occupied source window on one side of the current match."""
+
+    has_blocker: bool
+    clearance_seconds: float
 
 
 @dataclass
@@ -211,6 +232,7 @@ class GapResolutionService:
     # Default source rate (23.976fps for most anime)
     SOURCE_RATE = FrameRateInfo(timebase=24, ntsc=True)
     OVERLAP_COST_SCALE = 1_000_000
+    CONTINUATION_TIE_WINDOW = 0.15
 
     @classmethod
     async def detect_video_fps(cls, video_path: Path) -> Fraction:
@@ -1077,12 +1099,13 @@ class GapResolutionService:
     def _candidate_sort_key(
         cls,
         candidate: GapCandidate,
-    ) -> tuple[int, int, int, int, int, int, str, int, int]:
+    ) -> tuple[int, int, int, int, int, int, int, str, int, int]:
         """Sort candidates according to the /gaps ranking policy."""
         return (
             candidate.overlap_count,
             int(round(candidate.overlap_seconds * cls.OVERLAP_COST_SCALE)),
             0 if candidate.is_cut_aligned else 1,
+            candidate.continuation_priority,
             int(round(candidate.added_duration * cls.OVERLAP_COST_SCALE)),
             candidate.direction_priority,
             cls._threshold_rank(candidate.detector_threshold),
@@ -1145,6 +1168,7 @@ class GapResolutionService:
         )
 
         ranked = cls._merge_candidates(cut_candidates, fallback_candidates)
+        ranked = cls._apply_continuation_bias(ranked, gap, neighbor_context)
         return ranked[:max_candidates]
 
     @classmethod
@@ -1160,8 +1184,9 @@ class GapResolutionService:
         1) Number of overlaps across adjacent timeline scenes (same episode only)
         2) Total overlap duration
         3) Prefer cut-aligned candidates over fallback windows
-        4) Minimize added source duration (closer to the 75% floor)
-        5) Candidate rank sum (stable deterministic tie-break)
+        4) Prefer the continuation/open-side clean cut candidate inside the tie window
+        5) Minimize added source duration (closer to the 75% floor)
+        6) Candidate rank sum (stable deterministic tie-break)
         """
         if not matches:
             return AutoFillSelectionResult(
@@ -1200,6 +1225,7 @@ class GapResolutionService:
                         start_time=candidate.start_time,
                         end_time=candidate.end_time,
                         cut_penalty=0 if candidate.is_cut_aligned else 1,
+                        continuation_penalty=candidate.continuation_priority,
                         added_duration_micro=int(
                             round(candidate.added_duration * cls.OVERLAP_COST_SCALE)
                         ),
@@ -1216,6 +1242,7 @@ class GapResolutionService:
                         start_time=match.start_time,
                         end_time=match.end_time,
                         cut_penalty=0,
+                        continuation_penalty=0,
                         added_duration_micro=0,
                         candidate_rank=0,
                         candidate=None,
@@ -1228,14 +1255,19 @@ class GapResolutionService:
             if prev_state.episode_key != next_state.episode_key:
                 return (0, 0)
             tolerance = tolerance_by_episode.get(prev_state.episode_key, default_tolerance)
-            overlap_raw = prev_state.end_time - next_state.start_time
-            overlap_effective = max(0.0, overlap_raw - tolerance)
+            overlap_effective = cls._interval_overlap_seconds(
+                prev_state.start_time,
+                prev_state.end_time,
+                next_state.start_time,
+                next_state.end_time,
+                tolerance,
+            )
             if overlap_effective <= 0:
                 return (0, 0)
             overlap_micro = max(1, int(round(overlap_effective * cls.OVERLAP_COST_SCALE)))
             return (1, overlap_micro)
 
-        dp_costs: list[list[tuple[int, int, int, int, int] | None]] = [
+        dp_costs: list[list[tuple[int, int, int, int, int, int] | None]] = [
             [None for _ in scene_states] for scene_states in states_by_scene
         ]
         dp_prev: list[list[int | None]] = [
@@ -1247,6 +1279,7 @@ class GapResolutionService:
                 0,
                 0,
                 state.cut_penalty,
+                state.continuation_penalty,
                 state.added_duration_micro,
                 state.candidate_rank,
             )
@@ -1255,7 +1288,7 @@ class GapResolutionService:
             previous_states = states_by_scene[scene_pos - 1]
             current_states = states_by_scene[scene_pos]
             for current_index, current_state in enumerate(current_states):
-                best_cost: tuple[int, int, int, int, int] | None = None
+                best_cost: tuple[int, int, int, int, int, int] | None = None
                 best_previous_index: int | None = None
                 for previous_index, previous_state in enumerate(previous_states):
                     previous_cost = dp_costs[scene_pos - 1][previous_index]
@@ -1266,8 +1299,9 @@ class GapResolutionService:
                         previous_cost[0] + overlap_count,
                         previous_cost[1] + overlap_micro,
                         previous_cost[2] + current_state.cut_penalty,
-                        previous_cost[3] + current_state.added_duration_micro,
-                        previous_cost[4] + current_state.candidate_rank,
+                        previous_cost[3] + current_state.continuation_penalty,
+                        previous_cost[4] + current_state.added_duration_micro,
+                        previous_cost[5] + current_state.candidate_rank,
                     )
                     if best_cost is None or candidate_cost < best_cost:
                         best_cost = candidate_cost
@@ -1376,37 +1410,144 @@ class GapResolutionService:
         return overlap_count, overlap_seconds
 
     @classmethod
+    def _source_side_clearances(
+        cls,
+        gap: GapInfo,
+        neighbor_context: _NeighborContext,
+    ) -> dict[str, _SideClearance]:
+        """Measure nearest occupied source-space clearance on each side."""
+        left_clearance = float("inf")
+        right_clearance = float("inf")
+        left_has_blocker = False
+        right_has_blocker = False
+
+        for neighbor in (neighbor_context.previous, neighbor_context.next):
+            if neighbor is None:
+                continue
+
+            if neighbor.end_time <= gap.current_start + neighbor.tolerance:
+                left_has_blocker = True
+                left_clearance = min(
+                    left_clearance,
+                    max(0.0, gap.current_start - neighbor.end_time - neighbor.tolerance),
+                )
+
+            if neighbor.start_time >= gap.current_end - neighbor.tolerance:
+                right_has_blocker = True
+                right_clearance = min(
+                    right_clearance,
+                    max(0.0, neighbor.start_time - gap.current_end - neighbor.tolerance),
+                )
+
+        return {
+            "left": _SideClearance(
+                has_blocker=left_has_blocker,
+                clearance_seconds=left_clearance,
+            ),
+            "right": _SideClearance(
+                has_blocker=right_has_blocker,
+                clearance_seconds=right_clearance,
+            ),
+        }
+
+    @staticmethod
+    def _candidate_clearance_side(extend_type: str) -> str | None:
+        """Map single-sided candidate types to the source side they extend."""
+        if extend_type in {
+            "extend_start",
+            "extend_to_scene_start",
+            "fallback_extend_start",
+        }:
+            return "left"
+        if extend_type in {
+            "extend_end",
+            "extend_to_scene_end",
+            "fallback_extend_end",
+        }:
+            return "right"
+        return None
+
+    @classmethod
     def _preferred_single_side_order(
         cls,
         gap: GapInfo,
         neighbor_context: _NeighborContext,
     ) -> tuple[str, str]:
         """Choose which extension direction to try first based on blocked neighbors."""
-        previous = neighbor_context.previous
-        next_window = neighbor_context.next
+        side_clearances = cls._source_side_clearances(gap, neighbor_context)
+        left_clearance = side_clearances["left"]
+        right_clearance = side_clearances["right"]
 
-        left_clearance = float("inf")
-        right_clearance = float("inf")
-        if previous is not None:
-            left_clearance = max(
-                0.0,
-                gap.current_start - previous.end_time - previous.tolerance,
-            )
-        if next_window is not None:
-            right_clearance = max(
-                0.0,
-                next_window.start_time - gap.current_end - next_window.tolerance,
-            )
-
-        if next_window is not None and previous is None:
+        if not left_clearance.has_blocker and right_clearance.has_blocker:
             return ("start", "end")
-        if previous is not None and next_window is None:
+        if left_clearance.has_blocker and not right_clearance.has_blocker:
             return ("end", "start")
-        if previous is not None and next_window is not None:
-            if left_clearance >= right_clearance:
+        if left_clearance.has_blocker and right_clearance.has_blocker:
+            if left_clearance.clearance_seconds >= right_clearance.clearance_seconds:
                 return ("start", "end")
             return ("end", "start")
         return ("end", "start")
+
+    @classmethod
+    def _apply_continuation_bias(
+        cls,
+        candidates: list[GapCandidate],
+        gap: GapInfo,
+        neighbor_context: _NeighborContext,
+    ) -> list[GapCandidate]:
+        """Boost the better continuation side when clean cut candidates are near-tied."""
+        if not candidates:
+            return []
+
+        for candidate in candidates:
+            candidate.continuation_priority = 1
+            candidate.continuation_bias_applied = False
+
+        best_by_side: dict[str, GapCandidate] = {}
+        for candidate in candidates:
+            if not (
+                candidate.is_clean
+                and candidate.is_cut_aligned
+                and cls._is_single_sided_candidate(candidate.extend_type)
+            ):
+                continue
+            if candidate.clearance_side not in {"left", "right"}:
+                continue
+            existing = best_by_side.get(candidate.clearance_side)
+            if existing is None or cls._candidate_sort_key(candidate) < cls._candidate_sort_key(existing):
+                best_by_side[candidate.clearance_side] = candidate
+
+        left_candidate = best_by_side.get("left")
+        right_candidate = best_by_side.get("right")
+        if left_candidate is None or right_candidate is None:
+            return sorted(candidates, key=cls._candidate_sort_key)
+
+        added_duration_delta = abs(left_candidate.added_duration - right_candidate.added_duration)
+        if added_duration_delta > cls.CONTINUATION_TIE_WINDOW:
+            return sorted(candidates, key=cls._candidate_sort_key)
+
+        side_clearances = cls._source_side_clearances(gap, neighbor_context)
+        left_clearance = side_clearances["left"]
+        right_clearance = side_clearances["right"]
+
+        preferred_side: str | None = None
+        if left_clearance.has_blocker and not right_clearance.has_blocker:
+            preferred_side = "right"
+        elif right_clearance.has_blocker and not left_clearance.has_blocker:
+            preferred_side = "left"
+        elif left_clearance.has_blocker and right_clearance.has_blocker:
+            if left_clearance.clearance_seconds > right_clearance.clearance_seconds:
+                preferred_side = "left"
+            elif right_clearance.clearance_seconds > left_clearance.clearance_seconds:
+                preferred_side = "right"
+
+        if preferred_side is None:
+            return sorted(candidates, key=cls._candidate_sort_key)
+
+        preferred_candidate = best_by_side[preferred_side]
+        preferred_candidate.continuation_priority = 0
+        preferred_candidate.continuation_bias_applied = True
+        return sorted(candidates, key=cls._candidate_sort_key)
 
     @classmethod
     def _build_candidate(
@@ -1447,6 +1588,12 @@ class GapResolutionService:
             new_end,
             neighbor_context,
         )
+        clearance_side = cls._candidate_clearance_side(extend_type)
+        side_clearance_seconds = None
+        if clearance_side is not None:
+            side_clearance = cls._source_side_clearances(gap, neighbor_context)[clearance_side]
+            if side_clearance.has_blocker:
+                side_clearance_seconds = side_clearance.clearance_seconds
 
         return GapCandidate(
             start_time=new_start,
@@ -1463,6 +1610,8 @@ class GapResolutionService:
             added_duration=max(0.0, new_duration - gap.current_duration),
             detector_threshold=detector_threshold if is_cut_aligned else None,
             direction_priority=direction_priority,
+            clearance_side=clearance_side,
+            side_clearance_seconds=side_clearance_seconds,
         )
 
     @classmethod

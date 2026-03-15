@@ -7,16 +7,16 @@ import pytest
 
 sys.path.append(str(Path(__file__).resolve().parents[2]))
 
-from app.models.match import SceneMatch
+from app.models.match import MatchList, SceneMatch
 from app.services.anime_library import AnimeLibraryService
 from app.services.gap_resolution import GapInfo, GapResolutionService
-from app.services.project_service import ProjectService
 
 
 PROJECT_ID = "3c6cbee7ce0c"
 PROJECT_DIR = Path(__file__).resolve().parents[2] / "data" / "projects" / PROJECT_ID
 DEFAULT_FPS = Fraction(24000, 1001)
 DEFAULT_FRAME_OFFSET = float(GapResolutionService.SAFETY_FRAMES / float(DEFAULT_FPS))
+DEFAULT_TOLERANCE = float(Fraction(1, 1) / DEFAULT_FPS)
 
 
 def _make_match(
@@ -63,6 +63,18 @@ def _make_gap(
         effective_speed=GapResolutionService.MIN_SPEED,
         gap_duration=gap_duration,
     )
+
+
+def _load_pre_gap_project_gap(scene_index: int) -> tuple[GapInfo, list[SceneMatch]]:
+    match_list = MatchList.model_validate_json((PROJECT_DIR / "matches_before_gaps.json").read_text())
+    transcription = json.loads((PROJECT_DIR / "gap_detection_transcription.json").read_text())
+    gaps = GapResolutionService.calculate_gaps(match_list.matches, transcription["scenes"])
+    return next(gap for gap in gaps if gap.scene_index == scene_index), match_list.matches
+
+
+def _select_matches(matches: list[SceneMatch], *scene_indices: int) -> list[SceneMatch]:
+    scene_index_set = set(scene_indices)
+    return [match for match in matches if match.scene_index in scene_index_set]
 
 
 def _install_fake_episode(
@@ -140,11 +152,8 @@ async def test_project_scene0_surfaces_clean_backward_candidate_and_autofill_use
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ):
-    matches = ProjectService.load_matches(PROJECT_ID)
-    assert matches is not None
-    transcription = json.loads((PROJECT_DIR / "gap_detection_transcription.json").read_text())
-    gaps = GapResolutionService.calculate_gaps(matches.matches, transcription["scenes"])
-    gap = next(gap for gap in gaps if gap.scene_index == 0)
+    gap, project_matches = _load_pre_gap_project_gap(0)
+    matches = _select_matches(project_matches, 0, 1)
 
     _install_fake_episode(
         monkeypatch,
@@ -159,7 +168,7 @@ async def test_project_scene0_surfaces_clean_backward_candidate_and_autofill_use
 
     candidates = await GapResolutionService.generate_candidates(
         gap,
-        matches=matches.matches,
+        matches=matches,
         max_candidates=20,
     )
 
@@ -171,15 +180,12 @@ async def test_project_scene0_surfaces_clean_backward_candidate_and_autofill_use
     assert clean_backward
 
     selection = await GapResolutionService.select_autofill_candidates_overlap_aware(
-        matches=[
-            next(match for match in matches.matches if match.scene_index == 0),
-            next(match for match in matches.matches if match.scene_index == 1),
-        ],
+        matches=matches,
         gaps=[gap],
         candidates_by_scene={gap.scene_index: candidates},
     )
     selected = selection.selected_candidates_by_scene[gap.scene_index]
-    next_scene = next(match for match in matches.matches if match.scene_index == 1)
+    next_scene = next(match for match in matches if match.scene_index == 1)
 
     assert set(selection.selected_candidates_by_scene) == {gap.scene_index}
     assert selected.is_clean is True
@@ -189,6 +195,148 @@ async def test_project_scene0_surfaces_clean_backward_candidate_and_autofill_use
     assert selected.end_time < next_scene.start_time
     assert selection.total_overlap_count == 0
     assert selection.total_overlap_seconds == 0.0
+
+
+@pytest.mark.asyncio
+async def test_project_scene10_prefers_forward_continuation_inside_tie_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    gap, project_matches = _load_pre_gap_project_gap(10)
+    matches = _select_matches(project_matches, 9, 10, 11)
+
+    _install_fake_episode(
+        monkeypatch,
+        tmp_path,
+        episode=gap.episode,
+        cuts_by_threshold={
+            27.0: [
+                0.0,
+                490.07291666666663,
+                491.24075,
+                492.9090833333333,
+                493.9935,
+                1495.035,
+            ],
+        },
+    )
+
+    candidates = await GapResolutionService.generate_candidates(
+        gap,
+        matches=matches,
+        max_candidates=20,
+    )
+
+    assert candidates
+    assert candidates[0].extend_type == "extend_end"
+    assert candidates[0].snap_description == "Extend end to next cut (+1.37s)"
+    assert candidates[0].continuation_bias_applied is True
+    assert candidates[0].clearance_side == "right"
+    assert candidates[0].side_clearance_seconds is None
+
+    competing_start = next(
+        candidate
+        for candidate in candidates
+        if candidate.extend_type == "extend_start"
+        and candidate.snap_description == "Extend start to previous cut (-1.30s)"
+    )
+    assert competing_start.continuation_bias_applied is False
+
+    selection = await GapResolutionService.select_autofill_candidates_overlap_aware(
+        matches=matches,
+        gaps=[gap],
+        candidates_by_scene={gap.scene_index: candidates},
+    )
+    assert selection.selected_candidates_by_scene[gap.scene_index].extend_type == "extend_end"
+
+
+def test_next_timeline_neighbor_earlier_in_source_counts_as_left_blocker():
+    gap = _make_gap(scene_index=0, current_start=10.0, current_end=11.0, target_duration=3.0)
+    matches = [
+        _make_match(0, 10.0, 11.0),
+        _make_match(1, 8.4, 8.6),
+    ]
+    neighbor_context = GapResolutionService._build_neighbor_contexts(
+        matches,
+        episode_key_by_scene={0: "episode-a", 1: "episode-a"},
+        tolerance_by_episode={"episode-a": DEFAULT_TOLERANCE},
+    )[0]
+
+    side_clearances = GapResolutionService._source_side_clearances(gap, neighbor_context)
+
+    assert side_clearances["left"].has_blocker is True
+    assert side_clearances["right"].has_blocker is False
+    assert GapResolutionService._preferred_single_side_order(gap, neighbor_context) == ("end", "start")
+
+
+@pytest.mark.asyncio
+async def test_continuation_bias_prefers_more_open_side_within_tie_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    gap = _make_gap(scene_index=0, current_start=10.0, current_end=11.0, target_duration=3.0)
+    matches = [
+        _make_match(0, 10.0, 11.0),
+        _make_match(1, 8.4, 8.6),
+    ]
+
+    _install_fake_episode(
+        monkeypatch,
+        tmp_path,
+        episode=gap.episode,
+        cuts_by_threshold={27.0: [0.0, 8.7, 12.35, 100.0]},
+        frame_offset=0.0,
+    )
+
+    candidates = await GapResolutionService.generate_candidates(
+        gap,
+        matches=matches,
+        max_candidates=20,
+    )
+
+    assert candidates[0].extend_type == "extend_to_scene_end"
+    assert candidates[0].continuation_bias_applied is True
+    assert pytest.approx(candidates[0].added_duration, abs=1e-6) == 1.35
+
+    competing_start = next(
+        candidate for candidate in candidates if candidate.extend_type == "extend_to_scene_start"
+    )
+    assert pytest.approx(competing_start.added_duration, abs=1e-6) == 1.3
+
+
+@pytest.mark.asyncio
+async def test_project_scene26_keeps_smaller_added_duration_outside_tie_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    gap, project_matches = _load_pre_gap_project_gap(26)
+    matches = _select_matches(project_matches, 25, 26, 27)
+
+    _install_fake_episode(
+        monkeypatch,
+        tmp_path,
+        episode=gap.episode,
+        cuts_by_threshold={
+            27.0: [
+                0.0,
+                726.0586666666666,
+                727.727,
+                728.2275,
+                729.97925,
+                1495.035,
+            ],
+        },
+    )
+
+    candidates = await GapResolutionService.generate_candidates(
+        gap,
+        matches=matches,
+        max_candidates=20,
+    )
+
+    assert candidates[0].extend_type == "extend_start"
+    assert candidates[0].snap_description == "Extend start to previous cut (-0.15s)"
+    assert candidates[0].continuation_bias_applied is False
 
 
 @pytest.mark.asyncio
