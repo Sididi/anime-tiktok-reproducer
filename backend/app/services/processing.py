@@ -1,6 +1,7 @@
 """Processing pipeline service for final video generation."""
 
 import asyncio
+import html
 import json
 import logging
 import math
@@ -353,7 +354,12 @@ class ProcessingService:
         return f"{action} ({current}/{total}): {result.normalized_path.name}"
 
     @classmethod
-    def schedule_gap_candidate_prewarm(cls, project_id: str, gaps: list) -> None:
+    def schedule_gap_candidate_prewarm(
+        cls,
+        project_id: str,
+        gaps: list,
+        matches: list | None = None,
+    ) -> None:
         """Start a background prewarm for gap candidate generation."""
         if not gaps:
             return
@@ -364,7 +370,10 @@ class ProcessingService:
 
         async def _run() -> None:
             try:
-                await GapResolutionService.generate_candidates_batch_dedup(gaps)
+                await GapResolutionService.generate_candidates_batch_dedup(
+                    gaps,
+                    matches=matches,
+                )
             except Exception:
                 # Best-effort optimization only; failures should never block processing.
                 return
@@ -1055,7 +1064,15 @@ class ProcessingService:
     @classmethod
     def _normalize_external_subtitle_text(cls, raw_text: str) -> str:
         text = str(raw_text or "").replace("\r", "\n")
-        lines = [re.sub(r"\s+", " ", line).strip() for line in text.split("\n")]
+        text = html.unescape(text)
+        text = re.sub(r"\{[^{}]*\}", "", text)
+        text = text.replace("\\N", "\n").replace("\\n", "\n").replace("\\h", " ")
+        text = re.sub(r"<[^>]+>", "", text)
+        text = html.unescape(text)
+        lines = [
+            re.sub(r"\s+", " ", line.replace("\xa0", " ")).strip()
+            for line in text.split("\n")
+        ]
         lines = [line for line in lines if line]
         return " ".join(lines)
 
@@ -1717,7 +1734,7 @@ class ProcessingService:
                         mode="single_audio",
                         edited_audio_path=edited_audio_path,
                         segment_audio_paths=[],
-                        manifest=upload_manifest or ForcedAlignmentService.build_single_audio_manifest(
+                        manifest=ForcedAlignmentService.build_single_audio_manifest(
                             script_payload=new_script,
                         ),
                     )
@@ -1818,7 +1835,10 @@ class ProcessingService:
                             if matches_path.exists():
                                 shutil.copy(matches_path, matches_backup_path)
 
-                        candidates_by_scene = await GapResolutionService.generate_candidates_batch_dedup(gaps)
+                        candidates_by_scene = await GapResolutionService.generate_candidates_batch_dedup(
+                            gaps,
+                            matches=matches,
+                        )
                         selection_result = await GapResolutionService.select_autofill_candidates_overlap_aware(
                             matches=matches,
                             gaps=gaps,
@@ -1855,7 +1875,7 @@ class ProcessingService:
                     else:
                         # Manual flow: pause processing for user to resolve
                         # Prewarm scene-cut/fps analysis in background so /gaps loads faster.
-                        cls.schedule_gap_candidate_prewarm(project.id, gaps)
+                        cls.schedule_gap_candidate_prewarm(project.id, gaps, matches)
 
                         # Backup current matches before gap resolution modifies them
                         matches_backup_path = project_dir / "matches_before_gaps.json"

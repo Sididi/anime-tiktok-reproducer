@@ -148,7 +148,10 @@ async def get_all_candidates(project_id: str) -> AllCandidatesResponse:
     gaps = GapResolutionService.calculate_gaps(matches.matches, scene_timings)
 
     try:
-        candidates_by_scene_raw = await GapResolutionService.generate_candidates_batch_dedup(gaps)
+        candidates_by_scene_raw = await GapResolutionService.generate_candidates_batch_dedup(
+            gaps,
+            matches=matches.matches,
+        )
     except Exception:
         candidates_by_scene_raw = {gap.scene_index: [] for gap in gaps}
     candidates_by_scene = {
@@ -164,7 +167,8 @@ async def get_gap_candidates(project_id: str, scene_index: int) -> GapCandidates
     """Get AI candidates for resolving a specific gap.
 
     Runs pyscenedetect on the source episode (with caching) and generates
-    up to 4 candidates ranked by closeness to 100% speed.
+    candidates ranked to avoid same-episode overlap first, then minimize
+    extra source while preferring cut-aligned extensions.
     """
     project = ProjectService.load(project_id)
     if not project:
@@ -198,7 +202,10 @@ async def get_gap_candidates(project_id: str, scene_index: int) -> GapCandidates
         raise HTTPException(status_code=404, detail=f"Scene {scene_index} does not have a gap")
 
     # Generate candidates
-    candidates = await GapResolutionService.generate_candidates(gap)
+    candidates = await GapResolutionService.generate_candidates(
+        gap,
+        matches=matches.matches,
+    )
 
     return GapCandidatesResponse(
         scene_index=scene_index,
@@ -227,7 +234,7 @@ class AutoFillResponse(BaseModel):
 async def auto_fill_all_gaps(project_id: str) -> AutoFillResponse:
     """Automatically fill all gaps with their best AI candidate.
 
-    For each gap, generates candidates and applies the one closest to 100% speed.
+    For each gap, generates candidates and applies the overlap-aware best choice.
     Gaps without valid candidates are skipped.
     """
     project = ProjectService.load(project_id)
@@ -261,7 +268,10 @@ async def auto_fill_all_gaps(project_id: str) -> AutoFillResponse:
     filled_count = 0
     skipped_count = 0
 
-    candidates_by_scene = await GapResolutionService.generate_candidates_batch_dedup(gaps)
+    candidates_by_scene = await GapResolutionService.generate_candidates_batch_dedup(
+        gaps,
+        matches=matches.matches,
+    )
     selected_by_scene: dict[int, Any] = {}
     overlap_seconds_by_scene: dict[int, float] = {}
     try:

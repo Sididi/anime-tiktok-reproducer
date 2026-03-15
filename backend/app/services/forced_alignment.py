@@ -107,12 +107,7 @@ class ForcedAlignmentService:
 
         manifest_segments: list[dict[str, Any]] = []
         for idx, segment in enumerate(segments):
-            entry = {
-                "id": int(segment["id"]),
-                "scene_indices": [int(value) for value in segment.get("scene_indices", [])],
-                "text": str(segment.get("text") or ""),
-                "character_count": int(segment.get("character_count") or 0),
-            }
+            entry = cls._build_manifest_segment_entry(segment)
             if stored_part_paths is not None:
                 entry["audio_path"] = stored_part_paths[idx]
             manifest_segments.append(entry)
@@ -203,14 +198,28 @@ class ForcedAlignmentService:
             "mode": "single_audio",
             "language": prepared.get("language") or script_payload.get("language") or "fr",
             "segments": [
-                {
-                    "id": int(segment["id"]),
-                    "scene_indices": [int(value) for value in segment.get("scene_indices", [])],
-                    "text": str(segment.get("text") or ""),
-                    "character_count": int(segment.get("character_count") or 0),
-                }
+                cls._build_manifest_segment_entry(segment)
                 for segment in prepared.get("segments", [])
             ],
+        }
+
+    @classmethod
+    def _build_manifest_segment_entry(cls, segment: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": int(segment["id"]),
+            "scene_indices": [int(value) for value in segment.get("scene_indices", [])],
+            "scene_fragments": [
+                {
+                    "scene_index": int(fragment.get("scene_index")),
+                    "text": str(fragment.get("text") or ""),
+                }
+                for fragment in segment.get("scene_fragments", [])
+                if isinstance(fragment, dict)
+                and isinstance(fragment.get("scene_index"), int)
+                and str(fragment.get("text") or "")
+            ],
+            "text": str(segment.get("text") or ""),
+            "character_count": int(segment.get("character_count") or 0),
         }
 
     @classmethod
@@ -344,7 +353,6 @@ class ForcedAlignmentService:
         for actual, expected_segment in zip(actual_segments, expected_segments, strict=False):
             if (
                 int(actual.get("id") or 0) != int(expected_segment["id"])
-                or list(actual.get("scene_indices") or []) != list(expected_segment["scene_indices"])
                 or str(actual.get("text") or "") != str(expected_segment["text"])
             ):
                 raise ForcedAlignmentError(
@@ -358,8 +366,8 @@ class ForcedAlignmentService:
                         ],
                     },
                 )
-            merged = dict(expected_segment)
-            merged.update(actual)
+            merged = dict(actual)
+            merged.update(expected_segment)
             validated_segments.append(merged)
 
         validated_manifest = dict(expected)
@@ -629,16 +637,30 @@ class ForcedAlignmentService:
         }
 
         expected_entries: list[dict[str, Any]] = []
-        for scene_index in segment.get("scene_indices") or []:
-            scene_data = scenes_by_index.get(int(scene_index))
-            if not scene_data:
+        scene_fragments = segment.get("scene_fragments")
+        if isinstance(scene_fragments, list) and scene_fragments:
+            fragment_iterable = scene_fragments
+        else:
+            fragment_iterable = [
+                {
+                    "scene_index": int(scene_index),
+                    "text": str((scenes_by_index.get(int(scene_index)) or {}).get("text") or ""),
+                }
+                for scene_index in segment.get("scene_indices") or []
+            ]
+
+        for fragment in fragment_iterable:
+            if not isinstance(fragment, dict):
                 continue
-            for raw_word in str(scene_data.get("text") or "").split():
+            scene_index_raw = fragment.get("scene_index")
+            if not isinstance(scene_index_raw, int):
+                continue
+            for raw_word in str(fragment.get("text") or "").split():
                 norm = TranscriberService._normalize_token(raw_word)
                 if not norm:
                     continue
                 expected_entries.append({
-                    "scene_index": int(scene_index),
+                    "scene_index": int(scene_index_raw),
                     "text": raw_word,
                     "norm": norm,
                 })
@@ -705,6 +727,16 @@ class ForcedAlignmentService:
         report = {
             "id": int(segment["id"]),
             "scene_indices": [int(value) for value in segment.get("scene_indices", [])],
+            "scene_fragments": [
+                {
+                    "scene_index": int(fragment.get("scene_index")),
+                    "text": str(fragment.get("text") or ""),
+                }
+                for fragment in fragment_iterable
+                if isinstance(fragment, dict)
+                and isinstance(fragment.get("scene_index"), int)
+                and str(fragment.get("text") or "")
+            ],
             "text": str(segment.get("text") or ""),
             "expected_word_count": len(expected_entries),
             "aligned_word_count": len(aligned_entries),

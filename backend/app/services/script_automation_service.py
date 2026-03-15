@@ -279,6 +279,141 @@ class ScriptAutomationService:
         return text[:cap], text[cap:]
 
     @classmethod
+    def _coalesce_scene_fragments(
+        cls,
+        scene_fragments: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        coalesced: list[dict[str, Any]] = []
+        for raw_fragment in scene_fragments:
+            if not isinstance(raw_fragment, dict):
+                continue
+            scene_index = raw_fragment.get("scene_index")
+            if not isinstance(scene_index, int):
+                continue
+            fragment_text = str(raw_fragment.get("text") or "")
+            if not fragment_text:
+                continue
+            if (
+                coalesced
+                and int(coalesced[-1]["scene_index"]) == scene_index
+            ):
+                coalesced[-1]["text"] = str(coalesced[-1]["text"]) + fragment_text
+                continue
+            coalesced.append(
+                {
+                    "scene_index": scene_index,
+                    "text": fragment_text,
+                }
+            )
+        return coalesced
+
+    @classmethod
+    def _build_segment_from_fragments(
+        cls,
+        *,
+        segment_id: int,
+        scene_fragments: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        coalesced = cls._coalesce_scene_fragments(scene_fragments)
+        segment_text = "".join(str(fragment.get("text") or "") for fragment in coalesced).strip()
+        scene_indices: list[int] = []
+        seen_scene_indices: set[int] = set()
+        normalized_fragments: list[dict[str, Any]] = []
+        for fragment in coalesced:
+            scene_index = int(fragment["scene_index"])
+            fragment_text = str(fragment["text"])
+            normalized_fragments.append(
+                {
+                    "scene_index": scene_index,
+                    "text": fragment_text,
+                }
+            )
+            if scene_index not in seen_scene_indices:
+                seen_scene_indices.add(scene_index)
+                scene_indices.append(scene_index)
+        return {
+            "id": segment_id,
+            "scene_indices": scene_indices,
+            "scene_fragments": normalized_fragments,
+            "text": segment_text,
+            "character_count": len(segment_text),
+        }
+
+    @classmethod
+    def _split_scene_fragments_for_segment_text(
+        cls,
+        *,
+        scene_fragments: list[dict[str, Any]],
+        head_text: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        raw_text = "".join(str(fragment.get("text") or "") for fragment in scene_fragments)
+        if not head_text:
+            return [], cls._coalesce_scene_fragments(scene_fragments)
+
+        split_pos = len(head_text)
+        if split_pos > len(raw_text):
+            raise ValueError("Hard split text exceeds segment text length")
+
+        while split_pos < len(raw_text) and raw_text[split_pos].isspace():
+            split_pos += 1
+
+        head_fragments: list[dict[str, Any]] = []
+        tail_fragments: list[dict[str, Any]] = []
+        remaining_head_chars = split_pos
+
+        for raw_fragment in scene_fragments:
+            if not isinstance(raw_fragment, dict):
+                continue
+            scene_index = raw_fragment.get("scene_index")
+            if not isinstance(scene_index, int):
+                continue
+            fragment_text = str(raw_fragment.get("text") or "")
+            if not fragment_text:
+                continue
+
+            if remaining_head_chars <= 0:
+                tail_fragments.append(
+                    {
+                        "scene_index": scene_index,
+                        "text": fragment_text,
+                    }
+                )
+                continue
+
+            if remaining_head_chars >= len(fragment_text):
+                head_fragments.append(
+                    {
+                        "scene_index": scene_index,
+                        "text": fragment_text,
+                    }
+                )
+                remaining_head_chars -= len(fragment_text)
+                continue
+
+            head_part = fragment_text[:remaining_head_chars]
+            tail_part = fragment_text[remaining_head_chars:]
+            if head_part:
+                head_fragments.append(
+                    {
+                        "scene_index": scene_index,
+                        "text": head_part,
+                    }
+                )
+            if tail_part:
+                tail_fragments.append(
+                    {
+                        "scene_index": scene_index,
+                        "text": tail_part,
+                    }
+                )
+            remaining_head_chars = 0
+
+        return (
+            cls._coalesce_scene_fragments(head_fragments),
+            cls._coalesce_scene_fragments(tail_fragments),
+        )
+
+    @classmethod
     def _segment_scenes_for_tts_payload(cls, script_payload: dict[str, Any]) -> list[dict[str, Any]]:
         """Segment script scenes for TTS and keep scene index mapping."""
         scenes = script_payload.get("scenes", [])
@@ -286,24 +421,10 @@ class ScriptAutomationService:
             return []
 
         def _create_empty_segment(segment_id: int) -> dict[str, Any]:
-            return {
-                "id": segment_id,
-                "scene_indices": [],
-                "text": "",
-                "character_count": 0,
-            }
+            return cls._build_segment_from_fragments(segment_id=segment_id, scene_fragments=[])
 
         segments: list[dict[str, Any]] = []
         current_segment = _create_empty_segment(1)
-
-        # Build scene text lookup for accurate index partitioning during hard splits
-        scene_text_by_index: dict[int, str] = {}
-        for j, sc in enumerate(scenes):
-            if not isinstance(sc, dict):
-                continue
-            si_raw = sc.get("scene_index")
-            si = si_raw if isinstance(si_raw, int) else j + 1
-            scene_text_by_index[si] = str(sc.get("text") or "").strip()
 
         for i, scene in enumerate(scenes):
             if not isinstance(scene, dict):
@@ -314,10 +435,19 @@ class ScriptAutomationService:
 
             scene_index_raw = scene.get("scene_index")
             scene_index = scene_index_raw if isinstance(scene_index_raw, int) else i + 1
-            merged_text = f"{current_segment['text']} {scene_text}".strip() if current_segment["text"] else scene_text
-            current_segment["scene_indices"] = [*current_segment["scene_indices"], scene_index]
-            current_segment["text"] = merged_text
-            current_segment["character_count"] = len(merged_text)
+            new_fragment_text = scene_text
+            if current_segment.get("scene_fragments"):
+                new_fragment_text = f" {scene_text}"
+            current_segment = cls._build_segment_from_fragments(
+                segment_id=int(current_segment["id"]),
+                scene_fragments=[
+                    *list(current_segment.get("scene_fragments") or []),
+                    {
+                        "scene_index": scene_index,
+                        "text": new_fragment_text,
+                    },
+                ],
+            )
 
             while int(current_segment["character_count"]) > cls.TTS_HARD_MAX:
                 hard_chunk, remainder = cls._split_at_preferred_tts_boundary(
@@ -327,42 +457,33 @@ class ScriptAutomationService:
                 if not hard_chunk:
                     break
 
-                # Partition scene_indices: walk scenes, accumulate text length
-                all_indices = current_segment["scene_indices"]
-                head_len = len(hard_chunk)
-                char_pos = 0
-                split_at = len(all_indices)  # default: all in head
-                for j, si in enumerate(all_indices):
-                    st = scene_text_by_index.get(si, "")
-                    if char_pos > 0:
-                        char_pos += 1  # space separator
-                    if char_pos + len(st) > head_len:
-                        split_at = j
-                        break
-                    char_pos += len(st)
-
-                head_indices = all_indices[:split_at]
-                tail_indices = all_indices[split_at:]
-
-                # Safety: if head has text but no scenes, assign first scene to head
-                if not head_indices and all_indices:
-                    head_indices = [all_indices[0]]
-                    tail_indices = all_indices[1:]
-
-                segments.append(
-                    {
-                        "id": len(segments) + 1,
-                        "scene_indices": head_indices,
-                        "text": hard_chunk,
-                        "character_count": len(hard_chunk),
-                    }
+                head_fragments, tail_fragments = cls._split_scene_fragments_for_segment_text(
+                    scene_fragments=list(current_segment.get("scene_fragments") or []),
+                    head_text=hard_chunk,
                 )
-                current_segment = {
-                    "id": len(segments) + 1,
-                    "scene_indices": tail_indices,
-                    "text": remainder,
-                    "character_count": len(remainder),
-                }
+                head_segment = cls._build_segment_from_fragments(
+                    segment_id=len(segments) + 1,
+                    scene_fragments=head_fragments,
+                )
+                if not head_segment["text"]:
+                    break
+
+                segments.append(head_segment)
+                current_segment = cls._build_segment_from_fragments(
+                    segment_id=len(segments) + 1,
+                    scene_fragments=tail_fragments,
+                )
+                if remainder and current_segment["text"] != remainder:
+                    current_segment = cls._build_segment_from_fragments(
+                        segment_id=len(segments) + 1,
+                        scene_fragments=[
+                            {
+                                "scene_index": int(fragment["scene_index"]),
+                                "text": str(fragment["text"]),
+                            }
+                            for fragment in tail_fragments
+                        ],
+                    )
 
             if not current_segment["text"]:
                 continue
@@ -377,9 +498,16 @@ class ScriptAutomationService:
 
             if is_last:
                 normalized = cls._ensure_sentence_end(str(current_segment["text"]))
-                current_segment["text"] = normalized
-                current_segment["character_count"] = len(normalized)
-                segments.append(current_segment)
+                segments.append(
+                    cls._build_segment_from_fragments(
+                        segment_id=int(current_segment["id"]),
+                        scene_fragments=[
+                            *list(current_segment.get("scene_fragments") or []),
+                        ],
+                    )
+                )
+                segments[-1]["text"] = normalized
+                segments[-1]["character_count"] = len(normalized)
                 current_segment = _create_empty_segment(len(segments) + 1)
                 continue
 
@@ -399,16 +527,30 @@ class ScriptAutomationService:
 
             if close_now:
                 normalized = cls._ensure_sentence_end(str(current_segment["text"]))
-                current_segment["text"] = normalized
-                current_segment["character_count"] = len(normalized)
-                segments.append(current_segment)
+                segments.append(
+                    cls._build_segment_from_fragments(
+                        segment_id=int(current_segment["id"]),
+                        scene_fragments=[
+                            *list(current_segment.get("scene_fragments") or []),
+                        ],
+                    )
+                )
+                segments[-1]["text"] = normalized
+                segments[-1]["character_count"] = len(normalized)
                 current_segment = _create_empty_segment(len(segments) + 1)
 
-        if current_segment["scene_indices"]:
+        if current_segment["scene_fragments"]:
             normalized = cls._ensure_sentence_end(str(current_segment["text"]))
-            current_segment["text"] = normalized
-            current_segment["character_count"] = len(normalized)
-            segments.append(current_segment)
+            segments.append(
+                cls._build_segment_from_fragments(
+                    segment_id=int(current_segment["id"]),
+                    scene_fragments=[
+                        *list(current_segment.get("scene_fragments") or []),
+                    ],
+                )
+            )
+            segments[-1]["text"] = normalized
+            segments[-1]["character_count"] = len(normalized)
 
         # Merge small final chunk only when it keeps us within soft max and preserves sentence ending.
         if (
@@ -418,9 +560,16 @@ class ScriptAutomationService:
         ):
             merged = f"{segments[-2]['text']} {segments[-1]['text']}".strip()
             if len(merged) <= cls.TTS_SOFT_MAX:
-                segments[-2]["text"] = cls._ensure_sentence_end(merged)
-                segments[-2]["character_count"] = len(str(segments[-2]["text"]))
-                segments[-2]["scene_indices"] = [*segments[-2]["scene_indices"], *segments[-1]["scene_indices"]]
+                merged_segment = cls._build_segment_from_fragments(
+                    segment_id=int(segments[-2]["id"]),
+                    scene_fragments=[
+                        *list(segments[-2].get("scene_fragments") or []),
+                        *list(segments[-1].get("scene_fragments") or []),
+                    ],
+                )
+                merged_segment["text"] = cls._ensure_sentence_end(merged)
+                merged_segment["character_count"] = len(str(merged_segment["text"]))
+                segments[-2] = merged_segment
                 segments.pop()
 
         for i, segment in enumerate(segments):

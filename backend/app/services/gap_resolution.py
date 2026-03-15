@@ -79,9 +79,16 @@ class GapCandidate:
     end_time: float    # Proposed source end time (seconds)
     duration: float    # Proposed source duration (seconds)
     effective_speed: Fraction  # Speed with this timing (Fraction for precision)
-    speed_diff: float  # Difference from 100% (for ranking, lower is better)
+    speed_diff: float  # Legacy/debug metric: difference from 100% speed
     extend_type: str   # 'extend_start', 'extend_end', 'extend_both'
     snap_description: str  # Human-readable description of what scene cuts were used
+    overlap_count: int = 0
+    overlap_seconds: float = 0.0
+    is_cut_aligned: bool = False
+    is_clean: bool = True
+    added_duration: float = 0.0
+    detector_threshold: float | None = None
+    direction_priority: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -92,6 +99,13 @@ class GapCandidate:
             "speed_diff": round(self.speed_diff, 6),
             "extend_type": self.extend_type,
             "snap_description": self.snap_description,
+            "overlap_count": self.overlap_count,
+            "overlap_seconds": round(self.overlap_seconds, 6),
+            "is_cut_aligned": self.is_cut_aligned,
+            "is_clean": self.is_clean,
+            "added_duration": round(self.added_duration, 6),
+            "detector_threshold": self.detector_threshold,
+            "direction_priority": self.direction_priority,
         }
 
 
@@ -123,9 +137,28 @@ class _AutoFillState:
     episode_key: str
     start_time: float
     end_time: float
-    speed_diff_micro: int
+    cut_penalty: int
+    added_duration_micro: int
     candidate_rank: int
     candidate: GapCandidate | None
+
+
+@dataclass(frozen=True)
+class _NeighborWindow:
+    """Immediate adjacent source occupancy for overlap-aware candidate ranking."""
+
+    relation: str
+    start_time: float
+    end_time: float
+    tolerance: float
+
+
+@dataclass(frozen=True)
+class _NeighborContext:
+    """Neighbor windows used to prefer clean candidate directions."""
+
+    previous: _NeighborWindow | None = None
+    next: _NeighborWindow | None = None
 
 
 @dataclass
@@ -269,47 +302,157 @@ class GapResolutionService:
         return AnimeLibraryService.resolve_episode_path(episode_name)
 
     @classmethod
-    def get_scene_cache_path(cls, episode_path: str) -> Path:
-        """Get the cache file path for scene cuts of an episode."""
+    def _normalize_scene_cut_params(
+        cls,
+        threshold: float | None,
+        min_scene_len: int | None,
+        frame_skip: int | None,
+    ) -> tuple[float, int, int]:
+        """Normalize scene detection parameters used by caching/inflight dedupe."""
+        threshold_val = cls.SCENE_THRESHOLD if threshold is None else float(threshold)
+        min_scene_len_val = cls.MIN_SCENE_LEN if min_scene_len is None else int(min_scene_len)
+        frame_skip_val = (
+            cls.SCENE_DETECTION_FRAME_SKIP if frame_skip is None else int(frame_skip)
+        )
+        return threshold_val, min_scene_len_val, frame_skip_val
+
+    @classmethod
+    def _scene_cut_runtime_key(
+        cls,
+        episode_path: str,
+        threshold: float,
+        min_scene_len: int,
+        frame_skip: int,
+    ) -> str:
+        resolved = str(Path(episode_path).resolve())
+        return f"{resolved}|{threshold:.3f}|{min_scene_len}|{frame_skip}"
+
+    @classmethod
+    def _legacy_scene_cache_path(cls, episode_path: str) -> Path:
+        """Get the legacy cache file path used before parameter-aware caching."""
         # Hash the episode path to create a unique cache filename
         import hashlib
+
         path_hash = hashlib.md5(episode_path.encode()).hexdigest()[:16]
         episode_name = Path(episode_path).stem
         return settings.cache_dir / "scene_cuts" / f"{episode_name}_{path_hash}.json"
 
     @classmethod
-    def load_cached_scene_cuts(cls, episode_path: str) -> list[float] | None:
+    def get_scene_cache_path(
+        cls,
+        episode_path: str,
+        threshold: float | None = None,
+        min_scene_len: int | None = None,
+        frame_skip: int | None = None,
+    ) -> Path:
+        """Get the parameter-aware cache file path for scene cuts of an episode."""
+        import hashlib
+
+        threshold_val, min_scene_len_val, frame_skip_val = cls._normalize_scene_cut_params(
+            threshold,
+            min_scene_len,
+            frame_skip,
+        )
+        path_hash = hashlib.md5(episode_path.encode()).hexdigest()[:16]
+        params_hash = hashlib.md5(
+            f"{threshold_val:.3f}|{min_scene_len_val}|{frame_skip_val}".encode()
+        ).hexdigest()[:8]
+        episode_name = Path(episode_path).stem
+        return (
+            settings.cache_dir
+            / "scene_cuts"
+            / f"{episode_name}_{path_hash}_{params_hash}.json"
+        )
+
+    @classmethod
+    def load_cached_scene_cuts(
+        cls,
+        episode_path: str,
+        threshold: float | None = None,
+        min_scene_len: int | None = None,
+        frame_skip: int | None = None,
+    ) -> list[float] | None:
         """Load cached scene cut times for an episode.
 
         Returns:
             List of cut times in seconds, or None if cache doesn't exist.
         """
-        cache_key = str(Path(episode_path).resolve())
+        threshold_val, min_scene_len_val, frame_skip_val = cls._normalize_scene_cut_params(
+            threshold,
+            min_scene_len,
+            frame_skip,
+        )
+        cache_key = cls._scene_cut_runtime_key(
+            episode_path,
+            threshold_val,
+            min_scene_len_val,
+            frame_skip_val,
+        )
         in_memory = cls._scene_cut_cache.get(cache_key)
         if in_memory is not None:
             return in_memory
 
-        cache_path = cls.get_scene_cache_path(episode_path)
-        if cache_path.exists():
+        cache_path = cls.get_scene_cache_path(
+            episode_path,
+            threshold=threshold_val,
+            min_scene_len=min_scene_len_val,
+            frame_skip=frame_skip_val,
+        )
+        cache_paths = [cache_path]
+        if (
+            threshold_val == cls.SCENE_THRESHOLD
+            and min_scene_len_val == cls.MIN_SCENE_LEN
+            and frame_skip_val == cls.SCENE_DETECTION_FRAME_SKIP
+        ):
+            cache_paths.append(cls._legacy_scene_cache_path(episode_path))
+
+        for cache_candidate in cache_paths:
+            if not cache_candidate.exists():
+                continue
             try:
-                data = json.loads(cache_path.read_text())
+                data = json.loads(cache_candidate.read_text())
                 cuts = data.get("cuts", [])
                 cls._scene_cut_cache[cache_key] = cuts
                 return cuts
             except (json.JSONDecodeError, KeyError):
-                return None
+                continue
         return None
 
     @classmethod
-    def save_scene_cuts_cache(cls, episode_path: str, cuts: list[float]) -> None:
+    def save_scene_cuts_cache(
+        cls,
+        episode_path: str,
+        cuts: list[float],
+        threshold: float | None = None,
+        min_scene_len: int | None = None,
+        frame_skip: int | None = None,
+    ) -> None:
         """Save scene cut times to cache."""
-        cache_key = str(Path(episode_path).resolve())
+        threshold_val, min_scene_len_val, frame_skip_val = cls._normalize_scene_cut_params(
+            threshold,
+            min_scene_len,
+            frame_skip,
+        )
+        cache_key = cls._scene_cut_runtime_key(
+            episode_path,
+            threshold_val,
+            min_scene_len_val,
+            frame_skip_val,
+        )
         cls._scene_cut_cache[cache_key] = cuts
-        cache_path = cls.get_scene_cache_path(episode_path)
+        cache_path = cls.get_scene_cache_path(
+            episode_path,
+            threshold=threshold_val,
+            min_scene_len=min_scene_len_val,
+            frame_skip=frame_skip_val,
+        )
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "episode_path": episode_path,
             "cuts": cuts,
+            "threshold": threshold_val,
+            "min_scene_len": min_scene_len_val,
+            "frame_skip": frame_skip_val,
         }
         cache_path.write_text(json.dumps(data, indent=2))
 
@@ -334,15 +477,28 @@ class GapResolutionService:
         Returns:
             List of cut times in seconds (start of each scene)
         """
+        threshold_val, min_scene_len_val, frame_skip_val = cls._normalize_scene_cut_params(
+            threshold,
+            min_scene_len,
+            frame_skip,
+        )
+
         # Check cache first
-        cached = cls.load_cached_scene_cuts(episode_path)
+        cached = cls.load_cached_scene_cuts(
+            episode_path,
+            threshold=threshold_val,
+            min_scene_len=min_scene_len_val,
+            frame_skip=frame_skip_val,
+        )
         if cached is not None:
             return cached
 
-        abs_episode_key = str(Path(episode_path).resolve())
-        threshold_val = threshold or cls.SCENE_THRESHOLD
-        min_scene_len_val = min_scene_len or cls.MIN_SCENE_LEN
-        frame_skip_val = frame_skip if frame_skip is not None else cls.SCENE_DETECTION_FRAME_SKIP
+        abs_episode_key = cls._scene_cut_runtime_key(
+            episode_path,
+            threshold_val,
+            min_scene_len_val,
+            frame_skip_val,
+        )
 
         async with cls._scene_cut_inflight_lock:
             task = cls._scene_cut_inflight.get(abs_episode_key)
@@ -386,7 +542,13 @@ class GapResolutionService:
                 frame_skip,
             )
 
-        cls.save_scene_cuts_cache(episode_path, cuts)
+        cls.save_scene_cuts_cache(
+            episode_path,
+            cuts,
+            threshold=threshold,
+            min_scene_len=min_scene_len,
+            frame_skip=frame_skip,
+        )
         return cuts
 
     @staticmethod
@@ -549,64 +711,69 @@ class GapResolutionService:
     async def generate_candidates(
         cls,
         gap: GapInfo,
+        matches: list[SceneMatch] | None = None,
         max_candidates: int = 6,
     ) -> list[GapCandidate]:
         """Generate AI candidates for extending a clip to fill a gap.
 
         Uses pyscenedetect to find nearby scene cuts and proposes timings
-        that snap to these cuts. Candidates are ranked by closeness to 100% speed.
+        that snap to these cuts. Candidates are ranked by:
+        1) Avoiding same-episode adjacent overlap
+        2) Preferring cut-aligned candidates over fallback windows
+        3) Minimizing added source duration (closer to the 75% floor)
 
         Uses Fraction-based arithmetic for frame-perfect precision.
 
-        Strategies:
-        1. Push to current scene boundaries (if clip is inside a scene)
-        2. Extend end to next scene cut
-        3. Extend start to previous scene cut
-        4. Extend both directions
-
-        All candidates include a 2-3 frame safety offset to avoid
-        accidentally including frames from transitions.
-
         Args:
             gap: Gap information for the scene
+            matches: Full project match list used for neighbor-aware ranking
             max_candidates: Maximum number of candidates to return
 
         Returns:
-            List of GapCandidate objects, sorted by speed_diff (closest to 100% first)
+            List of GapCandidate objects sorted by the /gaps ranking policy
         """
-        manifest = await AnimeLibraryService.ensure_episode_manifest()
-
-        # Resolve episode path using indexed manifest (no recursive scan).
-        episode_path = AnimeLibraryService.resolve_episode_path(gap.episode, manifest)
-        if not episode_path:
-            manifest = await AnimeLibraryService.ensure_episode_manifest(force_refresh=True)
-            episode_path = AnimeLibraryService.resolve_episode_path(gap.episode, manifest)
-        if not episode_path:
-            return []
-
-        cuts, frame_offset = await cls._analyze_episode(episode_path)
-        return cls._generate_candidates_from_cuts(
-            gap=gap,
-            cuts=cuts,
-            frame_offset=frame_offset,
+        candidates_by_scene = await cls.generate_candidates_batch(
+            [gap],
+            matches=matches,
             max_candidates=max_candidates,
         )
+        return candidates_by_scene.get(gap.scene_index, [])
 
     @classmethod
-    async def _analyze_episode(cls, episode_path: Path) -> tuple[list[float], float]:
+    async def _analyze_episode(
+        cls,
+        episode_path: Path,
+        threshold: float | None = None,
+    ) -> tuple[list[float], float]:
         """Load per-episode analysis data once (scene cuts + frame offset)."""
-        cuts, frame_offset = await asyncio.gather(
-            cls.detect_scene_cuts(str(episode_path)),
-            cls.get_frame_offset(episode_path),
+        cuts_task = asyncio.create_task(
+            cls.detect_scene_cuts(str(episode_path), threshold=threshold)
         )
+        frame_offset_task = asyncio.create_task(cls.get_frame_offset(episode_path))
+
+        cuts: list[float]
+        try:
+            cuts = await cuts_task
+        except Exception:
+            cuts = []
+
+        try:
+            frame_offset = await frame_offset_task
+        except Exception:
+            frame_offset = float(cls.SAFETY_FRAMES / float(cls.DEFAULT_FPS))
         return cuts, frame_offset
 
     @classmethod
-    def _build_gap_batch_key(cls, gaps: list[GapInfo], max_candidates: int) -> str:
+    def _build_gap_batch_key(
+        cls,
+        gaps: list[GapInfo],
+        matches: list[SceneMatch] | None,
+        max_candidates: int,
+    ) -> str:
         """Build a stable key to dedupe concurrent all-candidates requests."""
         import hashlib
 
-        payload = [
+        gap_payload = [
             {
                 "scene_index": gap.scene_index,
                 "episode": gap.episode,
@@ -616,6 +783,21 @@ class GapResolutionService:
             }
             for gap in gaps
         ]
+        match_payload = []
+        if matches:
+            match_payload = [
+                {
+                    "scene_index": match.scene_index,
+                    "episode": match.episode,
+                    "start_time": round(match.start_time, 6),
+                    "end_time": round(match.end_time, 6),
+                }
+                for match in matches
+            ]
+        payload = {
+            "gaps": gap_payload,
+            "matches": match_payload,
+        }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         digest = hashlib.sha1(encoded).hexdigest()
         return f"{max_candidates}:{digest}"
@@ -624,18 +806,23 @@ class GapResolutionService:
     async def generate_candidates_batch_dedup(
         cls,
         gaps: list[GapInfo],
+        matches: list[SceneMatch] | None = None,
         max_candidates: int = 6,
     ) -> dict[int, list[GapCandidate]]:
         """Deduplicate concurrent batch-generation calls for the same gap set."""
         if not gaps:
             return {}
 
-        key = cls._build_gap_batch_key(gaps, max_candidates)
+        key = cls._build_gap_batch_key(gaps, matches, max_candidates)
         async with cls._candidate_batch_lock:
             task = cls._candidate_batch_inflight.get(key)
             if task is None:
                 task = asyncio.create_task(
-                    cls.generate_candidates_batch(gaps, max_candidates=max_candidates)
+                    cls.generate_candidates_batch(
+                        gaps,
+                        matches=matches,
+                        max_candidates=max_candidates,
+                    )
                 )
                 cls._candidate_batch_inflight[key] = task
 
@@ -652,6 +839,7 @@ class GapResolutionService:
     async def generate_candidates_batch(
         cls,
         gaps: list[GapInfo],
+        matches: list[SceneMatch] | None = None,
         max_candidates: int = 6,
     ) -> dict[int, list[GapCandidate]]:
         """Generate candidates for many gaps with deduplicated per-episode analysis."""
@@ -675,6 +863,17 @@ class GapResolutionService:
                 resolved = AnimeLibraryService.resolve_episode_path(gap.episode, refreshed_manifest)
                 if resolved and resolved.exists():
                     resolved_by_scene[gap.scene_index] = resolved
+
+        match_list = matches or []
+        _, episode_key_by_scene, tolerance_by_episode = await cls._build_episode_overlap_context(
+            match_list,
+            gaps,
+        )
+        neighbor_contexts = cls._build_neighbor_contexts(
+            match_list,
+            episode_key_by_scene,
+            tolerance_by_episode,
+        )
 
         unique_episodes = sorted({str(path.resolve()) for path in resolved_by_scene.values()})
         analysis_tasks = {
@@ -702,10 +901,12 @@ class GapResolutionService:
                 continue
 
             cuts, frame_offset = analysis
-            candidates_by_scene[gap.scene_index] = cls._generate_candidates_from_cuts(
+            candidates_by_scene[gap.scene_index] = await cls._generate_candidates_for_gap(
                 gap=gap,
-                cuts=cuts,
+                episode_path=resolved,
+                base_cuts=cuts,
                 frame_offset=frame_offset,
+                neighbor_context=neighbor_contexts.get(gap.scene_index, _NeighborContext()),
                 max_candidates=max_candidates,
             )
 
@@ -770,37 +971,13 @@ class GapResolutionService:
         return resolved_map
 
     @classmethod
-    async def select_autofill_candidates_overlap_aware(
+    async def _build_episode_overlap_context(
         cls,
         matches: list[SceneMatch],
         gaps: list[GapInfo],
-        candidates_by_scene: dict[int, list[GapCandidate]],
-    ) -> AutoFillSelectionResult:
-        """Pick one candidate per gap by minimizing overlaps first, speed second.
-
-        Objective order (lexicographic):
-        1) Number of overlaps across adjacent timeline scenes (same episode only)
-        2) Total overlap duration
-        3) Total speed diff from 100%
-        4) Candidate rank sum (stable deterministic tie-break)
-        """
-        if not matches:
-            return AutoFillSelectionResult(
-                selected_candidates_by_scene={},
-                overlap_seconds_by_scene={},
-                total_overlap_count=0,
-                total_overlap_seconds=0.0,
-            )
-
+    ) -> tuple[list[int], dict[int, str], dict[str, float]]:
+        """Build normalized episode/tolerance context shared by ranking and DP."""
         match_by_scene = {match.scene_index: match for match in matches}
-        if not match_by_scene:
-            return AutoFillSelectionResult(
-                selected_candidates_by_scene={},
-                overlap_seconds_by_scene={},
-                total_overlap_count=0,
-                total_overlap_seconds=0.0,
-            )
-
         gap_by_scene = {gap.scene_index: gap for gap in gaps}
         sorted_scene_indices = sorted(match_by_scene)
 
@@ -828,15 +1005,191 @@ class GapResolutionService:
             fps = float(fps_fraction)
             tolerance_by_episode[normalized_key] = (1.0 / fps) if fps > 0 else default_tolerance
 
+        episode_key_by_scene: dict[int, str] = {}
+        for scene_index in sorted_scene_indices:
+            raw_episode = episode_hint_by_scene.get(scene_index, "")
+            if raw_episode:
+                episode_key_by_scene[scene_index] = normalized_episode.get(
+                    raw_episode,
+                    (raw_episode, None),
+                )[0]
+            else:
+                episode_key_by_scene[scene_index] = f"__unknown_scene_{scene_index}"
+
+        return sorted_scene_indices, episode_key_by_scene, tolerance_by_episode
+
+    @classmethod
+    def _build_neighbor_contexts(
+        cls,
+        matches: list[SceneMatch],
+        episode_key_by_scene: dict[int, str],
+        tolerance_by_episode: dict[str, float],
+    ) -> dict[int, _NeighborContext]:
+        """Build immediate previous/next same-episode occupancy windows."""
+        match_by_scene = {match.scene_index: match for match in matches}
+        sorted_scene_indices = sorted(match_by_scene)
+        default_tolerance = float(Fraction(1, 1) / cls.DEFAULT_FPS)
+        contexts: dict[int, _NeighborContext] = {}
+
+        for position, scene_index in enumerate(sorted_scene_indices):
+            episode_key = episode_key_by_scene.get(scene_index, f"__unknown_scene_{scene_index}")
+            previous_window: _NeighborWindow | None = None
+            next_window: _NeighborWindow | None = None
+
+            if position > 0:
+                previous_scene_index = sorted_scene_indices[position - 1]
+                if episode_key_by_scene.get(previous_scene_index) == episode_key:
+                    previous_match = match_by_scene[previous_scene_index]
+                    previous_window = _NeighborWindow(
+                        relation="previous",
+                        start_time=previous_match.start_time,
+                        end_time=previous_match.end_time,
+                        tolerance=tolerance_by_episode.get(episode_key, default_tolerance),
+                    )
+
+            if position < len(sorted_scene_indices) - 1:
+                next_scene_index = sorted_scene_indices[position + 1]
+                if episode_key_by_scene.get(next_scene_index) == episode_key:
+                    next_match = match_by_scene[next_scene_index]
+                    next_window = _NeighborWindow(
+                        relation="next",
+                        start_time=next_match.start_time,
+                        end_time=next_match.end_time,
+                        tolerance=tolerance_by_episode.get(episode_key, default_tolerance),
+                    )
+
+            contexts[scene_index] = _NeighborContext(previous=previous_window, next=next_window)
+
+        return contexts
+
+    @classmethod
+    def _threshold_rank(cls, detector_threshold: float | None) -> int:
+        """Prefer baseline cuts before lower-threshold cascade results in ties."""
+        if detector_threshold is None:
+            return 0
+        cascade = (cls.SCENE_THRESHOLD, 18.0, 12.0)
+        for index, threshold in enumerate(cascade):
+            if abs(detector_threshold - threshold) < 1e-6:
+                return index
+        return len(cascade)
+
+    @classmethod
+    def _candidate_sort_key(
+        cls,
+        candidate: GapCandidate,
+    ) -> tuple[int, int, int, int, int, int, str, int, int]:
+        """Sort candidates according to the /gaps ranking policy."""
+        return (
+            candidate.overlap_count,
+            int(round(candidate.overlap_seconds * cls.OVERLAP_COST_SCALE)),
+            0 if candidate.is_cut_aligned else 1,
+            int(round(candidate.added_duration * cls.OVERLAP_COST_SCALE)),
+            candidate.direction_priority,
+            cls._threshold_rank(candidate.detector_threshold),
+            candidate.extend_type,
+            int(round(candidate.start_time * cls.OVERLAP_COST_SCALE)),
+            int(round(candidate.end_time * cls.OVERLAP_COST_SCALE)),
+        )
+
+    @classmethod
+    def _merge_candidates(
+        cls,
+        candidates: list[GapCandidate],
+        additional_candidates: list[GapCandidate],
+    ) -> list[GapCandidate]:
+        """Merge timing-unique candidates while keeping the better-ranked copy."""
+        merged: dict[tuple[float, float], GapCandidate] = {}
+        for candidate in [*candidates, *additional_candidates]:
+            timing_key = (round(candidate.start_time, 6), round(candidate.end_time, 6))
+            existing = merged.get(timing_key)
+            if existing is None or cls._candidate_sort_key(candidate) < cls._candidate_sort_key(existing):
+                merged[timing_key] = candidate
+        return sorted(merged.values(), key=cls._candidate_sort_key)
+
+    @classmethod
+    async def _generate_candidates_for_gap(
+        cls,
+        gap: GapInfo,
+        episode_path: Path,
+        base_cuts: list[float],
+        frame_offset: float,
+        neighbor_context: _NeighborContext,
+        max_candidates: int,
+    ) -> list[GapCandidate]:
+        """Generate ranked candidates for one gap using cuts, cascade, and fallbacks."""
+        cut_candidates = cls._generate_cut_candidates_from_cuts(
+            gap=gap,
+            cuts=base_cuts,
+            frame_offset=frame_offset,
+            neighbor_context=neighbor_context,
+            detector_threshold=cls.SCENE_THRESHOLD,
+        )
+
+        if not any(candidate.is_clean for candidate in cut_candidates):
+            for threshold in (18.0, 12.0):
+                cuts = await cls.detect_scene_cuts(str(episode_path), threshold=threshold)
+                threshold_candidates = cls._generate_cut_candidates_from_cuts(
+                    gap=gap,
+                    cuts=cuts,
+                    frame_offset=frame_offset,
+                    neighbor_context=neighbor_context,
+                    detector_threshold=threshold,
+                )
+                cut_candidates = cls._merge_candidates(cut_candidates, threshold_candidates)
+                if any(candidate.is_clean for candidate in cut_candidates):
+                    break
+
+        fallback_candidates = cls._generate_fallback_candidates(
+            gap=gap,
+            neighbor_context=neighbor_context,
+        )
+
+        ranked = cls._merge_candidates(cut_candidates, fallback_candidates)
+        return ranked[:max_candidates]
+
+    @classmethod
+    async def select_autofill_candidates_overlap_aware(
+        cls,
+        matches: list[SceneMatch],
+        gaps: list[GapInfo],
+        candidates_by_scene: dict[int, list[GapCandidate]],
+    ) -> AutoFillSelectionResult:
+        """Pick one candidate per gap by minimizing overlaps first, then source stretch.
+
+        Objective order (lexicographic):
+        1) Number of overlaps across adjacent timeline scenes (same episode only)
+        2) Total overlap duration
+        3) Prefer cut-aligned candidates over fallback windows
+        4) Minimize added source duration (closer to the 75% floor)
+        5) Candidate rank sum (stable deterministic tie-break)
+        """
+        if not matches:
+            return AutoFillSelectionResult(
+                selected_candidates_by_scene={},
+                overlap_seconds_by_scene={},
+                total_overlap_count=0,
+                total_overlap_seconds=0.0,
+            )
+
+        match_by_scene = {match.scene_index: match for match in matches}
+        if not match_by_scene:
+            return AutoFillSelectionResult(
+                selected_candidates_by_scene={},
+                overlap_seconds_by_scene={},
+                total_overlap_count=0,
+                total_overlap_seconds=0.0,
+            )
+
+        gap_by_scene = {gap.scene_index: gap for gap in gaps}
+        sorted_scene_indices, episode_key_by_scene, tolerance_by_episode = (
+            await cls._build_episode_overlap_context(matches, gaps)
+        )
+        default_tolerance = float(Fraction(1, 1) / cls.DEFAULT_FPS)
+
         states_by_scene: list[list[_AutoFillState]] = []
         for scene_index in sorted_scene_indices:
             match = match_by_scene[scene_index]
-            raw_episode = episode_hint_by_scene.get(scene_index, "")
-            if raw_episode:
-                episode_key = normalized_episode.get(raw_episode, (raw_episode, None))[0]
-            else:
-                # Unknown episode: isolate from overlap checks to avoid false positives.
-                episode_key = f"__unknown_scene_{scene_index}"
+            episode_key = episode_key_by_scene.get(scene_index, f"__unknown_scene_{scene_index}")
 
             scene_candidates = candidates_by_scene.get(scene_index, [])
             if gap_by_scene.get(scene_index) and scene_candidates:
@@ -846,7 +1199,10 @@ class GapResolutionService:
                         episode_key=episode_key,
                         start_time=candidate.start_time,
                         end_time=candidate.end_time,
-                        speed_diff_micro=int(round(candidate.speed_diff * cls.OVERLAP_COST_SCALE)),
+                        cut_penalty=0 if candidate.is_cut_aligned else 1,
+                        added_duration_micro=int(
+                            round(candidate.added_duration * cls.OVERLAP_COST_SCALE)
+                        ),
                         candidate_rank=rank,
                         candidate=candidate,
                     )
@@ -859,7 +1215,8 @@ class GapResolutionService:
                         episode_key=episode_key,
                         start_time=match.start_time,
                         end_time=match.end_time,
-                        speed_diff_micro=0,
+                        cut_penalty=0,
+                        added_duration_micro=0,
                         candidate_rank=0,
                         candidate=None,
                     )
@@ -878,7 +1235,7 @@ class GapResolutionService:
             overlap_micro = max(1, int(round(overlap_effective * cls.OVERLAP_COST_SCALE)))
             return (1, overlap_micro)
 
-        dp_costs: list[list[tuple[int, int, int, int] | None]] = [
+        dp_costs: list[list[tuple[int, int, int, int, int] | None]] = [
             [None for _ in scene_states] for scene_states in states_by_scene
         ]
         dp_prev: list[list[int | None]] = [
@@ -886,13 +1243,19 @@ class GapResolutionService:
         ]
 
         for state_index, state in enumerate(states_by_scene[0]):
-            dp_costs[0][state_index] = (0, 0, state.speed_diff_micro, state.candidate_rank)
+            dp_costs[0][state_index] = (
+                0,
+                0,
+                state.cut_penalty,
+                state.added_duration_micro,
+                state.candidate_rank,
+            )
 
         for scene_pos in range(1, len(states_by_scene)):
             previous_states = states_by_scene[scene_pos - 1]
             current_states = states_by_scene[scene_pos]
             for current_index, current_state in enumerate(current_states):
-                best_cost: tuple[int, int, int, int] | None = None
+                best_cost: tuple[int, int, int, int, int] | None = None
                 best_previous_index: int | None = None
                 for previous_index, previous_state in enumerate(previous_states):
                     previous_cost = dp_costs[scene_pos - 1][previous_index]
@@ -902,8 +1265,9 @@ class GapResolutionService:
                     candidate_cost = (
                         previous_cost[0] + overlap_count,
                         previous_cost[1] + overlap_micro,
-                        previous_cost[2] + current_state.speed_diff_micro,
-                        previous_cost[3] + current_state.candidate_rank,
+                        previous_cost[2] + current_state.cut_penalty,
+                        previous_cost[3] + current_state.added_duration_micro,
+                        previous_cost[4] + current_state.candidate_rank,
                     )
                     if best_cost is None or candidate_cost < best_cost:
                         best_cost = candidate_cost
@@ -968,59 +1332,188 @@ class GapResolutionService:
         )
 
     @classmethod
-    def _generate_candidates_from_cuts(
+    def _interval_overlap_seconds(
+        cls,
+        start_a: float,
+        end_a: float,
+        start_b: float,
+        end_b: float,
+        tolerance: float,
+    ) -> float:
+        """Measure interval overlap with a one-frame tolerance."""
+        overlap_raw = min(end_a, end_b) - max(start_a, start_b)
+        return max(0.0, overlap_raw - tolerance)
+
+    @staticmethod
+    def _is_single_sided_candidate(extend_type: str) -> bool:
+        """Return True when a candidate only grows one side of the match."""
+        return extend_type not in {"extend_both", "fill_scene", "fallback_extend_both"}
+
+    @classmethod
+    def _candidate_overlap_metrics(
+        cls,
+        new_start: float,
+        new_end: float,
+        neighbor_context: _NeighborContext,
+    ) -> tuple[int, float]:
+        """Compute overlap metrics against immediate same-episode neighbors."""
+        overlap_count = 0
+        overlap_seconds = 0.0
+        for neighbor in (neighbor_context.previous, neighbor_context.next):
+            if neighbor is None:
+                continue
+            overlap = cls._interval_overlap_seconds(
+                new_start,
+                new_end,
+                neighbor.start_time,
+                neighbor.end_time,
+                neighbor.tolerance,
+            )
+            if overlap <= 0:
+                continue
+            overlap_count += 1
+            overlap_seconds += overlap
+        return overlap_count, overlap_seconds
+
+    @classmethod
+    def _preferred_single_side_order(
+        cls,
+        gap: GapInfo,
+        neighbor_context: _NeighborContext,
+    ) -> tuple[str, str]:
+        """Choose which extension direction to try first based on blocked neighbors."""
+        previous = neighbor_context.previous
+        next_window = neighbor_context.next
+
+        left_clearance = float("inf")
+        right_clearance = float("inf")
+        if previous is not None:
+            left_clearance = max(
+                0.0,
+                gap.current_start - previous.end_time - previous.tolerance,
+            )
+        if next_window is not None:
+            right_clearance = max(
+                0.0,
+                next_window.start_time - gap.current_end - next_window.tolerance,
+            )
+
+        if next_window is not None and previous is None:
+            return ("start", "end")
+        if previous is not None and next_window is None:
+            return ("end", "start")
+        if previous is not None and next_window is not None:
+            if left_clearance >= right_clearance:
+                return ("start", "end")
+            return ("end", "start")
+        return ("end", "start")
+
+    @classmethod
+    def _build_candidate(
+        cls,
+        gap: GapInfo,
+        new_start: float,
+        new_end: float,
+        extend_type: str,
+        description: str,
+        neighbor_context: _NeighborContext,
+        *,
+        is_cut_aligned: bool,
+        detector_threshold: float | None,
+        direction_priority: int,
+    ) -> GapCandidate | None:
+        """Build and score a candidate if it satisfies the speed bounds."""
+        if new_start < 0:
+            return None
+
+        new_start_frac = Fraction(new_start).limit_denominator(100000)
+        new_end_frac = Fraction(new_end).limit_denominator(100000)
+        new_duration_frac = new_end_frac - new_start_frac
+        if new_duration_frac <= 0:
+            return None
+
+        target_duration_frac = Fraction(gap.target_duration).limit_denominator(100000)
+        if target_duration_frac > 0:
+            speed_frac = new_duration_frac / target_duration_frac
+        else:
+            speed_frac = Fraction(1, 1)
+
+        if speed_frac < cls.MIN_SPEED or speed_frac > cls.MAX_SPEED:
+            return None
+
+        new_duration = float(new_duration_frac)
+        overlap_count, overlap_seconds = cls._candidate_overlap_metrics(
+            new_start,
+            new_end,
+            neighbor_context,
+        )
+
+        return GapCandidate(
+            start_time=new_start,
+            end_time=new_end,
+            duration=new_duration,
+            effective_speed=speed_frac,
+            speed_diff=abs(float(speed_frac) - float(cls.TARGET_SPEED)),
+            extend_type=extend_type,
+            snap_description=description,
+            overlap_count=overlap_count,
+            overlap_seconds=overlap_seconds,
+            is_cut_aligned=is_cut_aligned,
+            is_clean=overlap_count == 0,
+            added_duration=max(0.0, new_duration - gap.current_duration),
+            detector_threshold=detector_threshold if is_cut_aligned else None,
+            direction_priority=direction_priority,
+        )
+
+    @classmethod
+    def _generate_cut_candidates_from_cuts(
         cls,
         gap: GapInfo,
         cuts: list[float],
         frame_offset: float,
-        max_candidates: int = 6,
+        neighbor_context: _NeighborContext,
+        detector_threshold: float,
     ) -> list[GapCandidate]:
-        """Generate timing candidates from precomputed scene cuts."""
+        """Generate cut-aligned candidates from detected cuts for one scene."""
         if not cuts or len(cuts) < 2:
             return []
 
         current_start = gap.current_start
         current_end = gap.current_end
-        target_duration_frac = Fraction(gap.target_duration).limit_denominator(100000)
-        target_duration = gap.target_duration
+        direction_order = cls._preferred_single_side_order(gap, neighbor_context)
+        direction_priority = {
+            direction_order[0]: 0,
+            direction_order[1]: 1,
+        }
 
-        candidates = []
-        seen_timings = set()
+        candidates: list[GapCandidate] = []
+        seen_timings: set[tuple[float, float]] = set()
 
-        def add_candidate(new_start: float, new_end: float, extend_type: str, description: str) -> bool:
-            new_start_frac = Fraction(new_start).limit_denominator(100000)
-            new_end_frac = Fraction(new_end).limit_denominator(100000)
-            new_duration_frac = new_end_frac - new_start_frac
-            new_duration = float(new_duration_frac)
-
-            if new_duration <= 0:
+        def add_candidate(
+            new_start: float,
+            new_end: float,
+            extend_type: str,
+            description: str,
+            direction: str | None = None,
+        ) -> bool:
+            candidate = cls._build_candidate(
+                gap,
+                new_start,
+                new_end,
+                extend_type,
+                description,
+                neighbor_context,
+                is_cut_aligned=True,
+                detector_threshold=detector_threshold,
+                direction_priority=2 if direction is None else direction_priority[direction],
+            )
+            if candidate is None:
                 return False
-
-            if target_duration_frac > 0:
-                speed_frac = new_duration_frac / target_duration_frac
-            else:
-                speed_frac = Fraction(1, 1)
-
-            if speed_frac < cls.MIN_SPEED or speed_frac > cls.MAX_SPEED:
-                return False
-
-            timing_key = (round(new_start, 6), round(new_end, 6))
+            timing_key = (round(candidate.start_time, 6), round(candidate.end_time, 6))
             if timing_key in seen_timings:
                 return False
             seen_timings.add(timing_key)
-
-            speed_diff = abs(float(speed_frac) - float(cls.TARGET_SPEED))
-            candidates.append(
-                GapCandidate(
-                    start_time=new_start,
-                    end_time=new_end,
-                    duration=new_duration,
-                    effective_speed=speed_frac,
-                    speed_diff=speed_diff,
-                    extend_type=extend_type,
-                    snap_description=description,
-                )
-            )
+            candidates.append(candidate)
             return True
 
         current_scene_start = None
@@ -1033,11 +1526,82 @@ class GapResolutionService:
                 current_scene_end = scene_end
                 break
 
+        safe_start = None
+        safe_end = None
         if current_scene_start is not None and current_scene_end is not None:
             safe_start = current_scene_start + frame_offset
             safe_end = current_scene_end - frame_offset
 
-            if safe_start < current_start or safe_end > current_end:
+        cuts_before = [c for c in cuts if c < current_start]
+        cuts_after = [c for c in cuts if c > current_end]
+        cuts_before.sort(key=lambda c: current_start - c)
+        cuts_after.sort(key=lambda c: c - current_end)
+
+        start_specs: list[tuple[float, float, str, str, str]] = []
+        end_specs: list[tuple[float, float, str, str, str]] = []
+
+        if safe_start is not None and safe_start < current_start:
+            start_specs.append(
+                (
+                    safe_start,
+                    current_end,
+                    "extend_to_scene_start",
+                    f"Extend to scene start (-{current_start - safe_start:.2f}s)",
+                    "start",
+                )
+            )
+        if safe_end is not None and safe_end > current_end:
+            end_specs.append(
+                (
+                    current_start,
+                    safe_end,
+                    "extend_to_scene_end",
+                    f"Extend to scene end (+{safe_end - current_end:.2f}s)",
+                    "end",
+                )
+            )
+
+        for cut_start in cuts_before[:5]:
+            new_start = cut_start + frame_offset
+            start_specs.append(
+                (
+                    new_start,
+                    current_end,
+                    "extend_start",
+                    f"Extend start to previous cut (-{current_start - new_start:.2f}s)",
+                    "start",
+                )
+            )
+
+        for cut_end in cuts_after[:5]:
+            new_end = cut_end - frame_offset
+            end_specs.append(
+                (
+                    current_start,
+                    new_end,
+                    "extend_end",
+                    f"Extend end to next cut (+{new_end - current_end:.2f}s)",
+                    "end",
+                )
+            )
+
+        specs_by_direction = {
+            "start": start_specs,
+            "end": end_specs,
+        }
+        for direction in direction_order:
+            for spec in specs_by_direction[direction]:
+                add_candidate(*spec)
+
+        if not any(
+            candidate.is_clean and cls._is_single_sided_candidate(candidate.extend_type)
+            for candidate in candidates
+        ):
+            if (
+                safe_start is not None
+                and safe_end is not None
+                and (safe_start < current_start or safe_end > current_end)
+            ):
                 add_candidate(
                     safe_start,
                     safe_end,
@@ -1045,97 +1609,106 @@ class GapResolutionService:
                     f"Fill current scene ({current_scene_end - current_scene_start:.2f}s scene)",
                 )
 
-            if safe_end > current_end:
-                add_candidate(
-                    current_start,
-                    safe_end,
-                    "extend_to_scene_end",
-                    f"Extend to scene end (+{safe_end - current_end:.2f}s)",
-                )
-
-            if safe_start < current_start:
-                add_candidate(
-                    safe_start,
-                    current_end,
-                    "extend_to_scene_start",
-                    f"Extend to scene start (-{current_start - safe_start:.2f}s)",
-                )
-
-        cuts_before = [c for c in cuts if c < current_start]
-        cuts_after = [c for c in cuts if c > current_end]
-        cuts_before.sort(key=lambda c: current_start - c)
-        cuts_after.sort(key=lambda c: c - current_end)
-
-        for cut_end in cuts_after[:5]:
-            new_start = current_start
-            new_end = cut_end - frame_offset
-            add_candidate(
-                new_start,
-                new_end,
-                "extend_end",
-                f"Extend end to next cut (+{new_end - current_end:.2f}s)",
-            )
-
-        for cut_start in cuts_before[:5]:
-            new_start = cut_start + frame_offset
-            new_end = current_end
-            add_candidate(
-                new_start,
-                new_end,
-                "extend_start",
-                f"Extend start to previous cut (-{current_start - new_start:.2f}s)",
-            )
-
-        for cut_start in cuts_before[:3]:
-            for cut_end in cuts_after[:3]:
-                new_start = cut_start + frame_offset
-                new_end = cut_end - frame_offset
-                add_candidate(
-                    new_start,
-                    new_end,
-                    "extend_both",
-                    f"Extend both (-{current_start - new_start:.2f}s, +{new_end - current_end:.2f}s)",
-                )
-
-        candidates.sort(key=lambda c: c.speed_diff)
-
-        if not candidates:
-            needed_duration = target_duration
-            current_duration = current_end - current_start
-            extra_needed = needed_duration - current_duration
-
-            if extra_needed > 0:
-                new_start = current_start - extra_needed
-                if new_start >= 0:
-                    add_candidate(
-                        new_start,
-                        current_end,
-                        "fallback_extend_start",
-                        f"Extend start for 100% speed (-{extra_needed:.2f}s)",
-                    )
-
-                new_end = current_end + extra_needed
-                add_candidate(
-                    current_start,
-                    new_end,
-                    "fallback_extend_end",
-                    f"Extend end for 100% speed (+{extra_needed:.2f}s)",
-                )
-
-                half_extra = extra_needed / 2
-                new_start = current_start - half_extra
-                new_end = current_end + half_extra
-                if new_start >= 0:
+            for cut_start in cuts_before[:3]:
+                for cut_end in cuts_after[:3]:
+                    new_start = cut_start + frame_offset
+                    new_end = cut_end - frame_offset
                     add_candidate(
                         new_start,
                         new_end,
-                        "fallback_extend_both",
-                        f"Extend both for 100% speed (-{half_extra:.2f}s, +{half_extra:.2f}s)",
+                        "extend_both",
+                        (
+                            "Extend both "
+                            f"(-{current_start - new_start:.2f}s, +{new_end - current_end:.2f}s)"
+                        ),
                     )
 
-                candidates.sort(key=lambda c: c.speed_diff)
+        return sorted(candidates, key=cls._candidate_sort_key)
 
-        return candidates[:max_candidates]
+    @classmethod
+    def _generate_fallback_candidates(
+        cls,
+        gap: GapInfo,
+        neighbor_context: _NeighborContext,
+    ) -> list[GapCandidate]:
+        """Generate minimal-duration fallback windows when cut alignment is insufficient."""
+        current_duration_frac = Fraction(gap.current_duration).limit_denominator(100000)
+        target_duration_frac = Fraction(gap.target_duration).limit_denominator(100000)
+        minimum_duration_frac = target_duration_frac * cls.MIN_SPEED
+        extra_needed_frac = minimum_duration_frac - current_duration_frac
+        if extra_needed_frac <= 0:
+            return []
+
+        extra_needed = float(extra_needed_frac)
+        direction_order = cls._preferred_single_side_order(gap, neighbor_context)
+        direction_priority = {
+            direction_order[0]: 0,
+            direction_order[1]: 1,
+        }
+
+        candidates: list[GapCandidate] = []
+        seen_timings: set[tuple[float, float]] = set()
+
+        def add_candidate(
+            new_start: float,
+            new_end: float,
+            extend_type: str,
+            description: str,
+            direction: str | None = None,
+        ) -> bool:
+            candidate = cls._build_candidate(
+                gap,
+                new_start,
+                new_end,
+                extend_type,
+                description,
+                neighbor_context,
+                is_cut_aligned=False,
+                detector_threshold=None,
+                direction_priority=2 if direction is None else direction_priority[direction],
+            )
+            if candidate is None:
+                return False
+            timing_key = (round(candidate.start_time, 6), round(candidate.end_time, 6))
+            if timing_key in seen_timings:
+                return False
+            seen_timings.add(timing_key)
+            candidates.append(candidate)
+            return True
+
+        single_side_specs = {
+            "start": (
+                gap.current_start - extra_needed,
+                gap.current_end,
+                "fallback_extend_start",
+                f"Extend start to 75% floor (-{extra_needed:.2f}s)",
+                "start",
+            ),
+            "end": (
+                gap.current_start,
+                gap.current_end + extra_needed,
+                "fallback_extend_end",
+                f"Extend end to 75% floor (+{extra_needed:.2f}s)",
+                "end",
+            ),
+        }
+
+        for direction in direction_order:
+            add_candidate(*single_side_specs[direction])
+
+        if not any(
+            candidate.is_clean and cls._is_single_sided_candidate(candidate.extend_type)
+            for candidate in candidates
+        ):
+            half_extra = extra_needed / 2
+            add_candidate(
+                gap.current_start - half_extra,
+                gap.current_end + half_extra,
+                "fallback_extend_both",
+                f"Extend both to 75% floor (-{half_extra:.2f}s, +{half_extra:.2f}s)",
+            )
+
+        return sorted(candidates, key=cls._candidate_sort_key)
 
     @classmethod
     def compute_speed_for_timing(

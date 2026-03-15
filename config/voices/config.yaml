@@ -66,6 +66,9 @@ voices:
       style: 0.0
       speed: 1.0
       use_speaker_boost: true
+    auto_editor_overrides:
+      threshold: "0.065"
+      margin: "0.02sec,0.12sec"
 
   adam:
     display_name: "Adam"
