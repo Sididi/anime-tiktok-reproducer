@@ -57,6 +57,11 @@ async def validate_raw_scenes(project_id: str, request: ValidateRequest):
 
     # Build lookup of validations
     validation_map = {v.scene_index: v for v in request.validations}
+    invalidated_raw_indices = {
+        v.scene_index
+        for v in request.validations
+        if not v.is_raw
+    }
 
     # Apply validations
     for scene in transcription.scenes:
@@ -86,7 +91,14 @@ async def validate_raw_scenes(project_id: str, request: ValidateRequest):
         )
         ProjectService.save_matches(project_id, match_list)
 
+    _enforce_raw_scene_invariants(transcription.scenes)
+
     ProjectService.save_transcription(project_id, transcription)
+    _persist_detection_after_validation(
+        project_id=project_id,
+        invalidated_raw_indices=invalidated_raw_indices,
+        updated_scenes=transcription.scenes,
+    )
 
     # Sync scenes.json with current scene structure
     ProjectService.save_scenes(project_id, SceneList(scenes=[
@@ -103,6 +115,13 @@ async def confirm_raw_scenes(project_id: str):
     project = ProjectService.load(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    # Defensive cleanup for historical inconsistencies where raw scenes
+    # may have been assigned text via a stale index update.
+    transcription = ProjectService.load_transcription(project_id)
+    if transcription:
+        _enforce_raw_scene_invariants(transcription.scenes)
+        ProjectService.save_transcription(project_id, transcription)
 
     project.phase = ProjectPhase.SCRIPT_RESTRUCTURE
     ProjectService.save(project)
@@ -146,6 +165,52 @@ async def reset_raw_scenes(project_id: str):
     return {"status": "ok"}
 
 
+def _persist_detection_after_validation(
+    *,
+    project_id: str,
+    invalidated_raw_indices: set[int],
+    updated_scenes: list[SceneTranscription],
+) -> None:
+    """Persist manual RAW->TTS choices by filtering stale raw candidates.
+
+    This intentionally does not modify merge/remap behavior. It only updates
+    persisted detection metadata so reloading /raw-scenes reflects user choices.
+    """
+    detection_file = ProjectService.get_project_dir(project_id) / "raw_scene_detection.json"
+    if not detection_file.exists():
+        return
+
+    detection = RawSceneDetectionResult.model_validate_json(detection_file.read_text())
+
+    if invalidated_raw_indices:
+        detection.candidates = [
+            candidate
+            for candidate in detection.candidates
+            if candidate.scene_index not in invalidated_raw_indices
+        ]
+
+    # Keep candidate indices aligned with current transcription after merge/reindex.
+    for candidate in detection.candidates:
+        for scene in updated_scenes:
+            if (
+                abs(scene.start_time - candidate.start_time) < 0.01
+                and abs(scene.end_time - candidate.end_time) < 0.01
+            ):
+                candidate.scene_index = scene.scene_index
+                break
+
+    detection.has_raw_scenes = len(detection.candidates) > 0
+    detection_file.write_text(detection.model_dump_json(indent=2))
+
+
+def _enforce_raw_scene_invariants(scenes: list[SceneTranscription]) -> None:
+    """Ensure raw scenes never carry text/words payloads."""
+    for scene in scenes:
+        if scene.is_raw:
+            scene.text = ""
+            scene.words = []
+
+
 def _merge_invalidated_scenes(scenes: list[SceneTranscription]) -> list[SceneTranscription]:
     """Merge invalidated (non-raw) scenes that were formerly raw back into adjacent TTS scenes.
 
@@ -155,13 +220,9 @@ def _merge_invalidated_scenes(scenes: list[SceneTranscription]) -> list[SceneTra
     if not scenes:
         return scenes
 
-    # Identify scenes that were invalidated (not raw, but have no words and empty text)
-    # These are scenes that were detected as raw but user said "not raw"
-    # They'll have is_raw=False set by validate, but may have user-provided text
-    # We only merge scenes that are still effectively empty after invalidation
-    # Actually, per the plan: merge if invalidated. We track this by checking
-    # scenes that had is_raw toggled off. Since we can't track the toggle directly,
-    # we merge any non-raw scene with no words (it was formerly raw).
+    # Merge only effectively-empty non-raw scenes.
+    # If a user provided text while marking a scene as TTS, keep that scene so the
+    # manual transcription remains attached to its own scene index.
     result: list[SceneTranscription] = []
     for scene in scenes:
         if not scene.is_raw and not scene.words and not scene.text.strip():
@@ -171,15 +232,6 @@ def _merge_invalidated_scenes(scenes: list[SceneTranscription]) -> list[SceneTra
                 prev.end_time = scene.end_time
             # If no previous scene, just drop it (edge case)
             continue
-
-        if not scene.is_raw and not scene.words and scene.text.strip():
-            # Non-raw scene with user-provided text but no words — merge text into previous
-            if result:
-                prev = result[-1]
-                prev.end_time = scene.end_time
-                if scene.text.strip():
-                    prev.text = f"{prev.text} {scene.text}".strip() if prev.text else scene.text
-                continue
 
         result.append(scene)
 

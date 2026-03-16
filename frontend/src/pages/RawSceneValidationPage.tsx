@@ -16,6 +16,26 @@ interface SceneValidationState {
   text: string;
 }
 
+function buildValidationState(
+  transcription: Transcription,
+  detection: RawSceneDetectionResult,
+): Record<number, SceneValidationState> {
+  const rawCandidateIndices = new Set(
+    detection.candidates.map((c) => c.scene_index),
+  );
+
+  const initial: Record<number, SceneValidationState> = {};
+  for (const scene of transcription.scenes) {
+    initial[scene.scene_index] = {
+      // Source of truth is persisted transcription state.
+      is_raw: scene.is_raw ?? rawCandidateIndices.has(scene.scene_index),
+      text: scene.text,
+    };
+  }
+
+  return initial;
+}
+
 export function RawSceneValidationPage() {
   const { projectId } = useParams<{ projectId: string }>();
   const navigate = useNavigate();
@@ -44,17 +64,7 @@ export function RawSceneValidationPage() {
         setTranscription(data.transcription);
 
         if (data.transcription && data.detection) {
-          const rawIndices = new Set(
-            data.detection.candidates.map((c) => c.scene_index),
-          );
-          const initial: Record<number, SceneValidationState> = {};
-          for (const scene of data.transcription.scenes) {
-            initial[scene.scene_index] = {
-              is_raw: rawIndices.has(scene.scene_index),
-              text: scene.text,
-            };
-          }
-          setValidations(initial);
+          setValidations(buildValidationState(data.transcription, data.detection));
         }
       } catch (err) {
         setError((err as Error).message);
@@ -100,17 +110,7 @@ export function RawSceneValidationPage() {
       setTranscription(data.transcription);
 
       if (data.transcription && data.detection) {
-        const rawIndices = new Set(
-          data.detection.candidates.map((c) => c.scene_index),
-        );
-        const initial: Record<number, SceneValidationState> = {};
-        for (const scene of data.transcription.scenes) {
-          initial[scene.scene_index] = {
-            is_raw: rawIndices.has(scene.scene_index),
-            text: scene.text,
-          };
-        }
-        setValidations(initial);
+        setValidations(buildValidationState(data.transcription, data.detection));
       }
     } catch (err) {
       setError((err as Error).message);
@@ -145,23 +145,6 @@ export function RawSceneValidationPage() {
           sceneValidations,
         );
         setTranscription(result.transcription);
-      }
-
-      // Also send text edits for non-raw scenes
-      const textUpdates = Object.entries(validations)
-        .filter(
-          ([idx]) =>
-            !rawCandidateIndices.has(Number(idx)) ||
-            !validations[Number(idx)]?.is_raw,
-        )
-        .filter(([, state]) => state.text)
-        .map(([idx, state]) => ({
-          scene_index: Number(idx),
-          text: state.text,
-        }));
-
-      if (textUpdates.length > 0) {
-        await api.updateTranscription(projectId, textUpdates);
       }
 
       await api.confirmRawScenes(projectId);

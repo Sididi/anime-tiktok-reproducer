@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import requests
 
 from ..config import settings
+
+
+logger = logging.getLogger(__name__)
 
 
 class GeminiService:
@@ -74,10 +78,70 @@ class GeminiService:
         return response.json()
 
     @staticmethod
+    def _response_diagnostics(response_payload: dict[str, Any]) -> str:
+        details: list[str] = []
+
+        prompt_feedback = response_payload.get("promptFeedback")
+        if isinstance(prompt_feedback, dict):
+            block_reason = prompt_feedback.get("blockReason")
+            if isinstance(block_reason, str) and block_reason.strip():
+                details.append(f"blockReason={block_reason.strip()}")
+
+            safety_ratings = prompt_feedback.get("safetyRatings")
+            if isinstance(safety_ratings, list):
+                categories: list[str] = []
+                for rating in safety_ratings:
+                    if not isinstance(rating, dict):
+                        continue
+                    category = rating.get("category")
+                    if isinstance(category, str) and category.strip():
+                        categories.append(category.strip())
+                if categories:
+                    details.append(
+                        "safetyCategories=" + ",".join(dict.fromkeys(categories))
+                    )
+
+        candidates = response_payload.get("candidates")
+        if isinstance(candidates, list) and candidates:
+            finish_reasons: list[str] = []
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                finish_reason = candidate.get("finishReason")
+                if isinstance(finish_reason, str) and finish_reason.strip():
+                    finish_reasons.append(finish_reason.strip())
+            if finish_reasons:
+                details.append("finishReasons=" + ",".join(dict.fromkeys(finish_reasons)))
+
+        return "; ".join(details) if details else "no diagnostics"
+
+    @staticmethod
+    def _is_schema_retryable_error(message: str, *, has_schema: bool) -> bool:
+        if not has_schema:
+            return False
+
+        lower = message.lower()
+        return (
+            "responsejsonschema" in lower
+            or "responseschema" in lower
+            or "unknown name" in lower
+            or "invalid argument" in lower
+            or "too many states" in lower
+            or "schema produces a constraint" in lower
+            or "did not contain candidates" in lower
+            or "did not contain textual output" in lower
+        )
+
+    @staticmethod
     def _extract_text(response_payload: dict[str, Any]) -> str:
         candidates = response_payload.get("candidates")
         if not isinstance(candidates, list) or not candidates:
-            raise RuntimeError("Gemini response did not contain candidates")
+            diagnostics = GeminiService._response_diagnostics(response_payload)
+            logger.warning("Gemini response missing candidates (%s)", diagnostics)
+            raise RuntimeError(
+                "Gemini response did not contain candidates "
+                f"({diagnostics})"
+            )
 
         chunks: list[str] = []
         for candidate in candidates:
@@ -97,7 +161,12 @@ class GeminiService:
 
         text_output = "\n".join(chunks).strip()
         if not text_output:
-            raise RuntimeError("Gemini response did not contain textual output")
+            diagnostics = GeminiService._response_diagnostics(response_payload)
+            logger.warning("Gemini response missing textual output (%s)", diagnostics)
+            raise RuntimeError(
+                "Gemini response did not contain textual output "
+                f"({diagnostics})"
+            )
         return text_output
 
     @staticmethod
@@ -140,29 +209,32 @@ class GeminiService:
         model: str | None = None,
         response_json_schema: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        has_schema = response_json_schema is not None
+        used_schema = response_json_schema
+
         try:
             payload = cls._generate_content(
                 prompt=prompt,
                 response_mime_type="application/json",
                 model=model,
-                response_json_schema=response_json_schema,
+                response_json_schema=used_schema,
             )
         except RuntimeError as exc:
-            # Some model revisions or API surfaces may reject schema fields or
-            # fail to serve overly complex schemas.
-            lower = str(exc).lower()
-            schema_not_supported = (
-                response_json_schema is not None
-                and (
-                    "responsejsonschema" in lower
-                    or "responseschema" in lower
-                    or "unknown name" in lower
-                    or "invalid argument" in lower
-                    or "too many states" in lower
-                    or "schema produces a constraint" in lower
-                )
+            if not cls._is_schema_retryable_error(str(exc), has_schema=has_schema):
+                raise
+
+            payload = cls._generate_content(
+                prompt=prompt,
+                response_mime_type="application/json",
+                model=model,
+                response_json_schema=None,
             )
-            if not schema_not_supported:
+            used_schema = None
+
+        try:
+            raw = cls._extract_text(payload)
+        except RuntimeError as exc:
+            if not cls._is_schema_retryable_error(str(exc), has_schema=used_schema is not None):
                 raise
             payload = cls._generate_content(
                 prompt=prompt,
@@ -170,7 +242,8 @@ class GeminiService:
                 model=model,
                 response_json_schema=None,
             )
-        raw = cls._extract_text(payload)
+            raw = cls._extract_text(payload)
+
         stripped = cls._strip_json_fence(raw)
 
         # First attempt: parse full payload as-is.

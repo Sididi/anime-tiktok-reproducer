@@ -12,6 +12,9 @@ from .script_phase_prompt_service import ScriptPhasePromptService
 class MetadataService:
     """Metadata prompt generation, validation and persistence."""
 
+    MIN_SCRIPT_CHARS = 50
+    MIN_SCRIPT_WORDS = 5
+
     @classmethod
     def build_prompt(
         cls,
@@ -33,11 +36,18 @@ class MetadataService:
         target_language: str = "fr",
     ) -> str:
         scenes = script_payload.get("scenes", [])
-        script_text = " ".join(
+        script_chunks = [
             scene.get("text", "").strip()
             for scene in scenes
             if isinstance(scene, dict) and isinstance(scene.get("text"), str)
-        ).strip()
+        ]
+        script_text = " ".join(chunk for chunk in script_chunks if chunk).strip()
+        word_count = len([token for token in script_text.split() if token.strip()])
+        if len(script_text) < cls.MIN_SCRIPT_CHARS or word_count < cls.MIN_SCRIPT_WORDS:
+            raise ValueError(
+                "Script text insufficient for metadata generation: "
+                f"{len(script_text)} chars, {word_count} words"
+            )
         return cls.build_prompt(
             anime_name=anime_name,
             script_text=script_text,

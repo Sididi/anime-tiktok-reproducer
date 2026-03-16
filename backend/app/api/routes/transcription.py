@@ -117,7 +117,11 @@ async def update_transcription(project_id: str, request: UpdateTranscriptionRequ
 
         for scene in transcription.scenes:
             if scene.scene_index == scene_index:
-                scene.text = new_text
+                # Raw scenes must keep empty text by invariant.
+                if scene.is_raw:
+                    scene.text = ""
+                else:
+                    scene.text = new_text
                 break
 
     ProjectService.save_transcription(project_id, transcription)

@@ -332,10 +332,10 @@ RÈGLES CATÉGORIE:
 FORMAT:
 - Réponds uniquement avec le JSON demandé
 - Structure attendue:
-{
+{{
   "title_hooks": ["hook 1", "hook 2", "..."],
   "category": "Genre • Genre"
-}
+}}
 
 ANIME: {anime_name}
 SCRIPT: {script_summary}
@@ -362,10 +362,10 @@ CATEGORY RULES:
 FORMAT:
 - Return JSON only
 - Expected shape:
-{
+{{
   "title_hooks": ["hook 1", "hook 2", "..."],
   "category": "Genre • Genre"
-}
+}}
 
 ANIME: {anime_name}
 SCRIPT: {script_summary}
