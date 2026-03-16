@@ -33,6 +33,7 @@
 
     var DEFAULT_PORT = 48653;
     var OUTPUT_FILENAME = "output.mp4";
+    var AUDIO_NO_MUSIC_OUTPUT_FILENAME = "output_no_music.wav";
     var ATR_OUTPUT_PATTERN = /^ATR_.*\.mp4$/i;
     var EXPORT_STABLE_MS = 10000;
     var EXPORT_POLL_INTERVAL_MS = 5000;
@@ -53,17 +54,21 @@
         parent_folder_id: "",
         port: DEFAULT_PORT,
         preset_epr_path: "",
+        audio_preset_epr_path: "",
         delete_after_upload_default: true,
+        export_audio_no_music_default: true,
     };
 
     var statusIndicator = document.getElementById("status-indicator");
     var btnBrowse = document.getElementById("btn-browse");
     var btnExportProject = document.getElementById("btn-export-project");
     var btnBrowsePreset = document.getElementById("btn-browse-preset");
+    var btnBrowseAudioPreset = document.getElementById("btn-browse-audio-preset");
     var btnSaveSettings = document.getElementById("btn-save-settings");
     var btnTestDrive = document.getElementById("btn-test-drive");
 
     var projectSelect = document.getElementById("project-select");
+    var exportAudioNoMusicCheckbox = document.getElementById("chk-export-audio-no-music");
     var deleteAfterUploadCheckbox = document.getElementById("chk-delete-after-upload");
 
     var settingClientId = document.getElementById("setting-client-id");
@@ -72,6 +77,7 @@
     var settingParentFolderId = document.getElementById("setting-parent-folder-id");
     var settingPort = document.getElementById("setting-port");
     var settingPresetEpr = document.getElementById("setting-preset-epr");
+    var settingAudioPresetEpr = document.getElementById("setting-audio-preset-epr");
     var settingsStatus = document.getElementById("settings-status");
     var settingsSection = document.getElementById("settings-section");
     var settingsToggle = document.getElementById("settings-toggle");
@@ -436,10 +442,73 @@
         if (!name) {
             return false;
         }
+        if (name.toLowerCase() === AUDIO_NO_MUSIC_OUTPUT_FILENAME.toLowerCase()) {
+            return true;
+        }
         if (name.toLowerCase() === OUTPUT_FILENAME.toLowerCase()) {
             return true;
         }
         return ATR_OUTPUT_PATTERN.test(name);
+    }
+
+    function clonePlainObject(value) {
+        var next = {};
+        Object.keys(value || {}).forEach(function (key) {
+            next[key] = value[key];
+        });
+        return next;
+    }
+
+    function normalizeOutputPathList(paths) {
+        var seen = {};
+        var normalized = [];
+        (paths || []).forEach(function (item) {
+            var asPath = String(item || "").trim();
+            if (!asPath || seen[asPath]) {
+                return;
+            }
+            seen[asPath] = true;
+            normalized.push(asPath);
+        });
+        return normalized;
+    }
+
+    function getExpectedOutputPaths(state) {
+        var listed = normalizeOutputPathList(state && state.expected_outputs ? state.expected_outputs : []);
+        if (listed.length > 0) {
+            return listed;
+        }
+
+        var fallback = [];
+        if (state && state.output_path) {
+            fallback.push(String(state.output_path));
+        }
+        if (state && state.audio_export_enabled && state.audio_output_path) {
+            fallback.push(String(state.audio_output_path));
+        }
+        return normalizeOutputPathList(fallback);
+    }
+
+    function hasOutputUploadFinished(state, outputPath) {
+        var targetPath = String(outputPath || "").trim();
+        if (!targetPath || !state) {
+            return false;
+        }
+        var uploadedOutputs = state.uploaded_outputs || {};
+        return !!uploadedOutputs[targetPath];
+    }
+
+    function hasAllExpectedUploads(state) {
+        var expected = getExpectedOutputPaths(state);
+        if (expected.length <= 0) {
+            return false;
+        }
+        for (var i = 0; i < expected.length; i += 1) {
+            if (!hasOutputUploadFinished(state, expected[i])) {
+                return false;
+            }
+        }
+        return true;
     }
 
     function listWatchedOutputPaths(dirPath) {
@@ -475,6 +544,7 @@
         }
 
         merged.delete_after_upload_default = !!merged.delete_after_upload_default;
+        merged.export_audio_no_music_default = !!merged.export_audio_no_music_default;
 
         return merged;
     }
@@ -491,7 +561,9 @@
         settingParentFolderId.value = settings.parent_folder_id || "";
         settingPort.value = String(settings.port || DEFAULT_PORT);
         settingPresetEpr.value = settings.preset_epr_path || "";
+        settingAudioPresetEpr.value = settings.audio_preset_epr_path || "";
         deleteAfterUploadCheckbox.checked = !!settings.delete_after_upload_default;
+        exportAudioNoMusicCheckbox.checked = !!settings.export_audio_no_music_default;
     }
 
     function readSettingsForm() {
@@ -507,7 +579,9 @@
             parent_folder_id: String(settingParentFolderId.value || "").trim(),
             port: Math.floor(parsedPort),
             preset_epr_path: String(settingPresetEpr.value || "").trim(),
+            audio_preset_epr_path: String(settingAudioPresetEpr.value || "").trim(),
             delete_after_upload_default: !!deleteAfterUploadCheckbox.checked,
+            export_audio_no_music_default: !!exportAudioNoMusicCheckbox.checked,
         };
     }
 
@@ -768,8 +842,13 @@
             cleanup_retry_count: 0,
             cleanup_next_retry_at: null,
             export_job_id: null,
+            video_export_job_id: null,
+            audio_export_job_id: null,
             encoder_progress: 0,
             upload_pending: false,
+            expected_outputs: getExpectedOutputPaths(state),
+            uploaded_outputs: {},
+            upload_results_by_output: {},
             completion_notified_status: null,
             completion_notified_at: null,
         });
@@ -1055,6 +1134,35 @@
         });
     }
 
+    function isUploadJobQueuedForOutput(projectId, outputPath) {
+        var normalizedProject = String(projectId || "").trim();
+        var normalizedOutput = String(outputPath || "").trim();
+        if (!normalizedProject || !normalizedOutput) {
+            return false;
+        }
+
+        var active = jobStore.active;
+        if (
+            active &&
+            active.type === "upload_output" &&
+            active.payload &&
+            active.payload.project_id === normalizedProject &&
+            String(active.payload.output_path || "").trim() === normalizedOutput
+        ) {
+            return true;
+        }
+
+        return jobStore.queue.some(function (job) {
+            return (
+                job &&
+                job.type === "upload_output" &&
+                job.payload &&
+                job.payload.project_id === normalizedProject &&
+                String(job.payload.output_path || "").trim() === normalizedOutput
+            );
+        });
+    }
+
     function enqueueJob(type, payload) {
         var job = {
             id: generateJobId(type),
@@ -1303,11 +1411,23 @@
             });
 
             return runScript(importPath).then(function () {
+                var enableAudioNoMusic = !!(exportAudioNoMusicCheckbox && exportAudioNoMusicCheckbox.checked);
+                var audioOutputPath = path.join(path.dirname(String(result.output_path || "")), AUDIO_NO_MUSIC_OUTPUT_FILENAME);
+                var expectedOutputs = normalizeOutputPathList(
+                    enableAudioNoMusic
+                        ? [String(result.output_path || ""), String(audioOutputPath || "")]
+                        : [String(result.output_path || "")]
+                );
                 var nextState = upsertProjectState(projectId, {
                     status: "ready_for_export",
                     imported_at: nowIso(),
                     upload_pending: false,
                     pending_cleanup_choice: !!deleteAfterUploadCheckbox.checked,
+                    audio_export_enabled: enableAudioNoMusic,
+                    audio_output_path: enableAudioNoMusic ? audioOutputPath : "",
+                    expected_outputs: expectedOutputs,
+                    uploaded_outputs: {},
+                    upload_results_by_output: {},
                 });
                 armExportMonitor(nextState.project_id);
                 projectSelect.value = projectId;
@@ -1337,12 +1457,18 @@
             return Promise.reject(new Error("Drive settings are incomplete"));
         }
 
+        var expectedOutputs = getExpectedOutputPaths(state);
+        if (expectedOutputs.length <= 0 && selectedOutputPath) {
+            expectedOutputs = [selectedOutputPath];
+        }
+
         upsertProjectState(projectId, {
             status: "uploading",
             upload_pending: false,
             pending_cleanup_choice: !!cleanupAfterUpload,
             upload_reason: reason,
             output_path: selectedOutputPath,
+            expected_outputs: expectedOutputs,
             last_error: null,
             cleanup_deleted: false,
             cleanup_error: null,
@@ -1371,11 +1497,28 @@
             }
         }).then(function (result) {
             var stat = fs.statSync(selectedOutputPath);
+            var freshState = getProjectState(projectId) || state;
+            var uploadedOutputs = clonePlainObject(freshState.uploaded_outputs || {});
+            var uploadResultsByOutput = clonePlainObject(freshState.upload_results_by_output || {});
+            uploadedOutputs[selectedOutputPath] = nowIso();
+            uploadResultsByOutput[selectedOutputPath] = result;
+
+            var expectedForCompletion = getExpectedOutputPaths(freshState);
+            if (expectedForCompletion.length <= 0) {
+                expectedForCompletion = expectedOutputs;
+            }
+            var allUploaded = expectedForCompletion.length > 0 && expectedForCompletion.every(function (outputPath) {
+                return !!uploadedOutputs[String(outputPath || "")];
+            });
+
             var newState = upsertProjectState(projectId, {
-                status: "uploaded",
+                status: allUploaded ? "uploaded" : "uploaded_partial",
                 uploaded_at: nowIso(),
                 upload_pending: false,
                 output_path: selectedOutputPath,
+                expected_outputs: expectedForCompletion,
+                uploaded_outputs: uploadedOutputs,
+                upload_results_by_output: uploadResultsByOutput,
                 last_uploaded_mtime_ms: stat.mtimeMs,
                 last_uploaded_output_path: selectedOutputPath,
                 last_upload_result: result,
@@ -1389,6 +1532,11 @@
                 "success"
             );
             resetMonitorCandidateSelection(projectId);
+
+            if (!allUploaded) {
+                armExportMonitor(projectId);
+                return null;
+            }
 
             if (cleanupAfterUpload) {
                 disarmExportMonitor(projectId);
@@ -1531,7 +1679,11 @@
             return false;
         }
 
-        if (isJobQueued("upload_output", projectId)) {
+        if (hasOutputUploadFinished(state, selectedOutputPath)) {
+            return false;
+        }
+
+        if (isUploadJobQueuedForOutput(projectId, selectedOutputPath)) {
             return false;
         }
 
@@ -1573,53 +1725,22 @@
         }
     }
 
-    function selectOutputCandidateForMonitor(monitor, projectId) {
-        var candidatePaths = listWatchedOutputPaths(monitor.dir);
-        var candidateSet = {};
-
-        candidatePaths.forEach(function (candidatePath) {
-            candidateSet[candidatePath] = true;
-            if (!monitor.candidate_first_seen_at[candidatePath]) {
-                monitor.candidate_first_seen_at[candidatePath] = Date.now();
-            }
+    function listExpectedCandidatesForMonitor(projectId, monitor, state) {
+        var candidates = listWatchedOutputPaths(monitor.dir);
+        var expected = getExpectedOutputPaths(state).map(function (p) {
+            return path.basename(String(p || ""));
         });
-
-        Object.keys(monitor.candidate_first_seen_at).forEach(function (trackedPath) {
-            if (!candidateSet[trackedPath]) {
-                delete monitor.candidate_first_seen_at[trackedPath];
-            }
+        if (expected.length <= 0) {
+            return candidates;
+        }
+        var expectedSet = {};
+        expected.forEach(function (name) {
+            expectedSet[name.toLowerCase()] = true;
         });
-
-        if (monitor.selected_output_path && !candidateSet[monitor.selected_output_path]) {
-            monitor.selected_output_path = null;
-            monitor.lastSignature = "";
-            monitor.lastChangedAt = Date.now();
-        }
-
-        if (!monitor.selected_output_path && candidatePaths.length > 0) {
-            var selectedPath = null;
-            var selectedAt = Number.MAX_SAFE_INTEGER;
-
-            candidatePaths.forEach(function (candidatePath) {
-                var firstSeenAt = Number(monitor.candidate_first_seen_at[candidatePath] || Date.now());
-                if (firstSeenAt < selectedAt) {
-                    selectedAt = firstSeenAt;
-                    selectedPath = candidatePath;
-                }
-            });
-
-            if (selectedPath) {
-                monitor.selected_output_path = selectedPath;
-                monitor.lastSignature = "";
-                monitor.lastChangedAt = Date.now();
-                log(
-                    "Watch target selected for " + projectId + ": " + path.basename(selectedPath),
-                    "info"
-                );
-            }
-        }
-
-        return monitor.selected_output_path;
+        return candidates.filter(function (candidatePath) {
+            var base = path.basename(candidatePath).toLowerCase();
+            return !!expectedSet[base];
+        });
     }
 
     function checkExportStability(projectId, source) {
@@ -1633,48 +1754,59 @@
             return;
         }
 
-        var selectedOutputPath = selectOutputCandidateForMonitor(monitor, projectId);
-        if (!selectedOutputPath) {
-            return;
-        }
+        var candidatePaths = listExpectedCandidatesForMonitor(projectId, monitor, state);
+        var candidateSet = {};
+        candidatePaths.forEach(function (candidatePath) {
+            candidateSet[candidatePath] = true;
+        });
 
-        var stat = readOutputStat(selectedOutputPath);
-        if (!stat || stat.size <= 0) {
-            monitor.lastSignature = "";
-            monitor.lastChangedAt = Date.now();
-            return;
-        }
+        Object.keys(monitor.output_signatures).forEach(function (trackedPath) {
+            if (!candidateSet[trackedPath]) {
+                delete monitor.output_signatures[trackedPath];
+                delete monitor.output_last_changed_at[trackedPath];
+            }
+        });
 
-        var signature = stat.size + ":" + stat.mtimeMs;
-        if (signature !== monitor.lastSignature) {
-            monitor.lastSignature = signature;
-            monitor.lastChangedAt = Date.now();
-            return;
-        }
+        candidatePaths.forEach(function (candidatePath) {
+            if (hasOutputUploadFinished(state, candidatePath) || isUploadJobQueuedForOutput(projectId, candidatePath)) {
+                return;
+            }
 
-        var stableMs = Date.now() - monitor.lastChangedAt;
-        if (stableMs < EXPORT_STABLE_MS) {
-            return;
-        }
+            var stat = readOutputStat(candidatePath);
+            if (!stat || stat.size <= 0) {
+                delete monitor.output_signatures[candidatePath];
+                monitor.output_last_changed_at[candidatePath] = Date.now();
+                return;
+            }
 
-        if (
-            state.last_uploaded_output_path === selectedOutputPath &&
-            state.last_uploaded_mtime_ms &&
-            Math.abs(state.last_uploaded_mtime_ms - stat.mtimeMs) < 1
-        ) {
-            return;
-        }
+            var signature = stat.size + ":" + stat.mtimeMs;
+            if (signature !== monitor.output_signatures[candidatePath]) {
+                monitor.output_signatures[candidatePath] = signature;
+                monitor.output_last_changed_at[candidatePath] = Date.now();
+                return;
+            }
 
-        if (state.upload_pending || state.status === "uploading") {
-            return;
-        }
+            var stableSince = Number(monitor.output_last_changed_at[candidatePath] || Date.now());
+            var stableMs = Date.now() - stableSince;
+            if (stableMs < EXPORT_STABLE_MS) {
+                return;
+            }
 
-        if (queueUpload(projectId, source || "watch_stable", selectedOutputPath)) {
-            log(
-                "Detected stable " + path.basename(selectedOutputPath) + " for " + projectId + " -> upload queued",
-                "info"
-            );
-        }
+            if (
+                state.last_uploaded_output_path === candidatePath &&
+                state.last_uploaded_mtime_ms &&
+                Math.abs(state.last_uploaded_mtime_ms - stat.mtimeMs) < 1
+            ) {
+                return;
+            }
+
+            if (queueUpload(projectId, source || "watch_stable", candidatePath)) {
+                log(
+                    "Detected stable " + path.basename(candidatePath) + " for " + projectId + " -> upload queued",
+                    "info"
+                );
+            }
+        });
     }
 
     function armFsWatcherForMonitor(projectId, monitor) {
@@ -1730,10 +1862,8 @@
         var monitor = {
             project_id: projectId,
             dir: dirPath,
-            selected_output_path: null,
-            candidate_first_seen_at: {},
-            lastSignature: "",
-            lastChangedAt: Date.now(),
+            output_signatures: {},
+            output_last_changed_at: {},
             intervalId: null,
             fsWatcher: null,
             watchRetryTimer: null,
@@ -1758,10 +1888,8 @@
         if (!monitor) {
             return;
         }
-        monitor.selected_output_path = null;
-        monitor.candidate_first_seen_at = {};
-        monitor.lastSignature = "";
-        monitor.lastChangedAt = Date.now();
+        monitor.output_signatures = {};
+        monitor.output_last_changed_at = {};
     }
 
     function disarmExportMonitor(projectId) {
@@ -1825,6 +1953,7 @@
             if (
                 state.status === "ready_for_export" ||
                 state.status === "upload_failed" ||
+                state.status === "uploaded_partial" ||
                 state.status === "uploaded" ||
                 state.status === "exporting"
             ) {
@@ -2263,6 +2392,8 @@
 
         var jobId = String(eventItem.job_id || "");
         var projectId = String(eventItem.project_id || "") || encoderJobMap[jobId] || "";
+        var renderKind = String(eventItem.detail && eventItem.detail.render_kind || "video");
+        var outputPath = String(eventItem.detail && eventItem.detail.output_path || "").trim();
 
         if (projectId && jobId) {
             encoderJobMap[jobId] = projectId;
@@ -2273,11 +2404,17 @@
         }
 
         if (eventItem.type === "queued") {
-            upsertProjectState(projectId, {
+            var queuedPatch = {
                 status: "exporting",
                 export_job_id: jobId,
                 last_error: null,
-            });
+            };
+            if (renderKind === "audio_no_music") {
+                queuedPatch.audio_export_job_id = jobId;
+            } else {
+                queuedPatch.video_export_job_id = jobId;
+            }
+            upsertProjectState(projectId, queuedPatch);
             log("Encoder queued for " + projectId + " (job " + jobId + ")", "info");
             return;
         }
@@ -2299,14 +2436,27 @@
 
         if (eventItem.type === "complete") {
             delete encoderJobMap[jobId];
-            upsertProjectState(projectId, {
-                status: "ready_for_export",
-                export_job_id: null,
+            var completeState = getProjectState(projectId);
+            var completePatch = {
                 encoder_progress: null,
-            });
+            };
+            if (renderKind === "audio_no_music") {
+                completePatch.audio_export_job_id = null;
+            } else {
+                completePatch.video_export_job_id = null;
+            }
+
+            var videoPending = completeState && completeState.video_export_job_id && String(completeState.video_export_job_id) !== String(jobId);
+            var audioPending = completeState && completeState.audio_export_job_id && String(completeState.audio_export_job_id) !== String(jobId);
+            completePatch.export_job_id = videoPending || audioPending ? (completeState.export_job_id || jobId) : null;
+            completePatch.status = videoPending || audioPending ? "exporting" : "ready_for_export";
+
+            upsertProjectState(projectId, completePatch);
             log("Encoder completed for " + projectId + " (job " + jobId + ")", "success");
 
-            if (!queueUpload(projectId, "encoder_complete")) {
+            if (outputPath && !queueUpload(projectId, "encoder_complete_" + renderKind, outputPath)) {
+                armExportMonitor(projectId);
+            } else if (!outputPath && !queueUpload(projectId, "encoder_complete")) {
                 // fallback to monitor flow
                 armExportMonitor(projectId);
             }
@@ -2316,12 +2466,18 @@
         if (eventItem.type === "error") {
             delete encoderJobMap[jobId];
             var errorText = (eventItem.detail && eventItem.detail.error) ? String(eventItem.detail.error) : "Encoder error";
-            upsertProjectState(projectId, {
+            var errorPatch = {
                 status: "error",
                 export_job_id: null,
                 encoder_progress: null,
                 last_error: errorText,
-            });
+            };
+            if (renderKind === "audio_no_music") {
+                errorPatch.audio_export_job_id = null;
+            } else {
+                errorPatch.video_export_job_id = null;
+            }
+            upsertProjectState(projectId, errorPatch);
             log("Encoder error for " + projectId + " (job " + jobId + "): " + errorText, "error");
         }
     }
@@ -2352,11 +2508,34 @@
             return;
         }
 
+        var enableAudioNoMusic = !!(exportAudioNoMusicCheckbox && exportAudioNoMusicCheckbox.checked);
+        var audioOutputPath = path.join(path.dirname(String(state.output_path)), AUDIO_NO_MUSIC_OUTPUT_FILENAME);
+        var audioPresetPath = String(settings.audio_preset_epr_path || "").trim() || presetPath;
+        if (enableAudioNoMusic && !audioPresetPath) {
+            log("Missing audio preset path for no-music export", "error");
+            setSettingsStatus("Audio preset .epr path is required for audio export", true);
+            return;
+        }
+        if (enableAudioNoMusic && !fs.existsSync(audioPresetPath)) {
+            log("Audio preset file not found: " + audioPresetPath, "error");
+            setSettingsStatus("Audio preset path is invalid", true);
+            return;
+        }
+
+        var expectedOutputs = [String(state.output_path)];
+        if (enableAudioNoMusic) {
+            expectedOutputs.push(String(audioOutputPath));
+        }
+        expectedOutputs = normalizeOutputPathList(expectedOutputs);
+
         var hostCall = [
             'startManagedExport(',
             '"', escapeForEval(projectId), '",',
             '"', escapeForEval(String(state.output_path).replace(/\\/g, "/")), '",',
-            '"', escapeForEval(String(presetPath).replace(/\\/g, "/")), '"',
+            '"', escapeForEval(String(presetPath).replace(/\\/g, "/")), '",',
+            enableAudioNoMusic ? '1,' : '0,',
+            '"', escapeForEval(String(audioOutputPath).replace(/\\/g, "/")), '",',
+            '"', escapeForEval(String(audioPresetPath).replace(/\\/g, "/")), '"',
             ')',
         ].join("");
 
@@ -2368,19 +2547,46 @@
             }
 
             var jobId = String(result || "").trim();
-            if (!jobId) {
+            var videoJobId = "";
+            var audioJobId = "";
+
+            if (jobId && jobId.charAt(0) === "{") {
+                try {
+                    var parsed = JSON.parse(jobId);
+                    videoJobId = String(parsed.video_job_id || "").trim();
+                    audioJobId = String(parsed.audio_job_id || "").trim();
+                } catch (parseErr) {
+                    // fallback to legacy payload below
+                }
+            }
+
+            if (!videoJobId && !audioJobId) {
+                videoJobId = jobId;
+            }
+
+            if (!videoJobId) {
                 throw new Error("Host did not return an encoder job ID");
             }
 
-            encoderJobMap[jobId] = projectId;
+            encoderJobMap[videoJobId] = projectId;
+            if (audioJobId) {
+                encoderJobMap[audioJobId] = projectId;
+            }
             upsertProjectState(projectId, {
                 status: "exporting",
-                export_job_id: jobId,
+                export_job_id: videoJobId,
+                video_export_job_id: videoJobId,
+                audio_export_job_id: audioJobId || null,
                 encoder_progress: 0,
                 pending_cleanup_choice: !!deleteAfterUploadCheckbox.checked,
+                audio_export_enabled: enableAudioNoMusic,
+                audio_output_path: enableAudioNoMusic ? audioOutputPath : "",
+                expected_outputs: expectedOutputs,
+                uploaded_outputs: {},
+                upload_results_by_output: {},
                 last_error: null,
             });
-            log("Managed export started for " + projectId + " (job " + jobId + ")", "info");
+            log("Managed export started for " + projectId + " (video job " + videoJobId + (audioJobId ? ", audio job " + audioJobId : "") + ")", "info");
             updateGlobalStatus();
         }).catch(function (err) {
             upsertProjectState(projectId, {
@@ -2436,6 +2642,17 @@
             }
         } else {
             log("Preset browse dialog not available", "error");
+        }
+    }
+
+    function browseAudioPreset() {
+        if (window.cep && window.cep.fs && window.cep.fs.showOpenDialog) {
+            var result = window.cep.fs.showOpenDialog(false, false, "Select AME Audio Preset (.epr)", "", ["epr"]);
+            if (result && result.data && result.data.length > 0) {
+                settingAudioPresetEpr.value = result.data[0];
+            }
+        } else {
+            log("Audio preset browse dialog not available", "error");
         }
     }
 
@@ -2522,6 +2739,9 @@
         btnBrowse.addEventListener("click", browseAndRun);
         btnExportProject.addEventListener("click", startManagedExportForSelectedProject);
         btnBrowsePreset.addEventListener("click", browsePreset);
+        if (btnBrowseAudioPreset) {
+            btnBrowseAudioPreset.addEventListener("click", browseAudioPreset);
+        }
         btnSaveSettings.addEventListener("click", saveSettingsFromUi);
         btnTestDrive.addEventListener("click", testDriveConnectionFromUi);
         projectStatusList.addEventListener("click", handleProjectStatusClick);
@@ -2537,6 +2757,14 @@
             saveSettings(settings);
             setSettingsStatus("Default cleanup behavior updated", false);
         });
+
+        if (exportAudioNoMusicCheckbox) {
+            exportAudioNoMusicCheckbox.addEventListener("change", function () {
+                settings.export_audio_no_music_default = !!exportAudioNoMusicCheckbox.checked;
+                saveSettings(settings);
+                setSettingsStatus("Default audio export behavior updated", false);
+            });
+        }
 
         projectSelect.addEventListener("change", function () {
             var selectedId = String(projectSelect.value || "");

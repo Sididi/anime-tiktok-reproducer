@@ -8,6 +8,7 @@
 var ATR_EXTENSION_ID = "com.animetiktok.tiktokreproducer.panel";
 var __atrEncoderEvents = [];
 var __atrEncoderJobProjectMap = {};
+var __atrEncoderJobMetaMap = {};
 var __atrEncoderCallbacksBound = false;
 var __atrCleanupMaxBinPasses = 5;
 
@@ -301,14 +302,37 @@ function __atrRemoveImportedTimelineClips(normalizedRootPath) {
 }
 
 function __atrPushEncoderEvent(type, jobID, detail) {
+    var meta = __atrEncoderJobMetaMap[jobID] || null;
     var event = {
         type: __atrSafeString(type),
         job_id: __atrSafeString(jobID),
-        project_id: __atrSafeString(__atrEncoderJobProjectMap[jobID] || ""),
+        project_id: __atrSafeString((meta && meta.project_id) || __atrEncoderJobProjectMap[jobID] || ""),
         timestamp: (new Date()).toISOString ? (new Date()).toISOString() : "",
         detail: detail || {}
     };
+    if (meta && meta.render_kind) {
+        event.detail.render_kind = __atrSafeString(meta.render_kind);
+    }
     __atrEncoderEvents.push(event);
+}
+
+function __atrRememberEncoderJob(jobID, projectId, renderKind, outputPath, presetPath) {
+    __atrEncoderJobProjectMap[jobID] = __atrSafeString(projectId);
+    __atrEncoderJobMetaMap[jobID] = {
+        project_id: __atrSafeString(projectId),
+        render_kind: __atrSafeString(renderKind || "video"),
+        output_path: __atrSafeString(outputPath),
+        preset_path: __atrSafeString(presetPath)
+    };
+}
+
+function __atrForgetEncoderJob(jobID) {
+    try {
+        delete __atrEncoderJobProjectMap[jobID];
+    } catch (e) {}
+    try {
+        delete __atrEncoderJobMetaMap[jobID];
+    } catch (e2) {}
 }
 
 function __atrBindEncoderCallbacks() {
@@ -347,18 +371,142 @@ function ATR_onEncoderJobComplete(jobID, outputPath) {
     __atrPushEncoderEvent("complete", jobID, {
         output_path: __atrSafeString(outputPath)
     });
-    try {
-        delete __atrEncoderJobProjectMap[jobID];
-    } catch (e) {}
+    __atrForgetEncoderJob(jobID);
 }
 
 function ATR_onEncoderJobError(jobID, errorDetail) {
     __atrPushEncoderEvent("error", jobID, {
         error: __atrSafeString(errorDetail)
     });
+    __atrForgetEncoderJob(jobID);
+}
+
+function __atrEncodeSequence(sequence, outputFsPath, presetFsPath) {
+    var jobID = null;
     try {
-        delete __atrEncoderJobProjectMap[jobID];
-    } catch (e) {}
+        jobID = app.encoder.encodeSequence(
+            sequence,
+            outputFsPath,
+            presetFsPath,
+            app.encoder.ENCODE_ENTIRE,
+            1
+        );
+    } catch (eFive) {
+        jobID = app.encoder.encodeSequence(
+            sequence,
+            outputFsPath,
+            presetFsPath,
+            app.encoder.ENCODE_ENTIRE
+        );
+    }
+
+    if (!jobID && jobID !== 0) {
+        throw new Error("encodeSequence returned an empty job ID");
+    }
+
+    return jobID;
+}
+
+function __atrRemoveAllTrackClips(tracks) {
+    if (!tracks) {
+        return;
+    }
+    var trackCount = 0;
+    try {
+        trackCount = Number(tracks.numTracks || 0);
+    } catch (eCount) {
+        trackCount = 0;
+    }
+
+    for (var t = 0; t < trackCount; t += 1) {
+        var track = tracks[t];
+        if (!track || !track.clips) {
+            continue;
+        }
+
+        var clipCount = 0;
+        try {
+            clipCount = Number(track.clips.numItems || 0);
+        } catch (eClipCount) {
+            clipCount = 0;
+        }
+
+        for (var c = clipCount - 1; c >= 0; c -= 1) {
+            try {
+                track.clips[c].remove(0, 1);
+            } catch (eRemove) {}
+        }
+    }
+}
+
+function __atrRemoveTrackByIndex(tracks, indexToRemove) {
+    if (!tracks) {
+        return;
+    }
+    var idx = Number(indexToRemove || 0);
+    if (idx < 0) {
+        return;
+    }
+
+    var track = tracks[idx];
+    if (!track || !track.clips) {
+        return;
+    }
+
+    var clipCount = 0;
+    try {
+        clipCount = Number(track.clips.numItems || 0);
+    } catch (eClipCount) {
+        clipCount = 0;
+    }
+
+    for (var c = clipCount - 1; c >= 0; c -= 1) {
+        try {
+            track.clips[c].remove(0, 1);
+        } catch (eRemove) {}
+    }
+}
+
+function __atrCloneActiveSequence() {
+    var sequences = app && app.project ? app.project.sequences : null;
+    if (!sequences) {
+        throw new Error("No sequence collection available");
+    }
+
+    var beforeCount = 0;
+    try {
+        beforeCount = Number(sequences.numSequences || 0);
+    } catch (eBefore) {
+        beforeCount = 0;
+    }
+
+    var sourceSequence = app.project.activeSequence;
+    if (!sourceSequence || !sourceSequence.clone) {
+        throw new Error("Active sequence cannot be cloned");
+    }
+
+    var cloned = sourceSequence.clone();
+    if (!cloned) {
+        throw new Error("Sequence clone() returned false");
+    }
+
+    var afterCount = 0;
+    try {
+        afterCount = Number(sequences.numSequences || 0);
+    } catch (eAfter) {
+        afterCount = beforeCount;
+    }
+
+    if (afterCount <= beforeCount) {
+        throw new Error("Clone did not create a new sequence");
+    }
+
+    var cloneSequence = sequences[afterCount - 1];
+    if (!cloneSequence) {
+        throw new Error("Unable to access cloned sequence");
+    }
+
+    return cloneSequence;
 }
 
 /**
@@ -408,6 +556,10 @@ function startManagedExport(projectId, outputPath, presetPath) {
             return "ERROR: No active sequence in current project";
         }
 
+        var exportAudioNoMusic = Number(arguments.length >= 4 ? arguments[3] : 0) === 1;
+        var audioOutputPath = arguments.length >= 5 ? __atrSafeString(arguments[4]) : "";
+        var audioPresetPath = arguments.length >= 6 ? __atrSafeString(arguments[5]) : "";
+
         var normalizedPresetPath = __atrNormalizePath(presetPath);
         var presetFile = new File(normalizedPresetPath);
         if (!presetFile.exists) {
@@ -435,39 +587,57 @@ function startManagedExport(projectId, outputPath, presetPath) {
             return "ERROR: Unable to bind AME encoder callbacks";
         }
 
-        var jobID = null;
-        try {
-            jobID = app.encoder.encodeSequence(
-                app.project.activeSequence,
-                outputFsPath,
-                presetFsPath,
-                app.encoder.ENCODE_ENTIRE,
-                1
-            );
-        } catch (eFive) {
-            try {
-                jobID = app.encoder.encodeSequence(
-                    app.project.activeSequence,
-                    outputFsPath,
-                    presetFsPath,
-                    app.encoder.ENCODE_ENTIRE
-                );
-            } catch (eFour) {
-                return "ERROR: encodeSequence failed (5-arg: " + __atrSafeString(eFive.message) + "; 4-arg: " + __atrSafeString(eFour.message) + ")";
-            }
-        }
-
-        if (!jobID && jobID !== 0) {
-            return "ERROR: encodeSequence returned an empty job ID";
-        }
-
-        __atrEncoderJobProjectMap[jobID] = __atrSafeString(projectId);
-        __atrPushEncoderEvent("queued", jobID, {
+        var videoJobID = __atrEncodeSequence(app.project.activeSequence, outputFsPath, presetFsPath);
+        __atrRememberEncoderJob(videoJobID, projectId, "video", outputFsPath, presetFsPath);
+        __atrPushEncoderEvent("queued", videoJobID, {
             output_path: outputFsPath,
-            preset_path: presetFsPath
+            preset_path: presetFsPath,
+            render_kind: "video"
         });
 
-        return __atrSafeString(jobID);
+        var audioJobID = "";
+        if (exportAudioNoMusic) {
+            var normalizedAudioPresetPath = __atrNormalizePath(audioPresetPath || presetPath);
+            var audioPresetFile = new File(normalizedAudioPresetPath);
+            if (!audioPresetFile.exists) {
+                return "ERROR: Audio preset file not found: " + normalizedAudioPresetPath;
+            }
+            var audioPresetFsPath = __atrSafeString(audioPresetFile.fsName || normalizedAudioPresetPath);
+
+            var normalizedAudioOutputPath = __atrNormalizePath(audioOutputPath);
+            if (!normalizedAudioOutputPath) {
+                return "ERROR: Missing audio output path";
+            }
+            var audioOutFile = new File(normalizedAudioOutputPath);
+            var audioOutFolder = audioOutFile.parent;
+            if (audioOutFolder && !audioOutFolder.exists) {
+                if (!audioOutFolder.create()) {
+                    return "ERROR: Unable to create audio output folder: " + audioOutFolder.fsName;
+                }
+            }
+            var audioOutputFsPath = __atrSafeString(audioOutFile.fsName || normalizedAudioOutputPath);
+
+            var tempSequence = __atrCloneActiveSequence();
+            __atrRemoveAllTrackClips(tempSequence.videoTracks);
+            __atrRemoveTrackByIndex(tempSequence.audioTracks, 2);
+
+            audioJobID = __atrEncodeSequence(tempSequence, audioOutputFsPath, audioPresetFsPath);
+            __atrRememberEncoderJob(audioJobID, projectId, "audio_no_music", audioOutputFsPath, audioPresetFsPath);
+            __atrPushEncoderEvent("queued", audioJobID, {
+                output_path: audioOutputFsPath,
+                preset_path: audioPresetFsPath,
+                render_kind: "audio_no_music"
+            });
+        }
+
+        if (JSON && JSON.stringify) {
+            return JSON.stringify({
+                video_job_id: __atrSafeString(videoJobID),
+                audio_job_id: __atrSafeString(audioJobID),
+                audio_enabled: !!exportAudioNoMusic
+            });
+        }
+        return __atrSafeString(videoJobID);
     } catch (e) {
         return "ERROR: " + e.message + " (line " + e.line + ")";
     }

@@ -23,6 +23,10 @@
                 <select id="project-select"></select>
             </label>
             <label class="checkbox-row">
+                <input type="checkbox" id="chk-export-audio-no-music" checked>
+                <span>Also queue audio-only WAV (A1+A2+A4, no A3)</span>
+            </label>
+            <label class="checkbox-row">
                 <input type="checkbox" id="chk-delete-after-upload" checked>
                 <span>Delete local folder after successful upload</span>
             </label>
@@ -60,6 +64,13 @@
                         <div class="inline-input">
                             <input id="setting-preset-epr" type="text" autocomplete="off">
                             <button id="btn-browse-preset" type="button">Browse</button>
+                        </div>
+                    </label>
+                    <label>
+                        AME Audio Preset (.epr)
+                        <div class="inline-input">
+                            <input id="setting-audio-preset-epr" type="text" autocomplete="off">
+                            <button id="btn-browse-audio-preset" type="button">Browse</button>
                         </div>
                     </label>
                 </div>
