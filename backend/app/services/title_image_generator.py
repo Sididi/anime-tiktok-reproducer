@@ -30,7 +30,7 @@ CAT_FONT_SIZE = 50
 CAT_TEXT_COLOR = (255, 255, 255)  # white
 CAT_OUTLINE_COLOR = (0, 0, 0)  # black
 CAT_OUTLINE_WIDTH = 4
-CAT_GAP_BELOW_CENTER = 90  # px between center frame bottom and category text top (matches title gap)
+CAT_GAP_BELOW_CENTER = 80  # px between center frame bottom and category text top
 
 FONT_DIR = Path(__file__).resolve().parents[3] / "assets" / "fonts"
 TITLE_FONT_PATH = FONT_DIR / "Inter-BlackItalic.ttf"
@@ -99,12 +99,14 @@ class TitleImageGeneratorService:
             return 0
         if letter_spacing == 0:
             return font.getlength(text)
-        # Sum advance widths with custom spacing
+        # Sum advance widths with custom spacing, preserving font kerning
         total = 0.0
         for i, ch in enumerate(text):
-            total += font.getlength(ch)
             if i < len(text) - 1:
+                total += font.getlength(text[i:i+2]) - font.getlength(text[i+1])
                 total += letter_spacing
+            else:
+                total += font.getlength(ch)
         return total
 
     @classmethod
@@ -122,7 +124,7 @@ class TitleImageGeneratorService:
         for i, ch in enumerate(text):
             draw.text((x, y), ch, fill=fill, font=font)
             if i < len(text) - 1:
-                x += font.getlength(ch) + letter_spacing
+                x += font.getlength(text[i:i+2]) - font.getlength(text[i+1]) + letter_spacing
 
     @classmethod
     def _wrap_text(

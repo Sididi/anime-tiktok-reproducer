@@ -1,109 +1,150 @@
-<!DOCTYPE html>
+<!doctype html>
 <html>
-<head>
-    <meta charset="UTF-8">
+  <head>
+    <meta charset="UTF-8" />
     <title>Tiktok Reproducer</title>
-    <link rel="stylesheet" href="style.css">
-</head>
-<body>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
     <div id="app">
-        <div id="header">
-            <h1>Tiktok Reproducer</h1>
-            <div id="status-indicator" class="idle" title="Not watching"></div>
-        </div>
+      <div id="header">
+        <h1>Tiktok Reproducer</h1>
+        <div id="status-indicator" class="idle" title="Not watching"></div>
+      </div>
 
-        <div class="button-row">
-            <button id="btn-browse" title="Browse for a .jsx script to run">Browse &amp; Run</button>
-            <button id="btn-export-project" title="Export selected project to output.mp4 via AME">Export via CEP</button>
-        </div>
+      <div class="button-row">
+        <button id="btn-browse" title="Browse for a .jsx script to run">
+          Browse &amp; Run
+        </button>
+        <button
+          id="btn-export-project"
+          title="Export selected project to output.mp4 via AME"
+        >
+          Export via CEP
+        </button>
+      </div>
 
-        <div class="control-grid">
+      <div class="control-grid">
+        <label>
+          Project
+          <select id="project-select"></select>
+        </label>
+        <label class="checkbox-row">
+          <input type="checkbox" id="chk-export-audio-no-music" checked />
+          <span>Also queue audio-only WAV (A1+A2+A4, no A3)</span>
+        </label>
+        <label class="checkbox-row">
+          <input type="checkbox" id="chk-delete-after-upload" checked />
+          <span>Delete local folder after successful upload</span>
+        </label>
+      </div>
+
+      <div id="settings-section" class="panel-section is-collapsed">
+        <button
+          id="settings-toggle"
+          class="section-toggle"
+          type="button"
+          aria-expanded="false"
+        >
+          <span class="section-title">Automation Settings</span>
+          <span class="section-chevron">▸</span>
+        </button>
+        <div id="settings-content" class="section-content">
+          <div class="settings-grid">
             <label>
-                Project
-                <select id="project-select"></select>
+              Drive Client ID
+              <input id="setting-client-id" type="text" autocomplete="off" />
             </label>
-            <label class="checkbox-row">
-                <input type="checkbox" id="chk-export-audio-no-music" checked>
-                <span>Also queue audio-only WAV (A1+A2+A4, no A3)</span>
+            <label>
+              Drive Client Secret
+              <input
+                id="setting-client-secret"
+                type="password"
+                autocomplete="off"
+              />
             </label>
-            <label class="checkbox-row">
-                <input type="checkbox" id="chk-delete-after-upload" checked>
-                <span>Delete local folder after successful upload</span>
+            <label>
+              Drive Refresh Token
+              <input
+                id="setting-refresh-token"
+                type="password"
+                autocomplete="off"
+              />
             </label>
+            <label>
+              Drive Parent Folder ID
+              <input
+                id="setting-parent-folder-id"
+                type="text"
+                autocomplete="off"
+              />
+            </label>
+            <label>
+              Local Server Port
+              <input
+                id="setting-port"
+                type="number"
+                min="1"
+                max="65535"
+                step="1"
+              />
+            </label>
+            <label>
+              AME Preset (.epr)
+              <div class="inline-input">
+                <input id="setting-preset-epr" type="text" autocomplete="off" />
+                <button id="btn-browse-preset" type="button">Browse</button>
+              </div>
+            </label>
+            <label>
+              AME Audio Preset (.epr)
+              <div class="inline-input">
+                <input
+                  id="setting-audio-preset-epr"
+                  type="text"
+                  autocomplete="off"
+                />
+                <button id="btn-browse-audio-preset" type="button">
+                  Browse
+                </button>
+              </div>
+            </label>
+          </div>
+          <div class="button-row settings-actions">
+            <button id="btn-save-settings" type="button">Save Settings</button>
+            <button id="btn-test-drive" type="button">Test Drive</button>
+            <span id="settings-status"></span>
+          </div>
         </div>
+      </div>
 
-        <div id="settings-section" class="panel-section is-collapsed">
-            <button id="settings-toggle" class="section-toggle" type="button" aria-expanded="false">
-                <span class="section-title">Automation Settings</span>
-                <span class="section-chevron">▸</span>
-            </button>
-            <div id="settings-content" class="section-content">
-                <div class="settings-grid">
-                    <label>
-                        Drive Client ID
-                        <input id="setting-client-id" type="text" autocomplete="off">
-                    </label>
-                    <label>
-                        Drive Client Secret
-                        <input id="setting-client-secret" type="password" autocomplete="off">
-                    </label>
-                    <label>
-                        Drive Refresh Token
-                        <input id="setting-refresh-token" type="password" autocomplete="off">
-                    </label>
-                    <label>
-                        Drive Parent Folder ID
-                        <input id="setting-parent-folder-id" type="text" autocomplete="off">
-                    </label>
-                    <label>
-                        Local Server Port
-                        <input id="setting-port" type="number" min="1" max="65535" step="1">
-                    </label>
-                    <label>
-                        AME Preset (.epr)
-                        <div class="inline-input">
-                            <input id="setting-preset-epr" type="text" autocomplete="off">
-                            <button id="btn-browse-preset" type="button">Browse</button>
-                        </div>
-                    </label>
-                    <label>
-                        AME Audio Preset (.epr)
-                        <div class="inline-input">
-                            <input id="setting-audio-preset-epr" type="text" autocomplete="off">
-                            <button id="btn-browse-audio-preset" type="button">Browse</button>
-                        </div>
-                    </label>
-                </div>
-                <div class="button-row settings-actions">
-                    <button id="btn-save-settings" type="button">Save Settings</button>
-                    <button id="btn-test-drive" type="button">Test Drive</button>
-                    <span id="settings-status"></span>
-                </div>
-            </div>
-        </div>
+      <div id="queue-section" class="panel-section">
+        <h2>Job Queue</h2>
+        <ul id="queue-list"></ul>
+      </div>
 
-        <div id="queue-section" class="panel-section">
-            <h2>Job Queue</h2>
-            <ul id="queue-list"></ul>
+      <div id="latest-projects-section" class="panel-section is-collapsed">
+        <button
+          id="latest-projects-toggle"
+          class="section-toggle"
+          type="button"
+          aria-expanded="false"
+        >
+          <span class="section-title">Latest Projects</span>
+          <span class="section-chevron">▸</span>
+        </button>
+        <div id="latest-projects-content" class="section-content">
+          <ul id="project-status-list"></ul>
         </div>
+      </div>
 
-        <div id="latest-projects-section" class="panel-section is-collapsed">
-            <button id="latest-projects-toggle" class="section-toggle" type="button" aria-expanded="false">
-                <span class="section-title">Latest Projects</span>
-                <span class="section-chevron">▸</span>
-            </button>
-            <div id="latest-projects-content" class="section-content">
-                <ul id="project-status-list"></ul>
-            </div>
-        </div>
-
-        <div id="log-section" class="panel-section">
-            <h2>Log</h2>
-            <div id="log"></div>
-        </div>
+      <div id="log-section" class="panel-section">
+        <h2>Log</h2>
+        <div id="log"></div>
+      </div>
     </div>
 
     <script src="CSInterface.js"></script>
     <script src="main.js"></script>
-</body>
+  </body>
 </html>
