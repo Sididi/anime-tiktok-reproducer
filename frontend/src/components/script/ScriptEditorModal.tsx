@@ -18,6 +18,8 @@ interface ScriptEditorModalProps {
   scenesJson: string;
   transcription: Transcription;
   targetLanguage: string;
+  title?: string;
+  saveLabel?: string;
 }
 
 interface SceneJsonEntry {
@@ -118,6 +120,8 @@ export function ScriptEditorModal({
   scenesJson,
   transcription,
   targetLanguage,
+  title = "Edit Script",
+  saveLabel = "Save Changes",
 }: ScriptEditorModalProps) {
   const [updateCounter, setUpdateCounter] = useState(0);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -314,7 +318,7 @@ export function ScriptEditorModal({
       <div className="bg-[hsl(var(--card))] rounded-lg w-full max-w-6xl max-h-[90vh] overflow-hidden flex flex-col">
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-[hsl(var(--border))]">
-          <h2 className="text-lg font-semibold">Edit Script</h2>
+          <h2 className="text-lg font-semibold">{title}</h2>
           <button
             onClick={onClose}
             className="p-1 hover:bg-[hsl(var(--muted))] rounded"
@@ -381,7 +385,7 @@ export function ScriptEditorModal({
             <Button variant="outline" onClick={onClose}>
               Cancel
             </Button>
-            <Button onClick={handleSave}>Save Changes</Button>
+            <Button onClick={handleSave}>{saveLabel}</Button>
           </div>
         </div>
       </div>

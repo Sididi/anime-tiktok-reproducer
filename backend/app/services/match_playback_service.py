@@ -697,6 +697,9 @@ class MatchPlaybackService:
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         duration = plan.end_time - plan.start_time
+        min_duration = max(1.0 / max(profile.fps, 1), 0.01)
+        if duration < min_duration:
+            duration = min_duration
         tmp_path = output_path.with_suffix(".tmp.mp4")
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
@@ -756,6 +759,16 @@ class MatchPlaybackService:
                 raise RuntimeError(
                     f"ffmpeg failed for {plan.clip_id}: {' | '.join(error_details)}"
                 )
+
+        if not tmp_path.exists() or tmp_path.stat().st_size == 0:
+            raise RuntimeError(
+                (
+                    "ffmpeg did not produce output clip "
+                    f"for {plan.clip_id} (scene={plan.scene_index}, track={plan.track}, "
+                    f"requested_start={plan.start_time:.6f}, requested_end={plan.end_time:.6f}, "
+                    f"encode_duration={duration:.6f})"
+                )
+            )
 
         tmp_path.replace(output_path)
         validated_duration = cls._validate_clip_sync(output_path)

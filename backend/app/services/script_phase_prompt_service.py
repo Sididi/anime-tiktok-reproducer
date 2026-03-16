@@ -312,38 +312,60 @@ Structure du JSON :
 """
 
 _OVERLAY_PROMPT_FR = """Tu es un expert en marketing vidéo TikTok anime.
-Génère un titre clickbait et une catégorie pour cette vidéo.
+Génère 10 hooks title clickbait distincts et 1 catégorie pour cette vidéo.
 
-RÈGLES TITRE:
-- Maximum 45 caractères (STRICT, compte chaque caractère)
+RÈGLES TITLE HOOKS:
+- Retourne EXACTEMENT 10 propositions dans `title_hooks`
+- Maximum 45 caractères par hook (STRICT, compte chaque caractère)
 - Style: phrases choc qui donnent envie de regarder
 - Ne JAMAIS citer le nom de l'anime
 - Typographie française OBLIGATOIRE: toujours un espace AVANT les ? ! : ; (ex: "MOT !" et non "MOT!")
+- Les 10 hooks doivent être variés, sans reformulations paresseuses
 - Exemples: "CET ANIME EST UNE DINGUERIE", "TU VAS PLEURER EN REGARDANT ÇA !", "L'ANIME LE PLUS FOU DE 2025"
 
 RÈGLES CATÉGORIE:
+- Retourne UNE SEULE catégorie dans `category`
 - Exactement 2 genres séparés par " • "
 - Choisis les genres les plus représentatifs et populaires
 - Exemples: "Action • Fantasy", "Romance • Slice of Life", "Shonen • Aventure"
+
+FORMAT:
+- Réponds uniquement avec le JSON demandé
+- Structure attendue:
+{
+  "title_hooks": ["hook 1", "hook 2", "..."],
+  "category": "Genre • Genre"
+}
 
 ANIME: {anime_name}
 SCRIPT: {script_summary}
 """
 
 _OVERLAY_PROMPT_MULTI = """You are a TikTok anime video marketing expert.
-Generate a clickbait title and category for this video.
+Generate 10 distinct clickbait title hooks and 1 category for this video.
 
-TITLE RULES:
-- Maximum 45 characters (STRICT)
+TITLE HOOK RULES:
+- Return EXACTLY 10 options in `title_hooks`
+- Maximum 45 characters per hook (STRICT)
 - Language: {target_language_name}
 - Shocking/intriguing phrases that make viewers want to watch
 - NEVER mention the anime name
+- Make the 10 hooks meaningfully varied
 - Examples (adapt to target language): "THIS ANIME IS INSANE", "YOU WILL CRY WATCHING THIS"
 
 CATEGORY RULES:
+- Return exactly 1 category in `category`
 - Exactly 2 genres separated by " • "
 - Pick the most representative and popular genres
 - Examples: "Action • Fantasy", "Romance • Slice of Life"
+
+FORMAT:
+- Return JSON only
+- Expected shape:
+{
+  "title_hooks": ["hook 1", "hook 2", "..."],
+  "category": "Genre • Genre"
+}
 
 ANIME: {anime_name}
 SCRIPT: {script_summary}

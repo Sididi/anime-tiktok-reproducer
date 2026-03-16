@@ -25,10 +25,15 @@ from .voice_config_service import VoiceConfigService
 _OVERLAY_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "title": {"type": "string"},
+        "title_hooks": {
+            "type": "array",
+            "minItems": 10,
+            "maxItems": 10,
+            "items": {"type": "string"},
+        },
         "category": {"type": "string"},
     },
-    "required": ["title", "category"],
+    "required": ["title_hooks", "category"],
     "additionalProperties": False,
 }
 
@@ -40,6 +45,7 @@ class ScriptAutomationService:
     """End-to-end automation for /script: script JSON + optional metadata + TTS chunks."""
 
     RUNS_DIR_NAME = "script_automation_runs"
+    MAX_OVERLAY_TITLE_CHARS = 45
 
     TTS_TARGET = 625
     TTS_MIN = 500
@@ -117,6 +123,44 @@ class ScriptAutomationService:
             payload=script_payload,
             target_language=target_language,
         )
+
+    @classmethod
+    def _truncate_overlay_title(cls, title: str) -> str:
+        cleaned = title.strip()
+        if len(cleaned) <= cls.MAX_OVERLAY_TITLE_CHARS:
+            return cleaned
+
+        truncated = cleaned[: cls.MAX_OVERLAY_TITLE_CHARS]
+        last_space = truncated.rfind(" ")
+        if last_space > cls.MAX_OVERLAY_TITLE_CHARS // 2:
+            return truncated[:last_space].rstrip()
+        return truncated.rstrip()
+
+    @classmethod
+    def _normalize_overlay_payload(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        raw_hooks = payload.get("title_hooks")
+        if not isinstance(raw_hooks, list):
+            raise RuntimeError("Overlay JSON must contain a 'title_hooks' array")
+
+        title_hooks = [
+            cls._truncate_overlay_title(item)
+            for item in raw_hooks
+            if isinstance(item, str) and item.strip()
+        ]
+        if len(title_hooks) != 10:
+            raise RuntimeError(
+                f"Overlay JSON must contain exactly 10 non-empty title hooks ({len(title_hooks)} received)"
+            )
+
+        category = str(payload.get("category", "")).strip()
+        if not category:
+            raise RuntimeError("Overlay JSON must contain a non-empty 'category'")
+
+        return {
+            "title": title_hooks[0],
+            "title_hooks": title_hooks,
+            "category": category,
+        }
 
     @classmethod
     def prepare_tts_payload(
@@ -656,8 +700,8 @@ class ScriptAutomationService:
         project: Project,
         script_payload: dict[str, Any],
         target_language: str,
-    ) -> dict[str, str]:
-        """Generate a video overlay (title + category) via Gemini light model."""
+    ) -> dict[str, Any]:
+        """Generate a video overlay (title hooks + category) via Gemini light model."""
         anime_name = project.anime_name or "Inconnu"
         script_summary = cls._script_text_from_payload(script_payload)[:500]
         prompt = ScriptPhasePromptService.build_overlay_prompt(
@@ -671,20 +715,7 @@ class ScriptAutomationService:
             model=settings.gemini_light_model,
             response_json_schema=_OVERLAY_RESPONSE_SCHEMA,
         )
-        title = str(result.get("title", ""))
-        category = str(result.get("category", ""))
-
-        # Enforce title character limit — Gemini sometimes exceeds the prompt constraint
-        max_title_chars = 45
-        if len(title) > max_title_chars:
-            truncated = title[:max_title_chars]
-            last_space = truncated.rfind(" ")
-            if last_space > max_title_chars // 2:
-                title = truncated[:last_space]
-            else:
-                title = truncated
-
-        return {"title": title, "category": category}
+        return cls._normalize_overlay_payload(result)
 
     @classmethod
     def get_latest_run(cls, project_id: str) -> dict[str, Any] | None:
@@ -811,40 +842,6 @@ class ScriptAutomationService:
                 script_scene_count=len(script_payload.get("scenes", [])),
             )
 
-            # --- Metadata generation ---
-            metadata_payload: dict[str, Any] | None = None
-            metadata_warning: str | None = None
-
-            if skip_metadata or not settings.automate_metadata_overlay_enabled:
-                yield cls._event("llm_metadata", message="Metadata generation skipped")
-            else:
-                yield cls._event("llm_metadata", message="Generating metadata JSON with Gemini...")
-                try:
-                    metadata_prompt = MetadataService.build_prompt_from_script_payload(
-                        anime_name=project.anime_name or "Inconnu",
-                        script_payload=script_payload,
-                        target_language=target_language,
-                    )
-                    raw_metadata_payload = await asyncio.to_thread(
-                        GeminiService.generate_json,
-                        metadata_prompt,
-                        response_json_schema=cls._metadata_response_schema(),
-                    )
-                    validated_metadata = MetadataService.validate_payload(raw_metadata_payload)
-                    metadata_payload = validated_metadata.model_dump()
-                    (run_dir / "metadata.json").write_text(
-                        json.dumps(metadata_payload, ensure_ascii=False, indent=2),
-                        encoding="utf-8",
-                    )
-                    yield cls._event("llm_metadata", message="Metadata JSON generated")
-                except Exception as exc:
-                    metadata_warning = f"Metadata generation failed: {exc}"
-                    yield cls._event(
-                        "llm_metadata",
-                        message=metadata_warning,
-                        warning=metadata_warning,
-                    )
-
             # --- Pause for validation ---
             if pause_after_script:
                 yield cls._event(
@@ -853,36 +850,14 @@ class ScriptAutomationService:
                     message="Script ready for validation",
                     run_id=run_id,
                     script_json=script_payload,
-                    metadata_json=metadata_payload,
-                    metadata_warning=metadata_warning,
                 )
                 return
 
-            # --- Video overlay generation ---
-            overlay_json: dict[str, str] | None = None
-            if not skip_overlay and settings.automate_metadata_overlay_enabled and GeminiService.is_configured():
-                yield cls._event("generating_overlay", message="Generating video overlay...")
-                try:
-                    overlay_json = await asyncio.to_thread(
-                        cls.generate_video_overlay,
-                        project=project,
-                        script_payload=script_payload,
-                        target_language=target_language,
-                    )
-                    yield cls._event(
-                        "overlay_ready",
-                        message="Video overlay generated",
-                        overlay_json=overlay_json,
-                    )
-                except Exception as exc:
-                    yield cls._event(
-                        "overlay_ready",
-                        message=f"Overlay generation failed: {exc}",
-                        warning=f"Overlay generation failed: {exc}",
-                    )
-
             # --- TTS generation ---
             parts: list[dict[str, Any]] = []
+            metadata_payload: dict[str, Any] | None = None
+            metadata_warning: str | None = None
+            overlay_json: dict[str, Any] | None = None
 
             if skip_tts:
                 yield cls._event("tts_generating", message="TTS generation skipped")
@@ -947,6 +922,59 @@ class ScriptAutomationService:
 
                 merged_path = run_dir / "merged.wav"
                 await asyncio.to_thread(cls._merge_parts_to_wav, part_paths, merged_path)
+
+            # --- Metadata generation ---
+            if skip_metadata or not settings.automate_metadata_overlay_enabled:
+                yield cls._event("llm_metadata", message="Metadata generation skipped")
+            else:
+                yield cls._event("llm_metadata", message="Generating metadata JSON with Gemini...")
+                try:
+                    metadata_prompt = MetadataService.build_prompt_from_script_payload(
+                        anime_name=project.anime_name or "Inconnu",
+                        script_payload=script_payload,
+                        target_language=target_language,
+                    )
+                    raw_metadata_payload = await asyncio.to_thread(
+                        GeminiService.generate_json,
+                        metadata_prompt,
+                        response_json_schema=cls._metadata_response_schema(),
+                    )
+                    validated_metadata = MetadataService.validate_payload(raw_metadata_payload)
+                    metadata_payload = validated_metadata.model_dump()
+                    (run_dir / "metadata.json").write_text(
+                        json.dumps(metadata_payload, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    yield cls._event("llm_metadata", message="Metadata JSON generated")
+                except Exception as exc:
+                    metadata_warning = f"Metadata generation failed: {exc}"
+                    yield cls._event(
+                        "llm_metadata",
+                        message=metadata_warning,
+                        warning=metadata_warning,
+                    )
+
+            # --- Video overlay generation ---
+            if not skip_overlay and settings.automate_metadata_overlay_enabled and GeminiService.is_configured():
+                yield cls._event("generating_overlay", message="Generating video overlay...")
+                try:
+                    overlay_json = await asyncio.to_thread(
+                        cls.generate_video_overlay,
+                        project=project,
+                        script_payload=script_payload,
+                        target_language=target_language,
+                    )
+                    yield cls._event(
+                        "overlay_ready",
+                        message="Video overlay generated",
+                        overlay_json=overlay_json,
+                    )
+                except Exception as exc:
+                    yield cls._event(
+                        "overlay_ready",
+                        message=f"Overlay generation failed: {exc}",
+                        warning=f"Overlay generation failed: {exc}",
+                    )
 
             complete_payload = cls._event(
                 "complete",

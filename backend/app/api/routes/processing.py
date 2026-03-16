@@ -253,6 +253,7 @@ async def get_script_automation_config(project_id: str):
 
     return {
         "enabled": settings.script_automate_enabled,
+        "overlay_title_selection_enabled": settings.automate_overlay_title_selection_enabled,
         "gemini": {
             "configured": GeminiService.is_configured(),
             "model": settings.gemini_model,

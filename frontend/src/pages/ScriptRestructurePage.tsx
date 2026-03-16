@@ -31,8 +31,13 @@ import type {
   ScriptAutomationPart,
   ScriptAutomationVoice,
   ScriptTtsPrepareResponse,
+  VideoOverlay,
 } from "@/types";
-import { ScriptEditorModal, MetadataEditorModal } from "@/components/script";
+import {
+  ScriptEditorModal,
+  MetadataEditorModal,
+  OverlayTitlePickerModal,
+} from "@/components/script";
 import { readSSEStream } from "@/utils/sse";
 
 // Upload mode types
@@ -351,11 +356,14 @@ export function ScriptRestructurePage() {
   const [overlayTitle, setOverlayTitle] = useState("");
   const [overlayCategory, setOverlayCategory] = useState("");
   const [overlayGenerating, setOverlayGenerating] = useState(false);
+  const [overlayPickerOpen, setOverlayPickerOpen] = useState(false);
+  const [pendingOverlaySelection, setPendingOverlaySelection] =
+    useState<VideoOverlay | null>(null);
 
   // Automation validation pause
   const [validateBeforeTts, setValidateBeforeTts] = useState(true);
   const [automationPhase, setAutomationPhase] = useState<
-    "idle" | "phase1" | "validating" | "phase2"
+    "idle" | "phase1" | "validating" | "phase2" | "overlay_selecting"
   >("idle");
   const [currentRunId, setCurrentRunId] = useState<string | null>(null);
 
@@ -805,6 +813,7 @@ export function ScriptRestructurePage() {
   const handleCancelAutomation = useCallback(() => {
     automationAbortRef.current?.abort();
     setAutomationRunning(false);
+    setAutomationPhase("idle");
     setAutomationMessage("Automation cancelled");
   }, []);
 
@@ -863,6 +872,69 @@ export function ScriptRestructurePage() {
     [projectId],
   );
 
+  const persistSelectedOverlay = useCallback(
+    async (overlay: { title: string; category: string }) => {
+      if (!projectId) return;
+      await api
+        .updateScriptSettings(projectId, {
+          video_overlay: {
+            title: overlay.title,
+            category: overlay.category,
+          },
+        })
+        .catch(() => {});
+    },
+    [projectId],
+  );
+
+  const applySelectedOverlay = useCallback(
+    (overlay: { title: string; category: string }) => {
+      setOverlayTitle(overlay.title);
+      setOverlayCategory(overlay.category);
+      void persistSelectedOverlay(overlay);
+    },
+    [persistSelectedOverlay],
+  );
+
+  const handleOverlayResult = useCallback(
+    (overlay: VideoOverlay | undefined, options?: { fromAutomation?: boolean }) => {
+      if (!overlay) return false;
+
+      const titleHooks = Array.isArray(overlay.title_hooks)
+        ? overlay.title_hooks
+            .filter((hook): hook is string => typeof hook === "string")
+            .map((hook) => hook.trim())
+            .filter(Boolean)
+        : [];
+      const selectedTitle = titleHooks[0] || overlay.title?.trim() || "";
+      const category = overlay.category?.trim() || "";
+
+      if (
+        automationConfig?.overlay_title_selection_enabled &&
+        titleHooks.length > 0
+      ) {
+        setPendingOverlaySelection({
+          ...overlay,
+          title: selectedTitle,
+          title_hooks: titleHooks,
+          category,
+        });
+        setOverlayPickerOpen(true);
+        if (options?.fromAutomation) {
+          setAutomationPhase("overlay_selecting");
+          setAutomationMessage("Select the overlay title");
+        }
+        return true;
+      }
+
+      if (selectedTitle) {
+        applySelectedOverlay({ title: selectedTitle, category });
+      }
+      return false;
+    },
+    [automationConfig?.overlay_title_selection_enabled, applySelectedOverlay],
+  );
+
   // Generate video overlay
   const handleGenerateOverlay = useCallback(async () => {
     if (!projectId || !jsonValid || !newScriptJson) return;
@@ -873,14 +945,19 @@ export function ScriptRestructurePage() {
         script_json: parsed,
         target_language: targetLanguage,
       });
-      setOverlayTitle(result.overlay.title);
-      setOverlayCategory(result.overlay.category);
+      handleOverlayResult(result.overlay);
     } catch (err) {
       setError((err as Error).message);
     } finally {
       setOverlayGenerating(false);
     }
-  }, [projectId, jsonValid, newScriptJson, targetLanguage]);
+  }, [
+    projectId,
+    jsonValid,
+    newScriptJson,
+    targetLanguage,
+    handleOverlayResult,
+  ]);
 
   // Build preview audio
   const buildPreview = useCallback(
@@ -948,6 +1025,23 @@ export function ScriptRestructurePage() {
     setPreviewUrl(null);
   }, []);
 
+  const handleOverlayTitleSelect = useCallback(
+    (title: string) => {
+      if (!pendingOverlaySelection) return;
+      applySelectedOverlay({
+        title,
+        category: pendingOverlaySelection.category || "",
+      });
+      setOverlayPickerOpen(false);
+      setPendingOverlaySelection(null);
+      if (automationPhase === "overlay_selecting") {
+        setAutomationPhase("idle");
+        setAutomationMessage("Overlay title selected");
+      }
+    },
+    [pendingOverlaySelection, applySelectedOverlay, automationPhase],
+  );
+
   const handleAutomate = useCallback(async () => {
     if (!projectId || !automationConfig) return;
     if (!automationConfig.enabled) {
@@ -966,6 +1060,8 @@ export function ScriptRestructurePage() {
     setAutomationRunning(true);
     setPromptCopied(true);
     setAutomationPhase("phase1");
+    setOverlayPickerOpen(false);
+    setPendingOverlaySelection(null);
 
     const controller = new AbortController();
     automationAbortRef.current = controller;
@@ -1054,6 +1150,7 @@ export function ScriptRestructurePage() {
         throw new Error("Automation response did not include script_json");
       }
 
+      let overlaySelectionPending = false;
       const prettyScript = JSON.stringify(finalEvent.script_json, null, 2);
       handleJsonChange(prettyScript);
 
@@ -1073,11 +1170,6 @@ export function ScriptRestructurePage() {
         setMetadataExpanded(true);
       }
 
-      if (finalEvent.overlay_json) {
-        setOverlayTitle(finalEvent.overlay_json.title);
-        setOverlayCategory(finalEvent.overlay_json.category);
-      }
-
       if (!finalEvent.run_id) {
         throw new Error("Automation response did not include run_id");
       }
@@ -1095,7 +1187,13 @@ export function ScriptRestructurePage() {
       } else {
         setAutomationMessage("Automation complete (audio kept as-is)");
       }
-      setAutomationPhase("idle");
+
+      overlaySelectionPending = handleOverlayResult(finalEvent.overlay_json, {
+        fromAutomation: true,
+      });
+      if (!overlaySelectionPending) {
+        setAutomationPhase("idle");
+      }
     } catch (err) {
       if ((err as Error).name === "AbortError") {
         return;
@@ -1121,10 +1219,11 @@ export function ScriptRestructurePage() {
     handleJsonChange,
     handleMetadataJsonChange,
     hydrateAutomationParts,
+    handleOverlayResult,
     validateBeforeTts,
   ]);
 
-  // Resume automation after validation pause (phase 2: overlay + TTS)
+  // Resume automation after validation pause (phase 2: TTS + metadata + overlay)
   const handleResumeAfterValidation = useCallback(
     async (scriptJsonOverride?: string) => {
       if (!projectId || !automationConfig || !automationVoiceKey) return;
@@ -1153,7 +1252,7 @@ export function ScriptRestructurePage() {
 
       setError(null);
       setAutomationStep("starting");
-      setAutomationMessage("Resuming automation (overlay + TTS)...");
+      setAutomationMessage("Resuming automation (TTS + metadata + overlay)...");
       setAutomationRunning(true);
       setAutomationPhase("phase2");
 
@@ -1167,7 +1266,7 @@ export function ScriptRestructurePage() {
             target_language: targetLanguage,
             voice_key: automationVoiceKey,
             existing_script_json: parsedScriptJson,
-            skip_metadata: true,
+            skip_metadata: false,
             skip_tts: false,
             pause_after_script: false,
             skip_overlay: false,
@@ -1196,9 +1295,27 @@ export function ScriptRestructurePage() {
           );
         }
 
-        if (finalEvent.overlay_json) {
-          setOverlayTitle(finalEvent.overlay_json.title);
-          setOverlayCategory(finalEvent.overlay_json.category);
+        let overlaySelectionPending = false;
+
+        if (finalEvent.script_json) {
+          const prettyScript = JSON.stringify(finalEvent.script_json, null, 2);
+          handleJsonChange(prettyScript);
+        }
+
+        if (finalEvent.metadata_json) {
+          const prettyMetadata = JSON.stringify(
+            finalEvent.metadata_json,
+            null,
+            2,
+          );
+          handleMetadataJsonChange(prettyMetadata);
+          setMetadataDetected(true);
+          setMetadataExpanded(true);
+        }
+
+        if (finalEvent.metadata_warning) {
+          setAutomationMetadataWarning(finalEvent.metadata_warning);
+          setMetadataExpanded(true);
         }
 
         const parts = finalEvent.parts || [];
@@ -1211,13 +1328,22 @@ export function ScriptRestructurePage() {
           setAutomationMessage(
             `Automation complete (${parts.length} part${parts.length > 1 ? "s" : ""} loaded)`,
           );
+        } else {
+          setAutomationMessage("Automation complete (audio kept as-is)");
+        }
+
+        overlaySelectionPending = handleOverlayResult(finalEvent.overlay_json, {
+          fromAutomation: true,
+        });
+        if (!overlaySelectionPending) {
+          setAutomationPhase("idle");
         }
       } catch (err) {
         if ((err as Error).name === "AbortError") return;
         setError((err as Error).message);
+        setAutomationPhase("idle");
       } finally {
         setAutomationRunning(false);
-        setAutomationPhase("idle");
         automationAbortRef.current = null;
       }
     },
@@ -1228,7 +1354,10 @@ export function ScriptRestructurePage() {
       targetLanguage,
       newScriptJson,
       transcription,
+      handleJsonChange,
+      handleMetadataJsonChange,
       hydrateAutomationParts,
+      handleOverlayResult,
     ],
   );
 
@@ -1546,19 +1675,23 @@ export function ScriptRestructurePage() {
     ? `Automation config error: ${automationConfigError}`
     : !automationConfig
       ? "Loading automation config..."
-      : !automationConfig.enabled
-        ? "Automation disabled on backend"
-        : !automationConfig.gemini.configured
-          ? "Gemini API key missing on backend"
-          : !automationConfig.elevenlabs.configured
-            ? "ElevenLabs API key missing on backend"
-            : automationConfig.voice_config_error
-              ? automationConfig.voice_config_error
-              : !automationVoiceKey
-                ? "Select a voice to automate"
-                : allFieldsFilled
-                  ? "All fields already filled"
-                  : null;
+      : automationPhase === "validating"
+        ? "Validate the script to continue automation"
+        : automationPhase === "overlay_selecting"
+          ? "Select an overlay title to finish automation"
+          : !automationConfig.enabled
+            ? "Automation disabled on backend"
+            : !automationConfig.gemini.configured
+              ? "Gemini API key missing on backend"
+              : !automationConfig.elevenlabs.configured
+                ? "ElevenLabs API key missing on backend"
+                : automationConfig.voice_config_error
+                  ? automationConfig.voice_config_error
+                  : !automationVoiceKey
+                    ? "Select a voice to automate"
+                    : allFieldsFilled
+                      ? "All fields already filled"
+                      : null;
   const canRunAutomation =
     automationBlockedReason === null && !automationRunning;
   const normalizedFullText =
@@ -2248,17 +2381,15 @@ export function ScriptRestructurePage() {
                   Validate script before TTS
                 </label>
 
-                {/* Resume button when in validation phase */}
+                {/* Re-open validation modal while automation is paused */}
                 {automationPhase === "validating" && !automationRunning && (
                   <Button
                     size="sm"
                     className="w-full"
-                    onClick={() => {
-                      void handleResumeAfterValidation();
-                    }}
+                    onClick={() => setScriptEditorOpen(true)}
                   >
-                    <Sparkles className="h-4 w-4 mr-2" />
-                    Continue (Overlay + TTS)
+                    <Pencil className="h-4 w-4 mr-2" />
+                    Open Script Validation
                   </Button>
                 )}
 
@@ -2443,17 +2574,10 @@ export function ScriptRestructurePage() {
       {transcription && (
         <ScriptEditorModal
           isOpen={scriptEditorOpen}
-          onClose={() => {
-            setScriptEditorOpen(false);
-            // If closing during validation phase, trigger resume
-            if (automationPhase === "validating") {
-              void handleResumeAfterValidation();
-            }
-          }}
+          onClose={() => setScriptEditorOpen(false)}
           onSave={(updatedJson) => {
             handleJsonChange(updatedJson);
             setScriptEditorOpen(false);
-            // If saving during validation phase, trigger resume
             if (automationPhase === "validating") {
               void handleResumeAfterValidation(updatedJson);
             }
@@ -2461,6 +2585,14 @@ export function ScriptRestructurePage() {
           scenesJson={newScriptJson}
           transcription={transcription}
           targetLanguage={targetLanguage}
+          title={
+            automationPhase === "validating" ? "Validate Script" : "Edit Script"
+          }
+          saveLabel={
+            automationPhase === "validating"
+              ? "Validate Script and Continue"
+              : "Save Changes"
+          }
         />
       )}
 
@@ -2469,6 +2601,13 @@ export function ScriptRestructurePage() {
         onClose={() => setMetadataEditorOpen(false)}
         metadata={metadataEditorValue}
         onSave={handleMetadataEditorSave}
+      />
+
+      <OverlayTitlePickerModal
+        isOpen={overlayPickerOpen && !!pendingOverlaySelection}
+        category={pendingOverlaySelection?.category || ""}
+        titleHooks={pendingOverlaySelection?.title_hooks || []}
+        onSelect={handleOverlayTitleSelect}
       />
     </div>
   );

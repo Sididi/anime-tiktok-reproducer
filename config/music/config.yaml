@@ -1,4 +1,4 @@
-default_music_key: carol_of_the_bells
+default_music_key: royalty
 
 music:
   credits_song_death:
@@ -34,4 +34,9 @@ music:
   carol_of_the_bells:
     display_name: "Carol of the Bells"
     file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/carol of the bells.wav"
+    volume_db: -30
+
+  night_cruising:
+    display_name: "Night Cruising"
+    file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/night cruising.wav"
     volume_db: -30

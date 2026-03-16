@@ -64,6 +64,7 @@ export interface ScriptAutomationMusic {
 
 export interface VideoOverlay {
   title: string;
+  title_hooks?: string[];
   category: string;
   title_image?: string;
   category_image?: string;
@@ -71,6 +72,7 @@ export interface VideoOverlay {
 
 export interface ScriptAutomationConfig {
   enabled: boolean;
+  overlay_title_selection_enabled: boolean;
   gemini: {
     configured: boolean;
     model: string;
