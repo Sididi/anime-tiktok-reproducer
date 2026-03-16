@@ -157,6 +157,7 @@ class GeminiService:
                     "responsejsonschema" in lower
                     or "responseschema" in lower
                     or "unknown name" in lower
+                    or "invalid argument" in lower
                     or "too many states" in lower
                     or "schema produces a constraint" in lower
                 )
