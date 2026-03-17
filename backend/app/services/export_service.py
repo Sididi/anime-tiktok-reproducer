@@ -7,6 +7,7 @@ import re
 import time
 import zipfile
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable
@@ -199,6 +200,7 @@ class _DriveUploadProgressTracker:
 class ExportService:
     VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
     BAKED_SUBTITLE_RE = re.compile(r"^subtitle_(\d+)\.mogrt$", re.IGNORECASE)
+    SUBTITLES_ARCHIVE_FILENAME = "atr_subtitles.zip"
 
     @classmethod
     def get_required_import_assets(cls) -> tuple[str, ...]:
@@ -290,7 +292,7 @@ tts_edited.wav          - Processed TTS audio
 metadata/               - Generated metadata files (optional)
 assets/                 - Required import assets
 sources/                - Source episodes + overlays + optional music
-subtitles/              - Baked subtitle MOGRT files
+subtitles/              - CEP subtitle archive (extracts baked MOGRT files locally)
 
 === SOURCES ===
 {source_list}
@@ -370,6 +372,30 @@ subtitles/              - Baked subtitle MOGRT files
         )
 
     @classmethod
+    def _build_subtitles_archive_entry(
+        cls,
+        output_dir: Path,
+        *,
+        relative_path: str,
+    ) -> ManifestEntry | None:
+        baked_subtitles = cls._collect_baked_subtitle_files(output_dir)
+        subtitle_timing_files = cls._collect_subtitle_timing_files(output_dir)
+        archive_sources = baked_subtitles + subtitle_timing_files
+        if not archive_sources:
+            return None
+
+        buffer = BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for source_path in archive_sources:
+                archive.write(source_path, source_path.name)
+
+        return ManifestEntry(
+            relative_path=relative_path,
+            inline_content=buffer.getvalue(),
+            mime_type="application/zip",
+        )
+
+    @classmethod
     def _collect_raw_scene_subtitle_files(cls, output_dir: Path) -> list[Path]:
         raw_dir = output_dir / "raw_scene_subtitles"
         if not raw_dir.exists():
@@ -395,11 +421,13 @@ subtitles/              - Baked subtitle MOGRT files
         if not subtitle_path.exists():
             raise FileNotFoundError("Missing subtitle file. Run processing first.")
 
-        baked_subtitles = cls._collect_baked_subtitle_files(output_dir)
-        subtitle_timing_files = cls._collect_subtitle_timing_files(output_dir)
+        folder = cls.output_folder_name(project)
+        subtitles_archive_entry = cls._build_subtitles_archive_entry(
+            output_dir,
+            relative_path=f"{folder}/subtitles/{cls.SUBTITLES_ARCHIVE_FILENAME}",
+        )
         raw_scene_subtitle_files = cls._collect_raw_scene_subtitle_files(output_dir)
 
-        folder = cls.output_folder_name(project)
         subtitle_name = subtitle_path.name
         entries: list[ManifestEntry] = [
             ManifestEntry(relative_path=f"{folder}/import_project.jsx", source_path=jsx_path),
@@ -467,20 +495,8 @@ subtitles/              - Baked subtitle MOGRT files
         if music_path is not None:
             _add_source_file(music_path)
 
-        for subtitle_mogrt in baked_subtitles:
-            entries.append(
-                ManifestEntry(
-                    relative_path=f"{folder}/subtitles/{subtitle_mogrt.name}",
-                    source_path=subtitle_mogrt,
-                )
-            )
-        for subtitle_timing_file in subtitle_timing_files:
-            entries.append(
-                ManifestEntry(
-                    relative_path=f"{folder}/subtitles/{subtitle_timing_file.name}",
-                    source_path=subtitle_timing_file,
-                )
-            )
+        if subtitles_archive_entry is not None:
+            entries.append(subtitles_archive_entry)
 
         raw_scene_subtitle_root = output_dir / "raw_scene_subtitles"
         for raw_scene_subtitle_file in raw_scene_subtitle_files:

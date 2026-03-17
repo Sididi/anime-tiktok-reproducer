@@ -35,11 +35,15 @@
   var DEFAULT_PORT = 48653;
   var OUTPUT_FILENAME = "output.mp4";
   var AUDIO_NO_MUSIC_OUTPUT_FILENAME = "output_no_music.wav";
+  var SUBTITLES_DIRNAME = "subtitles";
+  var SUBTITLES_ARCHIVE_FILENAME = "atr_subtitles.zip";
+  var SUBTITLE_TIMING_FILENAME = "subtitle_timings.srt";
   var ATR_OUTPUT_PATTERN = /^ATR_.*\.mp4$/i;
   var EXPORT_STABLE_MS = 10000;
   var EXPORT_POLL_INTERVAL_MS = 5000;
   var ENCODER_POLL_INTERVAL_MS = 1000;
   var FS_WATCH_RETRY_DELAY_MS = 10000;
+  var POWERSHELL_TIMEOUT_MS = 300000;
   var CLEANUP_IMMEDIATE_MAX_ATTEMPTS = 8;
   var CLEANUP_BACKGROUND_MAX_ATTEMPTS = 3;
   var CLEANUP_RETRYABLE_MAX_PASSES = 240;
@@ -170,6 +174,127 @@
     } catch (e) {
       return false;
     }
+  }
+
+  function escapePowerShellSingleQuoted(value) {
+    return String(value || "").replace(/'/g, "''");
+  }
+
+  function runPowerShellScriptAsync(script, timeoutMs) {
+    return new Promise(function (resolve, reject) {
+      var encoded = Buffer.from(String(script || ""), "utf16le").toString(
+        "base64",
+      );
+      childProcess.execFile(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-EncodedCommand",
+          encoded,
+        ],
+        {
+          windowsHide: true,
+          timeout: timeoutMs || POWERSHELL_TIMEOUT_MS,
+          encoding: "utf8",
+        },
+        function (error, stdout, stderr) {
+          if (error) {
+            var detail = String(stderr || stdout || "").trim();
+            if (detail && String(error.message || "").indexOf(detail) === -1) {
+              error.message += ": " + detail;
+            }
+            reject(error);
+            return;
+          }
+          resolve({
+            stdout: String(stdout || ""),
+            stderr: String(stderr || ""),
+          });
+        },
+      );
+    });
+  }
+
+  function listDirectFiles(dirPath, ignoredNames) {
+    if (!dirPath || !pathExists(dirPath)) {
+      return [];
+    }
+
+    var ignored = {};
+    (Array.isArray(ignoredNames) ? ignoredNames : []).forEach(function (name) {
+      ignored[String(name || "")] = true;
+    });
+
+    var entries = [];
+    fs.readdirSync(dirPath).forEach(function (name) {
+      if (ignored[name]) {
+        return;
+      }
+      var entryPath = path.join(dirPath, name);
+      try {
+        if (fs.statSync(entryPath).isFile()) {
+          entries.push(name);
+        }
+      } catch (e) {
+        // ignore transient filesystem errors during validation
+      }
+    });
+    entries.sort();
+    return entries;
+  }
+
+  function ensureProjectSubtitlesExpanded(localRootPath) {
+    var rootPath = String(localRootPath || "").trim();
+    if (!rootPath) {
+      return Promise.resolve({
+        extracted: false,
+      });
+    }
+
+    var subtitlesDir = path.join(rootPath, SUBTITLES_DIRNAME);
+    var archivePath = path.join(subtitlesDir, SUBTITLES_ARCHIVE_FILENAME);
+    if (!pathExists(archivePath)) {
+      return Promise.resolve({
+        extracted: false,
+      });
+    }
+
+    var script = [
+      "$ErrorActionPreference = 'Stop'",
+      "Expand-Archive -LiteralPath '" +
+        escapePowerShellSingleQuoted(archivePath) +
+        "' -DestinationPath '" +
+        escapePowerShellSingleQuoted(subtitlesDir) +
+        "' -Force",
+    ].join("; ");
+
+    return runPowerShellScriptAsync(script, POWERSHELL_TIMEOUT_MS).then(
+      function () {
+        var timingPath = path.join(subtitlesDir, SUBTITLE_TIMING_FILENAME);
+        if (!pathExists(timingPath)) {
+          throw new Error(
+            "Subtitle archive extraction did not recreate " +
+              SUBTITLE_TIMING_FILENAME,
+          );
+        }
+
+        var extractedFiles = listDirectFiles(subtitlesDir, [
+          SUBTITLES_ARCHIVE_FILENAME,
+        ]);
+        if (extractedFiles.length === 0) {
+          throw new Error("Subtitle archive extraction produced no files");
+        }
+
+        fs.unlinkSync(archivePath);
+        return {
+          extracted: true,
+          extractedFileCount: extractedFiles.length,
+        };
+      },
+    );
   }
 
   function copyDirRecursive(sourceDir, targetDir) {
@@ -731,7 +856,18 @@
     setStatus("running");
     log("Running: " + path.basename(jsxPath), "info");
 
-    return evalHost('runScript("' + escapeForEval(normalized) + '")')
+    return ensureProjectSubtitlesExpanded(path.dirname(jsxPath))
+      .then(function (preparation) {
+        if (preparation && preparation.extracted) {
+          log(
+            "Expanded subtitle archive before JSX run (" +
+              Number(preparation.extractedFileCount || 0) +
+              " files)",
+            "info",
+          );
+        }
+        return evalHost('runScript("' + escapeForEval(normalized) + '")');
+      })
       .then(function (result) {
         if (result && result.indexOf("ERROR:") === 0) {
           setStatus("error");
@@ -752,23 +888,8 @@
     localRootPath,
     suppressLogs,
   ) {
-    var normalizedRoot = String(localRootPath || "").trim();
     var quiet = !!suppressLogs;
-    if (!normalizedRoot) {
-      return Promise.resolve({
-        ok: false,
-        skipped: true,
-        reason: "missing_local_root",
-      });
-    }
-
-    var hostCall = [
-      "cleanupImportedProjectMedia(",
-      '"',
-      escapeForEval(String(normalizedRoot).replace(/\\/g, "/")),
-      '"',
-      ")",
-    ].join("");
+    var hostCall = "purgeActiveProject()";
 
     return evalHost(hostCall).then(function (result) {
       var raw = String(result || "").trim();
@@ -788,21 +909,26 @@
 
       var summary = parsed || { ok: true, raw: raw };
       if (!quiet && summary) {
-        var timelineRemoved = Number(summary.timeline_removed || 0);
-        var remainingItems = Number(summary.project_items_remaining || 0);
-        var deletedLeaves = Number(summary.leaf_items_deleted || 0);
-        var deletedBins = Number(summary.bins_deleted || 0);
+        var sequencesDeleted = Number(summary.sequences_deleted || 0);
+        var movedItems = Number(summary.items_moved_to_purge_bin || 0);
+        var remainingSequences = Number(summary.remaining_sequences || 0);
+        var remainingRootItems = Number(summary.remaining_root_items || 0);
+        var warningCount = Array.isArray(summary.warnings)
+          ? summary.warnings.length
+          : Number(summary.warning_count || 0);
         log(
           "Premiere cleanup for " +
             projectId +
-            ": timeline=" +
-            timelineRemoved +
-            ", bins=" +
-            deletedBins +
-            ", leafItems=" +
-            deletedLeaves +
-            ", remaining=" +
-            remainingItems,
+            ": sequencesDeleted=" +
+            sequencesDeleted +
+            ", movedToPurgeBin=" +
+            movedItems +
+            ", remainingSequences=" +
+            remainingSequences +
+            ", remainingRootItems=" +
+            remainingRootItems +
+            ", warnings=" +
+            warningCount,
           "info",
         );
       }
@@ -982,17 +1108,24 @@
     }
 
     parts.push(
-      "Remaining Premiere items: " +
-        Number(hostSummary.project_items_remaining || 0),
+      "Remaining sequences: " + Number(hostSummary.remaining_sequences || 0),
     );
-    parts.push("Deleted bins: " + Number(hostSummary.bins_deleted || 0));
     parts.push(
-      "Deleted leaf items: " + Number(hostSummary.leaf_items_deleted || 0),
+      "Remaining root items: " +
+        Number(hostSummary.remaining_root_items || 0),
     );
-
-    var timelineRemoved = Number(hostSummary.timeline_removed || 0);
-    if (timelineRemoved > 0) {
-      parts.push("Timeline removed: " + timelineRemoved);
+    parts.push(
+      "Deleted sequences: " + Number(hostSummary.sequences_deleted || 0),
+    );
+    parts.push(
+      "Moved to purge bin: " +
+        Number(hostSummary.items_moved_to_purge_bin || 0),
+    );
+    var warningCount = Array.isArray(hostSummary.warnings)
+      ? hostSummary.warnings.length
+      : Number(hostSummary.warning_count || 0);
+    if (warningCount > 0) {
+      parts.push("Warnings: " + warningCount);
     }
 
     return parts.join(" | ");
@@ -1571,6 +1704,17 @@
               progress.file_count +
               " for " +
               projectId,
+            "info",
+          );
+        } else if (progress.stage === "subtitle_archive_extract_start") {
+          log("Extracting subtitle archive for " + projectId, "info");
+        } else if (progress.stage === "subtitle_archive_extract_complete") {
+          log(
+            "Subtitle archive extracted for " +
+              projectId +
+              " (" +
+              Number(progress.extracted_file_count || 0) +
+              " files)",
             "info",
           );
         } else if (progress.stage === "download_complete") {

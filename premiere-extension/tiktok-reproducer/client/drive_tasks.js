@@ -6,11 +6,16 @@ var os = require("os");
 var https = require("https");
 var zlib = require("zlib");
 var querystring = require("querystring");
+var childProcess = require("child_process");
+var crypto = require("crypto");
 
 var DRIVE_API_HOST = "www.googleapis.com";
 var OAUTH_HOST = "oauth2.googleapis.com";
 var FOLDER_MIME = "application/vnd.google-apps.folder";
 var OUTPUT_FILENAME = "output.mp4";
+var SUBTITLES_DIRNAME = "subtitles";
+var SUBTITLES_ARCHIVE_FILENAME = "atr_subtitles.zip";
+var SUBTITLE_TIMING_FILENAME = "subtitle_timings.srt";
 var RESUMABLE_CHUNK_SIZE = 8 * 1024 * 1024;
 var MAX_RETRIES = 6;
 var DOWNLOAD_CONCURRENCY_DEFAULT = 4;
@@ -21,6 +26,7 @@ var SMALL_FILE_MEDIUM_COUNT = 40;
 var PROGRESS_EMIT_INTERVAL_MS = 250;
 var PROGRESS_EMIT_MIN_DELTA_BYTES = 4 * 1024 * 1024;
 var TREE_LIST_CONCURRENCY = 6;
+var POWERSHELL_TIMEOUT_MS = 300000;
 var SHARED_HTTPS_AGENT = new https.Agent({
   keepAlive: true,
   maxSockets: 32,
@@ -65,6 +71,141 @@ function removeIfExists(filePath) {
   } catch (e) {
     // best effort
   }
+}
+
+function generateRandomHexSuffix() {
+  try {
+    return crypto.randomBytes(2).toString("hex");
+  } catch (e) {
+    return Math.floor(Math.random() * 0x10000)
+      .toString(16)
+      .padStart(4, "0");
+  }
+}
+
+function escapePowerShellSingleQuoted(value) {
+  return String(value || "").replace(/'/g, "''");
+}
+
+function runPowerShellScript(script, timeoutMs) {
+  var encoded = Buffer.from(String(script || ""), "utf16le").toString("base64");
+  var result = childProcess.spawnSync(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-EncodedCommand",
+      encoded,
+    ],
+    {
+      windowsHide: true,
+      encoding: "utf8",
+      timeout: timeoutMs || POWERSHELL_TIMEOUT_MS,
+    },
+  );
+
+  if (result.error) {
+    throw result.error;
+  }
+
+  if (Number(result.status || 0) !== 0) {
+    var stderr = String(result.stderr || "").trim();
+    var stdout = String(result.stdout || "").trim();
+    throw new Error(
+      "PowerShell command failed" +
+        (stderr ? ": " + stderr : stdout ? ": " + stdout : ""),
+    );
+  }
+}
+
+function listDirectFiles(dirPath, ignoredNames) {
+  if (!dirPath || !fs.existsSync(dirPath)) {
+    return [];
+  }
+
+  var ignored = {};
+  (Array.isArray(ignoredNames) ? ignoredNames : []).forEach(function (name) {
+    ignored[String(name || "")] = true;
+  });
+
+  var entries = [];
+  fs.readdirSync(dirPath).forEach(function (name) {
+    if (ignored[name]) {
+      return;
+    }
+    var entryPath = path.join(dirPath, name);
+    try {
+      if (fs.statSync(entryPath).isFile()) {
+        entries.push(name);
+      }
+    } catch (e) {
+      // ignore unreadable entries during validation
+    }
+  });
+  entries.sort();
+  return entries;
+}
+
+function extractSubtitlesArchive(localRootPath, projectId, emitProgress) {
+  var reporter =
+    typeof emitProgress === "function" ? emitProgress : function () {};
+  var subtitlesDir = path.join(localRootPath, SUBTITLES_DIRNAME);
+  var archivePath = path.join(subtitlesDir, SUBTITLES_ARCHIVE_FILENAME);
+  if (!fs.existsSync(archivePath)) {
+    return {
+      extracted: false,
+      archive_path: archivePath,
+    };
+  }
+
+  var script = [
+    "$ErrorActionPreference = 'Stop'",
+    "Expand-Archive -LiteralPath '" +
+      escapePowerShellSingleQuoted(archivePath) +
+      "' -DestinationPath '" +
+      escapePowerShellSingleQuoted(subtitlesDir) +
+      "' -Force",
+  ].join("; ");
+
+  reporter({
+    stage: "subtitle_archive_extract_start",
+    project_id: projectId,
+    archive_path: archivePath,
+    destination_path: subtitlesDir,
+  });
+
+  runPowerShellScript(script, POWERSHELL_TIMEOUT_MS);
+
+  var timingPath = path.join(subtitlesDir, SUBTITLE_TIMING_FILENAME);
+  if (!fs.existsSync(timingPath)) {
+    throw new Error(
+      "Subtitle archive extraction did not recreate " +
+        SUBTITLE_TIMING_FILENAME,
+    );
+  }
+
+  var extractedFiles = listDirectFiles(subtitlesDir, [SUBTITLES_ARCHIVE_FILENAME]);
+  if (extractedFiles.length === 0) {
+    throw new Error("Subtitle archive extraction produced no files");
+  }
+
+  fs.unlinkSync(archivePath);
+
+  reporter({
+    stage: "subtitle_archive_extract_complete",
+    project_id: projectId,
+    archive_path: archivePath,
+    destination_path: subtitlesDir,
+    extracted_file_count: extractedFiles.length,
+  });
+
+  return {
+    extracted: true,
+    archive_path: archivePath,
+    extracted_file_count: extractedFiles.length,
+  };
 }
 
 function sleep(ms) {
@@ -734,17 +875,38 @@ function pickTargetBasePaths(folderName, appDataPath) {
     fs.accessSync(desktopParent, fs.constants.W_OK);
     return {
       parent: desktopParent,
-      folderName: folderName,
+      folderName: pickUniqueTargetFolderName(desktopParent, folderName),
       isFallback: false,
     };
   } catch (e) {
     ensureDir(fallbackParent);
     return {
       parent: fallbackParent,
-      folderName: folderName,
+      folderName: pickUniqueTargetFolderName(fallbackParent, folderName),
       isFallback: true,
     };
   }
+}
+
+function pickUniqueTargetFolderName(parentDir, baseFolderName) {
+  var baseName = String(baseFolderName || "project").trim() || "project";
+  for (var attempt = 0; attempt < 32; attempt += 1) {
+    var candidate = baseName + "_" + generateRandomHexSuffix();
+    if (
+      !fs.existsSync(path.join(parentDir, candidate)) &&
+      !fs.existsSync(path.join(parentDir, candidate + ".partial"))
+    ) {
+      return candidate;
+    }
+  }
+
+  return (
+    baseName +
+    "_" +
+    generateRandomHexSuffix() +
+    "_" +
+    Date.now().toString(16)
+  );
 }
 
 function runWithConcurrency(items, concurrency, workerFn) {
@@ -973,8 +1135,12 @@ function performDownloadProject(payload, emitProgress) {
             });
           },
         ).then(function () {
-          removeIfExists(targetRoot);
           fs.renameSync(partialRoot, targetRoot);
+          var extraction = extractSubtitlesArchive(
+            targetRoot,
+            projectId,
+            emitProgress,
+          );
 
           var outputPath = path.join(targetRoot, OUTPUT_FILENAME);
           var contextPath = path.join(targetRoot, ".atr_project_context.json");
@@ -992,6 +1158,7 @@ function performDownloadProject(payload, emitProgress) {
             download_elapsed_ms: elapsedMs,
             download_avg_mb_per_sec: avgMbPerSec,
             download_file_count: files.length,
+            subtitle_archive_extracted: !!(extraction && extraction.extracted),
           });
 
           emitProgress({
@@ -1016,6 +1183,7 @@ function performDownloadProject(payload, emitProgress) {
             download_avg_mb_per_sec: avgMbPerSec,
             download_file_count: files.length,
             download_total_bytes: totalBytes,
+            subtitle_archive_extracted: !!(extraction && extraction.extracted),
           };
         });
       });

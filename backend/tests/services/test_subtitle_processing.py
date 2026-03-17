@@ -1,5 +1,7 @@
 import asyncio
 import json
+import zipfile
+from io import BytesIO
 
 from app.models.project import Project
 from app.models.transcription import SceneTranscription, Transcription, Word
@@ -357,3 +359,67 @@ def test_export_collects_internal_subtitle_timing_files(tmp_path):
     (subtitles_dir / "notes.txt").write_text("ignore", encoding="utf-8")
 
     assert ExportService._collect_subtitle_timing_files(tmp_path) == [timing_path]
+
+
+def test_export_build_manifest_archives_subtitles(monkeypatch, tmp_path):
+    project = Project(
+        id="p-export",
+        anime_name="Demo Anime",
+        output_language="fr",
+    )
+    output_dir = tmp_path / "output"
+    output_dir.mkdir(parents=True)
+    (output_dir / "import_project.jsx").write_text("// jsx", encoding="utf-8")
+    (output_dir / "tts_edited.wav").write_bytes(b"wav")
+    (output_dir / "subtitles.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\nCaption\n", encoding="utf-8")
+
+    subtitles_dir = output_dir / "subtitles"
+    subtitles_dir.mkdir()
+    (subtitles_dir / "subtitle_0001.mogrt").write_text("mogrt1", encoding="utf-8")
+    (subtitles_dir / "subtitle_0002.mogrt").write_text("mogrt2", encoding="utf-8")
+    (subtitles_dir / "subtitle_timings.srt").write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nSubtitle\n",
+        encoding="utf-8",
+    )
+
+    assets_dir = tmp_path / "assets"
+    assets_dir.mkdir()
+    for asset_name in ExportService.get_required_import_assets():
+        (assets_dir / asset_name).write_text(asset_name, encoding="utf-8")
+    (assets_dir / "run_in_premiere.bat").write_text("@echo off\n", encoding="utf-8")
+
+    monkeypatch.setattr(ExportService, "get_output_dir", classmethod(lambda cls, _project_id: output_dir))
+    monkeypatch.setattr(ExportService, "get_assets_dir", classmethod(lambda cls: assets_dir))
+    monkeypatch.setattr(ExportService, "_collect_episode_sources", classmethod(lambda cls, _matches: []))
+    monkeypatch.setattr(
+        ExportService,
+        "_resolve_selected_music_path",
+        classmethod(lambda cls, _project: None),
+    )
+
+    folder, entries = ExportService.build_manifest(project, [])
+
+    archive_entry = next(
+        entry
+        for entry in entries
+        if entry.relative_path == f"{folder}/subtitles/{ExportService.SUBTITLES_ARCHIVE_FILENAME}"
+    )
+    assert archive_entry.inline_content is not None
+    assert archive_entry.mime_type == "application/zip"
+    assert all(
+        not entry.relative_path.endswith(".mogrt")
+        for entry in entries
+        if "/subtitles/" in entry.relative_path
+    )
+    assert all(
+        not entry.relative_path.endswith("subtitle_timings.srt")
+        for entry in entries
+        if "/subtitles/" in entry.relative_path
+    )
+
+    with zipfile.ZipFile(BytesIO(archive_entry.inline_content), "r") as archive:
+        assert sorted(archive.namelist()) == [
+            "subtitle_0001.mogrt",
+            "subtitle_0002.mogrt",
+            "subtitle_timings.srt",
+        ]

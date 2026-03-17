@@ -13,6 +13,7 @@ var __atrTempAudioSequenceByJob = {};
 var __atrEncoderCallbacksBound = false;
 var __atrCleanupMaxBinPasses = 5;
 var __atrTempAudioSequencePrefix = "ATR_AUDIO_NO_MUSIC_TMP__";
+var __atrProjectPurgeBinName = "__ATR_PURGE__";
 
 function __atrSafeString(value) {
   if (value === undefined || value === null) {
@@ -653,6 +654,213 @@ function cleanupOrphanTempAudioSequences() {
     return __atrSafeString(removed);
   } catch (e) {
     return "ERROR: " + e.message;
+  }
+}
+
+function __atrGetSequenceCount() {
+  var sequences = app && app.project ? app.project.sequences : null;
+  if (!sequences) {
+    return 0;
+  }
+
+  try {
+    return Number(sequences.numSequences || 0);
+  } catch (eCount) {
+    return 0;
+  }
+}
+
+function __atrGetRootChildCount(rootItem) {
+  if (!rootItem || !rootItem.children) {
+    return 0;
+  }
+
+  try {
+    return Number(rootItem.children.numItems || 0);
+  } catch (eCount) {
+    return 0;
+  }
+}
+
+function __atrDeleteSequenceObject(sequence) {
+  if (!sequence || !app || !app.project) {
+    return false;
+  }
+
+  var deleted = false;
+  try {
+    if (app.project.deleteSequence && sequence.sequenceID !== undefined) {
+      deleted = !!app.project.deleteSequence(sequence.sequenceID);
+    }
+  } catch (eDeleteById) {}
+
+  if (!deleted) {
+    try {
+      if (app.project.deleteSequence) {
+        deleted = !!app.project.deleteSequence(sequence);
+      }
+    } catch (eDeleteByObject) {}
+  }
+
+  if (!deleted) {
+    try {
+      if (sequence.projectItem && sequence.projectItem.deleteBin) {
+        deleted = !!sequence.projectItem.deleteBin();
+      }
+    } catch (eDeleteBin) {}
+  }
+
+  if (!deleted) {
+    try {
+      if (
+        sequence.projectItem &&
+        sequence.projectItem.select &&
+        app.project.deleteSelection
+      ) {
+        sequence.projectItem.select();
+        deleted = !!app.project.deleteSelection();
+      }
+    } catch (eDeleteSelection) {}
+  }
+
+  return deleted;
+}
+
+function purgeActiveProject() {
+  try {
+    if (!app || !app.project || !app.project.rootItem) {
+      return "ERROR: No active Premiere project is available";
+    }
+
+    var root = app.project.rootItem;
+    var warnings = [];
+    var sequencesDeleted = 0;
+    var sequencesFailed = 0;
+    var movedToPurgeBin = 0;
+    var moveFailures = 0;
+    var movePasses = 0;
+    var purgeBinDeleted = false;
+    var purgeBinCreateFailed = false;
+    var purgeBinDeleteFailed = false;
+
+    for (var s = __atrGetSequenceCount() - 1; s >= 0; s -= 1) {
+      var sequence = app.project.sequences[s];
+      if (!sequence) {
+        continue;
+      }
+      if (__atrDeleteSequenceObject(sequence)) {
+        sequencesDeleted += 1;
+      } else {
+        sequencesFailed += 1;
+        warnings.push(
+          "Could not delete sequence '" + __atrGetSequenceName(sequence) + "'.",
+        );
+      }
+    }
+
+    var remainingRootItemsBeforePurge = __atrGetRootChildCount(root);
+    if (remainingRootItemsBeforePurge > 0) {
+      var purgeBin = null;
+      try {
+        purgeBin = root.createBin(__atrProjectPurgeBinName);
+      } catch (eCreate) {
+        purgeBin = null;
+      }
+
+      if (!purgeBin) {
+        purgeBinCreateFailed = true;
+      } else {
+        var moveGuard = 0;
+        while (__atrGetRootChildCount(root) > 1 && moveGuard < 10000) {
+          moveGuard += 1;
+          movePasses += 1;
+          var movedInPass = false;
+
+          for (var i = __atrGetRootChildCount(root) - 1; i >= 0; i -= 1) {
+            var child = root.children[i];
+            if (!child || child === purgeBin) {
+              continue;
+            }
+
+            try {
+              child.moveBin(purgeBin);
+              movedToPurgeBin += 1;
+              movedInPass = true;
+            } catch (eMove) {
+              moveFailures += 1;
+              warnings.push(
+                "Could not move item '" +
+                  __atrSafeString(child.name || "item#" + i) +
+                  "' into purge bin.",
+              );
+            }
+          }
+
+          if (!movedInPass) {
+            break;
+          }
+        }
+
+        if (moveGuard >= 10000) {
+          warnings.push("Purge guard reached while moving project items.");
+        }
+
+        try {
+          purgeBinDeleted = !!purgeBin.deleteBin();
+        } catch (eDeleteBin0) {
+          purgeBinDeleted = false;
+        }
+        if (!purgeBinDeleted) {
+          try {
+            if (app.project.deleteBin) {
+              app.project.deleteBin(purgeBin);
+              purgeBinDeleted = true;
+            }
+          } catch (eDeleteBin1) {
+            purgeBinDeleted = false;
+          }
+        }
+        if (!purgeBinDeleted) {
+          purgeBinDeleteFailed = true;
+        }
+      }
+    }
+
+    var remainingSequences = __atrGetSequenceCount();
+    var remainingRootItems = __atrGetRootChildCount(root);
+    var result = {
+      ok: remainingSequences === 0 && remainingRootItems === 0,
+      sequences_deleted: sequencesDeleted,
+      sequences_failed: sequencesFailed,
+      items_moved_to_purge_bin: movedToPurgeBin,
+      move_failures: moveFailures,
+      move_passes: movePasses,
+      remaining_sequences: remainingSequences,
+      remaining_root_items: remainingRootItems,
+      purge_bin_create_failed: purgeBinCreateFailed,
+      purge_bin_delete_failed: purgeBinDeleteFailed,
+      warning_count: warnings.length,
+      warnings: warnings,
+    };
+
+    if (!result.ok) {
+      if (purgeBinCreateFailed) {
+        result.error =
+          "Could not create purge bin '" + __atrProjectPurgeBinName + "'.";
+      } else if (purgeBinDeleteFailed) {
+        result.error =
+          "Could not delete purge bin '" + __atrProjectPurgeBinName + "'.";
+      } else {
+        result.error = "Premiere project purge incomplete";
+      }
+    }
+
+    if (JSON && JSON.stringify) {
+      return JSON.stringify(result);
+    }
+    return result.ok ? "OK" : "ERROR";
+  } catch (e) {
+    return "ERROR: " + e.message + " (line " + e.line + ")";
   }
 }
 

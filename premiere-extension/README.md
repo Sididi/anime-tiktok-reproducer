@@ -38,10 +38,11 @@ The panel runs a local server bound to `127.0.0.1` with endpoints:
 
 On `/p/{project_id}`:
 1. resolve Drive folder `SPM_*_{project_id}` under configured parent,
-2. download folder recursively,
-3. write `.atr_project_context.json`,
-4. auto-run `import_project.jsx`,
-5. arm `output.mp4` monitor.
+2. download folder recursively into a fresh local folder suffixed with `_hhhh`,
+3. extract `subtitles/atr_subtitles.zip` when present,
+4. write `.atr_project_context.json`,
+5. auto-run `import_project.jsx`,
+6. arm `output.mp4` monitor.
 
 ## Export and Upload Flow
 
@@ -63,7 +64,7 @@ The panel starts AME export with configured `.epr`, tracks encoder job events, t
 Checkbox **Delete local folder after successful upload** is enabled by default.
 Deletion happens only after:
 - a confirmed successful Drive upload,
-- Premiere project cleanup reports no remaining imported items,
+- Premiere project cleanup fully purges the active ATR project,
 - the local downloaded folder is fully removed.
 
 ## Reliability / Recovery
