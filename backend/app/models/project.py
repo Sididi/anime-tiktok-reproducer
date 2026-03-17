@@ -48,6 +48,7 @@ class Project(BaseModel):
     final_upload_discord_message_id: str | None = None
     upload_completed_at: datetime | None = None
     upload_last_result: dict[str, Any] | None = None
+    discord_upload_message_crossed: bool = False
 
     # Script phase settings
     music_key: str | None = None

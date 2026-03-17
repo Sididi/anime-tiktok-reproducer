@@ -177,6 +177,7 @@ class UploadPhaseService:
     @classmethod
     def list_manager_rows(cls) -> list[dict[str, Any]]:
         projects = ProjectService.list_all()
+        cls._cross_overdue_upload_messages(projects)
         folder_candidates_by_name: dict[str, dict[str, Any]] = {}
         drive_root_videos: dict[str, list[dict[str, Any]]] = {}
         if GoogleDriveService.is_configured():
@@ -253,6 +254,61 @@ class UploadPhaseService:
         "facebook": "__Facebook__",
         "instagram": "__Instagram__",
     }
+
+    @classmethod
+    def _cross_out_discord_message(cls, project: Project) -> bool:
+        """Apply strikethrough to the project's final upload Discord message.
+
+        Returns True if successfully crossed out.
+        """
+        message_id = project.final_upload_discord_message_id
+        if not message_id or not DiscordService.is_configured():
+            return False
+        existing = DiscordService.get_message(message_id)
+        if existing:
+            content = existing.content
+            direct_url = (project.upload_last_result or {}).get("direct_drive_download", "")
+            if direct_url and direct_url in content:
+                content = content.replace(direct_url, f"<{direct_url}>")
+            struck_lines = [f"~~{line}~~" if line.strip() else "" for line in content.splitlines()]
+            DiscordService.edit_message(message_id, "\n".join(struck_lines))
+        else:
+            DiscordService.edit_message(message_id, "~~Upload removed~~")
+        return True
+
+    @classmethod
+    def _cross_overdue_upload_messages(cls, projects: list[Project]) -> None:
+        """Cross out Discord upload messages for projects whose scheduled_at has passed."""
+        if not DiscordService.is_configured():
+            return
+        now = datetime.now(tz=timezone.utc)
+        candidates = [
+            p for p in projects
+            if p.final_upload_discord_message_id
+            and p.scheduled_at is not None
+            and p.scheduled_at <= now
+            and not p.discord_upload_message_crossed
+        ]
+        if not candidates:
+            return
+
+        def _cross_one(project: Project) -> None:
+            try:
+                if cls._cross_out_discord_message(project):
+                    project.discord_upload_message_crossed = True
+                    ProjectService.save(project)
+            except Exception:
+                logger.warning(
+                    "Failed to cross Discord message for project %s",
+                    project.id,
+                    exc_info=True,
+                )
+
+        if len(candidates) == 1:
+            _cross_one(candidates[0])
+        else:
+            with ThreadPoolExecutor(max_workers=min(4, len(candidates))) as executor:
+                list(executor.map(_cross_one, candidates))
 
     @classmethod
     def _format_french_datetime(cls, dt: datetime) -> str:
@@ -916,24 +972,7 @@ class UploadPhaseService:
         cleanup_warnings: list[str] = []
         try:
             if project.final_upload_discord_message_id:
-                existing = DiscordService.get_message(project.final_upload_discord_message_id)
-                if existing:
-                    content = existing.content
-                    # Disable video embed by wrapping the direct download URL in angle brackets
-                    direct_url = (project.upload_last_result or {}).get("direct_drive_download", "")
-                    if direct_url and direct_url in content:
-                        content = content.replace(direct_url, f"<{direct_url}>")
-                    # Strike through each line of the original content
-                    struck_lines = [f"~~{line}~~" if line.strip() else "" for line in content.splitlines()]
-                    DiscordService.edit_message(
-                        project.final_upload_discord_message_id,
-                        "\n".join(struck_lines),
-                    )
-                else:
-                    DiscordService.edit_message(
-                        project.final_upload_discord_message_id,
-                        "~~Upload removed~~",
-                    )
+                DiscordService.delete_message(project.final_upload_discord_message_id)
             elif project.generation_discord_message_id:
                 DiscordService.delete_message(project.generation_discord_message_id)
         except Exception as exc:
