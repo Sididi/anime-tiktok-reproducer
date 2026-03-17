@@ -27,6 +27,10 @@ logger = logging.getLogger("uvicorn.error")
 async def lifespan(app: FastAPI):
     """Load accounts and run integration health checks on startup."""
     AccountService.load()
+    if not settings.integration_startup_health_check_enabled:
+        app.state.integrations_health = {"status": "skipped", "checks": {}}
+        yield
+        return
     try:
         result = await asyncio.to_thread(IntegrationHealthService.run_startup_health_check)
         app.state.integrations_health = result

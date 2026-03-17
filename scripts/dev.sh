@@ -6,6 +6,26 @@ set -e
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+ENABLE_STARTUP_HEALTH_CHECK=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --with-health-check)
+      ENABLE_STARTUP_HEALTH_CHECK=1
+      ;;
+    -h|--help)
+      echo "Usage: $0 [--with-health-check]"
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1"
+      echo "Usage: $0 [--with-health-check]"
+      exit 1
+      ;;
+  esac
+  shift
+done
+
 cleanup() {
   if [ -n "${BACKEND_PID:-}" ]; then
     kill "$BACKEND_PID" 2>/dev/null || true
@@ -17,7 +37,7 @@ cleanup() {
 
 # Start backend using pixi
 echo "Starting backend..."
-pixi run backend &
+ATR_INTEGRATION_STARTUP_HEALTH_CHECK_ENABLED="$ENABLE_STARTUP_HEALTH_CHECK" pixi run backend &
 BACKEND_PID=$!
 
 trap cleanup EXIT

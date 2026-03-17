@@ -37,6 +37,7 @@ class Settings(BaseSettings):
 
     # CORS
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
+    integration_startup_health_check_enabled: bool = True
 
     # Video settings
     default_fps: float = 30.0
