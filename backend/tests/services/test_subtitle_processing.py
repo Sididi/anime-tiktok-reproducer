@@ -1,6 +1,11 @@
-from app.models.transcription import Word
+import asyncio
+import json
+
+from app.models.project import Project
+from app.models.transcription import SceneTranscription, Transcription, Word
+from app.services.anime_library import AnimeLibraryService
 from app.services.forced_alignment import ForcedAlignmentService
-from app.services.processing import ProcessingService
+from app.services.processing import ProcessingService, ResolvedSceneSource
 from app.services.script_automation_service import ScriptAutomationService
 
 
@@ -139,3 +144,84 @@ def test_validate_manifest_upgrades_legacy_segment_indices_when_text_matches(mon
         fragment["scene_index"] == 2
         for fragment in validated["segments"][0]["scene_fragments"]
     )
+
+
+def test_raw_scene_image_render_plan_prefers_library_sidecar_without_probe(
+    monkeypatch,
+    tmp_path,
+):
+    source_path = tmp_path / "episode.mkv"
+    normalized_source_path = source_path.with_suffix(".mp4")
+    sidecar_dir = AnimeLibraryService.get_subtitle_sidecar_dir(normalized_source_path)
+    sidecar_dir.mkdir(parents=True)
+    (sidecar_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "source_path": str(normalized_source_path),
+                "generated_from": str(source_path),
+                "subtitle_streams": [
+                    {
+                        "stream_index": 5,
+                        "stream_position": 3,
+                        "codec_name": "hdmv_pgs_subtitle",
+                        "language": "fr",
+                        "raw_language": "fre",
+                        "title": "French",
+                        "kind": "image",
+                        "asset_filename": "subtitle_stream_03_fr.sup",
+                        "cue_manifest_filename": "subtitle_stream_03_fr.cues.json",
+                        "status": "ok",
+                        "error": None,
+                    }
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    def _probe_should_not_run(_source_path):
+        raise AssertionError("probe_source_media_sync should not run when a sidecar exists")
+
+    monkeypatch.setattr(AnimeLibraryService, "probe_source_media_sync", _probe_should_not_run)
+
+    project = Project(id="p-sidecar", output_language="fr")
+    transcription = Transcription(
+        language="fr",
+        scenes=[
+            SceneTranscription(
+                scene_index=0,
+                text="",
+                words=[],
+                start_time=0.0,
+                end_time=2.0,
+                is_raw=True,
+            )
+        ],
+    )
+    resolved_scene_sources = {
+        0: ResolvedSceneSource(
+            scene_index=0,
+            source_path=source_path,
+            clip_name="episode",
+            source_in_frame=30,
+            source_out_frame=66,
+            source_in_seconds=1.25,
+            source_out_seconds=2.75,
+            source_duration_seconds=1.5,
+        )
+    }
+
+    render_plan = asyncio.run(
+        ProcessingService._build_raw_scene_image_render_plan(
+            project,
+            transcription,
+            resolved_scene_sources,
+        )
+    )
+
+    assert render_plan == {
+        source_path: {
+            3: [(1.25, 2.75)],
+        }
+    }

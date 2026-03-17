@@ -1265,6 +1265,31 @@ class ProcessingService:
             if resolved_source is None:
                 continue
 
+            sidecar_source_path = AnimeLibraryService.resolve_subtitle_sidecar_source_path(
+                resolved_source.source_path
+            )
+            if sidecar_source_path is not None:
+                sidecar_entries = AnimeLibraryService.load_subtitle_sidecar_entries(
+                    sidecar_source_path
+                )
+                selected_entry = AnimeLibraryService.select_preferred_subtitle_entry(
+                    sidecar_entries,
+                    target_language=target_language,
+                )
+                if selected_entry is None or selected_entry.kind != "image":
+                    continue
+
+                render_plan.setdefault(resolved_source.source_path, {}).setdefault(
+                    selected_entry.stream_position,
+                    [],
+                ).append(
+                    (
+                        resolved_source.source_in_seconds,
+                        resolved_source.source_out_seconds,
+                    )
+                )
+                continue
+
             source_key = str(resolved_source.source_path.resolve())
             probe = probe_cache.get(source_key)
             if probe is None:

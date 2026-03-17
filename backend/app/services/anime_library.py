@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import subprocess
 import shutil
 import threading
@@ -183,6 +184,22 @@ class AnimeLibraryService:
         "spanish": "es",
         "espanol": "es",
         "español": "es",
+        "pt": "pt",
+        "por": "pt",
+        "portuguese": "pt",
+        "portugues": "pt",
+        "de": "de",
+        "deu": "de",
+        "ger": "de",
+        "german": "de",
+        "deutsch": "de",
+        "it": "it",
+        "ita": "it",
+        "italian": "it",
+        "italiano": "it",
+        "ru": "ru",
+        "rus": "ru",
+        "russian": "ru",
     }
 
     @staticmethod
@@ -441,17 +458,9 @@ class AnimeLibraryService:
         """Normalize stream language tags and fallback title hints to a short code."""
         raw = str(raw_language or "").strip().lower()
         if raw:
-            mapped = cls._LANGUAGE_ALIASES.get(raw)
-            if mapped:
-                return mapped
-            if "-" in raw:
-                mapped = cls._LANGUAGE_ALIASES.get(raw.split("-", 1)[0])
-                if mapped:
-                    return mapped
-            if "_" in raw:
-                mapped = cls._LANGUAGE_ALIASES.get(raw.split("_", 1)[0])
-                if mapped:
-                    return mapped
+            normalized = cls._normalize_language_token(raw)
+            if normalized:
+                return normalized
 
         haystack = " ".join(
             part for part in (title, handler_name) if part and str(part).strip()
@@ -470,9 +479,36 @@ class AnimeLibraryService:
             ("spanish", "es"),
             ("español", "es"),
             ("espanol", "es"),
+            ("portuguese", "pt"),
+            ("portugues", "pt"),
+            ("brazilian portuguese", "pt"),
+            ("german", "de"),
+            ("deutsch", "de"),
+            ("italian", "it"),
+            ("italiano", "it"),
+            ("russian", "ru"),
         ):
             if needle.strip() in haystack:
                 return normalized
+        return None
+
+    @classmethod
+    def _normalize_language_token(cls, raw_language: str) -> str | None:
+        token = str(raw_language or "").strip().lower()
+        if not token:
+            return None
+
+        mapped = cls._LANGUAGE_ALIASES.get(token)
+        if mapped:
+            return mapped
+
+        primary = re.split(r"[-_]", token, maxsplit=1)[0]
+        mapped = cls._LANGUAGE_ALIASES.get(primary)
+        if mapped:
+            return mapped
+
+        if len(primary) == 2 and primary.isascii() and primary.isalpha():
+            return primary
         return None
 
     @classmethod
@@ -546,6 +582,30 @@ class AnimeLibraryService:
     @classmethod
     def get_subtitle_sidecar_manifest_path(cls, source_path: Path) -> Path:
         return cls.get_subtitle_sidecar_dir(source_path) / "manifest.json"
+
+    @classmethod
+    def _subtitle_sidecar_lookup_paths(cls, source_path: Path) -> tuple[Path, ...]:
+        candidates = [source_path]
+        normalized_target = cls._normalized_target_path(source_path)
+        if normalized_target != source_path:
+            candidates.append(normalized_target)
+
+        unique: list[Path] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(candidate)
+        return tuple(unique)
+
+    @classmethod
+    def resolve_subtitle_sidecar_source_path(cls, source_path: Path) -> Path | None:
+        for candidate in cls._subtitle_sidecar_lookup_paths(source_path):
+            if cls.get_subtitle_sidecar_manifest_path(candidate).exists():
+                return candidate
+        return None
 
     @classmethod
     def _subtitle_asset_basename(
@@ -974,7 +1034,8 @@ class AnimeLibraryService:
     ) -> Path | None:
         if not entry.asset_filename:
             return None
-        return cls.get_subtitle_sidecar_dir(source_path) / entry.asset_filename
+        resolved_source_path = cls.resolve_subtitle_sidecar_source_path(source_path) or source_path
+        return cls.get_subtitle_sidecar_dir(resolved_source_path) / entry.asset_filename
 
     @classmethod
     def get_subtitle_sidecar_cue_manifest_path(
@@ -984,14 +1045,16 @@ class AnimeLibraryService:
     ) -> Path | None:
         if not entry.cue_manifest_filename:
             return None
-        return cls.get_subtitle_sidecar_dir(source_path) / entry.cue_manifest_filename
+        resolved_source_path = cls.resolve_subtitle_sidecar_source_path(source_path) or source_path
+        return cls.get_subtitle_sidecar_dir(resolved_source_path) / entry.cue_manifest_filename
 
     @classmethod
     def load_subtitle_sidecar_manifest(
         cls,
         source_path: Path,
     ) -> dict[str, Any] | None:
-        manifest_path = cls.get_subtitle_sidecar_manifest_path(source_path)
+        resolved_source_path = cls.resolve_subtitle_sidecar_source_path(source_path) or source_path
+        manifest_path = cls.get_subtitle_sidecar_manifest_path(resolved_source_path)
         if not manifest_path.exists():
             return None
         try:
@@ -1081,12 +1144,8 @@ class AnimeLibraryService:
         cls,
         source_path: Path,
     ) -> list[SubtitleSidecarEntry]:
-        manifest_path = cls.get_subtitle_sidecar_manifest_path(source_path)
-        if not manifest_path.exists():
-            return []
-        try:
-            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+        payload = cls.load_subtitle_sidecar_manifest(source_path)
+        if not payload:
             return []
 
         raw_entries = payload.get("subtitle_streams", [])
@@ -1097,15 +1156,21 @@ class AnimeLibraryService:
         for raw_entry in raw_entries:
             if not isinstance(raw_entry, dict):
                 continue
+            raw_language = str(raw_entry.get("raw_language", "")).strip() or None
+            title = str(raw_entry.get("title", "")).strip() or None
+            stored_language = str(raw_entry.get("language", "")).strip() or None
             try:
                 entries.append(
                     SubtitleSidecarEntry(
                         stream_index=int(raw_entry.get("stream_index")),
                         stream_position=int(raw_entry.get("stream_position")),
                         codec_name=str(raw_entry.get("codec_name", "")).strip().lower() or None,
-                        language=str(raw_entry.get("language", "")).strip().lower() or None,
-                        raw_language=str(raw_entry.get("raw_language", "")).strip() or None,
-                        title=str(raw_entry.get("title", "")).strip() or None,
+                        language=cls.normalize_stream_language(
+                            stored_language or raw_language,
+                            title=title,
+                        ),
+                        raw_language=raw_language,
+                        title=title,
                         kind=str(raw_entry.get("kind", "")).strip().lower() or "unsupported",
                         asset_filename=str(raw_entry.get("asset_filename", "")).strip() or None,
                         cue_manifest_filename=(
