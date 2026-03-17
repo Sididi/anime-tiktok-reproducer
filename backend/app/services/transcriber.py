@@ -1,4 +1,6 @@
 import asyncio
+import copy
+import logging
 import os
 import re
 import statistics
@@ -8,7 +10,7 @@ import threading
 import unicodedata
 from contextlib import suppress
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from ..models import Word, SceneTranscription, Transcription, Scene, SceneList, SceneMatch, MatchList
 from ..models.raw_scene import RawSceneDetectionResult
@@ -64,6 +66,17 @@ VIDEO_EXTENSIONS = {
 # Words longer than this (in seconds) are likely WhisperX alignment artifacts
 # where trailing silence inflates the end time.  Use start time for assignment.
 MAX_WORD_DURATION = 1.0
+WHISPERX_SAMPLE_RATE = 16000
+ALIGNMENT_REPAIR_MIN_SEGMENT_DURATION = 4.0
+ALIGNMENT_REPAIR_PADDING_SECONDS = 0.35
+ALIGNMENT_REPAIR_FALLBACK_PADDING_SECONDS = 2.0
+ALIGNMENT_REPAIR_MIN_LEXICAL_DENSITY = 0.8
+ALIGNMENT_REPAIR_MAX_WORD_COUNT = 4
+ALIGNMENT_REPAIR_MIN_MEAN_CONFIDENCE = 0.6
+ALIGNMENT_REPAIR_MIN_WORD_GAIN = 3
+ALIGNMENT_REPAIR_MIN_DENSITY_GAIN = 1.5
+
+logger = logging.getLogger(__name__)
 
 
 class TranscriberService:
@@ -434,6 +447,369 @@ class TranscriberService:
         return words
 
     @classmethod
+    def _extract_words_preserving_untimed(cls, segments: list[dict]) -> list[dict]:
+        words: list[dict] = []
+        for segment in segments:
+            segment_words = segment.get("words") or []
+            if not segment_words:
+                words.extend(cls._segment_words_from_text(segment))
+                continue
+
+            for word in segment_words:
+                text = (word.get("word") or word.get("text") or "").strip()
+                if not text:
+                    continue
+
+                start = word.get("start")
+                end = word.get("end")
+                confidence = word.get("score")
+                if confidence is None:
+                    confidence = word.get("confidence")
+                if confidence is None:
+                    confidence = word.get("probability")
+                if confidence is None:
+                    confidence = 1.0
+
+                words.append({
+                    "text": text,
+                    "start": float(start) if start is not None else None,
+                    "end": float(end) if end is not None else None,
+                    "confidence": float(confidence),
+                })
+        return words
+
+    @staticmethod
+    def _audio_duration(audio: Any) -> float:
+        try:
+            sample_count = len(audio)
+        except TypeError:
+            return 0.0
+        return max(float(sample_count), 0.0) / WHISPERX_SAMPLE_RATE
+
+    @staticmethod
+    def _slice_audio(audio: Any, start_sec: float, end_sec: float) -> Any:
+        try:
+            sample_count = len(audio)
+        except TypeError:
+            return audio
+
+        if sample_count <= 0:
+            return audio
+
+        start_sample = max(0, min(int(start_sec * WHISPERX_SAMPLE_RATE), sample_count))
+        end_sample = max(start_sample + 1, min(int(end_sec * WHISPERX_SAMPLE_RATE), sample_count))
+        return audio[start_sample:end_sample]
+
+    @classmethod
+    def _segment_alignment_metrics(cls, segment: dict[str, Any]) -> dict[str, float]:
+        start = segment.get("start")
+        end = segment.get("end")
+        segment_start = float(start) if isinstance(start, (int, float)) else 0.0
+        segment_end = float(end) if isinstance(end, (int, float)) else segment_start
+        duration = max(segment_end - segment_start, 0.0)
+
+        lexical_words = []
+        for word in cls._extract_words_preserving_untimed([segment]):
+            text = str(word.get("text") or "")
+            if not cls._normalize_token(text):
+                continue
+            lexical_words.append(word)
+
+        word_durations = [
+            float(word["end"]) - float(word["start"])
+            for word in lexical_words
+            if isinstance(word.get("start"), (int, float))
+            and isinstance(word.get("end"), (int, float))
+            and float(word["end"]) >= float(word["start"])
+        ]
+        confidences = [
+            float(word["confidence"])
+            for word in lexical_words
+            if isinstance(word.get("confidence"), (int, float))
+        ]
+        mean_confidence = (
+            statistics.fmean(confidences)
+            if confidences
+            else float(segment.get("confidence", 1.0) or 1.0)
+        )
+
+        return {
+            "duration": duration,
+            "word_count": float(len(lexical_words)),
+            "lexical_density": (len(lexical_words) / duration) if duration > 0 else float(len(lexical_words)),
+            "max_word_duration": max(word_durations, default=0.0),
+            "mean_confidence": mean_confidence,
+        }
+
+    @classmethod
+    def _segment_needs_alignment_repair(cls, segment: dict[str, Any]) -> bool:
+        metrics = cls._segment_alignment_metrics(segment)
+        if metrics["duration"] < ALIGNMENT_REPAIR_MIN_SEGMENT_DURATION:
+            return False
+
+        return any((
+            metrics["lexical_density"] < ALIGNMENT_REPAIR_MIN_LEXICAL_DENSITY,
+            metrics["max_word_duration"] > (2 * MAX_WORD_DURATION),
+            metrics["word_count"] <= ALIGNMENT_REPAIR_MAX_WORD_COUNT,
+            metrics["mean_confidence"] < ALIGNMENT_REPAIR_MIN_MEAN_CONFIDENCE,
+        ))
+
+    @classmethod
+    def _should_use_repaired_segment(
+        cls,
+        original_segment: dict[str, Any],
+        repaired_segment: dict[str, Any],
+    ) -> bool:
+        original_metrics = cls._segment_alignment_metrics(original_segment)
+        repaired_metrics = cls._segment_alignment_metrics(repaired_segment)
+
+        if repaired_metrics["word_count"] < (original_metrics["word_count"] + ALIGNMENT_REPAIR_MIN_WORD_GAIN):
+            return False
+
+        if repaired_metrics["lexical_density"] < (
+            original_metrics["lexical_density"] * ALIGNMENT_REPAIR_MIN_DENSITY_GAIN
+        ):
+            return False
+
+        original_max_word_duration = original_metrics["max_word_duration"]
+        if original_max_word_duration > 0:
+            return repaired_metrics["max_word_duration"] < original_max_word_duration
+
+        return repaired_metrics["max_word_duration"] <= (2 * MAX_WORD_DURATION)
+
+    @classmethod
+    def _align_segments(
+        cls,
+        *,
+        segments: list[dict],
+        audio: Any,
+        detected_language: str,
+        align_device: str,
+        alignment_model=None,
+        alignment_metadata: dict[str, Any] | None = None,
+    ) -> tuple[list[dict], Any, dict[str, Any] | None, str]:
+        if not segments:
+            return [], alignment_model, alignment_metadata, align_device
+
+        import whisperx
+
+        model_a = alignment_model
+        metadata = alignment_metadata
+        device = align_device
+
+        try:
+            if model_a is None or metadata is None:
+                model_a, metadata = cls._load_align_model(detected_language, device)
+            aligned = whisperx.align(segments, model_a, metadata, audio, device)
+            return aligned.get("segments") or segments, model_a, metadata, device
+        except Exception as exc:
+            if device == "cuda" and cls._is_cuda_oom(exc):
+                try:
+                    model_a, metadata = cls._load_align_model(detected_language, "cpu")
+                    aligned = whisperx.align(segments, model_a, metadata, audio, "cpu")
+                    return aligned.get("segments") or segments, model_a, metadata, "cpu"
+                except Exception:
+                    logger.debug("CPU fallback alignment failed during WhisperX repair", exc_info=True)
+            else:
+                logger.debug("WhisperX alignment failed, keeping segment-level timings", exc_info=True)
+
+        return segments, model_a, metadata, device
+
+    @classmethod
+    def _clip_repaired_words_to_segment(
+        cls,
+        *,
+        segments: list[dict],
+        offset_sec: float,
+        start_sec: float,
+        end_sec: float,
+    ) -> list[dict]:
+        clipped_words: list[dict] = []
+        for word in cls._extract_words_preserving_untimed(segments):
+            start = word.get("start")
+            end = word.get("end")
+            if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+                continue
+
+            shifted_start = float(start) + offset_sec
+            shifted_end = float(end) + offset_sec
+            if shifted_end <= start_sec or shifted_start >= end_sec:
+                continue
+
+            clipped_start = max(shifted_start, start_sec)
+            clipped_end = min(shifted_end, end_sec)
+            if clipped_end <= clipped_start:
+                continue
+
+            clipped_words.append({
+                "text": str(word.get("text") or ""),
+                "start": clipped_start,
+                "end": clipped_end,
+                "confidence": float(word.get("confidence", 1.0)),
+            })
+
+        clipped_words.sort(key=lambda item: (item["start"], item["end"]))
+        return clipped_words
+
+    @classmethod
+    def _build_repaired_segment(
+        cls,
+        *,
+        original_segment: dict[str, Any],
+        repaired_words: list[dict],
+    ) -> dict[str, Any]:
+        text = " ".join(
+            str(word.get("text") or "").strip()
+            for word in repaired_words
+            if str(word.get("text") or "").strip()
+        )
+        return {
+            "start": float(original_segment.get("start", 0.0) or 0.0),
+            "end": float(original_segment.get("end", 0.0) or 0.0),
+            "text": text,
+            "words": [
+                {
+                    "word": str(word.get("text") or ""),
+                    "start": float(word["start"]),
+                    "end": float(word["end"]),
+                    "score": float(word.get("confidence", 1.0)),
+                }
+                for word in repaired_words
+            ],
+        }
+
+    @classmethod
+    def _repair_suspect_segment(
+        cls,
+        *,
+        segment: dict[str, Any],
+        audio: Any,
+        model,
+        batch_size: int,
+        detected_language: str,
+        alignment_model,
+        alignment_metadata: dict[str, Any] | None,
+        align_device: str,
+    ) -> tuple[dict[str, Any] | None, Any, dict[str, Any] | None, str]:
+        segment_start = float(segment.get("start", 0.0) or 0.0)
+        segment_end = float(segment.get("end", 0.0) or 0.0)
+        audio_duration = cls._audio_duration(audio)
+        candidate_paddings = [ALIGNMENT_REPAIR_PADDING_SECONDS]
+        if ALIGNMENT_REPAIR_FALLBACK_PADDING_SECONDS > ALIGNMENT_REPAIR_PADDING_SECONDS:
+            candidate_paddings.append(ALIGNMENT_REPAIR_FALLBACK_PADDING_SECONDS)
+
+        for padding in candidate_paddings:
+            clip_start = max(0.0, segment_start - padding)
+            clip_end = min(audio_duration, segment_end + padding)
+            if clip_end <= clip_start:
+                continue
+
+            clip_audio = cls._slice_audio(audio, clip_start, clip_end)
+
+            try:
+                result = model.transcribe(
+                    clip_audio,
+                    batch_size=1 if batch_size > 0 else batch_size,
+                    num_workers=0,
+                    language=detected_language,
+                )
+            except Exception:
+                logger.debug(
+                    "Local WhisperX repair transcription failed for %.3fs -> %.3fs "
+                    "(padding=%.2fs)",
+                    segment_start,
+                    segment_end,
+                    padding,
+                    exc_info=True,
+                )
+                continue
+
+            repaired_segments = result.get("segments") or []
+            repaired_segments, alignment_model, alignment_metadata, align_device = cls._align_segments(
+                segments=repaired_segments,
+                audio=clip_audio,
+                detected_language=detected_language,
+                align_device=align_device,
+                alignment_model=alignment_model,
+                alignment_metadata=alignment_metadata,
+            )
+
+            repaired_words = cls._clip_repaired_words_to_segment(
+                segments=repaired_segments,
+                offset_sec=clip_start,
+                start_sec=segment_start,
+                end_sec=segment_end,
+            )
+            if not repaired_words:
+                continue
+
+            repaired_segment = cls._build_repaired_segment(
+                original_segment=segment,
+                repaired_words=repaired_words,
+            )
+            if not cls._should_use_repaired_segment(segment, repaired_segment):
+                continue
+
+            original_metrics = cls._segment_alignment_metrics(segment)
+            repaired_metrics = cls._segment_alignment_metrics(repaired_segment)
+            logger.info(
+                "Repaired WhisperX segment %.3fs -> %.3fs with %.2fs padding: "
+                "%.0f -> %.0f words, density %.2f -> %.2f, max_word_duration %.2f -> %.2f",
+                segment_start,
+                segment_end,
+                padding,
+                original_metrics["word_count"],
+                repaired_metrics["word_count"],
+                original_metrics["lexical_density"],
+                repaired_metrics["lexical_density"],
+                original_metrics["max_word_duration"],
+                repaired_metrics["max_word_duration"],
+            )
+            return repaired_segment, alignment_model, alignment_metadata, align_device
+
+        return None, alignment_model, alignment_metadata, align_device
+
+    @classmethod
+    def _repair_degenerate_aligned_segments(
+        cls,
+        *,
+        segments: list[dict],
+        audio: Any,
+        model,
+        batch_size: int,
+        detected_language: str,
+        alignment_model,
+        alignment_metadata: dict[str, Any] | None,
+        align_device: str,
+    ) -> tuple[list[dict], Any, dict[str, Any] | None, str]:
+        repaired_segments: list[dict] = []
+        active_alignment_model = alignment_model
+        active_alignment_metadata = alignment_metadata
+        active_align_device = align_device
+
+        for segment in segments:
+            segment_copy = copy.deepcopy(segment)
+            if not cls._segment_needs_alignment_repair(segment_copy):
+                repaired_segments.append(segment_copy)
+                continue
+
+            repaired_segment, active_alignment_model, active_alignment_metadata, active_align_device = (
+                cls._repair_suspect_segment(
+                    segment=segment_copy,
+                    audio=audio,
+                    model=model,
+                    batch_size=batch_size,
+                    detected_language=detected_language,
+                    alignment_model=active_alignment_model,
+                    alignment_metadata=active_alignment_metadata,
+                    align_device=active_align_device,
+                )
+            )
+            repaired_segments.append(repaired_segment or segment_copy)
+
+        return repaired_segments, active_alignment_model, active_alignment_metadata, active_align_device
+
+    @classmethod
     def _transcribe_sync(
         cls,
         audio_path: Path,
@@ -501,20 +877,22 @@ class TranscriberService:
                 segments = result.get("segments") or []
 
                 align_device = device
-                try:
-                    model_a, metadata = cls._load_align_model(detected_language, align_device)
-                    aligned = whisperx.align(segments, model_a, metadata, audio, align_device)
-                    segments = aligned.get("segments") or segments
-                except Exception as exc:
-                    # Retry alignment on CPU when GPU memory is tight.
-                    if align_device == "cuda" and cls._is_cuda_oom(exc):
-                        try:
-                            model_a, metadata = cls._load_align_model(detected_language, "cpu")
-                            aligned = whisperx.align(segments, model_a, metadata, audio, "cpu")
-                            segments = aligned.get("segments") or segments
-                        except Exception:
-                            pass
-                    # If alignment fails, fall back to segment-level timings.
+                segments, model_a, metadata, align_device = cls._align_segments(
+                    segments=segments,
+                    audio=audio,
+                    detected_language=detected_language,
+                    align_device=align_device,
+                )
+                segments, _, _, _ = cls._repair_degenerate_aligned_segments(
+                    segments=segments,
+                    audio=audio,
+                    model=model,
+                    batch_size=batch_size,
+                    detected_language=detected_language,
+                    alignment_model=model_a,
+                    alignment_metadata=metadata,
+                    align_device=align_device,
+                )
 
                 words = cls._extract_words_from_segments(segments)
                 return words, detected_language

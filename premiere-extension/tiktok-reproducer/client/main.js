@@ -1799,7 +1799,9 @@
               "/" +
               uploadProgress.total +
               " completed",
-            uploadProgress.uploaded >= uploadProgress.total ? "success" : "info",
+            uploadProgress.uploaded >= uploadProgress.total
+              ? "success"
+              : "info",
           );
         }
         resetMonitorCandidateSelection(projectId);
@@ -2300,7 +2302,10 @@
         armExportMonitor(projectId);
         recoveryMonitorArmed += 1;
 
-        if (state.status === "uploaded_partial" || state.status === "upload_failed") {
+        if (
+          state.status === "uploaded_partial" ||
+          state.status === "upload_failed"
+        ) {
           recoveryUploadQueued += queueMissingUploadsForState(
             projectId,
             state,
@@ -3279,7 +3284,10 @@
         }
         var removedCount = Number(normalized);
         if (!isNaN(removedCount) && removedCount > 0) {
-          log("Removed " + removedCount + " orphan audio temp sequence(s)", "info");
+          log(
+            "Removed " + removedCount + " orphan audio temp sequence(s)",
+            "info",
+          );
         }
       })
       .catch(function () {

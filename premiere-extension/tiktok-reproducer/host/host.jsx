@@ -373,7 +373,9 @@ function __atrRememberEncoderJob(
 }
 
 function __atrForgetEncoderJob(jobID) {
-  var tempSequenceName = __atrSafeString(__atrTempAudioSequenceByJob[jobID] || "");
+  var tempSequenceName = __atrSafeString(
+    __atrTempAudioSequenceByJob[jobID] || "",
+  );
   if (tempSequenceName) {
     __atrDeleteSequenceByName(tempSequenceName);
   }
@@ -607,7 +609,12 @@ function __atrDeleteSequenceByName(sequenceName) {
     } catch (eDeleteBin) {}
 
     try {
-      if (sequence.projectItem && sequence.projectItem.select && app.project && app.project.deleteSelection) {
+      if (
+        sequence.projectItem &&
+        sequence.projectItem.select &&
+        app.project &&
+        app.project.deleteSelection
+      ) {
         sequence.projectItem.select();
         return !!app.project.deleteSelection();
       }
@@ -786,7 +793,10 @@ function startManagedExport(projectId, outputPath, presetPath) {
 
       var tempSequence = __atrCloneActiveSequence();
       var tempSequenceName =
-        __atrTempAudioSequencePrefix + __atrSafeString(projectId) + "__" + new Date().getTime();
+        __atrTempAudioSequencePrefix +
+        __atrSafeString(projectId) +
+        "__" +
+        new Date().getTime();
       try {
         tempSequence.name = tempSequenceName;
       } catch (eRename) {
@@ -807,7 +817,8 @@ function startManagedExport(projectId, outputPath, presetPath) {
         audioOutputFsPath,
         audioPresetFsPath,
       );
-      __atrTempAudioSequenceByJob[audioJobID] = __atrSafeString(tempSequenceName);
+      __atrTempAudioSequenceByJob[audioJobID] =
+        __atrSafeString(tempSequenceName);
       __atrPushEncoderEvent("queued", audioJobID, {
         output_path: audioOutputFsPath,
         preset_path: audioPresetFsPath,

@@ -78,7 +78,9 @@ function isRetryableStatus(statusCode) {
 }
 
 function escapeQueryValue(value) {
-  return String(value || "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  return String(value || "")
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "\\'");
 }
 
 function sanitizeWindowsSegment(name) {
@@ -151,11 +153,19 @@ function decompressIfNeeded(buffer, contentEncoding) {
     if (encoding.indexOf("deflate") !== -1) {
       return zlib.inflateSync(buffer);
     }
-    if (encoding.indexOf("br") !== -1 && typeof zlib.brotliDecompressSync === "function") {
+    if (
+      encoding.indexOf("br") !== -1 &&
+      typeof zlib.brotliDecompressSync === "function"
+    ) {
       return zlib.brotliDecompressSync(buffer);
     }
   } catch (e) {
-    throw new Error("Failed to decode compressed HTTP response (" + encoding + "): " + e.message);
+    throw new Error(
+      "Failed to decode compressed HTTP response (" +
+        encoding +
+        "): " +
+        e.message,
+    );
   }
   return buffer;
 }
@@ -180,7 +190,10 @@ function requestRaw(options, bodyBuffer, timeoutMs) {
         var rawBody = Buffer.concat(chunks);
         var decodedBody = rawBody;
         try {
-          decodedBody = decompressIfNeeded(rawBody, res.headers["content-encoding"]);
+          decodedBody = decompressIfNeeded(
+            rawBody,
+            res.headers["content-encoding"],
+          );
         } catch (decodeErr) {
           reject(decodeErr);
           return;
@@ -257,7 +270,12 @@ function createDriveAuth(settings) {
       60000,
     ).then(function (res) {
       if (res.statusCode < 200 || res.statusCode >= 300) {
-        throw new Error("OAuth refresh failed (" + res.statusCode + "): " + res.body.toString("utf8"));
+        throw new Error(
+          "OAuth refresh failed (" +
+            res.statusCode +
+            "): " +
+            res.body.toString("utf8"),
+        );
       }
       var data = JSON.parse(res.body.toString("utf8"));
       var expiresIn = Number(data.expires_in || 3600);
@@ -268,7 +286,11 @@ function createDriveAuth(settings) {
   }
 
   function getAccessToken(forceRefresh) {
-    if (!forceRefresh && tokenCache.accessToken && Date.now() < tokenCache.expiryMs) {
+    if (
+      !forceRefresh &&
+      tokenCache.accessToken &&
+      Date.now() < tokenCache.expiryMs
+    ) {
       return Promise.resolve(tokenCache.accessToken);
     }
     return refreshToken();
@@ -279,7 +301,15 @@ function createDriveAuth(settings) {
   };
 }
 
-function driveApiRequest(auth, method, apiPath, query, body, extraHeaders, allowRetry) {
+function driveApiRequest(
+  auth,
+  method,
+  apiPath,
+  query,
+  body,
+  extraHeaders,
+  allowRetry,
+) {
   var qs = query ? querystring.stringify(query) : "";
   var fullPath = apiPath + (qs ? "?" + qs : "");
   var attempt = 0;
@@ -308,14 +338,25 @@ function driveApiRequest(auth, method, apiPath, query, body, extraHeaders, allow
         if (res.statusCode === 401 && !forceRefreshToken) {
           return run(true);
         }
-        if (allowRetry && isRetryableStatus(res.statusCode) && attempt < MAX_RETRIES) {
+        if (
+          allowRetry &&
+          isRetryableStatus(res.statusCode) &&
+          attempt < MAX_RETRIES
+        ) {
           attempt += 1;
           return sleep(Math.pow(2, attempt) * 250).then(function () {
             return run(false);
           });
         }
         if (res.statusCode < 200 || res.statusCode >= 300) {
-          throw new Error("Drive API error " + res.statusCode + " on " + apiPath + ": " + String(res.parsedBody || ""));
+          throw new Error(
+            "Drive API error " +
+              res.statusCode +
+              " on " +
+              apiPath +
+              ": " +
+              String(res.parsedBody || ""),
+          );
         }
         return res.parsedBody;
       });
@@ -325,7 +366,14 @@ function driveApiRequest(auth, method, apiPath, query, body, extraHeaders, allow
   return run(false);
 }
 
-function driveUploadRequest(auth, method, uploadUrl, headers, bodyBuffer, allowRetry) {
+function driveUploadRequest(
+  auth,
+  method,
+  uploadUrl,
+  headers,
+  bodyBuffer,
+  allowRetry,
+) {
   var urlMatch = uploadUrl.match(/^https:\/\/([^/]+)(\/.*)$/i);
   if (!urlMatch) {
     return Promise.reject(new Error("Invalid upload URL"));
@@ -357,7 +405,11 @@ function driveUploadRequest(auth, method, uploadUrl, headers, bodyBuffer, allowR
         if (res.statusCode === 401 && !forceRefreshToken) {
           return run(true);
         }
-        if (allowRetry && isRetryableStatus(res.statusCode) && attempt < MAX_RETRIES) {
+        if (
+          allowRetry &&
+          isRetryableStatus(res.statusCode) &&
+          attempt < MAX_RETRIES
+        ) {
           attempt += 1;
           return sleep(Math.pow(2, attempt) * 250).then(function () {
             return run(false);
@@ -372,7 +424,9 @@ function driveUploadRequest(auth, method, uploadUrl, headers, bodyBuffer, allowR
 }
 
 function listDriveFiles(auth, query, fields) {
-  var requestedFields = String(fields || "nextPageToken,files(id,name,mimeType,size)");
+  var requestedFields = String(
+    fields || "nextPageToken,files(id,name,mimeType,size)",
+  );
   var all = [];
 
   function fetchPage(pageToken) {
@@ -412,22 +466,40 @@ function resolveProjectFolder(auth, parentFolderId, projectId) {
     "name contains '" + escapeQueryValue(projectId) + "'",
   ].join(" and ");
 
-  var expectedRe = new RegExp("^SPM_.+_" + projectId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$", "i");
+  var expectedRe = new RegExp(
+    "^SPM_.+_" + projectId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$",
+    "i",
+  );
 
-  return listDriveFiles(auth, q, "nextPageToken,files(id,name,mimeType)").then(function (folders) {
-    var candidates = folders.filter(function (folder) {
-      var name = String(folder.name || "");
-      return expectedRe.test(name);
-    });
+  return listDriveFiles(auth, q, "nextPageToken,files(id,name,mimeType)").then(
+    function (folders) {
+      var candidates = folders.filter(function (folder) {
+        var name = String(folder.name || "");
+        return expectedRe.test(name);
+      });
 
-    if (candidates.length === 0) {
-      throw new Error("No Drive folder matching SPM_*_" + projectId + " under configured parent");
-    }
-    if (candidates.length > 1) {
-      throw new Error("Multiple Drive folders match project " + projectId + ": " + candidates.map(function (item) { return item.name; }).join(", "));
-    }
-    return candidates[0];
-  });
+      if (candidates.length === 0) {
+        throw new Error(
+          "No Drive folder matching SPM_*_" +
+            projectId +
+            " under configured parent",
+        );
+      }
+      if (candidates.length > 1) {
+        throw new Error(
+          "Multiple Drive folders match project " +
+            projectId +
+            ": " +
+            candidates
+              .map(function (item) {
+                return item.name;
+              })
+              .join(", "),
+        );
+      }
+      return candidates[0];
+    },
+  );
 }
 
 function walkDriveTree(auth, folderId, relativeDir, outFiles) {
@@ -436,7 +508,11 @@ function walkDriveTree(auth, folderId, relativeDir, outFiles) {
     "'" + escapeQueryValue(folderId) + "' in parents",
   ].join(" and ");
 
-  return listDriveFiles(auth, q, "nextPageToken,files(id,name,mimeType,size)").then(function (items) {
+  return listDriveFiles(
+    auth,
+    q,
+    "nextPageToken,files(id,name,mimeType,size)",
+  ).then(function (items) {
     var childFolders = [];
     items.forEach(function (item) {
       var safeName = sanitizeWindowsSegment(item.name || "");
@@ -457,20 +533,33 @@ function walkDriveTree(auth, folderId, relativeDir, outFiles) {
       });
     });
 
-    return runWithConcurrency(childFolders, TREE_LIST_CONCURRENCY, function (child) {
-      return walkDriveTree(auth, child.id, child.relativePath, outFiles);
-    });
+    return runWithConcurrency(
+      childFolders,
+      TREE_LIST_CONCURRENCY,
+      function (child) {
+        return walkDriveTree(auth, child.id, child.relativePath, outFiles);
+      },
+    );
   });
 }
 
-function downloadFileWithResume(auth, fileId, destinationPath, expectedSize, onProgress) {
+function downloadFileWithResume(
+  auth,
+  fileId,
+  destinationPath,
+  expectedSize,
+  onProgress,
+) {
   ensureDir(path.dirname(destinationPath));
   var partPath = destinationPath + ".part";
   var size = Number(expectedSize || 0);
 
   if (fs.existsSync(destinationPath)) {
     if (!size || fs.statSync(destinationPath).size === size) {
-      return Promise.resolve({ bytes: fs.statSync(destinationPath).size, reused: true });
+      return Promise.resolve({
+        bytes: fs.statSync(destinationPath).size,
+        reused: true,
+      });
     }
     fs.unlinkSync(destinationPath);
   }
@@ -493,16 +582,22 @@ function downloadFileWithResume(auth, fileId, destinationPath, expectedSize, onP
           {
             method: "GET",
             host: DRIVE_API_HOST,
-            path: "/drive/v3/files/" + encodeURIComponent(fileId) + "?alt=media&supportsAllDrives=true",
+            path:
+              "/drive/v3/files/" +
+              encodeURIComponent(fileId) +
+              "?alt=media&supportsAllDrives=true",
             headers: reqHeaders,
             agent: SHARED_HTTPS_AGENT,
           },
           function (res) {
             if (res.statusCode === 401) {
               res.resume();
-              auth.getAccessToken(true).then(function () {
-                resolve(attemptDownload(startOffset, attempt + 1));
-              }).catch(reject);
+              auth
+                .getAccessToken(true)
+                .then(function () {
+                  resolve(attemptDownload(startOffset, attempt + 1));
+                })
+                .catch(reject);
               return;
             }
 
@@ -521,16 +616,27 @@ function downloadFileWithResume(auth, fileId, destinationPath, expectedSize, onP
 
             if (!(res.statusCode === 200 || res.statusCode === 206)) {
               var chunks = [];
-              res.on("data", function (chunk) { chunks.push(chunk); });
+              res.on("data", function (chunk) {
+                chunks.push(chunk);
+              });
               res.on("end", function () {
                 var body = Buffer.concat(chunks).toString("utf8");
-                if (attempt < MAX_RETRIES && isRetryableStatus(res.statusCode)) {
-                  resolve(sleep(Math.pow(2, attempt) * 250).then(function () {
-                    return attemptDownload(startOffset, attempt + 1);
-                  }));
+                if (
+                  attempt < MAX_RETRIES &&
+                  isRetryableStatus(res.statusCode)
+                ) {
+                  resolve(
+                    sleep(Math.pow(2, attempt) * 250).then(function () {
+                      return attemptDownload(startOffset, attempt + 1);
+                    }),
+                  );
                   return;
                 }
-                reject(new Error("Download failed (" + res.statusCode + "): " + body));
+                reject(
+                  new Error(
+                    "Download failed (" + res.statusCode + "): " + body,
+                  ),
+                );
               });
               return;
             }
@@ -587,9 +693,11 @@ function downloadFileWithResume(auth, fileId, destinationPath, expectedSize, onP
 
         req.on("error", function (err) {
           if (attempt < MAX_RETRIES) {
-            resolve(sleep(Math.pow(2, attempt) * 250).then(function () {
-              return attemptDownload(startOffset, attempt + 1);
-            }));
+            resolve(
+              sleep(Math.pow(2, attempt) * 250).then(function () {
+                return attemptDownload(startOffset, attempt + 1);
+              }),
+            );
             return;
           }
           reject(err);
@@ -614,7 +722,12 @@ function downloadFileWithResume(auth, fileId, destinationPath, expectedSize, onP
 function pickTargetBasePaths(folderName, appDataPath) {
   var home = process.env.USERPROFILE || os.homedir();
   var desktopParent = path.join(home, "Desktop");
-  var fallbackParent = path.join(appDataPath || path.join(home, "AppData", "Roaming"), "Adobe", "TiktokReproducer", "downloads");
+  var fallbackParent = path.join(
+    appDataPath || path.join(home, "AppData", "Roaming"),
+    "Adobe",
+    "TiktokReproducer",
+    "downloads",
+  );
 
   try {
     ensureDir(desktopParent);
@@ -697,8 +810,12 @@ function parseDownloadConcurrencyOverride(rawValue) {
 
 function pickDownloadConcurrency(settings, files) {
   var override =
-    parseDownloadConcurrencyOverride(settings && settings.download_concurrency) ||
-    parseDownloadConcurrencyOverride(process.env.JSXRUNNER_DOWNLOAD_CONCURRENCY);
+    parseDownloadConcurrencyOverride(
+      settings && settings.download_concurrency,
+    ) ||
+    parseDownloadConcurrencyOverride(
+      process.env.JSXRUNNER_DOWNLOAD_CONCURRENCY,
+    );
   if (override > 0) {
     return override;
   }
@@ -741,138 +858,169 @@ function performDownloadProject(payload, emitProgress) {
 
   emitProgress({ stage: "resolve_folder", project_id: projectId });
 
-  return resolveProjectFolder(auth, settings.parent_folder_id, projectId).then(function (folder) {
-    var files = [];
-    emitProgress({ stage: "list_tree", project_id: projectId, folder_id: folder.id, folder_name: folder.name });
-
-    return walkDriveTree(auth, folder.id, "", files).then(function () {
-      var target = pickTargetBasePaths(sanitizeWindowsSegment(folder.name || ("project_" + projectId)), payload.app_data_path);
-      var targetRoot = path.join(target.parent, target.folderName);
-      var partialRoot = targetRoot + ".partial";
-
-      ensureDir(partialRoot);
-
-      var totalBytes = 0;
-      files.forEach(function (file) {
-        totalBytes += Number(file.size || 0);
-      });
-
-      var downloadConcurrency = pickDownloadConcurrency(settings, files);
-      var globalDownloaded = 0;
-      var activeProgressByFileId = {};
-      var activeProgressTotal = 0;
-      var lastProgressEmitAt = 0;
-      var lastProgressBytes = 0;
-      var downloadStartedAt = Date.now();
+  return resolveProjectFolder(auth, settings.parent_folder_id, projectId).then(
+    function (folder) {
+      var files = [];
       emitProgress({
-        stage: "download_tuning",
+        stage: "list_tree",
         project_id: projectId,
-        file_count: files.length,
-        selected_concurrency: downloadConcurrency,
-      });
-      emitProgress({
-        stage: "download_start",
-        project_id: projectId,
-        file_count: files.length,
-        total_bytes: totalBytes,
-        target_root: targetRoot,
+        folder_id: folder.id,
+        folder_name: folder.name,
       });
 
-      return runWithConcurrency(files, downloadConcurrency, function (file, index) {
-        var destination = path.join(partialRoot, file.relativePath);
-        return downloadFileWithResume(auth, file.id, destination, file.size, function (fileProgress) {
-          var nextBytes = Number(fileProgress.downloaded_bytes || 0);
-          var previousBytes = Number(activeProgressByFileId[file.id] || 0);
-          if (nextBytes < previousBytes) {
-            nextBytes = previousBytes;
-          }
-          activeProgressByFileId[file.id] = nextBytes;
-          activeProgressTotal += (nextBytes - previousBytes);
+      return walkDriveTree(auth, folder.id, "", files).then(function () {
+        var target = pickTargetBasePaths(
+          sanitizeWindowsSegment(folder.name || "project_" + projectId),
+          payload.app_data_path,
+        );
+        var targetRoot = path.join(target.parent, target.folderName);
+        var partialRoot = targetRoot + ".partial";
 
-          var estimateBytes = globalDownloaded + activeProgressTotal;
-          var nowMs = Date.now();
-          if (
-            nowMs - lastProgressEmitAt < PROGRESS_EMIT_INTERVAL_MS &&
-            Math.abs(estimateBytes - lastProgressBytes) < PROGRESS_EMIT_MIN_DELTA_BYTES
-          ) {
-            return;
-          }
-          lastProgressEmitAt = nowMs;
-          lastProgressBytes = estimateBytes;
+        ensureDir(partialRoot);
 
-          emitProgress({
-            stage: "download_file_progress",
-            project_id: projectId,
-            file_index: index + 1,
-            file_count: files.length,
-            relative_path: file.relativePath,
-            downloaded_bytes: fileProgress.downloaded_bytes,
-            total_bytes: fileProgress.total_bytes,
-            global_downloaded_estimate: estimateBytes,
-            global_total_bytes: totalBytes,
-          });
-        }).then(function (result) {
-          var lastTrackedBytes = Number(activeProgressByFileId[file.id] || 0);
-          if (lastTrackedBytes > 0) {
-            activeProgressTotal = Math.max(0, activeProgressTotal - lastTrackedBytes);
-          }
-          delete activeProgressByFileId[file.id];
-          globalDownloaded += Number(result.bytes || 0);
-          emitProgress({
-            stage: "download_file_complete",
-            project_id: projectId,
-            file_index: index + 1,
-            file_count: files.length,
-            relative_path: file.relativePath,
-            global_downloaded_bytes: globalDownloaded,
-            global_total_bytes: totalBytes,
-          });
-        });
-      }).then(function () {
-        removeIfExists(targetRoot);
-        fs.renameSync(partialRoot, targetRoot);
-
-        var outputPath = path.join(targetRoot, OUTPUT_FILENAME);
-        var contextPath = path.join(targetRoot, ".atr_project_context.json");
-        var elapsedMs = Math.max(1, Date.now() - downloadStartedAt);
-        var avgMbPerSec = totalBytes > 0 ? (totalBytes / (1024 * 1024)) / (elapsedMs / 1000) : 0;
-        writeJsonAtomic(contextPath, {
-          project_id: projectId,
-          drive_folder_id: folder.id,
-          local_root: targetRoot,
-          output_path: outputPath,
-          downloaded_at: nowIso(),
-          download_elapsed_ms: elapsedMs,
-          download_avg_mb_per_sec: avgMbPerSec,
-          download_file_count: files.length,
+        var totalBytes = 0;
+        files.forEach(function (file) {
+          totalBytes += Number(file.size || 0);
         });
 
+        var downloadConcurrency = pickDownloadConcurrency(settings, files);
+        var globalDownloaded = 0;
+        var activeProgressByFileId = {};
+        var activeProgressTotal = 0;
+        var lastProgressEmitAt = 0;
+        var lastProgressBytes = 0;
+        var downloadStartedAt = Date.now();
         emitProgress({
-          stage: "download_complete",
+          stage: "download_tuning",
           project_id: projectId,
-          target_root: targetRoot,
-          output_path: outputPath,
-          elapsed_ms: elapsedMs,
-          avg_mb_per_sec: avgMbPerSec,
+          file_count: files.length,
+          selected_concurrency: downloadConcurrency,
+        });
+        emitProgress({
+          stage: "download_start",
+          project_id: projectId,
           file_count: files.length,
           total_bytes: totalBytes,
+          target_root: targetRoot,
         });
 
-        return {
-          project_id: projectId,
-          drive_folder_id: folder.id,
-          drive_folder_name: folder.name,
-          local_root: targetRoot,
-          output_path: outputPath,
-          used_fallback_root: !!target.isFallback,
-          download_elapsed_ms: elapsedMs,
-          download_avg_mb_per_sec: avgMbPerSec,
-          download_file_count: files.length,
-          download_total_bytes: totalBytes,
-        };
+        return runWithConcurrency(
+          files,
+          downloadConcurrency,
+          function (file, index) {
+            var destination = path.join(partialRoot, file.relativePath);
+            return downloadFileWithResume(
+              auth,
+              file.id,
+              destination,
+              file.size,
+              function (fileProgress) {
+                var nextBytes = Number(fileProgress.downloaded_bytes || 0);
+                var previousBytes = Number(
+                  activeProgressByFileId[file.id] || 0,
+                );
+                if (nextBytes < previousBytes) {
+                  nextBytes = previousBytes;
+                }
+                activeProgressByFileId[file.id] = nextBytes;
+                activeProgressTotal += nextBytes - previousBytes;
+
+                var estimateBytes = globalDownloaded + activeProgressTotal;
+                var nowMs = Date.now();
+                if (
+                  nowMs - lastProgressEmitAt < PROGRESS_EMIT_INTERVAL_MS &&
+                  Math.abs(estimateBytes - lastProgressBytes) <
+                    PROGRESS_EMIT_MIN_DELTA_BYTES
+                ) {
+                  return;
+                }
+                lastProgressEmitAt = nowMs;
+                lastProgressBytes = estimateBytes;
+
+                emitProgress({
+                  stage: "download_file_progress",
+                  project_id: projectId,
+                  file_index: index + 1,
+                  file_count: files.length,
+                  relative_path: file.relativePath,
+                  downloaded_bytes: fileProgress.downloaded_bytes,
+                  total_bytes: fileProgress.total_bytes,
+                  global_downloaded_estimate: estimateBytes,
+                  global_total_bytes: totalBytes,
+                });
+              },
+            ).then(function (result) {
+              var lastTrackedBytes = Number(
+                activeProgressByFileId[file.id] || 0,
+              );
+              if (lastTrackedBytes > 0) {
+                activeProgressTotal = Math.max(
+                  0,
+                  activeProgressTotal - lastTrackedBytes,
+                );
+              }
+              delete activeProgressByFileId[file.id];
+              globalDownloaded += Number(result.bytes || 0);
+              emitProgress({
+                stage: "download_file_complete",
+                project_id: projectId,
+                file_index: index + 1,
+                file_count: files.length,
+                relative_path: file.relativePath,
+                global_downloaded_bytes: globalDownloaded,
+                global_total_bytes: totalBytes,
+              });
+            });
+          },
+        ).then(function () {
+          removeIfExists(targetRoot);
+          fs.renameSync(partialRoot, targetRoot);
+
+          var outputPath = path.join(targetRoot, OUTPUT_FILENAME);
+          var contextPath = path.join(targetRoot, ".atr_project_context.json");
+          var elapsedMs = Math.max(1, Date.now() - downloadStartedAt);
+          var avgMbPerSec =
+            totalBytes > 0
+              ? totalBytes / (1024 * 1024) / (elapsedMs / 1000)
+              : 0;
+          writeJsonAtomic(contextPath, {
+            project_id: projectId,
+            drive_folder_id: folder.id,
+            local_root: targetRoot,
+            output_path: outputPath,
+            downloaded_at: nowIso(),
+            download_elapsed_ms: elapsedMs,
+            download_avg_mb_per_sec: avgMbPerSec,
+            download_file_count: files.length,
+          });
+
+          emitProgress({
+            stage: "download_complete",
+            project_id: projectId,
+            target_root: targetRoot,
+            output_path: outputPath,
+            elapsed_ms: elapsedMs,
+            avg_mb_per_sec: avgMbPerSec,
+            file_count: files.length,
+            total_bytes: totalBytes,
+          });
+
+          return {
+            project_id: projectId,
+            drive_folder_id: folder.id,
+            drive_folder_name: folder.name,
+            local_root: targetRoot,
+            output_path: outputPath,
+            used_fallback_root: !!target.isFallback,
+            download_elapsed_ms: elapsedMs,
+            download_avg_mb_per_sec: avgMbPerSec,
+            download_file_count: files.length,
+            download_total_bytes: totalBytes,
+          };
+        });
       });
-    });
-  });
+    },
+  );
 }
 
 function getExistingOutputFile(auth, folderId, outputFileName) {
@@ -883,12 +1031,14 @@ function getExistingOutputFile(auth, folderId, outputFileName) {
     "'" + escapeQueryValue(folderId) + "' in parents",
   ].join(" and ");
 
-  return listDriveFiles(auth, q, "nextPageToken,files(id,name,mimeType)").then(function (files) {
-    if (!files || files.length === 0) {
-      return null;
-    }
-    return files[0];
-  });
+  return listDriveFiles(auth, q, "nextPageToken,files(id,name,mimeType)").then(
+    function (files) {
+      if (!files || files.length === 0) {
+        return null;
+      }
+      return files[0];
+    },
+  );
 }
 
 function queryResumableOffset(auth, sessionUrl, fileSize) {
@@ -911,7 +1061,12 @@ function queryResumableOffset(auth, sessionUrl, fileSize) {
       };
     }
     if (res.statusCode !== 308) {
-      throw new Error("Unexpected resumable status query response: " + res.statusCode + " " + res.body.toString("utf8"));
+      throw new Error(
+        "Unexpected resumable status query response: " +
+          res.statusCode +
+          " " +
+          res.body.toString("utf8"),
+      );
     }
 
     var range = String(res.headers.range || "");
@@ -949,9 +1104,18 @@ function readChunkFromFile(filePath, start, endInclusive) {
   });
 }
 
-function startResumableSession(auth, folderId, existingFileId, fileSize, outputFileName, uploadContentType) {
+function startResumableSession(
+  auth,
+  folderId,
+  existingFileId,
+  fileSize,
+  outputFileName,
+  uploadContentType,
+) {
   var targetOutputName = String(outputFileName || OUTPUT_FILENAME);
-  var targetContentType = String(uploadContentType || "application/octet-stream");
+  var targetContentType = String(
+    uploadContentType || "application/octet-stream",
+  );
   var method;
   var apiPath;
   var body;
@@ -991,7 +1155,12 @@ function startResumableSession(auth, folderId, existingFileId, fileSize, outputF
       120000,
     ).then(function (res) {
       if (res.statusCode < 200 || res.statusCode >= 300) {
-        throw new Error("Failed to start resumable upload: " + res.statusCode + " " + res.body.toString("utf8"));
+        throw new Error(
+          "Failed to start resumable upload: " +
+            res.statusCode +
+            " " +
+            res.body.toString("utf8"),
+        );
       }
       var location = res.headers.location;
       if (!location) {
@@ -999,7 +1168,8 @@ function startResumableSession(auth, folderId, existingFileId, fileSize, outputF
       }
       return {
         upload_url: location,
-        file_id: existingFileId || (res.parsedBody && res.parsedBody.id) || null,
+        file_id:
+          existingFileId || (res.parsedBody && res.parsedBody.id) || null,
       };
     });
   });
@@ -1040,7 +1210,9 @@ function performResumableUpload(payload, emitProgress) {
   var stat = fs.statSync(outputPath);
   var fileSize = stat.size;
   var fileMtimeMs = stat.mtimeMs;
-  var outputFileName = String(payload.output_file_name || path.basename(outputPath) || OUTPUT_FILENAME);
+  var outputFileName = String(
+    payload.output_file_name || path.basename(outputPath) || OUTPUT_FILENAME,
+  );
   var outputLower = outputFileName.toLowerCase();
   var outputContentType = "application/octet-stream";
   if (outputLower.slice(-4) === ".mp4") {
@@ -1061,177 +1233,217 @@ function performResumableUpload(payload, emitProgress) {
     file_size: fileSize,
   });
 
-  return getExistingOutputFile(auth, folderId, outputFileName).then(function (existingFile) {
-    var existingFileId = existingFile ? existingFile.id : null;
-    var sessionState = readJson(sessionFile, null);
+  return getExistingOutputFile(auth, folderId, outputFileName)
+    .then(function (existingFile) {
+      var existingFileId = existingFile ? existingFile.id : null;
+      var sessionState = readJson(sessionFile, null);
 
-    if (
-      !sessionState ||
-      sessionState.file_size !== fileSize ||
-      sessionState.file_mtime_ms !== fileMtimeMs ||
-      sessionState.output_file_name !== outputFileName ||
-      sessionState.drive_folder_id !== folderId ||
-      sessionState.drive_file_id !== (existingFileId || null) ||
-      !sessionState.upload_url
-    ) {
-      sessionState = null;
-    }
+      if (
+        !sessionState ||
+        sessionState.file_size !== fileSize ||
+        sessionState.file_mtime_ms !== fileMtimeMs ||
+        sessionState.output_file_name !== outputFileName ||
+        sessionState.drive_folder_id !== folderId ||
+        sessionState.drive_file_id !== (existingFileId || null) ||
+        !sessionState.upload_url
+      ) {
+        sessionState = null;
+      }
 
-    var sessionPromise;
-    if (sessionState) {
-      sessionPromise = Promise.resolve(sessionState);
-      emitProgress({
-        stage: "upload_resume_session",
-        project_id: projectId,
-        drive_file_id: sessionState.drive_file_id || null,
-      });
-    } else {
-      sessionPromise = startResumableSession(auth, folderId, existingFileId, fileSize, outputFileName, outputContentType).then(function (created) {
-        var nextState = {
-          upload_url: created.upload_url,
-          drive_file_id: created.file_id || existingFileId || null,
-          drive_folder_id: folderId,
-          output_file_name: outputFileName,
-          output_content_type: outputContentType,
-          file_size: fileSize,
-          file_mtime_ms: fileMtimeMs,
-          updated_at: nowIso(),
-        };
-        writeJsonAtomic(sessionFile, nextState);
+      var sessionPromise;
+      if (sessionState) {
+        sessionPromise = Promise.resolve(sessionState);
         emitProgress({
-          stage: "upload_new_session",
+          stage: "upload_resume_session",
           project_id: projectId,
-          drive_file_id: nextState.drive_file_id || null,
+          drive_file_id: sessionState.drive_file_id || null,
         });
-        return nextState;
-      });
-    }
-
-    return sessionPromise.then(function (activeSession) {
-      return queryResumableOffset(auth, activeSession.upload_url, fileSize).then(function (offsetResult) {
-        if (offsetResult.complete) {
-          removeIfExists(sessionFile);
-          var body = offsetResult.body || {};
-          if (body.id) {
-            return body;
-          }
-          if (!activeSession.drive_file_id) {
-            throw new Error("Upload already complete but Drive file ID unavailable");
-          }
-          return finalizeUploadMetadata(auth, activeSession.drive_file_id);
-        }
-
-        var offset = Number(offsetResult.offset || 0);
-        if (offset < 0) {
-          offset = 0;
-        }
-
-        function uploadFrom(startOffset) {
-          if (startOffset >= fileSize) {
-            var fallbackId = activeSession.drive_file_id;
-            if (!fallbackId) {
-              throw new Error("Upload reached EOF but file ID is unknown");
-            }
-            return finalizeUploadMetadata(auth, fallbackId);
-          }
-
-          var chunkStart = startOffset;
-          var chunkEnd = Math.min(chunkStart + RESUMABLE_CHUNK_SIZE, fileSize) - 1;
-
-          return readChunkFromFile(outputPath, chunkStart, chunkEnd).then(function (chunkBuffer) {
-            var contentRange = "bytes " + chunkStart + "-" + (chunkStart + chunkBuffer.length - 1) + "/" + fileSize;
-
-            var attempts = 0;
-
-            function sendChunk() {
-              return driveUploadRequest(
-                auth,
-                "PUT",
-                activeSession.upload_url,
-                {
-                  "Content-Length": String(chunkBuffer.length),
-                  "Content-Range": contentRange,
-                },
-                chunkBuffer,
-                false,
-              ).then(function (res) {
-                if (res.statusCode === 308) {
-                  var range = String(res.headers.range || "");
-                  var nextOffset = chunkStart + chunkBuffer.length;
-                  if (range) {
-                    var m = /bytes=0-(\d+)/i.exec(range);
-                    if (m) {
-                      nextOffset = Number(m[1]) + 1;
-                    }
-                  }
-                  activeSession.updated_at = nowIso();
-                  writeJsonAtomic(sessionFile, activeSession);
-                  emitProgress({
-                    stage: "upload_progress",
-                    project_id: projectId,
-                    uploaded_bytes: nextOffset,
-                    total_bytes: fileSize,
-                  });
-                  return uploadFrom(nextOffset);
-                }
-
-                if (res.statusCode === 200 || res.statusCode === 201) {
-                  var body = decodeBody(res.body, res.headers["content-type"]) || {};
-                  if (body.id && !activeSession.drive_file_id) {
-                    activeSession.drive_file_id = body.id;
-                  }
-                  removeIfExists(sessionFile);
-                  emitProgress({
-                    stage: "upload_progress",
-                    project_id: projectId,
-                    uploaded_bytes: fileSize,
-                    total_bytes: fileSize,
-                  });
-                  return body;
-                }
-
-                if (isRetryableStatus(res.statusCode) && attempts < MAX_RETRIES) {
-                  attempts += 1;
-                  return sleep(Math.pow(2, attempts) * 250).then(sendChunk);
-                }
-
-                throw new Error("Upload chunk failed (" + res.statusCode + "): " + res.body.toString("utf8"));
-              }).catch(function (err) {
-                if (attempts < MAX_RETRIES) {
-                  attempts += 1;
-                  return sleep(Math.pow(2, attempts) * 250).then(sendChunk);
-                }
-                throw err;
-              });
-            }
-
-            return sendChunk();
+      } else {
+        sessionPromise = startResumableSession(
+          auth,
+          folderId,
+          existingFileId,
+          fileSize,
+          outputFileName,
+          outputContentType,
+        ).then(function (created) {
+          var nextState = {
+            upload_url: created.upload_url,
+            drive_file_id: created.file_id || existingFileId || null,
+            drive_folder_id: folderId,
+            output_file_name: outputFileName,
+            output_content_type: outputContentType,
+            file_size: fileSize,
+            file_mtime_ms: fileMtimeMs,
+            updated_at: nowIso(),
+          };
+          writeJsonAtomic(sessionFile, nextState);
+          emitProgress({
+            stage: "upload_new_session",
+            project_id: projectId,
+            drive_file_id: nextState.drive_file_id || null,
           });
-        }
+          return nextState;
+        });
+      }
 
-        return uploadFrom(offset).then(function (finalMeta) {
-          var fileId = finalMeta.id || activeSession.drive_file_id;
-          if (!fileId) {
-            throw new Error("Upload succeeded but no Drive file id returned");
+      return sessionPromise.then(function (activeSession) {
+        return queryResumableOffset(
+          auth,
+          activeSession.upload_url,
+          fileSize,
+        ).then(function (offsetResult) {
+          if (offsetResult.complete) {
+            removeIfExists(sessionFile);
+            var body = offsetResult.body || {};
+            if (body.id) {
+              return body;
+            }
+            if (!activeSession.drive_file_id) {
+              throw new Error(
+                "Upload already complete but Drive file ID unavailable",
+              );
+            }
+            return finalizeUploadMetadata(auth, activeSession.drive_file_id);
           }
-          if (!finalMeta.webViewLink) {
-            return finalizeUploadMetadata(auth, fileId);
+
+          var offset = Number(offsetResult.offset || 0);
+          if (offset < 0) {
+            offset = 0;
           }
-          return finalMeta;
+
+          function uploadFrom(startOffset) {
+            if (startOffset >= fileSize) {
+              var fallbackId = activeSession.drive_file_id;
+              if (!fallbackId) {
+                throw new Error("Upload reached EOF but file ID is unknown");
+              }
+              return finalizeUploadMetadata(auth, fallbackId);
+            }
+
+            var chunkStart = startOffset;
+            var chunkEnd =
+              Math.min(chunkStart + RESUMABLE_CHUNK_SIZE, fileSize) - 1;
+
+            return readChunkFromFile(outputPath, chunkStart, chunkEnd).then(
+              function (chunkBuffer) {
+                var contentRange =
+                  "bytes " +
+                  chunkStart +
+                  "-" +
+                  (chunkStart + chunkBuffer.length - 1) +
+                  "/" +
+                  fileSize;
+
+                var attempts = 0;
+
+                function sendChunk() {
+                  return driveUploadRequest(
+                    auth,
+                    "PUT",
+                    activeSession.upload_url,
+                    {
+                      "Content-Length": String(chunkBuffer.length),
+                      "Content-Range": contentRange,
+                    },
+                    chunkBuffer,
+                    false,
+                  )
+                    .then(function (res) {
+                      if (res.statusCode === 308) {
+                        var range = String(res.headers.range || "");
+                        var nextOffset = chunkStart + chunkBuffer.length;
+                        if (range) {
+                          var m = /bytes=0-(\d+)/i.exec(range);
+                          if (m) {
+                            nextOffset = Number(m[1]) + 1;
+                          }
+                        }
+                        activeSession.updated_at = nowIso();
+                        writeJsonAtomic(sessionFile, activeSession);
+                        emitProgress({
+                          stage: "upload_progress",
+                          project_id: projectId,
+                          uploaded_bytes: nextOffset,
+                          total_bytes: fileSize,
+                        });
+                        return uploadFrom(nextOffset);
+                      }
+
+                      if (res.statusCode === 200 || res.statusCode === 201) {
+                        var body =
+                          decodeBody(res.body, res.headers["content-type"]) ||
+                          {};
+                        if (body.id && !activeSession.drive_file_id) {
+                          activeSession.drive_file_id = body.id;
+                        }
+                        removeIfExists(sessionFile);
+                        emitProgress({
+                          stage: "upload_progress",
+                          project_id: projectId,
+                          uploaded_bytes: fileSize,
+                          total_bytes: fileSize,
+                        });
+                        return body;
+                      }
+
+                      if (
+                        isRetryableStatus(res.statusCode) &&
+                        attempts < MAX_RETRIES
+                      ) {
+                        attempts += 1;
+                        return sleep(Math.pow(2, attempts) * 250).then(
+                          sendChunk,
+                        );
+                      }
+
+                      throw new Error(
+                        "Upload chunk failed (" +
+                          res.statusCode +
+                          "): " +
+                          res.body.toString("utf8"),
+                      );
+                    })
+                    .catch(function (err) {
+                      if (attempts < MAX_RETRIES) {
+                        attempts += 1;
+                        return sleep(Math.pow(2, attempts) * 250).then(
+                          sendChunk,
+                        );
+                      }
+                      throw err;
+                    });
+                }
+
+                return sendChunk();
+              },
+            );
+          }
+
+          return uploadFrom(offset).then(function (finalMeta) {
+            var fileId = finalMeta.id || activeSession.drive_file_id;
+            if (!fileId) {
+              throw new Error("Upload succeeded but no Drive file id returned");
+            }
+            if (!finalMeta.webViewLink) {
+              return finalizeUploadMetadata(auth, fileId);
+            }
+            return finalMeta;
+          });
         });
       });
+    })
+    .then(function (uploaded) {
+      return {
+        project_id: projectId,
+        drive_file_id: uploaded.id,
+        drive_file_name: uploaded.name,
+        drive_file_web_view_link: uploaded.webViewLink || null,
+        uploaded_at: nowIso(),
+        file_size: fileSize,
+        output_path: outputPath,
+      };
     });
-  }).then(function (uploaded) {
-    return {
-      project_id: projectId,
-      drive_file_id: uploaded.id,
-      drive_file_name: uploaded.name,
-      drive_file_web_view_link: uploaded.webViewLink || null,
-      uploaded_at: nowIso(),
-      file_size: fileSize,
-      output_path: outputPath,
-    };
-  });
 }
 
 function testDriveConnection(payload) {
@@ -1253,7 +1465,11 @@ function testDriveConnection(payload) {
     true,
   ).then(function (folder) {
     if (folder.mimeType !== FOLDER_MIME) {
-      throw new Error("Configured parent ID is not a folder (mimeType=" + folder.mimeType + ")");
+      throw new Error(
+        "Configured parent ID is not a folder (mimeType=" +
+          folder.mimeType +
+          ")",
+      );
     }
     return {
       ok: true,
@@ -1286,7 +1502,8 @@ function validateSettings(settings) {
 }
 
 function runTask(task, payload, emitProgress) {
-  var reporter = typeof emitProgress === "function" ? emitProgress : function () {};
+  var reporter =
+    typeof emitProgress === "function" ? emitProgress : function () {};
   var safePayload = payload || {};
 
   if (task === "testConnection") {
