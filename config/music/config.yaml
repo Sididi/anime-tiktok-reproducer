@@ -19,7 +19,7 @@ music:
   royalty:
     display_name: "Royalty"
     file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/royalty.wav"
-    volume_db: -25
+    volume_db: -26
 
   girl_a_full_small_loop:
     display_name: "Girl A Full - Small Loop"
