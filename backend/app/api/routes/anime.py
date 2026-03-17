@@ -1,12 +1,12 @@
 """API routes for anime library management."""
 
 import asyncio
+import json
+from pathlib import Path
+
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from pathlib import Path
-import json
-import os
 
 from ...services import AnimeLibraryService, AnimeMatcherService
 
@@ -111,9 +111,79 @@ async def index_anime(request: IndexAnimeRequest):
             require_gpu=request.require_gpu,
         ):
             if progress.status == "complete":
-                # Any successful indexing (new series or update) may change the in-memory
-                # matcher index cache; mark this series stale for lazy reload on next match.
-                AnimeMatcherService.mark_series_updated(target_anime_name)
+                AnimeMatcherService.mark_series_updated(progress.anime_name or target_anime_name)
+            yield f"data: {json.dumps(progress.to_dict())}\n\n"
+
+    return StreamingResponse(
+        stream_progress(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+class UpdateAnimeRequest(BaseModel):
+    anime_name: str
+    source_paths: list[str]
+    batch_size: int = 64
+    prefetch_batches: int = 3
+    transform_workers: int = 4
+    require_gpu: bool = True
+
+
+@router.post("/update")
+async def update_anime(request: UpdateAnimeRequest):
+    """Incrementally update an already indexed anime with a precise file list."""
+    if not request.source_paths:
+        raise HTTPException(status_code=400, detail="No source_paths provided.")
+
+    source_files = [Path(path) for path in request.source_paths]
+
+    async def stream_progress():
+        async for progress in AnimeLibraryService.update_anime(
+            anime_name=request.anime_name,
+            source_paths=source_files,
+            batch_size=request.batch_size,
+            prefetch_batches=request.prefetch_batches,
+            transform_workers=request.transform_workers,
+            require_gpu=request.require_gpu,
+        ):
+            if progress.status == "complete":
+                AnimeMatcherService.mark_series_updated(progress.anime_name or request.anime_name)
+            yield f"data: {json.dumps(progress.to_dict())}\n\n"
+
+    return StreamingResponse(
+        stream_progress(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+class RemoveAnimeFilesRequest(BaseModel):
+    anime_name: str
+    library_paths: list[str]
+
+
+@router.post("/remove")
+async def remove_anime_files(request: RemoveAnimeFilesRequest):
+    """Remove explicit library files from an indexed anime series."""
+    if not request.library_paths:
+        raise HTTPException(status_code=400, detail="No library_paths provided.")
+
+    target_paths = [Path(path) for path in request.library_paths]
+
+    async def stream_progress():
+        async for progress in AnimeLibraryService.remove_anime_files(
+            anime_name=request.anime_name,
+            library_paths=target_paths,
+        ):
+            if progress.status == "complete":
+                AnimeMatcherService.mark_series_updated(progress.anime_name or request.anime_name)
             yield f"data: {json.dumps(progress.to_dict())}\n\n"
 
     return StreamingResponse(

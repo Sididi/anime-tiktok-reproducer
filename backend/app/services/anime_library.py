@@ -8,6 +8,7 @@ import re
 import subprocess
 import shutil
 import threading
+import tempfile
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -38,9 +39,11 @@ class IndexProgress:
     total_files: int = 0
     completed_files: int = 0
     error: str | None = None
+    anime_name: str | None = None
+    prepared_library_paths: list[str] | None = None
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "status": self.status,
             "progress": self.progress,
             "message": self.message,
@@ -49,6 +52,11 @@ class IndexProgress:
             "completed_files": self.completed_files,
             "error": self.error,
         }
+        if self.anime_name is not None:
+            payload["anime_name"] = self.anime_name
+        if self.prepared_library_paths is not None:
+            payload["prepared_library_paths"] = self.prepared_library_paths
+        return payload
 
 
 @dataclass(frozen=True)
@@ -140,6 +148,7 @@ class AnimeLibraryService:
         "hdmv_pgs_subtitle",
     }
     SUBTITLE_SIDECAR_SUFFIX = ".atr_subtitles"
+    SOURCE_IMPORT_MANIFEST_SUFFIX = ".atr_source.json"
     INDEX_DIR_NAME = ".index"
     MANIFEST_FILE = "manifest.json"
     LEGACY_METADATA_FILE = "metadata.json"
@@ -2316,6 +2325,276 @@ class AnimeLibraryService:
         return await asyncio.to_thread(_scan_folders)
 
     @classmethod
+    def get_source_import_manifest_path(cls, prepared_path: Path) -> Path:
+        return prepared_path.with_name(f"{prepared_path.name}{cls.SOURCE_IMPORT_MANIFEST_SUFFIX}")
+
+    @classmethod
+    def _load_source_import_manifest_sync(cls, prepared_path: Path) -> dict[str, Any] | None:
+        manifest_path = cls.get_source_import_manifest_path(prepared_path)
+        if not manifest_path.exists():
+            return None
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    @classmethod
+    def _record_source_import_manifest_sync(cls, source_path: Path, prepared_path: Path) -> None:
+        source_stat = source_path.stat()
+        manifest_path = cls.get_source_import_manifest_path(prepared_path)
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "source_path": str(source_path.resolve()),
+                    "source_size": source_stat.st_size,
+                    "source_mtime_ns": source_stat.st_mtime_ns,
+                    "prepared_path": str(prepared_path.resolve()),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    @classmethod
+    def _clear_source_import_manifest_sync(cls, prepared_path: Path) -> None:
+        manifest_path = cls.get_source_import_manifest_path(prepared_path)
+        with suppress(OSError):
+            manifest_path.unlink()
+
+    @classmethod
+    def _source_matches_prepared_sync(cls, source_path: Path, prepared_path: Path) -> bool:
+        if not prepared_path.exists():
+            return False
+
+        try:
+            if source_path.resolve() == prepared_path.resolve():
+                return True
+        except OSError:
+            return False
+
+        payload = cls._load_source_import_manifest_sync(prepared_path)
+        if payload is None:
+            return False
+
+        try:
+            source_stat = source_path.stat()
+        except OSError:
+            return False
+
+        return (
+            payload.get("source_path") == str(source_path.resolve())
+            and int(payload.get("source_size", -1)) == source_stat.st_size
+            and int(payload.get("source_mtime_ns", -1)) == source_stat.st_mtime_ns
+        )
+
+    @classmethod
+    async def _prepare_single_source_for_library(
+        cls,
+        *,
+        source_path: Path,
+        dest_dir: Path,
+    ) -> tuple[Path, str, bool]:
+        source_codec = await asyncio.to_thread(cls.get_primary_video_codec_sync, source_path)
+        is_av1 = source_codec == "av1"
+        should_remux_mkv = source_path.suffix.lower() == ".mkv" and not is_av1
+        preferred_dest = dest_dir / (
+            source_path.stem + ".mp4" if should_remux_mkv else source_path.name
+        )
+        actual_dest = preferred_dest
+
+        action = "Copying"
+        if is_av1:
+            action = "Copying AV1 source"
+        elif should_remux_mkv:
+            action = "Remuxing"
+
+        existing_ready = await asyncio.to_thread(
+            cls._source_matches_prepared_sync,
+            source_path,
+            preferred_dest,
+        )
+        if existing_ready:
+            return preferred_dest, "Using existing", False
+
+        if should_remux_mkv:
+            try:
+                remux_result = await run_command(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        str(source_path),
+                        "-c",
+                        "copy",
+                        "-movflags",
+                        "+faststart",
+                        str(preferred_dest),
+                    ],
+                    timeout_seconds=cls.REMUX_TIMEOUT_SECONDS,
+                )
+                if remux_result.returncode != 0:
+                    import sys
+
+                    print(
+                        f"[WARNING] ffmpeg remux failed for {source_path.name}: "
+                        f"{remux_result.stderr.decode()[:200]}",
+                        file=sys.stderr,
+                    )
+                    fallback_dest = dest_dir / source_path.name
+                    if fallback_dest != source_path or not fallback_dest.exists():
+                        await asyncio.to_thread(shutil.copy2, source_path, fallback_dest)
+                    actual_dest = fallback_dest
+            except CommandTimeoutError:
+                import sys
+
+                print(
+                    f"[WARNING] ffmpeg remux timed out for {source_path.name}, falling back to copy",
+                    file=sys.stderr,
+                )
+                fallback_dest = dest_dir / source_path.name
+                if fallback_dest != source_path or not fallback_dest.exists():
+                    await asyncio.to_thread(shutil.copy2, source_path, fallback_dest)
+                actual_dest = fallback_dest
+            except FileNotFoundError as exc:
+                if is_media_binary_override_error(exc):
+                    raise
+                import sys
+
+                print("[WARNING] ffmpeg not found, falling back to copy", file=sys.stderr)
+                fallback_dest = dest_dir / source_path.name
+                if fallback_dest != source_path or not fallback_dest.exists():
+                    await asyncio.to_thread(shutil.copy2, source_path, fallback_dest)
+                actual_dest = fallback_dest
+        elif preferred_dest != source_path:
+            await asyncio.to_thread(shutil.copy2, source_path, preferred_dest)
+
+        if dest_dir == source_path.parent and actual_dest == preferred_dest and preferred_dest != source_path:
+            with suppress(OSError):
+                await asyncio.to_thread(source_path.unlink)
+
+        if actual_dest.exists():
+            await asyncio.to_thread(cls._record_source_import_manifest_sync, source_path, actual_dest)
+
+        return actual_dest, action, True
+
+    @classmethod
+    async def _verify_prepared_library_files(cls, prepared_files: list[Path]) -> str | None:
+        await asyncio.sleep(1.0)
+        for dest_file in prepared_files:
+            if not dest_file.exists():
+                return f"Prepared file missing after import: {dest_file.name}"
+            file_stat = await asyncio.to_thread(dest_file.stat)
+            if file_stat.st_size == 0:
+                return f"Prepared file is empty: {dest_file.name}"
+        return None
+
+    @classmethod
+    def _write_temp_path_manifest(cls, paths: list[Path]) -> Path:
+        settings.cache_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".anime_searcher_manifest.json",
+            prefix="anime_searcher_",
+            dir=settings.cache_dir,
+            delete=False,
+            encoding="utf-8",
+        ) as handle:
+            json.dump({"files": [str(path) for path in paths]}, handle)
+            return Path(handle.name)
+
+    @classmethod
+    async def _stream_searcher_command(
+        cls,
+        *,
+        cmd: list[str],
+        cwd: Path,
+        total_files: int,
+        status: str,
+        progress_start: float,
+        progress_span: float,
+    ) -> AsyncIterator[IndexProgress]:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(cwd),
+            env=get_media_subprocess_env(cmd),
+        )
+
+        stdout_lines: list[str] = []
+        stderr_task = asyncio.create_task(
+            process.stderr.read() if process.stderr is not None else asyncio.sleep(0, result=b"")
+        )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + cls.INDEX_TIMEOUT_SECONDS
+        aborted = False
+
+        try:
+            assert process.stdout is not None
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+
+                line = await asyncio.wait_for(process.stdout.readline(), timeout=remaining)
+                if not line:
+                    break
+                decoded = line.decode()
+                stdout_lines.append(decoded)
+                line_str = decoded.strip()
+                if line_str:
+                    denominator = max(total_files * 100, 1)
+                    yield IndexProgress(
+                        status=status,
+                        message=line_str[:100],
+                        progress=progress_start + progress_span * (len(stdout_lines) / denominator),
+                        total_files=total_files,
+                    )
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            await asyncio.wait_for(process.wait(), timeout=remaining)
+        except asyncio.CancelledError:
+            aborted = True
+            await terminate_process(process)
+            raise
+        except asyncio.TimeoutError:
+            aborted = True
+            await terminate_process(process)
+            yield IndexProgress(
+                status="error",
+                error=(
+                    f"anime_searcher command timed out after {int(cls.INDEX_TIMEOUT_SECONDS)} seconds. "
+                    "Try reducing library size or retrying."
+                ),
+            )
+            return
+        finally:
+            if aborted and not stderr_task.done():
+                stderr_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await stderr_task
+
+        stderr = await stderr_task
+        if process.returncode != 0:
+            yield IndexProgress(
+                status="error",
+                error=f"anime_searcher command failed: {stderr.decode()}",
+            )
+
+    @classmethod
+    async def _delete_library_file_artifacts(cls, source_path: Path) -> None:
+        sidecar_source_path = cls.resolve_subtitle_sidecar_source_path(source_path) or source_path
+        sidecar_dir = cls.get_subtitle_sidecar_dir(sidecar_source_path)
+        if sidecar_dir.exists():
+            await asyncio.to_thread(shutil.rmtree, sidecar_dir, True)
+        await asyncio.to_thread(cls._clear_source_import_manifest_sync, source_path)
+        if source_path.exists():
+            await asyncio.to_thread(source_path.unlink)
+
+    @classmethod
     async def index_anime(
         cls,
         source_folder: Path,
@@ -2348,10 +2627,8 @@ class AnimeLibraryService:
         library_path = cls.get_library_path()
         searcher_path = cls.get_anime_searcher_path()
 
-        # Ensure library directory exists
         library_path.mkdir(parents=True, exist_ok=True)
 
-        # Determine anime name
         if anime_name is None:
             anime_name = source_folder.name
 
@@ -2370,17 +2647,17 @@ class AnimeLibraryService:
         yield IndexProgress(
             status="starting",
             message=f"Preparing to index {anime_name}",
+            anime_name=anime_name,
         )
 
-        # Check if source folder exists
         if not source_folder.exists():
             yield IndexProgress(
                 status="error",
                 error=f"Source folder not found: {source_folder}",
+                anime_name=anime_name,
             )
             return
 
-        # Count video files for progress
         def _collect_video_files() -> list[Path]:
             return [
                 f for f in source_folder.iterdir()
@@ -2393,6 +2670,7 @@ class AnimeLibraryService:
             yield IndexProgress(
                 status="error",
                 error=f"No video files found in {source_folder}",
+                anime_name=anime_name,
             )
             return
 
@@ -2404,6 +2682,7 @@ class AnimeLibraryService:
                 status="copying",
                 message=f"Preparing {total_files} files for library import",
                 total_files=total_files,
+                anime_name=anime_name,
             )
             dest_path.mkdir(parents=True, exist_ok=True)
         else:
@@ -2411,98 +2690,24 @@ class AnimeLibraryService:
                 status="copying",
                 message=f"Normalizing {total_files} files in library",
                 total_files=total_files,
+                anime_name=anime_name,
             )
 
-        # Copy or remux each file depending on the source container/codec.
         for i, video_file in enumerate(video_files):
-            source_codec = await asyncio.to_thread(cls.get_primary_video_codec_sync, video_file)
-            is_av1 = source_codec == "av1"
-            should_remux_mkv = video_file.suffix.lower() == ".mkv" and not is_av1
-            preferred_dest = dest_path / (
-                video_file.stem + ".mp4" if should_remux_mkv else video_file.name
+            yield IndexProgress(
+                status="copying",
+                message=f"Preparing {video_file.name}",
+                progress=(i + 0.5) / total_files * 0.3,
+                current_file=video_file.name,
+                total_files=total_files,
+                completed_files=i,
+                anime_name=anime_name,
             )
-            actual_dest = preferred_dest
 
-            existing_ready = preferred_dest.exists()
-
-            action = "Copying"
-            if is_av1:
-                action = "Copying AV1 source"
-            elif should_remux_mkv:
-                action = "Remuxing"
-
-            if not existing_ready:
-                yield IndexProgress(
-                    status="copying",
-                    message=f"{action} {video_file.name}",
-                    progress=(i + 0.5) / total_files * 0.3,
-                    current_file=video_file.name,
-                    total_files=total_files,
-                    completed_files=i,
-                )
-
-                if should_remux_mkv:
-                    try:
-                        remux_result = await run_command(
-                            [
-                                "ffmpeg",
-                                "-y",
-                                "-i",
-                                str(video_file),
-                                "-c",
-                                "copy",
-                                "-movflags",
-                                "+faststart",
-                                str(preferred_dest),
-                            ],
-                            timeout_seconds=cls.REMUX_TIMEOUT_SECONDS,
-                        )
-                        if remux_result.returncode != 0:
-                            import sys
-                            print(
-                                f"[WARNING] ffmpeg remux failed for {video_file.name}: "
-                                f"{remux_result.stderr.decode()[:200]}",
-                                file=sys.stderr,
-                            )
-                            fallback_dest = dest_path / video_file.name
-                            if fallback_dest != video_file and not fallback_dest.exists():
-                                await asyncio.to_thread(shutil.copy2, video_file, fallback_dest)
-                            actual_dest = fallback_dest
-                    except CommandTimeoutError:
-                        import sys
-                        print(
-                            f"[WARNING] ffmpeg remux timed out for {video_file.name}, "
-                            "falling back to copy",
-                            file=sys.stderr,
-                        )
-                        fallback_dest = dest_path / video_file.name
-                        if fallback_dest != video_file and not fallback_dest.exists():
-                            await asyncio.to_thread(shutil.copy2, video_file, fallback_dest)
-                        actual_dest = fallback_dest
-                    except FileNotFoundError as exc:
-                        if is_media_binary_override_error(exc):
-                            raise
-                        import sys
-                        print("[WARNING] ffmpeg not found, falling back to copy", file=sys.stderr)
-                        fallback_dest = dest_path / video_file.name
-                        if fallback_dest != video_file and not fallback_dest.exists():
-                            await asyncio.to_thread(shutil.copy2, video_file, fallback_dest)
-                        actual_dest = fallback_dest
-                elif preferred_dest != video_file:
-                    await asyncio.to_thread(shutil.copy2, video_file, preferred_dest)
-            else:
-                action = "Using existing"
-
-            # When normalizing in-place, drop old non-MP4 source if replacement succeeded.
-            if (
-                dest_path == source_folder
-                and actual_dest == preferred_dest
-                and preferred_dest != video_file
-                and preferred_dest.exists()
-            ):
-                with suppress(OSError):
-                    await asyncio.to_thread(video_file.unlink)
-
+            actual_dest, action, _changed = await cls._prepare_single_source_for_library(
+                source_path=video_file,
+                dest_dir=dest_path,
+            )
             if actual_dest not in prepared_files:
                 prepared_files.append(actual_dest)
 
@@ -2513,35 +2718,25 @@ class AnimeLibraryService:
                 current_file=video_file.name,
                 total_files=total_files,
                 completed_files=i + 1,
+                anime_name=anime_name,
             )
 
-        # Verify all prepared files are accessible and complete before indexing.
         yield IndexProgress(
             status="copying",
             message="Verifying prepared files before indexing...",
             progress=0.3,
             total_files=total_files,
             completed_files=total_files,
+            anime_name=anime_name,
         )
-
-        # Small delay to ensure filesystem has flushed all writes.
-        await asyncio.sleep(1.0)
-
-        for dest_file in prepared_files:
-            if not dest_file.exists():
-                yield IndexProgress(
-                    status="error",
-                    error=f"Prepared file missing after import: {dest_file.name}",
-                )
-                return
-
-            file_stat = await asyncio.to_thread(dest_file.stat)
-            if file_stat.st_size == 0:
-                yield IndexProgress(
-                    status="error",
-                    error=f"Prepared file is empty: {dest_file.name}",
-                )
-                return
+        verify_error = await cls._verify_prepared_library_files(prepared_files)
+        if verify_error is not None:
+            yield IndexProgress(
+                status="error",
+                error=verify_error,
+                anime_name=anime_name,
+            )
+            return
 
         if is_existing_series and abs(effective_fps - requested_fps) > 1e-9:
             yield IndexProgress(
@@ -2552,14 +2747,15 @@ class AnimeLibraryService:
                 ),
                 progress=0.35,
                 total_files=total_files,
+                anime_name=anime_name,
             )
 
-        # Run indexing with pixi run
         yield IndexProgress(
             status="indexing",
             message=f"Indexing {anime_name} at {effective_fps:g} fps",
             progress=0.35,
             total_files=total_files,
+            anime_name=anime_name,
         )
 
         cmd = [
@@ -2575,78 +2771,18 @@ class AnimeLibraryService:
         if require_gpu:
             cmd.append("--require-gpu")
 
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(searcher_path),
-            env=get_media_subprocess_env(cmd),
-        )
-
-        # Read output progressively
-        stdout_lines = []
-        stderr_task = asyncio.create_task(
-            process.stderr.read() if process.stderr is not None else asyncio.sleep(0, result=b"")
-        )
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + cls.INDEX_TIMEOUT_SECONDS
-        aborted = False
-
-        try:
-            assert process.stdout is not None
-            while True:
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    raise asyncio.TimeoutError
-
-                line = await asyncio.wait_for(process.stdout.readline(), timeout=remaining)
-                if not line:
-                    break
-                stdout_lines.append(line.decode())
-
-                # Try to parse progress from output
-                line_str = line.decode().strip()
-                if line_str:
-                    # Estimate progress based on output
-                    yield IndexProgress(
-                        status="indexing",
-                        message=line_str[:100],  # Truncate long messages
-                        progress=0.35 + 0.60 * (len(stdout_lines) / (total_files * 100)),  # Rough estimate
-                        total_files=total_files,
-                    )
-
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                raise asyncio.TimeoutError
-            await asyncio.wait_for(process.wait(), timeout=remaining)
-        except asyncio.CancelledError:
-            aborted = True
-            await terminate_process(process)
-            raise
-        except asyncio.TimeoutError:
-            aborted = True
-            await terminate_process(process)
-            yield IndexProgress(
-                status="error",
-                error=(
-                    f"Indexing timed out after {int(cls.INDEX_TIMEOUT_SECONDS)} seconds. "
-                    "Try reducing library size or retrying."
-                ),
-            )
-            return
-        finally:
-            if aborted and not stderr_task.done():
-                stderr_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await stderr_task
-
-        stderr = await stderr_task
-        if process.returncode != 0:
-            yield IndexProgress(
-                status="error",
-                error=f"Indexing failed: {stderr.decode()}",
-            )
-            return
+        async for progress in cls._stream_searcher_command(
+            cmd=cmd,
+            cwd=searcher_path,
+            total_files=total_files,
+            status="indexing",
+            progress_start=0.35,
+            progress_span=0.60,
+        ):
+            progress.anime_name = anime_name
+            yield progress
+            if progress.status == "error":
+                return
 
         await cls.ensure_episode_manifest(force_refresh=True)
 
@@ -2656,6 +2792,289 @@ class AnimeLibraryService:
             progress=1.0,
             total_files=total_files,
             completed_files=total_files,
+            anime_name=anime_name,
+            prepared_library_paths=[str(path) for path in prepared_files],
+        )
+
+    @classmethod
+    async def update_anime(
+        cls,
+        *,
+        anime_name: str,
+        source_paths: list[Path],
+        batch_size: int = 64,
+        prefetch_batches: int = 3,
+        transform_workers: int = 4,
+        require_gpu: bool = True,
+    ) -> AsyncIterator[IndexProgress]:
+        """Prepare a precise list of source files then incrementally upsert them."""
+        library_path = cls.get_library_path()
+        searcher_path = cls.get_anime_searcher_path()
+        library_path.mkdir(parents=True, exist_ok=True)
+
+        yield IndexProgress(
+            status="starting",
+            message=f"Preparing incremental update for {anime_name}",
+            anime_name=anime_name,
+        )
+
+        if not source_paths:
+            yield IndexProgress(
+                status="error",
+                error="No source files provided for incremental update.",
+                anime_name=anime_name,
+            )
+            return
+
+        existing_series_fps = await asyncio.to_thread(cls._get_indexed_series_fps_sync, anime_name)
+        if existing_series_fps is None:
+            yield IndexProgress(
+                status="error",
+                error=f"Series '{anime_name}' is not indexed yet. Use /anime/index first.",
+                anime_name=anime_name,
+            )
+            return
+
+        video_files: list[Path] = []
+        seen_sources: set[str] = set()
+        for raw_path in source_paths:
+            candidate = raw_path.resolve()
+            if str(candidate) in seen_sources:
+                continue
+            seen_sources.add(str(candidate))
+            if not candidate.exists() or not candidate.is_file():
+                yield IndexProgress(
+                    status="error",
+                    error=f"Source file not found: {candidate}",
+                    anime_name=anime_name,
+                )
+                return
+            if candidate.suffix.lower() not in cls.VIDEO_EXTENSIONS:
+                yield IndexProgress(
+                    status="error",
+                    error=f"Unsupported source file type: {candidate.name}",
+                    anime_name=anime_name,
+                )
+                return
+            video_files.append(candidate)
+
+        total_files = len(video_files)
+        dest_dir = library_path / anime_name
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        prepared_files: list[Path] = []
+
+        yield IndexProgress(
+            status="copying",
+            message=f"Preparing {total_files} files for incremental update",
+            total_files=total_files,
+            anime_name=anime_name,
+        )
+
+        for i, video_file in enumerate(video_files):
+            yield IndexProgress(
+                status="copying",
+                message=f"Preparing {video_file.name}",
+                progress=(i + 0.5) / total_files * 0.3,
+                current_file=video_file.name,
+                total_files=total_files,
+                completed_files=i,
+                anime_name=anime_name,
+            )
+
+            actual_dest, action, _changed = await cls._prepare_single_source_for_library(
+                source_path=video_file,
+                dest_dir=dest_dir,
+            )
+            if actual_dest not in prepared_files:
+                prepared_files.append(actual_dest)
+
+            yield IndexProgress(
+                status="copying",
+                message=f"{action} {video_file.name}",
+                progress=(i + 1) / total_files * 0.3,
+                current_file=video_file.name,
+                total_files=total_files,
+                completed_files=i + 1,
+                anime_name=anime_name,
+            )
+
+        yield IndexProgress(
+            status="copying",
+            message="Verifying prepared files before indexing...",
+            progress=0.3,
+            total_files=total_files,
+            completed_files=total_files,
+            anime_name=anime_name,
+        )
+        verify_error = await cls._verify_prepared_library_files(prepared_files)
+        if verify_error is not None:
+            yield IndexProgress(
+                status="error",
+                error=verify_error,
+                anime_name=anime_name,
+            )
+            return
+
+        manifest_path = await asyncio.to_thread(cls._write_temp_path_manifest, prepared_files)
+        try:
+            yield IndexProgress(
+                status="indexing",
+                message=f"Updating {anime_name} at {existing_series_fps:g} fps",
+                progress=0.35,
+                total_files=total_files,
+                anime_name=anime_name,
+            )
+
+            cmd = [
+                "pixi", "run", "--locked",
+                "python", "-m", "anime_searcher.cli",
+                "update", str(library_path),
+                "--series", anime_name,
+                "--manifest", str(manifest_path),
+                "--batch-size", str(batch_size),
+                "--prefetch-batches", str(prefetch_batches),
+                "--transform-workers", str(transform_workers),
+            ]
+            if require_gpu:
+                cmd.append("--require-gpu")
+
+            async for progress in cls._stream_searcher_command(
+                cmd=cmd,
+                cwd=searcher_path,
+                total_files=total_files,
+                status="indexing",
+                progress_start=0.35,
+                progress_span=0.60,
+            ):
+                progress.anime_name = anime_name
+                yield progress
+                if progress.status == "error":
+                    return
+        finally:
+            with suppress(OSError):
+                manifest_path.unlink()
+
+        await cls.ensure_episode_manifest(force_refresh=True)
+        yield IndexProgress(
+            status="complete",
+            message=f"Successfully updated {anime_name}",
+            progress=1.0,
+            total_files=total_files,
+            completed_files=total_files,
+            anime_name=anime_name,
+            prepared_library_paths=[str(path) for path in prepared_files],
+        )
+
+    @classmethod
+    async def remove_anime_files(
+        cls,
+        *,
+        anime_name: str,
+        library_paths: list[Path],
+    ) -> AsyncIterator[IndexProgress]:
+        """Remove a precise list of already imported library files from the index and library."""
+        library_root = cls.get_library_path()
+        searcher_path = cls.get_anime_searcher_path()
+
+        yield IndexProgress(
+            status="starting",
+            message=f"Preparing removal for {anime_name}",
+            anime_name=anime_name,
+        )
+
+        if not library_paths:
+            yield IndexProgress(
+                status="error",
+                error="No library paths provided for removal.",
+                anime_name=anime_name,
+            )
+            return
+
+        normalized_paths: list[Path] = []
+        seen_paths: set[str] = set()
+        for raw_path in library_paths:
+            candidate = raw_path if raw_path.is_absolute() else (library_root / raw_path)
+            resolved = candidate.resolve()
+            try:
+                rel_path = resolved.relative_to(library_root.resolve())
+            except ValueError:
+                yield IndexProgress(
+                    status="error",
+                    error=f"Path is outside the library root: {raw_path}",
+                    anime_name=anime_name,
+                )
+                return
+            if len(rel_path.parts) < 2 or rel_path.parts[0] != anime_name:
+                yield IndexProgress(
+                    status="error",
+                    error=f"Path does not belong to series '{anime_name}': {raw_path}",
+                    anime_name=anime_name,
+                )
+                return
+            rel_key = str(rel_path)
+            if rel_key in seen_paths:
+                continue
+            seen_paths.add(rel_key)
+            normalized_paths.append(library_root / rel_path)
+
+        total_files = len(normalized_paths)
+        manifest_path = await asyncio.to_thread(cls._write_temp_path_manifest, normalized_paths)
+        try:
+            yield IndexProgress(
+                status="indexing",
+                message=f"Removing {total_files} file(s) from {anime_name}",
+                progress=0.2,
+                total_files=total_files,
+                anime_name=anime_name,
+            )
+
+            cmd = [
+                "pixi", "run", "--locked",
+                "python", "-m", "anime_searcher.cli",
+                "remove", str(library_root),
+                "--series", anime_name,
+                "--manifest", str(manifest_path),
+            ]
+
+            async for progress in cls._stream_searcher_command(
+                cmd=cmd,
+                cwd=searcher_path,
+                total_files=total_files,
+                status="indexing",
+                progress_start=0.2,
+                progress_span=0.5,
+            ):
+                progress.anime_name = anime_name
+                yield progress
+                if progress.status == "error":
+                    return
+        finally:
+            with suppress(OSError):
+                manifest_path.unlink()
+
+        removed_paths: list[str] = []
+        for i, prepared_path in enumerate(normalized_paths, start=1):
+            await cls._delete_library_file_artifacts(prepared_path)
+            removed_paths.append(str(prepared_path))
+            yield IndexProgress(
+                status="copying",
+                message=f"Removed {prepared_path.name}",
+                progress=0.7 + 0.25 * (i / max(total_files, 1)),
+                current_file=prepared_path.name,
+                total_files=total_files,
+                completed_files=i,
+                anime_name=anime_name,
+            )
+
+        await cls.ensure_episode_manifest(force_refresh=True)
+        yield IndexProgress(
+            status="complete",
+            message=f"Successfully removed {len(removed_paths)} file(s) from {anime_name}",
+            progress=1.0,
+            total_files=total_files,
+            completed_files=total_files,
+            anime_name=anime_name,
+            prepared_library_paths=removed_paths,
         )
 
     @classmethod
