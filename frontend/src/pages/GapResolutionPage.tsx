@@ -24,7 +24,7 @@ import {
 import { Button } from "@/components/ui";
 import { ClippedVideoPlayer, ManualMatchModal } from "@/components/video";
 import type { ClippedVideoPlayerHandle } from "@/components/video/ClippedVideoPlayer";
-import { useProjectStore, useSceneStore } from "@/stores";
+import { useSceneStore } from "@/stores";
 import { api } from "@/api/client";
 import { cn, formatTime } from "@/utils";
 import type { Scene, SourceStreamDescriptor } from "@/types";
@@ -70,9 +70,11 @@ interface GapCardProps {
   candidates: GapCandidate[];
   loadingCandidates: boolean;
   isActive?: boolean;
+  shouldLoadSourcePreview?: boolean;
   playbackRate?: number;
   controlsDisabled?: boolean;
   preloadMode?: "metadata" | "auto";
+  ensureEpisodesLoaded: () => Promise<string[]>;
   onUpdate: (
     sceneIndex: number,
     startTime: number,
@@ -102,15 +104,18 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
     candidates,
     loadingCandidates,
     isActive = false,
+    shouldLoadSourcePreview = false,
     playbackRate = 1,
     controlsDisabled = false,
     preloadMode = "metadata",
+    ensureEpisodesLoaded,
     onUpdate,
     onSkip,
   },
   ref,
 ) {
   const [showManualModal, setShowManualModal] = useState(false);
+  const [openingManual, setOpeningManual] = useState(false);
   const tiktokPlayerRef = useRef<ClippedVideoPlayerHandle>(null);
   const sourcePlayerRef = useRef<ClippedVideoPlayerHandle>(null);
   const pendingResolverRef = useRef<(() => void) | null>(null);
@@ -160,6 +165,12 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
 
   /* eslint-disable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
   useEffect(() => {
+    if (!shouldLoadSourcePreview) {
+      setSourceDescriptor(null);
+      setSourceDescriptorLoading(false);
+      return;
+    }
+
     let active = true;
     setSourceDescriptorLoading(true);
 
@@ -202,6 +213,7 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
     gap.episode,
     getSourceDescriptor,
     getChunkWindowStart,
+    shouldLoadSourcePreview,
   ]);
 
   useEffect(() => {
@@ -465,6 +477,18 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
     [gap.scene_index, gap.target_duration, onUpdate],
   );
 
+  const handleOpenManual = useCallback(async () => {
+    setOpeningManual(true);
+    try {
+      await ensureEpisodesLoaded();
+      setShowManualModal(true);
+    } catch {
+      return;
+    } finally {
+      setOpeningManual(false);
+    }
+  }, [ensureEpisodesLoaded]);
+
   const handleSyncPlay = useCallback(async () => {
     await playBothFromStart();
   }, [playBothFromStart]);
@@ -546,7 +570,11 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
             Source: {gap.episode.split("/").pop()}
           </p>
           <div className="aspect-9/16 bg-black rounded overflow-hidden">
-            {sourceDescriptorLoading ? (
+            {!shouldLoadSourcePreview ? (
+              <div className="w-full h-full flex items-center justify-center text-xs text-white/70 px-4 text-center">
+                Source preview loads when this card is nearby or visible.
+              </div>
+            ) : sourceDescriptorLoading ? (
               <div className="w-full h-full flex items-center justify-center text-xs text-white/70">
                 <Loader2 className="h-4 w-4 animate-spin mr-2" />
                 Preparing source stream...
@@ -713,10 +741,16 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
         <Button
           variant="outline"
           size="sm"
-          onClick={() => setShowManualModal(true)}
-          disabled={controlsDisabled}
+          onClick={() => {
+            void handleOpenManual();
+          }}
+          disabled={controlsDisabled || openingManual}
         >
-          <Clock className="h-4 w-4 mr-1" />
+          {openingManual ? (
+            <Loader2 className="h-4 w-4 mr-1 animate-spin" />
+          ) : (
+            <Clock className="h-4 w-4 mr-1" />
+          )}
           Manual
         </Button>
         <Button
@@ -766,7 +800,6 @@ export function GapResolutionPage() {
   const { projectId } = useParams<{ projectId: string }>();
   const navigate = useNavigate();
   const location = useLocation();
-  const { loadProject } = useProjectStore();
   const { scenes, loadScenes } = useSceneStore();
 
   const autoResolveRequested = Boolean(
@@ -792,6 +825,9 @@ export function GapResolutionPage() {
   const [autoScroll, setAutoScroll] = useState(true);
   const [fastWatchPlaying, setFastWatchPlaying] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1);
+  const [visibleSceneIndices, setVisibleSceneIndices] = useState<Set<number>>(
+    new Set(),
+  );
   const gapRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const cardRefs = useRef<Map<number, GapCardHandle>>(new Map());
   const descriptorCacheRef = useRef<Map<string, SourceStreamDescriptor | null>>(
@@ -805,12 +841,18 @@ export function GapResolutionPage() {
   const failedPreparedScenesRef = useRef<Set<number>>(new Set());
   const preparingScenesRef = useRef<Map<number, Promise<void>>>(new Map());
   const prefetchQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const episodesLoadedRef = useRef(false);
+  const episodesRequestRef = useRef<Promise<string[]> | null>(null);
   const autoScrollRef = useRef(true);
   autoScrollRef.current = autoScroll;
 
   const sortedGaps = useMemo(
     () => [...gaps].sort((a, b) => a.scene_index - b.scene_index),
     [gaps],
+  );
+  const sceneByIndex = useMemo(
+    () => new Map(scenes.map((scene) => [scene.index, scene])),
+    [scenes],
   );
 
   const fastWatchPrefetchAhead = useMemo(() => {
@@ -855,10 +897,94 @@ export function GapResolutionPage() {
     [projectId],
   );
 
+  const ensureEpisodesLoaded = useCallback(async (): Promise<string[]> => {
+    if (!projectId) {
+      return [];
+    }
+    if (episodesLoadedRef.current) {
+      return episodes;
+    }
+
+    const existing = episodesRequestRef.current;
+    if (existing) {
+      return existing;
+    }
+
+    const request = api
+      .getEpisodes(projectId)
+      .then(({ episodes: loadedEpisodes }) => {
+        episodesLoadedRef.current = true;
+        setEpisodes(loadedEpisodes);
+        return loadedEpisodes;
+      })
+      .catch((err) => {
+        setError((err as Error).message);
+        throw err;
+      })
+      .finally(() => {
+        episodesRequestRef.current = null;
+      });
+
+    episodesRequestRef.current = request;
+    return request;
+  }, [episodes, projectId]);
+
   useEffect(() => {
     descriptorCacheRef.current.clear();
     descriptorRequestsRef.current.clear();
+    episodesLoadedRef.current = false;
+    episodesRequestRef.current = null;
+    setEpisodes([]);
+    setVisibleSceneIndices(new Set());
   }, [projectId]);
+
+  useEffect(() => {
+    const observedEntries = Array.from(gapRefs.current.entries());
+    if (observedEntries.length === 0) {
+      setVisibleSceneIndices(new Set());
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        setVisibleSceneIndices((previous) => {
+          const next = new Set(previous);
+          let changed = false;
+
+          for (const entry of entries) {
+            const rawSceneIndex = (entry.target as HTMLElement).dataset.gapSceneIndex;
+            const sceneIndex = Number(rawSceneIndex);
+            if (!Number.isFinite(sceneIndex)) {
+              continue;
+            }
+
+            if (entry.isIntersecting) {
+              if (!next.has(sceneIndex)) {
+                next.add(sceneIndex);
+                changed = true;
+              }
+            } else if (next.delete(sceneIndex)) {
+              changed = true;
+            }
+          }
+
+          return changed ? next : previous;
+        });
+      },
+      {
+        rootMargin: "400px 0px",
+        threshold: 0.01,
+      },
+    );
+
+    for (const [, element] of observedEntries) {
+      observer.observe(element);
+    }
+
+    return () => {
+      observer.disconnect();
+    };
+  }, [sortedGaps]);
 
   const clearFastWatchBuffers = useCallback(() => {
     preparedScenesRef.current.clear();
@@ -1119,51 +1245,75 @@ export function GapResolutionPage() {
   useEffect(() => {
     if (!projectId) return;
 
-    const loadData = async () => {
-      setLoading(true);
+    let cancelled = false;
+
+    const loadCandidates = async () => {
+      if (autoResolveRequested) {
+        return;
+      }
+
+      setLoadingCandidates(true);
       try {
-        await loadProject(projectId);
-        await loadScenes(projectId);
-
-        // Load gaps
-        const gapsResponse = await fetch(`/api/projects/${projectId}/gaps`);
-        if (gapsResponse.ok) {
-          const gapsData = await gapsResponse.json();
-          const loadedGaps: GapInfo[] = gapsData.gaps || [];
-          setGaps(loadedGaps);
-
-          // Batch-fetch all candidates in a single request
-          // Skip when auto-resolving: auto-fill generates candidates internally
-          if (loadedGaps.length > 0 && !autoResolveRequested) {
-            setLoadingCandidates(true);
-            try {
-              const candidatesResponse = await fetch(
-                `/api/projects/${projectId}/gaps/all-candidates`,
-              );
-              if (candidatesResponse.ok) {
-                const candidatesData = await candidatesResponse.json();
-                setCandidatesByScene(candidatesData.candidates_by_scene || {});
-              }
-            } catch (err) {
-              console.error("Failed to batch-load candidates:", err);
-            } finally {
-              setLoadingCandidates(false);
-            }
-          }
+        const candidatesResponse = await fetch(
+          `/api/projects/${projectId}/gaps/all-candidates`,
+        );
+        if (!candidatesResponse.ok) {
+          throw new Error("Failed to load gap candidates");
         }
-
-        // Load episodes for manual editing
-        const { episodes: loadedEpisodes } = await api.getEpisodes(projectId);
-        setEpisodes(loadedEpisodes);
+        const candidatesData = await candidatesResponse.json();
+        if (!cancelled) {
+          setCandidatesByScene(candidatesData.candidates_by_scene || {});
+        }
       } catch (err) {
-        setError((err as Error).message);
+        console.error("Failed to batch-load candidates:", err);
       } finally {
-        setLoading(false);
+        if (!cancelled) {
+          setLoadingCandidates(false);
+        }
       }
     };
 
-    loadData();
-  }, [autoResolveRequested, projectId, loadProject, loadScenes]);
+    const loadData = async () => {
+      setLoading(true);
+      setError(null);
+      setGaps([]);
+      setCandidatesByScene({});
+      setLoadingCandidates(false);
+      try {
+        const gapsRequest = fetch(`/api/projects/${projectId}/gaps`);
+        await Promise.all([loadScenes(projectId), gapsRequest]);
+
+        const gapsResponse = await gapsRequest;
+        if (!gapsResponse.ok) {
+          throw new Error("Failed to load gaps");
+        }
+
+        const gapsData = await gapsResponse.json();
+        const loadedGaps: GapInfo[] = gapsData.gaps || [];
+        if (cancelled) {
+          return;
+        }
+
+        setGaps(loadedGaps);
+        setLoading(false);
+
+        if (loadedGaps.length > 0) {
+          void loadCandidates();
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError((err as Error).message);
+          setLoading(false);
+        }
+      }
+    };
+
+    void loadData();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [autoResolveRequested, projectId, loadScenes]);
 
   useEffect(() => {
     if (sortedGaps.length === 0) {
@@ -1553,14 +1703,18 @@ export function GapResolutionPage() {
         {/* Gap cards */}
         <div className="space-y-4">
           {sortedGaps.map((gap, gapPosition) => {
-            const scene = scenes.find((s) => s.index === gap.scene_index);
+            const scene = sceneByIndex.get(gap.scene_index);
             const isResolved = resolvedGaps.has(gap.scene_index);
             const isSkipped = skippedGaps.has(gap.scene_index);
             const resolvedTiming = resolvedGaps.get(gap.scene_index) || null;
+            const shouldLoadSourcePreview =
+              visibleSceneIndices.has(gap.scene_index) ||
+              Math.abs(gapPosition - activeScenePosition) <= 2;
 
             return (
               <div
                 key={gap.scene_index}
+                data-gap-scene-index={gap.scene_index}
                 className="[content-visibility:auto] [contain-intrinsic-size:960px]"
                 ref={(el) => {
                   if (el) gapRefs.current.set(gap.scene_index, el);
@@ -1583,6 +1737,7 @@ export function GapResolutionPage() {
                   candidates={candidatesByScene[gap.scene_index] || []}
                   loadingCandidates={loadingCandidates}
                   isActive={activeSceneIndex === gap.scene_index}
+                  shouldLoadSourcePreview={shouldLoadSourcePreview}
                   playbackRate={playbackRate}
                   controlsDisabled={fastWatchPlaying}
                   preloadMode={
@@ -1591,6 +1746,7 @@ export function GapResolutionPage() {
                       ? "auto"
                       : "metadata"
                   }
+                  ensureEpisodesLoaded={ensureEpisodesLoaded}
                   onUpdate={handleUpdateGap}
                   onSkip={handleSkipGap}
                 />

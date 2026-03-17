@@ -9,7 +9,7 @@ sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from app.models.match import MatchList, SceneMatch
 from app.services.anime_library import AnimeLibraryService
-from app.services.gap_resolution import GapInfo, GapResolutionService
+from app.services.gap_resolution import GapCandidate, GapInfo, GapResolutionService
 
 
 PROJECT_ID = "3c6cbee7ce0c"
@@ -145,6 +145,29 @@ def _install_fake_episode(
     GapResolutionService._fps_cache.clear()
 
     return episode_path, seen_thresholds
+
+
+def test_fixture_project_gap_output_is_stable():
+    match_list = MatchList.model_validate_json((PROJECT_DIR / "matches_before_gaps.json").read_text())
+    transcription = json.loads((PROJECT_DIR / "gap_detection_transcription.json").read_text())
+
+    gaps = GapResolutionService.calculate_gaps(match_list.matches, transcription["scenes"])
+
+    assert [gap.scene_index for gap in gaps] == [0, 2, 3, 10, 11, 16, 18, 25, 26, 41, 46]
+    assert round(sum(gap.gap_duration for gap in gaps), 6) == pytest.approx(5.738692, abs=1e-6)
+    assert [round(gap.gap_duration, 6) for gap in gaps] == [
+        1.383333,
+        0.7,
+        1.066667,
+        0.8,
+        0.883333,
+        0.1,
+        0.35,
+        0.333333,
+        0.016667,
+        0.072025,
+        0.033333,
+    ]
 
 
 @pytest.mark.asyncio
@@ -477,3 +500,56 @@ async def test_different_episode_neighbors_do_not_block_candidate_generation(
     assert candidates
     assert candidates[0].is_cut_aligned is True
     assert all(candidate.overlap_count == 0 for candidate in candidates)
+
+
+@pytest.mark.asyncio
+async def test_generate_candidates_batch_dedup_reuses_cached_result(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    gap = _make_gap(scene_index=0, current_start=10.0, current_end=11.0, target_duration=2.0)
+    matches = [_make_match(0, 10.0, 11.0)]
+    call_count = 0
+
+    async def fake_generate_candidates_batch(
+        cls,
+        gaps: list[GapInfo],
+        matches: list[SceneMatch] | None = None,
+        max_candidates: int = 6,
+    ) -> dict[int, list[GapCandidate]]:
+        nonlocal call_count
+        call_count += 1
+        return {
+            gaps[0].scene_index: [
+                GapCandidate(
+                    start_time=9.0,
+                    end_time=11.0,
+                    duration=2.0,
+                    effective_speed=Fraction(1, 1),
+                    speed_diff=0.0,
+                    extend_type="extend_start",
+                    snap_description="cached candidate",
+                )
+            ]
+        }
+
+    monkeypatch.setattr(
+        GapResolutionService,
+        "generate_candidates_batch",
+        classmethod(fake_generate_candidates_batch),
+    )
+    GapResolutionService._candidate_batch_inflight.clear()
+    GapResolutionService._candidate_batch_result_cache.clear()
+
+    first = await GapResolutionService.generate_candidates_batch_dedup(
+        [gap],
+        matches=matches,
+    )
+    second = await GapResolutionService.generate_candidates_batch_dedup(
+        [gap],
+        matches=matches,
+    )
+
+    assert call_count == 1
+    assert first == second
+    assert first is not second
+    assert first[gap.scene_index] is not second[gap.scene_index]

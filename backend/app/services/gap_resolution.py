@@ -12,6 +12,8 @@ consistent speed calculations that match the Premiere Pro JSX output.
 
 import asyncio
 import json
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -223,6 +225,10 @@ class GapResolutionService:
     _scene_cut_cache: dict[str, list[float]] = {}
     _candidate_batch_inflight: dict[str, asyncio.Task[dict[int, list["GapCandidate"]]]] = {}
     _candidate_batch_lock = asyncio.Lock()
+    _candidate_batch_result_cache: OrderedDict[
+        str,
+        tuple[float, dict[int, list["GapCandidate"]]],
+    ] = OrderedDict()
 
     # FPS cache: avoids redundant ffprobe calls for the same video file.
     _fps_cache: dict[str, Fraction] = {}
@@ -233,6 +239,8 @@ class GapResolutionService:
     SOURCE_RATE = FrameRateInfo(timebase=24, ntsc=True)
     OVERLAP_COST_SCALE = 1_000_000
     CONTINUATION_TIE_WINDOW = 0.15
+    CANDIDATE_BATCH_CACHE_TTL_SECONDS = 15 * 60
+    CANDIDATE_BATCH_CACHE_MAX_ENTRIES = 16
 
     @classmethod
     async def detect_video_fps(cls, video_path: Path) -> Fraction:
@@ -825,6 +833,75 @@ class GapResolutionService:
         return f"{max_candidates}:{digest}"
 
     @classmethod
+    def _clone_candidate_batch_result(
+        cls,
+        candidates_by_scene: dict[int, list[GapCandidate]],
+    ) -> dict[int, list[GapCandidate]]:
+        return {
+            scene_index: list(candidates)
+            for scene_index, candidates in candidates_by_scene.items()
+        }
+
+    @classmethod
+    def _prune_candidate_batch_cache_locked(cls, now: float | None = None) -> None:
+        current_time = time.monotonic() if now is None else now
+        expired_keys = [
+            cache_key
+            for cache_key, (stored_at, _) in cls._candidate_batch_result_cache.items()
+            if current_time - stored_at > cls.CANDIDATE_BATCH_CACHE_TTL_SECONDS
+        ]
+        for cache_key in expired_keys:
+            cls._candidate_batch_result_cache.pop(cache_key, None)
+
+        while len(cls._candidate_batch_result_cache) > cls.CANDIDATE_BATCH_CACHE_MAX_ENTRIES:
+            cls._candidate_batch_result_cache.popitem(last=False)
+
+    @classmethod
+    def _get_candidate_batch_cache_locked(
+        cls,
+        cache_key: str,
+    ) -> dict[int, list[GapCandidate]] | None:
+        now = time.monotonic()
+        cls._prune_candidate_batch_cache_locked(now)
+        entry = cls._candidate_batch_result_cache.get(cache_key)
+        if entry is None:
+            return None
+
+        cls._candidate_batch_result_cache.move_to_end(cache_key)
+        _, cached_result = entry
+        return cls._clone_candidate_batch_result(cached_result)
+
+    @classmethod
+    def _store_candidate_batch_cache_locked(
+        cls,
+        cache_key: str,
+        candidates_by_scene: dict[int, list[GapCandidate]],
+    ) -> None:
+        cls._candidate_batch_result_cache[cache_key] = (
+            time.monotonic(),
+            cls._clone_candidate_batch_result(candidates_by_scene),
+        )
+        cls._candidate_batch_result_cache.move_to_end(cache_key)
+        cls._prune_candidate_batch_cache_locked()
+
+    @classmethod
+    async def _generate_and_cache_candidates_batch(
+        cls,
+        cache_key: str,
+        gaps: list[GapInfo],
+        matches: list[SceneMatch] | None,
+        max_candidates: int,
+    ) -> dict[int, list[GapCandidate]]:
+        result = await cls.generate_candidates_batch(
+            gaps,
+            matches=matches,
+            max_candidates=max_candidates,
+        )
+        async with cls._candidate_batch_lock:
+            cls._store_candidate_batch_cache_locked(cache_key, result)
+        return cls._clone_candidate_batch_result(result)
+
+    @classmethod
     async def generate_candidates_batch_dedup(
         cls,
         gaps: list[GapInfo],
@@ -837,10 +914,15 @@ class GapResolutionService:
 
         key = cls._build_gap_batch_key(gaps, matches, max_candidates)
         async with cls._candidate_batch_lock:
+            cached = cls._get_candidate_batch_cache_locked(key)
+            if cached is not None:
+                return cached
+
             task = cls._candidate_batch_inflight.get(key)
             if task is None:
                 task = asyncio.create_task(
-                    cls.generate_candidates_batch(
+                    cls._generate_and_cache_candidates_batch(
+                        key,
                         gaps,
                         matches=matches,
                         max_candidates=max_candidates,
@@ -849,7 +931,8 @@ class GapResolutionService:
                 cls._candidate_batch_inflight[key] = task
 
         try:
-            return await task
+            result = await task
+            return cls._clone_candidate_batch_result(result)
         finally:
             if task.done():
                 async with cls._candidate_batch_lock:

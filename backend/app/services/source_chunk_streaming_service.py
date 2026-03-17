@@ -8,6 +8,7 @@ import os
 import subprocess
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 from ..config import settings
@@ -33,10 +34,17 @@ class SourceChunkStreamingService:
     GC_MAX_CACHE_BYTES = 8 * 1024 * 1024 * 1024
     GC_STALE_SECONDS = 7 * 24 * 3600
     GC_MIN_INTERVAL_SECONDS = 45.0
+    SOURCE_DESCRIPTOR_CACHE_MAX_ENTRIES = 256
 
     _global_semaphore: asyncio.Semaphore | None = None
     _source_locks_guard = threading.Lock()
     _source_locks: dict[str, threading.Lock] = {}
+    _descriptor_lock = asyncio.Lock()
+    _descriptor_cache: OrderedDict[tuple[str, int, int], dict[str, object]] = OrderedDict()
+    _descriptor_inflight: dict[
+        tuple[str, int, int],
+        asyncio.Task[dict[str, object]],
+    ] = {}
 
     _gc_lock = threading.Lock()
     _last_gc_run_epoch: float = 0.0
@@ -63,6 +71,75 @@ class SourceChunkStreamingService:
                 lock = threading.Lock()
                 cls._source_locks[key] = lock
             return lock
+
+    @classmethod
+    def _descriptor_cache_key_sync(cls, source_path: Path) -> tuple[str, int, int]:
+        resolved = source_path.resolve()
+        stat = resolved.stat()
+        return (str(resolved), stat.st_mtime_ns, stat.st_size)
+
+    @classmethod
+    def _prune_descriptor_cache_locked(cls) -> None:
+        while len(cls._descriptor_cache) > cls.SOURCE_DESCRIPTOR_CACHE_MAX_ENTRIES:
+            cls._descriptor_cache.popitem(last=False)
+
+    @classmethod
+    def _get_cached_descriptor_locked(
+        cls,
+        cache_key: tuple[str, int, int],
+    ) -> dict[str, object] | None:
+        cached = cls._descriptor_cache.get(cache_key)
+        if cached is None:
+            return None
+
+        cls._descriptor_cache.move_to_end(cache_key)
+        return dict(cached)
+
+    @classmethod
+    def _store_descriptor_cache_locked(
+        cls,
+        cache_key: tuple[str, int, int],
+        descriptor: dict[str, object],
+    ) -> None:
+        cls._descriptor_cache[cache_key] = dict(descriptor)
+        cls._descriptor_cache.move_to_end(cache_key)
+        cls._prune_descriptor_cache_locked()
+
+    @classmethod
+    def _build_descriptor_sync(cls, source_path: Path) -> dict[str, object]:
+        stream = cls._probe_stream_sync(source_path)
+        duration = cls._probe_duration_sync(source_path)
+
+        codec = str((stream or {}).get("codec_name", "")).strip()
+        pix_fmt = str((stream or {}).get("pix_fmt", "")).strip()
+        codec_normalized = codec.lower()
+        pix_fmt_normalized = pix_fmt.lower()
+        compatible = (
+            source_path.suffix.lower() == ".mp4"
+            and codec_normalized == "h264"
+            and pix_fmt_normalized in {"yuv420p", "yuvj420p"}
+        )
+
+        return {
+            "mode": "passthrough" if compatible else "chunked",
+            "duration": float(duration or 0.0),
+            "codec": codec,
+            "pix_fmt": pix_fmt,
+            "chunk_duration": cls.DEFAULT_CHUNK_DURATION_SECONDS,
+            "chunk_step": cls.DEFAULT_CHUNK_STEP_SECONDS,
+            "seek_guard_seconds": cls.DEFAULT_SEEK_GUARD_SECONDS,
+        }
+
+    @classmethod
+    async def _compute_and_cache_descriptor(
+        cls,
+        source_path: Path,
+        cache_key: tuple[str, int, int],
+    ) -> dict[str, object]:
+        descriptor = await asyncio.to_thread(cls._build_descriptor_sync, source_path)
+        async with cls._descriptor_lock:
+            cls._store_descriptor_cache_locked(cache_key, descriptor)
+        return dict(descriptor)
 
     @staticmethod
     def _probe_stream_sync(video_path: Path) -> dict | None:
@@ -527,25 +604,28 @@ class SourceChunkStreamingService:
 
     @classmethod
     async def get_descriptor(cls, source_path: Path) -> dict[str, object]:
-        stream = await asyncio.to_thread(cls._probe_stream_sync, source_path)
-        duration = await asyncio.to_thread(cls._probe_duration_sync, source_path)
-        compatible = await asyncio.to_thread(
-            AnimeLibraryService.is_browser_preview_compatible,
-            source_path,
-        )
+        cache_key = cls._descriptor_cache_key_sync(source_path)
+        async with cls._descriptor_lock:
+            cached = cls._get_cached_descriptor_locked(cache_key)
+            if cached is not None:
+                return cached
 
-        codec = str((stream or {}).get("codec_name", ""))
-        pix_fmt = str((stream or {}).get("pix_fmt", ""))
+            task = cls._descriptor_inflight.get(cache_key)
+            if task is None:
+                task = asyncio.create_task(
+                    cls._compute_and_cache_descriptor(source_path, cache_key)
+                )
+                cls._descriptor_inflight[cache_key] = task
 
-        return {
-            "mode": "passthrough" if compatible else "chunked",
-            "duration": float(duration or 0.0),
-            "codec": codec,
-            "pix_fmt": pix_fmt,
-            "chunk_duration": cls.DEFAULT_CHUNK_DURATION_SECONDS,
-            "chunk_step": cls.DEFAULT_CHUNK_STEP_SECONDS,
-            "seek_guard_seconds": cls.DEFAULT_SEEK_GUARD_SECONDS,
-        }
+        try:
+            descriptor = await task
+            return dict(descriptor)
+        finally:
+            if task.done():
+                async with cls._descriptor_lock:
+                    current = cls._descriptor_inflight.get(cache_key)
+                    if current is task:
+                        cls._descriptor_inflight.pop(cache_key, None)
 
     @classmethod
     async def get_chunk(
