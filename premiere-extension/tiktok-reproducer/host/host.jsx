@@ -9,8 +9,10 @@ var ATR_EXTENSION_ID = "com.animetiktok.tiktokreproducer.panel";
 var __atrEncoderEvents = [];
 var __atrEncoderJobProjectMap = {};
 var __atrEncoderJobMetaMap = {};
+var __atrTempAudioSequenceByJob = {};
 var __atrEncoderCallbacksBound = false;
 var __atrCleanupMaxBinPasses = 5;
+var __atrTempAudioSequencePrefix = "ATR_AUDIO_NO_MUSIC_TMP__";
 
 function __atrSafeString(value) {
   if (value === undefined || value === null) {
@@ -371,6 +373,13 @@ function __atrRememberEncoderJob(
 }
 
 function __atrForgetEncoderJob(jobID) {
+  var tempSequenceName = __atrSafeString(__atrTempAudioSequenceByJob[jobID] || "");
+  if (tempSequenceName) {
+    __atrDeleteSequenceByName(tempSequenceName);
+  }
+  try {
+    delete __atrTempAudioSequenceByJob[jobID];
+  } catch (e0) {}
   try {
     delete __atrEncoderJobProjectMap[jobID];
   } catch (e) {}
@@ -553,6 +562,93 @@ function __atrCloneActiveSequence() {
   return cloneSequence;
 }
 
+function __atrGetSequenceName(sequence) {
+  if (!sequence) {
+    return "";
+  }
+  try {
+    return __atrSafeString(sequence.name || sequence.sequenceID || "");
+  } catch (e) {
+    return "";
+  }
+}
+
+function __atrDeleteSequenceByName(sequenceName) {
+  var targetName = __atrSafeString(sequenceName);
+  if (!targetName) {
+    return false;
+  }
+
+  var sequences = app && app.project ? app.project.sequences : null;
+  if (!sequences) {
+    return false;
+  }
+
+  var count = 0;
+  try {
+    count = Number(sequences.numSequences || 0);
+  } catch (eCount) {
+    count = 0;
+  }
+
+  for (var i = 0; i < count; i += 1) {
+    var sequence = sequences[i];
+    if (!sequence) {
+      continue;
+    }
+    if (__atrGetSequenceName(sequence) !== targetName) {
+      continue;
+    }
+
+    try {
+      if (sequence.projectItem && sequence.projectItem.deleteBin) {
+        return !!sequence.projectItem.deleteBin();
+      }
+    } catch (eDeleteBin) {}
+
+    try {
+      if (sequence.projectItem && sequence.projectItem.select && app.project && app.project.deleteSelection) {
+        sequence.projectItem.select();
+        return !!app.project.deleteSelection();
+      }
+    } catch (eDeleteSelection) {}
+  }
+
+  return false;
+}
+
+function cleanupOrphanTempAudioSequences() {
+  try {
+    var sequences = app && app.project ? app.project.sequences : null;
+    if (!sequences) {
+      return "0";
+    }
+
+    var count = 0;
+    try {
+      count = Number(sequences.numSequences || 0);
+    } catch (eCount) {
+      count = 0;
+    }
+
+    var removed = 0;
+    for (var i = count - 1; i >= 0; i -= 1) {
+      var sequence = sequences[i];
+      var name = __atrGetSequenceName(sequence);
+      if (!name || name.indexOf(__atrTempAudioSequencePrefix) !== 0) {
+        continue;
+      }
+      if (__atrDeleteSequenceByName(name)) {
+        removed += 1;
+      }
+    }
+
+    return __atrSafeString(removed);
+  } catch (e) {
+    return "ERROR: " + e.message;
+  }
+}
+
 /**
  * Execute a .jsx script file with error handling.
  * @param {string} scriptPath - Absolute path to the .jsx file (forward slashes)
@@ -656,9 +752,10 @@ function startManagedExport(projectId, outputPath, presetPath) {
 
     var audioJobID = "";
     if (exportAudioNoMusic) {
-      var normalizedAudioPresetPath = __atrNormalizePath(
-        audioPresetPath || presetPath,
-      );
+      if (!audioPresetPath) {
+        return "ERROR: Missing audio preset path";
+      }
+      var normalizedAudioPresetPath = __atrNormalizePath(audioPresetPath);
       var audioPresetFile = new File(normalizedAudioPresetPath);
       if (!audioPresetFile.exists) {
         return (
@@ -688,6 +785,13 @@ function startManagedExport(projectId, outputPath, presetPath) {
       );
 
       var tempSequence = __atrCloneActiveSequence();
+      var tempSequenceName =
+        __atrTempAudioSequencePrefix + __atrSafeString(projectId) + "__" + new Date().getTime();
+      try {
+        tempSequence.name = tempSequenceName;
+      } catch (eRename) {
+        tempSequenceName = __atrGetSequenceName(tempSequence);
+      }
       __atrRemoveAllTrackClips(tempSequence.videoTracks);
       __atrRemoveTrackByIndex(tempSequence.audioTracks, 2);
 
@@ -703,6 +807,7 @@ function startManagedExport(projectId, outputPath, presetPath) {
         audioOutputFsPath,
         audioPresetFsPath,
       );
+      __atrTempAudioSequenceByJob[audioJobID] = __atrSafeString(tempSequenceName);
       __atrPushEncoderEvent("queued", audioJobID, {
         output_path: audioOutputFsPath,
         preset_path: audioPresetFsPath,

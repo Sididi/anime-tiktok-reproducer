@@ -875,10 +875,11 @@ function performDownloadProject(payload, emitProgress) {
   });
 }
 
-function getExistingOutputFile(auth, folderId) {
+function getExistingOutputFile(auth, folderId, outputFileName) {
+  var targetOutputName = String(outputFileName || OUTPUT_FILENAME);
   var q = [
     "trashed=false",
-    "name='" + escapeQueryValue(OUTPUT_FILENAME) + "'",
+    "name='" + escapeQueryValue(targetOutputName) + "'",
     "'" + escapeQueryValue(folderId) + "' in parents",
   ].join(" and ");
 
@@ -948,7 +949,9 @@ function readChunkFromFile(filePath, start, endInclusive) {
   });
 }
 
-function startResumableSession(auth, folderId, existingFileId, fileSize) {
+function startResumableSession(auth, folderId, existingFileId, fileSize, outputFileName, uploadContentType) {
+  var targetOutputName = String(outputFileName || OUTPUT_FILENAME);
+  var targetContentType = String(uploadContentType || "application/octet-stream");
   var method;
   var apiPath;
   var body;
@@ -956,12 +959,12 @@ function startResumableSession(auth, folderId, existingFileId, fileSize) {
   if (existingFileId) {
     method = "PATCH";
     apiPath = "/upload/drive/v3/files/" + encodeURIComponent(existingFileId);
-    body = { name: OUTPUT_FILENAME };
+    body = { name: targetOutputName };
   } else {
     method = "POST";
     apiPath = "/upload/drive/v3/files";
     body = {
-      name: OUTPUT_FILENAME,
+      name: targetOutputName,
       parents: [folderId],
     };
   }
@@ -980,7 +983,7 @@ function startResumableSession(auth, folderId, existingFileId, fileSize) {
         path: apiPath + "?" + qs,
         headers: {
           Authorization: "Bearer " + token,
-          "X-Upload-Content-Type": "video/mp4",
+          "X-Upload-Content-Type": targetContentType,
           "X-Upload-Content-Length": String(fileSize),
         },
       },
@@ -1037,6 +1040,18 @@ function performResumableUpload(payload, emitProgress) {
   var stat = fs.statSync(outputPath);
   var fileSize = stat.size;
   var fileMtimeMs = stat.mtimeMs;
+  var outputFileName = String(payload.output_file_name || path.basename(outputPath) || OUTPUT_FILENAME);
+  var outputLower = outputFileName.toLowerCase();
+  var outputContentType = "application/octet-stream";
+  if (outputLower.slice(-4) === ".mp4") {
+    outputContentType = "video/mp4";
+  } else if (outputLower.slice(-4) === ".wav") {
+    outputContentType = "audio/wav";
+  } else if (outputLower.slice(-4) === ".m4a") {
+    outputContentType = "audio/mp4";
+  } else if (outputLower.slice(-4) === ".mp3") {
+    outputContentType = "audio/mpeg";
+  }
   var auth = createDriveAuth(settings);
 
   emitProgress({
@@ -1046,7 +1061,7 @@ function performResumableUpload(payload, emitProgress) {
     file_size: fileSize,
   });
 
-  return getExistingOutputFile(auth, folderId).then(function (existingFile) {
+  return getExistingOutputFile(auth, folderId, outputFileName).then(function (existingFile) {
     var existingFileId = existingFile ? existingFile.id : null;
     var sessionState = readJson(sessionFile, null);
 
@@ -1054,6 +1069,7 @@ function performResumableUpload(payload, emitProgress) {
       !sessionState ||
       sessionState.file_size !== fileSize ||
       sessionState.file_mtime_ms !== fileMtimeMs ||
+      sessionState.output_file_name !== outputFileName ||
       sessionState.drive_folder_id !== folderId ||
       sessionState.drive_file_id !== (existingFileId || null) ||
       !sessionState.upload_url
@@ -1070,11 +1086,13 @@ function performResumableUpload(payload, emitProgress) {
         drive_file_id: sessionState.drive_file_id || null,
       });
     } else {
-      sessionPromise = startResumableSession(auth, folderId, existingFileId, fileSize).then(function (created) {
+      sessionPromise = startResumableSession(auth, folderId, existingFileId, fileSize, outputFileName, outputContentType).then(function (created) {
         var nextState = {
           upload_url: created.upload_url,
           drive_file_id: created.file_id || existingFileId || null,
           drive_folder_id: folderId,
+          output_file_name: outputFileName,
+          output_content_type: outputContentType,
           file_size: fileSize,
           file_mtime_ms: fileMtimeMs,
           updated_at: nowIso(),

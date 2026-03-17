@@ -530,6 +530,41 @@
     return true;
   }
 
+  function countUploadedExpectedOutputs(state) {
+    var expected = getExpectedOutputPaths(state);
+    var uploadedCount = 0;
+    expected.forEach(function (outputPath) {
+      if (hasOutputUploadFinished(state, outputPath)) {
+        uploadedCount += 1;
+      }
+    });
+    return {
+      uploaded: uploadedCount,
+      total: expected.length,
+    };
+  }
+
+  function queueMissingUploadsForState(projectId, state, reason) {
+    var expected = getExpectedOutputPaths(state);
+    var queued = 0;
+    expected.forEach(function (outputPath) {
+      var normalizedPath = String(outputPath || "").trim();
+      if (!normalizedPath) {
+        return;
+      }
+      if (hasOutputUploadFinished(state, normalizedPath)) {
+        return;
+      }
+      if (!fs.existsSync(normalizedPath)) {
+        return;
+      }
+      if (queueUpload(projectId, reason, normalizedPath)) {
+        queued += 1;
+      }
+    });
+    return queued;
+  }
+
   function listWatchedOutputPaths(dirPath) {
     try {
       var names = fs.readdirSync(dirPath);
@@ -1633,6 +1668,10 @@
     var selectedOutputPath = String(
       outputPathOverride || (state && state.output_path) || "",
     ).trim();
+    var selectedOutputName = path.basename(selectedOutputPath || "");
+    var safeOutputNameKey = selectedOutputName
+      ? selectedOutputName.replace(/[^a-zA-Z0-9._-]/g, "_")
+      : "output";
     if (!state) {
       return Promise.reject(new Error("Unknown project state: " + projectId));
     }
@@ -1681,9 +1720,10 @@
     uploadPayload.project_id = projectId;
     uploadPayload.drive_folder_id = state.drive_folder_id;
     uploadPayload.output_path = selectedOutputPath;
+    uploadPayload.output_file_name = selectedOutputName;
     uploadPayload.session_state_path = path.join(
       UPLOAD_SESSIONS_DIR,
-      projectId + ".json",
+      projectId + "__" + safeOutputNameKey + ".json",
     );
 
     var lastProgressPct = -1;
@@ -1748,6 +1788,20 @@
             ")",
           "success",
         );
+
+        var uploadProgress = countUploadedExpectedOutputs(newState);
+        if (uploadProgress.total > 0) {
+          log(
+            "Upload artifacts for " +
+              projectId +
+              ": " +
+              uploadProgress.uploaded +
+              "/" +
+              uploadProgress.total +
+              " completed",
+            uploadProgress.uploaded >= uploadProgress.total ? "success" : "info",
+          );
+        }
         resetMonitorCandidateSelection(projectId);
 
         if (!allUploaded) {
@@ -2185,6 +2239,11 @@
   }
 
   function armMonitorsForRecoveredStates() {
+    var recoveryDownloadQueued = 0;
+    var recoveryUploadQueued = 0;
+    var recoveryMonitorArmed = 0;
+    var recoveryCleanupScheduled = 0;
+
     Object.keys(projectStates).forEach(function (projectId) {
       var state = projectStates[projectId];
       if (!state) {
@@ -2197,18 +2256,27 @@
             project_id: projectId,
             source: "recovery",
           });
+          recoveryDownloadQueued += 1;
         }
         return;
       }
 
       if (state.status === "uploading") {
-        if (!isJobQueued("upload_output", projectId)) {
+        var queuedUploading = queueMissingUploadsForState(
+          projectId,
+          state,
+          "recovery_upload",
+        );
+        if (queuedUploading > 0) {
+          recoveryUploadQueued += queuedUploading;
+        } else if (!isJobQueued("upload_output", projectId)) {
           enqueueJob("upload_output", {
             project_id: projectId,
             output_path: state.output_path || "",
             cleanup_after_upload: !!state.pending_cleanup_choice,
             reason: "recovery_upload",
           });
+          recoveryUploadQueued += 1;
         }
         return;
       }
@@ -2218,6 +2286,7 @@
         (state.status === "cleanup_failed" && !!state.cleanup_retryable)
       ) {
         scheduleCleanupRetry(projectId, 1000);
+        recoveryCleanupScheduled += 1;
         return;
       }
 
@@ -2229,8 +2298,36 @@
         state.status === "exporting"
       ) {
         armExportMonitor(projectId);
+        recoveryMonitorArmed += 1;
+
+        if (state.status === "uploaded_partial" || state.status === "upload_failed") {
+          recoveryUploadQueued += queueMissingUploadsForState(
+            projectId,
+            state,
+            "recovery_missing_output",
+          );
+        }
       }
     });
+
+    if (
+      recoveryDownloadQueued > 0 ||
+      recoveryUploadQueued > 0 ||
+      recoveryMonitorArmed > 0 ||
+      recoveryCleanupScheduled > 0
+    ) {
+      log(
+        "Recovery: downloads=" +
+          recoveryDownloadQueued +
+          ", uploads=" +
+          recoveryUploadQueued +
+          ", monitors=" +
+          recoveryMonitorArmed +
+          ", cleanup retries=" +
+          recoveryCleanupScheduled,
+        "info",
+      );
+    }
   }
 
   // --- Render project list ---
@@ -2845,8 +2942,7 @@
       path.dirname(String(state.output_path)),
       AUDIO_NO_MUSIC_OUTPUT_FILENAME,
     );
-    var audioPresetPath =
-      String(settings.audio_preset_epr_path || "").trim() || presetPath;
+    var audioPresetPath = String(settings.audio_preset_epr_path || "").trim();
     if (enableAudioNoMusic && !audioPresetPath) {
       log("Missing audio preset path for no-music export", "error");
       setSettingsStatus(
@@ -3165,6 +3261,25 @@
       .then(function (result) {
         if (result && result.indexOf("ERROR:") === 0) {
           log("Panel persistence warning: " + result, "warn");
+        }
+      })
+      .catch(function () {
+        // ignore
+      });
+
+    evalHost("cleanupOrphanTempAudioSequences()")
+      .then(function (result) {
+        var normalized = String(result || "").trim();
+        if (!normalized) {
+          return;
+        }
+        if (normalized.indexOf("ERROR:") === 0) {
+          log("Temp audio sequence cleanup warning: " + normalized, "warn");
+          return;
+        }
+        var removedCount = Number(normalized);
+        if (!isNaN(removedCount) && removedCount > 0) {
+          log("Removed " + removedCount + " orphan audio temp sequence(s)", "info");
         }
       })
       .catch(function () {

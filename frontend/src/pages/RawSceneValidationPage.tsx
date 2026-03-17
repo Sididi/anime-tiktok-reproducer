@@ -64,7 +64,9 @@ export function RawSceneValidationPage() {
         setTranscription(data.transcription);
 
         if (data.transcription && data.detection) {
-          setValidations(buildValidationState(data.transcription, data.detection));
+          setValidations(
+            buildValidationState(data.transcription, data.detection),
+          );
         }
       } catch (err) {
         setError((err as Error).message);
@@ -110,7 +112,9 @@ export function RawSceneValidationPage() {
       setTranscription(data.transcription);
 
       if (data.transcription && data.detection) {
-        setValidations(buildValidationState(data.transcription, data.detection));
+        setValidations(
+          buildValidationState(data.transcription, data.detection),
+        );
       }
     } catch (err) {
       setError((err as Error).message);
@@ -140,10 +144,7 @@ export function RawSceneValidationPage() {
         }));
 
       if (sceneValidations.length > 0) {
-        const result = await api.validateRawScenes(
-          projectId,
-          sceneValidations,
-        );
+        const result = await api.validateRawScenes(projectId, sceneValidations);
         setTranscription(result.transcription);
       }
 
@@ -277,9 +278,7 @@ function SceneCard({
   return (
     <div
       className={`bg-[hsl(var(--card))] rounded-lg p-4 ${
-        isRaw
-          ? "ring-2 ring-amber-500/50"
-          : "ring-2 ring-green-500/50"
+        isRaw ? "ring-2 ring-amber-500/50" : "ring-2 ring-green-500/50"
       }`}
     >
       <div className="flex items-center justify-between mb-3">
