@@ -903,7 +903,7 @@ class UploadPhaseService:
             is_enabled=cls._youtube_upload_enabled,
             probe_media=SocialUploadService._probe_youtube_media,
             transcode_to_limit=SocialUploadService._transcode_youtube_video_to_limit,
-            max_duration=SocialUploadService._YOUTUBE_MAX_DURATION_SECONDS,
+            max_duration=SocialUploadService._YOUTUBE_UPLOAD_TARGET_DURATION_SECONDS,
             max_speed=SocialUploadService._YOUTUBE_MAX_SPEED_FACTOR,
         )
 

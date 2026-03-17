@@ -151,7 +151,9 @@ class SocialUploadService:
     _FACEBOOK_MAX_SPEED_FACTOR = 1.40
     _FACEBOOK_MAX_ACCEL_PERCENT = 40.0
     _YOUTUBE_MAX_DURATION_SECONDS = 180.0
-    _YOUTUBE_DURATION_SAFETY_BUFFER_SECONDS = 0.01
+    # Keep a larger headroom for Shorts than Facebook: 10 ms is below a single
+    # frame at common upload frame rates and is not enough to absorb duration drift.
+    _YOUTUBE_DURATION_SAFETY_BUFFER_SECONDS = 0.10
     _YOUTUBE_UPLOAD_TARGET_DURATION_SECONDS = (
         _YOUTUBE_MAX_DURATION_SECONDS - _YOUTUBE_DURATION_SAFETY_BUFFER_SECONDS
     )
@@ -869,7 +871,7 @@ class SocialUploadService:
 
         output_probe, output_probe_error = cls._probe_youtube_media(video_path=output_path)
         if output_probe_error is None and output_probe and output_probe.duration_seconds is not None:
-            if output_probe.duration_seconds <= cls._YOUTUBE_MAX_DURATION_SECONDS:
+            if output_probe.duration_seconds <= cls._YOUTUBE_UPLOAD_TARGET_DURATION_SECONDS + 0.01:
                 return None
 
         source_probe, source_probe_error = cls._probe_youtube_media(video_path=input_path)
@@ -1015,15 +1017,38 @@ class SocialUploadService:
         source_video_path: Path,
         work_dir: Path,
     ) -> LimitedDurationVideoPreparation:
-        return cls._prepare_video_for_limited_duration_upload(
+        prep = cls._prepare_video_for_limited_duration_upload(
             source_video_path=source_video_path,
             work_dir=work_dir,
             platform_label="YouTube",
-            max_duration_seconds=cls._YOUTUBE_MAX_DURATION_SECONDS,
+            max_duration_seconds=cls._YOUTUBE_UPLOAD_TARGET_DURATION_SECONDS,
             max_speed_factor=cls._YOUTUBE_MAX_SPEED_FACTOR,
             max_accel_percent=cls._YOUTUBE_MAX_ACCEL_PERCENT,
             output_suffix="youtube_180s",
         )
+        if prep.status != "ready" or prep.video_path is None:
+            return prep
+
+        output_probe, output_probe_error = cls._probe_youtube_media(video_path=prep.video_path)
+        if output_probe_error:
+            return LimitedDurationVideoPreparation(
+                status="error",
+                detail=f"YouTube video preparation failed: {output_probe_error}",
+                original_duration_seconds=prep.original_duration_seconds,
+                speed_factor=prep.speed_factor,
+            )
+        output_duration = output_probe.duration_seconds if output_probe else None
+        if output_duration is None or output_duration > cls._YOUTUBE_UPLOAD_TARGET_DURATION_SECONDS + 0.01:
+            return LimitedDurationVideoPreparation(
+                status="error",
+                detail=(
+                    "YouTube video preparation failed: "
+                    f"prepared video is still above the Shorts safety target ({output_duration or 0.0:.2f}s)."
+                ),
+                original_duration_seconds=prep.original_duration_seconds,
+                speed_factor=prep.speed_factor,
+            )
+        return prep
 
     @classmethod
     def upload_facebook(

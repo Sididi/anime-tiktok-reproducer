@@ -14,7 +14,9 @@ export default defineConfig({
   server: {
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        // Match the backend bind address exactly to avoid localhost/IPv6
+        // resolution races that show up as ECONNREFUSED AggregateError.
+        target: 'http://127.0.0.1:8000',
         changeOrigin: true,
       },
     },

@@ -32,6 +32,26 @@ interface PendingUploadContext {
   youtubeStrategy?: UploadDurationStrategy;
 }
 
+const LOAD_RETRY_DELAY_MS = 1000;
+const LOAD_RETRY_WINDOW_MS = 45000;
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
+function isTransientFetchError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const message = error.message.toLowerCase();
+  return (
+    message.includes("failed to fetch") ||
+    message.includes("fetch failed") ||
+    message.includes("networkerror") ||
+    message.includes("load failed")
+  );
+}
+
 export function ProjectManagerModal({
   open,
   onClose,
@@ -72,6 +92,7 @@ export function ProjectManagerModal({
   } | null>(null);
   const [pendingUpload, setPendingUpload] =
     useState<PendingUploadContext | null>(null);
+  const loadRequestIdRef = useRef(0);
 
   // Multi-delete state
   const [multiDeleteMode, setMultiDeleteMode] = useState(false);
@@ -88,24 +109,67 @@ export function ProjectManagerModal({
 
   /* ── Data loading (accounts fast, projects slow) ── */
   const loadData = useCallback(async () => {
+    const requestId = ++loadRequestIdRef.current;
+    const startedAt = Date.now();
+    const isStale = () => loadRequestIdRef.current !== requestId;
+
     setError(null);
-    api
-      .listAccounts()
-      .then((res) => setAccounts(res.accounts))
-      .catch(() => {});
     setLoading(true);
+
     try {
-      const projectsRes = await api.listProjectManagerProjects();
-      setRows(projectsRes.projects);
-    } catch (err) {
-      setError((err as Error).message);
+      while (!isStale()) {
+        try {
+          const [projectsRes, accountsRes] = await Promise.allSettled([
+            api.listProjectManagerProjects(),
+            api.listAccounts(),
+          ]);
+
+          if (isStale()) return;
+
+          if (accountsRes.status === "fulfilled") {
+            setAccounts(accountsRes.value.accounts);
+          }
+
+          if (projectsRes.status === "rejected") {
+            throw projectsRes.reason;
+          }
+
+          setRows(projectsRes.value.projects);
+          setError(null);
+          return;
+        } catch (err) {
+          if (isStale()) return;
+
+          if (
+            !isTransientFetchError(err) ||
+            Date.now() - startedAt >= LOAD_RETRY_WINDOW_MS
+          ) {
+            setError((err as Error).message);
+            return;
+          }
+
+          setError("Backend is still starting. Retrying...");
+          await sleep(LOAD_RETRY_DELAY_MS);
+        }
+      }
     } finally {
-      setLoading(false);
+      if (!isStale()) {
+        setLoading(false);
+      }
     }
   }, []);
 
   useEffect(() => {
-    if (open) loadData();
+    if (!open) {
+      loadRequestIdRef.current += 1;
+      return;
+    }
+
+    void loadData();
+
+    return () => {
+      loadRequestIdRef.current += 1;
+    };
   }, [open, loadData]);
 
   /* ── Escape key ── */
