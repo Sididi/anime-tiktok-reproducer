@@ -177,6 +177,11 @@ class ProcessingProgress:
     gaps_detected: bool = False
     gap_count: int = 0
     total_gap_duration: float = 0.0
+    # Duration warning fields
+    duration_warning: bool = False
+    audio_duration_seconds: float = 0.0
+    raw_scenes_duration_seconds: float = 0.0
+    total_duration_seconds: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -189,6 +194,10 @@ class ProcessingProgress:
             "gaps_detected": self.gaps_detected,
             "gap_count": self.gap_count,
             "total_gap_duration": self.total_gap_duration,
+            "duration_warning": self.duration_warning,
+            "audio_duration_seconds": self.audio_duration_seconds,
+            "raw_scenes_duration_seconds": self.raw_scenes_duration_seconds,
+            "total_duration_seconds": self.total_duration_seconds,
         }
 
 
@@ -245,6 +254,11 @@ class ProcessingService:
     PREMIERE_JSX_TEMPLATE_PATH = (
         Path(__file__).resolve().parent / "templates" / "premiere_import_project_v77.jsx"
     )
+    CLASSIC_SUBTITLE_TIMING_RELATIVE_PATH = "subtitles/subtitle_timings.srt"
+    RAW_SCENE_TEXT_SUBTITLE_TIMING_RELATIVE_PATH = (
+        "raw_scene_subtitles/text_subtitles.srt"
+    )
+    RAW_SCENE_TEXT_SUBTITLE_MOGRT_RELATIVE_DIR = "raw_scene_subtitles/text_mogrts"
     _gap_candidate_prewarm_tasks: dict[str, asyncio.Task[None]] = {}
 
     @classmethod
@@ -681,6 +695,15 @@ class ProcessingService:
                 raise
 
     @staticmethod
+    def _probe_wav_duration(path: Path) -> float:
+        """Return the duration in seconds of a WAV file."""
+        with wave.open(str(path), "rb") as wf:
+            frame_rate = wf.getframerate()
+            if frame_rate <= 0:
+                return 0.0
+            return wf.getnframes() / float(frame_rate)
+
+    @staticmethod
     async def detect_video_fps(video_path: Path) -> Fraction:
         """
         Detect video frame rate using ffprobe, returning as a Fraction for precision.
@@ -778,7 +801,9 @@ class ProcessingService:
         matches: list[SceneMatch],
         source_rate: FrameRateInfo | None = None,
         resolved_scene_sources: dict[int, ResolvedSceneSource] | None = None,
-        subtitle_filename: str = "subtitles.srt",
+        subtitle_timing_relative_path: str = "subtitles/subtitle_timings.srt",
+        raw_scene_subtitle_timing_relative_path: str = "raw_scene_subtitles/text_subtitles.srt",
+        raw_scene_subtitle_mogrt_relative_dir: str = "raw_scene_subtitles/text_mogrts",
         music_filename: str = "",
         music_gain_db: float = -24.0,
     ) -> str:
@@ -803,7 +828,9 @@ class ProcessingService:
             matches: Scene matches with source timing
             source_rate: Resolved source frame rate information. If None, defaults to 23.976fps.
             resolved_scene_sources: Pre-resolved scene source timings shared with playback rebuild.
-            subtitle_filename: Root-level SRT filename to reference in JSX
+            subtitle_timing_relative_path: Relative path to the classic subtitle timing SRT.
+            raw_scene_subtitle_timing_relative_path: Relative path to the raw-scene subtitle timing SRT.
+            raw_scene_subtitle_mogrt_relative_dir: Relative path to baked raw-scene subtitle MOGRT files.
             music_filename: Optional music filename placed in /sources
             music_gain_db: Music gain in dB (used only when music_filename is set)
 
@@ -944,7 +971,9 @@ class ProcessingService:
             scenes=scenes,
             source_fps_num=source_rate.rate.numerator,
             source_fps_den=source_rate.rate.denominator,
-            subtitle_filename=subtitle_filename,
+            subtitle_timing_relative_path=subtitle_timing_relative_path,
+            raw_scene_subtitle_timing_relative_path=raw_scene_subtitle_timing_relative_path,
+            raw_scene_subtitle_mogrt_relative_dir=raw_scene_subtitle_mogrt_relative_dir,
             music_filename=music_filename,
             music_gain_db=music_gain_db,
         )
@@ -980,7 +1009,9 @@ class ProcessingService:
         scenes: list[dict],
         source_fps_num: int,
         source_fps_den: int,
-        subtitle_filename: str,
+        subtitle_timing_relative_path: str,
+        raw_scene_subtitle_timing_relative_path: str,
+        raw_scene_subtitle_mogrt_relative_dir: str,
         music_filename: str,
         music_gain_db: float,
     ) -> str:
@@ -1050,7 +1081,11 @@ class ProcessingService:
         content = cls._replace_template_once(
             content,
             r'var SUBTITLE_SRT_PATH = ROOT_DIR \+ "[^"]*";',
-            f'var SUBTITLE_SRT_PATH = ROOT_DIR + "/{cls._escape_js_string(subtitle_filename)}";',
+            (
+                'var SUBTITLE_SRT_PATH = ROOT_DIR + "/'
+                + cls._escape_js_string(subtitle_timing_relative_path)
+                + '";'
+            ),
             label="SUBTITLE_SRT_PATH",
         )
         content = cls._replace_template_once(
@@ -1058,6 +1093,26 @@ class ProcessingService:
             r"var SUBTITLE_MOGRT_DIR = [^;]+;",
             'var SUBTITLE_MOGRT_DIR = ROOT_DIR + "/subtitles";',
             label="SUBTITLE_MOGRT_DIR",
+        )
+        content = cls._replace_template_once(
+            content,
+            r"var RAW_SCENE_TEXT_SUBTITLE_MOGRT_DIR = [^;]+;",
+            (
+                'var RAW_SCENE_TEXT_SUBTITLE_MOGRT_DIR = ROOT_DIR + "/'
+                + cls._escape_js_string(raw_scene_subtitle_mogrt_relative_dir)
+                + '";'
+            ),
+            label="RAW_SCENE_TEXT_SUBTITLE_MOGRT_DIR",
+        )
+        content = cls._replace_template_once(
+            content,
+            r'var RAW_SCENE_TEXT_SUBTITLE_SRT_PATH = ROOT_DIR \+ "[^"]*";',
+            (
+                'var RAW_SCENE_TEXT_SUBTITLE_SRT_PATH = ROOT_DIR + "/'
+                + cls._escape_js_string(raw_scene_subtitle_timing_relative_path)
+                + '";'
+            ),
+            label="RAW_SCENE_TEXT_SUBTITLE_SRT_PATH",
         )
         return content
 
@@ -1512,6 +1567,45 @@ class ProcessingService:
         return cls.render_srt_entries(merged_entries)
 
     @staticmethod
+    def _processing_asset_path(asset_name: str) -> Path:
+        return Path(__file__).resolve().parents[3] / "assets" / asset_name
+
+    @classmethod
+    def _bake_subtitle_mogrt_set(
+        cls,
+        *,
+        template_mogrt_path: Path,
+        srt_content: str,
+        srt_path: Path,
+        output_dir: Path,
+        label: str,
+    ) -> None:
+        if output_dir.exists():
+            shutil.rmtree(output_dir, ignore_errors=True)
+        if srt_path.exists():
+            srt_path.unlink()
+
+        if not srt_content.strip():
+            return
+
+        srt_path.parent.mkdir(parents=True, exist_ok=True)
+        srt_path.write_text(srt_content, encoding="utf-8")
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        bake_result = PremiereSubtitleBakerService.bake_from_srt(
+            template_mogrt_path=template_mogrt_path,
+            srt_path=srt_path,
+            output_dir=output_dir,
+        )
+        if bake_result.generated_count != bake_result.entries_count:
+            raise RuntimeError(
+                f"{label} MOGRT bake mismatch: "
+                f"{bake_result.generated_count} generated for {bake_result.entries_count} SRT entries"
+            )
+        if bake_result.entries_count <= 0:
+            raise RuntimeError(f"{label} MOGRT bake produced no entries.")
+
+    @staticmethod
     def _create_srt_block_aggressive(
         index: int,
         words: list,
@@ -1633,6 +1727,12 @@ class ProcessingService:
         return (project_dir / "gaps_resolved.flag").exists()
 
     @classmethod
+    def check_duration_warning_acknowledged(cls, project_id: str) -> bool:
+        """Check if the duration warning has been acknowledged by the user."""
+        project_dir = settings.projects_dir / project_id
+        return (project_dir / "duration_warning_acknowledged.flag").exists()
+
+    @classmethod
     def clear_processing_state(cls, project_id: str) -> None:
         """Clear saved processing state after completion."""
         output_dir = cls.get_output_dir(project_id)
@@ -1641,9 +1741,10 @@ class ProcessingService:
             state_path.unlink()
 
         project_dir = settings.projects_dir / project_id
-        flag_path = project_dir / "gaps_resolved.flag"
-        if flag_path.exists():
-            flag_path.unlink()
+        for flag_name in ("gaps_resolved.flag", "duration_warning_acknowledged.flag"):
+            flag_path = project_dir / flag_name
+            if flag_path.exists():
+                flag_path.unlink()
 
     @classmethod
     async def process(
@@ -1689,8 +1790,16 @@ class ProcessingService:
         output_dir = cls.get_output_dir(project.id)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Check if we're resuming after gap resolution
+        # Check if we're resuming after gap resolution or duration warning
         resuming_after_gaps = cls.check_has_saved_state(project.id) and cls.check_gaps_resolved(project.id)
+        resuming_after_duration_warning = False
+        if not resuming_after_gaps and cls.check_has_saved_state(project.id):
+            _peek_state = json.loads((output_dir / "processing_state.json").read_text())
+            if (
+                _peek_state.get("step") == "duration_warning"
+                and cls.check_duration_warning_acknowledged(project.id)
+            ):
+                resuming_after_duration_warning = True
         source_fps = await cls.detect_first_source_fps(matches)
         source_rate = cls._build_source_rate(source_fps)
         playback_scene_sources = cls.resolve_scene_sources(matches, source_rate)
@@ -1722,6 +1831,24 @@ class ProcessingService:
                     for s in transcription_data["scenes"]
                 ],
             )
+        elif resuming_after_duration_warning:
+            # Load saved state — skip auto-editor, resume from transcription
+            state_path = output_dir / "processing_state.json"
+            state = json.loads(state_path.read_text())
+            edited_audio_path = Path(state["edited_audio_path"])
+            pa_state = state["prepared_audio"]
+            prepared_audio = PreparedAlignmentAudio(
+                mode=pa_state["mode"],
+                edited_audio_path=Path(pa_state["edited_audio_path"]),
+                segment_audio_paths=[Path(p) for p in pa_state["segment_audio_paths"]],
+                manifest=pa_state["manifest"],
+            )
+            yield ProcessingProgress(
+                "processing",
+                "auto_editor",
+                0.2,
+                "Auto-editor complete (resuming after duration warning)...",
+            )
         else:
             yield ProcessingProgress(
                 "processing",
@@ -1732,37 +1859,77 @@ class ProcessingService:
 
         try:
             if not resuming_after_gaps:
-                # Resolve auto-editor profile from voice_key if available
-                auto_editor_profile = PRODUCTION_AUTO_EDITOR_PROFILE
-                if project.voice_key:
-                    try:
-                        auto_editor_profile = VoiceConfigService.get_auto_editor_profile(project.voice_key)
-                    except ValueError:
-                        pass  # voice no longer in config, use default
+                if not resuming_after_duration_warning:
+                    # Resolve auto-editor profile from voice_key if available
+                    auto_editor_profile = PRODUCTION_AUTO_EDITOR_PROFILE
+                    if project.voice_key:
+                        try:
+                            auto_editor_profile = VoiceConfigService.get_auto_editor_profile(project.voice_key)
+                        except ValueError:
+                            pass  # voice no longer in config, use default
 
-                # Step 1: Auto-editor (generates edited audio with silences removed)
-                edited_audio_path = output_dir / "tts_edited.wav"
-                upload_manifest = ForcedAlignmentService.load_upload_manifest(project.id)
-                if upload_manifest and upload_manifest.get("mode") == "audio_parts":
-                    from functools import partial
-                    runner = partial(cls.run_auto_editor, profile=auto_editor_profile)
-                    prepared_audio = await ForcedAlignmentService.prepare_audio_from_parts(
-                        project_id=project.id,
-                        output_dir=output_dir,
-                        tts_speed=float(project.tts_speed or 1.0),
-                        auto_editor_runner=runner,
+                    # Step 1: Auto-editor (generates edited audio with silences removed)
+                    edited_audio_path = output_dir / "tts_edited.wav"
+                    upload_manifest = ForcedAlignmentService.load_upload_manifest(project.id)
+                    if upload_manifest and upload_manifest.get("mode") == "audio_parts":
+                        from functools import partial
+                        runner = partial(cls.run_auto_editor, profile=auto_editor_profile)
+                        prepared_audio = await ForcedAlignmentService.prepare_audio_from_parts(
+                            project_id=project.id,
+                            output_dir=output_dir,
+                            tts_speed=float(project.tts_speed or 1.0),
+                            auto_editor_runner=runner,
+                        )
+                        edited_audio_path = prepared_audio.edited_audio_path
+                    else:
+                        await cls.run_auto_editor(audio_path, edited_audio_path, profile=auto_editor_profile)
+                        prepared_audio = PreparedAlignmentAudio(
+                            mode="single_audio",
+                            edited_audio_path=edited_audio_path,
+                            segment_audio_paths=[],
+                            manifest=ForcedAlignmentService.build_single_audio_manifest(
+                                script_payload=new_script,
+                            ),
+                        )
+
+                    # Duration check — warn if total estimated duration < 61s
+                    TIKTOK_MIN_DURATION_SECONDS = 61.0
+                    tts_duration = cls._probe_wav_duration(edited_audio_path)
+                    raw_scenes_duration = sum(
+                        resolved.source_duration_seconds
+                        for scene in reference_transcription.scenes
+                        if scene.is_raw
+                        for resolved in [playback_scene_sources.get(scene.scene_index)]
+                        if resolved is not None
                     )
-                    edited_audio_path = prepared_audio.edited_audio_path
-                else:
-                    await cls.run_auto_editor(audio_path, edited_audio_path, profile=auto_editor_profile)
-                    prepared_audio = PreparedAlignmentAudio(
-                        mode="single_audio",
-                        edited_audio_path=edited_audio_path,
-                        segment_audio_paths=[],
-                        manifest=ForcedAlignmentService.build_single_audio_manifest(
-                            script_payload=new_script,
-                        ),
-                    )
+                    total_estimated_duration = tts_duration + raw_scenes_duration
+
+                    if total_estimated_duration < TIKTOK_MIN_DURATION_SECONDS:
+                        # Save state so we can resume from transcription without re-running auto-editor
+                        processing_state = {
+                            "step": "duration_warning",
+                            "edited_audio_path": str(edited_audio_path),
+                            "prepared_audio": {
+                                "mode": prepared_audio.mode,
+                                "edited_audio_path": str(prepared_audio.edited_audio_path),
+                                "segment_audio_paths": [str(p) for p in prepared_audio.segment_audio_paths],
+                                "manifest": prepared_audio.manifest,
+                            },
+                        }
+                        state_path = output_dir / "processing_state.json"
+                        state_path.write_text(json.dumps(processing_state, indent=2))
+
+                        yield ProcessingProgress(
+                            "duration_warning",
+                            "auto_editor",
+                            0.2,
+                            f"Audio duration ({total_estimated_duration:.0f}s) is under 1min01",
+                            duration_warning=True,
+                            audio_duration_seconds=round(tts_duration, 2),
+                            raw_scenes_duration_seconds=round(raw_scenes_duration, 2),
+                            total_duration_seconds=round(total_estimated_duration, 2),
+                        )
+                        return  # Pause — frontend will show warning modal
 
                 yield ProcessingProgress(
                     "processing",
@@ -2021,6 +2188,15 @@ class ProcessingService:
                 )
 
             srt_filename = ExportService.subtitle_filename(project)
+            classic_subtitle_timing_relative_path = (
+                cls.CLASSIC_SUBTITLE_TIMING_RELATIVE_PATH
+            )
+            raw_scene_subtitle_timing_relative_path = (
+                cls.RAW_SCENE_TEXT_SUBTITLE_TIMING_RELATIVE_PATH
+            )
+            raw_scene_subtitle_mogrt_relative_dir = (
+                cls.RAW_SCENE_TEXT_SUBTITLE_MOGRT_RELATIVE_DIR
+            )
 
             # Resolve optional music settings for Premiere automation.
             music_filename = ""
@@ -2050,7 +2226,9 @@ class ProcessingService:
                 matches,
                 source_rate=source_rate,
                 resolved_scene_sources=resolved_scene_sources,
-                subtitle_filename=srt_filename,
+                subtitle_timing_relative_path=classic_subtitle_timing_relative_path,
+                raw_scene_subtitle_timing_relative_path=raw_scene_subtitle_timing_relative_path,
+                raw_scene_subtitle_mogrt_relative_dir=raw_scene_subtitle_mogrt_relative_dir,
                 music_filename=music_filename,
                 music_gain_db=music_gain_db,
             )
@@ -2074,11 +2252,18 @@ class ProcessingService:
             )
 
             # Step 4: Generate SRT subtitles (aggressive Hormozi style)
+            classic_srt_content = cls.render_srt_entries(
+                cls.generate_srt_entries(
+                    new_transcription,
+                    language=new_transcription.language,
+                )
+            )
             srt_content = cls.generate_srt(
                 new_transcription,
                 language=new_transcription.language,
                 extra_entries=raw_text_subtitle_entries,
             )
+            raw_scene_srt_content = cls.render_srt_entries(raw_text_subtitle_entries)
             srt_path = output_dir / srt_filename
             srt_path.write_text(srt_content, encoding="utf-8")
 
@@ -2089,25 +2274,27 @@ class ProcessingService:
                 "Baking subtitle MOGRT files...",
             )
 
-            subtitle_template_path = Path(__file__).resolve().parents[3] / "assets" / "SPM_Anime_Subtitle.mogrt"
-            subtitles_output_dir = output_dir / "subtitles"
-            if subtitles_output_dir.exists():
-                shutil.rmtree(subtitles_output_dir, ignore_errors=True)
-            subtitles_output_dir.mkdir(parents=True, exist_ok=True)
+            classic_subtitle_template_path = cls._processing_asset_path(
+                "SPM_Anime_Subtitle.mogrt"
+            )
+            raw_scene_subtitle_template_path = cls._processing_asset_path(
+                "SPM_Anime_Subtitle_Raw.mogrt"
+            )
 
-            if srt_content.strip():
-                bake_result = PremiereSubtitleBakerService.bake_from_srt(
-                    template_mogrt_path=subtitle_template_path,
-                    srt_path=srt_path,
-                    output_dir=subtitles_output_dir,
-                )
-                if bake_result.generated_count != bake_result.entries_count:
-                    raise RuntimeError(
-                        "Subtitle MOGRT bake mismatch: "
-                        f"{bake_result.generated_count} generated for {bake_result.entries_count} SRT entries"
-                    )
-                if bake_result.entries_count <= 0:
-                    raise RuntimeError("Subtitle MOGRT bake produced no entries.")
+            cls._bake_subtitle_mogrt_set(
+                template_mogrt_path=classic_subtitle_template_path,
+                srt_content=classic_srt_content,
+                srt_path=output_dir / classic_subtitle_timing_relative_path,
+                output_dir=output_dir / "subtitles",
+                label="Classic subtitle",
+            )
+            cls._bake_subtitle_mogrt_set(
+                template_mogrt_path=raw_scene_subtitle_template_path,
+                srt_content=raw_scene_srt_content,
+                srt_path=output_dir / raw_scene_subtitle_timing_relative_path,
+                output_dir=output_dir / raw_scene_subtitle_mogrt_relative_dir,
+                label="Raw-scene subtitle",
+            )
 
             # Step 5: Generate title overlay images (if video_overlay is set)
             if project.video_overlay and project.video_overlay.get("title"):

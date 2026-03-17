@@ -33,7 +33,9 @@
   var CATEGORY_TITLE_PRESET_FILE_PATH =
     ASSETS_DIR + "/" + CATEGORY_TITLE_PRESET_NAME + ".prfpset";
   var SUBTITLE_MOGRT_DIR = ROOT_DIR + "/subtitles";
-  var SUBTITLE_SRT_PATH = ROOT_DIR + "/let_this_grieving_soul_retire.fr_FR.srt";
+  var SUBTITLE_SRT_PATH = ROOT_DIR + "/subtitles/subtitle_timings.srt";
+  var RAW_SCENE_TEXT_SUBTITLE_MOGRT_DIR = ROOT_DIR + "/raw_scene_subtitles/text_mogrts";
+  var RAW_SCENE_TEXT_SUBTITLE_SRT_PATH = ROOT_DIR + "/raw_scene_subtitles/text_subtitles.srt";
   var RAW_SCENE_SUBTITLE_MANIFEST_PATH =
     ROOT_DIR + "/raw_scene_subtitles/manifest.json";
 
@@ -1976,7 +1978,10 @@
       3,
       SUBTITLE_MOGRT_DIR,
       SUBTITLE_SRT_PATH,
+      RAW_SCENE_TEXT_SUBTITLE_MOGRT_DIR,
+      RAW_SCENE_TEXT_SUBTITLE_SRT_PATH,
       RAW_SCENE_SUBTITLE_MANIFEST_PATH,
+      true,
     );
     perfEnd("subtitles", "Subtitles");
     refreshSequenceUI(sequence);
@@ -2135,7 +2140,52 @@
     }
   }
 
-  function buildClassicSubtitlePlacements(subtitleDirPath, srtPath) {
+  function buildMogrtSubtitlePlacement(kind, idx, mogrtPath, startSec, endSec) {
+    return {
+      kind: kind,
+      idx: idx,
+      mogrtPath: mogrtPath,
+      startSec: startSec,
+      startTicksStr: secondsToTicks(startSec).toString(),
+      endSec: endSec,
+      endTimeObj: buildSequenceTimeFromSeconds(endSec),
+    };
+  }
+
+  function buildImageSubtitlePlacement(idx, relativeAssetPath, startSec, endSec) {
+    return {
+      kind: "raw_image",
+      idx: idx,
+      relativeAssetPath: relativeAssetPath,
+      startSec: startSec,
+      endSec: endSec,
+    };
+  }
+
+  function cloneSubtitlePlacementWithRange(placement, startSec, endSec) {
+    if (!placement) return null;
+    if (placement.mogrtPath) {
+      return buildMogrtSubtitlePlacement(
+        placement.kind,
+        placement.idx,
+        placement.mogrtPath,
+        startSec,
+        endSec,
+      );
+    }
+    if (placement.relativeAssetPath) {
+      return {
+        kind: placement.kind,
+        idx: placement.idx,
+        relativeAssetPath: placement.relativeAssetPath,
+        startSec: startSec,
+        endSec: endSec,
+      };
+    }
+    return null;
+  }
+
+  function buildTextSubtitlePlacements(kind, subtitleDirPath, srtPath) {
     var stats = {
       timings: 0,
       mogrtsFound: 0,
@@ -2182,15 +2232,15 @@
       if (endSec <= startSec) {
         endSec = snapSecondsToFrame(startSec + 1 / SEQ_FPS);
       }
-      placements.push({
-        kind: "classic",
-        idx: k + 1,
-        mogrtPath: mogrtFile.fsName,
-        startSec: startSec,
-        startTicksStr: secondsToTicks(startSec).toString(),
-        endSec: endSec,
-        endTimeObj: buildSequenceTimeFromSeconds(endSec),
-      });
+      placements.push(
+        buildMogrtSubtitlePlacement(
+          kind || "classic",
+          k + 1,
+          mogrtFile.fsName,
+          startSec,
+          endSec,
+        ),
+      );
     }
 
     return {
@@ -2229,13 +2279,9 @@
       if (endSec <= startSec) {
         endSec = snapSecondsToFrame(startSec + 1 / SEQ_FPS);
       }
-      placements.push({
-        kind: "raw",
-        idx: i + 1,
-        relativeAssetPath: relativeAssetPath,
-        startSec: startSec,
-        endSec: endSec,
-      });
+      placements.push(
+        buildImageSubtitlePlacement(i + 1, relativeAssetPath, startSec, endSec),
+      );
     }
 
     placements.sort(function (a, b) {
@@ -2250,22 +2296,34 @@
     };
   }
 
+  function getSubtitlePlacementPriority(kind) {
+    if (kind === "classic") return 0;
+    if (kind === "raw_text") return 1;
+    return 2;
+  }
+
+  function isMogrtSubtitlePlacement(kind) {
+    return kind === "classic" || kind === "raw_text";
+  }
+
   function compareSubtitlePlacementOrder(a, b, frameDurationSec) {
     var delta = a.startSec - b.startSec;
+    var aPriority = getSubtitlePlacementPriority(a.kind);
+    var bPriority = getSubtitlePlacementPriority(b.kind);
     if (
-      a.kind !== b.kind &&
+      aPriority !== bPriority &&
       Math.abs(delta) <= frameDurationSec
     ) {
-      return a.kind === "classic" ? -1 : 1;
+      return aPriority < bPriority ? -1 : 1;
     }
     if (delta !== 0) return delta < 0 ? -1 : 1;
-    if (a.kind !== b.kind) return a.kind === "classic" ? -1 : 1;
+    if (aPriority !== bPriority) return aPriority < bPriority ? -1 : 1;
     if (a.endSec !== b.endSec) return a.endSec < b.endSec ? -1 : 1;
     return (a.idx || 0) - (b.idx || 0);
   }
 
-  function clampRawSubtitlePlacementsAgainstClassic(
-    rawPlacements,
+  function clampNonClassicSubtitlePlacementsAgainstClassic(
+    nonClassicPlacements,
     classicPlacements,
     frameDurationSec,
   ) {
@@ -2274,7 +2332,7 @@
       dropped: 0,
       trimmed: 0,
     };
-    if (!rawPlacements || rawPlacements.length <= 0) return result;
+    if (!nonClassicPlacements || nonClassicPlacements.length <= 0) return result;
 
     var classics = classicPlacements ? classicPlacements.slice(0) : [];
     classics.sort(function (a, b) {
@@ -2282,9 +2340,9 @@
       return a.endSec - b.endSec;
     });
 
-    for (var i = 0; i < rawPlacements.length; i++) {
-      var raw = rawPlacements[i];
-      if (!raw || !(raw.endSec > raw.startSec)) {
+    for (var i = 0; i < nonClassicPlacements.length; i++) {
+      var placement = nonClassicPlacements[i];
+      if (!placement || !(placement.endSec > placement.startSec)) {
         result.dropped++;
         continue;
       }
@@ -2293,14 +2351,17 @@
       for (var c = 0; c < classics.length; c++) {
         var classic = classics[c];
         if (!classic) continue;
-        if (classic.endSec <= raw.startSec || classic.startSec >= raw.endSec) {
+        if (
+          classic.endSec <= placement.startSec ||
+          classic.startSec >= placement.endSec
+        ) {
           continue;
         }
         overlaps.push(classic);
       }
 
       if (overlaps.length <= 0) {
-        result.placements.push(raw);
+        result.placements.push(placement);
         continue;
       }
 
@@ -2311,10 +2372,10 @@
 
       var firstOverlap = overlaps[0];
       var lastOverlap = overlaps[overlaps.length - 1];
-      var beforeStart = raw.startSec;
-      var beforeEnd = Math.min(firstOverlap.startSec, raw.endSec);
-      var afterStart = Math.max(lastOverlap.endSec, raw.startSec);
-      var afterEnd = raw.endSec;
+      var beforeStart = placement.startSec;
+      var beforeEnd = Math.min(firstOverlap.startSec, placement.endSec);
+      var afterStart = Math.max(lastOverlap.endSec, placement.startSec);
+      var afterEnd = placement.endSec;
       var beforeDuration = beforeEnd - beforeStart;
       var afterDuration = afterEnd - afterStart;
 
@@ -2339,13 +2400,16 @@
         continue;
       }
 
-      result.placements.push({
-        kind: raw.kind,
-        idx: raw.idx,
-        relativeAssetPath: raw.relativeAssetPath,
-        startSec: snapSecondsToFrame(newStart),
-        endSec: snapSecondsToFrame(newEnd),
-      });
+      var trimmedPlacement = cloneSubtitlePlacementWithRange(
+        placement,
+        snapSecondsToFrame(newStart),
+        snapSecondsToFrame(newEnd),
+      );
+      if (!trimmedPlacement || !(trimmedPlacement.endSec > trimmedPlacement.startSec)) {
+        result.dropped++;
+        continue;
+      }
+      result.placements.push(trimmedPlacement);
       result.trimmed++;
     }
     return result;
@@ -2353,7 +2417,8 @@
 
   function buildMergedSubtitlePlacementSchedule(
     classicPlacements,
-    rawPlacements,
+    rawTextPlacements,
+    rawImagePlacements,
     frameDurationSec,
   ) {
     var merge = {
@@ -2361,8 +2426,15 @@
       rawDropped: 0,
       rawTrimmed: 0,
     };
-    var clampedRaw = clampRawSubtitlePlacementsAgainstClassic(
-      rawPlacements,
+    var nonClassicPlacements = [];
+    if (rawTextPlacements && rawTextPlacements.length > 0) {
+      nonClassicPlacements = nonClassicPlacements.concat(rawTextPlacements);
+    }
+    if (rawImagePlacements && rawImagePlacements.length > 0) {
+      nonClassicPlacements = nonClassicPlacements.concat(rawImagePlacements);
+    }
+    var clampedRaw = clampNonClassicSubtitlePlacementsAgainstClassic(
+      nonClassicPlacements,
       classicPlacements,
       frameDurationSec,
     );
@@ -2380,6 +2452,8 @@
     videoTrackIndex,
     subtitleDirPath,
     srtPath,
+    rawTextSubtitleDirPath,
+    rawTextSrtPath,
     rawManifestPath,
     enableSecondsFallback,
   ) {
@@ -2388,7 +2462,11 @@
       classicMogrtsFound: 0,
       classicUnusedTimings: 0,
       classicUnusedMogrts: 0,
-      rawEntries: 0,
+      rawTextTimings: 0,
+      rawTextMogrtsFound: 0,
+      rawTextUnusedTimings: 0,
+      rawTextUnusedMogrts: 0,
+      rawImageEntries: 0,
       rawDropped: 0,
       rawTrimmed: 0,
       scheduled: 0,
@@ -2409,12 +2487,22 @@
       return stats;
     }
 
-    var classicResult = buildClassicSubtitlePlacements(subtitleDirPath, srtPath);
-    var rawResult = loadRawSceneSubtitleImagePlacements(rawManifestPath);
+    var classicResult = buildTextSubtitlePlacements(
+      "classic",
+      subtitleDirPath,
+      srtPath,
+    );
+    var rawTextResult = buildTextSubtitlePlacements(
+      "raw_text",
+      rawTextSubtitleDirPath,
+      rawTextSrtPath,
+    );
+    var rawImageResult = loadRawSceneSubtitleImagePlacements(rawManifestPath);
     var frameDurationSec = 1 / SEQ_FPS;
     var schedule = buildMergedSubtitlePlacementSchedule(
       classicResult.placements,
-      rawResult.placements,
+      rawTextResult.placements,
+      rawImageResult.placements,
       frameDurationSec,
     );
     var track = sequence.videoTracks[videoTrackIndex];
@@ -2424,23 +2512,38 @@
     stats.classicMogrtsFound = classicResult.stats.mogrtsFound;
     stats.classicUnusedTimings = classicResult.stats.timingsUnused;
     stats.classicUnusedMogrts = classicResult.stats.mogrtsUnused;
-    stats.rawEntries = rawResult.stats.entries;
+    stats.rawTextTimings = rawTextResult.stats.timings;
+    stats.rawTextMogrtsFound = rawTextResult.stats.mogrtsFound;
+    stats.rawTextUnusedTimings = rawTextResult.stats.timingsUnused;
+    stats.rawTextUnusedMogrts = rawTextResult.stats.mogrtsUnused;
+    stats.rawImageEntries = rawImageResult.stats.entries;
     stats.rawDropped = schedule.rawDropped;
     stats.rawTrimmed = schedule.rawTrimmed;
     stats.scheduled = schedule.placements.length;
 
-    if (stats.classicTimings <= 0 && stats.rawEntries <= 0) {
+    if (
+      stats.classicTimings <= 0 &&
+      stats.rawTextTimings <= 0 &&
+      stats.rawImageEntries <= 0
+    ) {
       return stats;
     }
     if (stats.classicTimings > 0 && stats.classicMogrtsFound <= 0) {
       log("Warning: No subtitle MOGRT files found in " + subtitleDirPath + ".");
+    }
+    if (stats.rawTextTimings > 0 && stats.rawTextMogrtsFound <= 0) {
+      log(
+        "Warning: No raw-scene subtitle MOGRT files found in " +
+          rawTextSubtitleDirPath +
+          ".",
+      );
     }
 
     for (var p = 0; p < schedule.placements.length; p++) {
       var placement = schedule.placements[p];
       if (!placement) continue;
 
-      if (placement.kind === "classic") {
+      if (isMogrtSubtitlePlacement(placement.kind)) {
         var mogrtItem = null;
         try {
           perfCounterInc("importMGTCalls");
@@ -2543,8 +2646,12 @@
         stats.classicTimings +
         ", classic mogrts " +
         stats.classicMogrtsFound +
-        ", raw entries " +
-        stats.rawEntries +
+        ", raw-text timings " +
+        stats.rawTextTimings +
+        ", raw-text mogrts " +
+        stats.rawTextMogrtsFound +
+        ", raw-image entries " +
+        stats.rawImageEntries +
         ", raw trimmed " +
         stats.rawTrimmed +
         ", raw dropped " +
@@ -2559,6 +2666,10 @@
         stats.classicUnusedTimings +
         ", classic mogrts unused " +
         stats.classicUnusedMogrts +
+        ", raw-text timings unused " +
+        stats.rawTextUnusedTimings +
+        ", raw-text mogrts unused " +
+        stats.rawTextUnusedMogrts +
         ".",
     );
     return stats;

@@ -945,6 +945,19 @@ async def process_project(project_id: str):
     )
 
 
+@router.post("/duration-warning/acknowledge")
+async def acknowledge_duration_warning(project_id: str):
+    """Acknowledge the duration warning, allowing processing to continue."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project_dir = ProjectService.get_project_dir(project_id)
+    (project_dir / "duration_warning_acknowledged.flag").touch()
+
+    return {"status": "ok"}
+
+
 @router.get("/download/bundle")
 async def download_bundle(project_id: str):
     """Download the generated project bundle."""

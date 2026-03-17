@@ -13,6 +13,7 @@ import { useProjectStore } from "@/stores";
 import { api } from "@/api/client";
 import { formatDriveUploadMessage } from "@/utils/driveUploadProgress";
 import { readSSEStream } from "@/utils/sse";
+import { DurationWarningModal } from "@/components/DurationWarningModal";
 
 interface ProcessingStep {
   id: string;
@@ -46,6 +47,11 @@ interface ProcessingProgress {
   gaps_detected?: boolean;
   gap_count?: number;
   total_gap_duration?: number;
+  // Duration warning fields
+  duration_warning?: boolean;
+  audio_duration_seconds?: number;
+  raw_scenes_duration_seconds?: number;
+  total_duration_seconds?: number;
 }
 
 const INITIAL_STEPS: ProcessingStep[] = [
@@ -109,6 +115,12 @@ export function ProcessingPage() {
     count: number;
     duration: number;
   } | null>(null);
+  const [durationWarning, setDurationWarning] = useState(false);
+  const [durationWarningData, setDurationWarningData] = useState<{
+    audioSeconds: number;
+    rawScenesSeconds: number;
+    totalSeconds: number;
+  } | null>(null);
   const [steps, setSteps] = useState<ProcessingStep[]>(INITIAL_STEPS);
 
   // Keep ref in sync for use inside SSE callback
@@ -165,6 +177,8 @@ export function ProcessingPage() {
     setError(null);
     setGapsDetected(false);
     setGapInfo(null);
+    setDurationWarning(false);
+    setDurationWarningData(null);
     setSteps(INITIAL_STEPS);
     setProcessingComplete(false);
     setBundleLoading(false);
@@ -211,6 +225,28 @@ export function ProcessingPage() {
       await readSSEStream<ProcessingProgress>(
         response,
         (data) => {
+          if (data.status === "duration_warning" && data.duration_warning) {
+            setDurationWarning(true);
+            setDurationWarningData({
+              audioSeconds: data.audio_duration_seconds || 0,
+              rawScenesSeconds: data.raw_scenes_duration_seconds || 0,
+              totalSeconds: data.total_duration_seconds || 0,
+            });
+            setSteps((prev) =>
+              prev.map((step) => {
+                if (step.id === "auto_editor") {
+                  return {
+                    ...step,
+                    status: "paused",
+                    message: data.message,
+                  };
+                }
+                return step;
+              }),
+            );
+            return;
+          }
+
           if (data.status === "gaps_detected" && data.gaps_detected) {
             setGapsDetected(true);
             setGapInfo({
@@ -294,6 +330,7 @@ export function ProcessingPage() {
       processing ||
       processingComplete ||
       gapsDetected ||
+      durationWarning ||
       hasStartedProcessing.current
     ) {
       return;
@@ -306,6 +343,7 @@ export function ProcessingPage() {
     processing,
     processingComplete,
     gapsDetected,
+    durationWarning,
     startProcessing,
   ]);
 
@@ -463,16 +501,20 @@ export function ProcessingPage() {
           <h1 className="text-2xl font-bold">
             {processingComplete
               ? "Processing Complete"
-              : gapsDetected
-                ? "Gaps Detected"
-                : "Processing Your Project"}
+              : durationWarning
+                ? "Duration Warning"
+                : gapsDetected
+                  ? "Gaps Detected"
+                  : "Processing Your Project"}
           </h1>
           <p className="text-[hsl(var(--muted-foreground))]">
             {processingComplete
               ? "Choose how to export project assets"
-              : gapsDetected
-                ? "Some clips need adjustments to fill timeline gaps"
-                : "Please wait while we generate your Premiere Pro project"}
+              : durationWarning
+                ? "Your video may be too short for TikTok monetization"
+                : gapsDetected
+                  ? "Some clips need adjustments to fill timeline gaps"
+                  : "Please wait while we generate your Premiere Pro project"}
           </p>
         </div>
 
@@ -639,6 +681,27 @@ export function ProcessingPage() {
           </div>
         )}
       </div>
+
+      <DurationWarningModal
+        open={durationWarning && durationWarningData !== null}
+        audioSeconds={durationWarningData?.audioSeconds ?? 0}
+        rawScenesSeconds={durationWarningData?.rawScenesSeconds ?? 0}
+        totalSeconds={durationWarningData?.totalSeconds ?? 0}
+        onGoBack={() => navigate(`/project/${projectId}/script`)}
+        onContinue={async () => {
+          if (!projectId) return;
+          try {
+            await api.acknowledgeDurationWarning(projectId);
+            setDurationWarning(false);
+            setDurationWarningData(null);
+            hasStartedProcessing.current = false;
+            // useEffect will auto-trigger startProcessing
+          } catch (err) {
+            setError((err as Error).message);
+            setDurationWarning(false);
+          }
+        }}
+      />
     </div>
   );
 }

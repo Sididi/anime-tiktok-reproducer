@@ -356,6 +356,20 @@ subtitles/              - Baked subtitle MOGRT files
         return [path for _, path in sortable]
 
     @classmethod
+    def _collect_subtitle_timing_files(cls, output_dir: Path) -> list[Path]:
+        subtitles_dir = output_dir / "subtitles"
+        if not subtitles_dir.exists():
+            return []
+        return sorted(
+            [
+                path
+                for path in subtitles_dir.iterdir()
+                if path.is_file() and path.suffix.lower() == ".srt"
+            ],
+            key=lambda path: path.name.lower(),
+        )
+
+    @classmethod
     def _collect_raw_scene_subtitle_files(cls, output_dir: Path) -> list[Path]:
         raw_dir = output_dir / "raw_scene_subtitles"
         if not raw_dir.exists():
@@ -382,6 +396,7 @@ subtitles/              - Baked subtitle MOGRT files
             raise FileNotFoundError("Missing subtitle file. Run processing first.")
 
         baked_subtitles = cls._collect_baked_subtitle_files(output_dir)
+        subtitle_timing_files = cls._collect_subtitle_timing_files(output_dir)
         raw_scene_subtitle_files = cls._collect_raw_scene_subtitle_files(output_dir)
 
         folder = cls.output_folder_name(project)
@@ -457,6 +472,13 @@ subtitles/              - Baked subtitle MOGRT files
                 ManifestEntry(
                     relative_path=f"{folder}/subtitles/{subtitle_mogrt.name}",
                     source_path=subtitle_mogrt,
+                )
+            )
+        for subtitle_timing_file in subtitle_timing_files:
+            entries.append(
+                ManifestEntry(
+                    relative_path=f"{folder}/subtitles/{subtitle_timing_file.name}",
+                    source_path=subtitle_timing_file,
                 )
             )
 

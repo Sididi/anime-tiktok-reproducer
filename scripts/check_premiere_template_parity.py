@@ -28,6 +28,18 @@ def _normalize(text: str) -> str:
         out,
         count=1,
     )
+    out = re.sub(
+        r"var RAW_SCENE_TEXT_SUBTITLE_MOGRT_DIR = [^;]+;",
+        "var RAW_SCENE_TEXT_SUBTITLE_MOGRT_DIR = <RAW_SCENE_TEXT_SUBTITLE_MOGRT_DIR>;",
+        out,
+        count=1,
+    )
+    out = re.sub(
+        r'var RAW_SCENE_TEXT_SUBTITLE_SRT_PATH = ROOT_DIR \+ "[^"]*";',
+        'var RAW_SCENE_TEXT_SUBTITLE_SRT_PATH = ROOT_DIR + "/<RAW_SCENE_TEXT_SUBTITLE_SRT_PATH>";',
+        out,
+        count=1,
+    )
 
     # Allowed contract override: root /subtitles.
     out = re.sub(

@@ -449,6 +449,13 @@ export const api = {
       }[];
     }>(`/anime/browse${path ? `?path=${encodeURIComponent(path)}` : ""}`),
 
+  // Duration Warning
+  acknowledgeDurationWarning: (projectId: string) =>
+    request<{ status: string }>(
+      `/projects/${projectId}/duration-warning/acknowledge`,
+      { method: "POST" },
+    ),
+
   // Gap Resolution
   getGapsConfig: (projectId: string) =>
     request<{ full_auto_enabled: boolean }>(
