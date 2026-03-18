@@ -280,13 +280,11 @@ export function ProjectSetup() {
         onSelect={(path) => {
           setShowFolderBrowser(false);
           if (updateSourceName) {
-            // Handle update: call indexAnime for update
-            // For now use sync index (Phase 2 will use async)
             api
               .indexAnime(path, selectedLibraryType, updateSourceName)
-              .then((resp) => {
-                readSSEStream(resp, () => {}).then(() => loadSources());
-              });
+              .then((resp) => readSSEStream(resp, () => {}))
+              .then(() => loadSources())
+              .catch((err) => setError((err as Error).message));
             setUpdateSourceName(null);
           }
         }}

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { AlertTriangle } from "lucide-react";
+import { getLibraryTypeLabel } from "@/utils/libraryTypes";
 import type { LibraryType } from "@/types";
 
 interface PurgeModalProps {
@@ -20,6 +21,7 @@ export function PurgeModal({
   open,
   onClose,
   onConfirm,
+  currentLibraryType,
   estimatedBytes,
   sourceCount,
 }: PurgeModalProps) {
@@ -46,7 +48,7 @@ export function PurgeModal({
 
         {/* Title */}
         <h2 className="font-semibold text-lg text-center">
-          Purger la librairie
+          Purger la librairie {getLibraryTypeLabel(currentLibraryType)}
         </h2>
 
         {/* Explanation */}

@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import type { SourceDetails } from "@/types";
 import { SourceRow } from "./SourceRow";
 
@@ -18,16 +19,20 @@ export function SourceList({
   onUpdateSource,
   searchQuery,
 }: SourceListProps) {
-  const filtered = sources
-    .filter((s) =>
-      s.name.toLowerCase().includes(searchQuery.toLowerCase())
-    )
-    .sort((a, b) =>
-      a.name.localeCompare(b.name, undefined, {
-        sensitivity: "base",
-        numeric: true,
-      })
-    );
+  const filtered = useMemo(
+    () =>
+      sources
+        .filter((s) =>
+          s.name.toLowerCase().includes(searchQuery.toLowerCase()),
+        )
+        .sort((a, b) =>
+          a.name.localeCompare(b.name, undefined, {
+            sensitivity: "base",
+            numeric: true,
+          }),
+        ),
+    [sources, searchQuery],
+  );
 
   return (
     <div className="flex flex-col flex-1 min-h-0">
