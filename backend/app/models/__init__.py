@@ -20,6 +20,12 @@ from .metadata import (
     TikTokMetadata,
     VideoMetadataPayload,
 )
+from .torrent import (
+    TorrentFileMapping,
+    TorrentEntry,
+    SourceTorrentMetadata,
+    IndexationJob,
+)
 
 __all__ = [
     "LibraryType",
@@ -31,4 +37,5 @@ __all__ = [
     "SubtitleGenerationRequest", "SubtitlePreviewRequest", "SubtitleGenerationProgress",
     "FacebookMetadata", "InstagramMetadata", "YouTubeMetadata",
     "TikTokMetadata", "VideoMetadataPayload",
+    "TorrentFileMapping", "TorrentEntry", "SourceTorrentMetadata", "IndexationJob",
 ]

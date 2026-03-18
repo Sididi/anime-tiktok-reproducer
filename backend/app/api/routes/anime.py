@@ -29,7 +29,7 @@ async def browse_directories(path: str | None = Query(default=None)):
     def _scan_path() -> tuple[list[dict], list[dict]]:
         dirs = []
         files = []
-        for entry in sorted(browse_path.iterdir(), key=lambda e: e.name.lower()):
+        for entry in sorted(browse_path.iterdir(), key=lambda e: e.stat().st_mtime, reverse=True):
             if entry.name.startswith("."):
                 continue
             if entry.is_dir():
@@ -46,6 +46,7 @@ async def browse_directories(path: str | None = Query(default=None)):
                     "path": str(entry),
                     "is_dir": True,
                     "has_videos": has_videos,
+                    "mtime": entry.stat().st_mtime,
                 })
             elif entry.is_file() and entry.suffix.lower() in VIDEO_EXTENSIONS:
                 files.append({
@@ -53,6 +54,7 @@ async def browse_directories(path: str | None = Query(default=None)):
                     "path": str(entry),
                     "is_dir": False,
                     "has_videos": False,
+                    "mtime": entry.stat().st_mtime,
                 })
         return dirs, files
 
@@ -229,3 +231,190 @@ async def check_folders(request: CheckFoldersRequest):
 
     folders = await AnimeLibraryService.get_available_folders(source_path)
     return {"path": request.path, "folders": folders}
+
+
+class SourceDetails(BaseModel):
+    name: str
+    episode_count: int
+    total_size_bytes: int
+    fps: float
+    missing_episodes: int
+    purge_protected: bool
+    original_index_path: str | None
+
+
+@router.get("/source-details")
+async def get_source_details(
+    library_type: LibraryType = Query(...),
+) -> list[SourceDetails]:
+    """Get detailed metadata for all sources in a library type."""
+    return await AnimeLibraryService.get_source_details(library_type=library_type)
+
+
+# ---------------------------------------------------------------------------
+# Async indexation queue
+# ---------------------------------------------------------------------------
+
+class IndexAnimeAsyncRequest(BaseModel):
+    source_path: str
+    library_type: LibraryType
+    anime_name: str | None = None
+    fps: float = 2.0
+
+
+@router.post("/index-async")
+async def index_anime_async(request: IndexAnimeAsyncRequest):
+    """Enqueue an async indexation job."""
+    from ...services.indexation_queue import indexation_queue
+
+    source_folder = Path(request.source_path)
+    if not source_folder.exists() or not source_folder.is_dir():
+        raise HTTPException(status_code=400, detail=f"Invalid source: {request.source_path}")
+    job_id = await indexation_queue.enqueue(
+        source_path=request.source_path,
+        library_type=request.library_type,
+        anime_name=request.anime_name,
+        fps=request.fps,
+    )
+    return {"job_id": job_id}
+
+
+@router.get("/jobs")
+async def list_jobs():
+    """List all indexation jobs."""
+    from ...services.indexation_queue import indexation_queue
+
+    return {"jobs": [j.model_dump(mode="json") for j in indexation_queue.list_jobs()]}
+
+
+@router.get("/jobs/stream")
+async def stream_jobs():
+    """Stream indexation job updates via SSE."""
+    from ...services.indexation_queue import indexation_queue
+
+    async def generate():
+        async for data in indexation_queue.stream_all_jobs():
+            yield f"data: {json.dumps(data)}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Purge system
+# ---------------------------------------------------------------------------
+
+class PurgeRequest(BaseModel):
+    library_type: LibraryType
+    all_types: bool = False
+
+
+@router.post("/purge")
+async def purge_library(request: PurgeRequest):
+    """Delete video files from library, preserving indexes and metadata."""
+    from ...services.torrent_linker import TorrentLinkerService
+
+    types_to_purge = list(LibraryType) if request.all_types else [request.library_type]
+    purged_sources: list[str] = []
+    freed_bytes = 0
+    skipped_protected: list[str] = []
+
+    for lt in types_to_purge:
+        library_root = AnimeLibraryService.get_library_path(library_type=lt)
+        if not library_root.exists():
+            continue
+        for source_dir in library_root.iterdir():
+            if not source_dir.is_dir() or source_dir.name.startswith("."):
+                continue
+            metadata = TorrentLinkerService.load_metadata(source_dir)
+            if metadata and metadata.purge_protection:
+                skipped_protected.append(source_dir.name)
+                continue
+            for f in source_dir.iterdir():
+                if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS:
+                    freed_bytes += f.stat().st_size
+                    f.unlink()
+            purged_sources.append(source_dir.name)
+
+    # Clear caches
+    from ...config import settings as app_settings
+    import shutil
+
+    cache_dir = app_settings.cache_dir
+    for lt in types_to_purge:
+        manifest = cache_dir / f"episodes_manifest__{lt.value}.json"
+        if manifest.exists():
+            manifest.unlink()
+    for subdir in ["source_previews", "source_stream_chunks_v1"]:
+        cache_subdir = cache_dir / subdir
+        if cache_subdir.exists():
+            shutil.rmtree(cache_subdir)
+    default_manifest = cache_dir / "episodes_manifest.json"
+    if default_manifest.exists():
+        default_manifest.unlink()
+
+    return {
+        "purged_sources": purged_sources,
+        "freed_bytes": freed_bytes,
+        "skipped_protected": skipped_protected,
+    }
+
+
+@router.get("/purge/estimate")
+async def estimate_purge(
+    library_type: LibraryType = Query(...),
+    all_types: bool = Query(False),
+):
+    """Estimate how much space would be freed by purging."""
+    from ...services.torrent_linker import TorrentLinkerService
+
+    types_to_check = list(LibraryType) if all_types else [library_type]
+    total_bytes = 0
+    source_count = 0
+
+    for lt in types_to_check:
+        library_root = AnimeLibraryService.get_library_path(library_type=lt)
+        if not library_root.exists():
+            continue
+        for source_dir in library_root.iterdir():
+            if not source_dir.is_dir() or source_dir.name.startswith("."):
+                continue
+            metadata = TorrentLinkerService.load_metadata(source_dir)
+            if metadata and metadata.purge_protection:
+                continue
+            has_videos = False
+            for f in source_dir.iterdir():
+                if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS:
+                    total_bytes += f.stat().st_size
+                    has_videos = True
+            if has_videos:
+                source_count += 1
+
+    return {"estimated_bytes": total_bytes, "source_count": source_count}
+
+
+# ---------------------------------------------------------------------------
+# Purge protection toggle
+# ---------------------------------------------------------------------------
+
+@router.patch("/{source_name}/protection")
+async def toggle_protection(
+    source_name: str,
+    library_type: LibraryType = Query(...),
+):
+    """Toggle purge protection for a source."""
+    from ...services.torrent_linker import TorrentLinkerService
+    from ...models.torrent import SourceTorrentMetadata
+
+    library_root = AnimeLibraryService.get_library_path(library_type=library_type)
+    source_dir = library_root / source_name
+    if not source_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Source not found: {source_name}")
+
+    metadata = TorrentLinkerService.load_metadata(source_dir) or SourceTorrentMetadata()
+    metadata.purge_protection = not metadata.purge_protection
+    TorrentLinkerService.save_metadata(source_dir, metadata)
+    return {"purge_protected": metadata.purge_protection}

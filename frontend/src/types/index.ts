@@ -326,3 +326,5 @@ export interface Transcription {
   language: string;
   scenes: SceneTranscription[];
 }
+
+export type { SourceDetails, BrowseEntry, BrowseResult, IndexationJob, PurgeResult } from "./library";

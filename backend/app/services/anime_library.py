@@ -3270,3 +3270,141 @@ class AnimeLibraryService:
             return payload.get("results", [])
         except json.JSONDecodeError:
             return []
+
+    @classmethod
+    def _get_source_details_sync(
+        cls,
+        library_type: LibraryType | str | None = None,
+    ) -> list[dict]:
+        """Collect per-source metadata for all series in a library type (sync)."""
+        scoped_type = coerce_library_type(library_type)
+        library_path = cls.get_library_path(scoped_type)
+
+        if not library_path.exists():
+            return []
+
+        # Load the shared index manifest once
+        index_dir = library_path / cls.INDEX_DIR_NAME
+        manifest_path = index_dir / cls.MANIFEST_FILE
+        manifest_series: dict = {}
+        manifest_default_fps: float | None = None
+        try:
+            manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(manifest_payload, dict):
+                raw_series = manifest_payload.get("series", {})
+                if isinstance(raw_series, dict):
+                    manifest_series = raw_series
+                config = manifest_payload.get("config", {})
+                if isinstance(config, dict):
+                    manifest_default_fps = cls._coerce_fps(config.get("default_fps"))
+        except (OSError, json.JSONDecodeError):
+            pass
+
+        # Load state.json once (indexed file paths keyed by relative path)
+        state_path = index_dir / cls.STATE_FILE
+        state_files: dict = {}
+        try:
+            state_payload = json.loads(state_path.read_text(encoding="utf-8"))
+            if isinstance(state_payload, dict):
+                files = state_payload.get("files", {})
+                if isinstance(files, dict):
+                    state_files = files
+        except (OSError, json.JSONDecodeError):
+            pass
+
+        results = []
+        try:
+            series_dirs = [
+                entry
+                for entry in library_path.iterdir()
+                if entry.is_dir() and not entry.name.startswith(".")
+            ]
+        except OSError:
+            return []
+
+        for series_dir in series_dirs:
+            series_name = series_dir.name
+
+            # Count video files on disk
+            video_files_on_disk: list[Path] = []
+            try:
+                video_files_on_disk = [
+                    f
+                    for f in series_dir.iterdir()
+                    if f.is_file() and f.suffix.lower() in cls.VIDEO_EXTENSIONS
+                ]
+            except OSError:
+                pass
+
+            episode_count_on_disk = len(video_files_on_disk)
+            total_size_bytes = sum(
+                f.stat().st_size for f in video_files_on_disk
+                if f.exists()
+            )
+
+            # Count indexed episodes from state.json
+            prefix = f"{series_name}/"
+            indexed_episode_count = sum(
+                1 for path in state_files
+                if path == series_name or path.startswith(prefix)
+            )
+
+            missing_episodes = max(0, episode_count_on_disk - indexed_episode_count)
+
+            # Get FPS from manifest
+            fps: float = 0.0
+            series_entry = manifest_series.get(series_name)
+            if isinstance(series_entry, dict):
+                fps_val = cls._coerce_fps(series_entry.get("fps"))
+                if fps_val is not None:
+                    fps = fps_val
+            if fps == 0.0 and manifest_default_fps is not None:
+                fps = manifest_default_fps
+
+            # Get purge_protection from .atr_torrents.json (may not exist yet)
+            purge_protected = False
+            torrents_path = series_dir / ".atr_torrents.json"
+            try:
+                torrents_payload = json.loads(torrents_path.read_text(encoding="utf-8"))
+                if isinstance(torrents_payload, dict):
+                    purge_protected = bool(torrents_payload.get("purge_protection", False))
+            except (OSError, json.JSONDecodeError):
+                pass
+
+            # Get original_index_path from first .atr_source.json found
+            original_index_path: str | None = None
+            try:
+                for entry in series_dir.iterdir():
+                    if entry.is_file() and entry.name.endswith(cls.SOURCE_IMPORT_MANIFEST_SUFFIX):
+                        try:
+                            source_payload = json.loads(entry.read_text(encoding="utf-8"))
+                            if isinstance(source_payload, dict):
+                                raw_source_path = source_payload.get("source_path")
+                                if isinstance(raw_source_path, str) and raw_source_path:
+                                    original_index_path = raw_source_path
+                                    break
+                        except (OSError, json.JSONDecodeError):
+                            continue
+            except OSError:
+                pass
+
+            results.append({
+                "name": series_name,
+                "episode_count": episode_count_on_disk,
+                "total_size_bytes": total_size_bytes,
+                "fps": fps,
+                "missing_episodes": missing_episodes,
+                "purge_protected": purge_protected,
+                "original_index_path": original_index_path,
+            })
+
+        return results
+
+    @classmethod
+    async def get_source_details(
+        cls,
+        *,
+        library_type: LibraryType | str | None = None,
+    ) -> list[dict]:
+        """Get detailed metadata for all sources in a library type."""
+        return await asyncio.to_thread(cls._get_source_details_sync, library_type)
