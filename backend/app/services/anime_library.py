@@ -3408,3 +3408,109 @@ class AnimeLibraryService:
     ) -> list[dict]:
         """Get detailed metadata for all sources in a library type."""
         return await asyncio.to_thread(cls._get_source_details_sync, library_type)
+
+    # ------------------------------------------------------------------
+    # Purge system
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _purge_library_sync(
+        cls,
+        library_types: list[LibraryType],
+    ) -> dict:
+        """Delete video files from library sources, preserving indexes and metadata.
+
+        Respects purge protection flags in .atr_torrents.json.
+        Returns dict with purged_sources, freed_bytes, skipped_protected.
+        """
+        import shutil
+        from .torrent_linker import TorrentLinkerService
+        from ..config import settings as app_settings
+
+        purged_sources: list[str] = []
+        freed_bytes = 0
+        skipped_protected: list[str] = []
+
+        for lt in library_types:
+            library_root = cls.get_library_path(library_type=lt)
+            if not library_root.exists():
+                continue
+            for source_dir in library_root.iterdir():
+                if not source_dir.is_dir() or source_dir.name.startswith("."):
+                    continue
+                metadata = TorrentLinkerService.load_metadata(source_dir)
+                if metadata and metadata.purge_protection:
+                    skipped_protected.append(source_dir.name)
+                    continue
+                for f in source_dir.iterdir():
+                    if f.is_file() and f.suffix.lower() in cls.VIDEO_EXTENSIONS:
+                        freed_bytes += f.stat().st_size
+                        f.unlink()
+                purged_sources.append(source_dir.name)
+
+        # Clear caches
+        cache_dir = app_settings.cache_dir
+        for lt in library_types:
+            manifest = cache_dir / f"episodes_manifest__{lt.value}.json"
+            if manifest.exists():
+                manifest.unlink()
+        for subdir in ["source_previews", "source_stream_chunks_v1"]:
+            cache_subdir = cache_dir / subdir
+            if cache_subdir.exists():
+                shutil.rmtree(cache_subdir)
+        default_manifest = cache_dir / "episodes_manifest.json"
+        if default_manifest.exists():
+            default_manifest.unlink()
+
+        return {
+            "purged_sources": purged_sources,
+            "freed_bytes": freed_bytes,
+            "skipped_protected": skipped_protected,
+        }
+
+    @classmethod
+    async def purge_library(
+        cls,
+        library_types: list[LibraryType],
+    ) -> dict:
+        """Async wrapper for purge."""
+        return await asyncio.to_thread(cls._purge_library_sync, library_types)
+
+    @classmethod
+    def _estimate_purge_size_sync(
+        cls,
+        library_types: list[LibraryType],
+    ) -> dict:
+        """Estimate space freed by purging (respects protection)."""
+        from .torrent_linker import TorrentLinkerService
+
+        total_bytes = 0
+        source_count = 0
+
+        for lt in library_types:
+            library_root = cls.get_library_path(library_type=lt)
+            if not library_root.exists():
+                continue
+            for source_dir in library_root.iterdir():
+                if not source_dir.is_dir() or source_dir.name.startswith("."):
+                    continue
+                metadata = TorrentLinkerService.load_metadata(source_dir)
+                if metadata and metadata.purge_protection:
+                    continue
+                has_videos = False
+                for f in source_dir.iterdir():
+                    if f.is_file() and f.suffix.lower() in cls.VIDEO_EXTENSIONS:
+                        total_bytes += f.stat().st_size
+                        has_videos = True
+                if has_videos:
+                    source_count += 1
+
+        return {"estimated_bytes": total_bytes, "source_count": source_count}
+
+    @classmethod
+    async def estimate_purge_size(
+        cls,
+        library_types: list[LibraryType],
+    ) -> dict:
+        """Async wrapper for purge estimate."""
+        return await asyncio.to_thread(cls._estimate_purge_size_sync, library_types)

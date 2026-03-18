@@ -1,6 +1,7 @@
 """Async indexation queue with SSE broadcasting."""
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 
@@ -8,6 +9,8 @@ from ..library_types import LibraryType
 from ..models.torrent import IndexationJob
 from .anime_library import AnimeLibraryService
 from .anime_matcher import AnimeMatcherService
+
+VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".webm", ".ts", ".m4v"}
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -57,6 +60,7 @@ class IndexationQueueService:
                     AnimeMatcherService.mark_series_updated(
                         job.library_type, job.source_name
                     )
+                    await self._link_torrents(job)
                 elif progress.status == "error":
                     job.status = "error"
                     job.error = progress.error
@@ -68,6 +72,67 @@ class IndexationQueueService:
             logger.exception("Indexation job %s failed", job.id)
         finally:
             self._semaphore.release()
+
+    async def _link_torrents(self, job: IndexationJob) -> None:
+        """Best-effort torrent linking after successful indexation."""
+        try:
+            from .qbittorrent import QBittorrentClient
+            from .torrent_linker import TorrentLinkerService
+        except ImportError:
+            logger.debug("httpx not installed, skipping torrent linking")
+            return
+
+        library_root = AnimeLibraryService.get_library_path(
+            library_type=job.library_type
+        )
+        source_dir = library_root / job.source_name
+        if not source_dir.exists():
+            return
+
+        # Collect original source paths from .atr_source.json files
+        source_files: list[Path] = []
+        for meta_file in source_dir.glob("*.atr_source.json"):
+            try:
+                meta = json.loads(meta_file.read_text())
+                original = Path(meta["source_path"])
+                source_files.append(original)
+            except (KeyError, json.JSONDecodeError):
+                continue
+
+        if not source_files:
+            return
+
+        qbt = QBittorrentClient()
+        try:
+            metadata, unmatched = await TorrentLinkerService.link_files_to_torrents(
+                source_files, qbt
+            )
+            # Preserve existing protection status if metadata already exists
+            existing = TorrentLinkerService.load_metadata(source_dir)
+            if existing:
+                metadata.purge_protection = existing.purge_protection
+            if metadata.torrents:
+                TorrentLinkerService.save_metadata(source_dir, metadata)
+            job.linked_torrents = len(metadata.torrents)
+            job.unmatched_files = [p.name for p in unmatched]
+            if unmatched:
+                logger.warning(
+                    "%d file(s) not linked to any torrent for %s: %s",
+                    len(unmatched),
+                    job.source_name,
+                    [p.name for p in unmatched],
+                )
+            if metadata.torrents:
+                logger.info(
+                    "Linked %d torrent(s) for %s",
+                    len(metadata.torrents),
+                    job.source_name,
+                )
+            self._broadcast(job)
+        except Exception:
+            logger.debug("Torrent linking failed for %s (non-fatal)", job.source_name)
+        finally:
+            await qbt.close()
 
     def _broadcast(self, job: IndexationJob) -> None:
         data = job.model_dump(mode="json")

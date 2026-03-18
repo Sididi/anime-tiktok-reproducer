@@ -1114,9 +1114,12 @@ export function MatchValidation() {
                 cached: true,
               });
             } else {
+              // Deferred download first (handles purged episodes), then prepare clips
+              await handleDeferredDownload();
               void preparePlaybackClips(false);
             }
           } catch {
+            await handleDeferredDownload();
             void preparePlaybackClips(false);
           }
         } else {
@@ -1152,7 +1155,7 @@ export function MatchValidation() {
     };
 
     loadData();
-  }, [projectId, loadProject, loadScenes, preparePlaybackClips]);
+  }, [projectId, loadProject, loadScenes, handleDeferredDownload, preparePlaybackClips]);
 
   useEffect(() => {
     if (scenes.length === 0) {
@@ -2109,7 +2112,8 @@ export function MatchValidation() {
               {playbackError && (
                 <Button
                   variant="outline"
-                  onClick={() => {
+                  onClick={async () => {
+                    await handleDeferredDownload();
                     void preparePlaybackClips(true);
                   }}
                 >

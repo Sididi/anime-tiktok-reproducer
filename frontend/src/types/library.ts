@@ -33,6 +33,8 @@ export interface IndexationJob {
   phase: string | null;
   message: string | null;
   error: string | null;
+  unmatched_files: string[];
+  linked_torrents: number;
   created_at: string;
 }
 

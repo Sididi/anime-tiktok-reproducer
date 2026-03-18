@@ -333,52 +333,8 @@ class PurgeRequest(BaseModel):
 @router.post("/purge")
 async def purge_library(request: PurgeRequest):
     """Delete video files from library, preserving indexes and metadata."""
-    from ...services.torrent_linker import TorrentLinkerService
-
     types_to_purge = list(LibraryType) if request.all_types else [request.library_type]
-    purged_sources: list[str] = []
-    freed_bytes = 0
-    skipped_protected: list[str] = []
-
-    for lt in types_to_purge:
-        library_root = AnimeLibraryService.get_library_path(library_type=lt)
-        if not library_root.exists():
-            continue
-        for source_dir in library_root.iterdir():
-            if not source_dir.is_dir() or source_dir.name.startswith("."):
-                continue
-            metadata = TorrentLinkerService.load_metadata(source_dir)
-            if metadata and metadata.purge_protection:
-                skipped_protected.append(source_dir.name)
-                continue
-            for f in source_dir.iterdir():
-                if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS:
-                    freed_bytes += f.stat().st_size
-                    f.unlink()
-            purged_sources.append(source_dir.name)
-
-    # Clear caches
-    from ...config import settings as app_settings
-    import shutil
-
-    cache_dir = app_settings.cache_dir
-    for lt in types_to_purge:
-        manifest = cache_dir / f"episodes_manifest__{lt.value}.json"
-        if manifest.exists():
-            manifest.unlink()
-    for subdir in ["source_previews", "source_stream_chunks_v1"]:
-        cache_subdir = cache_dir / subdir
-        if cache_subdir.exists():
-            shutil.rmtree(cache_subdir)
-    default_manifest = cache_dir / "episodes_manifest.json"
-    if default_manifest.exists():
-        default_manifest.unlink()
-
-    return {
-        "purged_sources": purged_sources,
-        "freed_bytes": freed_bytes,
-        "skipped_protected": skipped_protected,
-    }
+    return await AnimeLibraryService.purge_library(types_to_purge)
 
 
 @router.get("/purge/estimate")
@@ -387,31 +343,8 @@ async def estimate_purge(
     all_types: bool = Query(False),
 ):
     """Estimate how much space would be freed by purging."""
-    from ...services.torrent_linker import TorrentLinkerService
-
     types_to_check = list(LibraryType) if all_types else [library_type]
-    total_bytes = 0
-    source_count = 0
-
-    for lt in types_to_check:
-        library_root = AnimeLibraryService.get_library_path(library_type=lt)
-        if not library_root.exists():
-            continue
-        for source_dir in library_root.iterdir():
-            if not source_dir.is_dir() or source_dir.name.startswith("."):
-                continue
-            metadata = TorrentLinkerService.load_metadata(source_dir)
-            if metadata and metadata.purge_protection:
-                continue
-            has_videos = False
-            for f in source_dir.iterdir():
-                if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS:
-                    total_bytes += f.stat().st_size
-                    has_videos = True
-            if has_videos:
-                source_count += 1
-
-    return {"estimated_bytes": total_bytes, "source_count": source_count}
+    return await AnimeLibraryService.estimate_purge_size(types_to_check)
 
 
 # ---------------------------------------------------------------------------

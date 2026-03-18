@@ -61,7 +61,9 @@ class TorrentLinkerService:
             logger.debug("qBittorrent API unavailable for torrent linking")
 
         # Strategy 2: Parse .torrent files from .complete directory
-        if unmatched and settings.torrent_complete_dir.exists():
+        # Always runs if dir exists — enriches API matches with torrent_file_path
+        # and catches files that API missed.
+        if settings.torrent_complete_dir.exists():
             try:
                 import torf
             except ImportError:
@@ -97,7 +99,7 @@ class TorrentLinkerService:
                         if matched_files:
                             torrent_entries[t_hash] = TorrentEntry(
                                 info_hash=t_hash,
-                                magnet_uri=t.magnet(),
+                                magnet_uri=str(t.magnet()),
                                 torrent_name=t.name or torrent_path.stem,
                                 torrent_file_path=str(torrent_path),
                                 files=matched_files,

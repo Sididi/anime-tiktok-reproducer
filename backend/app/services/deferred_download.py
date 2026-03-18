@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from ..models.torrent import TorrentEntry, TorrentFileMapping
-from .qbittorrent import QBittorrentClient
 from .torrent_linker import TorrentLinkerService
 
 logger = logging.getLogger("uvicorn.error")
@@ -87,7 +86,7 @@ class DeferredDownloadService:
 
     @staticmethod
     async def execute_downloads(
-        plans: list[DownloadPlan], qbt: QBittorrentClient
+        plans: list[DownloadPlan], qbt: "QBittorrentClient"
     ) -> None:
         """Add torrents to qBittorrent, select only needed files."""
         for plan in plans:
@@ -113,7 +112,7 @@ class DeferredDownloadService:
 
     @staticmethod
     async def watch_downloads(
-        plans: list[DownloadPlan], qbt: QBittorrentClient
+        plans: list[DownloadPlan], qbt: "QBittorrentClient"
     ) -> AsyncIterator[dict]:
         """Poll until all needed files are downloaded. Yields progress events.
 

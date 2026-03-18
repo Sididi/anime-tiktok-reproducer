@@ -1,6 +1,13 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { ChevronDown, Loader2, CheckCircle2, XCircle, Clock } from "lucide-react";
+import {
+  ChevronDown,
+  Loader2,
+  CheckCircle2,
+  XCircle,
+  Clock,
+  AlertTriangle,
+} from "lucide-react";
 import { api } from "@/api/client";
 import { readSSEStream } from "@/utils/sse";
 import type { IndexationJob } from "@/types";
@@ -142,6 +149,13 @@ export function IndexJobsPanel({ onJobComplete }: IndexJobsPanelProps) {
                           ? ""
                           : `${Math.round(job.progress * 100)}%`}
                     </span>
+                    {job.status === "complete" &&
+                      job.unmatched_files?.length > 0 && (
+                        <AlertTriangle
+                          className="h-3.5 w-3.5 text-amber-500 shrink-0"
+                          title={`${job.unmatched_files.length} fichier(s) non lié(s) à un torrent`}
+                        />
+                      )}
                   </motion.div>
                 ))}
               </AnimatePresence>
@@ -174,8 +188,15 @@ function statusLabel(job: IndexationJob): string {
       return "En attente";
     case "indexing":
       return job.message || "Indexation...";
-    case "complete":
+    case "complete": {
+      if (job.unmatched_files?.length > 0) {
+        return `Terminé — ${job.unmatched_files.length} fichier(s) sans torrent`;
+      }
+      if (job.linked_torrents > 0) {
+        return `Terminé — ${job.linked_torrents} torrent(s) lié(s)`;
+      }
       return "Terminé";
+    }
     case "error":
       return job.error || "Erreur";
   }

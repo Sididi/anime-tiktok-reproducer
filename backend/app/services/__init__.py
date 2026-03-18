@@ -32,6 +32,9 @@ from .title_image_generator import TitleImageGeneratorService
 from .premiere_subtitle_baker import PremiereSubtitleBakerService
 from .raw_scene_detector import RawSceneDetectorService
 from .source_chunk_streaming_service import SourceChunkStreamingService
+from .indexation_queue import indexation_queue, IndexationQueueService
+from .torrent_linker import TorrentLinkerService
+from .deferred_download import DeferredDownloadService
 
 __all__ = [
     "AccountService",
@@ -56,4 +59,7 @@ __all__ = [
     "PremiereSubtitleBakerService",
     "RawSceneDetectorService",
     "SourceChunkStreamingService",
+    "indexation_queue", "IndexationQueueService",
+    "TorrentLinkerService",
+    "DeferredDownloadService",
 ]
