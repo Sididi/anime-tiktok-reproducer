@@ -41,3 +41,56 @@ export interface PurgeResult {
   freed_bytes: number;
   skipped_protected: string[];
 }
+
+// --- Torrent management types ---
+
+export interface TorrentFileMapping {
+  torrent_file_index: number;
+  torrent_filename: string;
+  library_path: string;
+  file_size: number;
+}
+
+export interface TorrentEntry {
+  id: string;
+  info_hash: string;
+  magnet_uri: string;
+  torrent_name: string;
+  torrent_file_path: string | null;
+  added_at: string;
+  files: TorrentFileMapping[];
+}
+
+export interface SourceTorrentMetadata {
+  torrents: TorrentEntry[];
+  purge_protection: boolean;
+}
+
+export interface VerificationResult {
+  torrent_id: string;
+  status: "pass" | "warn" | "fail";
+  match_rate: number;
+  avg_similarity: number;
+  offset_median: number;
+  message: string;
+}
+
+export interface ReplacementProgressEvent {
+  phase:
+    | "downloading_verification"
+    | "verifying"
+    | "results"
+    | "saving"
+    | "downloading_reindex"
+    | "removing_old_index"
+    | "reindexing"
+    | "cache_cleanup"
+    | "complete"
+    | "error"
+    | "stalled";
+  torrent_id: string | null;
+  progress: number;
+  message: string;
+  verification_results?: VerificationResult[];
+  error?: string | null;
+}

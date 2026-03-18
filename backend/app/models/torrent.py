@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -30,6 +31,58 @@ class TorrentEntry(BaseModel):
 class SourceTorrentMetadata(BaseModel):
     torrents: list[TorrentEntry] = []
     purge_protection: bool = False
+
+
+# --- Torrent replacement models ---
+
+
+class TorrentReplacementRequest(BaseModel):
+    """One torrent to replace within a source."""
+
+    torrent_id: str
+    new_magnet_uri: str
+
+
+class ReplaceTorrentsRequest(BaseModel):
+    source_name: str
+    library_type: LibraryType
+    replacements: list[TorrentReplacementRequest]
+
+
+class ConfirmReindexRequest(BaseModel):
+    source_name: str
+    library_type: LibraryType
+    torrent_ids: list[str]
+
+
+class VerificationResult(BaseModel):
+    torrent_id: str
+    status: Literal["pass", "warn", "fail"]
+    match_rate: float
+    avg_similarity: float
+    offset_median: float
+    message: str
+
+
+class ReplacementProgress(BaseModel):
+    phase: Literal[
+        "downloading_verification",
+        "verifying",
+        "results",
+        "saving",
+        "downloading_reindex",
+        "removing_old_index",
+        "reindexing",
+        "cache_cleanup",
+        "complete",
+        "error",
+        "stalled",
+    ]
+    torrent_id: str | None = None
+    progress: float = 0.0
+    message: str = ""
+    verification_results: list[VerificationResult] | None = None
+    error: str | None = None
 
 
 class IndexationJob(BaseModel):

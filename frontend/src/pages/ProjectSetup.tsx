@@ -8,6 +8,7 @@ import {
   BottomBar,
   NewSourceModal,
   PurgeModal,
+  TorrentManagementModal,
 } from "@/components/library";
 import { FolderBrowserModal } from "@/components/FolderBrowserModal";
 import { ProjectManagerModal } from "@/components/project-manager";
@@ -39,6 +40,7 @@ export function ProjectSetup() {
   const [showNewSource, setShowNewSource] = useState(false);
   const [showFolderBrowser, setShowFolderBrowser] = useState(false);
   const [updateSourceName, setUpdateSourceName] = useState<string | null>(null);
+  const [torrentSourceName, setTorrentSourceName] = useState<string | null>(null);
 
   // Purge estimate
   const [purgeEstimatedBytes, setPurgeEstimatedBytes] = useState(0);
@@ -231,6 +233,7 @@ export function ProjectSetup() {
           setUpdateSourceName(name);
           setShowFolderBrowser(true);
         }}
+        onManageTorrents={(name) => setTorrentSourceName(name)}
         searchQuery={searchQuery}
       />
 
@@ -295,6 +298,16 @@ export function ProjectSetup() {
             : undefined
         }
       />
+
+      {torrentSourceName && (
+        <TorrentManagementModal
+          open={!!torrentSourceName}
+          onClose={() => setTorrentSourceName(null)}
+          sourceName={torrentSourceName}
+          libraryType={selectedLibraryType}
+          onComplete={loadSources}
+        />
+      )}
     </div>
   );
 }

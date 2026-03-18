@@ -735,4 +735,44 @@ export const api = {
       },
     );
   },
+
+  // Torrent management
+  getSourceTorrents: (
+    libraryType: import("@/types").LibraryType,
+    sourceName: string,
+  ) =>
+    request<import("@/types").SourceTorrentMetadata>(
+      `/anime/${encodeURIComponent(sourceName)}/torrents?library_type=${encodeURIComponent(libraryType)}`,
+    ),
+
+  replaceTorrents: (
+    sourceName: string,
+    libraryType: import("@/types").LibraryType,
+    replacements: Array<{ torrent_id: string; new_magnet_uri: string }>,
+  ) =>
+    fetch(`${API_BASE}/anime/${encodeURIComponent(sourceName)}/torrents/replace`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        library_type: libraryType,
+        replacements,
+      }),
+    }),
+
+  confirmReindex: (
+    sourceName: string,
+    libraryType: import("@/types").LibraryType,
+    torrentIds: string[],
+  ) =>
+    fetch(
+      `${API_BASE}/anime/${encodeURIComponent(sourceName)}/torrents/replace/confirm-reindex`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          library_type: libraryType,
+          torrent_ids: torrentIds,
+        }),
+      },
+    ),
 };

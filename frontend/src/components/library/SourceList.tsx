@@ -8,6 +8,7 @@ interface SourceListProps {
   onSelectSource: (name: string) => void;
   onToggleProtection: (name: string) => void;
   onUpdateSource: (name: string) => void;
+  onManageTorrents: (name: string) => void;
   searchQuery: string;
 }
 
@@ -17,6 +18,7 @@ export function SourceList({
   onSelectSource,
   onToggleProtection,
   onUpdateSource,
+  onManageTorrents,
   searchQuery,
 }: SourceListProps) {
   const filtered = useMemo(
@@ -42,7 +44,7 @@ export function SourceList({
         <div className="w-20 shrink-0">Épisodes</div>
         <div className="w-14 shrink-0">FPS</div>
         <div className="w-16 shrink-0">Taille</div>
-        <div className="w-20 shrink-0 text-right">Actions</div>
+        <div className="w-24 shrink-0 text-right">Actions</div>
       </div>
 
       {/* Source rows */}
@@ -60,6 +62,7 @@ export function SourceList({
               onSelect={() => onSelectSource(source.name)}
               onToggleProtection={() => onToggleProtection(source.name)}
               onUpdate={() => onUpdateSource(source.name)}
+              onManageTorrents={() => onManageTorrents(source.name)}
             />
           ))
         )}

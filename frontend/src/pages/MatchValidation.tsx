@@ -23,9 +23,11 @@ import {
   Wand2,
   Undo2,
   Merge,
+  Cable,
 } from "lucide-react";
 import { Button } from "@/components/ui";
 import { MatchesClipPlayer, ManualMatchModal } from "@/components/video";
+import { TorrentManagementModal } from "@/components/library";
 import type { MatchesClipPlayerHandle } from "@/components/video/MatchesClipPlayer";
 import type { ManualMatchSaveMeta } from "@/components/video/ManualMatchModal";
 import { useProjectStore, useSceneStore } from "@/stores";
@@ -33,6 +35,7 @@ import { api } from "@/api/client";
 import { readSSEStream } from "@/utils/sse";
 import { cn, formatTime } from "@/utils";
 import type {
+  LibraryType,
   MatchesPlaybackManifest,
   SceneMatch,
   Scene,
@@ -644,6 +647,13 @@ export function MatchValidation() {
     message: string;
   } | null>(null);
   const [mergeContinuous, setMergeContinuous] = useState(true);
+  // Torrent failure state (deferred download stall detection)
+  const [torrentFailure, setTorrentFailure] = useState<{
+    sourceName: string;
+    torrentId: string;
+    message: string;
+  } | null>(null);
+  const [showTorrentModal, setShowTorrentModal] = useState(false);
   const [skipUiEnabled, setSkipUiEnabled] = useState(false);
   const skipUiEnabledRef = useRef(false);
   const [matchesAutoEnabled, setMatchesAutoEnabled] = useState(false);
@@ -939,6 +949,33 @@ export function MatchValidation() {
     },
     [],
   );
+
+  const handleDeferredDownload = useCallback(async () => {
+    if (!projectId) return;
+    try {
+      const response = await api.deferredDownload(projectId);
+      await readSSEStream<{
+        status: string;
+        type?: string;
+        torrent_id?: string;
+        source_name?: string;
+        info_hash?: string;
+        message?: string;
+        progress?: number;
+        error?: string;
+      }>(response, (data) => {
+        if (data.status === "torrent_failed") {
+          setTorrentFailure({
+            sourceName: data.source_name || "",
+            torrentId: data.torrent_id || "",
+            message: data.message || "Torrent expiré",
+          });
+        }
+      });
+    } catch {
+      // Non-critical — deferred download may not be needed
+    }
+  }, [projectId]);
 
   const preparePlaybackClips = useCallback(
     async (force = false) => {
@@ -1295,6 +1332,9 @@ export function MatchValidation() {
           setMatches(matchesWithTracking);
           await loadScenes(projectId);
           if (matchesWithTracking.length > 0) {
+            // Trigger deferred download for missing source files before playback
+            setTorrentFailure(null);
+            await handleDeferredDownload();
             await preparePlaybackClips(true);
           } else {
             setPlaybackManifest(null);
@@ -1316,6 +1356,7 @@ export function MatchValidation() {
     mergeContinuous,
     loadScenes,
     stopFastWatch,
+    handleDeferredDownload,
     preparePlaybackClips,
   ]);
 
@@ -2078,6 +2119,32 @@ export function MatchValidation() {
             </div>
           )}
 
+        {/* Torrent failure banner */}
+        {torrentFailure && (
+          <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg p-4 flex items-center justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <AlertCircle className="h-5 w-5 text-amber-500 shrink-0" />
+              <div>
+                <p className="text-sm font-medium text-amber-500">
+                  Torrent expiré
+                </p>
+                <p className="text-xs text-[hsl(var(--muted-foreground))]">
+                  {torrentFailure.message}
+                </p>
+              </div>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              className="border-amber-500/30 hover:bg-amber-500/10 text-amber-500 hover:text-amber-400 shrink-0"
+              onClick={() => setShowTorrentModal(true)}
+            >
+              <Cable className="h-4 w-4 mr-1.5" />
+              Remplacer le torrent
+            </Button>
+          </div>
+        )}
+
         {/* Show matches */}
         {isPlaybackReady && (
           <div className="space-y-4">
@@ -2231,6 +2298,22 @@ export function MatchValidation() {
             {toast.message}
           </div>
         </div>
+      )}
+
+      {/* Torrent replacement modal (triggered by stall detection) */}
+      {torrentFailure && showTorrentModal && (
+        <TorrentManagementModal
+          open={showTorrentModal}
+          onClose={() => setShowTorrentModal(false)}
+          sourceName={torrentFailure.sourceName}
+          libraryType={(project?.library_type as LibraryType) || "anime"}
+          focusTorrentId={torrentFailure.torrentId}
+          onComplete={() => {
+            setTorrentFailure(null);
+            setShowTorrentModal(false);
+            void preparePlaybackClips(true);
+          }}
+        />
       )}
     </div>
   );

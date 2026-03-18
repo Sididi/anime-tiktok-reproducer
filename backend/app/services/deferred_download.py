@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator
@@ -11,6 +12,8 @@ from .qbittorrent import QBittorrentClient
 from .torrent_linker import TorrentLinkerService
 
 logger = logging.getLogger("uvicorn.error")
+
+STALL_TIMEOUT_SECONDS = 45
 
 
 @dataclass
@@ -26,6 +29,7 @@ class DownloadPlan:
     torrent_entry: TorrentEntry
     needed_files: list[TorrentFileMapping]
     save_path: str
+    source_name: str = ""
 
 
 class DeferredDownloadService:
@@ -76,6 +80,7 @@ class DeferredDownloadService:
                     torrent_entry=m.torrent_entry,
                     needed_files=[],
                     save_path=str(Path(m.episode_path).parent),
+                    source_name=m.source_name,
                 )
             by_torrent[key].needed_files.append(m.file_mapping)
         return list(by_torrent.values())
@@ -110,10 +115,19 @@ class DeferredDownloadService:
     async def watch_downloads(
         plans: list[DownloadPlan], qbt: QBittorrentClient
     ) -> AsyncIterator[dict]:
-        """Poll until all needed files are downloaded. Yields progress events."""
+        """Poll until all needed files are downloaded. Yields progress events.
+
+        Detects stalled torrents (no progress for STALL_TIMEOUT_SECONDS) and
+        yields a ``torrent_failed`` event so the frontend can offer replacement.
+        """
         pending_hashes = {
             p.torrent_entry.info_hash: p for p in plans
         }
+        # Track last-seen progress per torrent for stall detection
+        last_progress: dict[str, float] = {h: 0.0 for h in pending_hashes}
+        last_change: dict[str, float] = {h: time.monotonic() for h in pending_hashes}
+        failed_hashes: set[str] = set()
+
         while pending_hashes:
             for info_hash, plan in list(pending_hashes.items()):
                 files = await qbt.get_torrent_files(info_hash)
@@ -130,6 +144,35 @@ class DeferredDownloadService:
                     for idx in needed_indices
                     if idx < len(files)
                 ) / max(len(needed_indices), 1)
+
+                # Stall detection
+                now = time.monotonic()
+                if total_progress > last_progress[info_hash]:
+                    last_progress[info_hash] = total_progress
+                    last_change[info_hash] = now
+
+                if (
+                    not all_done
+                    and info_hash not in failed_hashes
+                    and (now - last_change[info_hash]) >= STALL_TIMEOUT_SECONDS
+                ):
+                    failed_hashes.add(info_hash)
+                    logger.warning(
+                        "Torrent stalled for %ss: %s (%s)",
+                        STALL_TIMEOUT_SECONDS,
+                        plan.torrent_entry.torrent_name,
+                        info_hash,
+                    )
+                    yield {
+                        "type": "torrent_failed",
+                        "torrent": plan.torrent_entry.torrent_name,
+                        "torrent_id": plan.torrent_entry.id,
+                        "source_name": plan.source_name,
+                        "info_hash": info_hash,
+                        "message": f"Torrent stalled ({STALL_TIMEOUT_SECONDS}s sans progrès)",
+                    }
+                    del pending_hashes[info_hash]
+                    continue
 
                 yield {
                     "type": "download_progress",

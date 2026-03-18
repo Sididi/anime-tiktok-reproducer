@@ -436,3 +436,127 @@ async def toggle_protection(
     metadata.purge_protection = not metadata.purge_protection
     TorrentLinkerService.save_metadata(source_dir, metadata)
     return {"purge_protected": metadata.purge_protection}
+
+
+# ---------------------------------------------------------------------------
+# Torrent management
+# ---------------------------------------------------------------------------
+
+
+@router.get("/{source_name}/torrents")
+async def get_source_torrents(
+    source_name: str,
+    library_type: LibraryType = Query(...),
+):
+    """Get torrent metadata for a source."""
+    from ...services.torrent_linker import TorrentLinkerService
+    from ...models.torrent import SourceTorrentMetadata
+
+    library_root = AnimeLibraryService.get_library_path(library_type=library_type)
+    source_dir = library_root / source_name
+    if not source_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Source not found: {source_name}")
+
+    metadata = TorrentLinkerService.load_metadata(source_dir)
+    if not metadata:
+        return SourceTorrentMetadata().model_dump(mode="json")
+    return metadata.model_dump(mode="json")
+
+
+@router.post("/{source_name}/torrents/replace")
+async def replace_torrents(
+    source_name: str,
+    request: "ReplaceTorrentsBody",
+):
+    """Start torrent replacement pipeline. Returns SSE progress stream."""
+    from ...models.torrent import ReplaceTorrentsRequest
+    from ...services.torrent_replacer import TorrentReplacerService
+    from ...services.qbittorrent import QBittorrentClient
+
+    lock = TorrentReplacerService._get_lock(source_name)
+    if lock.locked():
+        raise HTTPException(
+            status_code=409,
+            detail="Un remplacement est déjà en cours pour cette source.",
+        )
+
+    full_request = ReplaceTorrentsRequest(
+        source_name=source_name,
+        library_type=request.library_type,
+        replacements=request.replacements,
+    )
+
+    async def stream_progress():
+        qbt = QBittorrentClient()
+        try:
+            async with lock:
+                async for progress in TorrentReplacerService.replace_torrents(
+                    full_request, qbt
+                ):
+                    yield f"data: {json.dumps(progress.model_dump(mode='json'))}\n\n"
+        finally:
+            await qbt.close()
+
+    return StreamingResponse(
+        stream_progress(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
+@router.post("/{source_name}/torrents/replace/confirm-reindex")
+async def confirm_reindex(
+    source_name: str,
+    request: "ConfirmReindexBody",
+):
+    """Confirm reindex for WARN torrents after replacement verification."""
+    from ...models.torrent import ConfirmReindexRequest
+    from ...services.torrent_replacer import TorrentReplacerService
+    from ...services.qbittorrent import QBittorrentClient
+
+    lock = TorrentReplacerService._get_lock(source_name)
+    if lock.locked():
+        raise HTTPException(
+            status_code=409,
+            detail="Un remplacement est déjà en cours pour cette source.",
+        )
+
+    full_request = ConfirmReindexRequest(
+        source_name=source_name,
+        library_type=request.library_type,
+        torrent_ids=request.torrent_ids,
+    )
+
+    async def stream_progress():
+        qbt = QBittorrentClient()
+        try:
+            async with lock:
+                async for progress in TorrentReplacerService.execute_reindex(
+                    full_request, qbt
+                ):
+                    yield f"data: {json.dumps(progress.model_dump(mode='json'))}\n\n"
+        finally:
+            await qbt.close()
+
+    return StreamingResponse(
+        stream_progress(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
+# Request bodies for torrent replacement endpoints (avoid circular import issues)
+
+class _TorrentReplacementItem(BaseModel):
+    torrent_id: str
+    new_magnet_uri: str
+
+
+class ReplaceTorrentsBody(BaseModel):
+    library_type: LibraryType
+    replacements: list[_TorrentReplacementItem]
+
+
+class ConfirmReindexBody(BaseModel):
+    library_type: LibraryType
+    torrent_ids: list[str]
