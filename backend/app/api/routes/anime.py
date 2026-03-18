@@ -249,3 +249,55 @@ async def get_source_details(
 ) -> list[SourceDetails]:
     """Get detailed metadata for all sources in a library type."""
     return await AnimeLibraryService.get_source_details(library_type=library_type)
+
+
+# ---------------------------------------------------------------------------
+# Async indexation queue
+# ---------------------------------------------------------------------------
+
+class IndexAnimeAsyncRequest(BaseModel):
+    source_path: str
+    library_type: LibraryType
+    anime_name: str | None = None
+    fps: float = 2.0
+
+
+@router.post("/index-async")
+async def index_anime_async(request: IndexAnimeAsyncRequest):
+    """Enqueue an async indexation job."""
+    from ...services.indexation_queue import indexation_queue
+
+    source_folder = Path(request.source_path)
+    if not source_folder.exists() or not source_folder.is_dir():
+        raise HTTPException(status_code=400, detail=f"Invalid source: {request.source_path}")
+    job_id = await indexation_queue.enqueue(
+        source_path=request.source_path,
+        library_type=request.library_type,
+        anime_name=request.anime_name,
+        fps=request.fps,
+    )
+    return {"job_id": job_id}
+
+
+@router.get("/jobs")
+async def list_jobs():
+    """List all indexation jobs."""
+    from ...services.indexation_queue import indexation_queue
+
+    return {"jobs": [j.model_dump(mode="json") for j in indexation_queue.list_jobs()]}
+
+
+@router.get("/jobs/stream")
+async def stream_jobs():
+    """Stream indexation job updates via SSE."""
+    from ...services.indexation_queue import indexation_queue
+
+    async def generate():
+        async for data in indexation_queue.stream_all_jobs():
+            yield f"data: {json.dumps(data)}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
