@@ -5,3 +5,4 @@ export { SearchBar } from "./SearchBar";
 export { BottomBar } from "./BottomBar";
 export { NewSourceModal } from "./NewSourceModal";
 export { PurgeModal } from "./PurgeModal";
+export { IndexJobsPanel } from "./IndexJobsPanel";

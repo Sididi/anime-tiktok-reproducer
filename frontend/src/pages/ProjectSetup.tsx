@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   LibraryHeader,
+  IndexJobsPanel,
   SourceList,
   SearchBar,
   BottomBar,
@@ -139,9 +140,7 @@ export function ProjectSetup() {
       try {
         await api.indexAnimeAsync(path, type, name, fps);
         setShowNewSource(false);
-        // Jobs panel will show progress (Phase 2)
-        // For now, reload sources after a delay
-        setTimeout(loadSources, 2000);
+        // IndexJobsPanel SSE will show progress and trigger reload on complete
       } catch (err) {
         setError((err as Error).message);
       }
@@ -215,7 +214,7 @@ export function ProjectSetup() {
         onOpenPurge={handleOpenPurge}
       />
 
-      {/* IndexJobsPanel will go here in Phase 2 */}
+      <IndexJobsPanel onJobComplete={loadSources} />
 
       <SearchBar
         searchQuery={searchQuery}
