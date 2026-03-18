@@ -117,6 +117,12 @@ class Settings(BaseSettings):
     # n8n webhook for deferred Instagram publishing at scheduled time
     n8n_webhook_url: str | None = None
 
+    # qBittorrent
+    qbittorrent_url: str = "http://localhost:8080"
+    qbittorrent_username: str = "admin"
+    qbittorrent_password: str = "adminadmin"
+    torrent_complete_dir: Path = Path.home() / "Torrents" / ".complete"
+
     @property
     def drive_google_client_id(self) -> str | None:
         return self.google_client_id
