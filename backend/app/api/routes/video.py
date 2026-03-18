@@ -52,8 +52,9 @@ def _search_episode_sync(episode_name: str, source_dirs: list[Path], video_exten
 def _build_source_dirs(project) -> list[Path]:
     if project.source_paths:
         return [Path(src) for src in project.source_paths]
-    if settings.anime_library_path and settings.anime_library_path.exists():
-        return [settings.anime_library_path]
+    library_root = AnimeLibraryService.get_library_path(project.library_type)
+    if library_root.exists():
+        return [library_root]
     return []
 
 
@@ -72,9 +73,16 @@ async def _resolve_source_path(project, raw_path: str) -> Path:
 
     found_path: Path | None = None
 
-    if settings.anime_library_path and settings.anime_library_path.exists():
-        manifest = await AnimeLibraryService.ensure_episode_manifest()
-        candidate = AnimeLibraryService.resolve_episode_path(decoded_path, manifest)
+    library_root = AnimeLibraryService.get_library_path(project.library_type)
+    if library_root.exists():
+        manifest = await AnimeLibraryService.ensure_episode_manifest(
+            library_type=project.library_type,
+        )
+        candidate = AnimeLibraryService.resolve_episode_path(
+            decoded_path,
+            manifest,
+            library_type=project.library_type,
+        )
         if candidate and _is_path_allowed(candidate, source_dirs):
             found_path = candidate
 

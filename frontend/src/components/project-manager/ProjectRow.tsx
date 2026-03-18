@@ -1,7 +1,13 @@
 import { Loader2, UploadCloud, Trash2, Eye } from "lucide-react";
 import { Button } from "@/components/ui";
 import { Tooltip } from "./Tooltip";
-import { formatBytes, formatScheduledAt, statusCircleClasses } from "./utils";
+import {
+  formatBytes,
+  formatScheduledAt,
+  getLibraryTypeLabel,
+  statusCircleClasses,
+} from "./utils";
+import { isAccountCompatibleWithProjectRow } from "@/utils/libraryTypes";
 import type { ProjectManagerRow, Account } from "@/types";
 
 interface ProjectRowProps {
@@ -33,12 +39,29 @@ export function ProjectRow({
   isSelected,
   onToggleSelect,
 }: ProjectRowProps) {
-  const canUpload = row.can_upload_status === "green" && row.uploaded_status === "red";
+  const libraryTypeLabel = getLibraryTypeLabel(row.library_type);
+  const compatibleAccounts = accounts.filter((account) =>
+    isAccountCompatibleWithProjectRow(account, row),
+  );
+  const hasCompatibleAccount = compatibleAccounts.length > 0;
+  const requiresCompatibleAccount = accounts.length > 0;
+  const readinessReasons = row.can_upload_reasons.join("; ");
+  const canUpload = row.can_upload_status === "green"
+    && row.uploaded_status === "red"
+    && (!requiresCompatibleAccount || hasCompatibleAccount);
+
+  const compatibilityReason = requiresCompatibleAccount && !hasCompatibleAccount
+    ? row.language
+      ? `No account supports ${libraryTypeLabel} in ${row.language.toUpperCase()}`
+      : `No account supports ${libraryTypeLabel}`
+    : null;
 
   const uploadDisabledReason = !canUpload
     ? row.uploaded_status !== "red"
       ? "Already uploaded or scheduled"
-      : row.can_upload_reasons.join("; ") || "Not ready for upload"
+      : [compatibilityReason, readinessReasons || null]
+          .filter(Boolean)
+          .join("; ") || "Not ready for upload"
     : null;
 
   const account = row.scheduled_account_id
@@ -85,7 +108,7 @@ export function ProjectRow({
         />
       </td>
 
-      {/* Anime Title — truncate to prevent overflow */}
+      {/* Title — truncate to prevent overflow */}
       <td className="py-3 pr-3 overflow-hidden">
         <div className="font-medium truncate">{row.anime_title || "Unknown"}</div>
         <div className="font-mono text-[11px] tracking-wide text-[hsl(var(--muted-foreground))] truncate">
@@ -120,6 +143,13 @@ export function ProjectRow({
       <td className="py-3 pr-3">
         <span className="text-xs font-medium uppercase text-[hsl(var(--muted-foreground))]">
           {row.language || ""}
+        </span>
+      </td>
+
+      {/* Type */}
+      <td className="py-3 pr-3">
+        <span className="text-xs text-[hsl(var(--muted-foreground))]">
+          {libraryTypeLabel}
         </span>
       </td>
 

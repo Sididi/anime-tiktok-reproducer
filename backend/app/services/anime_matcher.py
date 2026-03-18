@@ -12,6 +12,7 @@ import cv2
 from PIL import Image, ImageOps
 
 from ..config import settings
+from ..library_types import LibraryType, coerce_library_type
 from ..models import AlternativeMatch, MatchCandidate, MatchList, SceneMatch, SceneList
 
 
@@ -49,18 +50,28 @@ class AnimeMatcherService:
     _embedder = None
     _query_processor = None
     _loaded_library_path: Path | None = None
+    _loaded_library_type: LibraryType | None = None
     # Series that were updated on disk and require cache refresh before matching.
-    _stale_series: set[str] = set()
+    _stale_series: dict[LibraryType, set[str]] = defaultdict(set)
 
     @classmethod
-    def mark_series_updated(cls, series_name: str | None) -> None:
+    def mark_series_updated(
+        cls,
+        library_type: LibraryType | str,
+        series_name: str | None,
+    ) -> None:
         """Mark one series as stale so next match for it reloads the index cache."""
         if not series_name:
             return
-        cls._stale_series.add(series_name)
+        cls._stale_series[coerce_library_type(library_type)].add(series_name)
 
     @classmethod
-    def _init_searcher(cls, library_path: Path, anime_name: str | None = None) -> bool:
+    def _init_searcher(
+        cls,
+        library_path: Path,
+        library_type: LibraryType | str,
+        anime_name: str | None = None,
+    ) -> bool:
         """
         Initialize the anime_searcher components.
 
@@ -77,13 +88,16 @@ class AnimeMatcherService:
             sys.path.insert(0, str(searcher_path.parent))
 
         # Reuse cache unless current series was updated on disk.
+        scoped_type = coerce_library_type(library_type)
+        stale_series = cls._stale_series[scoped_type]
         cache_ready = (
             cls._loaded_library_path == library_path
+            and cls._loaded_library_type == scoped_type
             and cls._query_processor is not None
             and cls._index_manager is not None
         )
-        needs_refresh_for_series = anime_name is not None and anime_name in cls._stale_series
-        needs_refresh_for_unscoped_match = anime_name is None and bool(cls._stale_series)
+        needs_refresh_for_series = anime_name is not None and anime_name in stale_series
+        needs_refresh_for_unscoped_match = anime_name is None and bool(stale_series)
         missing_scoped_series = (
             cache_ready
             and anime_name is not None
@@ -118,8 +132,9 @@ class AnimeMatcherService:
             cls._embedder = SSCDEmbedder(model_path)
             cls._query_processor = QueryProcessor(cls._index_manager, cls._embedder)
             cls._loaded_library_path = library_path
+            cls._loaded_library_type = scoped_type
             # Full reload brings all series up to date.
-            cls._stale_series.clear()
+            stale_series.clear()
 
             return True
 
@@ -501,6 +516,7 @@ class AnimeMatcherService:
         video_path: Path,
         scenes: SceneList,
         library_path: Path,
+        library_type: LibraryType | str,
         anime_name: str | None = None,
         scene_indices_to_match: list[int] | None = None,
         existing_matches: MatchList | None = None,
@@ -539,7 +555,7 @@ class AnimeMatcherService:
         # Initialize searcher in thread pool
         loop = asyncio.get_event_loop()
         init_success = await loop.run_in_executor(
-            None, cls._init_searcher, library_path, anime_name
+            None, cls._init_searcher, library_path, library_type, anime_name
         )
 
         if not init_success:

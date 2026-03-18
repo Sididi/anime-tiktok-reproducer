@@ -1,6 +1,7 @@
 import { motion, AnimatePresence } from "framer-motion";
 import { Button } from "@/components/ui";
 import type { Account } from "@/types";
+import { getSupportedTypeLabels } from "@/utils/libraryTypes";
 
 interface AccountPickerPopupProps {
   open: boolean;
@@ -42,8 +43,12 @@ export function AccountPickerPopup({ open, accounts, onPick, onClose }: AccountP
                     alt=""
                     className="h-7 w-7 rounded-full object-cover bg-[hsl(var(--muted))]"
                   />
-                  <span className="flex-1 text-sm">{acc.name}</span>
-                  <span className="text-xs text-[hsl(var(--muted-foreground))] uppercase">{acc.language}</span>
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm">{acc.name}</div>
+                    <div className="truncate text-[11px] text-[hsl(var(--muted-foreground))]">
+                      {acc.language.toUpperCase()} • {getSupportedTypeLabels(acc.supported_types)}
+                    </div>
+                  </div>
                 </button>
               ))}
             </div>

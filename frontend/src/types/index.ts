@@ -11,6 +11,12 @@ export type ProjectPhase =
   | "processing"
   | "complete";
 
+export type LibraryType =
+  | "anime"
+  | "simpsons"
+  | "films_series"
+  | "dessin_anime";
+
 export interface Project {
   id: string;
   tiktok_url: string | null;
@@ -22,6 +28,7 @@ export interface Project {
   video_duration: number | null;
   video_fps: number | null;
   anime_name: string | null;
+  library_type: LibraryType;
   output_language: string | null;
   drive_folder_id: string | null;
   drive_folder_url: string | null;
@@ -144,6 +151,7 @@ export interface ScriptAutomationEvent {
 export interface ProjectManagerRow {
   project_id: string;
   anime_title: string | null;
+  library_type: LibraryType;
   language: string | null;
   local_size_bytes: number;
   uploaded: boolean;
@@ -184,6 +192,7 @@ export interface Account {
   language: string;
   avatar_url: string;
   slots: string[];
+  supported_types: LibraryType[];
 }
 
 export interface Scene {

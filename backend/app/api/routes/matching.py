@@ -103,17 +103,18 @@ async def list_episodes(project_id: str):
     # Use project source_paths if configured. Otherwise, scope to project anime in
     # the library so manual editors only offer episodes for this anime.
     source_dirs: list[Path] = []
+    library_root = AnimeLibraryService.get_library_path(project.library_type)
     if project.source_paths:
         source_dirs = [Path(src) for src in project.source_paths]
-    elif settings.anime_library_path and settings.anime_library_path.exists():
+    elif library_root.exists():
         if project.anime_name:
             scoped_dir = _resolve_anime_source_dir(
-                settings.anime_library_path,
+                library_root,
                 project.anime_name,
             )
             source_dirs = [scoped_dir] if scoped_dir else []
         else:
-            source_dirs = [settings.anime_library_path]
+            source_dirs = [library_root]
 
     def _is_under(path: Path, root: Path) -> bool:
         try:
@@ -132,12 +133,20 @@ async def list_episodes(project_id: str):
             found.append(str(src_path.resolve()))
         return found
 
-    library_root = settings.anime_library_path
     manifest: dict | None = None
     if library_root and any(_is_under(src, library_root) or src.resolve() == library_root.resolve() for src in source_dirs if src.exists()):
-        manifest = await AnimeLibraryService.ensure_episode_manifest()
+        manifest = await AnimeLibraryService.ensure_episode_manifest(
+            library_type=project.library_type,
+        )
 
-    manifest_episodes: list[str] = AnimeLibraryService.list_episode_paths(manifest) if manifest else []
+    manifest_episodes: list[str] = (
+        AnimeLibraryService.list_episode_paths(
+            manifest,
+            library_type=project.library_type,
+        )
+        if manifest
+        else []
+    )
 
     for src_path in source_dirs:
         if (
@@ -170,7 +179,11 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
         raise HTTPException(status_code=404, detail="Project not found")
 
     # Use provided source_path or default to anime_library_path
-    source_path = Path(request.source_path) if request.source_path else settings.anime_library_path
+    source_path = (
+        Path(request.source_path)
+        if request.source_path
+        else AnimeLibraryService.get_library_path(project.library_type)
+    )
     if not source_path.exists():
         raise HTTPException(status_code=400, detail="Source path not found")
 
@@ -198,6 +211,7 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
 
         async for progress in AnimeMatcherService.match_scenes(
             video_path, scenes, source_path,
+            project.library_type,
             anime_name=anime_name,
             pass_label=first_pass_label,
         ):
@@ -295,6 +309,7 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
                 pass2_matches: MatchList | None = None
                 async for progress in AnimeMatcherService.match_scenes(
                     video_path, merged_scenes, source_path,
+                    project.library_type,
                     anime_name=anime_name,
                     scene_indices_to_match=merged_indices,
                     existing_matches=merged_matches,

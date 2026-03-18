@@ -1,5 +1,6 @@
 import { ChevronDown, User } from "lucide-react";
 import type { Account } from "@/types";
+import { getSupportedTypeLabels } from "@/utils/libraryTypes";
 
 interface AccountSelectorDropdownProps {
   accounts: Account[];
@@ -60,7 +61,7 @@ export function AccountSelectorDropdown({
             <button
               key={acc.id}
               type="button"
-              className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-[hsl(var(--muted))] text-left transition-colors"
+              className="w-full flex items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-[hsl(var(--muted))]"
               onClick={() => onSelect(acc.id)}
             >
               <img
@@ -68,8 +69,12 @@ export function AccountSelectorDropdown({
                 alt=""
                 className="h-5 w-5 rounded-full object-cover bg-[hsl(var(--muted))]"
               />
-              <span className="flex-1">{acc.name}</span>
-              <span className="text-xs text-[hsl(var(--muted-foreground))] uppercase">{acc.language}</span>
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-sm">{acc.name}</div>
+                <div className="truncate text-[11px] text-[hsl(var(--muted-foreground))]">
+                  {acc.language.toUpperCase()} • {getSupportedTypeLabels(acc.supported_types)}
+                </div>
+              </div>
             </button>
           ))}
         </div>

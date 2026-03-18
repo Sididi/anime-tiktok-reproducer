@@ -21,6 +21,7 @@ from pathlib import Path
 from scenedetect import open_video, SceneManager, ContentDetector
 
 from ..config import settings
+from ..library_types import LibraryType
 from ..models import SceneMatch
 from ..utils.media_binaries import is_media_binary_override_error
 from ..utils.timing import compute_adjusted_scene_end_times
@@ -319,7 +320,12 @@ class GapResolutionService:
         return float(cls.SAFETY_FRAMES / fps)
 
     @classmethod
-    def resolve_episode_path(cls, episode_name: str) -> Path | None:
+    def resolve_episode_path(
+        cls,
+        episode_name: str,
+        *,
+        library_type: LibraryType | str | None = None,
+    ) -> Path | None:
         """Resolve an episode name to its full path in the anime library.
 
         Args:
@@ -329,7 +335,10 @@ class GapResolutionService:
         Returns:
             Full path to the episode file, or None if not found.
         """
-        return AnimeLibraryService.resolve_episode_path(episode_name)
+        return AnimeLibraryService.resolve_episode_path(
+            episode_name,
+            library_type=library_type,
+        )
 
     @classmethod
     def _normalize_scene_cut_params(
@@ -743,6 +752,7 @@ class GapResolutionService:
         gap: GapInfo,
         matches: list[SceneMatch] | None = None,
         max_candidates: int = 6,
+        library_type: LibraryType | str | None = None,
     ) -> list[GapCandidate]:
         """Generate AI candidates for extending a clip to fill a gap.
 
@@ -766,6 +776,7 @@ class GapResolutionService:
             [gap],
             matches=matches,
             max_candidates=max_candidates,
+            library_type=library_type,
         )
         return candidates_by_scene.get(gap.scene_index, [])
 
@@ -799,6 +810,7 @@ class GapResolutionService:
         gaps: list[GapInfo],
         matches: list[SceneMatch] | None,
         max_candidates: int,
+        library_type: LibraryType | str | None,
     ) -> str:
         """Build a stable key to dedupe concurrent all-candidates requests."""
         import hashlib
@@ -827,6 +839,7 @@ class GapResolutionService:
         payload = {
             "gaps": gap_payload,
             "matches": match_payload,
+            "library_type": str(library_type or "anime"),
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         digest = hashlib.sha1(encoded).hexdigest()
@@ -891,11 +904,13 @@ class GapResolutionService:
         gaps: list[GapInfo],
         matches: list[SceneMatch] | None,
         max_candidates: int,
+        library_type: LibraryType | str | None = None,
     ) -> dict[int, list[GapCandidate]]:
         result = await cls.generate_candidates_batch(
             gaps,
             matches=matches,
             max_candidates=max_candidates,
+            library_type=library_type,
         )
         async with cls._candidate_batch_lock:
             cls._store_candidate_batch_cache_locked(cache_key, result)
@@ -907,12 +922,13 @@ class GapResolutionService:
         gaps: list[GapInfo],
         matches: list[SceneMatch] | None = None,
         max_candidates: int = 6,
+        library_type: LibraryType | str | None = None,
     ) -> dict[int, list[GapCandidate]]:
         """Deduplicate concurrent batch-generation calls for the same gap set."""
         if not gaps:
             return {}
 
-        key = cls._build_gap_batch_key(gaps, matches, max_candidates)
+        key = cls._build_gap_batch_key(gaps, matches, max_candidates, library_type)
         async with cls._candidate_batch_lock:
             cached = cls._get_candidate_batch_cache_locked(key)
             if cached is not None:
@@ -926,6 +942,7 @@ class GapResolutionService:
                         gaps,
                         matches=matches,
                         max_candidates=max_candidates,
+                        library_type=library_type,
                     )
                 )
                 cls._candidate_batch_inflight[key] = task
@@ -946,26 +963,40 @@ class GapResolutionService:
         gaps: list[GapInfo],
         matches: list[SceneMatch] | None = None,
         max_candidates: int = 6,
+        library_type: LibraryType | str | None = None,
     ) -> dict[int, list[GapCandidate]]:
         """Generate candidates for many gaps with deduplicated per-episode analysis."""
         if not gaps:
             return {}
 
-        manifest = await AnimeLibraryService.ensure_episode_manifest()
+        manifest = await AnimeLibraryService.ensure_episode_manifest(
+            library_type=library_type,
+        )
         resolved_by_scene: dict[int, Path] = {}
         unresolved: list[GapInfo] = []
 
         for gap in gaps:
-            resolved = AnimeLibraryService.resolve_episode_path(gap.episode, manifest)
+            resolved = AnimeLibraryService.resolve_episode_path(
+                gap.episode,
+                manifest,
+                library_type=library_type,
+            )
             if resolved and resolved.exists():
                 resolved_by_scene[gap.scene_index] = resolved
             else:
                 unresolved.append(gap)
 
         if unresolved:
-            refreshed_manifest = await AnimeLibraryService.ensure_episode_manifest(force_refresh=True)
+            refreshed_manifest = await AnimeLibraryService.ensure_episode_manifest(
+                force_refresh=True,
+                library_type=library_type,
+            )
             for gap in unresolved:
-                resolved = AnimeLibraryService.resolve_episode_path(gap.episode, refreshed_manifest)
+                resolved = AnimeLibraryService.resolve_episode_path(
+                    gap.episode,
+                    refreshed_manifest,
+                    library_type=library_type,
+                )
                 if resolved and resolved.exists():
                     resolved_by_scene[gap.scene_index] = resolved
 
@@ -973,6 +1004,7 @@ class GapResolutionService:
         _, episode_key_by_scene, tolerance_by_episode = await cls._build_episode_overlap_context(
             match_list,
             gaps,
+            library_type=library_type,
         )
         neighbor_contexts = cls._build_neighbor_contexts(
             match_list,
@@ -1031,6 +1063,7 @@ class GapResolutionService:
     async def _normalize_episode_keys_for_overlap(
         cls,
         episode_hints: set[str],
+        library_type: LibraryType | str | None = None,
     ) -> dict[str, tuple[str, Path | None]]:
         """Normalize episode hints to stable comparison keys.
 
@@ -1043,7 +1076,9 @@ class GapResolutionService:
             return {}
 
         try:
-            manifest = await AnimeLibraryService.ensure_episode_manifest()
+            manifest = await AnimeLibraryService.ensure_episode_manifest(
+                library_type=library_type,
+            )
         except Exception:
             manifest = {}
 
@@ -1053,7 +1088,11 @@ class GapResolutionService:
         for episode in sorted(episode_hints):
             if not episode:
                 continue
-            resolved = AnimeLibraryService.resolve_episode_path(episode, manifest)
+            resolved = AnimeLibraryService.resolve_episode_path(
+                episode,
+                manifest,
+                library_type=library_type,
+            )
             if resolved:
                 resolved_path = resolved.resolve()
                 resolved_map[episode] = (str(resolved_path), resolved_path)
@@ -1062,11 +1101,18 @@ class GapResolutionService:
 
         if unresolved:
             try:
-                refreshed_manifest = await AnimeLibraryService.ensure_episode_manifest(force_refresh=True)
+                refreshed_manifest = await AnimeLibraryService.ensure_episode_manifest(
+                    force_refresh=True,
+                    library_type=library_type,
+                )
             except Exception:
                 refreshed_manifest = manifest
             for episode in unresolved:
-                resolved = AnimeLibraryService.resolve_episode_path(episode, refreshed_manifest)
+                resolved = AnimeLibraryService.resolve_episode_path(
+                    episode,
+                    refreshed_manifest,
+                    library_type=library_type,
+                )
                 if resolved:
                     resolved_path = resolved.resolve()
                     resolved_map[episode] = (str(resolved_path), resolved_path)
@@ -1080,6 +1126,7 @@ class GapResolutionService:
         cls,
         matches: list[SceneMatch],
         gaps: list[GapInfo],
+        library_type: LibraryType | str | None = None,
     ) -> tuple[list[int], dict[int, str], dict[str, float]]:
         """Build normalized episode/tolerance context shared by ranking and DP."""
         match_by_scene = {match.scene_index: match for match in matches}
@@ -1093,7 +1140,8 @@ class GapResolutionService:
             episode_hint_by_scene[scene_index] = cls._scene_episode_hint(match, gap)
 
         normalized_episode = await cls._normalize_episode_keys_for_overlap(
-            {episode for episode in episode_hint_by_scene.values() if episode}
+            {episode for episode in episode_hint_by_scene.values() if episode},
+            library_type=library_type,
         )
 
         default_tolerance = float(Fraction(1, 1) / cls.DEFAULT_FPS)
@@ -1260,6 +1308,7 @@ class GapResolutionService:
         matches: list[SceneMatch],
         gaps: list[GapInfo],
         candidates_by_scene: dict[int, list[GapCandidate]],
+        library_type: LibraryType | str | None = None,
     ) -> AutoFillSelectionResult:
         """Pick one candidate per gap by minimizing overlaps first, then source stretch.
 
@@ -1290,7 +1339,11 @@ class GapResolutionService:
 
         gap_by_scene = {gap.scene_index: gap for gap in gaps}
         sorted_scene_indices, episode_key_by_scene, tolerance_by_episode = (
-            await cls._build_episode_overlap_context(matches, gaps)
+            await cls._build_episode_overlap_context(
+                matches,
+                gaps,
+                library_type=library_type,
+            )
         )
         default_tolerance = float(Fraction(1, 1) / cls.DEFAULT_FPS)
 

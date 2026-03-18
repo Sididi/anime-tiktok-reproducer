@@ -1,3 +1,4 @@
+from ..library_types import LibraryType
 from .project import Project, ProjectPhase
 from .scene import Scene, SceneList
 from .match import AlternativeMatch, MatchCandidate, SceneMatch, MatchList
@@ -21,6 +22,7 @@ from .metadata import (
 )
 
 __all__ = [
+    "LibraryType",
     "Project", "ProjectPhase", "Scene", "SceneList",
     "AlternativeMatch", "MatchCandidate", "SceneMatch", "MatchList",
     "Word", "SceneTranscription", "Transcription",

@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { Project } from '@/types';
+import type { LibraryType, Project } from '@/types';
 import { api } from '@/api/client';
 
 interface ProjectState {
@@ -9,8 +9,16 @@ interface ProjectState {
 
   // Actions
   loadProject: (id: string) => Promise<void>;
-  createProject: (tiktokUrl?: string, sourcePath?: string, animeName?: string) => Promise<Project>;
-  updateProject: (id: string, data: { anime_name?: string }) => Promise<Project>;
+  createProject: (
+    tiktokUrl?: string,
+    sourcePath?: string,
+    animeName?: string,
+    libraryType?: LibraryType,
+  ) => Promise<Project>;
+  updateProject: (
+    id: string,
+    data: { anime_name?: string; library_type?: LibraryType },
+  ) => Promise<Project>;
   clearProject: () => void;
 }
 
@@ -29,10 +37,20 @@ export const useProjectStore = create<ProjectState>((set) => ({
     }
   },
 
-  createProject: async (tiktokUrl?: string, sourcePath?: string, animeName?: string) => {
+  createProject: async (
+    tiktokUrl?: string,
+    sourcePath?: string,
+    animeName?: string,
+    libraryType: LibraryType = "anime",
+  ) => {
     set({ loading: true, error: null });
     try {
-      const project = await api.createProject(tiktokUrl, sourcePath, animeName);
+      const project = await api.createProject(
+        tiktokUrl,
+        sourcePath,
+        animeName,
+        libraryType,
+      );
       set({ project, loading: false });
       return project;
     } catch (err) {
@@ -41,7 +59,10 @@ export const useProjectStore = create<ProjectState>((set) => ({
     }
   },
 
-  updateProject: async (id: string, data: { anime_name?: string }) => {
+  updateProject: async (
+    id: string,
+    data: { anime_name?: string; library_type?: LibraryType },
+  ) => {
     set({ loading: true, error: null });
     try {
       const project = await api.updateProject(id, data);

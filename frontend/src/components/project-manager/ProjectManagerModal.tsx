@@ -12,6 +12,10 @@ import { VideoPreviewModal } from "./VideoPreviewModal";
 import { ProjectTable } from "./ProjectTable";
 import { YouTubeDurationModal } from "./YouTubeDurationModal";
 import type { SortColumn, SortDirection } from "./types";
+import {
+  getLibraryTypeLabel,
+  isAccountCompatibleWithProjectRow,
+} from "@/utils/libraryTypes";
 import type {
   ProjectManagerRow,
   Account,
@@ -265,7 +269,7 @@ export function ProjectManagerModal({
     return rows.filter((r) => {
       if (r.uploaded || r.scheduled_at)
         return r.scheduled_account_id === selectedAccount.id;
-      return r.language === selectedAccount.language;
+      return isAccountCompatibleWithProjectRow(selectedAccount, r);
     });
   }, [rows, selectedAccount]);
 
@@ -283,6 +287,9 @@ export function ProjectManagerModal({
       } else if (sortColumn === "language") {
         aVal = (a.language || "").toLowerCase();
         bVal = (b.language || "").toLowerCase();
+      } else if (sortColumn === "library_type") {
+        aVal = getLibraryTypeLabel(a.library_type).toLowerCase();
+        bVal = getLibraryTypeLabel(b.library_type).toLowerCase();
       } else if (sortColumn === "anime_title") {
         aVal = (a.anime_title || "").toLowerCase();
         bVal = (b.anime_title || "").toLowerCase();
@@ -472,8 +479,8 @@ export function ProjectManagerModal({
   const compatibleAccounts = useMemo(() => {
     if (!accountPickerForProject) return [];
     const row = rows.find((r) => r.project_id === accountPickerForProject);
-    if (!row || !row.language) return accounts;
-    return accounts.filter((a) => a.language === row.language);
+    if (!row) return [];
+    return accounts.filter((a) => isAccountCompatibleWithProjectRow(a, row));
   }, [accountPickerForProject, rows, accounts]);
 
   /* ── Delete ── */

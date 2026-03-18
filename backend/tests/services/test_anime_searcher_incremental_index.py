@@ -137,7 +137,8 @@ def _install_fake_pipeline(monkeypatch: pytest.MonkeyPatch, batches_by_name: dic
 
 
 def test_update_only_indexes_new_files_and_skips_unchanged(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    library_path = tmp_path / "library"
+    library_root = tmp_path / "library"
+    library_path = library_root / "anime"
     series_dir = library_path / "Demo"
     series_dir.mkdir(parents=True)
     file1 = series_dir / "ep1.mp4"
@@ -154,7 +155,9 @@ def test_update_only_indexes_new_files_and_skips_unchanged(monkeypatch: pytest.M
         cli_module.app,
         [
             "update",
-            str(library_path),
+            str(library_root),
+            "--type",
+            "anime",
             "--series",
             "Demo",
             "--manifest",
@@ -181,7 +184,9 @@ def test_update_only_indexes_new_files_and_skips_unchanged(monkeypatch: pytest.M
         cli_module.app,
         [
             "update",
-            str(library_path),
+            str(library_root),
+            "--type",
+            "anime",
             "--series",
             "Demo",
             "--manifest",
@@ -200,7 +205,8 @@ def test_update_only_indexes_new_files_and_skips_unchanged(monkeypatch: pytest.M
 
 
 def test_update_replaces_existing_file_without_duplicate_frames(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    library_path = tmp_path / "library"
+    library_root = tmp_path / "library"
+    library_path = library_root / "anime"
     series_dir = library_path / "Demo"
     series_dir.mkdir(parents=True)
     file1 = series_dir / "ep1.mp4"
@@ -216,7 +222,9 @@ def test_update_replaces_existing_file_without_duplicate_frames(monkeypatch: pyt
         cli_module.app,
         [
             "update",
-            str(library_path),
+            str(library_root),
+            "--type",
+            "anime",
             "--series",
             "Demo",
             "--manifest",
@@ -239,7 +247,8 @@ def test_update_replaces_existing_file_without_duplicate_frames(monkeypatch: pyt
 
 
 def test_remove_command_only_deletes_listed_files(tmp_path: Path) -> None:
-    library_path = tmp_path / "library"
+    library_root = tmp_path / "library"
+    library_path = library_root / "anime"
     series_dir = library_path / "Demo"
     series_dir.mkdir(parents=True)
     file1 = series_dir / "ep1.mp4"
@@ -260,7 +269,9 @@ def test_remove_command_only_deletes_listed_files(tmp_path: Path) -> None:
         cli_module.app,
         [
             "remove",
-            str(library_path),
+            str(library_root),
+            "--type",
+            "anime",
             "--series",
             "Demo",
             "--manifest",
@@ -278,7 +289,8 @@ def test_remove_command_only_deletes_listed_files(tmp_path: Path) -> None:
 
 
 def test_migrate_converts_v2_and_mutating_commands_refuse_first(tmp_path: Path) -> None:
-    library_path = tmp_path / "library"
+    library_root = tmp_path / "library"
+    library_path = library_root / "anime"
     series_dir = library_path / "Demo"
     series_dir.mkdir(parents=True)
     file1 = series_dir / "ep1.mp4"
@@ -291,7 +303,9 @@ def test_migrate_converts_v2_and_mutating_commands_refuse_first(tmp_path: Path) 
         cli_module.app,
         [
             "remove",
-            str(library_path),
+            str(library_root),
+            "--type",
+            "anime",
             "--series",
             "Demo",
             "--manifest",
@@ -301,7 +315,10 @@ def test_migrate_converts_v2_and_mutating_commands_refuse_first(tmp_path: Path) 
     assert remove_before_migration.exit_code == 1
     assert "migrate" in remove_before_migration.stdout.lower()
 
-    migrate = RUNNER.invoke(cli_module.app, ["migrate", str(library_path)])
+    migrate = RUNNER.invoke(
+        cli_module.app,
+        ["migrate", str(library_root), "--type", "anime"],
+    )
     assert migrate.exit_code == 0, migrate.stdout
 
     manager = IndexManager(library_path)
@@ -313,6 +330,44 @@ def test_migrate_converts_v2_and_mutating_commands_refuse_first(tmp_path: Path) 
     results = manager.search(_make_vectors(1, 0)[0], top_k=1, series="Demo")
     assert results
     assert results[0][1].file_path == "Demo/ep1.mp4"
+
+
+def test_mutating_and_read_commands_require_library_type(tmp_path: Path) -> None:
+    library_root = tmp_path / "library"
+    library_root.mkdir(parents=True)
+
+    list_result = RUNNER.invoke(cli_module.app, ["list", str(library_root)])
+    assert list_result.exit_code != 0
+    assert "--type" in list_result.output
+
+    migrate_result = RUNNER.invoke(cli_module.app, ["migrate", str(library_root)])
+    assert migrate_result.exit_code != 0
+    assert "--type" in migrate_result.output
+
+
+def test_migrate_layout_moves_legacy_entries_into_anime_bucket(tmp_path: Path) -> None:
+    library_root = tmp_path / "library"
+    series_dir = library_root / "Demo"
+    index_dir = library_root / ".index"
+    series_dir.mkdir(parents=True)
+    index_dir.mkdir(parents=True)
+    episode_path = series_dir / "ep1.mp4"
+    episode_path.write_bytes(b"demo")
+    (index_dir / "state.json").write_text("{}", encoding="utf-8")
+
+    migrate_result = RUNNER.invoke(
+        cli_module.app,
+        ["migrate-layout", str(library_root)],
+    )
+    assert migrate_result.exit_code == 0, migrate_result.stdout
+    assert (library_root / "anime" / "Demo" / "ep1.mp4").exists()
+    assert (library_root / "anime" / ".index" / "state.json").exists()
+
+    second_result = RUNNER.invoke(
+        cli_module.app,
+        ["migrate-layout", str(library_root)],
+    )
+    assert second_result.exit_code == 0, second_result.stdout
 
 
 @pytest.mark.asyncio
@@ -330,7 +385,7 @@ async def test_backend_update_anime_returns_prepared_library_paths(
     monkeypatch.setattr(
         AnimeLibraryService,
         "get_library_path",
-        classmethod(lambda cls: library_path),
+        classmethod(lambda cls, library_type=None: library_path),
     )
     monkeypatch.setattr(
         AnimeLibraryService,
@@ -340,7 +395,7 @@ async def test_backend_update_anime_returns_prepared_library_paths(
     monkeypatch.setattr(
         AnimeLibraryService,
         "_get_indexed_series_fps_sync",
-        classmethod(lambda cls, anime_name: 2.0),
+        classmethod(lambda cls, anime_name, library_type=None: 2.0),
     )
 
     async def fake_prepare_single_source_for_library(*, source_path: Path, dest_dir: Path):
@@ -351,7 +406,11 @@ async def test_backend_update_anime_returns_prepared_library_paths(
     async def fake_stream_searcher_command(**kwargs):
         yield IndexProgress(status="indexing", message="updating", progress=0.6)
 
-    async def fake_ensure_episode_manifest(*, force_refresh: bool = False):
+    async def fake_ensure_episode_manifest(
+        *,
+        force_refresh: bool = False,
+        library_type=None,
+    ):
         return {}
 
     async def fake_verify_prepared_library_files(files: list[Path]) -> str | None:
@@ -364,7 +423,16 @@ async def test_backend_update_anime_returns_prepared_library_paths(
     )
     monkeypatch.setattr(AnimeLibraryService, "_verify_prepared_library_files", classmethod(lambda cls, files: fake_verify_prepared_library_files(files)))
     monkeypatch.setattr(AnimeLibraryService, "_stream_searcher_command", classmethod(lambda cls, **kwargs: fake_stream_searcher_command(**kwargs)))
-    monkeypatch.setattr(AnimeLibraryService, "ensure_episode_manifest", classmethod(lambda cls, force_refresh=False: fake_ensure_episode_manifest(force_refresh=force_refresh)))
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "ensure_episode_manifest",
+        classmethod(
+            lambda cls, force_refresh=False, library_type=None: fake_ensure_episode_manifest(
+                force_refresh=force_refresh,
+                library_type=library_type,
+            )
+        ),
+    )
 
     progress_events = [
         progress
@@ -372,6 +440,7 @@ async def test_backend_update_anime_returns_prepared_library_paths(
             anime_name="Demo",
             source_paths=[source_path],
             require_gpu=False,
+            library_type="anime",
         )
     ]
 
@@ -398,7 +467,7 @@ async def test_backend_remove_anime_files_deletes_file_and_sidecars(
     monkeypatch.setattr(
         AnimeLibraryService,
         "get_library_path",
-        classmethod(lambda cls: library_path),
+        classmethod(lambda cls, library_type=None: library_path),
     )
     monkeypatch.setattr(
         AnimeLibraryService,
@@ -409,17 +478,31 @@ async def test_backend_remove_anime_files_deletes_file_and_sidecars(
     async def fake_stream_searcher_command(**kwargs):
         yield IndexProgress(status="indexing", message="removing", progress=0.5)
 
-    async def fake_ensure_episode_manifest(*, force_refresh: bool = False):
+    async def fake_ensure_episode_manifest(
+        *,
+        force_refresh: bool = False,
+        library_type=None,
+    ):
         return {}
 
     monkeypatch.setattr(AnimeLibraryService, "_stream_searcher_command", classmethod(lambda cls, **kwargs: fake_stream_searcher_command(**kwargs)))
-    monkeypatch.setattr(AnimeLibraryService, "ensure_episode_manifest", classmethod(lambda cls, force_refresh=False: fake_ensure_episode_manifest(force_refresh=force_refresh)))
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "ensure_episode_manifest",
+        classmethod(
+            lambda cls, force_refresh=False, library_type=None: fake_ensure_episode_manifest(
+                force_refresh=force_refresh,
+                library_type=library_type,
+            )
+        ),
+    )
 
     progress_events = [
         progress
         async for progress in AnimeLibraryService.remove_anime_files(
             anime_name="Demo",
             library_paths=[source_path],
+            library_type="anime",
         )
     ]
 

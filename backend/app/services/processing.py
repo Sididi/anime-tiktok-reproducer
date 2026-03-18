@@ -262,9 +262,17 @@ class ProcessingService:
     _gap_candidate_prewarm_tasks: dict[str, asyncio.Task[None]] = {}
 
     @classmethod
-    def _resolve_source_reference(cls, episode: str) -> tuple[Path, str]:
+    def _resolve_source_reference(
+        cls,
+        episode: str,
+        *,
+        library_type: str | None = None,
+    ) -> tuple[Path, str]:
         """Resolve a match episode to a source path and Premiere-safe clip name."""
-        resolved_path = GapResolutionService.resolve_episode_path(episode)
+        resolved_path = GapResolutionService.resolve_episode_path(
+            episode,
+            library_type=library_type,
+        )
         if resolved_path and resolved_path.exists():
             return resolved_path, resolved_path.stem
 
@@ -278,9 +286,13 @@ class ProcessingService:
     async def _collect_required_source_groups(
         cls,
         matches: list[SceneMatch],
+        *,
+        library_type: str | None = None,
     ) -> list[tuple[Path, list[SceneMatch]]]:
         """Resolve and dedupe the final source episodes required by processing."""
-        manifest = await AnimeLibraryService.ensure_episode_manifest()
+        manifest = await AnimeLibraryService.ensure_episode_manifest(
+            library_type=library_type,
+        )
         paths_by_key: dict[str, Path] = {}
         matches_by_key: dict[str, list[SceneMatch]] = {}
         unresolved: list[str] = []
@@ -290,7 +302,11 @@ class ProcessingService:
             if not episode:
                 continue
 
-            resolved = AnimeLibraryService.resolve_episode_path(episode, manifest)
+            resolved = AnimeLibraryService.resolve_episode_path(
+                episode,
+                manifest,
+                library_type=library_type,
+            )
             if resolved is None:
                 fallback = Path(episode)
                 if fallback.exists():
@@ -373,6 +389,7 @@ class ProcessingService:
         project_id: str,
         gaps: list,
         matches: list | None = None,
+        library_type: str | None = None,
     ) -> None:
         """Start a background prewarm for gap candidate generation."""
         if not gaps:
@@ -387,6 +404,7 @@ class ProcessingService:
                 await GapResolutionService.generate_candidates_batch_dedup(
                     gaps,
                     matches=matches,
+                    library_type=library_type,
                 )
             except Exception:
                 # Best-effort optimization only; failures should never block processing.
@@ -457,12 +475,20 @@ class ProcessingService:
         return FrameRateInfo(timebase=24, ntsc=True)
 
     @classmethod
-    async def detect_first_source_fps(cls, matches: list[SceneMatch]) -> Fraction | None:
+    async def detect_first_source_fps(
+        cls,
+        matches: list[SceneMatch],
+        *,
+        library_type: str | None = None,
+    ) -> Fraction | None:
         """Detect source FPS once from the first resolvable episode in the match list."""
         for match in matches:
             if not match.episode:
                 continue
-            episode_path, _ = cls._resolve_source_reference(match.episode)
+            episode_path, _ = cls._resolve_source_reference(
+                match.episode,
+                library_type=library_type,
+            )
             if episode_path.exists():
                 return await cls.detect_video_fps(episode_path)
         return None
@@ -472,6 +498,8 @@ class ProcessingService:
         cls,
         matches: list[SceneMatch],
         source_rate: FrameRateInfo,
+        *,
+        library_type: str | None = None,
     ) -> dict[int, ResolvedSceneSource]:
         """Resolve source clips with frame-snapped in/out once for the whole pipeline."""
         resolved: dict[int, ResolvedSceneSource] = {}
@@ -492,7 +520,10 @@ class ProcessingService:
                 else:
                     continue
 
-            source_path, clip_name = cls._resolve_source_reference(episode)
+            source_path, clip_name = cls._resolve_source_reference(
+                episode,
+                library_type=library_type,
+            )
             source_in_frame = source_rate.frames_from_seconds_at_or_after(source_in_raw_sec)
             source_out_frame = source_rate.frames_from_seconds_at_or_after(source_out_raw_sec)
             if source_out_frame <= source_in_frame:
@@ -844,6 +875,7 @@ class ProcessingService:
         resolved_scene_sources = resolved_scene_sources or cls.resolve_scene_sources(
             matches,
             source_rate,
+            library_type=project.library_type,
         )
 
         calculator = OTIOTimingCalculator(
@@ -1800,9 +1832,16 @@ class ProcessingService:
                 and cls.check_duration_warning_acknowledged(project.id)
             ):
                 resuming_after_duration_warning = True
-        source_fps = await cls.detect_first_source_fps(matches)
+        source_fps = await cls.detect_first_source_fps(
+            matches,
+            library_type=project.library_type,
+        )
         source_rate = cls._build_source_rate(source_fps)
-        playback_scene_sources = cls.resolve_scene_sources(matches, source_rate)
+        playback_scene_sources = cls.resolve_scene_sources(
+            matches,
+            source_rate,
+            library_type=project.library_type,
+        )
 
         if resuming_after_gaps:
             # Load saved state and skip to JSX generation
@@ -2030,11 +2069,13 @@ class ProcessingService:
                         candidates_by_scene = await GapResolutionService.generate_candidates_batch_dedup(
                             gaps,
                             matches=matches,
+                            library_type=project.library_type,
                         )
                         selection_result = await GapResolutionService.select_autofill_candidates_overlap_aware(
                             matches=matches,
                             gaps=gaps,
                             candidates_by_scene=candidates_by_scene,
+                            library_type=project.library_type,
                         )
 
                         for gap in gaps:
@@ -2067,7 +2108,12 @@ class ProcessingService:
                     else:
                         # Manual flow: pause processing for user to resolve
                         # Prewarm scene-cut/fps analysis in background so /gaps loads faster.
-                        cls.schedule_gap_candidate_prewarm(project.id, gaps, matches)
+                        cls.schedule_gap_candidate_prewarm(
+                            project.id,
+                            gaps,
+                            matches,
+                            project.library_type,
+                        )
 
                         # Backup current matches before gap resolution modifies them
                         matches_backup_path = project_dir / "matches_before_gaps.json"
@@ -2097,13 +2143,20 @@ class ProcessingService:
                         return  # Stop processing here - frontend will redirect to gap resolution
 
             # Step 3: Normalize only the source episodes used by final matches.
-            playback_scene_sources = cls.resolve_scene_sources(matches, source_rate)
+            playback_scene_sources = cls.resolve_scene_sources(
+                matches,
+                source_rate,
+                library_type=project.library_type,
+            )
             raw_scene_image_render_plan = await cls._build_raw_scene_image_render_plan(
                 project,
                 new_transcription,
                 playback_scene_sources,
             )
-            source_groups = await cls._collect_required_source_groups(matches)
+            source_groups = await cls._collect_required_source_groups(
+                matches,
+                library_type=project.library_type,
+            )
             total_source_groups = len(source_groups)
             matches_updated = False
 
@@ -2217,7 +2270,11 @@ class ProcessingService:
                             music_path,
                         )
 
-            resolved_scene_sources = cls.resolve_scene_sources(matches, source_rate)
+            resolved_scene_sources = cls.resolve_scene_sources(
+                matches,
+                source_rate,
+                library_type=project.library_type,
+            )
 
             # Step 4: Generate JSX script from canonical v7.7 template
             jsx_content = cls.generate_jsx_script(

@@ -8,6 +8,8 @@ accounts:
   anime_fr:
     name: "Anime FR"
     language: "fr"
+    supported_types:
+      - "anime"
     avatar: "anime_fr.jpg"       # filename in avatars/ directory
     slots:                        # UTC hours, each = 1 upload/day
       - "14:00"
@@ -27,6 +29,8 @@ accounts:
   # anime_en:
   #   name: "Anime EN"
   #   language: "en"
+  #   supported_types:
+  #     - "anime"
   #   avatar: "anime_en.png"
   #   slots:
   #     - "15:00"

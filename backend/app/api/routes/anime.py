@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from ...library_types import LibraryType
 from ...services import AnimeLibraryService, AnimeMatcherService
 
 router = APIRouter(prefix="/anime", tags=["anime"])
@@ -68,10 +69,10 @@ async def browse_directories(path: str | None = Query(default=None)):
 
 
 @router.get("/list")
-async def list_indexed_anime():
+async def list_indexed_anime(library_type: LibraryType = Query(...)):
     """List all indexed anime series in the library."""
     try:
-        series = await AnimeLibraryService.list_indexed_anime()
+        series = await AnimeLibraryService.list_indexed_anime(library_type=library_type)
         return {"series": series, "count": len(series)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -79,6 +80,7 @@ async def list_indexed_anime():
 
 class IndexAnimeRequest(BaseModel):
     source_path: str
+    library_type: LibraryType
     anime_name: str | None = None
     fps: float = 2.0
     batch_size: int = 64
@@ -103,6 +105,7 @@ async def index_anime(request: IndexAnimeRequest):
     async def stream_progress():
         async for progress in AnimeLibraryService.index_anime(
             source_folder=source_folder,
+            library_type=request.library_type,
             anime_name=request.anime_name,
             fps=request.fps,
             batch_size=request.batch_size,
@@ -111,7 +114,10 @@ async def index_anime(request: IndexAnimeRequest):
             require_gpu=request.require_gpu,
         ):
             if progress.status == "complete":
-                AnimeMatcherService.mark_series_updated(progress.anime_name or target_anime_name)
+                AnimeMatcherService.mark_series_updated(
+                    request.library_type,
+                    progress.anime_name or target_anime_name,
+                )
             yield f"data: {json.dumps(progress.to_dict())}\n\n"
 
     return StreamingResponse(
@@ -125,6 +131,7 @@ async def index_anime(request: IndexAnimeRequest):
 
 
 class UpdateAnimeRequest(BaseModel):
+    library_type: LibraryType
     anime_name: str
     source_paths: list[str]
     batch_size: int = 64
@@ -143,6 +150,7 @@ async def update_anime(request: UpdateAnimeRequest):
 
     async def stream_progress():
         async for progress in AnimeLibraryService.update_anime(
+            library_type=request.library_type,
             anime_name=request.anime_name,
             source_paths=source_files,
             batch_size=request.batch_size,
@@ -151,7 +159,10 @@ async def update_anime(request: UpdateAnimeRequest):
             require_gpu=request.require_gpu,
         ):
             if progress.status == "complete":
-                AnimeMatcherService.mark_series_updated(progress.anime_name or request.anime_name)
+                AnimeMatcherService.mark_series_updated(
+                    request.library_type,
+                    progress.anime_name or request.anime_name,
+                )
             yield f"data: {json.dumps(progress.to_dict())}\n\n"
 
     return StreamingResponse(
@@ -165,6 +176,7 @@ async def update_anime(request: UpdateAnimeRequest):
 
 
 class RemoveAnimeFilesRequest(BaseModel):
+    library_type: LibraryType
     anime_name: str
     library_paths: list[str]
 
@@ -179,11 +191,15 @@ async def remove_anime_files(request: RemoveAnimeFilesRequest):
 
     async def stream_progress():
         async for progress in AnimeLibraryService.remove_anime_files(
+            library_type=request.library_type,
             anime_name=request.anime_name,
             library_paths=target_paths,
         ):
             if progress.status == "complete":
-                AnimeMatcherService.mark_series_updated(progress.anime_name or request.anime_name)
+                AnimeMatcherService.mark_series_updated(
+                    request.library_type,
+                    progress.anime_name or request.anime_name,
+                )
             yield f"data: {json.dumps(progress.to_dict())}\n\n"
 
     return StreamingResponse(

@@ -48,6 +48,7 @@ export const api = {
     tiktokUrl?: string,
     sourcePath?: string,
     animeName?: string,
+    libraryType: import("@/types").LibraryType = "anime",
   ) =>
     request<import("@/types").Project>("/projects", {
       method: "POST",
@@ -55,6 +56,7 @@ export const api = {
         tiktok_url: tiktokUrl,
         source_path: sourcePath,
         anime_name: animeName,
+        library_type: libraryType,
       }),
     }),
 
@@ -63,7 +65,13 @@ export const api = {
   getProject: (id: string) =>
     request<import("@/types").Project>(`/projects/${id}`),
 
-  updateProject: (id: string, data: { anime_name?: string }) =>
+  updateProject: (
+    id: string,
+    data: {
+      anime_name?: string;
+      library_type?: import("@/types").LibraryType;
+    },
+  ) =>
     request<import("@/types").Project>(`/projects/${id}`, {
       method: "PATCH",
       body: JSON.stringify(data),
@@ -412,15 +420,23 @@ export const api = {
     }),
 
   // Anime Library
-  listIndexedAnime: () =>
-    request<{ series: string[]; count: number }>("/anime/list"),
+  listIndexedAnime: (libraryType: import("@/types").LibraryType) =>
+    request<{ series: string[]; count: number }>(
+      `/anime/list?library_type=${encodeURIComponent(libraryType)}`,
+    ),
 
-  indexAnime: (sourcePath: string, animeName?: string, fps = 2.0) => {
+  indexAnime: (
+    sourcePath: string,
+    libraryType: import("@/types").LibraryType,
+    animeName?: string,
+    fps = 2.0,
+  ) => {
     return fetch(`${API_BASE}/anime/index`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         source_path: sourcePath,
+        library_type: libraryType,
         anime_name: animeName,
         fps,
         batch_size: 64,

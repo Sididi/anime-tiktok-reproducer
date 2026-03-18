@@ -24,9 +24,10 @@ interface ProjectTableProps {
 
 const COLUMNS: { key: SortColumn | null; label: string; className: string }[] = [
   { key: "uploaded",        label: "Status",       className: "w-20" },
-  { key: "anime_title",     label: "Anime Title",  className: "" },       // takes remaining space
+  { key: "anime_title",     label: "Title",        className: "" },
   { key: null,              label: "Account",      className: "w-28" },
   { key: "language",        label: "Lang",         className: "w-12" },
+  { key: "library_type",    label: "Type",         className: "w-28" },
   { key: "scheduled_at",    label: "Scheduled At", className: "w-32" },
   { key: "local_size_bytes",label: "Size",         className: "w-20" },
   { key: null,              label: "Actions",      className: "w-52" },
@@ -55,10 +56,11 @@ function SkeletonRows({ colCount }: { colCount: number }) {
           </td>
           <td className="py-3 pr-3"><div className="h-5 w-16 rounded bg-[hsl(var(--muted))] animate-pulse" /></td>
           <td className="py-3 pr-3"><div className="h-3 w-6 rounded bg-[hsl(var(--muted))] animate-pulse" /></td>
+          <td className="py-3 pr-3"><div className="h-3 w-20 rounded bg-[hsl(var(--muted))] animate-pulse" /></td>
           <td className="py-3 pr-3"><div className="h-3 w-16 rounded bg-[hsl(var(--muted))] animate-pulse" /></td>
           <td className="py-3 pr-3"><div className="h-3 w-10 rounded bg-[hsl(var(--muted))] animate-pulse" /></td>
           <td className="py-3 pr-3"><div className="h-8 w-24 rounded bg-[hsl(var(--muted))] animate-pulse" /></td>
-          {colCount > 7 && <td className="py-3 pr-3"><div className="h-4 w-4 rounded bg-[hsl(var(--muted))] animate-pulse" /></td>}
+          {colCount > 8 && <td className="py-3 pr-3"><div className="h-4 w-4 rounded bg-[hsl(var(--muted))] animate-pulse" /></td>}
         </tr>
       ))}
     </>

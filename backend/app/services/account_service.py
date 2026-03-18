@@ -11,6 +11,7 @@ import yaml
 from google.oauth2.credentials import Credentials
 
 from ..config import settings
+from ..library_types import DEFAULT_LIBRARY_TYPE, LibraryType, coerce_library_type
 from .meta_token_service import MetaTokenService, MetaUploadCredentials
 
 logger = logging.getLogger("uvicorn.error")
@@ -42,6 +43,7 @@ class AccountConfig:
     id: str
     name: str
     language: str
+    supported_types: list[LibraryType] = field(default_factory=lambda: [DEFAULT_LIBRARY_TYPE])
     avatar: str | None = None
     slots: list[str] = field(default_factory=list)
     youtube: AccountYouTubeConfig | None = None
@@ -86,11 +88,26 @@ class AccountService:
 
         slots_raw = raw.get("slots", [])
         slots = [str(s) for s in slots_raw] if isinstance(slots_raw, list) else []
+        supported_types_raw = raw.get("supported_types")
+        supported_types: list[LibraryType] = []
+        if isinstance(supported_types_raw, list):
+            for item in supported_types_raw:
+                try:
+                    supported_types.append(coerce_library_type(item))
+                except ValueError:
+                    logger.warning(
+                        "Ignoring unsupported library type %r for account %s",
+                        item,
+                        account_id,
+                    )
+        if not supported_types:
+            supported_types = [DEFAULT_LIBRARY_TYPE]
 
         return AccountConfig(
             id=account_id,
             name=str(raw.get("name", account_id)),
             language=str(raw.get("language", "")),
+            supported_types=supported_types,
             avatar=str(raw.get("avatar")) if raw.get("avatar") else None,
             slots=slots,
             youtube=youtube,
@@ -145,6 +162,7 @@ class AccountService:
                 "id": acc.id,
                 "name": acc.name,
                 "language": acc.language,
+                "supported_types": [item.value for item in acc.supported_types],
                 "avatar_url": f"/api/accounts/{acc.id}/avatar",
                 "slots": acc.slots,
             }

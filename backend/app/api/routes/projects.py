@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Any
 
+from ...library_types import DEFAULT_LIBRARY_TYPE, LibraryType
 from ...models import Project, ProjectPhase
 from ...services import ProjectService
 
@@ -12,10 +13,12 @@ class CreateProjectRequest(BaseModel):
     tiktok_url: str | None = None
     source_path: str | None = None
     anime_name: str | None = None
+    library_type: LibraryType = DEFAULT_LIBRARY_TYPE
 
 
 class UpdateProjectRequest(BaseModel):
     anime_name: str | None = None
+    library_type: LibraryType | None = None
 
 
 class ProjectResponse(BaseModel):
@@ -29,6 +32,7 @@ class ProjectResponse(BaseModel):
     video_duration: float | None
     video_fps: float | None
     anime_name: str | None
+    library_type: LibraryType
     output_language: str | None
     drive_folder_id: str | None
     drive_folder_url: str | None
@@ -50,6 +54,7 @@ class ProjectResponse(BaseModel):
             video_duration=project.video_duration,
             video_fps=project.video_fps,
             anime_name=project.anime_name,
+            library_type=project.library_type,
             output_language=project.output_language,
             drive_folder_id=project.drive_folder_id,
             drive_folder_url=project.drive_folder_url,
@@ -67,6 +72,7 @@ async def create_project(request: CreateProjectRequest) -> ProjectResponse:
         tiktok_url=request.tiktok_url,
         source_path=request.source_path,
         anime_name=request.anime_name,
+        library_type=request.library_type,
     )
     return ProjectResponse.from_project(project)
 
@@ -104,6 +110,8 @@ async def update_project(project_id: str, request: UpdateProjectRequest) -> Proj
 
     if request.anime_name is not None:
         project.anime_name = request.anime_name
+    if request.library_type is not None:
+        project.library_type = request.library_type
 
     ProjectService.save(project)
     return ProjectResponse.from_project(project)

@@ -151,6 +151,7 @@ async def get_all_candidates(project_id: str) -> AllCandidatesResponse:
         candidates_by_scene_raw = await GapResolutionService.generate_candidates_batch_dedup(
             gaps,
             matches=matches.matches,
+            library_type=project.library_type,
         )
     except Exception:
         candidates_by_scene_raw = {gap.scene_index: [] for gap in gaps}
@@ -205,6 +206,7 @@ async def get_gap_candidates(project_id: str, scene_index: int) -> GapCandidates
     candidates = await GapResolutionService.generate_candidates(
         gap,
         matches=matches.matches,
+        library_type=project.library_type,
     )
 
     return GapCandidatesResponse(
@@ -271,6 +273,7 @@ async def auto_fill_all_gaps(project_id: str) -> AutoFillResponse:
     candidates_by_scene = await GapResolutionService.generate_candidates_batch_dedup(
         gaps,
         matches=matches.matches,
+        library_type=project.library_type,
     )
     selected_by_scene: dict[int, Any] = {}
     overlap_seconds_by_scene: dict[int, float] = {}
@@ -279,6 +282,7 @@ async def auto_fill_all_gaps(project_id: str) -> AutoFillResponse:
             matches=matches.matches,
             gaps=gaps,
             candidates_by_scene=candidates_by_scene,
+            library_type=project.library_type,
         )
         selected_by_scene = selection_result.selected_candidates_by_scene
         overlap_seconds_by_scene = selection_result.overlap_seconds_by_scene

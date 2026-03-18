@@ -231,10 +231,11 @@ class MatchPlaybackService:
         video_extensions = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".m4v"}
 
         source_dirs: list[Path] = []
+        library_root = AnimeLibraryService.get_library_path(project.library_type)
         if project.source_paths:
             source_dirs = [Path(src) for src in project.source_paths]
-        elif settings.anime_library_path and settings.anime_library_path.exists():
-            source_dirs = [settings.anime_library_path]
+        elif library_root.exists():
+            source_dirs = [library_root]
 
         if not source_dirs:
             raise RuntimeError("No source paths configured for project")
@@ -247,9 +248,15 @@ class MatchPlaybackService:
             return source_path
 
         found_path: Path | None = None
-        if settings.anime_library_path and settings.anime_library_path.exists():
-            manifest = await AnimeLibraryService.ensure_episode_manifest()
-            candidate = AnimeLibraryService.resolve_episode_path(decoded_path, manifest)
+        if library_root.exists():
+            manifest = await AnimeLibraryService.ensure_episode_manifest(
+                library_type=project.library_type,
+            )
+            candidate = AnimeLibraryService.resolve_episode_path(
+                decoded_path,
+                manifest,
+                library_type=project.library_type,
+            )
             if candidate and cls._is_path_allowed(candidate, source_dirs):
                 found_path = candidate
 

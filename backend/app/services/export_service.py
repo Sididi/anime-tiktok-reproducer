@@ -311,13 +311,20 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
             )
 
     @classmethod
-    def _collect_episode_sources(cls, matches: list[SceneMatch]) -> list[Path]:
+    def _collect_episode_sources(
+        cls,
+        project: Project,
+        matches: list[SceneMatch],
+    ) -> list[Path]:
         seen: set[str] = set()
         sources: list[Path] = []
         for match in matches:
             if not match.episode:
                 continue
-            resolved = GapResolutionService.resolve_episode_path(match.episode)
+            resolved = GapResolutionService.resolve_episode_path(
+                match.episode,
+                library_type=project.library_type,
+            )
             if not resolved or not resolved.exists():
                 continue
             key = str(resolved.resolve())
@@ -483,7 +490,7 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
             source_items.append(name)
             entries.append(ManifestEntry(relative_path=f"{folder}/sources/{name}", source_path=path))
 
-        for source_path in cls._collect_episode_sources(matches):
+        for source_path in cls._collect_episode_sources(project, matches):
             _add_source_file(source_path)
 
         for overlay_name in ("title_overlay.png", "category_overlay.png"):

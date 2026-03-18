@@ -4,6 +4,7 @@ from pathlib import Path
 from datetime import datetime
 
 from ..config import settings
+from ..library_types import DEFAULT_LIBRARY_TYPE, LibraryType
 from ..models import Project, ProjectPhase, SceneList
 
 _PROJECT_ID_RE = re.compile(r"[a-zA-Z0-9_-]+$")
@@ -37,13 +38,24 @@ class ProjectService:
         return ProjectService.get_project_dir(project_id) / "scenes.json"
 
     @classmethod
-    def create(cls, tiktok_url: str | None = None, source_path: str | None = None, anime_name: str | None = None) -> Project:
+    def create(
+        cls,
+        tiktok_url: str | None = None,
+        source_path: str | None = None,
+        anime_name: str | None = None,
+        library_type: LibraryType = DEFAULT_LIBRARY_TYPE,
+    ) -> Project:
         """Create a new project."""
         source_paths = []
         if source_path:
             source_paths.append(source_path)
-        
-        project = Project(tiktok_url=tiktok_url, source_paths=source_paths, anime_name=anime_name)
+
+        project = Project(
+            tiktok_url=tiktok_url,
+            source_paths=source_paths,
+            anime_name=anime_name,
+            library_type=library_type,
+        )
         project_dir = cls.get_project_dir(project.id)
         project_dir.mkdir(parents=True, exist_ok=True)
 

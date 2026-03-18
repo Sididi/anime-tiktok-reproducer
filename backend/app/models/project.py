@@ -4,6 +4,8 @@ from pydantic import BaseModel, Field
 from typing import Any
 import uuid
 
+from ..library_types import DEFAULT_LIBRARY_TYPE, LibraryType
+
 
 class ProjectPhase(str, Enum):
     """Current phase of the project pipeline."""
@@ -27,6 +29,7 @@ class Project(BaseModel):
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
     tiktok_url: str | None = None
     anime_name: str | None = None  # Selected anime from indexed library
+    library_type: LibraryType = DEFAULT_LIBRARY_TYPE
     source_paths: list[str] = Field(default_factory=list)  # Kept for backwards compatibility
     phase: ProjectPhase = ProjectPhase.SETUP
     created_at: datetime = Field(default_factory=datetime.now)

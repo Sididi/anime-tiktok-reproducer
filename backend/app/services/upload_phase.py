@@ -13,8 +13,9 @@ import os
 
 import requests
 
-from ..models import Project
 from ..config import settings
+from ..library_types import coerce_library_type
+from ..models import Project
 from .account_service import AccountService
 from .discord_service import DiscordService
 from .export_service import ExportService
@@ -215,6 +216,7 @@ class UploadPhaseService:
             return {
                 "project_id": project.id,
                 "anime_title": project.anime_name,
+                "library_type": project.library_type.value,
                 "language": project.output_language,
                 "local_size_bytes": _dir_size(project_dir) if project_dir.exists() else 0,
                 **_uploaded_fields(project),
@@ -413,11 +415,13 @@ class UploadPhaseService:
         if not project:
             raise ValueError("Project not found")
         requested_platforms = cls._normalize_platforms(platforms)
+        configured_accounts = AccountService.list_accounts()
 
         # Validate account if provided
         account = None
         scheduled_at: datetime | None = None
         slot_dt: datetime | None = None
+        project_library_type = coerce_library_type(project.library_type)
         if account_id:
             account = AccountService.get_account(account_id)
             if not account:
@@ -427,6 +431,13 @@ class UploadPhaseService:
                     f"Project language '{project.output_language}' does not match "
                     f"account language '{account.language}'"
                 )
+            if project_library_type not in account.supported_types:
+                raise ValueError(
+                    f"Project type '{project_library_type.value}' does not match "
+                    f"account supported types {[item.value for item in account.supported_types]}"
+                )
+        elif configured_accounts:
+            raise ValueError("account_id is required when accounts are configured")
 
         readiness = cls.compute_readiness(project)
         if readiness.status != "green" or not readiness.drive_video_id:
