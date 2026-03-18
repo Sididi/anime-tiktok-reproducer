@@ -37,8 +37,7 @@ export function SourceList({
   return (
     <div className="flex flex-col flex-1 min-h-0">
       {/* Column headers */}
-      <div className="flex items-center gap-2 px-2 py-1 text-xs text-[hsl(var(--muted-foreground))] uppercase tracking-wider">
-        <div className="w-[20px] shrink-0" />
+      <div className="flex items-center gap-2 px-3 py-1 text-xs text-[hsl(var(--muted-foreground))] uppercase tracking-wider">
         <div className="flex-1 min-w-0">Nom</div>
         <div className="w-20 shrink-0">Épisodes</div>
         <div className="w-14 shrink-0">FPS</div>

@@ -9,7 +9,6 @@ from ..models.torrent import (
     TorrentEntry,
     TorrentFileMapping,
 )
-from .qbittorrent import QBittorrentClient
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -21,7 +20,7 @@ class TorrentLinkerService:
     @staticmethod
     async def link_files_to_torrents(
         source_files: list[Path],
-        qbt: QBittorrentClient,
+        qbt: "QBittorrentClient",
     ) -> tuple[SourceTorrentMetadata, list[Path]]:
         """
         Match source files to torrents.

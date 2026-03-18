@@ -32,35 +32,13 @@ export function SourceRow({
 }: SourceRowProps) {
   return (
     <div
-      className={`flex items-center gap-2 bg-[hsl(var(--card))] rounded px-2 py-2 border-l-[3px] ${
+      onClick={onSelect}
+      className={`flex items-center gap-2 rounded px-3 py-2 cursor-pointer transition-colors ${
         isSelected
-          ? "border-l-[hsl(var(--primary))]"
-          : "border-l-transparent"
+          ? "bg-[hsl(var(--primary))]/10 ring-1 ring-[hsl(var(--primary))]"
+          : "bg-[hsl(var(--card))] hover:bg-[hsl(var(--secondary))]/50"
       }`}
     >
-      {/* Radio checkbox */}
-      <div
-        role="radio"
-        aria-checked={isSelected}
-        tabIndex={0}
-        onClick={onSelect}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            onSelect();
-          }
-        }}
-        className={`shrink-0 w-[18px] h-[18px] rounded-full border-2 flex items-center justify-center cursor-pointer transition-colors outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--ring))] ${
-          isSelected
-            ? "border-[hsl(var(--primary))] bg-[hsl(var(--primary))]/20"
-            : "border-[hsl(var(--border))]"
-        }`}
-      >
-        {isSelected && (
-          <div className="w-2 h-2 rounded-full bg-[hsl(var(--primary))]" />
-        )}
-      </div>
-
       {/* Source name */}
       <div className="flex items-center gap-1 flex-1 min-w-0">
         <span className="font-semibold truncate">{source.name}</span>
@@ -90,7 +68,10 @@ export function SourceRow({
       {/* Actions */}
       <div className="flex gap-1 justify-end w-20 shrink-0">
         <button
-          onClick={onToggleProtection}
+          onClick={(e) => {
+            e.stopPropagation();
+            onToggleProtection();
+          }}
           className={`p-1 rounded transition-colors hover:bg-[hsl(var(--secondary))] ${
             source.purge_protected
               ? "text-green-500 opacity-100"
@@ -105,7 +86,10 @@ export function SourceRow({
           <ShieldCheck className="h-4 w-4" />
         </button>
         <button
-          onClick={onUpdate}
+          onClick={(e) => {
+            e.stopPropagation();
+            onUpdate();
+          }}
           className="p-1 rounded text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--secondary))] hover:text-[hsl(var(--foreground))] transition-colors"
           title="Mettre à jour les épisodes"
         >

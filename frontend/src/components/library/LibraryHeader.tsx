@@ -1,4 +1,4 @@
-import { FolderKanban } from "lucide-react";
+import { FolderKanban, Trash2 } from "lucide-react";
 import type { LibraryType } from "@/types";
 import { LIBRARY_TYPE_OPTIONS } from "@/utils/libraryTypes";
 
@@ -47,9 +47,10 @@ export function LibraryHeader({
 
       <button
         onClick={onOpenPurge}
-        className="rounded px-3 py-1.5 text-sm text-[hsl(var(--destructive))] bg-[hsl(var(--destructive))]/10 hover:bg-[hsl(var(--destructive))]/20 transition-colors"
+        className="p-1.5 rounded text-[hsl(var(--destructive))] hover:bg-[hsl(var(--destructive))]/15 transition-colors"
+        title="Purger la librairie"
       >
-        Purge
+        <Trash2 className="h-4 w-4" />
       </button>
     </div>
   );

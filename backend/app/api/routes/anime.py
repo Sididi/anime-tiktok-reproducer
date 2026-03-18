@@ -29,32 +29,50 @@ async def browse_directories(path: str | None = Query(default=None)):
     def _scan_path() -> tuple[list[dict], list[dict]]:
         dirs = []
         files = []
-        for entry in sorted(browse_path.iterdir(), key=lambda e: e.stat().st_mtime, reverse=True):
+        try:
+            raw_entries = list(browse_path.iterdir())
+        except PermissionError:
+            return [], []
+
+        def _safe_mtime(e: Path) -> float:
+            try:
+                return e.stat().st_mtime
+            except (OSError, ValueError):
+                return 0.0
+
+        raw_entries.sort(key=_safe_mtime, reverse=True)
+
+        for entry in raw_entries:
             if entry.name.startswith("."):
                 continue
-            if entry.is_dir():
+            try:
+                is_dir = entry.is_dir()
+                is_file = entry.is_file()
+            except OSError:
+                continue
+            if is_dir:
                 try:
                     has_videos = any(
                         child.suffix.lower() in VIDEO_EXTENSIONS
                         for child in entry.iterdir()
                         if child.is_file()
                     )
-                except PermissionError:
+                except (PermissionError, OSError):
                     has_videos = False
                 dirs.append({
                     "name": entry.name,
                     "path": str(entry),
                     "is_dir": True,
                     "has_videos": has_videos,
-                    "mtime": entry.stat().st_mtime,
+                    "mtime": _safe_mtime(entry),
                 })
-            elif entry.is_file() and entry.suffix.lower() in VIDEO_EXTENSIONS:
+            elif is_file and entry.suffix.lower() in VIDEO_EXTENSIONS:
                 files.append({
                     "name": entry.name,
                     "path": str(entry),
                     "is_dir": False,
                     "has_videos": False,
-                    "mtime": entry.stat().st_mtime,
+                    "mtime": _safe_mtime(entry),
                 })
         return dirs, files
 

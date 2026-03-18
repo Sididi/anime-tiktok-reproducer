@@ -56,3 +56,6 @@ config/accounts/avatars/
 Thumbs.db
 # pixi/uv artifacts
 backend/uv.lock
+
+# Superpowers (local development tool)
+.superpowers/
