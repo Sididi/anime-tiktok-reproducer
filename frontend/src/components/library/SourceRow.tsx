@@ -40,8 +40,17 @@ export function SourceRow({
     >
       {/* Radio checkbox */}
       <div
+        role="radio"
+        aria-checked={isSelected}
+        tabIndex={0}
         onClick={onSelect}
-        className={`shrink-0 w-[18px] h-[18px] rounded-full border-2 flex items-center justify-center cursor-pointer transition-colors ${
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            onSelect();
+          }
+        }}
+        className={`shrink-0 w-[18px] h-[18px] rounded-full border-2 flex items-center justify-center cursor-pointer transition-colors outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--ring))] ${
           isSelected
             ? "border-[hsl(var(--primary))] bg-[hsl(var(--primary))]/20"
             : "border-[hsl(var(--border))]"

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { FolderOpen, ChevronDown } from "lucide-react";
 import { Input } from "@/components/ui";
 import type { LibraryType } from "@/types";
@@ -31,6 +31,13 @@ export function NewSourceModal({
   const [fps, setFps] = useState(2);
   const [typeExpanded, setTypeExpanded] = useState(false);
   const [folderBrowserOpen, setFolderBrowserOpen] = useState(false);
+
+  // Sync selectedType when modal opens with a new currentLibraryType
+  useEffect(() => {
+    if (open) {
+      setSelectedType(currentLibraryType);
+    }
+  }, [open, currentLibraryType]);
 
   if (!open) return null;
 
