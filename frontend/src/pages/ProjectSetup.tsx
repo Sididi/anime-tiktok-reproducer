@@ -1,792 +1,302 @@
-import { useState, useCallback, useEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
-import { Loader2, ChevronDown, Plus, FolderOpen, FolderPlus, FolderKanban } from "lucide-react";
-import { Button, Input } from "@/components/ui";
+import {
+  LibraryHeader,
+  SourceList,
+  SearchBar,
+  BottomBar,
+  NewSourceModal,
+  PurgeModal,
+} from "@/components/library";
 import { FolderBrowserModal } from "@/components/FolderBrowserModal";
 import { ProjectManagerModal } from "@/components/project-manager";
-import { useProjectStore } from "@/stores";
 import { api } from "@/api/client";
 import { readSSEStream } from "@/utils/sse";
-import type { LibraryType } from "@/types";
-import {
-  getLibraryTypeLabel,
-  LIBRARY_TYPE_OPTIONS,
-} from "@/utils/libraryTypes";
-
-interface DownloadProgress {
-  status: string;
-  progress: number;
-  message: string;
-  error: string | null;
-}
-
-interface IndexProgress {
-  status: string;
-  phase: string;
-  progress: number;
-  message: string;
-  error: string | null;
-}
-
-interface DetectionProgress {
-  status: string;
-  progress: number;
-  message: string;
-  scenes?: import("@/types").Scene[];
-  error: string | null;
-}
-
-const sortAnimeNames = (series: string[]) =>
-  [...series].sort((a, b) =>
-    a.localeCompare(b, undefined, { sensitivity: "base", numeric: true }),
-  );
+import type { LibraryType, SourceDetails } from "@/types";
 
 export function ProjectSetup() {
   const navigate = useNavigate();
-  const {
-    createProject,
-    loading: creatingProject,
-    error: createError,
-  } = useProjectStore();
 
-  // Form state
-  const [tiktokUrl, setTiktokUrl] = useState("");
-  const [selectedLibraryType, setSelectedLibraryType] =
-    useState<LibraryType>("anime");
-  const [selectedAnime, setSelectedAnime] = useState<string | null>(null);
-  const [showAnimeDropdown, setShowAnimeDropdown] = useState(false);
-  const [animeSearch, setAnimeSearch] = useState("");
-  const [indexNewMode, setIndexNewMode] = useState(false);
-  const [newAnimePath, setNewAnimePath] = useState("");
-  const [newAnimeName, setNewAnimeName] = useState("");
-  const [newAnimeFps, setNewAnimeFps] = useState(2);
-  const [updateAnimeName, setUpdateAnimeName] = useState<string | null>(null);
-
-  // Anime list state
-  const [indexedAnime, setIndexedAnime] = useState<string[]>([]);
-  const [loadingAnime, setLoadingAnime] = useState(true);
-
-  // Progress state
-  const [downloadProgress, setDownloadProgress] =
-    useState<DownloadProgress | null>(null);
-  const [indexProgress, setIndexProgress] = useState<IndexProgress | null>(
-    null,
+  // Library state
+  const [selectedLibraryType, setSelectedLibraryType] = useState<LibraryType>(
+    () => (localStorage.getItem("libraryType") as LibraryType) || "anime",
   );
-  const [detectionProgress, setDetectionProgress] =
-    useState<DetectionProgress | null>(null);
-  const [downloading, setDownloading] = useState(false);
-  const [indexing, setIndexing] = useState(false);
-  const [detecting, setDetecting] = useState(false);
-  const [showFolderBrowser, setShowFolderBrowser] = useState(false);
+  const [sources, setSources] = useState<SourceDetails[]>([]);
+  const [selectedSource, setSelectedSource] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [loadingSources, setLoadingSources] = useState(true);
+
+  // TikTok URL + Start flow
+  const [tiktokUrl, setTiktokUrl] = useState("");
+  const [processing, setProcessing] = useState(false);
+  const [statusText, setStatusText] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  // Modals
   const [showProjectManager, setShowProjectManager] = useState(false);
-  const dropdownRef = useRef<HTMLDivElement>(null);
+  const [showPurge, setShowPurge] = useState(false);
+  const [showNewSource, setShowNewSource] = useState(false);
+  const [showFolderBrowser, setShowFolderBrowser] = useState(false);
+  const [updateSourceName, setUpdateSourceName] = useState<string | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
+  // Purge estimate
+  const [purgeEstimatedBytes, setPurgeEstimatedBytes] = useState(0);
+  const [purgeSourceCount, setPurgeSourceCount] = useState(0);
 
-    async function loadAnime() {
-      setLoadingAnime(true);
-      try {
-        const result = await api.listIndexedAnime(selectedLibraryType);
-        if (!cancelled) {
-          setIndexedAnime(sortAnimeNames(result.series));
-        }
-      } catch (err) {
-        if (!cancelled) {
-          console.error("Failed to load indexed titles:", err);
-          setIndexedAnime([]);
-        }
-      } finally {
-        if (!cancelled) {
-          setLoadingAnime(false);
-        }
-      }
+  // ---------------------------------------------------------------------------
+  // Load sources
+  // ---------------------------------------------------------------------------
+  const loadSources = useCallback(async () => {
+    setLoadingSources(true);
+    try {
+      const details = await api.getSourceDetails(selectedLibraryType);
+      setSources(details);
+    } catch (err) {
+      console.error("Failed to load sources:", err);
+      setSources([]);
+    } finally {
+      setLoadingSources(false);
     }
-
-    void loadAnime();
-    return () => {
-      cancelled = true;
-    };
   }, [selectedLibraryType]);
 
-  // Filter anime based on search
-  const filteredAnime = useMemo(() => {
-    if (!animeSearch.trim()) return indexedAnime;
-    const search = animeSearch.toLowerCase();
-    return indexedAnime.filter((a) => a.toLowerCase().includes(search));
-  }, [indexedAnime, animeSearch]);
-
   useEffect(() => {
-    if (!showAnimeDropdown) return;
-    const handleClickOutside = (e: MouseEvent) => {
-      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
-        setShowAnimeDropdown(false);
-      }
-    };
-    document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, [showAnimeDropdown]);
+    void loadSources();
+  }, [loadSources]);
 
-  // Run scene detection after download
-  const handleSceneDetection = useCallback(
-    async (projectId: string): Promise<boolean> => {
-      setDetecting(true);
-      setDetectionProgress({
-        status: "starting",
-        progress: 0,
-        message: "Starting scene detection...",
-        error: null,
-      });
+  // Persist library type to localStorage
+  useEffect(() => {
+    localStorage.setItem("libraryType", selectedLibraryType);
+  }, [selectedLibraryType]);
 
-      try {
-        const response = await api.detectScenes(projectId);
-
-        await readSSEStream<DetectionProgress>(response, (data) => {
-          setDetectionProgress(data);
-        });
-        return true;
-      } catch (err) {
-        setDetectionProgress({
-          status: "error",
-          progress: 0,
-          message: "",
-          error: (err as Error).message,
-        });
-        return false;
-      } finally {
-        setDetecting(false);
-      }
-    },
-    [],
-  );
-
-  const handleDownload = useCallback(
-    async (projectId: string, url: string): Promise<boolean> => {
-      setDownloading(true);
-      setDownloadProgress({
-        status: "starting",
-        progress: 0,
-        message: "Starting download...",
-        error: null,
-      });
-
-      try {
-        const response = await api.downloadVideo(projectId, url);
-
-        await readSSEStream<DownloadProgress>(response, (data) => {
-          setDownloadProgress(data);
-          if (data.status === "complete") {
-            // handled by return below
-          }
-        });
-        return true;
-      } catch (err) {
-        setDownloadProgress({
-          status: "error",
-          progress: 0,
-          message: "",
-          error: (err as Error).message,
-        });
-        return false;
-      } finally {
-        setDownloading(false);
-      }
-    },
-    [],
-  );
-
-  const runProjectPipeline = useCallback(
-    async (
-      url: string,
-      animeName: string,
-      libraryType: LibraryType,
-    ): Promise<boolean> => {
-      try {
-        const project = await createProject(
-          url,
-          undefined,
-          animeName,
-          libraryType,
-        );
-
-        // Step 1: Download video
-        const downloadSuccess = await handleDownload(project.id, url);
-        if (!downloadSuccess) return false;
-
-        // Step 2: Run scene detection
-        const detectionSuccess = await handleSceneDetection(project.id);
-        if (!detectionSuccess) return false;
-
-        // Step 3: Navigate to scenes, or skip directly to matches when configured
-        let skipScenesUi = false;
-        try {
-          const scenesConfig = await api.getScenesConfig(project.id);
-          skipScenesUi = Boolean(scenesConfig.skip_ui_enabled);
-        } catch {
-          skipScenesUi = false;
-        }
-
-        navigate(
-          skipScenesUi
-            ? `/project/${project.id}/matches`
-            : `/project/${project.id}/scenes`,
-        );
-        return true;
-      } catch {
-        // Error is handled in store
-        return false;
-      }
-    },
-    [createProject, handleDownload, handleSceneDetection, navigate],
-  );
-
-  const handleIndexAnime = useCallback(async (overrideName?: string, overrideFps?: number): Promise<string | null> => {
-    if (!newAnimePath.trim()) return null;
-
-    setIndexing(true);
-    setIndexProgress({
-      status: "starting",
-      phase: "starting",
-      progress: 0,
-      message: "Starting indexing...",
-      error: null,
-    });
+  // ---------------------------------------------------------------------------
+  // Start flow: create project -> download -> detect scenes -> navigate
+  // ---------------------------------------------------------------------------
+  const handleStart = useCallback(async () => {
+    if (!tiktokUrl.trim() || !selectedSource) return;
+    setProcessing(true);
+    setError(null);
 
     try {
-      const animeName = overrideName || newAnimeName.trim() || undefined;
-      const selectedFps = overrideFps ?? newAnimeFps;
-      const response = await api.indexAnime(
-        newAnimePath,
+      // Create project
+      setStatusText("Creating project...");
+      const project = await api.createProject(
+        tiktokUrl,
+        undefined,
+        selectedSource,
         selectedLibraryType,
-        animeName,
-        selectedFps,
       );
 
-      let finalAnimeName: string | null = null;
-      await readSSEStream<IndexProgress & { anime_name?: string }>(response, async (data) => {
-        setIndexProgress(data);
-        if (data.status === "complete") {
-          finalAnimeName = data.anime_name || animeName || newAnimePath.split("/").pop() || null;
-          const result = await api.listIndexedAnime(selectedLibraryType);
-          setIndexedAnime(sortAnimeNames(result.series));
+      // Download video
+      setStatusText("Downloading video...");
+      const downloadResp = await api.downloadVideo(project.id, tiktokUrl);
+      await readSSEStream(downloadResp, (data: { progress?: number }) => {
+        if (data.progress !== undefined) {
+          setStatusText(`Downloading... ${Math.round(data.progress)}%`);
         }
       });
 
-      if (finalAnimeName) {
-        setSelectedAnime(finalAnimeName);
-        setIndexNewMode(false);
-        setUpdateAnimeName(null);
-        setNewAnimePath("");
-        setNewAnimeName("");
-        setNewAnimeFps(2);
-        setIndexProgress(null);
-        return finalAnimeName;
+      // Detect scenes
+      setStatusText("Detecting scenes...");
+      const detectResp = await api.detectScenes(project.id);
+      await readSSEStream(detectResp, (data: { progress?: number }) => {
+        if (data.progress !== undefined) {
+          setStatusText(
+            `Detecting scenes... ${Math.round(data.progress * 100)}%`,
+          );
+        }
+      });
+
+      // Check whether to skip the scenes UI
+      let skipScenesUi = false;
+      try {
+        const scenesConfig = await api.getScenesConfig(project.id);
+        skipScenesUi = Boolean(scenesConfig.skip_ui_enabled);
+      } catch {
+        skipScenesUi = false;
       }
 
-      return null;
+      navigate(
+        skipScenesUi
+          ? `/project/${project.id}/matches`
+          : `/project/${project.id}/scenes`,
+      );
     } catch (err) {
-      setIndexProgress({
-        status: "error",
-        phase: "error",
-        progress: 0,
-        message: "",
-        error: (err as Error).message,
-      });
-      return null;
-    } finally {
-      setIndexing(false);
+      setError((err as Error).message);
+      setProcessing(false);
     }
-  }, [newAnimePath, newAnimeName, newAnimeFps, selectedLibraryType]);
+  }, [tiktokUrl, selectedSource, selectedLibraryType, navigate]);
 
-  const handleUpdateAnime = async () => {
-    if (!updateAnimeName || !newAnimePath.trim()) return;
-    const finalAnimeName = await handleIndexAnime(updateAnimeName, 2);
-    if (!finalAnimeName) return;
+  // ---------------------------------------------------------------------------
+  // New source submission (async indexing)
+  // ---------------------------------------------------------------------------
+  const handleNewSourceSubmit = useCallback(
+    async (
+      path: string,
+      name: string | undefined,
+      type: LibraryType,
+      fps: number,
+    ) => {
+      try {
+        await api.indexAnimeAsync(path, type, name, fps);
+        setShowNewSource(false);
+        // Jobs panel will show progress (Phase 2)
+        // For now, reload sources after a delay
+        setTimeout(loadSources, 2000);
+      } catch (err) {
+        setError((err as Error).message);
+      }
+    },
+    [loadSources],
+  );
 
-    const trimmedTikTokUrl = tiktokUrl.trim();
-    if (!trimmedTikTokUrl) return;
-
-    await runProjectPipeline(
-      trimmedTikTokUrl,
-      finalAnimeName,
-      selectedLibraryType,
-    );
-  };
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-
-    // Validate
-    const trimmedTikTokUrl = tiktokUrl.trim();
-    if (!trimmedTikTokUrl) return;
-
-    let animeName = selectedAnime;
-    if (indexNewMode) {
-      animeName = await handleIndexAnime();
+  // ---------------------------------------------------------------------------
+  // Purge
+  // ---------------------------------------------------------------------------
+  const handleOpenPurge = useCallback(async () => {
+    try {
+      const estimate = await api.estimatePurgeSize(
+        selectedLibraryType,
+        false,
+      );
+      setPurgeEstimatedBytes(estimate.estimated_bytes);
+      setPurgeSourceCount(estimate.source_count);
+    } catch {
+      /* ignore */
     }
+    setShowPurge(true);
+  }, [selectedLibraryType]);
 
-    if (!animeName) return;
+  const handlePurgeConfirm = useCallback(
+    async (allTypes: boolean) => {
+      try {
+        await api.purgeLibrary(selectedLibraryType, allTypes);
+        setShowPurge(false);
+        await loadSources();
+      } catch (err) {
+        setError((err as Error).message);
+      }
+    },
+    [selectedLibraryType, loadSources],
+  );
 
-    await runProjectPipeline(trimmedTikTokUrl, animeName, selectedLibraryType);
-  };
+  // ---------------------------------------------------------------------------
+  // Protection toggle
+  // ---------------------------------------------------------------------------
+  const handleToggleProtection = useCallback(
+    async (name: string) => {
+      try {
+        const result = await api.togglePurgeProtection(
+          selectedLibraryType,
+          name,
+        );
+        setSources((prev) =>
+          prev.map((s) =>
+            s.name === name
+              ? { ...s, purge_protected: result.purge_protected }
+              : s,
+          ),
+        );
+      } catch (err) {
+        setError((err as Error).message);
+      }
+    },
+    [selectedLibraryType],
+  );
 
-  const selectAnime = (anime: string) => {
-    setSelectedAnime(anime);
-    setShowAnimeDropdown(false);
-    setAnimeSearch("");
-    setIndexNewMode(false);
-  };
-
-  const startIndexNew = () => {
-    setIndexNewMode(true);
-    setUpdateAnimeName(null);
-    setShowAnimeDropdown(false);
-    setSelectedAnime(null);
-    setNewAnimeFps(2);
-  };
-
-  const handleLibraryTypeChange = (nextLibraryType: LibraryType) => {
-    if (nextLibraryType === selectedLibraryType) {
-      return;
-    }
-    setLoadingAnime(true);
-    setIndexedAnime([]);
-    setSelectedLibraryType(nextLibraryType);
-    setSelectedAnime(null);
-    setShowAnimeDropdown(false);
-    setAnimeSearch("");
-    setIndexNewMode(false);
-    setUpdateAnimeName(null);
-    setNewAnimePath("");
-    setNewAnimeName("");
-    setNewAnimeFps(2);
-    setIndexProgress(null);
-  };
-
-  const startUpdateAnime = (anime: string) => {
-    setUpdateAnimeName(anime);
-    setIndexNewMode(false);
-    setShowAnimeDropdown(false);
-    setNewAnimePath("");
-    setIndexProgress(null);
-  };
-
-  const isLoading = creatingProject || downloading || indexing || detecting;
-  const error =
-    createError ||
-    downloadProgress?.error ||
-    indexProgress?.error ||
-    detectionProgress?.error;
-  const canSubmit =
-    tiktokUrl.trim() &&
-    (selectedAnime || (indexNewMode && newAnimePath.trim()));
-
+  // ---------------------------------------------------------------------------
+  // Render
+  // ---------------------------------------------------------------------------
   return (
-    <div className="min-h-screen flex items-center justify-center p-4">
-      <div className="w-full max-w-md space-y-6">
-        <div className="text-center">
-          <h1 className="text-2xl font-bold">Anime TikTok Reproducer</h1>
-          <p className="text-[hsl(var(--muted-foreground))] mt-2">
-            Remaster your TikToks for other platforms
-          </p>
-          <div className="mt-4">
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => setShowProjectManager(true)}
-            >
-              <FolderKanban className="h-4 w-4 mr-2" />
-              Open Project Manager
-            </Button>
-          </div>
-        </div>
-
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <label className="text-sm text-[hsl(var(--muted-foreground))] mb-1 block">
-              Source Type{" "}
-              <span className="text-[hsl(var(--destructive))]">*</span>
-            </label>
-            <select
-              value={selectedLibraryType}
-              onChange={(e) =>
-                handleLibraryTypeChange(e.target.value as LibraryType)
-              }
-              disabled={isLoading}
-              className="w-full rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--background))] px-3 py-2 text-sm"
-            >
-              {LIBRARY_TYPE_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          {/* TikTok URL */}
-          <div>
-            <label className="text-sm text-[hsl(var(--muted-foreground))] mb-1 block">
-              TikTok URL
-            </label>
-            <Input
-              type="url"
-              placeholder="https://www.tiktok.com/@user/video/..."
-              value={tiktokUrl}
-              onChange={(e) => setTiktokUrl(e.target.value)}
-              disabled={isLoading}
-              data-testid="tiktok-url-input"
-              required
-            />
-          </div>
-
-          {/* Title Selection */}
-          <div>
-            <label className="text-sm text-[hsl(var(--muted-foreground))] mb-1 block">
-              Source Title{" "}
-              <span className="text-[hsl(var(--destructive))]">*</span>
-            </label>
-
-            {updateAnimeName ? (
-              /* Update Episodes Mode */
-              <div className="space-y-3 p-3 border border-[hsl(var(--border))] rounded-md bg-[hsl(var(--muted)/0.3)]">
-                <div className="flex items-center justify-between">
-                  <span className="text-sm font-medium">
-                    Update files for {updateAnimeName}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setUpdateAnimeName(null);
-                      setNewAnimePath("");
-                      setIndexProgress(null);
-                    }}
-                    className="text-xs text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))]"
-                  >
-                    Cancel
-                  </button>
-                </div>
-
-                <div>
-                  <label className="text-xs text-[hsl(var(--muted-foreground))] mb-1 block">
-                    Folder path with media files (existing + new)
-                  </label>
-                  <div className="flex gap-2">
-                    <Input
-                      type="text"
-                      placeholder="/path/to/library/title"
-                      value={newAnimePath}
-                      onChange={(e) => setNewAnimePath(e.target.value)}
-                      disabled={isLoading}
-                      className="flex-1"
-                    />
-                    <Button
-                      type="button"
-                      variant="outline"
-                      disabled={isLoading}
-                      onClick={() => setShowFolderBrowser(true)}
-                    >
-                      <FolderOpen className="h-4 w-4" />
-                    </Button>
-                  </div>
-                  <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
-                    Only new files will be copied and indexed into {getLibraryTypeLabel(selectedLibraryType)}
-                  </p>
-                </div>
-
-                <Button
-                  type="button"
-                  className="w-full"
-                  disabled={isLoading || !newAnimePath.trim()}
-                  onClick={handleUpdateAnime}
-                >
-                  {indexing ? (
-                    <>
-                      <Loader2 className="h-4 w-4 animate-spin mr-2" />
-                      Updating...
-                    </>
-                  ) : (
-                    "Update Files"
-                  )}
-                </Button>
-
-                {/* Indexing progress */}
-                {indexProgress && indexProgress.status !== "error" && (
-                  <div className="space-y-2">
-                    <div className="flex items-center gap-2 text-xs text-[hsl(var(--muted-foreground))]">
-                      <Loader2 className="h-3 w-3 animate-spin" />
-                      <span>{indexProgress.message}</span>
-                    </div>
-                    <div className="h-1.5 bg-[hsl(var(--muted))] rounded-full overflow-hidden">
-                      <div
-                        className="h-full bg-[hsl(var(--primary))] transition-all duration-300"
-                        style={{ width: `${indexProgress.progress * 100}%` }}
-                      />
-                    </div>
-                  </div>
-                )}
-
-                {indexProgress?.error && (
-                  <p className="text-xs text-[hsl(var(--destructive))]">{indexProgress.error}</p>
-                )}
-              </div>
-            ) : !indexNewMode ? (
-              <div className="relative" ref={dropdownRef}>
-                <button
-                  type="button"
-                  onClick={() => setShowAnimeDropdown(!showAnimeDropdown)}
-                  disabled={isLoading || loadingAnime}
-                  className="w-full flex items-center justify-between px-3 py-2 border border-[hsl(var(--border))] rounded-md bg-[hsl(var(--background))] text-left disabled:opacity-50"
-                >
-                  {loadingAnime ? (
-                    <span className="text-[hsl(var(--muted-foreground))]">
-                      Loading titles...
-                    </span>
-                  ) : selectedAnime ? (
-                    <span>{selectedAnime}</span>
-                  ) : (
-                    <span className="text-[hsl(var(--muted-foreground))]">
-                      Select a title...
-                    </span>
-                  )}
-                  <ChevronDown className="h-4 w-4 text-[hsl(var(--muted-foreground))]" />
-                </button>
-
-                {showAnimeDropdown && (
-                  <div className="absolute z-10 mt-1 w-full bg-[hsl(var(--background))] border border-[hsl(var(--border))] rounded-md shadow-lg flex max-h-[min(80vh,24rem)] flex-col overflow-hidden">
-                    {/* Search input */}
-                    <div className="p-2 border-b border-[hsl(var(--border))]">
-                      <Input
-                        type="text"
-                        placeholder="Search titles..."
-                        value={animeSearch}
-                        onChange={(e) => setAnimeSearch(e.target.value)}
-                        className="text-sm"
-                        autoFocus
-                      />
-                    </div>
-
-                    {/* Anime list */}
-                    <div className="overflow-y-auto min-h-0 flex-1">
-                      {filteredAnime.length === 0 ? (
-                        <div className="px-3 py-2 text-sm text-[hsl(var(--muted-foreground))]">
-                          {indexedAnime.length === 0
-                            ? "No titles indexed yet"
-                            : "No matches found"}
-                        </div>
-                      ) : (
-                        filteredAnime.map((anime) => (
-                          <div
-                            key={anime}
-                            className="flex items-center hover:bg-[hsl(var(--muted))]"
-                          >
-                            <button
-                              type="button"
-                              onClick={() => selectAnime(anime)}
-                              className="flex-1 text-left px-3 py-2 text-sm"
-                            >
-                              {anime}
-                            </button>
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                startUpdateAnime(anime);
-                              }}
-                              className="px-2 py-2 text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--primary))]"
-                              title="Update indexed files"
-                            >
-                              <FolderPlus className="h-3.5 w-3.5" />
-                            </button>
-                          </div>
-                        ))
-                      )}
-                    </div>
-
-                    {/* Index new option */}
-                    <div className="shrink-0 border-t border-[hsl(var(--border))] p-2">
-                      <button
-                        type="button"
-                        onClick={startIndexNew}
-                        className="w-full flex items-center gap-2 px-3 py-2 rounded-md hover:bg-[hsl(var(--muted))] text-sm text-[hsl(var(--primary))]"
-                      >
-                        <Plus className="h-4 w-4" />
-                        Index New Title
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </div>
-            ) : (
-              /* Index New Mode */
-              <div className="space-y-3 p-3 border border-[hsl(var(--border))] rounded-md bg-[hsl(var(--muted)/0.3)]">
-                <div className="flex items-center justify-between">
-                  <span className="text-sm font-medium">
-                    Index New Title in {getLibraryTypeLabel(selectedLibraryType)}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setIndexNewMode(false);
-                      setNewAnimeFps(2);
-                    }}
-                    className="text-xs text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))]"
-                  >
-                    Cancel
-                  </button>
-                </div>
-
-                <div>
-                  <label className="text-xs text-[hsl(var(--muted-foreground))] mb-1 block">
-                    Library folder path (with video files)
-                  </label>
-                  <div className="flex gap-2">
-                    <Input
-                      type="text"
-                      placeholder="/path/to/library/title"
-                      value={newAnimePath}
-                      onChange={(e) => setNewAnimePath(e.target.value)}
-                      disabled={isLoading}
-                      className="flex-1"
-                    />
-                    <Button
-                      type="button"
-                      variant="outline"
-                      disabled={isLoading}
-                      onClick={() => setShowFolderBrowser(true)}
-                    >
-                      <FolderOpen className="h-4 w-4" />
-                    </Button>
-                  </div>
-                  <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
-                    Note: Enter the full absolute path (e.g.,
-                    /home/user/library/MyTitle)
-                  </p>
-                </div>
-
-                <div>
-                  <label className="text-xs text-[hsl(var(--muted-foreground))] mb-1 block">
-                    Title name (optional, defaults to folder name)
-                  </label>
-                  <Input
-                    type="text"
-                    placeholder="e.g. Attack on Titan"
-                    value={newAnimeName}
-                    onChange={(e) => setNewAnimeName(e.target.value)}
-                    disabled={isLoading}
-                  />
-                </div>
-
-                <div>
-                  <label className="text-xs text-[hsl(var(--muted-foreground))] mb-1 block">
-                    Index FPS
-                  </label>
-                  <select
-                    value={newAnimeFps}
-                    onChange={(e) => setNewAnimeFps(Number(e.target.value))}
-                    disabled={isLoading}
-                    className="w-full rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--background))] px-3 py-2 text-sm"
-                  >
-                    <option value={1}>1 FPS</option>
-                    <option value={2}>2 FPS</option>
-                    <option value={4}>4 FPS</option>
-                  </select>
-                </div>
-
-                {/* Indexing progress */}
-                {indexProgress && indexProgress.status !== "error" && (
-                  <div className="space-y-2">
-                    <div className="flex items-center gap-2 text-xs text-[hsl(var(--muted-foreground))]">
-                      <Loader2 className="h-3 w-3 animate-spin" />
-                      <span>{indexProgress.message}</span>
-                    </div>
-                    <div className="h-1.5 bg-[hsl(var(--muted))] rounded-full overflow-hidden">
-                      <div
-                        className="h-full bg-[hsl(var(--primary))] transition-all duration-300"
-                        style={{ width: `${indexProgress.progress * 100}%` }}
-                      />
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-
-          {/* Download progress */}
-          {downloadProgress && downloadProgress.status !== "error" && (
-            <div className="space-y-2">
-              <div className="flex items-center gap-2 text-sm text-[hsl(var(--muted-foreground))]">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                <span>{downloadProgress.message}</span>
-              </div>
-              <div className="h-2 bg-[hsl(var(--muted))] rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-[hsl(var(--primary))] transition-all duration-300"
-                  style={{ width: `${downloadProgress.progress * 100}%` }}
-                />
-              </div>
-            </div>
-          )}
-
-          {/* Scene detection progress */}
-          {detectionProgress && detectionProgress.status !== "error" && (
-            <div className="space-y-2">
-              <div className="flex items-center gap-2 text-sm text-[hsl(var(--muted-foreground))]">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                <span>{detectionProgress.message}</span>
-              </div>
-              <div className="h-2 bg-[hsl(var(--muted))] rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-[hsl(var(--primary))] transition-all duration-300"
-                  style={{ width: `${detectionProgress.progress * 100}%` }}
-                />
-              </div>
-            </div>
-          )}
-
-          {error && !updateAnimeName && (
-            <p className="text-sm text-[hsl(var(--destructive))]">{error}</p>
-          )}
-
-          {!updateAnimeName && (
-            <Button
-              type="submit"
-              className="w-full"
-              disabled={isLoading || !canSubmit}
-              data-testid="create-project-btn"
-            >
-              {isLoading ? (
-                <>
-                  <Loader2 className="h-4 w-4 animate-spin mr-2" />
-                  {indexing
-                    ? "Indexing..."
-                    : downloading
-                      ? "Downloading..."
-                      : detecting
-                        ? "Detecting scenes..."
-                        : "Creating..."}
-                </>
-              ) : indexNewMode ? (
-                "Index & Start"
-              ) : (
-                "Download & Start"
-              )}
-            </Button>
-          )}
-        </form>
-
-        <p className="text-xs text-center text-[hsl(var(--muted-foreground))]">
-          Enter a TikTok URL and select the source title to reproduce from
-        </p>
-      </div>
-
-      <FolderBrowserModal
-        open={showFolderBrowser}
-        onClose={() => setShowFolderBrowser(false)}
-        onSelect={(path) => setNewAnimePath(path)}
+    <div className="flex flex-col h-screen bg-[hsl(var(--background))] p-3 gap-2">
+      <LibraryHeader
+        selectedType={selectedLibraryType}
+        onTypeChange={setSelectedLibraryType}
+        onOpenProjectManager={() => setShowProjectManager(true)}
+        onOpenPurge={handleOpenPurge}
       />
+
+      {/* IndexJobsPanel will go here in Phase 2 */}
+
+      <SearchBar
+        searchQuery={searchQuery}
+        onSearchChange={setSearchQuery}
+        onNewSource={() => setShowNewSource(true)}
+      />
+
+      <SourceList
+        sources={sources}
+        selectedSource={selectedSource}
+        onSelectSource={setSelectedSource}
+        onToggleProtection={handleToggleProtection}
+        onUpdateSource={(name) => {
+          setUpdateSourceName(name);
+          setShowFolderBrowser(true);
+        }}
+        searchQuery={searchQuery}
+      />
+
+      {error && (
+        <div className="text-sm text-[hsl(var(--destructive))] px-2">
+          {error}
+        </div>
+      )}
+
+      <BottomBar
+        tiktokUrl={tiktokUrl}
+        onUrlChange={setTiktokUrl}
+        onStart={handleStart}
+        disabled={!tiktokUrl.trim() || !selectedSource || processing}
+        loading={processing}
+        statusText={statusText}
+      />
+
+      {/* Modals */}
       <ProjectManagerModal
         open={showProjectManager}
         onClose={() => setShowProjectManager(false)}
+      />
+
+      <NewSourceModal
+        open={showNewSource}
+        onClose={() => setShowNewSource(false)}
+        onSubmit={handleNewSourceSubmit}
+        currentLibraryType={selectedLibraryType}
+      />
+
+      <PurgeModal
+        open={showPurge}
+        onClose={() => setShowPurge(false)}
+        onConfirm={handlePurgeConfirm}
+        currentLibraryType={selectedLibraryType}
+        estimatedBytes={purgeEstimatedBytes}
+        sourceCount={purgeSourceCount}
+      />
+
+      <FolderBrowserModal
+        open={showFolderBrowser}
+        onClose={() => {
+          setShowFolderBrowser(false);
+          setUpdateSourceName(null);
+        }}
+        onSelect={(path) => {
+          setShowFolderBrowser(false);
+          if (updateSourceName) {
+            // Handle update: call indexAnime for update
+            // For now use sync index (Phase 2 will use async)
+            api
+              .indexAnime(path, selectedLibraryType, updateSourceName)
+              .then((resp) => {
+                readSSEStream(resp, () => {}).then(() => loadSources());
+              });
+            setUpdateSourceName(null);
+          }
+        }}
+        initialPath={
+          updateSourceName
+            ? (sources.find((s) => s.name === updateSourceName)
+                ?.original_index_path ?? undefined)
+            : undefined
+        }
       />
     </div>
   );
