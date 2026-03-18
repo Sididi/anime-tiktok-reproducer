@@ -4,9 +4,9 @@ import json
 import sys
 from pathlib import Path
 
-import faiss
 import numpy as np
 import pytest
+from PIL import Image
 from typer.testing import CliRunner
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -19,8 +19,10 @@ if str(SEARCHER_ROOT) not in sys.path:
 
 from app.services.anime_library import AnimeLibraryService, IndexProgress
 from anime_searcher import cli as cli_module
-from anime_searcher.config import EMBEDDING_DIM
+from anime_searcher.config import EMBEDDING_DIM, INDEX_ENGINE_PROFILE, INDEX_FORMAT_VERSION
+from anime_searcher.indexer.frame_extractor import MediaBinaryProfile
 from anime_searcher.indexer.index_manager import IndexManager
+from anime_searcher.indexer.pipeline import FileStartedEvent, IndexedFileResult, IndexingJob, ParallelFileIndexer
 
 
 RUNNER = CliRunner()
@@ -48,13 +50,13 @@ def _make_vectors(count: int, offset: int) -> np.ndarray:
     return vectors
 
 
-def _seed_v3_series(library_path: Path, file_vectors: dict[Path, np.ndarray]) -> None:
+def _seed_v4_series(library_path: Path, file_vectors: dict[Path, np.ndarray]) -> None:
     manager = IndexManager(library_path)
     manager.load_or_create(2.0)
     manager.set_series_fps("Demo", 2.0)
     for file_path, vectors in file_vectors.items():
         timestamps = [float(i) for i in range(len(vectors))]
-        manager.add_embeddings(
+        manager.add_file_embeddings(
             vectors,
             "Demo",
             file_path.stem,
@@ -65,75 +67,109 @@ def _seed_v3_series(library_path: Path, file_vectors: dict[Path, np.ndarray]) ->
     manager.save()
 
 
-def _write_v2_sharded_index(library_path: Path, file_path: Path, vectors: np.ndarray) -> None:
-    state_path = library_path / ".index" / "state.json"
-    shard_dir = library_path / ".index" / "series" / "Demo_key"
-    shard_dir.mkdir(parents=True)
-
-    index = faiss.IndexFlatIP(EMBEDDING_DIM)
-    index.add(vectors)
-    faiss.write_index(index, str(shard_dir / "faiss.index"))
-
-    metadata = {
-        "series": "Demo",
-        "frames": [
-            {
-                "id": i + 1,
-                "series": "Demo",
-                "episode": file_path.stem,
-                "timestamp": float(i),
-            }
-            for i in range(len(vectors))
-        ],
-    }
-    (shard_dir / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
-    (library_path / ".index" / "manifest.json").write_text(
+def _write_legacy_manifest(library_path: Path) -> None:
+    index_dir = library_path / ".index"
+    index_dir.mkdir(parents=True)
+    (index_dir / "manifest.json").write_text(
         json.dumps(
             {
                 "version": 2,
-                "config": {"fps": 2.0, "default_fps": 2.0},
-                "series": {
-                    "Demo": {
-                        "key": "Demo_key",
-                        "frames": len(vectors),
-                        "fps": 2.0,
-                    }
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    state_path.write_text(
-        json.dumps(
-            {
-                "files": {
-                    "Demo/ep1.mp4": {
-                        "mtime": file_path.stat().st_mtime,
-                        "size": file_path.stat().st_size,
-                        "frame_count": len(vectors),
-                        "index_start": 0,
-                        "index_end": len(vectors) - 1,
-                    }
-                }
+                "engine_profile": "legacy",
+                "config": {"default_fps": 2.0},
+                "series": {},
             }
         ),
         encoding="utf-8",
     )
 
 
-def _install_fake_pipeline(monkeypatch: pytest.MonkeyPatch, batches_by_name: dict[str, tuple[np.ndarray, list[float]]]) -> None:
+def _install_fake_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    batches_by_name: dict[str, list[tuple[np.ndarray, list[float]]] | tuple[np.ndarray, list[float]]],
+) -> None:
     class DummyEmbedder:
         device = "cpu"
 
     class FakePipeline:
-        def embed_video(self, video_path: Path, fps: float):
-            yield batches_by_name[video_path.name]
+        file_workers = 1
+
+        def close(self) -> None:
+            return None
+
+        def run(self, jobs: list[IndexingJob]):
+            for job in jobs:
+                yield FileStartedEvent(job=job)
+                raw_batches = batches_by_name[job.video_path.name]
+                normalized_batches = raw_batches if isinstance(raw_batches, list) else [raw_batches]
+                embeddings = np.concatenate([batch[0] for batch in normalized_batches], axis=0)
+                timestamps: list[float] = []
+                for _, batch_timestamps in normalized_batches:
+                    timestamps.extend(batch_timestamps)
+                yield IndexedFileResult(job=job, timestamps=timestamps, embeddings=embeddings)
 
     monkeypatch.setattr(
         cli_module,
         "_create_pipeline",
-        lambda *args, **kwargs: (DummyEmbedder(), None, FakePipeline()),
+        lambda *args, **kwargs: (
+            DummyEmbedder(),
+            FakePipeline(),
+            MediaBinaryProfile("test", "/usr/bin/ffmpeg", "/usr/bin/ffprobe"),
+        ),
     )
+
+
+def test_parallel_file_indexer_combines_multi_batch_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    video_path = tmp_path / "episode.mp4"
+    video_path.write_bytes(b"video")
+
+    frames = [
+        (float(i), Image.new("RGB", (2, 2), color=(i * 10, 0, 0)))
+        for i in range(5)
+    ]
+
+    monkeypatch.setattr(
+        "anime_searcher.indexer.pipeline.extract_frames",
+        lambda *args, **kwargs: iter(frames),
+    )
+
+    class DummyEmbedder:
+        device = "cpu"
+        embedding_dim = EMBEDDING_DIM
+
+        def __init__(self) -> None:
+            self._offset = 0
+
+        def embed_preprocessed_batch(self, batch) -> np.ndarray:
+            vectors = _make_vectors(batch.shape[0], self._offset)
+            self._offset += batch.shape[0]
+            return vectors
+
+    pipeline = ParallelFileIndexer(
+        DummyEmbedder(),
+        batch_size=2,
+        prefetch_batches=2,
+        transform_workers=1,
+        file_workers=1,
+    )
+    outputs = list(
+        pipeline.run(
+            [
+                IndexingJob(
+                    video_path=video_path,
+                    series="Demo",
+                    episode="episode",
+                    fps=2.0,
+                )
+            ]
+        )
+    )
+    pipeline.close()
+
+    assert isinstance(outputs[0], FileStartedEvent)
+    assert isinstance(outputs[1], IndexedFileResult)
+    result = outputs[1]
+    assert result.embeddings.shape == (5, EMBEDDING_DIM)
+    assert result.timestamps == [0.0, 1.0, 2.0, 3.0, 4.0]
 
 
 def test_update_only_indexes_new_files_and_skips_unchanged(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -146,7 +182,7 @@ def test_update_only_indexes_new_files_and_skips_unchanged(monkeypatch: pytest.M
     file1.write_bytes(b"ep1")
     file2.write_bytes(b"ep2")
 
-    _seed_v3_series(library_path, {file1: _make_vectors(2, 0)})
+    _seed_v4_series(library_path, {file1: _make_vectors(2, 0)})
     manifest_path = _write_manifest(tmp_path, file2)
     model_path = _dummy_model(tmp_path)
 
@@ -212,12 +248,20 @@ def test_update_replaces_existing_file_without_duplicate_frames(monkeypatch: pyt
     file1 = series_dir / "ep1.mp4"
     file1.write_bytes(b"old")
 
-    _seed_v3_series(library_path, {file1: _make_vectors(2, 0)})
+    _seed_v4_series(library_path, {file1: _make_vectors(2, 0)})
     file1.write_bytes(b"changed-and-longer")
     manifest_path = _write_manifest(tmp_path, file1)
     model_path = _dummy_model(tmp_path)
 
-    _install_fake_pipeline(monkeypatch, {file1.name: (_make_vectors(3, 20), [0.0, 1.0, 2.0])})
+    _install_fake_pipeline(
+        monkeypatch,
+        {
+            file1.name: [
+                (_make_vectors(2, 20), [0.0, 1.0]),
+                (_make_vectors(1, 22), [2.0]),
+            ]
+        },
+    )
     result = RUNNER.invoke(
         cli_module.app,
         [
@@ -256,7 +300,7 @@ def test_remove_command_only_deletes_listed_files(tmp_path: Path) -> None:
     file1.write_bytes(b"ep1")
     file2.write_bytes(b"ep2")
 
-    _seed_v3_series(
+    _seed_v4_series(
         library_path,
         {
             file1: _make_vectors(2, 0),
@@ -288,48 +332,31 @@ def test_remove_command_only_deletes_listed_files(tmp_path: Path) -> None:
     assert "Demo/ep2.mp4" not in manager.state
 
 
-def test_migrate_converts_v2_and_mutating_commands_refuse_first(tmp_path: Path) -> None:
+def test_v4_rejects_legacy_indices_with_rebuild_message(tmp_path: Path) -> None:
     library_root = tmp_path / "library"
     library_path = library_root / "anime"
-    series_dir = library_path / "Demo"
-    series_dir.mkdir(parents=True)
-    file1 = series_dir / "ep1.mp4"
-    file1.write_bytes(b"ep1")
+    library_path.mkdir(parents=True)
+    _write_legacy_manifest(library_path)
 
-    _write_v2_sharded_index(library_path, file1, _make_vectors(2, 0))
-    manifest_path = _write_manifest(tmp_path, file1)
-
-    remove_before_migration = RUNNER.invoke(
+    result = RUNNER.invoke(
         cli_module.app,
-        [
-            "remove",
-            str(library_root),
-            "--type",
-            "anime",
-            "--series",
-            "Demo",
-            "--manifest",
-            str(manifest_path),
-        ],
+        ["info", str(library_root), "--type", "anime"],
     )
-    assert remove_before_migration.exit_code == 1
-    assert "migrate" in remove_before_migration.stdout.lower()
+    assert result.exit_code == 1
+    assert "rebuild" in result.stdout.lower()
 
-    migrate = RUNNER.invoke(
-        cli_module.app,
-        ["migrate", str(library_root), "--type", "anime"],
-    )
-    assert migrate.exit_code == 0, migrate.stdout
 
-    manager = IndexManager(library_path)
-    manager.load_or_create()
-    assert manager.format_version == 3
-    assert manager.total_files == 1
-    assert manager.total_frames == 2
+def test_migration_commands_are_removed(tmp_path: Path) -> None:
+    library_root = tmp_path / "library"
+    library_root.mkdir(parents=True)
 
-    results = manager.search(_make_vectors(1, 0)[0], top_k=1, series="Demo")
-    assert results
-    assert results[0][1].file_path == "Demo/ep1.mp4"
+    migrate_result = RUNNER.invoke(cli_module.app, ["migrate", str(library_root), "--type", "anime"])
+    assert migrate_result.exit_code != 0
+    assert "no such command" in migrate_result.output.lower()
+
+    migrate_layout_result = RUNNER.invoke(cli_module.app, ["migrate-layout", str(library_root)])
+    assert migrate_layout_result.exit_code != 0
+    assert "no such command" in migrate_layout_result.output.lower()
 
 
 def test_mutating_and_read_commands_require_library_type(tmp_path: Path) -> None:
@@ -340,34 +367,47 @@ def test_mutating_and_read_commands_require_library_type(tmp_path: Path) -> None
     assert list_result.exit_code != 0
     assert "--type" in list_result.output
 
-    migrate_result = RUNNER.invoke(cli_module.app, ["migrate", str(library_root)])
-    assert migrate_result.exit_code != 0
-    assert "--type" in migrate_result.output
+    info_result = RUNNER.invoke(cli_module.app, ["info", str(library_root)])
+    assert info_result.exit_code != 0
+    assert "--type" in info_result.output
 
 
-def test_migrate_layout_moves_legacy_entries_into_anime_bucket(tmp_path: Path) -> None:
-    library_root = tmp_path / "library"
-    series_dir = library_root / "Demo"
-    index_dir = library_root / ".index"
-    series_dir.mkdir(parents=True)
-    index_dir.mkdir(parents=True)
-    episode_path = series_dir / "ep1.mp4"
-    episode_path.write_bytes(b"demo")
-    (index_dir / "state.json").write_text("{}", encoding="utf-8")
-
-    migrate_result = RUNNER.invoke(
-        cli_module.app,
-        ["migrate-layout", str(library_root)],
+def test_backend_parses_structured_searcher_progress_events() -> None:
+    progress = AnimeLibraryService._parse_searcher_progress_line(
+        line=json.dumps(
+            {
+                "event": "file_completed",
+                "message": "Indexed Demo/ep1.mp4",
+                "current_file": "Demo/ep1.mp4",
+                "progress": 0.5,
+                "completed_files": 1,
+                "total_files": 2,
+            }
+        ),
+        status="indexing",
+        total_files=2,
+        progress_start=0.35,
+        progress_span=0.60,
+        text_line_index=1,
     )
-    assert migrate_result.exit_code == 0, migrate_result.stdout
-    assert (library_root / "anime" / "Demo" / "ep1.mp4").exists()
-    assert (library_root / "anime" / ".index" / "state.json").exists()
+    assert progress is not None
+    assert progress.status == "indexing"
+    assert progress.current_file == "Demo/ep1.mp4"
+    assert progress.completed_files == 1
+    assert progress.total_files == 2
+    assert progress.progress == pytest.approx(0.65)
 
-    second_result = RUNNER.invoke(
-        cli_module.app,
-        ["migrate-layout", str(library_root)],
+    error = AnimeLibraryService._parse_searcher_progress_line(
+        line=json.dumps({"event": "error", "error": "boom"}),
+        status="indexing",
+        total_files=2,
+        progress_start=0.35,
+        progress_span=0.60,
+        text_line_index=2,
     )
-    assert second_result.exit_code == 0, second_result.stdout
+    assert error is not None
+    assert error.status == "error"
+    assert error.error == "boom"
 
 
 @pytest.mark.asyncio
@@ -421,8 +461,16 @@ async def test_backend_update_anime_returns_prepared_library_paths(
         "_prepare_single_source_for_library",
         classmethod(lambda cls, **kwargs: fake_prepare_single_source_for_library(**kwargs)),
     )
-    monkeypatch.setattr(AnimeLibraryService, "_verify_prepared_library_files", classmethod(lambda cls, files: fake_verify_prepared_library_files(files)))
-    monkeypatch.setattr(AnimeLibraryService, "_stream_searcher_command", classmethod(lambda cls, **kwargs: fake_stream_searcher_command(**kwargs)))
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_verify_prepared_library_files",
+        classmethod(lambda cls, files: fake_verify_prepared_library_files(files)),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_stream_searcher_command",
+        classmethod(lambda cls, **kwargs: fake_stream_searcher_command(**kwargs)),
+    )
     monkeypatch.setattr(
         AnimeLibraryService,
         "ensure_episode_manifest",
@@ -485,7 +533,11 @@ async def test_backend_remove_anime_files_deletes_file_and_sidecars(
     ):
         return {}
 
-    monkeypatch.setattr(AnimeLibraryService, "_stream_searcher_command", classmethod(lambda cls, **kwargs: fake_stream_searcher_command(**kwargs)))
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_stream_searcher_command",
+        classmethod(lambda cls, **kwargs: fake_stream_searcher_command(**kwargs)),
+    )
     monkeypatch.setattr(
         AnimeLibraryService,
         "ensure_episode_manifest",
@@ -510,3 +562,17 @@ async def test_backend_remove_anime_files_deletes_file_and_sidecars(
     assert not source_path.exists()
     assert not sidecar_dir.exists()
     assert not AnimeLibraryService.get_source_import_manifest_path(source_path).exists()
+
+
+def test_seeded_index_uses_v4_manifest(tmp_path: Path) -> None:
+    library_path = tmp_path / "library" / "anime"
+    series_dir = library_path / "Demo"
+    series_dir.mkdir(parents=True)
+    file1 = series_dir / "ep1.mp4"
+    file1.write_bytes(b"ep1")
+
+    _seed_v4_series(library_path, {file1: _make_vectors(2, 0)})
+
+    payload = json.loads((library_path / ".index" / "manifest.json").read_text())
+    assert payload["version"] == INDEX_FORMAT_VERSION
+    assert payload["engine_profile"] == INDEX_ENGINE_PROFILE

@@ -93,6 +93,7 @@ dev = { depends-on = ["backend"] }
 
 # Anime searcher CLI
 anime-search = { cmd = "python -m anime_searcher.cli", cwd = "modules/anime_searcher" }
+benchmark-anime-index = { cmd = "python -m anime_searcher.benchmark", cwd = "modules/anime_searcher" }
 
 # Testing
 test = { cmd = "pytest", cwd = "backend" }

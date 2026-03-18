@@ -158,6 +158,8 @@ class AnimeLibraryService:
     SEARCH_TIMEOUT_SECONDS = 120.0
     REMUX_TIMEOUT_SECONDS = 600.0
     INDEX_TIMEOUT_SECONDS = 7200.0
+    SEARCHER_INDEX_FORMAT_VERSION = 4
+    SEARCHER_ENGINE_PROFILE = "sscd_exact_resize_v1"
     PREVIEW_PROXY_TIMEOUT_SECONDS = 3600.0
     SOURCE_NORMALIZATION_TIMEOUT_SECONDS = 7200.0
     SUBTITLE_EXTRACTION_TIMEOUT_SECONDS = 1800.0
@@ -257,6 +259,10 @@ class AnimeLibraryService:
                 payload = None
 
             if isinstance(payload, dict):
+                if payload.get("version") != cls.SEARCHER_INDEX_FORMAT_VERSION:
+                    return None
+                if payload.get("engine_profile") != cls.SEARCHER_ENGINE_PROFILE:
+                    return None
                 series_map = payload.get("series", {})
                 if isinstance(series_map, dict):
                     entry = series_map.get(anime_name)
@@ -268,41 +274,74 @@ class AnimeLibraryService:
                         config = payload.get("config", {})
                         if isinstance(config, dict):
                             return cls._coerce_fps(
-                                config.get("default_fps", config.get("fps"))
+                                config.get("default_fps")
                             )
+        return None
 
-        # Legacy fallback: single global FPS in metadata config.
-        legacy_metadata_path = index_dir / cls.LEGACY_METADATA_FILE
-        if not legacy_metadata_path.exists():
+    @classmethod
+    def _parse_searcher_progress_line(
+        cls,
+        *,
+        line: str,
+        status: str,
+        total_files: int,
+        progress_start: float,
+        progress_span: float,
+        text_line_index: int,
+    ) -> IndexProgress | None:
+        line_str = line.strip()
+        if not line_str:
             return None
-
-        # Legacy index is global; ensure this series actually exists in state.
-        state_path = index_dir / cls.STATE_FILE
-        if state_path.exists():
-            try:
-                state_payload = json.loads(state_path.read_text())
-            except (json.JSONDecodeError, OSError):
-                state_payload = {}
-            files = state_payload.get("files", {}) if isinstance(state_payload, dict) else {}
-            if isinstance(files, dict):
-                has_series_state = any(
-                    path == anime_name or path.startswith(f"{anime_name}/")
-                    for path in files
-                )
-                if not has_series_state:
-                    return None
 
         try:
-            legacy_payload = json.loads(legacy_metadata_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            return None
+            payload = json.loads(line_str)
+        except json.JSONDecodeError:
+            denominator = max(total_files * 100, 1)
+            return IndexProgress(
+                status=status,
+                message=line_str[:100],
+                progress=progress_start + progress_span * (text_line_index / denominator),
+                total_files=total_files,
+            )
 
-        if not isinstance(legacy_payload, dict):
-            return None
-        config = legacy_payload.get("config", {})
-        if not isinstance(config, dict):
-            return None
-        return cls._coerce_fps(config.get("fps"))
+        if not isinstance(payload, dict) or "event" not in payload:
+            denominator = max(total_files * 100, 1)
+            return IndexProgress(
+                status=status,
+                message=line_str[:100],
+                progress=progress_start + progress_span * (text_line_index / denominator),
+                total_files=total_files,
+            )
+
+        event = str(payload.get("event"))
+        message = str(payload.get("message") or "")
+        if event == "error":
+            error_message = str(payload.get("error") or message or "anime_searcher command failed")
+            return IndexProgress(status="error", error=error_message)
+
+        try:
+            progress_value = float(payload.get("progress", 0.0))
+        except (TypeError, ValueError):
+            progress_value = 0.0
+        progress_value = max(0.0, min(1.0, progress_value))
+
+        try:
+            completed_files = int(payload.get("completed_files", 0))
+        except (TypeError, ValueError):
+            completed_files = 0
+        try:
+            total_files_value = int(payload.get("total_files", total_files))
+        except (TypeError, ValueError):
+            total_files_value = total_files
+
+        return IndexProgress(
+            status=status,
+            message=message[:100],
+            current_file=str(payload.get("current_file") or ""),
+            progress=progress_start + progress_span * progress_value,
+            total_files=total_files_value,
+            completed_files=completed_files,
+        )
 
     @classmethod
     def get_episode_manifest_path(
@@ -2596,6 +2635,7 @@ class AnimeLibraryService:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + cls.INDEX_TIMEOUT_SECONDS
         aborted = False
+        saw_explicit_error = False
 
         try:
             assert process.stdout is not None
@@ -2609,15 +2649,23 @@ class AnimeLibraryService:
                     break
                 decoded = line.decode()
                 stdout_lines.append(decoded)
-                line_str = decoded.strip()
-                if line_str:
-                    denominator = max(total_files * 100, 1)
-                    yield IndexProgress(
-                        status=status,
-                        message=line_str[:100],
-                        progress=progress_start + progress_span * (len(stdout_lines) / denominator),
-                        total_files=total_files,
-                    )
+                progress = cls._parse_searcher_progress_line(
+                    line=decoded,
+                    status=status,
+                    total_files=total_files,
+                    progress_start=progress_start,
+                    progress_span=progress_span,
+                    text_line_index=len(stdout_lines),
+                )
+                if progress is None:
+                    continue
+                if progress.status == "error":
+                    saw_explicit_error = True
+                    aborted = True
+                    await terminate_process(process)
+                    yield progress
+                    return
+                yield progress
 
             remaining = deadline - loop.time()
             if remaining <= 0:
@@ -2645,10 +2693,13 @@ class AnimeLibraryService:
                     await stderr_task
 
         stderr = await stderr_task
-        if process.returncode != 0:
+        if process.returncode != 0 and not saw_explicit_error:
+            stdout_tail = "".join(stdout_lines[-5:]).strip()
+            stderr_text = stderr.decode().strip()
+            detail = stderr_text or stdout_tail or "unknown error"
             yield IndexProgress(
                 status="error",
-                error=f"anime_searcher command failed: {stderr.decode()}",
+                error=f"anime_searcher command failed: {detail}",
             )
 
     @classmethod
@@ -2838,6 +2889,7 @@ class AnimeLibraryService:
             "--batch-size", str(batch_size),
             "--prefetch-batches", str(prefetch_batches),
             "--transform-workers", str(transform_workers),
+            "--progress-json",
         ]
         if require_gpu:
             cmd.append("--require-gpu")
@@ -3012,6 +3064,7 @@ class AnimeLibraryService:
                 "--batch-size", str(batch_size),
                 "--prefetch-batches", str(prefetch_batches),
                 "--transform-workers", str(transform_workers),
+                "--progress-json",
             ]
             if require_gpu:
                 cmd.append("--require-gpu")
@@ -3115,6 +3168,7 @@ class AnimeLibraryService:
                 "--type", scoped_type.value,
                 "--series", anime_name,
                 "--manifest", str(manifest_path),
+                "--progress-json",
             ]
 
             async for progress in cls._stream_searcher_command(
