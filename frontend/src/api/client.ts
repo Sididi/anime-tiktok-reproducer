@@ -454,16 +454,59 @@ export const api = {
     }),
 
   browseDirectories: (path?: string) =>
-    request<{
-      current_path: string;
-      parent_path: string | null;
-      entries: {
-        name: string;
-        path: string;
-        is_dir: boolean;
-        has_videos: boolean;
-      }[];
-    }>(`/anime/browse${path ? `?path=${encodeURIComponent(path)}` : ""}`),
+    request<import("@/types").BrowseResult>(
+      `/anime/browse${path ? `?path=${encodeURIComponent(path)}` : ""}`,
+    ),
+
+  // Library - Source details
+  getSourceDetails: (libraryType: import("@/types").LibraryType) =>
+    request<import("@/types").SourceDetails[]>(
+      `/anime/source-details?library_type=${encodeURIComponent(libraryType)}`,
+    ),
+
+  // Library - Async indexation
+  indexAnimeAsync: (
+    sourcePath: string,
+    libraryType: import("@/types").LibraryType,
+    animeName?: string,
+    fps = 2.0,
+  ) =>
+    request<{ job_id: string }>("/anime/index-async", {
+      method: "POST",
+      body: JSON.stringify({
+        source_path: sourcePath,
+        library_type: libraryType,
+        anime_name: animeName,
+        fps,
+      }),
+    }),
+
+  // Library - Jobs
+  listIndexationJobs: () =>
+    request<{ jobs: import("@/types").IndexationJob[] }>("/anime/jobs"),
+
+  streamIndexationJobs: () =>
+    fetch(`${API_BASE}/anime/jobs/stream`),
+
+  // Library - Purge
+  purgeLibrary: (libraryType: import("@/types").LibraryType, allTypes: boolean) =>
+    request<import("@/types").PurgeResult>("/anime/purge", {
+      method: "POST",
+      body: JSON.stringify({ library_type: libraryType, all_types: allTypes }),
+    }),
+
+  // Library - Purge protection
+  togglePurgeProtection: (libraryType: import("@/types").LibraryType, sourceName: string) =>
+    request<{ purge_protected: boolean }>(
+      `/anime/${encodeURIComponent(sourceName)}/protection?library_type=${encodeURIComponent(libraryType)}`,
+      { method: "PATCH" },
+    ),
+
+  // Library - Estimate purge size
+  estimatePurgeSize: (libraryType: import("@/types").LibraryType, allTypes: boolean) =>
+    request<{ estimated_bytes: number; source_count: number }>(
+      `/anime/purge/estimate?library_type=${encodeURIComponent(libraryType)}&all_types=${allTypes}`,
+    ),
 
   // Duration Warning
   acknowledgeDurationWarning: (projectId: string) =>
