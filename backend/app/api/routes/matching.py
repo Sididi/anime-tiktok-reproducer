@@ -418,7 +418,10 @@ async def deferred_download(project_id: str):
             await DeferredDownloadService.execute_downloads(plans, qbt)
 
             async for progress in DeferredDownloadService.watch_downloads(plans, qbt):
-                yield f"data: {json.dumps({'status': 'downloading', **progress})}\n\n"
+                if progress.get("type") == "torrent_failed":
+                    yield f"data: {json.dumps({'status': 'torrent_failed', **progress})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'status': 'downloading', **progress})}\n\n"
 
             yield f"data: {json.dumps({'status': 'complete', 'message': f'Downloaded {len(missing)} episode(s)'})}\n\n"
         except Exception as e:

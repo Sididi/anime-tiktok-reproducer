@@ -1,4 +1,4 @@
-import { AlertTriangle, ShieldCheck, FolderDown } from "lucide-react";
+import { AlertTriangle, ShieldCheck, FolderDown, Cable } from "lucide-react";
 import type { SourceDetails } from "@/types";
 
 interface SourceRowProps {
@@ -7,6 +7,7 @@ interface SourceRowProps {
   onSelect: () => void;
   onToggleProtection: () => void;
   onUpdate: () => void;
+  onManageTorrents: () => void;
 }
 
 function formatBytes(bytes: number): string {
@@ -29,6 +30,7 @@ export function SourceRow({
   onSelect,
   onToggleProtection,
   onUpdate,
+  onManageTorrents,
 }: SourceRowProps) {
   return (
     <div
@@ -66,7 +68,7 @@ export function SourceRow({
       </span>
 
       {/* Actions */}
-      <div className="flex gap-1 justify-end w-20 shrink-0">
+      <div className="flex gap-1 justify-end w-24 shrink-0">
         <button
           onClick={(e) => {
             e.stopPropagation();
@@ -84,6 +86,16 @@ export function SourceRow({
           }
         >
           <ShieldCheck className="h-4 w-4" />
+        </button>
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onManageTorrents();
+          }}
+          className="p-1 rounded text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--secondary))] hover:text-[hsl(var(--foreground))] transition-colors"
+          title="Gérer les torrents"
+        >
+          <Cable className="h-4 w-4" />
         </button>
         <button
           onClick={(e) => {

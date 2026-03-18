@@ -6,3 +6,4 @@ export { BottomBar } from "./BottomBar";
 export { NewSourceModal } from "./NewSourceModal";
 export { PurgeModal } from "./PurgeModal";
 export { IndexJobsPanel } from "./IndexJobsPanel";
+export { TorrentManagementModal } from "./TorrentManagementModal";

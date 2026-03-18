@@ -1,5 +1,6 @@
 """qBittorrent Web API v2 client."""
 
+import asyncio
 import logging
 
 import httpx
@@ -78,6 +79,43 @@ class QBittorrentClient:
         resp.raise_for_status()
         torrents = resp.json()
         return torrents[0] if torrents else None
+
+    async def delete_torrent(
+        self, info_hash: str, delete_files: bool = True
+    ) -> None:
+        """Remove a torrent from qBittorrent, optionally deleting its files."""
+        await self._ensure_auth()
+        resp = await self._client.post(
+            "/api/v2/torrents/delete",
+            data={
+                "hashes": info_hash,
+                "deleteFiles": "true" if delete_files else "false",
+            },
+        )
+        resp.raise_for_status()
+
+    async def wait_for_torrent_metadata(
+        self, info_hash: str, timeout: float = 60
+    ) -> list[dict]:
+        """Poll until a newly added torrent resolves its metadata and file list.
+
+        Returns the file list once available, or raises TimeoutError.
+        """
+        await self._ensure_auth()
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                files = await self.get_torrent_files(info_hash)
+                # qBittorrent returns files once metadata is resolved.
+                # A non-empty list with at least one file with a real name means ready.
+                if files and any(f.get("name", "") for f in files):
+                    return files
+            except httpx.HTTPStatusError:
+                pass
+            await asyncio.sleep(2)
+        raise TimeoutError(
+            f"Torrent metadata did not resolve within {timeout}s for {info_hash}"
+        )
 
     async def close(self) -> None:
         await self._client.aclose()
