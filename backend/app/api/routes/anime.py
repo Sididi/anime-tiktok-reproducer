@@ -29,7 +29,7 @@ async def browse_directories(path: str | None = Query(default=None)):
     def _scan_path() -> tuple[list[dict], list[dict]]:
         dirs = []
         files = []
-        for entry in sorted(browse_path.iterdir(), key=lambda e: e.name.lower()):
+        for entry in sorted(browse_path.iterdir(), key=lambda e: e.stat().st_mtime, reverse=True):
             if entry.name.startswith("."):
                 continue
             if entry.is_dir():
@@ -46,6 +46,7 @@ async def browse_directories(path: str | None = Query(default=None)):
                     "path": str(entry),
                     "is_dir": True,
                     "has_videos": has_videos,
+                    "mtime": entry.stat().st_mtime,
                 })
             elif entry.is_file() and entry.suffix.lower() in VIDEO_EXTENSIONS:
                 files.append({
@@ -53,6 +54,7 @@ async def browse_directories(path: str | None = Query(default=None)):
                     "path": str(entry),
                     "is_dir": False,
                     "has_videos": False,
+                    "mtime": entry.stat().st_mtime,
                 })
         return dirs, files
 
@@ -229,3 +231,21 @@ async def check_folders(request: CheckFoldersRequest):
 
     folders = await AnimeLibraryService.get_available_folders(source_path)
     return {"path": request.path, "folders": folders}
+
+
+class SourceDetails(BaseModel):
+    name: str
+    episode_count: int
+    total_size_bytes: int
+    fps: float
+    missing_episodes: int
+    purge_protected: bool
+    original_index_path: str | None
+
+
+@router.get("/source-details")
+async def get_source_details(
+    library_type: LibraryType = Query(...),
+) -> list[SourceDetails]:
+    """Get detailed metadata for all sources in a library type."""
+    return await AnimeLibraryService.get_source_details(library_type=library_type)
