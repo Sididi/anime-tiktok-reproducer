@@ -172,6 +172,73 @@ def test_parallel_file_indexer_combines_multi_batch_file(monkeypatch: pytest.Mon
     assert result.timestamps == [0.0, 1.0, 2.0, 3.0, 4.0]
 
 
+def test_create_pipeline_warms_embedder_before_building_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "model.pt"
+    model_path.write_bytes(b"model")
+    sample_video = tmp_path / "episode.mp4"
+    sample_video.write_bytes(b"video")
+
+    profile = MediaBinaryProfile("test", "/usr/bin/ffmpeg", "/usr/bin/ffprobe")
+    call_order: list[str] = []
+
+    class DummyEmbedder:
+        def __init__(self, received_model_path: Path) -> None:
+            self.device = "cpu"
+            self.model_path = received_model_path
+            self.warmup_calls = 0
+            self.warmed = False
+            call_order.append("embedder_init")
+
+        def warmup(self) -> None:
+            self.warmup_calls += 1
+            self.warmed = True
+            call_order.append("warmup")
+
+    class DummyPipeline:
+        def __init__(
+            self,
+            embedder,
+            *,
+            batch_size: int,
+            prefetch_batches: int,
+            transform_workers: int,
+            file_workers: int,
+            media_profile: MediaBinaryProfile | None = None,
+        ) -> None:
+            assert embedder.warmed is True
+            self.embedder = embedder
+            self.batch_size = batch_size
+            self.prefetch_batches = prefetch_batches
+            self.transform_workers = transform_workers
+            self.file_workers = file_workers
+            self.media_profile = media_profile
+            call_order.append("pipeline_init")
+
+    monkeypatch.setattr(cli_module, "SSCDEmbedder", DummyEmbedder)
+    monkeypatch.setattr(cli_module, "select_indexing_media_profile", lambda *_args, **_kwargs: profile)
+    monkeypatch.setattr(cli_module, "ParallelFileIndexer", DummyPipeline)
+
+    embedder, pipeline, selected_profile = cli_module._create_pipeline(
+        model_path,
+        sample_video=sample_video,
+        sample_fps=2.0,
+        batch_size=8,
+        fast=True,
+        prefetch_batches=3,
+        transform_workers=2,
+        require_gpu=False,
+    )
+
+    assert embedder.model_path == model_path
+    assert embedder.warmup_calls == 1
+    assert pipeline.embedder is embedder
+    assert selected_profile is profile
+    assert call_order == ["embedder_init", "warmup", "pipeline_init"]
+
+
 def test_update_only_indexes_new_files_and_skips_unchanged(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     library_root = tmp_path / "library"
     library_path = library_root / "anime"
