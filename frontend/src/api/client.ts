@@ -239,6 +239,13 @@ export const api = {
       `/projects/${projectId}/matches/config`,
     ),
 
+  // Deferred download — check and download missing source episodes
+  deferredDownload: (projectId: string) =>
+    fetch(`${API_BASE}/projects/${projectId}/matches/deferred-download`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    }),
+
   prepareMatchesPlayback: (projectId: string, force = false) =>
     fetch(`${API_BASE}/projects/${projectId}/matches/playback/prepare`, {
       method: "POST",

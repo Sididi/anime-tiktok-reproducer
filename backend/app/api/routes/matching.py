@@ -365,6 +365,74 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
     )
 
 
+@router.post("/matches/deferred-download")
+async def deferred_download(project_id: str):
+    """Check for missing source episodes and download them via qBittorrent."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    matches = ProjectService.load_matches(project_id)
+    if not matches:
+        raise HTTPException(status_code=400, detail="No matches found")
+
+    library_root = AnimeLibraryService.get_library_path(project.library_type)
+    anime_name = project.anime_name
+
+    if not anime_name:
+        return {"status": "skipped", "message": "No anime name set"}
+
+    from ...services.deferred_download import DeferredDownloadService
+    from ...services.qbittorrent import QBittorrentClient
+
+    # Collect unique episode paths
+    episode_paths = list({
+        m.episode
+        for m in matches.matches
+        if m.episode
+    })
+
+    missing = DeferredDownloadService.check_missing_sources(
+        episode_paths, library_root, anime_name
+    )
+
+    if not missing:
+        return {"status": "ok", "message": "All source files present"}
+
+    # Check torrent links
+    no_torrent = [m for m in missing if not m.torrent_entry]
+    if no_torrent:
+        return {
+            "status": "error",
+            "message": f"{len(no_torrent)} missing file(s) without torrent link",
+            "missing_files": [m.episode_path for m in no_torrent],
+        }
+
+    plans = DeferredDownloadService.plan_downloads(missing)
+    qbt = QBittorrentClient()
+
+    async def stream_progress():
+        try:
+            yield f"data: {json.dumps({'status': 'starting', 'message': f'Downloading {len(missing)} missing episode(s)...'})}\n\n"
+
+            await DeferredDownloadService.execute_downloads(plans, qbt)
+
+            async for progress in DeferredDownloadService.watch_downloads(plans, qbt):
+                yield f"data: {json.dumps({'status': 'downloading', **progress})}\n\n"
+
+            yield f"data: {json.dumps({'status': 'complete', 'message': f'Downloaded {len(missing)} episode(s)'})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'status': 'error', 'error': str(e)})}\n\n"
+        finally:
+            await qbt.close()
+
+    return StreamingResponse(
+        stream_progress(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
 @router.post("/matches/playback/prepare")
 async def prepare_matches_playback(project_id: str, request: PreparePlaybackRequest):
     """Prepare browser-safe clips for /matches playback and Fast Watch."""
