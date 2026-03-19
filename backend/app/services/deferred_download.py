@@ -5,7 +5,7 @@ import json
 import logging
 import shutil
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -38,6 +38,59 @@ class DownloadPlan:
 
 class DeferredDownloadService:
 
+    @classmethod
+    def _resolve_episode_path(
+        cls,
+        episode_ref: str,
+        source_dir: Path,
+    ) -> Path | None:
+        """Resolve a match episode reference to a full library path.
+
+        ``episode_ref`` may be an absolute path, a relative path with extension,
+        or a bare stem like ``"Chio's School Road - S01E02"``.  We try, in order:
+        1. Absolute path that exists on disk.
+        2. Direct file inside ``source_dir`` (with and without ``.mp4``).
+        3. Lookup via ``.atr_source.json`` sidecar — even if the ``.mp4`` was
+           purged the sidecar's ``prepared_path`` tells us what the canonical
+           library path *should* be.
+        """
+        from .anime_library import AnimeLibraryService
+
+        p = Path(episode_ref)
+
+        # 1. Already an absolute, existing path
+        if p.is_absolute() and p.exists():
+            return p
+
+        # 2. Direct lookup in source_dir
+        for candidate in (source_dir / p.name, source_dir / f"{p.stem}.mp4"):
+            if candidate.exists():
+                return candidate
+
+        # 3. Sidecar-based resolution (works even after purge)
+        for suffix in (".mp4", ""):
+            stem = p.stem if p.suffix else str(p)
+            sidecar = source_dir / f"{stem}{suffix}{AnimeLibraryService.SOURCE_IMPORT_MANIFEST_SUFFIX}"
+            if sidecar.exists():
+                try:
+                    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+                    prepared = payload.get("prepared_path")
+                    if prepared:
+                        return Path(prepared)
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+        # 4. Match against .atr_torrents.json library_path entries by stem
+        metadata = TorrentLinkerService.load_metadata(source_dir)
+        if metadata:
+            target_stem = p.stem if p.suffix else str(p)
+            for te in metadata.torrents:
+                for fm in te.files:
+                    if Path(fm.library_path).stem == target_stem:
+                        return Path(fm.library_path)
+
+        return None
+
     @staticmethod
     def check_missing_sources(
         match_episodes: list[str],
@@ -46,16 +99,28 @@ class DeferredDownloadService:
     ) -> list[MissingEpisode]:
         """Check which matched episodes are missing from disk.
 
-        Also reads .atr_source.json sidecars to find original source paths
-        for recovery without re-downloading.
+        Handles both absolute paths and bare episode names (e.g.
+        ``"Chio's School Road - S01E02"``).  Reads ``.atr_source.json``
+        sidecars to find original source paths for recovery without
+        re-downloading.
         """
         from .anime_library import AnimeLibraryService
 
         missing = []
-        metadata = TorrentLinkerService.load_metadata(library_root / source_name)
+        source_dir = library_root / source_name
+        metadata = TorrentLinkerService.load_metadata(source_dir)
 
-        for ep_path in match_episodes:
-            if Path(ep_path).exists():
+        for ep_ref in match_episodes:
+            # Resolve bare name / relative ref to an absolute library path
+            resolved = DeferredDownloadService._resolve_episode_path(
+                ep_ref, source_dir
+            )
+            # Fall back to constructing a plausible path
+            if resolved is None:
+                stem = Path(ep_ref).stem if Path(ep_ref).suffix else ep_ref
+                resolved = source_dir / f"{stem}.mp4"
+
+            if resolved.exists():
                 continue
 
             torrent_entry = None
@@ -63,9 +128,7 @@ class DeferredDownloadService:
             original_source_path = None
 
             # Try to find original source via .atr_source.json sidecar
-            manifest = AnimeLibraryService._load_source_import_manifest_sync(
-                Path(ep_path)
-            )
+            manifest = AnimeLibraryService._load_source_import_manifest_sync(resolved)
             if manifest and manifest.get("source_path"):
                 src = Path(manifest["source_path"])
                 if src.exists():
@@ -73,10 +136,10 @@ class DeferredDownloadService:
 
             # Look up torrent info from .atr_torrents.json
             if metadata:
-                ep_name = Path(ep_path).name
+                resolved_stem = resolved.stem
                 for te in metadata.torrents:
                     for fm in te.files:
-                        if Path(fm.library_path).name == ep_name:
+                        if Path(fm.library_path).stem == resolved_stem:
                             torrent_entry = te
                             file_mapping = fm
                             break
@@ -85,7 +148,7 @@ class DeferredDownloadService:
 
             missing.append(
                 MissingEpisode(
-                    episode_path=ep_path,
+                    episode_path=str(resolved),
                     source_name=source_name,
                     torrent_entry=torrent_entry,
                     file_mapping=file_mapping,
