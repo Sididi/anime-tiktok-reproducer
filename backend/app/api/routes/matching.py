@@ -367,7 +367,10 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
 
 @router.post("/matches/deferred-download")
 async def deferred_download(project_id: str):
-    """Check for missing source episodes and download them via qBittorrent."""
+    """Check for missing source episodes, recover from source or download via qBittorrent.
+
+    Always returns an SSE stream so the frontend can track progress phases.
+    """
     project = ProjectService.load(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -380,54 +383,31 @@ async def deferred_download(project_id: str):
     anime_name = project.anime_name
 
     if not anime_name:
-        return {"status": "skipped", "message": "No anime name set"}
+        async def _skipped():
+            yield f"data: {json.dumps({'status': 'complete', 'phase': 'check', 'message': 'No anime name set', 'progress': 1.0})}\n\n"
+
+        return StreamingResponse(
+            _skipped(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
 
     from ...services.deferred_download import DeferredDownloadService
-    from ...services.qbittorrent import QBittorrentClient
 
-    # Collect unique episode paths
     episode_paths = list({
         m.episode
         for m in matches.matches
         if m.episode
     })
 
-    missing = DeferredDownloadService.check_missing_sources(
-        episode_paths, library_root, anime_name
-    )
-
-    if not missing:
-        return {"status": "ok", "message": "All source files present"}
-
-    # Check torrent links
-    no_torrent = [m for m in missing if not m.torrent_entry]
-    if no_torrent:
-        return {
-            "status": "error",
-            "message": f"{len(no_torrent)} missing file(s) without torrent link",
-            "missing_files": [m.episode_path for m in no_torrent],
-        }
-
-    plans = DeferredDownloadService.plan_downloads(missing)
-    qbt = QBittorrentClient()
-
     async def stream_progress():
         try:
-            yield f"data: {json.dumps({'status': 'starting', 'message': f'Downloading {len(missing)} missing episode(s)...'})}\n\n"
-
-            await DeferredDownloadService.execute_downloads(plans, qbt)
-
-            async for progress in DeferredDownloadService.watch_downloads(plans, qbt):
-                if progress.get("type") == "torrent_failed":
-                    yield f"data: {json.dumps({'status': 'torrent_failed', **progress})}\n\n"
-                else:
-                    yield f"data: {json.dumps({'status': 'downloading', **progress})}\n\n"
-
-            yield f"data: {json.dumps({'status': 'complete', 'message': f'Downloaded {len(missing)} episode(s)'})}\n\n"
+            async for event in DeferredDownloadService.recover_missing_episodes(
+                episode_paths, library_root, anime_name
+            ):
+                yield f"data: {json.dumps(event)}\n\n"
         except Exception as e:
-            yield f"data: {json.dumps({'status': 'error', 'error': str(e)})}\n\n"
-        finally:
-            await qbt.close()
+            yield f"data: {json.dumps({'status': 'error', 'phase': 'download', 'error': str(e), 'message': str(e)})}\n\n"
 
     return StreamingResponse(
         stream_progress(),

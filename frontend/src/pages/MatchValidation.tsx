@@ -24,6 +24,7 @@ import {
   Undo2,
   Merge,
   Cable,
+  Download,
 } from "lucide-react";
 import { Button } from "@/components/ui";
 import { MatchesClipPlayer, ManualMatchModal } from "@/components/video";
@@ -653,6 +654,11 @@ export function MatchValidation() {
     torrentId: string;
     message: string;
   } | null>(null);
+  const [downloadPhase, setDownloadPhase] = useState<{
+    phase: "check" | "recover" | "download" | "remux";
+    message: string;
+    progress: number;
+  } | null>(null);
   const [showTorrentModal, setShowTorrentModal] = useState(false);
   const [skipUiEnabled, setSkipUiEnabled] = useState(false);
   const skipUiEnabledRef = useRef(false);
@@ -950,13 +956,15 @@ export function MatchValidation() {
     [],
   );
 
-  const handleDeferredDownload = useCallback(async () => {
-    if (!projectId) return;
+  const handleDeferredDownload = useCallback(async (): Promise<boolean> => {
+    if (!projectId) return true;
+    setDownloadPhase({ phase: "check", message: "Checking source files...", progress: 0 });
     try {
       const response = await api.deferredDownload(projectId);
+      let success = true;
       await readSSEStream<{
         status: string;
-        type?: string;
+        phase?: string;
         torrent_id?: string;
         source_name?: string;
         info_hash?: string;
@@ -970,10 +978,22 @@ export function MatchValidation() {
             torrentId: data.torrent_id || "",
             message: data.message || "Torrent expiré",
           });
+          success = false;
+        }
+        if (data.phase && data.status !== "complete" && data.status !== "error") {
+          setDownloadPhase({
+            phase: data.phase as "check" | "recover" | "download" | "remux",
+            message: data.message || "",
+            progress: data.progress ?? 0,
+          });
         }
       });
-    } catch {
-      // Non-critical — deferred download may not be needed
+      setDownloadPhase(null);
+      return success;
+    } catch (err) {
+      setDownloadPhase(null);
+      setPlaybackError((err as Error).message);
+      return false;
     }
   }, [projectId]);
 
@@ -1115,12 +1135,12 @@ export function MatchValidation() {
               });
             } else {
               // Deferred download first (handles purged episodes), then prepare clips
-              await handleDeferredDownload();
-              void preparePlaybackClips(false);
+              const downloadOk = await handleDeferredDownload();
+              if (downloadOk) void preparePlaybackClips(false);
             }
           } catch {
-            await handleDeferredDownload();
-            void preparePlaybackClips(false);
+            const downloadOk = await handleDeferredDownload();
+            if (downloadOk) void preparePlaybackClips(false);
           }
         } else {
           setPlaybackManifest(null);
@@ -1337,8 +1357,8 @@ export function MatchValidation() {
           if (matchesWithTracking.length > 0) {
             // Trigger deferred download for missing source files before playback
             setTorrentFailure(null);
-            await handleDeferredDownload();
-            await preparePlaybackClips(true);
+            const downloadOk = await handleDeferredDownload();
+            if (downloadOk) await preparePlaybackClips(true);
           } else {
             setPlaybackManifest(null);
             setPlaybackProgress(null);
@@ -2076,8 +2096,43 @@ export function MatchValidation() {
           </div>
         )}
 
+        {/* Deferred download / recovery phase */}
+        {downloadPhase && (
+          <div className="bg-[hsl(var(--card))] rounded-lg p-8 text-center space-y-4 border border-amber-500/30">
+            {downloadPhase.phase === "download" ? (
+              <Download className="h-10 w-10 mx-auto animate-pulse text-amber-500" />
+            ) : downloadPhase.phase === "recover" || downloadPhase.phase === "remux" ? (
+              <Loader2 className="h-10 w-10 mx-auto animate-spin text-green-500" />
+            ) : (
+              <Loader2 className="h-10 w-10 mx-auto animate-spin text-amber-500" />
+            )}
+            <div>
+              <h2 className="text-lg font-semibold">
+                {downloadPhase.phase === "recover"
+                  ? "Recovering Source Files"
+                  : downloadPhase.phase === "download"
+                    ? "Downloading Missing Episodes"
+                    : downloadPhase.phase === "remux"
+                      ? "Preparing Downloaded Files"
+                      : "Checking Source Files"}
+              </h2>
+              <p className="text-sm text-[hsl(var(--muted-foreground))]">
+                {downloadPhase.message}
+              </p>
+            </div>
+            <div className="h-2 bg-[hsl(var(--muted))] rounded-full overflow-hidden max-w-md mx-auto">
+              <div
+                className="h-full bg-amber-500 transition-all duration-300"
+                style={{
+                  width: `${Math.max(0, Math.min(1, downloadPhase.progress)) * 100}%`,
+                }}
+              />
+            </div>
+          </div>
+        )}
+
         {/* Playback warmup */}
-        {matches.length > 0 &&
+        {!downloadPhase && matches.length > 0 &&
           (playbackPreparing || !isPlaybackReady || playbackError) && (
             <div className="bg-[hsl(var(--card))] rounded-lg p-8 text-center space-y-4 border border-[hsl(var(--border))]">
               <Loader2 className="h-10 w-10 mx-auto animate-spin text-[hsl(var(--primary))]" />
@@ -2113,8 +2168,9 @@ export function MatchValidation() {
                 <Button
                   variant="outline"
                   onClick={async () => {
-                    await handleDeferredDownload();
-                    void preparePlaybackClips(true);
+                    setPlaybackError(null);
+                    const downloadOk = await handleDeferredDownload();
+                    if (downloadOk) void preparePlaybackClips(true);
                   }}
                 >
                   Retry Warmup
