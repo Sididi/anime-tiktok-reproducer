@@ -708,6 +708,7 @@ class ScriptAutomationService:
             anime_name=anime_name,
             script_summary=script_summary,
             target_language=target_language,
+            library_type=project.library_type,
         )
 
         result = GeminiService.generate_json(
@@ -933,6 +934,7 @@ class ScriptAutomationService:
                         anime_name=project.anime_name or "Inconnu",
                         script_payload=script_payload,
                         target_language=target_language,
+                        library_type=project.library_type,
                     )
                     raw_metadata_payload = await asyncio.to_thread(
                         GeminiService.generate_json,

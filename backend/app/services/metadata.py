@@ -4,6 +4,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from ..library_types import LibraryType
 from ..models import VideoMetadataPayload
 from .project_service import ProjectService
 from .script_phase_prompt_service import ScriptPhasePromptService
@@ -21,11 +22,13 @@ class MetadataService:
         anime_name: str,
         script_text: str,
         target_language: str = "fr",
+        library_type: LibraryType = LibraryType.ANIME,
     ) -> str:
         return ScriptPhasePromptService.build_metadata_prompt(
             anime_name=anime_name,
             script_text=script_text,
             target_language=target_language,
+            library_type=library_type,
         )
 
     @classmethod
@@ -34,6 +37,7 @@ class MetadataService:
         anime_name: str,
         script_payload: dict[str, Any],
         target_language: str = "fr",
+        library_type: LibraryType = LibraryType.ANIME,
     ) -> str:
         scenes = script_payload.get("scenes", [])
         script_chunks = [
@@ -52,6 +56,7 @@ class MetadataService:
             anime_name=anime_name,
             script_text=script_text,
             target_language=target_language,
+            library_type=library_type,
         )
 
     @classmethod
@@ -60,12 +65,14 @@ class MetadataService:
         anime_name: str,
         script_json: str,
         target_language: str = "fr",
+        library_type: LibraryType = LibraryType.ANIME,
     ) -> str:
         payload = json.loads(script_json)
         return cls.build_prompt_from_script_payload(
             anime_name=anime_name,
             script_payload=payload,
             target_language=target_language,
+            library_type=library_type,
         )
 
     @classmethod

@@ -885,6 +885,7 @@ async def build_metadata_prompt(project_id: str, request: MetadataPromptRequest)
             anime_name=project.anime_name or "Inconnu",
             script_payload=normalized.public_payload,
             target_language=request.target_language,
+            library_type=project.library_type,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))

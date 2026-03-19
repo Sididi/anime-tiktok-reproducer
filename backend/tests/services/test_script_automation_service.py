@@ -132,7 +132,7 @@ async def test_stream_automation_resume_uses_edited_script_for_tts_metadata_and_
             ],
         }
 
-    def fake_build_metadata_prompt(*, anime_name, script_payload, target_language="fr"):
+    def fake_build_metadata_prompt(*, anime_name, script_payload, target_language="fr", library_type=None):
         seen["metadata_script"] = script_payload
         return "metadata-prompt"
 
