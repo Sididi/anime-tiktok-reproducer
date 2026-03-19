@@ -77,11 +77,12 @@ Legacy `%APPDATA%\Adobe\JSXRunner\...` state is migrated automatically on first 
 
 Files:
 - `settings.json`
-- `jobs.json`
 - `projects/<project_id>.json`
 - `upload_sessions/<project_id>.json` (resumable upload session)
 
-After Premiere restart, queued/in-progress jobs are resumed and export monitors are re-armed.
+After Premiere restart, tracked project state is restored for UI visibility and manual actions only.
+Queued/in-progress jobs are **not** resumed automatically, export monitors are **not** re-armed automatically, and cleanup retries are **not** restarted automatically.
+Transient states left by a crash/restart are normalized to manual-intervention states when the panel boots again.
 
 ## Legacy trigger still supported
 

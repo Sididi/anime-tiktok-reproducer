@@ -30,20 +30,15 @@
   var PROJECTS_STATE_DIR = path.join(STATE_DIR, "projects");
   var UPLOAD_SESSIONS_DIR = path.join(STATE_DIR, "upload_sessions");
   var SETTINGS_PATH = path.join(STATE_DIR, "settings.json");
-  var JOBS_PATH = path.join(STATE_DIR, "jobs.json");
 
   var DEFAULT_PORT = 48653;
   var OUTPUT_FILENAME = "output.mp4";
   var AUDIO_NO_MUSIC_OUTPUT_FILENAME = "output_no_music.wav";
-  var SUBTITLES_DIRNAME = "subtitles";
-  var SUBTITLES_ARCHIVE_FILENAME = "atr_subtitles.zip";
-  var SUBTITLE_TIMING_FILENAME = "subtitle_timings.srt";
   var ATR_OUTPUT_PATTERN = /^ATR_.*\.mp4$/i;
   var EXPORT_STABLE_MS = 10000;
   var EXPORT_POLL_INTERVAL_MS = 5000;
   var ENCODER_POLL_INTERVAL_MS = 1000;
   var FS_WATCH_RETRY_DELAY_MS = 10000;
-  var POWERSHELL_TIMEOUT_MS = 300000;
   var CLEANUP_IMMEDIATE_MAX_ATTEMPTS = 8;
   var CLEANUP_BACKGROUND_MAX_ATTEMPTS = 3;
   var CLEANUP_RETRYABLE_MAX_PASSES = 240;
@@ -110,11 +105,15 @@
   var localServerError = null;
 
   var exportMonitors = {}; // project_id -> monitor
-  var encoderJobMap = {}; // job_id -> project_id
+  var encoderJobMap = {}; // job_id -> { project_id, lease }
   var encoderPollTimer = null;
   var driveTasksFallback = null;
+  var automationControlHelperModule = null;
+  var runtimeStateHelperModule = null;
+  var subtitleArchiveHelperModule = null;
   var cleanupRetryTimers = {}; // project_id -> timeoutId
 
+  var automationRuntime = null;
   var settings = null;
   var projectStates = {}; // project_id -> state
   var jobStore = {
@@ -176,76 +175,6 @@
     }
   }
 
-  function escapePowerShellSingleQuoted(value) {
-    return String(value || "").replace(/'/g, "''");
-  }
-
-  function runPowerShellScriptAsync(script, timeoutMs) {
-    return new Promise(function (resolve, reject) {
-      var encoded = Buffer.from(String(script || ""), "utf16le").toString(
-        "base64",
-      );
-      childProcess.execFile(
-        "powershell.exe",
-        [
-          "-NoProfile",
-          "-NonInteractive",
-          "-ExecutionPolicy",
-          "Bypass",
-          "-EncodedCommand",
-          encoded,
-        ],
-        {
-          windowsHide: true,
-          timeout: timeoutMs || POWERSHELL_TIMEOUT_MS,
-          encoding: "utf8",
-        },
-        function (error, stdout, stderr) {
-          if (error) {
-            var detail = String(stderr || stdout || "").trim();
-            if (detail && String(error.message || "").indexOf(detail) === -1) {
-              error.message += ": " + detail;
-            }
-            reject(error);
-            return;
-          }
-          resolve({
-            stdout: String(stdout || ""),
-            stderr: String(stderr || ""),
-          });
-        },
-      );
-    });
-  }
-
-  function listDirectFiles(dirPath, ignoredNames) {
-    if (!dirPath || !pathExists(dirPath)) {
-      return [];
-    }
-
-    var ignored = {};
-    (Array.isArray(ignoredNames) ? ignoredNames : []).forEach(function (name) {
-      ignored[String(name || "")] = true;
-    });
-
-    var entries = [];
-    fs.readdirSync(dirPath).forEach(function (name) {
-      if (ignored[name]) {
-        return;
-      }
-      var entryPath = path.join(dirPath, name);
-      try {
-        if (fs.statSync(entryPath).isFile()) {
-          entries.push(name);
-        }
-      } catch (e) {
-        // ignore transient filesystem errors during validation
-      }
-    });
-    entries.sort();
-    return entries;
-  }
-
   function ensureProjectSubtitlesExpanded(localRootPath) {
     var rootPath = String(localRootPath || "").trim();
     if (!rootPath) {
@@ -254,47 +183,18 @@
       });
     }
 
-    var subtitlesDir = path.join(rootPath, SUBTITLES_DIRNAME);
-    var archivePath = path.join(subtitlesDir, SUBTITLES_ARCHIVE_FILENAME);
-    if (!pathExists(archivePath)) {
-      return Promise.resolve({
-        extracted: false,
-      });
-    }
-
-    var script = [
-      "$ErrorActionPreference = 'Stop'",
-      "Expand-Archive -LiteralPath '" +
-        escapePowerShellSingleQuoted(archivePath) +
-        "' -DestinationPath '" +
-        escapePowerShellSingleQuoted(subtitlesDir) +
-        "' -Force",
-    ].join("; ");
-
-    return runPowerShellScriptAsync(script, POWERSHELL_TIMEOUT_MS).then(
-      function () {
-        var timingPath = path.join(subtitlesDir, SUBTITLE_TIMING_FILENAME);
-        if (!pathExists(timingPath)) {
-          throw new Error(
-            "Subtitle archive extraction did not recreate " +
-              SUBTITLE_TIMING_FILENAME,
-          );
-        }
-
-        var extractedFiles = listDirectFiles(subtitlesDir, [
-          SUBTITLES_ARCHIVE_FILENAME,
-        ]);
-        if (extractedFiles.length === 0) {
-          throw new Error("Subtitle archive extraction produced no files");
-        }
-
-        fs.unlinkSync(archivePath);
+    return getSubtitleArchiveHelper()
+      .expandSubtitleArchiveAsync({
+        localRootPath: rootPath,
+      })
+      .then(function (result) {
         return {
-          extracted: true,
-          extractedFileCount: extractedFiles.length,
+          extracted: !!(result && result.extracted),
+          extractedFileCount: Number(
+            (result && result.extracted_file_count) || 0,
+          ),
         };
-      },
-    );
+      });
   }
 
   function copyDirRecursive(sourceDir, targetDir) {
@@ -569,6 +469,118 @@
 
   function getClientFilePath(fileName) {
     return path.join(resolveClientDir(), fileName);
+  }
+
+  function getAutomationControlHelper() {
+    if (!automationControlHelperModule) {
+      automationControlHelperModule = require(
+        getClientFilePath("automation_control.js"),
+      );
+    }
+    return automationControlHelperModule;
+  }
+
+  function getRuntimeStateHelper() {
+    if (!runtimeStateHelperModule) {
+      runtimeStateHelperModule = require(getClientFilePath("runtime_state.js"));
+    }
+    return runtimeStateHelperModule;
+  }
+
+  function getSubtitleArchiveHelper() {
+    if (!subtitleArchiveHelperModule) {
+      subtitleArchiveHelperModule = require(
+        getClientFilePath("subtitle_archive.js"),
+      );
+    }
+    return subtitleArchiveHelperModule;
+  }
+
+  function ensureAutomationRuntime() {
+    if (!automationRuntime) {
+      automationRuntime = getAutomationControlHelper().createAutomationRuntime();
+    }
+    return automationRuntime;
+  }
+
+  function captureAutomationLease(projectId) {
+    return getAutomationControlHelper().captureLease(
+      ensureAutomationRuntime(),
+      projectId,
+    );
+  }
+
+  function isAutomationLeaseActive(lease) {
+    return getAutomationControlHelper().isLeaseActive(
+      ensureAutomationRuntime(),
+      lease,
+    );
+  }
+
+  function isAutomationProjectActive(projectId) {
+    return getAutomationControlHelper().isProjectActive(
+      ensureAutomationRuntime(),
+      projectId,
+    );
+  }
+
+  function createAutomationCanceledError(projectId, reason) {
+    var err = new Error(
+      "Automation canceled for " +
+        String(projectId || "unknown") +
+        (reason ? ": " + String(reason) : ""),
+    );
+    err.code = "ATR_AUTOMATION_CANCELED";
+    err.project_id = String(projectId || "");
+    err.cancel_reason = String(reason || "superseded");
+    return err;
+  }
+
+  function isAutomationCanceledError(err) {
+    return !!err && String(err.code || "") === "ATR_AUTOMATION_CANCELED";
+  }
+
+  function ensureAutomationLeaseActive(lease, reason) {
+    if (!isAutomationLeaseActive(lease)) {
+      throw createAutomationCanceledError(
+        lease && lease.project_id,
+        reason || "superseded",
+      );
+    }
+  }
+
+  function createActiveJobController(job) {
+    return {
+      job_id: String((job && job.id) || ""),
+      project_id: String(
+        (job && job.payload && job.payload.project_id) || "",
+      ).trim(),
+      canceled: false,
+      cancel_reason: "",
+      child: null,
+    };
+  }
+
+  function cancelJobController(controller, reason) {
+    if (!controller || controller.canceled) {
+      return false;
+    }
+
+    controller.canceled = true;
+    controller.cancel_reason = String(reason || "superseded");
+    try {
+      if (controller.child) {
+        controller.child.kill();
+      }
+    } catch (e) {
+      // ignore kill failures during hard-precedence cancellation
+    }
+    controller.child = null;
+    return true;
+  }
+
+  function isJobControllerCanceled(controller) {
+    return !!(controller && controller.canceled);
   }
 
   function formatPercent(uploaded, total) {
@@ -965,6 +977,30 @@
     });
 
     return map;
+  }
+
+  function loadNormalizedProjectStates() {
+    var normalization = getRuntimeStateHelper().normalizeLoadedProjectStates(
+      loadProjectStates(),
+      nowIso(),
+    );
+
+    if (normalization.changed_count > 0) {
+      normalization.changed_project_ids.forEach(function (projectId) {
+        writeJsonAtomic(
+          projectStatePath(projectId),
+          normalization.states[projectId],
+        );
+      });
+      log(
+        "Startup normalized " +
+          normalization.changed_count +
+          " project state(s); automatic recovery remains disabled",
+        "info",
+      );
+    }
+
+    return normalization.states;
   }
 
   function getProjectState(projectId) {
@@ -1365,28 +1401,14 @@
       });
   }
 
-  // --- Queue persistence ---
+  // --- Queue runtime ---
 
   function loadJobs() {
-    var loaded = readJson(JOBS_PATH, { queue: [], active: null });
-    var queue = Array.isArray(loaded.queue) ? loaded.queue.slice(0) : [];
-
-    if (loaded.active && loaded.active.type && loaded.active.payload) {
-      queue.unshift(loaded.active);
-    }
-
-    queue = queue.filter(function (job) {
-      return job && typeof job.type === "string" && job.payload;
-    });
-
-    return {
-      queue: queue,
-      active: null,
-    };
+    return getRuntimeStateHelper().createEmptyJobStore();
   }
 
   function persistJobs() {
-    writeJsonAtomic(JOBS_PATH, jobStore);
+    return;
   }
 
   function generateJobId(type) {
@@ -1490,6 +1512,137 @@
     });
   }
 
+  function dropQueuedJobsForOtherProjects(activeProjectId) {
+    var kept = [];
+    var removed = 0;
+
+    jobStore.queue.forEach(function (job) {
+      var queuedProjectId = String(
+        (job && job.payload && job.payload.project_id) || "",
+      ).trim();
+      if (queuedProjectId && queuedProjectId !== activeProjectId) {
+        removed += 1;
+        return;
+      }
+      kept.push(job);
+    });
+
+    jobStore.queue = kept;
+    return removed;
+  }
+
+  function dropEncoderJobsForOtherProjects(activeProjectId) {
+    var removed = 0;
+    Object.keys(encoderJobMap).forEach(function (jobId) {
+      var mapped = encoderJobMap[jobId];
+      var mappedProjectId = String(
+        mapped && mapped.project_id ? mapped.project_id : mapped || "",
+      ).trim();
+      if (!mappedProjectId || mappedProjectId === activeProjectId) {
+        return;
+      }
+      delete encoderJobMap[jobId];
+      removed += 1;
+    });
+    return removed;
+  }
+
+  function deactivateAutomationForOtherProjects(activeProjectId) {
+    var disarmedMonitors = 0;
+    var clearedRetries = 0;
+
+    Object.keys(exportMonitors).forEach(function (projectId) {
+      if (projectId === activeProjectId) {
+        return;
+      }
+      disarmExportMonitor(projectId);
+      disarmedMonitors += 1;
+    });
+
+    Object.keys(cleanupRetryTimers).forEach(function (projectId) {
+      if (projectId === activeProjectId) {
+        return;
+      }
+      clearCleanupRetry(projectId);
+      clearedRetries += 1;
+    });
+
+    return {
+      disarmed_monitors: disarmedMonitors,
+      cleared_retries: clearedRetries,
+    };
+  }
+
+  function takeHardPrecedence(projectId, reason) {
+    var nextProjectId = String(projectId || "").trim();
+    if (!nextProjectId) {
+      throw new Error("Missing project id for precedence switch");
+    }
+
+    var activation = getAutomationControlHelper().activateProjectOwnership(
+      ensureAutomationRuntime(),
+      nextProjectId,
+    );
+
+    if (!activation.changed) {
+      return activation.lease;
+    }
+
+    var activeController = jobStore.active && jobStore.active.controller;
+    var activeProjectId = String(
+      (jobStore.active &&
+        jobStore.active.payload &&
+        jobStore.active.payload.project_id) ||
+        "",
+    ).trim();
+    var canceledActive = false;
+    if (activeProjectId && activeProjectId !== nextProjectId) {
+      canceledActive = cancelJobController(
+        activeController,
+        "superseded by " + nextProjectId,
+      );
+      jobStore.active = null;
+    }
+
+    var removedQueued = dropQueuedJobsForOtherProjects(nextProjectId);
+    var deactivated = deactivateAutomationForOtherProjects(nextProjectId);
+    var removedEncoderJobs = dropEncoderJobsForOtherProjects(nextProjectId);
+
+    renderQueue();
+    updateGlobalStatus();
+    processJobQueue();
+
+    var details = [];
+    if (activation.previous_project_id) {
+      details.push("previous=" + activation.previous_project_id);
+    }
+    if (canceledActive) {
+      details.push("active_job=canceled");
+    }
+    if (removedQueued > 0) {
+      details.push("queued_jobs_removed=" + removedQueued);
+    }
+    if (deactivated.disarmed_monitors > 0) {
+      details.push("monitors_disarmed=" + deactivated.disarmed_monitors);
+    }
+    if (deactivated.cleared_retries > 0) {
+      details.push("cleanup_retries_cleared=" + deactivated.cleared_retries);
+    }
+    if (removedEncoderJobs > 0) {
+      details.push("encoder_jobs_cleared=" + removedEncoderJobs);
+    }
+
+    log(
+      "Project " +
+        nextProjectId +
+        " took hard precedence" +
+        (details.length > 0 ? " (" + details.join(", ") + ")" : ""),
+      "info",
+    );
+
+    return activation.lease;
+  }
+
   function processJobQueue() {
     if (jobStore.active || jobStore.queue.length === 0) {
       updateGlobalStatus();
@@ -1499,13 +1652,17 @@
     var job = jobStore.queue.shift();
     job.status = "running";
     job.updated_at = nowIso();
+    job.controller = createActiveJobController(job);
     jobStore.active = job;
     persistJobs();
     renderQueue();
     setStatus("running");
 
-    executeJob(job)
+    executeJob(job, job.controller)
       .then(function () {
+        if (isJobControllerCanceled(job.controller)) {
+          return;
+        }
         log(
           "Job completed: " +
             job.type +
@@ -1516,19 +1673,28 @@
         );
       })
       .catch(function (err) {
+        if (
+          isJobControllerCanceled(job.controller) ||
+          isAutomationCanceledError(err)
+        ) {
+          return;
+        }
         log("Job failed: " + job.type + " -> " + err.message, "error");
       })
       .finally(function () {
-        jobStore.active = null;
+        if (jobStore.active && jobStore.active.id === job.id) {
+          jobStore.active = null;
+        }
+        delete job.controller;
         persistJobs();
         renderQueue();
         processJobQueue();
       });
   }
 
-  function executeJob(job) {
+  function executeJob(job, controller) {
     if (job.type === "download_import") {
-      return executeDownloadImport(job.payload.project_id);
+      return executeDownloadImport(job.payload.project_id, controller);
     }
     if (job.type === "upload_output") {
       var outputPath =
@@ -1540,6 +1706,7 @@
         !!job.payload.cleanup_after_upload,
         String(job.payload.reason || "watch"),
         outputPath,
+        controller,
       );
     }
     return Promise.reject(new Error("Unknown job type: " + job.type));
@@ -1554,23 +1721,62 @@
     return driveTasksFallback.runTask(taskName, payload, onProgress);
   }
 
-  function runDriveTask(taskName, payload, onProgress) {
+  function runDriveTask(taskName, payload, onProgress, options) {
     return new Promise(function (resolve, reject) {
+      var controller = options && options.controller ? options.controller : null;
+      var taskProjectId = String(
+        (options && options.projectId) ||
+          (payload && payload.project_id) ||
+          (controller && controller.project_id) ||
+          "",
+      ).trim();
       var workerPath = getClientFilePath("drive_worker.js");
       var child;
       var exitingWithFallback = false;
+
+      function buildCanceledError() {
+        return createAutomationCanceledError(
+          taskProjectId,
+          (controller && controller.cancel_reason) || taskName,
+        );
+      }
+
+      if (isJobControllerCanceled(controller)) {
+        reject(buildCanceledError());
+        return;
+      }
+
       try {
         child = childProcess.fork(workerPath, [], {
           stdio: ["ignore", "ignore", "ignore", "ipc"],
         });
       } catch (forkErr) {
+        if (isJobControllerCanceled(controller)) {
+          reject(buildCanceledError());
+          return;
+        }
         log("Worker unavailable, using in-process fallback", "warn");
         runDriveTaskFallback(taskName, payload, onProgress)
-          .then(resolve)
-          .catch(reject);
+          .then(function (result) {
+            if (isJobControllerCanceled(controller)) {
+              reject(buildCanceledError());
+              return;
+            }
+            resolve(result);
+          })
+          .catch(function (err) {
+            if (isJobControllerCanceled(controller)) {
+              reject(buildCanceledError());
+              return;
+            }
+            reject(err);
+          });
         return;
       }
 
+      if (controller) {
+        controller.child = child;
+      }
       var settled = false;
 
       function completeWithError(err) {
@@ -1581,6 +1787,9 @@
         try {
           child.kill();
         } catch (e) {}
+        if (controller && controller.child === child) {
+          controller.child = null;
+        }
         reject(err);
       }
 
@@ -1589,20 +1798,34 @@
           return;
         }
         if (msg.type === "progress") {
+          if (isJobControllerCanceled(controller)) {
+            return;
+          }
           if (typeof onProgress === "function") {
             onProgress(msg.progress || {});
           }
           return;
         }
         if (msg.type === "result") {
+          if (isJobControllerCanceled(controller)) {
+            completeWithError(buildCanceledError());
+            return;
+          }
           settled = true;
           resolve(msg.result);
           try {
             child.kill();
           } catch (eKill) {}
+          if (controller && controller.child === child) {
+            controller.child = null;
+          }
           return;
         }
         if (msg.type === "error") {
+          if (isJobControllerCanceled(controller)) {
+            completeWithError(buildCanceledError());
+            return;
+          }
           completeWithError(
             new Error((msg.error && msg.error.message) || "Worker error"),
           );
@@ -1615,6 +1838,13 @@
 
       child.on("exit", function (code) {
         if (settled) {
+          return;
+        }
+        if (controller && controller.child === child) {
+          controller.child = null;
+        }
+        if (isJobControllerCanceled(controller)) {
+          completeWithError(buildCanceledError());
           return;
         }
         if (code === 0) {
@@ -1633,8 +1863,20 @@
           "warn",
         );
         runDriveTaskFallback(taskName, payload, onProgress)
-          .then(resolve)
-          .catch(reject);
+          .then(function (result) {
+            if (isJobControllerCanceled(controller)) {
+              reject(buildCanceledError());
+              return;
+            }
+            resolve(result);
+          })
+          .catch(function (err) {
+            if (isJobControllerCanceled(controller)) {
+              reject(buildCanceledError());
+              return;
+            }
+            reject(err);
+          });
       });
 
       child.send({
@@ -1647,13 +1889,16 @@
 
   // --- Drive automation jobs ---
 
-  function executeDownloadImport(projectId) {
+  function executeDownloadImport(projectId, controller) {
     if (!validateProjectId(projectId)) {
       return Promise.reject(new Error("Invalid project ID: " + projectId));
     }
     if (!isDriveConfigured()) {
       return Promise.reject(new Error("Drive settings are incomplete"));
     }
+
+    var lease = captureAutomationLease(projectId);
+    ensureAutomationLeaseActive(lease, "download_import_start");
 
     upsertProjectState(projectId, {
       status: "downloading",
@@ -1676,6 +1921,9 @@
       "downloadProject",
       downloadPayload,
       function (progress) {
+        if (!isAutomationLeaseActive(lease)) {
+          return;
+        }
         if (progress.stage === "download_tuning") {
           log(
             "Download tuning for " +
@@ -1738,8 +1986,13 @@
           );
         }
       },
+      {
+        controller: controller,
+        projectId: projectId,
+      },
     )
       .then(function (result) {
+        ensureAutomationLeaseActive(lease, "download_import_complete");
         var importPath = path.join(result.local_root, "import_project.jsx");
         if (!fs.existsSync(importPath)) {
           throw new Error(
@@ -1763,6 +2016,7 @@
         });
 
         return runScript(importPath).then(function () {
+          ensureAutomationLeaseActive(lease, "download_import_after_jsx");
           var enableAudioNoMusic = !!(
             exportAudioNoMusicCheckbox && exportAudioNoMusicCheckbox.checked
           );
@@ -1789,11 +2043,21 @@
             uploaded_outputs: {},
             upload_results_by_output: {},
           });
+          ensureAutomationLeaseActive(lease, "download_import_ready");
           armExportMonitor(nextState.project_id);
           projectSelect.value = projectId;
         });
       })
       .catch(function (err) {
+        if (isAutomationCanceledError(err)) {
+          throw err;
+        }
+        if (!isAutomationLeaseActive(lease)) {
+          throw createAutomationCanceledError(
+            projectId,
+            "download_import_superseded",
+          );
+        }
         upsertProjectState(projectId, {
           status: "error",
           last_error: err.message,
@@ -1807,6 +2071,7 @@
     cleanupAfterUpload,
     reason,
     outputPathOverride,
+    controller,
   ) {
     var state = getProjectState(projectId);
     var selectedOutputPath = String(
@@ -1837,6 +2102,9 @@
     if (!isDriveConfigured()) {
       return Promise.reject(new Error("Drive settings are incomplete"));
     }
+
+    var lease = captureAutomationLease(projectId);
+    ensureAutomationLeaseActive(lease, "upload_output_start");
 
     var expectedOutputs = getExpectedOutputPaths(state);
     if (expectedOutputs.length <= 0 && selectedOutputPath) {
@@ -1872,20 +2140,32 @@
 
     var lastProgressPct = -1;
 
-    return runDriveTask("uploadOutput", uploadPayload, function (progress) {
-      if (progress.stage === "upload_progress") {
-        var pct = Math.round(
-          (Number(progress.uploaded_bytes || 0) /
-            Math.max(1, Number(progress.total_bytes || 1))) *
-            100,
-        );
-        if (pct !== lastProgressPct && (pct % 5 === 0 || pct === 100)) {
-          lastProgressPct = pct;
-          log("Upload " + projectId + ": " + pct + "%", "info");
+    return runDriveTask(
+      "uploadOutput",
+      uploadPayload,
+      function (progress) {
+        if (!isAutomationLeaseActive(lease)) {
+          return;
         }
-      }
-    })
+        if (progress.stage === "upload_progress") {
+          var pct = Math.round(
+            (Number(progress.uploaded_bytes || 0) /
+              Math.max(1, Number(progress.total_bytes || 1))) *
+              100,
+          );
+          if (pct !== lastProgressPct && (pct % 5 === 0 || pct === 100)) {
+            lastProgressPct = pct;
+            log("Upload " + projectId + ": " + pct + "%", "info");
+          }
+        }
+      },
+      {
+        controller: controller,
+        projectId: projectId,
+      },
+    )
       .then(function (result) {
+        ensureAutomationLeaseActive(lease, "upload_output_complete");
         var stat = fs.statSync(selectedOutputPath);
         var freshState = getProjectState(projectId) || state;
         var uploadedOutputs = clonePlainObject(
@@ -1951,11 +2231,13 @@
         resetMonitorCandidateSelection(projectId);
 
         if (!allUploaded) {
+          ensureAutomationLeaseActive(lease, "upload_output_partial");
           armExportMonitor(projectId);
           return null;
         }
 
         if (cleanupAfterUpload) {
+          ensureAutomationLeaseActive(lease, "upload_output_cleanup_start");
           disarmExportMonitor(projectId);
           clearCleanupRetry(projectId);
           return cleanupImportedProjectInHost(
@@ -1964,6 +2246,7 @@
             false,
           )
             .then(function (hostSummary) {
+              ensureAutomationLeaseActive(lease, "upload_output_host_cleanup");
               upsertProjectState(projectId, {
                 host_cleanup_result: hostSummary || null,
                 host_cleanup_error: null,
@@ -1988,11 +2271,15 @@
                 scheduleCleanupRetry(projectId, CLEANUP_RETRY_DELAY_MS);
                 return null;
               }
-              return removePathSafe(newState.local_root, {
-                maxAttempts: CLEANUP_IMMEDIATE_MAX_ATTEMPTS,
-              });
-            })
+                return removePathSafe(newState.local_root, {
+                  maxAttempts: CLEANUP_IMMEDIATE_MAX_ATTEMPTS,
+                });
+              })
             .catch(function (hostErr) {
+              ensureAutomationLeaseActive(
+                lease,
+                "upload_output_host_cleanup_error",
+              );
               upsertProjectState(projectId, {
                 host_cleanup_error: hostErr.message,
                 status: "cleanup_failed",
@@ -2011,6 +2298,7 @@
               return null;
             })
             .then(function (cleanupResult) {
+              ensureAutomationLeaseActive(lease, "upload_output_cleanup_finish");
               if (!cleanupResult) {
                 return;
               }
@@ -2065,11 +2353,21 @@
               );
             });
         }
+        ensureAutomationLeaseActive(lease, "upload_output_post_complete");
         armExportMonitor(projectId);
         maybeNotifyProjectCompletion(newState);
         return null;
       })
       .catch(function (err) {
+        if (isAutomationCanceledError(err)) {
+          throw err;
+        }
+        if (!isAutomationLeaseActive(lease)) {
+          throw createAutomationCanceledError(
+            projectId,
+            "upload_output_superseded",
+          );
+        }
         upsertProjectState(projectId, {
           status: "upload_failed",
           upload_pending: false,
@@ -2083,6 +2381,8 @@
     if (!validateProjectId(projectId)) {
       throw new Error("Invalid project id: " + projectId);
     }
+
+    takeHardPrecedence(projectId, source || "manual");
     if (isJobQueued("download_import", projectId)) {
       log("Download/import already queued for " + projectId, "warn");
       return false;
@@ -2108,10 +2408,16 @@
       completion_notified_at: null,
     });
 
+    projectSelect.value = projectId;
+
     return true;
   }
 
   function queueUpload(projectId, reason, outputPathOverride) {
+    if (!isAutomationProjectActive(projectId)) {
+      return false;
+    }
+
     var state = getProjectState(projectId);
     if (!state || !state.drive_folder_id) {
       return false;
@@ -2189,6 +2495,10 @@
   }
 
   function checkExportStability(projectId, source) {
+    if (!isAutomationProjectActive(projectId)) {
+      return;
+    }
+
     var monitor = exportMonitors[projectId];
     var state = getProjectState(projectId);
     if (!monitor || !state) {
@@ -2309,6 +2619,10 @@
   }
 
   function armExportMonitor(projectId) {
+    if (!isAutomationProjectActive(projectId)) {
+      return;
+    }
+
     var state = getProjectState(projectId);
     if (!state) {
       return;
@@ -2382,101 +2696,6 @@
       }
     } catch (e3) {}
     delete exportMonitors[projectId];
-  }
-
-  function armMonitorsForRecoveredStates() {
-    var recoveryDownloadQueued = 0;
-    var recoveryUploadQueued = 0;
-    var recoveryMonitorArmed = 0;
-    var recoveryCleanupScheduled = 0;
-
-    Object.keys(projectStates).forEach(function (projectId) {
-      var state = projectStates[projectId];
-      if (!state) {
-        return;
-      }
-
-      if (state.status === "downloading" || state.status === "importing") {
-        if (!isJobQueued("download_import", projectId)) {
-          enqueueJob("download_import", {
-            project_id: projectId,
-            source: "recovery",
-          });
-          recoveryDownloadQueued += 1;
-        }
-        return;
-      }
-
-      if (state.status === "uploading") {
-        var queuedUploading = queueMissingUploadsForState(
-          projectId,
-          state,
-          "recovery_upload",
-        );
-        if (queuedUploading > 0) {
-          recoveryUploadQueued += queuedUploading;
-        } else if (!isJobQueued("upload_output", projectId)) {
-          enqueueJob("upload_output", {
-            project_id: projectId,
-            output_path: state.output_path || "",
-            cleanup_after_upload: !!state.pending_cleanup_choice,
-            reason: "recovery_upload",
-          });
-          recoveryUploadQueued += 1;
-        }
-        return;
-      }
-
-      if (
-        state.status === "cleanup_pending" ||
-        (state.status === "cleanup_failed" && !!state.cleanup_retryable)
-      ) {
-        scheduleCleanupRetry(projectId, 1000);
-        recoveryCleanupScheduled += 1;
-        return;
-      }
-
-      if (
-        state.status === "ready_for_export" ||
-        state.status === "upload_failed" ||
-        state.status === "uploaded_partial" ||
-        state.status === "uploaded" ||
-        state.status === "exporting"
-      ) {
-        armExportMonitor(projectId);
-        recoveryMonitorArmed += 1;
-
-        if (
-          state.status === "uploaded_partial" ||
-          state.status === "upload_failed"
-        ) {
-          recoveryUploadQueued += queueMissingUploadsForState(
-            projectId,
-            state,
-            "recovery_missing_output",
-          );
-        }
-      }
-    });
-
-    if (
-      recoveryDownloadQueued > 0 ||
-      recoveryUploadQueued > 0 ||
-      recoveryMonitorArmed > 0 ||
-      recoveryCleanupScheduled > 0
-    ) {
-      log(
-        "Recovery: downloads=" +
-          recoveryDownloadQueued +
-          ", uploads=" +
-          recoveryUploadQueued +
-          ", monitors=" +
-          recoveryMonitorArmed +
-          ", cleanup retries=" +
-          recoveryCleanupScheduled,
-        "info",
-      );
-    }
   }
 
   // --- Render project list ---
@@ -2939,8 +3158,11 @@
     }
 
     var jobId = String(eventItem.job_id || "");
-    var projectId =
-      String(eventItem.project_id || "") || encoderJobMap[jobId] || "";
+    var mappedJob = jobId ? encoderJobMap[jobId] || null : null;
+    var projectId = String(
+      mappedJob && mappedJob.project_id ? mappedJob.project_id : "",
+    ).trim();
+    var jobLease = mappedJob && mappedJob.lease ? mappedJob.lease : null;
     var renderKind = String(
       (eventItem.detail && eventItem.detail.render_kind) || "video",
     );
@@ -2948,11 +3170,18 @@
       (eventItem.detail && eventItem.detail.output_path) || "",
     ).trim();
 
-    if (projectId && jobId) {
-      encoderJobMap[jobId] = projectId;
+    if (!jobId || !mappedJob || !projectId) {
+      return;
     }
 
-    if (!projectId) {
+    if (jobLease && !isAutomationLeaseActive(jobLease)) {
+      if (jobId) {
+        delete encoderJobMap[jobId];
+      }
+      return;
+    }
+    if (!jobLease || !isAutomationProjectActive(projectId)) {
+      delete encoderJobMap[jobId];
       return;
     }
 
@@ -3133,10 +3362,12 @@
       ")",
     ].join("");
 
+    var lease = takeHardPrecedence(projectId, "managed_export");
     setStatus("running");
 
     evalHost(hostCall)
       .then(function (result) {
+        ensureAutomationLeaseActive(lease, "managed_export_result");
         if (result && result.indexOf("ERROR:") === 0) {
           throw new Error(result);
         }
@@ -3163,9 +3394,15 @@
           throw new Error("Host did not return an encoder job ID");
         }
 
-        encoderJobMap[videoJobId] = projectId;
+        encoderJobMap[videoJobId] = {
+          project_id: projectId,
+          lease: lease,
+        };
         if (audioJobId) {
-          encoderJobMap[audioJobId] = projectId;
+          encoderJobMap[audioJobId] = {
+            project_id: projectId,
+            lease: lease,
+          };
         }
         upsertProjectState(projectId, {
           status: "exporting",
@@ -3193,6 +3430,10 @@
         updateGlobalStatus();
       })
       .catch(function (err) {
+        if (isAutomationCanceledError(err) || !isAutomationLeaseActive(lease)) {
+          updateGlobalStatus();
+          return;
+        }
         upsertProjectState(projectId, {
           status: "error",
           last_error: err.message,
@@ -3351,7 +3592,7 @@
 
     settings = loadSettings();
     jobStore = loadJobs();
-    projectStates = loadProjectStates();
+    projectStates = loadNormalizedProjectStates();
 
     setSettingsSectionCollapsed(true);
     setLatestProjectsSectionCollapsed(true);
@@ -3445,7 +3686,6 @@
       updateGlobalStatus();
     });
 
-    armMonitorsForRecoveredStates();
     processJobQueue();
 
     log("Tiktok Reproducer automation initialized", "info");
