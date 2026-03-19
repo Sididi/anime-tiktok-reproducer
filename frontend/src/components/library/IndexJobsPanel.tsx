@@ -13,7 +13,7 @@ import { readSSEStream } from "@/utils/sse";
 import type { IndexationJob } from "@/types";
 
 interface IndexJobsPanelProps {
-  onJobComplete?: () => void;
+  onJobComplete?: (job: IndexationJob) => void;
 }
 
 export function IndexJobsPanel({ onJobComplete }: IndexJobsPanelProps) {
@@ -52,7 +52,7 @@ export function IndexJobsPanel({ onJobComplete }: IndexJobsPanelProps) {
                 completedTimers.current.delete(job.id);
               }, 5000),
             );
-            onJobComplete?.();
+            onJobComplete?.(job);
           }
         },
         { signal: controller.signal },

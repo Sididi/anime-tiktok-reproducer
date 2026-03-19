@@ -44,12 +44,6 @@ export function SourceRow({
       {/* Source name */}
       <div className="flex items-center gap-1 flex-1 min-w-0">
         <span className="font-semibold truncate">{source.name}</span>
-        {source.missing_episodes > 0 && (
-          <AlertTriangle
-            className="text-amber-500 h-4 w-4 shrink-0"
-            title={`${source.missing_episodes} épisode(s) manquant(s)`}
-          />
-        )}
       </div>
 
       {/* Episode count */}
@@ -68,7 +62,15 @@ export function SourceRow({
       </span>
 
       {/* Actions */}
-      <div className="flex gap-1 justify-end w-24 shrink-0">
+      <div className="flex gap-1 justify-end w-28 shrink-0">
+        {source.missing_episodes > 0 && (
+          <div
+            className="p-1 mr-auto text-amber-500 opacity-30"
+            title={`${source.missing_episodes} épisode(s) manquant(s)`}
+          >
+            <AlertTriangle className="h-4 w-4" />
+          </div>
+        )}
         <button
           onClick={(e) => {
             e.stopPropagation();

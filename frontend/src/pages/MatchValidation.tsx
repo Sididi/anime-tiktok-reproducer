@@ -1319,6 +1319,7 @@ export function MatchValidation() {
     setPendingSceneUpdates({});
     setSceneWarnings({});
     setToast(null);
+    matchesAutoFillTriggeredRef.current = false;
     setMatching(true);
     setPlaybackManifest(null);
     setPlaybackProgress(null);

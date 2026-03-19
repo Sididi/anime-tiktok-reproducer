@@ -14,7 +14,7 @@ import { FolderBrowserModal } from "@/components/FolderBrowserModal";
 import { ProjectManagerModal } from "@/components/project-manager";
 import { api } from "@/api/client";
 import { readSSEStream } from "@/utils/sse";
-import type { LibraryType, SourceDetails } from "@/types";
+import type { LibraryType, SourceDetails, IndexationJob } from "@/types";
 
 export function ProjectSetup() {
   const navigate = useNavigate();
@@ -65,6 +65,16 @@ export function ProjectSetup() {
   useEffect(() => {
     void loadSources();
   }, [loadSources]);
+
+  const handleJobComplete = useCallback(
+    async (job: IndexationJob) => {
+      await loadSources();
+      if (job.library_type === selectedLibraryType) {
+        setSelectedSource(job.source_name);
+      }
+    },
+    [loadSources, selectedLibraryType],
+  );
 
   // Persist library type to localStorage
   useEffect(() => {
@@ -216,7 +226,7 @@ export function ProjectSetup() {
         onOpenPurge={handleOpenPurge}
       />
 
-      <IndexJobsPanel onJobComplete={loadSources} />
+      <IndexJobsPanel onJobComplete={handleJobComplete} />
 
       <SearchBar
         searchQuery={searchQuery}

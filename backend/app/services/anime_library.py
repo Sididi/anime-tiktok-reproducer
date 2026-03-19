@@ -3349,7 +3349,7 @@ class AnimeLibraryService:
                 if path == series_name or path.startswith(prefix)
             )
 
-            missing_episodes = max(0, episode_count_on_disk - indexed_episode_count)
+            missing_episodes = max(0, indexed_episode_count - episode_count_on_disk)
 
             # Get FPS from manifest
             fps: float = 0.0
@@ -3390,7 +3390,7 @@ class AnimeLibraryService:
 
             results.append({
                 "name": series_name,
-                "episode_count": episode_count_on_disk,
+                "episode_count": indexed_episode_count,
                 "total_size_bytes": total_size_bytes,
                 "fps": fps,
                 "missing_episodes": missing_episodes,

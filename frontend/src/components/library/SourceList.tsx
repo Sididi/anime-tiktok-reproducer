@@ -44,7 +44,7 @@ export function SourceList({
         <div className="w-20 shrink-0">Épisodes</div>
         <div className="w-14 shrink-0">FPS</div>
         <div className="w-16 shrink-0">Taille</div>
-        <div className="w-24 shrink-0 text-right">Actions</div>
+        <div className="w-28 shrink-0 text-right">Actions</div>
       </div>
 
       {/* Source rows */}
