@@ -12,6 +12,7 @@ import {
 } from "@/components/library";
 import { FolderBrowserModal } from "@/components/FolderBrowserModal";
 import { ProjectManagerModal } from "@/components/project-manager";
+import { DuplicateTikTokWarning } from "@/components/DuplicateTikTokWarning";
 import { api } from "@/api/client";
 import { readSSEStream } from "@/utils/sse";
 import type { LibraryType, SourceDetails, IndexationJob } from "@/types";
@@ -41,6 +42,12 @@ export function ProjectSetup() {
   const [showFolderBrowser, setShowFolderBrowser] = useState(false);
   const [updateSourceName, setUpdateSourceName] = useState<string | null>(null);
   const [torrentSourceName, setTorrentSourceName] = useState<string | null>(null);
+
+  // Duplicate TikTok warning
+  const [duplicateWarning, setDuplicateWarning] = useState<{
+    videoId: string;
+    registeredAt: string | null;
+  } | null>(null);
 
   // Purge estimate
   const [purgeEstimatedBytes, setPurgeEstimatedBytes] = useState(0);
@@ -82,9 +89,9 @@ export function ProjectSetup() {
   }, [selectedLibraryType]);
 
   // ---------------------------------------------------------------------------
-  // Start flow: create project -> download -> detect scenes -> navigate
+  // Start flow: check duplicate -> create project -> download -> detect -> nav
   // ---------------------------------------------------------------------------
-  const handleStart = useCallback(async () => {
+  const proceedWithStart = useCallback(async () => {
     if (!tiktokUrl.trim() || !selectedSource) return;
     setProcessing(true);
     setError(null);
@@ -139,6 +146,26 @@ export function ProjectSetup() {
     }
   }, [tiktokUrl, selectedSource, selectedLibraryType, navigate]);
 
+  const handleStart = useCallback(async () => {
+    if (!tiktokUrl.trim() || !selectedSource) return;
+    setError(null);
+
+    try {
+      const result = await api.checkTiktokUrl(tiktokUrl);
+      if (result.exists && result.video_id) {
+        setDuplicateWarning({
+          videoId: result.video_id,
+          registeredAt: result.registered_at,
+        });
+        return;
+      }
+    } catch {
+      // If check fails, proceed anyway
+    }
+
+    proceedWithStart();
+  }, [tiktokUrl, selectedSource, proceedWithStart]);
+
   // ---------------------------------------------------------------------------
   // New source submission (async indexing)
   // ---------------------------------------------------------------------------
@@ -157,7 +184,28 @@ export function ProjectSetup() {
         setError((err as Error).message);
       }
     },
-    [loadSources],
+    [],
+  );
+
+  // ---------------------------------------------------------------------------
+  // Batch source submission (async indexing for multiple sources)
+  // ---------------------------------------------------------------------------
+  const handleBatchSourceSubmit = useCallback(
+    async (
+      items: Array<{ path: string; name: string }>,
+      type: LibraryType,
+      fps: number,
+    ) => {
+      try {
+        for (const item of items) {
+          await api.indexAnimeAsync(item.path, type, item.name, fps);
+        }
+        setShowNewSource(false);
+      } catch (err) {
+        setError((err as Error).message);
+      }
+    },
+    [],
   );
 
   // ---------------------------------------------------------------------------
@@ -272,6 +320,7 @@ export function ProjectSetup() {
         open={showNewSource}
         onClose={() => setShowNewSource(false)}
         onSubmit={handleNewSourceSubmit}
+        onBatchSubmit={handleBatchSourceSubmit}
         currentLibraryType={selectedLibraryType}
       />
 
@@ -307,6 +356,17 @@ export function ProjectSetup() {
                 ?.original_index_path ?? undefined)
             : undefined
         }
+      />
+
+      <DuplicateTikTokWarning
+        open={!!duplicateWarning}
+        videoId={duplicateWarning?.videoId ?? ""}
+        registeredAt={duplicateWarning?.registeredAt ?? null}
+        onCancel={() => setDuplicateWarning(null)}
+        onContinue={() => {
+          setDuplicateWarning(null);
+          proceedWithStart();
+        }}
       />
 
       {torrentSourceName && (

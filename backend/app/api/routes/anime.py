@@ -13,7 +13,7 @@ from ...services import AnimeLibraryService, AnimeMatcherService
 
 router = APIRouter(prefix="/anime", tags=["anime"])
 
-VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".webm", ".mov"}
+VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".webm", ".mov", ".m4v"}
 
 
 @router.get("/browse")
@@ -249,6 +249,171 @@ async def check_folders(request: CheckFoldersRequest):
 
     folders = await AnimeLibraryService.get_available_folders(source_path)
     return {"path": request.path, "folders": folders}
+
+
+# ---------------------------------------------------------------------------
+# Batch folder validation
+# ---------------------------------------------------------------------------
+
+
+class ValidateBatchFoldersRequest(BaseModel):
+    paths: list[str]
+    library_type: LibraryType
+
+
+class ConflictDetails(BaseModel):
+    new_episodes: list[str]
+    removed_episodes: list[str]
+    existing_episode_count: int
+    existing_torrent_count: int
+
+
+class FolderValidationResult(BaseModel):
+    path: str
+    name: str
+    has_videos: bool
+    suggested_path: str | None = None
+    index_status: str = "new"  # "new" | "exact_match" | "conflict"
+    conflict_details: ConflictDetails | None = None
+
+
+def _find_first_video_dir(root: Path) -> str | None:
+    """BFS for the first subdirectory that directly contains video files."""
+    from collections import deque
+
+    queue = deque([root])
+    while queue:
+        current = queue.popleft()
+        try:
+            children = sorted(current.iterdir())
+        except PermissionError:
+            continue
+        for child in children:
+            if not child.is_dir() or child.name.startswith("."):
+                continue
+            try:
+                has_vids = any(
+                    f.suffix.lower() in VIDEO_EXTENSIONS
+                    for f in child.iterdir()
+                    if f.is_file()
+                )
+            except (PermissionError, OSError):
+                continue
+            if has_vids:
+                return str(child)
+            queue.append(child)
+    return None
+
+
+def _validate_batch_folders_sync(
+    paths: list[str],
+    library_type: LibraryType,
+) -> list[dict]:
+    library_path = AnimeLibraryService.get_library_path(library_type=library_type)
+
+    # Load state.json once for indexed episode comparison
+    index_dir = library_path / ".index"
+    state_files: dict = {}
+    try:
+        state_payload = json.loads(
+            (index_dir / "state.json").read_text(encoding="utf-8")
+        )
+        if isinstance(state_payload, dict):
+            files = state_payload.get("files", {})
+            if isinstance(files, dict):
+                state_files = files
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    results = []
+    for folder_path in paths:
+        p = Path(folder_path)
+        if not p.exists() or not p.is_dir():
+            continue
+
+        name = p.name
+
+        # Check direct video files in the source folder
+        try:
+            source_videos = sorted(
+                f.name
+                for f in p.iterdir()
+                if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS
+            )
+        except (PermissionError, OSError):
+            source_videos = []
+
+        has_videos = len(source_videos) > 0
+
+        suggested = None
+        if not has_videos:
+            suggested = _find_first_video_dir(p)
+
+        # Check if already indexed
+        source_dir = library_path / name
+        index_status = "new"
+        conflict_details = None
+
+        if source_dir.exists() and source_dir.is_dir():
+            # Get video files on disk in the library directory
+            try:
+                library_videos = sorted(
+                    f.name
+                    for f in source_dir.iterdir()
+                    if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS
+                )
+            except (PermissionError, OSError):
+                library_videos = []
+
+            # Get torrent count
+            torrent_count = 0
+            torrents_path = source_dir / ".atr_torrents.json"
+            try:
+                t_payload = json.loads(torrents_path.read_text(encoding="utf-8"))
+                if isinstance(t_payload, dict):
+                    torrent_count = len(t_payload.get("torrents", []))
+            except (OSError, json.JSONDecodeError):
+                pass
+
+            # Compare source folder videos with library videos
+            source_set = set(source_videos) if has_videos else set()
+            library_set = set(library_videos)
+
+            new_episodes = sorted(source_set - library_set)
+            removed_episodes = sorted(library_set - source_set)
+
+            if not new_episodes and not removed_episodes:
+                index_status = "exact_match"
+            else:
+                index_status = "conflict"
+                conflict_details = {
+                    "new_episodes": new_episodes,
+                    "removed_episodes": removed_episodes,
+                    "existing_episode_count": len(library_videos),
+                    "existing_torrent_count": torrent_count,
+                }
+
+        results.append({
+            "path": folder_path,
+            "name": name,
+            "has_videos": has_videos,
+            "suggested_path": suggested,
+            "index_status": index_status,
+            "conflict_details": conflict_details,
+        })
+
+    return results
+
+
+@router.post("/validate-batch-folders")
+async def validate_batch_folders(request: ValidateBatchFoldersRequest):
+    """Validate a batch of folders for indexation, detecting conflicts."""
+    results = await asyncio.to_thread(
+        _validate_batch_folders_sync,
+        request.paths,
+        request.library_type,
+    )
+    return {"results": results}
 
 
 class SourceDetails(BaseModel):

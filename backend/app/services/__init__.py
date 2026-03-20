@@ -35,6 +35,7 @@ from .source_chunk_streaming_service import SourceChunkStreamingService
 from .indexation_queue import indexation_queue, IndexationQueueService
 from .torrent_linker import TorrentLinkerService
 from .deferred_download import DeferredDownloadService
+from .tiktok_url_db_service import TikTokUrlDbService
 
 __all__ = [
     "AccountService",
@@ -62,4 +63,5 @@ __all__ = [
     "indexation_queue", "IndexationQueueService",
     "TorrentLinkerService",
     "DeferredDownloadService",
+    "TikTokUrlDbService",
 ]

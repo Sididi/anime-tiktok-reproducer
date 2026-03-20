@@ -460,6 +460,29 @@ export const api = {
       body: JSON.stringify({ path }),
     }),
 
+  validateBatchFolders: (
+    paths: string[],
+    libraryType: import("@/types").LibraryType,
+  ) =>
+    request<{
+      results: Array<{
+        path: string;
+        name: string;
+        has_videos: boolean;
+        suggested_path: string | null;
+        index_status: "new" | "exact_match" | "conflict";
+        conflict_details: {
+          new_episodes: string[];
+          removed_episodes: string[];
+          existing_episode_count: number;
+          existing_torrent_count: number;
+        } | null;
+      }>;
+    }>("/anime/validate-batch-folders", {
+      method: "POST",
+      body: JSON.stringify({ paths, library_type: libraryType }),
+    }),
+
   browseDirectories: (path?: string) =>
     request<import("@/types").BrowseResult>(
       `/anime/browse${path ? `?path=${encodeURIComponent(path)}` : ""}`,
@@ -513,6 +536,13 @@ export const api = {
   estimatePurgeSize: (libraryType: import("@/types").LibraryType, allTypes: boolean) =>
     request<{ estimated_bytes: number; source_count: number }>(
       `/anime/purge/estimate?library_type=${encodeURIComponent(libraryType)}&all_types=${allTypes}`,
+    ),
+
+  // TikTok URL duplicate check
+  checkTiktokUrl: (url: string) =>
+    request<{ exists: boolean; video_id: string | null; registered_at: string | null }>(
+      "/tiktok-urls/check",
+      { method: "POST", body: JSON.stringify({ url }) },
     ),
 
   // Duration Warning

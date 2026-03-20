@@ -13,6 +13,7 @@ from .gaps import router as gaps_router
 from .raw_scenes import router as raw_scenes_router
 from .project_manager import router as project_manager_router
 from .integrations import router as integrations_router
+from .tiktok_url_db import router as tiktok_url_db_router
 # TEMPORARILY DISABLED - Subtitle video generation feature
 # from .subtitles import router as subtitles_router
 
@@ -30,6 +31,7 @@ api_router.include_router(gaps_router)
 api_router.include_router(raw_scenes_router)
 api_router.include_router(project_manager_router)
 api_router.include_router(integrations_router)
+api_router.include_router(tiktok_url_db_router)
 # TEMPORARILY DISABLED - Subtitle video generation feature
 # api_router.include_router(subtitles_router)
 

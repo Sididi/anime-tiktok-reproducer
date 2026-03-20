@@ -5,6 +5,7 @@ import json
 
 from ...models import ProjectPhase
 from ...services import ProjectService, DownloaderService
+from ...services.tiktok_url_db_service import TikTokUrlDbService
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["download"])
 
@@ -39,7 +40,9 @@ async def download_video(project_id: str, request: DownloadRequest):
                 project.video_height = video_info.get("height")
                 project.phase = ProjectPhase.SCENE_DETECTION
                 ProjectService.save(project)
-                
+
+                await TikTokUrlDbService.register(request.url)
+
                 yield f"data: {json.dumps(progress.to_dict())}\n\n"
 
             elif progress.status == "error":
