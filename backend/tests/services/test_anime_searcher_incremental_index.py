@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 from PIL import Image
 from typer.testing import CliRunner
 
@@ -20,6 +21,7 @@ if str(SEARCHER_ROOT) not in sys.path:
 from app.services.anime_library import AnimeLibraryService, IndexProgress
 from anime_searcher import cli as cli_module
 from anime_searcher.config import EMBEDDING_DIM, INDEX_ENGINE_PROFILE, INDEX_FORMAT_VERSION
+from anime_searcher.indexer import embedder as embedder_module
 from anime_searcher.indexer.frame_extractor import MediaBinaryProfile
 from anime_searcher.indexer.index_manager import IndexManager
 from anime_searcher.indexer.pipeline import FileStartedEvent, IndexedFileResult, IndexingJob, ParallelFileIndexer
@@ -237,6 +239,110 @@ def test_create_pipeline_warms_embedder_before_building_pipeline(
     assert pipeline.embedder is embedder
     assert selected_profile is profile
     assert call_order == ["embedder_init", "warmup", "pipeline_init"]
+
+
+def test_embedder_warmup_uses_scalar_resize_size_for_square_batch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    model_path = _dummy_model(tmp_path)
+    seen_shapes: list[tuple[int, ...]] = []
+
+    class DummyModel:
+        def to(self, _device: str):
+            return self
+
+        def eval(self):
+            return self
+
+    def fake_embed_preprocessed_batch(batch: torch.Tensor) -> np.ndarray:
+        seen_shapes.append(tuple(batch.shape))
+        return np.zeros((batch.shape[0], EMBEDDING_DIM), dtype=np.float32)
+
+    monkeypatch.setattr(embedder_module.torch.jit, "load", lambda *_args, **_kwargs: DummyModel())
+    monkeypatch.setattr(embedder_module, "RESIZE_SIZE", 288)
+
+    embedder = embedder_module.SSCDEmbedder(model_path, device="cpu")
+    monkeypatch.setattr(embedder, "embed_preprocessed_batch", fake_embed_preprocessed_batch)
+
+    embedder.warmup()
+
+    assert seen_shapes == [(1, 3, 288, 288)]
+
+
+@pytest.mark.parametrize("resize_size", [(288, 320), [288, 320]])
+def test_embedder_warmup_accepts_sequence_resize_size(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    resize_size: tuple[int, int] | list[int],
+) -> None:
+    model_path = _dummy_model(tmp_path)
+    seen_shapes: list[tuple[int, ...]] = []
+
+    class DummyModel:
+        def to(self, _device: str):
+            return self
+
+        def eval(self):
+            return self
+
+    def fake_embed_preprocessed_batch(batch: torch.Tensor) -> np.ndarray:
+        seen_shapes.append(tuple(batch.shape))
+        return np.zeros((batch.shape[0], EMBEDDING_DIM), dtype=np.float32)
+
+    monkeypatch.setattr(embedder_module.torch.jit, "load", lambda *_args, **_kwargs: DummyModel())
+    monkeypatch.setattr(embedder_module, "RESIZE_SIZE", resize_size)
+
+    embedder = embedder_module.SSCDEmbedder(model_path, device="cpu")
+    monkeypatch.setattr(embedder, "embed_preprocessed_batch", fake_embed_preprocessed_batch)
+
+    embedder.warmup()
+
+    assert seen_shapes == [(1, 3, 288, 320)]
+
+
+def test_index_progress_json_emits_structured_error_for_unexpected_pipeline_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    library_root = tmp_path / "library"
+    series_dir = library_root / "anime" / "Demo"
+    series_dir.mkdir(parents=True)
+    (series_dir / "ep1.mp4").write_bytes(b"ep1")
+    model_path = _dummy_model(tmp_path)
+
+    monkeypatch.setattr(
+        cli_module,
+        "_create_pipeline",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("unexpected pipeline failure")),
+    )
+
+    result = RUNNER.invoke(
+        cli_module.app,
+        [
+            "index",
+            str(library_root),
+            "--type",
+            "anime",
+            "--series",
+            "Demo",
+            "--model",
+            str(model_path),
+            "--progress-json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payloads = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    assert payloads == [
+        {
+            "event": "error",
+            "message": "unexpected pipeline failure",
+            "error": "unexpected pipeline failure",
+            "progress": 1.0,
+        }
+    ]
+    assert "Traceback" not in result.output
 
 
 def test_update_only_indexes_new_files_and_skips_unchanged(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
