@@ -6,6 +6,8 @@ import { api } from "@/api/client";
 import { readSSEStream } from "@/utils/sse";
 import { AccountSelectorDropdown } from "./AccountSelectorDropdown";
 import { AccountPickerPopup } from "./AccountPickerPopup";
+import { CopyrightMusicModal } from "./CopyrightMusicModal";
+import { CopyrightWarningModal } from "./CopyrightWarningModal";
 import { FacebookDurationModal } from "./FacebookDurationModal";
 import { ScheduledDeleteConfirm } from "./ScheduledDeleteConfirm";
 import { VideoPreviewModal } from "./VideoPreviewModal";
@@ -19,6 +21,7 @@ import {
 import type {
   ProjectManagerRow,
   Account,
+  CopyrightCheckResult,
   FacebookCheckResult,
   YouTubeCheckResult,
   UploadDurationStrategy,
@@ -34,6 +37,7 @@ interface PendingUploadContext {
   accountId?: string;
   facebookStrategy?: UploadDurationStrategy;
   youtubeStrategy?: UploadDurationStrategy;
+  copyrightAudioPath?: string;
 }
 
 const LOAD_RETRY_DELAY_MS = 1000;
@@ -93,6 +97,10 @@ export function ProjectManagerModal({
   const [youtubeCheck, setYouTubeCheck] = useState<{
     context: PendingUploadContext;
     result: YouTubeCheckResult;
+  } | null>(null);
+  const [copyrightCheck, setCopyrightCheck] = useState<{
+    context: PendingUploadContext;
+    result: CopyrightCheckResult;
   } | null>(null);
   const [pendingUpload, setPendingUpload] =
     useState<PendingUploadContext | null>(null);
@@ -202,6 +210,7 @@ export function ProjectManagerModal({
 
   useEffect(() => {
     if (!open) {
+      setCopyrightCheck(null);
       setFacebookCheck(null);
       setYouTubeCheck(null);
       setPendingUpload(null);
@@ -325,6 +334,7 @@ export function ProjectManagerModal({
       accountId?: string,
       facebookStrategy?: UploadDurationStrategy,
       youtubeStrategy?: UploadDurationStrategy,
+      copyrightAudioPath?: string,
     ) => {
       setActiveUploadId(projectId);
       setUploadMessage("Starting upload...");
@@ -335,6 +345,7 @@ export function ProjectManagerModal({
           accountId,
           facebookStrategy,
           youtubeStrategy,
+          copyrightAudioPath,
         );
         await readSSEStream(response, (event) => {
           if (event.message) setUploadMessage(event.message);
@@ -368,6 +379,7 @@ export function ProjectManagerModal({
         context.accountId,
         context.facebookStrategy,
         context.youtubeStrategy,
+        context.copyrightAudioPath,
       );
     },
     [runUpload],
@@ -403,15 +415,15 @@ export function ProjectManagerModal({
     [finalizeUpload],
   );
 
-  const startUploadWithChecks = useCallback(
-    async (projectId: string, accountId?: string) => {
-      const context: PendingUploadContext = { projectId, accountId };
+  const continueUploadAfterCopyright = useCallback(
+    async (context: PendingUploadContext) => {
+      setCopyrightCheck(null);
       setError(null);
       setPendingUpload(context);
-      setActiveUploadId(projectId);
+      setActiveUploadId(context.projectId);
       setUploadMessage("Vérification de la durée Facebook...");
       try {
-        const result = await api.checkFacebookDuration(projectId, accountId);
+        const result = await api.checkFacebookDuration(context.projectId, context.accountId);
         if (result.needed) {
           setFacebookCheck({ context, result });
           setUploadMessage(null);
@@ -429,6 +441,31 @@ export function ProjectManagerModal({
       }
     },
     [continueUploadAfterFacebook],
+  );
+
+  const startUploadWithChecks = useCallback(
+    async (projectId: string, accountId?: string) => {
+      const context: PendingUploadContext = { projectId, accountId };
+      setError(null);
+      setPendingUpload(context);
+      setActiveUploadId(projectId);
+      setUploadMessage("Vérification des droits musicaux...");
+      try {
+        const result = await api.checkCopyright(projectId, accountId);
+        if (result.copyrighted) {
+          setCopyrightCheck({ context, result });
+          setUploadMessage(null);
+          setActiveUploadId(null);
+          return;
+        }
+      } catch (err) {
+        console.warn("Copyright check failed, proceeding:", err);
+      }
+      setUploadMessage(null);
+      setActiveUploadId(null);
+      continueUploadAfterCopyright(context);
+    },
+    [continueUploadAfterCopyright],
   );
 
   const handleFacebookChoice = useCallback(
@@ -454,6 +491,28 @@ export function ProjectManagerModal({
     },
     [finalizeUpload, youtubeCheck],
   );
+
+  const handleCopyrightConfirm = useCallback(
+    (copyrightAudioPath: string | null) => {
+      if (!copyrightCheck) return;
+      const context: PendingUploadContext = {
+        ...copyrightCheck.context,
+        copyrightAudioPath: copyrightAudioPath ?? undefined,
+      };
+      continueUploadAfterCopyright(context);
+    },
+    [copyrightCheck, continueUploadAfterCopyright],
+  );
+
+  const handleCopyrightContinueOriginal = useCallback(() => {
+    if (!copyrightCheck) return;
+    continueUploadAfterCopyright(copyrightCheck.context);
+  }, [copyrightCheck, continueUploadAfterCopyright]);
+
+  const handleCopyrightCancel = useCallback(() => {
+    setCopyrightCheck(null);
+    clearPendingUploadFlow();
+  }, [clearPendingUploadFlow]);
 
   const handleUploadClick = useCallback(
     (row: ProjectManagerRow) => {
@@ -721,6 +780,26 @@ export function ProjectManagerModal({
             onChoice={handleYouTubeChoice}
             onClose={handleDurationModalClose}
           />
+
+          {/* Copyright music modal */}
+          {copyrightCheck?.result.no_music_available ? (
+            <CopyrightMusicModal
+              open={!!copyrightCheck}
+              projectId={copyrightCheck.context.projectId}
+              musicDisplayName={copyrightCheck.result.music_display_name!}
+              noMusicFileId={copyrightCheck.result.no_music_file_id!}
+              availableMusics={copyrightCheck.result.available_musics!}
+              onConfirm={handleCopyrightConfirm}
+              onCancel={handleCopyrightCancel}
+            />
+          ) : copyrightCheck ? (
+            <CopyrightWarningModal
+              open
+              musicDisplayName={copyrightCheck.result.music_display_name!}
+              onContinueWithOriginal={handleCopyrightContinueOriginal}
+              onCancel={handleCopyrightCancel}
+            />
+          ) : null}
 
           {/* Scheduled delete confirmation */}
           <ScheduledDeleteConfirm

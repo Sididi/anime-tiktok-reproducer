@@ -23,6 +23,7 @@ from .export_service import ExportService
 from .google_drive_service import GoogleDriveService
 from .metadata import MetadataService
 from .meta_token_service import MetaTokenService
+from .music_config_service import MusicConfigService
 from .project_service import ProjectService
 from .scheduling_service import SchedulingService
 from .social_upload_service import PlatformUploadResult, SocialUploadService
@@ -519,6 +520,7 @@ class UploadPhaseService:
         platforms: list[str] | None = None,
         facebook_strategy: str | None = None,
         youtube_strategy: str | None = None,
+        copyright_audio_path: str | None = None,
     ) -> dict[str, Any]:
         project = ProjectService.load(project_id)
         if not project:
@@ -576,6 +578,20 @@ class UploadPhaseService:
             local_video_path = Path(tmp_dir) / (readiness.drive_video_name or "final_video.mp4")
             GoogleDriveService.download_file(readiness.drive_video_id, local_video_path)
 
+            # When copyright audio replacement is active, re-mux the video with the
+            # new audio track.  We keep the *original* direct_drive_download URL for
+            # the Discord message (TikTok uses the original copyrighted audio), but
+            # disable the GDrive fast-path so Facebook/YouTube get the local file.
+            force_local_upload = False
+            if copyright_audio_path:
+                audio_path = Path(copyright_audio_path)
+                if not audio_path.exists():
+                    raise ValueError("Copyright replacement audio file not found")
+                replaced_video = Path(tmp_dir) / "copyright_replaced.mp4"
+                cls._replace_video_audio(local_video_path, audio_path, replaced_video)
+                local_video_path = replaced_video
+                force_local_upload = True
+
             jobs: dict[str, Any] = {}
             instagram_enabled = bool((settings.n8n_webhook_url or "").strip())
 
@@ -621,12 +637,13 @@ class UploadPhaseService:
                 if "facebook" in requested_platforms:
                     _fb_strategy = facebook_strategy  # capture for lambda
                     _fb_prep_dir = cls._facebook_prep_dir(project_id)
+                    _fb_video_url = None if force_local_upload else direct_drive_download
                     jobs["facebook"] = lambda: SocialUploadService.upload_facebook(
                         video_path=local_video_path,
                         subtitle_path=subtitle_path,
                         subtitle_locale=subtitle_locale,
                         metadata=metadata,
-                        video_url=direct_drive_download,
+                        video_url=_fb_video_url,
                         page_id=meta_creds.page_id,
                         page_access_token=meta_creds.facebook_page_access_token,
                         scheduled_at=scheduled_at,
@@ -658,12 +675,13 @@ class UploadPhaseService:
                 if "facebook" in requested_platforms:
                     _fb_strategy_global = facebook_strategy
                     _fb_prep_dir_global = cls._facebook_prep_dir(project_id)
+                    _fb_video_url_global = None if force_local_upload else direct_drive_download
                     jobs["facebook"] = lambda: SocialUploadService.upload_facebook(
                         video_path=local_video_path,
                         subtitle_path=subtitle_path,
                         subtitle_locale=subtitle_locale,
                         metadata=metadata,
-                        video_url=direct_drive_download,
+                        video_url=_fb_video_url_global,
                         facebook_strategy=_fb_strategy_global,
                         facebook_prep_dir=_fb_prep_dir_global,
                     )
@@ -723,7 +741,7 @@ class UploadPhaseService:
         final_message = DiscordService.post_message(
             cls._format_upload_discord_message(
                 project=project,
-                drive_download_url=direct_drive_download,
+                drive_download_url=direct_drive_download or drive_video_url,
                 platform_results=platform_results,
                 youtube_title=metadata.youtube.title,
                 youtube_description=metadata.youtube.description,
@@ -847,6 +865,8 @@ class UploadPhaseService:
     _LEGACY_YOUTUBE_PREP_CACHE_DIR = (
         settings.data_dir.parent / "backend" / "data" / "cache" / "youtube_prep"
     )
+    _COPYRIGHT_AUDIO_CACHE_DIR = settings.cache_dir / "copyright_audio"
+    _COPYRIGHT_AUDIO_MAX_AGE_SECONDS = 7200
 
     @classmethod
     def _normalize_legacy_prep_cache_dir(cls, cache_dir: Path, legacy_cache_dir: Path) -> Path:
@@ -885,6 +905,12 @@ class UploadPhaseService:
             cls._YOUTUBE_PREP_CACHE_DIR,
             cls._LEGACY_YOUTUBE_PREP_CACHE_DIR,
         ) / project_id
+
+    @classmethod
+    def _copyright_audio_dir(cls, project_id: str) -> Path:
+        d = cls._COPYRIGHT_AUDIO_CACHE_DIR / project_id
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
     @classmethod
     def _cleanup_prep_dir(cls, prep_dir: Path) -> None:
@@ -935,6 +961,13 @@ class UploadPhaseService:
                 cls._LEGACY_YOUTUBE_PREP_CACHE_DIR,
             ),
             cls._YOUTUBE_PREP_MAX_AGE_SECONDS,
+        )
+
+    @classmethod
+    def cleanup_stale_copyright_audio(cls) -> None:
+        cls._cleanup_stale_prep_cache(
+            cls._COPYRIGHT_AUDIO_CACHE_DIR,
+            cls._COPYRIGHT_AUDIO_MAX_AGE_SECONDS,
         )
 
     @classmethod
@@ -1131,3 +1164,116 @@ class UploadPhaseService:
         if cleanup_warnings:
             result["cleanup_warnings"] = cleanup_warnings
         return result
+
+    # ── Copyright music replacement ──────────────────────────────────────
+
+    @classmethod
+    def check_copyright(cls, project_id: str, account_id: str | None = None) -> dict[str, Any]:
+        project = ProjectService.load(project_id)
+        if not project:
+            raise ValueError("Project not found")
+
+        if not project.music_key:
+            return {"copyrighted": False}
+
+        try:
+            music = MusicConfigService.get_music(project.music_key)
+        except ValueError:
+            return {"copyrighted": False}
+
+        if not music.copyright:
+            return {"copyrighted": False}
+
+        # Look for output_no_music.wav in GDrive folder
+        readiness = cls.compute_readiness(project)
+        no_music_file_id = None
+        no_music_available = False
+
+        if readiness.drive_folder_id:
+            try:
+                children = GoogleDriveService.list_children(readiness.drive_folder_id)
+                for child in children:
+                    if child.get("name") == "output_no_music.wav":
+                        no_music_file_id = child["id"]
+                        no_music_available = True
+                        break
+            except Exception:
+                pass
+
+        available = MusicConfigService.list_non_copyrighted()
+        available_musics = [{"key": m.key, "display_name": m.display_name} for m in available]
+
+        return {
+            "copyrighted": True,
+            "music_key": project.music_key,
+            "music_display_name": music.display_name,
+            "no_music_file_id": no_music_file_id,
+            "no_music_available": no_music_available,
+            "available_musics": available_musics,
+            "drive_video_id": readiness.drive_video_id,
+        }
+
+    @classmethod
+    def build_copyright_audio(cls, project_id: str, music_key: str | None, no_music_file_id: str) -> Path:
+        from pydub import AudioSegment
+
+        prep_dir = cls._copyright_audio_dir(project_id)
+
+        # Download output_no_music.wav from GDrive (cached)
+        no_music_path = prep_dir / "output_no_music.wav"
+        if not no_music_path.exists():
+            GoogleDriveService.download_file(no_music_file_id, no_music_path)
+
+        if music_key is None:
+            # No music - use output_no_music.wav as-is
+            output_path = prep_dir / "copyright_replacement_no_music.wav"
+            if not output_path.exists():
+                shutil.copy2(no_music_path, output_path)
+            return output_path
+
+        # Mix with replacement music
+        music = MusicConfigService.get_music(music_key)
+        music_file = Path(music.file_path)
+        if not music_file.exists():
+            raise ValueError(f"Music file not found: {music.file_path}")
+
+        output_path = prep_dir / f"copyright_replacement_{music_key}.wav"
+
+        no_music_audio = AudioSegment.from_file(str(no_music_path))
+        music_audio = AudioSegment.from_file(str(music_file))
+        target_len = len(no_music_audio)
+
+        if len(music_audio) < target_len:
+            repeats = (target_len // len(music_audio)) + 1
+            music_audio = music_audio * repeats
+        music_audio = music_audio[:target_len]
+        music_audio = music_audio + music.volume_db
+        music_audio = music_audio.fade_out(2000)
+        result = no_music_audio.overlay(music_audio)
+
+        result.export(str(output_path), format="wav")
+        return output_path
+
+    @staticmethod
+    def _replace_video_audio(video_path: Path, audio_path: Path, output_path: Path) -> None:
+        import subprocess
+        from ..utils.media_binaries import rewrite_media_command, get_media_subprocess_env
+
+        cmd = rewrite_media_command([
+            "ffmpeg", "-y",
+            "-i", str(video_path),
+            "-i", str(audio_path),
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "48000",
+            "-shortest",
+            str(output_path),
+        ])
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            env=get_media_subprocess_env(cmd),
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg audio replacement failed: {result.stderr.decode()}")

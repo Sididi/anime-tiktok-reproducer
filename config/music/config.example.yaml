@@ -10,8 +10,10 @@ musics:
     display_name: "Epic Battle"
     file_path: "/absolute/path/to/epic_battle.mp3"
     volume_db: -12
+    copyright: true  # true = copyrighted, will be replaced on platforms that detect it
 
   chill_vibes:
     display_name: "Chill Vibes"
     file_path: "/absolute/path/to/chill_vibes.mp3"
     volume_db: -14
+    copyright: false  # false (default) = royalty-free, safe for all platforms

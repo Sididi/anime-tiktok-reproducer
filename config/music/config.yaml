@@ -15,6 +15,7 @@ music:
     display_name: "La leçon particulière"
     file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/la lecon particuliere.wav"
     volume_db: -30
+    copyright: true
 
   royalty:
     display_name: "Royalty"
@@ -40,3 +41,4 @@ music:
     display_name: "Night Cruising"
     file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/night cruising.wav"
     volume_db: -30
+    copyright: true

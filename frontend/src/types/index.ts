@@ -186,6 +186,16 @@ export interface YouTubeCheckResult {
   sped_up_available: boolean;
 }
 
+export interface CopyrightCheckResult {
+  copyrighted: boolean;
+  music_key?: string | null;
+  music_display_name?: string | null;
+  no_music_file_id?: string | null;
+  no_music_available?: boolean;
+  available_musics?: { key: string; display_name: string }[];
+  drive_video_id?: string | null;
+}
+
 export interface Account {
   id: string;
   name: string;

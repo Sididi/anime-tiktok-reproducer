@@ -16,6 +16,7 @@ class MusicEntry:
     display_name: str
     file_path: str
     volume_db: float
+    copyright: bool
 
 
 @dataclass(frozen=True)
@@ -70,12 +71,17 @@ class MusicConfigService:
             if volume_db < -30 or volume_db > 0:
                 raise ValueError(f"Music '{key}' volume_db must be between -30 and 0")
 
+            copyright_raw = value.get("copyright", False)
+            if not isinstance(copyright_raw, bool):
+                raise ValueError(f"Music '{key}' copyright must be a boolean")
+
             normalized_key = key.strip()
             musics[normalized_key] = MusicEntry(
                 key=normalized_key,
                 display_name=display_name.strip(),
                 file_path=file_path.strip(),
                 volume_db=volume_db,
+                copyright=copyright_raw,
             )
 
         if default_key is not None:
@@ -122,3 +128,8 @@ class MusicConfigService:
         if music is None:
             raise ValueError(f"Unknown music key '{music_key}'")
         return music
+
+    @classmethod
+    def list_non_copyrighted(cls) -> list[MusicEntry]:
+        config = cls.get_config()
+        return [m for m in config.musics.values() if not m.copyright]

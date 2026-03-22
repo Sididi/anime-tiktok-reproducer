@@ -95,6 +95,7 @@ export const api = {
     accountId?: string,
     facebookStrategy?: string,
     youtubeStrategy?: string,
+    copyrightAudioPath?: string,
   ) =>
     fetch(`${API_BASE}/project-manager/projects/${projectId}/upload`, {
       method: "POST",
@@ -103,6 +104,7 @@ export const api = {
         account_id: accountId ?? null,
         facebook_strategy: facebookStrategy ?? null,
         youtube_strategy: youtubeStrategy ?? null,
+        copyright_audio_path: copyrightAudioPath ?? null,
       }),
     }),
 
@@ -129,6 +131,30 @@ export const api = {
 
   getYouTubePreviewUrl: (projectId: string, version: "original" | "sped_up") =>
     `${API_BASE}/project-manager/projects/${projectId}/youtube-preview/${version}`,
+
+  checkCopyright: (projectId: string, accountId?: string) =>
+    request<import("@/types").CopyrightCheckResult>(
+      `/project-manager/projects/${projectId}/copyright-check`,
+      {
+        method: "POST",
+        body: JSON.stringify({ account_id: accountId ?? null }),
+      },
+    ),
+
+  buildCopyrightAudio: (projectId: string, musicKey: string | null, noMusicFileId: string) =>
+    request<{ audio_path: string }>(
+      `/project-manager/projects/${projectId}/copyright-build-audio`,
+      {
+        method: "POST",
+        body: JSON.stringify({ music_key: musicKey, no_music_file_id: noMusicFileId }),
+      },
+    ),
+
+  getCopyrightAudioUrl: (projectId: string) =>
+    `${API_BASE}/project-manager/projects/${projectId}/copyright-audio`,
+
+  getCopyrightVideoUrl: (projectId: string) =>
+    `${API_BASE}/project-manager/projects/${projectId}/copyright-video`,
 
   deleteManagedProject: (projectId: string) =>
     request<{ status: string; local_deleted: boolean; drive_deleted: boolean }>(
