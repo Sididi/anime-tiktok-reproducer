@@ -100,6 +100,24 @@ class ScriptAutomationService:
         return normalized.public_payload
 
     @classmethod
+    def _coerce_generated_script_payload(
+        cls,
+        *,
+        payload: Any,
+        target_language: str,
+    ) -> dict[str, Any]:
+        if isinstance(payload, dict):
+            return payload
+
+        if isinstance(payload, list):
+            return {
+                "language": (target_language or "").strip().lower() or "fr",
+                "scenes": payload,
+            }
+
+        raise RuntimeError("Gemini script JSON root must be an object or an array of scenes")
+
+    @classmethod
     def _script_text_from_payload(cls, script_payload: dict[str, Any]) -> str:
         scenes = script_payload.get("scenes")
         if not isinstance(scenes, list):
@@ -818,7 +836,7 @@ class ScriptAutomationService:
                     target_language=target_language,
                 )
                 raw_script_payload = await asyncio.to_thread(
-                    GeminiService.generate_json,
+                    GeminiService.generate_json_value,
                     prompt,
                     response_json_schema=cls._script_response_schema(
                         target_language=target_language,
@@ -826,7 +844,10 @@ class ScriptAutomationService:
                     ),
                 )
                 script_payload = cls._normalize_script_payload(
-                    payload=raw_script_payload,
+                    payload=cls._coerce_generated_script_payload(
+                        payload=raw_script_payload,
+                        target_language=target_language,
+                    ),
                     transcription=transcription,
                     target_language=target_language,
                 )

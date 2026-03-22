@@ -1,4 +1,4 @@
-default_voice_key: victor
+default_voice_key: sebastien
 
 voices:
   victor:
@@ -86,6 +86,22 @@ voices:
       similarity_boost: 0.75
       style: 0.0
       speed: 1.05
+      use_speaker_boost: true
+    auto_editor_overrides:
+      threshold: "0.065"
+      margin: "0.02sec,0.12sec"
+
+  sebastien:
+    display_name: "Sébastien"
+    elevenlabs_voice_id: "BUJMBsQ3Oq4cEeWSb48y"
+    model_id: "eleven_v3"
+    languages: ["fr"]
+    voice_settings:
+      stability: 0.5
+      similarity_boost: 0.75
+      style: 0.0
+      #speed: 1.05
+      speed: 1.0
       use_speaker_boost: true
     auto_editor_overrides:
       threshold: "0.065"

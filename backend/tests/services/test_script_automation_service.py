@@ -85,6 +85,70 @@ async def test_stream_automation_pauses_before_phase_2(monkeypatch, tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_stream_automation_coerces_top_level_scene_array_from_gemini(
+    monkeypatch,
+    tmp_path: Path,
+):
+    monkeypatch.setattr(settings, "projects_dir", tmp_path)
+    monkeypatch.setattr(settings, "script_automate_enabled", True)
+    monkeypatch.setattr(ProjectService, "load", lambda project_id: _build_project())
+    monkeypatch.setattr(ProjectService, "load_transcription", lambda project_id: _build_transcription())
+    monkeypatch.setattr(
+        VoiceConfigService,
+        "get_voice",
+        lambda voice_key: SimpleNamespace(
+            elevenlabs_voice_id="voice-id",
+            voice_settings={},
+            model_id=None,
+        ),
+    )
+    monkeypatch.setattr(GeminiService, "is_configured", lambda: True)
+
+    def fake_generate_content(**kwargs):
+        return {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "text": '[{"scene_index": 1, "text": "Script généré depuis un tableau."}]'
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(GeminiService, "_generate_content", fake_generate_content)
+
+    events = await _collect_events(
+        project_id="proj123",
+        target_language="fr",
+        voice_key="voice-a",
+        skip_metadata=True,
+        skip_tts=True,
+        pause_after_script=True,
+    )
+
+    assert [event["event"] for event in events] == [
+        "starting",
+        "llm_script",
+        "llm_script",
+        "script_ready",
+    ]
+    assert events[-1]["status"] == "paused"
+    assert events[-1]["script_json"] == {
+        "language": "fr",
+        "scenes": [
+            {
+                "scene_index": 1,
+                "text": "Script généré depuis un tableau.",
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
 async def test_stream_automation_resume_uses_edited_script_for_tts_metadata_and_overlay(
     monkeypatch,
     tmp_path: Path,

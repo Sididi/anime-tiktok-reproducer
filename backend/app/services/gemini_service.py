@@ -186,6 +186,29 @@ class GeminiService:
         return "\n".join(lines).strip()
 
     @classmethod
+    def _parse_json_value(cls, raw: str) -> Any:
+        stripped = cls._strip_json_fence(raw)
+        decoder = json.JSONDecoder()
+
+        try:
+            parsed, end = decoder.raw_decode(stripped)
+            if not stripped[end:].strip():
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+        for idx, char in enumerate(stripped):
+            if char not in "[{":
+                continue
+            try:
+                parsed, _ = decoder.raw_decode(stripped[idx:])
+                return parsed
+            except json.JSONDecodeError:
+                continue
+
+        raise RuntimeError("Unable to parse Gemini JSON response")
+
+    @classmethod
     def generate_text(
         cls,
         prompt: str,
@@ -209,6 +232,23 @@ class GeminiService:
         model: str | None = None,
         response_json_schema: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        parsed = cls.generate_json_value(
+            prompt,
+            model=model,
+            response_json_schema=response_json_schema,
+        )
+        if isinstance(parsed, dict):
+            return parsed
+        raise RuntimeError("Gemini JSON response must be a JSON object")
+
+    @classmethod
+    def generate_json_value(
+        cls,
+        prompt: str,
+        *,
+        model: str | None = None,
+        response_json_schema: dict[str, Any] | None = None,
+    ) -> Any:
         has_schema = response_json_schema is not None
         used_schema = response_json_schema
 
@@ -244,30 +284,7 @@ class GeminiService:
             )
             raw = cls._extract_text(payload)
 
-        stripped = cls._strip_json_fence(raw)
-
-        # First attempt: parse full payload as-is.
-        try:
-            parsed = json.loads(stripped)
-            if isinstance(parsed, dict):
-                return parsed
-            raise RuntimeError("Gemini JSON response must be a JSON object")
-        except json.JSONDecodeError:
-            pass
-
-        # Fallback: extract outer-most JSON object from noisy output.
-        start = stripped.find("{")
-        end = stripped.rfind("}")
-        if start >= 0 and end > start:
-            candidate = stripped[start : end + 1]
-            try:
-                parsed = json.loads(candidate)
-                if isinstance(parsed, dict):
-                    return parsed
-            except json.JSONDecodeError:
-                pass
-
-        raise RuntimeError("Unable to parse Gemini JSON response")
+        return cls._parse_json_value(raw)
 
     @classmethod
     def check_api_health(cls) -> dict[str, Any]:
