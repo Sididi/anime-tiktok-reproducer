@@ -30,8 +30,17 @@ class IndexationQueueService:
         anime_name: str | None,
         fps: float,
     ) -> str:
+        source_name = anime_name or Path(source_path).name
+        for existing_job in self._jobs.values():
+            if (
+                existing_job.library_type == library_type
+                and existing_job.source_name == source_name
+                and existing_job.status in {"queued", "indexing"}
+            ):
+                return existing_job.id
+
         job = IndexationJob(
-            source_name=anime_name or Path(source_path).name,
+            source_name=source_name,
             library_type=library_type,
             source_path=source_path,
             fps=fps,

@@ -28,6 +28,11 @@ from anime_searcher.indexer.pipeline import FileStartedEvent, IndexedFileResult,
 
 
 RUNNER = CliRunner()
+FAULTY_PROJECT_SERIES = {
+    "Bokura no Ameiro Protocol (Protocol Rain)": "Bokura_no_Ameiro_Protocol__Protocol_Rain_d6306a28",
+    "Tougen Anki": "Tougen_Anki_9f8b2809",
+    "Yamada-kun to Lv999 no Koi wo Suru (My Love Story)": "Yamada-kun_to_Lv999_no_Koi_wo_Suru__My_Love_Story_c136df76",
+}
 
 
 def _write_manifest(tmp_path: Path, *paths: Path) -> Path:
@@ -413,6 +418,54 @@ def test_update_only_indexes_new_files_and_skips_unchanged(monkeypatch: pytest.M
     assert manager.total_frames == 5
 
 
+def test_save_merges_series_added_from_stale_snapshots(tmp_path: Path) -> None:
+    library_path = tmp_path / "library" / "anime"
+    existing_dir = library_path / "Existing"
+    existing_dir.mkdir(parents=True)
+    existing_file = existing_dir / "ep0.mp4"
+    existing_file.write_bytes(b"seed")
+    seed_manager = IndexManager(library_path)
+    seed_manager.load_or_create(2.0)
+    seed_manager.set_series_fps("Existing", 2.0)
+    seed_manager.add_file_embeddings(_make_vectors(1, 0), "Existing", "ep0", existing_file, [0.0])
+    seed_manager.update_file_state(existing_file, 1)
+    seed_manager.save()
+
+    first_manager = IndexManager(library_path)
+    first_manager.load_or_create(2.0)
+    second_manager = IndexManager(library_path)
+    second_manager.load_or_create(2.0)
+
+    alpha_dir = library_path / "Alpha"
+    alpha_dir.mkdir()
+    alpha_file = alpha_dir / "ep1.mp4"
+    alpha_file.write_bytes(b"alpha")
+    first_manager.set_series_fps("Alpha", 2.0)
+    first_manager.add_file_embeddings(_make_vectors(1, 10), "Alpha", "ep1", alpha_file, [0.0])
+    first_manager.update_file_state(alpha_file, 1)
+
+    beta_dir = library_path / "Beta"
+    beta_dir.mkdir()
+    beta_file = beta_dir / "ep1.mp4"
+    beta_file.write_bytes(b"beta")
+    second_manager.set_series_fps("Beta", 2.0)
+    second_manager.add_file_embeddings(_make_vectors(1, 20), "Beta", "ep1", beta_file, [0.0])
+    second_manager.update_file_state(beta_file, 1)
+
+    first_manager.save()
+    second_manager.save()
+
+    merged_manager = IndexManager(library_path)
+    merged_manager.load_or_create()
+
+    assert set(merged_manager.get_series_list()) == {"Alpha", "Beta", "Existing"}
+    assert set(merged_manager.state) == {
+        "Alpha/ep1.mp4",
+        "Beta/ep1.mp4",
+        "Existing/ep0.mp4",
+    }
+
+
 def test_update_replaces_existing_file_without_duplicate_frames(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     library_root = tmp_path / "library"
     library_path = library_root / "anime"
@@ -749,3 +802,16 @@ def test_seeded_index_uses_v4_manifest(tmp_path: Path) -> None:
     payload = json.loads((library_path / ".index" / "manifest.json").read_text())
     assert payload["version"] == INDEX_FORMAT_VERSION
     assert payload["engine_profile"] == INDEX_ENGINE_PROFILE
+
+
+def test_checked_in_project_library_excludes_removed_faulty_series() -> None:
+    library_path = REPO_ROOT / "modules" / "anime_searcher" / "library" / "anime"
+    if not library_path.exists():
+        library_path = REPO_ROOT.parent.parent / "modules" / "anime_searcher" / "library" / "anime"
+    shard_dir = library_path / ".index" / "series"
+
+    present_series_dirs = {path.name for path in library_path.iterdir() if path.is_dir() and not path.name.startswith(".")}
+    present_shards = {path.name for path in shard_dir.iterdir() if path.is_dir()}
+
+    assert present_series_dirs.isdisjoint(FAULTY_PROJECT_SERIES)
+    assert present_shards.isdisjoint(set(FAULTY_PROJECT_SERIES.values()))
