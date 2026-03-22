@@ -305,6 +305,11 @@ def _find_first_video_dir(root: Path) -> str | None:
     return None
 
 
+def _batch_episode_stems(video_names: list[str]) -> set[str]:
+    """Normalize batch comparison to logical episode names without extensions."""
+    return {Path(video_name).stem for video_name in video_names}
+
+
 def _validate_batch_folders_sync(
     paths: list[str],
     library_type: LibraryType,
@@ -376,8 +381,8 @@ def _validate_batch_folders_sync(
                 pass
 
             # Compare source folder videos with library videos
-            source_set = set(source_videos) if has_videos else set()
-            library_set = set(library_videos)
+            source_set = _batch_episode_stems(source_videos) if has_videos else set()
+            library_set = _batch_episode_stems(library_videos)
 
             new_episodes = sorted(source_set - library_set)
             removed_episodes = sorted(library_set - source_set)
@@ -385,6 +390,7 @@ def _validate_batch_folders_sync(
             if not new_episodes and not removed_episodes:
                 index_status = "exact_match"
             else:
+                # Conflict details list logical episode ids, not container-specific filenames.
                 index_status = "conflict"
                 conflict_details = {
                     "new_episodes": new_episodes,
