@@ -116,6 +116,20 @@ class GoogleDriveService:
         return cached_client
 
     @classmethod
+    def reset_client(cls) -> None:
+        """Drop the current thread-local Drive client so the next request rebuilds it."""
+        cached_client = getattr(cls._client_local, "client", None)
+        http = getattr(cached_client, "_http", None)
+        if http is not None and hasattr(http, "close"):
+            try:
+                http.close()
+            except Exception:
+                pass
+        for attr in ("client", "creds_ref"):
+            if hasattr(cls._client_local, attr):
+                delattr(cls._client_local, attr)
+
+    @classmethod
     def _client(cls):
         return cls.client()
 

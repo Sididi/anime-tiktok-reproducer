@@ -10,6 +10,7 @@ import logging
 import shutil
 import tempfile
 import os
+import time
 
 import requests
 
@@ -79,6 +80,53 @@ class UploadPhaseService:
     """Project manager view, upload execution, and managed delete flow."""
     _SUPPORTED_PLATFORMS = ("youtube", "facebook", "instagram")
     _FRENCH_TZ = ZoneInfo("Europe/Paris")
+    _drive_video_cache: dict[str, dict[str, Any]] = {}
+    _DRIVE_BATCH_LOOKUP_MAX_ATTEMPTS = 3
+
+    @classmethod
+    def _cache_drive_video(
+        cls,
+        *,
+        project_id: str,
+        folder_id: str | None,
+        folder_url: str | None,
+        video_files: list[dict[str, Any]],
+    ) -> None:
+        if not folder_id:
+            cls._drive_video_cache.pop(project_id, None)
+            return
+        if len(video_files) != 1:
+            cls._drive_video_cache.pop(project_id, None)
+            return
+        video = video_files[0]
+        cls._drive_video_cache[project_id] = {
+            "id": video.get("id"),
+            "name": video.get("name"),
+            "webViewLink": video.get("webViewLink"),
+            "folder_id": folder_id,
+            "folder_url": folder_url,
+        }
+
+    @classmethod
+    def _cached_drive_video(
+        cls,
+        *,
+        project_id: str,
+        folder_id: str | None,
+    ) -> dict[str, Any] | None:
+        cached = cls._drive_video_cache.get(project_id)
+        if not cached:
+            return None
+        cached_folder_id = cached.get("folder_id")
+        if folder_id and cached_folder_id and cached_folder_id != folder_id:
+            return None
+        if not cached.get("id"):
+            return None
+        return {
+            "id": cached.get("id"),
+            "name": cached.get("name"),
+            "webViewLink": cached.get("webViewLink"),
+        }
 
     @classmethod
     def _resolve_drive_folder(
@@ -122,6 +170,7 @@ class UploadPhaseService:
         folder_id: str | None,
         folder_url: str | None,
         video_files: list[dict[str, Any]],
+        video_lookup_failed: bool = False,
     ) -> UploadReadiness:
         reasons: list[str] = []
         if not folder_id:
@@ -133,7 +182,10 @@ class UploadPhaseService:
         if not metadata_exists:
             reasons.append("no metadata found")
         if video_count == 0:
-            reasons.append("no output video found")
+            if video_lookup_failed and folder_id:
+                reasons.append("unable to verify output video in Drive")
+            else:
+                reasons.append("no output video found")
         elif video_count > 1:
             reasons.append("more than one output video found (conflicting)")
 
@@ -162,17 +214,39 @@ class UploadPhaseService:
         folder_id, folder_url = cls._resolve_drive_folder(project)
 
         video_files: list[dict[str, Any]] = []
+        video_lookup_failed = False
         if folder_id:
             try:
                 video_files = ExportService.detect_upload_video_in_drive_root(folder_id)
-            except Exception:
-                video_files = []
+                cls._cache_drive_video(
+                    project_id=project.id,
+                    folder_id=folder_id,
+                    folder_url=folder_url,
+                    video_files=video_files,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Drive video lookup failed during upload readiness: project_id=%s folder_id=%s error=%s",
+                    project.id,
+                    folder_id,
+                    exc,
+                )
+                video_lookup_failed = True
+                cached_video = cls._cached_drive_video(
+                    project_id=project.id,
+                    folder_id=folder_id,
+                )
+                if cached_video is not None:
+                    video_files = [cached_video]
+                else:
+                    video_files = []
 
         return cls._build_readiness(
             metadata_exists=metadata_exists,
             folder_id=folder_id,
             folder_url=folder_url,
             video_files=video_files,
+            video_lookup_failed=video_lookup_failed,
         )
 
     @classmethod
@@ -181,23 +255,42 @@ class UploadPhaseService:
         cls._cross_overdue_upload_messages(projects)
         folder_candidates_by_name: dict[str, dict[str, Any]] = {}
         drive_root_videos: dict[str, list[dict[str, Any]]] = {}
+        drive_batch_lookup_failed = False
         if GoogleDriveService.is_configured():
-            drive = GoogleDriveService.client()
-            folder_candidates_by_name = GoogleDriveService.list_project_folders_under_parent(drive=drive)
-            folder_ids: list[str] = []
-            for project in projects:
-                folder_id, _ = cls._resolve_drive_folder(
-                    project,
-                    folder_candidates_by_name=folder_candidates_by_name,
-                    resolve_remote_url=False,
-                )
-                if folder_id:
-                    folder_ids.append(folder_id)
-            drive_root_videos = GoogleDriveService.list_root_video_files_by_parent_ids(
-                folder_ids,
-                ExportService.VIDEO_EXTENSIONS,
-                drive=drive,
-            )
+            for attempt in range(1, cls._DRIVE_BATCH_LOOKUP_MAX_ATTEMPTS + 1):
+                try:
+                    drive = GoogleDriveService.client()
+                    folder_candidates_by_name = GoogleDriveService.list_project_folders_under_parent(drive=drive)
+                    folder_ids: list[str] = []
+                    for project in projects:
+                        folder_id, _ = cls._resolve_drive_folder(
+                            project,
+                            folder_candidates_by_name=folder_candidates_by_name,
+                            resolve_remote_url=False,
+                        )
+                        if folder_id:
+                            folder_ids.append(folder_id)
+                    drive_root_videos = GoogleDriveService.list_root_video_files_by_parent_ids(
+                        folder_ids,
+                        ExportService.VIDEO_EXTENSIONS,
+                        drive=drive,
+                    )
+                    drive_batch_lookup_failed = False
+                    break
+                except Exception as exc:
+                    drive_batch_lookup_failed = True
+                    logger.warning(
+                        "Project manager Drive batch lookup failed: attempt=%d/%d error=%s",
+                        attempt,
+                        cls._DRIVE_BATCH_LOOKUP_MAX_ATTEMPTS,
+                        exc,
+                    )
+                    GoogleDriveService.reset_client()
+                    if attempt >= cls._DRIVE_BATCH_LOOKUP_MAX_ATTEMPTS:
+                        folder_candidates_by_name = {}
+                        drive_root_videos = {}
+                        break
+                    time.sleep(min(0.25 * attempt, 0.75))
 
         def _build_row(project: Project) -> dict[str, Any]:
             project_dir = ProjectService.get_project_dir(project.id)
@@ -207,11 +300,27 @@ class UploadPhaseService:
                 folder_candidates_by_name=folder_candidates_by_name if folder_candidates_by_name else None,
                 resolve_remote_url=False,
             )
+            video_files = drive_root_videos.get(folder_id or "", [])
+            if drive_batch_lookup_failed and folder_id and not video_files:
+                cached_video = cls._cached_drive_video(
+                    project_id=project.id,
+                    folder_id=folder_id,
+                )
+                if cached_video is not None:
+                    video_files = [cached_video]
+            if video_files or not drive_batch_lookup_failed:
+                cls._cache_drive_video(
+                    project_id=project.id,
+                    folder_id=folder_id,
+                    folder_url=folder_url,
+                    video_files=video_files,
+                )
             readiness = cls._build_readiness(
                 metadata_exists=metadata_exists,
                 folder_id=folder_id,
                 folder_url=folder_url,
-                video_files=drive_root_videos.get(folder_id or "", []),
+                video_files=video_files,
+                video_lookup_failed=drive_batch_lookup_failed,
             )
             return {
                 "project_id": project.id,

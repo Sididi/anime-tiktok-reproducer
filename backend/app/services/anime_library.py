@@ -543,6 +543,19 @@ class AnimeLibraryService:
             return None
         return fps
 
+    @staticmethod
+    def _parse_ffprobe_duration(raw_value: object) -> float | None:
+        raw = str(raw_value or "").strip()
+        if not raw:
+            return None
+        try:
+            duration = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if duration <= 0:
+            return None
+        return duration
+
     @classmethod
     def normalize_stream_language(
         cls,
@@ -724,7 +737,7 @@ class AnimeLibraryService:
                 "-show_entries",
                 (
                     "format=format_name,duration:"
-                    "stream=index,codec_type,codec_name,pix_fmt,avg_frame_rate,r_frame_rate:"
+                    "stream=index,codec_type,codec_name,pix_fmt,avg_frame_rate,r_frame_rate,duration:"
                     "stream_tags=language,title,handler_name:"
                     "stream_disposition=default"
                 ),
@@ -803,14 +816,21 @@ class AnimeLibraryService:
         if not isinstance(format_payload, dict):
             format_payload = {}
 
-        raw_duration = str(format_payload.get("duration", "")).strip()
-        duration: float | None = None
-        if raw_duration:
-            try:
-                parsed_duration = float(raw_duration)
-            except ValueError:
-                parsed_duration = 0.0
-            duration = parsed_duration if parsed_duration > 0 else None
+        duration = cls._parse_ffprobe_duration(format_payload.get("duration"))
+
+        av_durations: list[float] = []
+        video_duration = cls._parse_ffprobe_duration(video_stream.get("duration"))
+        if video_duration is not None:
+            av_durations.append(video_duration)
+        for stream in streams:
+            if not isinstance(stream, dict):
+                continue
+            if str(stream.get("codec_type", "")).strip().lower() != "audio":
+                continue
+            audio_duration = cls._parse_ffprobe_duration(stream.get("duration"))
+            if audio_duration is not None:
+                av_durations.append(audio_duration)
+        effective_duration = max(av_durations) if av_durations else duration
 
         fps = cls._parse_ffprobe_rate(video_stream.get("avg_frame_rate"))
         if fps is None:
@@ -827,7 +847,7 @@ class AnimeLibraryService:
                 audio_codec=None,
                 pix_fmt=str(video_stream.get("pix_fmt", "")).strip().lower() or None,
                 fps=fps,
-                duration=duration,
+                duration=effective_duration,
                 has_audio=bool(audio_streams),
                 audio_streams=tuple(audio_streams),
                 subtitle_streams=tuple(subtitle_streams),
@@ -848,7 +868,7 @@ class AnimeLibraryService:
             audio_codec=audio_codec,
             pix_fmt=str(video_stream.get("pix_fmt", "")).strip().lower() or None,
             fps=fps,
-            duration=duration,
+            duration=effective_duration,
             has_audio=bool(audio_streams),
             audio_streams=tuple(audio_streams),
             subtitle_streams=tuple(subtitle_streams),
@@ -1684,6 +1704,7 @@ class AnimeLibraryService:
         *,
         normalized_target_path: Path,
         original_source_path: Path,
+        subtitle_image_render_windows: dict[int, list[tuple[float, float]]] | None = None,
     ) -> None:
         if not normalized_target_path.exists():
             raise FileNotFoundError(f"Normalized source not found: {normalized_target_path}")
@@ -1696,6 +1717,7 @@ class AnimeLibraryService:
             source_path=original_source_path,
             normalized_target_path=normalized_target_path,
             probe=probe,
+            subtitle_image_render_windows=subtitle_image_render_windows,
         )
 
     @classmethod
@@ -2523,6 +2545,15 @@ class AnimeLibraryService:
         if existing_ready:
             return preferred_dest, "Using existing", False
 
+        # Probe source for subtitle streams before remux (MKV→MP4 drops them).
+        source_probe: SourceMediaProbe | None = None
+        if should_remux_mkv:
+            try:
+                source_probe = await asyncio.to_thread(cls._probe_media_sync, source_path)
+            except Exception as exc:
+                logger.debug("Could not probe %s for subtitles: %s", source_path.name, exc)
+                source_probe = None
+
         if should_remux_mkv:
             try:
                 remux_result = await run_command(
@@ -2574,6 +2605,27 @@ class AnimeLibraryService:
                 actual_dest = fallback_dest
         elif preferred_dest != source_path:
             await asyncio.to_thread(shutil.copy2, source_path, preferred_dest)
+
+        # Extract subtitles to sidecar before the original source is deleted.
+        # The source MKV has subtitle streams that are lost during MKV→MP4 remux
+        # (MP4 cannot hold ASS/PGS). Extract them now while we still have the source.
+        if (
+            source_probe is not None
+            and source_probe.subtitle_streams
+            and actual_dest.exists()
+        ):
+            try:
+                await cls._write_subtitle_sidecar(
+                    source_path=source_path,
+                    normalized_target_path=actual_dest,
+                    probe=source_probe,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to extract subtitle sidecar during import for %s: %s",
+                    source_path.name,
+                    exc,
+                )
 
         if dest_dir == source_path.parent and actual_dest == preferred_dest and preferred_dest != source_path:
             with suppress(OSError):
