@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -21,13 +22,22 @@ if str(SEARCHER_ROOT) not in sys.path:
 
 from anime_searcher import benchmark as benchmark_module
 from app.services.anime_library import AnimeLibraryService, IndexProgress
+from app.services.anime_matcher import AnimeMatcherService
 from anime_searcher import cli as cli_module
 from anime_searcher.config import EMBEDDING_DIM, INDEX_ENGINE_PROFILE, INDEX_FORMAT_VERSION
 from anime_searcher.indexer import embedder as embedder_module
 from anime_searcher.indexer import frame_extractor as frame_extractor_module
+from anime_searcher.indexer import index_manager as index_manager_module
 from anime_searcher.indexer.frame_extractor import DecodedFrameBatch, MediaBinaryProfile
 from anime_searcher.indexer.index_manager import IndexManager
-from anime_searcher.indexer.pipeline import FileStartedEvent, IndexedFileResult, IndexingJob, ParallelFileIndexer
+from anime_searcher.indexer.pipeline import (
+    FileStartedEvent,
+    IndexedFileResult,
+    IndexingJob,
+    ParallelFileIndexer,
+    SkippedFileResult,
+)
+from anime_searcher.searcher import query as query_module
 
 
 RUNNER = CliRunner()
@@ -373,6 +383,54 @@ def test_parallel_file_indexer_ffmpeg_cuda_falls_back_to_ffmpeg_cpu_on_decode_er
     assert isinstance(outputs[1], IndexedFileResult)
     assert outputs[1].timestamps == [0.0, 1.0]
     assert pipeline.decode_fallbacks == 1
+
+
+def test_parallel_file_indexer_skips_unreadable_file_instead_of_aborting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    video_path = tmp_path / "broken.mp4"
+    video_path.write_bytes(b"broken")
+
+    monkeypatch.setattr(
+        "anime_searcher.indexer.pipeline.extract_frames",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            frame_extractor_module.UnreadableVideoError("invalid media stream")
+        ),
+    )
+
+    class DummyEmbedder:
+        device = "cpu"
+        embedding_dim = EMBEDDING_DIM
+
+        def embed_preprocessed_batch(self, batch: torch.Tensor) -> np.ndarray:
+            return _make_vectors(batch.shape[0], 0)
+
+    pipeline = ParallelFileIndexer(
+        DummyEmbedder(),
+        batch_size=2,
+        prefetch_batches=2,
+        transform_workers=1,
+        file_workers=1,
+    )
+    outputs = list(
+        pipeline.run(
+            [
+                IndexingJob(
+                    video_path=video_path,
+                    series="Demo",
+                    episode="broken",
+                    fps=1.0,
+                )
+            ]
+        )
+    )
+    pipeline.close()
+
+    assert isinstance(outputs[0], FileStartedEvent)
+    assert isinstance(outputs[1], SkippedFileResult)
+    assert outputs[1].job.video_path == video_path
+    assert "invalid media stream" in outputs[1].error_message
 
 
 def test_run_benchmark_reports_decode_backend_and_precision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -723,7 +781,7 @@ def test_create_pipeline_prefers_torchcodec_cuda_and_single_gpu_worker(
             self.device = "cuda"
             self.model_path = received_model_path
             self.precision = precision
-            self.resolved_precision = "fp16"
+            self.resolved_precision = "fp32"
             self.warmed = False
 
         def warmup(self) -> None:
@@ -770,7 +828,7 @@ def test_create_pipeline_prefers_torchcodec_cuda_and_single_gpu_worker(
 
     assert embedder.model_path == model_path
     assert embedder.precision == "auto"
-    assert embedder.resolved_precision == "fp16"
+    assert embedder.resolved_precision == "fp32"
     assert pipeline.decode_backend == "torchcodec_cuda"
     assert pipeline.file_workers == 1
     assert selected_profile.name == "torchcodec_cuda"
@@ -874,7 +932,7 @@ def test_embedder_warmup_uses_scalar_resize_size_for_square_batch(
     assert seen_shapes == [(1, 3, 288, 288)]
 
 
-def test_embedder_auto_precision_uses_fp16_on_cuda(
+def test_embedder_auto_precision_uses_fp32_on_cuda(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -900,9 +958,9 @@ def test_embedder_auto_precision_uses_fp16_on_cuda(
 
     embedder = embedder_module.SSCDEmbedder(model_path, device="cuda", precision="auto")
 
-    assert embedder.resolved_precision == "fp16"
-    assert embedder.model_dtype == torch.float16
-    assert embedder.model.half_calls == 1
+    assert embedder.resolved_precision == "fp32"
+    assert embedder.model_dtype == torch.float32
+    assert embedder.model.half_calls == 0
 
 
 def test_embedder_rejects_unknown_precision(
@@ -996,6 +1054,79 @@ def test_index_progress_json_emits_structured_error_for_unexpected_pipeline_fail
             "progress": 1.0,
         }
     ]
+    assert "Traceback" not in result.output
+
+
+def test_index_progress_json_reports_unreadable_file_and_errors_when_all_files_are_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    library_root = tmp_path / "library"
+    series_dir = library_root / "anime" / "Demo"
+    series_dir.mkdir(parents=True)
+    (series_dir / "ep1.mp4").write_bytes(b"ep1")
+    model_path = _dummy_model(tmp_path)
+
+    class DummyEmbedder:
+        device = "cpu"
+        resolved_precision = "fp32"
+
+    class FakePipeline:
+        file_workers = 1
+        decode_backend = "ffmpeg_cpu"
+        decode_fallbacks = 0
+
+        def close(self) -> None:
+            return None
+
+        def run(self, jobs: list[IndexingJob]):
+            for job in jobs:
+                yield FileStartedEvent(job=job)
+                yield SkippedFileResult(
+                    job=job,
+                    error_message=(
+                        f"Unable to probe video stream for '{job.video_path.name}' via /usr/bin/ffprobe: "
+                        "Invalid data found when processing input"
+                    ),
+                )
+
+    monkeypatch.setattr(
+        cli_module,
+        "_create_pipeline",
+        lambda *args, **kwargs: (
+            DummyEmbedder(),
+            FakePipeline(),
+            MediaBinaryProfile("test", "/usr/bin/ffmpeg", "/usr/bin/ffprobe"),
+        ),
+    )
+
+    result = RUNNER.invoke(
+        cli_module.app,
+        [
+            "index",
+            str(library_root),
+            "--type",
+            "anime",
+            "--series",
+            "Demo",
+            "--model",
+            str(model_path),
+            "--progress-json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payloads = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    assert [payload["event"] for payload in payloads] == [
+        "start",
+        "file_started",
+        "file_skipped",
+        "error",
+    ]
+    assert payloads[2]["current_file"] == "Demo/ep1.mp4"
+    assert "Invalid data found when processing input" in payloads[2]["error"]
+    assert "No files were indexed." in payloads[3]["error"]
+    assert "ep1.mp4" in payloads[3]["error"]
     assert "Traceback" not in result.output
 
 
@@ -1461,6 +1592,61 @@ async def test_backend_index_anime_passes_decode_backend_and_precision_flags(
     assert "torchcodec_cuda" in captured_cmd
     assert "--precision" in captured_cmd
     assert "fp16" in captured_cmd
+
+
+def test_anime_matcher_init_searcher_uses_explicit_fp32_precision(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    library_path = tmp_path / "library"
+    library_path.mkdir()
+    model_path = _dummy_model(tmp_path)
+    captured: dict[str, object] = {}
+
+    class DummyIndexManager:
+        def __init__(self, received_library_path: Path) -> None:
+            captured["library_path"] = received_library_path
+
+        def load_or_create(self) -> None:
+            captured["load_or_create_called"] = True
+
+        def get_series_list(self) -> list[str]:
+            return ["Demo"]
+
+    class DummyEmbedder:
+        def __init__(
+            self,
+            received_model_path: Path,
+            *,
+            device: str | None = None,
+            precision: str = "auto",
+        ) -> None:
+            captured["model_path"] = received_model_path
+            captured["precision"] = precision
+            self.device = device or "cpu"
+            self.precision = precision
+            self.resolved_precision = precision
+
+    class DummyQueryProcessor:
+        def __init__(self, index_manager, embedder) -> None:
+            captured["query_processor_index_manager"] = index_manager
+            captured["query_processor_embedder"] = embedder
+
+    monkeypatch.setattr(AnimeMatcherService, "_index_manager", None)
+    monkeypatch.setattr(AnimeMatcherService, "_embedder", None)
+    monkeypatch.setattr(AnimeMatcherService, "_query_processor", None)
+    monkeypatch.setattr(AnimeMatcherService, "_loaded_library_path", None)
+    monkeypatch.setattr(AnimeMatcherService, "_loaded_library_type", None)
+    monkeypatch.setattr(AnimeMatcherService, "_stale_series", defaultdict(set))
+    monkeypatch.setattr(embedder_module, "SSCDEmbedder", DummyEmbedder)
+    monkeypatch.setattr(index_manager_module, "IndexManager", DummyIndexManager)
+    monkeypatch.setattr(query_module, "QueryProcessor", DummyQueryProcessor)
+    monkeypatch.setattr("app.services.anime_matcher.settings.sscd_model_path", model_path)
+
+    assert AnimeMatcherService._init_searcher(library_path, "anime", "Demo") is True
+    assert captured["load_or_create_called"] is True
+    assert captured["model_path"] == model_path
+    assert captured["precision"] == "fp32"
 
 
 @pytest.mark.asyncio
