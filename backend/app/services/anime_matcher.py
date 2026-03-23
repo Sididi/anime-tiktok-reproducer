@@ -134,7 +134,7 @@ class AnimeMatcherService:
 
             cls._index_manager = IndexManager(library_path)
             cls._index_manager.load_or_create()
-            cls._embedder = SSCDEmbedder(model_path)
+            cls._embedder = SSCDEmbedder(model_path, precision="fp32")
             cls._query_processor = QueryProcessor(cls._index_manager, cls._embedder)
             cls._loaded_library_path = library_path
             cls._loaded_library_type = scoped_type
