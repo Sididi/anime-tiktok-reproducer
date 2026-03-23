@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import tempfile
 from pathlib import Path
 from unittest import TestCase
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -21,8 +22,12 @@ def _make_probe(
     *,
     suffix: str = ".mkv",
     video_codec: str = "h264",
+    audio_streams: tuple[SourceMediaStream, ...] | None = None,
     subtitle_streams: tuple[SourceMediaStream, ...] = (),
 ) -> SourceMediaProbe:
+    resolved_audio_streams = audio_streams
+    if resolved_audio_streams is None:
+        resolved_audio_streams = (_audio_stream(index=1, stream_position=0, language="ja"),)
     return SourceMediaProbe(
         source_path=source_path,
         container_suffix=suffix,
@@ -32,20 +37,30 @@ def _make_probe(
         pix_fmt="yuv420p",
         fps=23.976,
         duration=1400.0,
-        has_audio=True,
-        audio_streams=(
-            SourceMediaStream(
-                index=1,
-                stream_position=0,
-                codec_type="audio",
-                codec_name="aac",
-                language="ja",
-                raw_language="jpn",
-                title=None,
-                handler_name=None,
-            ),
-        ),
+        has_audio=bool(resolved_audio_streams),
+        audio_streams=resolved_audio_streams,
         subtitle_streams=subtitle_streams,
+    )
+
+
+def _audio_stream(
+    *,
+    index: int,
+    stream_position: int,
+    language: str | None,
+    raw_language: str | None = None,
+    is_default: bool = False,
+) -> SourceMediaStream:
+    return SourceMediaStream(
+        index=index,
+        stream_position=stream_position,
+        codec_type="audio",
+        codec_name="aac",
+        language=language,
+        raw_language=raw_language or language,
+        title=None,
+        handler_name=None,
+        is_default=is_default,
     )
 
 
@@ -130,6 +145,7 @@ class TestSubtitleExtractionDuringImport(TestCase):
             AnimeLibraryService,
             "_record_source_import_manifest_sync",
         )
+        patches["replace"] = patch.object(Path, "replace")
         return patches, mock_write_sidecar, mock_run_cmd
 
     def test_mkv_with_ass_subtitles_creates_sidecar(self) -> None:
@@ -153,6 +169,7 @@ class TestSubtitleExtractionDuringImport(TestCase):
             patches["run_cmd"],
             patches["write_sidecar"],
             patches["record_manifest"],
+            patches["replace"],
             patch.object(Path, "exists", return_value=True),
             patch.object(Path, "unlink"),
         ):
@@ -188,6 +205,7 @@ class TestSubtitleExtractionDuringImport(TestCase):
             patches["run_cmd"],
             patches["write_sidecar"],
             patches["record_manifest"],
+            patches["replace"],
             patch.object(Path, "exists", return_value=True),
             patch.object(Path, "unlink"),
         ):
@@ -221,6 +239,7 @@ class TestSubtitleExtractionDuringImport(TestCase):
             patches["run_cmd"],
             patches["write_sidecar"],
             patches["record_manifest"],
+            patches["replace"],
             patch.object(Path, "exists", return_value=True),
             patch.object(Path, "unlink"),
             self.assertLogs("uvicorn.error", level="WARNING") as logs,
@@ -251,6 +270,7 @@ class TestSubtitleExtractionDuringImport(TestCase):
             patches["probe"] as mock_probe,
             patches["write_sidecar"],
             patches["record_manifest"],
+            patches["replace"],
             patch.object(Path, "exists", return_value=True),
             patch("shutil.copy2"),
         ):
@@ -286,6 +306,7 @@ class TestSubtitleExtractionDuringImport(TestCase):
             patches["run_cmd"],
             patches["write_sidecar"],
             patches["record_manifest"],
+            patches["replace"],
             patch.object(Path, "exists", return_value=True),
             patch.object(Path, "unlink"),
         ):
@@ -320,6 +341,7 @@ class TestSubtitleExtractionDuringImport(TestCase):
             patches["run_cmd"],
             patches["write_sidecar"],
             patches["record_manifest"],
+            patches["replace"],
         ):
             actual, action, changed = self._run(
                 AnimeLibraryService._prepare_single_source_for_library(
@@ -334,3 +356,178 @@ class TestSubtitleExtractionDuringImport(TestCase):
         mock_probe.assert_not_called()
         mock_write.assert_not_awaited()
         mock_cmd.assert_not_awaited()
+
+    def test_mkv_remux_maps_primary_video_and_all_audio_streams_only(self) -> None:
+        """Import remux keeps one video stream and every audio stream, not subtitles/data."""
+        source = Path("/tmp/test_src/episode.mkv")
+        dest_dir = Path("/tmp/test_lib/Anime")
+        probe = _make_probe(
+            source,
+            audio_streams=(
+                _audio_stream(index=1, stream_position=0, language="ja"),
+                _audio_stream(index=2, stream_position=1, language="en"),
+            ),
+            subtitle_streams=(_ass_subtitle_stream(),),
+        )
+        output_probe = _make_probe(
+            dest_dir / "episode.import.tmp.mp4",
+            suffix=".mp4",
+            audio_streams=probe.audio_streams,
+        )
+        mock_write_sidecar = AsyncMock()
+        mock_run_cmd = AsyncMock(
+            return_value=CommandResult(
+                returncode=0,
+                stdout=b"",
+                stderr=b"",
+            )
+        )
+
+        with (
+            patch.object(
+                AnimeLibraryService,
+                "get_primary_video_codec_sync",
+                return_value="h264",
+            ),
+            patch.object(
+                AnimeLibraryService,
+                "_source_matches_prepared_sync",
+                return_value=False,
+            ),
+            patch.object(
+                AnimeLibraryService,
+                "_probe_media_sync",
+                side_effect=[probe, output_probe],
+            ),
+            patch(
+                "app.services.anime_library.run_command",
+                mock_run_cmd,
+            ),
+            patch.object(
+                AnimeLibraryService,
+                "_write_subtitle_sidecar",
+                mock_write_sidecar,
+            ),
+            patch.object(
+                AnimeLibraryService,
+                "_record_source_import_manifest_sync",
+            ),
+            patch.object(Path, "exists", return_value=True),
+            patch.object(Path, "unlink"),
+            patch.object(Path, "replace"),
+        ):
+            self._run(
+                AnimeLibraryService._prepare_single_source_for_library(
+                    source_path=source,
+                    dest_dir=dest_dir,
+                )
+            )
+
+        cmd = mock_run_cmd.await_args.args[0]
+        self.assertIn("-map", cmd)
+        self.assertIn("0:v:0", cmd)
+        self.assertIn("0:a?", cmd)
+        self.assertIn("-sn", cmd)
+        self.assertIn("-dn", cmd)
+        self.assertNotIn("0:1", cmd)
+        self.assertNotIn("0:2", cmd)
+
+    def test_remux_validation_failure_falls_back_to_original_container(self) -> None:
+        """An unreadable or incomplete remux is discarded and the original source is copied."""
+        source = Path("/tmp/test_src/episode.mkv")
+        dest_dir = Path("/tmp/test_lib/Anime")
+        fallback_dest = dest_dir / "episode.mkv"
+        source_probe = _make_probe(
+            source,
+            audio_streams=(
+                _audio_stream(index=1, stream_position=0, language="ja"),
+                _audio_stream(index=2, stream_position=1, language="en"),
+            ),
+            subtitle_streams=(_ass_subtitle_stream(),),
+        )
+        invalid_output_probe = _make_probe(
+            dest_dir / "episode.import.tmp.mp4",
+            suffix=".mp4",
+            audio_streams=(
+                _audio_stream(index=1, stream_position=0, language="ja"),
+            ),
+        )
+        mock_write_sidecar = AsyncMock()
+        mock_run_cmd = AsyncMock(
+            return_value=CommandResult(
+                returncode=0,
+                stdout=b"",
+                stderr=b"",
+            )
+        )
+
+        with (
+            patch.object(
+                AnimeLibraryService,
+                "get_primary_video_codec_sync",
+                return_value="h264",
+            ),
+            patch.object(
+                AnimeLibraryService,
+                "_source_matches_prepared_sync",
+                return_value=False,
+            ),
+            patch.object(
+                AnimeLibraryService,
+                "_probe_media_sync",
+                side_effect=[source_probe, invalid_output_probe],
+            ),
+            patch(
+                "app.services.anime_library.run_command",
+                mock_run_cmd,
+            ),
+            patch.object(
+                AnimeLibraryService,
+                "_write_subtitle_sidecar",
+                mock_write_sidecar,
+            ),
+            patch.object(
+                AnimeLibraryService,
+                "_record_source_import_manifest_sync",
+            ),
+            patch.object(Path, "exists", return_value=True),
+            patch.object(Path, "unlink") as mock_unlink,
+            patch.object(Path, "replace") as mock_replace,
+            patch("shutil.copy2") as mock_copy2,
+        ):
+            actual, _action, changed = self._run(
+                AnimeLibraryService._prepare_single_source_for_library(
+                    source_path=source,
+                    dest_dir=dest_dir,
+                )
+            )
+
+        self.assertEqual(actual, fallback_dest)
+        self.assertTrue(changed)
+        mock_copy2.assert_called_once_with(source, fallback_dest)
+        mock_replace.assert_not_called()
+        self.assertGreaterEqual(mock_unlink.call_count, 1)
+        mock_write_sidecar.assert_awaited_once_with(
+            source_path=source,
+            normalized_target_path=fallback_dest,
+            probe=source_probe,
+        )
+
+    def test_source_matches_prepared_rejects_unprobeable_file(self) -> None:
+        """Prepared-file reuse requires both manifest match and a readable video probe."""
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            tmp_dir = Path(tmp_dir_raw)
+            source = tmp_dir / "episode.mkv"
+            prepared = tmp_dir / "episode.mp4"
+            source.write_bytes(b"source")
+            prepared.write_bytes(b"prepared")
+            AnimeLibraryService._record_source_import_manifest_sync(source, prepared)
+
+            with patch.object(
+                AnimeLibraryService,
+                "_probe_media_sync",
+                return_value=None,
+            ):
+                self.assertFalse(
+                    AnimeLibraryService._source_matches_prepared_sync(source, prepared)
+                )

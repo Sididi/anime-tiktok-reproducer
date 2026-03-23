@@ -2180,6 +2180,7 @@ class ProcessingService:
                     )
                     normalization_result = await AnimeLibraryService.normalize_source_for_processing(
                         resolved_source_path,
+                        preferred_audio_language=project.output_language,
                         subtitle_image_render_windows=raw_scene_image_render_plan.get(
                             resolved_source_path,
                         ),

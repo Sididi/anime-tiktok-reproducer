@@ -10,7 +10,7 @@ import shutil
 import threading
 import tempfile
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -672,16 +672,68 @@ class AnimeLibraryService:
     def select_preferred_audio_stream(
         cls,
         probe: SourceMediaProbe,
+        *,
+        target_language: str | None = None,
     ) -> SourceMediaStream | None:
         """Select the single audio stream kept in normalized sources."""
         if not probe.audio_streams:
             return None
 
-        for preferred_lang in ("ja", "en"):
+        preferred_languages: list[str] = []
+        seen_languages: set[str] = set()
+        for preferred_lang in (
+            "ja",
+            cls.normalize_stream_language(target_language),
+            "en",
+        ):
+            if not preferred_lang or preferred_lang in seen_languages:
+                continue
+            preferred_languages.append(preferred_lang)
+            seen_languages.add(preferred_lang)
+
+        for preferred_lang in preferred_languages:
             for stream in probe.audio_streams:
                 if stream.language == preferred_lang:
                     return stream
-        return min(probe.audio_streams, key=lambda stream: stream.index)
+
+        default_stream = next((stream for stream in probe.audio_streams if stream.is_default), None)
+        if default_stream is not None:
+            return default_stream
+        return min(probe.audio_streams, key=lambda stream: (stream.stream_position, stream.index))
+
+    @classmethod
+    def _with_preferred_audio_stream(
+        cls,
+        probe: SourceMediaProbe,
+        *,
+        target_language: str | None,
+    ) -> SourceMediaProbe:
+        preferred_audio_stream = cls.select_preferred_audio_stream(
+            probe,
+            target_language=target_language,
+        )
+        audio_codec = None
+        selected_audio_stream_index = None
+        if preferred_audio_stream is not None:
+            audio_codec = preferred_audio_stream.codec_name
+            selected_audio_stream_index = preferred_audio_stream.index
+        return replace(
+            probe,
+            audio_codec=audio_codec,
+            selected_audio_stream_index=selected_audio_stream_index,
+        )
+
+    @staticmethod
+    def _audio_stream_by_index(
+        probe: SourceMediaProbe,
+        stream_index: int | None,
+    ) -> SourceMediaStream | None:
+        if stream_index is None:
+            return None
+        for stream in probe.audio_streams:
+            if stream.index == stream_index:
+                return stream
+        return None
 
     @classmethod
     def get_subtitle_sidecar_dir(cls, source_path: Path) -> Path:
@@ -838,34 +890,12 @@ class AnimeLibraryService:
 
         format_name = str(format_payload.get("format_name", "")).strip().lower() or None
         video_codec = str(video_stream.get("codec_name", "")).strip().lower() or None
-        preferred_audio_stream = cls.select_preferred_audio_stream(
-            SourceMediaProbe(
-                source_path=source_path,
-                container_suffix=source_path.suffix.lower(),
-                format_name=format_name,
-                video_codec=video_codec,
-                audio_codec=None,
-                pix_fmt=str(video_stream.get("pix_fmt", "")).strip().lower() or None,
-                fps=fps,
-                duration=effective_duration,
-                has_audio=bool(audio_streams),
-                audio_streams=tuple(audio_streams),
-                subtitle_streams=tuple(subtitle_streams),
-                data_streams=tuple(data_streams),
-            )
-        )
-        audio_codec = None
-        selected_audio_stream_index = None
-        if preferred_audio_stream is not None:
-            audio_codec = preferred_audio_stream.codec_name
-            selected_audio_stream_index = preferred_audio_stream.index
-
-        return SourceMediaProbe(
+        base_probe = SourceMediaProbe(
             source_path=source_path,
             container_suffix=source_path.suffix.lower(),
             format_name=format_name,
             video_codec=video_codec,
-            audio_codec=audio_codec,
+            audio_codec=None,
             pix_fmt=str(video_stream.get("pix_fmt", "")).strip().lower() or None,
             fps=fps,
             duration=effective_duration,
@@ -873,7 +903,10 @@ class AnimeLibraryService:
             audio_streams=tuple(audio_streams),
             subtitle_streams=tuple(subtitle_streams),
             data_streams=tuple(data_streams),
-            selected_audio_stream_index=selected_audio_stream_index,
+        )
+        return cls._with_preferred_audio_stream(
+            base_probe,
+            target_language=None,
         )
 
     @classmethod
@@ -922,6 +955,8 @@ class AnimeLibraryService:
     def _build_source_normalization_plan_sync(
         cls,
         source_path: Path,
+        *,
+        preferred_audio_language: str | None = None,
     ) -> SourceNormalizationPlan:
         probe = cls._probe_media_sync(source_path)
         if probe is None:
@@ -930,11 +965,65 @@ class AnimeLibraryService:
             raise RuntimeError(f"Unable to determine source duration: {source_path}")
         if probe.video_codec is None:
             raise RuntimeError(f"Unable to determine source video codec: {source_path}")
+        probe = cls._with_preferred_audio_stream(
+            probe,
+            target_language=preferred_audio_language,
+        )
         return SourceNormalizationPlan(
             action=cls.classify_source_normalization(probe),
             source_path=source_path,
             target_path=cls._normalized_target_path(source_path),
             probe=probe,
+        )
+
+    @classmethod
+    def _build_processing_reimport_plan_sync(
+        cls,
+        source_path: Path,
+        *,
+        preferred_audio_language: str | None = None,
+    ) -> SourceNormalizationPlan | None:
+        current_probe = cls._probe_media_sync(source_path)
+        if current_probe is None:
+            return None
+        if not cls._is_valid_normalized_probe(current_probe, reference_probe=current_probe):
+            return None
+
+        payload = cls._load_source_import_manifest_sync(source_path)
+        if payload is None:
+            return None
+
+        original_source_raw = str(payload.get("source_path", "")).strip()
+        if not original_source_raw:
+            return None
+
+        original_source_path = Path(original_source_raw)
+        try:
+            if original_source_path.resolve() == source_path.resolve():
+                return None
+        except OSError:
+            return None
+        if not original_source_path.exists():
+            return None
+
+        original_probe = cls._probe_media_sync(original_source_path)
+        if original_probe is None or len(original_probe.audio_streams) <= 1:
+            return None
+        if original_probe.duration is None or original_probe.video_codec is None:
+            return None
+
+        original_probe = cls._with_preferred_audio_stream(
+            original_probe,
+            target_language=preferred_audio_language,
+        )
+        if cls._is_valid_normalized_probe(current_probe, reference_probe=original_probe):
+            return None
+
+        return SourceNormalizationPlan(
+            action=cls.classify_source_normalization(original_probe),
+            source_path=original_source_path,
+            target_path=source_path,
+            probe=original_probe,
         )
 
     @classmethod
@@ -973,6 +1062,19 @@ class AnimeLibraryService:
         elif normalized_probe.has_audio:
             return False
 
+        selected_audio_stream = cls._audio_stream_by_index(
+            reference_probe,
+            reference_probe.selected_audio_stream_index,
+        )
+        if selected_audio_stream is not None and normalized_probe.audio_streams:
+            normalized_audio_stream = normalized_probe.audio_streams[0]
+            if (
+                selected_audio_stream.language
+                and normalized_audio_stream.language
+                and normalized_audio_stream.language != selected_audio_stream.language
+            ):
+                return False
+
         if reference_probe.duration is not None and normalized_probe.duration is not None:
             tolerance = cls._normalization_duration_tolerance_seconds(reference_probe)
             if abs(reference_probe.duration - normalized_probe.duration) > tolerance:
@@ -998,6 +1100,36 @@ class AnimeLibraryService:
             source_path,
             probe=probe,
         ) + [
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+
+    @classmethod
+    def _build_library_import_remux_cmd(
+        cls,
+        source_path: Path,
+        output_path: Path,
+    ) -> list[str]:
+        return [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(source_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-map_metadata",
+            "-1",
+            "-map_chapters",
+            "-1",
+            "-dn",
+            "-sn",
+            "-write_tmcd",
+            "0",
             "-c",
             "copy",
             "-movflags",
@@ -1761,20 +1893,33 @@ class AnimeLibraryService:
         cls,
         source_path: Path,
         *,
+        preferred_audio_language: str | None = None,
         subtitle_image_render_windows: dict[int, list[tuple[float, float]]] | None = None,
     ) -> SourceNormalizationResult:
         """Normalize one source episode to Premiere-safe H.264 MP4 + AAC when needed."""
         if not source_path.exists() or not source_path.is_file():
             raise FileNotFoundError(f"Source file not found: {source_path}")
 
-        plan = await asyncio.to_thread(cls._build_source_normalization_plan_sync, source_path)
+        plan = await asyncio.to_thread(
+            cls._build_source_normalization_plan_sync,
+            source_path,
+            preferred_audio_language=preferred_audio_language,
+        )
         if plan.action == "noop":
-            return SourceNormalizationResult(
-                action=plan.action,
-                source_path=plan.source_path,
-                normalized_path=plan.source_path,
-                changed=False,
+            reimport_plan = await asyncio.to_thread(
+                cls._build_processing_reimport_plan_sync,
+                source_path,
+                preferred_audio_language=preferred_audio_language,
             )
+            if reimport_plan is not None:
+                plan = reimport_plan
+            else:
+                return SourceNormalizationResult(
+                    action=plan.action,
+                    source_path=plan.source_path,
+                    normalized_path=plan.source_path,
+                    changed=False,
+                )
 
         target_path = plan.target_path
         tmp_path = target_path.with_name(f"{target_path.stem}.normalize.tmp.mp4")
@@ -2495,6 +2640,10 @@ class AnimeLibraryService:
         if not prepared_path.exists():
             return False
 
+        prepared_probe = cls._probe_media_sync(prepared_path)
+        if prepared_probe is None or prepared_probe.duration is None:
+            return False
+
         try:
             if source_path.resolve() == prepared_path.resolve():
                 return True
@@ -2508,6 +2657,14 @@ class AnimeLibraryService:
         try:
             source_stat = source_path.stat()
         except OSError:
+            return False
+
+        source_probe = cls._probe_media_sync(source_path)
+        if source_probe is None:
+            return False
+        if prepared_probe.has_audio != source_probe.has_audio:
+            return False
+        if source_probe.has_audio and len(prepared_probe.audio_streams) != len(source_probe.audio_streams):
             return False
 
         return (
@@ -2555,33 +2712,15 @@ class AnimeLibraryService:
                 source_probe = None
 
         if should_remux_mkv:
+            tmp_dest = preferred_dest.with_name(f"{preferred_dest.stem}.import.tmp.mp4")
+            if tmp_dest.exists():
+                with suppress(OSError):
+                    await asyncio.to_thread(tmp_dest.unlink)
             try:
                 remux_result = await run_command(
-                    [
-                        "ffmpeg",
-                        "-y",
-                        "-i",
-                        str(source_path),
-                        "-c",
-                        "copy",
-                        "-movflags",
-                        "+faststart",
-                        str(preferred_dest),
-                    ],
+                    cls._build_library_import_remux_cmd(source_path, tmp_dest),
                     timeout_seconds=cls.REMUX_TIMEOUT_SECONDS,
                 )
-                if remux_result.returncode != 0:
-                    import sys
-
-                    print(
-                        f"[WARNING] ffmpeg remux failed for {source_path.name}: "
-                        f"{remux_result.stderr.decode()[:200]}",
-                        file=sys.stderr,
-                    )
-                    fallback_dest = dest_dir / source_path.name
-                    if fallback_dest != source_path or not fallback_dest.exists():
-                        await asyncio.to_thread(shutil.copy2, source_path, fallback_dest)
-                    actual_dest = fallback_dest
             except CommandTimeoutError:
                 import sys
 
@@ -2592,6 +2731,9 @@ class AnimeLibraryService:
                 fallback_dest = dest_dir / source_path.name
                 if fallback_dest != source_path or not fallback_dest.exists():
                     await asyncio.to_thread(shutil.copy2, source_path, fallback_dest)
+                if preferred_dest.exists():
+                    with suppress(OSError):
+                        await asyncio.to_thread(preferred_dest.unlink)
                 actual_dest = fallback_dest
             except FileNotFoundError as exc:
                 if is_media_binary_override_error(exc):
@@ -2602,7 +2744,54 @@ class AnimeLibraryService:
                 fallback_dest = dest_dir / source_path.name
                 if fallback_dest != source_path or not fallback_dest.exists():
                     await asyncio.to_thread(shutil.copy2, source_path, fallback_dest)
+                if preferred_dest.exists():
+                    with suppress(OSError):
+                        await asyncio.to_thread(preferred_dest.unlink)
                 actual_dest = fallback_dest
+            else:
+                remux_valid = False
+                if remux_result.returncode == 0:
+                    remux_probe = await asyncio.to_thread(cls._probe_media_sync, tmp_dest)
+                    remux_valid = (
+                        remux_probe is not None
+                        and remux_probe.duration is not None
+                        and (
+                            source_probe is None
+                            or (
+                                remux_probe.has_audio == source_probe.has_audio
+                                and (
+                                    not source_probe.has_audio
+                                    or len(remux_probe.audio_streams) == len(source_probe.audio_streams)
+                                )
+                            )
+                        )
+                    )
+                if not remux_valid:
+                    if tmp_dest.exists():
+                        with suppress(OSError):
+                            await asyncio.to_thread(tmp_dest.unlink)
+                    import sys
+
+                    if remux_result.returncode != 0:
+                        print(
+                            f"[WARNING] ffmpeg remux failed for {source_path.name}: "
+                            f"{remux_result.stderr.decode()[:200]}",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            f"[WARNING] ffmpeg remux output failed validation for {source_path.name}",
+                            file=sys.stderr,
+                        )
+                    fallback_dest = dest_dir / source_path.name
+                    if fallback_dest != source_path or not fallback_dest.exists():
+                        await asyncio.to_thread(shutil.copy2, source_path, fallback_dest)
+                    if preferred_dest.exists():
+                        with suppress(OSError):
+                            await asyncio.to_thread(preferred_dest.unlink)
+                    actual_dest = fallback_dest
+                else:
+                    await asyncio.to_thread(tmp_dest.replace, preferred_dest)
         elif preferred_dest != source_path:
             await asyncio.to_thread(shutil.copy2, source_path, preferred_dest)
 
@@ -2645,6 +2834,9 @@ class AnimeLibraryService:
             file_stat = await asyncio.to_thread(dest_file.stat)
             if file_stat.st_size == 0:
                 return f"Prepared file is empty: {dest_file.name}"
+            prepared_probe = await asyncio.to_thread(cls._probe_media_sync, dest_file)
+            if prepared_probe is None or prepared_probe.duration is None:
+                return f"Prepared file is unreadable: {dest_file.name}"
         return None
 
     @classmethod

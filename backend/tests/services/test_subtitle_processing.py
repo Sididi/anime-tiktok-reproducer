@@ -1,11 +1,17 @@
 import asyncio
 import json
+import sys
 import zipfile
 from io import BytesIO
+from pathlib import Path
+
+BACKEND_ROOT = Path(__file__).resolve().parents[2]
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
 
 from app.models.project import Project
 from app.models.transcription import SceneTranscription, Transcription, Word
-from app.services.anime_library import AnimeLibraryService
+from app.services.anime_library import AnimeLibraryService, SourceNormalizationResult
 from app.services.export_service import ExportService
 from app.services.forced_alignment import ForcedAlignmentService
 from app.services.processing import ProcessingService, ResolvedSceneSource
@@ -318,11 +324,134 @@ def test_collect_raw_scene_source_subtitles_returns_text_entries_for_text_sideca
     )
 
     assert image_entries == []
-    assert [(entry.start, entry.end, entry.text) for entry in text_entries] == [
+    assert [(round(entry.start, 1), round(entry.end, 1), entry.text) for entry in text_entries] == [
         (5.0, 5.4, "Avant"),
         (5.6, 6.2, "Pendant"),
         (6.9, 7.0, "Fin"),
     ]
+
+
+def test_process_passes_project_output_language_to_source_normalization(
+    monkeypatch,
+    tmp_path,
+):
+    output_dir = tmp_path / "project-output"
+    output_dir.mkdir(parents=True)
+    edited_audio_path = output_dir / "tts_edited.wav"
+    edited_audio_path.write_bytes(b"wav")
+    transcription_path = output_dir / "transcription_timing.json"
+    transcription_path.write_text(
+        json.dumps({"language": "fr", "scenes": []}),
+        encoding="utf-8",
+    )
+    (output_dir / "processing_state.json").write_text(
+        json.dumps(
+            {
+                "edited_audio_path": str(edited_audio_path),
+                "transcription_path": str(transcription_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    source_path = tmp_path / "episode.mp4"
+    source_path.write_bytes(b"video")
+    calls: list[tuple[Path, str | None, dict[int, list[tuple[float, float]]] | None]] = []
+
+    async def _fake_normalize_source(
+        cls,
+        path: Path,
+        *,
+        preferred_audio_language: str | None = None,
+        subtitle_image_render_windows=None,
+    ) -> SourceNormalizationResult:
+        calls.append((path, preferred_audio_language, subtitle_image_render_windows))
+        return SourceNormalizationResult(
+            action="noop",
+            source_path=path,
+            normalized_path=path,
+            changed=False,
+        )
+
+    monkeypatch.setattr(
+        ProcessingService,
+        "get_output_dir",
+        classmethod(lambda cls, _project_id: output_dir),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "check_has_saved_state",
+        classmethod(lambda cls, _project_id: True),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "check_gaps_resolved",
+        classmethod(lambda cls, _project_id: True),
+    )
+
+    async def _fake_detect_first_source_fps(cls, *_args, **_kwargs):
+        return 23.976
+
+    async def _fake_build_raw_scene_image_render_plan(cls, *_args, **_kwargs):
+        return {source_path: {2: [(1.0, 2.0)]}}
+
+    async def _fake_collect_required_source_groups(cls, *_args, **_kwargs):
+        return [(source_path, [])]
+
+    monkeypatch.setattr(
+        ProcessingService,
+        "detect_first_source_fps",
+        classmethod(_fake_detect_first_source_fps),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "resolve_scene_sources",
+        classmethod(lambda cls, *_args, **_kwargs: {}),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "_build_raw_scene_image_render_plan",
+        classmethod(_fake_build_raw_scene_image_render_plan),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "_collect_required_source_groups",
+        classmethod(_fake_collect_required_source_groups),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "_update_absolute_match_episode_hints",
+        classmethod(lambda cls, *_args, **_kwargs: False),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "_format_source_normalization_message",
+        classmethod(lambda cls, **_kwargs: "normalized"),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "normalize_source_for_processing",
+        classmethod(_fake_normalize_source),
+    )
+
+    project = Project(id="p-audio-pref", output_language="fr")
+    reference_transcription = Transcription(language="fr", scenes=[])
+
+    async def _run() -> None:
+        progress_iter = ProcessingService.process(
+            project,
+            new_script={"language": "fr", "scenes": []},
+            audio_path=tmp_path / "tts.wav",
+            matches=[],
+            reference_transcription=reference_transcription,
+        )
+        await anext(progress_iter)
+        await anext(progress_iter)
+        await progress_iter.aclose()
+
+    asyncio.run(_run())
+
+    assert calls == [(source_path, "fr", {2: [(1.0, 2.0)]})]
 
 
 def test_render_jsx_from_template_includes_dedicated_raw_scene_text_subtitle_paths():
@@ -390,7 +519,11 @@ def test_export_build_manifest_archives_subtitles(monkeypatch, tmp_path):
 
     monkeypatch.setattr(ExportService, "get_output_dir", classmethod(lambda cls, _project_id: output_dir))
     monkeypatch.setattr(ExportService, "get_assets_dir", classmethod(lambda cls: assets_dir))
-    monkeypatch.setattr(ExportService, "_collect_episode_sources", classmethod(lambda cls, _matches: []))
+    monkeypatch.setattr(
+        ExportService,
+        "_collect_episode_sources",
+        classmethod(lambda cls, _project, _matches: []),
+    )
     monkeypatch.setattr(
         ExportService,
         "_resolve_selected_music_path",
