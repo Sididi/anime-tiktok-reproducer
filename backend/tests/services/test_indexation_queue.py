@@ -26,7 +26,7 @@ async def _wait_for(predicate, timeout: float = 1.0) -> None:
 
 
 @pytest.mark.asyncio
-async def test_enqueue_reuses_live_job_and_keeps_distinct_series_parallel(
+async def test_enqueue_reuses_live_job_and_serializes_distinct_series_indexing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = IndexationQueueService()
@@ -62,11 +62,15 @@ async def test_enqueue_reuses_live_job_and_keeps_distinct_series_parallel(
     assert duplicate_job_id == first_job_id
     assert {job.source_name for job in service.list_jobs()} == {"Demo", "Other"}
 
-    await _wait_for(lambda: "Demo" in started and "Other" in started)
+    await _wait_for(lambda: "Demo" in started)
     await asyncio.wait_for(started["Demo"].wait(), timeout=1.0)
-    await asyncio.wait_for(started["Other"].wait(), timeout=1.0)
+    await asyncio.sleep(0.05)
+    assert "Other" not in started
 
     release["Demo"].set()
+    await _wait_for(lambda: "Other" in started)
+    await asyncio.wait_for(started.setdefault("Other", asyncio.Event()).wait(), timeout=1.0)
+
     release["Other"].set()
 
     await _wait_for(

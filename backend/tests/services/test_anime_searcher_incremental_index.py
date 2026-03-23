@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import sys
 from pathlib import Path
@@ -18,11 +19,13 @@ if str(BACKEND_ROOT) not in sys.path:
 if str(SEARCHER_ROOT) not in sys.path:
     sys.path.insert(0, str(SEARCHER_ROOT))
 
+from anime_searcher import benchmark as benchmark_module
 from app.services.anime_library import AnimeLibraryService, IndexProgress
 from anime_searcher import cli as cli_module
 from anime_searcher.config import EMBEDDING_DIM, INDEX_ENGINE_PROFILE, INDEX_FORMAT_VERSION
 from anime_searcher.indexer import embedder as embedder_module
-from anime_searcher.indexer.frame_extractor import MediaBinaryProfile
+from anime_searcher.indexer import frame_extractor as frame_extractor_module
+from anime_searcher.indexer.frame_extractor import DecodedFrameBatch, MediaBinaryProfile
 from anime_searcher.indexer.index_manager import IndexManager
 from anime_searcher.indexer.pipeline import FileStartedEvent, IndexedFileResult, IndexingJob, ParallelFileIndexer
 
@@ -179,6 +182,458 @@ def test_parallel_file_indexer_combines_multi_batch_file(monkeypatch: pytest.Mon
     assert result.timestamps == [0.0, 1.0, 2.0, 3.0, 4.0]
 
 
+def test_parallel_file_indexer_torchcodec_backend_embeds_decoded_batches(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    video_path = tmp_path / "episode.mp4"
+    video_path.write_bytes(b"video")
+
+    decoded_batches = [
+        DecodedFrameBatch(
+            timestamps=[0.0, 1.0],
+            data=torch.full((2, 3, 8, 8), 255, dtype=torch.uint8),
+        ),
+        DecodedFrameBatch(
+            timestamps=[2.0],
+            data=torch.full((1, 3, 8, 8), 255, dtype=torch.uint8),
+        ),
+    ]
+
+    monkeypatch.setattr(
+        "anime_searcher.indexer.pipeline.iter_torchcodec_frame_batches",
+        lambda *args, **kwargs: iter(decoded_batches),
+    )
+
+    class DummyEmbedder:
+        device = "cuda"
+        embedding_dim = EMBEDDING_DIM
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def preprocess_decoded_batch(self, batch: torch.Tensor) -> torch.Tensor:
+            assert batch.dtype == torch.uint8
+            return torch.zeros((batch.shape[0], 3, 288, 288), dtype=torch.float32)
+
+        def embed_preprocessed_batch(self, batch: torch.Tensor) -> np.ndarray:
+            vectors = _make_vectors(batch.shape[0], self.calls * 8)
+            self.calls += 1
+            return vectors
+
+    pipeline = ParallelFileIndexer(
+        DummyEmbedder(),
+        batch_size=2,
+        prefetch_batches=2,
+        transform_workers=1,
+        file_workers=1,
+        decode_backend="torchcodec_cuda",
+    )
+    outputs = list(
+        pipeline.run(
+            [
+                IndexingJob(
+                    video_path=video_path,
+                    series="Demo",
+                    episode="episode",
+                    fps=2.0,
+                )
+            ]
+        )
+    )
+    pipeline.close()
+
+    assert isinstance(outputs[0], FileStartedEvent)
+    assert isinstance(outputs[1], IndexedFileResult)
+    result = outputs[1]
+    assert result.embeddings.shape == (3, EMBEDDING_DIM)
+    assert result.timestamps == [0.0, 1.0, 2.0]
+
+
+def test_parallel_file_indexer_ffmpeg_cuda_backend_embeds_decoded_batches(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    video_path = tmp_path / "episode.mp4"
+    video_path.write_bytes(b"video")
+
+    decoded_batches = [
+        DecodedFrameBatch(
+            timestamps=[0.0, 1.0],
+            data=torch.full((2, 3, 8, 8), 255, dtype=torch.uint8),
+        ),
+        DecodedFrameBatch(
+            timestamps=[2.0],
+            data=torch.full((1, 3, 8, 8), 255, dtype=torch.uint8),
+        ),
+    ]
+
+    monkeypatch.setattr(
+        "anime_searcher.indexer.pipeline.iter_ffmpeg_cuda_frame_batches",
+        lambda *args, **kwargs: iter(decoded_batches),
+    )
+
+    class DummyEmbedder:
+        device = "cuda"
+        embedding_dim = EMBEDDING_DIM
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def preprocess_decoded_batch(self, batch: torch.Tensor) -> torch.Tensor:
+            assert batch.dtype == torch.uint8
+            return torch.zeros((batch.shape[0], 3, 288, 288), dtype=torch.float32)
+
+        def embed_preprocessed_batch(self, batch: torch.Tensor) -> np.ndarray:
+            vectors = _make_vectors(batch.shape[0], self.calls * 8)
+            self.calls += 1
+            return vectors
+
+    pipeline = ParallelFileIndexer(
+        DummyEmbedder(),
+        batch_size=2,
+        prefetch_batches=2,
+        transform_workers=1,
+        file_workers=1,
+        decode_backend="ffmpeg_cuda",
+    )
+    outputs = list(
+        pipeline.run(
+            [
+                IndexingJob(
+                    video_path=video_path,
+                    series="Demo",
+                    episode="episode",
+                    fps=2.0,
+                )
+            ]
+        )
+    )
+    pipeline.close()
+
+    assert isinstance(outputs[0], FileStartedEvent)
+    assert isinstance(outputs[1], IndexedFileResult)
+    result = outputs[1]
+    assert result.embeddings.shape == (3, EMBEDDING_DIM)
+    assert result.timestamps == [0.0, 1.0, 2.0]
+    assert pipeline.decode_fallbacks == 0
+
+
+def test_parallel_file_indexer_ffmpeg_cuda_falls_back_to_ffmpeg_cpu_on_decode_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    video_path = tmp_path / "episode.mp4"
+    video_path.write_bytes(b"video")
+    frames = [
+        (0.0, Image.new("RGB", (2, 2), color=(10, 0, 0))),
+        (1.0, Image.new("RGB", (2, 2), color=(20, 0, 0))),
+    ]
+
+    monkeypatch.setattr(
+        "anime_searcher.indexer.pipeline.iter_ffmpeg_cuda_frame_batches",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            frame_extractor_module.FFmpegCudaDecodeError("nvdec failed")
+        ),
+    )
+    monkeypatch.setattr(
+        "anime_searcher.indexer.pipeline.extract_frames",
+        lambda *args, **kwargs: iter(frames),
+    )
+
+    class DummyEmbedder:
+        device = "cuda"
+        embedding_dim = EMBEDDING_DIM
+
+        def embed_preprocessed_batch(self, batch: torch.Tensor) -> np.ndarray:
+            return _make_vectors(batch.shape[0], 0)
+
+    pipeline = ParallelFileIndexer(
+        DummyEmbedder(),
+        batch_size=2,
+        prefetch_batches=2,
+        transform_workers=1,
+        file_workers=1,
+        decode_backend="ffmpeg_cuda",
+    )
+    outputs = list(
+        pipeline.run(
+            [
+                IndexingJob(
+                    video_path=video_path,
+                    series="Demo",
+                    episode="episode",
+                    fps=1.0,
+                )
+            ]
+        )
+    )
+    pipeline.close()
+
+    assert isinstance(outputs[1], IndexedFileResult)
+    assert outputs[1].timestamps == [0.0, 1.0]
+    assert pipeline.decode_fallbacks == 1
+
+
+def test_run_benchmark_reports_decode_backend_and_precision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    video_path = tmp_path / "episode.mp4"
+    video_path.write_bytes(b"video")
+    profile = MediaBinaryProfile("system", "/usr/bin/ffmpeg", "/usr/bin/ffprobe")
+
+    class DummyEmbedder:
+        device = "cuda"
+        resolved_precision = "fp16"
+
+    class DummyPipeline:
+        def __init__(self, *_args, **kwargs) -> None:
+            self.file_workers = kwargs["file_workers"]
+
+        def run(self, jobs: list[IndexingJob]):
+            yield IndexedFileResult(
+                job=jobs[0],
+                timestamps=[0.0, 1.0],
+                embeddings=_make_vectors(2, 0),
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(benchmark_module, "ParallelFileIndexer", DummyPipeline)
+
+    result = benchmark_module._run_benchmark(
+        embedder=DummyEmbedder(),
+        jobs=[IndexingJob(video_path=video_path, series="Demo", episode="episode", fps=1.0)],
+        batch_size=2,
+        prefetch_batches=2,
+        transform_workers=1,
+        file_workers=1,
+        media_profile=profile,
+        decode_backend="torchcodec_cuda",
+    )
+
+    assert result.decode_backend == "torchcodec_cuda"
+    assert result.precision == "fp16"
+
+
+def test_iter_ffmpeg_cuda_frame_batches_uses_nvdec_command_and_returns_tensors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    video_path = tmp_path / "episode.mp4"
+    video_path.write_bytes(b"video")
+    profile = MediaBinaryProfile("system", "/usr/bin/ffmpeg", "/usr/bin/ffprobe")
+    frame_one = bytes(range(12))
+    frame_two = bytes(range(12, 24))
+    captured_cmd: list[str] | None = None
+
+    class DummyProcess:
+        def __init__(self) -> None:
+            self.stdout = io.BytesIO(frame_one + frame_two)
+            self.stderr = io.BytesIO()
+            self.returncode = 0
+
+        def wait(self) -> int:
+            return self.returncode
+
+    def fake_popen(cmd, **kwargs):
+        nonlocal captured_cmd
+        captured_cmd = cmd
+        return DummyProcess()
+
+    monkeypatch.setattr(frame_extractor_module, "get_video_resolution", lambda *_args, **_kwargs: (2, 2))
+    monkeypatch.setattr(frame_extractor_module, "get_video_codec_name", lambda *_args, **_kwargs: "hevc")
+    monkeypatch.setattr(frame_extractor_module.subprocess, "Popen", fake_popen)
+
+    batches = list(
+        frame_extractor_module.iter_ffmpeg_cuda_frame_batches(
+            video_path,
+            1.0,
+            batch_size=2,
+            media_profile=profile,
+        )
+    )
+
+    assert captured_cmd is not None
+    assert "-hwaccel" in captured_cmd
+    assert "cuda" in captured_cmd
+    assert "-hwaccel_output_format" in captured_cmd
+    assert "-c:v" in captured_cmd
+    assert "hevc_cuvid" in captured_cmd
+    assert any("scale_cuda=format=nv12,hwdownload,format=nv12,format=rgb24" in arg for arg in captured_cmd)
+    assert len(batches) == 1
+    assert batches[0].timestamps == [0.0, 1.0]
+    assert tuple(batches[0].data.shape) == (2, 3, 2, 2)
+    assert batches[0].data.dtype == torch.uint8
+
+
+def test_resolve_decode_backend_auto_prefers_ffmpeg_cuda_before_torchcodec(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    video_path = tmp_path / "episode.mp4"
+    video_path.write_bytes(b"video")
+
+    monkeypatch.setattr(frame_extractor_module, "ffmpeg_cuda_available", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(frame_extractor_module, "torchcodec_cuda_available", lambda *_args, **_kwargs: True)
+
+    assert frame_extractor_module.resolve_decode_backend("auto", "cuda", sample_video=video_path) == "ffmpeg_cuda"
+
+
+def test_resolve_decode_backend_auto_falls_back_when_torchcodec_cuda_probe_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    video_path = tmp_path / "episode.mp4"
+    video_path.write_bytes(b"video")
+
+    monkeypatch.setattr(frame_extractor_module, "ffmpeg_cuda_available", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(frame_extractor_module, "torchcodec_available", lambda: True)
+    monkeypatch.setattr(frame_extractor_module, "torchcodec_cuda_available", lambda *_args, **_kwargs: False)
+
+    assert frame_extractor_module.resolve_decode_backend("auto", "cuda", sample_video=video_path) == "ffmpeg_cpu"
+    with pytest.raises(RuntimeError, match="CUDA video decode is unavailable"):
+        frame_extractor_module.resolve_decode_backend(
+            "torchcodec_cuda",
+            "cuda",
+            sample_video=video_path,
+        )
+
+
+def test_resolve_decode_backend_explicit_ffmpeg_cuda_errors_when_probe_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    video_path = tmp_path / "episode.mp4"
+    video_path.write_bytes(b"video")
+
+    monkeypatch.setattr(frame_extractor_module, "ffmpeg_cuda_available", lambda *_args, **_kwargs: False)
+
+    with pytest.raises(RuntimeError, match="FFmpeg CUDA decode is unavailable"):
+        frame_extractor_module.resolve_decode_backend(
+            "ffmpeg_cuda",
+            "cuda",
+            sample_video=video_path,
+        )
+
+
+def test_select_ffmpeg_cuda_media_profile_prefers_system_binary_when_managed_probe_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    video_path = tmp_path / "episode.mp4"
+    video_path.write_bytes(b"video")
+    managed = MediaBinaryProfile("managed", "/managed/ffmpeg", "/managed/ffprobe")
+    system = MediaBinaryProfile("system", "/usr/bin/ffmpeg", "/usr/bin/ffprobe")
+
+    monkeypatch.setattr(frame_extractor_module, "_explicit_media_profile", lambda: None)
+    monkeypatch.setattr(frame_extractor_module, "_current_media_profile", lambda: managed)
+    monkeypatch.setattr(frame_extractor_module, "_system_media_profile", lambda: system)
+    monkeypatch.setattr(frame_extractor_module, "get_video_codec_name", lambda *_args, **_kwargs: "hevc")
+    monkeypatch.setattr(
+        frame_extractor_module,
+        "_probe_ffmpeg_cuda",
+        lambda _sample, _fps, ffmpeg_binary, _decoder: ffmpeg_binary == system.ffmpeg_binary,
+    )
+
+    profile = frame_extractor_module.select_ffmpeg_cuda_media_profile(video_path, 1.0)
+
+    assert profile == system
+    assert frame_extractor_module.ffmpeg_cuda_available(video_path) is True
+
+
+def test_resolve_decode_backend_rejects_unknown_value(tmp_path: Path) -> None:
+    video_path = tmp_path / "episode.mp4"
+    video_path.write_bytes(b"video")
+
+    with pytest.raises(RuntimeError, match="Unsupported decode backend"):
+        frame_extractor_module.resolve_decode_backend("nope", "cuda", sample_video=video_path)  # type: ignore[arg-type]
+
+
+def test_benchmark_main_compares_backend_and_precision_modes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    library_root = tmp_path / "library"
+    library_path = library_root / "anime"
+    series_dir = library_path / "Demo"
+    series_dir.mkdir(parents=True)
+    video_path = series_dir / "episode.mp4"
+    video_path.write_bytes(b"video")
+    model_path = _dummy_model(tmp_path)
+    cpu_profile = MediaBinaryProfile("managed", "/managed/ffmpeg", "/managed/ffprobe")
+    cuda_profile = MediaBinaryProfile("system", "/usr/bin/ffmpeg", "/usr/bin/ffprobe")
+
+    class DummyEmbedder:
+        def __init__(self, _model_path: Path, *, precision: str = "auto") -> None:
+            self.device = "cuda"
+            self.resolved_precision = "fp16" if precision == "fp16" else "fp32"
+
+        def warmup(self) -> None:
+            return None
+
+    seen_runs: list[tuple[str, str, int, str]] = []
+
+    def fake_run_benchmark(*, embedder, file_workers: int, decode_backend: str, media_profile, **_kwargs):
+        seen_runs.append((decode_backend, embedder.resolved_precision, file_workers, media_profile.name))
+        return benchmark_module.BenchmarkResult(
+            mode="parallel" if file_workers > 1 else "serial",
+            elapsed_seconds=1.0,
+            frames=10,
+            files=1,
+            frames_per_second=10.0,
+            file_workers=file_workers,
+            device=embedder.device,
+            ffmpeg_profile=media_profile.name,
+            decode_backend=decode_backend,
+            precision=embedder.resolved_precision,
+            decode_fallbacks=0,
+        )
+
+    monkeypatch.setattr(benchmark_module, "SSCDEmbedder", DummyEmbedder)
+    monkeypatch.setattr(benchmark_module, "select_indexing_media_profile", lambda *_args, **_kwargs: cpu_profile)
+    monkeypatch.setattr(
+        benchmark_module,
+        "select_ffmpeg_cuda_media_profile",
+        lambda *_args, **_kwargs: cuda_profile,
+    )
+    monkeypatch.setattr(benchmark_module, "_benchmark_decode_backends", lambda **_kwargs: ["ffmpeg_cpu", "ffmpeg_cuda"])
+    monkeypatch.setattr(benchmark_module, "_benchmark_precisions", lambda **_kwargs: ["fp32", "fp16"])
+    monkeypatch.setattr(
+        benchmark_module,
+        "_default_file_workers",
+        lambda _device, _transform_workers, fast, decode_backend: 2 if fast and decode_backend == "ffmpeg_cpu" else 1,
+    )
+    monkeypatch.setattr(benchmark_module, "_run_benchmark", fake_run_benchmark)
+
+    result = RUNNER.invoke(
+        benchmark_module.app,
+        [
+            str(library_root),
+            "--type",
+            "anime",
+            "--model",
+            str(model_path),
+            "--compare-backends",
+            "--compare-precisions",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["compare_backends"] is True
+    assert payload["compare_precisions"] is True
+    assert len(payload["results"]) == 6
+    assert seen_runs == [
+        ("ffmpeg_cpu", "fp32", 1, "managed"),
+        ("ffmpeg_cpu", "fp32", 2, "managed"),
+        ("ffmpeg_cuda", "fp32", 1, "system"),
+        ("ffmpeg_cpu", "fp16", 1, "managed"),
+        ("ffmpeg_cpu", "fp16", 2, "managed"),
+        ("ffmpeg_cuda", "fp16", 1, "system"),
+    ]
+
+
 def test_create_pipeline_warms_embedder_before_building_pipeline(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -246,6 +701,150 @@ def test_create_pipeline_warms_embedder_before_building_pipeline(
     assert call_order == ["embedder_init", "warmup", "pipeline_init"]
 
 
+def test_create_pipeline_prefers_torchcodec_cuda_and_single_gpu_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "model.pt"
+    model_path.write_bytes(b"model")
+    sample_video = tmp_path / "episode.mp4"
+    sample_video.write_bytes(b"video")
+
+    profile = MediaBinaryProfile("test", "/usr/bin/ffmpeg", "/usr/bin/ffprobe")
+
+    class DummyEmbedder:
+        def __init__(
+            self,
+            received_model_path: Path,
+            *,
+            device: str | None = None,
+            precision: str = "auto",
+        ) -> None:
+            self.device = "cuda"
+            self.model_path = received_model_path
+            self.precision = precision
+            self.resolved_precision = "fp16"
+            self.warmed = False
+
+        def warmup(self) -> None:
+            self.warmed = True
+
+    class DummyPipeline:
+        def __init__(
+            self,
+            embedder,
+            *,
+            batch_size: int,
+            prefetch_batches: int,
+            transform_workers: int,
+            file_workers: int,
+            media_profile: MediaBinaryProfile | None = None,
+            decode_backend: str,
+        ) -> None:
+            assert embedder.warmed is True
+            self.embedder = embedder
+            self.batch_size = batch_size
+            self.prefetch_batches = prefetch_batches
+            self.transform_workers = transform_workers
+            self.file_workers = file_workers
+            self.media_profile = media_profile
+            self.decode_backend = decode_backend
+
+    monkeypatch.setattr(cli_module, "SSCDEmbedder", DummyEmbedder)
+    monkeypatch.setattr(cli_module, "resolve_decode_backend", lambda *_args, **_kwargs: "torchcodec_cuda")
+    monkeypatch.setattr(cli_module, "select_indexing_media_profile", lambda *_args, **_kwargs: profile)
+    monkeypatch.setattr(cli_module, "ParallelFileIndexer", DummyPipeline)
+
+    embedder, pipeline, selected_profile = cli_module._create_pipeline(
+        model_path,
+        sample_video=sample_video,
+        sample_fps=2.0,
+        batch_size=8,
+        fast=True,
+        prefetch_batches=3,
+        transform_workers=2,
+        require_gpu=False,
+        decode_backend="auto",
+        precision="auto",
+    )
+
+    assert embedder.model_path == model_path
+    assert embedder.precision == "auto"
+    assert embedder.resolved_precision == "fp16"
+    assert pipeline.decode_backend == "torchcodec_cuda"
+    assert pipeline.file_workers == 1
+    assert selected_profile.name == "torchcodec_cuda"
+
+
+def test_create_pipeline_prefers_ffmpeg_cuda_and_single_gpu_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "model.pt"
+    model_path.write_bytes(b"model")
+    sample_video = tmp_path / "episode.mp4"
+    sample_video.write_bytes(b"video")
+
+    class DummyEmbedder:
+        def __init__(
+            self,
+            received_model_path: Path,
+            *,
+            device: str | None = None,
+            precision: str = "auto",
+        ) -> None:
+            self.device = "cuda"
+            self.model_path = received_model_path
+            self.precision = precision
+            self.resolved_precision = "fp16"
+            self.warmed = False
+
+        def warmup(self) -> None:
+            self.warmed = True
+
+    class DummyPipeline:
+        def __init__(
+            self,
+            embedder,
+            *,
+            batch_size: int,
+            prefetch_batches: int,
+            transform_workers: int,
+            file_workers: int,
+            media_profile: MediaBinaryProfile | None = None,
+            decode_backend: str,
+        ) -> None:
+            assert embedder.warmed is True
+            self.file_workers = file_workers
+            self.decode_backend = decode_backend
+            self.media_profile = media_profile
+
+    monkeypatch.setattr(cli_module, "SSCDEmbedder", DummyEmbedder)
+    monkeypatch.setattr(cli_module, "resolve_decode_backend", lambda *_args, **_kwargs: "ffmpeg_cuda")
+    monkeypatch.setattr(cli_module, "select_indexing_media_profile", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not benchmark ffmpeg profiles for ffmpeg_cuda")))
+    profile = MediaBinaryProfile("system", "/usr/bin/ffmpeg", "/usr/bin/ffprobe")
+    monkeypatch.setattr(cli_module, "select_ffmpeg_cuda_media_profile", lambda *_args, **_kwargs: profile)
+    monkeypatch.setattr(cli_module, "ParallelFileIndexer", DummyPipeline)
+
+    embedder, pipeline, selected_profile = cli_module._create_pipeline(
+        model_path,
+        sample_video=sample_video,
+        sample_fps=2.0,
+        batch_size=8,
+        fast=True,
+        prefetch_batches=3,
+        transform_workers=2,
+        require_gpu=False,
+        decode_backend="auto",
+        precision="auto",
+    )
+
+    assert embedder.model_path == model_path
+    assert pipeline.decode_backend == "ffmpeg_cuda"
+    assert pipeline.file_workers == 1
+    assert selected_profile == profile
+
+
 def test_embedder_warmup_uses_scalar_resize_size_for_square_batch(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -273,6 +872,56 @@ def test_embedder_warmup_uses_scalar_resize_size_for_square_batch(
     embedder.warmup()
 
     assert seen_shapes == [(1, 3, 288, 288)]
+
+
+def test_embedder_auto_precision_uses_fp16_on_cuda(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    model_path = _dummy_model(tmp_path)
+
+    class DummyModel:
+        def __init__(self) -> None:
+            self.half_calls = 0
+            self.to_calls: list[str] = []
+
+        def to(self, device: str):
+            self.to_calls.append(device)
+            return self
+
+        def eval(self):
+            return self
+
+        def half(self):
+            self.half_calls += 1
+            return self
+
+    monkeypatch.setattr(embedder_module.torch.jit, "load", lambda *_args, **_kwargs: DummyModel())
+
+    embedder = embedder_module.SSCDEmbedder(model_path, device="cuda", precision="auto")
+
+    assert embedder.resolved_precision == "fp16"
+    assert embedder.model_dtype == torch.float16
+    assert embedder.model.half_calls == 1
+
+
+def test_embedder_rejects_unknown_precision(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    model_path = _dummy_model(tmp_path)
+
+    class DummyModel:
+        def to(self, _device: str):
+            return self
+
+        def eval(self):
+            return self
+
+    monkeypatch.setattr(embedder_module.torch.jit, "load", lambda *_args, **_kwargs: DummyModel())
+
+    with pytest.raises(ValueError, match="Unsupported precision"):
+        embedder_module.SSCDEmbedder(model_path, device="cpu", precision="bf16")  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("resize_size", [(288, 320), [288, 320]])
@@ -720,6 +1369,98 @@ async def test_backend_update_anime_returns_prepared_library_paths(
 
     assert progress_events[-1].status == "complete"
     assert progress_events[-1].prepared_library_paths == [str(prepared_path)]
+
+
+@pytest.mark.asyncio
+async def test_backend_index_anime_passes_decode_backend_and_precision_flags(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    library_path = tmp_path / "library"
+    searcher_path = tmp_path / "searcher"
+    source_folder = tmp_path / "incoming"
+    source_folder.mkdir(parents=True)
+    source_path = source_folder / "ep1.mkv"
+    source_path.write_bytes(b"source")
+    prepared_path = library_path / "Demo" / "ep1.mp4"
+    captured_cmd: list[str] | None = None
+
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "get_library_path",
+        classmethod(lambda cls, library_type=None: library_path),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "get_anime_searcher_path",
+        classmethod(lambda cls: searcher_path),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_get_indexed_series_fps_sync",
+        classmethod(lambda cls, anime_name, library_type=None: None),
+    )
+
+    async def fake_prepare_single_source_for_library(*, source_path: Path, dest_dir: Path):
+        prepared_path.parent.mkdir(parents=True, exist_ok=True)
+        prepared_path.write_bytes(b"prepared")
+        return prepared_path, "Copying", True
+
+    async def fake_stream_searcher_command(**kwargs):
+        nonlocal captured_cmd
+        captured_cmd = kwargs["cmd"]
+        yield IndexProgress(status="indexing", message="indexing", progress=0.6)
+
+    async def fake_ensure_episode_manifest(*, force_refresh: bool = False, library_type=None):
+        return {}
+
+    async def fake_verify_prepared_library_files(files: list[Path]) -> str | None:
+        return None
+
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_prepare_single_source_for_library",
+        classmethod(lambda cls, **kwargs: fake_prepare_single_source_for_library(**kwargs)),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_verify_prepared_library_files",
+        classmethod(lambda cls, files: fake_verify_prepared_library_files(files)),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_stream_searcher_command",
+        classmethod(lambda cls, **kwargs: fake_stream_searcher_command(**kwargs)),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "ensure_episode_manifest",
+        classmethod(
+            lambda cls, force_refresh=False, library_type=None: fake_ensure_episode_manifest(
+                force_refresh=force_refresh,
+                library_type=library_type,
+            )
+        ),
+    )
+
+    progress_events = [
+        progress
+        async for progress in AnimeLibraryService.index_anime(
+            source_folder=source_folder,
+            anime_name="Demo",
+            require_gpu=False,
+            library_type="anime",
+            decode_backend="torchcodec_cuda",
+            precision="fp16",
+        )
+    ]
+
+    assert progress_events[-1].status == "complete"
+    assert captured_cmd is not None
+    assert "--decode-backend" in captured_cmd
+    assert "torchcodec_cuda" in captured_cmd
+    assert "--precision" in captured_cmd
+    assert "fp16" in captured_cmd
 
 
 @pytest.mark.asyncio

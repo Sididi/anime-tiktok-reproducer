@@ -8,7 +8,6 @@ from functools import partial
 from pathlib import Path
 from typing import AsyncIterator
 
-import cv2
 from PIL import Image, ImageOps
 
 from ..config import settings
@@ -64,6 +63,12 @@ class AnimeMatcherService:
         if not series_name:
             return
         cls._stale_series[coerce_library_type(library_type)].add(series_name)
+
+    @staticmethod
+    def _require_cv2():
+        import cv2
+
+        return cv2
 
     @classmethod
     def _init_searcher(
@@ -142,8 +147,8 @@ class AnimeMatcherService:
             print(f"Failed to initialize anime_searcher: {e}")
             return False
 
-    @staticmethod
-    def extract_frame(video_path: Path, timestamp: float) -> Image.Image | None:
+    @classmethod
+    def extract_frame(cls, video_path: Path, timestamp: float) -> Image.Image | None:
         """
         Extract a single frame from a video at the given timestamp.
 
@@ -154,6 +159,7 @@ class AnimeMatcherService:
         Returns:
             PIL Image or None if extraction failed
         """
+        cv2 = cls._require_cv2()
         cap = cv2.VideoCapture(str(video_path))
         try:
             # Seek to timestamp
@@ -168,8 +174,8 @@ class AnimeMatcherService:
         finally:
             cap.release()
 
-    @staticmethod
-    def extract_frames(video_path: Path, timestamps: list[float]) -> list[Image.Image | None]:
+    @classmethod
+    def extract_frames(cls, video_path: Path, timestamps: list[float]) -> list[Image.Image | None]:
         """
         Extract multiple frames in one pass using a single VideoCapture instance.
 
@@ -180,6 +186,7 @@ class AnimeMatcherService:
         Returns:
             List of PIL images (or None on extraction failure), in input order.
         """
+        cv2 = cls._require_cv2()
         cap = cv2.VideoCapture(str(video_path))
         frames: list[Image.Image | None] = []
         try:

@@ -1,67 +1,68 @@
-from .account_service import AccountService
-from .project_service import ProjectService
-from .downloader import DownloaderService
-from .scene_detector import SceneDetectorService
-from .anime_matcher import AnimeMatcherService
-from .anime_library import AnimeLibraryService
-from .transcriber import TranscriberService
-from .processing import ProcessingService
-from .subtitle_video import SubtitleVideoService
-from .subtitle_renderer import SubtitleFrameRenderer
-from .subtitle_styles import get_style, list_styles
-from .gap_resolution import GapResolutionService
-from .scene_merger import SceneMergerService
-from .metadata import MetadataService
-from .google_drive_service import GoogleDriveService
-from .discord_service import DiscordService
-from .export_service import ExportService
-from .social_upload_service import SocialUploadService, PlatformUploadResult
-from .scheduling_service import SchedulingService
-from .upload_phase import UploadPhaseService
-from .meta_token_service import MetaTokenService
-from .integration_health_service import IntegrationHealthService
-from .gemini_service import GeminiService
-from .elevenlabs_service import ElevenLabsService
-from .voice_config_service import VoiceConfigService
-from .script_automation_service import ScriptAutomationService
-from .script_payload_service import ScriptPayloadService
-from .script_phase_prompt_service import ScriptPhasePromptService
-from .music_config_service import MusicConfigService
-from .audio_speed_service import AudioSpeedService
-from .title_image_generator import TitleImageGeneratorService
-from .premiere_subtitle_baker import PremiereSubtitleBakerService
-from .raw_scene_detector import RawSceneDetectorService
-from .source_chunk_streaming_service import SourceChunkStreamingService
-from .indexation_queue import indexation_queue, IndexationQueueService
-from .torrent_linker import TorrentLinkerService
-from .deferred_download import DeferredDownloadService
-from .tiktok_url_db_service import TikTokUrlDbService
+"""Lazy exports for app.services.
 
-__all__ = [
-    "AccountService",
-    "ProjectService", "DownloaderService", "SceneDetectorService",
-    "AnimeMatcherService", "AnimeLibraryService", "TranscriberService", "ProcessingService",
-    "SubtitleVideoService", "SubtitleFrameRenderer", "get_style", "list_styles",
-    "GapResolutionService", "SceneMergerService",
-    "MetadataService", "GoogleDriveService", "DiscordService", "ExportService",
-    "SchedulingService",
-    "SocialUploadService", "PlatformUploadResult", "UploadPhaseService",
-    "MetaTokenService",
-    "IntegrationHealthService",
-    "GeminiService",
-    "ElevenLabsService",
-    "VoiceConfigService",
-    "ScriptAutomationService",
-    "ScriptPayloadService",
-    "ScriptPhasePromptService",
-    "MusicConfigService",
-    "AudioSpeedService",
-    "TitleImageGeneratorService",
-    "PremiereSubtitleBakerService",
-    "RawSceneDetectorService",
-    "SourceChunkStreamingService",
-    "indexation_queue", "IndexationQueueService",
-    "TorrentLinkerService",
-    "DeferredDownloadService",
-    "TikTokUrlDbService",
-]
+Avoid importing every service eagerly at package import time. Some services
+pull in heavyweight optional runtime dependencies such as OpenCV/scenedetect,
+which should not be required just to import unrelated modules like
+AnimeLibraryService in tests.
+"""
+
+from __future__ import annotations
+
+import importlib
+
+
+_EXPORTS = {
+    "AccountService": (".account_service", "AccountService"),
+    "ProjectService": (".project_service", "ProjectService"),
+    "DownloaderService": (".downloader", "DownloaderService"),
+    "SceneDetectorService": (".scene_detector", "SceneDetectorService"),
+    "AnimeMatcherService": (".anime_matcher", "AnimeMatcherService"),
+    "AnimeLibraryService": (".anime_library", "AnimeLibraryService"),
+    "TranscriberService": (".transcriber", "TranscriberService"),
+    "ProcessingService": (".processing", "ProcessingService"),
+    "SubtitleVideoService": (".subtitle_video", "SubtitleVideoService"),
+    "SubtitleFrameRenderer": (".subtitle_renderer", "SubtitleFrameRenderer"),
+    "get_style": (".subtitle_styles", "get_style"),
+    "list_styles": (".subtitle_styles", "list_styles"),
+    "GapResolutionService": (".gap_resolution", "GapResolutionService"),
+    "SceneMergerService": (".scene_merger", "SceneMergerService"),
+    "MetadataService": (".metadata", "MetadataService"),
+    "GoogleDriveService": (".google_drive_service", "GoogleDriveService"),
+    "DiscordService": (".discord_service", "DiscordService"),
+    "ExportService": (".export_service", "ExportService"),
+    "SocialUploadService": (".social_upload_service", "SocialUploadService"),
+    "PlatformUploadResult": (".social_upload_service", "PlatformUploadResult"),
+    "SchedulingService": (".scheduling_service", "SchedulingService"),
+    "UploadPhaseService": (".upload_phase", "UploadPhaseService"),
+    "MetaTokenService": (".meta_token_service", "MetaTokenService"),
+    "IntegrationHealthService": (".integration_health_service", "IntegrationHealthService"),
+    "GeminiService": (".gemini_service", "GeminiService"),
+    "ElevenLabsService": (".elevenlabs_service", "ElevenLabsService"),
+    "VoiceConfigService": (".voice_config_service", "VoiceConfigService"),
+    "ScriptAutomationService": (".script_automation_service", "ScriptAutomationService"),
+    "ScriptPayloadService": (".script_payload_service", "ScriptPayloadService"),
+    "ScriptPhasePromptService": (".script_phase_prompt_service", "ScriptPhasePromptService"),
+    "MusicConfigService": (".music_config_service", "MusicConfigService"),
+    "AudioSpeedService": (".audio_speed_service", "AudioSpeedService"),
+    "TitleImageGeneratorService": (".title_image_generator", "TitleImageGeneratorService"),
+    "PremiereSubtitleBakerService": (".premiere_subtitle_baker", "PremiereSubtitleBakerService"),
+    "RawSceneDetectorService": (".raw_scene_detector", "RawSceneDetectorService"),
+    "SourceChunkStreamingService": (".source_chunk_streaming_service", "SourceChunkStreamingService"),
+    "indexation_queue": (".indexation_queue", "indexation_queue"),
+    "IndexationQueueService": (".indexation_queue", "IndexationQueueService"),
+    "TorrentLinkerService": (".torrent_linker", "TorrentLinkerService"),
+    "DeferredDownloadService": (".deferred_download", "DeferredDownloadService"),
+    "TikTokUrlDbService": (".tiktok_url_db_service", "TikTokUrlDbService"),
+}
+
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name: str):
+    if name not in _EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attr_name = _EXPORTS[name]
+    module = importlib.import_module(module_name, __name__)
+    value = getattr(module, attr_name)
+    globals()[name] = value
+    return value

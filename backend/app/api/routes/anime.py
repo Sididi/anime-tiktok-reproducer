@@ -106,6 +106,8 @@ class IndexAnimeRequest(BaseModel):
     batch_size: int = 64
     prefetch_batches: int = 3
     transform_workers: int = 4
+    decode_backend: str = "auto"
+    precision: str = "auto"
     require_gpu: bool = True
 
 
@@ -131,6 +133,8 @@ async def index_anime(request: IndexAnimeRequest):
             batch_size=request.batch_size,
             prefetch_batches=request.prefetch_batches,
             transform_workers=request.transform_workers,
+            decode_backend=request.decode_backend,
+            precision=request.precision,
             require_gpu=request.require_gpu,
         ):
             if progress.status == "complete":
@@ -157,6 +161,8 @@ class UpdateAnimeRequest(BaseModel):
     batch_size: int = 64
     prefetch_batches: int = 3
     transform_workers: int = 4
+    decode_backend: str = "auto"
+    precision: str = "auto"
     require_gpu: bool = True
 
 
@@ -176,6 +182,8 @@ async def update_anime(request: UpdateAnimeRequest):
             batch_size=request.batch_size,
             prefetch_batches=request.prefetch_batches,
             transform_workers=request.transform_workers,
+            decode_backend=request.decode_backend,
+            precision=request.precision,
             require_gpu=request.require_gpu,
         ):
             if progress.status == "complete":

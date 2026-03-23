@@ -16,7 +16,7 @@ logger = logging.getLogger("uvicorn.error")
 
 
 class IndexationQueueService:
-    MAX_CONCURRENT = 2
+    MAX_CONCURRENT = 1
 
     def __init__(self) -> None:
         self._jobs: dict[str, IndexationJob] = {}

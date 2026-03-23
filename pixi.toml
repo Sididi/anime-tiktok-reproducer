@@ -25,6 +25,7 @@ httpx = ">=0.28.1,<0.29"
 torch = { version = ">=2.8.0,<2.9.0", index = "https://download.pytorch.org/whl/cu128" }
 torchaudio = { version = ">=2.8.0,<2.9.0", index = "https://download.pytorch.org/whl/cu128" }
 torchvision = { version = ">=0.23.0", index = "https://download.pytorch.org/whl/cu128" }
+torchcodec = ">=0.7.0,<0.8.0"
 
 # WhisperX (requires torch 2.8.x) - GPU accelerated transcription
 whisperx = ">=3.7.6"

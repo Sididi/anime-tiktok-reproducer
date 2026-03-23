@@ -2774,6 +2774,8 @@ class AnimeLibraryService:
         batch_size: int = 64,
         prefetch_batches: int = 3,
         transform_workers: int = 4,
+        decode_backend: str = "auto",
+        precision: str = "auto",
         require_gpu: bool = True,
     ) -> AsyncIterator[IndexProgress]:
         """
@@ -2790,6 +2792,8 @@ class AnimeLibraryService:
             batch_size: Embedding batch size.
             prefetch_batches: Pipeline prefetch queue size.
             transform_workers: CPU worker count for image transforms.
+            decode_backend: Requested frame decode backend.
+            precision: Requested model precision.
             require_gpu: Fail if CUDA is unavailable.
 
         Yields:
@@ -2941,6 +2945,8 @@ class AnimeLibraryService:
             "--batch-size", str(batch_size),
             "--prefetch-batches", str(prefetch_batches),
             "--transform-workers", str(transform_workers),
+            "--decode-backend", decode_backend,
+            "--precision", precision,
             "--progress-json",
         ]
         if require_gpu:
@@ -2981,6 +2987,8 @@ class AnimeLibraryService:
         batch_size: int = 64,
         prefetch_batches: int = 3,
         transform_workers: int = 4,
+        decode_backend: str = "auto",
+        precision: str = "auto",
         require_gpu: bool = True,
     ) -> AsyncIterator[IndexProgress]:
         """Prepare a precise list of source files then incrementally upsert them."""
@@ -3116,6 +3124,8 @@ class AnimeLibraryService:
                 "--batch-size", str(batch_size),
                 "--prefetch-batches", str(prefetch_batches),
                 "--transform-workers", str(transform_workers),
+                "--decode-backend", decode_backend,
+                "--precision", precision,
                 "--progress-json",
             ]
             if require_gpu:
