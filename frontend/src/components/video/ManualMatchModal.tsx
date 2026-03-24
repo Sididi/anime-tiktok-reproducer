@@ -65,7 +65,7 @@ function evaluateSelection(
   };
 }
 
-export function ManualMatchModal({
+function ManualMatchModalContent({
   isOpen,
   onClose,
   scene,
@@ -397,6 +397,9 @@ export function ManualMatchModal({
 
   const tiktokVideoUrl = api.getVideoUrl(projectId);
   const sourceControlsDisabled = sourceLoading || sourceHasError || !sourceVideoUrl;
+  const sourceErrorMessage = chunkStreamingMode
+    ? "Unable to preview source video."
+    : "Video format not supported for direct preview.";
 
   const renderCandidateButton = (item: CandidateWithMeta) => {
     const { candidate, meta } = item;
@@ -457,6 +460,7 @@ export function ManualMatchModal({
                     startTime={scene.start_time}
                     endTime={scene.end_time}
                     eager
+                    loadStallTimeoutMs={12000}
                     className="w-full h-full"
                   />
                 </div>
@@ -537,7 +541,7 @@ export function ManualMatchModal({
                           api
                             .getSourceDescriptor(projectId, selectedEpisode)
                             .then((desc) => {
-                              if (desc && desc.mode === "chunked") {
+                              if (desc) {
                                 setChunkDescriptor(desc);
                                 setChunkStreamingMode(true);
                                 setSourceHasError(false);
@@ -571,9 +575,7 @@ export function ManualMatchModal({
                     )}
                     {sourceHasError && (
                       <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-black/80 px-4 text-center text-white">
-                        <span className="text-xs">
-                          Video format not supported for direct preview.
-                        </span>
+                        <span className="text-xs">{sourceErrorMessage}</span>
                         <Button
                           variant="outline"
                           size="sm"
@@ -692,4 +694,12 @@ export function ManualMatchModal({
 
   if (!isOpen) return null;
   return createPortal(modalContent, document.body);
+}
+
+export function ManualMatchModal(props: ManualMatchModalProps) {
+  if (!props.isOpen) {
+    return null;
+  }
+
+  return <ManualMatchModalContent {...props} />;
 }

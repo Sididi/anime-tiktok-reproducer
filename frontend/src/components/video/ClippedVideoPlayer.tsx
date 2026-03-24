@@ -9,7 +9,12 @@ import {
 } from "react";
 import { RotateCcw, Play, Loader2 } from "lucide-react";
 import { cn } from "@/utils";
-import { acquire, acquirePriority } from "@/utils/videoConnectionPool";
+import {
+  acquire,
+  acquirePriority,
+  getActiveCount,
+  getQueueLength,
+} from "@/utils/videoConnectionPool";
 
 interface ClippedVideoPlayerProps {
   src: string;
@@ -20,6 +25,7 @@ interface ClippedVideoPlayerProps {
   playbackRate?: number;
   onClipEnded?: () => void;
   eager?: boolean;
+  loadStallTimeoutMs?: number | null;
 }
 
 export interface ClippedVideoPlayerHandle {
@@ -48,6 +54,7 @@ interface ReadyWaiter {
 }
 
 const INTENTIONAL_UNLOAD_SUPPRESSION_MS = 250;
+const LOAD_STALL_TIMEOUT_MS = 12000;
 
 /**
  * A video player that strictly clips playback between startTime and endTime.
@@ -70,6 +77,7 @@ export const ClippedVideoPlayer = forwardRef<
     playbackRate = 1,
     onClipEnded,
     eager = false,
+    loadStallTimeoutMs = null,
   },
   ref,
 ) {
@@ -586,7 +594,7 @@ export const ClippedVideoPlayer = forwardRef<
       const errorCode = video.error?.code;
       const errorMessage = video.error?.message || "Unknown error";
       console.error(
-        `Video load error for ${src}: code=${errorCode}, message=${errorMessage}`,
+        `Video load error for ${src}: code=${errorCode}, message=${errorMessage}, pool_active=${getActiveCount()}, pool_queue=${getQueueLength()}`,
       );
       setHasError(true);
       hasErrorRef.current = true;
@@ -596,6 +604,48 @@ export const ClippedVideoPlayer = forwardRef<
     },
     [src, notifyClipCompleted, resolveReadyWaiters],
   );
+
+  // Prevent indefinite loader state by failing fast if media never becomes ready.
+  // Opt-in only to avoid impacting high-speed orchestration flows (e.g. Fast Watch).
+  useEffect(() => {
+    if (
+      loadStallTimeoutMs === null ||
+      loadStallTimeoutMs <= 0 ||
+      !loadRequested ||
+      isLoaded ||
+      hasError ||
+      isRetrying
+    ) {
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      if (!isMountedRef.current) return;
+      if (hasErrorRef.current) return;
+
+      console.warn(
+        `Video load stalled for ${src}: pool_active=${getActiveCount()}, pool_queue=${getQueueLength()}`,
+      );
+      setHasError(true);
+      hasErrorRef.current = true;
+      setIsLoaded(true);
+      notifyClipCompleted();
+      resolveReadyWaiters(true);
+    }, loadStallTimeoutMs || LOAD_STALL_TIMEOUT_MS);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [
+    hasError,
+    isLoaded,
+    isRetrying,
+    loadStallTimeoutMs,
+    loadRequested,
+    notifyClipCompleted,
+    resolveReadyWaiters,
+    src,
+  ]);
 
   // Monitor playback to enforce end boundary only.
   // Start boundary is handled by handleSeeked (user scrubbing) — not needed

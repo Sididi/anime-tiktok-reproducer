@@ -181,13 +181,6 @@ async def get_source_video_chunk(
         raise HTTPException(status_code=404, detail="Project not found")
 
     source_path = await _resolve_source_path(project, path)
-    descriptor = await SourceChunkStreamingService.get_descriptor(source_path)
-
-    if descriptor.get("mode") == "passthrough":
-        raise HTTPException(
-            status_code=400,
-            detail="Source is browser-compatible. Use /video/source for direct passthrough.",
-        )
 
     try:
         chunk_path = await SourceChunkStreamingService.get_chunk(
@@ -224,11 +217,8 @@ async def get_source_video(
 
     source_path = await _resolve_source_path(project, path)
 
-    compatible = await asyncio.to_thread(
-        AnimeLibraryService.is_browser_preview_compatible,
-        source_path,
-    )
-    if not compatible:
+    descriptor = await SourceChunkStreamingService.get_descriptor(source_path)
+    if descriptor.get("mode") != "passthrough":
         raise HTTPException(
             status_code=415,
             detail=(
