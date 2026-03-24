@@ -278,7 +278,10 @@ export const ClippedVideoPlayer = forwardRef<
           setSourceAttachedState(true);
         })
         .catch(() => {
-          if (pendingAcquireIdRef.current !== acquireId || !isMountedRef.current) {
+          if (
+            pendingAcquireIdRef.current !== acquireId ||
+            !isMountedRef.current
+          ) {
             return;
           }
           pendingAcquireIdRef.current = null;

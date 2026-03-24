@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect, useMemo } from "react";
+import { memo, useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { createPortal } from "react-dom";
 import {
   X,
@@ -52,7 +52,9 @@ function evaluateSelection(
 ): ManualMatchSaveMeta {
   const sourceDuration = Math.max(0, endTime - startTime);
   const speedRatio =
-    sourceDuration > 0 ? sceneDuration / sourceDuration : Number.POSITIVE_INFINITY;
+    sourceDuration > 0
+      ? sceneDuration / sourceDuration
+      : Number.POSITIVE_INFINITY;
   const anomalous =
     sourceDuration > ANOMALY_MAX_SOURCE_DURATION ||
     speedRatio < ANOMALY_MIN_SPEED ||
@@ -254,7 +256,7 @@ function ManualMatchModalContent({
     const fallbackStart =
       match?.confidence && match.confidence > 0
         ? match.start_time
-        : parsedStart ?? 0;
+        : (parsedStart ?? 0);
     const requestedTime = pendingSeekTimeRef.current ?? fallbackStart;
     const mediaDuration = Number.isFinite(video.duration) ? video.duration : 0;
     const boundedStart = clampSourceTime(requestedTime, mediaDuration);
@@ -393,10 +395,18 @@ function ManualMatchModalContent({
     if (sourceRetryCount === 0) return base;
     const separator = base.includes("?") ? "&" : "?";
     return `${base}${separator}_retry=${sourceRetryCount}`;
-  }, [projectId, selectedEpisode, sourceRetryCount, chunkStreamingMode, chunkDescriptor, chunkSeekTime]);
+  }, [
+    projectId,
+    selectedEpisode,
+    sourceRetryCount,
+    chunkStreamingMode,
+    chunkDescriptor,
+    chunkSeekTime,
+  ]);
 
   const tiktokVideoUrl = api.getVideoUrl(projectId);
-  const sourceControlsDisabled = sourceLoading || sourceHasError || !sourceVideoUrl;
+  const sourceControlsDisabled =
+    sourceLoading || sourceHasError || !sourceVideoUrl;
   const sourceErrorMessage = chunkStreamingMode
     ? "Unable to preview source video."
     : "Video format not supported for direct preview.";
@@ -414,14 +424,16 @@ function ManualMatchModalContent({
             {candidate.episode.split("/").pop()}
           </div>
           <div className="text-xs text-[hsl(var(--muted-foreground))]">
-            {formatTime(candidate.start_time)} - {formatTime(candidate.end_time)}
+            {formatTime(candidate.start_time)} -{" "}
+            {formatTime(candidate.end_time)}
             {candidate.algorithm && (
               <span className="ml-1 opacity-60">[{candidate.algorithm}]</span>
             )}
           </div>
           {meta.anomalous && (
             <div className="mt-1 text-[10px] text-amber-500">
-              Risky: {formatTime(meta.sourceDuration)} source ({meta.speedRatio.toFixed(2)}x)
+              Risky: {formatTime(meta.sourceDuration)} source (
+              {meta.speedRatio.toFixed(2)}x)
             </div>
           )}
         </div>
@@ -466,7 +478,8 @@ function ManualMatchModalContent({
                 </div>
               </div>
 
-              {(normalAlternatives.length > 0 || riskyAlternatives.length > 0) && (
+              {(normalAlternatives.length > 0 ||
+                riskyAlternatives.length > 0) && (
                 <div className="bg-[hsl(var(--muted))] rounded-lg p-3 space-y-3">
                   <div className="flex items-center gap-2">
                     <Sparkles className="h-4 w-4 text-amber-500" />
@@ -546,7 +559,8 @@ function ManualMatchModalContent({
                                 setChunkStreamingMode(true);
                                 setSourceHasError(false);
                                 setSourceLoading(true);
-                                if (desc.duration > 0) setDuration(desc.duration);
+                                if (desc.duration > 0)
+                                  setDuration(desc.duration);
                               } else {
                                 setSourceLoading(false);
                                 setSourceHasError(true);
@@ -590,11 +604,13 @@ function ManualMatchModalContent({
                         </Button>
                       </div>
                     )}
-                    {chunkStreamingMode && !sourceLoading && !sourceHasError && (
-                      <div className="absolute top-1 right-1 z-10 bg-black/60 text-white text-[10px] px-1.5 py-0.5 rounded">
-                        Streaming preview
-                      </div>
-                    )}
+                    {chunkStreamingMode &&
+                      !sourceLoading &&
+                      !sourceHasError && (
+                        <div className="absolute top-1 right-1 z-10 bg-black/60 text-white text-[10px] px-1.5 py-0.5 rounded">
+                          Streaming preview
+                        </div>
+                      )}
                   </div>
 
                   <div className="flex items-center gap-2">
@@ -696,10 +712,15 @@ function ManualMatchModalContent({
   return createPortal(modalContent, document.body);
 }
 
-export function ManualMatchModal(props: ManualMatchModalProps) {
+function ManualMatchModalBase(props: ManualMatchModalProps) {
   if (!props.isOpen) {
     return null;
   }
 
   return <ManualMatchModalContent {...props} />;
 }
+
+export const ManualMatchModal = memo(
+  ManualMatchModalBase,
+  (prevProps, nextProps) => !prevProps.isOpen && !nextProps.isOpen,
+);

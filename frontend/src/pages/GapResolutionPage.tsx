@@ -138,7 +138,22 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
 
   // Calculate if still has gap after resolution
   const hasGapAfterResolution = displaySpeed < 0.75;
-  const isChunkedSource = sourceDescriptor?.mode === "chunked";
+
+  const shouldUseChunkedSource = useCallback(
+    (descriptor: SourceStreamDescriptor | null): boolean => {
+      if (!descriptor) return false;
+      if (descriptor.mode === "chunked") return true;
+
+      // High-rate Fast Watch can stutter on direct HEVC decode; prefer chunked
+      // H.264 preview to stabilize playback pacing.
+      const codec = (descriptor.codec || "").toLowerCase();
+      const pixFmt = (descriptor.pix_fmt || "").toLowerCase();
+      return playbackRate >= 8 && (codec === "hevc" || pixFmt.includes("10"));
+    },
+    [playbackRate],
+  );
+
+  const isChunkedSource = shouldUseChunkedSource(sourceDescriptor);
 
   const getChunkWindowStart = useCallback(
     (
@@ -179,7 +194,7 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
         if (!active) return;
         setSourceDescriptor(descriptor);
 
-        if (descriptor?.mode === "chunked") {
+        if (shouldUseChunkedSource(descriptor)) {
           const desiredDuration = Math.min(
             Math.max(
               descriptor.chunk_duration,
@@ -213,11 +228,12 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
     gap.episode,
     getSourceDescriptor,
     getChunkWindowStart,
+    shouldUseChunkedSource,
     shouldLoadSourcePreview,
   ]);
 
   useEffect(() => {
-    if (!sourceDescriptor || sourceDescriptor.mode !== "chunked") return;
+    if (!sourceDescriptor || !isChunkedSource) return;
 
     const duration =
       sourceChunkDuration > 0 ? sourceChunkDuration : sourceDescriptor.chunk_duration;
@@ -249,6 +265,7 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
     sourceChunkStart,
     sourceClipDuration,
     sourceDescriptor,
+    isChunkedSource,
   ]);
   /* eslint-enable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
 
@@ -856,6 +873,7 @@ export function GapResolutionPage() {
   );
 
   const fastWatchPrefetchAhead = useMemo(() => {
+    if (playbackRate >= 8) return 3;
     if (playbackRate >= 2) return 2;
     return 1;
   }, [playbackRate]);
