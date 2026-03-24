@@ -107,6 +107,12 @@ export function ManualMatchModal({
   const [sourceRetryCount, setSourceRetryCount] = useState(0);
   const [sourceLoading, setSourceLoading] = useState(false);
   const [sourceHasError, setSourceHasError] = useState(false);
+  const [chunkStreamingMode, setChunkStreamingMode] = useState(false);
+  const [chunkDescriptor, setChunkDescriptor] = useState<
+    import("@/types").SourceStreamDescriptor | null
+  >(null);
+  const [chunkSeekTime, setChunkSeekTime] = useState(0);
+  const chunkStreamingAttemptedRef = useRef(false);
 
   const sceneDuration = scene.end_time - scene.start_time;
 
@@ -117,6 +123,10 @@ export function ManualMatchModal({
     setIsPlaying(false);
     setCurrentTime(0);
     setDuration(0);
+    setChunkStreamingMode(false);
+    setChunkDescriptor(null);
+    setChunkSeekTime(0);
+    chunkStreamingAttemptedRef.current = false;
     pendingSeekTimeRef.current = null;
     resumePlaybackAfterLoadRef.current = false;
   }, []);
@@ -290,6 +300,14 @@ export function ManualMatchModal({
       const time = parseFloat(e.target.value);
       if (!Number.isFinite(time)) return;
 
+      if (chunkStreamingMode) {
+        // In chunk mode, seek reloads a new chunk from the target position.
+        setCurrentTime(time);
+        setChunkSeekTime(time);
+        setSourceLoading(true);
+        return;
+      }
+
       const bounded = clampSourceTime(
         time,
         Number.isFinite(video.duration) ? video.duration : undefined,
@@ -302,7 +320,7 @@ export function ManualMatchModal({
       video.currentTime = bounded;
       setCurrentTime(bounded);
     },
-    [clampSourceTime],
+    [clampSourceTime, chunkStreamingMode],
   );
 
   const handlePlayPause = useCallback(() => {
@@ -363,11 +381,19 @@ export function ManualMatchModal({
 
   const sourceVideoUrl = useMemo(() => {
     if (!selectedEpisode) return "";
+    if (chunkStreamingMode && chunkDescriptor) {
+      return api.getSourceChunkUrl(
+        projectId,
+        selectedEpisode,
+        chunkSeekTime,
+        chunkDescriptor.chunk_duration,
+      );
+    }
     const base = api.getSourceVideoUrl(projectId, selectedEpisode);
     if (sourceRetryCount === 0) return base;
     const separator = base.includes("?") ? "&" : "?";
     return `${base}${separator}_retry=${sourceRetryCount}`;
-  }, [projectId, selectedEpisode, sourceRetryCount]);
+  }, [projectId, selectedEpisode, sourceRetryCount, chunkStreamingMode, chunkDescriptor, chunkSeekTime]);
 
   const tiktokVideoUrl = api.getVideoUrl(projectId);
   const sourceControlsDisabled = sourceLoading || sourceHasError || !sourceVideoUrl;
@@ -502,6 +528,34 @@ export function ManualMatchModal({
                       onPlay={() => setIsPlaying(true)}
                       onPause={() => setIsPlaying(false)}
                       onError={() => {
+                        if (
+                          !chunkStreamingMode &&
+                          !chunkStreamingAttemptedRef.current &&
+                          selectedEpisode
+                        ) {
+                          chunkStreamingAttemptedRef.current = true;
+                          api
+                            .getSourceDescriptor(projectId, selectedEpisode)
+                            .then((desc) => {
+                              if (desc && desc.mode === "chunked") {
+                                setChunkDescriptor(desc);
+                                setChunkStreamingMode(true);
+                                setSourceHasError(false);
+                                setSourceLoading(true);
+                                if (desc.duration > 0) setDuration(desc.duration);
+                              } else {
+                                setSourceLoading(false);
+                                setSourceHasError(true);
+                                setIsPlaying(false);
+                              }
+                            })
+                            .catch(() => {
+                              setSourceLoading(false);
+                              setSourceHasError(true);
+                              setIsPlaying(false);
+                            });
+                          return;
+                        }
                         setSourceLoading(false);
                         setSourceHasError(true);
                         setIsPlaying(false);
@@ -518,7 +572,7 @@ export function ManualMatchModal({
                     {sourceHasError && (
                       <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-black/80 px-4 text-center text-white">
                         <span className="text-xs">
-                          Failed to load source directly. This modal only supports browser-playable files.
+                          Video format not supported for direct preview.
                         </span>
                         <Button
                           variant="outline"
@@ -532,6 +586,11 @@ export function ManualMatchModal({
                         >
                           Retry
                         </Button>
+                      </div>
+                    )}
+                    {chunkStreamingMode && !sourceLoading && !sourceHasError && (
+                      <div className="absolute top-1 right-1 z-10 bg-black/60 text-white text-[10px] px-1.5 py-0.5 rounded">
+                        Streaming preview
                       </div>
                     )}
                   </div>

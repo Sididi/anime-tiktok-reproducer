@@ -169,6 +169,14 @@ class AnimeLibraryService:
     SOURCE_NORMALIZATION_PROFILE_H264_MP4_AAC = "h264_mp4_aac"
     GPU_HWACCEL = "cuda"
     GPU_H264_ENCODER = "h264_nvenc"
+    PRORES_TRANSCODE_TIMEOUT_SECONDS = 7200.0
+    PREMIERE_NATIVE_VIDEO_CODECS = {"h264", "hevc"}
+    _CUDA_DECODERS: dict[str, str] = {
+        "av1": "av1_cuvid",
+        "h264": "h264_cuvid",
+        "hevc": "hevc_cuvid",
+        "vp9": "vp9_cuvid",
+    }
 
     _episode_manifest_cache: dict[str, dict] = {}
     _episode_manifest_locks: dict[str, asyncio.Lock] = {}
@@ -916,38 +924,57 @@ class AnimeLibraryService:
 
     @classmethod
     def classify_source_normalization(cls, probe: SourceMediaProbe) -> str:
-        """Classify the cheapest compatibility action for Premiere-safe output."""
-        profile = cls._get_source_normalization_profile()
-        if profile != cls.SOURCE_NORMALIZATION_PROFILE_H264_MP4_AAC:
-            raise RuntimeError(f"Unsupported source normalization profile: {profile}")
+        """Classify the cheapest compatibility action for Premiere-safe output.
 
+        Since format normalization now happens at indexation time (incompatible
+        codecs are transcoded to ProRes, MKV→MP4 remuxed), the processing step
+        only needs to handle audio track selection and container fixups.
+        """
         video_codec = (probe.video_codec or "").strip().lower()
         audio_codec = (probe.audio_codec or "").strip().lower()
         has_extra_audio_streams = len(probe.audio_streams) > 1
         has_subtitle_streams = len(probe.subtitle_streams) > 0
         has_data_streams = len(probe.data_streams) > 0
+        premiere_compatible_container = probe.container_suffix in {".mp4", ".mov"}
+        premiere_compatible_video = video_codec in cls.PREMIERE_NATIVE_VIDEO_CODECS or video_codec == "prores"
 
+        # Already perfect: right codec, container, single audio, no junk streams.
         if (
-            video_codec == "h264"
-            and probe.container_suffix == ".mp4"
+            premiere_compatible_video
+            and premiere_compatible_container
             and not has_extra_audio_streams
             and not has_subtitle_streams
             and not has_data_streams
-            and (not probe.has_audio or audio_codec == "aac")
+            and (not probe.has_audio or audio_codec in {"aac", "pcm_s16le", "pcm_s24le", "pcm_s32le"})
         ):
             return "noop"
 
-        if video_codec != "h264":
+        # Legacy: source still has an incompatible video codec (indexed before
+        # the ProRes-at-indexation feature).  Fall back to full h264 transcode.
+        if not premiere_compatible_video:
             return "full_h264_aac_transcode"
 
-        if probe.has_audio and audio_codec != "aac":
+        # Container needs fixing (e.g. MKV with Premiere-native codec).
+        if not premiere_compatible_container:
+            return "remux_to_mp4"
+
+        # Multiple audio streams → need to select one and remux.
+        if has_extra_audio_streams:
+            return "remux_audio_select"
+
+        # Audio codec not Premiere-friendly for this container.
+        if probe.has_audio and audio_codec not in {"aac", "pcm_s16le", "pcm_s24le", "pcm_s32le"}:
             return "audio_to_aac"
 
+        # Container OK but has subtitle/data streams to strip, or multiple
+        # audio streams remain.  The remux copies video and selected audio
+        # while dropping everything else.
         return "remux_to_mp4"
 
     @staticmethod
     def _normalized_target_path(source_path: Path) -> Path:
-        if source_path.suffix.lower() == ".mp4":
+        suffix = source_path.suffix.lower()
+        if suffix in {".mp4", ".mov"}:
             return source_path
         return source_path.with_suffix(".mp4")
 
@@ -1040,9 +1067,10 @@ class AnimeLibraryService:
     ) -> bool:
         if normalized_probe is None:
             return False
-        if normalized_probe.container_suffix != ".mp4":
+        if normalized_probe.container_suffix not in {".mp4", ".mov"}:
             return False
-        if (normalized_probe.video_codec or "").strip().lower() != "h264":
+        video_codec = (normalized_probe.video_codec or "").strip().lower()
+        if video_codec not in cls.PREMIERE_NATIVE_VIDEO_CODECS and video_codec != "prores":
             return False
         if normalized_probe.duration is None:
             return False
@@ -1052,10 +1080,11 @@ class AnimeLibraryService:
             return False
 
         normalized_audio = (normalized_probe.audio_codec or "").strip().lower()
+        premiere_audio_codecs = {"aac", "pcm_s16le", "pcm_s24le", "pcm_s32le"}
         if reference_probe.has_audio:
             if (
                 not normalized_probe.has_audio
-                or normalized_audio != "aac"
+                or normalized_audio not in premiere_audio_codecs
                 or len(normalized_probe.audio_streams) != 1
             ):
                 return False
@@ -1136,6 +1165,82 @@ class AnimeLibraryService:
             "+faststart",
             str(output_path),
         ]
+
+    @classmethod
+    def _is_premiere_native_codec(cls, codec: str | None) -> bool:
+        """Return True when video codec is natively supported by Premiere Pro."""
+        return (codec or "").strip().lower() in cls.PREMIERE_NATIVE_VIDEO_CODECS
+
+    @classmethod
+    def _build_gpu_prores_cmd(
+        cls,
+        source_path: Path,
+        output_path: Path,
+        *,
+        source_codec: str | None = None,
+    ) -> list[str]:
+        """GPU-decode → CPU ProRes 422 LT encode."""
+        codec = (source_codec or "").strip().lower()
+        cmd: list[str] = ["ffmpeg", "-y"]
+        cuda_decoder = cls._CUDA_DECODERS.get(codec)
+        if cuda_decoder:
+            cmd.extend(["-hwaccel", cls.GPU_HWACCEL, "-c:v", cuda_decoder])
+        cmd.extend([
+            "-i", str(source_path),
+            "-map", "0:v:0",
+            "-map", "0:a?",
+            "-map_metadata", "-1",
+            "-map_chapters", "-1",
+            "-dn", "-sn",
+            "-write_tmcd", "0",
+            "-c:v", "prores_ks",
+            "-profile:v", "1",
+            "-vendor", "apl0",
+            "-pix_fmt", "yuv422p10le",
+            "-c:a", "copy",
+            str(output_path),
+        ])
+        return cmd
+
+    @classmethod
+    def _build_cpu_prores_cmd(
+        cls,
+        source_path: Path,
+        output_path: Path,
+    ) -> list[str]:
+        """CPU-only ProRes 422 LT encode (fallback when GPU decode unavailable)."""
+        return [
+            "ffmpeg", "-y",
+            "-i", str(source_path),
+            "-map", "0:v:0",
+            "-map", "0:a?",
+            "-map_metadata", "-1",
+            "-map_chapters", "-1",
+            "-dn", "-sn",
+            "-write_tmcd", "0",
+            "-c:v", "prores_ks",
+            "-profile:v", "1",
+            "-vendor", "apl0",
+            "-pix_fmt", "yuv422p10le",
+            "-c:a", "copy",
+            str(output_path),
+        ]
+
+    @classmethod
+    def _build_remux_audio_select_cmd(
+        cls,
+        source_path: Path,
+        output_path: Path,
+        *,
+        probe: SourceMediaProbe,
+    ) -> list[str]:
+        """Remux with selected audio track — video copied, audio to AAC.
+
+        Functionally identical to ``_build_audio_to_aac_cmd``; the separate
+        action name exists so that log messages distinguish *why* the remux
+        happens (multi-track selection vs. incompatible audio codec).
+        """
+        return cls._build_audio_to_aac_cmd(source_path, output_path, probe=probe)
 
     @classmethod
     def _build_common_normalization_cmd_from_probe(
@@ -1896,7 +2001,13 @@ class AnimeLibraryService:
         preferred_audio_language: str | None = None,
         subtitle_image_render_windows: dict[int, list[tuple[float, float]]] | None = None,
     ) -> SourceNormalizationResult:
-        """Normalize one source episode to Premiere-safe H.264 MP4 + AAC when needed."""
+        """Normalize one source episode for Premiere Pro import.
+
+        Since format normalization now happens at indexation (incompatible codecs
+        → ProRes, MKV → MP4), this step typically only remuxes the selected
+        audio track.  The full_h264_aac_transcode path is kept for backward
+        compatibility with sources indexed before the ProRes feature.
+        """
         if not source_path.exists() or not source_path.is_file():
             raise FileNotFoundError(f"Source file not found: {source_path}")
 
@@ -1922,7 +2033,8 @@ class AnimeLibraryService:
                 )
 
         target_path = plan.target_path
-        tmp_path = target_path.with_name(f"{target_path.stem}.normalize.tmp.mp4")
+        tmp_suffix = target_path.suffix or ".mp4"
+        tmp_path = target_path.with_name(f"{target_path.stem}.normalize.tmp{tmp_suffix}")
 
         if target_path != source_path and target_path.exists():
             existing_probe = await asyncio.to_thread(cls._probe_media_sync, target_path)
@@ -1972,14 +2084,23 @@ class AnimeLibraryService:
                     raise RuntimeError(
                         f"Failed to remux source for Premiere: {cls._format_media_failure(result)}"
                     )
-            elif plan.action == "audio_to_aac":
+            elif plan.action in {"audio_to_aac", "remux_audio_select"}:
                 try:
-                    result = await cls._run_normalization_command(
-                        cls._build_audio_to_aac_cmd(
+                    cmd = (
+                        cls._build_remux_audio_select_cmd(
                             plan.source_path,
                             tmp_path,
                             probe=plan.probe,
-                        ),
+                        )
+                        if plan.action == "remux_audio_select"
+                        else cls._build_audio_to_aac_cmd(
+                            plan.source_path,
+                            tmp_path,
+                            probe=plan.probe,
+                        )
+                    )
+                    result = await cls._run_normalization_command(
+                        cmd,
                         timeout_seconds=cls.SOURCE_NORMALIZATION_TIMEOUT_SECONDS,
                     )
                 except (CommandTimeoutError, FileNotFoundError) as exc:
@@ -2681,18 +2802,23 @@ class AnimeLibraryService:
         dest_dir: Path,
     ) -> tuple[Path, str, bool]:
         source_codec = await asyncio.to_thread(cls.get_primary_video_codec_sync, source_path)
-        is_av1 = source_codec == "av1"
-        should_remux_mkv = source_path.suffix.lower() == ".mkv" and not is_av1
-        preferred_dest = dest_dir / (
-            source_path.stem + ".mp4" if should_remux_mkv else source_path.name
-        )
-        actual_dest = preferred_dest
+        codec_lower = (source_codec or "").strip().lower()
+        is_premiere_native = cls._is_premiere_native_codec(codec_lower)
+        is_mkv = source_path.suffix.lower() == ".mkv"
+        needs_prores_transcode = not is_premiere_native
 
-        action = "Copying"
-        if is_av1:
-            action = "Copying AV1 source"
-        elif should_remux_mkv:
+        # Decide destination path and action label.
+        if needs_prores_transcode:
+            preferred_dest = dest_dir / (source_path.stem + ".mov")
+            action = f"Transcoding {codec_lower or 'unknown'} to ProRes"
+        elif is_mkv:
+            preferred_dest = dest_dir / (source_path.stem + ".mp4")
             action = "Remuxing"
+        else:
+            preferred_dest = dest_dir / source_path.name
+            action = "Copying"
+
+        actual_dest = preferred_dest
 
         existing_ready = await asyncio.to_thread(
             cls._source_matches_prepared_sync,
@@ -2702,16 +2828,102 @@ class AnimeLibraryService:
         if existing_ready:
             return preferred_dest, "Using existing", False
 
-        # Probe source for subtitle streams before remux (MKV→MP4 drops them).
+        # Always probe source for subtitle streams (extraction needed for all
+        # transform types: remux drops subs, transcode drops subs, and even
+        # plain copies may come from containers with embedded subs).
         source_probe: SourceMediaProbe | None = None
-        if should_remux_mkv:
-            try:
-                source_probe = await asyncio.to_thread(cls._probe_media_sync, source_path)
-            except Exception as exc:
-                logger.debug("Could not probe %s for subtitles: %s", source_path.name, exc)
-                source_probe = None
+        try:
+            source_probe = await asyncio.to_thread(cls._probe_media_sync, source_path)
+        except Exception as exc:
+            logger.debug("Could not probe %s for subtitles: %s", source_path.name, exc)
+            source_probe = None
 
-        if should_remux_mkv:
+        if needs_prores_transcode:
+            # --- ProRes 422 LT transcode for Premiere-incompatible codecs ---
+            tmp_suffix = ".import.tmp.mov"
+            tmp_dest = preferred_dest.with_name(f"{preferred_dest.stem}{tmp_suffix}")
+            if tmp_dest.exists():
+                with suppress(OSError):
+                    await asyncio.to_thread(tmp_dest.unlink)
+
+            gpu_error: str | None = None
+            try:
+                gpu_result = await run_command(
+                    rewrite_media_command(
+                        cls._build_gpu_prores_cmd(source_path, tmp_dest, source_codec=source_codec)
+                    ),
+                    timeout_seconds=cls.PRORES_TRANSCODE_TIMEOUT_SECONDS,
+                )
+            except (CommandTimeoutError, FileNotFoundError) as exc:
+                gpu_error = cls._format_media_failure(exc)
+            else:
+                if gpu_result.returncode != 0:
+                    gpu_error = cls._format_media_failure(gpu_result)
+
+            if gpu_error is not None:
+                if tmp_dest.exists():
+                    with suppress(OSError):
+                        await asyncio.to_thread(tmp_dest.unlink)
+                try:
+                    cpu_result = await run_command(
+                        rewrite_media_command(
+                            cls._build_cpu_prores_cmd(source_path, tmp_dest)
+                        ),
+                        timeout_seconds=cls.PRORES_TRANSCODE_TIMEOUT_SECONDS,
+                    )
+                except (CommandTimeoutError, FileNotFoundError) as exc:
+                    logger.error(
+                        "ProRes transcode failed for %s (GPU: %s; CPU: %s)",
+                        source_path.name,
+                        gpu_error,
+                        cls._format_media_failure(exc),
+                    )
+                    # Fall back to plain copy so indexing can still proceed.
+                    fallback_dest = dest_dir / source_path.name
+                    if fallback_dest != source_path or not fallback_dest.exists():
+                        await asyncio.to_thread(shutil.copy2, source_path, fallback_dest)
+                    actual_dest = fallback_dest
+                    action = f"Copying (ProRes failed)"
+                    cpu_result = None
+                else:
+                    if cpu_result.returncode != 0:
+                        logger.error(
+                            "ProRes transcode failed for %s (GPU: %s; CPU: %s)",
+                            source_path.name,
+                            gpu_error,
+                            cls._format_media_failure(cpu_result),
+                        )
+                        fallback_dest = dest_dir / source_path.name
+                        if fallback_dest != source_path or not fallback_dest.exists():
+                            await asyncio.to_thread(shutil.copy2, source_path, fallback_dest)
+                        actual_dest = fallback_dest
+                        action = f"Copying (ProRes failed)"
+                        cpu_result = None
+
+            # Validate & commit transcoded file.
+            if actual_dest == preferred_dest and tmp_dest.exists():
+                transcode_probe = await asyncio.to_thread(cls._probe_media_sync, tmp_dest)
+                if (
+                    transcode_probe is not None
+                    and transcode_probe.duration is not None
+                    and transcode_probe.duration > 0
+                ):
+                    await asyncio.to_thread(tmp_dest.replace, preferred_dest)
+                else:
+                    logger.warning(
+                        "ProRes transcode output failed validation for %s",
+                        source_path.name,
+                    )
+                    with suppress(OSError):
+                        await asyncio.to_thread(tmp_dest.unlink)
+                    fallback_dest = dest_dir / source_path.name
+                    if fallback_dest != source_path or not fallback_dest.exists():
+                        await asyncio.to_thread(shutil.copy2, source_path, fallback_dest)
+                    actual_dest = fallback_dest
+                    action = f"Copying (ProRes failed)"
+
+        elif is_mkv:
+            # --- Remux MKV → MP4 (stream copy) for Premiere-native codecs ---
             tmp_dest = preferred_dest.with_name(f"{preferred_dest.stem}.import.tmp.mp4")
             if tmp_dest.exists():
                 with suppress(OSError):
@@ -2795,9 +3007,9 @@ class AnimeLibraryService:
         elif preferred_dest != source_path:
             await asyncio.to_thread(shutil.copy2, source_path, preferred_dest)
 
-        # Extract subtitles to sidecar before the original source is deleted.
-        # The source MKV has subtitle streams that are lost during MKV→MP4 remux
-        # (MP4 cannot hold ASS/PGS). Extract them now while we still have the source.
+        # Extract subtitles to sidecar.  Always attempt extraction regardless
+        # of transform type — remux/transcode strip subtitle streams and even
+        # plain copies benefit from having a sidecar for later use.
         if (
             source_probe is not None
             and source_probe.subtitle_streams

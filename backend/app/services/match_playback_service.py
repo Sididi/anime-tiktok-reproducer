@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import collections
 import os
 import shutil
 import subprocess
@@ -103,9 +104,13 @@ class MatchPlaybackService:
     ULTRA_LONG_SOURCE_SECONDS = 60.0
     CLIP_STORE_MAX_BYTES = 8 * 1024 * 1024 * 1024
     CLIP_STORE_STALE_SECONDS = 7 * 24 * 3600
+    WEB_COMPATIBLE_CODECS = {"h264", "hevc"}
+    WEB_COMPATIBLE_PIX_FMTS = {"yuv420p", "yuvj420p", "yuv420p10le"}
+    _SOURCE_WEB_COMPAT_CACHE_MAX = 256
     _prepare_locks: dict[str, asyncio.Lock] = {}
     _nvenc_checked = False
     _nvenc_available = False
+    _source_web_compat_cache: collections.OrderedDict[str, bool] = collections.OrderedDict()
 
     _PROFILE_MAP: dict[str, _ClipProfile] = {
         "tiktok_fast": _ClipProfile(
@@ -501,9 +506,9 @@ class MatchPlaybackService:
         stream0 = streams[0]
         codec = str(stream0.get("codec_name", "")).lower()
         pix_fmt = str(stream0.get("pix_fmt", "")).lower()
-        if codec != "h264":
+        if codec not in cls.WEB_COMPATIBLE_CODECS:
             raise RuntimeError(f"Unexpected codec for {path.name}: {codec}")
-        if pix_fmt not in {"yuv420p", "yuvj420p"}:
+        if pix_fmt not in cls.WEB_COMPATIBLE_PIX_FMTS:
             raise RuntimeError(f"Unexpected pixel format for {path.name}: {pix_fmt}")
 
         duration_raw = (payload.get("format") or {}).get("duration")
@@ -598,6 +603,101 @@ class MatchPlaybackService:
             result.returncode == 0 and "h264_nvenc" in result.stdout
         )
         return cls._nvenc_available
+
+    @classmethod
+    def _cache_web_compat(cls, key: str, value: bool) -> bool:
+        cls._source_web_compat_cache[key] = value
+        cls._source_web_compat_cache.move_to_end(key)
+        while len(cls._source_web_compat_cache) > cls._SOURCE_WEB_COMPAT_CACHE_MAX:
+            cls._source_web_compat_cache.popitem(last=False)
+        return value
+
+    @classmethod
+    def _is_source_web_compatible_sync(cls, source_path: Path) -> bool:
+        """Return True when source can be stream-copied into a browser-safe clip."""
+        cache_key = str(source_path)
+        cached = cls._source_web_compat_cache.get(cache_key)
+        if cached is not None:
+            cls._source_web_compat_cache.move_to_end(cache_key)
+            return cached
+
+        if source_path.suffix.lower() not in {".mp4", ".m4v"}:
+            return cls._cache_web_compat(cache_key, False)
+
+        cmd = rewrite_media_command(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=codec_name,pix_fmt",
+                "-of", "json",
+                str(source_path),
+            ]
+        )
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+                env=get_media_subprocess_env(cmd),
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return cls._cache_web_compat(cache_key, False)
+
+        if result.returncode != 0:
+            return cls._cache_web_compat(cache_key, False)
+
+        import json as _json
+        try:
+            streams = _json.loads(result.stdout).get("streams") or []
+        except (ValueError, KeyError):
+            return cls._cache_web_compat(cache_key, False)
+
+        if not streams:
+            return cls._cache_web_compat(cache_key, False)
+
+        codec = str(streams[0].get("codec_name", "")).lower()
+        pix_fmt = str(streams[0].get("pix_fmt", "")).lower()
+        compat = (
+            codec in cls.WEB_COMPATIBLE_CODECS
+            and pix_fmt in cls.WEB_COMPATIBLE_PIX_FMTS
+        )
+        return cls._cache_web_compat(cache_key, compat)
+
+    @classmethod
+    def _build_stream_copy_command_sync(
+        cls,
+        *,
+        plan: _ClipPlan,
+        duration: float,
+        output_path: Path,
+    ) -> list[str]:
+        """Build ffmpeg command for stream-copy clip extraction (no re-encode)."""
+        return rewrite_media_command(
+            [
+                "ffmpeg",
+                "-y",
+                "-v",
+                "error",
+                "-ss",
+                f"{plan.start_time:.6f}",
+                "-i",
+                str(plan.input_path),
+                "-t",
+                f"{duration:.6f}",
+                "-map",
+                "0:v:0",
+                "-an",
+                "-sn",
+                "-dn",
+                "-c:v",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ]
+        )
 
     @classmethod
     def _build_nvenc_command_sync(
@@ -711,61 +811,95 @@ class MatchPlaybackService:
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
 
-        vf = (
-            f"scale=w={profile.width}:h={profile.height}:"
-            f"force_original_aspect_ratio=decrease,fps={profile.fps}"
-        )
-
         error_details: list[str] = []
         encoded = False
 
-        if cls._is_nvenc_available_sync():
-            nvenc_cmd = cls._build_nvenc_command_sync(
+        # --- Fast path: stream copy for web-compatible sources ---
+        if plan.track == "source" and cls._is_source_web_compatible_sync(plan.input_path):
+            copy_cmd = cls._build_stream_copy_command_sync(
                 plan=plan,
-                profile=profile,
                 duration=duration,
-                vf=vf,
                 output_path=tmp_path,
             )
-            result = subprocess.run(
-                nvenc_cmd,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=cls.FFMPEG_TIMEOUT_SECONDS,
-                env=get_media_subprocess_env(nvenc_cmd),
-            )
-            if result.returncode == 0:
-                encoded = True
-            else:
-                error_details.append(
-                    f"nvenc: {result.stderr.strip() or 'unknown error'}"
+            try:
+                result = subprocess.run(
+                    copy_cmd,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=cls.FFMPEG_TIMEOUT_SECONDS,
+                    env=get_media_subprocess_env(copy_cmd),
                 )
+                if result.returncode == 0 and tmp_path.exists() and tmp_path.stat().st_size > 0:
+                    try:
+                        cls._validate_clip_sync(tmp_path)
+                        encoded = True
+                    except RuntimeError:
+                        tmp_path.unlink(missing_ok=True)
+                        error_details.append("stream_copy: validation failed, falling back to transcode")
+                else:
+                    error_details.append(
+                        f"stream_copy: {result.stderr.strip() or 'unknown error'}"
+                    )
+                    tmp_path.unlink(missing_ok=True)
+            except (subprocess.TimeoutExpired, FileNotFoundError):
                 tmp_path.unlink(missing_ok=True)
+                error_details.append("stream_copy: timeout or ffmpeg not found")
 
+        # --- Standard transcode path ---
         if not encoded:
-            cpu_cmd = cls._build_cpu_command_sync(
-                plan=plan,
-                profile=profile,
-                duration=duration,
-                vf=vf,
-                output_path=tmp_path,
+            vf = (
+                f"scale=w={profile.width}:h={profile.height}:"
+                f"force_original_aspect_ratio=decrease,fps={profile.fps}"
             )
-            result = subprocess.run(
-                cpu_cmd,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=cls.FFMPEG_TIMEOUT_SECONDS,
-                env=get_media_subprocess_env(cpu_cmd),
-            )
-            if result.returncode != 0:
-                error_details.append(
-                    f"cpu: {result.stderr.strip() or 'unknown error'}"
+
+            if cls._is_nvenc_available_sync():
+                nvenc_cmd = cls._build_nvenc_command_sync(
+                    plan=plan,
+                    profile=profile,
+                    duration=duration,
+                    vf=vf,
+                    output_path=tmp_path,
                 )
-                raise RuntimeError(
-                    f"ffmpeg failed for {plan.clip_id}: {' | '.join(error_details)}"
+                result = subprocess.run(
+                    nvenc_cmd,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=cls.FFMPEG_TIMEOUT_SECONDS,
+                    env=get_media_subprocess_env(nvenc_cmd),
                 )
+                if result.returncode == 0:
+                    encoded = True
+                else:
+                    error_details.append(
+                        f"nvenc: {result.stderr.strip() or 'unknown error'}"
+                    )
+                    tmp_path.unlink(missing_ok=True)
+
+            if not encoded:
+                cpu_cmd = cls._build_cpu_command_sync(
+                    plan=plan,
+                    profile=profile,
+                    duration=duration,
+                    vf=vf,
+                    output_path=tmp_path,
+                )
+                result = subprocess.run(
+                    cpu_cmd,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=cls.FFMPEG_TIMEOUT_SECONDS,
+                    env=get_media_subprocess_env(cpu_cmd),
+                )
+                if result.returncode != 0:
+                    error_details.append(
+                        f"cpu: {result.stderr.strip() or 'unknown error'}"
+                    )
+                    raise RuntimeError(
+                        f"ffmpeg failed for {plan.clip_id}: {' | '.join(error_details)}"
+                    )
 
         if not tmp_path.exists() or tmp_path.stat().st_size == 0:
             raise RuntimeError(

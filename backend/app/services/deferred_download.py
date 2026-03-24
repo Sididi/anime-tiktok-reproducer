@@ -63,12 +63,16 @@ class DeferredDownloadService:
             return p
 
         # 2. Direct lookup in source_dir
-        for candidate in (source_dir / p.name, source_dir / f"{p.stem}.mp4"):
+        for candidate in (
+            source_dir / p.name,
+            source_dir / f"{p.stem}.mp4",
+            source_dir / f"{p.stem}.mov",
+        ):
             if candidate.exists():
                 return candidate
 
         # 3. Sidecar-based resolution (works even after purge)
-        for suffix in (".mp4", ""):
+        for suffix in (".mp4", ".mov", ""):
             stem = p.stem if p.suffix else str(p)
             sidecar = source_dir / f"{stem}{suffix}{AnimeLibraryService.SOURCE_IMPORT_MANIFEST_SUFFIX}"
             if sidecar.exists():

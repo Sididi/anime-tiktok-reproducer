@@ -72,7 +72,7 @@ const INITIAL_STEPS: ProcessingStep[] = [
   },
   {
     id: "source_normalization",
-    label: "Normalizing source episodes for Premiere Pro",
+    label: "Preparing source audio track for Premiere Pro",
     status: "pending",
   },
   {

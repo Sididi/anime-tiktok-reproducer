@@ -375,12 +375,12 @@ class ProcessingService:
 
         if result.action == "remux_to_mp4":
             action = "Remuxed source for Premiere"
-        elif result.action == "audio_to_aac":
-            action = "Normalized source audio for Premiere"
+        elif result.action in {"audio_to_aac", "remux_audio_select"}:
+            action = "Prepared source audio track for Premiere"
         elif result.action == "full_h264_aac_transcode":
             action = "Transcoded source for Premiere"
         else:
-            action = "Normalized source for Premiere"
+            action = "Prepared source for Premiere"
         return f"{action} ({current}/{total}): {result.normalized_path.name}"
 
     @classmethod

@@ -116,8 +116,8 @@ class SourceChunkStreamingService:
         pix_fmt_normalized = pix_fmt.lower()
         compatible = (
             source_path.suffix.lower() == ".mp4"
-            and codec_normalized == "h264"
-            and pix_fmt_normalized in {"yuv420p", "yuvj420p"}
+            and codec_normalized in {"h264", "hevc"}
+            and pix_fmt_normalized in {"yuv420p", "yuvj420p", "yuv420p10le"}
         )
 
         return {
