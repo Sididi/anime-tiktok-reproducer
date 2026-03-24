@@ -165,7 +165,10 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
         Math.max(windowDuration, descriptor.chunk_duration),
         MAX_DYNAMIC_CHUNK_SECONDS,
       );
-      const maxStart = Math.max((descriptor.duration || 0) - boundedDuration, 0);
+      const maxStart = Math.max(
+        (descriptor.duration || 0) - boundedDuration,
+        0,
+      );
       const boundedTarget = Math.min(
         Math.max(targetTime, 0),
         descriptor.duration || targetTime,
@@ -236,7 +239,9 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
     if (!sourceDescriptor || !isChunkedSource) return;
 
     const duration =
-      sourceChunkDuration > 0 ? sourceChunkDuration : sourceDescriptor.chunk_duration;
+      sourceChunkDuration > 0
+        ? sourceChunkDuration
+        : sourceDescriptor.chunk_duration;
     const guard = sourceDescriptor.seek_guard_seconds;
     const safeStart = sourceChunkStart + guard;
     const safeEnd = sourceChunkStart + duration - guard;
@@ -246,10 +251,7 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
     }
 
     const requestedDuration = Math.min(
-      Math.max(
-        sourceDescriptor.chunk_duration,
-        sourceClipDuration + guard * 2,
-      ),
+      Math.max(sourceDescriptor.chunk_duration, sourceClipDuration + guard * 2),
       MAX_DYNAMIC_CHUNK_SECONDS,
     );
     const centeredTarget = (displayStart + displayEnd) / 2;
@@ -300,18 +302,20 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
         sourceStartForPlayer + 0.05,
         Math.min(
           displayEnd - sourceChunkStart,
-          (sourceChunkDuration > 0
+          sourceChunkDuration > 0
             ? sourceChunkDuration
-            : sourceDescriptor?.chunk_duration || displayEnd),
+            : sourceDescriptor?.chunk_duration || displayEnd,
         ),
       )
     : displayEnd;
 
   const fastWatchMinReadyState =
-    playbackRate >= 3
+    playbackRate >= 8
+      ? HTMLMediaElement.HAVE_ENOUGH_DATA
+      : playbackRate >= 3
       ? HTMLMediaElement.HAVE_FUTURE_DATA
       : HTMLMediaElement.HAVE_CURRENT_DATA;
-  const fastWatchReadyTimeoutMs = playbackRate >= 4 ? 9000 : 7000;
+  const fastWatchReadyTimeoutMs = playbackRate >= 8 ? 12000 : playbackRate >= 4 ? 9000 : 7000;
 
   const resolvePendingPlayback = useCallback(() => {
     if (pendingTimeoutRef.current !== null) {
@@ -873,7 +877,7 @@ export function GapResolutionPage() {
   );
 
   const fastWatchPrefetchAhead = useMemo(() => {
-    if (playbackRate >= 8) return 3;
+    if (playbackRate >= 8) return 4;
     if (playbackRate >= 2) return 2;
     return 1;
   }, [playbackRate]);
@@ -885,9 +889,7 @@ export function GapResolutionPage() {
       }
 
       if (descriptorCacheRef.current.has(episode)) {
-        return Promise.resolve(
-          descriptorCacheRef.current.get(episode) ?? null,
-        );
+        return Promise.resolve(descriptorCacheRef.current.get(episode) ?? null);
       }
 
       const existing = descriptorRequestsRef.current.get(episode);
@@ -970,7 +972,8 @@ export function GapResolutionPage() {
           let changed = false;
 
           for (const entry of entries) {
-            const rawSceneIndex = (entry.target as HTMLElement).dataset.gapSceneIndex;
+            const rawSceneIndex = (entry.target as HTMLElement).dataset
+              .gapSceneIndex;
             const sceneIndex = Number(rawSceneIndex);
             if (!Number.isFinite(sceneIndex)) {
               continue;
@@ -1097,7 +1100,7 @@ export function GapResolutionPage() {
 
   const releaseOutsideFastWatchWindow = useCallback(
     (orderedGaps: GapInfo[], currentOffset: number) => {
-      const keepBehind = 0;
+      const keepBehind = playbackRate >= 8 ? 1 : 0;
       const keepStart = Math.max(0, currentOffset - keepBehind);
       const keepEnd = Math.min(
         orderedGaps.length - 1,
@@ -1126,7 +1129,7 @@ export function GapResolutionPage() {
         failedPreparedScenesRef.current.delete(failedSceneIndex);
       }
     },
-    [fastWatchPrefetchAhead],
+    [fastWatchPrefetchAhead, playbackRate],
   );
 
   const playFastWatchFromScene = useCallback(
@@ -1141,7 +1144,8 @@ export function GapResolutionPage() {
       const startPos = sortedGaps.findIndex(
         (gap) => gap.scene_index === startSceneIndex,
       );
-      const orderedGaps = startPos >= 0 ? sortedGaps.slice(startPos) : sortedGaps;
+      const orderedGaps =
+        startPos >= 0 ? sortedGaps.slice(startPos) : sortedGaps;
       const initialWindow = orderedGaps.slice(0, fastWatchPrefetchAhead + 1);
       const mandatoryWarmup = initialWindow.slice(
         0,

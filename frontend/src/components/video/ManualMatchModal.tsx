@@ -8,9 +8,9 @@ import {
   Sparkles,
   AlertTriangle,
   Loader2,
+  RotateCcw,
 } from "lucide-react";
 import { Button, Input } from "@/components/ui";
-import { ClippedVideoPlayer } from "./ClippedVideoPlayer";
 import { formatTime, parseTime } from "@/utils";
 import { api } from "@/api/client";
 import type { Scene, SceneMatch, AlternativeMatch } from "@/types";
@@ -77,6 +77,7 @@ function ManualMatchModalContent({
   onSave,
 }: ManualMatchModalProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const tiktokVideoRef = useRef<HTMLVideoElement>(null);
   const pendingSeekTimeRef = useRef<number | null>(null);
   const resumePlaybackAfterLoadRef = useRef(false);
 
@@ -109,6 +110,9 @@ function ManualMatchModalContent({
   const [sourceRetryCount, setSourceRetryCount] = useState(0);
   const [sourceLoading, setSourceLoading] = useState(false);
   const [sourceHasError, setSourceHasError] = useState(false);
+  const [tiktokLoading, setTiktokLoading] = useState(false);
+  const [tiktokHasError, setTiktokHasError] = useState(false);
+  const [tiktokRetryCount, setTiktokRetryCount] = useState(0);
   const [chunkStreamingMode, setChunkStreamingMode] = useState(false);
   const [chunkDescriptor, setChunkDescriptor] = useState<
     import("@/types").SourceStreamDescriptor | null
@@ -411,6 +415,57 @@ function ManualMatchModalContent({
     ? "Unable to preview source video."
     : "Video format not supported for direct preview.";
 
+  const tiktokVideoUrlWithRetry = useMemo(() => {
+    const base = tiktokVideoUrl;
+    if (tiktokRetryCount === 0) return base;
+    const separator = base.includes("?") ? "&" : "?";
+    return `${base}${separator}_retry=${tiktokRetryCount}`;
+  }, [tiktokRetryCount, tiktokVideoUrl]);
+
+  const handleTiktokLoadStart = useCallback(() => {
+    setTiktokLoading(true);
+    setTiktokHasError(false);
+  }, []);
+
+  const handleTiktokLoadedMetadata = useCallback(() => {
+    const video = tiktokVideoRef.current;
+    if (!video) return;
+    setTiktokLoading(false);
+    setTiktokHasError(false);
+    video.currentTime = Math.max(0, scene.start_time);
+  }, [scene.start_time]);
+
+  const handleTiktokCanPlay = useCallback(() => {
+    setTiktokLoading(false);
+    setTiktokHasError(false);
+  }, []);
+
+  const handleTiktokTimeUpdate = useCallback(() => {
+    const video = tiktokVideoRef.current;
+    if (!video) return;
+    if (video.currentTime >= scene.end_time) {
+      if (!video.paused) {
+        video.pause();
+      }
+      if (Math.abs(video.currentTime - scene.end_time) > 0.03) {
+        video.currentTime = scene.end_time;
+      }
+    }
+  }, [scene.end_time]);
+
+  const handleRetryTiktok = useCallback(() => {
+    setTiktokHasError(false);
+    setTiktokLoading(true);
+    setTiktokRetryCount((value) => value + 1);
+  }, []);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    setTiktokLoading(true);
+    setTiktokHasError(false);
+    setTiktokRetryCount(0);
+  }, [isOpen, scene.index]);
+
   const renderCandidateButton = (item: CandidateWithMeta) => {
     const { candidate, meta } = item;
     return (
@@ -466,15 +521,39 @@ function ManualMatchModalContent({
                 <h3 className="text-sm font-medium mb-2 text-[hsl(var(--muted-foreground))]">
                   TikTok Scene ({formatTime(sceneDuration)})
                 </h3>
-                <div className="aspect-[9/16] bg-black rounded overflow-hidden">
-                  <ClippedVideoPlayer
-                    src={tiktokVideoUrl}
-                    startTime={scene.start_time}
-                    endTime={scene.end_time}
-                    eager
-                    loadStallTimeoutMs={12000}
-                    className="w-full h-full"
+                <div className="relative aspect-[9/16] bg-black rounded overflow-hidden">
+                  <video
+                    key={tiktokVideoUrlWithRetry}
+                    ref={tiktokVideoRef}
+                    src={tiktokVideoUrlWithRetry}
+                    className="w-full h-full object-contain"
+                    onLoadStart={handleTiktokLoadStart}
+                    onLoadedMetadata={handleTiktokLoadedMetadata}
+                    onCanPlay={handleTiktokCanPlay}
+                    onTimeUpdate={handleTiktokTimeUpdate}
+                    onError={() => {
+                      setTiktokLoading(false);
+                      setTiktokHasError(true);
+                    }}
+                    controls
+                    muted
+                    playsInline
+                    preload="auto"
                   />
+                  {tiktokLoading && !tiktokHasError && (
+                    <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/50 text-white">
+                      <Loader2 className="h-5 w-5 animate-spin" />
+                    </div>
+                  )}
+                  {tiktokHasError && (
+                    <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-black/80 px-4 text-center text-white">
+                      <span className="text-xs">Unable to load TikTok preview.</span>
+                      <Button variant="outline" size="sm" onClick={handleRetryTiktok}>
+                        <RotateCcw className="h-3.5 w-3.5 mr-1" />
+                        Retry
+                      </Button>
+                    </div>
+                  )}
                 </div>
               </div>
 
