@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import requests
 
 from ..config import settings
+
+
+@dataclass(frozen=True)
+class SynthesisResult:
+    audio_bytes: bytes
+    request_id: str | None = None
 
 
 class ElevenLabsService:
@@ -79,9 +86,9 @@ class ElevenLabsService:
         model_id: str | None = None,
         output_format: str | None = None,
         voice_settings: dict[str, Any] | None = None,
-        previous_text: str | None = None,
-        next_text: str | None = None,
-    ) -> bytes:
+        previous_request_ids: list[str] | None = None,
+        seed: int | None = None,
+    ) -> SynthesisResult:
         if not voice_id.strip():
             raise ValueError("voice_id is required")
 
@@ -105,10 +112,15 @@ class ElevenLabsService:
                 "use_speaker_boost": True,
             },
         }
-        if previous_text:
-            body["previous_text"] = previous_text
-        if next_text:
-            body["next_text"] = next_text
+        clean_previous_request_ids = [
+            request_id.strip()
+            for request_id in previous_request_ids or []
+            if isinstance(request_id, str) and request_id.strip()
+        ]
+        if clean_previous_request_ids:
+            body["previous_request_ids"] = clean_previous_request_ids
+        if seed is not None:
+            body["seed"] = int(seed)
 
         response = requests.post(
             f"{cls._BASE_URL}/text-to-speech/{voice_id}",
@@ -129,7 +141,10 @@ class ElevenLabsService:
 
         if not response.content:
             raise RuntimeError("ElevenLabs returned an empty audio payload")
-        return response.content
+        return SynthesisResult(
+            audio_bytes=response.content,
+            request_id=response.headers.get("request-id"),
+        )
 
     @classmethod
     def get_preview_url_map(cls) -> dict[str, str | None]:

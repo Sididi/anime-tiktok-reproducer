@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import re
+import secrets
 import uuid
 import wave
 from pathlib import Path
@@ -51,6 +52,7 @@ class ScriptAutomationService:
     TTS_MIN = 500
     TTS_SOFT_MAX = 750
     TTS_HARD_MAX = 800
+    V3_CONTROL_PREFIX = "[TikTok narrator, energetic, rapid]"
 
     @classmethod
     def _event(
@@ -899,6 +901,8 @@ class ScriptAutomationService:
 
                 extension = cls._output_extension()
                 part_paths: list[Path] = []
+                previous_request_id: str | None = None
+                v3_seed: int | None = None
 
                 for idx, chunk in enumerate(chunks, start=1):
                     segment_char_count = len(chunk)
@@ -915,19 +919,39 @@ class ScriptAutomationService:
                         char_count=segment_char_count,
                     )
 
-                    effective_model = voice.model_id or settings.elevenlabs_model_id
-                    # eleven_v3 does not support previous_text/next_text
-                    supports_context = not effective_model.startswith("eleven_v3")
-                    audio_bytes = await asyncio.to_thread(
+                    effective_model = (voice.model_id or settings.elevenlabs_model_id).strip()
+                    normalized_model = effective_model.lower()
+                    is_v3_model = normalized_model.startswith("eleven_v3")
+                    supports_request_stitching = normalized_model == "eleven_multilingual_v2"
+
+                    outgoing_text = chunk
+                    seed: int | None = None
+                    previous_request_ids: list[str] | None = None
+                    if is_v3_model:
+                        if v3_seed is None:
+                            v3_seed = secrets.randbits(32)
+                        seed = v3_seed
+                        outgoing_text = f"{cls.V3_CONTROL_PREFIX} {chunk}"
+                    elif supports_request_stitching and previous_request_id:
+                        previous_request_ids = [previous_request_id]
+
+                    synthesis_result = await asyncio.to_thread(
                         ElevenLabsService.synthesize,
                         voice_id=voice.elevenlabs_voice_id,
-                        text=chunk,
+                        text=outgoing_text,
                         model_id=effective_model,
                         output_format=settings.elevenlabs_output_format,
                         voice_settings=voice.voice_settings or None,
-                        previous_text=(chunks[idx - 2] if idx >= 2 else None) if supports_context else None,
-                        next_text=(chunks[idx] if idx <= len(chunks) - 1 else None) if supports_context else None,
+                        previous_request_ids=previous_request_ids,
+                        seed=seed,
                     )
+                    audio_bytes = (
+                        synthesis_result
+                        if isinstance(synthesis_result, bytes)
+                        else synthesis_result.audio_bytes
+                    )
+                    if supports_request_stitching:
+                        previous_request_id = getattr(synthesis_result, "request_id", None) or None
                     if cls._is_pcm_format():
                         audio_bytes = cls._wrap_pcm_as_wav(audio_bytes)
                     part_path = parts_dir / f"part_{idx}.{extension}"

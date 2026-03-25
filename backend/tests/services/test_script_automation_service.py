@@ -15,6 +15,14 @@ from app.services.script_automation_service import ScriptAutomationService
 from app.services.voice_config_service import VoiceConfigService
 
 
+class _FakeSynthesisPayload(bytes):
+    def __new__(cls, payload: bytes, request_id: str | None = None):
+        instance = super().__new__(cls, payload)
+        instance.audio_bytes = payload
+        instance.request_id = request_id
+        return instance
+
+
 def _build_project() -> Project:
     return Project(id="proj123", anime_name="Test Anime")
 
@@ -227,7 +235,7 @@ async def test_stream_automation_resume_uses_edited_script_for_tts_metadata_and_
 
     def fake_synthesize(**kwargs):
         seen["tts_text"] = kwargs["text"]
-        return b"fake-audio"
+        return _FakeSynthesisPayload(b"fake-audio", request_id="req-1")
 
     def fake_merge_parts(part_paths, output_path):
         seen["part_count"] = len(part_paths)
@@ -271,6 +279,215 @@ async def test_stream_automation_resume_uses_edited_script_for_tts_metadata_and_
     assert seen["part_count"] == 1
     assert events[-1]["metadata_json"]["facebook"]["title"] == "Titre"
     assert events[-1]["overlay_json"]["title"] == "HOOK 1"
+
+
+@pytest.mark.asyncio
+async def test_stream_automation_v2_uses_previous_request_ids_between_chunks(
+    monkeypatch,
+    tmp_path: Path,
+):
+    synthesize_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(settings, "projects_dir", tmp_path)
+    monkeypatch.setattr(settings, "script_automate_enabled", True)
+    monkeypatch.setattr(ProjectService, "load", lambda project_id: _build_project())
+    monkeypatch.setattr(ProjectService, "load_transcription", lambda project_id: _build_transcription())
+    monkeypatch.setattr(
+        VoiceConfigService,
+        "get_voice",
+        lambda voice_key: SimpleNamespace(
+            elevenlabs_voice_id="voice-id",
+            voice_settings={},
+            model_id="eleven_multilingual_v2",
+        ),
+    )
+    monkeypatch.setattr(GeminiService, "is_configured", lambda: True)
+    monkeypatch.setattr(ElevenLabsService, "is_configured", lambda: True)
+    monkeypatch.setattr(
+        ScriptAutomationService,
+        "prepare_tts_payload",
+        lambda **kwargs: {
+            "language": "fr",
+            "normalized_full_text": "Chunk 1. Chunk 2. Chunk 3.",
+            "segments": [
+                {"id": 1, "scene_indices": [1], "text": "Chunk 1.", "character_count": 8},
+                {"id": 2, "scene_indices": [1], "text": "Chunk 2.", "character_count": 8},
+                {"id": 3, "scene_indices": [1], "text": "Chunk 3.", "character_count": 8},
+            ],
+        },
+    )
+
+    def fake_synthesize(**kwargs):
+        synthesize_calls.append(kwargs)
+        return _FakeSynthesisPayload(
+            f"audio-{len(synthesize_calls)}".encode(),
+            request_id=f"req-{len(synthesize_calls)}",
+        )
+
+    monkeypatch.setattr(ElevenLabsService, "synthesize", fake_synthesize)
+    monkeypatch.setattr(
+        ScriptAutomationService,
+        "_merge_parts_to_wav",
+        lambda part_paths, output_path: output_path.write_bytes(b"merged"),
+    )
+
+    await _collect_events(
+        project_id="proj123",
+        target_language="fr",
+        voice_key="voice-a",
+        existing_script_json={"language": "fr", "scenes": [{"scene_index": 1, "text": "x"}]},
+        skip_metadata=True,
+        skip_tts=False,
+        pause_after_script=False,
+        skip_overlay=True,
+    )
+
+    assert [call["text"] for call in synthesize_calls] == ["Chunk 1.", "Chunk 2.", "Chunk 3."]
+    assert synthesize_calls[0].get("previous_request_ids") is None
+    assert synthesize_calls[1].get("previous_request_ids") == ["req-1"]
+    assert synthesize_calls[2].get("previous_request_ids") == ["req-2"]
+    assert all(call.get("seed") is None for call in synthesize_calls)
+    assert all("previous_text" not in call for call in synthesize_calls)
+    assert all("next_text" not in call for call in synthesize_calls)
+
+
+@pytest.mark.asyncio
+async def test_stream_automation_v2_continues_without_stitching_when_request_id_missing(
+    monkeypatch,
+    tmp_path: Path,
+):
+    synthesize_calls: list[dict[str, object]] = []
+    request_ids = [None, "req-2", "req-3"]
+
+    monkeypatch.setattr(settings, "projects_dir", tmp_path)
+    monkeypatch.setattr(settings, "script_automate_enabled", True)
+    monkeypatch.setattr(ProjectService, "load", lambda project_id: _build_project())
+    monkeypatch.setattr(ProjectService, "load_transcription", lambda project_id: _build_transcription())
+    monkeypatch.setattr(
+        VoiceConfigService,
+        "get_voice",
+        lambda voice_key: SimpleNamespace(
+            elevenlabs_voice_id="voice-id",
+            voice_settings={},
+            model_id="eleven_multilingual_v2",
+        ),
+    )
+    monkeypatch.setattr(GeminiService, "is_configured", lambda: True)
+    monkeypatch.setattr(ElevenLabsService, "is_configured", lambda: True)
+    monkeypatch.setattr(
+        ScriptAutomationService,
+        "prepare_tts_payload",
+        lambda **kwargs: {
+            "language": "fr",
+            "normalized_full_text": "Chunk 1. Chunk 2. Chunk 3.",
+            "segments": [
+                {"id": 1, "scene_indices": [1], "text": "Chunk 1.", "character_count": 8},
+                {"id": 2, "scene_indices": [1], "text": "Chunk 2.", "character_count": 8},
+                {"id": 3, "scene_indices": [1], "text": "Chunk 3.", "character_count": 8},
+            ],
+        },
+    )
+
+    def fake_synthesize(**kwargs):
+        synthesize_calls.append(kwargs)
+        idx = len(synthesize_calls) - 1
+        return _FakeSynthesisPayload(
+            f"audio-{idx + 1}".encode(),
+            request_id=request_ids[idx],
+        )
+
+    monkeypatch.setattr(ElevenLabsService, "synthesize", fake_synthesize)
+    monkeypatch.setattr(
+        ScriptAutomationService,
+        "_merge_parts_to_wav",
+        lambda part_paths, output_path: output_path.write_bytes(b"merged"),
+    )
+
+    await _collect_events(
+        project_id="proj123",
+        target_language="fr",
+        voice_key="voice-a",
+        existing_script_json={"language": "fr", "scenes": [{"scene_index": 1, "text": "x"}]},
+        skip_metadata=True,
+        skip_tts=False,
+        pause_after_script=False,
+        skip_overlay=True,
+    )
+
+    assert synthesize_calls[0].get("previous_request_ids") is None
+    assert synthesize_calls[1].get("previous_request_ids") is None
+    assert synthesize_calls[2].get("previous_request_ids") == ["req-2"]
+
+
+@pytest.mark.asyncio
+async def test_stream_automation_v3_reuses_seed_and_prefixes_each_chunk(
+    monkeypatch,
+    tmp_path: Path,
+):
+    synthesize_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(settings, "projects_dir", tmp_path)
+    monkeypatch.setattr(settings, "script_automate_enabled", True)
+    monkeypatch.setattr(ProjectService, "load", lambda project_id: _build_project())
+    monkeypatch.setattr(ProjectService, "load_transcription", lambda project_id: _build_transcription())
+    monkeypatch.setattr(
+        VoiceConfigService,
+        "get_voice",
+        lambda voice_key: SimpleNamespace(
+            elevenlabs_voice_id="voice-id",
+            voice_settings={},
+            model_id="eleven_v3",
+        ),
+    )
+    monkeypatch.setattr(GeminiService, "is_configured", lambda: True)
+    monkeypatch.setattr(ElevenLabsService, "is_configured", lambda: True)
+    monkeypatch.setattr(
+        ScriptAutomationService,
+        "prepare_tts_payload",
+        lambda **kwargs: {
+            "language": "fr",
+            "normalized_full_text": "Chunk 1. Chunk 2.",
+            "segments": [
+                {"id": 1, "scene_indices": [1], "text": "Chunk 1.", "character_count": 8},
+                {"id": 2, "scene_indices": [1], "text": "Chunk 2.", "character_count": 8},
+            ],
+        },
+    )
+
+    def fake_synthesize(**kwargs):
+        synthesize_calls.append(kwargs)
+        return _FakeSynthesisPayload(
+            f"audio-{len(synthesize_calls)}".encode(),
+            request_id=f"req-{len(synthesize_calls)}",
+        )
+
+    monkeypatch.setattr(ElevenLabsService, "synthesize", fake_synthesize)
+    monkeypatch.setattr(
+        ScriptAutomationService,
+        "_merge_parts_to_wav",
+        lambda part_paths, output_path: output_path.write_bytes(b"merged"),
+    )
+
+    await _collect_events(
+        project_id="proj123",
+        target_language="fr",
+        voice_key="voice-a",
+        existing_script_json={"language": "fr", "scenes": [{"scene_index": 1, "text": "x"}]},
+        skip_metadata=True,
+        skip_tts=False,
+        pause_after_script=False,
+        skip_overlay=True,
+    )
+
+    assert [call["text"] for call in synthesize_calls] == [
+        "[TikTok narrator, energetic, rapid] Chunk 1.",
+        "[TikTok narrator, energetic, rapid] Chunk 2.",
+    ]
+    assert all(call.get("previous_request_ids") is None for call in synthesize_calls)
+    assert all("previous_text" not in call for call in synthesize_calls)
+    assert all("next_text" not in call for call in synthesize_calls)
+    assert all(isinstance(call.get("seed"), int) for call in synthesize_calls)
+    assert len({call.get("seed") for call in synthesize_calls}) == 1
 
 
 def test_generate_video_overlay_normalizes_ten_title_hooks(monkeypatch):
