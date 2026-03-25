@@ -9,11 +9,12 @@ import {
   X,
   Copy,
   Check,
+  Download,
 } from "lucide-react";
 import type { LibraryType } from "@/types";
 import type {
   TorrentEntry,
-  SourceTorrentMetadata,
+  EpisodeSourcesPayload,
   VerificationResult,
   ReplacementProgressEvent,
 } from "@/types/library";
@@ -26,21 +27,26 @@ interface TorrentManagementModalProps {
   open: boolean;
   onClose: () => void;
   sourceName: string;
+  seriesId?: string | null;
   libraryType: LibraryType;
   focusTorrentId?: string;
   onComplete: () => void;
+  onSourcesChanged?: () => void | Promise<void>;
 }
 
 export function TorrentManagementModal({
   open,
   onClose,
   sourceName,
+  seriesId,
   libraryType,
   focusTorrentId,
   onComplete,
+  onSourcesChanged,
 }: TorrentManagementModalProps) {
   const [state, setState] = useState<ModalState>("editing");
-  const [metadata, setMetadata] = useState<SourceTorrentMetadata | null>(null);
+  const [episodeSources, setEpisodeSources] =
+    useState<EpisodeSourcesPayload | null>(null);
   const [loading, setLoading] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [editedMagnets, setEditedMagnets] = useState<Record<string, string>>(
@@ -54,29 +60,48 @@ export function TorrentManagementModal({
     useState<ReplacementProgressEvent | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [hydrateTarget, setHydrateTarget] = useState<string | "all" | null>(
+    null,
+  );
   const abortRef = useRef<AbortController | null>(null);
 
-  // Load torrent metadata on open
+  const loadEpisodeSources = useCallback(async () => {
+    if (!seriesId) {
+      setEpisodeSources(null);
+      setError("Identifiant de série introuvable pour cette source.");
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      const data = await api.getEpisodeSources(libraryType, seriesId);
+      setEpisodeSources(data);
+      setExpandedId(focusTorrentId ?? data.torrents.items[0]?.id ?? null);
+    } catch (e) {
+      setEpisodeSources(null);
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  }, [focusTorrentId, libraryType, seriesId]);
+
+  // Load episode sources on open
   useEffect(() => {
-    if (!open || !sourceName) return;
+    if (!open || (!sourceName && !seriesId)) return;
     setState("editing");
+    setEpisodeSources(null);
     setEditedMagnets({});
     setEditingId(null);
     setResults([]);
     setError(null);
     setVerificationProgress(null);
     setReindexProgress(null);
+    setHydrateTarget(null);
 
-    setLoading(true);
-    api
-      .getSourceTorrents(libraryType, sourceName)
-      .then((data) => {
-        setMetadata(data);
-        setExpandedId(focusTorrentId ?? data.torrents[0]?.id ?? null);
-      })
-      .catch((e) => setError(e.message))
-      .finally(() => setLoading(false));
-  }, [open, sourceName, libraryType, focusTorrentId]);
+    void loadEpisodeSources();
+  }, [open, sourceName, seriesId, loadEpisodeSources]);
 
   const hasChanges = useMemo(
     () => Object.keys(editedMagnets).length > 0,
@@ -85,7 +110,7 @@ export function TorrentManagementModal({
 
   const handleEditMagnet = useCallback(
     (torrentId: string, value: string) => {
-      const torrent = metadata?.torrents.find((t) => t.id === torrentId);
+      const torrent = episodeSources?.torrents.items.find((t) => t.id === torrentId);
       if (!torrent) return;
       if (value === torrent.magnet_uri || value === "") {
         setEditedMagnets((prev) => {
@@ -97,7 +122,7 @@ export function TorrentManagementModal({
         setEditedMagnets((prev) => ({ ...prev, [torrentId]: value }));
       }
     },
-    [metadata],
+    [episodeSources],
   );
 
   const handleCancelEdit = useCallback(
@@ -124,6 +149,10 @@ export function TorrentManagementModal({
   // --- Verify & Apply ---
   const handleVerify = useCallback(async () => {
     if (!hasChanges) return;
+    if (!sourceName) {
+      setError("Nom de source introuvable pour le remplacement de torrents.");
+      return;
+    }
     setState("verifying");
     setError(null);
     setVerificationProgress(null);
@@ -167,6 +196,10 @@ export function TorrentManagementModal({
 
   // --- Confirm Reindex ---
   const handleReindex = useCallback(async () => {
+    if (!sourceName) {
+      setError("Nom de source introuvable pour la réindexation.");
+      return;
+    }
     const warnIds = results
       .filter((r) => r.status === "warn")
       .map((r) => r.torrent_id);
@@ -217,6 +250,31 @@ export function TorrentManagementModal({
     onClose();
   }, [onComplete, onClose]);
 
+  const handleHydrate = useCallback(
+    async (episodeKey?: string) => {
+      if (!seriesId) {
+        setError("Identifiant de série introuvable pour cette source.");
+        return;
+      }
+
+      setError(null);
+      setHydrateTarget(episodeKey ?? "all");
+      try {
+        await api.hydrateSeries(libraryType, seriesId, {
+          episode_keys: episodeKey ? [episodeKey] : [],
+          full_series: !episodeKey,
+        });
+        await loadEpisodeSources();
+        await onSourcesChanged?.();
+      } catch (e) {
+        setError((e as Error).message);
+      } finally {
+        setHydrateTarget(null);
+      }
+    },
+    [libraryType, loadEpisodeSources, onSourcesChanged, seriesId],
+  );
+
   // Cleanup on unmount
   useEffect(() => {
     return () => {
@@ -229,6 +287,7 @@ export function TorrentManagementModal({
   const hasWarn = results.some((r) => r.status === "warn");
   const hasFail = results.some((r) => r.status === "fail");
   const allPass = results.length > 0 && results.every((r) => r.status === "pass");
+  const torrentItems = episodeSources?.torrents.items ?? [];
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
@@ -258,9 +317,9 @@ export function TorrentManagementModal({
               className="text-xs mt-0.5"
               style={{ color: "hsl(var(--muted-foreground))" }}
             >
-              {sourceName}
-              {metadata &&
-                ` · ${metadata.torrents.length} torrent(s)`}
+              {sourceName || seriesId || "Source inconnue"}
+              {episodeSources &&
+                ` · ${episodeSources.storage_box.episode_count} épisode(s) · ${episodeSources.torrents.torrent_count} torrent(s) de secours`}
             </p>
           </div>
           {(state === "editing" || state === "results") && (
@@ -297,22 +356,53 @@ export function TorrentManagementModal({
             </div>
           )}
 
-          {/* Editing state: accordion of torrents */}
-          {state === "editing" && metadata && (
-            <TorrentAccordion
-              torrents={metadata.torrents}
-              expandedId={expandedId}
-              onToggle={(id) =>
-                setExpandedId(expandedId === id ? null : id)
-              }
-              editedMagnets={editedMagnets}
-              editingId={editingId}
-              onStartEdit={setEditingId}
-              onEditMagnet={handleEditMagnet}
-              onCancelEdit={handleCancelEdit}
-              copiedId={copiedId}
-              onCopyMagnet={handleCopyMagnet}
-            />
+          {/* Editing state: Storage Box primary + torrents fallback */}
+          {state === "editing" && episodeSources && (
+            <div className="space-y-4">
+              <StorageBoxSection
+                releaseId={episodeSources.storage_box.release_id}
+                episodeCount={episodeSources.storage_box.episode_count}
+                localEpisodeCount={episodeSources.storage_box.local_episode_count}
+                episodes={episodeSources.storage_box.episodes}
+                hydratingTarget={hydrateTarget}
+                onHydrateAll={() => void handleHydrate()}
+                onHydrateEpisode={(episodeKey) => void handleHydrate(episodeKey)}
+              />
+
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <h3
+                      className="text-sm font-semibold"
+                      style={{ color: "hsl(var(--foreground))" }}
+                    >
+                      Torrents de secours
+                    </h3>
+                    <p
+                      className="text-xs"
+                      style={{ color: "hsl(var(--muted-foreground))" }}
+                    >
+                      Utilisés uniquement si l’hydratation Storage Box échoue.
+                    </p>
+                  </div>
+                </div>
+
+                <TorrentAccordion
+                  torrents={torrentItems}
+                  expandedId={expandedId}
+                  onToggle={(id) =>
+                    setExpandedId(expandedId === id ? null : id)
+                  }
+                  editedMagnets={editedMagnets}
+                  editingId={editingId}
+                  onStartEdit={setEditingId}
+                  onEditMagnet={handleEditMagnet}
+                  onCancelEdit={handleCancelEdit}
+                  copiedId={copiedId}
+                  onCopyMagnet={handleCopyMagnet}
+                />
+              </div>
+            </div>
           )}
 
           {/* Verifying state */}
@@ -642,6 +732,150 @@ function TorrentAccordion({
       })}
     </div>
   );
+}
+
+function StorageBoxSection({
+  releaseId,
+  episodeCount,
+  localEpisodeCount,
+  episodes,
+  hydratingTarget,
+  onHydrateAll,
+  onHydrateEpisode,
+}: {
+  releaseId: string;
+  episodeCount: number;
+  localEpisodeCount: number;
+  episodes: EpisodeSourcesPayload["storage_box"]["episodes"];
+  hydratingTarget: string | "all" | null;
+  onHydrateAll: () => void;
+  onHydrateEpisode: (episodeKey: string) => void;
+}) {
+  const totalSizeBytes = useMemo(
+    () => episodes.reduce((sum, episode) => sum + episode.size_bytes, 0),
+    [episodes],
+  );
+
+  return (
+    <div
+      className="rounded-lg border p-4 space-y-3"
+      style={{
+        borderColor: "hsl(var(--border))",
+        backgroundColor: "hsl(var(--primary) / 0.04)",
+      }}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h3
+            className="text-sm font-semibold"
+            style={{ color: "hsl(var(--foreground))" }}
+          >
+            Storage Box principal
+          </h3>
+          <p
+            className="text-xs mt-1 break-all"
+            style={{ color: "hsl(var(--muted-foreground))" }}
+          >
+            Release {releaseId} · {localEpisodeCount}/{episodeCount} épisode(s)
+            local(aux) · {formatBytes(totalSizeBytes)}
+          </p>
+        </div>
+        <button
+          onClick={onHydrateAll}
+          disabled={hydratingTarget !== null || episodes.length === 0}
+          className="px-3 py-2 text-xs rounded-lg font-medium text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+          style={{ backgroundColor: "hsl(var(--primary))" }}
+        >
+          {hydratingTarget === "all" ? "Hydratation..." : "Télécharger tout"}
+        </button>
+      </div>
+
+      {episodes.length === 0 ? (
+        <p
+          className="text-sm py-2"
+          style={{ color: "hsl(var(--muted-foreground))" }}
+        >
+          Aucun épisode trouvé dans la release active.
+        </p>
+      ) : (
+        <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+          {episodes.map((episode) => {
+            const isHydrating = hydratingTarget === episode.episode_key;
+            return (
+              <div
+                key={episode.episode_key}
+                className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2"
+                style={{ borderColor: "hsl(var(--border))" }}
+              >
+                <div className="min-w-0">
+                  <div
+                    className="text-sm truncate"
+                    style={{ color: "hsl(var(--foreground))" }}
+                  >
+                    {episode.episode_key}
+                  </div>
+                  <div
+                    className="text-xs"
+                    style={{ color: "hsl(var(--muted-foreground))" }}
+                  >
+                    {formatBytes(episode.size_bytes)}
+                    {episode.local_relative_path
+                      ? ` · ${episode.local_relative_path}`
+                      : ""}
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2 shrink-0">
+                  <span
+                    className="text-[11px] px-2 py-1 rounded-full"
+                    style={{
+                      backgroundColor: episode.local
+                        ? "hsl(142 71% 45% / 0.14)"
+                        : "hsl(215 100% 60% / 0.12)",
+                      color: episode.local ? "#4ade80" : "#60a5fa",
+                    }}
+                  >
+                    {episode.local ? "Local" : "En ligne"}
+                  </span>
+                  {!episode.local && (
+                    <button
+                      onClick={() => onHydrateEpisode(episode.episode_key)}
+                      disabled={hydratingTarget !== null}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                      style={{
+                        backgroundColor: "hsl(var(--secondary))",
+                        color: "hsl(var(--secondary-foreground))",
+                      }}
+                    >
+                      {isHydrating ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Download className="h-3.5 w-3.5" />
+                      )}
+                      {isHydrating ? "Téléchargement..." : "Télécharger"}
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  const decimals = unitIndex === 0 ? 0 : value >= 10 ? 1 : 2;
+  return `${value.toFixed(decimals)} ${units[unitIndex]}`;
 }
 
 function VerificationProgressView({

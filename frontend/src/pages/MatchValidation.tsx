@@ -2383,6 +2383,7 @@ export function MatchValidation() {
           open={showTorrentModal}
           onClose={() => setShowTorrentModal(false)}
           sourceName={torrentFailure.sourceName}
+          seriesId={project?.series_id ?? null}
           libraryType={(project?.library_type as LibraryType) || "anime"}
           focusTorrentId={torrentFailure.torrentId}
           onComplete={() => {

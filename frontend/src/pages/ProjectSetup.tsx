@@ -40,7 +40,7 @@ export function ProjectSetup() {
   const [showNewSource, setShowNewSource] = useState(false);
   const [showFolderBrowser, setShowFolderBrowser] = useState(false);
   const [updateSourceName, setUpdateSourceName] = useState<string | null>(null);
-  const [torrentSourceName, setTorrentSourceName] = useState<string | null>(null);
+  const [episodeSource, setEpisodeSource] = useState<SourceDetails | null>(null);
 
   // Duplicate TikTok warning
   const [duplicateWarning, setDuplicateWarning] = useState<{
@@ -308,7 +308,7 @@ export function ProjectSetup() {
           setUpdateSourceName(source.name);
           setShowFolderBrowser(true);
         }}
-        onManageTorrents={(source) => setTorrentSourceName(source.name)}
+        onManageTorrents={(source) => setEpisodeSource(source)}
         searchQuery={searchQuery}
       />
 
@@ -381,13 +381,15 @@ export function ProjectSetup() {
         }}
       />
 
-      {torrentSourceName && (
+      {episodeSource && (
         <TorrentManagementModal
-          open={!!torrentSourceName}
-          onClose={() => setTorrentSourceName(null)}
-          sourceName={torrentSourceName}
+          open={!!episodeSource}
+          onClose={() => setEpisodeSource(null)}
+          sourceName={episodeSource.name}
+          seriesId={episodeSource.series_id}
           libraryType={selectedLibraryType}
           onComplete={loadSources}
+          onSourcesChanged={loadSources}
         />
       )}
     </div>
