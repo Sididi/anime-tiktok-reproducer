@@ -143,19 +143,6 @@ function validateScriptPayload(
       };
     }
 
-    const trimmedText = sceneObj.text.trim();
-    if (expected.is_raw && trimmedText) {
-      return {
-        valid: false,
-        error: `Scene ${expected.scene_index} is raw and must keep an empty text`,
-      };
-    }
-    if (!expected.is_raw && !trimmedText) {
-      return {
-        valid: false,
-        error: `Scene ${expected.scene_index} must contain non-empty text`,
-      };
-    }
   }
 
   return { valid: true, error: null };

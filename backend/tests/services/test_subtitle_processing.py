@@ -155,180 +155,41 @@ def test_validate_manifest_upgrades_legacy_segment_indices_when_text_matches(mon
     )
 
 
-def test_raw_scene_image_render_plan_prefers_library_sidecar_without_probe(
-    monkeypatch,
-    tmp_path,
-):
-    source_path = tmp_path / "episode.mkv"
-    normalized_source_path = source_path.with_suffix(".mp4")
-    sidecar_dir = AnimeLibraryService.get_subtitle_sidecar_dir(normalized_source_path)
-    sidecar_dir.mkdir(parents=True)
-    (sidecar_dir / "manifest.json").write_text(
-        json.dumps(
-            {
-                "source_path": str(normalized_source_path),
-                "generated_from": str(source_path),
-                "subtitle_streams": [
-                    {
-                        "stream_index": 5,
-                        "stream_position": 3,
-                        "codec_name": "hdmv_pgs_subtitle",
-                        "language": "fr",
-                        "raw_language": "fre",
-                        "title": "French",
-                        "kind": "image",
-                        "asset_filename": "subtitle_stream_03_fr.sup",
-                        "cue_manifest_filename": "subtitle_stream_03_fr.cues.json",
-                        "status": "ok",
-                        "error": None,
-                    }
-                ],
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-    def _probe_should_not_run(_source_path):
-        raise AssertionError("probe_source_media_sync should not run when a sidecar exists")
-
-    monkeypatch.setattr(AnimeLibraryService, "probe_source_media_sync", _probe_should_not_run)
-
-    project = Project(id="p-sidecar", output_language="fr")
+def test_build_authoritative_playback_timeline_inserts_silence_for_empty_scenes():
     transcription = Transcription(
         language="fr",
         scenes=[
             SceneTranscription(
                 scene_index=0,
-                text="",
-                words=[],
+                text="Bonjour",
+                words=[
+                    Word(text="Bonjour", start=0.0, end=0.8, confidence=1.0),
+                ],
                 start_time=0.0,
-                end_time=2.0,
-                is_raw=True,
-            )
-        ],
-    )
-    resolved_scene_sources = {
-        0: ResolvedSceneSource(
-            scene_index=0,
-            source_path=source_path,
-            clip_name="episode",
-            source_in_frame=30,
-            source_out_frame=66,
-            source_in_seconds=1.25,
-            source_out_seconds=2.75,
-            source_duration_seconds=1.5,
-        )
-    }
-
-    render_plan = asyncio.run(
-        ProcessingService._build_raw_scene_image_render_plan(
-            project,
-            transcription,
-            resolved_scene_sources,
-        )
-    )
-
-    assert render_plan == {
-        source_path: {
-            3: [(1.25, 2.75)],
-        }
-    }
-
-
-def test_collect_raw_scene_source_subtitles_returns_text_entries_for_text_sidecar(
-    tmp_path,
-):
-    source_path = tmp_path / "episode.mkv"
-    normalized_source_path = source_path.with_suffix(".mp4")
-    sidecar_dir = AnimeLibraryService.get_subtitle_sidecar_dir(normalized_source_path)
-    sidecar_dir.mkdir(parents=True)
-    (sidecar_dir / "manifest.json").write_text(
-        json.dumps(
-            {
-                "source_path": str(normalized_source_path),
-                "generated_from": str(source_path),
-                "subtitle_streams": [
-                    {
-                        "stream_index": 2,
-                        "stream_position": 0,
-                        "codec_name": "subrip",
-                        "language": "fr",
-                        "raw_language": "fre",
-                        "title": "French",
-                        "kind": "text",
-                        "asset_filename": "subtitle_stream_00_fr.srt",
-                        "status": "ok",
-                        "error": None,
-                    }
-                ],
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    (sidecar_dir / "subtitle_stream_00_fr.srt").write_text(
-        "\n".join(
-            [
-                "1",
-                "00:00:09,500 --> 00:00:10,400",
-                "Avant",
-                "",
-                "2",
-                "00:00:10,600 --> 00:00:11,200",
-                "Pendant",
-                "",
-                "3",
-                "00:00:11,900 --> 00:00:12,300",
-                "<b>Fin</b>",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    project = Project(id="p-text-sidecar", output_language="fr")
-    transcription = Transcription(
-        language="fr",
-        scenes=[
+                end_time=0.8,
+            ),
             SceneTranscription(
-                scene_index=0,
+                scene_index=1,
                 text="",
                 words=[],
-                start_time=5.0,
-                end_time=7.0,
-                is_raw=True,
-            )
+                start_time=2.0,
+                end_time=4.5,
+            ),
         ],
     )
-    resolved_scene_sources = {
-        0: ResolvedSceneSource(
-            scene_index=0,
-            source_path=source_path,
-            clip_name="episode",
-            source_in_frame=240,
-            source_out_frame=288,
-            source_in_seconds=10.0,
-            source_out_seconds=12.0,
-            source_duration_seconds=2.0,
-        )
-    }
 
-    text_entries, image_entries = asyncio.run(
-        ProcessingService._collect_raw_scene_source_subtitles(
-            project,
-            transcription,
-            resolved_scene_sources,
-            tmp_path / "output",
-        )
+    transformed, segments = ProcessingService.build_authoritative_playback_timeline(
+        transcription
     )
 
-    assert image_entries == []
-    assert [(round(entry.start, 1), round(entry.end, 1), entry.text) for entry in text_entries] == [
-        (5.0, 5.4, "Avant"),
-        (5.6, 6.2, "Pendant"),
-        (6.9, 7.0, "Fin"),
+    assert [(segment.kind, round(segment.duration, 1)) for segment in segments] == [
+        ("audio", 0.8),
+        ("silence", 2.5),
     ]
+    assert transformed.scenes[0].start_time == 0.0
+    assert round(transformed.scenes[0].end_time, 1) == 0.8
+    assert round(transformed.scenes[1].start_time, 1) == 0.8
+    assert round(transformed.scenes[1].end_time, 1) == 3.3
 
 
 def test_process_passes_project_output_language_to_source_normalization(
@@ -356,16 +217,15 @@ def test_process_passes_project_output_language_to_source_normalization(
 
     source_path = tmp_path / "episode.mp4"
     source_path.write_bytes(b"video")
-    calls: list[tuple[Path, str | None, dict[int, list[tuple[float, float]]] | None]] = []
+    calls: list[tuple[Path, str | None]] = []
 
     async def _fake_normalize_source(
         cls,
         path: Path,
         *,
         preferred_audio_language: str | None = None,
-        subtitle_image_render_windows=None,
     ) -> SourceNormalizationResult:
-        calls.append((path, preferred_audio_language, subtitle_image_render_windows))
+        calls.append((path, preferred_audio_language))
         return SourceNormalizationResult(
             action="noop",
             source_path=path,
@@ -392,9 +252,6 @@ def test_process_passes_project_output_language_to_source_normalization(
     async def _fake_detect_first_source_fps(cls, *_args, **_kwargs):
         return 23.976
 
-    async def _fake_build_raw_scene_image_render_plan(cls, *_args, **_kwargs):
-        return {source_path: {2: [(1.0, 2.0)]}}
-
     async def _fake_collect_required_source_groups(cls, *_args, **_kwargs):
         return [(source_path, [])]
 
@@ -407,11 +264,6 @@ def test_process_passes_project_output_language_to_source_normalization(
         ProcessingService,
         "resolve_scene_sources",
         classmethod(lambda cls, *_args, **_kwargs: {}),
-    )
-    monkeypatch.setattr(
-        ProcessingService,
-        "_build_raw_scene_image_render_plan",
-        classmethod(_fake_build_raw_scene_image_render_plan),
     )
     monkeypatch.setattr(
         ProcessingService,
@@ -451,32 +303,22 @@ def test_process_passes_project_output_language_to_source_normalization(
 
     asyncio.run(_run())
 
-    assert calls == [(source_path, "fr", {2: [(1.0, 2.0)]})]
+    assert calls == [(source_path, "fr")]
 
 
-def test_render_jsx_from_template_includes_dedicated_raw_scene_text_subtitle_paths():
+def test_render_jsx_from_template_only_uses_classic_subtitle_paths():
     jsx = ProcessingService._render_jsx_from_template(
         scenes=[],
         source_fps_num=24000,
         source_fps_den=1001,
         subtitle_timing_relative_path="subtitles/classic_timings.srt",
-        raw_scene_subtitle_timing_relative_path="raw_scene_subtitles/raw_text.srt",
-        raw_scene_subtitle_mogrt_relative_dir="raw_scene_subtitles/raw_text_mogrts",
         music_filename="",
         music_gain_db=-24.0,
     )
 
     assert 'var SUBTITLE_SRT_PATH = ROOT_DIR + "/subtitles/classic_timings.srt";' in jsx
-    assert (
-        'var RAW_SCENE_TEXT_SUBTITLE_MOGRT_DIR = ROOT_DIR + "/raw_scene_subtitles/raw_text_mogrts";'
-        in jsx
-    )
-    assert (
-        'var RAW_SCENE_TEXT_SUBTITLE_SRT_PATH = ROOT_DIR + "/raw_scene_subtitles/raw_text.srt";'
-        in jsx
-    )
-    assert "RAW_SCENE_TEXT_SUBTITLE_MOGRT_DIR" in jsx
-    assert "RAW_SCENE_TEXT_SUBTITLE_SRT_PATH" in jsx
+    assert "RAW_SCENE_TEXT_SUBTITLE_MOGRT_DIR" not in jsx
+    assert "RAW_SCENE_TEXT_SUBTITLE_SRT_PATH" not in jsx
 
 
 def test_export_collects_internal_subtitle_timing_files(tmp_path):

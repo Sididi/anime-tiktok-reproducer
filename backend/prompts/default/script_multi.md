@@ -102,7 +102,7 @@ Ton input JSON découpe la vidéo en "plans de coupe" (cuts) très courts. Ne tr
 - Retourne **UNIQUEMENT** un JSON valide.
 - Garde **STRICTEMENT** la même structure (mêmes clés, même nombre d'objets).
 - Change la valeur de la clé `"language"` pour le code ISO de [TARGET] (ex: "fr", "es", "de").
-- Si une scène d'entrée a un `text` vide (`""`), conserve-la vide en sortie. Ne génère aucun texte pour ces scènes. Cela veut dire que ce sont des scènes purement visuelles (raw scenes) où on laisse le son originel de l'œuvre.
+- Si une scène d'entrée a un `text` vide (`""`), traite-la comme une scène normale. Tu peux générer du texte si c'est pertinent.
 - Ne mets aucun markdown (pas de ```json), pas d'intro, pas de conclusion. Juste le raw JSON string.
 
 DONNÉES D'ENTRÉE :

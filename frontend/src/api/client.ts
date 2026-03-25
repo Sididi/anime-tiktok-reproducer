@@ -437,35 +437,6 @@ export const api = {
       },
     ),
 
-  // Raw Scene Validation
-  getRawScenes: (projectId: string) =>
-    request<{
-      detection: import("@/types").RawSceneDetectionResult | null;
-      transcription: import("@/types").Transcription | null;
-    }>(`/projects/${projectId}/raw-scenes`),
-
-  validateRawScenes: (
-    projectId: string,
-    validations: Array<{ scene_index: number; is_raw: boolean; text?: string }>,
-  ) =>
-    request<{ status: string; transcription: import("@/types").Transcription }>(
-      `/projects/${projectId}/raw-scenes/validate`,
-      {
-        method: "POST",
-        body: JSON.stringify({ validations }),
-      },
-    ),
-
-  confirmRawScenes: (projectId: string) =>
-    request<{ status: string }>(`/projects/${projectId}/raw-scenes/confirm`, {
-      method: "POST",
-    }),
-
-  resetRawScenes: (projectId: string) =>
-    request<{ status: string }>(`/projects/${projectId}/raw-scenes/reset`, {
-      method: "POST",
-    }),
-
   // Anime Library
   listIndexedAnime: (libraryType: import("@/types").LibraryType) =>
     request<{ series: string[]; count: number }>(

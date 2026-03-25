@@ -67,15 +67,15 @@ class ScriptPayloadService:
             if not isinstance(item, dict):
                 raise RuntimeError(f"Scene at position {idx} is not an object")
 
-            raw_scene_index = item.get("scene_index")
-            if not isinstance(raw_scene_index, int):
+            scene_index = item.get("scene_index")
+            if not isinstance(scene_index, int):
                 raise RuntimeError(
                     f"Scene at position {idx} must contain a numeric 'scene_index'"
                 )
-            if raw_scene_index != expected_scene.scene_index:
+            if scene_index != expected_scene.scene_index:
                 raise RuntimeError(
                     "Script scene_index mismatch at position "
-                    f"{idx}: expected {expected_scene.scene_index}, got {raw_scene_index}"
+                    f"{idx}: expected {expected_scene.scene_index}, got {scene_index}"
                 )
 
             raw_text = item.get("text")
@@ -85,16 +85,6 @@ class ScriptPayloadService:
                 )
 
             normalized_text = raw_text.strip()
-            if expected_scene.is_raw:
-                if normalized_text:
-                    raise RuntimeError(
-                        f"Scene {expected_scene.scene_index} is raw and must keep an empty text"
-                    )
-                normalized_text = ""
-            elif not normalized_text:
-                raise RuntimeError(
-                    f"Scene {expected_scene.scene_index} must contain non-empty text"
-                )
 
             public_scene = {
                 "scene_index": expected_scene.scene_index,
@@ -104,7 +94,6 @@ class ScriptPayloadService:
             internal_scenes.append(
                 {
                     **public_scene,
-                    "is_raw": expected_scene.is_raw,
                     "start_time": expected_scene.start_time,
                     "end_time": expected_scene.end_time,
                 }

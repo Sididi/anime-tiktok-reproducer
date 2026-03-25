@@ -50,7 +50,7 @@ interface ProcessingProgress {
   // Duration warning fields
   duration_warning?: boolean;
   audio_duration_seconds?: number;
-  raw_scenes_duration_seconds?: number;
+  empty_scenes_duration_seconds?: number;
   total_duration_seconds?: number;
 }
 
@@ -118,7 +118,7 @@ export function ProcessingPage() {
   const [durationWarning, setDurationWarning] = useState(false);
   const [durationWarningData, setDurationWarningData] = useState<{
     audioSeconds: number;
-    rawScenesSeconds: number;
+    emptyScenesSeconds: number;
     totalSeconds: number;
   } | null>(null);
   const [steps, setSteps] = useState<ProcessingStep[]>(INITIAL_STEPS);
@@ -229,7 +229,7 @@ export function ProcessingPage() {
             setDurationWarning(true);
             setDurationWarningData({
               audioSeconds: data.audio_duration_seconds || 0,
-              rawScenesSeconds: data.raw_scenes_duration_seconds || 0,
+              emptyScenesSeconds: data.empty_scenes_duration_seconds || 0,
               totalSeconds: data.total_duration_seconds || 0,
             });
             setSteps((prev) =>
@@ -685,7 +685,7 @@ export function ProcessingPage() {
       <DurationWarningModal
         open={durationWarning && durationWarningData !== null}
         audioSeconds={durationWarningData?.audioSeconds ?? 0}
-        rawScenesSeconds={durationWarningData?.rawScenesSeconds ?? 0}
+        emptyScenesSeconds={durationWarningData?.emptyScenesSeconds ?? 0}
         totalSeconds={durationWarningData?.totalSeconds ?? 0}
         onGoBack={() => navigate(`/project/${projectId}/script`)}
         onContinue={async () => {

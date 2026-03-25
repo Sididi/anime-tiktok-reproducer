@@ -5,7 +5,7 @@ import { Button } from "@/components/ui";
 interface DurationWarningModalProps {
   open: boolean;
   audioSeconds: number;
-  rawScenesSeconds: number;
+  emptyScenesSeconds: number;
   totalSeconds: number;
   onGoBack: () => void;
   onContinue: () => void;
@@ -16,13 +16,13 @@ const TIKTOK_MIN_SECONDS = 61;
 export function DurationWarningModal({
   open,
   audioSeconds,
-  rawScenesSeconds,
+  emptyScenesSeconds,
   totalSeconds,
   onGoBack,
   onContinue,
 }: DurationWarningModalProps) {
   const deficit = TIKTOK_MIN_SECONDS - totalSeconds;
-  const hasRawScenes = rawScenesSeconds > 0;
+  const hasEmptyScenes = emptyScenesSeconds > 0;
 
   return (
     <AnimatePresence>
@@ -63,13 +63,13 @@ export function DurationWarningModal({
                 </span>
                 <span className="font-medium">{audioSeconds.toFixed(1)}s</span>
               </div>
-              {hasRawScenes && (
+              {hasEmptyScenes && (
                 <div className="flex justify-between text-sm">
                   <span className="text-[hsl(var(--muted-foreground))]">
-                    Raw scenes
+                    Empty scenes
                   </span>
                   <span className="font-medium">
-                    +{rawScenesSeconds.toFixed(1)}s
+                    +{emptyScenesSeconds.toFixed(1)}s
                   </span>
                 </div>
               )}

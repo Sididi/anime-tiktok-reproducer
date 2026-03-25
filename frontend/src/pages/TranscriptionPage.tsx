@@ -131,12 +131,8 @@ export function TranscriptionPage() {
         finalEvent?.status === "complete" &&
         finalEvent.transcription
       ) {
-        const confirmResult = await api.confirmTranscription(projectId);
-        if (confirmResult.next_phase === "raw_scene_validation") {
-          navigate(`/project/${projectId}/raw-scenes`);
-        } else {
-          navigate(`/project/${projectId}/script`);
-        }
+        await api.confirmTranscription(projectId);
+        navigate(`/project/${projectId}/script`);
       }
     } catch (err) {
       setError((err as Error).message);
@@ -196,12 +192,8 @@ export function TranscriptionPage() {
 
     try {
       await handleSave();
-      const confirmResult = await api.confirmTranscription(projectId);
-      if (confirmResult.next_phase === "raw_scene_validation") {
-        navigate(`/project/${projectId}/raw-scenes`);
-      } else {
-        navigate(`/project/${projectId}/script`);
-      }
+      await api.confirmTranscription(projectId);
+      navigate(`/project/${projectId}/script`);
     } catch (err) {
       setError((err as Error).message);
     }

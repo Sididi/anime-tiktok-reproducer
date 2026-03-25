@@ -22,7 +22,7 @@ from ..models.transcription import Word, SceneTranscription
 from ..utils.media_binaries import is_media_binary_override_error
 from ..utils.subprocess_runner import CommandTimeoutError, run_command
 from ..utils.timing import compute_adjusted_scene_end_times
-from .anime_library import AnimeLibraryService, SubtitleSidecarEntry
+from .anime_library import AnimeLibraryService
 from .transcriber import TranscriberService
 from .otio_timing import ClipTiming, OTIOTimingCalculator, FrameRateInfo
 from .gap_resolution import GapResolutionService
@@ -180,7 +180,7 @@ class ProcessingProgress:
     # Duration warning fields
     duration_warning: bool = False
     audio_duration_seconds: float = 0.0
-    raw_scenes_duration_seconds: float = 0.0
+    empty_scenes_duration_seconds: float = 0.0
     total_duration_seconds: float = 0.0
 
     def to_dict(self) -> dict:
@@ -196,7 +196,7 @@ class ProcessingProgress:
             "total_gap_duration": self.total_gap_duration,
             "duration_warning": self.duration_warning,
             "audio_duration_seconds": self.audio_duration_seconds,
-            "raw_scenes_duration_seconds": self.raw_scenes_duration_seconds,
+            "empty_scenes_duration_seconds": self.empty_scenes_duration_seconds,
             "total_duration_seconds": self.total_duration_seconds,
         }
 
@@ -236,16 +236,6 @@ class SrtEntry:
     text: str
 
 
-@dataclass(frozen=True)
-class RawSceneSubtitleImageEntry:
-    """Image-based raw-scene subtitle asset placed directly on V4."""
-
-    scene_index: int
-    start: float
-    end: float
-    relative_asset_path: str
-
-
 class ProcessingService:
     """Service for processing the final video generation pipeline."""
 
@@ -255,10 +245,6 @@ class ProcessingService:
         Path(__file__).resolve().parent / "templates" / "premiere_import_project_v77.jsx"
     )
     CLASSIC_SUBTITLE_TIMING_RELATIVE_PATH = "subtitles/subtitle_timings.srt"
-    RAW_SCENE_TEXT_SUBTITLE_TIMING_RELATIVE_PATH = (
-        "raw_scene_subtitles/text_subtitles.srt"
-    )
-    RAW_SCENE_TEXT_SUBTITLE_MOGRT_RELATIVE_DIR = "raw_scene_subtitles/text_mogrts"
     _gap_candidate_prewarm_tasks: dict[str, asyncio.Task[None]] = {}
 
     @classmethod
@@ -427,7 +413,7 @@ class ProcessingService:
 
     @staticmethod
     def normalize_transcription_timings(transcription: Transcription) -> None:
-        """Shift non-raw aligned timings so the earliest spoken word starts at 0s."""
+        """Shift aligned timings so the earliest spoken word starts at 0s."""
         min_start = None
         for scene in transcription.scenes:
             for word in scene.words:
@@ -554,9 +540,9 @@ class ProcessingService:
     ) -> tuple[Transcription, list[PlaybackAudioSegment]]:
         """Convert aligned TTS timings into the final playback timeline.
 
-        Non-raw scenes consume contiguous TTS audio windows using the existing
-        next-non-raw-start rule. Raw scenes insert real pauses into the final
-        cursor using native matched-source duration.
+        Spoken scenes consume contiguous TTS audio windows using the existing
+        next-scene-start rule. Empty scenes insert real silence into the final
+        cursor while preserving their authoritative scene duration.
         """
         adjusted_ends = compute_adjusted_scene_end_times(
             scenes=transcription.scenes,
@@ -570,38 +556,6 @@ class ProcessingService:
         cursor = 0.0
 
         for scene in transcription.scenes:
-            if scene.is_raw:
-                resolved_source = (resolved_scene_sources or {}).get(scene.scene_index)
-                raw_duration = (
-                    resolved_source.source_duration_seconds
-                    if resolved_source is not None
-                    else cls._get_scene_duration_from_bounds(
-                        scene.start_time,
-                        scene.end_time,
-                    )
-                )
-                start_time = cursor
-                end_time = cursor + raw_duration
-                transformed_scenes.append(
-                    SceneTranscription(
-                        scene_index=scene.scene_index,
-                        text=scene.text,
-                        words=[],
-                        start_time=start_time,
-                        end_time=end_time,
-                        is_raw=True,
-                    )
-                )
-                playback_segments.append(
-                    PlaybackAudioSegment(
-                        scene_index=scene.scene_index,
-                        kind="silence",
-                        duration=raw_duration,
-                    )
-                )
-                cursor = end_time
-                continue
-
             if scene.words:
                 source_start = float(scene.words[0].start)
                 source_end = float(
@@ -632,7 +586,6 @@ class ProcessingService:
                         words=shifted_words,
                         start_time=start_time,
                         end_time=end_time,
-                        is_raw=False,
                     )
                 )
                 playback_segments.append(
@@ -647,23 +600,29 @@ class ProcessingService:
                 cursor = end_time
                 continue
 
-            # Invalid non-raw scenes should still preserve cursor continuity so
-            # downstream validation can fail with a coherent timeline.
             fallback_duration = cls._get_scene_duration_from_bounds(
                 scene.start_time,
                 scene.end_time,
             )
+            start_time = cursor
+            end_time = cursor + fallback_duration
             transformed_scenes.append(
                 SceneTranscription(
                     scene_index=scene.scene_index,
                     text=scene.text,
                     words=[],
-                    start_time=cursor,
-                    end_time=cursor + fallback_duration,
-                    is_raw=False,
+                    start_time=start_time,
+                    end_time=end_time,
                 )
             )
-            cursor += fallback_duration
+            playback_segments.append(
+                PlaybackAudioSegment(
+                    scene_index=scene.scene_index,
+                    kind="silence",
+                    duration=fallback_duration,
+                )
+            )
+            cursor = end_time
 
         return (
             Transcription(language=transcription.language, scenes=transformed_scenes),
@@ -677,7 +636,7 @@ class ProcessingService:
         output_audio_path: Path,
         segments: list[PlaybackAudioSegment],
     ) -> None:
-        """Rebuild the final TTS WAV by inserting exact silences for raw scenes."""
+        """Rebuild the final TTS WAV by inserting exact silences for empty scenes."""
         if not contiguous_audio_path.exists():
             raise FileNotFoundError(f"Missing contiguous TTS audio: {contiguous_audio_path}")
 
@@ -833,8 +792,6 @@ class ProcessingService:
         source_rate: FrameRateInfo | None = None,
         resolved_scene_sources: dict[int, ResolvedSceneSource] | None = None,
         subtitle_timing_relative_path: str = "subtitles/subtitle_timings.srt",
-        raw_scene_subtitle_timing_relative_path: str = "raw_scene_subtitles/text_subtitles.srt",
-        raw_scene_subtitle_mogrt_relative_dir: str = "raw_scene_subtitles/text_mogrts",
         music_filename: str = "",
         music_gain_db: float = -24.0,
     ) -> str:
@@ -860,8 +817,6 @@ class ProcessingService:
             source_rate: Resolved source frame rate information. If None, defaults to 23.976fps.
             resolved_scene_sources: Pre-resolved scene source timings shared with playback rebuild.
             subtitle_timing_relative_path: Relative path to the classic subtitle timing SRT.
-            raw_scene_subtitle_timing_relative_path: Relative path to the raw-scene subtitle timing SRT.
-            raw_scene_subtitle_mogrt_relative_dir: Relative path to baked raw-scene subtitle MOGRT files.
             music_filename: Optional music filename placed in /sources
             music_gain_db: Music gain in dB (used only when music_filename is set)
 
@@ -888,9 +843,6 @@ class ProcessingService:
         clip_timings = []  # For continuity validation
 
         for scene_trans in transcription.scenes:
-            if not scene_trans.words and not scene_trans.is_raw:
-                continue
-
             resolved_source = resolved_scene_sources.get(scene_trans.scene_index)
             if not resolved_source:
                 continue
@@ -901,9 +853,11 @@ class ProcessingService:
             if scene_trans.end_time > scene_trans.start_time:
                 timeline_start_raw = scene_trans.start_time
                 timeline_end_raw = scene_trans.end_time
-            else:
+            elif scene_trans.words:
                 timeline_start_raw = scene_trans.words[0].start
                 timeline_end_raw = scene_trans.words[-1].end
+            else:
+                continue
 
             # Snap timeline positions to 60fps frame grid BEFORE speed calculation
             # This keeps speed and placement perfectly aligned to frame boundaries
@@ -912,50 +866,23 @@ class ProcessingService:
                 timeline_start_frames
             )
 
-            if scene_trans.is_raw:
-                timeline_end_snapped = (
-                    timeline_start_snapped + resolved_source.source_duration_seconds
-                )
-                clip_timing = ClipTiming(
-                    scene_index=scene_trans.scene_index,
-                    source_path=resolved_source.source_path,
-                    bundle_filename=resolved_source.clip_name,
-                    source_in=calculator.seconds_to_source_time(
-                        resolved_source.source_in_seconds
-                    ),
-                    source_out=calculator.seconds_to_source_time(
-                        resolved_source.source_out_seconds
-                    ),
-                    source_rate=source_rate,
-                    timeline_start=calculator.seconds_to_timeline_time(
-                        timeline_start_snapped
-                    ),
-                    timeline_end=calculator.seconds_to_timeline_time(
-                        timeline_end_snapped
-                    ),
-                    timeline_rate=sequence_rate,
-                    speed_ratio=Fraction(1, 1),
-                    effective_speed=Fraction(1, 1),
-                    leaves_gap=False,
-                )
-            else:
-                timeline_end_frames = calculator.sequence_rate.frames_from_seconds(
-                    timeline_end_raw
-                )
-                timeline_end_snapped = calculator.sequence_rate.seconds_from_frames(
-                    timeline_end_frames
-                )
+            timeline_end_frames = calculator.sequence_rate.frames_from_seconds(
+                timeline_end_raw
+            )
+            timeline_end_snapped = calculator.sequence_rate.seconds_from_frames(
+                timeline_end_frames
+            )
 
-                # Calculate frame-perfect timing using OTIO
-                clip_timing = calculator.calculate_clip_timing(
-                    scene_index=scene_trans.scene_index,
-                    source_path=resolved_source.source_path,
-                    bundle_filename=resolved_source.clip_name,
-                    source_in_seconds=resolved_source.source_in_seconds,
-                    source_out_seconds=resolved_source.source_out_seconds,
-                    timeline_start_seconds=timeline_start_snapped,
-                    timeline_end_seconds=timeline_end_snapped,
-                )
+            # Calculate frame-perfect timing using OTIO
+            clip_timing = calculator.calculate_clip_timing(
+                scene_index=scene_trans.scene_index,
+                source_path=resolved_source.source_path,
+                bundle_filename=resolved_source.clip_name,
+                source_in_seconds=resolved_source.source_in_seconds,
+                source_out_seconds=resolved_source.source_out_seconds,
+                timeline_start_seconds=timeline_start_snapped,
+                timeline_end_seconds=timeline_end_snapped,
+            )
             clip_timings.append(clip_timing)
 
             # Subtitle text for this scene
@@ -979,7 +906,6 @@ class ProcessingService:
                 "effective_speed": round(float(clip_timing.effective_speed), 4),
                 "leaves_gap": clip_timing.leaves_gap,  # True if 75% floor hit
                 "used_alternative": resolved_source.used_alternative,
-                "is_raw": scene_trans.is_raw,
             })
 
         # Validate continuity - log warnings for intentional gaps
@@ -1004,8 +930,6 @@ class ProcessingService:
             source_fps_num=source_rate.rate.numerator,
             source_fps_den=source_rate.rate.denominator,
             subtitle_timing_relative_path=subtitle_timing_relative_path,
-            raw_scene_subtitle_timing_relative_path=raw_scene_subtitle_timing_relative_path,
-            raw_scene_subtitle_mogrt_relative_dir=raw_scene_subtitle_mogrt_relative_dir,
             music_filename=music_filename,
             music_gain_db=music_gain_db,
         )
@@ -1042,8 +966,6 @@ class ProcessingService:
         source_fps_num: int,
         source_fps_den: int,
         subtitle_timing_relative_path: str,
-        raw_scene_subtitle_timing_relative_path: str,
-        raw_scene_subtitle_mogrt_relative_dir: str,
         music_filename: str,
         music_gain_db: float,
     ) -> str:
@@ -1126,26 +1048,6 @@ class ProcessingService:
             'var SUBTITLE_MOGRT_DIR = ROOT_DIR + "/subtitles";',
             label="SUBTITLE_MOGRT_DIR",
         )
-        content = cls._replace_template_once(
-            content,
-            r"var RAW_SCENE_TEXT_SUBTITLE_MOGRT_DIR = [^;]+;",
-            (
-                'var RAW_SCENE_TEXT_SUBTITLE_MOGRT_DIR = ROOT_DIR + "/'
-                + cls._escape_js_string(raw_scene_subtitle_mogrt_relative_dir)
-                + '";'
-            ),
-            label="RAW_SCENE_TEXT_SUBTITLE_MOGRT_DIR",
-        )
-        content = cls._replace_template_once(
-            content,
-            r'var RAW_SCENE_TEXT_SUBTITLE_SRT_PATH = ROOT_DIR \+ "[^"]*";',
-            (
-                'var RAW_SCENE_TEXT_SUBTITLE_SRT_PATH = ROOT_DIR + "/'
-                + cls._escape_js_string(raw_scene_subtitle_timing_relative_path)
-                + '";'
-            ),
-            label="RAW_SCENE_TEXT_SUBTITLE_SRT_PATH",
-        )
         return content
 
     @classmethod
@@ -1203,31 +1105,16 @@ class ProcessingService:
         """Generate aggressive single-line subtitle entries from aligned TTS words."""
         entries: list[SrtEntry] = []
 
-        raw_break_scene_indices: set[int] = set()
-        next_non_raw_index: int | None = None
-        saw_raw_since_last_non_raw = False
-        for idx in range(len(transcription.scenes) - 1, -1, -1):
-            scene_trans = transcription.scenes[idx]
-            if scene_trans.is_raw:
-                saw_raw_since_last_non_raw = True
-                continue
-            if scene_trans.words and next_non_raw_index is not None and saw_raw_since_last_non_raw:
-                raw_break_scene_indices.add(scene_trans.scene_index)
-            if scene_trans.words:
-                next_non_raw_index = idx
-                saw_raw_since_last_non_raw = False
-
         all_words: list[dict[str, object]] = []
         for scene_trans in transcription.scenes:
-            if scene_trans.is_raw or not scene_trans.words:
+            if not scene_trans.words:
                 continue
-            force_break_after_scene = scene_trans.scene_index in raw_break_scene_indices
             last_word_index = len(scene_trans.words) - 1
             for idx, word in enumerate(scene_trans.words):
                 all_words.append(
                     {
                         "word": word,
-                        "force_break_after": force_break_after_scene and idx == last_word_index,
+                        "force_break_after": idx == last_word_index,
                     }
                 )
 
@@ -1329,262 +1216,6 @@ class ProcessingService:
                 )
 
         return entries
-
-    @classmethod
-    async def _build_raw_scene_image_render_plan(
-        cls,
-        project: Project,
-        transcription: Transcription,
-        resolved_scene_sources: dict[int, ResolvedSceneSource],
-    ) -> dict[Path, dict[int, list[tuple[float, float]]]]:
-        raw_scenes = [scene for scene in transcription.scenes if scene.is_raw]
-        if not raw_scenes:
-            return {}
-
-        target_language = AnimeLibraryService.normalize_stream_language(
-            project.output_language or transcription.language
-        )
-        probe_cache: dict[str, Any] = {}
-        render_plan: dict[Path, dict[int, list[tuple[float, float]]]] = {}
-
-        for scene in raw_scenes:
-            resolved_source = resolved_scene_sources.get(scene.scene_index)
-            if resolved_source is None:
-                continue
-
-            sidecar_source_path = AnimeLibraryService.resolve_subtitle_sidecar_source_path(
-                resolved_source.source_path
-            )
-            if sidecar_source_path is not None:
-                sidecar_entries = AnimeLibraryService.load_subtitle_sidecar_entries(
-                    sidecar_source_path
-                )
-                selected_entry = AnimeLibraryService.select_preferred_subtitle_entry(
-                    sidecar_entries,
-                    target_language=target_language,
-                )
-                if selected_entry is None or selected_entry.kind != "image":
-                    continue
-
-                render_plan.setdefault(resolved_source.source_path, {}).setdefault(
-                    selected_entry.stream_position,
-                    [],
-                ).append(
-                    (
-                        resolved_source.source_in_seconds,
-                        resolved_source.source_out_seconds,
-                    )
-                )
-                continue
-
-            source_key = str(resolved_source.source_path.resolve())
-            probe = probe_cache.get(source_key)
-            if probe is None:
-                probe = await asyncio.to_thread(
-                    AnimeLibraryService.probe_source_media_sync,
-                    resolved_source.source_path,
-                )
-                probe_cache[source_key] = probe
-            if probe is None or not probe.subtitle_streams:
-                continue
-
-            synthetic_entries = [
-                SubtitleSidecarEntry(
-                    stream_index=stream.index,
-                    stream_position=stream.stream_position,
-                    codec_name=stream.codec_name,
-                    language=stream.language,
-                    raw_language=stream.raw_language,
-                    title=stream.title,
-                    kind=AnimeLibraryService._subtitle_kind_for_codec(stream.codec_name),
-                    asset_filename="planned",
-                )
-                for stream in probe.subtitle_streams
-            ]
-            selected_entry = AnimeLibraryService.select_preferred_subtitle_entry(
-                synthetic_entries,
-                target_language=target_language,
-            )
-            if selected_entry is None or selected_entry.kind != "image":
-                continue
-
-            render_plan.setdefault(resolved_source.source_path, {}).setdefault(
-                selected_entry.stream_position,
-                [],
-            ).append(
-                (
-                    resolved_source.source_in_seconds,
-                    resolved_source.source_out_seconds,
-                )
-            )
-
-        return render_plan
-
-    @classmethod
-    async def _collect_raw_scene_source_subtitles(
-        cls,
-        project: Project,
-        transcription: Transcription,
-        resolved_scene_sources: dict[int, ResolvedSceneSource],
-        output_dir: Path,
-    ) -> tuple[list[SrtEntry], list[RawSceneSubtitleImageEntry]]:
-        raw_output_dir = output_dir / "raw_scene_subtitles"
-        if raw_output_dir.exists():
-            shutil.rmtree(raw_output_dir, ignore_errors=True)
-
-        raw_scenes = [scene for scene in transcription.scenes if scene.is_raw]
-        if not raw_scenes:
-            return [], []
-
-        target_language = AnimeLibraryService.normalize_stream_language(
-            project.output_language or transcription.language
-        )
-        text_entries: list[SrtEntry] = []
-        image_entries: list[RawSceneSubtitleImageEntry] = []
-        parsed_text_cache: dict[str, list[Any]] = {}
-        parsed_cue_cache: dict[str, list[dict[str, Any]]] = {}
-        rendered_cue_cache: dict[tuple[str, int], Path | None] = {}
-
-        for scene in raw_scenes:
-            resolved_source = resolved_scene_sources.get(scene.scene_index)
-            if resolved_source is None:
-                continue
-            sidecar_entries = AnimeLibraryService.load_subtitle_sidecar_entries(
-                resolved_source.source_path
-            )
-            selected_entry = AnimeLibraryService.select_preferred_subtitle_entry(
-                sidecar_entries,
-                target_language=target_language,
-            )
-            if selected_entry is None:
-                continue
-
-            asset_path = AnimeLibraryService.get_subtitle_sidecar_asset_path(
-                resolved_source.source_path,
-                selected_entry,
-            )
-            if asset_path is None or not asset_path.exists():
-                continue
-
-            source_window_start = resolved_source.source_in_seconds
-            source_window_end = resolved_source.source_out_seconds
-            timeline_scene_start = scene.start_time
-
-            if selected_entry.kind == "text":
-                cache_key = str(asset_path.resolve())
-                parsed_entries = parsed_text_cache.get(cache_key)
-                if parsed_entries is None:
-                    parsed_entries = PremiereSubtitleBakerService.parse_srt_entries(asset_path)
-                    parsed_text_cache[cache_key] = parsed_entries
-                for entry in parsed_entries:
-                    clipped_start = max(entry.start, source_window_start)
-                    clipped_end = min(entry.end, source_window_end)
-                    if clipped_end <= clipped_start:
-                        continue
-                    normalized_text = cls._normalize_external_subtitle_text(entry.text)
-                    if not normalized_text:
-                        continue
-                    text_entries.append(
-                        SrtEntry(
-                            start=timeline_scene_start + (clipped_start - source_window_start),
-                            end=timeline_scene_start + (clipped_end - source_window_start),
-                            text=normalized_text,
-                        )
-                    )
-                continue
-
-            cue_manifest_path = AnimeLibraryService.get_subtitle_sidecar_cue_manifest_path(
-                resolved_source.source_path,
-                selected_entry,
-            )
-            if cue_manifest_path is None or not cue_manifest_path.exists():
-                continue
-            cache_key = str(cue_manifest_path.resolve())
-            cue_entries = parsed_cue_cache.get(cache_key)
-            if cue_entries is None:
-                try:
-                    cue_payload = json.loads(cue_manifest_path.read_text(encoding="utf-8"))
-                except (json.JSONDecodeError, OSError):
-                    cue_payload = {}
-                raw_cues = cue_payload.get("cues", []) if isinstance(cue_payload, dict) else []
-                cue_entries = [cue for cue in raw_cues if isinstance(cue, dict)]
-                parsed_cue_cache[cache_key] = cue_entries
-
-            for cue_idx, cue in enumerate(cue_entries, start=1):
-                try:
-                    cue_index = int(cue.get("cue_index", cue_idx))
-                except (TypeError, ValueError):
-                    cue_index = cue_idx
-                try:
-                    cue_start = float(cue.get("start"))
-                    cue_end = float(cue.get("end"))
-                except (TypeError, ValueError):
-                    continue
-                clipped_start = max(cue_start, source_window_start)
-                clipped_end = min(cue_end, source_window_end)
-                if clipped_end <= clipped_start:
-                    continue
-                cue_asset_filename = str(cue.get("asset_filename", "")).strip()
-                source_cue_asset_path: Path | None = None
-                if cue_asset_filename:
-                    candidate_asset_path = cue_manifest_path.parent / cue_asset_filename
-                    if candidate_asset_path.exists():
-                        source_cue_asset_path = candidate_asset_path
-                if source_cue_asset_path is None:
-                    cache_entry_key = (cache_key, cue_index)
-                    if cache_entry_key not in rendered_cue_cache:
-                        rendered_cue_cache[cache_entry_key] = (
-                            await AnimeLibraryService.ensure_subtitle_sidecar_cue_asset(
-                                resolved_source.source_path,
-                                selected_entry,
-                                cue_index=cue_index,
-                                cue_start=cue_start,
-                                cue_end=cue_end,
-                            )
-                        )
-                    source_cue_asset_path = rendered_cue_cache[cache_entry_key]
-                if source_cue_asset_path is None or not source_cue_asset_path.exists():
-                    continue
-                raw_output_dir.mkdir(parents=True, exist_ok=True)
-                target_name = (
-                    f"scene_{scene.scene_index:04d}_cue_{cue_index:04d}{source_cue_asset_path.suffix.lower()}"
-                )
-                target_path = raw_output_dir / target_name
-                if not target_path.exists():
-                    shutil.copy2(source_cue_asset_path, target_path)
-                image_entries.append(
-                    RawSceneSubtitleImageEntry(
-                        scene_index=scene.scene_index,
-                        start=timeline_scene_start + (clipped_start - source_window_start),
-                        end=timeline_scene_start + (clipped_end - source_window_start),
-                        relative_asset_path=f"raw_scene_subtitles/{target_name}",
-                    )
-                )
-
-        if image_entries:
-            manifest_path = raw_output_dir / "manifest.json"
-            manifest_path.write_text(
-                json.dumps(
-                    {
-                        "entries": [
-                            {
-                                "scene_index": entry.scene_index,
-                                "start": entry.start,
-                                "end": entry.end,
-                                "relative_asset_path": entry.relative_asset_path,
-                            }
-                            for entry in sorted(
-                                image_entries,
-                                key=lambda entry: (entry.start, entry.end, entry.relative_asset_path),
-                            )
-                        ]
-                    },
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-
-        return text_entries, image_entries
 
     @classmethod
     def generate_srt(
@@ -1804,9 +1435,8 @@ class ProcessingService:
         - V2: White border MOGRT (10px grand mode / 5px small mode)
         - V1: Background (Scale 183%)
         - A1: Original anime audio (MUTED)
-        - A2: TTS audio with inserted raw-scene pauses
+        - A2: TTS audio with inserted silent empty-scene gaps
         - A3: Music bed
-        - A4: Raw-scene source audio (active)
 
         Args:
             project: Project data
@@ -1814,7 +1444,7 @@ class ProcessingService:
             audio_path: Path to uploaded TTS audio
             matches: Scene matches with source timings
             reference_transcription: Final validated transcription used as the
-                raw-scene timing/source-of-truth reference
+                timing/source-of-truth reference
 
         Yields:
             ProcessingProgress updates
@@ -1865,7 +1495,6 @@ class ProcessingService:
                         words=[Word(**w) for w in s["words"]],
                         start_time=float(s.get("start_time", s["words"][0]["start"] if s["words"] else 0.0)),
                         end_time=float(s.get("end_time", s["words"][-1]["end"] if s["words"] else 0.0)),
-                        is_raw=bool(s.get("is_raw", False)),
                     )
                     for s in transcription_data["scenes"]
                 ],
@@ -1934,14 +1563,34 @@ class ProcessingService:
                     # Duration check — warn if total estimated duration < 61s
                     TIKTOK_MIN_DURATION_SECONDS = 61.0
                     tts_duration = cls._probe_wav_duration(edited_audio_path)
-                    raw_scenes_duration = sum(
-                        resolved.source_duration_seconds
+                    reference_by_index = {
+                        scene.scene_index: scene
                         for scene in reference_transcription.scenes
-                        if scene.is_raw
-                        for resolved in [playback_scene_sources.get(scene.scene_index)]
-                        if resolved is not None
-                    )
-                    total_estimated_duration = tts_duration + raw_scenes_duration
+                    }
+                    empty_scenes_duration = 0.0
+                    for scene_payload in new_script.get("scenes", []):
+                        if not isinstance(scene_payload, dict):
+                            continue
+                        if str(scene_payload.get("text") or "").strip():
+                            continue
+                        scene_index = scene_payload.get("scene_index")
+                        if not isinstance(scene_index, int):
+                            continue
+                        start_time = scene_payload.get("start_time")
+                        end_time = scene_payload.get("end_time")
+                        if isinstance(start_time, (int, float)) and isinstance(end_time, (int, float)):
+                            empty_scenes_duration += cls._get_scene_duration_from_bounds(
+                                float(start_time),
+                                float(end_time),
+                            )
+                            continue
+                        reference_scene = reference_by_index.get(scene_index)
+                        if reference_scene is not None:
+                            empty_scenes_duration += cls._get_scene_duration_from_bounds(
+                                reference_scene.start_time,
+                                reference_scene.end_time,
+                            )
+                    total_estimated_duration = tts_duration + empty_scenes_duration
 
                     if total_estimated_duration < TIKTOK_MIN_DURATION_SECONDS:
                         # Save state so we can resume from transcription without re-running auto-editor
@@ -1965,7 +1614,7 @@ class ProcessingService:
                             f"Audio duration ({total_estimated_duration:.0f}s) is under 1min01",
                             duration_warning=True,
                             audio_duration_seconds=round(tts_duration, 2),
-                            raw_scenes_duration_seconds=round(raw_scenes_duration, 2),
+                            empty_scenes_duration_seconds=round(empty_scenes_duration, 2),
                             total_duration_seconds=round(total_estimated_duration, 2),
                         )
                         return  # Pause — frontend will show warning modal
@@ -2016,7 +1665,6 @@ class ProcessingService:
                             "words": [{"text": w.text, "start": w.start, "end": w.end, "confidence": w.confidence} for w in s.words],
                             "start_time": s.start_time,
                             "end_time": s.end_time,
-                            "is_raw": s.is_raw,
                         }
                         for s in new_transcription.scenes
                     ]
@@ -2148,11 +1796,6 @@ class ProcessingService:
                 source_rate,
                 library_type=project.library_type,
             )
-            raw_scene_image_render_plan = await cls._build_raw_scene_image_render_plan(
-                project,
-                new_transcription,
-                playback_scene_sources,
-            )
             source_groups = await cls._collect_required_source_groups(
                 matches,
                 library_type=project.library_type,
@@ -2181,9 +1824,6 @@ class ProcessingService:
                     normalization_result = await AnimeLibraryService.normalize_source_for_processing(
                         resolved_source_path,
                         preferred_audio_language=project.output_language,
-                        subtitle_image_render_windows=raw_scene_image_render_plan.get(
-                            resolved_source_path,
-                        ),
                     )
                     if cls._update_absolute_match_episode_hints(
                         source_matches,
@@ -2245,12 +1885,6 @@ class ProcessingService:
             classic_subtitle_timing_relative_path = (
                 cls.CLASSIC_SUBTITLE_TIMING_RELATIVE_PATH
             )
-            raw_scene_subtitle_timing_relative_path = (
-                cls.RAW_SCENE_TEXT_SUBTITLE_TIMING_RELATIVE_PATH
-            )
-            raw_scene_subtitle_mogrt_relative_dir = (
-                cls.RAW_SCENE_TEXT_SUBTITLE_MOGRT_RELATIVE_DIR
-            )
 
             # Resolve optional music settings for Premiere automation.
             music_filename = ""
@@ -2285,8 +1919,6 @@ class ProcessingService:
                 source_rate=source_rate,
                 resolved_scene_sources=resolved_scene_sources,
                 subtitle_timing_relative_path=classic_subtitle_timing_relative_path,
-                raw_scene_subtitle_timing_relative_path=raw_scene_subtitle_timing_relative_path,
-                raw_scene_subtitle_mogrt_relative_dir=raw_scene_subtitle_mogrt_relative_dir,
                 music_filename=music_filename,
                 music_gain_db=music_gain_db,
             )
@@ -2300,15 +1932,6 @@ class ProcessingService:
                 "Creating subtitles...",
             )
 
-            raw_text_subtitle_entries, _raw_image_subtitle_entries = (
-                await cls._collect_raw_scene_source_subtitles(
-                    project,
-                    new_transcription,
-                    resolved_scene_sources,
-                    output_dir,
-                )
-            )
-
             # Step 4: Generate SRT subtitles (aggressive Hormozi style)
             classic_srt_content = cls.render_srt_entries(
                 cls.generate_srt_entries(
@@ -2319,9 +1942,7 @@ class ProcessingService:
             srt_content = cls.generate_srt(
                 new_transcription,
                 language=new_transcription.language,
-                extra_entries=raw_text_subtitle_entries,
             )
-            raw_scene_srt_content = cls.render_srt_entries(raw_text_subtitle_entries)
             srt_path = output_dir / srt_filename
             srt_path.write_text(srt_content, encoding="utf-8")
 
@@ -2335,9 +1956,6 @@ class ProcessingService:
             classic_subtitle_template_path = cls._processing_asset_path(
                 "SPM_Anime_Subtitle.mogrt"
             )
-            raw_scene_subtitle_template_path = cls._processing_asset_path(
-                "SPM_Anime_Subtitle_Raw.mogrt"
-            )
 
             cls._bake_subtitle_mogrt_set(
                 template_mogrt_path=classic_subtitle_template_path,
@@ -2345,13 +1963,6 @@ class ProcessingService:
                 srt_path=output_dir / classic_subtitle_timing_relative_path,
                 output_dir=output_dir / "subtitles",
                 label="Classic subtitle",
-            )
-            cls._bake_subtitle_mogrt_set(
-                template_mogrt_path=raw_scene_subtitle_template_path,
-                srt_content=raw_scene_srt_content,
-                srt_path=output_dir / raw_scene_subtitle_timing_relative_path,
-                output_dir=output_dir / raw_scene_subtitle_mogrt_relative_dir,
-                label="Raw-scene subtitle",
             )
 
             # Step 5: Generate title overlay images (if video_overlay is set)

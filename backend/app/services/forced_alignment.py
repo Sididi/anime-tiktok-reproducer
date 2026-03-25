@@ -292,9 +292,6 @@ class ForcedAlignmentService:
         previous_end = -1.0
 
         for scene in transcription.scenes:
-            if scene.is_raw:
-                continue
-
             if scene.text.strip() and not scene.words:
                 issues.append(f"Scene {scene.scene_index} has text but no aligned words")
                 continue
@@ -770,24 +767,18 @@ class ForcedAlignmentService:
             scene_text = str(scene_data.get("text") or "")
             words = scene_word_map.get(scene_index, [])
             reference_scene = reference_by_index.get(scene_index)
-            is_raw = bool(scene_data.get("is_raw"))
-            if reference_scene is not None:
-                is_raw = is_raw or reference_scene.is_raw
 
             if words:
                 words = sorted(words, key=lambda word: (word.start, word.end))
                 start_time = words[0].start
                 end_time = words[-1].end
-            elif is_raw:
+            else:
                 if reference_scene is not None:
                     start_time = reference_scene.start_time
                     end_time = reference_scene.end_time
                 else:
                     start_time = float(scene_data.get("start_time") or 0.0)
                     end_time = float(scene_data.get("end_time") or 0.0)
-            else:
-                start_time = 0.0
-                end_time = 0.0
                 if scene_text.strip():
                     issues.append(f"Scene {scene_index} has no aligned lexical words")
 
@@ -798,7 +789,6 @@ class ForcedAlignmentService:
                     words=words,
                     start_time=start_time,
                     end_time=end_time,
-                    is_raw=is_raw,
                 )
             )
 
@@ -810,11 +800,11 @@ class ForcedAlignmentService:
 
     @classmethod
     def _enforce_monotonic_words(cls, transcription: Transcription) -> None:
-        """Adjust word timings to be strictly monotonic across non-raw scenes."""
+        """Adjust word timings to be strictly monotonic across scenes with words."""
         min_duration = 0.02
         previous_end = 0.0
         for scene in transcription.scenes:
-            if scene.is_raw or not scene.words:
+            if not scene.words:
                 continue
             for word in scene.words:
                 if word.start < previous_end:

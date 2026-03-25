@@ -16,6 +16,7 @@ class Settings(BaseSettings):
         env_prefix="ATR_",
         env_file=(PROJECT_ROOT / ".env", BACKEND_ROOT / ".env"),
         env_file_encoding="utf-8",
+        extra="ignore",
     )
 
     # Paths
@@ -49,9 +50,6 @@ class Settings(BaseSettings):
     # Discord webhook integration
     discord_webhook_url: str | None = None
     cep_trigger_url_template: str = "http://localhost:48653/p/{project_id}"
-
-    # HuggingFace (pyannote diarization for raw scene detection)
-    hf_token: str | None = None
 
     # Script automation (Gemini + ElevenLabs)
     script_automate_enabled: bool = True

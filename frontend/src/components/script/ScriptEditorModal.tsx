@@ -42,7 +42,6 @@ interface ParsedScript {
  */
 function buildTipTapDoc(
   scenes: SceneJsonEntry[],
-  rawSceneIndices: Set<number>,
 ) {
   const content: Record<string, unknown>[] = [];
 
@@ -51,7 +50,6 @@ function buildTipTapDoc(
       type: "sceneHeader",
       attrs: {
         sceneIndex: scene.scene_index,
-        isRaw: rawSceneIndices.has(scene.scene_index),
       },
     });
     content.push({
@@ -66,48 +64,39 @@ function buildTipTapDoc(
 /**
  * Extract scene texts from the TipTap editor JSON.
  * Collects all paragraph text between consecutive sceneHeader nodes.
- * Raw scenes (by scene_index) are always returned as empty string.
  */
-function extractScenesFromEditor(
-  editorJson: Record<string, unknown>,
-  rawSceneIndices: Set<number>,
-): string[] {
+function extractScenesFromEditor(editorJson: Record<string, unknown>): string[] {
   const content = editorJson.content as Array<Record<string, unknown>>;
   if (!content) return [];
 
   const scenes: string[] = [];
   let currentTexts: string[] = [];
   let inScene = false;
-  let currentIsRaw = false;
 
   for (const node of content) {
     if (node.type === "sceneHeader") {
       if (inScene) {
-        scenes.push(currentIsRaw ? "" : currentTexts.join(" ").trim());
+        scenes.push(currentTexts.join(" ").trim());
       }
-      const attrs = node.attrs as { sceneIndex: number };
-      currentIsRaw = rawSceneIndices.has(attrs.sceneIndex);
       currentTexts = [];
       inScene = true;
     } else if (inScene && node.type === "paragraph") {
-      if (!currentIsRaw) {
-        const nodeContent = node.content as
-          | Array<Record<string, unknown>>
-          | undefined;
-        if (nodeContent) {
-          const text = nodeContent
-            .filter((c) => c.type === "text")
-            .map((c) => c.text as string)
-            .join("");
-          if (text) currentTexts.push(text);
-        }
+      const nodeContent = node.content as
+        | Array<Record<string, unknown>>
+        | undefined;
+      if (nodeContent) {
+        const text = nodeContent
+          .filter((c) => c.type === "text")
+          .map((c) => c.text as string)
+          .join("");
+        if (text) currentTexts.push(text);
       }
     }
   }
 
   // Last scene
   if (inScene) {
-    scenes.push(currentIsRaw ? "" : currentTexts.join(" ").trim());
+    scenes.push(currentTexts.join(" ").trim());
   }
 
   return scenes;
@@ -136,15 +125,6 @@ export function ScriptEditorModal({
     }
   }, [scenesJson]);
 
-  // Set of scene indices that are raw (locked)
-  const rawSceneIndices = useMemo(
-    () =>
-      new Set(
-        transcription.scenes.filter((s) => s.is_raw).map((s) => s.scene_index),
-      ),
-    [transcription],
-  );
-
   const editor = useEditor({
     extensions: [
       StarterKit.configure({
@@ -164,7 +144,7 @@ export function ScriptEditorModal({
     ],
     content:
       parsedScript && Array.isArray(parsedScript.scenes)
-        ? buildTipTapDoc(parsedScript.scenes, rawSceneIndices)
+        ? buildTipTapDoc(parsedScript.scenes)
         : "",
     onUpdate: () => {
       setUpdateCounter((c) => c + 1);
@@ -180,11 +160,11 @@ export function ScriptEditorModal({
       Array.isArray(parsedScript.scenes)
     ) {
       editor.commands.setContent(
-        buildTipTapDoc(parsedScript.scenes, rawSceneIndices),
+        buildTipTapDoc(parsedScript.scenes),
       );
       setUpdateCounter((c) => c + 1);
     }
-  }, [isOpen, editor, parsedScript, rawSceneIndices]);
+  }, [isOpen, editor, parsedScript]);
 
   // Measure scene header chip positions for aligning stats
   useEffect(() => {
@@ -219,28 +199,13 @@ export function ScriptEditorModal({
       return [];
 
     const editorJson = editor.getJSON();
-    const texts = extractScenesFromEditor(
-      editorJson as Record<string, unknown>,
-      rawSceneIndices,
-    );
+    const texts = extractScenesFromEditor(editorJson as Record<string, unknown>);
 
     return parsedScript.scenes.map((scene, i) => {
-      const isRaw = rawSceneIndices.has(scene.scene_index);
       const origScene = transcription.scenes[i];
       const originalDuration = origScene
         ? origScene.end_time - origScene.start_time
         : parseFloat(scene.duration_seconds) || 0;
-
-      if (isRaw) {
-        return {
-          sceneIndex: scene.scene_index,
-          isRaw: true,
-          estimatedDuration: 0,
-          originalDuration,
-          deltaPct: 0,
-          category: "green" as const,
-        };
-      }
 
       const newText = texts[i] || "";
       const estimatedDuration = estimateTtsDuration(newText, targetLanguage);
@@ -251,7 +216,6 @@ export function ScriptEditorModal({
 
       return {
         sceneIndex: scene.scene_index,
-        isRaw: false,
         estimatedDuration,
         originalDuration,
         deltaPct,
@@ -265,16 +229,14 @@ export function ScriptEditorModal({
     transcription,
     targetLanguage,
     editor,
-    rawSceneIndices,
   ]);
 
   const totals = useMemo(() => {
-    const nonRawStats = sceneStats.filter((s) => !s.isRaw);
-    const totalEstimated = nonRawStats.reduce(
+    const totalEstimated = sceneStats.reduce(
       (s, x) => s + x.estimatedDuration,
       0,
     );
-    const totalOriginal = nonRawStats.reduce(
+    const totalOriginal = sceneStats.reduce(
       (s, x) => s + x.originalDuration,
       0,
     );
@@ -285,10 +247,7 @@ export function ScriptEditorModal({
     if (!editor || !parsedScript) return;
 
     const editorJson = editor.getJSON();
-    const texts = extractScenesFromEditor(
-      editorJson as Record<string, unknown>,
-      rawSceneIndices,
-    );
+    const texts = extractScenesFromEditor(editorJson as Record<string, unknown>);
 
     const updatedScript: ParsedScript = {
       ...parsedScript,
@@ -304,7 +263,7 @@ export function ScriptEditorModal({
 
     onSave(JSON.stringify(updatedScript, null, 2));
     onClose();
-  }, [editor, parsedScript, rawSceneIndices, onSave, onClose]);
+  }, [editor, parsedScript, onSave, onClose]);
 
   if (!isOpen) return null;
 
@@ -350,25 +309,17 @@ export function ScriptEditorModal({
                     className="absolute left-0 right-0 px-4 font-mono text-xs whitespace-nowrap"
                     style={{ top: scenePositions[i] ?? 0 }}
                   >
-                    {stat.isRaw ? (
-                      <span className="text-[hsl(var(--muted-foreground))] opacity-50">
-                        🔒 locked
-                      </span>
-                    ) : (
-                      <>
-                        <span>~{stat.estimatedDuration.toFixed(1)}s</span>
-                        <span className="text-[hsl(var(--muted-foreground))]">
-                          {" / "}
-                          {stat.originalDuration.toFixed(1)}s
-                        </span>
-                        <span
-                          className={`ml-1.5 font-semibold ${DELTA_COLORS[stat.category]}`}
-                        >
-                          {stat.deltaPct >= 0 ? "+" : ""}
-                          {stat.deltaPct.toFixed(0)}%
-                        </span>
-                      </>
-                    )}
+                    <span>~{stat.estimatedDuration.toFixed(1)}s</span>
+                    <span className="text-[hsl(var(--muted-foreground))]">
+                      {" / "}
+                      {stat.originalDuration.toFixed(1)}s
+                    </span>
+                    <span
+                      className={`ml-1.5 font-semibold ${DELTA_COLORS[stat.category]}`}
+                    >
+                      {stat.deltaPct >= 0 ? "+" : ""}
+                      {stat.deltaPct.toFixed(0)}%
+                    </span>
                   </div>
                 ))}
             </div>

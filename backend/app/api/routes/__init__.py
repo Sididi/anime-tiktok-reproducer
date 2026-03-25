@@ -10,7 +10,6 @@ from .transcription import router as transcription_router
 from .processing import router as processing_router
 from .anime import router as anime_router
 from .gaps import router as gaps_router
-from .raw_scenes import router as raw_scenes_router
 from .project_manager import router as project_manager_router
 from .integrations import router as integrations_router
 from .tiktok_url_db import router as tiktok_url_db_router
@@ -28,7 +27,6 @@ api_router.include_router(transcription_router)
 api_router.include_router(processing_router)
 api_router.include_router(anime_router)
 api_router.include_router(gaps_router)
-api_router.include_router(raw_scenes_router)
 api_router.include_router(project_manager_router)
 api_router.include_router(integrations_router)
 api_router.include_router(tiktok_url_db_router)

@@ -46,7 +46,6 @@ _EXPORTS = {
     "AudioSpeedService": (".audio_speed_service", "AudioSpeedService"),
     "TitleImageGeneratorService": (".title_image_generator", "TitleImageGeneratorService"),
     "PremiereSubtitleBakerService": (".premiere_subtitle_baker", "PremiereSubtitleBakerService"),
-    "RawSceneDetectorService": (".raw_scene_detector", "RawSceneDetectorService"),
     "SourceChunkStreamingService": (".source_chunk_streaming_service", "SourceChunkStreamingService"),
     "indexation_queue": (".indexation_queue", "indexation_queue"),
     "IndexationQueueService": (".indexation_queue", "IndexationQueueService"),

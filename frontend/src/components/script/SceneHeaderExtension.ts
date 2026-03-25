@@ -18,13 +18,6 @@ export const SceneHeader = Node.create({
           "data-scene-index": attributes.sceneIndex,
         }),
       },
-      isRaw: {
-        default: false,
-        parseHTML: (element) => element.getAttribute("data-is-raw") === "true",
-        renderHTML: (attributes) => ({
-          "data-is-raw": attributes.isRaw ? "true" : "false",
-        }),
-      },
     };
   },
 
@@ -33,14 +26,10 @@ export const SceneHeader = Node.create({
   },
 
   renderHTML({ node, HTMLAttributes }) {
-    const isRaw: boolean = node.attrs.isRaw;
     const sceneIndex: number = node.attrs.sceneIndex;
-    const label = isRaw
-      ? `🔒 Scene ${sceneIndex + 1} · Raw`
-      : `Scene ${sceneIndex + 1}`;
-    const colorClasses = isRaw
-      ? "scene-header-chip bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))] opacity-50 text-xs font-semibold uppercase select-none pointer-events-none px-2 py-0.5 rounded w-fit whitespace-nowrap"
-      : "scene-header-chip bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))] text-xs font-semibold uppercase select-none pointer-events-none px-2 py-0.5 rounded w-fit whitespace-nowrap";
+    const label = `Scene ${sceneIndex + 1}`;
+    const colorClasses =
+      "scene-header-chip bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))] text-xs font-semibold uppercase select-none pointer-events-none px-2 py-0.5 rounded w-fit whitespace-nowrap";
     return [
       "div",
       mergeAttributes(HTMLAttributes, {

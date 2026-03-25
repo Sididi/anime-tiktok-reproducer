@@ -36,7 +36,6 @@ def _build_transcription() -> Transcription:
                 text="Bonjour tout le monde.",
                 start_time=0.0,
                 end_time=2.0,
-                is_raw=False,
             )
         ],
     )

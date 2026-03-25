@@ -6,7 +6,6 @@ export type ProjectPhase =
   | "matching"
   | "match_validation"
   | "transcription"
-  | "raw_scene_validation"
   | "script_restructure"
   | "processing"
   | "complete";
@@ -329,25 +328,6 @@ export interface SceneTranscription {
   words: Word[];
   start_time: number;
   end_time: number;
-  is_raw: boolean;
-}
-
-export interface RawSceneCandidate {
-  scene_index: number;
-  start_time: number;
-  end_time: number;
-  confidence: number;
-  reason: string;
-  was_split: boolean;
-  original_scene_index: number | null;
-}
-
-export interface RawSceneDetectionResult {
-  has_raw_scenes: boolean;
-  candidates: RawSceneCandidate[];
-  tts_speaker_id: string;
-  speaker_count: number;
-  scene_parent_indices: number[];
 }
 
 export interface Transcription {

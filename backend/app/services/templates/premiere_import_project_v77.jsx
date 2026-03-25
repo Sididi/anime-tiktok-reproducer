@@ -34,10 +34,6 @@
     ASSETS_DIR + "/" + CATEGORY_TITLE_PRESET_NAME + ".prfpset";
   var SUBTITLE_MOGRT_DIR = ROOT_DIR + "/subtitles";
   var SUBTITLE_SRT_PATH = ROOT_DIR + "/subtitles/subtitle_timings.srt";
-  var RAW_SCENE_TEXT_SUBTITLE_MOGRT_DIR = ROOT_DIR + "/raw_scene_subtitles/text_mogrts";
-  var RAW_SCENE_TEXT_SUBTITLE_SRT_PATH = ROOT_DIR + "/raw_scene_subtitles/text_subtitles.srt";
-  var RAW_SCENE_SUBTITLE_MANIFEST_PATH =
-    ROOT_DIR + "/raw_scene_subtitles/manifest.json";
 
   // --- SCENES DATA ---
   var scenes = [
@@ -1494,7 +1490,7 @@
   }
 
   function getOrCreateRawAudioSubclip(scene) {
-    if (!scene || !scene.is_raw) return null;
+    if (!scene) return null;
     var subclipName = buildRawAudioSubclipName(scene);
     if (!subclipName) return null;
 
@@ -1588,7 +1584,6 @@
     }
 
     // --- ENSURE TRACKS (V=6, A=4) ---
-    // A4 is used for raw scene audio (active, not muted)
     ensureVideoTracks(sequence, 6);
     ensureAudioTracks(sequence, 4);
     var qeSeq = null;
@@ -1780,7 +1775,7 @@
 
         // 4. APPLY SPEED (Both V1, V3, A1, and optionally A2)
         // QE setSpeed often fails to ripple-edit duration for speedups, so we pre-resize above.
-        if (!s.is_raw && Math.abs(s.effective_speed - 1.0) > 0.01) {
+        if (Math.abs(s.effective_speed - 1.0) > 0.01) {
           perfStart("scenes_speed");
           if (v3)
             safeApplySpeedQE(
@@ -1901,8 +1896,6 @@
       }
     }
 
-    duplicateRawSceneAudioToTrack(a4, scenes);
-
     log("Adding overlays on V5 and V6...");
     if (!placeOverlayOnTrack(v5, CATEGORY_OVERLAY_FILENAME, sequenceEndSec)) {
       log("Warning: Failed to place " + CATEGORY_OVERLAY_FILENAME + " on V5.");
@@ -1978,9 +1971,6 @@
       3,
       SUBTITLE_MOGRT_DIR,
       SUBTITLE_SRT_PATH,
-      RAW_SCENE_TEXT_SUBTITLE_MOGRT_DIR,
-      RAW_SCENE_TEXT_SUBTITLE_SRT_PATH,
-      RAW_SCENE_SUBTITLE_MANIFEST_PATH,
       true,
     );
     perfEnd("subtitles", "Subtitles");
@@ -2249,53 +2239,6 @@
     };
   }
 
-  function loadRawSceneSubtitleImagePlacements(manifestPath) {
-    var stats = {
-      entries: 0,
-      skipped: 0,
-    };
-    var placements = [];
-
-    var payload = readJsonFile(manifestPath);
-    if (!payload || !payload.entries || !payload.entries.length) {
-      return {
-        stats: stats,
-        placements: placements,
-      };
-    }
-
-    stats.entries = payload.entries.length;
-    for (var i = 0; i < payload.entries.length; i++) {
-      var entry = payload.entries[i];
-      if (!entry) continue;
-      var relativeAssetPath = trimSpaces(entry.relative_asset_path);
-      if (!relativeAssetPath) {
-        stats.skipped++;
-        continue;
-      }
-
-      var startSec = snapSecondsToFrame(entry.start);
-      var endSec = snapSecondsToFrame(entry.end);
-      if (endSec <= startSec) {
-        endSec = snapSecondsToFrame(startSec + 1 / SEQ_FPS);
-      }
-      placements.push(
-        buildImageSubtitlePlacement(i + 1, relativeAssetPath, startSec, endSec),
-      );
-    }
-
-    placements.sort(function (a, b) {
-      if (a.startSec !== b.startSec) return a.startSec - b.startSec;
-      if (a.endSec !== b.endSec) return a.endSec - b.endSec;
-      return a.idx - b.idx;
-    });
-
-    return {
-      stats: stats,
-      placements: placements,
-    };
-  }
-
   function getSubtitlePlacementPriority(kind) {
     if (kind === "classic") return 0;
     if (kind === "raw_text") return 1;
@@ -2462,13 +2405,6 @@
       classicMogrtsFound: 0,
       classicUnusedTimings: 0,
       classicUnusedMogrts: 0,
-      rawTextTimings: 0,
-      rawTextMogrtsFound: 0,
-      rawTextUnusedTimings: 0,
-      rawTextUnusedMogrts: 0,
-      rawImageEntries: 0,
-      rawDropped: 0,
-      rawTrimmed: 0,
       scheduled: 0,
       inserted: 0,
       failed: 0,
@@ -2492,19 +2428,11 @@
       subtitleDirPath,
       srtPath,
     );
-    var rawTextResult = buildTextSubtitlePlacements(
-      "raw_text",
-      rawTextSubtitleDirPath,
-      rawTextSrtPath,
-    );
-    var rawImageResult = loadRawSceneSubtitleImagePlacements(rawManifestPath);
-    var frameDurationSec = 1 / SEQ_FPS;
-    var schedule = buildMergedSubtitlePlacementSchedule(
-      classicResult.placements,
-      rawTextResult.placements,
-      rawImageResult.placements,
-      frameDurationSec,
-    );
+    var schedule = {
+      placements: classicResult.placements.slice(0),
+      rawDropped: 0,
+      rawTrimmed: 0,
+    };
     var track = sequence.videoTracks[videoTrackIndex];
     var useSecondsFallback = enableSecondsFallback !== false;
 
@@ -2512,31 +2440,13 @@
     stats.classicMogrtsFound = classicResult.stats.mogrtsFound;
     stats.classicUnusedTimings = classicResult.stats.timingsUnused;
     stats.classicUnusedMogrts = classicResult.stats.mogrtsUnused;
-    stats.rawTextTimings = rawTextResult.stats.timings;
-    stats.rawTextMogrtsFound = rawTextResult.stats.mogrtsFound;
-    stats.rawTextUnusedTimings = rawTextResult.stats.timingsUnused;
-    stats.rawTextUnusedMogrts = rawTextResult.stats.mogrtsUnused;
-    stats.rawImageEntries = rawImageResult.stats.entries;
-    stats.rawDropped = schedule.rawDropped;
-    stats.rawTrimmed = schedule.rawTrimmed;
     stats.scheduled = schedule.placements.length;
 
-    if (
-      stats.classicTimings <= 0 &&
-      stats.rawTextTimings <= 0 &&
-      stats.rawImageEntries <= 0
-    ) {
+    if (stats.classicTimings <= 0) {
       return stats;
     }
     if (stats.classicTimings > 0 && stats.classicMogrtsFound <= 0) {
       log("Warning: No subtitle MOGRT files found in " + subtitleDirPath + ".");
-    }
-    if (stats.rawTextTimings > 0 && stats.rawTextMogrtsFound <= 0) {
-      log(
-        "Warning: No raw-scene subtitle MOGRT files found in " +
-          rawTextSubtitleDirPath +
-          ".",
-      );
     }
 
     for (var p = 0; p < schedule.placements.length; p++) {
@@ -4513,55 +4423,6 @@
     return true;
   }
 
-  function duplicateRawSceneAudioToTrack(
-    a4,
-    scenes,
-  ) {
-    if (!a4 || !scenes || scenes.length <= 0) return;
-
-    log("Duplicating raw scene audio to A4...");
-    for (var i = 0; i < scenes.length; i++) {
-      var s = scenes[i];
-      if (!s || !s.is_raw) continue;
-
-      var startSec = snapSecondsToFrame(s.start);
-      var subclipName = buildRawAudioSubclipName(s);
-      var subclip = getOrCreateRawAudioSubclip(s);
-      if (!subclip) {
-        log(
-          "Warning: Could not resolve raw audio source for scene " +
-            s.scene_index +
-            ".",
-        );
-        continue;
-      }
-
-      try {
-        a4.overwriteClip(subclip, startSec);
-      } catch (eOverwrite) {
-        log(
-          "Warning: Failed to place raw audio on A4 for scene " +
-            s.scene_index +
-            ": " +
-            (eOverwrite && eOverwrite.message ? eOverwrite.message : eOverwrite),
-        );
-        continue;
-      }
-
-      var a4Item =
-        resolvePlacedItemFast(a4, startSec, subclipName, TRACK_ITEM_WAIT_MAX_MS) ||
-        findTrackItemAtStart(a4, startSec, subclipName) ||
-        findTrackItemAtStart(a4, startSec, null);
-      if (!a4Item) {
-        log(
-          "Warning: Could not resolve raw audio clip on A4 for scene " +
-            s.scene_index +
-            ".",
-        );
-      }
-    }
-  }
-
   function scoreAudioGainProperty(prop) {
     if (!prop) return -1;
     var propName = prop.displayName
@@ -5000,7 +4861,6 @@
     if (!seq || !seq.audioTracks) return;
     for (var i = 0; i < seq.audioTracks.numTracks; i++) {
       if (i === 0) continue; // keep A1 (source audio, muted)
-      if (i === 3) continue; // keep A4 (raw scene audio, active)
       var track = seq.audioTracks[i];
       if (!track || !track.clips) continue;
       for (var j = track.clips.numItems - 1; j >= 0; j--) {

@@ -19,6 +19,13 @@ def _validate_project_id(project_id: str) -> None:
         )
 
 
+def _coerce_legacy_project_payload(payload: dict) -> dict:
+    if payload.get("phase") == "raw_scene_validation":
+        payload = dict(payload)
+        payload["phase"] = ProjectPhase.SCRIPT_RESTRUCTURE.value
+    return payload
+
+
 class ProjectService:
     """Service for managing projects."""
 
@@ -79,7 +86,9 @@ class ProjectService:
         project_file = cls.get_project_file(project_id)
         if not project_file.exists():
             return None
-        return Project.model_validate_json(project_file.read_text())
+        return Project.model_validate(
+            _coerce_legacy_project_payload(json.loads(project_file.read_text()))
+        )
 
     @classmethod
     def delete(cls, project_id: str) -> bool:

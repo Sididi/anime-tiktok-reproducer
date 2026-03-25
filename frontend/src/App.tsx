@@ -4,7 +4,6 @@ import {
   SceneValidation,
   MatchValidation,
   TranscriptionPage,
-  RawSceneValidationPage,
   ScriptRestructurePage,
   ProcessingPage,
   GapResolutionPage,
@@ -26,10 +25,6 @@ function App() {
         <Route
           path="/project/:projectId/transcription"
           element={<TranscriptionPage />}
-        />
-        <Route
-          path="/project/:projectId/raw-scenes"
-          element={<RawSceneValidationPage />}
         />
         <Route
           path="/project/:projectId/script"

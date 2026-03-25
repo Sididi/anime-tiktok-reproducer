@@ -18,7 +18,6 @@ class SceneTranscription(BaseModel):
     words: list[Word] = []
     start_time: float
     end_time: float
-    is_raw: bool = False
 
     @property
     def duration(self) -> float:

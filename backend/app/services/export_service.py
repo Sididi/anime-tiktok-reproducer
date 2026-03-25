@@ -403,16 +403,6 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
         )
 
     @classmethod
-    def _collect_raw_scene_subtitle_files(cls, output_dir: Path) -> list[Path]:
-        raw_dir = output_dir / "raw_scene_subtitles"
-        if not raw_dir.exists():
-            return []
-        return sorted(
-            [path for path in raw_dir.rglob("*") if path.is_file()],
-            key=lambda path: str(path.relative_to(raw_dir)).lower(),
-        )
-
-    @classmethod
     def build_manifest(cls, project: Project, matches: list[SceneMatch]) -> tuple[str, list[ManifestEntry]]:
         output_dir = cls.get_output_dir(project.id)
         if not output_dir.exists():
@@ -433,7 +423,6 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
             output_dir,
             relative_path=f"{folder}/subtitles/{cls.SUBTITLES_ARCHIVE_FILENAME}",
         )
-        raw_scene_subtitle_files = cls._collect_raw_scene_subtitle_files(output_dir)
 
         subtitle_name = subtitle_path.name
         entries: list[ManifestEntry] = [
@@ -504,16 +493,6 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
 
         if subtitles_archive_entry is not None:
             entries.append(subtitles_archive_entry)
-
-        raw_scene_subtitle_root = output_dir / "raw_scene_subtitles"
-        for raw_scene_subtitle_file in raw_scene_subtitle_files:
-            relative = raw_scene_subtitle_file.relative_to(raw_scene_subtitle_root).as_posix()
-            entries.append(
-                ManifestEntry(
-                    relative_path=f"{folder}/raw_scene_subtitles/{relative}",
-                    source_path=raw_scene_subtitle_file,
-                )
-            )
 
         entries.append(
             ManifestEntry(
