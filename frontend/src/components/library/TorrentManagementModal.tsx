@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
-  Cable,
   ChevronDown,
   CheckCircle2,
   XCircle,
@@ -146,8 +145,6 @@ export function TorrentManagementModal({
       await readSSEStream<ReplacementProgressEvent & { status?: string; error?: string | null; message?: string | null }>(
         response,
         (event) => {
-          // Map phase to status for readSSEStream compatibility
-          const mapped = { ...event, status: event.phase === "error" ? "error" : undefined };
           setVerificationProgress(event);
           if (event.phase === "results" && event.verification_results) {
             setResults(event.verification_results);
@@ -252,7 +249,7 @@ export function TorrentManagementModal({
               className="text-base font-semibold"
               style={{ color: "hsl(var(--foreground))" }}
             >
-              {state === "editing" && "Gestion des torrents"}
+              {state === "editing" && "Gestion des épisodes"}
               {state === "verifying" && "Vérification en cours..."}
               {state === "results" && "Résultats de vérification"}
               {state === "reindexing" && "Réindexation en cours..."}
@@ -545,7 +542,6 @@ function TorrentAccordion({
                               backgroundColor: "hsl(var(--background))",
                               borderColor: "hsl(45 93% 58% / 0.3)",
                               color: "#fbbf24",
-                              ringColor: "hsl(45 93% 58%)",
                             }}
                             placeholder="magnet:?xt=urn:btih:..."
                             autoFocus={isEditing && !isModified}

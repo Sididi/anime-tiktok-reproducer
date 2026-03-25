@@ -9,6 +9,7 @@ from ..library_types import LibraryType
 from ..models.torrent import IndexationJob
 from .anime_library import AnimeLibraryService
 from .anime_matcher import AnimeMatcherService
+from .storage_box_repository import StorageBoxRepository
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".webm", ".ts", ".m4v"}
 
@@ -65,11 +66,30 @@ class IndexationQueueService:
                 job.phase = progress.status
                 job.message = progress.message
                 if progress.status == "complete":
+                    job.phase = "link_sources"
+                    job.message = "Linking fallback torrent sources..."
+                    self._broadcast(job)
+                    await self._link_torrents(job)
+                    job.phase = "package_release"
+                    job.message = "Packaging release for Storage Box..."
+                    job.progress = max(job.progress, 0.96)
+                    self._broadcast(job)
+                    job.phase = "upload_release"
+                    job.message = "Uploading release to Storage Box..."
+                    job.progress = max(job.progress, 0.98)
+                    self._broadcast(job)
+                    publish_result = await StorageBoxRepository.publish_series(
+                        library_type=job.library_type,
+                        display_name=job.source_name,
+                    )
+                    job.series_id = str(publish_result["series_id"])
+                    job.storage_release_id = str(publish_result["release_id"])
+                    job.message = "Published release to Storage Box"
+                    job.progress = 1.0
                     job.status = "complete"
                     AnimeMatcherService.mark_series_updated(
                         job.library_type, job.source_name
                     )
-                    await self._link_torrents(job)
                 elif progress.status == "error":
                     job.status = "error"
                     job.error = progress.error

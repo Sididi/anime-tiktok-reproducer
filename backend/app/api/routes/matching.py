@@ -8,7 +8,13 @@ import re
 
 from ...config import settings
 from ...models import ProjectPhase, MatchList, SceneMatch, Scene, SceneList
-from ...services import ProjectService, AnimeMatcherService, SceneMergerService, AnimeLibraryService
+from ...services import (
+    ProjectService,
+    AnimeMatcherService,
+    SceneMergerService,
+    AnimeLibraryService,
+    LibraryHydrationService,
+)
 from ...services.match_playback_service import MatchPlaybackService
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["matching"])
@@ -177,6 +183,16 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
     project = ProjectService.load(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    if project.series_id:
+        try:
+            await LibraryHydrationService.ensure_matcher_ready_for_project(
+                project_id=project.id,
+                library_type=project.library_type,
+                series_id=project.series_id,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     # Use provided source_path or default to anime_library_path
     source_path = (
@@ -381,6 +397,7 @@ async def deferred_download(project_id: str):
 
     library_root = AnimeLibraryService.get_library_path(project.library_type)
     anime_name = project.anime_name
+    series_id = project.series_id
 
     if not anime_name:
         async def _skipped():
@@ -402,6 +419,23 @@ async def deferred_download(project_id: str):
 
     async def stream_progress():
         try:
+            if series_id:
+                yield f"data: {json.dumps({'status': 'running', 'phase': 'hydrate_index', 'message': 'Ensuring local matcher cache is ready...', 'progress': 0.05})}\n\n"
+                await LibraryHydrationService.ensure_matcher_ready_for_project(
+                    project_id=project.id,
+                    library_type=project.library_type,
+                    series_id=series_id,
+                )
+                yield f"data: {json.dumps({'status': 'running', 'phase': 'hydrate_episode', 'message': 'Hydrating missing episodes from Storage Box...', 'progress': 0.15})}\n\n"
+                try:
+                    await LibraryHydrationService.hydrate_series(
+                        library_type=project.library_type,
+                        series_id=series_id,
+                        episode_keys=episode_paths,
+                        full_series=False,
+                    )
+                except Exception as exc:
+                    yield f"data: {json.dumps({'status': 'warning', 'phase': 'hydrate_episode', 'message': f'Storage Box hydration failed, falling back: {exc}', 'progress': 0.2})}\n\n"
             async for event in DeferredDownloadService.recover_missing_episodes(
                 episode_paths, library_root, anime_name
             ):

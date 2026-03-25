@@ -1,13 +1,13 @@
-import { AlertTriangle, ShieldCheck, FolderDown, Cable } from "lucide-react";
+import { HardDrive, ShieldCheck, FolderDown, Cable, Loader2 } from "lucide-react";
 import type { SourceDetails } from "@/types";
 
 interface SourceRowProps {
   source: SourceDetails;
   isSelected: boolean;
   onSelect: () => void;
-  onToggleProtection: () => void;
+  onTogglePin: () => void;
   onUpdate: () => void;
-  onManageTorrents: () => void;
+  onManageEpisodes: () => void;
 }
 
 function formatBytes(bytes: number): string {
@@ -28,10 +28,19 @@ export function SourceRow({
   source,
   isSelected,
   onSelect,
-  onToggleProtection,
+  onTogglePin,
   onUpdate,
-  onManageTorrents,
+  onManageEpisodes,
 }: SourceRowProps) {
+  const hydrationInProgress =
+    source.hydration_status === "hydrating_index" ||
+    source.hydration_status === "hydrating_episodes";
+  const episodeLabel =
+    source.local_episode_count > 0 &&
+    source.local_episode_count !== source.episode_count
+      ? `${source.local_episode_count}/${source.episode_count} ep.`
+      : `${source.episode_count} ep.`;
+
   return (
     <div
       onClick={onSelect}
@@ -48,7 +57,7 @@ export function SourceRow({
 
       {/* Episode count */}
       <span className="text-sm text-[hsl(var(--muted-foreground))] w-20 shrink-0">
-        {source.episode_count} ep.
+        {episodeLabel}
       </span>
 
       {/* FPS */}
@@ -62,29 +71,37 @@ export function SourceRow({
       </span>
 
       {/* Actions */}
-      <div className="flex gap-1 justify-end w-28 shrink-0">
-        {source.missing_episodes > 0 && (
+      <div className="flex gap-1 justify-end w-32 shrink-0">
+        {source.is_fully_local && (
           <div
-            className="p-1 mr-auto text-amber-500 opacity-30"
-            title={`${source.missing_episodes} épisode(s) manquant(s)`}
+            className="p-1 mr-auto text-sky-400 opacity-30"
+            title="Tous les épisodes sont disponibles localement"
           >
-            <AlertTriangle className="h-4 w-4" />
+            <HardDrive className="h-4 w-4" />
+          </div>
+        )}
+        {hydrationInProgress && (
+          <div
+            className="p-1 text-sky-400 opacity-70"
+            title="Hydratation locale en cours"
+          >
+            <Loader2 className="h-4 w-4 animate-spin" />
           </div>
         )}
         <button
           onClick={(e) => {
             e.stopPropagation();
-            onToggleProtection();
+            onTogglePin();
           }}
           className={`p-1 rounded transition-colors hover:bg-[hsl(var(--secondary))] ${
-            source.purge_protected
+            source.permanent_pin
               ? "text-green-500 opacity-100"
               : "text-[hsl(var(--muted-foreground))] opacity-30 hover:opacity-60"
           }`}
           title={
-            source.purge_protected
-              ? "Protégé contre la purge"
-              : "Non protégé contre la purge"
+            source.permanent_pin
+              ? "Épinglé localement"
+              : "Protéger de l'éviction locale"
           }
         >
           <ShieldCheck className="h-4 w-4" />
@@ -92,10 +109,10 @@ export function SourceRow({
         <button
           onClick={(e) => {
             e.stopPropagation();
-            onManageTorrents();
+            onManageEpisodes();
           }}
           className="p-1 rounded text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--secondary))] hover:text-[hsl(var(--foreground))] transition-colors"
-          title="Gérer les torrents"
+          title="Gérer les épisodes"
         >
           <Cable className="h-4 w-4" />
         </button>

@@ -74,6 +74,7 @@ google-auth = ">=2.40.0"
 google-auth-httplib2 = ">=0.2.0"
 google-auth-oauthlib = ">=1.2.2"
 torf = ">=4.3.1, <5"
+asyncssh = ">=2.21.1"
 
 [feature.dev.pypi-dependencies]
 pytest = ">=8.0.0"

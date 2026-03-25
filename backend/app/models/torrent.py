@@ -98,4 +98,6 @@ class IndexationJob(BaseModel):
     error: str | None = None
     unmatched_files: list[str] = []  # files not linked to any torrent
     linked_torrents: int = 0  # number of torrents linked after indexation
+    series_id: str | None = None
+    storage_release_id: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

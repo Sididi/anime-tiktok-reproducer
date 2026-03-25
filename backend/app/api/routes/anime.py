@@ -9,7 +9,12 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from ...library_types import LibraryType
-from ...services import AnimeLibraryService, AnimeMatcherService
+from ...services import (
+    AnimeLibraryService,
+    AnimeMatcherService,
+    LibraryHydrationService,
+    StorageBoxRepository,
+)
 
 router = APIRouter(prefix="/anime", tags=["anime"])
 
@@ -92,7 +97,8 @@ async def browse_directories(path: str | None = Query(default=None)):
 async def list_indexed_anime(library_type: LibraryType = Query(...)):
     """List all indexed anime series in the library."""
     try:
-        series = await AnimeLibraryService.list_indexed_anime(library_type=library_type)
+        details = await LibraryHydrationService.list_source_details(library_type=library_type)
+        series = [item["name"] for item in details]
         return {"series": series, "count": len(series)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -125,6 +131,8 @@ async def index_anime(request: IndexAnimeRequest):
     target_anime_name = request.anime_name or source_folder.name
 
     async def stream_progress():
+        final_complete: dict | None = None
+        saw_error = False
         async for progress in AnimeLibraryService.index_anime(
             source_folder=source_folder,
             library_type=request.library_type,
@@ -137,12 +145,40 @@ async def index_anime(request: IndexAnimeRequest):
             precision=request.precision,
             require_gpu=request.require_gpu,
         ):
+            if progress.status == "error":
+                saw_error = True
+                yield f"data: {json.dumps(progress.to_dict())}\n\n"
+                return
             if progress.status == "complete":
-                AnimeMatcherService.mark_series_updated(
-                    request.library_type,
-                    progress.anime_name or target_anime_name,
-                )
+                final_complete = progress.to_dict()
+                break
             yield f"data: {json.dumps(progress.to_dict())}\n\n"
+
+        if saw_error:
+            return
+        yield f"data: {json.dumps({'status': 'indexing', 'progress': 0.97, 'message': 'Packaging release...', 'anime_name': target_anime_name})}\n\n"
+        try:
+            publish_result = await StorageBoxRepository.publish_series(
+                library_type=request.library_type,
+                display_name=target_anime_name,
+            )
+        except Exception as exc:
+            yield f"data: {json.dumps({'status': 'error', 'progress': 0.0, 'message': str(exc), 'error': str(exc), 'anime_name': target_anime_name})}\n\n"
+            return
+        AnimeMatcherService.mark_series_updated(
+            request.library_type,
+            target_anime_name,
+        )
+        if final_complete is None:
+            final_complete = {
+                "status": "complete",
+                "progress": 1.0,
+                "message": f"Successfully indexed {target_anime_name}",
+                "anime_name": target_anime_name,
+            }
+        final_complete["series_id"] = str(publish_result["series_id"])
+        final_complete["storage_release_id"] = str(publish_result["release_id"])
+        yield f"data: {json.dumps(final_complete)}\n\n"
 
     return StreamingResponse(
         stream_progress(),
@@ -175,6 +211,8 @@ async def update_anime(request: UpdateAnimeRequest):
     source_files = [Path(path) for path in request.source_paths]
 
     async def stream_progress():
+        final_complete: dict | None = None
+        saw_error = False
         async for progress in AnimeLibraryService.update_anime(
             library_type=request.library_type,
             anime_name=request.anime_name,
@@ -186,12 +224,40 @@ async def update_anime(request: UpdateAnimeRequest):
             precision=request.precision,
             require_gpu=request.require_gpu,
         ):
+            if progress.status == "error":
+                saw_error = True
+                yield f"data: {json.dumps(progress.to_dict())}\n\n"
+                return
             if progress.status == "complete":
-                AnimeMatcherService.mark_series_updated(
-                    request.library_type,
-                    progress.anime_name or request.anime_name,
-                )
+                final_complete = progress.to_dict()
+                break
             yield f"data: {json.dumps(progress.to_dict())}\n\n"
+
+        if saw_error:
+            return
+        yield f"data: {json.dumps({'status': 'indexing', 'progress': 0.97, 'message': 'Publishing updated release...', 'anime_name': request.anime_name})}\n\n"
+        try:
+            publish_result = await StorageBoxRepository.publish_series(
+                library_type=request.library_type,
+                display_name=request.anime_name,
+            )
+        except Exception as exc:
+            yield f"data: {json.dumps({'status': 'error', 'progress': 0.0, 'message': str(exc), 'error': str(exc), 'anime_name': request.anime_name})}\n\n"
+            return
+        AnimeMatcherService.mark_series_updated(
+            request.library_type,
+            request.anime_name,
+        )
+        if final_complete is None:
+            final_complete = {
+                "status": "complete",
+                "progress": 1.0,
+                "message": f"Successfully updated {request.anime_name}",
+                "anime_name": request.anime_name,
+            }
+        final_complete["series_id"] = str(publish_result["series_id"])
+        final_complete["storage_release_id"] = str(publish_result["release_id"])
+        yield f"data: {json.dumps(final_complete)}\n\n"
 
     return StreamingResponse(
         stream_progress(),
@@ -432,12 +498,18 @@ async def validate_batch_folders(request: ValidateBatchFoldersRequest):
 
 class SourceDetails(BaseModel):
     name: str
+    series_id: str
     episode_count: int
+    local_episode_count: int
     total_size_bytes: int
     fps: float
-    missing_episodes: int
-    purge_protected: bool
-    original_index_path: str | None
+    is_fully_local: bool
+    project_pin_count: int
+    permanent_pin: bool
+    storage_release_id: str
+    torrent_count: int
+    hydration_status: str
+    updated_at: str
 
 
 @router.get("/source-details")
@@ -445,7 +517,7 @@ async def get_source_details(
     library_type: LibraryType = Query(...),
 ) -> list[SourceDetails]:
     """Get detailed metadata for all sources in a library type."""
-    return await AnimeLibraryService.get_source_details(library_type=library_type)
+    return await LibraryHydrationService.list_source_details(library_type=library_type)
 
 
 # ---------------------------------------------------------------------------
@@ -511,9 +583,39 @@ class PurgeRequest(BaseModel):
 
 @router.post("/purge")
 async def purge_library(request: PurgeRequest):
-    """Delete video files from library, preserving indexes and metadata."""
+    """Evict local unpinned library data while keeping remote releases intact."""
     types_to_purge = list(LibraryType) if request.all_types else [request.library_type]
-    return await AnimeLibraryService.purge_library(types_to_purge)
+    purged_sources: list[str] = []
+    skipped_protected: list[str] = []
+    freed_bytes = 0
+
+    for library_type in types_to_purge:
+        details = await LibraryHydrationService.list_source_details(library_type=library_type)
+        for entry in details:
+            if entry["permanent_pin"] or int(entry["project_pin_count"]) > 0:
+                skipped_protected.append(entry["name"])
+                continue
+            series_dir = AnimeLibraryService.get_library_path(library_type) / entry["name"]
+            if series_dir.exists():
+                freed_bytes += sum(
+                    path.stat().st_size
+                    for path in series_dir.rglob("*")
+                    if path.is_file()
+                )
+            try:
+                await LibraryHydrationService.evict_series(
+                    library_type=library_type,
+                    series_id=entry["series_id"],
+                )
+                purged_sources.append(entry["name"])
+            except Exception as exc:
+                skipped_protected.append(f"{entry['name']} ({exc})")
+
+    return {
+        "purged_sources": purged_sources,
+        "freed_bytes": freed_bytes,
+        "skipped_protected": skipped_protected,
+    }
 
 
 @router.get("/purge/estimate")
@@ -521,33 +623,93 @@ async def estimate_purge(
     library_type: LibraryType = Query(...),
     all_types: bool = Query(False),
 ):
-    """Estimate how much space would be freed by purging."""
+    """Estimate how much local space would be freed by evicting unpinned series."""
     types_to_check = list(LibraryType) if all_types else [library_type]
-    return await AnimeLibraryService.estimate_purge_size(types_to_check)
+    estimated_bytes = 0
+    source_count = 0
+    for current_type in types_to_check:
+        details = await LibraryHydrationService.list_source_details(library_type=current_type)
+        for entry in details:
+            if entry["permanent_pin"] or int(entry["project_pin_count"]) > 0:
+                continue
+            series_dir = AnimeLibraryService.get_library_path(current_type) / entry["name"]
+            if not series_dir.exists():
+                continue
+            source_count += 1
+            estimated_bytes += sum(
+                path.stat().st_size
+                for path in series_dir.rglob("*")
+                if path.is_file()
+            )
+    return {"estimated_bytes": estimated_bytes, "source_count": source_count}
 
 
 # ---------------------------------------------------------------------------
 # Purge protection toggle
 # ---------------------------------------------------------------------------
 
-@router.patch("/{source_name}/protection")
-async def toggle_protection(
-    source_name: str,
+@router.patch("/{series_id}/pin")
+async def toggle_pin(
+    series_id: str,
     library_type: LibraryType = Query(...),
 ):
-    """Toggle purge protection for a source."""
-    from ...services.torrent_linker import TorrentLinkerService
-    from ...models.torrent import SourceTorrentMetadata
+    """Toggle permanent pin for a series."""
+    try:
+        state = await LibraryHydrationService.describe_series(
+            library_type=library_type,
+            series_id=series_id,
+        )
+        return await LibraryHydrationService.toggle_permanent_pin(
+            library_type=library_type,
+            series_id=series_id,
+            enabled=not bool(state.get("permanent_pin")),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    library_root = AnimeLibraryService.get_library_path(library_type=library_type)
-    source_dir = library_root / source_name
-    if not source_dir.exists():
-        raise HTTPException(status_code=404, detail=f"Source not found: {source_name}")
 
-    metadata = TorrentLinkerService.load_metadata(source_dir) or SourceTorrentMetadata()
-    metadata.purge_protection = not metadata.purge_protection
-    TorrentLinkerService.save_metadata(source_dir, metadata)
-    return {"purge_protected": metadata.purge_protection}
+class HydrateSeriesRequest(BaseModel):
+    library_type: LibraryType
+    episode_keys: list[str] = []
+    full_series: bool = False
+
+
+@router.post("/{series_id}/hydrate")
+async def hydrate_series(
+    series_id: str,
+    request: HydrateSeriesRequest,
+):
+    """Hydrate episodes locally from the active Storage Box release."""
+    try:
+        return await LibraryHydrationService.hydrate_series(
+            library_type=request.library_type,
+            series_id=series_id,
+            episode_keys=request.episode_keys,
+            full_series=request.full_series,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+class EvictSeriesRequest(BaseModel):
+    library_type: LibraryType
+
+
+@router.post("/{series_id}/evict")
+async def evict_series(
+    series_id: str,
+    request: EvictSeriesRequest,
+):
+    """Evict local hydrated data for one series if it is not pinned."""
+    try:
+        return await LibraryHydrationService.evict_series(
+            library_type=request.library_type,
+            series_id=series_id,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -555,24 +717,19 @@ async def toggle_protection(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/{source_name}/torrents")
-async def get_source_torrents(
-    source_name: str,
+@router.get("/{series_id}/episodes")
+async def get_episode_sources(
+    series_id: str,
     library_type: LibraryType = Query(...),
 ):
-    """Get torrent metadata for a source."""
-    from ...services.torrent_linker import TorrentLinkerService
-    from ...models.torrent import SourceTorrentMetadata
-
-    library_root = AnimeLibraryService.get_library_path(library_type=library_type)
-    source_dir = library_root / source_name
-    if not source_dir.exists():
-        raise HTTPException(status_code=404, detail=f"Source not found: {source_name}")
-
-    metadata = TorrentLinkerService.load_metadata(source_dir)
-    if not metadata:
-        return SourceTorrentMetadata().model_dump(mode="json")
-    return metadata.model_dump(mode="json")
+    """Return Storage Box primary episodes plus torrent fallback metadata."""
+    try:
+        return await LibraryHydrationService.get_episode_sources(
+            library_type=library_type,
+            series_id=series_id,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.post("/{source_name}/torrents/replace")

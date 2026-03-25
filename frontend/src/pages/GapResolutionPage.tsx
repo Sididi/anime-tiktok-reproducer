@@ -197,6 +197,12 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
         if (!active) return;
         setSourceDescriptor(descriptor);
 
+        if (!descriptor) {
+          setSourceChunkDuration(0);
+          setSourceChunkStart(0);
+          return;
+        }
+
         if (shouldUseChunkedSource(descriptor)) {
           const desiredDuration = Math.min(
             Math.max(

@@ -48,6 +48,7 @@ export const api = {
     tiktokUrl?: string,
     sourcePath?: string,
     animeName?: string,
+    seriesId?: string,
     libraryType: import("@/types").LibraryType = "anime",
   ) =>
     request<import("@/types").Project>("/projects", {
@@ -56,6 +57,7 @@ export const api = {
         tiktok_url: tiktokUrl,
         source_path: sourcePath,
         anime_name: animeName,
+        series_id: seriesId,
         library_type: libraryType,
       }),
     }),
@@ -69,6 +71,7 @@ export const api = {
     id: string,
     data: {
       anime_name?: string;
+      series_id?: string;
       library_type?: import("@/types").LibraryType;
     },
   ) =>
@@ -79,6 +82,17 @@ export const api = {
 
   deleteProject: (id: string) =>
     request<{ status: string }>(`/projects/${id}`, { method: "DELETE" }),
+
+  activateProjectLibrary: (projectId: string) =>
+    request<import("@/types").LibraryActivationState>(
+      `/projects/${projectId}/library/activate`,
+      { method: "POST" },
+    ),
+
+  getProjectLibraryActivation: (projectId: string) =>
+    request<import("@/types").LibraryActivationState>(
+      `/projects/${projectId}/library/activation`,
+    ),
 
   // Accounts
   listAccounts: () =>
@@ -552,10 +566,47 @@ export const api = {
     }),
 
   // Library - Purge protection
-  togglePurgeProtection: (libraryType: import("@/types").LibraryType, sourceName: string) =>
-    request<{ purge_protected: boolean }>(
-      `/anime/${encodeURIComponent(sourceName)}/protection?library_type=${encodeURIComponent(libraryType)}`,
+  togglePermanentPin: (libraryType: import("@/types").LibraryType, seriesId: string) =>
+    request<{ permanent_pin: boolean; hydration_started: boolean }>(
+      `/anime/${encodeURIComponent(seriesId)}/pin?library_type=${encodeURIComponent(libraryType)}`,
       { method: "PATCH" },
+    ),
+
+  hydrateSeries: (
+    libraryType: import("@/types").LibraryType,
+    seriesId: string,
+    payload?: { episode_keys?: string[]; full_series?: boolean },
+  ) =>
+    request<import("@/types").LibraryActivationState>(
+      `/anime/${encodeURIComponent(seriesId)}/hydrate`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          library_type: libraryType,
+          episode_keys: payload?.episode_keys ?? [],
+          full_series: payload?.full_series ?? false,
+        }),
+      },
+    ),
+
+  evictSeries: (
+    libraryType: import("@/types").LibraryType,
+    seriesId: string,
+  ) =>
+    request<import("@/types").LibraryActivationState>(
+      `/anime/${encodeURIComponent(seriesId)}/evict`,
+      {
+        method: "POST",
+        body: JSON.stringify({ library_type: libraryType }),
+      },
+    ),
+
+  getEpisodeSources: (
+    libraryType: import("@/types").LibraryType,
+    seriesId: string,
+  ) =>
+    request<import("@/types").EpisodeSourcesPayload>(
+      `/anime/${encodeURIComponent(seriesId)}/episodes?library_type=${encodeURIComponent(libraryType)}`,
     ),
 
   // Library - Estimate purge size

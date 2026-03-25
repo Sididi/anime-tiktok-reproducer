@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     data_dir: Path = Path(__file__).parent.parent / "data"
     projects_dir: Path = Path(__file__).parent.parent / "data" / "projects"
     cache_dir: Path = Path(__file__).parent.parent / "data" / "cache"
+    library_state_db_path: Path = Path(__file__).parent.parent / "data" / "library_state.db"
     ffmpeg_binary: str | None = None
     ffprobe_binary: str | None = None
 
@@ -123,6 +124,19 @@ class Settings(BaseSettings):
     qbittorrent_password: str = "adminadmin"
     torrent_complete_dir: Path = Path.home() / "Torrents" / ".complete"
 
+    # Hetzner Storage Box
+    storage_box_enabled: bool = False
+    storage_box_host: str | None = None
+    storage_box_port: int = 22
+    storage_box_username: str | None = None
+    storage_box_ssh_key_path: Path | None = None
+    storage_box_password: str | None = None
+    storage_box_root: str = ""
+    storage_box_known_hosts_path: Path | None = None
+    storage_box_max_connections: int = 3
+    storage_box_upload_max_parallel: int = 2
+    storage_box_download_max_parallel: int = 3
+
     @property
     def drive_google_client_id(self) -> str | None:
         return self.google_client_id
@@ -170,6 +184,14 @@ class Settings(BaseSettings):
         stripped = value.strip()
         return stripped or None
 
+    @field_validator("storage_box_host", "storage_box_username", "storage_box_root")
+    @classmethod
+    def _trim_storage_box_strings(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
     @field_validator("drive_upload_max_parallel")
     @classmethod
     def _clamp_drive_upload_max_parallel(cls, value: int) -> int:
@@ -198,5 +220,7 @@ class Settings(BaseSettings):
 settings = Settings()
 
 # Ensure directories exist
+settings.data_dir.mkdir(parents=True, exist_ok=True)
 settings.projects_dir.mkdir(parents=True, exist_ok=True)
 settings.cache_dir.mkdir(parents=True, exist_ok=True)
+settings.library_state_db_path.parent.mkdir(parents=True, exist_ok=True)

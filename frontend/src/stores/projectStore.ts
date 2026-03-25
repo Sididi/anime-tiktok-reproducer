@@ -13,11 +13,12 @@ interface ProjectState {
     tiktokUrl?: string,
     sourcePath?: string,
     animeName?: string,
+    seriesId?: string,
     libraryType?: LibraryType,
   ) => Promise<Project>;
   updateProject: (
     id: string,
-    data: { anime_name?: string; library_type?: LibraryType },
+    data: { anime_name?: string; series_id?: string; library_type?: LibraryType },
   ) => Promise<Project>;
   clearProject: () => void;
 }
@@ -41,6 +42,7 @@ export const useProjectStore = create<ProjectState>((set) => ({
     tiktokUrl?: string,
     sourcePath?: string,
     animeName?: string,
+    seriesId?: string,
     libraryType: LibraryType = "anime",
   ) => {
     set({ loading: true, error: null });
@@ -49,6 +51,7 @@ export const useProjectStore = create<ProjectState>((set) => ({
         tiktokUrl,
         sourcePath,
         animeName,
+        seriesId,
         libraryType,
       );
       set({ project, loading: false });
@@ -61,7 +64,7 @@ export const useProjectStore = create<ProjectState>((set) => ({
 
   updateProject: async (
     id: string,
-    data: { anime_name?: string; library_type?: LibraryType },
+    data: { anime_name?: string; series_id?: string; library_type?: LibraryType },
   ) => {
     set({ loading: true, error: null });
     try {

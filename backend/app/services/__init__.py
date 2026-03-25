@@ -53,6 +53,10 @@ _EXPORTS = {
     "TorrentLinkerService": (".torrent_linker", "TorrentLinkerService"),
     "DeferredDownloadService": (".deferred_download", "DeferredDownloadService"),
     "TikTokUrlDbService": (".tiktok_url_db_service", "TikTokUrlDbService"),
+    "StorageBoxSftpClient": (".storage_box_sftp_client", "StorageBoxSftpClient"),
+    "StorageBoxRepository": (".storage_box_repository", "StorageBoxRepository"),
+    "LibraryHydrationService": (".library_hydration_service", "LibraryHydrationService"),
+    "LibraryStateDb": (".library_state_db", "LibraryStateDb"),
 }
 
 __all__ = list(_EXPORTS)

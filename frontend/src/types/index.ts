@@ -28,6 +28,7 @@ export interface Project {
   video_duration: number | null;
   video_fps: number | null;
   anime_name: string | null;
+  series_id: string | null;
   library_type: LibraryType;
   output_language: string | null;
   drive_folder_id: string | null;
@@ -354,4 +355,17 @@ export interface Transcription {
   scenes: SceneTranscription[];
 }
 
-export type { SourceDetails, BrowseEntry, BrowseResult, IndexationJob, PurgeResult } from "./library";
+export type {
+  SourceDetails,
+  BrowseEntry,
+  BrowseResult,
+  IndexationJob,
+  PurgeResult,
+  LibraryActivationState,
+  EpisodeSourcesPayload,
+  SourceTorrentMetadata,
+  TorrentEntry,
+  TorrentFileMapping,
+  ReplacementProgressEvent,
+  VerificationResult,
+} from "./library";

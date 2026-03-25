@@ -5,10 +5,10 @@ import { SourceRow } from "./SourceRow";
 interface SourceListProps {
   sources: SourceDetails[];
   selectedSource: string | null;
-  onSelectSource: (name: string) => void;
-  onToggleProtection: (name: string) => void;
-  onUpdateSource: (name: string) => void;
-  onManageTorrents: (name: string) => void;
+  onSelectSource: (seriesId: string) => void;
+  onToggleProtection: (seriesId: string) => void;
+  onUpdateSource: (source: SourceDetails) => void;
+  onManageTorrents: (source: SourceDetails) => void;
   searchQuery: string;
 }
 
@@ -56,13 +56,13 @@ export function SourceList({
         ) : (
           filtered.map((source) => (
             <SourceRow
-              key={source.name}
+              key={source.series_id}
               source={source}
-              isSelected={selectedSource === source.name}
-              onSelect={() => onSelectSource(source.name)}
-              onToggleProtection={() => onToggleProtection(source.name)}
-              onUpdate={() => onUpdateSource(source.name)}
-              onManageTorrents={() => onManageTorrents(source.name)}
+              isSelected={selectedSource === source.series_id}
+              onSelect={() => onSelectSource(source.series_id)}
+              onTogglePin={() => onToggleProtection(source.series_id)}
+              onUpdate={() => onUpdateSource(source)}
+              onManageEpisodes={() => onManageTorrents(source)}
             />
           ))
         )}

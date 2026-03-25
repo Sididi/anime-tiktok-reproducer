@@ -53,8 +53,9 @@ export function PurgeModal({
 
         {/* Explanation */}
         <p className="text-sm text-[hsl(var(--muted-foreground))] text-center leading-relaxed">
-          Les fichiers vidéo source seront supprimés. Les index FAISS,
-          métadonnées torrent et informations d'indexation sont conservés.
+          Les fichiers vidéo source et les index locaux seront supprimés. Les
+          données restent disponibles sur le Storage Box pour un
+          retéléchargement ultérieur.
         </p>
 
         {/* Space estimate */}

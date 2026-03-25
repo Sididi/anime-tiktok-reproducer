@@ -27,7 +27,6 @@ export function ProjectSetup() {
   const [sources, setSources] = useState<SourceDetails[]>([]);
   const [selectedSource, setSelectedSource] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
-  const [loadingSources, setLoadingSources] = useState(true);
 
   // TikTok URL + Start flow
   const [tiktokUrl, setTiktokUrl] = useState("");
@@ -57,15 +56,12 @@ export function ProjectSetup() {
   // Load sources
   // ---------------------------------------------------------------------------
   const loadSources = useCallback(async () => {
-    setLoadingSources(true);
     try {
       const details = await api.getSourceDetails(selectedLibraryType);
       setSources(details);
     } catch (err) {
       console.error("Failed to load sources:", err);
       setSources([]);
-    } finally {
-      setLoadingSources(false);
     }
   }, [selectedLibraryType]);
 
@@ -76,8 +72,8 @@ export function ProjectSetup() {
   const handleJobComplete = useCallback(
     async (job: IndexationJob) => {
       await loadSources();
-      if (job.library_type === selectedLibraryType) {
-        setSelectedSource(job.source_name);
+      if (job.library_type === selectedLibraryType && job.series_id) {
+        setSelectedSource(job.series_id);
       }
     },
     [loadSources, selectedLibraryType],
@@ -97,19 +93,33 @@ export function ProjectSetup() {
     setError(null);
 
     try {
+      const selectedSourceDetails = sources.find(
+        (source) => source.series_id === selectedSource,
+      );
+      if (!selectedSourceDetails) {
+        throw new Error("Selected source not found");
+      }
+
       // Create project
       setStatusText("Creating project...");
       const project = await api.createProject(
         tiktokUrl,
         undefined,
-        selectedSource,
+        selectedSourceDetails.name,
+        selectedSourceDetails.series_id,
         selectedLibraryType,
+      );
+      const activationPromise = api.activateProjectLibrary(project.id).catch(
+        (activationError) => {
+          console.error("Failed to activate library:", activationError);
+          throw activationError;
+        },
       );
 
       // Download video
       setStatusText("Downloading video...");
       const downloadResp = await api.downloadVideo(project.id, tiktokUrl);
-      await readSSEStream(downloadResp, (data: { progress?: number }) => {
+      await readSSEStream<{ status?: string; error?: string | null; message?: string | null; progress?: number }>(downloadResp, (data) => {
         if (data.progress !== undefined) {
           setStatusText(`Downloading... ${Math.round(data.progress)}%`);
         }
@@ -118,7 +128,7 @@ export function ProjectSetup() {
       // Detect scenes
       setStatusText("Detecting scenes...");
       const detectResp = await api.detectScenes(project.id);
-      await readSSEStream(detectResp, (data: { progress?: number }) => {
+      await readSSEStream<{ status?: string; error?: string | null; message?: string | null; progress?: number }>(detectResp, (data) => {
         if (data.progress !== undefined) {
           setStatusText(
             `Detecting scenes... ${Math.round(data.progress * 100)}%`,
@@ -135,6 +145,13 @@ export function ProjectSetup() {
         skipScenesUi = false;
       }
 
+      if (skipScenesUi) {
+        setStatusText("Preparing library...");
+        await activationPromise;
+      } else {
+        void activationPromise;
+      }
+
       navigate(
         skipScenesUi
           ? `/project/${project.id}/matches`
@@ -144,7 +161,7 @@ export function ProjectSetup() {
       setError((err as Error).message);
       setProcessing(false);
     }
-  }, [tiktokUrl, selectedSource, selectedLibraryType, navigate]);
+  }, [tiktokUrl, selectedSource, selectedLibraryType, navigate, sources]);
 
   const handleStart = useCallback(async () => {
     if (!tiktokUrl.trim() || !selectedSource) return;
@@ -242,16 +259,16 @@ export function ProjectSetup() {
   // Protection toggle
   // ---------------------------------------------------------------------------
   const handleToggleProtection = useCallback(
-    async (name: string) => {
+    async (seriesId: string) => {
       try {
-        const result = await api.togglePurgeProtection(
+        const result = await api.togglePermanentPin(
           selectedLibraryType,
-          name,
+          seriesId,
         );
         setSources((prev) =>
           prev.map((s) =>
-            s.name === name
-              ? { ...s, purge_protected: result.purge_protected }
+            s.series_id === seriesId
+              ? { ...s, permanent_pin: result.permanent_pin }
               : s,
           ),
         );
@@ -287,11 +304,11 @@ export function ProjectSetup() {
         selectedSource={selectedSource}
         onSelectSource={setSelectedSource}
         onToggleProtection={handleToggleProtection}
-        onUpdateSource={(name) => {
-          setUpdateSourceName(name);
+        onUpdateSource={(source) => {
+          setUpdateSourceName(source.name);
           setShowFolderBrowser(true);
         }}
-        onManageTorrents={(name) => setTorrentSourceName(name)}
+        onManageTorrents={(source) => setTorrentSourceName(source.name)}
         searchQuery={searchQuery}
       />
 
@@ -350,12 +367,7 @@ export function ProjectSetup() {
             setUpdateSourceName(null);
           }
         }}
-        initialPath={
-          updateSourceName
-            ? (sources.find((s) => s.name === updateSourceName)
-                ?.original_index_path ?? undefined)
-            : undefined
-        }
+        initialPath={undefined}
       />
 
       <DuplicateTikTokWarning

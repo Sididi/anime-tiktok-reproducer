@@ -29,6 +29,7 @@ class Project(BaseModel):
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
     tiktok_url: str | None = None
     anime_name: str | None = None  # Selected anime from indexed library
+    series_id: str | None = None
     library_type: LibraryType = DEFAULT_LIBRARY_TYPE
     source_paths: list[str] = Field(default_factory=list)  # Kept for backwards compatibility
     phase: ProjectPhase = ProjectPhase.SETUP

@@ -63,7 +63,7 @@ export function NewSourceModal({
   const [batchProcessing, setBatchProcessing] = useState(false);
 
   // Batch validation flow state
-  const [validationResults, setValidationResults] = useState<ValidationResult[]>([]);
+  const [, setValidationResults] = useState<ValidationResult[]>([]);
   const [fixQueue, setFixQueue] = useState<ValidationResult[]>([]);
   const [conflictQueue, setConflictQueue] = useState<ValidationResult[]>([]);
   const [currentFixIndex, setCurrentFixIndex] = useState(-1);

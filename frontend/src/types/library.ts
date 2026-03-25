@@ -1,11 +1,17 @@
 export interface SourceDetails {
   name: string;
+  series_id: string;
   episode_count: number;
+  local_episode_count: number;
   total_size_bytes: number;
   fps: number;
-  missing_episodes: number;
-  purge_protected: boolean;
-  original_index_path: string | null;
+  is_fully_local: boolean;
+  project_pin_count: number;
+  permanent_pin: boolean;
+  storage_release_id: string;
+  torrent_count: number;
+  hydration_status: string;
+  updated_at: string;
 }
 
 export interface BrowseEntry {
@@ -35,7 +41,51 @@ export interface IndexationJob {
   error: string | null;
   unmatched_files: string[];
   linked_torrents: number;
+  series_id: string | null;
+  storage_release_id: string | null;
   created_at: string;
+}
+
+export interface LibraryActivationState {
+  series_id: string | null;
+  release_id: string | null;
+  hydration_status: string;
+  local_episode_count: number;
+  expected_episode_count: number;
+  is_fully_local: boolean;
+  permanent_pin: boolean;
+  project_pin_count: number;
+  last_error: string | null;
+  operation: {
+    type: string;
+    status: string;
+    progress: number;
+    error: string | null;
+    updated_at: string;
+  } | null;
+  updated_at: string | null;
+}
+
+export interface StorageBoxEpisodeItem {
+  episode_key: string;
+  size_bytes: number;
+  local: boolean;
+  local_relative_path: string | null;
+}
+
+export interface EpisodeSourcesPayload {
+  storage_box: {
+    available: boolean;
+    series_id: string;
+    release_id: string;
+    episode_count: number;
+    local_episode_count: number;
+    episodes: StorageBoxEpisodeItem[];
+  };
+  torrents: {
+    torrent_count: number;
+    items: TorrentEntry[];
+  };
 }
 
 export interface PurgeResult {

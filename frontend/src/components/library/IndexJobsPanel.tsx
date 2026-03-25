@@ -94,8 +94,8 @@ export function IndexJobsPanel({ onJobComplete }: IndexJobsPanelProps) {
       >
         <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
         <span className="text-[hsl(var(--muted-foreground))]">
-          {activeJobs.length} indexation{activeJobs.length !== 1 ? "s" : ""} en
-          cours
+          {activeJobs.length} opération{activeJobs.length !== 1 ? "s" : ""} de
+          librairie en cours
         </span>
         <ChevronDown
           className={`ml-auto h-3.5 w-3.5 text-[hsl(var(--muted-foreground))] transition-transform ${
@@ -151,10 +151,12 @@ export function IndexJobsPanel({ onJobComplete }: IndexJobsPanelProps) {
                     </span>
                     {job.status === "complete" &&
                       job.unmatched_files?.length > 0 && (
-                        <AlertTriangle
-                          className="h-3.5 w-3.5 text-amber-500 shrink-0"
+                        <div
+                          className="shrink-0"
                           title={`${job.unmatched_files.length} fichier(s) non lié(s) à un torrent`}
-                        />
+                        >
+                          <AlertTriangle className="h-3.5 w-3.5 text-amber-500" />
+                        </div>
                       )}
                   </motion.div>
                 ))}
@@ -187,6 +189,9 @@ function statusLabel(job: IndexationJob): string {
     case "queued":
       return "En attente";
     case "indexing":
+      if (job.phase === "link_sources") return job.message || "Association des sources...";
+      if (job.phase === "package_release") return job.message || "Préparation de la release...";
+      if (job.phase === "upload_release") return job.message || "Upload vers le Storage Box...";
       return job.message || "Indexation...";
     case "complete": {
       if (job.unmatched_files?.length > 0) {
