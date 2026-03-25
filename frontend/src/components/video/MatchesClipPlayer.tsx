@@ -28,6 +28,7 @@ export interface MatchesClipPlayerHandle {
   retryLoad: () => Promise<void>;
   forceLoad: () => void;
   releaseLoad: () => void;
+  releaseAndPreventReload: () => void;
 }
 
 interface MatchesClipPlayerProps {
@@ -334,6 +335,11 @@ export const MatchesClipPlayer = forwardRef<
         detachSource();
         releasePoolSlot();
         setPreloadOverride(null);
+      },
+      releaseAndPreventReload: () => {
+        detachSource();
+        releasePoolSlot();
+        setPreloadOverride("none");
       },
     }),
     [detachSource, hasError, playbackRate, releasePoolSlot, resetEndState],

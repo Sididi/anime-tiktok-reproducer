@@ -98,6 +98,7 @@ interface MatchCardHandle {
   playBothAndWait: () => Promise<void>;
   prepareForAutoplay: () => Promise<boolean>;
   releasePreload: () => void;
+  softRelease: () => void;
   stop: () => void;
 }
 
@@ -311,6 +312,13 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
       sourcePlayerRef.current?.releaseLoad();
     }, []);
 
+    const softRelease = useCallback(() => {
+      primedForFastWatchRef.current = false;
+      loadFailureRef.current = false;
+      tiktokPlayerRef.current?.releaseAndPreventReload();
+      sourcePlayerRef.current?.releaseAndPreventReload();
+    }, []);
+
     const stop = useCallback(() => {
       primedForFastWatchRef.current = false;
       loadFailureRef.current = false;
@@ -402,9 +410,10 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
         playBothAndWait,
         prepareForAutoplay,
         releasePreload,
+        softRelease,
         stop,
       }),
-      [playBothAndWait, prepareForAutoplay, releasePreload, stop],
+      [playBothAndWait, prepareForAutoplay, releasePreload, softRelease, stop],
     );
 
     useEffect(() => {
@@ -685,9 +694,10 @@ export function MatchValidation() {
   autoScrollRef.current = autoScroll;
 
   const fastWatchPrefetchAhead = useMemo(() => {
-    // At high speeds clips are very short (~0.3-0.6s effective).
-    // More prefetch = more concurrent connections which saturate the pool.
-    // 2 ahead is optimal: leaves time to load while current plays.
+    // At extreme speeds clips play in <0.3s. Scale lookahead so the
+    // connection pool has time to finish loading upcoming videos.
+    if (playbackRate >= 8) return 4;
+    if (playbackRate >= 4) return 3;
     if (playbackRate >= 2) return 2;
     return 1;
   }, [playbackRate]);
@@ -787,11 +797,10 @@ export function MatchValidation() {
       if (preparedScenesRef.current.has(sceneIndex)) return;
       if (preparingScenesRef.current.has(sceneIndex)) return;
 
-      prefetchQueueRef.current = prefetchQueueRef.current
-        .then(() => ensureScenePrepared(sceneIndex, token))
-        .catch(() => {
-          // Keep queue alive even if one preparation fails.
-        });
+      // Start preparation immediately — the pool semaphore handles
+      // concurrency. Serial chaining delayed later scenes by up to 9s
+      // each, starving the prefetch pipeline at high speeds.
+      void ensureScenePrepared(sceneIndex, token);
     },
     [ensureScenePrepared],
   );
@@ -817,7 +826,7 @@ export function MatchValidation() {
 
       for (const preparedSceneIndex of Array.from(preparedScenesRef.current)) {
         if (keepSceneIndices.has(preparedSceneIndex)) continue;
-        cardRefs.current.get(preparedSceneIndex)?.releasePreload();
+        cardRefs.current.get(preparedSceneIndex)?.softRelease();
         preparedScenesRef.current.delete(preparedSceneIndex);
       }
 
@@ -825,7 +834,7 @@ export function MatchValidation() {
         failedPreparedScenesRef.current,
       )) {
         if (keepSceneIndices.has(failedSceneIndex)) continue;
-        cardRefs.current.get(failedSceneIndex)?.releasePreload();
+        cardRefs.current.get(failedSceneIndex)?.softRelease();
         failedPreparedScenesRef.current.delete(failedSceneIndex);
       }
     },
@@ -1812,7 +1821,11 @@ export function MatchValidation() {
     }
 
     if (fastWatchPlaying) {
-      for (let offset = 0; offset <= fastWatchPrefetchAhead; offset += 1) {
+      // Wide window keeps <video> DOM alive (cheap) even after pool slots
+      // are released by softRelease, preventing flash on re-render.
+      const keepBehind = 3;
+      const keepAhead = fastWatchPrefetchAhead + 2;
+      for (let offset = -keepBehind; offset <= keepAhead; offset += 1) {
         addScene(scenes[activePosition + offset]?.index);
       }
       return enabled;
@@ -1863,13 +1876,16 @@ export function MatchValidation() {
   mediaEnabledSceneIndicesRef.current = mediaEnabledSceneIndices;
 
   useEffect(() => {
+    // During fast watch, releaseOutsideFastWatchWindow handles slot
+    // management via softRelease. Skip to avoid destructive releasePreload.
+    if (fastWatchPlaying) return;
     for (const [sceneIndex, card] of cardRefs.current.entries()) {
       if (mediaEnabledSceneIndices.has(sceneIndex)) continue;
       card.releasePreload();
       preparedScenesRef.current.delete(sceneIndex);
       failedPreparedScenesRef.current.delete(sceneIndex);
     }
-  }, [mediaEnabledSceneIndices]);
+  }, [mediaEnabledSceneIndices, fastWatchPlaying]);
 
   const hasAnyMatch = useMemo(
     () => matches.some((match) => match.confidence > 0 && match.episode),
@@ -2306,7 +2322,7 @@ export function MatchValidation() {
               <input
                 type="range"
                 min="0.5"
-                max="12"
+                max="16"
                 step="0.25"
                 value={playbackRate}
                 onChange={(e) => setPlaybackRate(parseFloat(e.target.value))}

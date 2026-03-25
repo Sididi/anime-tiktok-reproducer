@@ -32,6 +32,7 @@ export interface ClippedVideoPlayerHandle {
   playFromStart: () => void;
   seekToStart: () => Promise<void>;
   play: () => void;
+  playChecked: () => Promise<boolean>;
   pause: () => void;
   waitUntilReady: (options?: WaitUntilReadyOptions) => Promise<void>;
   hasLoadError: () => boolean;
@@ -376,6 +377,22 @@ export const ClippedVideoPlayer = forwardRef<
           videoRef.current.play().catch(console.error);
         }
       },
+      playChecked: async () => {
+        const video = videoRef.current;
+        if (!video || hasErrorRef.current) {
+          return false;
+        }
+
+        resetClipEndedState();
+        video.playbackRate = playbackRate;
+
+        try {
+          await video.play();
+          return true;
+        } catch {
+          return false;
+        }
+      },
       pause: () => {
         videoRef.current?.pause();
       },
@@ -444,6 +461,7 @@ export const ClippedVideoPlayer = forwardRef<
     [
       eager,
       adjustedStartTime,
+      playbackRate,
       requestPoolSlot,
       resetClipEndedState,
       setLoadRequestedState,
@@ -703,15 +721,20 @@ export const ClippedVideoPlayer = forwardRef<
     }
   }, [adjustedStartTime, endTime, markClipEnded, resetClipEndedState]);
 
-  // Reset to start when src or times change
+  // Reset to start when src or clip bounds change.
   useEffect(() => {
     if (videoRef.current && isLoaded) {
       videoRef.current.currentTime = adjustedStartTime;
-      videoRef.current.playbackRate = playbackRate;
       endNotifiedRef.current = false;
       isClipEndedRef.current = false;
     }
-  }, [src, adjustedStartTime, isLoaded, playbackRate]);
+  }, [src, adjustedStartTime, isLoaded]);
+
+  useEffect(() => {
+    if (videoRef.current) {
+      videoRef.current.playbackRate = playbackRate;
+    }
+  }, [playbackRate]);
 
   const handleReplay = useCallback(() => {
     if (videoRef.current) {

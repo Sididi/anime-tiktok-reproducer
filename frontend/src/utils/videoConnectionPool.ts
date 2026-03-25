@@ -13,7 +13,7 @@
  * ahead of regular IntersectionObserver-triggered loads in the queue.
  */
 
-const MAX_CONCURRENT = 5;
+const MAX_CONCURRENT = 10;
 
 interface QueueEntry {
   resolve: () => void;
