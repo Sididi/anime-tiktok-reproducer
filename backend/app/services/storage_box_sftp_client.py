@@ -67,12 +67,9 @@ class StorageBoxSftpClient:
             "username": settings.storage_box_username,
             "client_keys": client_keys,
             "password": settings.storage_box_password or None,
-            "known_hosts": (
-                str(settings.storage_box_known_hosts_path)
-                if settings.storage_box_known_hosts_path
-                else None
-            ),
         }
+        if settings.storage_box_known_hosts_path:
+            connect_kwargs["known_hosts"] = str(settings.storage_box_known_hosts_path)
         connection = await asyncssh.connect(**connect_kwargs)
         sftp = await connection.start_sftp_client()
         return _ClientHandle(connection=connection, sftp=sftp)
