@@ -101,6 +101,42 @@ class LibraryHydrationService:
             cls._library_locks[key] = lock
         return lock
 
+    @staticmethod
+    def _normalize_episode_reference(value: Any) -> str:
+        return str(value or "").strip().replace("\\", "/").casefold()
+
+    @classmethod
+    def _episode_matches_reference(
+        cls,
+        library_type: LibraryType | str,
+        episode: dict[str, Any],
+        reference: str,
+    ) -> bool:
+        normalized_reference = cls._normalize_episode_reference(reference)
+        if not normalized_reference:
+            return False
+
+        media = episode.get("media", {})
+        local_relative_path = str(media.get("local_relative_path") or "").strip() if isinstance(media, dict) else ""
+        episode_key = str(episode.get("episode_key") or "").strip()
+        library_root = AnimeLibraryService.get_library_path(library_type)
+
+        candidates: set[str] = set()
+        for candidate in (episode_key, local_relative_path):
+            normalized_candidate = cls._normalize_episode_reference(candidate)
+            if normalized_candidate:
+                candidates.add(normalized_candidate)
+                path_candidate = Path(candidate)
+                candidates.add(cls._normalize_episode_reference(path_candidate.name))
+                candidates.add(cls._normalize_episode_reference(path_candidate.stem))
+
+        if local_relative_path:
+            local_path = library_root / local_relative_path
+            candidates.add(cls._normalize_episode_reference(local_path))
+            candidates.add(cls._normalize_episode_reference(local_path.resolve(strict=False)))
+
+        return normalized_reference in candidates
+
     @classmethod
     async def startup_cleanup(cls) -> None:
         await asyncio.to_thread(LibraryStateDb.mark_incomplete_operations_interrupted)
@@ -310,7 +346,11 @@ class LibraryHydrationService:
                     selected_episodes = [
                         entry
                         for entry in episodes
-                        if isinstance(entry, dict) and str(entry.get("episode_key")) in target_keys
+                        if isinstance(entry, dict)
+                        and any(
+                            cls._episode_matches_reference(scoped_type, entry, requested_key)
+                            for requested_key in target_keys
+                        )
                     ]
 
                 total = len(selected_episodes)

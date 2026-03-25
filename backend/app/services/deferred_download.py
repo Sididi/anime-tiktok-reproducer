@@ -16,6 +16,7 @@ from .torrent_linker import TorrentLinkerService
 logger = logging.getLogger("uvicorn.error")
 
 STALL_TIMEOUT_SECONDS = 45
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".ts"}
 
 
 @dataclass
@@ -38,6 +39,14 @@ class DownloadPlan:
 
 class DeferredDownloadService:
 
+    @staticmethod
+    def _episode_ref_parts(episode_ref: str) -> tuple[Path, bool, str, str]:
+        path = Path(episode_ref)
+        has_video_extension = path.suffix.lower() in VIDEO_EXTENSIONS
+        display_name = path.name
+        stem = path.stem if has_video_extension else display_name
+        return path, has_video_extension, display_name, stem
+
     @classmethod
     def _resolve_episode_path(
         cls,
@@ -56,24 +65,31 @@ class DeferredDownloadService:
         """
         from .anime_library import AnimeLibraryService
 
-        p = Path(episode_ref)
+        p, has_video_extension, display_name, stem = cls._episode_ref_parts(episode_ref)
 
         # 1. Already an absolute, existing path
         if p.is_absolute() and p.exists():
             return p
 
         # 2. Direct lookup in source_dir
-        for candidate in (
-            source_dir / p.name,
-            source_dir / f"{p.stem}.mp4",
-            source_dir / f"{p.stem}.mov",
-        ):
+        direct_candidates: list[Path] = []
+        if has_video_extension:
+            direct_candidates.append(source_dir / display_name)
+        for extension in VIDEO_EXTENSIONS:
+            direct_candidates.append(source_dir / f"{stem}{extension}")
+
+        seen_candidates: set[str] = set()
+        for candidate in direct_candidates:
+            candidate_key = str(candidate)
+            if candidate_key in seen_candidates:
+                continue
+            seen_candidates.add(candidate_key)
             if candidate.exists():
                 return candidate
 
         # 3. Sidecar-based resolution (works even after purge)
-        for suffix in (".mp4", ".mov", ""):
-            stem = p.stem if p.suffix else str(p)
+        sidecar_suffixes = [p.suffix] if has_video_extension else list(VIDEO_EXTENSIONS) + [""]
+        for suffix in sidecar_suffixes:
             sidecar = source_dir / f"{stem}{suffix}{AnimeLibraryService.SOURCE_IMPORT_MANIFEST_SUFFIX}"
             if sidecar.exists():
                 try:
@@ -87,16 +103,16 @@ class DeferredDownloadService:
         # 4. Match against .atr_torrents.json library_path entries by stem
         metadata = TorrentLinkerService.load_metadata(source_dir)
         if metadata:
-            target_stem = p.stem if p.suffix else str(p)
             for te in metadata.torrents:
                 for fm in te.files:
-                    if Path(fm.library_path).stem == target_stem:
+                    if Path(fm.library_path).stem == stem:
                         return Path(fm.library_path)
 
         return None
 
-    @staticmethod
+    @classmethod
     def check_missing_sources(
+        cls,
         match_episodes: list[str],
         library_root: Path,
         source_name: str,
@@ -115,13 +131,13 @@ class DeferredDownloadService:
         metadata = TorrentLinkerService.load_metadata(source_dir)
 
         for ep_ref in match_episodes:
+            _p, _has_video_extension, _display_name, stem = cls._episode_ref_parts(ep_ref)
             # Resolve bare name / relative ref to an absolute library path
             resolved = DeferredDownloadService._resolve_episode_path(
                 ep_ref, source_dir
             )
             # Fall back to constructing a plausible path
             if resolved is None:
-                stem = Path(ep_ref).stem if Path(ep_ref).suffix else ep_ref
                 resolved = source_dir / f"{stem}.mp4"
 
             if resolved.exists():
@@ -506,9 +522,8 @@ class DeferredDownloadService:
                     await qbt.close()
 
         # --- Phase: verify ---
-        still_missing = [
-            ep for ep in match_episodes if not Path(ep).exists()
-        ]
+        still_missing_rows = cls.check_missing_sources(match_episodes, library_root, source_name)
+        still_missing = [row.episode_path for row in still_missing_rows]
         if still_missing:
             names = [Path(p).name for p in still_missing]
             yield {
