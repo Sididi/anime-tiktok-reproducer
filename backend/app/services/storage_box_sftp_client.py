@@ -54,6 +54,24 @@ class StorageBoxSftpClient:
             cls._semaphore = asyncio.Semaphore(max(1, settings.storage_box_max_connections))
         return cls._semaphore
 
+    @staticmethod
+    def _connection_is_closed(connection: object) -> bool:
+        is_closed = getattr(connection, "is_closed", None)
+        if callable(is_closed):
+            try:
+                return bool(is_closed())
+            except Exception:
+                return True
+
+        is_closing = getattr(connection, "is_closing", None)
+        if callable(is_closing):
+            try:
+                return bool(is_closing())
+            except Exception:
+                return True
+
+        return False
+
     @classmethod
     async def _connect_handle(cls) -> _ClientHandle:
         cls._require_dependency()
@@ -81,7 +99,7 @@ class StorageBoxSftpClient:
             async with cls._pool_lock:
                 while cls._pool:
                     handle = cls._pool.pop()
-                    if not handle.connection.is_closing():
+                    if not cls._connection_is_closed(handle.connection):
                         return handle
             return await cls._connect_handle()
         except Exception:
@@ -91,10 +109,19 @@ class StorageBoxSftpClient:
     @classmethod
     async def _release_handle(cls, handle: _ClientHandle) -> None:
         try:
-            if handle.connection.is_closing():
-                await handle.sftp.exit()
-                handle.connection.close()
-                await handle.connection.wait_closed()
+            if cls._connection_is_closed(handle.connection):
+                try:
+                    await handle.sftp.exit()
+                except Exception:
+                    pass
+                try:
+                    handle.connection.close()
+                except Exception:
+                    pass
+                try:
+                    await handle.connection.wait_closed()
+                except Exception:
+                    pass
             else:
                 async with cls._pool_lock:
                     cls._pool.append(handle)
@@ -160,13 +187,15 @@ class StorageBoxSftpClient:
     async def listdir(cls, remote_path: str | PurePosixPath) -> list[str]:
         remote = cls.normalize_remote_path(remote_path)
         async with cls.sftp_session() as sftp:
-            return list(await sftp.listdir(str(remote)))
+            entries = list(await sftp.listdir(str(remote)))
+            return [entry for entry in entries if entry not in {".", ".."}]
 
     @classmethod
     async def scandir(cls, remote_path: str | PurePosixPath):
         remote = cls.normalize_remote_path(remote_path)
         async with cls.sftp_session() as sftp:
-            return [entry async for entry in sftp.scandir(str(remote))]
+            entries = [entry async for entry in sftp.scandir(str(remote))]
+            return [entry for entry in entries if getattr(entry, "filename", None) not in {".", ".."}]
 
     @classmethod
     async def rename(cls, src: str | PurePosixPath, dst: str | PurePosixPath) -> None:
@@ -174,6 +203,29 @@ class StorageBoxSftpClient:
         dst_path = cls.normalize_remote_path(dst)
         async with cls.sftp_session() as sftp:
             await sftp.makedirs(str(dst_path.parent), exist_ok=True)
+            await sftp.rename(str(src_path), str(dst_path))
+
+    @classmethod
+    async def replace_file(cls, src: str | PurePosixPath, dst: str | PurePosixPath) -> None:
+        src_path = cls.normalize_remote_path(src)
+        dst_path = cls.normalize_remote_path(dst)
+        async with cls.sftp_session() as sftp:
+            await sftp.makedirs(str(dst_path.parent), exist_ok=True)
+            posix_rename = getattr(sftp, "posix_rename", None)
+            if callable(posix_rename):
+                try:
+                    await posix_rename(str(src_path), str(dst_path))
+                    return
+                except Exception:
+                    logger.warning(
+                        "Storage Box POSIX rename failed for %s -> %s; falling back to remove+rename",
+                        src_path,
+                        dst_path,
+                    )
+            try:
+                await sftp.remove(str(dst_path))
+            except Exception:
+                pass
             await sftp.rename(str(src_path), str(dst_path))
 
     @classmethod

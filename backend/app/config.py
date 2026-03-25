@@ -192,6 +192,14 @@ class Settings(BaseSettings):
         stripped = value.strip()
         return stripped or None
 
+    @field_validator("library_state_db_path")
+    @classmethod
+    def _resolve_library_state_db_path(cls, value: Path) -> Path:
+        expanded = value.expanduser()
+        if expanded.is_absolute():
+            return expanded
+        return (PROJECT_ROOT / expanded).resolve()
+
     @field_validator("drive_upload_max_parallel")
     @classmethod
     def _clamp_drive_upload_max_parallel(cls, value: int) -> int:

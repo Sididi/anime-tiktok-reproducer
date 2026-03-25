@@ -205,6 +205,52 @@ class StorageBoxRepository:
         scoped_type = coerce_library_type(library_type).value
         cls._catalog_cache.pop(scoped_type, None)
 
+    @staticmethod
+    def _normalized_catalog_name(value: Any) -> str:
+        return str(value or "").strip().casefold()
+
+    @classmethod
+    def _catalog_entry_priority(cls, entry: dict[str, Any]) -> tuple[str, str, str]:
+        return (
+            str(entry.get("updated_at") or ""),
+            str(entry.get("storage_release_id") or ""),
+            str(entry.get("series_id") or ""),
+        )
+
+    @classmethod
+    def _dedupe_catalog_entries(cls, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        deduped: dict[str, dict[str, Any]] = {}
+
+        for raw_entry in entries:
+            if not isinstance(raw_entry, dict):
+                continue
+            entry = dict(raw_entry)
+            series_id = str(entry.get("series_id") or "").strip()
+            name_key = cls._normalized_catalog_name(entry.get("name"))
+            dedupe_key = name_key or series_id
+            if not dedupe_key:
+                continue
+
+            existing = deduped.get(dedupe_key)
+            if existing is None:
+                deduped[dedupe_key] = entry
+                continue
+
+            if cls._catalog_entry_priority(entry) >= cls._catalog_entry_priority(existing):
+                if str(existing.get("series_id") or "") != series_id:
+                    logger.warning(
+                        "Duplicate catalog entry for '%s'; keeping series_id=%s over series_id=%s",
+                        entry.get("name") or existing.get("name") or dedupe_key,
+                        series_id,
+                        existing.get("series_id"),
+                    )
+                deduped[dedupe_key] = entry
+
+        return sorted(
+            deduped.values(),
+            key=lambda item: str(item.get("name", "")).casefold(),
+        )
+
     @classmethod
     async def _read_remote_json(
         cls,
@@ -239,7 +285,9 @@ class StorageBoxRepository:
         if not isinstance(items, list):
             items = []
 
-        normalized_items = [dict(item) for item in items if isinstance(item, dict)]
+        normalized_items = cls._dedupe_catalog_entries(
+            [dict(item) for item in items if isinstance(item, dict)]
+        )
         cls._catalog_cache[scoped_type] = (now, normalized_items)
         return [dict(entry) for entry in normalized_items]
 
@@ -271,6 +319,45 @@ class StorageBoxRepository:
                 f"Unsupported current.json schema for {series_id}: {payload.get('schema_version')}"
             )
         return payload
+
+    @classmethod
+    async def find_remote_series_id_by_name(
+        cls,
+        library_type: LibraryType | str,
+        display_name: str,
+    ) -> str | None:
+        normalized_name = cls._normalized_catalog_name(display_name)
+        if not normalized_name:
+            return None
+
+        series_root = cls._type_root(library_type) / "series"
+        try:
+            series_ids = await StorageBoxSftpClient.listdir(series_root)
+        except Exception:
+            return None
+
+        best_priority: tuple[str, str, str] | None = None
+        best_series_id: str | None = None
+
+        for candidate_series_id in series_ids:
+            try:
+                current = await cls.get_current_release(library_type, candidate_series_id)
+            except Exception:
+                continue
+
+            if cls._normalized_catalog_name(current.get("display_name")) != normalized_name:
+                continue
+
+            candidate_priority = (
+                str(current.get("published_at") or ""),
+                str(current.get("release_id") or ""),
+                str(candidate_series_id),
+            )
+            if best_priority is None or candidate_priority >= best_priority:
+                best_priority = candidate_priority
+                best_series_id = str(candidate_series_id)
+
+        return best_series_id
 
     @classmethod
     async def get_series_manifest(
@@ -358,20 +445,19 @@ class StorageBoxRepository:
                 }
             )
 
+        items = cls._dedupe_catalog_entries(items)
+
         payload = {
             "schema_version": SCHEMA_VERSION,
             "library_type": scoped_type.value,
             "updated_at": _utc_now_iso(),
-            "items": sorted(
-                items,
-                key=lambda item: str(item.get("name", "")).casefold(),
-            ),
+            "items": items,
         }
 
         catalog_path = cls._catalog_path(scoped_type)
         tmp_path = catalog_path.with_name(f"catalog.{uuid.uuid4().hex[:8]}.tmp")
         await cls._write_remote_json(tmp_path, payload)
-        await StorageBoxSftpClient.rename(tmp_path, catalog_path)
+        await StorageBoxSftpClient.replace_file(tmp_path, catalog_path)
         cls._invalidate_catalog_cache(scoped_type)
         return payload
 
@@ -609,6 +695,11 @@ class StorageBoxRepository:
                 if series_id:
                     return series_id
 
+        with suppress(Exception):
+            series_id = await cls.find_remote_series_id_by_name(library_type, display_name)
+            if series_id:
+                return series_id
+
         return _uuid7_string()
 
     @classmethod
@@ -724,7 +815,7 @@ class StorageBoxRepository:
                 backup_path = series_dir / ".atr_storage_box.current.backup.json"
                 backup_path.write_text(existing_current, encoding="utf-8")
             await cls._write_remote_json(tmp_current, current_payload)
-            await StorageBoxSftpClient.rename(tmp_current, current_path)
+            await StorageBoxSftpClient.replace_file(tmp_current, current_path)
             await cls.rebuild_catalog(scoped_type)
             await asyncio.to_thread(
                 cls.write_local_series_metadata,
