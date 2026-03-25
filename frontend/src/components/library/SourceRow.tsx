@@ -32,11 +32,12 @@ export function SourceRow({
   onUpdate,
   onManageEpisodes,
 }: SourceRowProps) {
+  const hasLocalEpisodes = source.local_episode_count > 0;
   const hydrationInProgress =
     source.hydration_status === "hydrating_index" ||
     source.hydration_status === "hydrating_episodes";
   const episodeLabel =
-    source.local_episode_count > 0 &&
+    hasLocalEpisodes &&
     source.local_episode_count !== source.episode_count
       ? `${source.local_episode_count}/${source.episode_count} ep.`
       : `${source.episode_count} ep.`;
@@ -71,11 +72,11 @@ export function SourceRow({
       </span>
 
       {/* Actions */}
-      <div className="flex gap-1 justify-end w-32 shrink-0">
-        {source.is_fully_local && (
+      <div className="flex gap-1 justify-end w-36 shrink-0">
+        {hasLocalEpisodes && (
           <div
-            className="p-1 mr-auto text-sky-400 opacity-30"
-            title="Tous les épisodes sont disponibles localement"
+            className="p-1 text-sky-400 opacity-30"
+            title="Un ou plusieurs épisodes sont disponibles localement"
           >
             <HardDrive className="h-4 w-4" />
           </div>

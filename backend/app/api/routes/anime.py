@@ -162,6 +162,11 @@ async def index_anime(request: IndexAnimeRequest):
                 library_type=request.library_type,
                 display_name=target_anime_name,
             )
+            await LibraryHydrationService.sync_local_series_state(
+                library_type=request.library_type,
+                series_id=str(publish_result["series_id"]),
+                release_id=str(publish_result["release_id"]),
+            )
         except Exception as exc:
             yield f"data: {json.dumps({'status': 'error', 'progress': 0.0, 'message': str(exc), 'error': str(exc), 'anime_name': target_anime_name})}\n\n"
             return
@@ -240,6 +245,11 @@ async def update_anime(request: UpdateAnimeRequest):
             publish_result = await StorageBoxRepository.publish_series(
                 library_type=request.library_type,
                 display_name=request.anime_name,
+            )
+            await LibraryHydrationService.sync_local_series_state(
+                library_type=request.library_type,
+                series_id=str(publish_result["series_id"]),
+                release_id=str(publish_result["release_id"]),
             )
         except Exception as exc:
             yield f"data: {json.dumps({'status': 'error', 'progress': 0.0, 'message': str(exc), 'error': str(exc), 'anime_name': request.anime_name})}\n\n"

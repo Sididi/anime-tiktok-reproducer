@@ -563,6 +563,7 @@ class LibraryHydrationService:
     ) -> list[dict[str, Any]]:
         scoped_type = coerce_library_type(library_type)
         catalog = await StorageBoxRepository.list_catalog(scoped_type)
+        library_path = AnimeLibraryService.get_library_path(scoped_type)
         state_by_series = await asyncio.to_thread(LibraryStateDb.list_series_states, scoped_type)
         pin_counts = await asyncio.to_thread(
             LibraryStateDb.get_project_pin_counts,
@@ -572,6 +573,25 @@ class LibraryHydrationService:
         for entry in catalog:
             series_id = str(entry.get("series_id"))
             state = state_by_series.get(series_id)
+            storage_release_id = str(entry.get("storage_release_id", ""))
+            if state is None or (storage_release_id and state.release_id != storage_release_id):
+                display_name = str(entry.get("name", "")).strip()
+                local_series_dir = library_path / display_name
+                local_metadata = await asyncio.to_thread(
+                    StorageBoxRepository.read_local_series_metadata,
+                    local_series_dir,
+                )
+                if (
+                    isinstance(local_metadata, dict)
+                    and str(local_metadata.get("series_id") or "").strip() == series_id
+                ):
+                    state = await cls.sync_local_series_state(
+                        library_type=scoped_type,
+                        series_id=series_id,
+                        release_id=storage_release_id or None,
+                    )
+                    if state is not None:
+                        state_by_series[series_id] = state
             local_episode_count = state.local_episode_count if state else 0
             expected_episode_count = state.expected_episode_count if state else int(entry.get("episode_count", 0) or 0)
             hydration_status = state.hydration_status if state else HYDRATION_STATUS_NOT_HYDRATED
@@ -586,7 +606,7 @@ class LibraryHydrationService:
                     "is_fully_local": expected_episode_count > 0 and local_episode_count >= expected_episode_count,
                     "project_pin_count": pin_counts.get(series_id, 0),
                     "permanent_pin": bool(state.permanent_pin) if state else False,
-                    "storage_release_id": str(entry.get("storage_release_id", "")),
+                    "storage_release_id": storage_release_id,
                     "torrent_count": int(entry.get("torrent_count", 0) or 0),
                     "hydration_status": hydration_status,
                     "updated_at": str(
@@ -597,6 +617,66 @@ class LibraryHydrationService:
                 }
             )
         return results
+
+    @classmethod
+    async def sync_local_series_state(
+        cls,
+        *,
+        library_type: LibraryType | str,
+        series_id: str,
+        release_id: str | None = None,
+    ) -> SeriesStateRow | None:
+        scoped_type = coerce_library_type(library_type)
+        manifest = await cls._load_or_fetch_manifest(scoped_type, series_id)
+        if release_id and str(manifest.get("release_id") or "") != release_id:
+            manifest = await StorageBoxRepository.get_series_manifest(
+                scoped_type,
+                series_id,
+                release_id,
+            )
+            await cls._cache_manifest(scoped_type, manifest)
+
+        local_episode_count = await asyncio.to_thread(
+            cls._count_local_episodes_from_manifest,
+            scoped_type,
+            manifest,
+        )
+        expected_episode_count = int(
+            manifest.get("episode_count", len(manifest.get("episodes", [])))
+        )
+        local_series_dir = (
+            AnimeLibraryService.get_library_path(scoped_type) / str(manifest["display_name"])
+        )
+        local_metadata = await asyncio.to_thread(
+            StorageBoxRepository.read_local_series_metadata,
+            local_series_dir,
+        )
+        has_local_index_metadata = (
+            isinstance(local_metadata, dict)
+            and str(local_metadata.get("series_id") or "").strip() == series_id
+        )
+        hydration_status = (
+            HYDRATION_STATUS_FULLY_LOCAL
+            if expected_episode_count > 0 and local_episode_count >= expected_episode_count
+            else HYDRATION_STATUS_INDEX_READY
+            if has_local_index_metadata or local_episode_count > 0
+            else HYDRATION_STATUS_NOT_HYDRATED
+        )
+        await asyncio.to_thread(
+            LibraryStateDb.upsert_series_state,
+            library_type=scoped_type,
+            series_id=series_id,
+            release_id=str(manifest["release_id"]),
+            hydration_status=hydration_status,
+            local_episode_count=local_episode_count,
+            expected_episode_count=expected_episode_count,
+            last_error=None,
+        )
+        return await asyncio.to_thread(
+            LibraryStateDb.get_series_state,
+            scoped_type,
+            series_id,
+        )
 
     @classmethod
     async def get_episode_sources(

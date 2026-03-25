@@ -9,6 +9,7 @@ from ..library_types import LibraryType
 from ..models.torrent import IndexationJob
 from .anime_library import AnimeLibraryService
 from .anime_matcher import AnimeMatcherService
+from .library_hydration_service import LibraryHydrationService
 from .storage_box_repository import StorageBoxRepository
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".webm", ".ts", ".m4v"}
@@ -84,6 +85,11 @@ class IndexationQueueService:
                     )
                     job.series_id = str(publish_result["series_id"])
                     job.storage_release_id = str(publish_result["release_id"])
+                    await LibraryHydrationService.sync_local_series_state(
+                        library_type=job.library_type,
+                        series_id=job.series_id,
+                        release_id=job.storage_release_id,
+                    )
                     job.message = "Published release to Storage Box"
                     job.progress = 1.0
                     job.status = "complete"
