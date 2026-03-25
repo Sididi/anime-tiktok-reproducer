@@ -56,9 +56,9 @@ class Settings(BaseSettings):
     script_automate_enabled: bool = True
     # When False, metadata and video overlay generation are skipped entirely during Automate.
     automate_metadata_overlay_enabled: bool = False
-    # When True, overlay generation returns multiple title hooks and the UI asks
+    # When True, /script title generation returns multiple choices and the UI asks
     # the user to pick one instead of auto-selecting the first suggestion.
-    automate_overlay_title_selection_enabled: bool = False
+    script_title_selection_enabled: bool = False
     # When True, "grand" mode: uses White border 10px mogrt and V3 scale 75%.
     # When False (default), uses White border 5px and V3 scale 68%.
     grand_mode_enabled: bool = False

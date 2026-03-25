@@ -24,6 +24,7 @@ import type { SearchableSelectOption } from "@/components/ui";
 import { useProjectStore, useSceneStore } from "@/stores";
 import { api } from "@/api/client";
 import type {
+  MetadataTitleCandidatesPayload,
   Transcription,
   PlatformMetadata,
   ScriptAutomationConfig,
@@ -36,7 +37,7 @@ import type {
 import {
   ScriptEditorModal,
   MetadataEditorModal,
-  OverlayTitlePickerModal,
+  TitleSelectionModal,
 } from "@/components/script";
 import { readSSEStream } from "@/utils/sse";
 
@@ -59,6 +60,18 @@ const LANGUAGE_OPTIONS = [
 ] as const;
 
 type TargetLanguage = "fr" | "en" | "es";
+
+const METADATA_TITLE_CANDIDATE_COUNT = 10;
+const METADATA_TITLE_MAX_CHARS = 62;
+const TIKTOK_FIXED_HASHTAGS = ["#Anime", "#animerecommendations"];
+
+interface PendingTitleSelection {
+  metadataCandidates: MetadataTitleCandidatesPayload | null;
+  metadataError: string | null;
+  overlay: VideoOverlay | null;
+  overlayError: string | null;
+  fromAutomation: boolean;
+}
 
 function mapPreparedSegments(
   payload: ScriptTtsPrepareResponse | null,
@@ -216,6 +229,145 @@ function validateMetadataObject(payload: unknown): {
   return { valid: true, error: null };
 }
 
+function validateMetadataCandidatesObject(payload: unknown): {
+  valid: boolean;
+  error: string | null;
+} {
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    Array.isArray(payload)
+  ) {
+    return {
+      valid: false,
+      error: "Metadata candidate JSON must be an object",
+    };
+  }
+
+  const obj = payload as Record<string, unknown>;
+  const expectedKeys = ["title_candidates", "facebook", "instagram", "youtube"];
+  const keys = Object.keys(obj);
+  const missing = expectedKeys.filter((k) => !(k in obj));
+  const extras = keys.filter((k) => !expectedKeys.includes(k));
+  if (missing.length > 0) {
+    return { valid: false, error: `Missing keys: ${missing.join(", ")}` };
+  }
+  if (extras.length > 0) {
+    return { valid: false, error: `Unexpected keys: ${extras.join(", ")}` };
+  }
+
+  const asRecord = (value: unknown, label: string) => {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new Error(`${label} must be an object`);
+    }
+    return value as Record<string, unknown>;
+  };
+  const asString = (value: unknown, label: string) => {
+    if (typeof value !== "string" || !value.trim()) {
+      throw new Error(`${label} must be a non-empty string`);
+    }
+    return value.trim();
+  };
+  const asStringArray = (value: unknown, label: string) => {
+    if (!Array.isArray(value) || value.length === 0) {
+      throw new Error(`${label} must be a non-empty string array`);
+    }
+    const normalized = value.map((item) => asString(item, `${label} entry`));
+    return normalized;
+  };
+
+  try {
+    const titleCandidates = asStringArray(obj.title_candidates, "title_candidates");
+    if (titleCandidates.length !== METADATA_TITLE_CANDIDATE_COUNT) {
+      throw new Error(
+        `title_candidates must contain exactly ${METADATA_TITLE_CANDIDATE_COUNT} entries`,
+      );
+    }
+    for (const title of titleCandidates) {
+      if (title.length > METADATA_TITLE_MAX_CHARS) {
+        throw new Error(
+          `title_candidates entries must be <= ${METADATA_TITLE_MAX_CHARS} characters`,
+        );
+      }
+    }
+
+    const facebook = asRecord(obj.facebook, "facebook");
+    asString(facebook.description, "facebook.description");
+    asStringArray(facebook.tags, "facebook.tags");
+
+    const instagram = asRecord(obj.instagram, "instagram");
+    asStringArray(instagram.hashtags, "instagram.hashtags");
+
+    const youtube = asRecord(obj.youtube, "youtube");
+    asString(youtube.description, "youtube.description");
+    asStringArray(youtube.tags, "youtube.tags");
+  } catch (err) {
+    return { valid: false, error: (err as Error).message };
+  }
+
+  return { valid: true, error: null };
+}
+
+function coerceMetadataCandidates(
+  payload: unknown,
+): MetadataTitleCandidatesPayload | null {
+  const validation = validateMetadataCandidatesObject(payload);
+  if (!validation.valid) return null;
+
+  const obj = payload as Record<string, unknown>;
+  const facebook = obj.facebook as Record<string, unknown>;
+  const instagram = obj.instagram as Record<string, unknown>;
+  const youtube = obj.youtube as Record<string, unknown>;
+
+  return {
+    title_candidates: (obj.title_candidates as string[]).map((title) =>
+      title.trim(),
+    ),
+    facebook: {
+      description: String(facebook.description).trim(),
+      tags: (facebook.tags as string[]).map((tag) => tag.trim()),
+    },
+    instagram: {
+      hashtags: (instagram.hashtags as string[]).map((hashtag) => {
+        const trimmed = hashtag.trim().replace(/\s+/g, "");
+        return trimmed.startsWith("#") ? trimmed : `#${trimmed}`;
+      }),
+    },
+    youtube: {
+      description: String(youtube.description).trim(),
+      tags: (youtube.tags as string[]).map((tag) => tag.trim()),
+    },
+  };
+}
+
+function resolveMetadataCandidatesToPlatformMetadata(
+  payload: MetadataTitleCandidatesPayload,
+  selectedTitle: string,
+): PlatformMetadata {
+  const title = selectedTitle.trim();
+  const instagramHashtags = payload.instagram.hashtags.join(" ").trim();
+  const tiktokHashtags = TIKTOK_FIXED_HASHTAGS.join(" ");
+
+  return {
+    facebook: {
+      title,
+      description: payload.facebook.description,
+      tags: payload.facebook.tags,
+    },
+    instagram: {
+      caption: [title, instagramHashtags].filter(Boolean).join(" "),
+    },
+    youtube: {
+      title,
+      description: payload.youtube.description,
+      tags: payload.youtube.tags,
+    },
+    tiktok: {
+      description: [title, tiktokHashtags].filter(Boolean).join(" "),
+    },
+  };
+}
+
 function createEmptyMetadata(): PlatformMetadata {
   return {
     facebook: {
@@ -325,6 +477,9 @@ export function ScriptRestructurePage() {
   const [automationMetadataWarning, setAutomationMetadataWarning] = useState<
     string | null
   >(null);
+  const [automationOverlayWarning, setAutomationOverlayWarning] = useState<
+    string | null
+  >(null);
 
   // Script automation state
   const [automationConfig, setAutomationConfig] =
@@ -356,14 +511,14 @@ export function ScriptRestructurePage() {
   const [overlayTitle, setOverlayTitle] = useState("");
   const [overlayCategory, setOverlayCategory] = useState("");
   const [overlayGenerating, setOverlayGenerating] = useState(false);
-  const [overlayPickerOpen, setOverlayPickerOpen] = useState(false);
-  const [pendingOverlaySelection, setPendingOverlaySelection] =
-    useState<VideoOverlay | null>(null);
+  const [titlePickerOpen, setTitlePickerOpen] = useState(false);
+  const [pendingTitleSelection, setPendingTitleSelection] =
+    useState<PendingTitleSelection | null>(null);
 
   // Automation validation pause
   const [validateBeforeTts, setValidateBeforeTts] = useState(true);
   const [automationPhase, setAutomationPhase] = useState<
-    "idle" | "phase1" | "validating" | "phase2" | "overlay_selecting"
+    "idle" | "phase1" | "validating" | "phase2" | "title_selecting"
   >("idle");
   const [currentRunId, setCurrentRunId] = useState<string | null>(null);
 
@@ -762,34 +917,104 @@ export function ScriptRestructurePage() {
     [transcription],
   );
 
-  const handleMetadataJsonChange = useCallback((value: string) => {
-    setMetadataJson(value);
+  const applyResolvedMetadata = useCallback((metadata: PlatformMetadata) => {
+    const pretty = JSON.stringify(metadata, null, 2);
+    setMetadataJson(pretty);
     setMetadataError(null);
-    setMetadataValid(false);
-    if (!value.trim()) {
-      setMetadataDetected(false);
-      return;
-    }
-    try {
-      const parsed = JSON.parse(value);
-      const validation = validateMetadataObject(parsed);
-      if (!validation.valid) {
-        setMetadataError(validation.error);
+    setMetadataValid(true);
+    setMetadataDetected(true);
+    setMetadataExpanded(true);
+  }, []);
+
+  const queueMetadataTitleSelection = useCallback(
+    (
+      candidates: MetadataTitleCandidatesPayload,
+      options?: {
+        fromAutomation?: boolean;
+        overlay?: VideoOverlay | null;
+        overlayError?: string | null;
+      },
+    ) => {
+      if (!automationConfig?.script_title_selection_enabled) {
+        applyResolvedMetadata(
+          resolveMetadataCandidatesToPlatformMetadata(
+            candidates,
+            candidates.title_candidates[0] || "",
+          ),
+        );
+        return false;
+      }
+
+      setPendingTitleSelection({
+        metadataCandidates: candidates,
+        metadataError: null,
+        overlay: options?.overlay ?? null,
+        overlayError: options?.overlayError ?? null,
+        fromAutomation: Boolean(options?.fromAutomation),
+      });
+      setTitlePickerOpen(true);
+      if (options?.fromAutomation) {
+        setAutomationPhase("title_selecting");
+        setAutomationMessage("Select titles to finish automation");
+      }
+      return true;
+    },
+    [automationConfig?.script_title_selection_enabled, applyResolvedMetadata],
+  );
+
+  const handleMetadataJsonChange = useCallback(
+    (value: string) => {
+      setMetadataJson(value);
+      setMetadataError(null);
+      setMetadataValid(false);
+      if (!value.trim()) {
+        setMetadataDetected(false);
         return;
       }
-      setMetadataValid(true);
-    } catch (err) {
-      setMetadataError(`Invalid JSON: ${(err as Error).message}`);
-    }
-  }, []);
+      try {
+        const parsed = JSON.parse(value);
+        const finalValidation = validateMetadataObject(parsed);
+        if (finalValidation.valid) {
+          setMetadataValid(true);
+          setMetadataDetected(true);
+          return;
+        }
+
+        const candidateValidation = validateMetadataCandidatesObject(parsed);
+        if (!candidateValidation.valid) {
+          const looksCandidateLike =
+            typeof parsed === "object" &&
+            parsed !== null &&
+            !Array.isArray(parsed) &&
+            "title_candidates" in parsed;
+          setMetadataError(
+            looksCandidateLike
+              ? candidateValidation.error
+              : finalValidation.error || candidateValidation.error,
+          );
+          return;
+        }
+
+        const candidates = coerceMetadataCandidates(parsed);
+        if (!candidates) {
+          setMetadataError("Invalid metadata candidate JSON");
+          return;
+        }
+
+        setMetadataJson("");
+        queueMetadataTitleSelection(candidates);
+      } catch (err) {
+        setMetadataError(`Invalid JSON: ${(err as Error).message}`);
+      }
+    },
+    [queueMetadataTitleSelection],
+  );
 
   const handleMetadataEditorSave = useCallback(
     (metadata: PlatformMetadata) => {
-      const pretty = JSON.stringify(metadata, null, 2);
-      handleMetadataJsonChange(pretty);
-      setMetadataExpanded(true);
+      applyResolvedMetadata(metadata);
     },
-    [handleMetadataJsonChange],
+    [applyResolvedMetadata],
   );
 
   const handleCopyMetadataPrompt = useCallback(async () => {
@@ -896,43 +1121,129 @@ export function ScriptRestructurePage() {
     [persistSelectedOverlay],
   );
 
-  const handleOverlayResult = useCallback(
-    (overlay: VideoOverlay | undefined, options?: { fromAutomation?: boolean }) => {
-      if (!overlay) return false;
+  const normalizeOverlaySelection = useCallback((overlay?: VideoOverlay | null) => {
+    if (!overlay) return null;
 
-      const titleHooks = Array.isArray(overlay.title_hooks)
-        ? overlay.title_hooks
-            .filter((hook): hook is string => typeof hook === "string")
-            .map((hook) => hook.trim())
-            .filter(Boolean)
-        : [];
-      const selectedTitle = titleHooks[0] || overlay.title?.trim() || "";
-      const category = overlay.category?.trim() || "";
+    const titleHooks = Array.isArray(overlay.title_hooks)
+      ? overlay.title_hooks
+          .filter((hook): hook is string => typeof hook === "string")
+          .map((hook) => hook.trim())
+          .filter(Boolean)
+      : [];
+    const category = overlay.category?.trim() || "";
+    const title = titleHooks[0] || overlay.title?.trim() || "";
 
-      if (
-        automationConfig?.overlay_title_selection_enabled &&
-        titleHooks.length > 0
-      ) {
-        setPendingOverlaySelection({
-          ...overlay,
-          title: selectedTitle,
-          title_hooks: titleHooks,
-          category,
-        });
-        setOverlayPickerOpen(true);
-        if (options?.fromAutomation) {
-          setAutomationPhase("overlay_selecting");
-          setAutomationMessage("Select the overlay title");
+    if (!titleHooks.length && !title) {
+      return null;
+    }
+
+    return {
+      ...overlay,
+      title,
+      title_hooks: titleHooks.length > 0 ? titleHooks : [title],
+      category,
+    };
+  }, []);
+
+  const queueTitleSelection = useCallback(
+    ({
+      metadataCandidates,
+      metadataError,
+      overlay,
+      overlayError,
+      fromAutomation,
+    }: PendingTitleSelection) => {
+      const normalizedOverlay = normalizeOverlaySelection(overlay);
+      const hasMetadataChoices =
+        (metadataCandidates?.title_candidates.length || 0) > 0;
+      const hasOverlayChoices =
+        (normalizedOverlay?.title_hooks?.length || 0) > 0;
+
+      if (!hasMetadataChoices && !hasOverlayChoices) {
+        if (fromAutomation) {
+          setAutomationPhase("idle");
         }
-        return true;
+        return false;
       }
 
-      if (selectedTitle) {
-        applySelectedOverlay({ title: selectedTitle, category });
+      if (!automationConfig?.script_title_selection_enabled) {
+        if (metadataCandidates && hasMetadataChoices) {
+          applyResolvedMetadata(
+            resolveMetadataCandidatesToPlatformMetadata(
+              metadataCandidates,
+              metadataCandidates.title_candidates[0] || "",
+            ),
+          );
+        }
+        if (normalizedOverlay && hasOverlayChoices) {
+          applySelectedOverlay({
+            title: normalizedOverlay.title_hooks?.[0] || normalizedOverlay.title,
+            category: normalizedOverlay.category || "",
+          });
+        }
+        if (fromAutomation) {
+          setAutomationPhase("idle");
+        }
+        return false;
       }
-      return false;
+
+      setPendingTitleSelection({
+        metadataCandidates,
+        metadataError,
+        overlay: normalizedOverlay,
+        overlayError,
+        fromAutomation,
+      });
+      setTitlePickerOpen(true);
+      if (fromAutomation) {
+        setAutomationPhase("title_selecting");
+        setAutomationMessage("Select titles to finish automation");
+      }
+      return true;
     },
-    [automationConfig?.overlay_title_selection_enabled, applySelectedOverlay],
+    [
+      automationConfig?.script_title_selection_enabled,
+      normalizeOverlaySelection,
+      applyResolvedMetadata,
+      applySelectedOverlay,
+    ],
+  );
+
+  const handleTitleSelectionConfirm = useCallback(
+    ({
+      metadataTitle,
+      overlayTitle,
+    }: {
+      metadataTitle?: string;
+      overlayTitle?: string;
+    }) => {
+      if (!pendingTitleSelection) return;
+
+      if (pendingTitleSelection.metadataCandidates && metadataTitle) {
+        applyResolvedMetadata(
+          resolveMetadataCandidatesToPlatformMetadata(
+            pendingTitleSelection.metadataCandidates,
+            metadataTitle,
+          ),
+        );
+      }
+
+      if (pendingTitleSelection.overlay && overlayTitle) {
+        applySelectedOverlay({
+          title: overlayTitle,
+          category: pendingTitleSelection.overlay.category || "",
+        });
+      }
+
+      setTitlePickerOpen(false);
+      const fromAutomation = pendingTitleSelection.fromAutomation;
+      setPendingTitleSelection(null);
+      if (fromAutomation) {
+        setAutomationPhase("idle");
+        setAutomationMessage("Titles selected");
+      }
+    },
+    [pendingTitleSelection, applyResolvedMetadata, applySelectedOverlay],
   );
 
   // Generate video overlay
@@ -945,7 +1256,13 @@ export function ScriptRestructurePage() {
         script_json: parsed,
         target_language: targetLanguage,
       });
-      handleOverlayResult(result.overlay);
+      queueTitleSelection({
+        metadataCandidates: null,
+        metadataError: null,
+        overlay: result.overlay,
+        overlayError: null,
+        fromAutomation: false,
+      });
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -956,7 +1273,7 @@ export function ScriptRestructurePage() {
     jsonValid,
     newScriptJson,
     targetLanguage,
-    handleOverlayResult,
+    queueTitleSelection,
   ]);
 
   // Build preview audio
@@ -1025,23 +1342,6 @@ export function ScriptRestructurePage() {
     setPreviewUrl(null);
   }, []);
 
-  const handleOverlayTitleSelect = useCallback(
-    (title: string) => {
-      if (!pendingOverlaySelection) return;
-      applySelectedOverlay({
-        title,
-        category: pendingOverlaySelection.category || "",
-      });
-      setOverlayPickerOpen(false);
-      setPendingOverlaySelection(null);
-      if (automationPhase === "overlay_selecting") {
-        setAutomationPhase("idle");
-        setAutomationMessage("Overlay title selected");
-      }
-    },
-    [pendingOverlaySelection, applySelectedOverlay, automationPhase],
-  );
-
   const handleAutomate = useCallback(async () => {
     if (!projectId || !automationConfig) return;
     if (!automationConfig.enabled) {
@@ -1055,13 +1355,14 @@ export function ScriptRestructurePage() {
 
     setError(null);
     setAutomationMetadataWarning(null);
+    setAutomationOverlayWarning(null);
     setAutomationStep("starting");
     setAutomationMessage("Starting automation...");
     setAutomationRunning(true);
     setPromptCopied(true);
     setAutomationPhase("phase1");
-    setOverlayPickerOpen(false);
-    setPendingOverlaySelection(null);
+    setTitlePickerOpen(false);
+    setPendingTitleSelection(null);
 
     const controller = new AbortController();
     automationAbortRef.current = controller;
@@ -1097,7 +1398,13 @@ export function ScriptRestructurePage() {
           setAutomationStep(event.event);
           setAutomationMessage(event.message || null);
           if (event.warning) {
-            setAutomationMetadataWarning(event.warning);
+            if (event.event === "overlay_ready") {
+              setAutomationOverlayWarning(
+                event.overlay_warning || event.warning,
+              );
+            } else {
+              setAutomationMetadataWarning(event.warning);
+            }
           }
           if (event.run_id) {
             setCurrentRunId(event.run_id);
@@ -1117,19 +1424,11 @@ export function ScriptRestructurePage() {
           const prettyScript = JSON.stringify(finalEvent.script_json, null, 2);
           handleJsonChange(prettyScript);
         }
-        if (finalEvent.metadata_json) {
-          const prettyMetadata = JSON.stringify(
-            finalEvent.metadata_json,
-            null,
-            2,
-          );
-          handleMetadataJsonChange(prettyMetadata);
-          setMetadataDetected(true);
-          setMetadataExpanded(true);
-        }
         if (finalEvent.metadata_warning) {
           setAutomationMetadataWarning(finalEvent.metadata_warning);
-          setMetadataExpanded(true);
+        }
+        if (finalEvent.overlay_warning) {
+          setAutomationOverlayWarning(finalEvent.overlay_warning);
         }
         setAutomationPhase("validating");
         setAutomationRunning(false);
@@ -1150,24 +1449,16 @@ export function ScriptRestructurePage() {
         throw new Error("Automation response did not include script_json");
       }
 
-      let overlaySelectionPending = false;
+      let titleSelectionPending = false;
       const prettyScript = JSON.stringify(finalEvent.script_json, null, 2);
       handleJsonChange(prettyScript);
 
-      if (finalEvent.metadata_json) {
-        const prettyMetadata = JSON.stringify(
-          finalEvent.metadata_json,
-          null,
-          2,
-        );
-        handleMetadataJsonChange(prettyMetadata);
-        setMetadataDetected(true);
-        setMetadataExpanded(true);
-      }
-
       if (finalEvent.metadata_warning) {
         setAutomationMetadataWarning(finalEvent.metadata_warning);
-        setMetadataExpanded(true);
+      }
+
+      if (finalEvent.overlay_warning) {
+        setAutomationOverlayWarning(finalEvent.overlay_warning);
       }
 
       if (!finalEvent.run_id) {
@@ -1188,10 +1479,14 @@ export function ScriptRestructurePage() {
         setAutomationMessage("Automation complete (audio kept as-is)");
       }
 
-      overlaySelectionPending = handleOverlayResult(finalEvent.overlay_json, {
+      titleSelectionPending = queueTitleSelection({
+        metadataCandidates: finalEvent.metadata_candidates_json || null,
+        metadataError: finalEvent.metadata_warning || null,
+        overlay: finalEvent.overlay_json || null,
+        overlayError: finalEvent.overlay_warning || null,
         fromAutomation: true,
       });
-      if (!overlaySelectionPending) {
+      if (!titleSelectionPending) {
         setAutomationPhase("idle");
       }
     } catch (err) {
@@ -1217,9 +1512,8 @@ export function ScriptRestructurePage() {
     audioFile,
     segmentFiles,
     handleJsonChange,
-    handleMetadataJsonChange,
     hydrateAutomationParts,
-    handleOverlayResult,
+    queueTitleSelection,
     validateBeforeTts,
   ]);
 
@@ -1251,6 +1545,8 @@ export function ScriptRestructurePage() {
       }
 
       setError(null);
+      setAutomationMetadataWarning(null);
+      setAutomationOverlayWarning(null);
       setAutomationStep("starting");
       setAutomationMessage("Resuming automation (TTS + metadata + overlay)...");
       setAutomationRunning(true);
@@ -1295,27 +1591,19 @@ export function ScriptRestructurePage() {
           );
         }
 
-        let overlaySelectionPending = false;
+        let titleSelectionPending = false;
 
         if (finalEvent.script_json) {
           const prettyScript = JSON.stringify(finalEvent.script_json, null, 2);
           handleJsonChange(prettyScript);
         }
 
-        if (finalEvent.metadata_json) {
-          const prettyMetadata = JSON.stringify(
-            finalEvent.metadata_json,
-            null,
-            2,
-          );
-          handleMetadataJsonChange(prettyMetadata);
-          setMetadataDetected(true);
-          setMetadataExpanded(true);
-        }
-
         if (finalEvent.metadata_warning) {
           setAutomationMetadataWarning(finalEvent.metadata_warning);
-          setMetadataExpanded(true);
+        }
+
+        if (finalEvent.overlay_warning) {
+          setAutomationOverlayWarning(finalEvent.overlay_warning);
         }
 
         const parts = finalEvent.parts || [];
@@ -1332,10 +1620,14 @@ export function ScriptRestructurePage() {
           setAutomationMessage("Automation complete (audio kept as-is)");
         }
 
-        overlaySelectionPending = handleOverlayResult(finalEvent.overlay_json, {
+        titleSelectionPending = queueTitleSelection({
+          metadataCandidates: finalEvent.metadata_candidates_json || null,
+          metadataError: finalEvent.metadata_warning || null,
+          overlay: finalEvent.overlay_json || null,
+          overlayError: finalEvent.overlay_warning || null,
           fromAutomation: true,
         });
-        if (!overlaySelectionPending) {
+        if (!titleSelectionPending) {
           setAutomationPhase("idle");
         }
       } catch (err) {
@@ -1355,9 +1647,8 @@ export function ScriptRestructurePage() {
       newScriptJson,
       transcription,
       handleJsonChange,
-      handleMetadataJsonChange,
       hydrateAutomationParts,
-      handleOverlayResult,
+      queueTitleSelection,
     ],
   );
 
@@ -1677,8 +1968,8 @@ export function ScriptRestructurePage() {
       ? "Loading automation config..."
       : automationPhase === "validating"
         ? "Validate the script to continue automation"
-        : automationPhase === "overlay_selecting"
-          ? "Select an overlay title to finish automation"
+        : automationPhase === "title_selecting"
+          ? "Select titles to finish automation"
           : !automationConfig.enabled
             ? "Automation disabled on backend"
             : !automationConfig.gemini.configured
@@ -1929,7 +2220,8 @@ export function ScriptRestructurePage() {
                   <div className="flex items-center justify-between">
                     <p className="text-sm text-[hsl(var(--muted-foreground))]">
                       Copy the metadata prompt, run it in your LLM, and paste
-                      the JSON response.
+                      the JSON response. Candidate-aware metadata JSON is also
+                      accepted.
                     </p>
                     <Button
                       variant="outline"
@@ -1966,7 +2258,7 @@ export function ScriptRestructurePage() {
                   <textarea
                     value={metadataJson}
                     onChange={(e) => handleMetadataJsonChange(e.target.value)}
-                    placeholder='{"facebook": {...}, "instagram": {...}, "youtube": {...}, "tiktok": {...}}'
+                    placeholder='{"facebook": {...}, "instagram": {...}, "youtube": {...}, "tiktok": {...}} or {"title_candidates": [...], "facebook": {...}, "instagram": {...}, "youtube": {...}}'
                     className="w-full min-h-[180px] p-3 rounded-md border border-[hsl(var(--input))] bg-transparent font-mono text-sm resize-y"
                   />
                   {metadataError && (
@@ -2412,6 +2704,12 @@ export function ScriptRestructurePage() {
                   </div>
                 )}
 
+                {automationOverlayWarning && (
+                  <div className="text-sm p-3 rounded-md bg-amber-500/10 text-amber-600">
+                    {automationOverlayWarning}
+                  </div>
+                )}
+
                 {automationBlockedReason && !automationRunning && (
                   <p className="text-xs text-[hsl(var(--muted-foreground))]">
                     {automationBlockedReason}
@@ -2603,11 +2901,13 @@ export function ScriptRestructurePage() {
         onSave={handleMetadataEditorSave}
       />
 
-      <OverlayTitlePickerModal
-        isOpen={overlayPickerOpen && !!pendingOverlaySelection}
-        category={pendingOverlaySelection?.category || ""}
-        titleHooks={pendingOverlaySelection?.title_hooks || []}
-        onSelect={handleOverlayTitleSelect}
+      <TitleSelectionModal
+        isOpen={titlePickerOpen && !!pendingTitleSelection}
+        metadataCandidates={pendingTitleSelection?.metadataCandidates || null}
+        metadataError={pendingTitleSelection?.metadataError || null}
+        overlay={pendingTitleSelection?.overlay || null}
+        overlayError={pendingTitleSelection?.overlayError || null}
+        onConfirm={handleTitleSelectionConfirm}
       />
     </div>
   );

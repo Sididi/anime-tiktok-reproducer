@@ -13,7 +13,12 @@ from typing import Any, AsyncIterator
 from pydub import AudioSegment
 
 from ..config import settings
-from ..models import Project, Transcription
+from ..models import (
+    METADATA_TITLE_CANDIDATE_COUNT,
+    METADATA_TITLE_MAX_CHARS,
+    Project,
+    Transcription,
+)
 from .elevenlabs_service import ElevenLabsService
 from .gemini_service import GeminiService
 from .metadata import MetadataService
@@ -264,44 +269,47 @@ class ScriptAutomationService:
         return {
             "type": "object",
             "properties": {
+                "title_candidates": {
+                    "type": "array",
+                    "minItems": METADATA_TITLE_CANDIDATE_COUNT,
+                    "maxItems": METADATA_TITLE_CANDIDATE_COUNT,
+                    "items": {
+                        "type": "string",
+                        "maxLength": METADATA_TITLE_MAX_CHARS,
+                    },
+                },
                 "facebook": {
                     "type": "object",
                     "properties": {
-                        "title": {"type": "string"},
                         "description": {"type": "string"},
                         "tags": {"type": "array", "items": {"type": "string"}, "minItems": 1},
                     },
-                    "required": ["title", "description", "tags"],
+                    "required": ["description", "tags"],
                     "additionalProperties": False,
                 },
                 "instagram": {
                     "type": "object",
                     "properties": {
-                        "caption": {"type": "string"},
+                        "hashtags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                        },
                     },
-                    "required": ["caption"],
+                    "required": ["hashtags"],
                     "additionalProperties": False,
                 },
                 "youtube": {
                     "type": "object",
                     "properties": {
-                        "title": {"type": "string"},
                         "description": {"type": "string"},
                         "tags": {"type": "array", "items": {"type": "string"}, "minItems": 1},
                     },
-                    "required": ["title", "description", "tags"],
-                    "additionalProperties": False,
-                },
-                "tiktok": {
-                    "type": "object",
-                    "properties": {
-                        "description": {"type": "string"},
-                    },
-                    "required": ["description"],
+                    "required": ["description", "tags"],
                     "additionalProperties": False,
                 },
             },
-            "required": ["facebook", "instagram", "youtube", "tiktok"],
+            "required": ["title_candidates", "facebook", "instagram", "youtube"],
             "additionalProperties": False,
         }
 
@@ -879,9 +887,10 @@ class ScriptAutomationService:
 
             # --- TTS generation ---
             parts: list[dict[str, Any]] = []
-            metadata_payload: dict[str, Any] | None = None
+            metadata_candidates_payload: dict[str, Any] | None = None
             metadata_warning: str | None = None
             overlay_json: dict[str, Any] | None = None
+            overlay_warning: str | None = None
 
             if skip_tts:
                 yield cls._event("tts_generating", message="TTS generation skipped")
@@ -986,13 +995,22 @@ class ScriptAutomationService:
                         metadata_prompt,
                         response_json_schema=cls._metadata_response_schema(),
                     )
-                    validated_metadata = MetadataService.validate_payload(raw_metadata_payload)
-                    metadata_payload = validated_metadata.model_dump()
-                    (run_dir / "metadata.json").write_text(
-                        json.dumps(metadata_payload, ensure_ascii=False, indent=2),
+                    validated_metadata = MetadataService.validate_candidate_payload(
+                        raw_metadata_payload
+                    )
+                    metadata_candidates_payload = validated_metadata.model_dump()
+                    (run_dir / "metadata_candidates.json").write_text(
+                        json.dumps(
+                            metadata_candidates_payload,
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
                         encoding="utf-8",
                     )
-                    yield cls._event("llm_metadata", message="Metadata JSON generated")
+                    yield cls._event(
+                        "llm_metadata",
+                        message="Metadata title candidates generated",
+                    )
                 except Exception as exc:
                     metadata_warning = f"Metadata generation failed: {exc}"
                     yield cls._event(
@@ -1017,10 +1035,12 @@ class ScriptAutomationService:
                         overlay_json=overlay_json,
                     )
                 except Exception as exc:
+                    overlay_warning = f"Overlay generation failed: {exc}"
                     yield cls._event(
                         "overlay_ready",
-                        message=f"Overlay generation failed: {exc}",
-                        warning=f"Overlay generation failed: {exc}",
+                        message=overlay_warning,
+                        warning=overlay_warning,
+                        overlay_warning=overlay_warning,
                     )
 
             complete_payload = cls._event(
@@ -1029,9 +1049,10 @@ class ScriptAutomationService:
                 message="Automation complete",
                 run_id=run_id,
                 script_json=script_payload,
-                metadata_json=metadata_payload,
+                metadata_candidates_json=metadata_candidates_payload,
                 metadata_warning=metadata_warning,
                 overlay_json=overlay_json,
+                overlay_warning=overlay_warning,
                 parts=parts,
             )
             yield complete_payload

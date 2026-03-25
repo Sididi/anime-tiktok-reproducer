@@ -211,18 +211,16 @@ async def test_stream_automation_resume_uses_edited_script_for_tts_metadata_and_
     def fake_generate_json(prompt, *, model=None, response_json_schema=None):
         assert prompt == "metadata-prompt"
         return {
+            "title_candidates": [f"Titre {idx}" for idx in range(1, 11)],
             "facebook": {
-                "title": "Titre",
                 "description": "Description",
                 "tags": ["anime"],
             },
-            "instagram": {"caption": "Caption"},
+            "instagram": {"hashtags": ["#anime"]},
             "youtube": {
-                "title": "Titre youtube",
                 "description": "Description",
                 "tags": ["anime"],
             },
-            "tiktok": {"description": "Description"},
         }
 
     def fake_generate_video_overlay(*, project, script_payload, target_language):
@@ -277,8 +275,130 @@ async def test_stream_automation_resume_uses_edited_script_for_tts_metadata_and_
     assert seen["overlay_script"] == edited_script
     assert seen["tts_text"] == "Texte édité par l'utilisateur."
     assert seen["part_count"] == 1
-    assert events[-1]["metadata_json"]["facebook"]["title"] == "Titre"
+    assert events[-1]["metadata_candidates_json"]["title_candidates"][0] == "Titre 1"
     assert events[-1]["overlay_json"]["title"] == "HOOK 1"
+
+
+@pytest.mark.asyncio
+async def test_stream_automation_sets_metadata_warning_without_blocking_overlay(
+    monkeypatch,
+    tmp_path: Path,
+):
+    monkeypatch.setattr(settings, "projects_dir", tmp_path)
+    monkeypatch.setattr(settings, "script_automate_enabled", True)
+    monkeypatch.setattr(settings, "automate_metadata_overlay_enabled", True)
+    monkeypatch.setattr(ProjectService, "load", lambda project_id: _build_project())
+    monkeypatch.setattr(ProjectService, "load_transcription", lambda project_id: _build_transcription())
+    monkeypatch.setattr(
+        VoiceConfigService,
+        "get_voice",
+        lambda voice_key: SimpleNamespace(
+            elevenlabs_voice_id="voice-id",
+            voice_settings={},
+            model_id=None,
+        ),
+    )
+    monkeypatch.setattr(GeminiService, "is_configured", lambda: True)
+
+    monkeypatch.setattr(
+        MetadataService,
+        "build_prompt_from_script_payload",
+        lambda **kwargs: "metadata-prompt",
+    )
+    monkeypatch.setattr(
+        GeminiService,
+        "generate_json",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom metadata")),
+    )
+    monkeypatch.setattr(
+        ScriptAutomationService,
+        "generate_video_overlay",
+        lambda **kwargs: {
+            "title": "HOOK 1",
+            "title_hooks": [f"HOOK {idx}" for idx in range(1, 11)],
+            "category": "Action • Fantasy",
+        },
+    )
+
+    events = await _collect_events(
+        project_id="proj123",
+        target_language="fr",
+        voice_key="voice-a",
+        existing_script_json={"language": "fr", "scenes": [{"scene_index": 1, "text": "x"}]},
+        skip_metadata=False,
+        skip_tts=True,
+        pause_after_script=False,
+        skip_overlay=False,
+    )
+
+    assert events[-1]["metadata_candidates_json"] is None
+    assert "boom metadata" in events[-1]["metadata_warning"]
+    assert events[-1]["overlay_json"]["title"] == "HOOK 1"
+    assert events[-1]["overlay_warning"] is None
+
+
+@pytest.mark.asyncio
+async def test_stream_automation_sets_overlay_warning_without_blocking_metadata(
+    monkeypatch,
+    tmp_path: Path,
+):
+    monkeypatch.setattr(settings, "projects_dir", tmp_path)
+    monkeypatch.setattr(settings, "script_automate_enabled", True)
+    monkeypatch.setattr(settings, "automate_metadata_overlay_enabled", True)
+    monkeypatch.setattr(ProjectService, "load", lambda project_id: _build_project())
+    monkeypatch.setattr(ProjectService, "load_transcription", lambda project_id: _build_transcription())
+    monkeypatch.setattr(
+        VoiceConfigService,
+        "get_voice",
+        lambda voice_key: SimpleNamespace(
+            elevenlabs_voice_id="voice-id",
+            voice_settings={},
+            model_id=None,
+        ),
+    )
+    monkeypatch.setattr(GeminiService, "is_configured", lambda: True)
+
+    monkeypatch.setattr(
+        MetadataService,
+        "build_prompt_from_script_payload",
+        lambda **kwargs: "metadata-prompt",
+    )
+    monkeypatch.setattr(
+        GeminiService,
+        "generate_json",
+        lambda *args, **kwargs: {
+            "title_candidates": [f"Titre {idx}" for idx in range(1, 11)],
+            "facebook": {
+                "description": "Description",
+                "tags": ["anime"],
+            },
+            "instagram": {"hashtags": ["#anime"]},
+            "youtube": {
+                "description": "Description",
+                "tags": ["anime"],
+            },
+        },
+    )
+    monkeypatch.setattr(
+        ScriptAutomationService,
+        "generate_video_overlay",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("boom overlay")),
+    )
+
+    events = await _collect_events(
+        project_id="proj123",
+        target_language="fr",
+        voice_key="voice-a",
+        existing_script_json={"language": "fr", "scenes": [{"scene_index": 1, "text": "x"}]},
+        skip_metadata=False,
+        skip_tts=True,
+        pause_after_script=False,
+        skip_overlay=False,
+    )
+
+    assert events[-1]["metadata_candidates_json"]["title_candidates"][0] == "Titre 1"
+    assert events[-1]["overlay_json"] is None
+    assert "boom overlay" in events[-1]["overlay_warning"]
 
 
 @pytest.mark.asyncio

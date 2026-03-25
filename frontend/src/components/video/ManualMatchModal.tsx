@@ -547,8 +547,14 @@ function ManualMatchModalContent({
                   )}
                   {tiktokHasError && (
                     <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-black/80 px-4 text-center text-white">
-                      <span className="text-xs">Unable to load TikTok preview.</span>
-                      <Button variant="outline" size="sm" onClick={handleRetryTiktok}>
+                      <span className="text-xs">
+                        Unable to load TikTok preview.
+                      </span>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleRetryTiktok}
+                      >
                         <RotateCcw className="h-3.5 w-3.5 mr-1" />
                         Retry
                       </Button>

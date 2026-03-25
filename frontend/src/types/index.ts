@@ -57,6 +57,21 @@ export interface PlatformMetadata {
   };
 }
 
+export interface MetadataTitleCandidatesPayload {
+  title_candidates: string[];
+  facebook: {
+    description: string;
+    tags: string[];
+  };
+  instagram: {
+    hashtags: string[];
+  };
+  youtube: {
+    description: string;
+    tags: string[];
+  };
+}
+
 export interface ScriptAutomationVoice {
   key: string;
   display_name: string;
@@ -79,7 +94,7 @@ export interface VideoOverlay {
 
 export interface ScriptAutomationConfig {
   enabled: boolean;
-  overlay_title_selection_enabled: boolean;
+  script_title_selection_enabled: boolean;
   gemini: {
     configured: boolean;
     model: string;
@@ -138,8 +153,10 @@ export interface ScriptAutomationEvent {
   run_id?: string;
   script_json?: Record<string, unknown>;
   metadata_json?: PlatformMetadata | null;
+  metadata_candidates_json?: MetadataTitleCandidatesPayload | null;
   metadata_warning?: string | null;
   overlay_json?: VideoOverlay;
+  overlay_warning?: string | null;
   parts?: ScriptAutomationPart[];
   warning?: string;
   part_id?: string;

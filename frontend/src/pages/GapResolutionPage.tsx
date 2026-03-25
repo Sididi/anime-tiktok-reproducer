@@ -313,9 +313,10 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
     playbackRate >= 8
       ? HTMLMediaElement.HAVE_ENOUGH_DATA
       : playbackRate >= 3
-      ? HTMLMediaElement.HAVE_FUTURE_DATA
-      : HTMLMediaElement.HAVE_CURRENT_DATA;
-  const fastWatchReadyTimeoutMs = playbackRate >= 8 ? 12000 : playbackRate >= 4 ? 9000 : 7000;
+        ? HTMLMediaElement.HAVE_FUTURE_DATA
+        : HTMLMediaElement.HAVE_CURRENT_DATA;
+  const fastWatchReadyTimeoutMs =
+    playbackRate >= 8 ? 12000 : playbackRate >= 4 ? 9000 : 7000;
 
   const resolvePendingPlayback = useCallback(() => {
     if (pendingTimeoutRef.current !== null) {

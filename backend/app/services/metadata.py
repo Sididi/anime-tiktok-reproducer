@@ -5,7 +5,11 @@ from typing import Any
 from pydantic import ValidationError
 
 from ..library_types import LibraryType
-from ..models import VideoMetadataPayload
+from ..models import (
+    MetadataTitleCandidatesPayload,
+    TIKTOK_FIXED_HASHTAGS,
+    VideoMetadataPayload,
+)
 from .project_service import ProjectService
 from .script_phase_prompt_service import ScriptPhasePromptService
 
@@ -90,6 +94,70 @@ class MetadataService:
             return cls.validate_payload(parsed)
         except ValidationError as exc:
             raise ValueError(f"Invalid metadata schema: {exc}") from exc
+
+    @classmethod
+    def validate_candidate_payload(
+        cls,
+        payload: dict[str, Any],
+    ) -> MetadataTitleCandidatesPayload:
+        return MetadataTitleCandidatesPayload.model_validate(payload)
+
+    @classmethod
+    def validate_candidate_json_string(
+        cls,
+        raw_json: str,
+    ) -> MetadataTitleCandidatesPayload:
+        try:
+            parsed = json.loads(raw_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid metadata JSON: {exc}") from exc
+
+        try:
+            return cls.validate_candidate_payload(parsed)
+        except ValidationError as exc:
+            raise ValueError(f"Invalid metadata candidate schema: {exc}") from exc
+
+    @classmethod
+    def resolve_candidate_payload(
+        cls,
+        payload: MetadataTitleCandidatesPayload | dict[str, Any],
+        *,
+        selected_title: str,
+    ) -> VideoMetadataPayload:
+        validated = (
+            payload
+            if isinstance(payload, MetadataTitleCandidatesPayload)
+            else cls.validate_candidate_payload(payload)
+        )
+        title = selected_title.strip()
+        if not title:
+            raise ValueError("selected_title cannot be empty")
+
+        instagram_hashtags = " ".join(validated.instagram.hashtags).strip()
+        instagram_caption = title if not instagram_hashtags else f"{title} {instagram_hashtags}"
+        tiktok_hashtags = " ".join(TIKTOK_FIXED_HASHTAGS)
+        tiktok_description = f"{title} {tiktok_hashtags}".strip()
+
+        return VideoMetadataPayload.model_validate(
+            {
+                "facebook": {
+                    "title": title,
+                    "description": validated.facebook.description,
+                    "tags": validated.facebook.tags,
+                },
+                "instagram": {
+                    "caption": instagram_caption,
+                },
+                "youtube": {
+                    "title": title,
+                    "description": validated.youtube.description,
+                    "tags": validated.youtube.tags,
+                },
+                "tiktok": {
+                    "description": tiktok_description,
+                },
+            }
+        )
 
     @classmethod
     def load(cls, project_id: str) -> VideoMetadataPayload | None:
