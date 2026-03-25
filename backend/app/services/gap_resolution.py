@@ -632,7 +632,7 @@ class GapResolutionService:
             matches: Scene matches with source timings
             scene_timings: Authoritative playback scene timings. When present,
                 start_time/end_time are preferred over word-derived timing,
-                including for empty scenes.
+                including for raw scenes.
 
         Returns:
             List of GapInfo for scenes that have gaps
