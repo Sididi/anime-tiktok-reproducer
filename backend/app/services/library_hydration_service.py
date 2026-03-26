@@ -1052,7 +1052,10 @@ class LibraryHydrationService:
         manifest: dict[str, Any] | None,
     ) -> None:
         library_root = AnimeLibraryService.get_library_path(library_type)
-        display_name = str(manifest["display_name"]) if manifest else None
+        display_name = str(manifest["display_name"]) if manifest else cls._resolve_local_display_name_sync(
+            library_type,
+            series_id,
+        )
         if display_name:
             series_dir = library_root / display_name
             if series_dir.exists():
@@ -1087,6 +1090,29 @@ class LibraryHydrationService:
 
         if shard_key:
             shutil.rmtree(index_dir / "series" / shard_key, ignore_errors=True)
+
+        manifest_cache_dir = cls._storage_cache_root() / "manifests" / library_type.value / series_id
+        if manifest_cache_dir.exists():
+            shutil.rmtree(manifest_cache_dir, ignore_errors=True)
+
+    @classmethod
+    def _resolve_local_display_name_sync(
+        cls,
+        library_type: LibraryType,
+        series_id: str,
+    ) -> str | None:
+        library_root = AnimeLibraryService.get_library_path(library_type)
+        if not library_root.exists():
+            return None
+        for source_dir in library_root.iterdir():
+            if not source_dir.is_dir() or source_dir.name.startswith("."):
+                continue
+            metadata = StorageBoxRepository.read_local_series_metadata(source_dir)
+            if not isinstance(metadata, dict):
+                continue
+            if str(metadata.get("series_id") or "").strip() == series_id:
+                return source_dir.name
+        return None
 
     @classmethod
     def _state_payload(

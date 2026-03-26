@@ -19,6 +19,7 @@ from .library_types import LibraryType
 from .services.account_service import AccountService
 from .services.integration_health_service import IntegrationHealthService
 from .services.library_hydration_service import LibraryHydrationService
+from .services.project_service import ProjectService
 from .services.storage_box_sftp_client import StorageBoxSftpClient
 
 
@@ -30,6 +31,7 @@ logger = logging.getLogger("uvicorn.error")
 async def lifespan(app: FastAPI):
     """Load accounts and run integration health checks on startup."""
     AccountService.load()
+    ProjectService.sync_all_project_pins()
     await LibraryHydrationService.startup_cleanup()
     if settings.storage_box_enabled:
         for library_type in LibraryType:

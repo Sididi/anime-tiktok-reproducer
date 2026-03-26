@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import shutil
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
@@ -13,12 +14,113 @@ from ...services import (
     AnimeLibraryService,
     AnimeMatcherService,
     LibraryHydrationService,
+    LibraryStateDb,
     StorageBoxRepository,
 )
 
 router = APIRouter(prefix="/anime", tags=["anime"])
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".webm", ".mov", ".m4v"}
+
+
+def _json_write_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(
+        json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    tmp_path.replace(path)
+
+
+def _series_dir_size_bytes(series_dir: Path) -> int:
+    return sum(path.stat().st_size for path in series_dir.rglob("*") if path.is_file())
+
+
+def _purge_local_orphan_series_sync(
+    library_type: LibraryType,
+    source_dir: Path,
+) -> None:
+    display_name = source_dir.name
+    library_root = AnimeLibraryService.get_library_path(library_type)
+    if source_dir.exists():
+        shutil.rmtree(source_dir, ignore_errors=True)
+
+    index_dir = library_root / AnimeLibraryService.INDEX_DIR_NAME
+    manifest_path = index_dir / AnimeLibraryService.MANIFEST_FILE
+    state_path = index_dir / AnimeLibraryService.STATE_FILE
+    if not manifest_path.exists() or not state_path.exists():
+        return
+
+    try:
+        local_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        local_state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+
+    shard_key = None
+    raw_series = local_manifest.get("series", {})
+    if isinstance(raw_series, dict):
+        series_entry = raw_series.pop(display_name, None)
+        if isinstance(series_entry, dict):
+            shard_key = str(series_entry.get("key") or "").strip() or None
+        _json_write_atomic(manifest_path, local_manifest)
+
+    raw_files = local_state.get("files", {})
+    if isinstance(raw_files, dict):
+        prefix = f"{display_name}/"
+        local_state["files"] = {
+            path: value
+            for path, value in raw_files.items()
+            if not (path == display_name or str(path).startswith(prefix))
+        }
+        _json_write_atomic(state_path, local_state)
+
+    if shard_key:
+        shutil.rmtree(index_dir / "series" / shard_key, ignore_errors=True)
+
+
+def _scan_local_purge_candidates(
+    library_type: LibraryType,
+    details_by_series: dict[str, dict],
+) -> list[dict]:
+    library_root = AnimeLibraryService.get_library_path(library_type)
+    if not library_root.exists():
+        return []
+
+    state_by_series = LibraryStateDb.list_series_states(library_type)
+    candidates: list[dict] = []
+    for source_dir in library_root.iterdir():
+        if not source_dir.is_dir() or source_dir.name.startswith("."):
+            continue
+
+        metadata = StorageBoxRepository.read_local_series_metadata(source_dir)
+        series_id = None
+        if isinstance(metadata, dict):
+            raw_series_id = str(metadata.get("series_id") or "").strip()
+            if raw_series_id:
+                series_id = raw_series_id
+
+        detail = details_by_series.get(series_id) if series_id else None
+        state = state_by_series.get(series_id) if series_id else None
+        project_pin_count = (
+            LibraryStateDb.count_project_pins(series_id) if series_id else 0
+        )
+        permanent_pin = bool(detail["permanent_pin"]) if detail else bool(
+            state.permanent_pin
+        ) if state else False
+        size_bytes = _series_dir_size_bytes(source_dir)
+        candidates.append(
+            {
+                "name": str(detail["name"]) if detail else source_dir.name,
+                "series_id": series_id,
+                "project_pin_count": int(detail["project_pin_count"]) if detail else project_pin_count,
+                "permanent_pin": bool(detail["permanent_pin"]) if detail else permanent_pin,
+                "size_bytes": size_bytes,
+                "path": str(source_dir),
+            }
+        )
+    return candidates
 
 
 @router.get("/browse")
@@ -601,25 +703,36 @@ async def purge_library(request: PurgeRequest):
 
     for library_type in types_to_purge:
         details = await LibraryHydrationService.list_source_details(library_type=library_type)
-        for entry in details:
-            if entry["permanent_pin"] or int(entry["project_pin_count"]) > 0:
-                skipped_protected.append(entry["name"])
+        details_by_series = {
+            str(entry["series_id"]): entry
+            for entry in details
+            if str(entry.get("series_id") or "").strip()
+        }
+        candidates = await asyncio.to_thread(
+            _scan_local_purge_candidates,
+            library_type,
+            details_by_series,
+        )
+        for candidate in candidates:
+            if candidate["permanent_pin"] or int(candidate["project_pin_count"]) > 0:
+                skipped_protected.append(candidate["name"])
                 continue
-            series_dir = AnimeLibraryService.get_library_path(library_type) / entry["name"]
-            if series_dir.exists():
-                freed_bytes += sum(
-                    path.stat().st_size
-                    for path in series_dir.rglob("*")
-                    if path.is_file()
-                )
+            freed_bytes += int(candidate["size_bytes"])
             try:
-                await LibraryHydrationService.evict_series(
-                    library_type=library_type,
-                    series_id=entry["series_id"],
-                )
-                purged_sources.append(entry["name"])
+                if candidate["series_id"]:
+                    await LibraryHydrationService.evict_series(
+                        library_type=library_type,
+                        series_id=str(candidate["series_id"]),
+                    )
+                else:
+                    await asyncio.to_thread(
+                        _purge_local_orphan_series_sync,
+                        library_type,
+                        Path(candidate["path"]),
+                    )
+                purged_sources.append(candidate["name"])
             except Exception as exc:
-                skipped_protected.append(f"{entry['name']} ({exc})")
+                skipped_protected.append(f"{candidate['name']} ({exc})")
 
     return {
         "purged_sources": purged_sources,
@@ -639,18 +752,24 @@ async def estimate_purge(
     source_count = 0
     for current_type in types_to_check:
         details = await LibraryHydrationService.list_source_details(library_type=current_type)
-        for entry in details:
-            if entry["permanent_pin"] or int(entry["project_pin_count"]) > 0:
+        details_by_series = {
+            str(entry["series_id"]): entry
+            for entry in details
+            if str(entry.get("series_id") or "").strip()
+        }
+        candidates = await asyncio.to_thread(
+            _scan_local_purge_candidates,
+            current_type,
+            details_by_series,
+        )
+        for candidate in candidates:
+            if candidate["permanent_pin"] or int(candidate["project_pin_count"]) > 0:
                 continue
-            series_dir = AnimeLibraryService.get_library_path(current_type) / entry["name"]
-            if not series_dir.exists():
+            size_bytes = int(candidate["size_bytes"])
+            if size_bytes <= 0:
                 continue
             source_count += 1
-            estimated_bytes += sum(
-                path.stat().st_size
-                for path in series_dir.rglob("*")
-                if path.is_file()
-            )
+            estimated_bytes += size_bytes
     return {"estimated_bytes": estimated_bytes, "source_count": source_count}
 
 

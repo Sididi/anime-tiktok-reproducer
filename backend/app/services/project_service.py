@@ -23,6 +23,19 @@ class ProjectService:
     """Service for managing projects."""
 
     @staticmethod
+    def should_keep_project_pin(project: Project) -> bool:
+        """Keep local residency only while a project is still actively generating."""
+        if not project.series_id:
+            return False
+        if project.upload_completed_at is not None:
+            return False
+        if project.scheduled_at is not None:
+            return False
+        if project.phase == ProjectPhase.COMPLETE:
+            return False
+        return True
+
+    @staticmethod
     def get_project_dir(project_id: str) -> Path:
         """Get the directory for a project."""
         _validate_project_id(project_id)
@@ -63,7 +76,6 @@ class ProjectService:
         project_dir.mkdir(parents=True, exist_ok=True)
 
         cls.save(project)
-        cls.sync_project_pin(project)
         return project
 
     @classmethod
@@ -72,6 +84,7 @@ class ProjectService:
         project.updated_at = datetime.now()
         project_file = cls.get_project_file(project.id)
         project_file.write_text(project.model_dump_json(indent=2))
+        cls.sync_project_pin(project)
 
     @classmethod
     def load(cls, project_id: str) -> Project | None:
@@ -97,8 +110,16 @@ class ProjectService:
     @classmethod
     def sync_project_pin(cls, project: Project) -> None:
         LibraryStateDb.remove_project_pins(project.id)
-        if project.series_id:
+        if cls.should_keep_project_pin(project):
             LibraryStateDb.add_project_pin(project.id, project.series_id)
+
+    @classmethod
+    def sync_all_project_pins(cls) -> None:
+        """Rebuild project pins from saved projects using current pin rules."""
+        LibraryStateDb.clear_all_project_pins()
+        for project in cls.list_all():
+            if cls.should_keep_project_pin(project):
+                LibraryStateDb.add_project_pin(project.id, project.series_id)
 
     @classmethod
     def list_all(cls) -> list[Project]:

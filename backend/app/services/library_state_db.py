@@ -271,6 +271,11 @@ class LibraryStateDb:
             )
 
     @classmethod
+    def clear_all_project_pins(cls) -> None:
+        with cls.connect() as conn:
+            conn.execute("DELETE FROM project_series_pins")
+
+    @classmethod
     def count_project_pins(cls, series_id: str) -> int:
         with cls.connect() as conn:
             row = conn.execute(
