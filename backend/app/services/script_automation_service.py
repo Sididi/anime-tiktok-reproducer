@@ -940,18 +940,24 @@ class ScriptAutomationService:
                             v3_seed = secrets.randbits(32)
                         seed = v3_seed
                         outgoing_text = f"{cls.V3_CONTROL_PREFIX} {chunk}"
-                    if previous_request_id:
+                    elif previous_request_id:
                         previous_request_ids = [previous_request_id]
+
+                    synthesize_kwargs: dict[str, Any] = {
+                        "voice_id": voice.elevenlabs_voice_id,
+                        "text": outgoing_text,
+                        "model_id": effective_model,
+                        "output_format": settings.elevenlabs_output_format,
+                        "voice_settings": voice.voice_settings or None,
+                    }
+                    if previous_request_ids is not None:
+                        synthesize_kwargs["previous_request_ids"] = previous_request_ids
+                    if seed is not None:
+                        synthesize_kwargs["seed"] = seed
 
                     synthesis_result = await asyncio.to_thread(
                         ElevenLabsService.synthesize,
-                        voice_id=voice.elevenlabs_voice_id,
-                        text=outgoing_text,
-                        model_id=effective_model,
-                        output_format=settings.elevenlabs_output_format,
-                        voice_settings=voice.voice_settings or None,
-                        previous_request_ids=previous_request_ids,
-                        seed=seed,
+                        **synthesize_kwargs,
                     )
                     audio_bytes = (
                         synthesis_result
