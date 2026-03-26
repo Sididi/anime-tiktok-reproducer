@@ -150,10 +150,11 @@ export function IndexJobsPanel({ onJobComplete }: IndexJobsPanelProps) {
                           : `${Math.round(job.progress * 100)}%`}
                     </span>
                     {job.status === "complete" &&
-                      job.unmatched_files?.length > 0 && (
+                      (job.warnings?.length > 0 ||
+                        job.unmatched_files?.length > 0) && (
                         <div
                           className="shrink-0"
-                          title={`${job.unmatched_files.length} fichier(s) non lié(s) à un torrent`}
+                          title={jobWarningTooltip(job)}
                         >
                           <AlertTriangle className="h-3.5 w-3.5 text-amber-500" />
                         </div>
@@ -195,6 +196,9 @@ function statusLabel(job: IndexationJob): string {
       if (job.phase === "upload_release") return job.message || "Upload vers le Storage Box...";
       return job.message || (job.job_type === "update" ? "Mise à jour..." : "Indexation...");
     case "complete": {
+      if (job.warnings?.length > 0) {
+        return ignoredFilesLabel(job.warnings.length);
+      }
       if (job.unmatched_files?.length > 0) {
         return `Terminé — ${job.unmatched_files.length} fichier(s) sans torrent`;
       }
@@ -206,4 +210,19 @@ function statusLabel(job: IndexationJob): string {
     case "error":
       return job.error || "Erreur";
   }
+}
+
+function ignoredFilesLabel(count: number): string {
+  return `Terminé — ${count} fichier${count > 1 ? "s" : ""} ignoré${count > 1 ? "s" : ""}`;
+}
+
+function jobWarningTooltip(job: IndexationJob): string {
+  const parts: string[] = [];
+  if (job.warnings?.length > 0) {
+    parts.push(job.warnings.join("\n"));
+  }
+  if (job.unmatched_files?.length > 0) {
+    parts.push(`${job.unmatched_files.length} fichier(s) non lié(s) à un torrent`);
+  }
+  return parts.join("\n\n");
 }

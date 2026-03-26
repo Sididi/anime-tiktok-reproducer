@@ -174,3 +174,57 @@ async def test_enqueue_blocks_concurrent_index_and_update_for_same_target(
 
 async def _async_value(value):
     return value
+
+
+@pytest.mark.asyncio
+async def test_queue_preserves_warnings_from_index_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = IndexationQueueService()
+
+    async def fake_index_anime(
+        *,
+        source_folder: Path,
+        library_type: LibraryType | str | None = None,
+        anime_name: str | None = None,
+        fps: float = 2.0,
+        **_: object,
+    ):
+        yield IndexProgress(
+            status="copying",
+            progress=0.1,
+            message="skipping broken file",
+            warnings=["Ignored unreadable source file: broken.mkv"],
+        )
+        yield IndexProgress(status="complete", progress=1.0, message=f"done {anime_name}")
+
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "index_anime",
+        classmethod(lambda cls, **kwargs: fake_index_anime(**kwargs)),
+    )
+    monkeypatch.setattr(AnimeMatcherService, "mark_series_updated", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service, "_link_torrents", lambda job: asyncio.sleep(0))
+    monkeypatch.setattr(
+        StorageBoxRepository,
+        "publish_series",
+        classmethod(
+            lambda cls, library_type, display_name, series_id=None: _async_value(
+                {
+                    "series_id": series_id or f"series-{display_name.lower()}",
+                    "release_id": f"release-{display_name.lower()}",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        LibraryHydrationService,
+        "sync_local_series_state",
+        classmethod(lambda cls, **kwargs: _async_value(None)),
+    )
+
+    job_id = await service.enqueue("/tmp/demo", LibraryType.ANIME, "Demo", 2.0)
+    await _wait_for(lambda: service.list_jobs()[0].status == "complete")
+
+    job = next(job for job in service.list_jobs() if job.id == job_id)
+    assert job.warnings == ["Ignored unreadable source file: broken.mkv"]

@@ -11,6 +11,7 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from app.services.anime_library import AnimeLibraryService, SourceMediaProbe, SourceMediaStream
+from app.utils.subprocess_runner import CommandResult
 
 
 def _audio_stream(
@@ -323,3 +324,21 @@ class TestAnimeLibraryNormalization(TestCase):
             self.assertTrue(original_source_path.exists())
 
         asyncio.run(_run())
+
+    def test_format_media_failure_prefers_meaningful_stderr_tail_over_ffmpeg_banner(self) -> None:
+        result = CommandResult(
+            returncode=1,
+            stdout=b"",
+            stderr=(
+                b"ffmpeg version n8.1 Copyright (c) 2000-2026 the FFmpeg developers\n"
+                b"built with gcc 15.2.1 (GCC) 20260209\n"
+                b"configuration: --prefix=/usr\n"
+                b"[hevc_metadata @ 0x123] No start code is found.\n"
+                b"Error opening output files: Invalid data found when processing input\n"
+            ),
+        )
+
+        formatted = AnimeLibraryService._format_media_failure(result)
+
+        self.assertIn("Error opening output files", formatted)
+        self.assertNotIn("ffmpeg version", formatted)

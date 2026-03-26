@@ -40,6 +40,7 @@ export interface IndexationJob {
   phase: string | null;
   message: string | null;
   error: string | null;
+  warnings: string[];
   unmatched_files: string[];
   linked_torrents: number;
   series_id: string | null;

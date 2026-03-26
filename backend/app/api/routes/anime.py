@@ -34,6 +34,7 @@ def _preflight_error_payload(
     storage_release_id: str | None = None,
     conflict_details: dict | None = None,
     orphan_reason: str | None = None,
+    invalid_video_files: list[str] | None = None,
 ) -> dict:
     return {
         "code": code,
@@ -44,7 +45,18 @@ def _preflight_error_payload(
         "storage_release_id": storage_release_id,
         "conflict_details": conflict_details,
         "orphan_reason": orphan_reason,
+        "invalid_video_files": invalid_video_files,
     }
+
+
+def _format_invalid_video_files_message(name: str, invalid_video_files: list[str]) -> str:
+    preview = ", ".join(invalid_video_files[:5])
+    if len(invalid_video_files) > 5:
+        preview += f", et {len(invalid_video_files) - 5} autre(s)"
+    return (
+        f"'{name}' contient uniquement des fichiers vidéo illisibles ou corrompus. "
+        f"Fichiers détectés: {preview}"
+    )
 
 
 def _raise_index_preflight_error(result: dict) -> None:
@@ -86,14 +98,24 @@ def _raise_index_preflight_error(result: dict) -> None:
         )
     elif resolution == "needs_fix":
         status_code = 400
+        invalid_video_files = [
+            str(value).strip()
+            for value in (result.get("invalid_video_files") or [])
+            if str(value).strip()
+        ]
         payload = _preflight_error_payload(
-            code="needs_fix",
+            code="invalid_video_files" if invalid_video_files else "needs_fix",
             message=(
-                f"'{name}' ne contient pas directement de fichiers vidéo. "
-                "Choisissez le sous-dossier qui contient les épisodes."
+                _format_invalid_video_files_message(name, invalid_video_files)
+                if invalid_video_files
+                else (
+                    f"'{name}' ne contient pas directement de fichiers vidéo. "
+                    "Choisissez le sous-dossier qui contient les épisodes."
+                )
             ),
             resolution=resolution,
             name=name,
+            invalid_video_files=invalid_video_files or None,
         )
 
     if payload is not None:
@@ -136,14 +158,24 @@ def _raise_update_preflight_error(result: dict) -> None:
         )
     elif resolution == "needs_fix":
         status_code = 400
+        invalid_video_files = [
+            str(value).strip()
+            for value in (result.get("invalid_video_files") or [])
+            if str(value).strip()
+        ]
         payload = _preflight_error_payload(
-            code="needs_fix",
+            code="invalid_video_files" if invalid_video_files else "needs_fix",
             message=(
-                f"'{name}' ne contient pas directement de fichiers vidéo. "
-                "Choisissez le sous-dossier qui contient les épisodes."
+                _format_invalid_video_files_message(name, invalid_video_files)
+                if invalid_video_files
+                else (
+                    f"'{name}' ne contient pas directement de fichiers vidéo. "
+                    "Choisissez le sous-dossier qui contient les épisodes."
+                )
             ),
             resolution=resolution,
             name=name,
+            invalid_video_files=invalid_video_files or None,
         )
 
     if payload is not None:

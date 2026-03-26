@@ -539,6 +539,7 @@ export const api = {
           existing_torrent_count: number;
         } | null;
         orphan_reason: string | null;
+        invalid_video_files: string[] | null;
       }>;
     }>("/anime/validate-batch-folders", {
       method: "POST",

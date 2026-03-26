@@ -94,7 +94,7 @@ class TestSubtitleExtractionDuringImport(TestCase):
     """Test _prepare_single_source_for_library() subtitle extraction."""
 
     def _run(self, coro):
-        return asyncio.get_event_loop().run_until_complete(coro)
+        return asyncio.run(coro)
 
     def _setup_patches(
         self,
@@ -256,12 +256,13 @@ class TestSubtitleExtractionDuringImport(TestCase):
         self.assertIn("Failed to extract subtitle sidecar", logs.output[0])
 
     def test_mp4_source_skips_subtitle_extraction(self) -> None:
-        """Non-MKV (already MP4) → no probe for subtitles, no extraction."""
+        """Readable MP4 source is copied without subtitle sidecar extraction."""
         source = Path("/tmp/test_src/episode.mp4")
         dest_dir = Path("/tmp/test_lib/Anime")
+        probe = _make_probe(source, suffix=".mp4", subtitle_streams=())
 
         patches, mock_write, mock_cmd = self._setup_patches(
-            source, dest_dir, codec="h264",
+            source, dest_dir, codec="h264", probe=probe,
         )
 
         with (
@@ -281,9 +282,47 @@ class TestSubtitleExtractionDuringImport(TestCase):
                 )
             )
 
-        # _probe_media_sync should NOT be called for non-MKV.
-        mock_probe.assert_not_called()
+        mock_probe.assert_called_once_with(source)
         mock_write.assert_not_awaited()
+
+    def test_unreadable_source_is_rejected_before_fallback_copy(self) -> None:
+        """Unreadable source files fail fast instead of being copied as fallback artifacts."""
+        source = Path("/tmp/test_src/broken.mkv")
+        dest_dir = Path("/tmp/test_lib/Anime")
+        mock_run_cmd = AsyncMock()
+
+        with (
+            patch.object(
+                AnimeLibraryService,
+                "get_primary_video_codec_sync",
+                return_value=None,
+            ),
+            patch.object(
+                AnimeLibraryService,
+                "_source_matches_prepared_sync",
+                return_value=False,
+            ),
+            patch.object(
+                AnimeLibraryService,
+                "_probe_media_sync",
+                return_value=None,
+            ),
+            patch(
+                "app.services.anime_library.run_command",
+                mock_run_cmd,
+            ),
+            patch("shutil.copy2") as mock_copy2,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Source file is unreadable: broken.mkv"):
+                self._run(
+                    AnimeLibraryService._prepare_single_source_for_library(
+                        source_path=source,
+                        dest_dir=dest_dir,
+                    )
+                )
+
+        mock_copy2.assert_not_called()
+        mock_run_cmd.assert_not_awaited()
 
     def test_mkv_with_pgs_subtitles_extracts_without_render_windows(self) -> None:
         """MKV with PGS image subtitles → sidecar extracted, no PNG rendering."""

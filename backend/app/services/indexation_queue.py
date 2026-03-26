@@ -103,6 +103,10 @@ class IndexationQueueService:
                 job.progress = progress.progress
                 job.phase = progress.status
                 job.message = progress.message
+                if progress.warnings:
+                    for warning in progress.warnings:
+                        if warning not in job.warnings:
+                            job.warnings.append(warning)
                 if progress.status == "complete":
                     job.phase = "link_sources"
                     job.message = "Linking fallback torrent sources..."

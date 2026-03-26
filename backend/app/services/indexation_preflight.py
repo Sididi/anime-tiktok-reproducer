@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any
@@ -25,14 +26,6 @@ class IndexationPreflightService:
     @staticmethod
     def normalize_target_name(value: Any) -> str:
         return str(value or "").strip().casefold()
-
-    @classmethod
-    def _list_direct_video_names(cls, folder: Path) -> list[str]:
-        return sorted(
-            entry.name
-            for entry in folder.iterdir()
-            if entry.is_file() and entry.suffix.lower() in AnimeLibraryService.VIDEO_EXTENSIONS
-        )
 
     @staticmethod
     def _batch_episode_stems(video_names: list[str]) -> set[str]:
@@ -184,27 +177,36 @@ class IndexationPreflightService:
         folder = Path(source_path)
         display_name = (anime_name or folder.name).strip()
 
-        try:
-            source_video_names = cls._list_direct_video_names(folder)
-        except (OSError, PermissionError):
-            source_video_names = []
-
-        has_videos = len(source_video_names) > 0
-        suggested_path = None if has_videos else cls._find_first_video_dir(folder)
-
         result: dict[str, Any] = {
             "path": str(folder),
             "name": display_name,
-            "has_videos": has_videos,
-            "suggested_path": suggested_path,
+            "has_videos": False,
+            "suggested_path": None,
             "resolution": RESOLUTION_NEW,
             "series_id": None,
             "storage_release_id": None,
             "conflict_details": None,
             "orphan_reason": None,
+            "invalid_video_files": [],
         }
 
-        if not has_videos:
+        source_scan = await asyncio.to_thread(
+            AnimeLibraryService.scan_direct_video_files_sync,
+            folder,
+        )
+        source_video_names = [path.name for path in source_scan.readable_files]
+        invalid_video_files = [path.name for path in source_scan.invalid_files]
+        has_videos = source_scan.has_direct_videos
+        suggested_path = None if has_videos else cls._find_first_video_dir(folder)
+
+        result["has_videos"] = has_videos
+        result["suggested_path"] = suggested_path
+        result["invalid_video_files"] = invalid_video_files
+
+        if not source_video_names:
+            if invalid_video_files:
+                result["resolution"] = RESOLUTION_NEEDS_FIX
+                return result
             result["resolution"] = RESOLUTION_NEEDS_FIX
             return result
 
@@ -282,6 +284,7 @@ class IndexationPreflightService:
                             "Plusieurs dossiers du batch ciblent la même série. "
                             "Gardez un seul dossier par série."
                         ),
+                        "invalid_video_files": [],
                     }
                 )
                 continue

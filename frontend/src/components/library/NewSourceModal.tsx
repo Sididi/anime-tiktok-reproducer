@@ -46,6 +46,7 @@ interface ValidationResult {
     existing_torrent_count: number;
   } | null;
   orphan_reason: string | null;
+  invalid_video_files: string[] | null;
 }
 
 const FPS_OPTIONS = [1, 2, 4];
@@ -172,6 +173,7 @@ export function NewSourceModal({
       const needsFix: ValidationResult[] = [];
       const hasConflict: ValidationResult[] = [];
       const blocked: ValidationResult[] = [];
+      const blockedMessages: string[] = [];
 
       for (const r of results) {
         if (r.resolution === "blocked_orphan") {
@@ -180,6 +182,12 @@ export function NewSourceModal({
         }
         if (r.resolution === "exact_match") {
           // Silently skip — already indexed with same content
+          continue;
+        }
+        if (r.resolution === "needs_fix" && r.invalid_video_files?.length) {
+          blockedMessages.push(
+            `${r.name}: fichiers vidéo illisibles ou corrompus (${r.invalid_video_files.join(", ")})`,
+          );
           continue;
         }
         if (r.resolution === "needs_fix") {
@@ -196,17 +204,18 @@ export function NewSourceModal({
         }
       }
 
-      if (blocked.length > 0) {
+      if (blocked.length > 0 || blockedMessages.length > 0) {
         setValidationError(
-          blocked
-            .map(
+          [
+            ...blocked.map(
               (item) =>
                 `${item.name}: ${
                   item.orphan_reason ||
                   "un conflit local empêche l'indexation"
                 }`,
-            )
-            .join(" "),
+            ),
+            ...blockedMessages,
+          ].join(" "),
         );
         setResolvedItems([]);
         setFixQueue([]);

@@ -42,6 +42,7 @@ class IndexProgress:
     error: str | None = None
     anime_name: str | None = None
     prepared_library_paths: list[str] | None = None
+    warnings: list[str] | None = None
 
     def to_dict(self) -> dict:
         payload = {
@@ -57,7 +58,21 @@ class IndexProgress:
             payload["anime_name"] = self.anime_name
         if self.prepared_library_paths is not None:
             payload["prepared_library_paths"] = self.prepared_library_paths
+        if self.warnings is not None:
+            payload["warnings"] = self.warnings
         return payload
+
+
+@dataclass(frozen=True)
+class SourceVideoScan:
+    """Readable vs unreadable source candidates discovered in one scan."""
+
+    readable_files: tuple[Path, ...] = ()
+    invalid_files: tuple[Path, ...] = ()
+
+    @property
+    def has_direct_videos(self) -> bool:
+        return bool(self.readable_files or self.invalid_files)
 
 
 @dataclass(frozen=True)
@@ -528,6 +543,61 @@ class AnimeLibraryService:
     def _get_source_normalization_profile(cls) -> str:
         profile = str(settings.source_normalization_profile or "").strip().lower()
         return profile or cls.SOURCE_NORMALIZATION_PROFILE_H264_MP4_AAC
+
+    @classmethod
+    def _list_direct_video_files_sync(cls, folder: Path) -> list[Path]:
+        try:
+            return sorted(
+                entry
+                for entry in folder.iterdir()
+                if entry.is_file() and entry.suffix.lower() in cls.VIDEO_EXTENSIONS
+            )
+        except (OSError, PermissionError):
+            return []
+
+    @classmethod
+    def _scan_source_video_paths_sync(cls, source_paths: list[Path]) -> SourceVideoScan:
+        readable_files: list[Path] = []
+        invalid_files: list[Path] = []
+        seen_paths: set[str] = set()
+
+        for source_path in source_paths:
+            try:
+                key = str(source_path.resolve())
+            except OSError:
+                key = str(source_path)
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+
+            probe = cls._probe_media_sync(source_path)
+            if probe is None or probe.duration is None:
+                invalid_files.append(source_path)
+            else:
+                readable_files.append(source_path)
+
+        return SourceVideoScan(
+            readable_files=tuple(readable_files),
+            invalid_files=tuple(invalid_files),
+        )
+
+    @classmethod
+    def scan_direct_video_files_sync(cls, folder: Path) -> SourceVideoScan:
+        return cls._scan_source_video_paths_sync(cls._list_direct_video_files_sync(folder))
+
+    @staticmethod
+    def _invalid_source_warning(source_path: Path) -> str:
+        return f"Ignored unreadable source file: {source_path.name}"
+
+    @staticmethod
+    def _invalid_source_error_detail(invalid_files: tuple[Path, ...]) -> str:
+        names = [path.name for path in invalid_files if path.name]
+        if not names:
+            return "Unreadable source files were detected."
+        preview = ", ".join(names[:5])
+        if len(names) > 5:
+            preview += f", and {len(names) - 5} more"
+        return f"Unreadable source files: {preview}"
 
     @staticmethod
     def _parse_ffprobe_rate(raw_value: object) -> float | None:
@@ -1368,7 +1438,30 @@ class AnimeLibraryService:
             or stdout.decode("utf-8", errors="replace").strip()
             or "unknown ffmpeg error"
         )
-        return detail[:500]
+        lines = [
+            line.strip()
+            for line in detail.replace("\r", "\n").splitlines()
+            if line.strip()
+        ]
+        noisy_prefixes = (
+            "ffmpeg version",
+            "built with",
+            "configuration:",
+            "libav",
+            "Input #",
+            "Metadata:",
+            "Duration:",
+            "Stream #",
+            "Press [q] to stop",
+            "frame=",
+            "size=",
+        )
+        filtered_lines = [
+            line for line in lines
+            if not any(line.startswith(prefix) for prefix in noisy_prefixes)
+        ]
+        candidate_lines = filtered_lines or lines
+        return " | ".join(candidate_lines[-3:])[:500]
 
     @classmethod
     async def _run_normalization_command(
@@ -2828,15 +2921,16 @@ class AnimeLibraryService:
         if existing_ready:
             return preferred_dest, "Using existing", False
 
-        # Always probe source for subtitle streams (extraction needed for all
-        # transform types: remux drops subs, transcode drops subs, and even
-        # plain copies may come from containers with embedded subs).
+        # Probe source once up front so unreadable inputs never get copied into
+        # the library via fallback paths.
         source_probe: SourceMediaProbe | None = None
         try:
             source_probe = await asyncio.to_thread(cls._probe_media_sync, source_path)
         except Exception as exc:
             logger.debug("Could not probe %s for subtitles: %s", source_path.name, exc)
             source_probe = None
+        if source_probe is None or source_probe.duration is None:
+            raise RuntimeError(f"Source file is unreadable: {source_path.name}")
 
         if needs_prores_transcode:
             # --- ProRes 422 LT transcode for Premiere-incompatible codecs ---
@@ -3239,15 +3333,25 @@ class AnimeLibraryService:
             )
             return
 
-        def _collect_video_files() -> list[Path]:
-            return [
-                f for f in source_folder.iterdir()
-                if f.is_file() and f.suffix.lower() in cls.VIDEO_EXTENSIONS
-            ]
-
-        video_files = await asyncio.to_thread(_collect_video_files)
+        source_scan = await asyncio.to_thread(cls.scan_direct_video_files_sync, source_folder)
+        video_files = list(source_scan.readable_files)
+        skipped_warnings = [
+            cls._invalid_source_warning(path)
+            for path in source_scan.invalid_files
+        ]
 
         if not video_files:
+            if source_scan.invalid_files:
+                yield IndexProgress(
+                    status="error",
+                    error=(
+                        f"No readable video files found in {source_folder}. "
+                        f"{cls._invalid_source_error_detail(source_scan.invalid_files)}"
+                    ),
+                    anime_name=anime_name,
+                    warnings=skipped_warnings or None,
+                )
+                return
             yield IndexProgress(
                 status="error",
                 error=f"No video files found in {source_folder}",
@@ -3257,6 +3361,20 @@ class AnimeLibraryService:
 
         total_files = len(video_files)
         prepared_files: list[Path] = []
+
+        if skipped_warnings:
+            skipped_count = len(skipped_warnings)
+            yield IndexProgress(
+                status="copying",
+                message=(
+                    f"Skipping {skipped_count} unreadable source file"
+                    f"{'s' if skipped_count != 1 else ''} before import"
+                ),
+                progress=0.0,
+                total_files=total_files,
+                anime_name=anime_name,
+                warnings=skipped_warnings,
+            )
 
         if dest_path != source_folder:
             yield IndexProgress(
@@ -3379,6 +3497,7 @@ class AnimeLibraryService:
             completed_files=total_files,
             anime_name=anime_name,
             prepared_library_paths=[str(path) for path in prepared_files],
+            warnings=skipped_warnings or None,
         )
 
     @classmethod
@@ -3451,10 +3570,50 @@ class AnimeLibraryService:
                 return
             video_files.append(candidate)
 
+        source_scan = await asyncio.to_thread(cls._scan_source_video_paths_sync, video_files)
+        video_files = list(source_scan.readable_files)
+        skipped_warnings = [
+            cls._invalid_source_warning(path)
+            for path in source_scan.invalid_files
+        ]
+
+        if not video_files:
+            if source_scan.invalid_files:
+                yield IndexProgress(
+                    status="error",
+                    error=(
+                        f"No readable source files provided for incremental update. "
+                        f"{cls._invalid_source_error_detail(source_scan.invalid_files)}"
+                    ),
+                    anime_name=anime_name,
+                    warnings=skipped_warnings or None,
+                )
+                return
+            yield IndexProgress(
+                status="error",
+                error="No source files provided for incremental update.",
+                anime_name=anime_name,
+            )
+            return
+
         total_files = len(video_files)
         dest_dir = library_path / anime_name
         dest_dir.mkdir(parents=True, exist_ok=True)
         prepared_files: list[Path] = []
+
+        if skipped_warnings:
+            skipped_count = len(skipped_warnings)
+            yield IndexProgress(
+                status="copying",
+                message=(
+                    f"Skipping {skipped_count} unreadable source file"
+                    f"{'s' if skipped_count != 1 else ''} before update"
+                ),
+                progress=0.0,
+                total_files=total_files,
+                anime_name=anime_name,
+                warnings=skipped_warnings,
+            )
 
         yield IndexProgress(
             status="copying",
@@ -3560,6 +3719,7 @@ class AnimeLibraryService:
             completed_files=total_files,
             anime_name=anime_name,
             prepared_library_paths=[str(path) for path in prepared_files],
+            warnings=skipped_warnings or None,
         )
 
     @classmethod

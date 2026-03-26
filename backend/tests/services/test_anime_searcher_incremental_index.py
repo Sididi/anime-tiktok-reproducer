@@ -21,7 +21,7 @@ if str(SEARCHER_ROOT) not in sys.path:
     sys.path.insert(0, str(SEARCHER_ROOT))
 
 from anime_searcher import benchmark as benchmark_module
-from app.services.anime_library import AnimeLibraryService, IndexProgress
+from app.services.anime_library import AnimeLibraryService, IndexProgress, SourceVideoScan
 from app.services.anime_matcher import AnimeMatcherService
 from anime_searcher import cli as cli_module
 from anime_searcher.config import EMBEDDING_DIM, INDEX_ENGINE_PROFILE, INDEX_FORMAT_VERSION
@@ -46,6 +46,17 @@ FAULTY_PROJECT_SERIES = {
     "Tougen Anki": "Tougen_Anki_9f8b2809",
     "Yamada-kun to Lv999 no Koi wo Suru (My Love Story)": "Yamada-kun_to_Lv999_no_Koi_wo_Suru__My_Love_Story_c136df76",
 }
+
+
+def _source_scan(
+    *,
+    readable: list[Path] | tuple[Path, ...] = (),
+    invalid: list[Path] | tuple[Path, ...] = (),
+) -> SourceVideoScan:
+    return SourceVideoScan(
+        readable_files=tuple(readable),
+        invalid_files=tuple(invalid),
+    )
 
 
 def _write_manifest(tmp_path: Path, *paths: Path) -> Path:
@@ -1469,6 +1480,13 @@ async def test_backend_update_anime_returns_prepared_library_paths(
     )
     monkeypatch.setattr(
         AnimeLibraryService,
+        "_scan_source_video_paths_sync",
+        classmethod(
+            lambda cls, source_paths: _source_scan(readable=list(source_paths))
+        ),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
         "_verify_prepared_library_files",
         classmethod(lambda cls, files: fake_verify_prepared_library_files(files)),
     )
@@ -1555,6 +1573,11 @@ async def test_backend_index_anime_passes_decode_backend_and_precision_flags(
     )
     monkeypatch.setattr(
         AnimeLibraryService,
+        "scan_direct_video_files_sync",
+        classmethod(lambda cls, folder: _source_scan(readable=[source_path])),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
         "_verify_prepared_library_files",
         classmethod(lambda cls, files: fake_verify_prepared_library_files(files)),
     )
@@ -1592,6 +1615,158 @@ async def test_backend_index_anime_passes_decode_backend_and_precision_flags(
     assert "torchcodec_cuda" in captured_cmd
     assert "--precision" in captured_cmd
     assert "fp16" in captured_cmd
+
+
+@pytest.mark.asyncio
+async def test_backend_index_anime_skips_unreadable_direct_sources_with_warnings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    library_path = tmp_path / "library"
+    searcher_path = tmp_path / "searcher"
+    source_folder = tmp_path / "incoming"
+    source_folder.mkdir(parents=True)
+    readable_source = source_folder / "ep1.mkv"
+    unreadable_source = source_folder / "ep2.mkv"
+    readable_source.write_bytes(b"source")
+    unreadable_source.write_bytes(b"broken")
+    prepared_path = library_path / "Demo" / "ep1.mp4"
+
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "get_library_path",
+        classmethod(lambda cls, library_type=None: library_path),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "get_anime_searcher_path",
+        classmethod(lambda cls: searcher_path),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_get_indexed_series_fps_sync",
+        classmethod(lambda cls, anime_name, library_type=None: None),
+    )
+
+    async def fake_prepare_single_source_for_library(*, source_path: Path, dest_dir: Path):
+        prepared_path.parent.mkdir(parents=True, exist_ok=True)
+        prepared_path.write_bytes(b"prepared")
+        return prepared_path, "Copying", True
+
+    async def fake_stream_searcher_command(**kwargs):
+        yield IndexProgress(status="indexing", message="indexing", progress=0.6)
+
+    async def fake_ensure_episode_manifest(*, force_refresh: bool = False, library_type=None):
+        return {}
+
+    async def fake_verify_prepared_library_files(files: list[Path]) -> str | None:
+        return None
+
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_prepare_single_source_for_library",
+        classmethod(lambda cls, **kwargs: fake_prepare_single_source_for_library(**kwargs)),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "scan_direct_video_files_sync",
+        classmethod(
+            lambda cls, folder: _source_scan(
+                readable=[readable_source],
+                invalid=[unreadable_source],
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_verify_prepared_library_files",
+        classmethod(lambda cls, files: fake_verify_prepared_library_files(files)),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_stream_searcher_command",
+        classmethod(lambda cls, **kwargs: fake_stream_searcher_command(**kwargs)),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "ensure_episode_manifest",
+        classmethod(
+            lambda cls, force_refresh=False, library_type=None: fake_ensure_episode_manifest(
+                force_refresh=force_refresh,
+                library_type=library_type,
+            )
+        ),
+    )
+
+    progress_events = [
+        progress
+        async for progress in AnimeLibraryService.index_anime(
+            source_folder=source_folder,
+            anime_name="Demo",
+            require_gpu=False,
+            library_type="anime",
+        )
+    ]
+
+    assert progress_events[1].warnings == [
+        "Ignored unreadable source file: ep2.mkv"
+    ]
+    assert progress_events[-1].status == "complete"
+    assert progress_events[-1].warnings == [
+        "Ignored unreadable source file: ep2.mkv"
+    ]
+    assert progress_events[-1].prepared_library_paths == [str(prepared_path)]
+
+
+@pytest.mark.asyncio
+async def test_backend_update_anime_fails_when_all_sources_are_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    library_path = tmp_path / "library"
+    searcher_path = tmp_path / "searcher"
+    source_path = tmp_path / "incoming" / "ep3.mkv"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_bytes(b"broken")
+
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "get_library_path",
+        classmethod(lambda cls, library_type=None: library_path),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "get_anime_searcher_path",
+        classmethod(lambda cls: searcher_path),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_get_indexed_series_fps_sync",
+        classmethod(lambda cls, anime_name, library_type=None: 2.0),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_scan_source_video_paths_sync",
+        classmethod(
+            lambda cls, source_paths: _source_scan(invalid=list(source_paths))
+        ),
+    )
+
+    progress_events = [
+        progress
+        async for progress in AnimeLibraryService.update_anime(
+            anime_name="Demo",
+            source_paths=[source_path],
+            require_gpu=False,
+            library_type="anime",
+        )
+    ]
+
+    assert progress_events[-1].status == "error"
+    assert "No readable source files provided for incremental update" in (progress_events[-1].error or "")
+    assert progress_events[-1].warnings == [
+        "Ignored unreadable source file: ep3.mkv"
+    ]
 
 
 def test_anime_matcher_init_searcher_uses_explicit_fp32_precision(
@@ -1735,7 +1910,11 @@ def test_checked_in_project_library_excludes_removed_faulty_series() -> None:
     library_path = REPO_ROOT / "modules" / "anime_searcher" / "library" / "anime"
     if not library_path.exists():
         library_path = REPO_ROOT.parent.parent / "modules" / "anime_searcher" / "library" / "anime"
+    if not library_path.exists():
+        pytest.skip("checked-in anime_searcher library is not available in this workspace")
     shard_dir = library_path / ".index" / "series"
+    if not shard_dir.exists():
+        pytest.skip("checked-in anime_searcher shard directory is not available in this workspace")
 
     present_series_dirs = {path.name for path in library_path.iterdir() if path.is_dir() and not path.name.startswith(".")}
     present_shards = {path.name for path in shard_dir.iterdir() if path.is_dir()}

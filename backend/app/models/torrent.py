@@ -97,6 +97,7 @@ class IndexationJob(BaseModel):
     phase: str | None = None
     message: str | None = None
     error: str | None = None
+    warnings: list[str] = Field(default_factory=list)
     unmatched_files: list[str] = []  # files not linked to any torrent
     linked_torrents: int = 0  # number of torrents linked after indexation
     series_id: str | None = None
