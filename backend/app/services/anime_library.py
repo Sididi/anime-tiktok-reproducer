@@ -9,6 +9,7 @@ import subprocess
 import shutil
 import threading
 import tempfile
+from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -3176,12 +3177,32 @@ class AnimeLibraryService:
             stderr=asyncio.subprocess.PIPE,
             cwd=str(cwd),
             env=get_media_subprocess_env(cmd),
+            start_new_session=True,
         )
 
-        stdout_lines: list[str] = []
-        stderr_task = asyncio.create_task(
-            process.stderr.read() if process.stderr is not None else asyncio.sleep(0, result=b"")
-        )
+        stdout_tail: deque[str] = deque(maxlen=5)
+        stdout_line_count = 0
+        stderr_chunks: deque[str] = deque()
+        stderr_bytes = 0
+        stderr_limit = 8192
+
+        async def _drain_stderr() -> str:
+            nonlocal stderr_bytes
+            if process.stderr is None:
+                return ""
+            while True:
+                chunk = await process.stderr.read(4096)
+                if not chunk:
+                    break
+                decoded = chunk.decode("utf-8", errors="replace")
+                stderr_chunks.append(decoded)
+                stderr_bytes += len(decoded.encode("utf-8", errors="replace"))
+                while stderr_chunks and stderr_bytes > stderr_limit:
+                    dropped = stderr_chunks.popleft()
+                    stderr_bytes -= len(dropped.encode("utf-8", errors="replace"))
+            return "".join(stderr_chunks).strip()
+
+        stderr_task = asyncio.create_task(_drain_stderr())
         loop = asyncio.get_running_loop()
         deadline = loop.time() + cls.INDEX_TIMEOUT_SECONDS
         aborted = False
@@ -3198,21 +3219,22 @@ class AnimeLibraryService:
                 if not line:
                     break
                 decoded = line.decode()
-                stdout_lines.append(decoded)
+                stdout_line_count += 1
+                stdout_tail.append(decoded)
                 progress = cls._parse_searcher_progress_line(
                     line=decoded,
                     status=status,
                     total_files=total_files,
                     progress_start=progress_start,
                     progress_span=progress_span,
-                    text_line_index=len(stdout_lines),
+                    text_line_index=stdout_line_count,
                 )
                 if progress is None:
                     continue
                 if progress.status == "error":
                     saw_explicit_error = True
                     aborted = True
-                    await terminate_process(process)
+                    await terminate_process(process, kill_group=True)
                     yield progress
                     return
                 yield progress
@@ -3223,11 +3245,11 @@ class AnimeLibraryService:
             await asyncio.wait_for(process.wait(), timeout=remaining)
         except asyncio.CancelledError:
             aborted = True
-            await terminate_process(process)
+            await terminate_process(process, kill_group=True)
             raise
         except asyncio.TimeoutError:
             aborted = True
-            await terminate_process(process)
+            await terminate_process(process, kill_group=True)
             yield IndexProgress(
                 status="error",
                 error=(
@@ -3237,16 +3259,13 @@ class AnimeLibraryService:
             )
             return
         finally:
-            if aborted and not stderr_task.done():
-                stderr_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await stderr_task
+            if aborted and process.returncode is None:
+                await terminate_process(process, kill_group=True)
 
         stderr = await stderr_task
         if process.returncode != 0 and not saw_explicit_error:
-            stdout_tail = "".join(stdout_lines[-5:]).strip()
-            stderr_text = stderr.decode().strip()
-            detail = stderr_text or stdout_tail or "unknown error"
+            stdout_text = "".join(stdout_tail).strip()
+            detail = stderr or stdout_text or "unknown error"
             yield IndexProgress(
                 status="error",
                 error=f"anime_searcher command failed: {detail}",

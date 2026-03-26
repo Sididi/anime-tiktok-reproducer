@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
+import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -31,6 +33,7 @@ from anime_searcher.indexer import index_manager as index_manager_module
 from anime_searcher.indexer.frame_extractor import DecodedFrameBatch, MediaBinaryProfile
 from anime_searcher.indexer.index_manager import IndexManager
 from anime_searcher.indexer.pipeline import (
+    FileProgressEvent,
     FileStartedEvent,
     IndexedFileResult,
     IndexingJob,
@@ -72,6 +75,10 @@ def _dummy_model(tmp_path: Path) -> Path:
     model_path = tmp_path / "dummy_model.pt"
     model_path.write_bytes(b"model")
     return model_path
+
+
+async def _collect_progress(stream) -> list[IndexProgress]:
+    return [progress async for progress in stream]
 
 
 def _make_vectors(count: int, offset: int) -> np.ndarray:
@@ -444,6 +451,139 @@ def test_parallel_file_indexer_skips_unreadable_file_instead_of_aborting(
     assert "invalid media stream" in outputs[1].error_message
 
 
+def test_parallel_file_indexer_emits_heartbeat_events_for_slow_batches(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    video_path = tmp_path / "episode.mp4"
+    video_path.write_bytes(b"video")
+
+    frames = [
+        (0.0, Image.new("RGB", (2, 2), color=(10, 0, 0))),
+        (1.0, Image.new("RGB", (2, 2), color=(20, 0, 0))),
+    ]
+    monotonic_values = iter([0.0, 3.0, 3.0, 3.0])
+
+    monkeypatch.setattr(
+        "anime_searcher.indexer.pipeline.extract_frames",
+        lambda *args, **kwargs: iter(frames),
+    )
+    monkeypatch.setattr(
+        "anime_searcher.indexer.pipeline.time.monotonic",
+        lambda: next(monotonic_values),
+    )
+
+    class DummyEmbedder:
+        device = "cpu"
+        embedding_dim = EMBEDDING_DIM
+
+        def embed_preprocessed_batch(self, batch: torch.Tensor) -> np.ndarray:
+            return _make_vectors(batch.shape[0], 0)
+
+    pipeline = ParallelFileIndexer(
+        DummyEmbedder(),
+        batch_size=2,
+        prefetch_batches=2,
+        transform_workers=1,
+        file_workers=1,
+    )
+    outputs = list(
+        pipeline.run(
+            [
+                IndexingJob(
+                    video_path=video_path,
+                    series="Demo",
+                    episode="episode",
+                    fps=1.0,
+                )
+            ]
+        )
+    )
+    pipeline.close()
+
+    assert isinstance(outputs[0], FileStartedEvent)
+    assert isinstance(outputs[1], FileProgressEvent)
+    assert outputs[1].batches_processed == 1
+    assert outputs[1].frames_processed == 2
+    assert isinstance(outputs[2], IndexedFileResult)
+
+
+def test_index_files_emits_file_progress_events(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    library_root = tmp_path / "library"
+    library_path = library_root / "anime"
+    series_dir = library_path / "Demo"
+    series_dir.mkdir(parents=True)
+    video_path = series_dir / "ep1.mp4"
+    video_path.write_bytes(b"video")
+    model_path = _dummy_model(tmp_path)
+    emitted: list[dict[str, object]] = []
+
+    manager = IndexManager(library_path)
+    manager.load_or_create(2.0)
+
+    class DummyEmbedder:
+        device = "cpu"
+        resolved_precision = "fp32"
+
+    class DummyPipeline:
+        file_workers = 1
+        decode_backend = "ffmpeg_cpu"
+        decode_fallbacks = 0
+
+        def run(self, jobs: list[IndexingJob]):
+            yield FileStartedEvent(job=jobs[0])
+            yield FileProgressEvent(job=jobs[0], batches_processed=3, frames_processed=48)
+            yield IndexedFileResult(
+                job=jobs[0],
+                timestamps=[0.0, 1.0],
+                embeddings=_make_vectors(2, 0),
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        cli_module,
+        "_create_pipeline",
+        lambda *args, **kwargs: (
+            DummyEmbedder(),
+            DummyPipeline(),
+            MediaBinaryProfile("test", "/usr/bin/ffmpeg", "/usr/bin/ffprobe"),
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_emit_progress_event",
+        lambda enabled, **payload: emitted.append(payload) if enabled else None,
+    )
+
+    processed_files = cli_module._index_files(
+        files_to_index=[video_path],
+        index_manager=manager,
+        fps_by_series={"Demo": 2.0},
+        model_path=model_path,
+        batch_size=8,
+        fast=True,
+        prefetch_batches=2,
+        transform_workers=1,
+        require_gpu=False,
+        decode_backend="ffmpeg_cpu",
+        precision="fp32",
+        replace_existing_files=False,
+        progress_json=True,
+    )
+
+    assert processed_files == 1
+    assert any(event["event"] == "file_progress" for event in emitted)
+    heartbeat = next(event for event in emitted if event["event"] == "file_progress")
+    assert heartbeat["current_file"] == "Demo/ep1.mp4"
+    assert heartbeat["completed_files"] == 0
+    assert heartbeat["total_files"] == 1
+
+
 def test_run_benchmark_reports_decode_backend_and_precision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     video_path = tmp_path / "episode.mp4"
     video_path.write_bytes(b"video")
@@ -533,6 +673,101 @@ def test_iter_ffmpeg_cuda_frame_batches_uses_nvdec_command_and_returns_tensors(
     assert batches[0].timestamps == [0.0, 1.0]
     assert tuple(batches[0].data.shape) == (2, 3, 2, 2)
     assert batches[0].data.dtype == torch.uint8
+
+
+@pytest.mark.asyncio
+async def test_extract_frames_drains_stderr_and_raises_on_nonzero_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    video_path = tmp_path / "episode.mp4"
+    video_path.write_bytes(b"video")
+    original_popen = subprocess.Popen
+
+    monkeypatch.setattr(
+        frame_extractor_module,
+        "get_video_resolution",
+        lambda *_args, **_kwargs: (2, 2),
+    )
+
+    def fake_popen(cmd, **kwargs):
+        script = (
+            "import sys\n"
+            "sys.stdout.buffer.write(bytes(range(12)))\n"
+            "sys.stdout.flush()\n"
+            "sys.stderr.write('x' * 200000)\n"
+            "sys.stderr.write('\\nFRAME-TAIL\\n')\n"
+            "sys.stderr.flush()\n"
+            "sys.exit(1)\n"
+        )
+        return original_popen(
+            [sys.executable, "-c", script],
+            stdout=kwargs.get("stdout"),
+            stderr=kwargs.get("stderr"),
+            env=kwargs.get("env"),
+        )
+
+    monkeypatch.setattr(frame_extractor_module.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(frame_extractor_module.UnreadableVideoError, match="FRAME-TAIL"):
+        await asyncio.wait_for(
+            asyncio.to_thread(lambda: list(frame_extractor_module.extract_frames(video_path, 1.0))),
+            timeout=5.0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_iter_ffmpeg_cuda_frame_batches_drains_stderr_and_raises_on_nonzero_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    video_path = tmp_path / "episode.mp4"
+    video_path.write_bytes(b"video")
+    original_popen = subprocess.Popen
+
+    monkeypatch.setattr(
+        frame_extractor_module,
+        "get_video_resolution",
+        lambda *_args, **_kwargs: (2, 2),
+    )
+    monkeypatch.setattr(
+        frame_extractor_module,
+        "get_video_codec_name",
+        lambda *_args, **_kwargs: "hevc",
+    )
+
+    def fake_popen(cmd, **kwargs):
+        script = (
+            "import sys\n"
+            "sys.stdout.buffer.write(bytes(range(12)))\n"
+            "sys.stdout.flush()\n"
+            "sys.stderr.write('x' * 200000)\n"
+            "sys.stderr.write('\\nCUDA-TAIL\\n')\n"
+            "sys.stderr.flush()\n"
+            "sys.exit(1)\n"
+        )
+        return original_popen(
+            [sys.executable, "-c", script],
+            stdout=kwargs.get("stdout"),
+            stderr=kwargs.get("stderr"),
+            env=kwargs.get("env"),
+        )
+
+    monkeypatch.setattr(frame_extractor_module.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(frame_extractor_module.FFmpegCudaDecodeError, match="CUDA-TAIL"):
+        await asyncio.wait_for(
+            asyncio.to_thread(
+                lambda: list(
+                    frame_extractor_module.iter_ffmpeg_cuda_frame_batches(
+                        video_path,
+                        1.0,
+                        batch_size=1,
+                    )
+                )
+            ),
+            timeout=5.0,
+        )
 
 
 def test_resolve_decode_backend_auto_prefers_ffmpeg_cuda_before_torchcodec(
@@ -1615,6 +1850,85 @@ async def test_backend_index_anime_passes_decode_backend_and_precision_flags(
     assert "torchcodec_cuda" in captured_cmd
     assert "--precision" in captured_cmd
     assert "fp16" in captured_cmd
+
+
+@pytest.mark.asyncio
+async def test_stream_searcher_command_drains_stderr_and_reports_tail(
+    tmp_path: Path,
+) -> None:
+    cmd = [
+        sys.executable,
+        "-c",
+        (
+            "import sys\n"
+            "sys.stderr.write('x' * 200000)\n"
+            "sys.stderr.write('\\nTAIL-MARKER\\n')\n"
+            "sys.stderr.flush()\n"
+            "sys.exit(1)\n"
+        ),
+    ]
+
+    progress_events = await asyncio.wait_for(
+        _collect_progress(
+            AnimeLibraryService._stream_searcher_command(
+                cmd=cmd,
+                cwd=tmp_path,
+                total_files=1,
+                status="indexing",
+                progress_start=0.35,
+                progress_span=0.60,
+            )
+        ),
+        timeout=5.0,
+    )
+
+    assert len(progress_events) == 1
+    assert progress_events[0].status == "error"
+    assert "TAIL-MARKER" in (progress_events[0].error or "")
+
+
+@pytest.mark.asyncio
+async def test_stream_searcher_command_maps_file_progress_events(
+    tmp_path: Path,
+) -> None:
+    payload = {
+        "event": "file_progress",
+        "message": "Processing Demo/ep1.mp4 (batch 3, frames 48)",
+        "current_file": "Demo/ep1.mp4",
+        "progress": 0.42,
+        "total_files": 3,
+        "completed_files": 1,
+    }
+    cmd = [
+        sys.executable,
+        "-c",
+        (
+            "import json, sys\n"
+            f"sys.stdout.write({json.dumps(json.dumps(payload))} + '\\n')\n"
+            "sys.stdout.flush()\n"
+        ),
+    ]
+
+    progress_events = await asyncio.wait_for(
+        _collect_progress(
+            AnimeLibraryService._stream_searcher_command(
+                cmd=cmd,
+                cwd=tmp_path,
+                total_files=3,
+                status="indexing",
+                progress_start=0.35,
+                progress_span=0.60,
+            )
+        ),
+        timeout=5.0,
+    )
+
+    assert len(progress_events) == 1
+    assert progress_events[0].status == "indexing"
+    assert progress_events[0].current_file == "Demo/ep1.mp4"
+    assert progress_events[0].completed_files == 1
+    assert progress_events[0].total_files == 3
+    assert progress_events[0].message == "Processing Demo/ep1.mp4 (batch 3, frames 48)"
 
 
 @pytest.mark.asyncio

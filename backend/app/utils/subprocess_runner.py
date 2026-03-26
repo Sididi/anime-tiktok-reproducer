@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -27,8 +29,32 @@ async def terminate_process(
     process: asyncio.subprocess.Process,
     *,
     terminate_grace_seconds: float = 3.0,
+    kill_group: bool = False,
 ) -> None:
     """Terminate a subprocess and escalate to kill if needed."""
+    if kill_group and process.pid is not None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        else:
+            try:
+                await asyncio.wait_for(process.wait(), timeout=terminate_grace_seconds)
+                return
+            except (asyncio.TimeoutError, ProcessLookupError):
+                pass
+
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+
+        try:
+            await process.wait()
+        except ProcessLookupError:
+            pass
+        return
+
     if process.returncode is not None:
         return
 

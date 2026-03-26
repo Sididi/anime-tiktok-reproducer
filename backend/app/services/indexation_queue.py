@@ -140,10 +140,14 @@ class IndexationQueueService:
                     )
                 elif progress.status == "error":
                     job.status = "error"
-                    job.error = progress.error
+                    job.phase = "error"
+                    job.error = progress.error or progress.message or "Indexation failed"
+                    self._broadcast(job)
+                    return
                 self._broadcast(job)
         except Exception as e:
             job.status = "error"
+            job.phase = "error"
             job.error = str(e)
             self._broadcast(job)
             logger.exception("Indexation job %s failed", job.id)
