@@ -96,6 +96,13 @@ class IndexationJob(BaseModel):
     progress: float = 0.0
     phase: str | None = None
     message: str | None = None
+    current_file: str | None = None
+    total_files: int = 0
+    completed_files: int = 0
+    current_file_progress: float | None = None
+    current_file_frames_processed: int | None = None
+    current_file_total_frames: int | None = None
+    current_file_batches_processed: int | None = None
     error: str | None = None
     warnings: list[str] = Field(default_factory=list)
     unmatched_files: list[str] = []  # files not linked to any torrent

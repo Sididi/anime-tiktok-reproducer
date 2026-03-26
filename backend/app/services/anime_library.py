@@ -44,6 +44,10 @@ class IndexProgress:
     anime_name: str | None = None
     prepared_library_paths: list[str] | None = None
     warnings: list[str] | None = None
+    current_file_progress: float | None = None
+    current_file_frames_processed: int | None = None
+    current_file_total_frames: int | None = None
+    current_file_batches_processed: int | None = None
 
     def to_dict(self) -> dict:
         payload = {
@@ -61,6 +65,14 @@ class IndexProgress:
             payload["prepared_library_paths"] = self.prepared_library_paths
         if self.warnings is not None:
             payload["warnings"] = self.warnings
+        if self.current_file_progress is not None:
+            payload["current_file_progress"] = self.current_file_progress
+        if self.current_file_frames_processed is not None:
+            payload["current_file_frames_processed"] = self.current_file_frames_processed
+        if self.current_file_total_frames is not None:
+            payload["current_file_total_frames"] = self.current_file_total_frames
+        if self.current_file_batches_processed is not None:
+            payload["current_file_batches_processed"] = self.current_file_batches_processed
         return payload
 
 
@@ -357,6 +369,40 @@ class AnimeLibraryService:
             total_files_value = int(payload.get("total_files", total_files))
         except (TypeError, ValueError):
             total_files_value = total_files
+        try:
+            current_file_progress = payload.get("current_file_progress")
+            current_file_progress_value = (
+                None
+                if current_file_progress is None
+                else max(0.0, min(1.0, float(current_file_progress)))
+            )
+        except (TypeError, ValueError):
+            current_file_progress_value = None
+        try:
+            current_file_frames_processed = payload.get("current_file_frames_processed")
+            current_file_frames_processed_value = (
+                None
+                if current_file_frames_processed is None
+                else int(current_file_frames_processed)
+            )
+        except (TypeError, ValueError):
+            current_file_frames_processed_value = None
+        try:
+            current_file_total_frames = payload.get("current_file_total_frames")
+            current_file_total_frames_value = (
+                None if current_file_total_frames is None else int(current_file_total_frames)
+            )
+        except (TypeError, ValueError):
+            current_file_total_frames_value = None
+        try:
+            current_file_batches_processed = payload.get("current_file_batches_processed")
+            current_file_batches_processed_value = (
+                None
+                if current_file_batches_processed is None
+                else int(current_file_batches_processed)
+            )
+        except (TypeError, ValueError):
+            current_file_batches_processed_value = None
 
         return IndexProgress(
             status=status,
@@ -365,6 +411,10 @@ class AnimeLibraryService:
             progress=progress_start + progress_span * progress_value,
             total_files=total_files_value,
             completed_files=completed_files,
+            current_file_progress=current_file_progress_value,
+            current_file_frames_processed=current_file_frames_processed_value,
+            current_file_total_frames=current_file_total_frames_value,
+            current_file_batches_processed=current_file_batches_processed_value,
         )
 
     @classmethod
@@ -395,6 +445,14 @@ class AnimeLibraryService:
         return cls._preview_generation_lock
 
     @classmethod
+    def is_transient_library_video_path(cls, path: Path) -> bool:
+        """Return True for importer-owned temporary media artifacts."""
+        if path.suffix.lower() not in cls.VIDEO_EXTENSIONS:
+            return False
+        stem = path.stem.lower()
+        return stem.endswith(".import.tmp") or stem.endswith(".normalize.tmp")
+
+    @classmethod
     def _get_preview_proxy_lock(cls, source_path: Path) -> threading.Lock:
         """Return a per-source lock to serialize sync preview proxy generation."""
         key = str(source_path.resolve())
@@ -418,7 +476,11 @@ class AnimeLibraryService:
 
         if library_path.exists():
             for entry in library_path.rglob("*"):
-                if not entry.is_file() or entry.suffix.lower() not in cls.VIDEO_EXTENSIONS:
+                if (
+                    not entry.is_file()
+                    or entry.suffix.lower() not in cls.VIDEO_EXTENSIONS
+                    or cls.is_transient_library_video_path(entry)
+                ):
                     continue
                 resolved = str(entry.resolve())
                 episodes.append(resolved)
@@ -551,7 +613,11 @@ class AnimeLibraryService:
             return sorted(
                 entry
                 for entry in folder.iterdir()
-                if entry.is_file() and entry.suffix.lower() in cls.VIDEO_EXTENSIONS
+                if (
+                    entry.is_file()
+                    and entry.suffix.lower() in cls.VIDEO_EXTENSIONS
+                    and not cls.is_transient_library_video_path(entry)
+                )
             )
         except (OSError, PermissionError):
             return []
@@ -2937,9 +3003,14 @@ class AnimeLibraryService:
             # --- ProRes 422 LT transcode for Premiere-incompatible codecs ---
             tmp_suffix = ".import.tmp.mov"
             tmp_dest = preferred_dest.with_name(f"{preferred_dest.stem}{tmp_suffix}")
+
+            async def _cleanup_tmp_dest() -> None:
+                if tmp_dest.exists():
+                    with suppress(OSError):
+                        await asyncio.to_thread(tmp_dest.unlink)
+
             if tmp_dest.exists():
-                with suppress(OSError):
-                    await asyncio.to_thread(tmp_dest.unlink)
+                await _cleanup_tmp_dest()
 
             gpu_error: str | None = None
             try:
@@ -2956,9 +3027,7 @@ class AnimeLibraryService:
                     gpu_error = cls._format_media_failure(gpu_result)
 
             if gpu_error is not None:
-                if tmp_dest.exists():
-                    with suppress(OSError):
-                        await asyncio.to_thread(tmp_dest.unlink)
+                await _cleanup_tmp_dest()
                 try:
                     cpu_result = await run_command(
                         rewrite_media_command(
@@ -2967,6 +3036,7 @@ class AnimeLibraryService:
                         timeout_seconds=cls.PRORES_TRANSCODE_TIMEOUT_SECONDS,
                     )
                 except (CommandTimeoutError, FileNotFoundError) as exc:
+                    await _cleanup_tmp_dest()
                     logger.error(
                         "ProRes transcode failed for %s (GPU: %s; CPU: %s)",
                         source_path.name,
@@ -2982,6 +3052,7 @@ class AnimeLibraryService:
                     cpu_result = None
                 else:
                     if cpu_result.returncode != 0:
+                        await _cleanup_tmp_dest()
                         logger.error(
                             "ProRes transcode failed for %s (GPU: %s; CPU: %s)",
                             source_path.name,
@@ -3009,8 +3080,7 @@ class AnimeLibraryService:
                         "ProRes transcode output failed validation for %s",
                         source_path.name,
                     )
-                    with suppress(OSError):
-                        await asyncio.to_thread(tmp_dest.unlink)
+                    await _cleanup_tmp_dest()
                     fallback_dest = dest_dir / source_path.name
                     if fallback_dest != source_path or not fallback_dest.exists():
                         await asyncio.to_thread(shutil.copy2, source_path, fallback_dest)
@@ -3976,7 +4046,11 @@ class AnimeLibraryService:
                 video_files_on_disk = [
                     f
                     for f in series_dir.iterdir()
-                    if f.is_file() and f.suffix.lower() in cls.VIDEO_EXTENSIONS
+                    if (
+                        f.is_file()
+                        and f.suffix.lower() in cls.VIDEO_EXTENSIONS
+                        and not cls.is_transient_library_video_path(f)
+                    )
                 ]
             except OSError:
                 pass

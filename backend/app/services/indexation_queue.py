@@ -103,6 +103,13 @@ class IndexationQueueService:
                 job.progress = progress.progress
                 job.phase = progress.status
                 job.message = progress.message
+                job.current_file = progress.current_file or None
+                job.total_files = progress.total_files
+                job.completed_files = progress.completed_files
+                job.current_file_progress = progress.current_file_progress
+                job.current_file_frames_processed = progress.current_file_frames_processed
+                job.current_file_total_frames = progress.current_file_total_frames
+                job.current_file_batches_processed = progress.current_file_batches_processed
                 if progress.warnings:
                     for warning in progress.warnings:
                         if warning not in job.warnings:
@@ -159,7 +166,11 @@ class IndexationQueueService:
         return sorted(
             entry
             for entry in source_folder.iterdir()
-            if entry.is_file() and entry.suffix.lower() in VIDEO_EXTENSIONS
+            if (
+                entry.is_file()
+                and entry.suffix.lower() in VIDEO_EXTENSIONS
+                and not AnimeLibraryService.is_transient_library_video_path(entry)
+            )
         )
 
     async def _link_torrents(self, job: IndexationJob) -> None:

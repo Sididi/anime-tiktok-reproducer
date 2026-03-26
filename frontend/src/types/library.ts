@@ -39,6 +39,13 @@ export interface IndexationJob {
   progress: number;
   phase: string | null;
   message: string | null;
+  current_file: string | null;
+  total_files: number;
+  completed_files: number;
+  current_file_progress: number | null;
+  current_file_frames_processed: number | null;
+  current_file_total_frames: number | null;
+  current_file_batches_processed: number | null;
   error: string | null;
   warnings: string[];
   unmatched_files: string[];

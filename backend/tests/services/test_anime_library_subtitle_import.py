@@ -552,6 +552,72 @@ class TestSubtitleExtractionDuringImport(TestCase):
             probe=source_probe,
         )
 
+    def test_failed_prores_fallback_cleans_up_tmp_mov_before_copying_source(self) -> None:
+        """A failed AV1->ProRes import removes leaked temp MOV output before fallback copy."""
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            tmp_dir = Path(tmp_dir_raw)
+            source = tmp_dir / "source" / "episode.mkv"
+            dest_dir = tmp_dir / "library" / "Anime"
+            source.parent.mkdir(parents=True, exist_ok=True)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(b"source-video")
+
+            source_probe = _make_probe(
+                source,
+                video_codec="av1",
+                subtitle_streams=(),
+            )
+            fallback_dest = dest_dir / source.name
+            tmp_dest = dest_dir / "episode.import.tmp.mov"
+            run_count = 0
+
+            async def _fake_run_command(_cmd, *, timeout_seconds):
+                nonlocal run_count
+                run_count += 1
+                tmp_dest.write_bytes(f"partial-{run_count}".encode("utf-8"))
+                return CommandResult(returncode=1, stdout=b"", stderr=b"transcode failed")
+
+            with (
+                patch.object(
+                    AnimeLibraryService,
+                    "get_primary_video_codec_sync",
+                    return_value="av1",
+                ),
+                patch.object(
+                    AnimeLibraryService,
+                    "_source_matches_prepared_sync",
+                    return_value=False,
+                ),
+                patch.object(
+                    AnimeLibraryService,
+                    "_probe_media_sync",
+                    return_value=source_probe,
+                ),
+                patch(
+                    "app.services.anime_library.run_command",
+                    side_effect=_fake_run_command,
+                ),
+                patch.object(
+                    AnimeLibraryService,
+                    "_record_source_import_manifest_sync",
+                ) as mock_record_manifest,
+            ):
+                actual, action, changed = self._run(
+                    AnimeLibraryService._prepare_single_source_for_library(
+                        source_path=source,
+                        dest_dir=dest_dir,
+                    )
+                )
+
+            self.assertEqual(actual, fallback_dest)
+            self.assertEqual(action, "Copying (ProRes failed)")
+            self.assertTrue(changed)
+            self.assertEqual(run_count, 2)
+            self.assertTrue(fallback_dest.exists())
+            self.assertEqual(fallback_dest.read_bytes(), b"source-video")
+            self.assertFalse(tmp_dest.exists())
+            mock_record_manifest.assert_called_once_with(source, fallback_dest)
+
     def test_source_matches_prepared_rejects_unprobeable_file(self) -> None:
         """Prepared-file reuse requires both manifest match and a readable video probe."""
         with tempfile.TemporaryDirectory() as tmp_dir_raw:

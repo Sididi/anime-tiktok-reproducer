@@ -169,6 +169,15 @@ def test_parallel_file_indexer_combines_multi_batch_file(monkeypatch: pytest.Mon
         "anime_searcher.indexer.pipeline.extract_frames",
         lambda *args, **kwargs: iter(frames),
     )
+    monkeypatch.setattr(
+        "anime_searcher.indexer.pipeline.probe_video_info",
+        lambda *args, **kwargs: frame_extractor_module.VideoProbeInfo(
+            width=2,
+            height=2,
+            codec_name="h264",
+            duration_seconds=2.5,
+        ),
+    )
 
     class DummyEmbedder:
         device = "cpu"
@@ -208,6 +217,96 @@ def test_parallel_file_indexer_combines_multi_batch_file(monkeypatch: pytest.Mon
     result = outputs[1]
     assert result.embeddings.shape == (5, EMBEDDING_DIM)
     assert result.timestamps == [0.0, 1.0, 2.0, 3.0, 4.0]
+
+
+def test_find_video_files_skips_transient_library_temp_media(tmp_path: Path) -> None:
+    library_path = tmp_path / "library"
+    series_dir = library_path / "Demo"
+    series_dir.mkdir(parents=True)
+
+    real_episode = series_dir / "episode01.mkv"
+    transient_import = series_dir / "episode01.import.tmp.mov"
+    transient_normalize = series_dir / "episode01.normalize.tmp.mp4"
+    real_episode.write_bytes(b"real")
+    transient_import.write_bytes(b"tmp-import")
+    transient_normalize.write_bytes(b"tmp-normalize")
+
+    discovered = sorted(
+        path.name for path in frame_extractor_module.find_video_files(library_path)
+    )
+
+    assert discovered == ["episode01.mkv"]
+
+
+def test_library_scans_ignore_transient_temp_media(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    library_path = tmp_path / "anime"
+    series_dir = library_path / "Demo"
+    series_dir.mkdir(parents=True)
+
+    real_episode = series_dir / "episode01.mkv"
+    transient_import = series_dir / "episode01.import.tmp.mov"
+    transient_normalize = series_dir / "episode01.normalize.tmp.mp4"
+    real_episode.write_bytes(b"real-episode")
+    transient_import.write_bytes(b"tmp-import")
+    transient_normalize.write_bytes(b"tmp-normalize")
+
+    index_dir = library_path / AnimeLibraryService.INDEX_DIR_NAME
+    index_dir.mkdir(parents=True)
+    (index_dir / AnimeLibraryService.MANIFEST_FILE).write_text(
+        json.dumps(
+            {
+                "version": AnimeLibraryService.SEARCHER_INDEX_FORMAT_VERSION,
+                "engine_profile": AnimeLibraryService.SEARCHER_ENGINE_PROFILE,
+                "config": {"default_fps": 2.0},
+                "series": {"Demo": {"fps": 2.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (index_dir / AnimeLibraryService.STATE_FILE).write_text(
+        json.dumps(
+            {
+                "files": {
+                    "Demo/episode01.mkv": {
+                        "mtime_ns": 1,
+                        "size": real_episode.stat().st_size,
+                        "frame_count": 12,
+                        "episode": "episode01",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manifest_cache_path = tmp_path / "episodes_manifest__anime.json"
+    AnimeLibraryService._episode_manifest_cache.clear()
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "get_library_path",
+        classmethod(lambda cls, library_type=None: library_path),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "get_episode_manifest_path",
+        classmethod(lambda cls, library_type=None: manifest_cache_path),
+    )
+
+    manifest = AnimeLibraryService._scan_library_episodes_sync("anime")
+    details = AnimeLibraryService._get_source_details_sync("anime")
+
+    assert manifest["episodes"] == [str(real_episode.resolve())]
+    assert details == [
+        {
+            "name": "Demo",
+            "episode_count": 1,
+            "total_size_bytes": real_episode.stat().st_size,
+            "fps": 2.0,
+            "missing_episodes": 0,
+            "purge_protected": False,
+            "original_index_path": None,
+        }
+    ]
 
 
 def test_parallel_file_indexer_torchcodec_backend_embeds_decoded_batches(
@@ -300,6 +399,15 @@ def test_parallel_file_indexer_ffmpeg_cuda_backend_embeds_decoded_batches(
         "anime_searcher.indexer.pipeline.iter_ffmpeg_cuda_frame_batches",
         lambda *args, **kwargs: iter(decoded_batches),
     )
+    monkeypatch.setattr(
+        "anime_searcher.indexer.pipeline.probe_video_info",
+        lambda *args, **kwargs: frame_extractor_module.VideoProbeInfo(
+            width=8,
+            height=8,
+            codec_name="hevc",
+            duration_seconds=1.5,
+        ),
+    )
 
     class DummyEmbedder:
         device = "cuda"
@@ -368,6 +476,15 @@ def test_parallel_file_indexer_ffmpeg_cuda_falls_back_to_ffmpeg_cpu_on_decode_er
         "anime_searcher.indexer.pipeline.extract_frames",
         lambda *args, **kwargs: iter(frames),
     )
+    monkeypatch.setattr(
+        "anime_searcher.indexer.pipeline.probe_video_info",
+        lambda *args, **kwargs: frame_extractor_module.VideoProbeInfo(
+            width=2,
+            height=2,
+            codec_name="hevc",
+            duration_seconds=2.0,
+        ),
+    )
 
     class DummyEmbedder:
         device = "cuda"
@@ -414,6 +531,15 @@ def test_parallel_file_indexer_skips_unreadable_file_instead_of_aborting(
         "anime_searcher.indexer.pipeline.extract_frames",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             frame_extractor_module.UnreadableVideoError("invalid media stream")
+        ),
+    )
+    monkeypatch.setattr(
+        "anime_searcher.indexer.pipeline.probe_video_info",
+        lambda *args, **kwargs: frame_extractor_module.VideoProbeInfo(
+            width=2,
+            height=2,
+            codec_name="h264",
+            duration_seconds=1.0,
         ),
     )
 
@@ -467,6 +593,15 @@ def test_parallel_file_indexer_emits_heartbeat_events_for_slow_batches(
     monkeypatch.setattr(
         "anime_searcher.indexer.pipeline.extract_frames",
         lambda *args, **kwargs: iter(frames),
+    )
+    monkeypatch.setattr(
+        "anime_searcher.indexer.pipeline.probe_video_info",
+        lambda *args, **kwargs: frame_extractor_module.VideoProbeInfo(
+            width=2,
+            height=2,
+            codec_name="h264",
+            duration_seconds=2.0,
+        ),
     )
     monkeypatch.setattr(
         "anime_searcher.indexer.pipeline.time.monotonic",
@@ -534,8 +669,13 @@ def test_index_files_emits_file_progress_events(
         decode_fallbacks = 0
 
         def run(self, jobs: list[IndexingJob]):
-            yield FileStartedEvent(job=jobs[0])
-            yield FileProgressEvent(job=jobs[0], batches_processed=3, frames_processed=48)
+            yield FileStartedEvent(job=jobs[0], current_file_total_frames=120)
+            yield FileProgressEvent(
+                job=jobs[0],
+                batches_processed=3,
+                frames_processed=48,
+                current_file_total_frames=120,
+            )
             yield IndexedFileResult(
                 job=jobs[0],
                 timestamps=[0.0, 1.0],
@@ -582,6 +722,92 @@ def test_index_files_emits_file_progress_events(
     assert heartbeat["current_file"] == "Demo/ep1.mp4"
     assert heartbeat["completed_files"] == 0
     assert heartbeat["total_files"] == 1
+    assert heartbeat["current_file_progress"] == pytest.approx(0.4)
+    assert heartbeat["current_file_frames_processed"] == 48
+    assert heartbeat["current_file_total_frames"] == 120
+    assert heartbeat["current_file_batches_processed"] == 3
+    assert heartbeat["progress"] == pytest.approx(0.4)
+
+
+def test_index_files_keeps_nullable_current_file_progress_when_total_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    library_root = tmp_path / "library"
+    library_path = library_root / "anime"
+    series_dir = library_path / "Demo"
+    series_dir.mkdir(parents=True)
+    video_path = series_dir / "ep1.mp4"
+    video_path.write_bytes(b"video")
+    model_path = _dummy_model(tmp_path)
+    emitted: list[dict[str, object]] = []
+
+    manager = IndexManager(library_path)
+    manager.load_or_create(2.0)
+
+    class DummyEmbedder:
+        device = "cpu"
+        resolved_precision = "fp32"
+
+    class DummyPipeline:
+        file_workers = 1
+        decode_backend = "ffmpeg_cpu"
+        decode_fallbacks = 0
+
+        def run(self, jobs: list[IndexingJob]):
+            yield FileStartedEvent(job=jobs[0], current_file_total_frames=None)
+            yield FileProgressEvent(
+                job=jobs[0],
+                batches_processed=3,
+                frames_processed=48,
+                current_file_total_frames=None,
+            )
+            yield IndexedFileResult(
+                job=jobs[0],
+                timestamps=[0.0, 1.0],
+                embeddings=_make_vectors(2, 0),
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        cli_module,
+        "_create_pipeline",
+        lambda *args, **kwargs: (
+            DummyEmbedder(),
+            DummyPipeline(),
+            MediaBinaryProfile("test", "/usr/bin/ffmpeg", "/usr/bin/ffprobe"),
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_emit_progress_event",
+        lambda enabled, **payload: emitted.append(payload) if enabled else None,
+    )
+
+    cli_module._index_files(
+        files_to_index=[video_path],
+        index_manager=manager,
+        fps_by_series={"Demo": 2.0},
+        model_path=model_path,
+        batch_size=8,
+        fast=True,
+        prefetch_batches=2,
+        transform_workers=1,
+        require_gpu=False,
+        decode_backend="ffmpeg_cpu",
+        precision="fp32",
+        replace_existing_files=False,
+        progress_json=True,
+    )
+
+    heartbeat = next(event for event in emitted if event["event"] == "file_progress")
+    assert heartbeat["current_file_progress"] is None
+    assert heartbeat["current_file_frames_processed"] == 48
+    assert heartbeat["current_file_total_frames"] is None
+    assert heartbeat["current_file_batches_processed"] == 3
+    assert heartbeat["progress"] == pytest.approx(0.3)
 
 
 def test_run_benchmark_reports_decode_backend_and_precision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -624,6 +850,46 @@ def test_run_benchmark_reports_decode_backend_and_precision(tmp_path: Path, monk
     assert result.precision == "fp16"
 
 
+def test_probe_video_info_returns_combined_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    video_path = tmp_path / "episode.mp4"
+    video_path.write_bytes(b"video")
+    profile = MediaBinaryProfile("system", "/usr/bin/ffmpeg", "/usr/bin/ffprobe")
+
+    class DummyCompletedProcess:
+        def __init__(self, stdout: str) -> None:
+            self.stdout = stdout
+            self.stderr = ""
+
+    monkeypatch.setattr(
+        frame_extractor_module.subprocess,
+        "run",
+        lambda *args, **kwargs: DummyCompletedProcess(
+            json.dumps(
+                {
+                    "streams": [
+                        {"width": 1920, "height": 1080, "codec_name": "hevc"},
+                    ],
+                    "format": {"duration": "57.5"},
+                }
+            )
+        ),
+    )
+
+    frame_extractor_module.probe_video_info.cache_clear()
+    probe_info = frame_extractor_module.probe_video_info(
+        video_path,
+        media_profile=profile,
+    )
+
+    assert probe_info.width == 1920
+    assert probe_info.height == 1080
+    assert probe_info.codec_name == "hevc"
+    assert probe_info.duration_seconds == pytest.approx(57.5)
+
+
 def test_iter_ffmpeg_cuda_frame_batches_uses_nvdec_command_and_returns_tensors(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -649,8 +915,16 @@ def test_iter_ffmpeg_cuda_frame_batches_uses_nvdec_command_and_returns_tensors(
         captured_cmd = cmd
         return DummyProcess()
 
-    monkeypatch.setattr(frame_extractor_module, "get_video_resolution", lambda *_args, **_kwargs: (2, 2))
-    monkeypatch.setattr(frame_extractor_module, "get_video_codec_name", lambda *_args, **_kwargs: "hevc")
+    monkeypatch.setattr(
+        frame_extractor_module,
+        "probe_video_info",
+        lambda *_args, **_kwargs: frame_extractor_module.VideoProbeInfo(
+            width=2,
+            height=2,
+            codec_name="hevc",
+            duration_seconds=2.0,
+        ),
+    )
     monkeypatch.setattr(frame_extractor_module.subprocess, "Popen", fake_popen)
 
     batches = list(
@@ -686,8 +960,13 @@ async def test_extract_frames_drains_stderr_and_raises_on_nonzero_exit(
 
     monkeypatch.setattr(
         frame_extractor_module,
-        "get_video_resolution",
-        lambda *_args, **_kwargs: (2, 2),
+        "probe_video_info",
+        lambda *_args, **_kwargs: frame_extractor_module.VideoProbeInfo(
+            width=2,
+            height=2,
+            codec_name="hevc",
+            duration_seconds=2.0,
+        ),
     )
 
     def fake_popen(cmd, **kwargs):
@@ -727,13 +1006,13 @@ async def test_iter_ffmpeg_cuda_frame_batches_drains_stderr_and_raises_on_nonzer
 
     monkeypatch.setattr(
         frame_extractor_module,
-        "get_video_resolution",
-        lambda *_args, **_kwargs: (2, 2),
-    )
-    monkeypatch.setattr(
-        frame_extractor_module,
-        "get_video_codec_name",
-        lambda *_args, **_kwargs: "hevc",
+        "probe_video_info",
+        lambda *_args, **_kwargs: frame_extractor_module.VideoProbeInfo(
+            width=2,
+            height=2,
+            codec_name="hevc",
+            duration_seconds=2.0,
+        ),
     )
 
     def fake_popen(cmd, **kwargs):
@@ -832,7 +1111,16 @@ def test_select_ffmpeg_cuda_media_profile_prefers_system_binary_when_managed_pro
     monkeypatch.setattr(frame_extractor_module, "_explicit_media_profile", lambda: None)
     monkeypatch.setattr(frame_extractor_module, "_current_media_profile", lambda: managed)
     monkeypatch.setattr(frame_extractor_module, "_system_media_profile", lambda: system)
-    monkeypatch.setattr(frame_extractor_module, "get_video_codec_name", lambda *_args, **_kwargs: "hevc")
+    monkeypatch.setattr(
+        frame_extractor_module,
+        "probe_video_info",
+        lambda *_args, **_kwargs: frame_extractor_module.VideoProbeInfo(
+            width=1920,
+            height=1080,
+            codec_name="hevc",
+            duration_seconds=60.0,
+        ),
+    )
     monkeypatch.setattr(
         frame_extractor_module,
         "_probe_ffmpeg_cuda",
@@ -1634,6 +1922,10 @@ def test_backend_parses_structured_searcher_progress_events() -> None:
                 "progress": 0.5,
                 "completed_files": 1,
                 "total_files": 2,
+                "current_file_progress": 1.0,
+                "current_file_frames_processed": 114,
+                "current_file_total_frames": 114,
+                "current_file_batches_processed": 8,
             }
         ),
         status="indexing",
@@ -1648,6 +1940,10 @@ def test_backend_parses_structured_searcher_progress_events() -> None:
     assert progress.completed_files == 1
     assert progress.total_files == 2
     assert progress.progress == pytest.approx(0.65)
+    assert progress.current_file_progress == pytest.approx(1.0)
+    assert progress.current_file_frames_processed == 114
+    assert progress.current_file_total_frames == 114
+    assert progress.current_file_batches_processed == 8
 
     error = AnimeLibraryService._parse_searcher_progress_line(
         line=json.dumps({"event": "error", "error": "boom"}),
@@ -1898,6 +2194,10 @@ async def test_stream_searcher_command_maps_file_progress_events(
         "progress": 0.42,
         "total_files": 3,
         "completed_files": 1,
+        "current_file_progress": 0.4,
+        "current_file_frames_processed": 48,
+        "current_file_total_frames": 120,
+        "current_file_batches_processed": 3,
     }
     cmd = [
         sys.executable,
@@ -1929,6 +2229,10 @@ async def test_stream_searcher_command_maps_file_progress_events(
     assert progress_events[0].completed_files == 1
     assert progress_events[0].total_files == 3
     assert progress_events[0].message == "Processing Demo/ep1.mp4 (batch 3, frames 48)"
+    assert progress_events[0].current_file_progress == pytest.approx(0.4)
+    assert progress_events[0].current_file_frames_processed == 48
+    assert progress_events[0].current_file_total_frames == 120
+    assert progress_events[0].current_file_batches_processed == 3
 
 
 @pytest.mark.asyncio

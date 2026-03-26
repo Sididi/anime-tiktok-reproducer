@@ -231,6 +231,77 @@ async def test_queue_preserves_warnings_from_index_progress(
 
 
 @pytest.mark.asyncio
+async def test_queue_preserves_current_file_progress_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = IndexationQueueService()
+    gate = asyncio.Event()
+
+    async def fake_index_anime(
+        *,
+        source_folder: Path,
+        library_type: LibraryType | str | None = None,
+        anime_name: str | None = None,
+        fps: float = 2.0,
+        **_: object,
+    ):
+        yield IndexProgress(
+            status="indexing",
+            progress=0.52,
+            message="Processing Demo/ep1.mp4 (batch 3, frames 48)",
+            current_file="Demo/ep1.mp4",
+            total_files=4,
+            completed_files=1,
+            current_file_progress=0.4,
+            current_file_frames_processed=48,
+            current_file_total_frames=120,
+            current_file_batches_processed=3,
+        )
+        await gate.wait()
+        yield IndexProgress(status="complete", progress=1.0, message=f"done {anime_name}")
+
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "index_anime",
+        classmethod(lambda cls, **kwargs: fake_index_anime(**kwargs)),
+    )
+    monkeypatch.setattr(AnimeMatcherService, "mark_series_updated", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service, "_link_torrents", lambda job: asyncio.sleep(0))
+    monkeypatch.setattr(
+        StorageBoxRepository,
+        "publish_series",
+        classmethod(
+            lambda cls, library_type, display_name, series_id=None: _async_value(
+                {
+                    "series_id": series_id or f"series-{display_name.lower()}",
+                    "release_id": f"release-{display_name.lower()}",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        LibraryHydrationService,
+        "sync_local_series_state",
+        classmethod(lambda cls, **kwargs: _async_value(None)),
+    )
+
+    job_id = await service.enqueue("/tmp/demo", LibraryType.ANIME, "Demo", 2.0)
+    await _wait_for(lambda: service.list_jobs()[0].current_file == "Demo/ep1.mp4")
+
+    job = next(job for job in service.list_jobs() if job.id == job_id)
+    assert job.current_file == "Demo/ep1.mp4"
+    assert job.total_files == 4
+    assert job.completed_files == 1
+    assert job.current_file_progress == pytest.approx(0.4)
+    assert job.current_file_frames_processed == 48
+    assert job.current_file_total_frames == 120
+    assert job.current_file_batches_processed == 3
+
+    gate.set()
+    await _wait_for(lambda: service.list_jobs()[0].status == "complete")
+
+
+@pytest.mark.asyncio
 async def test_failed_job_releases_slot_while_parallel_job_keeps_running(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
