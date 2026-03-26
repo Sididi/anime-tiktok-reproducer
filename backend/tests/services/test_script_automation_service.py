@@ -603,7 +603,8 @@ async def test_stream_automation_v3_reuses_seed_and_prefixes_each_chunk(
         "[TikTok narrator, energetic, rapid] Chunk 1.",
         "[TikTok narrator, energetic, rapid] Chunk 2.",
     ]
-    assert all(call.get("previous_request_ids") is None for call in synthesize_calls)
+    assert synthesize_calls[0].get("previous_request_ids") is None
+    assert synthesize_calls[1].get("previous_request_ids") == ["req-1"]
     assert all("previous_text" not in call for call in synthesize_calls)
     assert all("next_text" not in call for call in synthesize_calls)
     assert all(isinstance(call.get("seed"), int) for call in synthesize_calls)
