@@ -225,7 +225,7 @@ def test_find_video_files_skips_transient_library_temp_media(tmp_path: Path) -> 
     series_dir.mkdir(parents=True)
 
     real_episode = series_dir / "episode01.mkv"
-    transient_import = series_dir / "episode01.import.tmp.mov"
+    transient_import = series_dir / "episode01.import.tmp.mp4"
     transient_normalize = series_dir / "episode01.normalize.tmp.mp4"
     real_episode.write_bytes(b"real")
     transient_import.write_bytes(b"tmp-import")
@@ -244,7 +244,7 @@ def test_library_scans_ignore_transient_temp_media(monkeypatch: pytest.MonkeyPat
     series_dir.mkdir(parents=True)
 
     real_episode = series_dir / "episode01.mkv"
-    transient_import = series_dir / "episode01.import.tmp.mov"
+    transient_import = series_dir / "episode01.import.tmp.mp4"
     transient_normalize = series_dir / "episode01.normalize.tmp.mp4"
     real_episode.write_bytes(b"real-episode")
     transient_import.write_bytes(b"tmp-import")

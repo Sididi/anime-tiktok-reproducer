@@ -231,6 +231,31 @@ class TestAnimeLibraryNormalization(TestCase):
             )
         )
 
+    def test_is_valid_normalized_probe_rejects_mov_container(self) -> None:
+        reference_probe = _make_probe(
+            Path("/tmp/source.mkv"),
+            audio_streams=(
+                _audio_stream(index=1, stream_position=0, language="ja"),
+            ),
+            selected_audio_stream_index=1,
+        )
+        normalized_probe = _make_probe(
+            Path("/tmp/source.mov"),
+            suffix=".mov",
+            video_codec="h264",
+            audio_streams=(
+                _audio_stream(index=1, stream_position=0, language="ja"),
+            ),
+            selected_audio_stream_index=1,
+        )
+
+        self.assertFalse(
+            AnimeLibraryService._is_valid_normalized_probe(
+                normalized_probe,
+                reference_probe=reference_probe,
+            )
+        )
+
     def test_normalize_source_for_processing_rebuilds_from_original_import_when_audio_policy_changes(self) -> None:
         async def _run() -> None:
             source_path = Path("/tmp/library/episode.mp4")
@@ -343,23 +368,23 @@ class TestAnimeLibraryNormalization(TestCase):
         self.assertIn("Error opening output files", formatted)
         self.assertNotIn("ffmpeg version", formatted)
 
-    def test_format_media_failure_keeps_muxer_support_error_when_present(self) -> None:
+    def test_format_media_failure_keeps_mp4_muxer_support_error_when_present(self) -> None:
         result = CommandResult(
             returncode=1,
             stdout=b"",
             stderr=(
                 b"Stream mapping:\n"
-                b"  Stream #0:0 -> #0:0 (av1 (libdav1d) -> prores (prores_ks))\n"
-                b"  Stream #0:1 -> #0:1 (copy)\n"
-                b"[mov @ 0x123] opus only supported in MP4.\n"
-                b"[out#0/mov @ 0x456] Could not write header (incorrect codec parameters ?): Invalid argument\n"
+                b"  Stream #0:0 -> #0:0 (av1 (libdav1d) -> h264 (h264_nvenc))\n"
+                b"  Stream #0:1 -> #0:1 (aac (native) -> aac (native))\n"
+                b"[mp4 @ 0x123] track 1: codec frame size is not set.\n"
+                b"[out#0/mp4 @ 0x456] Could not write header (incorrect codec parameters ?): Invalid argument\n"
                 b"[vf#0:0 @ 0x789] Terminating thread with return code -22 (Invalid argument)\n"
-                b"[out#0/mov @ 0x456] Nothing was written into output file, because at least one of its streams received no packets.\n"
+                b"[out#0/mp4 @ 0x456] Nothing was written into output file, because at least one of its streams received no packets.\n"
                 b"Conversion failed!\n"
             ),
         )
 
         formatted = AnimeLibraryService._format_media_failure(result)
 
-        self.assertIn("opus only supported in MP4", formatted)
         self.assertIn("Could not write header", formatted)
+        self.assertIn("Nothing was written into output file", formatted)

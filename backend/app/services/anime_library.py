@@ -197,8 +197,7 @@ class AnimeLibraryService:
     SOURCE_NORMALIZATION_PROFILE_H264_MP4_AAC = "h264_mp4_aac"
     GPU_HWACCEL = "cuda"
     GPU_H264_ENCODER = "h264_nvenc"
-    PRORES_TRANSCODE_TIMEOUT_SECONDS = 7200.0
-    PRORES_AUDIO_CODEC = "pcm_s16le"
+    LIBRARY_IMPORT_TRANSCODE_TIMEOUT_SECONDS = 7200.0
     PREMIERE_NATIVE_VIDEO_CODECS = {"h264", "hevc"}
     _CUDA_DECODERS: dict[str, str] = {
         "av1": "av1_cuvid",
@@ -1064,17 +1063,17 @@ class AnimeLibraryService:
     def classify_source_normalization(cls, probe: SourceMediaProbe) -> str:
         """Classify the cheapest compatibility action for Premiere-safe output.
 
-        Since format normalization now happens at indexation time (incompatible
-        codecs are transcoded to ProRes, MKV→MP4 remuxed), the processing step
-        only needs to handle audio track selection and container fixups.
+        Since format normalization now happens at indexation time (unsupported
+        sources are converted to MP4), the processing step usually only needs
+        to handle audio-track selection and container fixups.
         """
         video_codec = (probe.video_codec or "").strip().lower()
         audio_codec = (probe.audio_codec or "").strip().lower()
         has_extra_audio_streams = len(probe.audio_streams) > 1
         has_subtitle_streams = len(probe.subtitle_streams) > 0
         has_data_streams = len(probe.data_streams) > 0
-        premiere_compatible_container = probe.container_suffix in {".mp4", ".mov"}
-        premiere_compatible_video = video_codec in cls.PREMIERE_NATIVE_VIDEO_CODECS or video_codec == "prores"
+        premiere_compatible_container = probe.container_suffix == ".mp4"
+        premiere_compatible_video = video_codec in cls.PREMIERE_NATIVE_VIDEO_CODECS
 
         # Already perfect: right codec, container, single audio, no junk streams.
         if (
@@ -1087,12 +1086,12 @@ class AnimeLibraryService:
         ):
             return "noop"
 
-        # Legacy: source still has an incompatible video codec (indexed before
-        # the ProRes-at-indexation feature).  Fall back to full h264 transcode.
+        # Source still has an incompatible video codec. Fall back to full H.264
+        # MP4 transcode.
         if not premiere_compatible_video:
             return "full_h264_aac_transcode"
 
-        # Container needs fixing (e.g. MKV with Premiere-native codec).
+        # Container needs fixing (for example MKV/QuickTime with a native codec).
         if not premiere_compatible_container:
             return "remux_to_mp4"
 
@@ -1111,8 +1110,7 @@ class AnimeLibraryService:
 
     @staticmethod
     def _normalized_target_path(source_path: Path) -> Path:
-        suffix = source_path.suffix.lower()
-        if suffix in {".mp4", ".mov"}:
+        if source_path.suffix.lower() == ".mp4":
             return source_path
         return source_path.with_suffix(".mp4")
 
@@ -1205,10 +1203,10 @@ class AnimeLibraryService:
     ) -> bool:
         if normalized_probe is None:
             return False
-        if normalized_probe.container_suffix not in {".mp4", ".mov"}:
+        if normalized_probe.container_suffix != ".mp4":
             return False
         video_codec = (normalized_probe.video_codec or "").strip().lower()
-        if video_codec not in cls.PREMIERE_NATIVE_VIDEO_CODECS and video_codec != "prores":
+        if video_codec not in cls.PREMIERE_NATIVE_VIDEO_CODECS:
             return False
         if normalized_probe.duration is None:
             return False
@@ -1310,61 +1308,113 @@ class AnimeLibraryService:
         return (codec or "").strip().lower() in cls.PREMIERE_NATIVE_VIDEO_CODECS
 
     @classmethod
-    def _build_gpu_prores_cmd(
+    def _build_gpu_library_import_h264_cmd(
         cls,
         source_path: Path,
         output_path: Path,
         *,
         source_codec: str | None = None,
+        probe: SourceMediaProbe,
     ) -> list[str]:
-        """GPU-decode → CPU ProRes 422 LT encode."""
+        """Build a GPU-first library-import transcode to H.264/AAC MP4."""
         codec = (source_codec or "").strip().lower()
-        cmd: list[str] = ["ffmpeg", "-y"]
+        cmd: list[str] = [
+            "ffmpeg",
+            "-y",
+            "-hwaccel",
+            cls.GPU_HWACCEL,
+            "-hwaccel_output_format",
+            cls.GPU_HWACCEL,
+        ]
         cuda_decoder = cls._CUDA_DECODERS.get(codec)
         if cuda_decoder:
-            cmd.extend(["-hwaccel", cls.GPU_HWACCEL, "-c:v", cuda_decoder])
-        cmd.extend([
-            "-i", str(source_path),
-            "-map", "0:v:0",
-            "-map", "0:a?",
-            "-map_metadata", "-1",
-            "-map_chapters", "-1",
-            "-dn", "-sn",
-            "-write_tmcd", "0",
-            "-c:v", "prores_ks",
-            "-profile:v", "1",
-            "-vendor", "apl0",
-            "-pix_fmt", "yuv422p10le",
-            # MOV cannot stream-copy Opus audio, so normalize all mapped audio
-            # tracks to PCM when building ProRes outputs.
-            "-c:a", cls.PRORES_AUDIO_CODEC,
-            str(output_path),
-        ])
+            cmd.extend(["-c:v", cuda_decoder])
+        cmd.extend(
+            [
+                "-i",
+                str(source_path),
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-map_metadata",
+                "-1",
+                "-map_chapters",
+                "-1",
+                "-dn",
+                "-sn",
+                "-write_tmcd",
+                "0",
+                "-vf",
+                "scale_cuda=format=nv12",
+                "-c:v",
+                cls.GPU_H264_ENCODER,
+                "-preset",
+                "p5",
+                "-rc",
+                "constqp",
+                "-qp",
+                "23",
+                "-b:v",
+                "0",
+                "-profile:v",
+                "high",
+            ]
+        )
+        cmd.extend(cls._build_audio_args(has_audio=probe.has_audio))
+        cmd.extend(
+            [
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ]
+        )
         return cmd
 
     @classmethod
-    def _build_cpu_prores_cmd(
+    def _build_cpu_library_import_h264_cmd(
         cls,
         source_path: Path,
         output_path: Path,
+        *,
+        probe: SourceMediaProbe,
     ) -> list[str]:
-        """CPU-only ProRes 422 LT encode (fallback when GPU decode unavailable)."""
-        return [
-            "ffmpeg", "-y",
-            "-i", str(source_path),
-            "-map", "0:v:0",
-            "-map", "0:a?",
-            "-map_metadata", "-1",
-            "-map_chapters", "-1",
-            "-dn", "-sn",
-            "-write_tmcd", "0",
-            "-c:v", "prores_ks",
-            "-profile:v", "1",
-            "-vendor", "apl0",
-            "-pix_fmt", "yuv422p10le",
-            "-c:a", cls.PRORES_AUDIO_CODEC,
-            str(output_path),
+        """Build a CPU fallback library-import transcode to H.264/AAC MP4."""
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(source_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-map_metadata",
+            "-1",
+            "-map_chapters",
+            "-1",
+            "-dn",
+            "-sn",
+            "-write_tmcd",
+            "0",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
         ]
+        cmd.extend(cls._build_audio_args(has_audio=probe.has_audio))
+        cmd.extend(
+            [
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ]
+        )
+        return cmd
 
     @classmethod
     def _build_remux_audio_select_cmd(
@@ -1493,6 +1543,33 @@ class AnimeLibraryService:
             "0",
         ] + cls._build_audio_args(has_audio=probe.has_audio) + [str(output_path)]
 
+    @classmethod
+    def _is_valid_prepared_library_probe(
+        cls,
+        prepared_probe: SourceMediaProbe | None,
+        *,
+        reference_probe: SourceMediaProbe | None = None,
+        require_h264_video: bool = False,
+    ) -> bool:
+        if prepared_probe is None:
+            return False
+        if prepared_probe.container_suffix != ".mp4":
+            return False
+        video_codec = (prepared_probe.video_codec or "").strip().lower()
+        if video_codec not in cls.PREMIERE_NATIVE_VIDEO_CODECS:
+            return False
+        if require_h264_video and video_codec != "h264":
+            return False
+        if prepared_probe.duration is None or prepared_probe.duration <= 0:
+            return False
+        if reference_probe is None:
+            return True
+        if prepared_probe.has_audio != reference_probe.has_audio:
+            return False
+        if reference_probe.has_audio and len(prepared_probe.audio_streams) != len(reference_probe.audio_streams):
+            return False
+        return True
+
     @staticmethod
     def _format_media_failure(result: object) -> str:
         if isinstance(result, CommandTimeoutError):
@@ -1568,6 +1645,79 @@ class AnimeLibraryService:
         timeout_seconds: float,
     ):
         return await run_command(cmd, timeout_seconds=timeout_seconds)
+
+    @classmethod
+    async def _run_library_import_h264_transcode(
+        cls,
+        source_path: Path,
+        output_path: Path,
+        *,
+        source_codec: str | None,
+        probe: SourceMediaProbe,
+    ) -> None:
+        gpu_error: str | None = None
+        try:
+            gpu_result = await run_command(
+                rewrite_media_command(
+                    cls._build_gpu_library_import_h264_cmd(
+                        source_path,
+                        output_path,
+                        source_codec=source_codec,
+                        probe=probe,
+                    )
+                ),
+                timeout_seconds=cls.LIBRARY_IMPORT_TRANSCODE_TIMEOUT_SECONDS,
+            )
+        except FileNotFoundError as exc:
+            if is_media_binary_override_error(exc):
+                raise
+            gpu_error = cls._format_media_failure(exc)
+        except CommandTimeoutError as exc:
+            gpu_error = cls._format_media_failure(exc)
+        else:
+            if gpu_result.returncode == 0:
+                gpu_probe = await asyncio.to_thread(cls._probe_media_sync, output_path)
+                if cls._is_valid_prepared_library_probe(
+                    gpu_probe,
+                    reference_probe=probe,
+                    require_h264_video=True,
+                ):
+                    return
+                with suppress(OSError):
+                    await asyncio.to_thread(output_path.unlink)
+                gpu_error = f"Transcoded H.264 MP4 output failed validation: {source_path.name}"
+            else:
+                gpu_error = cls._format_media_failure(gpu_result)
+
+        try:
+            cpu_result = await run_command(
+                rewrite_media_command(
+                    cls._build_cpu_library_import_h264_cmd(
+                        source_path,
+                        output_path,
+                        probe=probe,
+                    )
+                ),
+                timeout_seconds=cls.LIBRARY_IMPORT_TRANSCODE_TIMEOUT_SECONDS,
+            )
+        except FileNotFoundError as exc:
+            if is_media_binary_override_error(exc):
+                raise
+            raise RuntimeError(
+                "Failed to transcode source to H.264 MP4 "
+                f"(GPU: {gpu_error}; CPU: {cls._format_media_failure(exc)})"
+            ) from exc
+        except CommandTimeoutError as exc:
+            raise RuntimeError(
+                "Failed to transcode source to H.264 MP4 "
+                f"(GPU: {gpu_error}; CPU: {cls._format_media_failure(exc)})"
+            ) from exc
+
+        if cpu_result.returncode != 0:
+            raise RuntimeError(
+                "Failed to transcode source to H.264 MP4 "
+                f"(GPU: {gpu_error}; CPU: {cls._format_media_failure(cpu_result)})"
+            )
 
     @classmethod
     def get_subtitle_sidecar_asset_path(
@@ -2193,10 +2343,10 @@ class AnimeLibraryService:
     ) -> SourceNormalizationResult:
         """Normalize one source episode for Premiere Pro import.
 
-        Since format normalization now happens at indexation (incompatible codecs
-        → ProRes, MKV → MP4), this step typically only remuxes the selected
-        audio track.  The full_h264_aac_transcode path is kept for backward
-        compatibility with sources indexed before the ProRes feature.
+        Since format normalization now happens at indexation time, this step
+        typically only remuxes the selected audio track. The full H.264 MP4
+        transcode path remains as the fallback when a source still is not
+        library-normalized.
         """
         if not source_path.exists() or not source_path.is_file():
             raise FileNotFoundError(f"Source file not found: {source_path}")
@@ -2952,7 +3102,7 @@ class AnimeLibraryService:
             return False
 
         prepared_probe = cls._probe_media_sync(prepared_path)
-        if prepared_probe is None or prepared_probe.duration is None:
+        if not cls._is_valid_prepared_library_probe(prepared_probe):
             return False
 
         try:
@@ -2973,9 +3123,7 @@ class AnimeLibraryService:
         source_probe = cls._probe_media_sync(source_path)
         if source_probe is None:
             return False
-        if prepared_probe.has_audio != source_probe.has_audio:
-            return False
-        if source_probe.has_audio and len(prepared_probe.audio_streams) != len(source_probe.audio_streams):
+        if not cls._is_valid_prepared_library_probe(prepared_probe, reference_probe=source_probe):
             return False
 
         return (
@@ -2994,18 +3142,18 @@ class AnimeLibraryService:
         source_codec = await asyncio.to_thread(cls.get_primary_video_codec_sync, source_path)
         codec_lower = (source_codec or "").strip().lower()
         is_premiere_native = cls._is_premiere_native_codec(codec_lower)
-        is_mkv = source_path.suffix.lower() == ".mkv"
-        needs_prores_transcode = not is_premiere_native
+        source_suffix = source_path.suffix.lower()
+        is_mp4 = source_suffix == ".mp4"
+        needs_direct_h264_transcode = not is_premiere_native
+        transcode_action = "Transcoding to H.264 MP4"
 
         # Decide destination path and action label.
-        if needs_prores_transcode:
-            preferred_dest = dest_dir / (source_path.stem + ".mov")
-            action = f"Transcoding {codec_lower or 'unknown'} to ProRes"
-        elif is_mkv:
-            preferred_dest = dest_dir / (source_path.stem + ".mp4")
+        preferred_dest = dest_dir / (source_path.stem + ".mp4")
+        if needs_direct_h264_transcode:
+            action = transcode_action
+        elif not is_mp4:
             action = "Remuxing"
         else:
-            preferred_dest = dest_dir / source_path.name
             action = "Copying"
 
         actual_dest = preferred_dest
@@ -3028,177 +3176,76 @@ class AnimeLibraryService:
             source_probe = None
         if source_probe is None or source_probe.duration is None:
             raise RuntimeError(f"Source file is unreadable: {source_path.name}")
+        tmp_dest = preferred_dest.with_name(f"{preferred_dest.stem}.import.tmp.mp4")
 
-        if needs_prores_transcode:
-            # --- ProRes 422 LT transcode for Premiere-incompatible codecs ---
-            tmp_suffix = ".import.tmp.mov"
-            tmp_dest = preferred_dest.with_name(f"{preferred_dest.stem}{tmp_suffix}")
-
-            async def _cleanup_tmp_dest() -> None:
-                if tmp_dest.exists():
-                    with suppress(OSError):
-                        await asyncio.to_thread(tmp_dest.unlink)
-
-            if tmp_dest.exists():
-                await _cleanup_tmp_dest()
-
-            gpu_error: str | None = None
-            try:
-                gpu_result = await run_command(
-                    rewrite_media_command(
-                        cls._build_gpu_prores_cmd(source_path, tmp_dest, source_codec=source_codec)
-                    ),
-                    timeout_seconds=cls.PRORES_TRANSCODE_TIMEOUT_SECONDS,
-                )
-            except (CommandTimeoutError, FileNotFoundError) as exc:
-                gpu_error = cls._format_media_failure(exc)
-            else:
-                if gpu_result.returncode != 0:
-                    gpu_error = cls._format_media_failure(gpu_result)
-
-            if gpu_error is not None:
-                await _cleanup_tmp_dest()
-                try:
-                    cpu_result = await run_command(
-                        rewrite_media_command(
-                            cls._build_cpu_prores_cmd(source_path, tmp_dest)
-                        ),
-                        timeout_seconds=cls.PRORES_TRANSCODE_TIMEOUT_SECONDS,
-                    )
-                except (CommandTimeoutError, FileNotFoundError) as exc:
-                    await _cleanup_tmp_dest()
-                    logger.error(
-                        "ProRes transcode failed for %s (GPU: %s; CPU: %s)",
-                        source_path.name,
-                        gpu_error,
-                        cls._format_media_failure(exc),
-                    )
-                    # Fall back to plain copy so indexing can still proceed.
-                    fallback_dest = dest_dir / source_path.name
-                    if fallback_dest != source_path or not fallback_dest.exists():
-                        await asyncio.to_thread(shutil.copy2, source_path, fallback_dest)
-                    actual_dest = fallback_dest
-                    action = f"Copying (ProRes failed)"
-                    cpu_result = None
-                else:
-                    if cpu_result.returncode != 0:
-                        await _cleanup_tmp_dest()
-                        logger.error(
-                            "ProRes transcode failed for %s (GPU: %s; CPU: %s)",
-                            source_path.name,
-                            gpu_error,
-                            cls._format_media_failure(cpu_result),
-                        )
-                        fallback_dest = dest_dir / source_path.name
-                        if fallback_dest != source_path or not fallback_dest.exists():
-                            await asyncio.to_thread(shutil.copy2, source_path, fallback_dest)
-                        actual_dest = fallback_dest
-                        action = f"Copying (ProRes failed)"
-                        cpu_result = None
-
-            # Validate & commit transcoded file.
-            if actual_dest == preferred_dest and tmp_dest.exists():
-                transcode_probe = await asyncio.to_thread(cls._probe_media_sync, tmp_dest)
-                if (
-                    transcode_probe is not None
-                    and transcode_probe.duration is not None
-                    and transcode_probe.duration > 0
-                ):
-                    await asyncio.to_thread(tmp_dest.replace, preferred_dest)
-                else:
-                    logger.warning(
-                        "ProRes transcode output failed validation for %s",
-                        source_path.name,
-                    )
-                    await _cleanup_tmp_dest()
-                    fallback_dest = dest_dir / source_path.name
-                    if fallback_dest != source_path or not fallback_dest.exists():
-                        await asyncio.to_thread(shutil.copy2, source_path, fallback_dest)
-                    actual_dest = fallback_dest
-                    action = f"Copying (ProRes failed)"
-
-        elif is_mkv:
-            # --- Remux MKV → MP4 (stream copy) for Premiere-native codecs ---
-            tmp_dest = preferred_dest.with_name(f"{preferred_dest.stem}.import.tmp.mp4")
+        async def _cleanup_tmp_dest() -> None:
             if tmp_dest.exists():
                 with suppress(OSError):
                     await asyncio.to_thread(tmp_dest.unlink)
+
+        async def _commit_transcoded_tmp_dest() -> None:
+            try:
+                await cls._run_library_import_h264_transcode(
+                    source_path,
+                    tmp_dest,
+                    source_codec=source_codec,
+                    probe=source_probe,
+                )
+            except Exception:
+                await _cleanup_tmp_dest()
+                raise
+            transcode_probe = await asyncio.to_thread(cls._probe_media_sync, tmp_dest)
+            if not cls._is_valid_prepared_library_probe(
+                transcode_probe,
+                reference_probe=source_probe,
+                require_h264_video=True,
+            ):
+                await _cleanup_tmp_dest()
+                raise RuntimeError(
+                    f"Transcoded H.264 MP4 output failed validation: {source_path.name}"
+                )
+            await asyncio.to_thread(tmp_dest.replace, preferred_dest)
+
+        if needs_direct_h264_transcode:
+            if tmp_dest.exists():
+                await _cleanup_tmp_dest()
+            await _commit_transcoded_tmp_dest()
+        elif not is_mp4:
+            # --- Remux native video to MP4, then fall back to full H.264 MP4 transcode ---
+            if tmp_dest.exists():
+                await _cleanup_tmp_dest()
+            remux_error: str | None = None
             try:
                 remux_result = await run_command(
                     cls._build_library_import_remux_cmd(source_path, tmp_dest),
                     timeout_seconds=cls.REMUX_TIMEOUT_SECONDS,
                 )
-            except CommandTimeoutError:
-                import sys
-
-                print(
-                    f"[WARNING] ffmpeg remux timed out for {source_path.name}, falling back to copy",
-                    file=sys.stderr,
-                )
-                fallback_dest = dest_dir / source_path.name
-                if fallback_dest != source_path or not fallback_dest.exists():
-                    await asyncio.to_thread(shutil.copy2, source_path, fallback_dest)
-                if preferred_dest.exists():
-                    with suppress(OSError):
-                        await asyncio.to_thread(preferred_dest.unlink)
-                actual_dest = fallback_dest
             except FileNotFoundError as exc:
                 if is_media_binary_override_error(exc):
                     raise
-                import sys
-
-                print("[WARNING] ffmpeg not found, falling back to copy", file=sys.stderr)
-                fallback_dest = dest_dir / source_path.name
-                if fallback_dest != source_path or not fallback_dest.exists():
-                    await asyncio.to_thread(shutil.copy2, source_path, fallback_dest)
-                if preferred_dest.exists():
-                    with suppress(OSError):
-                        await asyncio.to_thread(preferred_dest.unlink)
-                actual_dest = fallback_dest
+                remux_error = cls._format_media_failure(exc)
+            except CommandTimeoutError as exc:
+                remux_error = cls._format_media_failure(exc)
             else:
-                remux_valid = False
+                remux_probe = None
                 if remux_result.returncode == 0:
                     remux_probe = await asyncio.to_thread(cls._probe_media_sync, tmp_dest)
-                    remux_valid = (
-                        remux_probe is not None
-                        and remux_probe.duration is not None
-                        and (
-                            source_probe is None
-                            or (
-                                remux_probe.has_audio == source_probe.has_audio
-                                and (
-                                    not source_probe.has_audio
-                                    or len(remux_probe.audio_streams) == len(source_probe.audio_streams)
-                                )
-                            )
-                        )
-                    )
-                if not remux_valid:
-                    if tmp_dest.exists():
-                        with suppress(OSError):
-                            await asyncio.to_thread(tmp_dest.unlink)
-                    import sys
-
-                    if remux_result.returncode != 0:
-                        print(
-                            f"[WARNING] ffmpeg remux failed for {source_path.name}: "
-                            f"{remux_result.stderr.decode()[:200]}",
-                            file=sys.stderr,
-                        )
-                    else:
-                        print(
-                            f"[WARNING] ffmpeg remux output failed validation for {source_path.name}",
-                            file=sys.stderr,
-                        )
-                    fallback_dest = dest_dir / source_path.name
-                    if fallback_dest != source_path or not fallback_dest.exists():
-                        await asyncio.to_thread(shutil.copy2, source_path, fallback_dest)
-                    if preferred_dest.exists():
-                        with suppress(OSError):
-                            await asyncio.to_thread(preferred_dest.unlink)
-                    actual_dest = fallback_dest
-                else:
+                if cls._is_valid_prepared_library_probe(remux_probe, reference_probe=source_probe):
                     await asyncio.to_thread(tmp_dest.replace, preferred_dest)
+                else:
+                    remux_error = cls._format_media_failure(remux_result)
+                    if remux_result.returncode == 0:
+                        remux_error = f"Prepared MP4 output failed validation for {source_path.name}"
+
+            if remux_error is not None:
+                await _cleanup_tmp_dest()
+                action = transcode_action
+                try:
+                    await _commit_transcoded_tmp_dest()
+                except RuntimeError as exc:
+                    raise RuntimeError(
+                        f"Failed to prepare source as MP4 (remux: {remux_error}; {exc})"
+                    ) from exc
         elif preferred_dest != source_path:
             await asyncio.to_thread(shutil.copy2, source_path, preferred_dest)
 
@@ -3242,7 +3289,7 @@ class AnimeLibraryService:
             if file_stat.st_size == 0:
                 return f"Prepared file is empty: {dest_file.name}"
             prepared_probe = await asyncio.to_thread(cls._probe_media_sync, dest_file)
-            if prepared_probe is None or prepared_probe.duration is None:
+            if not cls._is_valid_prepared_library_probe(prepared_probe):
                 return f"Prepared file is unreadable: {dest_file.name}"
         return None
 

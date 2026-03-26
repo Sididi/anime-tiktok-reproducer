@@ -116,6 +116,13 @@ class TestSubtitleExtractionDuringImport(TestCase):
                 stderr=b"",
             )
         )
+        resolved_probe = probe or _make_probe(source_path)
+        prepared_probe = _make_probe(
+            dest_dir / f"{source_path.stem}.import.tmp.mp4",
+            suffix=".mp4",
+            video_codec=resolved_probe.video_codec or ("h264" if codec not in {"h264", "hevc"} else codec),
+            audio_streams=resolved_probe.audio_streams,
+        )
 
         patches["codec"] = patch.object(
             AnimeLibraryService,
@@ -130,7 +137,7 @@ class TestSubtitleExtractionDuringImport(TestCase):
         patches["probe"] = patch.object(
             AnimeLibraryService,
             "_probe_media_sync",
-            return_value=probe,
+            side_effect=[resolved_probe, prepared_probe],
         )
         patches["run_cmd"] = patch(
             "app.services.anime_library.run_command",
@@ -471,34 +478,112 @@ class TestSubtitleExtractionDuringImport(TestCase):
         self.assertNotIn("0:1", cmd)
         self.assertNotIn("0:2", cmd)
 
-    def test_prores_import_commands_encode_audio_to_pcm_for_mov_output(self) -> None:
-        """ProRes MOV output must transcode audio instead of stream-copying unsupported codecs."""
+    def test_av1_source_transcodes_to_h264_mp4(self) -> None:
+        """Unsupported codecs are transcoded directly to H.264/AAC MP4."""
         source = Path("/tmp/test_src/episode.mkv")
-        output = Path("/tmp/test_lib/Anime/episode.mov")
+        dest_dir = Path("/tmp/test_lib/Anime")
+        expected_mp4 = dest_dir / "episode.mp4"
+        source_probe = _make_probe(source, video_codec="av1")
+        output_probe = _make_probe(
+            dest_dir / "episode.import.tmp.mp4",
+            suffix=".mp4",
+            video_codec="h264",
+            audio_streams=source_probe.audio_streams,
+        )
+        tmp_output_path = dest_dir / "episode.import.tmp.mp4"
+        mock_run_cmd = AsyncMock(
+            return_value=CommandResult(
+                returncode=0,
+                stdout=b"",
+                stderr=b"",
+            )
+        )
 
-        gpu_cmd = AnimeLibraryService._build_gpu_prores_cmd(
+        def _probe_side_effect(path: Path):
+            if path == source:
+                return source_probe
+            if path == tmp_output_path:
+                return output_probe
+            raise AssertionError(f"Unexpected probe path: {path}")
+
+        with (
+            patch.object(
+                AnimeLibraryService,
+                "get_primary_video_codec_sync",
+                return_value="av1",
+            ),
+            patch.object(
+                AnimeLibraryService,
+                "_source_matches_prepared_sync",
+                return_value=False,
+            ),
+            patch.object(
+                AnimeLibraryService,
+                "_probe_media_sync",
+                side_effect=_probe_side_effect,
+            ),
+            patch(
+                "app.services.anime_library.run_command",
+                mock_run_cmd,
+            ),
+            patch.object(
+                AnimeLibraryService,
+                "_write_subtitle_sidecar",
+                AsyncMock(),
+            ) as mock_write_sidecar,
+            patch.object(
+                AnimeLibraryService,
+                "_record_source_import_manifest_sync",
+            ),
+            patch.object(Path, "exists", return_value=True),
+            patch.object(Path, "unlink"),
+            patch.object(Path, "replace"),
+        ):
+            actual, action, changed = self._run(
+                AnimeLibraryService._prepare_single_source_for_library(
+                    source_path=source,
+                    dest_dir=dest_dir,
+                )
+            )
+
+        self.assertEqual(actual, expected_mp4)
+        self.assertEqual(action, "Transcoding to H.264 MP4")
+        self.assertTrue(changed)
+        cmd = mock_run_cmd.await_args.args[0]
+        self.assertIn("h264_nvenc", cmd)
+        self.assertIn("aac", cmd)
+        mock_write_sidecar.assert_not_awaited()
+
+    def test_library_import_h264_mp4_commands_encode_audio_to_aac(self) -> None:
+        """Library MP4 transcodes must normalize audio to AAC."""
+        source = Path("/tmp/test_src/episode.mkv")
+        output = Path("/tmp/test_lib/Anime/episode.mp4")
+        probe = _make_probe(source, video_codec="av1")
+
+        gpu_cmd = AnimeLibraryService._build_gpu_library_import_h264_cmd(
             source,
             output,
             source_codec="av1",
+            probe=probe,
         )
-        cpu_cmd = AnimeLibraryService._build_cpu_prores_cmd(source, output)
+        cpu_cmd = AnimeLibraryService._build_cpu_library_import_h264_cmd(
+            source,
+            output,
+            probe=probe,
+        )
 
-        self.assertEqual(
-            gpu_cmd[gpu_cmd.index("-c:a") + 1],
-            AnimeLibraryService.PRORES_AUDIO_CODEC,
-        )
-        self.assertEqual(
-            cpu_cmd[cpu_cmd.index("-c:a") + 1],
-            AnimeLibraryService.PRORES_AUDIO_CODEC,
-        )
-        self.assertNotEqual(gpu_cmd[gpu_cmd.index("-c:a") + 1], "copy")
-        self.assertNotEqual(cpu_cmd[cpu_cmd.index("-c:a") + 1], "copy")
+        self.assertEqual(gpu_cmd[gpu_cmd.index("-c:v") + 1], "av1_cuvid")
+        self.assertEqual(gpu_cmd[gpu_cmd.index("-c:a") + 1], "aac")
+        self.assertEqual(cpu_cmd[cpu_cmd.index("-c:v") + 1], "libx264")
+        self.assertEqual(cpu_cmd[cpu_cmd.index("-c:a") + 1], "aac")
+        self.assertIn(AnimeLibraryService.SOURCE_NORMALIZATION_AUDIO_RATE, gpu_cmd)
+        self.assertIn(AnimeLibraryService.SOURCE_NORMALIZATION_AUDIO_RATE, cpu_cmd)
 
-    def test_remux_validation_failure_falls_back_to_original_container(self) -> None:
-        """An unreadable or incomplete remux is discarded and the original source is copied."""
+    def test_remux_validation_failure_falls_back_to_h264_mp4_transcode(self) -> None:
+        """An unreadable remux retries as a full H.264/AAC MP4 transcode."""
         source = Path("/tmp/test_src/episode.mkv")
         dest_dir = Path("/tmp/test_lib/Anime")
-        fallback_dest = dest_dir / "episode.mkv"
+        expected_mp4 = dest_dir / "episode.mp4"
         source_probe = _make_probe(
             source,
             audio_streams=(
@@ -510,18 +595,45 @@ class TestSubtitleExtractionDuringImport(TestCase):
         invalid_output_probe = _make_probe(
             dest_dir / "episode.import.tmp.mp4",
             suffix=".mp4",
+            video_codec="h264",
             audio_streams=(
                 _audio_stream(index=1, stream_position=0, language="ja"),
             ),
         )
+        transcoded_output_probe = _make_probe(
+            dest_dir / "episode.import.tmp.mp4",
+            suffix=".mp4",
+            video_codec="h264",
+            audio_streams=source_probe.audio_streams,
+        )
+        tmp_output_path = dest_dir / "episode.import.tmp.mp4"
+        tmp_probe_calls = 0
         mock_write_sidecar = AsyncMock()
         mock_run_cmd = AsyncMock(
-            return_value=CommandResult(
-                returncode=0,
-                stdout=b"",
-                stderr=b"",
-            )
+            side_effect=[
+                CommandResult(
+                    returncode=0,
+                    stdout=b"",
+                    stderr=b"",
+                ),
+                CommandResult(
+                    returncode=0,
+                    stdout=b"",
+                    stderr=b"",
+                ),
+            ]
         )
+
+        def _probe_side_effect(path: Path):
+            nonlocal tmp_probe_calls
+            if path == source:
+                return source_probe
+            if path == tmp_output_path:
+                tmp_probe_calls += 1
+                if tmp_probe_calls == 1:
+                    return invalid_output_probe
+                return transcoded_output_probe
+            raise AssertionError(f"Unexpected probe path: {path}")
 
         with (
             patch.object(
@@ -537,7 +649,7 @@ class TestSubtitleExtractionDuringImport(TestCase):
             patch.object(
                 AnimeLibraryService,
                 "_probe_media_sync",
-                side_effect=[source_probe, invalid_output_probe],
+                side_effect=_probe_side_effect,
             ),
             patch(
                 "app.services.anime_library.run_command",
@@ -557,26 +669,28 @@ class TestSubtitleExtractionDuringImport(TestCase):
             patch.object(Path, "replace") as mock_replace,
             patch("shutil.copy2") as mock_copy2,
         ):
-            actual, _action, changed = self._run(
+            actual, action, changed = self._run(
                 AnimeLibraryService._prepare_single_source_for_library(
                     source_path=source,
                     dest_dir=dest_dir,
                 )
             )
 
-        self.assertEqual(actual, fallback_dest)
+        self.assertEqual(actual, expected_mp4)
+        self.assertEqual(action, "Transcoding to H.264 MP4")
         self.assertTrue(changed)
-        mock_copy2.assert_called_once_with(source, fallback_dest)
-        mock_replace.assert_not_called()
+        mock_copy2.assert_not_called()
+        self.assertEqual(mock_run_cmd.await_count, 2)
+        mock_replace.assert_called_once()
         self.assertGreaterEqual(mock_unlink.call_count, 1)
         mock_write_sidecar.assert_awaited_once_with(
             source_path=source,
-            normalized_target_path=fallback_dest,
+            normalized_target_path=expected_mp4,
             probe=source_probe,
         )
 
-    def test_failed_prores_fallback_cleans_up_tmp_mov_before_copying_source(self) -> None:
-        """A failed AV1->ProRes import removes leaked temp MOV output before fallback copy."""
+    def test_failed_h264_mp4_transcode_cleans_up_tmp_mp4_and_raises(self) -> None:
+        """A failed H.264 MP4 transcode removes leaked temp output and aborts import."""
         with tempfile.TemporaryDirectory() as tmp_dir_raw:
             tmp_dir = Path(tmp_dir_raw)
             source = tmp_dir / "source" / "episode.mkv"
@@ -590,8 +704,7 @@ class TestSubtitleExtractionDuringImport(TestCase):
                 video_codec="av1",
                 subtitle_streams=(),
             )
-            fallback_dest = dest_dir / source.name
-            tmp_dest = dest_dir / "episode.import.tmp.mov"
+            tmp_dest = dest_dir / "episode.import.tmp.mp4"
             run_count = 0
 
             async def _fake_run_command(_cmd, *, timeout_seconds):
@@ -625,21 +738,17 @@ class TestSubtitleExtractionDuringImport(TestCase):
                     "_record_source_import_manifest_sync",
                 ) as mock_record_manifest,
             ):
-                actual, action, changed = self._run(
-                    AnimeLibraryService._prepare_single_source_for_library(
-                        source_path=source,
-                        dest_dir=dest_dir,
+                with self.assertRaisesRegex(RuntimeError, "Failed to transcode source to H.264 MP4"):
+                    self._run(
+                        AnimeLibraryService._prepare_single_source_for_library(
+                            source_path=source,
+                            dest_dir=dest_dir,
+                        )
                     )
-                )
 
-            self.assertEqual(actual, fallback_dest)
-            self.assertEqual(action, "Copying (ProRes failed)")
-            self.assertTrue(changed)
             self.assertEqual(run_count, 2)
-            self.assertTrue(fallback_dest.exists())
-            self.assertEqual(fallback_dest.read_bytes(), b"source-video")
             self.assertFalse(tmp_dest.exists())
-            mock_record_manifest.assert_called_once_with(source, fallback_dest)
+            mock_record_manifest.assert_not_called()
 
     def test_source_matches_prepared_rejects_unprobeable_file(self) -> None:
         """Prepared-file reuse requires both manifest match and a readable video probe."""
@@ -655,6 +764,25 @@ class TestSubtitleExtractionDuringImport(TestCase):
                 AnimeLibraryService,
                 "_probe_media_sync",
                 return_value=None,
+            ):
+                self.assertFalse(
+                    AnimeLibraryService._source_matches_prepared_sync(source, prepared)
+                )
+
+    def test_source_matches_prepared_rejects_legacy_mov_output(self) -> None:
+        """Prepared-file reuse only accepts MP4 library outputs."""
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            tmp_dir = Path(tmp_dir_raw)
+            source = tmp_dir / "episode.mkv"
+            prepared = tmp_dir / "episode.mov"
+            source.write_bytes(b"source")
+            prepared.write_bytes(b"prepared")
+            AnimeLibraryService._record_source_import_manifest_sync(source, prepared)
+
+            with patch.object(
+                AnimeLibraryService,
+                "_probe_media_sync",
+                return_value=_make_probe(prepared, suffix=".mov", video_codec="h264"),
             ):
                 self.assertFalse(
                     AnimeLibraryService._source_matches_prepared_sync(source, prepared)
