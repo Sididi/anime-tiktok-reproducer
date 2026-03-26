@@ -334,6 +334,9 @@ ATR_LIBRARY_STATE_DB_PATH=backend/data/library_state.db
 ATR_STORAGE_BOX_MAX_CONNECTIONS=3
 ATR_STORAGE_BOX_UPLOAD_MAX_PARALLEL=2
 ATR_STORAGE_BOX_DOWNLOAD_MAX_PARALLEL=3
+ATR_STORAGE_BOX_TRANSFER_MODE=auto
+ATR_STORAGE_BOX_RSYNC_MIN_FILE_SIZE_MB=16
+ATR_STORAGE_BOX_RSYNC_TIMEOUT_SECONDS=7200
 ```
 
 Project recommendations:
@@ -341,6 +344,8 @@ Project recommendations:
 - use absolute paths, not `~`
 - leave `ATR_STORAGE_BOX_PASSWORD=` empty once SSH keys work
 - keep `ATR_STORAGE_BOX_MAX_CONNECTIONS` conservative
+- keep `ATR_STORAGE_BOX_TRANSFER_MODE=auto` unless you intentionally want pure SFTP
+- `auto` uses `rsync` only on port `23` with SSH key auth and falls back to SFTP if preflight fails
 - keep the defaults unless you have measured a reason to raise them
 
 ### If you intentionally use main-account credentials
@@ -358,6 +363,9 @@ ATR_LIBRARY_STATE_DB_PATH=backend/data/library_state.db
 ATR_STORAGE_BOX_MAX_CONNECTIONS=3
 ATR_STORAGE_BOX_UPLOAD_MAX_PARALLEL=2
 ATR_STORAGE_BOX_DOWNLOAD_MAX_PARALLEL=3
+ATR_STORAGE_BOX_TRANSFER_MODE=auto
+ATR_STORAGE_BOX_RSYNC_MIN_FILE_SIZE_MB=16
+ATR_STORAGE_BOX_RSYNC_TIMEOUT_SECONDS=7200
 ```
 
 This works, but it is less isolated than using a dedicated sub-account.
@@ -483,4 +491,3 @@ These are the official docs used to write this guide:
   - https://docs.hetzner.com/storage/storage-box/access/access-ssh-rsync-borg/
 - Creating snapshots:
   - https://docs.hetzner.com/storage/storage-box/getting-started/creating-snapshots/
-

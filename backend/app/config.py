@@ -136,6 +136,9 @@ class Settings(BaseSettings):
     storage_box_max_connections: int = 3
     storage_box_upload_max_parallel: int = 2
     storage_box_download_max_parallel: int = 3
+    storage_box_transfer_mode: str = "auto"
+    storage_box_rsync_min_file_size_mb: int = 16
+    storage_box_rsync_timeout_seconds: int = 7200
 
     @property
     def drive_google_client_id(self) -> str | None:
@@ -192,6 +195,14 @@ class Settings(BaseSettings):
         stripped = value.strip()
         return stripped or None
 
+    @field_validator("storage_box_transfer_mode")
+    @classmethod
+    def _normalize_storage_box_transfer_mode(cls, value: str) -> str:
+        normalized = str(value or "").strip().lower() or "auto"
+        if normalized not in {"auto", "sftp", "rsync"}:
+            raise ValueError("ATR_STORAGE_BOX_TRANSFER_MODE must be one of auto, sftp, rsync")
+        return normalized
+
     @field_validator("library_state_db_path")
     @classmethod
     def _resolve_library_state_db_path(cls, value: Path) -> Path:
@@ -219,6 +230,26 @@ class Settings(BaseSettings):
     @classmethod
     def _clamp_match_playback_max_workers(cls, value: int) -> int:
         return max(1, min(8, value))
+
+    @field_validator("storage_box_max_connections")
+    @classmethod
+    def _clamp_storage_box_max_connections(cls, value: int) -> int:
+        return max(1, min(16, value))
+
+    @field_validator("storage_box_upload_max_parallel", "storage_box_download_max_parallel")
+    @classmethod
+    def _clamp_storage_box_parallelism(cls, value: int) -> int:
+        return max(1, min(16, value))
+
+    @field_validator("storage_box_rsync_min_file_size_mb")
+    @classmethod
+    def _clamp_storage_box_rsync_min_file_size_mb(cls, value: int) -> int:
+        return max(1, min(1024, value))
+
+    @field_validator("storage_box_rsync_timeout_seconds")
+    @classmethod
+    def _clamp_storage_box_rsync_timeout_seconds(cls, value: int) -> int:
+        return max(30, min(24 * 3600, value))
 
     @field_validator("match_playback_max_workers_per_episode")
     @classmethod

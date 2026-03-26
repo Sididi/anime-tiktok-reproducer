@@ -15,6 +15,7 @@ from ..library_types import LibraryType, coerce_library_type
 from .anime_library import AnimeLibraryService
 from .library_state_db import LibraryStateDb, OperationRow, SeriesStateRow
 from .storage_box_repository import StorageBoxRepository
+from .storage_box_transfer import StorageBoxTransferService
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -57,6 +58,18 @@ def _sha256_file(path: Path) -> str:
         while chunk := handle.read(1024 * 1024):
             hasher.update(chunk)
     return hasher.hexdigest()
+
+
+async def _run_bounded(items: list[Any], limit: int, worker) -> None:
+    semaphore = asyncio.Semaphore(max(1, limit))
+
+    async def _run_one(item: Any) -> None:
+        async with semaphore:
+            await worker(item)
+
+    async with asyncio.TaskGroup() as task_group:
+        for item in items:
+            task_group.create_task(_run_one(item))
 
 
 class LibraryHydrationService:
@@ -354,17 +367,29 @@ class LibraryHydrationService:
                     ]
 
                 total = len(selected_episodes)
-                for index, episode in enumerate(selected_episodes, start=1):
-                    await asyncio.to_thread(
-                        LibraryStateDb.upsert_operation,
-                        library_type=scoped_type,
-                        series_id=series_id,
-                        operation_type="hydrate",
-                        status=OPERATION_RUNNING,
-                        progress=(index - 1) / max(total, 1),
-                        error=None,
-                    )
+                completed = 0
+                progress_lock = asyncio.Lock()
+
+                async def _hydrate_with_progress(episode: dict[str, Any]) -> None:
+                    nonlocal completed
                     await cls._hydrate_episode(scoped_type, manifest, episode)
+                    async with progress_lock:
+                        completed += 1
+                        await asyncio.to_thread(
+                            LibraryStateDb.upsert_operation,
+                            library_type=scoped_type,
+                            series_id=series_id,
+                            operation_type="hydrate",
+                            status=OPERATION_RUNNING,
+                            progress=completed / max(total, 1),
+                            error=None,
+                        )
+
+                await _run_bounded(
+                    selected_episodes,
+                    settings.storage_box_download_max_parallel,
+                    _hydrate_with_progress,
+                )
 
                 local_episode_count = await asyncio.to_thread(
                     cls._count_local_episodes_from_manifest,
@@ -841,18 +866,22 @@ class LibraryHydrationService:
             str(manifest["release_id"]),
         )
         try:
-            for artifact in index_artifacts:
+            async def _download_artifact(artifact: dict[str, Any]) -> None:
                 relative_path = str(artifact["relative_path"])
                 local_relative_path = Path(relative_path).relative_to("payload/index")
                 download_path = temp_root / local_relative_path
-                from .storage_box_sftp_client import StorageBoxSftpClient
-
-                await StorageBoxSftpClient.download_file(
+                await StorageBoxTransferService.download_file(
                     release_root / relative_path,
                     download_path,
                 )
                 if _sha256_file(download_path) != str(artifact["sha256"]):
                     raise RuntimeError(f"Checksum mismatch for {relative_path}")
+
+            await _run_bounded(
+                index_artifacts,
+                settings.storage_box_download_max_parallel,
+                _download_artifact,
+            )
             await cls._materialize_local_matcher_cache(library_type, manifest, temp_root)
         finally:
             shutil.rmtree(temp_root, ignore_errors=True)
@@ -981,18 +1010,15 @@ class LibraryHydrationService:
             str(manifest["release_id"]),
         )
 
-        from .storage_box_sftp_client import StorageBoxSftpClient
-
         try:
-            items = [media, *sidecars]
             downloaded: list[tuple[Path, Path]] = []
-            for item in items:
+            for item in [media, *sidecars]:
                 remote_relative_path = str(item.get("relative_path") or "")
                 local_relative_path = str(item.get("local_relative_path") or "")
                 if not remote_relative_path or not local_relative_path:
                     raise RuntimeError("Episode artifact is missing relative paths")
                 temp_path = temp_root / local_relative_path
-                await StorageBoxSftpClient.download_file(
+                await StorageBoxTransferService.download_file(
                     release_root / remote_relative_path,
                     temp_path,
                 )

@@ -19,6 +19,7 @@ from ..config import settings
 from ..library_types import LibraryType, coerce_library_type
 from .anime_library import AnimeLibraryService
 from .storage_box_sftp_client import StorageBoxSftpClient
+from .storage_box_transfer import StorageBoxTransferService
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -75,6 +76,18 @@ def _safe_json_loads(raw: str, *, context: str) -> dict[str, Any]:
 
 def _series_state_file_prefix(display_name: str) -> str:
     return f"{display_name}/"
+
+
+async def _run_bounded(items: list[Any], limit: int, worker) -> None:
+    semaphore = asyncio.Semaphore(max(1, limit))
+
+    async def _run_one(item: Any) -> None:
+        async with semaphore:
+            await worker(item)
+
+    async with asyncio.TaskGroup() as task_group:
+        for item in items:
+            task_group.create_task(_run_one(item))
 
 
 @dataclass(frozen=True)
@@ -660,7 +673,7 @@ class StorageBoxRepository:
         staging_root: PurePosixPath,
         artifacts: list[LocalArtifact],
     ) -> None:
-        for artifact in artifacts:
+        async def _verify(artifact: LocalArtifact) -> None:
             remote_path = staging_root / artifact.remote_relative_path
             stat_result = await StorageBoxSftpClient.stat(remote_path)
             remote_size = int(getattr(stat_result, "size", 0))
@@ -669,6 +682,12 @@ class StorageBoxRepository:
                     f"Remote size mismatch for {artifact.remote_relative_path.as_posix()}: "
                     f"expected {artifact.size_bytes}, got {remote_size}"
                 )
+
+        await _run_bounded(
+            artifacts,
+            settings.storage_box_upload_max_parallel,
+            _verify,
+        )
 
     @classmethod
     async def _resolve_or_create_series_id(
@@ -788,11 +807,17 @@ class StorageBoxRepository:
             }
             manifest_text = _json_dumps(manifest_payload)
 
-            for artifact in artifacts:
-                await StorageBoxSftpClient.upload_file(
+            async def _upload_artifact(artifact: LocalArtifact) -> None:
+                await StorageBoxTransferService.upload_file(
                     artifact.local_path,
                     staging_root / artifact.remote_relative_path,
                 )
+
+            await _run_bounded(
+                artifacts,
+                settings.storage_box_upload_max_parallel,
+                _upload_artifact,
+            )
             await cls._verify_remote_artifacts(staging_root=staging_root, artifacts=artifacts)
             await StorageBoxSftpClient.write_text(
                 staging_root / "series_manifest.json",
