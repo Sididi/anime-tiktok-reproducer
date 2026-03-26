@@ -198,6 +198,7 @@ class AnimeLibraryService:
     GPU_HWACCEL = "cuda"
     GPU_H264_ENCODER = "h264_nvenc"
     PRORES_TRANSCODE_TIMEOUT_SECONDS = 7200.0
+    PRORES_AUDIO_CODEC = "pcm_s16le"
     PREMIERE_NATIVE_VIDEO_CODECS = {"h264", "hevc"}
     _CUDA_DECODERS: dict[str, str] = {
         "av1": "av1_cuvid",
@@ -1334,7 +1335,9 @@ class AnimeLibraryService:
             "-profile:v", "1",
             "-vendor", "apl0",
             "-pix_fmt", "yuv422p10le",
-            "-c:a", "copy",
+            # MOV cannot stream-copy Opus audio, so normalize all mapped audio
+            # tracks to PCM when building ProRes outputs.
+            "-c:a", cls.PRORES_AUDIO_CODEC,
             str(output_path),
         ])
         return cmd
@@ -1359,7 +1362,7 @@ class AnimeLibraryService:
             "-profile:v", "1",
             "-vendor", "apl0",
             "-pix_fmt", "yuv422p10le",
-            "-c:a", "copy",
+            "-c:a", cls.PRORES_AUDIO_CODEC,
             str(output_path),
         ]
 
@@ -1528,6 +1531,33 @@ class AnimeLibraryService:
             if not any(line.startswith(prefix) for prefix in noisy_prefixes)
         ]
         candidate_lines = filtered_lines or lines
+        meaningful_markers = (
+            "only supported",
+            "not supported",
+            "not currently supported",
+            "could not write header",
+            "incorrect codec parameters",
+            "unknown encoder",
+            "error opening output files",
+            "invalid data found",
+        )
+        preferred_lines = [
+            line for line in candidate_lines
+            if any(marker in line.lower() for marker in meaningful_markers)
+        ]
+        if preferred_lines:
+            selected_lines = preferred_lines[-2:]
+            for line in candidate_lines[-3:]:
+                lowered = line.lower()
+                if (
+                    line not in selected_lines
+                    and (
+                        "nothing was written into output file" in lowered
+                        or "conversion failed" in lowered
+                    )
+                ):
+                    selected_lines.append(line)
+            return " | ".join(selected_lines)[:500]
         return " | ".join(candidate_lines[-3:])[:500]
 
     @classmethod

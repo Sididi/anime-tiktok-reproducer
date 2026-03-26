@@ -342,3 +342,24 @@ class TestAnimeLibraryNormalization(TestCase):
 
         self.assertIn("Error opening output files", formatted)
         self.assertNotIn("ffmpeg version", formatted)
+
+    def test_format_media_failure_keeps_muxer_support_error_when_present(self) -> None:
+        result = CommandResult(
+            returncode=1,
+            stdout=b"",
+            stderr=(
+                b"Stream mapping:\n"
+                b"  Stream #0:0 -> #0:0 (av1 (libdav1d) -> prores (prores_ks))\n"
+                b"  Stream #0:1 -> #0:1 (copy)\n"
+                b"[mov @ 0x123] opus only supported in MP4.\n"
+                b"[out#0/mov @ 0x456] Could not write header (incorrect codec parameters ?): Invalid argument\n"
+                b"[vf#0:0 @ 0x789] Terminating thread with return code -22 (Invalid argument)\n"
+                b"[out#0/mov @ 0x456] Nothing was written into output file, because at least one of its streams received no packets.\n"
+                b"Conversion failed!\n"
+            ),
+        )
+
+        formatted = AnimeLibraryService._format_media_failure(result)
+
+        self.assertIn("opus only supported in MP4", formatted)
+        self.assertIn("Could not write header", formatted)

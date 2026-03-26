@@ -471,6 +471,29 @@ class TestSubtitleExtractionDuringImport(TestCase):
         self.assertNotIn("0:1", cmd)
         self.assertNotIn("0:2", cmd)
 
+    def test_prores_import_commands_encode_audio_to_pcm_for_mov_output(self) -> None:
+        """ProRes MOV output must transcode audio instead of stream-copying unsupported codecs."""
+        source = Path("/tmp/test_src/episode.mkv")
+        output = Path("/tmp/test_lib/Anime/episode.mov")
+
+        gpu_cmd = AnimeLibraryService._build_gpu_prores_cmd(
+            source,
+            output,
+            source_codec="av1",
+        )
+        cpu_cmd = AnimeLibraryService._build_cpu_prores_cmd(source, output)
+
+        self.assertEqual(
+            gpu_cmd[gpu_cmd.index("-c:a") + 1],
+            AnimeLibraryService.PRORES_AUDIO_CODEC,
+        )
+        self.assertEqual(
+            cpu_cmd[cpu_cmd.index("-c:a") + 1],
+            AnimeLibraryService.PRORES_AUDIO_CODEC,
+        )
+        self.assertNotEqual(gpu_cmd[gpu_cmd.index("-c:a") + 1], "copy")
+        self.assertNotEqual(cpu_cmd[cpu_cmd.index("-c:a") + 1], "copy")
+
     def test_remux_validation_failure_falls_back_to_original_container(self) -> None:
         """An unreadable or incomplete remux is discarded and the original source is copied."""
         source = Path("/tmp/test_src/episode.mkv")
