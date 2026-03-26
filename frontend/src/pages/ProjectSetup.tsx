@@ -209,13 +209,23 @@ export function ProjectSetup() {
   // ---------------------------------------------------------------------------
   const handleBatchSourceSubmit = useCallback(
     async (
-      items: Array<{ path: string; name: string }>,
+      items: Array<{ path: string; name: string; jobType: "index" | "update" }>,
       type: LibraryType,
       fps: number,
     ) => {
       try {
-        for (const item of items) {
-          await api.indexAnimeAsync(item.path, type, item.name, fps);
+        const results = await Promise.allSettled(
+          items.map((item) =>
+            item.jobType === "update"
+              ? api.updateAnimeAsync(item.path, type, item.name)
+              : api.indexAnimeAsync(item.path, type, item.name, fps),
+          ),
+        );
+        const rejected = results.find(
+          (result): result is PromiseRejectedResult => result.status === "rejected",
+        );
+        if (rejected) {
+          throw rejected.reason;
         }
         setShowNewSource(false);
       } catch (err) {
@@ -360,8 +370,7 @@ export function ProjectSetup() {
           setShowFolderBrowser(false);
           if (updateSourceName) {
             api
-              .indexAnime(path, selectedLibraryType, updateSourceName)
-              .then((resp) => readSSEStream(resp, () => {}))
+              .updateAnimeAsync(path, selectedLibraryType, updateSourceName)
               .then(() => loadSources())
               .catch((err) => setError((err as Error).message));
             setUpdateSourceName(null);

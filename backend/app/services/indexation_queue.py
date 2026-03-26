@@ -9,6 +9,7 @@ from ..library_types import LibraryType
 from ..models.torrent import IndexationJob
 from .anime_library import AnimeLibraryService
 from .anime_matcher import AnimeMatcherService
+from .indexation_preflight import IndexationPreflightService
 from .library_hydration_service import LibraryHydrationService
 from .storage_box_repository import StorageBoxRepository
 
@@ -18,7 +19,7 @@ logger = logging.getLogger("uvicorn.error")
 
 
 class IndexationQueueService:
-    MAX_CONCURRENT = 1
+    MAX_CONCURRENT = 2
 
     def __init__(self) -> None:
         self._jobs: dict[str, IndexationJob] = {}
@@ -31,21 +32,27 @@ class IndexationQueueService:
         library_type: LibraryType,
         anime_name: str | None,
         fps: float,
+        job_type: str = "index",
+        series_id: str | None = None,
     ) -> str:
         source_name = anime_name or Path(source_path).name
+        normalized_target = IndexationPreflightService.normalize_target_name(source_name)
         for existing_job in self._jobs.values():
             if (
                 existing_job.library_type == library_type
-                and existing_job.source_name == source_name
+                and IndexationPreflightService.normalize_target_name(existing_job.source_name)
+                == normalized_target
                 and existing_job.status in {"queued", "indexing"}
             ):
                 return existing_job.id
 
         job = IndexationJob(
+            job_type=job_type,
             source_name=source_name,
             library_type=library_type,
             source_path=source_path,
             fps=fps,
+            series_id=series_id,
         )
         self._jobs[job.id] = job
         self._broadcast(job)
@@ -57,12 +64,42 @@ class IndexationQueueService:
         try:
             job.status = "indexing"
             self._broadcast(job)
-            async for progress in AnimeLibraryService.index_anime(
-                source_folder=Path(job.source_path),
-                library_type=job.library_type,
-                anime_name=job.source_name,
-                fps=job.fps,
-            ):
+            if job.job_type == "update":
+                job.phase = "hydrate_index"
+                job.message = "Hydrating matcher cache from Storage Box..."
+                job.progress = 0.02
+                self._broadcast(job)
+                if not job.series_id:
+                    resolved_series_id = await StorageBoxRepository.find_remote_series_id_by_name(
+                        job.library_type,
+                        job.source_name,
+                    )
+                    job.series_id = str(resolved_series_id or "")
+                if not job.series_id:
+                    raise RuntimeError(
+                        f"Remote series not found for update target '{job.source_name}'."
+                    )
+                await LibraryHydrationService.ensure_series_index_hydrated(
+                    library_type=job.library_type,
+                    series_id=job.series_id,
+                )
+                source_files = self._collect_direct_video_files(Path(job.source_path))
+                if not source_files:
+                    raise RuntimeError(f"No video files found in {job.source_path}")
+                progress_stream = AnimeLibraryService.update_anime(
+                    library_type=job.library_type,
+                    anime_name=job.source_name,
+                    source_paths=source_files,
+                )
+            else:
+                progress_stream = AnimeLibraryService.index_anime(
+                    source_folder=Path(job.source_path),
+                    library_type=job.library_type,
+                    anime_name=job.source_name,
+                    fps=job.fps,
+                )
+
+            async for progress in progress_stream:
                 job.progress = progress.progress
                 job.phase = progress.status
                 job.message = progress.message
@@ -82,6 +119,7 @@ class IndexationQueueService:
                     publish_result = await StorageBoxRepository.publish_series(
                         library_type=job.library_type,
                         display_name=job.source_name,
+                        series_id=job.series_id or None,
                     )
                     job.series_id = str(publish_result["series_id"])
                     job.storage_release_id = str(publish_result["release_id"])
@@ -107,6 +145,14 @@ class IndexationQueueService:
             logger.exception("Indexation job %s failed", job.id)
         finally:
             self._semaphore.release()
+
+    @staticmethod
+    def _collect_direct_video_files(source_folder: Path) -> list[Path]:
+        return sorted(
+            entry
+            for entry in source_folder.iterdir()
+            if entry.is_file() and entry.suffix.lower() in VIDEO_EXTENSIONS
+        )
 
     async def _link_torrents(self, job: IndexationJob) -> None:
         """Best-effort torrent linking after successful indexation."""

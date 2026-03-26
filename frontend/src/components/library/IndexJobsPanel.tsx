@@ -187,12 +187,13 @@ function StatusIcon({ status }: { status: IndexationJob["status"] }) {
 function statusLabel(job: IndexationJob): string {
   switch (job.status) {
     case "queued":
-      return "En attente";
+      return job.job_type === "update" ? "Mise à jour en attente" : "En attente";
     case "indexing":
+      if (job.phase === "hydrate_index") return job.message || "Hydratation de l'index...";
       if (job.phase === "link_sources") return job.message || "Association des sources...";
       if (job.phase === "package_release") return job.message || "Préparation de la release...";
       if (job.phase === "upload_release") return job.message || "Upload vers le Storage Box...";
-      return job.message || "Indexation...";
+      return job.message || (job.job_type === "update" ? "Mise à jour..." : "Indexation...");
     case "complete": {
       if (job.unmatched_files?.length > 0) {
         return `Terminé — ${job.unmatched_files.length} fichier(s) sans torrent`;
@@ -200,7 +201,7 @@ function statusLabel(job: IndexationJob): string {
       if (job.linked_torrents > 0) {
         return `Terminé — ${job.linked_torrents} torrent(s) lié(s)`;
       }
-      return "Terminé";
+      return job.job_type === "update" ? "Mise à jour terminée" : "Terminé";
     }
     case "error":
       return job.error || "Erreur";

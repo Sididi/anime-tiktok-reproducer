@@ -19,7 +19,7 @@ interface NewSourceModalProps {
     fps: number,
   ) => void;
   onBatchSubmit?: (
-    items: Array<{ path: string; name: string }>,
+    items: Array<{ path: string; name: string; jobType: "index" | "update" }>,
     type: LibraryType,
     fps: number,
   ) => void;
@@ -31,13 +31,21 @@ interface ValidationResult {
   name: string;
   has_videos: boolean;
   suggested_path: string | null;
-  index_status: "new" | "exact_match" | "conflict";
+  resolution:
+    | "new"
+    | "exact_match"
+    | "update_required"
+    | "needs_fix"
+    | "blocked_orphan";
+  series_id: string | null;
+  storage_release_id: string | null;
   conflict_details: {
     new_episodes: string[];
     removed_episodes: string[];
     existing_episode_count: number;
     existing_torrent_count: number;
   } | null;
+  orphan_reason: string | null;
 }
 
 const FPS_OPTIONS = [1, 2, 4];
@@ -61,6 +69,7 @@ export function NewSourceModal({
   const [batchPaths, setBatchPaths] = useState<string[]>([]);
   const [batchBrowserOpen, setBatchBrowserOpen] = useState(false);
   const [batchProcessing, setBatchProcessing] = useState(false);
+  const [validationError, setValidationError] = useState<string | null>(null);
 
   // Batch validation flow state
   const [, setValidationResults] = useState<ValidationResult[]>([]);
@@ -68,7 +77,7 @@ export function NewSourceModal({
   const [conflictQueue, setConflictQueue] = useState<ValidationResult[]>([]);
   const [currentFixIndex, setCurrentFixIndex] = useState(-1);
   const [currentConflictIndex, setCurrentConflictIndex] = useState(-1);
-  const [resolvedItems, setResolvedItems] = useState<Array<{ path: string; name: string }>>([]);
+  const [resolvedItems, setResolvedItems] = useState<Array<{ path: string; name: string; jobType: "index" | "update" }>>([]);
 
   // Manual browse during fix flow
   const [fixBrowseOpen, setFixBrowseOpen] = useState(false);
@@ -102,6 +111,7 @@ export function NewSourceModal({
     setCurrentConflictIndex(-1);
     setResolvedItems([]);
     setBatchProcessing(false);
+    setValidationError(null);
     onClose();
   };
 
@@ -117,14 +127,29 @@ export function NewSourceModal({
     setCurrentConflictIndex(-1);
     setResolvedItems([]);
     setBatchProcessing(false);
+    setValidationError(null);
   };
 
   // -------------------------------------------------------------------------
   // Batch validation + fix/conflict flow
   // -------------------------------------------------------------------------
-  const finalizeBatch = (items: Array<{ path: string; name: string }>) => {
-    if (items.length > 0 && onBatchSubmit) {
-      onBatchSubmit(items, selectedType, fps);
+  const finalizeBatch = (
+    items: Array<{ path: string; name: string; jobType: "index" | "update" }>,
+  ) => {
+    const deduped: Array<{
+      path: string;
+      name: string;
+      jobType: "index" | "update";
+    }> = [];
+    const seen = new Set<string>();
+    for (const item of items) {
+      const key = item.name.trim().toLowerCase();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(item);
+    }
+    if (deduped.length > 0 && onBatchSubmit) {
+      onBatchSubmit(deduped, selectedType, fps);
     }
     handleClose();
   };
@@ -132,29 +157,63 @@ export function NewSourceModal({
   const startBatchValidation = async () => {
     if (batchPaths.length === 0) return;
     setBatchProcessing(true);
+    setValidationError(null);
 
     try {
       const { results } = await api.validateBatchFolders(batchPaths, selectedType);
       setValidationResults(results);
 
       // Separate into categories
-      const immediatelyValid: Array<{ path: string; name: string }> = [];
+      const immediatelyValid: Array<{
+        path: string;
+        name: string;
+        jobType: "index" | "update";
+      }> = [];
       const needsFix: ValidationResult[] = [];
       const hasConflict: ValidationResult[] = [];
+      const blocked: ValidationResult[] = [];
 
       for (const r of results) {
-        if (r.index_status === "exact_match") {
+        if (r.resolution === "blocked_orphan") {
+          blocked.push(r);
+          continue;
+        }
+        if (r.resolution === "exact_match") {
           // Silently skip — already indexed with same content
           continue;
         }
-        if (!r.has_videos) {
+        if (r.resolution === "needs_fix") {
           needsFix.push(r);
-        } else if (r.index_status === "conflict") {
+        } else if (r.resolution === "update_required") {
           hasConflict.push(r);
         } else {
           // "new" and has_videos — good to go
-          immediatelyValid.push({ path: r.path, name: r.name });
+          immediatelyValid.push({
+            path: r.path,
+            name: r.name,
+            jobType: "index",
+          });
         }
+      }
+
+      if (blocked.length > 0) {
+        setValidationError(
+          blocked
+            .map(
+              (item) =>
+                `${item.name}: ${
+                  item.orphan_reason ||
+                  "un conflit local empêche l'indexation"
+                }`,
+            )
+            .join(" "),
+        );
+        setResolvedItems([]);
+        setFixQueue([]);
+        setConflictQueue([]);
+        setCurrentFixIndex(-1);
+        setCurrentConflictIndex(-1);
+        return;
       }
 
       setResolvedItems(immediatelyValid);
@@ -171,18 +230,58 @@ export function NewSourceModal({
       }
     } catch (err) {
       console.error("Batch validation failed:", err);
+      setValidationError((err as Error).message);
     } finally {
       setBatchProcessing(false);
     }
   };
 
   // Fix flow: handle resolution for current fix item
-  const handleFixResolved = (resolvedPath: string | null) => {
+  const handleFixResolved = async (resolvedPath: string | null) => {
     const currentItem = fixQueue[currentFixIndex];
     const nextItems = [...resolvedItems];
+    setValidationError(null);
+    let nextConflictQueue = [...conflictQueue];
 
     if (resolvedPath) {
-      nextItems.push({ path: resolvedPath, name: currentItem.name });
+      const { results } = await api.validateBatchFolders(
+        [{ path: resolvedPath, name: currentItem.name }],
+        selectedType,
+      );
+      const revalidated = results[0];
+      if (!revalidated) {
+        setValidationError(
+          `Impossible de valider ${currentItem.name} après correction.`,
+        );
+        return;
+      }
+      if (revalidated.resolution === "blocked_orphan") {
+        setValidationError(
+          `${currentItem.name}: ${
+            revalidated.orphan_reason ||
+            "un conflit local empêche l'indexation"
+          }`,
+        );
+        setCurrentFixIndex(-1);
+        setCurrentConflictIndex(-1);
+        return;
+      }
+      if (revalidated.resolution === "needs_fix") {
+        setValidationError(
+          `${currentItem.name}: le dossier choisi ne contient toujours pas directement de vidéos.`,
+        );
+        return;
+      }
+      if (revalidated.resolution === "update_required") {
+        nextConflictQueue = [...nextConflictQueue, revalidated];
+        setConflictQueue(nextConflictQueue);
+      } else if (revalidated.resolution === "new") {
+        nextItems.push({
+          path: resolvedPath,
+          name: currentItem.name,
+          jobType: "index",
+        });
+      }
     }
 
     const nextIndex = currentFixIndex + 1;
@@ -193,7 +292,7 @@ export function NewSourceModal({
       // Fix phase done, move to conflict phase
       setResolvedItems(nextItems);
       setCurrentFixIndex(-1);
-      if (conflictQueue.length > 0) {
+      if (nextConflictQueue.length > 0) {
         setCurrentConflictIndex(0);
       } else {
         finalizeBatch(nextItems);
@@ -205,9 +304,14 @@ export function NewSourceModal({
   const handleConflictResolved = (accepted: boolean) => {
     const currentItem = conflictQueue[currentConflictIndex];
     const nextItems = [...resolvedItems];
+    setValidationError(null);
 
     if (accepted) {
-      nextItems.push({ path: currentItem.path, name: currentItem.name });
+      nextItems.push({
+        path: currentItem.path,
+        name: currentItem.name,
+        jobType: "update",
+      });
     }
 
     const nextIndex = currentConflictIndex + 1;
@@ -403,6 +507,11 @@ export function NewSourceModal({
           </div>
 
           {/* Actions */}
+          {validationError && (
+            <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+              {validationError}
+            </div>
+          )}
           <div className="flex justify-end gap-3 pt-2">
             <button
               onClick={handleClose}

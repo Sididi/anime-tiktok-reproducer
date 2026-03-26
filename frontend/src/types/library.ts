@@ -30,6 +30,7 @@ export interface BrowseResult {
 
 export interface IndexationJob {
   id: string;
+  job_type: "index" | "update";
   source_name: string;
   library_type: import("./index").LibraryType;
   source_path: string;

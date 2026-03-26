@@ -36,7 +36,21 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 
   if (!res.ok) {
     const error = await res.json().catch(() => ({ detail: "Request failed" }));
-    throw new Error(error.detail || "Request failed");
+    const detail = error?.detail;
+    if (typeof detail === "string") {
+      throw new Error(detail || "Request failed");
+    }
+    if (detail && typeof detail === "object") {
+      const message =
+        ("message" in detail && typeof detail.message === "string"
+          ? detail.message
+          : null) ||
+        ("code" in detail && typeof detail.code === "string"
+          ? detail.code
+          : null);
+      throw new Error(message || "Request failed");
+    }
+    throw new Error("Request failed");
   }
 
   return res.json();
@@ -501,7 +515,7 @@ export const api = {
     }),
 
   validateBatchFolders: (
-    paths: string[],
+    items: Array<string | { path: string; name?: string }>,
     libraryType: import("@/types").LibraryType,
   ) =>
     request<{
@@ -510,17 +524,30 @@ export const api = {
         name: string;
         has_videos: boolean;
         suggested_path: string | null;
-        index_status: "new" | "exact_match" | "conflict";
+        resolution:
+          | "new"
+          | "exact_match"
+          | "update_required"
+          | "needs_fix"
+          | "blocked_orphan";
+        series_id: string | null;
+        storage_release_id: string | null;
         conflict_details: {
           new_episodes: string[];
           removed_episodes: string[];
           existing_episode_count: number;
           existing_torrent_count: number;
         } | null;
+        orphan_reason: string | null;
       }>;
     }>("/anime/validate-batch-folders", {
       method: "POST",
-      body: JSON.stringify({ paths, library_type: libraryType }),
+      body: JSON.stringify({
+        items: items.map((item) =>
+          typeof item === "string" ? { path: item } : item,
+        ),
+        library_type: libraryType,
+      }),
     }),
 
   browseDirectories: (path?: string) =>
@@ -548,6 +575,20 @@ export const api = {
         library_type: libraryType,
         anime_name: animeName,
         fps,
+      }),
+    }),
+
+  updateAnimeAsync: (
+    sourcePath: string,
+    libraryType: import("@/types").LibraryType,
+    animeName: string,
+  ) =>
+    request<{ job_id: string }>("/anime/update-async", {
+      method: "POST",
+      body: JSON.stringify({
+        source_path: sourcePath,
+        library_type: libraryType,
+        anime_name: animeName,
       }),
     }),
 

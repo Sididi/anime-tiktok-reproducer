@@ -210,6 +210,93 @@ class LibraryHydrationService:
         )
 
     @classmethod
+    async def ensure_series_index_hydrated(
+        cls,
+        *,
+        library_type: LibraryType | str,
+        series_id: str,
+    ) -> dict[str, Any]:
+        scoped_type = coerce_library_type(library_type)
+        async with cls._series_lock(scoped_type, series_id):
+            current = await StorageBoxRepository.get_current_release(scoped_type, series_id)
+            manifest = await StorageBoxRepository.get_series_manifest(
+                scoped_type,
+                series_id,
+                str(current["release_id"]),
+            )
+            expected_episode_count = int(
+                manifest.get("episode_count", len(manifest.get("episodes", [])))
+            )
+            state = await asyncio.to_thread(
+                LibraryStateDb.get_series_state,
+                scoped_type,
+                series_id,
+            )
+            if (
+                state is not None
+                and state.release_id == str(manifest["release_id"])
+                and state.hydration_status
+                in {HYDRATION_STATUS_INDEX_READY, HYDRATION_STATUS_FULLY_LOCAL}
+            ):
+                await cls._cache_manifest(scoped_type, manifest)
+                return manifest
+
+            try:
+                await asyncio.to_thread(
+                    LibraryStateDb.upsert_series_state,
+                    library_type=scoped_type,
+                    series_id=series_id,
+                    release_id=str(manifest["release_id"]),
+                    hydration_status=HYDRATION_STATUS_HYDRATING_INDEX,
+                    local_episode_count=await asyncio.to_thread(
+                        cls._count_local_episodes_from_manifest,
+                        scoped_type,
+                        manifest,
+                    ),
+                    expected_episode_count=expected_episode_count,
+                    last_error=None,
+                )
+                await cls._cache_manifest(scoped_type, manifest)
+                await cls._hydrate_index_artifacts(scoped_type, manifest)
+                local_episode_count = await asyncio.to_thread(
+                    cls._count_local_episodes_from_manifest,
+                    scoped_type,
+                    manifest,
+                )
+                hydration_status = (
+                    HYDRATION_STATUS_FULLY_LOCAL
+                    if expected_episode_count > 0 and local_episode_count >= expected_episode_count
+                    else HYDRATION_STATUS_INDEX_READY
+                )
+                await asyncio.to_thread(
+                    LibraryStateDb.upsert_series_state,
+                    library_type=scoped_type,
+                    series_id=series_id,
+                    release_id=str(manifest["release_id"]),
+                    hydration_status=hydration_status,
+                    local_episode_count=local_episode_count,
+                    expected_episode_count=expected_episode_count,
+                    last_error=None,
+                )
+                return manifest
+            except Exception as exc:
+                await asyncio.to_thread(
+                    LibraryStateDb.upsert_series_state,
+                    library_type=scoped_type,
+                    series_id=series_id,
+                    release_id=str(manifest.get("release_id") or ""),
+                    hydration_status=HYDRATION_STATUS_ERROR,
+                    local_episode_count=await asyncio.to_thread(
+                        cls._count_local_episodes_from_manifest,
+                        scoped_type,
+                        manifest,
+                    ),
+                    expected_episode_count=expected_episode_count,
+                    last_error=str(exc),
+                )
+                raise
+
+    @classmethod
     async def activate_project_series(
         cls,
         *,

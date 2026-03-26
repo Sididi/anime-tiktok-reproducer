@@ -87,6 +87,7 @@ class ReplacementProgress(BaseModel):
 
 class IndexationJob(BaseModel):
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:16])
+    job_type: Literal["index", "update"] = "index"
     source_name: str
     library_type: LibraryType
     source_path: str

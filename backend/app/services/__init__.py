@@ -58,6 +58,7 @@ _EXPORTS = {
     "StorageBoxRepository": (".storage_box_repository", "StorageBoxRepository"),
     "LibraryHydrationService": (".library_hydration_service", "LibraryHydrationService"),
     "LibraryStateDb": (".library_state_db", "LibraryStateDb"),
+    "IndexationPreflightService": (".indexation_preflight", "IndexationPreflightService"),
 }
 
 __all__ = list(_EXPORTS)
