@@ -101,6 +101,7 @@ class SourceMediaStream:
     title: str | None
     handler_name: str | None
     is_default: bool = False
+    duration: float | None = None
 
 
 @dataclass(frozen=True)
@@ -120,6 +121,7 @@ class SourceMediaProbe:
     subtitle_streams: tuple[SourceMediaStream, ...] = ()
     data_streams: tuple[SourceMediaStream, ...] = ()
     selected_audio_stream_index: int | None = None
+    video_duration: float | None = None
 
 
 @dataclass(frozen=True)
@@ -811,6 +813,7 @@ class AnimeLibraryService:
             title=title,
             handler_name=handler_name,
             is_default=bool(disposition.get("default", 0)),
+            duration=cls._parse_ffprobe_duration(stream.get("duration")),
         )
 
     @classmethod
@@ -1048,6 +1051,7 @@ class AnimeLibraryService:
             audio_streams=tuple(audio_streams),
             subtitle_streams=tuple(subtitle_streams),
             data_streams=tuple(data_streams),
+            video_duration=video_duration,
         )
         return cls._with_preferred_audio_stream(
             base_probe,
@@ -1195,6 +1199,25 @@ class AnimeLibraryService:
         return max(0.25, min(1.0, 3.0 / fps))
 
     @classmethod
+    def _expected_normalized_duration_seconds(
+        cls,
+        reference_probe: SourceMediaProbe,
+    ) -> float | None:
+        selected_audio_stream = cls._audio_stream_by_index(
+            reference_probe,
+            reference_probe.selected_audio_stream_index,
+        )
+        if (
+            reference_probe.video_duration is not None
+            and selected_audio_stream is not None
+            and selected_audio_stream.duration is not None
+        ):
+            return max(reference_probe.video_duration, selected_audio_stream.duration)
+        if reference_probe.video_duration is not None and not reference_probe.has_audio:
+            return reference_probe.video_duration
+        return reference_probe.duration
+
+    @classmethod
     def _is_valid_normalized_probe(
         cls,
         normalized_probe: SourceMediaProbe | None,
@@ -1240,9 +1263,10 @@ class AnimeLibraryService:
             ):
                 return False
 
-        if reference_probe.duration is not None and normalized_probe.duration is not None:
+        expected_duration = cls._expected_normalized_duration_seconds(reference_probe)
+        if expected_duration is not None and normalized_probe.duration is not None:
             tolerance = cls._normalization_duration_tolerance_seconds(reference_probe)
-            if abs(reference_probe.duration - normalized_probe.duration) > tolerance:
+            if abs(expected_duration - normalized_probe.duration) > tolerance:
                 return False
 
         return normalized_probe.source_path.exists() and normalized_probe.source_path.stat().st_size > 0
@@ -2469,7 +2493,11 @@ class AnimeLibraryService:
                     gpu_error = cls._format_media_failure(exc)
                 else:
                     if gpu_result.returncode == 0:
-                        gpu_error = None
+                        gpu_probe = await asyncio.to_thread(cls._probe_media_sync, tmp_path)
+                        if cls._is_valid_normalized_probe(gpu_probe, reference_probe=plan.probe):
+                            gpu_error = None
+                        else:
+                            gpu_error = f"Normalized output failed validation: {tmp_path.name}"
                     else:
                         gpu_error = cls._format_media_failure(gpu_result)
 

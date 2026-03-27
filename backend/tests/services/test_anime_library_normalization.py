@@ -3,6 +3,7 @@ import subprocess
 import sys
 import asyncio
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import AsyncMock, patch
 
@@ -21,6 +22,7 @@ def _audio_stream(
     language: str | None,
     codec_name: str = "aac",
     is_default: bool = False,
+    duration: float | None = None,
 ) -> SourceMediaStream:
     return SourceMediaStream(
         index=index,
@@ -32,6 +34,7 @@ def _audio_stream(
         title=None,
         handler_name=None,
         is_default=is_default,
+        duration=duration,
     )
 
 
@@ -42,6 +45,8 @@ def _make_probe(
     video_codec: str = "h264",
     audio_streams: tuple[SourceMediaStream, ...] = (),
     selected_audio_stream_index: int | None = None,
+    duration: float = 1400.0,
+    video_duration: float | None = None,
 ) -> SourceMediaProbe:
     audio_codec = None
     if selected_audio_stream_index is not None:
@@ -59,10 +64,11 @@ def _make_probe(
         audio_codec=audio_codec,
         pix_fmt="yuv420p",
         fps=23.976,
-        duration=1400.0,
+        duration=duration,
         has_audio=bool(audio_streams),
         audio_streams=audio_streams,
         selected_audio_stream_index=selected_audio_stream_index,
+        video_duration=duration if video_duration is None else video_duration,
     )
 
 
@@ -256,6 +262,58 @@ class TestAnimeLibraryNormalization(TestCase):
             )
         )
 
+    def test_is_valid_normalized_probe_uses_selected_audio_duration_for_multi_audio_source(self) -> None:
+        reference_probe = _make_probe(
+            Path("/tmp/source.mp4"),
+            suffix=".mp4",
+            audio_streams=(
+                _audio_stream(
+                    index=1,
+                    stream_position=0,
+                    language="ja",
+                    is_default=True,
+                    duration=1400.05,
+                ),
+                _audio_stream(
+                    index=2,
+                    stream_position=1,
+                    language="en",
+                    duration=1401.10,
+                ),
+            ),
+            selected_audio_stream_index=1,
+            duration=1401.10,
+            video_duration=1400.00,
+        )
+        normalized_path = Path("/tmp/source.normalize.tmp.mp4")
+        normalized_path.write_bytes(b"normalized")
+        normalized_probe = _make_probe(
+            normalized_path,
+            suffix=".mp4",
+            video_codec="h264",
+            audio_streams=(
+                _audio_stream(
+                    index=1,
+                    stream_position=0,
+                    language="ja",
+                    duration=1400.06,
+                ),
+            ),
+            selected_audio_stream_index=1,
+            duration=1400.06,
+            video_duration=1400.00,
+        )
+
+        try:
+            self.assertTrue(
+                AnimeLibraryService._is_valid_normalized_probe(
+                    normalized_probe,
+                    reference_probe=reference_probe,
+                )
+            )
+        finally:
+            normalized_path.unlink(missing_ok=True)
+
     def test_normalize_source_for_processing_rebuilds_from_original_import_when_audio_policy_changes(self) -> None:
         async def _run() -> None:
             source_path = Path("/tmp/library/episode.mp4")
@@ -347,6 +405,104 @@ class TestAnimeLibraryNormalization(TestCase):
             cmd = mock_run_command.await_args.args[0]
             self.assertEqual(cmd[3], str(original_source_path))
             self.assertTrue(original_source_path.exists())
+
+        asyncio.run(_run())
+
+    def test_normalize_source_for_processing_retries_cpu_when_gpu_output_fails_validation(self) -> None:
+        async def _run() -> None:
+            with TemporaryDirectory() as tmp_dir:
+                source_path = Path(tmp_dir) / "episode.mkv"
+                target_path = source_path.with_suffix(".mp4")
+                tmp_output_path = target_path.with_name(f"{target_path.stem}.normalize.tmp.mp4")
+                source_path.write_bytes(b"source")
+
+                source_probe = _make_probe(
+                    source_path,
+                    video_codec="av1",
+                    audio_streams=(
+                        _audio_stream(index=1, stream_position=0, language="ja"),
+                    ),
+                    selected_audio_stream_index=1,
+                )
+                invalid_gpu_probe = SourceMediaProbe(
+                    source_path=tmp_output_path,
+                    container_suffix=".mp4",
+                    format_name="mov,mp4,m4a,3gp,3g2,mj2",
+                    video_codec="h264",
+                    audio_codec=None,
+                    pix_fmt="yuv420p",
+                    fps=23.976,
+                    duration=1400.0,
+                    has_audio=False,
+                    audio_streams=(),
+                    selected_audio_stream_index=None,
+                )
+                valid_cpu_probe = _make_probe(
+                    tmp_output_path,
+                    suffix=".mp4",
+                    video_codec="h264",
+                    audio_streams=(
+                        _audio_stream(index=1, stream_position=0, language="ja"),
+                    ),
+                    selected_audio_stream_index=1,
+                )
+                tmp_probe_calls = 0
+
+                def _probe_side_effect(path: Path):
+                    nonlocal tmp_probe_calls
+                    if path == source_path:
+                        return source_probe
+                    if path == tmp_output_path:
+                        tmp_probe_calls += 1
+                        if tmp_probe_calls == 1:
+                            return invalid_gpu_probe
+                        return valid_cpu_probe
+                    raise AssertionError(f"Unexpected probe path: {path}")
+
+                async def _fake_run_command(cmd, *, timeout_seconds):
+                    tmp_output_path.write_bytes(b"tmp-output")
+                    return type(
+                        "Result",
+                        (),
+                        {
+                            "returncode": 0,
+                            "stdout": b"",
+                            "stderr": b"",
+                        },
+                    )()
+
+                with (
+                    patch.object(
+                        AnimeLibraryService,
+                        "_probe_media_sync",
+                        side_effect=_probe_side_effect,
+                    ),
+                    patch.object(
+                        AnimeLibraryService,
+                        "_write_subtitle_sidecar",
+                        AsyncMock(),
+                    ),
+                    patch.object(
+                        AnimeLibraryService,
+                        "_postprocess_source_normalization_commit",
+                        AsyncMock(),
+                    ),
+                    patch.object(
+                        AnimeLibraryService,
+                        "_run_normalization_command",
+                        side_effect=_fake_run_command,
+                    ) as mock_run_command,
+                ):
+                    result = await AnimeLibraryService.normalize_source_for_processing(
+                        source_path,
+                        preferred_audio_language="ja",
+                    )
+
+                self.assertTrue(result.changed)
+                self.assertEqual(result.normalized_path, target_path)
+                self.assertEqual(mock_run_command.await_count, 2)
+                self.assertIn("h264_nvenc", mock_run_command.await_args_list[0].args[0])
+                self.assertIn("libx264", mock_run_command.await_args_list[1].args[0])
 
         asyncio.run(_run())
 
