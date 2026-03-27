@@ -189,8 +189,9 @@ async def test_stream_automation_resume_uses_edited_script_for_tts_metadata_and_
     monkeypatch.setattr(GeminiService, "is_configured", lambda: True)
     monkeypatch.setattr(ElevenLabsService, "is_configured", lambda: True)
 
-    def fake_prepare_tts_payload(*, script_payload, target_language=None):
+    def fake_prepare_tts_payload(*, script_payload, target_language=None, model_id=None):
         seen["tts_script"] = script_payload
+        seen["tts_model_id"] = model_id
         return {
             "language": "fr",
             "normalized_full_text": "Texte édité par l'utilisateur.",
@@ -273,6 +274,7 @@ async def test_stream_automation_resume_uses_edited_script_for_tts_metadata_and_
     assert seen["tts_script"] == edited_script
     assert seen["metadata_script"] == edited_script
     assert seen["overlay_script"] == edited_script
+    assert seen["tts_model_id"] == settings.elevenlabs_model_id
     assert seen["tts_text"] == "Texte édité par l'utilisateur."
     assert seen["part_count"] == 1
     assert events[-1]["metadata_candidates_json"]["title_candidates"][0] == "Titre 1"
@@ -407,6 +409,7 @@ async def test_stream_automation_v2_uses_previous_request_ids_between_chunks(
     tmp_path: Path,
 ):
     synthesize_calls: list[dict[str, object]] = []
+    prepared_model_ids: list[str | None] = []
 
     monkeypatch.setattr(settings, "projects_dir", tmp_path)
     monkeypatch.setattr(settings, "script_automate_enabled", True)
@@ -426,15 +429,18 @@ async def test_stream_automation_v2_uses_previous_request_ids_between_chunks(
     monkeypatch.setattr(
         ScriptAutomationService,
         "prepare_tts_payload",
-        lambda **kwargs: {
-            "language": "fr",
-            "normalized_full_text": "Chunk 1. Chunk 2. Chunk 3.",
-            "segments": [
-                {"id": 1, "scene_indices": [1], "text": "Chunk 1.", "character_count": 8},
-                {"id": 2, "scene_indices": [1], "text": "Chunk 2.", "character_count": 8},
-                {"id": 3, "scene_indices": [1], "text": "Chunk 3.", "character_count": 8},
-            ],
-        },
+        lambda **kwargs: (
+            prepared_model_ids.append(kwargs.get("model_id")),
+            {
+                "language": "fr",
+                "normalized_full_text": "Chunk 1. Chunk 2. Chunk 3.",
+                "segments": [
+                    {"id": 1, "scene_indices": [1], "text": "Chunk 1.", "character_count": 8},
+                    {"id": 2, "scene_indices": [1], "text": "Chunk 2.", "character_count": 8},
+                    {"id": 3, "scene_indices": [1], "text": "Chunk 3.", "character_count": 8},
+                ],
+            },
+        )[1],
     )
 
     def fake_synthesize(**kwargs):
@@ -462,6 +468,7 @@ async def test_stream_automation_v2_uses_previous_request_ids_between_chunks(
         skip_overlay=True,
     )
 
+    assert prepared_model_ids == ["eleven_multilingual_v2"]
     assert [call["text"] for call in synthesize_calls] == ["Chunk 1.", "Chunk 2.", "Chunk 3."]
     assert synthesize_calls[0].get("previous_request_ids") is None
     assert synthesize_calls[1].get("previous_request_ids") == ["req-1"]
@@ -545,6 +552,7 @@ async def test_stream_automation_v3_reuses_seed_and_prefixes_each_chunk(
     tmp_path: Path,
 ):
     synthesize_calls: list[dict[str, object]] = []
+    prepared_model_ids: list[str | None] = []
 
     monkeypatch.setattr(settings, "projects_dir", tmp_path)
     monkeypatch.setattr(settings, "script_automate_enabled", True)
@@ -564,14 +572,17 @@ async def test_stream_automation_v3_reuses_seed_and_prefixes_each_chunk(
     monkeypatch.setattr(
         ScriptAutomationService,
         "prepare_tts_payload",
-        lambda **kwargs: {
-            "language": "fr",
-            "normalized_full_text": "Chunk 1. Chunk 2.",
-            "segments": [
-                {"id": 1, "scene_indices": [1], "text": "Chunk 1.", "character_count": 8},
-                {"id": 2, "scene_indices": [1], "text": "Chunk 2.", "character_count": 8},
-            ],
-        },
+        lambda **kwargs: (
+            prepared_model_ids.append(kwargs.get("model_id")),
+            {
+                "language": "fr",
+                "normalized_full_text": "Chunk 1. Chunk 2.",
+                "segments": [
+                    {"id": 1, "scene_indices": [1], "text": "Chunk 1.", "character_count": 8},
+                    {"id": 2, "scene_indices": [1], "text": "Chunk 2.", "character_count": 8},
+                ],
+            },
+        )[1],
     )
 
     def fake_synthesize(**kwargs):
@@ -599,6 +610,7 @@ async def test_stream_automation_v3_reuses_seed_and_prefixes_each_chunk(
         skip_overlay=True,
     )
 
+    assert prepared_model_ids == ["eleven_v3"]
     assert [call["text"] for call in synthesize_calls] == [
         "[TikTok narrator, energetic, rapid] Chunk 1.",
         "[TikTok narrator, energetic, rapid] Chunk 2.",

@@ -4,18 +4,26 @@ import sys
 import zipfile
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
+from app.config import settings
 from app.models.project import Project
 from app.models.transcription import SceneTranscription, Transcription, Word
 from app.services.anime_library import AnimeLibraryService, SourceNormalizationResult
 from app.services.export_service import ExportService
 from app.services.forced_alignment import ForcedAlignmentService
 from app.services.processing import ProcessingService, ResolvedSceneSource
+from app.services.project_service import ProjectService
 from app.services.script_automation_service import ScriptAutomationService
+from app.services.voice_config_service import VoiceConfigService
+
+
+def _build_sentence(prefix: str, *, repeat_count: int = 28) -> str:
+    return f"{prefix} " + " ".join(["story"] * repeat_count) + "."
 
 
 def test_normalize_external_subtitle_text_strips_markup_and_ass_controls():
@@ -107,6 +115,92 @@ def test_fragment_based_alignment_maps_one_scene_across_adjacent_segments(monkey
     assert [word.text for word in combined_scene_words] == scene_text.split()
 
 
+def test_tts_segmentation_uses_smaller_v3_target_while_preserving_sentence_boundaries():
+    script_payload = {
+        "language": "fr",
+        "scenes": [
+            {"scene_index": 1, "text": _build_sentence("One")},
+            {"scene_index": 2, "text": _build_sentence("Two")},
+            {"scene_index": 3, "text": _build_sentence("Three")},
+            {"scene_index": 4, "text": _build_sentence("Four")},
+            {"scene_index": 5, "text": _build_sentence("Five")},
+            {"scene_index": 6, "text": _build_sentence("Six")},
+            {"scene_index": 7, "text": _build_sentence("Seven")},
+            {"scene_index": 8, "text": _build_sentence("Eight")},
+        ],
+    }
+
+    v2_segments = ScriptAutomationService._segment_scenes_for_tts_payload(
+        script_payload,
+        model_id="eleven_multilingual_v2",
+    )
+    v3_segments = ScriptAutomationService._segment_scenes_for_tts_payload(
+        script_payload,
+        model_id="eleven_v3",
+    )
+
+    assert len(v2_segments) == 2
+    assert v2_segments[0]["scene_indices"] == [1, 2, 3, 4]
+    assert v2_segments[1]["scene_indices"] == [5, 6, 7, 8]
+    assert len(v3_segments) == 3
+    assert v3_segments[0]["scene_indices"] == [1, 2, 3]
+    assert v3_segments[1]["scene_indices"] == [4, 5, 6]
+    assert v3_segments[2]["scene_indices"] == [7, 8]
+    assert all(str(segment["text"]).endswith(".") for segment in [*v2_segments, *v3_segments])
+
+
+def test_tts_segmentation_v3_target_does_not_close_before_minimum():
+    script_payload = {
+        "language": "fr",
+        "scenes": [
+            {"scene_index": 1, "text": _build_sentence("One")},
+            {"scene_index": 2, "text": _build_sentence("Two")},
+            {"scene_index": 3, "text": _build_sentence("Three")},
+        ],
+    }
+
+    segments = ScriptAutomationService._segment_scenes_for_tts_payload(
+        script_payload,
+        model_id="eleven_v3",
+    )
+
+    assert len(segments) == 1
+    assert segments[0]["scene_indices"] == [1, 2, 3]
+
+
+def test_tts_segmentation_v3_hard_cap_still_prefers_sentence_boundary(monkeypatch):
+    monkeypatch.setattr(ScriptAutomationService, "TTS_HARD_MAX", 120)
+    monkeypatch.setattr(ScriptAutomationService, "TTS_SOFT_MAX", 120)
+    monkeypatch.setattr(ScriptAutomationService, "TTS_MIN", 1)
+    monkeypatch.setattr(ScriptAutomationService, "TTS_TARGET", 60)
+    monkeypatch.setattr(ScriptAutomationService, "TTS_V3_TARGET", 60)
+
+    first_sentence = _build_sentence("One", repeat_count=8)
+    second_sentence = _build_sentence("Two", repeat_count=8)
+    third_sentence = _build_sentence("Three", repeat_count=8)
+    scene_text = f"{first_sentence} {second_sentence} {third_sentence}"
+    payload = {
+        "language": "fr",
+        "scenes": [
+            {
+                "scene_index": 35,
+                "text": scene_text,
+            }
+        ],
+    }
+
+    segments = ScriptAutomationService._segment_scenes_for_tts_payload(
+        payload,
+        model_id="eleven_v3",
+    )
+
+    assert len(segments) == 2
+    assert segments[0]["text"] == f"{first_sentence} {second_sentence}"
+    assert segments[1]["text"] == third_sentence
+    assert segments[0]["text"].endswith(".")
+    assert segments[1]["text"].endswith(".")
+
+
 def test_validate_manifest_upgrades_legacy_segment_indices_when_text_matches(monkeypatch):
     monkeypatch.setattr(ScriptAutomationService, "TTS_HARD_MAX", 35)
     monkeypatch.setattr(ScriptAutomationService, "TTS_SOFT_MAX", 35)
@@ -153,6 +247,54 @@ def test_validate_manifest_upgrades_legacy_segment_indices_when_text_matches(mon
         fragment["scene_index"] == 2
         for fragment in validated["segments"][0]["scene_fragments"]
     )
+
+
+def test_save_upload_manifest_uses_project_voice_model_for_segment_count(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "projects_dir", tmp_path)
+    monkeypatch.setattr(settings, "elevenlabs_model_id", "eleven_multilingual_v2")
+    monkeypatch.setattr(
+        VoiceConfigService,
+        "get_voice",
+        lambda voice_key: SimpleNamespace(
+            elevenlabs_voice_id="voice-id",
+            voice_settings={},
+            model_id="eleven_v3",
+        ),
+    )
+
+    project = Project(id="proj-v3-manifest", voice_key="voice-v3")
+    ProjectService.get_project_dir(project.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(project)
+
+    script_payload = {
+        "language": "fr",
+        "scenes": [
+            {"scene_index": 1, "text": _build_sentence("One")},
+            {"scene_index": 2, "text": _build_sentence("Two")},
+            {"scene_index": 3, "text": _build_sentence("Three")},
+            {"scene_index": 4, "text": _build_sentence("Four")},
+            {"scene_index": 5, "text": _build_sentence("Five")},
+            {"scene_index": 6, "text": _build_sentence("Six")},
+            {"scene_index": 7, "text": _build_sentence("Seven")},
+            {"scene_index": 8, "text": _build_sentence("Eight")},
+        ],
+    }
+
+    manifest = ForcedAlignmentService.save_upload_manifest(
+        project.id,
+        script_payload=script_payload,
+        mode="audio_parts",
+        stored_part_paths=[
+            "tts_parts/part_0001.wav",
+            "tts_parts/part_0002.wav",
+            "tts_parts/part_0003.wav",
+        ],
+    )
+
+    assert len(manifest["segments"]) == 3
 
 
 def test_raw_scene_image_render_plan_prefers_library_sidecar_without_probe(

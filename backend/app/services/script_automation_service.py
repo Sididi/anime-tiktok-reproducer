@@ -54,6 +54,7 @@ class ScriptAutomationService:
     MAX_OVERLAY_TITLE_CHARS = 45
 
     TTS_TARGET = 625
+    TTS_V3_TARGET = 550
     TTS_MIN = 500
     TTS_SOFT_MAX = 750
     TTS_HARD_MAX = 800
@@ -188,11 +189,43 @@ class ScriptAutomationService:
         }
 
     @classmethod
+    def resolve_tts_model_id(
+        cls,
+        *,
+        model_id: str | None = None,
+        voice_key: str | None = None,
+    ) -> str:
+        selected_model = (model_id or "").strip()
+        if selected_model:
+            return selected_model
+
+        normalized_voice_key = (voice_key or "").strip()
+        if normalized_voice_key:
+            try:
+                voice = VoiceConfigService.get_voice(normalized_voice_key)
+            except Exception:
+                pass
+            else:
+                voice_model_id = (voice.model_id or "").strip()
+                if voice_model_id:
+                    return voice_model_id
+
+        return (settings.elevenlabs_model_id or "").strip()
+
+    @classmethod
+    def resolve_tts_target(cls, model_id: str | None = None) -> int:
+        normalized_model = cls.resolve_tts_model_id(model_id=model_id).lower()
+        if normalized_model.startswith("eleven_v3"):
+            return cls.TTS_V3_TARGET
+        return cls.TTS_TARGET
+
+    @classmethod
     def prepare_tts_payload(
         cls,
         *,
         script_payload: dict[str, Any],
         target_language: str | None = None,
+        model_id: str | None = None,
     ) -> dict[str, Any]:
         scenes = script_payload.get("scenes")
         if not isinstance(scenes, list) or not scenes:
@@ -224,7 +257,10 @@ class ScriptAutomationService:
             "language": language,
             "scenes": normalized_scenes,
         }
-        segments = cls._segment_scenes_for_tts_payload(normalized_payload)
+        segments = cls._segment_scenes_for_tts_payload(
+            normalized_payload,
+            model_id=model_id,
+        )
         normalized_full_text = " ".join(scene["text"] for scene in normalized_scenes if scene["text"]).strip()
         return {
             "language": language,
@@ -486,11 +522,17 @@ class ScriptAutomationService:
         )
 
     @classmethod
-    def _segment_scenes_for_tts_payload(cls, script_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    def _segment_scenes_for_tts_payload(
+        cls,
+        script_payload: dict[str, Any],
+        *,
+        model_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Segment script scenes for TTS and keep scene index mapping."""
         scenes = script_payload.get("scenes", [])
         if not isinstance(scenes, list) or not scenes:
             return []
+        target = cls.resolve_tts_target(model_id)
 
         def _create_empty_segment(segment_id: int) -> dict[str, Any]:
             return cls._build_segment_from_fragments(segment_id=segment_id, scene_fragments=[])
@@ -591,7 +633,7 @@ class ScriptAutomationService:
                 close_now = (
                     current_len >= cls.TTS_SOFT_MAX
                     or with_next_len > cls.TTS_SOFT_MAX
-                    or abs(current_len - cls.TTS_TARGET) <= abs(with_next_len - cls.TTS_TARGET)
+                    or abs(current_len - target) <= abs(with_next_len - target)
                 )
             else:
                 # Prefer short sentence-complete chunks over drifting toward hard cap.
@@ -650,8 +692,16 @@ class ScriptAutomationService:
         return segments
 
     @classmethod
-    def _segment_scenes_for_tts(cls, script_payload: dict[str, Any]) -> list[str]:
-        return [str(segment.get("text", "")).strip() for segment in cls._segment_scenes_for_tts_payload(script_payload)]
+    def _segment_scenes_for_tts(
+        cls,
+        script_payload: dict[str, Any],
+        *,
+        model_id: str | None = None,
+    ) -> list[str]:
+        return [
+            str(segment.get("text", "")).strip()
+            for segment in cls._segment_scenes_for_tts_payload(script_payload, model_id=model_id)
+        ]
 
     @classmethod
     def _output_extension(cls) -> str:
@@ -896,7 +946,14 @@ class ScriptAutomationService:
                 yield cls._event("tts_generating", message="TTS generation skipped")
             else:
                 yield cls._event("tts_segmenting", message="Segmenting script for TTS...")
-                prepared_tts = cls.prepare_tts_payload(script_payload=script_payload, target_language=target_language)
+                effective_model = cls.resolve_tts_model_id(model_id=voice.model_id)
+                normalized_model = effective_model.lower()
+                is_v3_model = normalized_model.startswith("eleven_v3")
+                prepared_tts = cls.prepare_tts_payload(
+                    script_payload=script_payload,
+                    target_language=target_language,
+                    model_id=effective_model,
+                )
                 segments = prepared_tts.get("segments", [])
                 chunks = [str(segment.get("text", "")).strip() for segment in segments]
                 if not chunks:
@@ -927,10 +984,6 @@ class ScriptAutomationService:
                         part_total=len(chunks),
                         char_count=segment_char_count,
                     )
-
-                    effective_model = (voice.model_id or settings.elevenlabs_model_id).strip()
-                    normalized_model = effective_model.lower()
-                    is_v3_model = normalized_model.startswith("eleven_v3")
 
                     outgoing_text = chunk
                     seed: int | None = None

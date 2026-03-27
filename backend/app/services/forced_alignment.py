@@ -82,17 +82,26 @@ class ForcedAlignmentService:
         return json.loads(manifest_path.read_text(encoding="utf-8"))
 
     @classmethod
+    def _resolve_project_tts_model_id(cls, project_id: str) -> str:
+        project = ProjectService.load(project_id)
+        voice_key = project.voice_key if project is not None else None
+        return ScriptAutomationService.resolve_tts_model_id(voice_key=voice_key)
+
+    @classmethod
     def save_upload_manifest(
         cls,
         project_id: str,
         *,
         script_payload: dict[str, Any],
         mode: str,
+        model_id: str | None = None,
         stored_part_paths: list[str] | None = None,
     ) -> dict[str, Any]:
+        effective_model_id = model_id or cls._resolve_project_tts_model_id(project_id)
         prepared = ScriptAutomationService.prepare_tts_payload(
             script_payload=script_payload,
             target_language=script_payload.get("language"),
+            model_id=effective_model_id,
         )
         segments = prepared.get("segments") or []
 
@@ -188,10 +197,16 @@ class ForcedAlignmentService:
         )
 
     @classmethod
-    def build_single_audio_manifest(cls, *, script_payload: dict[str, Any]) -> dict[str, Any]:
+    def build_single_audio_manifest(
+        cls,
+        *,
+        script_payload: dict[str, Any],
+        model_id: str | None = None,
+    ) -> dict[str, Any]:
         prepared = ScriptAutomationService.prepare_tts_payload(
             script_payload=script_payload,
             target_language=script_payload.get("language"),
+            model_id=model_id,
         )
         return {
             "version": 1,
@@ -236,9 +251,11 @@ class ForcedAlignmentService:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         try:
+            effective_model_id = cls._resolve_project_tts_model_id(project_id)
             manifest = cls._validate_manifest_against_script(
                 manifest=prepared_audio.manifest,
                 script_payload=script_payload,
+                model_id=effective_model_id,
             )
             align_language = cls._resolve_alignment_language(manifest.get("language"))
             if prepared_audio.mode == "audio_parts":
@@ -332,8 +349,12 @@ class ForcedAlignmentService:
         *,
         manifest: dict[str, Any],
         script_payload: dict[str, Any],
+        model_id: str | None = None,
     ) -> dict[str, Any]:
-        expected = cls.build_single_audio_manifest(script_payload=script_payload)
+        expected = cls.build_single_audio_manifest(
+            script_payload=script_payload,
+            model_id=model_id,
+        )
         expected_segments = expected.get("segments", [])
         actual_segments = manifest.get("segments", [])
         if len(actual_segments) != len(expected_segments):

@@ -32,6 +32,7 @@ from .premiere_subtitle_baker import PremiereSubtitleBakerService
 from .project_service import ProjectService
 from .auto_editor_profiles import AutoEditorProfile, PRODUCTION_AUTO_EDITOR_PROFILE
 from .forced_alignment import ForcedAlignmentService, PreparedAlignmentAudio
+from .script_automation_service import ScriptAutomationService
 from .voice_config_service import VoiceConfigService
 
 logger = logging.getLogger("uvicorn.error")
@@ -1946,6 +1947,9 @@ class ProcessingService:
                             segment_audio_paths=[],
                             manifest=ForcedAlignmentService.build_single_audio_manifest(
                                 script_payload=new_script,
+                                model_id=ScriptAutomationService.resolve_tts_model_id(
+                                    voice_key=project.voice_key,
+                                ),
                             ),
                         )
 

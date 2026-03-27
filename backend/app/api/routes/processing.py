@@ -108,6 +108,10 @@ def _normalize_script_payload_or_400(
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+def _resolve_project_tts_model_id(project) -> str:
+    return ScriptAutomationService.resolve_tts_model_id(voice_key=project.voice_key)
+
+
 def _notify_drive_upload_complete(project_id: str, _folder_url: str) -> None:
     """
     Best-effort Discord notification after Drive export.
@@ -388,10 +392,12 @@ async def prepare_script_tts(project_id: str, request: ScriptTtsPrepareRequest):
     )
 
     try:
+        effective_model_id = _resolve_project_tts_model_id(project)
         prepared_payload = await asyncio.to_thread(
             ScriptAutomationService.prepare_tts_payload,
             script_payload=normalized.public_payload,
             target_language=request.target_language,
+            model_id=effective_model_id,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -450,10 +456,12 @@ async def upload_restructured_script(
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
     normalized_script = _normalize_script_payload_or_400(project_id, script_data)
+    effective_model_id = _resolve_project_tts_model_id(project)
     try:
         prepared_tts = ScriptAutomationService.prepare_tts_payload(
             script_payload=normalized_script.public_payload,
             target_language=normalized_script.language,
+            model_id=effective_model_id,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -487,6 +495,7 @@ async def upload_restructured_script(
             project_id,
             script_payload=normalized_script.public_payload,
             mode="single_audio",
+            model_id=effective_model_id,
         )
     else:
         expected_segment_count = len(prepared_tts.get("segments") or [])
@@ -550,6 +559,7 @@ async def upload_restructured_script(
             project_id,
             script_payload=normalized_script.public_payload,
             mode="audio_parts",
+            model_id=effective_model_id,
             stored_part_paths=[
                 str(path.relative_to(project_dir))
                 for path in stored_part_paths
