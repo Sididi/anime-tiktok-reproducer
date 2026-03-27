@@ -1,4 +1,4 @@
-import { FolderKanban, Trash2 } from "lucide-react";
+import { FolderKanban, Eraser } from "lucide-react";
 import type { LibraryType } from "@/types";
 import { LIBRARY_TYPE_OPTIONS } from "@/utils/libraryTypes";
 
@@ -50,7 +50,7 @@ export function LibraryHeader({
         className="p-1.5 rounded text-[hsl(var(--destructive))] hover:bg-[hsl(var(--destructive))]/15 transition-colors"
         title="Purger la librairie"
       >
-        <Trash2 className="h-4 w-4" />
+        <Eraser className="h-4 w-4" />
       </button>
     </div>
   );

@@ -2872,6 +2872,7 @@ export function ScriptRestructurePage() {
       {transcription && (
         <ScriptEditorModal
           isOpen={scriptEditorOpen}
+          projectId={projectId}
           onClose={() => setScriptEditorOpen(false)}
           onSave={(updatedJson) => {
             handleJsonChange(updatedJson);
@@ -2903,6 +2904,7 @@ export function ScriptRestructurePage() {
 
       <TitleSelectionModal
         isOpen={titlePickerOpen && !!pendingTitleSelection}
+        projectId={projectId}
         metadataCandidates={pendingTitleSelection?.metadataCandidates || null}
         metadataError={pendingTitleSelection?.metadataError || null}
         overlay={pendingTitleSelection?.overlay || null}

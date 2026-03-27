@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { X } from "lucide-react";
 import { useEditor, EditorContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
+import { api } from "@/api/client";
 import { Button } from "@/components/ui";
 import { SceneHeader } from "./SceneHeaderExtension";
 import {
@@ -13,6 +14,7 @@ import type { Transcription } from "@/types";
 
 interface ScriptEditorModalProps {
   isOpen: boolean;
+  projectId?: string;
   onClose: () => void;
   onSave: (updatedJson: string) => void;
   scenesJson: string;
@@ -115,6 +117,7 @@ function extractScenesFromEditor(
 
 export function ScriptEditorModal({
   isOpen,
+  projectId,
   onClose,
   onSave,
   scenesJson,
@@ -315,7 +318,20 @@ export function ScriptEditorModal({
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="bg-[hsl(var(--card))] rounded-lg w-full max-w-6xl max-h-[90vh] overflow-hidden flex flex-col">
+      <div className="bg-[hsl(var(--card))] rounded-lg w-full max-w-7xl max-h-[90vh] overflow-hidden flex">
+        {/* TikTok video preview */}
+        {projectId && (
+          <div className="w-72 shrink-0 flex items-center justify-center bg-black rounded-l-lg overflow-hidden">
+            <video
+              src={api.getVideoUrl(projectId)}
+              controls
+              className="w-full h-auto max-h-[90vh] object-contain"
+            />
+          </div>
+        )}
+
+        {/* Main content */}
+        <div className="flex-1 min-w-0 flex flex-col overflow-hidden">
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-[hsl(var(--border))]">
           <h2 className="text-lg font-semibold">{title}</h2>
@@ -387,6 +403,7 @@ export function ScriptEditorModal({
             </Button>
             <Button onClick={handleSave}>{saveLabel}</Button>
           </div>
+        </div>
         </div>
       </div>
     </div>

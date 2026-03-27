@@ -112,7 +112,7 @@ export function SourceRow({
             e.stopPropagation();
             onManageEpisodes();
           }}
-          className="p-1 rounded text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--secondary))] hover:text-[hsl(var(--foreground))] transition-colors"
+          className="p-1 rounded text-amber-500/50 hover:bg-amber-500/10 hover:text-amber-400 transition-colors"
           title="Gérer les épisodes"
         >
           <Cable className="h-4 w-4" />
@@ -122,7 +122,7 @@ export function SourceRow({
             e.stopPropagation();
             onUpdate();
           }}
-          className="p-1 rounded text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--secondary))] hover:text-[hsl(var(--foreground))] transition-colors"
+          className="p-1 rounded text-violet-400/50 hover:bg-violet-500/10 hover:text-violet-400 transition-colors"
           title="Mettre à jour les épisodes"
         >
           <FolderDown className="h-4 w-4" />

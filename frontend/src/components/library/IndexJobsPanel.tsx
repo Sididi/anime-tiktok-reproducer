@@ -94,8 +94,7 @@ export function IndexJobsPanel({ onJobComplete }: IndexJobsPanelProps) {
       >
         <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
         <span className="text-[hsl(var(--muted-foreground))]">
-          {activeJobs.length} opération{activeJobs.length !== 1 ? "s" : ""} de
-          librairie en cours
+          {activeJobs.length} indexation{activeJobs.length !== 1 ? "s" : ""} en cours
         </span>
         <ChevronDown
           className={`ml-auto h-3.5 w-3.5 text-[hsl(var(--muted-foreground))] transition-transform ${
