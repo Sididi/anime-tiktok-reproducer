@@ -21,6 +21,8 @@
   var CATEGORY_OVERLAY_FILENAME = "category_overlay.png";
   var TITLE_OVERLAY_FILENAME = "title_overlay.png";
   var MUSIC_FILENAME = "credits song for my death.wav";
+  var PROJECT_ID = "project_id";
+  var BATCH_SEQUENCE_NAME = "ATR_BATCH__project_id";
   var MUSIC_GAIN_DB = -23.0;
   var PROJECT_PURGE_BIN_NAME = "__ATR_PURGE__";
   var BACKGROUND_PRESET_NAME = "SPM Anime Background";
@@ -1567,16 +1569,8 @@
       alert("Open a project.");
       return;
     }
-    log("Purging project to start fresh...");
-    perfStart("purge");
-    if (!purgeProjectCompletely()) {
-      perfEnd("purge", "Purge");
-      alert("Error: Could not fully purge the project. Aborting.");
-      return;
-    }
-    perfEnd("purge", "Purge");
 
-    var seqName = "ATR_Layered_" + Math.floor(Math.random() * 9999);
+    var seqName = BATCH_SEQUENCE_NAME;
     var presetFile = new File(SEQUENCE_PRESET_PATH);
     var sequence;
 
@@ -1987,10 +1981,6 @@
     refreshSequenceUI(sequence);
     perfEnd("total");
     perfLogSummary();
-
-    alert(
-      "Script Complete (v7.7 Layered - Presets + External Subtitle MOGRTs).",
-    );
   }
 
   // ========================================================================

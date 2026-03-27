@@ -2,10 +2,12 @@
 
 var TRANSIENT_ERROR_STATUSES = {
   queued_download: true,
+  sleeping_download: true,
   downloading: true,
   importing: true,
   exporting: true,
   uploading: true,
+  cleaning: true,
 };
 
 function cloneRecord(value) {

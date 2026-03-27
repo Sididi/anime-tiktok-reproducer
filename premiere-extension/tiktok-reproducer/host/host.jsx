@@ -523,7 +523,38 @@ function __atrRemoveTrackByIndex(tracks, indexToRemove) {
   }
 }
 
-function __atrCloneActiveSequence() {
+function __atrFindSequenceByName(sequenceName) {
+  var targetName = __atrSafeString(sequenceName);
+  if (!targetName) {
+    return null;
+  }
+
+  var sequences = app && app.project ? app.project.sequences : null;
+  if (!sequences) {
+    return null;
+  }
+
+  var count = 0;
+  try {
+    count = Number(sequences.numSequences || 0);
+  } catch (eCount) {
+    count = 0;
+  }
+
+  for (var i = 0; i < count; i += 1) {
+    var sequence = sequences[i];
+    if (!sequence) {
+      continue;
+    }
+    if (__atrGetSequenceName(sequence) === targetName) {
+      return sequence;
+    }
+  }
+
+  return null;
+}
+
+function __atrCloneSequence(sourceSequence) {
   var sequences = app && app.project ? app.project.sequences : null;
   if (!sequences) {
     throw new Error("No sequence collection available");
@@ -536,9 +567,8 @@ function __atrCloneActiveSequence() {
     beforeCount = 0;
   }
 
-  var sourceSequence = app.project.activeSequence;
   if (!sourceSequence || !sourceSequence.clone) {
-    throw new Error("Active sequence cannot be cloned");
+    throw new Error("Sequence cannot be cloned");
   }
 
   var cloned = sourceSequence.clone();
@@ -901,22 +931,32 @@ function setPanelPersistent() {
  * Start managed export via Adobe Media Encoder and return job ID.
  *
  * @param {string} projectId
+ * @param {string} sequenceName
  * @param {string} outputPath
  * @param {string} presetPath
  * @returns {string} jobID or ERROR message
  */
-function startManagedExport(projectId, outputPath, presetPath) {
+function startManagedExport(projectId, sequenceName, outputPath, presetPath) {
   try {
-    if (!app || !app.project || !app.project.activeSequence) {
-      return "ERROR: No active sequence in current project";
+    if (!app || !app.project) {
+      return "ERROR: No active Premiere project";
+    }
+
+    var targetSequenceName = __atrSafeString(sequenceName);
+    if (!targetSequenceName) {
+      return "ERROR: Missing sequence name";
+    }
+    var targetSequence = __atrFindSequenceByName(targetSequenceName);
+    if (!targetSequence) {
+      return "ERROR: Sequence not found: " + targetSequenceName;
     }
 
     var exportAudioNoMusic =
-      Number(arguments.length >= 4 ? arguments[3] : 0) === 1;
+      Number(arguments.length >= 5 ? arguments[4] : 0) === 1;
     var audioOutputPath =
-      arguments.length >= 5 ? __atrSafeString(arguments[4]) : "";
-    var audioPresetPath =
       arguments.length >= 6 ? __atrSafeString(arguments[5]) : "";
+    var audioPresetPath =
+      arguments.length >= 7 ? __atrSafeString(arguments[6]) : "";
 
     var normalizedPresetPath = __atrNormalizePath(presetPath);
     var presetFile = new File(normalizedPresetPath);
@@ -948,7 +988,7 @@ function startManagedExport(projectId, outputPath, presetPath) {
     }
 
     var videoJobID = __atrEncodeSequence(
-      app.project.activeSequence,
+      targetSequence,
       outputFsPath,
       presetFsPath,
     );
@@ -999,7 +1039,7 @@ function startManagedExport(projectId, outputPath, presetPath) {
         audioOutFile.fsName || normalizedAudioOutputPath,
       );
 
-      var tempSequence = __atrCloneActiveSequence();
+      var tempSequence = __atrCloneSequence(targetSequence);
       var tempSequenceName =
         __atrTempAudioSequencePrefix +
         __atrSafeString(projectId) +

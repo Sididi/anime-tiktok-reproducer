@@ -1000,6 +1000,7 @@ class ProcessingService:
                           f"at {issue.position_seconds:.3f}s", file=sys.stderr)
 
         return cls._render_jsx_from_template(
+            project_id=project.id,
             scenes=scenes,
             source_fps_num=source_rate.rate.numerator,
             source_fps_den=source_rate.rate.denominator,
@@ -1038,6 +1039,7 @@ class ProcessingService:
     def _render_jsx_from_template(
         cls,
         *,
+        project_id: str,
         scenes: list[dict],
         source_fps_num: int,
         source_fps_den: int,
@@ -1103,6 +1105,22 @@ class ProcessingService:
             r'var MUSIC_FILENAME = "[^"]*";',
             f'var MUSIC_FILENAME = "{cls._escape_js_string(music_filename)}";',
             label="MUSIC_FILENAME",
+        )
+        content = cls._replace_template_once(
+            content,
+            r'var PROJECT_ID = "[^"]*";',
+            f'var PROJECT_ID = "{cls._escape_js_string(project_id)}";',
+            label="PROJECT_ID",
+        )
+        content = cls._replace_template_once(
+            content,
+            r'var BATCH_SEQUENCE_NAME = "[^"]*";',
+            (
+                'var BATCH_SEQUENCE_NAME = "ATR_BATCH__'
+                + cls._escape_js_string(project_id)
+                + '";'
+            ),
+            label="BATCH_SEQUENCE_NAME",
         )
         content = cls._replace_template_once(
             content,

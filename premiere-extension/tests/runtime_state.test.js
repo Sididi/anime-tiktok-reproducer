@@ -26,6 +26,11 @@ test("normalizeLoadedProjectStates converts transient states to manual recovery 
       cleanup_retryable: true,
       cleanup_next_retry_at: "2026-03-18T10:05:00.000Z",
     },
+    sleepingProject: {
+      project_id: "sleepingProject",
+      status: "sleeping_download",
+      updated_at: "2026-03-18T10:03:00.000Z",
+    },
     exportProject: {
       project_id: "exportProject",
       status: "ready_for_export",
@@ -38,7 +43,7 @@ test("normalizeLoadedProjectStates converts transient states to manual recovery 
     "2026-03-19T08:00:00.000Z",
   );
 
-  assert.equal(result.changed_count, 2);
+  assert.equal(result.changed_count, 3);
   assert.equal(result.states.downloadingProject.status, "error");
   assert.match(
     result.states.downloadingProject.last_error,
@@ -51,6 +56,12 @@ test("normalizeLoadedProjectStates converts transient states to manual recovery 
   assert.equal(result.states.cleanupProject.cleanup_next_retry_at, null);
   assert.match(
     result.states.cleanupProject.cleanup_error,
+    /Automatic recovery is disabled/i,
+  );
+
+  assert.equal(result.states.sleepingProject.status, "error");
+  assert.match(
+    result.states.sleepingProject.last_error,
     /Automatic recovery is disabled/i,
   );
 

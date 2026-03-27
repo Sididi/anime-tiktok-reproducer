@@ -456,6 +456,7 @@ def test_process_passes_project_output_language_to_source_normalization(
 
 def test_render_jsx_from_template_includes_dedicated_raw_scene_text_subtitle_paths():
     jsx = ProcessingService._render_jsx_from_template(
+        project_id="project-123",
         scenes=[],
         source_fps_num=24000,
         source_fps_den=1001,
@@ -477,6 +478,12 @@ def test_render_jsx_from_template_includes_dedicated_raw_scene_text_subtitle_pat
     )
     assert "RAW_SCENE_TEXT_SUBTITLE_MOGRT_DIR" in jsx
     assert "RAW_SCENE_TEXT_SUBTITLE_SRT_PATH" in jsx
+    assert 'var PROJECT_ID = "project-123";' in jsx
+    assert 'var BATCH_SEQUENCE_NAME = "ATR_BATCH__project-123";' in jsx
+    assert 'var seqName = BATCH_SEQUENCE_NAME;' in jsx
+    assert 'log("Purging project to start fresh...");' not in jsx
+    assert "if (!purgeProjectCompletely())" not in jsx
+    assert "Script Complete (v7.7 Layered - Presets + External Subtitle MOGRTs)." not in jsx
 
 
 def test_export_collects_internal_subtitle_timing_files(tmp_path):
