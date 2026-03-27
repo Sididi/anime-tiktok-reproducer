@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import subprocess
 import shutil
@@ -3336,6 +3337,22 @@ class AnimeLibraryService:
             return Path(handle.name)
 
     @classmethod
+    def _anime_searcher_subprocess_env(cls, cmd: list[str]) -> dict[str, str]:
+        env = get_media_subprocess_env(cmd)
+        merged_env = dict(os.environ) if env is None else dict(env)
+        allocator_conf = str(merged_env.get("PYTORCH_CUDA_ALLOC_CONF") or "").strip()
+        allocator_hint = "expandable_segments:True"
+        allocator_parts = [
+            part.strip()
+            for part in allocator_conf.split(",")
+            if part.strip()
+        ]
+        if allocator_hint not in allocator_parts:
+            allocator_parts.append(allocator_hint)
+        merged_env["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(allocator_parts)
+        return merged_env
+
+    @classmethod
     async def _stream_searcher_command(
         cls,
         *,
@@ -3351,7 +3368,7 @@ class AnimeLibraryService:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(cwd),
-            env=get_media_subprocess_env(cmd),
+            env=cls._anime_searcher_subprocess_env(cmd),
             start_new_session=True,
         )
 

@@ -27,6 +27,31 @@ async def _wait_for(predicate, timeout: float = 1.0) -> None:
     await asyncio.wait_for(_poll(), timeout=timeout)
 
 
+def _patch_publish_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+    service: IndexationQueueService,
+) -> None:
+    monkeypatch.setattr(AnimeMatcherService, "mark_series_updated", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service, "_link_torrents", lambda job: asyncio.sleep(0))
+    monkeypatch.setattr(
+        StorageBoxRepository,
+        "publish_series",
+        classmethod(
+            lambda cls, library_type, display_name, series_id=None: _async_value(
+                {
+                    "series_id": series_id or f"series-{display_name.lower()}",
+                    "release_id": f"release-{display_name.lower()}",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        LibraryHydrationService,
+        "sync_local_series_state",
+        classmethod(lambda cls, **kwargs: _async_value(None)),
+    )
+
+
 @pytest.mark.asyncio
 async def test_enqueue_reuses_live_job_and_serializes_distinct_series_indexing(
     monkeypatch: pytest.MonkeyPatch,
@@ -54,25 +79,7 @@ async def test_enqueue_reuses_live_job_and_serializes_distinct_series_indexing(
         "index_anime",
         classmethod(lambda cls, **kwargs: fake_index_anime(**kwargs)),
     )
-    monkeypatch.setattr(AnimeMatcherService, "mark_series_updated", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(service, "_link_torrents", lambda job: asyncio.sleep(0))
-    monkeypatch.setattr(
-        StorageBoxRepository,
-        "publish_series",
-        classmethod(
-            lambda cls, library_type, display_name, series_id=None: _async_value(
-                {
-                    "series_id": series_id or f"series-{display_name.lower()}",
-                    "release_id": f"release-{display_name.lower()}",
-                }
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        LibraryHydrationService,
-        "sync_local_series_state",
-        classmethod(lambda cls, **kwargs: _async_value(None)),
-    )
+    _patch_publish_dependencies(monkeypatch, service)
 
     first_job_id = await service.enqueue("/tmp/demo-a", LibraryType.ANIME, "Demo", 2.0)
     duplicate_job_id = await service.enqueue("/tmp/demo-b", LibraryType.ANIME, " demo ", 2.0)
@@ -130,25 +137,7 @@ async def test_enqueue_blocks_concurrent_index_and_update_for_same_target(
         "index_anime",
         classmethod(lambda cls, **kwargs: fake_index_anime(**kwargs)),
     )
-    monkeypatch.setattr(AnimeMatcherService, "mark_series_updated", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(service, "_link_torrents", lambda job: asyncio.sleep(0))
-    monkeypatch.setattr(
-        StorageBoxRepository,
-        "publish_series",
-        classmethod(
-            lambda cls, library_type, display_name, series_id=None: _async_value(
-                {
-                    "series_id": series_id or f"series-{display_name.lower()}",
-                    "release_id": f"release-{display_name.lower()}",
-                }
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        LibraryHydrationService,
-        "sync_local_series_state",
-        classmethod(lambda cls, **kwargs: _async_value(None)),
-    )
+    _patch_publish_dependencies(monkeypatch, service)
 
     first_job_id = await service.enqueue(
         "/tmp/demo-a",
@@ -203,25 +192,7 @@ async def test_queue_preserves_warnings_from_index_progress(
         "index_anime",
         classmethod(lambda cls, **kwargs: fake_index_anime(**kwargs)),
     )
-    monkeypatch.setattr(AnimeMatcherService, "mark_series_updated", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(service, "_link_torrents", lambda job: asyncio.sleep(0))
-    monkeypatch.setattr(
-        StorageBoxRepository,
-        "publish_series",
-        classmethod(
-            lambda cls, library_type, display_name, series_id=None: _async_value(
-                {
-                    "series_id": series_id or f"series-{display_name.lower()}",
-                    "release_id": f"release-{display_name.lower()}",
-                }
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        LibraryHydrationService,
-        "sync_local_series_state",
-        classmethod(lambda cls, **kwargs: _async_value(None)),
-    )
+    _patch_publish_dependencies(monkeypatch, service)
 
     job_id = await service.enqueue("/tmp/demo", LibraryType.ANIME, "Demo", 2.0)
     await _wait_for(lambda: service.list_jobs()[0].status == "complete")
@@ -265,25 +236,7 @@ async def test_queue_preserves_current_file_progress_fields(
         "index_anime",
         classmethod(lambda cls, **kwargs: fake_index_anime(**kwargs)),
     )
-    monkeypatch.setattr(AnimeMatcherService, "mark_series_updated", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(service, "_link_torrents", lambda job: asyncio.sleep(0))
-    monkeypatch.setattr(
-        StorageBoxRepository,
-        "publish_series",
-        classmethod(
-            lambda cls, library_type, display_name, series_id=None: _async_value(
-                {
-                    "series_id": series_id or f"series-{display_name.lower()}",
-                    "release_id": f"release-{display_name.lower()}",
-                }
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        LibraryHydrationService,
-        "sync_local_series_state",
-        classmethod(lambda cls, **kwargs: _async_value(None)),
-    )
+    _patch_publish_dependencies(monkeypatch, service)
 
     job_id = await service.enqueue("/tmp/demo", LibraryType.ANIME, "Demo", 2.0)
     await _wait_for(lambda: service.list_jobs()[0].current_file == "Demo/ep1.mp4")
@@ -334,25 +287,7 @@ async def test_failed_job_releases_slot_while_parallel_job_keeps_running(
         "index_anime",
         classmethod(lambda cls, **kwargs: fake_index_anime(**kwargs)),
     )
-    monkeypatch.setattr(AnimeMatcherService, "mark_series_updated", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(service, "_link_torrents", lambda job: asyncio.sleep(0))
-    monkeypatch.setattr(
-        StorageBoxRepository,
-        "publish_series",
-        classmethod(
-            lambda cls, library_type, display_name, series_id=None: _async_value(
-                {
-                    "series_id": series_id or f"series-{display_name.lower()}",
-                    "release_id": f"release-{display_name.lower()}",
-                }
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        LibraryHydrationService,
-        "sync_local_series_state",
-        classmethod(lambda cls, **kwargs: _async_value(None)),
-    )
+    _patch_publish_dependencies(monkeypatch, service)
 
     crash_job_id = await service.enqueue("/tmp/crash", LibraryType.ANIME, "Crash", 2.0)
     steady_job_id = await service.enqueue("/tmp/steady", LibraryType.ANIME, "Steady", 2.0)
@@ -381,4 +316,185 @@ async def test_failed_job_releases_slot_while_parallel_job_keeps_running(
             steady_job_id: "complete",
             queued_job_id: "complete",
         }
+    )
+
+
+@pytest.mark.asyncio
+async def test_cuda_oom_job_retries_once_and_completes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = IndexationQueueService()
+    service.CUDA_OOM_RETRY_BACKOFF_SECONDS = 0.1
+    attempts: dict[str, int] = {}
+    started: dict[str, asyncio.Event] = {}
+    crash_now = asyncio.Event()
+    steady_release = asyncio.Event()
+    retry_release = asyncio.Event()
+
+    async def fake_index_anime(
+        *,
+        source_folder: Path,
+        library_type: LibraryType | str | None = None,
+        anime_name: str | None = None,
+        fps: float = 2.0,
+        **_: object,
+    ):
+        assert anime_name is not None
+        attempts[anime_name] = attempts.get(anime_name, 0) + 1
+        started.setdefault(f"{anime_name}-{attempts[anime_name]}", asyncio.Event()).set()
+        if anime_name == "Retry":
+            if attempts[anime_name] == 1:
+                await crash_now.wait()
+                yield IndexProgress(
+                    status="error",
+                    error="CUDA out of memory. Tried to allocate 1.48 GiB.",
+                )
+                return
+            await retry_release.wait()
+            yield IndexProgress(status="complete", progress=1.0, message="done Retry")
+            return
+
+        await steady_release.wait()
+        yield IndexProgress(status="complete", progress=1.0, message=f"done {anime_name}")
+
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "index_anime",
+        classmethod(lambda cls, **kwargs: fake_index_anime(**kwargs)),
+    )
+    _patch_publish_dependencies(monkeypatch, service)
+
+    retry_job_id = await service.enqueue("/tmp/retry", LibraryType.ANIME, "Retry", 2.0)
+    steady_job_id = await service.enqueue("/tmp/steady", LibraryType.ANIME, "Steady", 2.0)
+
+    await _wait_for(lambda: "Retry-1" in started and "Steady-1" in started)
+    crash_now.set()
+
+    await _wait_for(
+        lambda: any(
+            job.id == retry_job_id
+            and job.status == "queued"
+            and job.phase == "retry_wait"
+            for job in service.list_jobs()
+        )
+    )
+    retry_job = next(job for job in service.list_jobs() if job.id == retry_job_id)
+    steady_job = next(job for job in service.list_jobs() if job.id == steady_job_id)
+    assert retry_job.message == "CUDA OOM detected; waiting to retry once with the same settings."
+    assert steady_job.status == "indexing"
+
+    await _wait_for(lambda: attempts.get("Retry") == 2)
+    retry_release.set()
+    steady_release.set()
+
+    await _wait_for(
+        lambda: {
+            job.id: job.status
+            for job in service.list_jobs()
+        }
+        == {
+            retry_job_id: "complete",
+            steady_job_id: "complete",
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_cuda_oom_retry_becomes_terminal_after_second_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = IndexationQueueService()
+    attempts = 0
+
+    async def fake_index_anime(
+        *,
+        source_folder: Path,
+        library_type: LibraryType | str | None = None,
+        anime_name: str | None = None,
+        fps: float = 2.0,
+        **_: object,
+    ):
+        nonlocal attempts
+        attempts += 1
+        yield IndexProgress(
+            status="error",
+            error="CUDA out of memory. Tried to allocate 1.48 GiB.",
+        )
+
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "index_anime",
+        classmethod(lambda cls, **kwargs: fake_index_anime(**kwargs)),
+    )
+    _patch_publish_dependencies(monkeypatch, service)
+
+    job_id = await service.enqueue("/tmp/retry", LibraryType.ANIME, "Retry", 2.0)
+
+    await _wait_for(
+        lambda: any(
+            job.id == job_id and job.status == "error"
+            for job in service.list_jobs()
+        )
+    )
+    job = next(job for job in service.list_jobs() if job.id == job_id)
+    assert attempts == 2
+    assert job.phase == "error"
+    assert "exceeded available VRAM under the current parallel load" in str(job.error)
+
+
+@pytest.mark.asyncio
+async def test_enqueue_reuses_job_while_cuda_oom_retry_is_waiting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = IndexationQueueService()
+    service.CUDA_OOM_RETRY_BACKOFF_SECONDS = 0.2
+    attempts = 0
+    release = asyncio.Event()
+
+    async def fake_index_anime(
+        *,
+        source_folder: Path,
+        library_type: LibraryType | str | None = None,
+        anime_name: str | None = None,
+        fps: float = 2.0,
+        **_: object,
+    ):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            yield IndexProgress(
+                status="error",
+                error="CUDA out of memory. Tried to allocate 1.48 GiB.",
+            )
+            return
+        await release.wait()
+        yield IndexProgress(status="complete", progress=1.0, message="done Demo")
+
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "index_anime",
+        classmethod(lambda cls, **kwargs: fake_index_anime(**kwargs)),
+    )
+    _patch_publish_dependencies(monkeypatch, service)
+
+    first_job_id = await service.enqueue("/tmp/demo-a", LibraryType.ANIME, "Demo", 2.0)
+    await _wait_for(
+        lambda: any(
+            job.id == first_job_id
+            and job.status == "queued"
+            and job.phase == "retry_wait"
+            for job in service.list_jobs()
+        )
+    )
+
+    duplicate_job_id = await service.enqueue("/tmp/demo-b", LibraryType.ANIME, " demo ", 2.0)
+    assert duplicate_job_id == first_job_id
+
+    release.set()
+    await _wait_for(lambda: attempts == 2)
+    await _wait_for(
+        lambda: any(
+            job.id == first_job_id and job.status == "complete"
+            for job in service.list_jobs()
+        )
     )
