@@ -9,13 +9,19 @@ import {
   NewSourceModal,
   PurgeModal,
   TorrentManagementModal,
+  DeleteSourceModal,
 } from "@/components/library";
 import { FolderBrowserModal } from "@/components/FolderBrowserModal";
 import { ProjectManagerModal } from "@/components/project-manager";
 import { DuplicateTikTokWarning } from "@/components/DuplicateTikTokWarning";
-import { api } from "@/api/client";
+import { api, SeriesDeleteConflictError } from "@/api/client";
 import { readSSEStream } from "@/utils/sse";
-import type { LibraryType, SourceDetails, IndexationJob } from "@/types";
+import type {
+  LibraryType,
+  SourceDetails,
+  IndexationJob,
+  SeriesDeleteReferencingProject,
+} from "@/types";
 
 export function ProjectSetup() {
   const navigate = useNavigate();
@@ -41,6 +47,13 @@ export function ProjectSetup() {
   const [showFolderBrowser, setShowFolderBrowser] = useState(false);
   const [updateSourceName, setUpdateSourceName] = useState<string | null>(null);
   const [episodeSource, setEpisodeSource] = useState<SourceDetails | null>(null);
+  const [deleteSource, setDeleteSource] = useState<SourceDetails | null>(null);
+  const [deletingSourceId, setDeletingSourceId] = useState<string | null>(null);
+  const [deleteLoading, setDeleteLoading] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [deleteBlockingProjects, setDeleteBlockingProjects] = useState<
+    SeriesDeleteReferencingProject[]
+  >([]);
 
   // Duplicate TikTok warning
   const [duplicateWarning, setDuplicateWarning] = useState<{
@@ -289,6 +302,51 @@ export function ProjectSetup() {
     [selectedLibraryType],
   );
 
+  const handleOpenDeleteSource = useCallback((source: SourceDetails) => {
+    setDeleteSource(source);
+    setDeleteError(null);
+    setDeleteBlockingProjects([]);
+  }, []);
+
+  const handleCloseDeleteSource = useCallback(() => {
+    if (deleteLoading) {
+      return;
+    }
+    setDeleteSource(null);
+    setDeleteError(null);
+    setDeleteBlockingProjects([]);
+  }, [deleteLoading]);
+
+  const handleDeleteSource = useCallback(async () => {
+    if (!deleteSource) {
+      return;
+    }
+
+    setDeleteLoading(true);
+    setDeleteError(null);
+    setDeleteBlockingProjects([]);
+    setDeletingSourceId(deleteSource.series_id);
+
+    try {
+      await api.deleteSeries(selectedLibraryType, deleteSource.series_id);
+      setSelectedSource((current) =>
+        current === deleteSource.series_id ? null : current,
+      );
+      setDeleteSource(null);
+      await loadSources();
+    } catch (err) {
+      if (err instanceof SeriesDeleteConflictError) {
+        setDeleteError(err.message);
+        setDeleteBlockingProjects(err.referencingProjects);
+      } else {
+        setDeleteError((err as Error).message);
+      }
+    } finally {
+      setDeleteLoading(false);
+      setDeletingSourceId(null);
+    }
+  }, [deleteSource, loadSources, selectedLibraryType]);
+
   // ---------------------------------------------------------------------------
   // Render
   // ---------------------------------------------------------------------------
@@ -312,6 +370,7 @@ export function ProjectSetup() {
       <SourceList
         sources={sources}
         selectedSource={selectedSource}
+        deletingSourceId={deletingSourceId}
         onSelectSource={setSelectedSource}
         onToggleProtection={handleToggleProtection}
         onUpdateSource={(source) => {
@@ -319,6 +378,7 @@ export function ProjectSetup() {
           setShowFolderBrowser(true);
         }}
         onManageTorrents={(source) => setEpisodeSource(source)}
+        onDeleteSource={handleOpenDeleteSource}
         searchQuery={searchQuery}
       />
 
@@ -358,6 +418,16 @@ export function ProjectSetup() {
         currentLibraryType={selectedLibraryType}
         estimatedBytes={purgeEstimatedBytes}
         sourceCount={purgeSourceCount}
+      />
+
+      <DeleteSourceModal
+        open={!!deleteSource}
+        source={deleteSource}
+        loading={deleteLoading}
+        error={deleteError}
+        blockingProjects={deleteBlockingProjects}
+        onClose={handleCloseDeleteSource}
+        onConfirm={handleDeleteSource}
       />
 
       <FolderBrowserModal

@@ -18,6 +18,7 @@ from ...services import (
     LibraryStateDb,
     StorageBoxRepository,
 )
+from ...services.library_hydration_service import SeriesDeleteBlockedError
 
 router = APIRouter(prefix="/anime", tags=["anime"])
 
@@ -425,14 +426,9 @@ async def index_anime(request: IndexAnimeRequest):
             return
         yield f"data: {json.dumps({'status': 'indexing', 'progress': 0.97, 'message': 'Packaging release...', 'anime_name': target_anime_name})}\n\n"
         try:
-            publish_result = await StorageBoxRepository.publish_series(
+            publish_result = await LibraryHydrationService.publish_series_release(
                 library_type=request.library_type,
                 display_name=target_anime_name,
-            )
-            await LibraryHydrationService.sync_local_series_state(
-                library_type=request.library_type,
-                series_id=str(publish_result["series_id"]),
-                release_id=str(publish_result["release_id"]),
             )
         except Exception as exc:
             yield f"data: {json.dumps({'status': 'error', 'progress': 0.0, 'message': str(exc), 'error': str(exc), 'anime_name': target_anime_name})}\n\n"
@@ -518,15 +514,10 @@ async def update_anime(request: UpdateAnimeRequest):
             return
         yield f"data: {json.dumps({'status': 'indexing', 'progress': 0.97, 'message': 'Publishing updated release...', 'anime_name': request.anime_name})}\n\n"
         try:
-            publish_result = await StorageBoxRepository.publish_series(
+            publish_result = await LibraryHydrationService.publish_series_release(
                 library_type=request.library_type,
                 display_name=request.anime_name,
                 series_id=series_id,
-            )
-            await LibraryHydrationService.sync_local_series_state(
-                library_type=request.library_type,
-                series_id=str(publish_result["series_id"]),
-                release_id=str(publish_result["release_id"]),
             )
         except Exception as exc:
             yield f"data: {json.dumps({'status': 'error', 'progress': 0.0, 'message': str(exc), 'error': str(exc), 'anime_name': request.anime_name})}\n\n"
@@ -969,6 +960,32 @@ async def evict_series(
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.delete("/{series_id}")
+async def delete_series(
+    series_id: str,
+    library_type: LibraryType = Query(...),
+):
+    """Permanently delete a series from local storage and the Storage Box."""
+    try:
+        result = await LibraryHydrationService.delete_series(
+            library_type=library_type,
+            series_id=series_id,
+        )
+        AnimeMatcherService.mark_series_updated(
+            library_type,
+            result.get("display_name"),
+        )
+        return {
+            "status": "deleted",
+            "series_id": series_id,
+            "library_type": library_type.value,
+        }
+    except SeriesDeleteBlockedError as exc:
+        raise HTTPException(status_code=409, detail=exc.to_payload()) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

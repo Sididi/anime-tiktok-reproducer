@@ -14,6 +14,7 @@ from ..config import settings
 from ..library_types import LibraryType, coerce_library_type
 from .anime_library import AnimeLibraryService
 from .library_state_db import LibraryStateDb, OperationRow, SeriesStateRow
+from .project_service import ProjectService
 from .storage_box_repository import StorageBoxRepository
 from .storage_box_transfer import StorageBoxTransferService
 
@@ -33,6 +34,29 @@ OPERATION_RUNNING = "running"
 OPERATION_INTERRUPTED = "interrupted"
 OPERATION_COMPLETE = "complete"
 OPERATION_ERROR = "error"
+
+
+class SeriesDeleteBlockedError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        library_type: LibraryType | str,
+        series_id: str,
+        referencing_projects: list[dict[str, Any]],
+    ) -> None:
+        self.library_type = coerce_library_type(library_type)
+        self.series_id = series_id
+        self.referencing_projects = referencing_projects
+        super().__init__(
+            "Cette source est encore utilisee par un ou plusieurs projets enregistres."
+        )
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "code": "series_delete_blocked",
+            "message": str(self),
+            "referencing_projects": self.referencing_projects,
+        }
 
 
 def _json_load(path: Path) -> dict[str, Any]:
@@ -872,6 +896,132 @@ class LibraryHydrationService:
             )
         except Exception:
             logger.exception("Background full hydration failed for %s/%s", library_type, series_id)
+
+    @classmethod
+    async def publish_series_release(
+        cls,
+        *,
+        library_type: LibraryType | str,
+        display_name: str,
+        series_id: str | None = None,
+    ) -> dict[str, Any]:
+        scoped_type = coerce_library_type(library_type)
+
+        async def _publish() -> dict[str, Any]:
+            publish_result = await StorageBoxRepository.publish_series(
+                library_type=scoped_type,
+                display_name=display_name,
+                series_id=series_id,
+            )
+            await cls.sync_local_series_state(
+                library_type=scoped_type,
+                series_id=str(publish_result["series_id"]),
+                release_id=str(publish_result["release_id"]),
+            )
+            return publish_result
+
+        if series_id:
+            async with cls._series_lock(scoped_type, series_id):
+                return await _publish()
+        return await _publish()
+
+    @classmethod
+    async def delete_series(
+        cls,
+        *,
+        library_type: LibraryType | str,
+        series_id: str,
+    ) -> dict[str, Any]:
+        scoped_type = coerce_library_type(library_type)
+        async with cls._series_lock(scoped_type, series_id):
+            referencing_projects = [
+                {
+                    "project_id": project.id,
+                    "anime_title": project.anime_name,
+                    "phase": project.phase.value,
+                    "scheduled_at": (
+                        project.scheduled_at.isoformat() if project.scheduled_at else None
+                    ),
+                    "upload_completed_at": (
+                        project.upload_completed_at.isoformat()
+                        if project.upload_completed_at
+                        else None
+                    ),
+                }
+                for project in await asyncio.to_thread(
+                    ProjectService.list_referencing_series,
+                    library_type=scoped_type,
+                    series_id=series_id,
+                )
+            ]
+            if referencing_projects:
+                raise SeriesDeleteBlockedError(
+                    library_type=scoped_type,
+                    series_id=series_id,
+                    referencing_projects=referencing_projects,
+                )
+
+            state = await asyncio.to_thread(
+                LibraryStateDb.get_series_state,
+                scoped_type,
+                series_id,
+            )
+            manifest = None
+            with suppress(Exception):
+                manifest = await cls._load_or_fetch_manifest(scoped_type, series_id)
+
+            display_name = (
+                str(manifest["display_name"])
+                if manifest
+                else await asyncio.to_thread(
+                    cls._resolve_local_display_name_sync,
+                    scoped_type,
+                    series_id,
+                )
+            )
+
+            async with cls._library_lock(scoped_type):
+                await asyncio.to_thread(
+                    cls._evict_local_series_sync,
+                    scoped_type,
+                    series_id,
+                    manifest,
+                )
+
+            release_id = str(manifest["release_id"]) if manifest else (state.release_id if state else None)
+            expected_episode_count = (
+                int(manifest.get("episode_count", len(manifest.get("episodes", []))))
+                if manifest
+                else (state.expected_episode_count if state else 0)
+            )
+            permanent_pin = state.permanent_pin if state else False
+            await asyncio.to_thread(
+                LibraryStateDb.upsert_series_state,
+                library_type=scoped_type,
+                series_id=series_id,
+                release_id=release_id,
+                permanent_pin=permanent_pin,
+                hydration_status=HYDRATION_STATUS_NOT_HYDRATED,
+                local_episode_count=0,
+                expected_episode_count=expected_episode_count,
+                last_error=None,
+            )
+            await StorageBoxRepository.delete_series(
+                library_type=scoped_type,
+                series_id=series_id,
+            )
+            await asyncio.to_thread(
+                LibraryStateDb.delete_series_records,
+                library_type=scoped_type,
+                series_id=series_id,
+            )
+
+        return {
+            "status": "deleted",
+            "series_id": series_id,
+            "library_type": scoped_type.value,
+            "display_name": display_name or None,
+        }
 
     @classmethod
     async def _cache_manifest(

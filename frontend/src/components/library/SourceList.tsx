@@ -5,20 +5,24 @@ import { SourceRow } from "./SourceRow";
 interface SourceListProps {
   sources: SourceDetails[];
   selectedSource: string | null;
+  deletingSourceId: string | null;
   onSelectSource: (seriesId: string) => void;
   onToggleProtection: (seriesId: string) => void;
   onUpdateSource: (source: SourceDetails) => void;
   onManageTorrents: (source: SourceDetails) => void;
+  onDeleteSource: (source: SourceDetails) => void;
   searchQuery: string;
 }
 
 export function SourceList({
   sources,
   selectedSource,
+  deletingSourceId,
   onSelectSource,
   onToggleProtection,
   onUpdateSource,
   onManageTorrents,
+  onDeleteSource,
   searchQuery,
 }: SourceListProps) {
   const filtered = useMemo(
@@ -44,7 +48,7 @@ export function SourceList({
         <div className="w-20 shrink-0">Épisodes</div>
         <div className="w-14 shrink-0">FPS</div>
         <div className="w-16 shrink-0">Taille</div>
-        <div className="w-36 shrink-0 text-right">Actions</div>
+        <div className="w-44 shrink-0 text-right">Actions</div>
       </div>
 
       {/* Source rows */}
@@ -59,10 +63,12 @@ export function SourceList({
               key={source.series_id}
               source={source}
               isSelected={selectedSource === source.series_id}
+              isDeleting={deletingSourceId === source.series_id}
               onSelect={() => onSelectSource(source.series_id)}
               onTogglePin={() => onToggleProtection(source.series_id)}
               onUpdate={() => onUpdateSource(source)}
               onManageEpisodes={() => onManageTorrents(source)}
+              onDelete={() => onDeleteSource(source)}
             />
           ))
         )}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import sys
 from pathlib import Path, PurePosixPath
 
@@ -14,10 +15,13 @@ if str(BACKEND_ROOT) not in sys.path:
 
 from app.config import settings
 from app.library_types import LibraryType
+from app.models.project import Project
 from app.services.anime_library import AnimeLibraryService
 from app.services.library_hydration_service import LibraryHydrationService
 from app.services.library_hydration_service import OPERATION_COMPLETE, OPERATION_RUNNING
+from app.services.library_hydration_service import SeriesDeleteBlockedError
 from app.services.library_state_db import LibraryStateDb
+from app.services.project_service import ProjectService
 from app.services.storage_box_repository import LocalArtifact, StorageBoxRepository
 from app.services.storage_box_sftp_client import StorageBoxSftpClient
 from app.services.storage_box_transfer import StorageBoxTransferService
@@ -312,3 +316,222 @@ async def test_hydrate_series_runs_episode_downloads_with_bounded_parallelism(
     assert running_progresses[-1] == 1.0
     assert upsert_calls[-1] == (OPERATION_COMPLETE, 1.0)
     assert result["completed"] == completed
+
+
+@pytest.mark.asyncio
+async def test_delete_series_removes_remote_tree_and_rebuilds_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    removed_paths: list[PurePosixPath] = []
+    rebuilt_types: list[LibraryType] = []
+
+    async def fake_exists(cls, remote_path: PurePosixPath) -> bool:
+        return True
+
+    async def fake_remove_tree(cls, remote_path: PurePosixPath) -> None:
+        removed_paths.append(PurePosixPath(remote_path))
+
+    async def fake_rebuild_catalog(cls, library_type: LibraryType) -> dict[str, object]:
+        rebuilt_types.append(library_type)
+        return {}
+
+    monkeypatch.setattr(StorageBoxSftpClient, "is_configured", classmethod(lambda cls: True))
+    monkeypatch.setattr(StorageBoxSftpClient, "exists", classmethod(fake_exists))
+    monkeypatch.setattr(StorageBoxSftpClient, "remove_tree", classmethod(fake_remove_tree))
+    monkeypatch.setattr(StorageBoxRepository, "rebuild_catalog", classmethod(fake_rebuild_catalog))
+
+    await StorageBoxRepository.delete_series(
+        library_type=LibraryType.ANIME,
+        series_id="series-1",
+    )
+
+    assert removed_paths == [StorageBoxRepository._series_root(LibraryType.ANIME, "series-1")]
+    assert rebuilt_types == [LibraryType.ANIME]
+
+
+@pytest.mark.asyncio
+async def test_delete_series_blocks_when_saved_projects_reference_series(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = Project(
+        id="project-1",
+        anime_name="Demo",
+        series_id="series-1",
+        library_type=LibraryType.ANIME,
+    )
+
+    def fake_evict_local_series_sync(cls, *_args, **_kwargs) -> None:
+        raise AssertionError("local eviction should not run when deletion is blocked")
+
+    async def fake_delete_remote_series(cls, **_kwargs) -> None:
+        raise AssertionError("remote deletion should not run when deletion is blocked")
+
+    def fake_delete_series_records(**_kwargs) -> None:
+        raise AssertionError("db cleanup should not run when deletion is blocked")
+
+    monkeypatch.setattr(
+        ProjectService,
+        "list_referencing_series",
+        classmethod(lambda cls, **kwargs: [project]),
+    )
+    monkeypatch.setattr(
+        LibraryHydrationService,
+        "_evict_local_series_sync",
+        classmethod(fake_evict_local_series_sync),
+    )
+    monkeypatch.setattr(
+        StorageBoxRepository,
+        "delete_series",
+        classmethod(fake_delete_remote_series),
+    )
+    monkeypatch.setattr(LibraryStateDb, "delete_series_records", fake_delete_series_records)
+
+    with pytest.raises(SeriesDeleteBlockedError) as exc_info:
+        await LibraryHydrationService.delete_series(
+            library_type=LibraryType.ANIME,
+            series_id="series-1",
+        )
+
+    payload = exc_info.value.to_payload()
+    assert payload["code"] == "series_delete_blocked"
+    assert payload["referencing_projects"][0]["project_id"] == "project-1"
+
+
+@pytest.mark.asyncio
+async def test_delete_series_cleans_local_state_and_disappears_from_source_listing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    library_root = tmp_path / "library" / "anime"
+    series_dir = library_root / "Demo"
+    series_dir.mkdir(parents=True, exist_ok=True)
+    (series_dir / "ep-1.mp4").write_bytes(b"episode-1")
+    StorageBoxRepository.write_local_series_metadata(
+        series_dir=series_dir,
+        series_id="series-1",
+        display_name="Demo",
+        release_id="release-1",
+    )
+
+    index_dir = library_root / AnimeLibraryService.INDEX_DIR_NAME
+    shard_dir = index_dir / "series" / "demo-key"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    (shard_dir / "faiss.index").write_bytes(b"index")
+    (index_dir / AnimeLibraryService.MANIFEST_FILE).write_text(
+        json.dumps(
+            {
+                "version": 4,
+                "engine_profile": "profile",
+                "config": {},
+                "series": {"Demo": {"key": "demo-key"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (index_dir / AnimeLibraryService.STATE_FILE).write_text(
+        json.dumps({"files": {"Demo/ep-1.mp4": {"frames": 1}}}),
+        encoding="utf-8",
+    )
+
+    cache_dir = tmp_path / "cache"
+    manifest_cache_dir = cache_dir / "storage_box" / "manifests" / "anime" / "series-1"
+    manifest_cache_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "series_id": "series-1",
+        "release_id": "release-1",
+        "display_name": "Demo",
+        "episode_count": 1,
+        "episodes": [
+            {
+                "episode_key": "ep-1",
+                "media": {
+                    "local_relative_path": "Demo/ep-1.mp4",
+                    "size_bytes": 9,
+                },
+                "sidecars": [],
+            }
+        ],
+    }
+    (manifest_cache_dir / "release-1.json").write_text(
+        json.dumps(manifest),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(settings, "cache_dir", cache_dir)
+    monkeypatch.setattr(settings, "library_state_db_path", tmp_path / "library_state.db")
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "get_library_path",
+        classmethod(lambda cls, library_type=None: library_root),
+    )
+    monkeypatch.setattr(
+        ProjectService,
+        "list_referencing_series",
+        classmethod(lambda cls, **kwargs: []),
+    )
+    LibraryStateDb.initialize()
+    LibraryStateDb.upsert_series_state(
+        library_type=LibraryType.ANIME,
+        series_id="series-1",
+        release_id="release-1",
+        permanent_pin=True,
+        hydration_status="fully_local",
+        local_episode_count=1,
+        expected_episode_count=1,
+    )
+    LibraryStateDb.upsert_operation(
+        library_type=LibraryType.ANIME,
+        series_id="series-1",
+        operation_type="hydrate",
+        status="complete",
+        progress=1.0,
+        error=None,
+    )
+    LibraryStateDb.add_project_pin("stale-project", "series-1")
+
+    remote_delete_calls: list[tuple[LibraryType, str]] = []
+
+    async def fake_delete_remote_series(
+        cls,
+        *,
+        library_type: LibraryType,
+        series_id: str,
+    ) -> None:
+        remote_delete_calls.append((library_type, series_id))
+
+    async def fake_list_catalog(cls, library_type: LibraryType) -> list[dict[str, object]]:
+        return []
+
+    monkeypatch.setattr(
+        StorageBoxRepository,
+        "delete_series",
+        classmethod(fake_delete_remote_series),
+    )
+    monkeypatch.setattr(
+        StorageBoxRepository,
+        "list_catalog",
+        classmethod(fake_list_catalog),
+    )
+
+    result = await LibraryHydrationService.delete_series(
+        library_type=LibraryType.ANIME,
+        series_id="series-1",
+    )
+    details = await LibraryHydrationService.list_source_details(
+        library_type=LibraryType.ANIME,
+    )
+
+    assert result["status"] == "deleted"
+    assert remote_delete_calls == [(LibraryType.ANIME, "series-1")]
+    assert not series_dir.exists()
+    assert not shard_dir.exists()
+    assert not manifest_cache_dir.exists()
+    assert json.loads((index_dir / AnimeLibraryService.MANIFEST_FILE).read_text())["series"] == {}
+    assert json.loads((index_dir / AnimeLibraryService.STATE_FILE).read_text())["files"] == {}
+    assert LibraryStateDb.get_series_state(LibraryType.ANIME, "series-1") is None
+    assert LibraryStateDb.list_operations(
+        library_type=LibraryType.ANIME,
+        series_id="series-1",
+    ) == []
+    assert LibraryStateDb.count_project_pins("series-1") == 0
+    assert details == []

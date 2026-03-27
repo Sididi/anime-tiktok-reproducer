@@ -4,7 +4,7 @@ from pathlib import Path
 from datetime import datetime
 
 from ..config import settings
-from ..library_types import DEFAULT_LIBRARY_TYPE, LibraryType
+from ..library_types import DEFAULT_LIBRARY_TYPE, LibraryType, coerce_library_type
 from ..models import Project, ProjectPhase, SceneList
 from .library_state_db import LibraryStateDb
 
@@ -120,6 +120,20 @@ class ProjectService:
         for project in cls.list_all():
             if cls.should_keep_project_pin(project):
                 LibraryStateDb.add_project_pin(project.id, project.series_id)
+
+    @classmethod
+    def list_referencing_series(
+        cls,
+        *,
+        library_type: LibraryType | str,
+        series_id: str,
+    ) -> list[Project]:
+        scoped_type = coerce_library_type(library_type)
+        return [
+            project
+            for project in cls.list_all()
+            if project.series_id == series_id and project.library_type == scoped_type
+        ]
 
     @classmethod
     def list_all(cls) -> list[Project]:

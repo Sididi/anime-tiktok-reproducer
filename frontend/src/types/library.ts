@@ -103,6 +103,26 @@ export interface PurgeResult {
   skipped_protected: string[];
 }
 
+export interface SeriesDeleteReferencingProject {
+  project_id: string;
+  anime_title: string | null;
+  phase: import("./index").ProjectPhase;
+  scheduled_at: string | null;
+  upload_completed_at: string | null;
+}
+
+export interface DeleteSeriesResponse {
+  status: "deleted";
+  series_id: string;
+  library_type: import("./index").LibraryType;
+}
+
+export interface SeriesDeleteConflictDetail {
+  code: string;
+  message: string;
+  referencing_projects: SeriesDeleteReferencingProject[];
+}
+
 // --- Torrent management types ---
 
 export interface TorrentFileMapping {

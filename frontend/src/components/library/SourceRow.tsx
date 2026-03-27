@@ -1,13 +1,22 @@
-import { HardDrive, ShieldCheck, FolderDown, Cable, Loader2 } from "lucide-react";
+import {
+  HardDrive,
+  ShieldCheck,
+  FolderDown,
+  Cable,
+  Loader2,
+  Trash2,
+} from "lucide-react";
 import type { SourceDetails } from "@/types";
 
 interface SourceRowProps {
   source: SourceDetails;
   isSelected: boolean;
+  isDeleting: boolean;
   onSelect: () => void;
   onTogglePin: () => void;
   onUpdate: () => void;
   onManageEpisodes: () => void;
+  onDelete: () => void;
 }
 
 function formatBytes(bytes: number): string {
@@ -27,10 +36,12 @@ function formatBytes(bytes: number): string {
 export function SourceRow({
   source,
   isSelected,
+  isDeleting,
   onSelect,
   onTogglePin,
   onUpdate,
   onManageEpisodes,
+  onDelete,
 }: SourceRowProps) {
   const hasLocalEpisodes = source.local_episode_count > 0;
   const hydrationInProgress =
@@ -72,7 +83,7 @@ export function SourceRow({
       </span>
 
       {/* Actions */}
-      <div className="flex gap-1 justify-end w-36 shrink-0">
+      <div className="flex gap-1 justify-end w-44 shrink-0">
         {hasLocalEpisodes && (
           <div
             className="p-1 text-violet-400 opacity-30"
@@ -92,13 +103,16 @@ export function SourceRow({
         <button
           onClick={(e) => {
             e.stopPropagation();
-            onTogglePin();
+            if (!isDeleting) {
+              onTogglePin();
+            }
           }}
           className={`p-1 rounded transition-colors hover:bg-[hsl(var(--secondary))] ${
             source.permanent_pin
               ? "text-green-500 opacity-100"
               : "text-[hsl(var(--muted-foreground))] opacity-30 hover:opacity-60"
           }`}
+          disabled={isDeleting}
           title={
             source.permanent_pin
               ? "Épinglé localement"
@@ -110,9 +124,12 @@ export function SourceRow({
         <button
           onClick={(e) => {
             e.stopPropagation();
-            onManageEpisodes();
+            if (!isDeleting) {
+              onManageEpisodes();
+            }
           }}
           className="p-1 rounded text-amber-500/50 hover:bg-amber-500/10 hover:text-amber-400 transition-colors"
+          disabled={isDeleting}
           title="Gérer les épisodes"
         >
           <Cable className="h-4 w-4" />
@@ -120,12 +137,32 @@ export function SourceRow({
         <button
           onClick={(e) => {
             e.stopPropagation();
-            onUpdate();
+            if (!isDeleting) {
+              onUpdate();
+            }
           }}
           className="p-1 rounded text-sky-600/50 hover:bg-sky-600/10 hover:text-sky-500 transition-colors"
+          disabled={isDeleting}
           title="Mettre à jour les épisodes"
         >
           <FolderDown className="h-4 w-4" />
+        </button>
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            if (!isDeleting) {
+              onDelete();
+            }
+          }}
+          className="p-1 rounded text-red-500/60 hover:bg-red-500/10 hover:text-red-400 transition-colors"
+          disabled={isDeleting}
+          title="Supprimer définitivement"
+        >
+          {isDeleting ? (
+            <Loader2 className="h-4 w-4 animate-spin" />
+          ) : (
+            <Trash2 className="h-4 w-4" />
+          )}
         </button>
       </div>
     </div>

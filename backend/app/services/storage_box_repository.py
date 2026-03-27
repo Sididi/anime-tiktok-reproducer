@@ -861,3 +861,19 @@ class StorageBoxRepository:
             raise
         finally:
             shutil.rmtree(temp_root, ignore_errors=True)
+
+    @classmethod
+    async def delete_series(
+        cls,
+        *,
+        library_type: LibraryType | str,
+        series_id: str,
+    ) -> None:
+        scoped_type = coerce_library_type(library_type)
+        if not cls.is_enabled():
+            raise RuntimeError("Storage Box is not configured.")
+
+        series_root = cls._series_root(scoped_type, series_id)
+        if await StorageBoxSftpClient.exists(series_root):
+            await StorageBoxSftpClient.remove_tree(series_root)
+        await cls.rebuild_catalog(scoped_type)

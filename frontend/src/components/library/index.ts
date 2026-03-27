@@ -7,3 +7,4 @@ export { NewSourceModal } from "./NewSourceModal";
 export { PurgeModal } from "./PurgeModal";
 export { IndexJobsPanel } from "./IndexJobsPanel";
 export { TorrentManagementModal } from "./TorrentManagementModal";
+export { DeleteSourceModal } from "./DeleteSourceModal";

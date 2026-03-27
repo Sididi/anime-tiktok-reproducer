@@ -127,18 +127,13 @@ class IndexationQueueService:
                     job.message = "Uploading release to Storage Box..."
                     job.progress = max(job.progress, 0.98)
                     self._broadcast(job)
-                    publish_result = await StorageBoxRepository.publish_series(
+                    publish_result = await LibraryHydrationService.publish_series_release(
                         library_type=job.library_type,
                         display_name=job.source_name,
                         series_id=job.series_id or None,
                     )
                     job.series_id = str(publish_result["series_id"])
                     job.storage_release_id = str(publish_result["release_id"])
-                    await LibraryHydrationService.sync_local_series_state(
-                        library_type=job.library_type,
-                        series_id=job.series_id,
-                        release_id=job.storage_release_id,
-                    )
                     job.message = "Published release to Storage Box"
                     job.progress = 1.0
                     job.status = "complete"

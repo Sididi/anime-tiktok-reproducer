@@ -443,5 +443,36 @@ class LibraryStateDb:
                 (scoped_type, series_id, operation_type),
             )
 
+    @classmethod
+    def delete_series_records(
+        cls,
+        *,
+        library_type: LibraryType | str,
+        series_id: str,
+    ) -> None:
+        scoped_type = coerce_library_type(library_type).value
+        with cls.connect() as conn:
+            conn.execute(
+                """
+                DELETE FROM operations
+                WHERE library_type = ? AND series_id = ?
+                """,
+                (scoped_type, series_id),
+            )
+            conn.execute(
+                """
+                DELETE FROM series_state
+                WHERE library_type = ? AND series_id = ?
+                """,
+                (scoped_type, series_id),
+            )
+            conn.execute(
+                """
+                DELETE FROM project_series_pins
+                WHERE series_id = ?
+                """,
+                (series_id,),
+            )
+
 
 LibraryStateDb.initialize()

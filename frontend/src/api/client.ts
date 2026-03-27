@@ -37,6 +37,18 @@ interface GapsResponse {
   min_speed_factor: number;
 }
 
+export class SeriesDeleteConflictError extends Error {
+  code: string;
+  referencingProjects: import("@/types").SeriesDeleteReferencingProject[];
+
+  constructor(detail: import("@/types").SeriesDeleteConflictDetail) {
+    super(detail.message || "Suppression bloquee");
+    this.name = "SeriesDeleteConflictError";
+    this.code = detail.code;
+    this.referencingProjects = detail.referencing_projects;
+  }
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     headers: {
@@ -662,6 +674,56 @@ export const api = {
     request<import("@/types").EpisodeSourcesPayload>(
       `/anime/${encodeURIComponent(seriesId)}/episodes?library_type=${encodeURIComponent(libraryType)}`,
     ),
+
+  deleteSeries: async (
+    libraryType: import("@/types").LibraryType,
+    seriesId: string,
+  ) => {
+    const res = await fetch(
+      `${API_BASE}/anime/${encodeURIComponent(seriesId)}?library_type=${encodeURIComponent(libraryType)}`,
+      { method: "DELETE" },
+    );
+
+    if (res.ok) {
+      return res.json() as Promise<import("@/types").DeleteSeriesResponse>;
+    }
+
+    const error = await res.json().catch(() => ({ detail: "Request failed" }));
+    const detail = error?.detail;
+    if (
+      res.status === 409 &&
+      detail &&
+      typeof detail === "object" &&
+      Array.isArray(detail.referencing_projects)
+    ) {
+      throw new SeriesDeleteConflictError({
+        code:
+          typeof detail.code === "string"
+            ? detail.code
+            : "series_delete_blocked",
+        message:
+          typeof detail.message === "string"
+            ? detail.message
+            : "Cette source est encore referencee par des projets.",
+        referencing_projects:
+          detail.referencing_projects as import("@/types").SeriesDeleteReferencingProject[],
+      });
+    }
+    if (typeof detail === "string") {
+      throw new Error(detail || "Request failed");
+    }
+    if (detail && typeof detail === "object") {
+      const message =
+        ("message" in detail && typeof detail.message === "string"
+          ? detail.message
+          : null) ||
+        ("code" in detail && typeof detail.code === "string"
+          ? detail.code
+          : null);
+      throw new Error(message || "Request failed");
+    }
+    throw new Error("Request failed");
+  },
 
   // Library - Estimate purge size
   estimatePurgeSize: (libraryType: import("@/types").LibraryType, allTypes: boolean) =>
