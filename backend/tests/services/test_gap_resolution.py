@@ -9,11 +9,34 @@ sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from app.models.match import MatchList, SceneMatch
 from app.services.anime_library import AnimeLibraryService
-from app.services.gap_resolution import GapCandidate, GapInfo, GapResolutionService
+from app.services.gap_resolution import (
+    GapCandidate,
+    GapInfo,
+    GapResolutionService,
+    _EpisodeAnalysisContext,
+    _EpisodeVideoMetadata,
+    _ThresholdIntervalCache,
+)
 
 
 PROJECT_ID = "3c6cbee7ce0c"
 PROJECT_DIR = Path(__file__).resolve().parents[2] / "data" / "projects" / PROJECT_ID
+ONE_GAP_PROJECT_ID = "a08c11bbbc57"
+ONE_GAP_PROJECT_DIR = Path(__file__).resolve().parents[2] / "data" / "projects" / ONE_GAP_PROJECT_ID
+ONE_GAP_CACHE_27 = (
+    Path(__file__).resolve().parents[2]
+    / "data"
+    / "cache"
+    / "scene_cuts"
+    / "[Trix] Ride Your Wave (2019) (BD 1080p AV1) [CD751055]_33bbef21f33c6c66_13a75b01.json"
+)
+ONE_GAP_CACHE_18 = (
+    Path(__file__).resolve().parents[2]
+    / "data"
+    / "cache"
+    / "scene_cuts"
+    / "[Trix] Ride Your Wave (2019) (BD 1080p AV1) [CD751055]_33bbef21f33c6c66_f564d250.json"
+)
 DEFAULT_FPS = Fraction(24000, 1001)
 DEFAULT_FRAME_OFFSET = float(GapResolutionService.SAFETY_FRAMES / float(DEFAULT_FPS))
 DEFAULT_TOLERANCE = float(Fraction(1, 1) / DEFAULT_FPS)
@@ -65,16 +88,72 @@ def _make_gap(
     )
 
 
-def _load_pre_gap_project_gap(scene_index: int) -> tuple[GapInfo, list[SceneMatch]]:
-    match_list = MatchList.model_validate_json((PROJECT_DIR / "matches_before_gaps.json").read_text())
-    transcription = json.loads((PROJECT_DIR / "gap_detection_transcription.json").read_text())
+def _load_pre_gap_project_gap_from(
+    project_dir: Path,
+    scene_index: int,
+) -> tuple[GapInfo, list[SceneMatch]]:
+    if not (project_dir / "matches_before_gaps.json").exists():
+        pytest.skip(f"fixture project missing: {project_dir.name}")
+    if not (project_dir / "gap_detection_transcription.json").exists():
+        pytest.skip(f"fixture transcription missing: {project_dir.name}")
+    match_list = MatchList.model_validate_json((project_dir / "matches_before_gaps.json").read_text())
+    transcription = json.loads((project_dir / "gap_detection_transcription.json").read_text())
     gaps = GapResolutionService.calculate_gaps(match_list.matches, transcription["scenes"])
     return next(gap for gap in gaps if gap.scene_index == scene_index), match_list.matches
+
+
+def _load_pre_gap_project_gap(scene_index: int) -> tuple[GapInfo, list[SceneMatch]]:
+    return _load_pre_gap_project_gap_from(PROJECT_DIR, scene_index)
 
 
 def _select_matches(matches: list[SceneMatch], *scene_indices: int) -> list[SceneMatch]:
     scene_index_set = set(scene_indices)
     return [match for match in matches if match.scene_index in scene_index_set]
+
+
+def _candidate_signature(candidates: list[GapCandidate]) -> list[tuple[str, float, float, float]]:
+    return [
+        (
+            candidate.extend_type,
+            round(candidate.start_time, 3),
+            round(candidate.end_time, 3),
+            round(float(candidate.effective_speed), 3),
+        )
+        for candidate in candidates
+    ]
+
+
+def _build_neighbor_context_for_matches(
+    matches: list[SceneMatch],
+    scene_index: int,
+    *,
+    episode_key: str = "episode-a",
+) -> object:
+    contexts = GapResolutionService._build_neighbor_contexts(
+        matches,
+        episode_key_by_scene={match.scene_index: episode_key for match in matches},
+        tolerance_by_episode={episode_key: DEFAULT_TOLERANCE},
+    )
+    return contexts[scene_index]
+
+
+def _build_episode_analysis_context(
+    *,
+    duration_seconds: float,
+    episode: str = "episode-a",
+) -> _EpisodeAnalysisContext:
+    return _EpisodeAnalysisContext(
+        episode_path=Path(f"/tmp/{episode}.mp4"),
+        episode_key=episode,
+        fps_fraction=DEFAULT_FPS,
+        frame_offset=DEFAULT_FRAME_OFFSET,
+        tolerance_seconds=DEFAULT_TOLERANCE,
+        video_duration=duration_seconds,
+    )
+
+
+def _load_cached_cut_list(cache_path: Path) -> list[float]:
+    return list(json.loads(cache_path.read_text())["cuts"])
 
 
 def _install_fake_episode(
@@ -90,27 +169,48 @@ def _install_fake_episode(
     episode_path.touch()
     seen_thresholds: list[float] = []
 
-    async def fake_ensure_episode_manifest(cls, *, force_refresh: bool = False) -> dict:
+    async def fake_ensure_episode_manifest(
+        cls,
+        *,
+        force_refresh: bool = False,
+        library_type=None,
+    ) -> dict:
         return {}
 
-    def fake_resolve_episode_path(cls, episode_name: str, manifest: dict | None = None) -> Path | None:
+    def fake_resolve_episode_path(
+        cls,
+        episode_name: str,
+        manifest: dict | None = None,
+        *,
+        library_type=None,
+    ) -> Path | None:
         if episode_name == episode:
             return episode_path
         return None
 
-    async def fake_detect_scene_cuts(
+    async def fake_get_cuts_for_gap_threshold(
         cls,
-        episode_path_arg: str,
-        threshold: float | None = None,
-        min_scene_len: int | None = None,
-        frame_skip: int | None = None,
+        gap: GapInfo,
+        analysis_context: _EpisodeAnalysisContext,
+        *,
+        threshold: float,
     ) -> list[float]:
-        threshold_val = GapResolutionService.SCENE_THRESHOLD if threshold is None else float(threshold)
+        threshold_val = float(threshold)
         seen_thresholds.append(threshold_val)
         return list(cuts_by_threshold.get(threshold_val, []))
 
-    async def fake_get_frame_offset(cls, episode_path_arg: Path) -> float:
-        return frame_offset
+    async def fake_load_episode_video_metadata(
+        cls,
+        episode_path_arg: Path,
+    ) -> _EpisodeVideoMetadata:
+        duration_seconds = max(
+            (cuts[-1] for cuts in cuts_by_threshold.values() if cuts),
+            default=100.0,
+        )
+        return _EpisodeVideoMetadata(
+            fps_fraction=fps,
+            duration_seconds=duration_seconds,
+        )
 
     async def fake_detect_video_fps(cls, episode_path_arg: Path) -> Fraction:
         return fps
@@ -127,18 +227,23 @@ def _install_fake_episode(
     )
     monkeypatch.setattr(
         GapResolutionService,
-        "detect_scene_cuts",
-        classmethod(fake_detect_scene_cuts),
+        "_get_cuts_for_gap_threshold",
+        classmethod(fake_get_cuts_for_gap_threshold),
     )
     monkeypatch.setattr(
         GapResolutionService,
-        "get_frame_offset",
-        classmethod(fake_get_frame_offset),
+        "_load_episode_video_metadata",
+        classmethod(fake_load_episode_video_metadata),
     )
     monkeypatch.setattr(
         GapResolutionService,
         "detect_video_fps",
         classmethod(fake_detect_video_fps),
+    )
+    monkeypatch.setattr(
+        GapResolutionService,
+        "SAFETY_FRAMES",
+        int(round(frame_offset * float(fps))),
     )
 
     GapResolutionService._scene_cut_cache.clear()
@@ -148,6 +253,8 @@ def _install_fake_episode(
 
 
 def test_fixture_project_gap_output_is_stable():
+    if not (PROJECT_DIR / "matches_before_gaps.json").exists():
+        pytest.skip(f"fixture project missing: {PROJECT_DIR.name}")
     match_list = MatchList.model_validate_json((PROJECT_DIR / "matches_before_gaps.json").read_text())
     transcription = json.loads((PROJECT_DIR / "gap_detection_transcription.json").read_text())
 
@@ -515,6 +622,7 @@ async def test_generate_candidates_batch_dedup_reuses_cached_result(
         gaps: list[GapInfo],
         matches: list[SceneMatch] | None = None,
         max_candidates: int = 6,
+        library_type=None,
     ) -> dict[int, list[GapCandidate]]:
         nonlocal call_count
         call_count += 1
@@ -553,3 +661,455 @@ async def test_generate_candidates_batch_dedup_reuses_cached_result(
     assert first == second
     assert first is not second
     assert first[gap.scene_index] is not second[gap.scene_index]
+
+
+@pytest.mark.asyncio
+async def test_fast_path_core_window_matches_full_cache_for_one_gap_project(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    gap, matches = _load_pre_gap_project_gap_from(ONE_GAP_PROJECT_DIR, 38)
+    neighbor_context = _build_neighbor_context_for_matches(
+        matches,
+        gap.scene_index,
+        episode_key=gap.episode,
+    )
+    full_27 = _load_cached_cut_list(ONE_GAP_CACHE_27)
+    full_18 = _load_cached_cut_list(ONE_GAP_CACHE_18)
+    duration_seconds = full_27[-1]
+
+    baseline_context = _build_episode_analysis_context(
+        duration_seconds=duration_seconds,
+        episode=gap.episode,
+    )
+    baseline_context.threshold_caches = {
+        27.0: _ThresholdIntervalCache(
+            cuts=list(full_27),
+            covered_intervals=[(0.0, duration_seconds)],
+            full_scan_cuts=list(full_27),
+        ),
+        18.0: _ThresholdIntervalCache(
+            cuts=list(full_18),
+            covered_intervals=[(0.0, duration_seconds)],
+            full_scan_cuts=list(full_18),
+        ),
+    }
+    baseline_candidates = await GapResolutionService._generate_candidates_for_gap(
+        gap=gap,
+        analysis_context=baseline_context,
+        neighbor_context=neighbor_context,
+        max_candidates=6,
+    )
+
+    window_calls: list[tuple[float, float, float]] = []
+
+    def fake_load_cached_scene_cuts(
+        cls,
+        episode_path: str,
+        threshold: float | None = None,
+        min_scene_len: int | None = None,
+        frame_skip: int | None = None,
+    ) -> list[float] | None:
+        return None
+
+    async def fake_detect_scene_cuts_window(
+        cls,
+        episode_path: Path,
+        *,
+        interval_start: float,
+        interval_end: float,
+        threshold: float,
+        min_scene_len: int,
+        frame_skip: int,
+        guard_seconds: float,
+    ) -> tuple[list[float], float]:
+        window_calls.append((threshold, round(interval_start, 3), round(interval_end, 3)))
+        source = full_27 if abs(threshold - 27.0) < 1e-6 else full_18
+        return (
+            [cut for cut in source if interval_start <= cut <= interval_end],
+            duration_seconds,
+        )
+
+    async def fail_detect_scene_cuts(
+        cls,
+        episode_path: str,
+        threshold: float | None = None,
+        min_scene_len: int | None = None,
+        frame_skip: int | None = None,
+    ) -> list[float]:
+        raise AssertionError("full fallback should not be used for the one-gap fast-path parity test")
+
+    monkeypatch.setattr(
+        GapResolutionService,
+        "load_cached_scene_cuts",
+        classmethod(fake_load_cached_scene_cuts),
+    )
+    monkeypatch.setattr(
+        GapResolutionService,
+        "_detect_scene_cuts_window",
+        classmethod(fake_detect_scene_cuts_window),
+    )
+    monkeypatch.setattr(
+        GapResolutionService,
+        "detect_scene_cuts",
+        classmethod(fail_detect_scene_cuts),
+    )
+
+    fast_context = _build_episode_analysis_context(
+        duration_seconds=duration_seconds,
+        episode=gap.episode,
+    )
+    fast_candidates = await GapResolutionService._generate_candidates_for_gap(
+        gap=gap,
+        analysis_context=fast_context,
+        neighbor_context=neighbor_context,
+        max_candidates=6,
+    )
+
+    assert _candidate_signature(fast_candidates) == _candidate_signature(baseline_candidates)
+    assert window_calls == [
+        (27.0, round(gap.current_start - 30.0, 3), round(gap.current_end + 30.0, 3)),
+        (18.0, round(gap.current_start - 30.0, 3), round(gap.current_end + 30.0, 3)),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_banded_expansion_preserves_inner_candidate_result_vs_naive_wider_rescan(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    gap, matches = _load_pre_gap_project_gap_from(ONE_GAP_PROJECT_DIR, 38)
+    neighbor_context = _build_neighbor_context_for_matches(
+        matches,
+        gap.scene_index,
+        episode_key=gap.episode,
+    )
+    full_27 = _load_cached_cut_list(ONE_GAP_CACHE_27)
+    full_18 = _load_cached_cut_list(ONE_GAP_CACHE_18)
+    duration_seconds = full_27[-1]
+    core_start = gap.current_start - 30.0
+    core_end = gap.current_end + 30.0
+
+    baseline_context = _build_episode_analysis_context(
+        duration_seconds=duration_seconds,
+        episode=gap.episode,
+    )
+    baseline_context.threshold_caches = {
+        27.0: _ThresholdIntervalCache(
+            cuts=list(full_27),
+            covered_intervals=[(0.0, duration_seconds)],
+            full_scan_cuts=list(full_27),
+        ),
+        18.0: _ThresholdIntervalCache(
+            cuts=list(full_18),
+            covered_intervals=[(0.0, duration_seconds)],
+            full_scan_cuts=list(full_18),
+        ),
+    }
+    baseline_candidates = await GapResolutionService._generate_candidates_for_gap(
+        gap=gap,
+        analysis_context=baseline_context,
+        neighbor_context=neighbor_context,
+        max_candidates=6,
+    )
+
+    window_calls: list[tuple[float, float, float]] = []
+
+    def fake_load_cached_scene_cuts(
+        cls,
+        episode_path: str,
+        threshold: float | None = None,
+        min_scene_len: int | None = None,
+        frame_skip: int | None = None,
+    ) -> list[float] | None:
+        return None
+
+    async def fake_detect_scene_cuts_window(
+        cls,
+        episode_path: Path,
+        *,
+        interval_start: float,
+        interval_end: float,
+        threshold: float,
+        min_scene_len: int,
+        frame_skip: int,
+        guard_seconds: float,
+    ) -> tuple[list[float], float]:
+        window_calls.append((threshold, round(interval_start, 3), round(interval_end, 3)))
+        source = full_27 if abs(threshold - 27.0) < 1e-6 else full_18
+        if interval_start < core_start - 1e-6 and interval_end > core_end + 1e-6:
+            shifted = [
+                cut - DEFAULT_TOLERANCE
+                for cut in source
+                if interval_start <= cut <= interval_end
+            ]
+            return shifted, duration_seconds
+        return (
+            [cut for cut in source if interval_start <= cut <= interval_end],
+            duration_seconds,
+        )
+
+    async def fail_detect_scene_cuts(
+        cls,
+        episode_path: str,
+        threshold: float | None = None,
+        min_scene_len: int | None = None,
+        frame_skip: int | None = None,
+    ) -> list[float]:
+        raise AssertionError("full fallback should not run in the banded expansion test")
+
+    monkeypatch.setattr(
+        GapResolutionService,
+        "load_cached_scene_cuts",
+        classmethod(fake_load_cached_scene_cuts),
+    )
+    monkeypatch.setattr(
+        GapResolutionService,
+        "_detect_scene_cuts_window",
+        classmethod(fake_detect_scene_cuts_window),
+    )
+    monkeypatch.setattr(
+        GapResolutionService,
+        "detect_scene_cuts",
+        classmethod(fail_detect_scene_cuts),
+    )
+    monkeypatch.setattr(GapResolutionService, "FAST_SCAN_REQUIRED_SIDE_CUTS", 8)
+
+    fast_context = _build_episode_analysis_context(
+        duration_seconds=duration_seconds,
+        episode=gap.episode,
+    )
+    fast_candidates = await GapResolutionService._generate_candidates_for_gap(
+        gap=gap,
+        analysis_context=fast_context,
+        neighbor_context=neighbor_context,
+        max_candidates=6,
+    )
+
+    assert _candidate_signature(fast_candidates) == _candidate_signature(baseline_candidates)
+    assert len(window_calls) >= 4
+    assert not any(
+        start < round(core_start, 3) and end > round(core_end, 3)
+        for _, start, end in window_calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_insufficient_fast_path_coverage_falls_back_to_full_scene_scan(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    gap = _make_gap(scene_index=0, current_start=100.0, current_end=101.0, target_duration=2.0)
+    matches = [
+        _make_match(0, 100.0, 101.0),
+        _make_match(1, 105.0, 106.0),
+    ]
+    neighbor_context = _build_neighbor_context_for_matches(matches, 0)
+    full_cuts = [0.0, 99.0, 101.8, 200.0]
+    baseline_context = _build_episode_analysis_context(duration_seconds=200.0)
+    baseline_context.threshold_caches = {
+        27.0: _ThresholdIntervalCache(
+            cuts=list(full_cuts),
+            covered_intervals=[(0.0, 200.0)],
+            full_scan_cuts=list(full_cuts),
+        )
+    }
+    baseline_candidates = await GapResolutionService._generate_candidates_for_gap(
+        gap=gap,
+        analysis_context=baseline_context,
+        neighbor_context=neighbor_context,
+        max_candidates=6,
+    )
+
+    fallback_thresholds: list[float] = []
+
+    def fake_load_cached_scene_cuts(
+        cls,
+        episode_path: str,
+        threshold: float | None = None,
+        min_scene_len: int | None = None,
+        frame_skip: int | None = None,
+    ) -> list[float] | None:
+        return None
+
+    async def fake_detect_scene_cuts_window(
+        cls,
+        episode_path: Path,
+        *,
+        interval_start: float,
+        interval_end: float,
+        threshold: float,
+        min_scene_len: int,
+        frame_skip: int,
+        guard_seconds: float,
+    ) -> tuple[list[float], float]:
+        return [], 200.0
+
+    async def fake_detect_scene_cuts(
+        cls,
+        episode_path: str,
+        threshold: float | None = None,
+        min_scene_len: int | None = None,
+        frame_skip: int | None = None,
+    ) -> list[float]:
+        fallback_thresholds.append(GapResolutionService.SCENE_THRESHOLD if threshold is None else float(threshold))
+        return list(full_cuts)
+
+    monkeypatch.setattr(
+        GapResolutionService,
+        "load_cached_scene_cuts",
+        classmethod(fake_load_cached_scene_cuts),
+    )
+    monkeypatch.setattr(
+        GapResolutionService,
+        "_detect_scene_cuts_window",
+        classmethod(fake_detect_scene_cuts_window),
+    )
+    monkeypatch.setattr(
+        GapResolutionService,
+        "detect_scene_cuts",
+        classmethod(fake_detect_scene_cuts),
+    )
+    monkeypatch.setattr(GapResolutionService, "FAST_SCAN_CORE_RADIUS_SECONDS", 10.0)
+    monkeypatch.setattr(GapResolutionService, "FAST_SCAN_BAND_SIZE_SECONDS", 10.0)
+    monkeypatch.setattr(GapResolutionService, "FAST_SCAN_MAX_RADIUS_SECONDS", 20.0)
+
+    fast_context = _build_episode_analysis_context(duration_seconds=200.0)
+    fast_candidates = await GapResolutionService._generate_candidates_for_gap(
+        gap=gap,
+        analysis_context=fast_context,
+        neighbor_context=neighbor_context,
+        max_candidates=6,
+    )
+
+    assert fallback_thresholds == [27.0]
+    assert _candidate_signature(fast_candidates) == _candidate_signature(baseline_candidates)
+
+
+@pytest.mark.asyncio
+async def test_generate_candidates_batch_reuses_episode_metadata_and_window_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    gaps = [
+        _make_gap(scene_index=0, current_start=100.0, current_end=101.0, target_duration=2.0),
+        _make_gap(scene_index=1, current_start=118.0, current_end=119.0, target_duration=2.0),
+    ]
+    matches = [
+        _make_match(0, 100.0, 101.0),
+        _make_match(1, 118.0, 119.0),
+    ]
+    episode_path = tmp_path / "shared-episode.mp4"
+    episode_path.touch()
+    metadata_calls = 0
+    window_calls: list[tuple[float, float, float]] = []
+    cuts_27 = [
+        60.0, 70.0, 80.0, 90.0, 95.0, 99.0,
+        101.8, 103.0, 110.0, 115.0, 117.0, 117.5,
+        119.5, 125.0, 130.0, 135.0, 140.0, 200.0,
+    ]
+
+    async def fake_ensure_episode_manifest(
+        cls,
+        *,
+        force_refresh: bool = False,
+        library_type=None,
+    ) -> dict:
+        return {}
+
+    def fake_resolve_episode_path(
+        cls,
+        episode_name: str,
+        manifest: dict | None = None,
+        *,
+        library_type=None,
+    ) -> Path | None:
+        return episode_path if episode_name == "episode-a" else None
+
+    async def fake_load_episode_video_metadata(
+        cls,
+        episode_path_arg: Path,
+    ) -> _EpisodeVideoMetadata:
+        nonlocal metadata_calls
+        metadata_calls += 1
+        return _EpisodeVideoMetadata(
+            fps_fraction=DEFAULT_FPS,
+            duration_seconds=200.0,
+        )
+
+    def fake_load_cached_scene_cuts(
+        cls,
+        episode_path_arg: str,
+        threshold: float | None = None,
+        min_scene_len: int | None = None,
+        frame_skip: int | None = None,
+    ) -> list[float] | None:
+        return None
+
+    async def fake_detect_scene_cuts_window(
+        cls,
+        episode_path_arg: Path,
+        *,
+        interval_start: float,
+        interval_end: float,
+        threshold: float,
+        min_scene_len: int,
+        frame_skip: int,
+        guard_seconds: float,
+    ) -> tuple[list[float], float]:
+        window_calls.append((threshold, round(interval_start, 3), round(interval_end, 3)))
+        return (
+            [cut for cut in cuts_27 if interval_start <= cut <= interval_end],
+            200.0,
+        )
+
+    async def fail_detect_scene_cuts(
+        cls,
+        episode_path_arg: str,
+        threshold: float | None = None,
+        min_scene_len: int | None = None,
+        frame_skip: int | None = None,
+    ) -> list[float]:
+        raise AssertionError("full fallback should not run when interval reuse is sufficient")
+
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "ensure_episode_manifest",
+        classmethod(fake_ensure_episode_manifest),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "resolve_episode_path",
+        classmethod(fake_resolve_episode_path),
+    )
+    monkeypatch.setattr(
+        GapResolutionService,
+        "_load_episode_video_metadata",
+        classmethod(fake_load_episode_video_metadata),
+    )
+    monkeypatch.setattr(
+        GapResolutionService,
+        "load_cached_scene_cuts",
+        classmethod(fake_load_cached_scene_cuts),
+    )
+    monkeypatch.setattr(
+        GapResolutionService,
+        "_detect_scene_cuts_window",
+        classmethod(fake_detect_scene_cuts_window),
+    )
+    monkeypatch.setattr(
+        GapResolutionService,
+        "detect_scene_cuts",
+        classmethod(fail_detect_scene_cuts),
+    )
+
+    candidates_by_scene = await GapResolutionService.generate_candidates_batch(
+        gaps,
+        matches=matches,
+        max_candidates=6,
+    )
+
+    assert metadata_calls == 1
+    assert candidates_by_scene[0]
+    assert candidates_by_scene[1]
+    assert window_calls == [
+        (27.0, 70.0, 131.0),
+        (27.0, 131.0, 149.0),
+    ]
