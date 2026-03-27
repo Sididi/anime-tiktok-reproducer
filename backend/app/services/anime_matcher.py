@@ -271,7 +271,7 @@ class AnimeMatcherService:
 
         The algorithm looks for candidates from the same episode where the timestamps
         follow each other in order (start < middle < end) with a speed ratio between
-        70% and 160% of original speed.
+        the configured matcher floor and 160% of original speed.
 
         Args:
             start_candidates: Top 5 matches for scene start frame
@@ -282,7 +282,7 @@ class AnimeMatcherService:
         Returns:
             SceneMatch if a consistent match is found, None otherwise
         """
-        MIN_SPEED = 0.70  # 70% - slowed down
+        MIN_SPEED = settings.matcher_min_speed_factor
         MAX_SPEED = 1.60  # 160% - sped up
 
         best_match: SceneMatch | None = None

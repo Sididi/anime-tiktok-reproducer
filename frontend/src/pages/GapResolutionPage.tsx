@@ -26,7 +26,7 @@ import { ClippedVideoPlayer, ManualMatchModal } from "@/components/video";
 import type { ClippedVideoPlayerHandle } from "@/components/video/ClippedVideoPlayer";
 import { useSceneStore } from "@/stores";
 import { api } from "@/api/client";
-import { cn, formatTime } from "@/utils";
+import { cn, formatSpeedFactorPercent, formatTime } from "@/utils";
 import type { Scene, SourceStreamDescriptor } from "@/types";
 
 interface GapInfo {
@@ -55,6 +55,7 @@ interface GapCandidate {
 
 const CANDIDATE_MATCH_EPSILON = 1e-4;
 const MAX_DYNAMIC_CHUNK_SECONDS = 120;
+const DEFAULT_MIN_SPEED_FACTOR = 0.75;
 
 interface GapCardProps {
   gap: GapInfo;
@@ -72,6 +73,7 @@ interface GapCardProps {
   isActive?: boolean;
   shouldLoadSourcePreview?: boolean;
   playbackRate?: number;
+  minSpeedFactor: number;
   controlsDisabled?: boolean;
   preloadMode?: "metadata" | "auto";
   ensureEpisodesLoaded: () => Promise<string[]>;
@@ -106,6 +108,7 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
     isActive = false,
     shouldLoadSourcePreview = false,
     playbackRate = 1,
+    minSpeedFactor,
     controlsDisabled = false,
     preloadMode = "metadata",
     ensureEpisodesLoaded,
@@ -137,7 +140,7 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
   const sourceClipDuration = Math.max(0.1, displayEnd - displayStart);
 
   // Calculate if still has gap after resolution
-  const hasGapAfterResolution = displaySpeed < 0.75;
+  const hasGapAfterResolution = displaySpeed < minSpeedFactor;
 
   const shouldUseChunkedSource = useCallback(
     (descriptor: SourceStreamDescriptor | null): boolean => {
@@ -498,11 +501,11 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
       // Calculate speed for this timing
       const duration = endTime - startTime;
       const speed = duration / gap.target_duration;
-      const effectiveSpeed = Math.max(0.75, Math.min(1.6, speed));
+      const effectiveSpeed = Math.max(minSpeedFactor, Math.min(1.6, speed));
 
       onUpdate(gap.scene_index, startTime, endTime, effectiveSpeed);
     },
-    [gap.scene_index, gap.target_duration, onUpdate],
+    [gap.scene_index, gap.target_duration, minSpeedFactor, onUpdate],
   );
 
   const handleOpenManual = useCallback(async () => {
@@ -522,7 +525,7 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
   }, [playBothFromStart]);
 
   const formatSpeed = (speed: number) => {
-    return `${Math.round(speed * 100)}%`;
+    return formatSpeedFactorPercent(speed);
   };
 
   return (
@@ -686,7 +689,7 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
           </div>
           {hasGapAfterResolution && (
             <p className="text-xs text-red-500 mt-1">
-              ⚠️ Still has gap (speed &lt; 75%)
+              ⚠️ Still has gap (speed &lt; {formatSpeed(minSpeedFactor)})
             </p>
           )}
         </div>
@@ -729,7 +732,7 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
                         candidate.effective_speed >= 0.95 &&
                         candidate.effective_speed <= 1.05
                           ? "text-green-500"
-                          : candidate.effective_speed < 0.75
+                          : candidate.effective_speed < minSpeedFactor
                             ? "text-red-500"
                             : "text-amber-500"
                       }`}
@@ -790,7 +793,7 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
               ? "bg-amber-500/20 text-amber-500 border border-amber-500/50"
               : "text-amber-500"
           }`}
-          title="Skip this gap (keep 75% speed)"
+          title={`Skip this gap (keep ${formatSpeed(minSpeedFactor)} speed)`}
         >
           <SkipForward className="h-4 w-4" />
         </Button>
@@ -840,6 +843,9 @@ export function GapResolutionPage() {
   const [episodes, setEpisodes] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [minSpeedFactor, setMinSpeedFactor] = useState(
+    DEFAULT_MIN_SPEED_FACTOR,
+  );
   const [resolvedGaps, setResolvedGaps] = useState<
     Map<number, { start: number; end: number; speed: number }>
   >(new Map());
@@ -1306,23 +1312,24 @@ export function GapResolutionPage() {
       setLoading(true);
       setError(null);
       setGaps([]);
+      setMinSpeedFactor(DEFAULT_MIN_SPEED_FACTOR);
       setCandidatesByScene({});
       setLoadingCandidates(false);
       try {
-        const gapsRequest = fetch(`/api/projects/${projectId}/gaps`);
-        await Promise.all([loadScenes(projectId), gapsRequest]);
-
-        const gapsResponse = await gapsRequest;
-        if (!gapsResponse.ok) {
-          throw new Error("Failed to load gaps");
-        }
-
-        const gapsData = await gapsResponse.json();
+        const [, gapsData] = await Promise.all([
+          loadScenes(projectId),
+          api.getGaps(projectId),
+        ]);
         const loadedGaps: GapInfo[] = gapsData.gaps || [];
         if (cancelled) {
           return;
         }
 
+        setMinSpeedFactor(
+          Number.isFinite(gapsData.min_speed_factor)
+            ? gapsData.min_speed_factor
+            : DEFAULT_MIN_SPEED_FACTOR,
+        );
         setGaps(loadedGaps);
         setLoading(false);
 
@@ -1668,8 +1675,8 @@ export function GapResolutionPage() {
               <AlertTriangle className="h-5 w-5 text-amber-500 shrink-0 mt-0.5" />
               <div className="space-y-1">
                 <p className="text-sm font-medium">
-                  {totalGaps} clip{totalGaps !== 1 ? "s" : ""} hit the 75% speed
-                  floor
+                  {totalGaps} clip{totalGaps !== 1 ? "s" : ""} hit the{" "}
+                  {formatSpeedFactorPercent(minSpeedFactor)} speed floor
                 </p>
                 <p className="text-xs text-[hsl(var(--muted-foreground))]">
                   These clips need more source footage to avoid gaps in the
@@ -1760,6 +1767,7 @@ export function GapResolutionPage() {
                   projectId={projectId!}
                   episodes={episodes}
                   getSourceDescriptor={getSourceDescriptorCached}
+                  minSpeedFactor={minSpeedFactor}
                   isResolved={isResolved || isSkipped}
                   isSkipped={isSkipped}
                   resolvedTiming={resolvedTiming}

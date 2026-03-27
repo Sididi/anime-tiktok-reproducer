@@ -1,7 +1,7 @@
-"""Gap Resolution Service for extending clips that hit the 75% speed floor.
+"""Gap Resolution Service for extending clips that hit the configured speed floor.
 
 This service handles:
-1. Detecting which scenes have gaps (speed < 75% required)
+1. Detecting which scenes have gaps (speed below the configured floor)
 2. Running pyscenedetect on source anime episodes to find cut points
 3. Generating AI candidates for extending clips to fill gaps
 4. Caching scene cut data per episode
@@ -30,9 +30,14 @@ from .anime_library import AnimeLibraryService
 from .otio_timing import OTIOTimingCalculator, FrameRateInfo
 
 
+class classproperty(property):
+    def __get__(self, obj, owner=None):
+        return self.fget(owner)
+
+
 @dataclass
 class GapInfo:
-    """Information about a scene that has a gap (hit 75% speed floor).
+    """Information about a scene that has a gap (hit the configured speed floor).
 
     Uses Fraction-based arithmetic internally for frame-perfect precision,
     matching the OTIOTimingCalculator used in Premiere Pro JSX generation.
@@ -51,8 +56,8 @@ class GapInfo:
     target_duration: float  # How long the clip needs to be on timeline (seconds)
 
     # Gap calculations - use Fraction for precision
-    required_speed: Fraction  # Speed that would be needed (< 0.75)
-    effective_speed: Fraction  # Capped at 0.75
+    required_speed: Fraction  # Speed that would be needed (< configured floor)
+    effective_speed: Fraction  # Capped at the configured floor
     gap_duration: float    # Duration of gap in seconds
 
     def to_dict(self) -> dict:
@@ -196,14 +201,13 @@ class AutoFillSelectionResult:
 
 
 class GapResolutionService:
-    """Service for resolving gaps in clips that hit the 75% speed floor.
+    """Service for resolving gaps in clips that hit the configured speed floor.
 
     Uses OTIOTimingCalculator for frame-perfect precision, ensuring
     consistent results that match the Premiere Pro JSX automation.
     """
 
     # Speed constraints as Fractions for exact comparison
-    MIN_SPEED = Fraction(75, 100)  # 0.75
     MAX_SPEED = Fraction(160, 100)  # 1.60
     TARGET_SPEED = Fraction(1, 1)  # 1.0
 
@@ -242,6 +246,28 @@ class GapResolutionService:
     CONTINUATION_TIE_WINDOW = 0.15
     CANDIDATE_BATCH_CACHE_TTL_SECONDS = 15 * 60
     CANDIDATE_BATCH_CACHE_MAX_ENTRIES = 16
+
+    @classproperty
+    def MIN_SPEED(cls) -> Fraction:
+        return settings.min_playback_speed_fraction
+
+    @classmethod
+    def min_speed(cls) -> Fraction:
+        return settings.min_playback_speed_fraction
+
+    @classmethod
+    def min_speed_factor(cls) -> float:
+        return settings.min_playback_speed_factor
+
+    @classmethod
+    def min_speed_percent_label(cls) -> str:
+        return cls._format_speed_percent(cls.min_speed_factor())
+
+    @staticmethod
+    def _format_speed_percent(value: float | Fraction) -> str:
+        percent = float(value) * 100.0
+        formatted = f"{percent:.2f}".rstrip("0").rstrip(".")
+        return f"{formatted}%"
 
     @classmethod
     async def detect_video_fps(cls, video_path: Path) -> Fraction:
@@ -623,7 +649,7 @@ class GapResolutionService:
         matches: list[SceneMatch],
         scene_timings: list[dict],  # From transcription, each has words with start/end
     ) -> list[GapInfo]:
-        """Calculate which scenes have gaps due to 75% speed floor.
+        """Calculate which scenes have gaps due to the configured speed floor.
 
         Uses Fraction-based arithmetic and frame-snapping for precision,
         matching the OTIOTimingCalculator used in Premiere Pro JSX generation.
@@ -722,10 +748,12 @@ class GapResolutionService:
             else:
                 continue
 
-            # Check if this scene hits the 75% floor
-            if speed_ratio < cls.MIN_SPEED:
+            min_speed = cls.min_speed()
+
+            # Check if this scene hits the configured floor
+            if speed_ratio < min_speed:
                 # Calculate gap using Fraction arithmetic
-                effective_speed = cls.MIN_SPEED
+                effective_speed = min_speed
                 actual_duration_frac = source_duration_frac / effective_speed
                 gap_duration_frac = target_duration_frac - actual_duration_frac
                 gap_duration = float(gap_duration_frac)
@@ -760,7 +788,7 @@ class GapResolutionService:
         that snap to these cuts. Candidates are ranked by:
         1) Avoiding same-episode adjacent overlap
         2) Preferring cut-aligned candidates over fallback windows
-        3) Minimizing added source duration (closer to the 75% floor)
+        3) Minimizing added source duration (closer to the configured floor)
 
         Uses Fraction-based arithmetic for frame-perfect precision.
 
@@ -1317,7 +1345,7 @@ class GapResolutionService:
         2) Total overlap duration
         3) Prefer cut-aligned candidates over fallback windows
         4) Prefer the continuation/open-side clean cut candidate inside the tie window
-        5) Minimize added source duration (closer to the 75% floor)
+        5) Minimize added source duration (closer to the configured floor)
         6) Candidate rank sum (stable deterministic tie-break)
         """
         if not matches:
@@ -1715,7 +1743,8 @@ class GapResolutionService:
         else:
             speed_frac = Fraction(1, 1)
 
-        if speed_frac < cls.MIN_SPEED or speed_frac > cls.MAX_SPEED:
+        min_speed = cls.min_speed()
+        if speed_frac < min_speed or speed_frac > cls.MAX_SPEED:
             return None
 
         new_duration = float(new_duration_frac)
@@ -1919,7 +1948,8 @@ class GapResolutionService:
         """Generate minimal-duration fallback windows when cut alignment is insufficient."""
         current_duration_frac = Fraction(gap.current_duration).limit_denominator(100000)
         target_duration_frac = Fraction(gap.target_duration).limit_denominator(100000)
-        minimum_duration_frac = target_duration_frac * cls.MIN_SPEED
+        min_speed = cls.min_speed()
+        minimum_duration_frac = target_duration_frac * min_speed
         extra_needed_frac = minimum_duration_frac - current_duration_frac
         if extra_needed_frac <= 0:
             return []
@@ -1966,14 +1996,14 @@ class GapResolutionService:
                 gap.current_start - extra_needed,
                 gap.current_end,
                 "fallback_extend_start",
-                f"Extend start to 75% floor (-{extra_needed:.2f}s)",
+                f"Extend start to {cls.min_speed_percent_label()} floor (-{extra_needed:.2f}s)",
                 "start",
             ),
             "end": (
                 gap.current_start,
                 gap.current_end + extra_needed,
                 "fallback_extend_end",
-                f"Extend end to 75% floor (+{extra_needed:.2f}s)",
+                f"Extend end to {cls.min_speed_percent_label()} floor (+{extra_needed:.2f}s)",
                 "end",
             ),
         }
@@ -1990,7 +2020,10 @@ class GapResolutionService:
                 gap.current_start - half_extra,
                 gap.current_end + half_extra,
                 "fallback_extend_both",
-                f"Extend both to 75% floor (-{half_extra:.2f}s, +{half_extra:.2f}s)",
+                (
+                    f"Extend both to {cls.min_speed_percent_label()} floor "
+                    f"(-{half_extra:.2f}s, +{half_extra:.2f}s)"
+                ),
             )
 
         return sorted(candidates, key=cls._candidate_sort_key)
@@ -2012,7 +2045,7 @@ class GapResolutionService:
             target_duration: Target duration on timeline (seconds)
 
         Returns:
-            Effective speed as Fraction (clamped to 0.75-1.60)
+            Effective speed as Fraction (clamped to configured floor-1.60)
         """
         # Use Fraction for exact calculation
         source_start_frac = Fraction(source_start).limit_denominator(100000)
@@ -2027,8 +2060,9 @@ class GapResolutionService:
         speed_frac = source_duration_frac / target_frac
 
         # Clamp to valid range using Fraction comparison
-        if speed_frac < cls.MIN_SPEED:
-            return cls.MIN_SPEED
+        min_speed = cls.min_speed()
+        if speed_frac < min_speed:
+            return min_speed
         elif speed_frac > cls.MAX_SPEED:
             return cls.MAX_SPEED
         return speed_frac
@@ -2048,7 +2082,7 @@ class GapResolutionService:
             target_duration: Target duration on timeline (seconds)
 
         Returns:
-            Raw speed as Fraction (may be outside 0.75-1.60 range)
+            Raw speed as Fraction (may be outside configured floor-1.60 range)
         """
         # Use Fraction for exact calculation
         source_start_frac = Fraction(source_start).limit_denominator(100000)

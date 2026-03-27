@@ -25,6 +25,18 @@ interface GapCandidate {
   snap_description: string;
 }
 
+interface GapsConfig {
+  full_auto_enabled: boolean;
+  min_speed_factor: number;
+}
+
+interface GapsResponse {
+  has_gaps: boolean;
+  gaps: GapInfo[];
+  total_gap_duration: number;
+  min_speed_factor: number;
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     headers: {
@@ -673,12 +685,12 @@ export const api = {
 
   // Gap Resolution
   getGapsConfig: (projectId: string) =>
-    request<{ full_auto_enabled: boolean }>(
+    request<GapsConfig>(
       `/projects/${projectId}/gaps/config`,
     ),
 
   getGaps: (projectId: string) =>
-    request<{ has_gaps: boolean; gaps: GapInfo[]; total_gap_duration: number }>(
+    request<GapsResponse>(
       `/projects/${projectId}/gaps`,
     ),
 

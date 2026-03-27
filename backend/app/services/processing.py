@@ -851,7 +851,7 @@ class ProcessingService:
         Frame-Perfect Timing:
         - All timeline positions are snapped to 60fps frame grid
         - Uses OTIOTimingCalculator for Fraction-based speed calculations
-        - Gaps only occur when 75% speed floor is reached
+        - Gaps only occur when the configured minimum playback speed floor is reached
 
         Args:
             project: Project data
@@ -977,7 +977,7 @@ class ProcessingService:
                 "target_duration": round(clip_timing.target_duration.to_seconds(), 4),
                 "speed_ratio": round(float(clip_timing.speed_ratio), 4),
                 "effective_speed": round(float(clip_timing.effective_speed), 4),
-                "leaves_gap": clip_timing.leaves_gap,  # True if 75% floor hit
+                "leaves_gap": clip_timing.leaves_gap,  # True if speed floor hit
                 "used_alternative": resolved_source.used_alternative,
                 "is_raw": scene_trans.is_raw,
             })
@@ -986,11 +986,11 @@ class ProcessingService:
         issues = calculator.validate_clip_continuity(clip_timings, tolerance_frames=1)
         for issue in issues:
             if issue.issue_type == "gap":
-                # Check if this is an expected gap (75% floor)
+                # Check if this is an expected gap (configured speed floor)
                 scene_a = issue.between_scenes[0]
                 clip_a = next((c for c in clip_timings if c.scene_index == scene_a), None)
                 if clip_a and clip_a.leaves_gap:
-                    # Expected gap due to 75% floor - this is fine
+                    # Expected gap due to configured speed floor - this is fine
                     pass
                 else:
                     # Unexpected gap - log warning (would be nice to surface this)
@@ -2035,7 +2035,7 @@ class ProcessingService:
                     "Checking for clips with gaps...",
                 )
 
-                # Step 2b: Check for gaps (scenes that hit 75% speed floor)
+                # Step 2b: Check for gaps (scenes that hit the configured speed floor)
                 # Skip this check if gaps were already resolved in a previous run
                 gaps_already_resolved = cls.check_gaps_resolved(project.id)
 

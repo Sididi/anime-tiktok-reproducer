@@ -1,4 +1,5 @@
 import os
+from fractions import Fraction
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
@@ -45,6 +46,7 @@ class Settings(BaseSettings):
     source_normalization_profile: str = "h264_mp4_aac"
     match_playback_max_workers: int = 4
     match_playback_max_workers_per_episode: int = 1
+    min_playback_speed_factor: float = 0.75
 
     # Discord webhook integration
     discord_webhook_url: str | None = None
@@ -172,11 +174,32 @@ class Settings(BaseSettings):
     def youtube_google_token_uri(self) -> str:
         return self.google_token_uri
 
+    @property
+    def min_playback_speed_fraction(self) -> Fraction:
+        return Fraction(str(self.min_playback_speed_factor)).limit_denominator(100000)
+
+    @property
+    def matcher_min_speed_fraction(self) -> Fraction:
+        return self.min_playback_speed_fraction - Fraction(1, 10)
+
+    @property
+    def matcher_min_speed_factor(self) -> float:
+        return float(self.matcher_min_speed_fraction)
+
     @field_validator("cep_trigger_url_template")
     @classmethod
     def _validate_cep_trigger_url_template(cls, value: str) -> str:
         if "{project_id}" not in value:
             raise ValueError("ATR_CEP_TRIGGER_URL_TEMPLATE must contain '{project_id}'")
+        return value
+
+    @field_validator("min_playback_speed_factor")
+    @classmethod
+    def _validate_min_playback_speed_factor(cls, value: float) -> float:
+        if value <= 0.10 or value > 1.0:
+            raise ValueError(
+                "ATR_MIN_PLAYBACK_SPEED_FACTOR must be greater than 0.10 and at most 1.0"
+            )
         return value
 
     @field_validator("ffmpeg_binary", "ffprobe_binary")

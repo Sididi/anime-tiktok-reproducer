@@ -127,6 +127,7 @@ Environment variables or defaults in `backend/app/config.py`:
 | `SSCD_MODEL_PATH`     | Auto-detected                    | Path to SSCD model file        |
 | `FFMPEG_BINARY`       | Auto-detected                    | Override `ffmpeg` binary path  |
 | `FFPROBE_BINARY`      | Auto-detected                    | Override `ffprobe` binary path |
+| `MIN_PLAYBACK_SPEED_FACTOR` | `0.75`                    | Minimum playback speed factor before gap resolution triggers |
 
 Additional integration variables (see `.env.example`):
 
@@ -343,7 +344,9 @@ Each project is stored in `backend/data/projects/{project_id}/`:
 2. Generate SSCD embeddings for each frame
 3. Search FAISS index for top-5 candidates per frame
 4. Find temporally consistent matches across all three positions
-5. Validate speed ratio is within 70%-160% of original
+5. Validate speed ratio is within the matcher range
+   The lower bound is derived from `ATR_MIN_PLAYBACK_SPEED_FACTOR - 0.10`
+   (default `65%-160%` when the playback floor stays at `75%`).
 
 ### Anime Indexing
 
