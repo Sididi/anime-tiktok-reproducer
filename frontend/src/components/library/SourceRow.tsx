@@ -75,7 +75,7 @@ export function SourceRow({
       <div className="flex gap-1 justify-end w-36 shrink-0">
         {hasLocalEpisodes && (
           <div
-            className="p-1 text-sky-400 opacity-30"
+            className="p-1 text-violet-400 opacity-30"
             title="Un ou plusieurs épisodes sont disponibles localement"
           >
             <HardDrive className="h-4 w-4" />
@@ -122,7 +122,7 @@ export function SourceRow({
             e.stopPropagation();
             onUpdate();
           }}
-          className="p-1 rounded text-violet-400/50 hover:bg-violet-500/10 hover:text-violet-400 transition-colors"
+          className="p-1 rounded text-sky-600/50 hover:bg-sky-600/10 hover:text-sky-500 transition-colors"
           title="Mettre à jour les épisodes"
         >
           <FolderDown className="h-4 w-4" />
