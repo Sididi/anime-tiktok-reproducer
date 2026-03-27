@@ -372,10 +372,10 @@ class IndexAnimeRequest(BaseModel):
     anime_name: str | None = None
     fps: float = 2.0
     batch_size: int = 64
-    prefetch_batches: int = 3
+    prefetch_batches: int = 2
     transform_workers: int = 4
     decode_backend: str = "auto"
-    precision: str = "auto"
+    precision: str = "fp16"
     require_gpu: bool = True
 
 
@@ -463,10 +463,10 @@ class UpdateAnimeRequest(BaseModel):
     anime_name: str
     source_paths: list[str]
     batch_size: int = 64
-    prefetch_batches: int = 3
+    prefetch_batches: int = 2
     transform_workers: int = 4
     decode_backend: str = "auto"
-    precision: str = "auto"
+    precision: str = "fp16"
     require_gpu: bool = True
 
 

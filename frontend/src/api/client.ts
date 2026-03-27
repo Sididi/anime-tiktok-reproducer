@@ -1,4 +1,9 @@
 const API_BASE = "/api";
+const DEFAULT_INDEX_BATCH_SIZE = 64;
+const DEFAULT_INDEX_PREFETCH_BATCHES = 2;
+const DEFAULT_INDEX_TRANSFORM_WORKERS = 4;
+const DEFAULT_INDEX_DECODE_BACKEND = "auto";
+const DEFAULT_INDEX_PRECISION = "fp16";
 
 // Gap resolution types
 interface GapInfo {
@@ -524,9 +529,11 @@ export const api = {
         library_type: libraryType,
         anime_name: animeName,
         fps,
-        batch_size: 64,
-        prefetch_batches: 3,
-        transform_workers: 4,
+        batch_size: DEFAULT_INDEX_BATCH_SIZE,
+        prefetch_batches: DEFAULT_INDEX_PREFETCH_BATCHES,
+        transform_workers: DEFAULT_INDEX_TRANSFORM_WORKERS,
+        decode_backend: DEFAULT_INDEX_DECODE_BACKEND,
+        precision: DEFAULT_INDEX_PRECISION,
         require_gpu: true,
       }),
     });
