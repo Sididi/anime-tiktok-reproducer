@@ -8,7 +8,10 @@ RÈGLES TITLE HOOKS:
 - Ne JAMAIS citer le nom de l'anime
 - Typographie française OBLIGATOIRE: toujours un espace AVANT les ? ! : ; (ex: "MOT !" et non "MOT!")
 - Les 10 hooks doivent être variés, sans reformulations paresseuses
-- Exemples: "CET ANIME EST UNE DINGUERIE", "TU VAS PLEURER EN REGARDANT ÇA !", "L'ANIME LE PLUS FOU DE 2025"
+- Tu PEUX ajouter 1 emoji au début ou à la fin de CERTAINS hooks (pas tous !) pour l'impact visuel
+- Emojis simples uniquement : 🔥 💀 😭 🤯 😱 💔 🏆 ⚡ etc. (1 seul emoji par hook, jamais 2+)
+- Au moins 4 hooks sur 10 doivent rester SANS emoji
+- Exemples: "CET ANIME EST UNE DINGUERIE", "TU VAS PLEURER EN REGARDANT ÇA !", "L'ANIME LE PLUS FOU 🔥"
 
 RÈGLES CATÉGORIE:
 - Retourne UNE SEULE catégorie dans `category`

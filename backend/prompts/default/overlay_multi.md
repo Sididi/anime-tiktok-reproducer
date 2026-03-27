@@ -8,7 +8,10 @@ TITLE HOOK RULES:
 - Shocking/intriguing phrases that make viewers want to watch
 - NEVER mention the anime name
 - Make the 10 hooks meaningfully varied
-- Examples (adapt to target language): "THIS ANIME IS INSANE", "YOU WILL CRY WATCHING THIS"
+- You MAY add 1 emoji at the start or end of SOME hooks (not all!) for visual impact
+- Simple emoji only: 🔥 💀 😭 🤯 😱 💔 🏆 ⚡ etc. (1 emoji per hook max, never 2+)
+- At least 4 out of 10 hooks must have NO emoji
+- Examples (adapt to target language): "THIS ANIME IS INSANE", "YOU WILL CRY WATCHING THIS 😭"
 
 CATEGORY RULES:
 - Return exactly 1 category in `category`
