@@ -34,11 +34,37 @@ class DownloadProgress:
         }
 
 
+@dataclass(frozen=True)
+class _DownloadCommandResult:
+    """Outcome of one yt-dlp subprocess invocation."""
+
+    returncode: int | None = None
+    stderr: str = ""
+    error: str | None = None
+
+
 class DownloaderService:
     """Service for downloading TikTok videos using yt-dlp."""
 
     DOWNLOAD_TIMEOUT_SECONDS = 1800.0
     FFPROBE_TIMEOUT_SECONDS = 30.0
+    MUX_TIMEOUT_SECONDS = 300.0
+    AUDIO_RECOVERY_DURATION_TOLERANCE_SECONDS = 0.25
+    PRIMARY_FORMAT_SELECTOR = (
+        "bv*[ext=mp4]+ba[ext=m4a]/"
+        "bv*+ba/"
+        "b[ext=mp4][acodec!=none]/"
+        "b[acodec!=none]/"
+        "bv*[ext=mp4]/"
+        "bv*/"
+        "b"
+    )
+    AUDIO_RECOVERY_FORMAT_SELECTOR = "download"
+    AUDIO_REQUIRED_ERROR_MESSAGE = (
+        "Downloaded video has no audio stream. "
+        "This TikTok may not have audio or the audio stream is unavailable. "
+        "Note: Audio is required for transcription in this project."
+    )
 
     @staticmethod
     def get_output_path(project_id: str) -> Path:
@@ -46,16 +72,13 @@ class DownloaderService:
         return settings.projects_dir / project_id / "tiktok.mp4"
 
     @classmethod
-    def _build_download_command(cls, url: str, output_path: Path) -> list[str]:
-        format_selector = (
-            "bv*[ext=mp4]+ba[ext=m4a]/"
-            "bv*+ba/"
-            "b[ext=mp4][acodec!=none]/"
-            "b[acodec!=none]/"
-            "bv*[ext=mp4]/"
-            "bv*/"
-            "b"
-        )
+    def _build_download_command(
+        cls,
+        url: str,
+        output_path: Path,
+        *,
+        format_selector: str,
+    ) -> list[str]:
         cmd = [
             "yt-dlp",
             "--no-warnings",
@@ -75,6 +98,131 @@ class DownloaderService:
             cmd.extend(["--ffmpeg-location", ffmpeg_location])
         cmd.append(url)
         return cmd
+
+    @classmethod
+    def _build_primary_download_command(cls, url: str, output_path: Path) -> list[str]:
+        return cls._build_download_command(
+            url,
+            output_path,
+            format_selector=cls.PRIMARY_FORMAT_SELECTOR,
+        )
+
+    @classmethod
+    def _build_audio_recovery_command(cls, url: str, output_path: Path) -> list[str]:
+        return cls._build_download_command(
+            url,
+            output_path,
+            format_selector=cls.AUDIO_RECOVERY_FORMAT_SELECTOR,
+        )
+
+    @staticmethod
+    def _cleanup_paths(*paths: Path) -> None:
+        for path in paths:
+            path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _replace_file(source_path: Path, dest_path: Path) -> None:
+        dest_path.unlink(missing_ok=True)
+        source_path.replace(dest_path)
+
+    @staticmethod
+    def _extract_ffmpeg_location(cmd: list[str]) -> str | None:
+        if "--ffmpeg-location" not in cmd:
+            return None
+        location_index = cmd.index("--ffmpeg-location") + 1
+        if location_index >= len(cmd):
+            return None
+        return cmd[location_index]
+
+    @classmethod
+    async def _stream_download_command(
+        cls,
+        cmd: list[str],
+        *,
+        progress_message_prefix: str,
+    ) -> AsyncIterator[DownloadProgress | _DownloadCommandResult]:
+        process: asyncio.subprocess.Process | None = None
+        stderr_task: asyncio.Task[bytes] | None = None
+        aborted = False
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=get_media_subprocess_env(cmd, extra_binary=cls._extract_ffmpeg_location(cmd)),
+            )
+            stderr_task = asyncio.create_task(
+                process.stderr.read() if process.stderr is not None else asyncio.sleep(0, result=b"")
+            )
+
+            last_progress = 0.0
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + cls.DOWNLOAD_TIMEOUT_SECONDS
+
+            while True:
+                if process.stdout is None:
+                    break
+
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+
+                line = await asyncio.wait_for(process.stdout.readline(), timeout=remaining)
+                if not line:
+                    break
+
+                line_str = line.decode().strip()
+                if not line_str:
+                    continue
+
+                if "[download]" in line_str and "%" in line_str:
+                    try:
+                        percent_str = line_str.split("%")[0].split()[-1]
+                        progress = float(percent_str) / 100.0
+                        if progress > last_progress:
+                            last_progress = progress
+                            yield DownloadProgress(
+                                "downloading",
+                                progress,
+                                f"{progress_message_prefix}: {percent_str}%",
+                            )
+                    except (ValueError, IndexError):
+                        pass
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            await asyncio.wait_for(process.wait(), timeout=remaining)
+            stderr = (await stderr_task).decode() if stderr_task is not None else ""
+            yield _DownloadCommandResult(returncode=process.returncode, stderr=stderr)
+        except asyncio.CancelledError:
+            aborted = True
+            if process is not None:
+                await terminate_process(process)
+            raise
+        except asyncio.TimeoutError:
+            aborted = True
+            if process is not None:
+                await terminate_process(process)
+            yield _DownloadCommandResult(
+                error=f"Download timed out after {int(cls.DOWNLOAD_TIMEOUT_SECONDS)} seconds",
+            )
+        except FileNotFoundError:
+            aborted = True
+            yield _DownloadCommandResult(
+                error="yt-dlp not found. Please install it: pip install yt-dlp",
+            )
+        except Exception as exc:
+            aborted = True
+            if process is not None:
+                await terminate_process(process)
+            yield _DownloadCommandResult(error=str(exc))
+        finally:
+            if aborted and stderr_task is not None and not stderr_task.done():
+                stderr_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await stderr_task
 
     @staticmethod
     async def _has_audio_stream(video_path: Path) -> bool | None:
@@ -106,6 +254,62 @@ class DownloaderService:
         return bool(result.stdout.decode().strip())
 
     @classmethod
+    async def _can_mux_recovered_audio(
+        cls,
+        primary_path: Path,
+        recovery_path: Path,
+    ) -> bool:
+        primary_info = await cls.get_video_info(primary_path)
+        recovery_info = await cls.get_video_info(recovery_path)
+        primary_duration = primary_info.get("duration")
+        recovery_duration = recovery_info.get("duration")
+        if not isinstance(primary_duration, (int, float)) or primary_duration <= 0:
+            return False
+        if not isinstance(recovery_duration, (int, float)) or recovery_duration <= 0:
+            return False
+        return abs(primary_duration - recovery_duration) <= cls.AUDIO_RECOVERY_DURATION_TOLERANCE_SECONDS
+
+    @classmethod
+    async def _mux_recovered_audio(
+        cls,
+        *,
+        video_path: Path,
+        audio_source_path: Path,
+        output_path: Path,
+    ) -> str | None:
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(video_path),
+            "-i",
+            str(audio_source_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c",
+            "copy",
+            "-shortest",
+            str(output_path),
+        ]
+
+        try:
+            result = await run_command(cmd, timeout_seconds=cls.MUX_TIMEOUT_SECONDS)
+        except CommandTimeoutError:
+            return f"Audio recovery mux timed out after {int(cls.MUX_TIMEOUT_SECONDS)} seconds"
+        except FileNotFoundError as exc:
+            if is_media_binary_override_error(exc):
+                raise
+            return "ffmpeg not found. Please install ffmpeg."
+
+        if result.returncode != 0:
+            stderr = result.stderr.decode(errors="replace").strip()
+            return stderr or "ffmpeg failed to mux recovered audio"
+
+        return None
+
+    @classmethod
     async def download(
         cls,
         url: str,
@@ -125,84 +329,48 @@ class DownloaderService:
 
         output_path = cls.get_output_path(project_id)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # yt-dlp command with progress output.
-        # Format selector prefers audio+video but falls back to video-only if needed.
-        cmd = cls._build_download_command(url, output_path)
-
-        process: asyncio.subprocess.Process | None = None
-        stderr_task: asyncio.Task[bytes] | None = None
-        aborted = False
+        recovery_path = output_path.with_name(f"{output_path.stem}.recovery{output_path.suffix}")
+        mux_path = output_path.with_name(f"{output_path.stem}.muxed{output_path.suffix}")
+        cls._cleanup_paths(recovery_path, mux_path)
 
         try:
-            ffmpeg_location: str | None = None
-            if "--ffmpeg-location" in cmd:
-                location_index = cmd.index("--ffmpeg-location") + 1
-                if location_index < len(cmd):
-                    ffmpeg_location = cmd[location_index]
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=get_media_subprocess_env(cmd, extra_binary=ffmpeg_location),
-            )
-            stderr_task = asyncio.create_task(
-                process.stderr.read() if process.stderr is not None else asyncio.sleep(0, result=b"")
-            )
+            primary_result: _DownloadCommandResult | None = None
+            async for event in cls._stream_download_command(
+                cls._build_primary_download_command(url, output_path),
+                progress_message_prefix="Downloading",
+            ):
+                if isinstance(event, DownloadProgress):
+                    yield event
+                else:
+                    primary_result = event
 
-            last_progress = 0.0
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + cls.DOWNLOAD_TIMEOUT_SECONDS
-
-            while True:
-                if process.stdout is None:
-                    break
-
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    raise asyncio.TimeoutError
-
-                line = await asyncio.wait_for(process.stdout.readline(), timeout=remaining)
-                if not line:
-                    break
-
-                line_str = line.decode().strip()
-                if not line_str:
-                    continue
-
-                # Parse yt-dlp progress output
-                # Example: "[download]  45.2% of 12.50MiB at 2.50MiB/s ETA 00:03"
-                if "[download]" in line_str and "%" in line_str:
-                    try:
-                        percent_str = line_str.split("%")[0].split()[-1]
-                        progress = float(percent_str) / 100.0
-                        if progress > last_progress:
-                            last_progress = progress
-                            yield DownloadProgress(
-                                "downloading",
-                                progress,
-                                f"Downloading: {percent_str}%",
-                            )
-                    except (ValueError, IndexError):
-                        pass
-
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                raise asyncio.TimeoutError
-            await asyncio.wait_for(process.wait(), timeout=remaining)
-
-            stderr = (await stderr_task).decode() if stderr_task is not None else ""
-            if process.returncode != 0:
+            if primary_result is None:
+                cls._cleanup_paths(output_path, recovery_path, mux_path)
                 yield DownloadProgress(
                     "error",
                     0,
                     "",
-                    error=f"yt-dlp failed with code {process.returncode}: {stderr}",
+                    error="yt-dlp exited without reporting a result",
                 )
                 return
 
-            # Verify file exists
+            if primary_result.error is not None:
+                cls._cleanup_paths(output_path, recovery_path, mux_path)
+                yield DownloadProgress("error", 0, "", error=primary_result.error)
+                return
+
+            if primary_result.returncode != 0:
+                cls._cleanup_paths(output_path, recovery_path, mux_path)
+                yield DownloadProgress(
+                    "error",
+                    0,
+                    "",
+                    error=f"yt-dlp failed with code {primary_result.returncode}: {primary_result.stderr}",
+                )
+                return
+
             if not output_path.exists():
+                cls._cleanup_paths(output_path, recovery_path, mux_path)
                 yield DownloadProgress(
                     "error",
                     0,
@@ -213,54 +381,106 @@ class DownloaderService:
 
             has_audio = await cls._has_audio_stream(output_path)
             if has_audio is False:
-                output_path.unlink(missing_ok=True)
-                yield DownloadProgress(
-                    "error",
-                    0,
-                    "",
-                    error=(
-                        "Downloaded video has no audio stream. "
-                        "This TikTok may not have audio or the audio stream is unavailable. "
-                        "Note: Audio is required for transcription in this project."
-                    ),
-                )
-                return
+                yield DownloadProgress("downloading", 0.0, "Recovering audio track...")
+
+                recovery_result: _DownloadCommandResult | None = None
+                async for event in cls._stream_download_command(
+                    cls._build_audio_recovery_command(url, recovery_path),
+                    progress_message_prefix="Recovering audio",
+                ):
+                    if isinstance(event, DownloadProgress):
+                        yield event
+                    else:
+                        recovery_result = event
+
+                if recovery_result is None:
+                    cls._cleanup_paths(output_path, recovery_path, mux_path)
+                    yield DownloadProgress(
+                        "error",
+                        0,
+                        "",
+                        error="yt-dlp audio recovery exited without reporting a result",
+                    )
+                    return
+
+                if recovery_result.error is not None:
+                    cls._cleanup_paths(output_path, recovery_path, mux_path)
+                    yield DownloadProgress("error", 0, "", error=recovery_result.error)
+                    return
+
+                if recovery_result.returncode != 0:
+                    cls._cleanup_paths(output_path, recovery_path, mux_path)
+                    yield DownloadProgress(
+                        "error",
+                        0,
+                        "",
+                        error=(
+                            f"yt-dlp audio recovery failed with code {recovery_result.returncode}: "
+                            f"{recovery_result.stderr}"
+                        ),
+                    )
+                    return
+
+                if not recovery_path.exists():
+                    cls._cleanup_paths(output_path, recovery_path, mux_path)
+                    yield DownloadProgress(
+                        "error",
+                        0,
+                        "",
+                        error="Audio recovery completed but file not found",
+                    )
+                    return
+
+                recovery_has_audio = await cls._has_audio_stream(recovery_path)
+                if recovery_has_audio is False:
+                    cls._cleanup_paths(output_path, recovery_path, mux_path)
+                    yield DownloadProgress(
+                        "error",
+                        0,
+                        "",
+                        error=cls.AUDIO_REQUIRED_ERROR_MESSAGE,
+                    )
+                    return
+
+                should_mux = await cls._can_mux_recovered_audio(output_path, recovery_path)
+                if should_mux:
+                    yield DownloadProgress("downloading", 0.0, "Merging recovered audio...")
+                    mux_error = await cls._mux_recovered_audio(
+                        video_path=output_path,
+                        audio_source_path=recovery_path,
+                        output_path=mux_path,
+                    )
+                    mux_has_audio = await cls._has_audio_stream(mux_path) if mux_error is None else False
+                    if mux_error is None and mux_has_audio is not False:
+                        cls._replace_file(mux_path, output_path)
+                        cls._cleanup_paths(recovery_path)
+                    else:
+                        cls._cleanup_paths(mux_path)
+                        cls._replace_file(recovery_path, output_path)
+                else:
+                    cls._replace_file(recovery_path, output_path)
+
+                final_has_audio = await cls._has_audio_stream(output_path)
+                if final_has_audio is False:
+                    cls._cleanup_paths(output_path, recovery_path, mux_path)
+                    yield DownloadProgress(
+                        "error",
+                        0,
+                        "",
+                        error=cls.AUDIO_REQUIRED_ERROR_MESSAGE,
+                    )
+                    return
 
             yield DownloadProgress("complete", 1.0, "Download complete!")
 
         except asyncio.CancelledError:
-            aborted = True
-            if process is not None:
-                await terminate_process(process)
+            cls._cleanup_paths(recovery_path, mux_path)
             raise
-        except asyncio.TimeoutError:
-            aborted = True
-            if process is not None:
-                await terminate_process(process)
-            yield DownloadProgress(
-                "error",
-                0,
-                "",
-                error=f"Download timed out after {int(cls.DOWNLOAD_TIMEOUT_SECONDS)} seconds",
-            )
-        except FileNotFoundError:
-            aborted = True
-            yield DownloadProgress(
-                "error",
-                0,
-                "",
-                error="yt-dlp not found. Please install it: pip install yt-dlp",
-            )
-        except Exception as e:
-            aborted = True
-            if process is not None:
-                await terminate_process(process)
-            yield DownloadProgress("error", 0, "", error=str(e))
+        except Exception as exc:
+            cls._cleanup_paths(recovery_path, mux_path)
+            yield DownloadProgress("error", 0, "", error=str(exc))
         finally:
-            if aborted and stderr_task is not None and not stderr_task.done():
-                stderr_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await stderr_task
+            cls._cleanup_paths(recovery_path, mux_path)
 
     @staticmethod
     async def get_video_info(video_path: Path) -> dict:

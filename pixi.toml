@@ -43,7 +43,7 @@ aiofiles = ">=24.1.0"
 requests = ">=2.32.0"
 
 # Video/Audio processing
-yt-dlp = ">=2026.2.4"
+yt-dlp = ">=2026.3.17"
 scenedetect = ">=0.6.5"
 auto-editor = ">=28.0.0,<29.0.0"
 opentimelineio = ">=0.18.1"
