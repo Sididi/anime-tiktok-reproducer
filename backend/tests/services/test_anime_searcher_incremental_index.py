@@ -2052,6 +2052,98 @@ async def test_backend_update_anime_returns_prepared_library_paths(
 
 
 @pytest.mark.asyncio
+async def test_backend_update_anime_uses_reverted_default_prefetch_and_precision(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    library_path = tmp_path / "library"
+    searcher_path = tmp_path / "searcher"
+    source_path = tmp_path / "incoming" / "ep3.mkv"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_bytes(b"source")
+    prepared_path = library_path / "Demo" / "ep3.mp4"
+    captured_cmd: list[str] | None = None
+
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "get_library_path",
+        classmethod(lambda cls, library_type=None: library_path),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "get_anime_searcher_path",
+        classmethod(lambda cls: searcher_path),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_get_indexed_series_fps_sync",
+        classmethod(lambda cls, anime_name, library_type=None: 2.0),
+    )
+
+    async def fake_prepare_single_source_for_library(*, source_path: Path, dest_dir: Path):
+        prepared_path.parent.mkdir(parents=True, exist_ok=True)
+        prepared_path.write_bytes(b"prepared")
+        return prepared_path, "Copying", True
+
+    async def fake_stream_searcher_command(**kwargs):
+        nonlocal captured_cmd
+        captured_cmd = kwargs["cmd"]
+        yield IndexProgress(status="indexing", message="updating", progress=0.6)
+
+    async def fake_ensure_episode_manifest(*, force_refresh: bool = False, library_type=None):
+        return {}
+
+    async def fake_verify_prepared_library_files(files: list[Path]) -> str | None:
+        return None
+
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_prepare_single_source_for_library",
+        classmethod(lambda cls, **kwargs: fake_prepare_single_source_for_library(**kwargs)),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_scan_source_video_paths_sync",
+        classmethod(lambda cls, source_paths: _source_scan(readable=list(source_paths))),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_verify_prepared_library_files",
+        classmethod(lambda cls, files: fake_verify_prepared_library_files(files)),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_stream_searcher_command",
+        classmethod(lambda cls, **kwargs: fake_stream_searcher_command(**kwargs)),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "ensure_episode_manifest",
+        classmethod(
+            lambda cls, force_refresh=False, library_type=None: fake_ensure_episode_manifest(
+                force_refresh=force_refresh,
+                library_type=library_type,
+            )
+        ),
+    )
+
+    progress_events = [
+        progress
+        async for progress in AnimeLibraryService.update_anime(
+            anime_name="Demo",
+            source_paths=[source_path],
+            require_gpu=False,
+            library_type="anime",
+        )
+    ]
+
+    assert progress_events[-1].status == "complete"
+    assert captured_cmd is not None
+    assert captured_cmd[captured_cmd.index("--prefetch-batches") + 1] == "3"
+    assert captured_cmd[captured_cmd.index("--precision") + 1] == "auto"
+
+
+@pytest.mark.asyncio
 async def test_backend_index_anime_passes_decode_backend_and_precision_flags(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2146,6 +2238,99 @@ async def test_backend_index_anime_passes_decode_backend_and_precision_flags(
     assert "torchcodec_cuda" in captured_cmd
     assert "--precision" in captured_cmd
     assert "fp16" in captured_cmd
+
+
+@pytest.mark.asyncio
+async def test_backend_index_anime_uses_reverted_default_prefetch_and_precision(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    library_path = tmp_path / "library"
+    searcher_path = tmp_path / "searcher"
+    source_folder = tmp_path / "incoming"
+    source_folder.mkdir(parents=True)
+    source_path = source_folder / "ep1.mkv"
+    source_path.write_bytes(b"source")
+    prepared_path = library_path / "Demo" / "ep1.mp4"
+    captured_cmd: list[str] | None = None
+
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "get_library_path",
+        classmethod(lambda cls, library_type=None: library_path),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "get_anime_searcher_path",
+        classmethod(lambda cls: searcher_path),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_get_indexed_series_fps_sync",
+        classmethod(lambda cls, anime_name, library_type=None: None),
+    )
+
+    async def fake_prepare_single_source_for_library(*, source_path: Path, dest_dir: Path):
+        prepared_path.parent.mkdir(parents=True, exist_ok=True)
+        prepared_path.write_bytes(b"prepared")
+        return prepared_path, "Copying", True
+
+    async def fake_stream_searcher_command(**kwargs):
+        nonlocal captured_cmd
+        captured_cmd = kwargs["cmd"]
+        yield IndexProgress(status="indexing", message="indexing", progress=0.6)
+
+    async def fake_ensure_episode_manifest(*, force_refresh: bool = False, library_type=None):
+        return {}
+
+    async def fake_verify_prepared_library_files(files: list[Path]) -> str | None:
+        return None
+
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_prepare_single_source_for_library",
+        classmethod(lambda cls, **kwargs: fake_prepare_single_source_for_library(**kwargs)),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "scan_direct_video_files_sync",
+        classmethod(lambda cls, folder: _source_scan(readable=[source_path])),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_verify_prepared_library_files",
+        classmethod(lambda cls, files: fake_verify_prepared_library_files(files)),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_stream_searcher_command",
+        classmethod(lambda cls, **kwargs: fake_stream_searcher_command(**kwargs)),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "ensure_episode_manifest",
+        classmethod(
+            lambda cls, force_refresh=False, library_type=None: fake_ensure_episode_manifest(
+                force_refresh=force_refresh,
+                library_type=library_type,
+            )
+        ),
+    )
+
+    progress_events = [
+        progress
+        async for progress in AnimeLibraryService.index_anime(
+            source_folder=source_folder,
+            anime_name="Demo",
+            require_gpu=False,
+            library_type="anime",
+        )
+    ]
+
+    assert progress_events[-1].status == "complete"
+    assert captured_cmd is not None
+    assert captured_cmd[captured_cmd.index("--prefetch-batches") + 1] == "3"
+    assert captured_cmd[captured_cmd.index("--precision") + 1] == "auto"
 
 
 @pytest.mark.asyncio
@@ -2440,6 +2625,15 @@ def test_anime_matcher_init_searcher_uses_explicit_fp32_precision(
     assert captured["load_or_create_called"] is True
     assert captured["model_path"] == model_path
     assert captured["precision"] == "fp32"
+
+
+def test_cli_help_mentions_fp32_default_precision() -> None:
+    expected_help = "Defaults to fp32; pass fp16 explicitly to opt in on CUDA."
+    cli_source = Path(cli_module.__file__).read_text(encoding="utf-8")
+    benchmark_source = Path(benchmark_module.__file__).read_text(encoding="utf-8")
+
+    assert cli_source.count(expected_help) >= 2
+    assert expected_help in benchmark_source
 
 
 @pytest.mark.asyncio

@@ -1,9 +1,9 @@
 const API_BASE = "/api";
 const DEFAULT_INDEX_BATCH_SIZE = 64;
-const DEFAULT_INDEX_PREFETCH_BATCHES = 2;
+const DEFAULT_INDEX_PREFETCH_BATCHES = 3;
 const DEFAULT_INDEX_TRANSFORM_WORKERS = 4;
 const DEFAULT_INDEX_DECODE_BACKEND = "auto";
-const DEFAULT_INDEX_PRECISION = "fp16";
+const DEFAULT_INDEX_PRECISION = "auto";
 
 // Gap resolution types
 interface GapInfo {

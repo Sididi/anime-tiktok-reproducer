@@ -3481,10 +3481,10 @@ class AnimeLibraryService:
         anime_name: str | None = None,
         fps: float = 2.0,
         batch_size: int = 64,
-        prefetch_batches: int = 2,
+        prefetch_batches: int = 3,
         transform_workers: int = 4,
         decode_backend: str = "auto",
-        precision: str = "fp16",
+        precision: str = "auto",
         require_gpu: bool = True,
     ) -> AsyncIterator[IndexProgress]:
         """
@@ -3719,10 +3719,10 @@ class AnimeLibraryService:
         anime_name: str,
         source_paths: list[Path],
         batch_size: int = 64,
-        prefetch_batches: int = 2,
+        prefetch_batches: int = 3,
         transform_workers: int = 4,
         decode_backend: str = "auto",
-        precision: str = "fp16",
+        precision: str = "auto",
         require_gpu: bool = True,
     ) -> AsyncIterator[IndexProgress]:
         """Prepare a precise list of source files then incrementally upsert them."""
