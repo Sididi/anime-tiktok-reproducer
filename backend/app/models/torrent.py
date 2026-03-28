@@ -103,6 +103,10 @@ class IndexationJob(BaseModel):
     current_file_frames_processed: int | None = None
     current_file_total_frames: int | None = None
     current_file_batches_processed: int | None = None
+    requested_batch_size: int | None = None
+    effective_batch_size: int | None = None
+    effective_decode_backend: str | None = None
+    retry_reason: str | None = None
     error: str | None = None
     warnings: list[str] = Field(default_factory=list)
     unmatched_files: list[str] = []  # files not linked to any torrent

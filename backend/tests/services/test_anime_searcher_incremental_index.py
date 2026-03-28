@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -453,6 +454,72 @@ def test_parallel_file_indexer_ffmpeg_cuda_backend_embeds_decoded_batches(
     assert result.embeddings.shape == (3, EMBEDDING_DIM)
     assert result.timestamps == [0.0, 1.0, 2.0]
     assert pipeline.decode_fallbacks == 0
+
+
+def test_iter_ffmpeg_cuda_frame_batches_resizes_before_download(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    video_path = tmp_path / "episode.mp4"
+    video_path.write_bytes(b"video")
+    media_profile = MediaBinaryProfile("cuda", "/usr/bin/ffmpeg", "/usr/bin/ffprobe")
+    frame_size = 4 * 4 * 3
+    raw_frames = [
+        bytes([10]) * frame_size,
+        bytes([20]) * frame_size,
+        bytes([30]) * frame_size,
+        b"",
+    ]
+
+    class FakeProcess:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self._chunks = iter(chunks)
+
+        def read(self, size: int) -> bytes:
+            chunk = next(self._chunks)
+            assert len(chunk) in {0, size}
+            return chunk
+
+    @contextmanager
+    def fake_open_rawvideo_process(cmd: list[str], *, error_factory):
+        del error_factory
+        vf_arg = cmd[cmd.index("-vf") + 1]
+        assert "scale_cuda=w=4:h=4:format=nv12" in vf_arg
+        yield FakeProcess(raw_frames)
+
+    monkeypatch.setattr(frame_extractor_module, "RESIZE_SIZE", 4)
+    monkeypatch.setattr(
+        frame_extractor_module,
+        "probe_video_info",
+        lambda *args, **kwargs: frame_extractor_module.VideoProbeInfo(
+            width=1920,
+            height=1080,
+            codec_name="h264",
+            duration_seconds=1.1,
+        ),
+    )
+    monkeypatch.setattr(
+        frame_extractor_module,
+        "_open_rawvideo_process",
+        fake_open_rawvideo_process,
+    )
+
+    batches = list(
+        frame_extractor_module.iter_ffmpeg_cuda_frame_batches(
+            video_path,
+            2.0,
+            batch_size=2,
+            media_profile=media_profile,
+        )
+    )
+
+    assert len(batches) == 2
+    assert batches[0].timestamps == [0.0, 0.5]
+    assert batches[1].timestamps == [1.0]
+    assert batches[0].total_sampled_frames == 3
+    assert batches[1].total_sampled_frames == 3
+    assert tuple(batches[0].data.shape) == (2, 3, 4, 4)
+    assert tuple(batches[1].data.shape) == (1, 3, 4, 4)
 
 
 def test_parallel_file_indexer_ffmpeg_cuda_falls_back_to_ffmpeg_cpu_on_decode_error(
@@ -925,6 +992,7 @@ def test_iter_ffmpeg_cuda_frame_batches_uses_nvdec_command_and_returns_tensors(
             duration_seconds=2.0,
         ),
     )
+    monkeypatch.setattr(frame_extractor_module, "RESIZE_SIZE", 2)
     monkeypatch.setattr(frame_extractor_module.subprocess, "Popen", fake_popen)
 
     batches = list(
@@ -942,7 +1010,10 @@ def test_iter_ffmpeg_cuda_frame_batches_uses_nvdec_command_and_returns_tensors(
     assert "-hwaccel_output_format" in captured_cmd
     assert "-c:v" in captured_cmd
     assert "hevc_cuvid" in captured_cmd
-    assert any("scale_cuda=format=nv12,hwdownload,format=nv12,format=rgb24" in arg for arg in captured_cmd)
+    assert any(
+        "scale_cuda=w=2:h=2:format=nv12,hwdownload,format=nv12,format=rgb24" in arg
+        for arg in captured_cmd
+    )
     assert len(batches) == 1
     assert batches[0].timestamps == [0.0, 1.0]
     assert tuple(batches[0].data.shape) == (2, 3, 2, 2)
@@ -1926,6 +1997,8 @@ def test_backend_parses_structured_searcher_progress_events() -> None:
                 "current_file_frames_processed": 114,
                 "current_file_total_frames": 114,
                 "current_file_batches_processed": 8,
+                "batch_size": 64,
+                "decode_backend": "ffmpeg_cuda",
             }
         ),
         status="indexing",
@@ -1944,6 +2017,8 @@ def test_backend_parses_structured_searcher_progress_events() -> None:
     assert progress.current_file_frames_processed == 114
     assert progress.current_file_total_frames == 114
     assert progress.current_file_batches_processed == 8
+    assert progress.effective_batch_size == 64
+    assert progress.effective_decode_backend == "ffmpeg_cuda"
 
     error = AnimeLibraryService._parse_searcher_progress_line(
         line=json.dumps({"event": "error", "error": "boom"}),
@@ -2331,6 +2406,261 @@ async def test_backend_index_anime_uses_reverted_default_prefetch_and_precision(
     assert captured_cmd is not None
     assert captured_cmd[captured_cmd.index("--prefetch-batches") + 1] == "3"
     assert captured_cmd[captured_cmd.index("--precision") + 1] == "auto"
+
+
+@pytest.mark.asyncio
+async def test_backend_index_anime_retries_cuda_oom_with_reduced_batch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    library_path = tmp_path / "library"
+    searcher_path = tmp_path / "searcher"
+    source_folder = tmp_path / "incoming"
+    source_folder.mkdir(parents=True)
+    source_path = source_folder / "ep1.mkv"
+    source_path.write_bytes(b"source")
+    prepared_path = library_path / "Demo" / "ep1.mp4"
+    prepare_calls = 0
+    attempted_batches: list[str] = []
+
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "get_library_path",
+        classmethod(lambda cls, library_type=None: library_path),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "get_anime_searcher_path",
+        classmethod(lambda cls: searcher_path),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_get_indexed_series_fps_sync",
+        classmethod(lambda cls, anime_name, library_type=None: None),
+    )
+
+    async def fake_prepare_single_source_for_library(*, source_path: Path, dest_dir: Path):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        prepared_path.parent.mkdir(parents=True, exist_ok=True)
+        prepared_path.write_bytes(b"prepared")
+        return prepared_path, "Copying", True
+
+    async def fake_stream_searcher_command(**kwargs):
+        batch_value = kwargs["cmd"][kwargs["cmd"].index("--batch-size") + 1]
+        attempted_batches.append(batch_value)
+        yield IndexProgress(
+            status="indexing",
+            message="Preparing indexing pipeline",
+            progress=0.36,
+            effective_decode_backend="ffmpeg_cuda",
+        )
+        if batch_value == "64":
+            yield IndexProgress(
+                status="error",
+                error="CUDA out of memory. Tried to allocate 5.62 GiB.",
+            )
+            return
+        yield IndexProgress(
+            status="indexing",
+            message="retry succeeded",
+            progress=0.72,
+            effective_decode_backend="ffmpeg_cuda",
+        )
+
+    async def fake_ensure_episode_manifest(*, force_refresh: bool = False, library_type=None):
+        return {}
+
+    async def fake_verify_prepared_library_files(files: list[Path]) -> str | None:
+        return None
+
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_prepare_single_source_for_library",
+        classmethod(lambda cls, **kwargs: fake_prepare_single_source_for_library(**kwargs)),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "scan_direct_video_files_sync",
+        classmethod(lambda cls, folder: _source_scan(readable=[source_path])),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_verify_prepared_library_files",
+        classmethod(lambda cls, files: fake_verify_prepared_library_files(files)),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_stream_searcher_command",
+        classmethod(lambda cls, **kwargs: fake_stream_searcher_command(**kwargs)),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "ensure_episode_manifest",
+        classmethod(
+            lambda cls, force_refresh=False, library_type=None: fake_ensure_episode_manifest(
+                force_refresh=force_refresh,
+                library_type=library_type,
+            )
+        ),
+    )
+
+    progress_events = [
+        progress
+        async for progress in AnimeLibraryService.index_anime(
+            source_folder=source_folder,
+            anime_name="Demo",
+            require_gpu=False,
+            library_type="anime",
+            batch_size=64,
+        )
+    ]
+
+    retry_events = [
+        progress
+        for progress in progress_events
+        if progress.retry_reason == AnimeLibraryService.SEARCHER_CUDA_OOM_RETRY_REASON
+    ]
+    assert prepare_calls == 1
+    assert attempted_batches == ["64", "32"]
+    assert retry_events
+    assert "reduced batch size (64 -> 32)" in retry_events[0].message
+    assert progress_events[-1].status == "complete"
+    assert progress_events[-1].requested_batch_size == 64
+    assert progress_events[-1].effective_batch_size == 32
+    assert progress_events[-1].effective_decode_backend == "ffmpeg_cuda"
+    assert progress_events[-1].retry_reason == AnimeLibraryService.SEARCHER_CUDA_OOM_RETRY_REASON
+    assert any(
+        "reduced batch size (64 -> 32)" in warning
+        for warning in (progress_events[-1].warnings or [])
+    )
+
+
+@pytest.mark.asyncio
+async def test_backend_update_anime_retries_cuda_oom_with_reduced_batch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    library_path = tmp_path / "library"
+    searcher_path = tmp_path / "searcher"
+    source_path = tmp_path / "incoming" / "ep3.mkv"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_bytes(b"source")
+    prepared_path = library_path / "Demo" / "ep3.mp4"
+    prepare_calls = 0
+    attempted_batches: list[str] = []
+
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "get_library_path",
+        classmethod(lambda cls, library_type=None: library_path),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "get_anime_searcher_path",
+        classmethod(lambda cls: searcher_path),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_get_indexed_series_fps_sync",
+        classmethod(lambda cls, anime_name, library_type=None: 2.0),
+    )
+
+    async def fake_prepare_single_source_for_library(*, source_path: Path, dest_dir: Path):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        prepared_path.parent.mkdir(parents=True, exist_ok=True)
+        prepared_path.write_bytes(b"prepared")
+        return prepared_path, "Copying", True
+
+    async def fake_stream_searcher_command(**kwargs):
+        batch_value = kwargs["cmd"][kwargs["cmd"].index("--batch-size") + 1]
+        attempted_batches.append(batch_value)
+        yield IndexProgress(
+            status="indexing",
+            message="Preparing indexing pipeline",
+            progress=0.36,
+            effective_decode_backend="ffmpeg_cuda",
+        )
+        if batch_value == "64":
+            yield IndexProgress(
+                status="error",
+                error="CUDA out of memory. Tried to allocate 5.62 GiB.",
+            )
+            return
+        yield IndexProgress(
+            status="indexing",
+            message="retry succeeded",
+            progress=0.72,
+            effective_decode_backend="ffmpeg_cuda",
+        )
+
+    async def fake_ensure_episode_manifest(*, force_refresh: bool = False, library_type=None):
+        return {}
+
+    async def fake_verify_prepared_library_files(files: list[Path]) -> str | None:
+        return None
+
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_prepare_single_source_for_library",
+        classmethod(lambda cls, **kwargs: fake_prepare_single_source_for_library(**kwargs)),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_scan_source_video_paths_sync",
+        classmethod(lambda cls, source_paths: _source_scan(readable=list(source_paths))),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_verify_prepared_library_files",
+        classmethod(lambda cls, files: fake_verify_prepared_library_files(files)),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_stream_searcher_command",
+        classmethod(lambda cls, **kwargs: fake_stream_searcher_command(**kwargs)),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "ensure_episode_manifest",
+        classmethod(
+            lambda cls, force_refresh=False, library_type=None: fake_ensure_episode_manifest(
+                force_refresh=force_refresh,
+                library_type=library_type,
+            )
+        ),
+    )
+
+    progress_events = [
+        progress
+        async for progress in AnimeLibraryService.update_anime(
+            anime_name="Demo",
+            source_paths=[source_path],
+            require_gpu=False,
+            library_type="anime",
+            batch_size=64,
+        )
+    ]
+
+    retry_events = [
+        progress
+        for progress in progress_events
+        if progress.retry_reason == AnimeLibraryService.SEARCHER_CUDA_OOM_RETRY_REASON
+    ]
+    assert prepare_calls == 1
+    assert attempted_batches == ["64", "32"]
+    assert retry_events
+    assert "reduced batch size (64 -> 32)" in retry_events[0].message
+    assert progress_events[-1].status == "complete"
+    assert progress_events[-1].requested_batch_size == 64
+    assert progress_events[-1].effective_batch_size == 32
+    assert progress_events[-1].effective_decode_backend == "ffmpeg_cuda"
+    assert progress_events[-1].retry_reason == AnimeLibraryService.SEARCHER_CUDA_OOM_RETRY_REASON
+    assert any(
+        "reduced batch size (64 -> 32)" in warning
+        for warning in (progress_events[-1].warnings or [])
+    )
 
 
 @pytest.mark.asyncio

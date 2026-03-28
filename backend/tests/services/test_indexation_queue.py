@@ -320,16 +320,11 @@ async def test_failed_job_releases_slot_while_parallel_job_keeps_running(
 
 
 @pytest.mark.asyncio
-async def test_cuda_oom_job_retries_once_and_completes(
+async def test_queue_preserves_service_level_cuda_retry_metadata_without_requeue(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = IndexationQueueService()
-    service.CUDA_OOM_RETRY_BACKOFF_SECONDS = 0.1
-    attempts: dict[str, int] = {}
-    started: dict[str, asyncio.Event] = {}
-    crash_now = asyncio.Event()
-    steady_release = asyncio.Event()
-    retry_release = asyncio.Event()
+    attempts = 0
 
     async def fake_index_anime(
         *,
@@ -339,23 +334,32 @@ async def test_cuda_oom_job_retries_once_and_completes(
         fps: float = 2.0,
         **_: object,
     ):
-        assert anime_name is not None
-        attempts[anime_name] = attempts.get(anime_name, 0) + 1
-        started.setdefault(f"{anime_name}-{attempts[anime_name]}", asyncio.Event()).set()
-        if anime_name == "Retry":
-            if attempts[anime_name] == 1:
-                await crash_now.wait()
-                yield IndexProgress(
-                    status="error",
-                    error="CUDA out of memory. Tried to allocate 1.48 GiB.",
-                )
-                return
-            await retry_release.wait()
-            yield IndexProgress(status="complete", progress=1.0, message="done Retry")
-            return
-
-        await steady_release.wait()
-        yield IndexProgress(status="complete", progress=1.0, message=f"done {anime_name}")
+        nonlocal attempts
+        attempts += 1
+        yield IndexProgress(
+            status="indexing",
+            progress=0.55,
+            message="CUDA OOM detected under the current parallel load; retrying with reduced batch size (64 -> 32) while keeping fp32.",
+            requested_batch_size=64,
+            effective_batch_size=32,
+            effective_decode_backend="ffmpeg_cuda",
+            retry_reason=AnimeLibraryService.SEARCHER_CUDA_OOM_RETRY_REASON,
+            warnings=[
+                "CUDA OOM detected under the current parallel load; retrying with reduced batch size (64 -> 32) while keeping fp32."
+            ],
+        )
+        yield IndexProgress(
+            status="complete",
+            progress=1.0,
+            message=f"done {anime_name}",
+            requested_batch_size=64,
+            effective_batch_size=32,
+            effective_decode_backend="ffmpeg_cuda",
+            retry_reason=AnimeLibraryService.SEARCHER_CUDA_OOM_RETRY_REASON,
+            warnings=[
+                "CUDA OOM detected under the current parallel load; retrying with reduced batch size (64 -> 32) while keeping fp32."
+            ],
+        )
 
     monkeypatch.setattr(
         AnimeLibraryService,
@@ -364,43 +368,28 @@ async def test_cuda_oom_job_retries_once_and_completes(
     )
     _patch_publish_dependencies(monkeypatch, service)
 
-    retry_job_id = await service.enqueue("/tmp/retry", LibraryType.ANIME, "Retry", 2.0)
-    steady_job_id = await service.enqueue("/tmp/steady", LibraryType.ANIME, "Steady", 2.0)
-
-    await _wait_for(lambda: "Retry-1" in started and "Steady-1" in started)
-    crash_now.set()
+    job_id = await service.enqueue("/tmp/retry", LibraryType.ANIME, "Retry", 2.0)
 
     await _wait_for(
         lambda: any(
-            job.id == retry_job_id
-            and job.status == "queued"
-            and job.phase == "retry_wait"
+            job.id == job_id and job.status == "complete"
             for job in service.list_jobs()
         )
     )
-    retry_job = next(job for job in service.list_jobs() if job.id == retry_job_id)
-    steady_job = next(job for job in service.list_jobs() if job.id == steady_job_id)
-    assert retry_job.message == "CUDA OOM detected; waiting to retry once with the same settings."
-    assert steady_job.status == "indexing"
-
-    await _wait_for(lambda: attempts.get("Retry") == 2)
-    retry_release.set()
-    steady_release.set()
-
-    await _wait_for(
-        lambda: {
-            job.id: job.status
-            for job in service.list_jobs()
-        }
-        == {
-            retry_job_id: "complete",
-            steady_job_id: "complete",
-        }
+    job = next(job for job in service.list_jobs() if job.id == job_id)
+    assert attempts == 1
+    assert job.requested_batch_size == 64
+    assert job.effective_batch_size == 32
+    assert job.effective_decode_backend == "ffmpeg_cuda"
+    assert job.retry_reason == AnimeLibraryService.SEARCHER_CUDA_OOM_RETRY_REASON
+    assert any(
+        "reduced batch size (64 -> 32)" in warning
+        for warning in job.warnings
     )
 
 
 @pytest.mark.asyncio
-async def test_cuda_oom_retry_becomes_terminal_after_second_attempt(
+async def test_cuda_oom_job_becomes_terminal_without_queue_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = IndexationQueueService()
@@ -437,64 +426,6 @@ async def test_cuda_oom_retry_becomes_terminal_after_second_attempt(
         )
     )
     job = next(job for job in service.list_jobs() if job.id == job_id)
-    assert attempts == 2
+    assert attempts == 1
     assert job.phase == "error"
     assert "exceeded available VRAM under the current parallel load" in str(job.error)
-
-
-@pytest.mark.asyncio
-async def test_enqueue_reuses_job_while_cuda_oom_retry_is_waiting(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service = IndexationQueueService()
-    service.CUDA_OOM_RETRY_BACKOFF_SECONDS = 0.2
-    attempts = 0
-    release = asyncio.Event()
-
-    async def fake_index_anime(
-        *,
-        source_folder: Path,
-        library_type: LibraryType | str | None = None,
-        anime_name: str | None = None,
-        fps: float = 2.0,
-        **_: object,
-    ):
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            yield IndexProgress(
-                status="error",
-                error="CUDA out of memory. Tried to allocate 1.48 GiB.",
-            )
-            return
-        await release.wait()
-        yield IndexProgress(status="complete", progress=1.0, message="done Demo")
-
-    monkeypatch.setattr(
-        AnimeLibraryService,
-        "index_anime",
-        classmethod(lambda cls, **kwargs: fake_index_anime(**kwargs)),
-    )
-    _patch_publish_dependencies(monkeypatch, service)
-
-    first_job_id = await service.enqueue("/tmp/demo-a", LibraryType.ANIME, "Demo", 2.0)
-    await _wait_for(
-        lambda: any(
-            job.id == first_job_id
-            and job.status == "queued"
-            and job.phase == "retry_wait"
-            for job in service.list_jobs()
-        )
-    )
-
-    duplicate_job_id = await service.enqueue("/tmp/demo-b", LibraryType.ANIME, " demo ", 2.0)
-    assert duplicate_job_id == first_job_id
-
-    release.set()
-    await _wait_for(lambda: attempts == 2)
-    await _wait_for(
-        lambda: any(
-            job.id == first_job_id and job.status == "complete"
-            for job in service.list_jobs()
-        )
-    )

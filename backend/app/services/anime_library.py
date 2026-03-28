@@ -49,6 +49,10 @@ class IndexProgress:
     current_file_frames_processed: int | None = None
     current_file_total_frames: int | None = None
     current_file_batches_processed: int | None = None
+    requested_batch_size: int | None = None
+    effective_batch_size: int | None = None
+    effective_decode_backend: str | None = None
+    retry_reason: str | None = None
 
     def to_dict(self) -> dict:
         payload = {
@@ -74,7 +78,27 @@ class IndexProgress:
             payload["current_file_total_frames"] = self.current_file_total_frames
         if self.current_file_batches_processed is not None:
             payload["current_file_batches_processed"] = self.current_file_batches_processed
+        if self.requested_batch_size is not None:
+            payload["requested_batch_size"] = self.requested_batch_size
+        if self.effective_batch_size is not None:
+            payload["effective_batch_size"] = self.effective_batch_size
+        if self.effective_decode_backend is not None:
+            payload["effective_decode_backend"] = self.effective_decode_backend
+        if self.retry_reason is not None:
+            payload["retry_reason"] = self.retry_reason
         return payload
+
+
+@dataclass
+class SearcherExecutionMetadata:
+    """Mutable metadata describing the active anime_searcher subprocess run."""
+
+    requested_batch_size: int
+    effective_batch_size: int
+    requested_decode_backend: str
+    effective_decode_backend: str | None = None
+    retry_reason: str | None = None
+    retry_warning: str | None = None
 
 
 @dataclass(frozen=True)
@@ -191,6 +215,8 @@ class AnimeLibraryService:
     INDEX_TIMEOUT_SECONDS = 7200.0
     SEARCHER_INDEX_FORMAT_VERSION = 4
     SEARCHER_ENGINE_PROFILE = "sscd_exact_resize_v1"
+    SEARCHER_CUDA_OOM_BATCH_RETRY_LIMIT = 1
+    SEARCHER_CUDA_OOM_RETRY_REASON = "cuda_oom_batch_downshift"
     PREVIEW_PROXY_TIMEOUT_SECONDS = 3600.0
     SOURCE_NORMALIZATION_TIMEOUT_SECONDS = 7200.0
     SUBTITLE_EXTRACTION_TIMEOUT_SECONDS = 1800.0
@@ -208,6 +234,13 @@ class AnimeLibraryService:
         "hevc": "hevc_cuvid",
         "vp9": "vp9_cuvid",
     }
+    _CUDA_OOM_MARKERS = (
+        "cuda out of memory",
+        "torch.cuda.outofmemoryerror",
+        "tried to allocate",
+        "pytorch_cuda_alloc_conf",
+        "expandable_segments:true",
+    )
 
     _episode_manifest_cache: dict[str, dict] = {}
     _episode_manifest_locks: dict[str, asyncio.Lock] = {}
@@ -318,6 +351,138 @@ class AnimeLibraryService:
         return None
 
     @classmethod
+    def _is_cuda_oom_error(cls, message: str | None) -> bool:
+        if not message:
+            return False
+        normalized = message.casefold()
+        return all(marker in normalized for marker in ("cuda", "memory")) or any(
+            marker in normalized for marker in cls._CUDA_OOM_MARKERS
+        )
+
+    @classmethod
+    def _terminal_cuda_oom_message(cls, message: str) -> str:
+        guidance = (
+            " Retry also failed; this job exceeded available VRAM under the current parallel load."
+        )
+        return message if message.endswith(guidance.strip()) else f"{message}{guidance}"
+
+    @staticmethod
+    def _with_cli_flag(cmd: list[str], flag: str, value: str) -> list[str]:
+        updated = list(cmd)
+        if flag in updated:
+            flag_index = updated.index(flag)
+            if flag_index + 1 < len(updated):
+                updated[flag_index + 1] = value
+                return updated
+        updated.extend([flag, value])
+        return updated
+
+    @classmethod
+    def _annotate_searcher_progress(
+        cls,
+        progress: IndexProgress,
+        *,
+        anime_name: str,
+        metadata: SearcherExecutionMetadata,
+    ) -> IndexProgress:
+        progress.anime_name = anime_name
+        progress.requested_batch_size = metadata.requested_batch_size
+        progress.effective_batch_size = metadata.effective_batch_size
+        progress.effective_decode_backend = (
+            progress.effective_decode_backend
+            or metadata.effective_decode_backend
+            or metadata.requested_decode_backend
+        )
+        progress.retry_reason = metadata.retry_reason
+        return progress
+
+    @classmethod
+    async def _stream_searcher_index_command(
+        cls,
+        *,
+        cmd: list[str],
+        cwd: Path,
+        total_files: int,
+        anime_name: str,
+        metadata: SearcherExecutionMetadata,
+        progress_start: float,
+        progress_span: float,
+    ) -> AsyncIterator[IndexProgress]:
+        current_batch_size = metadata.effective_batch_size
+        retry_attempts = 0
+
+        while True:
+            current_cmd = cls._with_cli_flag(
+                cmd,
+                "--batch-size",
+                str(current_batch_size),
+            )
+            retry_requested = False
+
+            async for raw_progress in cls._stream_searcher_command(
+                cmd=current_cmd,
+                cwd=cwd,
+                total_files=total_files,
+                status="indexing",
+                progress_start=progress_start,
+                progress_span=progress_span,
+            ):
+                if raw_progress.effective_decode_backend:
+                    metadata.effective_decode_backend = raw_progress.effective_decode_backend
+
+                progress = cls._annotate_searcher_progress(
+                    raw_progress,
+                    anime_name=anime_name,
+                    metadata=metadata,
+                )
+
+                if progress.status != "error":
+                    yield progress
+                    continue
+
+                error_message = progress.error or progress.message or "anime_searcher command failed"
+                reduced_batch_size = max(1, current_batch_size // 2)
+                should_retry = (
+                    cls._is_cuda_oom_error(error_message)
+                    and retry_attempts < cls.SEARCHER_CUDA_OOM_BATCH_RETRY_LIMIT
+                    and reduced_batch_size < current_batch_size
+                )
+                if should_retry:
+                    retry_attempts += 1
+                    current_batch_size = reduced_batch_size
+                    metadata.effective_batch_size = current_batch_size
+                    metadata.retry_reason = cls.SEARCHER_CUDA_OOM_RETRY_REASON
+                    metadata.retry_warning = (
+                        "CUDA OOM detected under the current parallel load; retrying "
+                        f"with reduced batch size ({metadata.requested_batch_size} -> {current_batch_size}) "
+                        "while keeping fp32."
+                    )
+                    yield cls._annotate_searcher_progress(
+                        IndexProgress(
+                            status="indexing",
+                            message=metadata.retry_warning,
+                            progress=max(progress.progress, progress_start),
+                            total_files=total_files,
+                            completed_files=progress.completed_files,
+                            current_file=progress.current_file,
+                            warnings=[metadata.retry_warning],
+                        ),
+                        anime_name=anime_name,
+                        metadata=metadata,
+                    )
+                    retry_requested = True
+                    break
+
+                if cls._is_cuda_oom_error(error_message):
+                    progress.error = cls._terminal_cuda_oom_message(error_message)
+                yield progress
+                return
+
+            if not retry_requested:
+                metadata.effective_batch_size = current_batch_size
+                return
+
+    @classmethod
     def _parse_searcher_progress_line(
         cls,
         *,
@@ -406,6 +571,19 @@ class AnimeLibraryService:
             )
         except (TypeError, ValueError):
             current_file_batches_processed_value = None
+        effective_decode_backend = payload.get("decode_backend")
+        effective_decode_backend_value = (
+            None
+            if effective_decode_backend in {None, ""}
+            else str(effective_decode_backend)
+        )
+        try:
+            effective_batch_size = payload.get("batch_size")
+            effective_batch_size_value = (
+                None if effective_batch_size is None else int(effective_batch_size)
+            )
+        except (TypeError, ValueError):
+            effective_batch_size_value = None
 
         return IndexProgress(
             status=status,
@@ -418,6 +596,8 @@ class AnimeLibraryService:
             current_file_frames_processed=current_file_frames_processed_value,
             current_file_total_frames=current_file_total_frames_value,
             current_file_batches_processed=current_file_batches_processed_value,
+            effective_batch_size=effective_batch_size_value,
+            effective_decode_backend=effective_decode_backend_value,
         )
 
     @classmethod
@@ -3666,6 +3846,9 @@ class AnimeLibraryService:
             progress=0.35,
             total_files=total_files,
             anime_name=anime_name,
+            requested_batch_size=batch_size,
+            effective_batch_size=batch_size,
+            effective_decode_backend=decode_backend,
         )
 
         cmd = [
@@ -3685,20 +3868,29 @@ class AnimeLibraryService:
         if require_gpu:
             cmd.append("--require-gpu")
 
-        async for progress in cls._stream_searcher_command(
+        searcher_metadata = SearcherExecutionMetadata(
+            requested_batch_size=batch_size,
+            effective_batch_size=batch_size,
+            requested_decode_backend=decode_backend,
+        )
+
+        async for progress in cls._stream_searcher_index_command(
             cmd=cmd,
             cwd=searcher_path,
             total_files=total_files,
-            status="indexing",
+            anime_name=anime_name,
+            metadata=searcher_metadata,
             progress_start=0.35,
             progress_span=0.60,
         ):
-            progress.anime_name = anime_name
             yield progress
             if progress.status == "error":
                 return
 
         await cls.ensure_episode_manifest(force_refresh=True, library_type=scoped_type)
+        completion_warnings = list(skipped_warnings)
+        if searcher_metadata.retry_warning and searcher_metadata.retry_warning not in completion_warnings:
+            completion_warnings.append(searcher_metadata.retry_warning)
 
         yield IndexProgress(
             status="complete",
@@ -3708,7 +3900,13 @@ class AnimeLibraryService:
             completed_files=total_files,
             anime_name=anime_name,
             prepared_library_paths=[str(path) for path in prepared_files],
-            warnings=skipped_warnings or None,
+            warnings=completion_warnings or None,
+            requested_batch_size=batch_size,
+            effective_batch_size=searcher_metadata.effective_batch_size,
+            effective_decode_backend=(
+                searcher_metadata.effective_decode_backend or decode_backend
+            ),
+            retry_reason=searcher_metadata.retry_reason,
         )
 
     @classmethod
@@ -3886,6 +4084,9 @@ class AnimeLibraryService:
                 progress=0.35,
                 total_files=total_files,
                 anime_name=anime_name,
+                requested_batch_size=batch_size,
+                effective_batch_size=batch_size,
+                effective_decode_backend=decode_backend,
             )
 
             cmd = [
@@ -3905,15 +4106,21 @@ class AnimeLibraryService:
             if require_gpu:
                 cmd.append("--require-gpu")
 
-            async for progress in cls._stream_searcher_command(
+            searcher_metadata = SearcherExecutionMetadata(
+                requested_batch_size=batch_size,
+                effective_batch_size=batch_size,
+                requested_decode_backend=decode_backend,
+            )
+
+            async for progress in cls._stream_searcher_index_command(
                 cmd=cmd,
                 cwd=searcher_path,
                 total_files=total_files,
-                status="indexing",
+                anime_name=anime_name,
+                metadata=searcher_metadata,
                 progress_start=0.35,
                 progress_span=0.60,
             ):
-                progress.anime_name = anime_name
                 yield progress
                 if progress.status == "error":
                     return
@@ -3922,6 +4129,9 @@ class AnimeLibraryService:
                 manifest_path.unlink()
 
         await cls.ensure_episode_manifest(force_refresh=True, library_type=scoped_type)
+        completion_warnings = list(skipped_warnings)
+        if searcher_metadata.retry_warning and searcher_metadata.retry_warning not in completion_warnings:
+            completion_warnings.append(searcher_metadata.retry_warning)
         yield IndexProgress(
             status="complete",
             message=f"Successfully updated {anime_name}",
@@ -3930,7 +4140,13 @@ class AnimeLibraryService:
             completed_files=total_files,
             anime_name=anime_name,
             prepared_library_paths=[str(path) for path in prepared_files],
-            warnings=skipped_warnings or None,
+            warnings=completion_warnings or None,
+            requested_batch_size=batch_size,
+            effective_batch_size=searcher_metadata.effective_batch_size,
+            effective_decode_backend=(
+                searcher_metadata.effective_decode_backend or decode_backend
+            ),
+            retry_reason=searcher_metadata.retry_reason,
         )
 
     @classmethod

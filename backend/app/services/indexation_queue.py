@@ -20,21 +20,11 @@ logger = logging.getLogger("uvicorn.error")
 
 class IndexationQueueService:
     MAX_CONCURRENT = 2
-    CUDA_OOM_RETRY_LIMIT = 1
-    CUDA_OOM_RETRY_BACKOFF_SECONDS = 0.0
-    _CUDA_OOM_MARKERS = (
-        "cuda out of memory",
-        "torch.cuda.outofmemoryerror",
-        "tried to allocate",
-        "pytorch_cuda_alloc_conf",
-        "expandable_segments:true",
-    )
 
     def __init__(self) -> None:
         self._jobs: dict[str, IndexationJob] = {}
         self._semaphore = asyncio.Semaphore(self.MAX_CONCURRENT)
         self._subscribers: list[asyncio.Queue[dict]] = []
-        self._oom_retry_counts: dict[str, int] = {}
 
     async def enqueue(
         self,
@@ -71,12 +61,7 @@ class IndexationQueueService:
 
     @classmethod
     def _is_cuda_oom_error(cls, message: str | None) -> bool:
-        if not message:
-            return False
-        normalized = message.casefold()
-        return all(marker in normalized for marker in ("cuda", "memory")) or any(
-            marker in normalized for marker in cls._CUDA_OOM_MARKERS
-        )
+        return AnimeLibraryService._is_cuda_oom_error(message)
 
     def _reset_job_transient_fields(self, job: IndexationJob) -> None:
         job.error = None
@@ -87,35 +72,16 @@ class IndexationQueueService:
         job.current_file_frames_processed = None
         job.current_file_total_frames = None
         job.current_file_batches_processed = None
+        job.requested_batch_size = None
+        job.effective_batch_size = None
+        job.effective_decode_backend = None
+        job.retry_reason = None
 
     @classmethod
     def _terminal_oom_message(cls, message: str) -> str:
-        guidance = (
-            " Retry also failed; this job exceeded available VRAM under the current parallel load."
-        )
-        return message if message.endswith(guidance.strip()) else f"{message}{guidance}"
+        return AnimeLibraryService._terminal_cuda_oom_message(message)
 
-    def _should_retry_cuda_oom(self, job: IndexationJob, message: str | None) -> bool:
-        return self._is_cuda_oom_error(message) and (
-            self._oom_retry_counts.get(job.id, 0) < self.CUDA_OOM_RETRY_LIMIT
-        )
-
-    def _queue_cuda_oom_retry(self, job: IndexationJob) -> None:
-        self._oom_retry_counts[job.id] = self._oom_retry_counts.get(job.id, 0) + 1
-        self._reset_job_transient_fields(job)
-        job.status = "queued"
-        job.phase = "retry_wait"
-        job.progress = 0.0
-        job.message = (
-            "CUDA OOM detected; waiting to retry once with the same settings."
-        )
-        self._broadcast(job)
-
-    def _finalize_job_error(self, job: IndexationJob, message: str) -> bool:
-        if self._should_retry_cuda_oom(job, message):
-            self._queue_cuda_oom_retry(job)
-            return True
-
+    def _finalize_job_error(self, job: IndexationJob, message: str) -> None:
         self._reset_job_transient_fields(job)
         job.status = "error"
         job.phase = "error"
@@ -126,26 +92,13 @@ class IndexationQueueService:
             else message
         )
         self._broadcast(job)
-        self._oom_retry_counts.pop(job.id, None)
-        return False
-
-    async def _retry_job(self, job: IndexationJob) -> None:
-        backoff = max(0.0, float(self.CUDA_OOM_RETRY_BACKOFF_SECONDS))
-        if backoff > 0:
-            await asyncio.sleep(backoff)
-        else:
-            await asyncio.sleep(0)
-        await self._run_job(job)
 
     async def _run_job(self, job: IndexationJob) -> None:
-        retry_requested = False
         await self._semaphore.acquire()
         try:
             self._reset_job_transient_fields(job)
             job.status = "indexing"
             job.phase = "starting"
-            if self._oom_retry_counts.get(job.id, 0) > 0:
-                job.message = "Retrying after CUDA OOM with the same settings..."
             self._broadcast(job)
             if job.job_type == "update":
                 job.phase = "hydrate_index"
@@ -193,6 +146,14 @@ class IndexationQueueService:
                 job.current_file_frames_processed = progress.current_file_frames_processed
                 job.current_file_total_frames = progress.current_file_total_frames
                 job.current_file_batches_processed = progress.current_file_batches_processed
+                if progress.requested_batch_size is not None:
+                    job.requested_batch_size = progress.requested_batch_size
+                if progress.effective_batch_size is not None:
+                    job.effective_batch_size = progress.effective_batch_size
+                if progress.effective_decode_backend is not None:
+                    job.effective_decode_backend = progress.effective_decode_backend
+                if progress.retry_reason is not None:
+                    job.retry_reason = progress.retry_reason
                 if progress.warnings:
                     for warning in progress.warnings:
                         if warning not in job.warnings:
@@ -221,28 +182,21 @@ class IndexationQueueService:
                     job.progress = 1.0
                     job.status = "complete"
                     job.error = None
-                    self._oom_retry_counts.pop(job.id, None)
                     AnimeMatcherService.mark_series_updated(
                         job.library_type, job.source_name
                     )
                 elif progress.status == "error":
-                    retry_requested = self._finalize_job_error(
+                    self._finalize_job_error(
                         job,
                         progress.error or progress.message or "Indexation failed",
                     )
-                    if retry_requested:
-                        break
                     return
                 self._broadcast(job)
         except Exception as e:
-            retry_requested = self._finalize_job_error(job, str(e))
-            if not retry_requested:
-                logger.exception("Indexation job %s failed", job.id)
+            self._finalize_job_error(job, str(e))
+            logger.exception("Indexation job %s failed", job.id)
         finally:
             self._semaphore.release()
-
-        if retry_requested:
-            asyncio.create_task(self._retry_job(job))
 
     @staticmethod
     def _collect_direct_video_files(source_folder: Path) -> list[Path]:
