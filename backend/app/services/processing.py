@@ -247,6 +247,25 @@ class RawSceneSubtitleImageEntry:
     relative_asset_path: str
 
 
+@dataclass(frozen=True)
+class _RawSceneTextCueCandidate:
+    start: float
+    end: float
+    text: str
+    priority: int
+    stream_position: int
+
+
+@dataclass(frozen=True)
+class _RawSceneImageCueCandidate:
+    start: float
+    end: float
+    priority: int
+    stream_position: int
+    cue_index: int
+    source_asset_path: Path | None = None
+
+
 class ProcessingService:
     """Service for processing the final video generation pipeline."""
 
@@ -340,8 +359,9 @@ class ProcessingService:
         *,
         old_source_path: Path,
         new_source_path: Path,
+        library_type: str | None = None,
     ) -> bool:
-        """Keep absolute-path manual matches valid if the normalized filename changes."""
+        """Rewrite match episode hints when processing swaps to a project-local source."""
         if old_source_path.resolve() == new_source_path.resolve():
             return False
 
@@ -353,12 +373,24 @@ class ProcessingService:
             if not episode_hint:
                 continue
             candidate = Path(episode_hint)
-            if not candidate.is_absolute():
-                continue
-            try:
-                candidate_resolved = candidate.resolve()
-            except OSError:
-                candidate_resolved = candidate
+            candidate_resolved: Path | None = None
+            if candidate.is_absolute():
+                try:
+                    candidate_resolved = candidate.resolve()
+                except OSError:
+                    candidate_resolved = candidate
+            else:
+                resolved = AnimeLibraryService.resolve_episode_path(
+                    episode_hint,
+                    library_type=library_type,
+                )
+                if resolved is None and candidate.exists():
+                    resolved = candidate
+                if resolved is not None:
+                    try:
+                        candidate_resolved = resolved.resolve()
+                    except OSError:
+                        candidate_resolved = resolved
             if candidate_resolved == old_resolved:
                 match.episode = new_value
                 changed = True
@@ -1213,6 +1245,380 @@ class ProcessingService:
         ]
         return "\n".join(blocks)
 
+    @staticmethod
+    def _raw_scene_subtitle_entry_priority(entry: SubtitleSidecarEntry) -> int:
+        title = str(entry.title or "").lower()
+        if any(token in title for token in ("sign", "song", "forced")):
+            return 2
+        if (
+            any(token in title for token in ("sdh", "closed caption", "closed-caption"))
+            or re.search(r"\bcc\b", title) is not None
+        ):
+            return 1
+        return 0
+
+    @staticmethod
+    def _merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        if not intervals:
+            return []
+        epsilon = 1e-6
+        merged: list[tuple[float, float]] = []
+        for start, end in sorted(intervals, key=lambda item: (item[0], item[1])):
+            if end <= start:
+                continue
+            if not merged:
+                merged.append((start, end))
+                continue
+            prev_start, prev_end = merged[-1]
+            if start <= prev_end + epsilon:
+                merged[-1] = (prev_start, max(prev_end, end))
+            else:
+                merged.append((start, end))
+        return merged
+
+    @classmethod
+    def _subtract_intervals(
+        cls,
+        start: float,
+        end: float,
+        blocked_intervals: list[tuple[float, float]],
+    ) -> list[tuple[float, float]]:
+        if end <= start:
+            return []
+        segments = [(start, end)]
+        epsilon = 1e-6
+        for block_start, block_end in cls._merge_intervals(blocked_intervals):
+            next_segments: list[tuple[float, float]] = []
+            for segment_start, segment_end in segments:
+                if block_end <= segment_start + epsilon or block_start >= segment_end - epsilon:
+                    next_segments.append((segment_start, segment_end))
+                    continue
+                if block_start > segment_start + epsilon:
+                    next_segments.append((segment_start, min(block_start, segment_end)))
+                if block_end < segment_end - epsilon:
+                    next_segments.append((max(block_end, segment_start), segment_end))
+            segments = next_segments
+            if not segments:
+                break
+        return [
+            (segment_start, segment_end)
+            for segment_start, segment_end in segments
+            if segment_end - segment_start > epsilon
+        ]
+
+    @staticmethod
+    def _load_raw_scene_cue_entries(
+        cue_manifest_path: Path,
+        cache: dict[str, list[dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        cache_key = str(cue_manifest_path.resolve())
+        cue_entries = cache.get(cache_key)
+        if cue_entries is not None:
+            return cue_entries
+        try:
+            cue_payload = json.loads(cue_manifest_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            cue_payload = {}
+        raw_cues = cue_payload.get("cues", []) if isinstance(cue_payload, dict) else []
+        cue_entries = [cue for cue in raw_cues if isinstance(cue, dict)]
+        cache[cache_key] = cue_entries
+        return cue_entries
+
+    @classmethod
+    def _collect_raw_scene_text_candidates(
+        cls,
+        *,
+        resolved_source: ResolvedSceneSource,
+        timeline_scene_start: float,
+        entry: SubtitleSidecarEntry,
+        parsed_text_cache: dict[str, list[Any]],
+    ) -> list[_RawSceneTextCueCandidate]:
+        asset_path = AnimeLibraryService.get_subtitle_sidecar_asset_path(
+            resolved_source.source_path,
+            entry,
+        )
+        if asset_path is None or not asset_path.exists():
+            return []
+        cache_key = str(asset_path.resolve())
+        parsed_entries = parsed_text_cache.get(cache_key)
+        if parsed_entries is None:
+            parsed_entries = PremiereSubtitleBakerService.parse_srt_entries(asset_path)
+            parsed_text_cache[cache_key] = parsed_entries
+
+        source_window_start = resolved_source.source_in_seconds
+        source_window_end = resolved_source.source_out_seconds
+        priority = cls._raw_scene_subtitle_entry_priority(entry)
+        candidates: list[_RawSceneTextCueCandidate] = []
+        for parsed_entry in parsed_entries:
+            clipped_start = max(parsed_entry.start, source_window_start)
+            clipped_end = min(parsed_entry.end, source_window_end)
+            if clipped_end <= clipped_start:
+                continue
+            normalized_text = cls._normalize_external_subtitle_text(parsed_entry.text)
+            if not normalized_text:
+                continue
+            candidates.append(
+                _RawSceneTextCueCandidate(
+                    start=timeline_scene_start + (clipped_start - source_window_start),
+                    end=timeline_scene_start + (clipped_end - source_window_start),
+                    text=normalized_text,
+                    priority=priority,
+                    stream_position=entry.stream_position,
+                )
+            )
+        return candidates
+
+    @classmethod
+    async def _collect_raw_scene_image_candidates(
+        cls,
+        *,
+        resolved_source: ResolvedSceneSource,
+        timeline_scene_start: float,
+        entry: SubtitleSidecarEntry,
+        parsed_cue_cache: dict[str, list[dict[str, Any]]],
+        rendered_cue_cache: dict[tuple[str, int], Path | None] | None = None,
+        resolve_assets: bool,
+    ) -> list[_RawSceneImageCueCandidate]:
+        cue_manifest_path = AnimeLibraryService.get_subtitle_sidecar_cue_manifest_path(
+            resolved_source.source_path,
+            entry,
+        )
+        if cue_manifest_path is None or not cue_manifest_path.exists():
+            return []
+
+        cue_entries = cls._load_raw_scene_cue_entries(cue_manifest_path, parsed_cue_cache)
+        source_window_start = resolved_source.source_in_seconds
+        source_window_end = resolved_source.source_out_seconds
+        priority = cls._raw_scene_subtitle_entry_priority(entry)
+        cache_key = str(cue_manifest_path.resolve())
+        candidates: list[_RawSceneImageCueCandidate] = []
+        for cue_idx, cue in enumerate(cue_entries, start=1):
+            try:
+                cue_index = int(cue.get("cue_index", cue_idx))
+                cue_start = float(cue.get("start"))
+                cue_end = float(cue.get("end"))
+            except (TypeError, ValueError):
+                continue
+            clipped_start = max(cue_start, source_window_start)
+            clipped_end = min(cue_end, source_window_end)
+            if clipped_end <= clipped_start:
+                continue
+
+            source_cue_asset_path: Path | None = None
+            cue_asset_filename = str(cue.get("asset_filename", "")).strip()
+            if cue_asset_filename:
+                candidate_asset_path = cue_manifest_path.parent / cue_asset_filename
+                if candidate_asset_path.exists():
+                    source_cue_asset_path = candidate_asset_path
+            if resolve_assets and source_cue_asset_path is None and rendered_cue_cache is not None:
+                cache_entry_key = (cache_key, cue_index)
+                if cache_entry_key not in rendered_cue_cache:
+                    rendered_cue_cache[cache_entry_key] = (
+                        await AnimeLibraryService.ensure_subtitle_sidecar_cue_asset(
+                            resolved_source.source_path,
+                            entry,
+                            cue_index=cue_index,
+                            cue_start=cue_start,
+                            cue_end=cue_end,
+                        )
+                    )
+                source_cue_asset_path = rendered_cue_cache[cache_entry_key]
+            if resolve_assets and source_cue_asset_path is None:
+                continue
+
+            candidates.append(
+                _RawSceneImageCueCandidate(
+                    start=timeline_scene_start + (clipped_start - source_window_start),
+                    end=timeline_scene_start + (clipped_end - source_window_start),
+                    priority=priority,
+                    stream_position=entry.stream_position,
+                    cue_index=cue_index,
+                    source_asset_path=source_cue_asset_path,
+                )
+            )
+        return candidates
+
+    @classmethod
+    def _resolve_raw_scene_text_candidates(
+        cls,
+        candidates: list[_RawSceneTextCueCandidate],
+    ) -> list[SrtEntry]:
+        if not candidates:
+            return []
+
+        epsilon = 1e-6
+        boundaries = sorted({point for candidate in candidates for point in (candidate.start, candidate.end)})
+        resolved: list[SrtEntry] = []
+        for start, end in zip(boundaries, boundaries[1:]):
+            if end - start <= epsilon:
+                continue
+            active = [
+                candidate
+                for candidate in candidates
+                if candidate.start < end - epsilon and candidate.end > start + epsilon
+            ]
+            if not active:
+                continue
+            winner = min(
+                active,
+                key=lambda candidate: (
+                    candidate.priority,
+                    candidate.stream_position,
+                    candidate.text.lower(),
+                ),
+            )
+            if (
+                resolved
+                and abs(resolved[-1].end - start) <= epsilon
+                and resolved[-1].text == winner.text
+            ):
+                previous = resolved[-1]
+                resolved[-1] = SrtEntry(
+                    start=previous.start,
+                    end=end,
+                    text=previous.text,
+                )
+                continue
+            resolved.append(SrtEntry(start=start, end=end, text=winner.text))
+        return resolved
+
+    @classmethod
+    def _resolve_raw_scene_image_candidates(
+        cls,
+        candidates: list[_RawSceneImageCueCandidate],
+        *,
+        blocked_intervals: list[tuple[float, float]],
+    ) -> list[_RawSceneImageCueCandidate]:
+        if not candidates:
+            return []
+
+        uncovered_candidates: list[_RawSceneImageCueCandidate] = []
+        for candidate in candidates:
+            for start, end in cls._subtract_intervals(
+                candidate.start,
+                candidate.end,
+                blocked_intervals,
+            ):
+                uncovered_candidates.append(
+                    _RawSceneImageCueCandidate(
+                        start=start,
+                        end=end,
+                        priority=candidate.priority,
+                        stream_position=candidate.stream_position,
+                        cue_index=candidate.cue_index,
+                        source_asset_path=candidate.source_asset_path,
+                    )
+                )
+        if not uncovered_candidates:
+            return []
+
+        epsilon = 1e-6
+        boundaries = sorted(
+            {point for candidate in uncovered_candidates for point in (candidate.start, candidate.end)}
+        )
+        resolved: list[_RawSceneImageCueCandidate] = []
+        for start, end in zip(boundaries, boundaries[1:]):
+            if end - start <= epsilon:
+                continue
+            active = [
+                candidate
+                for candidate in uncovered_candidates
+                if candidate.start < end - epsilon and candidate.end > start + epsilon
+            ]
+            if not active:
+                continue
+            winner = min(
+                active,
+                key=lambda candidate: (
+                    candidate.priority,
+                    candidate.stream_position,
+                    candidate.cue_index,
+                    str(candidate.source_asset_path or ""),
+                ),
+            )
+            if (
+                resolved
+                and abs(resolved[-1].end - start) <= epsilon
+                and resolved[-1].stream_position == winner.stream_position
+                and resolved[-1].cue_index == winner.cue_index
+                and resolved[-1].source_asset_path == winner.source_asset_path
+            ):
+                previous = resolved[-1]
+                resolved[-1] = _RawSceneImageCueCandidate(
+                    start=previous.start,
+                    end=end,
+                    priority=previous.priority,
+                    stream_position=previous.stream_position,
+                    cue_index=previous.cue_index,
+                    source_asset_path=previous.source_asset_path,
+                )
+                continue
+            resolved.append(
+                _RawSceneImageCueCandidate(
+                    start=start,
+                    end=end,
+                    priority=winner.priority,
+                    stream_position=winner.stream_position,
+                    cue_index=winner.cue_index,
+                    source_asset_path=winner.source_asset_path,
+                )
+            )
+        return resolved
+
+    @classmethod
+    async def _resolve_raw_scene_sidecar_subtitles(
+        cls,
+        *,
+        resolved_source: ResolvedSceneSource,
+        timeline_scene_start: float,
+        target_language: str | None,
+        sidecar_entries: list[SubtitleSidecarEntry],
+        parsed_text_cache: dict[str, list[Any]],
+        parsed_cue_cache: dict[str, list[dict[str, Any]]],
+        rendered_cue_cache: dict[tuple[str, int], Path | None] | None = None,
+        resolve_image_assets: bool,
+    ) -> tuple[list[SrtEntry], list[_RawSceneImageCueCandidate]]:
+        for _language, language_entries in AnimeLibraryService.get_preferred_subtitle_language_groups(
+            sidecar_entries,
+            target_language=target_language,
+        ):
+            text_candidates: list[_RawSceneTextCueCandidate] = []
+            image_candidates: list[_RawSceneImageCueCandidate] = []
+            for entry in language_entries:
+                if entry.kind == "text":
+                    text_candidates.extend(
+                        cls._collect_raw_scene_text_candidates(
+                            resolved_source=resolved_source,
+                            timeline_scene_start=timeline_scene_start,
+                            entry=entry,
+                            parsed_text_cache=parsed_text_cache,
+                        )
+                    )
+                    continue
+                if entry.kind == "image":
+                    image_candidates.extend(
+                        await cls._collect_raw_scene_image_candidates(
+                            resolved_source=resolved_source,
+                            timeline_scene_start=timeline_scene_start,
+                            entry=entry,
+                            parsed_cue_cache=parsed_cue_cache,
+                            rendered_cue_cache=rendered_cue_cache,
+                            resolve_assets=resolve_image_assets,
+                        )
+                    )
+
+            if not text_candidates and not image_candidates:
+                continue
+
+            resolved_text_entries = cls._resolve_raw_scene_text_candidates(text_candidates)
+            resolved_image_entries = cls._resolve_raw_scene_image_candidates(
+                image_candidates,
+                blocked_intervals=[(entry.start, entry.end) for entry in resolved_text_entries],
+            )
+            if resolved_text_entries or resolved_image_entries:
+                return resolved_text_entries, resolved_image_entries
+        return [], []
+
     @classmethod
     def generate_srt_entries(
         cls,
@@ -1365,6 +1771,8 @@ class ProcessingService:
         )
         probe_cache: dict[str, Any] = {}
         render_plan: dict[Path, dict[int, list[tuple[float, float]]]] = {}
+        parsed_text_cache: dict[str, list[Any]] = {}
+        parsed_cue_cache: dict[str, list[dict[str, Any]]] = {}
 
         for scene in raw_scenes:
             resolved_source = resolved_scene_sources.get(scene.scene_index)
@@ -1378,22 +1786,55 @@ class ProcessingService:
                 sidecar_entries = AnimeLibraryService.load_subtitle_sidecar_entries(
                     sidecar_source_path
                 )
-                selected_entry = AnimeLibraryService.select_preferred_subtitle_entry(
+                language_groups = AnimeLibraryService.get_preferred_subtitle_language_groups(
                     sidecar_entries,
                     target_language=target_language,
                 )
-                if selected_entry is None or selected_entry.kind != "image":
+                _, resolved_image_entries = await cls._resolve_raw_scene_sidecar_subtitles(
+                    resolved_source=resolved_source,
+                    timeline_scene_start=scene.start_time,
+                    target_language=target_language,
+                    sidecar_entries=sidecar_entries,
+                    parsed_text_cache=parsed_text_cache,
+                    parsed_cue_cache=parsed_cue_cache,
+                    resolve_image_assets=False,
+                )
+                planned_stream_positions = {
+                    entry.stream_position for entry in resolved_image_entries
+                }
+                if not planned_stream_positions:
+                    for _language, language_entries in language_groups:
+                        fallback_stream_positions = {
+                            entry.stream_position
+                            for entry in language_entries
+                            if entry.kind == "image"
+                            and (
+                                (
+                                    cue_manifest_path := AnimeLibraryService.get_subtitle_sidecar_cue_manifest_path(
+                                        resolved_source.source_path,
+                                        entry,
+                                    )
+                                )
+                                is None
+                                or not cue_manifest_path.exists()
+                            )
+                        }
+                        if fallback_stream_positions:
+                            planned_stream_positions = fallback_stream_positions
+                            break
+                if not planned_stream_positions:
                     continue
 
-                render_plan.setdefault(resolved_source.source_path, {}).setdefault(
-                    selected_entry.stream_position,
-                    [],
-                ).append(
-                    (
-                        resolved_source.source_in_seconds,
-                        resolved_source.source_out_seconds,
+                for stream_position in sorted(planned_stream_positions):
+                    render_plan.setdefault(resolved_source.source_path, {}).setdefault(
+                        stream_position,
+                        [],
+                    ).append(
+                        (
+                            resolved_source.source_in_seconds,
+                            resolved_source.source_out_seconds,
+                        )
                     )
-                )
                 continue
 
             source_key = str(resolved_source.source_path.resolve())
@@ -1415,27 +1856,35 @@ class ProcessingService:
                     language=stream.language,
                     raw_language=stream.raw_language,
                     title=stream.title,
+                    handler_name=stream.handler_name,
                     kind=AnimeLibraryService._subtitle_kind_for_codec(stream.codec_name),
                     asset_filename="planned",
                 )
                 for stream in probe.subtitle_streams
             ]
-            selected_entry = AnimeLibraryService.select_preferred_subtitle_entry(
-                synthetic_entries,
-                target_language=target_language,
+            planned_stream_positions = sorted(
+                {
+                    entry.stream_position
+                    for _language, language_entries in (
+                        AnimeLibraryService.get_preferred_subtitle_language_groups(
+                            synthetic_entries,
+                            target_language=target_language,
+                        )
+                    )
+                    for entry in language_entries
+                    if entry.kind == "image"
+                }
             )
-            if selected_entry is None or selected_entry.kind != "image":
-                continue
-
-            render_plan.setdefault(resolved_source.source_path, {}).setdefault(
-                selected_entry.stream_position,
-                [],
-            ).append(
-                (
-                    resolved_source.source_in_seconds,
-                    resolved_source.source_out_seconds,
+            for stream_position in planned_stream_positions:
+                render_plan.setdefault(resolved_source.source_path, {}).setdefault(
+                    stream_position,
+                    [],
+                ).append(
+                    (
+                        resolved_source.source_in_seconds,
+                        resolved_source.source_out_seconds,
+                    )
                 )
-            )
 
         return render_plan
 
@@ -1463,6 +1912,7 @@ class ProcessingService:
         parsed_text_cache: dict[str, list[Any]] = {}
         parsed_cue_cache: dict[str, list[dict[str, Any]]] = {}
         rendered_cue_cache: dict[tuple[str, int], Path | None] = {}
+        copied_image_assets: dict[tuple[int, int, int, str], str] = {}
 
         for scene in raw_scenes:
             resolved_source = resolved_scene_sources.get(scene.scene_index)
@@ -1471,111 +1921,44 @@ class ProcessingService:
             sidecar_entries = AnimeLibraryService.load_subtitle_sidecar_entries(
                 resolved_source.source_path
             )
-            selected_entry = AnimeLibraryService.select_preferred_subtitle_entry(
-                sidecar_entries,
+            scene_text_entries, scene_image_entries = await cls._resolve_raw_scene_sidecar_subtitles(
+                resolved_source=resolved_source,
+                timeline_scene_start=scene.start_time,
                 target_language=target_language,
+                sidecar_entries=sidecar_entries,
+                parsed_text_cache=parsed_text_cache,
+                parsed_cue_cache=parsed_cue_cache,
+                rendered_cue_cache=rendered_cue_cache,
+                resolve_image_assets=True,
             )
-            if selected_entry is None:
-                continue
-
-            asset_path = AnimeLibraryService.get_subtitle_sidecar_asset_path(
-                resolved_source.source_path,
-                selected_entry,
-            )
-            if asset_path is None or not asset_path.exists():
-                continue
-
-            source_window_start = resolved_source.source_in_seconds
-            source_window_end = resolved_source.source_out_seconds
-            timeline_scene_start = scene.start_time
-
-            if selected_entry.kind == "text":
-                cache_key = str(asset_path.resolve())
-                parsed_entries = parsed_text_cache.get(cache_key)
-                if parsed_entries is None:
-                    parsed_entries = PremiereSubtitleBakerService.parse_srt_entries(asset_path)
-                    parsed_text_cache[cache_key] = parsed_entries
-                for entry in parsed_entries:
-                    clipped_start = max(entry.start, source_window_start)
-                    clipped_end = min(entry.end, source_window_end)
-                    if clipped_end <= clipped_start:
-                        continue
-                    normalized_text = cls._normalize_external_subtitle_text(entry.text)
-                    if not normalized_text:
-                        continue
-                    text_entries.append(
-                        SrtEntry(
-                            start=timeline_scene_start + (clipped_start - source_window_start),
-                            end=timeline_scene_start + (clipped_end - source_window_start),
-                            text=normalized_text,
-                        )
-                    )
-                continue
-
-            cue_manifest_path = AnimeLibraryService.get_subtitle_sidecar_cue_manifest_path(
-                resolved_source.source_path,
-                selected_entry,
-            )
-            if cue_manifest_path is None or not cue_manifest_path.exists():
-                continue
-            cache_key = str(cue_manifest_path.resolve())
-            cue_entries = parsed_cue_cache.get(cache_key)
-            if cue_entries is None:
-                try:
-                    cue_payload = json.loads(cue_manifest_path.read_text(encoding="utf-8"))
-                except (json.JSONDecodeError, OSError):
-                    cue_payload = {}
-                raw_cues = cue_payload.get("cues", []) if isinstance(cue_payload, dict) else []
-                cue_entries = [cue for cue in raw_cues if isinstance(cue, dict)]
-                parsed_cue_cache[cache_key] = cue_entries
-
-            for cue_idx, cue in enumerate(cue_entries, start=1):
-                try:
-                    cue_index = int(cue.get("cue_index", cue_idx))
-                except (TypeError, ValueError):
-                    cue_index = cue_idx
-                try:
-                    cue_start = float(cue.get("start"))
-                    cue_end = float(cue.get("end"))
-                except (TypeError, ValueError):
-                    continue
-                clipped_start = max(cue_start, source_window_start)
-                clipped_end = min(cue_end, source_window_end)
-                if clipped_end <= clipped_start:
-                    continue
-                cue_asset_filename = str(cue.get("asset_filename", "")).strip()
-                source_cue_asset_path: Path | None = None
-                if cue_asset_filename:
-                    candidate_asset_path = cue_manifest_path.parent / cue_asset_filename
-                    if candidate_asset_path.exists():
-                        source_cue_asset_path = candidate_asset_path
-                if source_cue_asset_path is None:
-                    cache_entry_key = (cache_key, cue_index)
-                    if cache_entry_key not in rendered_cue_cache:
-                        rendered_cue_cache[cache_entry_key] = (
-                            await AnimeLibraryService.ensure_subtitle_sidecar_cue_asset(
-                                resolved_source.source_path,
-                                selected_entry,
-                                cue_index=cue_index,
-                                cue_start=cue_start,
-                                cue_end=cue_end,
-                            )
-                        )
-                    source_cue_asset_path = rendered_cue_cache[cache_entry_key]
-                if source_cue_asset_path is None or not source_cue_asset_path.exists():
+            text_entries.extend(scene_text_entries)
+            for scene_image_entry in scene_image_entries:
+                if scene_image_entry.source_asset_path is None or not scene_image_entry.source_asset_path.exists():
                     continue
                 raw_output_dir.mkdir(parents=True, exist_ok=True)
-                target_name = (
-                    f"scene_{scene.scene_index:04d}_cue_{cue_index:04d}{source_cue_asset_path.suffix.lower()}"
+                asset_key = (
+                    scene.scene_index,
+                    scene_image_entry.stream_position,
+                    scene_image_entry.cue_index,
+                    str(scene_image_entry.source_asset_path.resolve()),
                 )
-                target_path = raw_output_dir / target_name
-                if not target_path.exists():
-                    shutil.copy2(source_cue_asset_path, target_path)
+                target_name = copied_image_assets.get(asset_key)
+                if target_name is None:
+                    target_name = (
+                        "scene_"
+                        f"{scene.scene_index:04d}_stream_{scene_image_entry.stream_position:02d}"
+                        f"_cue_{scene_image_entry.cue_index:04d}"
+                        f"{scene_image_entry.source_asset_path.suffix.lower()}"
+                    )
+                    target_path = raw_output_dir / target_name
+                    if not target_path.exists():
+                        shutil.copy2(scene_image_entry.source_asset_path, target_path)
+                    copied_image_assets[asset_key] = target_name
                 image_entries.append(
                     RawSceneSubtitleImageEntry(
                         scene_index=scene.scene_index,
-                        start=timeline_scene_start + (clipped_start - source_window_start),
-                        end=timeline_scene_start + (clipped_end - source_window_start),
+                        start=scene_image_entry.start,
+                        end=scene_image_entry.end,
                         relative_asset_path=f"raw_scene_subtitles/{target_name}",
                     )
                 )
@@ -2206,11 +2589,13 @@ class ProcessingService:
                         subtitle_image_render_windows=raw_scene_image_render_plan.get(
                             resolved_source_path,
                         ),
+                        project_id=project.id,
                     )
                     if cls._update_absolute_match_episode_hints(
                         source_matches,
                         old_source_path=resolved_source_path,
                         new_source_path=normalization_result.normalized_path,
+                        library_type=project.library_type,
                     ):
                         matches_updated = True
                     yield ProcessingProgress(

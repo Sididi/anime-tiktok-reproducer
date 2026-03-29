@@ -318,8 +318,12 @@ class TestAnimeLibraryNormalization(TestCase):
         async def _run() -> None:
             source_path = Path("/tmp/library/episode.mp4")
             original_source_path = Path("/tmp/torrents/episode.mkv")
+            target_path = Path("/tmp/project/processing_sources/episode.mp4")
             source_path.parent.mkdir(parents=True, exist_ok=True)
             original_source_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.unlink(missing_ok=True)
+            target_path.with_name(f"{target_path.stem}.normalize.tmp.mp4").unlink(missing_ok=True)
             source_path.write_bytes(b"normalized")
             original_source_path.write_bytes(b"original")
             AnimeLibraryService._record_source_import_manifest_sync(original_source_path, source_path)
@@ -341,7 +345,7 @@ class TestAnimeLibraryNormalization(TestCase):
                 ),
                 selected_audio_stream_index=1,
             )
-            tmp_output_path = source_path.with_name(f"{source_path.stem}.normalize.tmp.mp4")
+            tmp_output_path = target_path.with_name(f"{target_path.stem}.normalize.tmp.mp4")
             normalized_probe = _make_probe(
                 tmp_output_path,
                 suffix=".mp4",
@@ -381,8 +385,13 @@ class TestAnimeLibraryNormalization(TestCase):
                 ),
                 patch.object(
                     AnimeLibraryService,
-                    "_write_subtitle_sidecar",
-                    AsyncMock(),
+                    "_processing_normalized_target_path",
+                    return_value=target_path,
+                ),
+                patch.object(
+                    AnimeLibraryService,
+                    "_clone_subtitle_sidecar_sync",
+                    return_value=False,
                 ),
                 patch.object(
                     AnimeLibraryService,
@@ -398,13 +407,122 @@ class TestAnimeLibraryNormalization(TestCase):
                 result = await AnimeLibraryService.normalize_source_for_processing(
                     source_path,
                     preferred_audio_language="fr",
+                    project_id="project-123",
                 )
 
             self.assertTrue(result.changed)
-            self.assertEqual(result.normalized_path, source_path)
+            self.assertEqual(result.normalized_path, target_path)
             cmd = mock_run_command.await_args.args[0]
             self.assertEqual(cmd[3], str(original_source_path))
+            self.assertTrue(source_path.exists())
             self.assertTrue(original_source_path.exists())
+
+        asyncio.run(_run())
+
+    def test_normalize_source_for_processing_uses_original_audio_metadata_when_library_stream_languages_are_unknown(self) -> None:
+        async def _run() -> None:
+            source_path = Path("/tmp/library/episode-unknown.mp4")
+            original_source_path = Path("/tmp/torrents/episode-unknown.mkv")
+            target_path = Path("/tmp/project/processing_sources/episode-unknown.mp4")
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            original_source_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.unlink(missing_ok=True)
+            target_path.with_name(f"{target_path.stem}.normalize.tmp.mp4").unlink(missing_ok=True)
+            source_path.write_bytes(b"normalized")
+            original_source_path.write_bytes(b"original")
+
+            original_probe = _make_probe(
+                original_source_path,
+                audio_streams=(
+                    _audio_stream(index=1, stream_position=0, language="en"),
+                    _audio_stream(index=2, stream_position=1, language="ja"),
+                ),
+            )
+            AnimeLibraryService._record_source_import_manifest_sync(
+                original_source_path,
+                source_path,
+                source_probe=original_probe,
+            )
+
+            current_probe = _make_probe(
+                source_path,
+                suffix=".mp4",
+                video_codec="h264",
+                audio_streams=(
+                    _audio_stream(index=1, stream_position=0, language=None),
+                    _audio_stream(index=2, stream_position=1, language=None),
+                ),
+            )
+            tmp_output_path = target_path.with_name(f"{target_path.stem}.normalize.tmp.mp4")
+            normalized_probe = _make_probe(
+                tmp_output_path,
+                suffix=".mp4",
+                video_codec="h264",
+                audio_streams=(
+                    _audio_stream(index=1, stream_position=0, language="ja"),
+                ),
+                selected_audio_stream_index=1,
+            )
+
+            def _probe_side_effect(path: Path):
+                if path == source_path:
+                    return current_probe
+                if path == original_source_path:
+                    return original_probe
+                if path == tmp_output_path:
+                    return normalized_probe
+                raise AssertionError(f"Unexpected probe path: {path}")
+
+            async def _fake_run_command(cmd, *, timeout_seconds):
+                tmp_output_path.write_bytes(b"tmp-output")
+                return type(
+                    "Result",
+                    (),
+                    {
+                        "returncode": 0,
+                        "stdout": b"",
+                        "stderr": b"",
+                    },
+                )()
+
+            with (
+                patch.object(
+                    AnimeLibraryService,
+                    "_probe_media_sync",
+                    side_effect=_probe_side_effect,
+                ),
+                patch.object(
+                    AnimeLibraryService,
+                    "_processing_normalized_target_path",
+                    return_value=target_path,
+                ),
+                patch.object(
+                    AnimeLibraryService,
+                    "_clone_subtitle_sidecar_sync",
+                    return_value=False,
+                ),
+                patch.object(
+                    AnimeLibraryService,
+                    "_postprocess_source_normalization_commit",
+                    AsyncMock(),
+                ),
+                patch.object(
+                    AnimeLibraryService,
+                    "_run_normalization_command",
+                    side_effect=_fake_run_command,
+                ) as mock_run_command,
+            ):
+                result = await AnimeLibraryService.normalize_source_for_processing(
+                    source_path,
+                    preferred_audio_language="fr",
+                    project_id="project-123",
+                )
+
+            self.assertTrue(result.changed)
+            self.assertEqual(result.normalized_path, target_path)
+            cmd = mock_run_command.await_args.args[0]
+            self.assertIn("0:2", cmd)
 
         asyncio.run(_run())
 
@@ -479,8 +597,8 @@ class TestAnimeLibraryNormalization(TestCase):
                     ),
                     patch.object(
                         AnimeLibraryService,
-                        "_write_subtitle_sidecar",
-                        AsyncMock(),
+                        "_clone_subtitle_sidecar_sync",
+                        return_value=False,
                     ),
                     patch.object(
                         AnimeLibraryService,

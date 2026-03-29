@@ -1,6 +1,12 @@
 import json
+import sys
+from pathlib import Path
 
 import pytest
+
+BACKEND_ROOT = Path(__file__).resolve().parents[2]
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
 
 from app.services.anime_library import AnimeLibraryService, SubtitleSidecarEntry
 
@@ -38,7 +44,7 @@ def test_normalize_stream_language_handles_extended_language_aliases(
     )
 
 
-def test_select_preferred_subtitle_entry_prefers_target_language_then_english():
+def test_select_preferred_subtitle_entry_prefers_target_language_then_english_then_fallback():
     entries = [
         SubtitleSidecarEntry(
             stream_index=3,
@@ -60,6 +66,16 @@ def test_select_preferred_subtitle_entry_prefers_target_language_then_english():
             kind="text",
             asset_filename="subtitle_stream_01_pt.srt",
         ),
+        SubtitleSidecarEntry(
+            stream_index=5,
+            stream_position=2,
+            codec_name="ass",
+            language="ja",
+            raw_language="jpn",
+            title="Japanese",
+            kind="text",
+            asset_filename="subtitle_stream_02_ja.srt",
+        ),
     ]
 
     preferred_pt = AnimeLibraryService.select_preferred_subtitle_entry(
@@ -70,11 +86,17 @@ def test_select_preferred_subtitle_entry_prefers_target_language_then_english():
         entries,
         target_language="de",
     )
+    preferred_final_fallback = AnimeLibraryService.select_preferred_subtitle_entry(
+        [entry for entry in entries if entry.language != "en"],
+        target_language="de",
+    )
 
     assert preferred_pt is not None
     assert preferred_pt.language == "pt"
     assert preferred_fallback is not None
     assert preferred_fallback.language == "en"
+    assert preferred_final_fallback is not None
+    assert preferred_final_fallback.language == "pt"
 
 
 def test_load_subtitle_sidecar_entries_normalizes_legacy_language_values(tmp_path):

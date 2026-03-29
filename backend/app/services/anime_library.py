@@ -147,6 +147,7 @@ class SourceMediaProbe:
     data_streams: tuple[SourceMediaStream, ...] = ()
     selected_audio_stream_index: int | None = None
     video_duration: float | None = None
+    selected_audio_stream: SourceMediaStream | None = None
 
 
 @dataclass(frozen=True)
@@ -157,6 +158,7 @@ class SourceNormalizationPlan:
     source_path: Path
     target_path: Path
     probe: SourceMediaProbe
+    cleanup_source_after_commit: bool = False
 
 
 @dataclass(frozen=True)
@@ -181,6 +183,7 @@ class SubtitleSidecarEntry:
     title: str | None
     kind: str
     asset_filename: str | None
+    handler_name: str | None = None
     cue_manifest_filename: str | None = None
     status: str = "ok"
     error: str | None = None
@@ -1005,7 +1008,20 @@ class AnimeLibraryService:
         target_language: str | None = None,
     ) -> SourceMediaStream | None:
         """Select the single audio stream kept in normalized sources."""
-        if not probe.audio_streams:
+        return cls._select_preferred_audio_stream_from_streams(
+            probe.audio_streams,
+            target_language=target_language,
+        )
+
+    @classmethod
+    def _select_preferred_audio_stream_from_streams(
+        cls,
+        streams: tuple[SourceMediaStream, ...] | list[SourceMediaStream],
+        *,
+        target_language: str | None = None,
+    ) -> SourceMediaStream | None:
+        """Select the preferred audio stream from an ordered stream list."""
+        if not streams:
             return None
 
         preferred_languages: list[str] = []
@@ -1021,14 +1037,14 @@ class AnimeLibraryService:
             seen_languages.add(preferred_lang)
 
         for preferred_lang in preferred_languages:
-            for stream in probe.audio_streams:
+            for stream in streams:
                 if stream.language == preferred_lang:
                     return stream
 
-        default_stream = next((stream for stream in probe.audio_streams if stream.is_default), None)
+        default_stream = next((stream for stream in streams if stream.is_default), None)
         if default_stream is not None:
             return default_stream
-        return min(probe.audio_streams, key=lambda stream: (stream.stream_position, stream.index))
+        return min(streams, key=lambda stream: (stream.stream_position, stream.index))
 
     @classmethod
     def _with_preferred_audio_stream(
@@ -1036,11 +1052,28 @@ class AnimeLibraryService:
         probe: SourceMediaProbe,
         *,
         target_language: str | None,
+        source_import_payload: dict[str, Any] | None = None,
     ) -> SourceMediaProbe:
         preferred_audio_stream = cls.select_preferred_audio_stream(
             probe,
             target_language=target_language,
         )
+        selected_audio_stream = preferred_audio_stream
+        if len(probe.audio_streams) > 1:
+            import_audio_streams = cls._load_source_import_audio_streams(source_import_payload)
+            if import_audio_streams and not any(stream.language for stream in probe.audio_streams):
+                preferred_original_stream = cls._select_preferred_audio_stream_from_streams(
+                    import_audio_streams,
+                    target_language=target_language,
+                )
+                if preferred_original_stream is not None:
+                    mapped_current_stream = cls._audio_stream_by_position(
+                        probe,
+                        preferred_original_stream.stream_position,
+                    )
+                    if mapped_current_stream is not None:
+                        preferred_audio_stream = mapped_current_stream
+                        selected_audio_stream = preferred_original_stream
         audio_codec = None
         selected_audio_stream_index = None
         if preferred_audio_stream is not None:
@@ -1050,6 +1083,7 @@ class AnimeLibraryService:
             probe,
             audio_codec=audio_codec,
             selected_audio_stream_index=selected_audio_stream_index,
+            selected_audio_stream=selected_audio_stream,
         )
 
     @staticmethod
@@ -1061,6 +1095,18 @@ class AnimeLibraryService:
             return None
         for stream in probe.audio_streams:
             if stream.index == stream_index:
+                return stream
+        return None
+
+    @staticmethod
+    def _audio_stream_by_position(
+        probe: SourceMediaProbe,
+        stream_position: int | None,
+    ) -> SourceMediaStream | None:
+        if stream_position is None:
+            return None
+        for stream in probe.audio_streams:
+            if stream.stream_position == stream_position:
                 return stream
         return None
 
@@ -1092,9 +1138,30 @@ class AnimeLibraryService:
 
     @classmethod
     def resolve_subtitle_sidecar_source_path(cls, source_path: Path) -> Path | None:
-        for candidate in cls._subtitle_sidecar_lookup_paths(source_path):
+        queue = deque(cls._subtitle_sidecar_lookup_paths(source_path))
+        seen: set[str] = set()
+
+        while queue:
+            candidate = queue.popleft()
+            key = str(candidate.resolve()) if candidate.exists() else str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+
             if cls.get_subtitle_sidecar_manifest_path(candidate).exists():
                 return candidate
+
+            payload = cls._load_source_import_manifest_sync(candidate)
+            if not isinstance(payload, dict):
+                continue
+            linked_sidecar_source_raw = str(payload.get("sidecar_source_path", "")).strip()
+            linked_sidecar_source = Path(linked_sidecar_source_raw) if linked_sidecar_source_raw else None
+            if linked_sidecar_source is not None:
+                queue.extend(cls._subtitle_sidecar_lookup_paths(linked_sidecar_source))
+            original_source_raw = str(payload.get("source_path", "")).strip()
+            original_source = Path(original_source_raw) if original_source_raw else None
+            if original_source is not None:
+                queue.extend(cls._subtitle_sidecar_lookup_paths(original_source))
         return None
 
     @classmethod
@@ -1300,11 +1367,91 @@ class AnimeLibraryService:
         return source_path.with_suffix(".mp4")
 
     @classmethod
+    def _processing_normalized_target_path(
+        cls,
+        source_path: Path,
+        *,
+        project_id: str | None,
+    ) -> Path:
+        normalized_target = cls._normalized_target_path(source_path)
+        if not project_id or cls._library_context_for_path(source_path) is None:
+            return normalized_target
+
+        from .project_service import ProjectService
+
+        project_root = ProjectService.get_project_dir(project_id) / "processing_sources"
+        try:
+            library_root = cls.get_library_root().resolve()
+            relative_path = normalized_target.resolve().relative_to(library_root)
+            relative_parts = relative_path.parts[1:] if len(relative_path.parts) > 1 else relative_path.parts
+        except (OSError, ValueError):
+            relative_parts = (normalized_target.name,)
+        return project_root.joinpath(*relative_parts)
+
+    @classmethod
+    def _serialize_source_import_audio_stream(
+        cls,
+        stream: SourceMediaStream,
+    ) -> dict[str, Any]:
+        return {
+            "stream_index": stream.index,
+            "stream_position": stream.stream_position,
+            "language": stream.language,
+            "raw_language": stream.raw_language,
+            "title": stream.title,
+            "handler_name": stream.handler_name,
+            "is_default": stream.is_default,
+        }
+
+    @classmethod
+    def _load_source_import_audio_streams(
+        cls,
+        payload: dict[str, Any] | None,
+    ) -> tuple[SourceMediaStream, ...]:
+        if not isinstance(payload, dict):
+            return ()
+        raw_streams = payload.get("audio_streams", [])
+        if not isinstance(raw_streams, list):
+            return ()
+
+        streams: list[SourceMediaStream] = []
+        for raw_stream in raw_streams:
+            if not isinstance(raw_stream, dict):
+                continue
+            try:
+                stream_index = int(raw_stream.get("stream_index"))
+                stream_position = int(raw_stream.get("stream_position"))
+            except (TypeError, ValueError):
+                continue
+            title = str(raw_stream.get("title", "")).strip() or None
+            handler_name = str(raw_stream.get("handler_name", "")).strip() or None
+            raw_language = str(raw_stream.get("raw_language", "")).strip() or None
+            streams.append(
+                SourceMediaStream(
+                    index=stream_index,
+                    stream_position=stream_position,
+                    codec_type="audio",
+                    codec_name=None,
+                    language=cls.normalize_stream_language(
+                        raw_stream.get("language") or raw_language,
+                        title=title,
+                        handler_name=handler_name,
+                    ),
+                    raw_language=raw_language,
+                    title=title,
+                    handler_name=handler_name,
+                    is_default=bool(raw_stream.get("is_default", False)),
+                )
+            )
+        return tuple(streams)
+
+    @classmethod
     def _build_source_normalization_plan_sync(
         cls,
         source_path: Path,
         *,
         preferred_audio_language: str | None = None,
+        target_path: Path | None = None,
     ) -> SourceNormalizationPlan:
         probe = cls._probe_media_sync(source_path)
         if probe is None:
@@ -1313,15 +1460,19 @@ class AnimeLibraryService:
             raise RuntimeError(f"Unable to determine source duration: {source_path}")
         if probe.video_codec is None:
             raise RuntimeError(f"Unable to determine source video codec: {source_path}")
+        source_import_payload = cls._load_source_import_manifest_sync(source_path)
         probe = cls._with_preferred_audio_stream(
             probe,
             target_language=preferred_audio_language,
+            source_import_payload=source_import_payload,
         )
+        resolved_target_path = target_path or cls._normalized_target_path(source_path)
         return SourceNormalizationPlan(
             action=cls.classify_source_normalization(probe),
             source_path=source_path,
-            target_path=cls._normalized_target_path(source_path),
+            target_path=resolved_target_path,
             probe=probe,
+            cleanup_source_after_commit=resolved_target_path != source_path,
         )
 
     @classmethod
@@ -1330,6 +1481,7 @@ class AnimeLibraryService:
         source_path: Path,
         *,
         preferred_audio_language: str | None = None,
+        target_path: Path | None = None,
     ) -> SourceNormalizationPlan | None:
         current_probe = cls._probe_media_sync(source_path)
         if current_probe is None:
@@ -1341,7 +1493,9 @@ class AnimeLibraryService:
         if payload is None:
             return None
 
-        original_source_raw = str(payload.get("source_path", "")).strip()
+        original_source_raw = str(payload.get("original_source_path", "")).strip()
+        if not original_source_raw:
+            original_source_raw = str(payload.get("source_path", "")).strip()
         if not original_source_raw:
             return None
 
@@ -1363,15 +1517,18 @@ class AnimeLibraryService:
         original_probe = cls._with_preferred_audio_stream(
             original_probe,
             target_language=preferred_audio_language,
+            source_import_payload=payload,
         )
         if cls._is_valid_normalized_probe(current_probe, reference_probe=original_probe):
             return None
 
+        resolved_target_path = target_path or source_path
         return SourceNormalizationPlan(
             action=cls.classify_source_normalization(original_probe),
             source_path=original_source_path,
-            target_path=source_path,
+            target_path=resolved_target_path,
             probe=original_probe,
+            cleanup_source_after_commit=False,
         )
 
     @classmethod
@@ -1384,9 +1541,12 @@ class AnimeLibraryService:
         cls,
         reference_probe: SourceMediaProbe,
     ) -> float | None:
-        selected_audio_stream = cls._audio_stream_by_index(
-            reference_probe,
-            reference_probe.selected_audio_stream_index,
+        selected_audio_stream = (
+            reference_probe.selected_audio_stream
+            or cls._audio_stream_by_index(
+                reference_probe,
+                reference_probe.selected_audio_stream_index,
+            )
         )
         if (
             reference_probe.video_duration is not None
@@ -1431,16 +1591,22 @@ class AnimeLibraryService:
         elif normalized_probe.has_audio:
             return False
 
-        selected_audio_stream = cls._audio_stream_by_index(
-            reference_probe,
-            reference_probe.selected_audio_stream_index,
+        selected_audio_stream = (
+            reference_probe.selected_audio_stream
+            or cls._audio_stream_by_index(
+                reference_probe,
+                reference_probe.selected_audio_stream_index,
+            )
         )
         if selected_audio_stream is not None and normalized_probe.audio_streams:
             normalized_audio_stream = normalized_probe.audio_streams[0]
-            if (
-                selected_audio_stream.language
-                and normalized_audio_stream.language
-                and normalized_audio_stream.language != selected_audio_stream.language
+            if selected_audio_stream.language and normalized_audio_stream.language:
+                if normalized_audio_stream.language != selected_audio_stream.language:
+                    return False
+            elif (
+                len(reference_probe.audio_streams) > 1
+                and selected_audio_stream.language
+                and normalized_audio_stream.language is None
             ):
                 return False
 
@@ -1457,6 +1623,49 @@ class AnimeLibraryService:
         if probe.selected_audio_stream_index is None:
             return []
         return ["-map", f"0:{probe.selected_audio_stream_index}"]
+
+    @classmethod
+    def _build_audio_stream_metadata_args(
+        cls,
+        audio_streams: tuple[SourceMediaStream, ...] | list[SourceMediaStream],
+    ) -> list[str]:
+        args: list[str] = []
+        default_indices = {
+            idx for idx, stream in enumerate(audio_streams) if stream.is_default
+        }
+        for idx, stream in enumerate(audio_streams):
+            language = (
+                str(stream.raw_language or "").strip().lower()
+                or cls.normalize_stream_language(
+                    stream.language,
+                    title=stream.title,
+                    handler_name=stream.handler_name,
+                )
+                or "und"
+            )
+            args.extend(["-metadata:s:a:" + str(idx), f"language={language}"])
+            if stream.title:
+                args.extend(["-metadata:s:a:" + str(idx), f"title={stream.title}"])
+            if stream.is_default:
+                args.extend(["-disposition:a:" + str(idx), "default"])
+            elif default_indices:
+                args.extend(["-disposition:a:" + str(idx), "0"])
+        return args
+
+    @classmethod
+    def _build_selected_audio_metadata_args(
+        cls,
+        probe: SourceMediaProbe,
+    ) -> list[str]:
+        if not probe.has_audio:
+            return []
+        selected_stream = (
+            probe.selected_audio_stream
+            or cls._audio_stream_by_index(probe, probe.selected_audio_stream_index)
+        )
+        if selected_stream is None:
+            return []
+        return cls._build_audio_stream_metadata_args((selected_stream,))
 
     @classmethod
     def _build_remux_to_mp4_cmd(
@@ -1482,6 +1691,8 @@ class AnimeLibraryService:
         cls,
         source_path: Path,
         output_path: Path,
+        *,
+        probe: SourceMediaProbe,
     ) -> list[str]:
         return [
             "ffmpeg",
@@ -1502,6 +1713,7 @@ class AnimeLibraryService:
             "0",
             "-c",
             "copy",
+            *cls._build_audio_stream_metadata_args(probe.audio_streams),
             "-movflags",
             "+faststart",
             str(output_path),
@@ -1567,6 +1779,7 @@ class AnimeLibraryService:
             ]
         )
         cmd.extend(cls._build_audio_args(has_audio=probe.has_audio))
+        cmd.extend(cls._build_audio_stream_metadata_args(probe.audio_streams))
         cmd.extend(
             [
                 "-movflags",
@@ -1612,6 +1825,7 @@ class AnimeLibraryService:
             "yuv420p",
         ]
         cmd.extend(cls._build_audio_args(has_audio=probe.has_audio))
+        cmd.extend(cls._build_audio_stream_metadata_args(probe.audio_streams))
         cmd.extend(
             [
                 "-movflags",
@@ -1684,6 +1898,7 @@ class AnimeLibraryService:
             "2",
             "-ar",
             cls.SOURCE_NORMALIZATION_AUDIO_RATE,
+            *cls._build_selected_audio_metadata_args(probe),
             "-movflags",
             "+faststart",
             str(output_path),
@@ -1725,7 +1940,7 @@ class AnimeLibraryService:
             "-sn",
             "-write_tmcd",
             "0",
-        ] + cls._build_audio_args(has_audio=probe.has_audio) + [str(output_path)]
+        ] + cls._build_audio_args(has_audio=probe.has_audio) + cls._build_selected_audio_metadata_args(probe) + [str(output_path)]
 
     @classmethod
     def _build_cpu_h264_aac_cmd(
@@ -1746,7 +1961,7 @@ class AnimeLibraryService:
             "-sn",
             "-write_tmcd",
             "0",
-        ] + cls._build_audio_args(has_audio=probe.has_audio) + [str(output_path)]
+        ] + cls._build_audio_args(has_audio=probe.has_audio) + cls._build_selected_audio_metadata_args(probe) + [str(output_path)]
 
     @classmethod
     def _is_valid_prepared_library_probe(
@@ -2056,6 +2271,7 @@ class AnimeLibraryService:
                 continue
             raw_language = str(raw_entry.get("raw_language", "")).strip() or None
             title = str(raw_entry.get("title", "")).strip() or None
+            handler_name = str(raw_entry.get("handler_name", "")).strip() or None
             stored_language = str(raw_entry.get("language", "")).strip() or None
             try:
                 entries.append(
@@ -2066,9 +2282,11 @@ class AnimeLibraryService:
                         language=cls.normalize_stream_language(
                             stored_language or raw_language,
                             title=title,
+                            handler_name=handler_name,
                         ),
                         raw_language=raw_language,
                         title=title,
+                        handler_name=handler_name,
                         kind=str(raw_entry.get("kind", "")).strip().lower() or "unsupported",
                         asset_filename=str(raw_entry.get("asset_filename", "")).strip() or None,
                         cue_manifest_filename=(
@@ -2085,11 +2303,73 @@ class AnimeLibraryService:
     @staticmethod
     def _subtitle_entry_title_rank(entry: SubtitleSidecarEntry) -> int:
         title = str(entry.title or "").lower()
-        if "full" in title:
-            return 0
-        if "sign" in title or "song" in title:
+        if any(token in title for token in ("sign", "song", "forced")):
+            return 2
+        if any(token in title for token in ("sdh", "closed caption", "closed-caption", "cc")):
             return 1
-        return 2
+        if any(token in title for token in ("dialogue", "dialog", "full", "default", "plain")):
+            return 0
+        return 0
+
+    @classmethod
+    def get_preferred_subtitle_language_groups(
+        cls,
+        entries: list[SubtitleSidecarEntry],
+        *,
+        target_language: str | None,
+    ) -> list[tuple[str | None, list[SubtitleSidecarEntry]]]:
+        usable_entries = [
+            entry
+            for entry in entries
+            if entry.status == "ok"
+            and entry.kind in {"text", "image"}
+            and entry.asset_filename
+        ]
+        if not usable_entries:
+            return []
+
+        groups: dict[str | None, list[SubtitleSidecarEntry]] = {}
+        first_position_by_language: dict[str | None, int] = {}
+        for entry in usable_entries:
+            groups.setdefault(entry.language, []).append(entry)
+            first_position_by_language.setdefault(entry.language, entry.stream_position)
+
+        normalized_target = cls.normalize_stream_language(target_language)
+        ordered_languages: list[str | None] = []
+        seen_languages: set[str | None] = set()
+        for preferred_language in (normalized_target, "en"):
+            if preferred_language not in groups or preferred_language in seen_languages:
+                continue
+            ordered_languages.append(preferred_language)
+            seen_languages.add(preferred_language)
+
+        fallback_languages = sorted(
+            [
+                language
+                for language in groups
+                if language not in seen_languages
+            ],
+            key=lambda language: (
+                first_position_by_language.get(language, 10**9),
+                language or "zzzz",
+            ),
+        )
+        ordered_languages.extend(fallback_languages)
+
+        return [
+            (
+                language,
+                sorted(
+                    groups[language],
+                    key=lambda entry: (
+                        0 if entry.kind == "text" else 1,
+                        cls._subtitle_entry_title_rank(entry),
+                        entry.stream_position,
+                    ),
+                ),
+            )
+            for language in ordered_languages
+        ]
 
     @classmethod
     def select_preferred_subtitle_entry(
@@ -2098,38 +2378,21 @@ class AnimeLibraryService:
         *,
         target_language: str | None,
     ) -> SubtitleSidecarEntry | None:
-        normalized_target = cls.normalize_stream_language(target_language)
-        allowed_languages = [lang for lang in (normalized_target, "en") if lang]
-        seen_languages: set[str] = set()
-        ordered_languages: list[str] = []
-        for language in allowed_languages:
-            if language in seen_languages:
-                continue
-            seen_languages.add(language)
-            ordered_languages.append(language)
-
-        candidates = [
-            entry
-            for entry in entries
-            if entry.status == "ok"
-            and entry.kind in {"text", "image"}
-            and entry.language in ordered_languages
-            and entry.asset_filename
-        ]
-        if not candidates:
+        language_groups = cls.get_preferred_subtitle_language_groups(
+            entries,
+            target_language=target_language,
+        )
+        if not language_groups:
             return None
+        candidates = language_groups[0][1]
 
         def _rank(entry: SubtitleSidecarEntry) -> tuple[int, int, int, int]:
-            language_rank = ordered_languages.index(entry.language or "en")
             kind_rank = 0 if entry.kind == "text" else 1
-            english_title_rank = (
-                cls._subtitle_entry_title_rank(entry) if entry.language == "en" else 0
-            )
             return (
-                language_rank,
                 kind_rank,
-                english_title_rank,
+                cls._subtitle_entry_title_rank(entry),
                 entry.stream_position,
+                entry.stream_index,
             )
 
         return min(candidates, key=_rank)
@@ -2352,6 +2615,7 @@ class AnimeLibraryService:
                 "language": stream.language,
                 "raw_language": stream.raw_language,
                 "title": stream.title,
+                "handler_name": stream.handler_name,
                 "kind": kind,
                 "asset_filename": None,
                 "cue_manifest_filename": None,
@@ -2430,6 +2694,7 @@ class AnimeLibraryService:
                                         language=stream.language,
                                         raw_language=stream.raw_language,
                                         title=stream.title,
+                                        handler_name=stream.handler_name,
                                         kind=kind,
                                         asset_filename=asset_name,
                                     ),
@@ -2503,6 +2768,43 @@ class AnimeLibraryService:
         )
 
     @classmethod
+    def _clone_subtitle_sidecar_sync(
+        cls,
+        source_path: Path,
+        target_path: Path,
+    ) -> bool:
+        sidecar_source_path = cls.resolve_subtitle_sidecar_source_path(source_path)
+        if sidecar_source_path is None:
+            return False
+
+        source_dir = cls.get_subtitle_sidecar_dir(sidecar_source_path)
+        manifest_path = source_dir / "manifest.json"
+        if not source_dir.exists() or not manifest_path.exists():
+            return False
+
+        target_dir = cls.get_subtitle_sidecar_dir(target_path)
+        tmp_dir = target_dir.with_name(f"{target_dir.name}.tmp")
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.copytree(source_dir, tmp_dir)
+
+        try:
+            payload = json.loads((tmp_dir / "manifest.json").read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            payload = {}
+        if isinstance(payload, dict):
+            payload["source_path"] = str(target_path)
+            (tmp_dir / "manifest.json").write_text(
+                json.dumps(payload, indent=2),
+                encoding="utf-8",
+            )
+
+        if target_dir.exists():
+            shutil.rmtree(target_dir, ignore_errors=True)
+        tmp_dir.replace(target_dir)
+        return True
+
+    @classmethod
     def _library_context_for_path(
         cls,
         source_path: Path,
@@ -2545,6 +2847,7 @@ class AnimeLibraryService:
         *,
         preferred_audio_language: str | None = None,
         subtitle_image_render_windows: dict[int, list[tuple[float, float]]] | None = None,
+        project_id: str | None = None,
     ) -> SourceNormalizationResult:
         """Normalize one source episode for Premiere Pro import.
 
@@ -2556,48 +2859,120 @@ class AnimeLibraryService:
         if not source_path.exists() or not source_path.is_file():
             raise FileNotFoundError(f"Source file not found: {source_path}")
 
+        target_path = await asyncio.to_thread(
+            cls._processing_normalized_target_path,
+            source_path,
+            project_id=project_id,
+        )
+        source_import_payload = await asyncio.to_thread(
+            cls._load_source_import_manifest_sync,
+            source_path,
+        )
         plan = await asyncio.to_thread(
             cls._build_source_normalization_plan_sync,
             source_path,
             preferred_audio_language=preferred_audio_language,
+            target_path=target_path,
         )
-        if plan.action == "noop":
-            reimport_plan = await asyncio.to_thread(
-                cls._build_processing_reimport_plan_sync,
-                source_path,
-                preferred_audio_language=preferred_audio_language,
+        reimport_plan = await asyncio.to_thread(
+            cls._build_processing_reimport_plan_sync,
+            source_path,
+            preferred_audio_language=preferred_audio_language,
+            target_path=target_path,
+        )
+        if reimport_plan is not None:
+            plan = reimport_plan
+        elif plan.action == "noop":
+            return SourceNormalizationResult(
+                action=plan.action,
+                source_path=plan.source_path,
+                normalized_path=plan.source_path,
+                changed=False,
             )
-            if reimport_plan is not None:
-                plan = reimport_plan
-            else:
-                return SourceNormalizationResult(
-                    action=plan.action,
-                    source_path=plan.source_path,
-                    normalized_path=plan.source_path,
-                    changed=False,
-                )
 
         target_path = plan.target_path
         tmp_suffix = target_path.suffix or ".mp4"
         tmp_path = target_path.with_name(f"{target_path.stem}.normalize.tmp{tmp_suffix}")
+        target_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if target_path != source_path and target_path.exists():
-            existing_probe = await asyncio.to_thread(cls._probe_media_sync, target_path)
-            if cls._is_valid_normalized_probe(existing_probe, reference_probe=plan.probe):
-                try:
+        manifest_original_source_raw = (
+            str(source_import_payload.get("original_source_path", "")).strip()
+            if isinstance(source_import_payload, dict)
+            else ""
+        )
+        if not manifest_original_source_raw and isinstance(source_import_payload, dict):
+            manifest_original_source_raw = str(source_import_payload.get("source_path", "")).strip()
+        manifest_original_source_path = (
+            Path(manifest_original_source_raw)
+            if manifest_original_source_raw
+            else plan.source_path
+        )
+        sidecar_source_path = (
+            cls.resolve_subtitle_sidecar_source_path(source_path)
+            or cls.resolve_subtitle_sidecar_source_path(plan.source_path)
+            or source_path
+        )
+
+        async def _preserve_target_metadata() -> None:
+            recorded_probe = plan.probe
+            if (
+                manifest_original_source_path != plan.source_path
+                and manifest_original_source_path.exists()
+            ):
+                manifest_probe = await asyncio.to_thread(
+                    cls._probe_media_sync,
+                    manifest_original_source_path,
+                )
+                if manifest_probe is not None:
+                    recorded_probe = cls._with_preferred_audio_stream(
+                        manifest_probe,
+                        target_language=preferred_audio_language,
+                        source_import_payload=source_import_payload,
+                    )
+            await asyncio.to_thread(
+                cls._record_source_import_manifest_sync,
+                source_path,
+                target_path,
+                source_probe=recorded_probe,
+                original_source_path=manifest_original_source_path,
+                sidecar_source_path=sidecar_source_path,
+            )
+
+        async def _preserve_target_sidecar() -> None:
+            try:
+                if plan.probe.subtitle_streams:
                     await cls._write_subtitle_sidecar(
                         source_path=plan.source_path,
                         normalized_target_path=target_path,
                         probe=plan.probe,
                         subtitle_image_render_windows=subtitle_image_render_windows,
                     )
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to preserve subtitle sidecar for %s: %s",
-                        plan.source_path,
-                        exc,
+                    return
+                cloned = await asyncio.to_thread(
+                    cls._clone_subtitle_sidecar_sync,
+                    sidecar_source_path,
+                    target_path,
+                )
+                if not cloned:
+                    logger.debug(
+                        "No subtitle sidecar available to clone for %s -> %s",
+                        sidecar_source_path,
+                        target_path,
                     )
-                await asyncio.to_thread(source_path.unlink)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to preserve subtitle sidecar for %s: %s",
+                    plan.source_path,
+                    exc,
+                )
+
+        if target_path != source_path and target_path.exists():
+            existing_probe = await asyncio.to_thread(cls._probe_media_sync, target_path)
+            if cls._is_valid_normalized_probe(existing_probe, reference_probe=plan.probe):
+                await _preserve_target_sidecar()
+                await _preserve_target_metadata()
+                if plan.cleanup_source_after_commit and source_path.exists():
+                    await asyncio.to_thread(source_path.unlink)
                 await cls._postprocess_source_normalization_commit(target_path)
                 return SourceNormalizationResult(
                     action=plan.action,
@@ -2711,21 +3086,10 @@ class AnimeLibraryService:
             if not cls._is_valid_normalized_probe(normalized_probe, reference_probe=plan.probe):
                 raise RuntimeError(f"Normalized output failed validation: {tmp_path.name}")
 
-            try:
-                await cls._write_subtitle_sidecar(
-                    source_path=plan.source_path,
-                    normalized_target_path=target_path,
-                    probe=plan.probe,
-                    subtitle_image_render_windows=subtitle_image_render_windows,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Failed to preserve subtitle sidecar for %s: %s",
-                    plan.source_path,
-                    exc,
-                )
             await asyncio.to_thread(tmp_path.replace, target_path)
-            if target_path != source_path and source_path.exists():
+            await _preserve_target_sidecar()
+            await _preserve_target_metadata()
+            if plan.cleanup_source_after_commit and source_path.exists():
                 await asyncio.to_thread(source_path.unlink)
 
             await cls._postprocess_source_normalization_commit(target_path)
@@ -3283,19 +3647,35 @@ class AnimeLibraryService:
         return payload if isinstance(payload, dict) else None
 
     @classmethod
-    def _record_source_import_manifest_sync(cls, source_path: Path, prepared_path: Path) -> None:
+    def _record_source_import_manifest_sync(
+        cls,
+        source_path: Path,
+        prepared_path: Path,
+        *,
+        source_probe: SourceMediaProbe | None = None,
+        original_source_path: Path | None = None,
+        sidecar_source_path: Path | None = None,
+    ) -> None:
         source_stat = source_path.stat()
         manifest_path = cls.get_source_import_manifest_path(prepared_path)
+        resolved_original_source_path = original_source_path or source_path
+        manifest_payload: dict[str, Any] = {
+            "source_path": str(source_path.resolve()),
+            "source_size": source_stat.st_size,
+            "source_mtime_ns": source_stat.st_mtime_ns,
+            "prepared_path": str(prepared_path.resolve()),
+            "original_source_path": str(resolved_original_source_path.resolve()),
+            "sidecar_source_path": str((sidecar_source_path or source_path).resolve()),
+        }
+        if source_probe is None:
+            source_probe = cls._probe_media_sync(resolved_original_source_path)
+        if source_probe is not None and source_probe.audio_streams:
+            manifest_payload["audio_streams"] = [
+                cls._serialize_source_import_audio_stream(stream)
+                for stream in source_probe.audio_streams
+            ]
         manifest_path.write_text(
-            json.dumps(
-                {
-                    "source_path": str(source_path.resolve()),
-                    "source_size": source_stat.st_size,
-                    "source_mtime_ns": source_stat.st_mtime_ns,
-                    "prepared_path": str(prepared_path.resolve()),
-                },
-                indent=2,
-            ),
+            json.dumps(manifest_payload, indent=2),
             encoding="utf-8",
         )
 
@@ -3426,7 +3806,11 @@ class AnimeLibraryService:
             remux_error: str | None = None
             try:
                 remux_result = await run_command(
-                    cls._build_library_import_remux_cmd(source_path, tmp_dest),
+                    cls._build_library_import_remux_cmd(
+                        source_path,
+                        tmp_dest,
+                        probe=source_probe,
+                    ),
                     timeout_seconds=cls.REMUX_TIMEOUT_SECONDS,
                 )
             except FileNotFoundError as exc:
@@ -3484,7 +3868,12 @@ class AnimeLibraryService:
                 await asyncio.to_thread(source_path.unlink)
 
         if actual_dest.exists():
-            await asyncio.to_thread(cls._record_source_import_manifest_sync, source_path, actual_dest)
+            await asyncio.to_thread(
+                cls._record_source_import_manifest_sync,
+                source_path,
+                actual_dest,
+                source_probe=source_probe,
+            )
 
         return actual_dest, action, True
 

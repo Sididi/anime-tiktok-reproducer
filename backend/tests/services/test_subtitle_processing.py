@@ -473,6 +473,430 @@ def test_collect_raw_scene_source_subtitles_returns_text_entries_for_text_sideca
     ]
 
 
+def test_collect_raw_scene_source_subtitles_prefers_overlapping_dialogue_over_non_overlapping_signs(
+    tmp_path,
+):
+    source_path = tmp_path / "episode.mkv"
+    normalized_source_path = source_path.with_suffix(".mp4")
+    sidecar_dir = AnimeLibraryService.get_subtitle_sidecar_dir(normalized_source_path)
+    sidecar_dir.mkdir(parents=True)
+    (sidecar_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "source_path": str(normalized_source_path),
+                "generated_from": str(source_path),
+                "subtitle_streams": [
+                    {
+                        "stream_index": 2,
+                        "stream_position": 0,
+                        "codec_name": "ass",
+                        "language": "en",
+                        "raw_language": "eng",
+                        "title": "English Signs",
+                        "kind": "text",
+                        "asset_filename": "subtitle_stream_00_en.srt",
+                        "status": "ok",
+                        "error": None,
+                    },
+                    {
+                        "stream_index": 3,
+                        "stream_position": 1,
+                        "codec_name": "ass",
+                        "language": "en",
+                        "raw_language": "eng",
+                        "title": "English Dialogue",
+                        "kind": "text",
+                        "asset_filename": "subtitle_stream_01_en.srt",
+                        "status": "ok",
+                        "error": None,
+                    },
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (sidecar_dir / "subtitle_stream_00_en.srt").write_text(
+        "1\n00:00:08,000 --> 00:00:08,400\nSIGN\n",
+        encoding="utf-8",
+    )
+    (sidecar_dir / "subtitle_stream_01_en.srt").write_text(
+        "1\n00:00:10,200 --> 00:00:10,800\nDialogue\n",
+        encoding="utf-8",
+    )
+
+    project = Project(id="p-dialogue-sidecar", output_language="de")
+    transcription = Transcription(
+        language="fr",
+        scenes=[
+            SceneTranscription(
+                scene_index=0,
+                text="",
+                words=[],
+                start_time=5.0,
+                end_time=6.0,
+                is_raw=True,
+            )
+        ],
+    )
+    resolved_scene_sources = {
+        0: ResolvedSceneSource(
+            scene_index=0,
+            source_path=source_path,
+            clip_name="episode",
+            source_in_frame=240,
+            source_out_frame=264,
+            source_in_seconds=10.0,
+            source_out_seconds=11.0,
+            source_duration_seconds=1.0,
+        )
+    }
+
+    text_entries, image_entries = asyncio.run(
+        ProcessingService._collect_raw_scene_source_subtitles(
+            project,
+            transcription,
+            resolved_scene_sources,
+            tmp_path / "output",
+        )
+    )
+
+    assert image_entries == []
+    assert [(round(entry.start, 1), round(entry.end, 1), entry.text) for entry in text_entries] == [
+        (5.2, 5.8, "Dialogue"),
+    ]
+
+
+def test_collect_raw_scene_source_subtitles_merges_same_language_tracks_with_priority_and_dedup(
+    tmp_path,
+):
+    source_path = tmp_path / "episode.mkv"
+    normalized_source_path = source_path.with_suffix(".mp4")
+    sidecar_dir = AnimeLibraryService.get_subtitle_sidecar_dir(normalized_source_path)
+    sidecar_dir.mkdir(parents=True)
+    (sidecar_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "source_path": str(normalized_source_path),
+                "generated_from": str(source_path),
+                "subtitle_streams": [
+                    {
+                        "stream_index": 2,
+                        "stream_position": 0,
+                        "codec_name": "ass",
+                        "language": "en",
+                        "raw_language": "eng",
+                        "title": "English Dialogue",
+                        "kind": "text",
+                        "asset_filename": "subtitle_stream_00_en.srt",
+                        "status": "ok",
+                        "error": None,
+                    },
+                    {
+                        "stream_index": 3,
+                        "stream_position": 1,
+                        "codec_name": "ass",
+                        "language": "en",
+                        "raw_language": "eng",
+                        "title": "English SDH",
+                        "kind": "text",
+                        "asset_filename": "subtitle_stream_01_en.srt",
+                        "status": "ok",
+                        "error": None,
+                    },
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (sidecar_dir / "subtitle_stream_00_en.srt").write_text(
+        "\n".join(
+            [
+                "1",
+                "00:00:10,000 --> 00:00:10,800",
+                "Hello",
+                "",
+                "2",
+                "00:00:11,100 --> 00:00:11,400",
+                "Next",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (sidecar_dir / "subtitle_stream_01_en.srt").write_text(
+        "\n".join(
+            [
+                "1",
+                "00:00:10,000 --> 00:00:10,800",
+                "Hello",
+                "",
+                "2",
+                "00:00:10,400 --> 00:00:11,200",
+                "[Door slams]",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    project = Project(id="p-fusion-sidecar", output_language="de")
+    transcription = Transcription(
+        language="fr",
+        scenes=[
+            SceneTranscription(
+                scene_index=0,
+                text="",
+                words=[],
+                start_time=5.0,
+                end_time=6.5,
+                is_raw=True,
+            )
+        ],
+    )
+    resolved_scene_sources = {
+        0: ResolvedSceneSource(
+            scene_index=0,
+            source_path=source_path,
+            clip_name="episode",
+            source_in_frame=240,
+            source_out_frame=276,
+            source_in_seconds=10.0,
+            source_out_seconds=11.5,
+            source_duration_seconds=1.5,
+        )
+    }
+
+    text_entries, image_entries = asyncio.run(
+        ProcessingService._collect_raw_scene_source_subtitles(
+            project,
+            transcription,
+            resolved_scene_sources,
+            tmp_path / "output",
+        )
+    )
+
+    assert image_entries == []
+    assert [(round(entry.start, 1), round(entry.end, 1), entry.text) for entry in text_entries] == [
+        (5.0, 5.8, "Hello"),
+        (5.8, 6.1, "[Door slams]"),
+        (6.1, 6.4, "Next"),
+    ]
+
+
+def test_collect_raw_scene_source_subtitles_prefers_text_over_overlapping_image_cues(
+    tmp_path,
+):
+    source_path = tmp_path / "episode.mkv"
+    normalized_source_path = source_path.with_suffix(".mp4")
+    sidecar_dir = AnimeLibraryService.get_subtitle_sidecar_dir(normalized_source_path)
+    cue_dir = sidecar_dir / "subtitle_stream_01_en_cues"
+    cue_dir.mkdir(parents=True)
+    (sidecar_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "source_path": str(normalized_source_path),
+                "generated_from": str(source_path),
+                "subtitle_streams": [
+                    {
+                        "stream_index": 2,
+                        "stream_position": 0,
+                        "codec_name": "ass",
+                        "language": "en",
+                        "raw_language": "eng",
+                        "title": "English Dialogue",
+                        "kind": "text",
+                        "asset_filename": "subtitle_stream_00_en.srt",
+                        "status": "ok",
+                        "error": None,
+                    },
+                    {
+                        "stream_index": 3,
+                        "stream_position": 1,
+                        "codec_name": "hdmv_pgs_subtitle",
+                        "language": "en",
+                        "raw_language": "eng",
+                        "title": "English Signs",
+                        "kind": "image",
+                        "asset_filename": "subtitle_stream_01_en.sup",
+                        "cue_manifest_filename": "subtitle_stream_01_en.cues.json",
+                        "status": "ok",
+                        "error": None,
+                    },
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (sidecar_dir / "subtitle_stream_00_en.srt").write_text(
+        "1\n00:00:10,200 --> 00:00:10,600\nText\n",
+        encoding="utf-8",
+    )
+    (sidecar_dir / "subtitle_stream_01_en.sup").write_bytes(b"sup")
+    cue_asset = cue_dir / "cue_0001.png"
+    cue_asset.write_bytes(b"png")
+    (sidecar_dir / "subtitle_stream_01_en.cues.json").write_text(
+        json.dumps(
+            {
+                "cues": [
+                    {
+                        "cue_index": 1,
+                        "start": 10.0,
+                        "end": 11.0,
+                        "asset_filename": "subtitle_stream_01_en_cues/cue_0001.png",
+                    }
+                ]
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    project = Project(id="p-text-image-sidecar", output_language="de")
+    transcription = Transcription(
+        language="fr",
+        scenes=[
+            SceneTranscription(
+                scene_index=0,
+                text="",
+                words=[],
+                start_time=5.0,
+                end_time=6.0,
+                is_raw=True,
+            )
+        ],
+    )
+    resolved_scene_sources = {
+        0: ResolvedSceneSource(
+            scene_index=0,
+            source_path=source_path,
+            clip_name="episode",
+            source_in_frame=240,
+            source_out_frame=264,
+            source_in_seconds=10.0,
+            source_out_seconds=11.0,
+            source_duration_seconds=1.0,
+        )
+    }
+
+    text_entries, image_entries = asyncio.run(
+        ProcessingService._collect_raw_scene_source_subtitles(
+            project,
+            transcription,
+            resolved_scene_sources,
+            tmp_path / "output",
+        )
+    )
+
+    assert [(round(entry.start, 1), round(entry.end, 1), entry.text) for entry in text_entries] == [
+        (5.2, 5.6, "Text"),
+    ]
+    assert [(round(entry.start, 1), round(entry.end, 1)) for entry in image_entries] == [
+        (5.0, 5.2),
+        (5.6, 6.0),
+    ]
+    assert len({entry.relative_asset_path for entry in image_entries}) == 1
+    assert (tmp_path / "output" / "raw_scene_subtitles" / "manifest.json").exists()
+
+
+def test_build_raw_scene_image_render_plan_uses_only_overlapping_image_tracks_from_selected_language(
+    tmp_path,
+):
+    source_path = tmp_path / "episode.mkv"
+    normalized_source_path = source_path.with_suffix(".mp4")
+    sidecar_dir = AnimeLibraryService.get_subtitle_sidecar_dir(normalized_source_path)
+    sidecar_dir.mkdir(parents=True)
+    (sidecar_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "source_path": str(normalized_source_path),
+                "generated_from": str(source_path),
+                "subtitle_streams": [
+                    {
+                        "stream_index": 2,
+                        "stream_position": 0,
+                        "codec_name": "hdmv_pgs_subtitle",
+                        "language": "en",
+                        "raw_language": "eng",
+                        "title": "English Signs",
+                        "kind": "image",
+                        "asset_filename": "subtitle_stream_00_en.sup",
+                        "cue_manifest_filename": "subtitle_stream_00_en.cues.json",
+                        "status": "ok",
+                        "error": None,
+                    },
+                    {
+                        "stream_index": 3,
+                        "stream_position": 1,
+                        "codec_name": "hdmv_pgs_subtitle",
+                        "language": "en",
+                        "raw_language": "eng",
+                        "title": "English Dialogue",
+                        "kind": "image",
+                        "asset_filename": "subtitle_stream_01_en.sup",
+                        "cue_manifest_filename": "subtitle_stream_01_en.cues.json",
+                        "status": "ok",
+                        "error": None,
+                    },
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (sidecar_dir / "subtitle_stream_00_en.cues.json").write_text(
+        json.dumps({"cues": [{"cue_index": 1, "start": 3.0, "end": 3.4}]}, indent=2),
+        encoding="utf-8",
+    )
+    (sidecar_dir / "subtitle_stream_01_en.cues.json").write_text(
+        json.dumps({"cues": [{"cue_index": 1, "start": 1.5, "end": 2.0}]}, indent=2),
+        encoding="utf-8",
+    )
+
+    project = Project(id="p-image-plan", output_language="de")
+    transcription = Transcription(
+        language="fr",
+        scenes=[
+            SceneTranscription(
+                scene_index=0,
+                text="",
+                words=[],
+                start_time=0.0,
+                end_time=2.0,
+                is_raw=True,
+            )
+        ],
+    )
+    resolved_scene_sources = {
+        0: ResolvedSceneSource(
+            scene_index=0,
+            source_path=source_path,
+            clip_name="episode",
+            source_in_frame=30,
+            source_out_frame=66,
+            source_in_seconds=1.25,
+            source_out_seconds=2.75,
+            source_duration_seconds=1.5,
+        )
+    }
+
+    render_plan = asyncio.run(
+        ProcessingService._build_raw_scene_image_render_plan(
+            project,
+            transcription,
+            resolved_scene_sources,
+        )
+    )
+
+    assert render_plan == {
+        source_path: {
+            1: [(1.25, 2.75)],
+        }
+    }
+
+
 def test_process_passes_project_output_language_to_source_normalization(
     monkeypatch,
     tmp_path,
@@ -498,7 +922,7 @@ def test_process_passes_project_output_language_to_source_normalization(
 
     source_path = tmp_path / "episode.mp4"
     source_path.write_bytes(b"video")
-    calls: list[tuple[Path, str | None, dict[int, list[tuple[float, float]]] | None]] = []
+    calls: list[tuple[Path, str | None, dict[int, list[tuple[float, float]]] | None, str | None]] = []
 
     async def _fake_normalize_source(
         cls,
@@ -506,8 +930,9 @@ def test_process_passes_project_output_language_to_source_normalization(
         *,
         preferred_audio_language: str | None = None,
         subtitle_image_render_windows=None,
+        project_id: str | None = None,
     ) -> SourceNormalizationResult:
-        calls.append((path, preferred_audio_language, subtitle_image_render_windows))
+        calls.append((path, preferred_audio_language, subtitle_image_render_windows, project_id))
         return SourceNormalizationResult(
             action="noop",
             source_path=path,
@@ -593,7 +1018,7 @@ def test_process_passes_project_output_language_to_source_normalization(
 
     asyncio.run(_run())
 
-    assert calls == [(source_path, "fr", {2: [(1.0, 2.0)]})]
+    assert calls == [(source_path, "fr", {2: [(1.0, 2.0)]}, "p-audio-pref")]
 
 
 def test_render_jsx_from_template_includes_dedicated_raw_scene_text_subtitle_paths():
