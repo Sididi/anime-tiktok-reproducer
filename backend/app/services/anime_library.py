@@ -1389,6 +1389,90 @@ class AnimeLibraryService:
         return project_root.joinpath(*relative_parts)
 
     @classmethod
+    def _is_processing_normalized_target(
+        cls,
+        target_path: Path,
+        *,
+        project_id: str | None,
+    ) -> bool:
+        if not project_id:
+            return False
+
+        from .project_service import ProjectService
+
+        processing_root = ProjectService.get_project_dir(project_id) / "processing_sources"
+        try:
+            target_resolved = target_path.resolve()
+            processing_root_resolved = processing_root.resolve()
+        except OSError:
+            return False
+
+        try:
+            target_resolved.relative_to(processing_root_resolved)
+        except ValueError:
+            return False
+        return True
+
+    @classmethod
+    def _manifest_path_from_payload(
+        cls,
+        payload: dict[str, Any] | None,
+        *keys: str,
+    ) -> Path | None:
+        if not isinstance(payload, dict):
+            return None
+        for key in keys:
+            raw_value = str(payload.get(key, "")).strip()
+            if raw_value:
+                return Path(raw_value)
+        return None
+
+    @classmethod
+    def _build_processing_refresh_plan_sync(
+        cls,
+        source_path: Path,
+        *,
+        preferred_audio_language: str | None = None,
+        target_path: Path | None = None,
+    ) -> SourceNormalizationPlan | None:
+        payload = cls._load_source_import_manifest_sync(source_path)
+        rebuild_source_path = cls._manifest_path_from_payload(
+            payload,
+            "source_path",
+            "original_source_path",
+        )
+        if rebuild_source_path is None or not rebuild_source_path.exists():
+            return None
+
+        resolved_target_path = target_path or source_path
+        try:
+            if rebuild_source_path.resolve() == source_path.resolve():
+                return None
+            if resolved_target_path.resolve() != source_path.resolve():
+                return None
+        except OSError:
+            return None
+
+        rebuild_probe = cls._probe_media_sync(rebuild_source_path)
+        if rebuild_probe is None:
+            return None
+        if rebuild_probe.duration is None or rebuild_probe.video_codec is None:
+            return None
+
+        rebuild_probe = cls._with_preferred_audio_stream(
+            rebuild_probe,
+            target_language=preferred_audio_language,
+            source_import_payload=payload,
+        )
+        return SourceNormalizationPlan(
+            action=cls.classify_source_normalization(rebuild_probe),
+            source_path=rebuild_source_path,
+            target_path=resolved_target_path,
+            probe=rebuild_probe,
+            cleanup_source_after_commit=False,
+        )
+
+    @classmethod
     def _serialize_source_import_audio_stream(
         cls,
         stream: SourceMediaStream,
@@ -2864,10 +2948,23 @@ class AnimeLibraryService:
             source_path,
             project_id=project_id,
         )
+        is_processing_target = await asyncio.to_thread(
+            cls._is_processing_normalized_target,
+            target_path,
+            project_id=project_id,
+        )
         source_import_payload = await asyncio.to_thread(
             cls._load_source_import_manifest_sync,
             source_path,
         )
+        refresh_plan = None
+        if is_processing_target:
+            refresh_plan = await asyncio.to_thread(
+                cls._build_processing_refresh_plan_sync,
+                source_path,
+                preferred_audio_language=preferred_audio_language,
+                target_path=target_path,
+            )
         plan = await asyncio.to_thread(
             cls._build_source_normalization_plan_sync,
             source_path,
@@ -2880,9 +2977,20 @@ class AnimeLibraryService:
             preferred_audio_language=preferred_audio_language,
             target_path=target_path,
         )
-        if reimport_plan is not None:
+        if refresh_plan is not None:
+            plan = refresh_plan
+        elif reimport_plan is not None:
             plan = reimport_plan
-        elif plan.action == "noop":
+        if is_processing_target:
+            plan = replace(plan, cleanup_source_after_commit=False)
+
+        should_return_noop = plan.action == "noop"
+        if should_return_noop:
+            try:
+                should_return_noop = target_path.resolve() == plan.source_path.resolve()
+            except OSError:
+                should_return_noop = target_path == plan.source_path
+        if should_return_noop:
             return SourceNormalizationResult(
                 action=plan.action,
                 source_path=plan.source_path,
@@ -2895,17 +3003,13 @@ class AnimeLibraryService:
         tmp_path = target_path.with_name(f"{target_path.stem}.normalize.tmp{tmp_suffix}")
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
-        manifest_original_source_raw = (
-            str(source_import_payload.get("original_source_path", "")).strip()
-            if isinstance(source_import_payload, dict)
-            else ""
-        )
-        if not manifest_original_source_raw and isinstance(source_import_payload, dict):
-            manifest_original_source_raw = str(source_import_payload.get("source_path", "")).strip()
         manifest_original_source_path = (
-            Path(manifest_original_source_raw)
-            if manifest_original_source_raw
-            else plan.source_path
+            cls._manifest_path_from_payload(
+                source_import_payload,
+                "original_source_path",
+                "source_path",
+            )
+            or plan.source_path
         )
         sidecar_source_path = (
             cls.resolve_subtitle_sidecar_source_path(source_path)
@@ -2966,7 +3070,7 @@ class AnimeLibraryService:
                     exc,
                 )
 
-        if target_path != source_path and target_path.exists():
+        if not is_processing_target and target_path != source_path and target_path.exists():
             existing_probe = await asyncio.to_thread(cls._probe_media_sync, target_path)
             if cls._is_valid_normalized_probe(existing_probe, reference_probe=plan.probe):
                 await _preserve_target_sidecar()
@@ -2986,7 +3090,9 @@ class AnimeLibraryService:
             await asyncio.to_thread(tmp_path.unlink)
 
         try:
-            if plan.action == "remux_to_mp4":
+            if plan.action == "noop":
+                await asyncio.to_thread(shutil.copy2, plan.source_path, tmp_path)
+            elif plan.action == "remux_to_mp4":
                 try:
                     result = await cls._run_normalization_command(
                         cls._build_remux_to_mp4_cmd(

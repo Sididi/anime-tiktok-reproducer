@@ -6,11 +6,14 @@ from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from app.config import settings
+from app.models import MatchList, SceneMatch
 from app.models.project import Project
 from app.models.transcription import SceneTranscription, Transcription, Word
 from app.services.anime_library import AnimeLibraryService, SourceNormalizationResult
@@ -1021,6 +1024,176 @@ def test_process_passes_project_output_language_to_source_normalization(
     assert calls == [(source_path, "fr", {2: [(1.0, 2.0)]}, "p-audio-pref")]
 
 
+def test_process_saves_rewritten_local_match_paths_after_source_normalization(
+    monkeypatch,
+    tmp_path,
+):
+    output_dir = tmp_path / "project-output"
+    output_dir.mkdir(parents=True)
+    edited_audio_path = output_dir / "tts_edited.wav"
+    edited_audio_path.write_bytes(b"wav")
+    transcription_path = output_dir / "transcription_timing.json"
+    transcription_path.write_text(
+        json.dumps({"language": "fr", "scenes": []}),
+        encoding="utf-8",
+    )
+    (output_dir / "processing_state.json").write_text(
+        json.dumps(
+            {
+                "edited_audio_path": str(edited_audio_path),
+                "transcription_path": str(transcription_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    source_path = tmp_path / "library" / "episode.mp4"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(b"video")
+    local_processing_path = (
+        tmp_path
+        / "project"
+        / "processing_sources"
+        / "Demo Anime"
+        / "episode.mp4"
+    )
+    local_processing_path.parent.mkdir(parents=True, exist_ok=True)
+
+    match = SceneMatch(
+        scene_index=0,
+        episode="episode-1",
+        start_time=0.0,
+        end_time=1.0,
+        confidence=0.9,
+        speed_ratio=1.0,
+    )
+    saved_payloads: list[tuple[str, MatchList]] = []
+
+    async def _fake_normalize_source(
+        cls,
+        path: Path,
+        *,
+        preferred_audio_language: str | None = None,
+        subtitle_image_render_windows=None,
+        project_id: str | None = None,
+    ) -> SourceNormalizationResult:
+        return SourceNormalizationResult(
+            action="noop",
+            source_path=path,
+            normalized_path=local_processing_path,
+            changed=True,
+        )
+
+    monkeypatch.setattr(
+        ProcessingService,
+        "get_output_dir",
+        classmethod(lambda cls, _project_id: output_dir),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "check_has_saved_state",
+        classmethod(lambda cls, _project_id: True),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "check_gaps_resolved",
+        classmethod(lambda cls, _project_id: True),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "detect_first_source_fps",
+        classmethod(lambda cls, *_args, **_kwargs: asyncio.sleep(0, result=23.976)),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "resolve_scene_sources",
+        classmethod(lambda cls, *_args, **_kwargs: {}),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "_build_raw_scene_image_render_plan",
+        classmethod(lambda cls, *_args, **_kwargs: asyncio.sleep(0, result={})),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "_collect_required_source_groups",
+        classmethod(lambda cls, *_args, **_kwargs: asyncio.sleep(0, result=[(source_path, [match])])),
+    )
+
+    def _fake_update_hints(
+        source_matches,
+        *,
+        old_source_path: Path,
+        new_source_path: Path,
+        library_type: str | None = None,
+    ) -> bool:
+        source_matches[0].episode = str(new_source_path)
+        return True
+
+    monkeypatch.setattr(
+        ProcessingService,
+        "_update_absolute_match_episode_hints",
+        staticmethod(_fake_update_hints),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "_format_source_normalization_message",
+        classmethod(lambda cls, **_kwargs: "normalized"),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "normalize_source_for_processing",
+        classmethod(_fake_normalize_source),
+    )
+    monkeypatch.setattr(
+        ProjectService,
+        "save_matches",
+        classmethod(lambda cls, project_id, matches_payload: saved_payloads.append((project_id, matches_payload))),
+    )
+
+    project = Project(id="p-save-local", anime_name="Demo Anime", output_language="fr")
+    reference_transcription = Transcription(language="fr", scenes=[])
+
+    async def _run() -> None:
+        progress_iter = ProcessingService.process(
+            project,
+            new_script={"language": "fr", "scenes": []},
+            audio_path=tmp_path / "tts.wav",
+            matches=[match],
+            reference_transcription=reference_transcription,
+        )
+        while not saved_payloads:
+            try:
+                await anext(progress_iter)
+            except StopAsyncIteration:
+                break
+        await progress_iter.aclose()
+
+    asyncio.run(_run())
+
+    assert len(saved_payloads) == 1
+    assert saved_payloads[0][0] == "p-save-local"
+    assert saved_payloads[0][1].matches[0].episode == str(local_processing_path)
+
+
+def test_format_source_normalization_message_reports_project_local_noop_copy():
+    source_path = Path("/tmp/library/episode.mp4")
+    local_processing_path = Path("/tmp/project/processing_sources/episode.mp4")
+
+    message = ProcessingService._format_source_normalization_message(
+        current=1,
+        total=1,
+        result=SourceNormalizationResult(
+            action="noop",
+            source_path=source_path,
+            normalized_path=local_processing_path,
+            changed=True,
+        ),
+    )
+
+    assert message == "Prepared project-local source copy (1/1): episode.mp4"
+
+
 def test_render_jsx_from_template_includes_dedicated_raw_scene_text_subtitle_paths():
     jsx = ProcessingService._render_jsx_from_template(
         project_id="project-123",
@@ -1062,6 +1235,93 @@ def test_export_collects_internal_subtitle_timing_files(tmp_path):
     (subtitles_dir / "notes.txt").write_text("ignore", encoding="utf-8")
 
     assert ExportService._collect_subtitle_timing_files(tmp_path) == [timing_path]
+
+
+def test_export_build_manifest_includes_project_local_episode_sources(monkeypatch, tmp_path):
+    project = Project(
+        id="p-export-local",
+        anime_name="Demo Anime",
+        output_language="fr",
+    )
+    project_dir = tmp_path / "projects" / project.id
+    processing_dir = project_dir / "processing_sources" / "Demo Anime"
+    processing_dir.mkdir(parents=True)
+    episode_path = processing_dir / "episode.mp4"
+    episode_path.write_bytes(b"video")
+
+    output_dir = tmp_path / "output"
+    output_dir.mkdir(parents=True)
+    (output_dir / "import_project.jsx").write_text("// jsx", encoding="utf-8")
+    (output_dir / "tts_edited.wav").write_bytes(b"wav")
+    (output_dir / "subtitles.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\nCaption\n", encoding="utf-8")
+
+    assets_dir = tmp_path / "assets"
+    assets_dir.mkdir()
+    for asset_name in ExportService.get_required_import_assets():
+        (assets_dir / asset_name).write_text(asset_name, encoding="utf-8")
+
+    monkeypatch.setattr(ExportService, "get_output_dir", classmethod(lambda cls, _project_id: output_dir))
+    monkeypatch.setattr(ExportService, "get_assets_dir", classmethod(lambda cls: assets_dir))
+    monkeypatch.setattr(
+        ExportService,
+        "_resolve_selected_music_path",
+        classmethod(lambda cls, _project: None),
+    )
+    monkeypatch.setattr(
+        ProjectService,
+        "get_project_dir",
+        staticmethod(lambda _project_id: project_dir),
+    )
+
+    match = SceneMatch(
+        scene_index=0,
+        episode=str(episode_path),
+        start_time=0.0,
+        end_time=1.0,
+        confidence=0.9,
+        speed_ratio=1.0,
+    )
+
+    folder, entries = ExportService.build_manifest(project, [match])
+
+    source_entries = [
+        entry
+        for entry in entries
+        if entry.relative_path == f"{folder}/sources/{episode_path.name}"
+    ]
+    assert len(source_entries) == 1
+    assert source_entries[0].source_path == episode_path
+
+
+def test_export_collect_episode_sources_fails_for_non_local_processing_refs(monkeypatch, tmp_path):
+    project = Project(
+        id="p-export-strict",
+        anime_name="Demo Anime",
+        output_language="fr",
+    )
+    project_dir = tmp_path / "projects" / project.id
+    (project_dir / "processing_sources").mkdir(parents=True)
+
+    monkeypatch.setattr(
+        ProjectService,
+        "get_project_dir",
+        staticmethod(lambda _project_id: project_dir),
+    )
+
+    match = SceneMatch(
+        scene_index=0,
+        episode="episode-1",
+        start_time=0.0,
+        end_time=1.0,
+        confidence=0.9,
+        speed_ratio=1.0,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        ExportService._collect_episode_sources(project, [match])
+
+    assert "project-local prepared files" in str(exc_info.value)
+    assert "Rerun /processing" in str(exc_info.value)
 
 
 def test_export_build_manifest_archives_subtitles(monkeypatch, tmp_path):

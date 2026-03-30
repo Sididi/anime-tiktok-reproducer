@@ -406,7 +406,9 @@ class ProcessingService:
         if not result.changed:
             return f"Source already compatible ({current}/{total}): {result.source_path.name}"
 
-        if result.action == "remux_to_mp4":
+        if result.action == "noop":
+            action = "Prepared project-local source copy"
+        elif result.action == "remux_to_mp4":
             action = "Remuxed source for Premiere"
         elif result.action in {"audio_to_aac", "remux_audio_select"}:
             action = "Prepared source audio track for Premiere"
@@ -2466,7 +2468,6 @@ class ProcessingService:
                         # Backup current matches before modification
                         matches_backup_path = project_dir / "matches_before_gaps.json"
                         if not matches_backup_path.exists():
-                            from ..models import MatchList
                             matches_path = project_dir / "matches.json"
                             if matches_path.exists():
                                 shutil.copy(matches_path, matches_backup_path)
@@ -2499,7 +2500,6 @@ class ProcessingService:
                                         break
 
                         # Save updated matches
-                        from ..models import MatchList
                         ProjectService.save_matches(project.id, MatchList(matches=matches))
                         (project_dir / "gaps_resolved.flag").touch()
 
