@@ -1220,6 +1220,44 @@ def test_render_jsx_from_template_includes_dedicated_raw_scene_text_subtitle_pat
     assert "Script Complete (v7.7 Layered - Presets + External Subtitle MOGRTs)." not in jsx
 
 
+def test_render_jsx_from_template_clears_a4_before_raw_audio_rebuild():
+    jsx = ProcessingService._render_jsx_from_template(
+        project_id="project-raw-a4",
+        scenes=[
+            {
+                "scene_index": 7,
+                "start": 335.183333,
+                "end": 338.185667,
+                "text": "",
+                "clipName": "S01E03-Our First Date [AA9843FE]",
+                "source_in_frame": 12804,
+                "source_out_frame": 12876,
+                "source_in": 534.0335,
+                "source_out": 537.0365,
+                "target_duration": 3.002334,
+                "is_raw": True,
+            }
+        ],
+        source_audio_policies={},
+        source_fps_num=24000,
+        source_fps_den=1001,
+        subtitle_timing_relative_path="subtitles/classic_timings.srt",
+        raw_scene_subtitle_timing_relative_path="raw_scene_subtitles/raw_text.srt",
+        raw_scene_subtitle_mogrt_relative_dir="raw_scene_subtitles/raw_text_mogrts",
+        music_filename="",
+        music_gain_db=-24.0,
+    )
+
+    assert "clearTrackClips(a4);" in jsx
+    assert "duplicateRawSceneAudioToTrack(a4, scenes);" in jsx
+    assert "function clearTrackClips(track)" in jsx
+    assert "clip.remove(false, true);" in jsx
+    assert "validateRawAudioTrack(a4, scenes, sequenceEndSec);" not in jsx
+    assert "waitForTrackItemAtExactStart(" not in jsx
+    assert 'var clipKey = normalizeLooseName(scene.clipName || "");' not in jsx
+    assert "a4.overwriteClip(subclip, secondsToTicks(startSec).toString());" not in jsx
+
+
 def test_export_collects_internal_subtitle_timing_files(tmp_path):
     subtitles_dir = tmp_path / "subtitles"
     subtitles_dir.mkdir(parents=True)

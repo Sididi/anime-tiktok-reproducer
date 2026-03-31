@@ -2057,6 +2057,7 @@
       }
     }
 
+    clearTrackClips(a4);
     duplicateRawSceneAudioToTrack(a4, scenes);
 
     log("Adding overlays on V5 and V6...");
@@ -5168,6 +5169,21 @@
             } catch (e2) {}
           }
         }
+      }
+    }
+  }
+
+  function clearTrackClips(track) {
+    if (!track || !track.clips) return;
+    for (var i = track.clips.numItems - 1; i >= 0; i--) {
+      var clip = track.clips[i];
+      if (!clip) continue;
+      try {
+        clip.remove(false, true);
+      } catch (e0) {
+        try {
+          clip.remove();
+        } catch (e1) {}
       }
     }
   }
