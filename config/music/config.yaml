@@ -1,4 +1,4 @@
-default_music_key: royalty
+default_music_key: kentenshi_paranoia
 
 music:
   credits_song_death:
@@ -42,3 +42,8 @@ music:
     file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/night cruising.wav"
     volume_db: -30
     copyright: true
+
+  kentenshi_paranoia:
+    display_name: "Kentenshi Paranoia"
+    file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/kentenshi paranoia.wav"
+    volume_db: -30

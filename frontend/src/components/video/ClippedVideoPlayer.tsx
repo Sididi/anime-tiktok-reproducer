@@ -212,15 +212,6 @@ export const ClippedVideoPlayer = forwardRef<
     }
   }, []);
 
-  const detachActiveSource = useCallback(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    suppressIntentionalUnloadErrors();
-    video.pause();
-    video.removeAttribute("src");
-    video.load();
-  }, [suppressIntentionalUnloadErrors]);
-
   const resetLoadState = useCallback(
     (
       options: {
@@ -241,6 +232,54 @@ export const ClippedVideoPlayer = forwardRef<
       }
     },
     [resolveReadyWaiters, resetClipEndedState],
+  );
+
+  const teardownMedia = useCallback(
+    (
+      options: {
+        suppressErrors?: boolean;
+        clearError?: boolean;
+        resetPreload?: boolean;
+      } = {},
+    ) => {
+      const {
+        suppressErrors = false,
+        clearError = true,
+        resetPreload = true,
+      } = options;
+
+      cancelPendingAcquire();
+      if (suppressErrors) {
+        suppressIntentionalUnloadErrors();
+      } else {
+        clearIntentionalUnloadSuppression();
+      }
+
+      const video = videoRef.current;
+      if (video) {
+        video.pause();
+        video.removeAttribute("src");
+        video.load();
+      }
+
+      sourceAttachedRef.current = false;
+      if (isMountedRef.current) {
+        setIsSourceAttached(false);
+        resetLoadState({ clearError, resetPreload });
+      } else {
+        resolveReadyWaiters(true);
+      }
+
+      releasePoolSlot();
+    },
+    [
+      cancelPendingAcquire,
+      clearIntentionalUnloadSuppression,
+      releasePoolSlot,
+      resetLoadState,
+      resolveReadyWaiters,
+      suppressIntentionalUnloadErrors,
+    ],
   );
 
   const requestPoolSlot = useCallback(
@@ -301,13 +340,8 @@ export const ClippedVideoPlayer = forwardRef<
     return new Promise<void>((resolve) => {
       setIsRetrying(true);
       setLoadRequestedState(true);
-      setHasError(false);
-      hasErrorRef.current = false;
-      setIsLoaded(false);
       setPreloadMode("auto");
-      resolveReadyWaiters(true);
-      setSourceAttachedState(false);
-      detachActiveSource();
+      teardownMedia({ suppressErrors: true, resetPreload: false });
 
       // Small delay to ensure video element is unmounted before creating new one
       window.setTimeout(() => {
@@ -316,12 +350,7 @@ export const ClippedVideoPlayer = forwardRef<
         resolve();
       }, 100);
     });
-  }, [
-    detachActiveSource,
-    resolveReadyWaiters,
-    setLoadRequestedState,
-    setSourceAttachedState,
-  ]);
+  }, [setLoadRequestedState, teardownMedia]);
 
   // Expose playback control methods to parent
   useImperativeHandle(
@@ -471,25 +500,13 @@ export const ClippedVideoPlayer = forwardRef<
 
   useEffect(() => {
     isMountedRef.current = true;
-    const video = videoRef.current;
     return () => {
       isMountedRef.current = false;
-      cancelPendingAcquire();
-      clearIntentionalUnloadSuppression();
-      if (video) {
-        video.pause();
-        video.removeAttribute("src");
-        video.load();
-      }
-      resolveReadyWaiters(true);
-      releasePoolSlot();
+      // Read the live ref during cleanup so SPA route transitions always
+      // detach the actual mounted media element.
+      teardownMedia();
     };
-  }, [
-    cancelPendingAcquire,
-    clearIntentionalUnloadSuppression,
-    releasePoolSlot,
-    resolveReadyWaiters,
-  ]);
+  }, [teardownMedia]);
 
   /* eslint-disable react-hooks/set-state-in-effect */
   // Intersection Observer for lazy loading AND unloading
@@ -537,11 +554,7 @@ export const ClippedVideoPlayer = forwardRef<
 
   useEffect(() => {
     if (!loadRequested) {
-      cancelPendingAcquire();
-      setSourceAttachedState(false);
-      detachActiveSource();
-      resetLoadState();
-      releasePoolSlot();
+      teardownMedia({ suppressErrors: true });
       return;
     }
 
@@ -561,16 +574,13 @@ export const ClippedVideoPlayer = forwardRef<
 
     requestPoolSlot(preloadMode === "auto");
   }, [
-    cancelPendingAcquire,
-    detachActiveSource,
     hasSlot,
     isRetrying,
     loadRequested,
     preloadMode,
-    releasePoolSlot,
     requestPoolSlot,
-    resetLoadState,
     setSourceAttachedState,
+    teardownMedia,
   ]);
   /* eslint-enable react-hooks/set-state-in-effect */
 
