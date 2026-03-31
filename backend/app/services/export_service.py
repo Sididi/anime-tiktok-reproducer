@@ -14,6 +14,7 @@ from typing import Any, Callable
 
 from ..config import settings
 from ..models import Project, SceneMatch
+from .anime_library import AnimeLibraryService
 from .google_drive_service import GoogleDriveService
 from .music_config_service import MusicConfigService
 from .project_service import ProjectService
@@ -315,38 +316,49 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
         project: Project,
         matches: list[SceneMatch],
     ) -> list[Path]:
-        processing_root = ProjectService.get_project_dir(project.id) / "processing_sources"
-        try:
-            processing_root_resolved = processing_root.resolve()
-        except OSError as exc:
-            raise RuntimeError(
-                f"Unable to resolve project-local processing sources for export: {processing_root}"
-            ) from exc
+        def _resolve_export_source_path(episode_ref: str) -> Path | None:
+            episode_ref = str(episode_ref or "").strip()
+            if not episode_ref:
+                return None
+
+            candidate = Path(episode_ref)
+            if candidate.is_absolute() and candidate.exists():
+                payload = AnimeLibraryService._load_source_import_manifest_sync(candidate)
+                if isinstance(payload, dict):
+                    for key in ("original_source_path", "source_path"):
+                        raw_path = str(payload.get(key, "")).strip()
+                        if not raw_path:
+                            continue
+                        manifest_path = Path(raw_path)
+                        if manifest_path.exists():
+                            return manifest_path
+                return candidate
+
+            resolved = AnimeLibraryService.resolve_episode_path(
+                episode_ref,
+                library_type=project.library_type,
+            )
+            if resolved is not None and resolved.exists():
+                return resolved
+
+            if candidate.exists():
+                return candidate
+            return None
 
         seen: set[str] = set()
         sources: list[Path] = []
-        invalid_refs: list[str] = []
+        unresolved_refs: list[str] = []
         missing_refs: list[str] = []
         for match in matches:
             episode_ref = str(match.episode or "").strip()
             if not episode_ref:
                 continue
-            candidate = Path(episode_ref)
-            if not candidate.is_absolute():
-                invalid_refs.append(episode_ref)
-                continue
-            try:
-                resolved = candidate.resolve()
-            except OSError:
-                missing_refs.append(episode_ref)
-                continue
-            try:
-                resolved.relative_to(processing_root_resolved)
-            except ValueError:
-                invalid_refs.append(episode_ref)
+            resolved = _resolve_export_source_path(episode_ref)
+            if resolved is None:
+                unresolved_refs.append(episode_ref)
                 continue
             if not resolved.exists() or not resolved.is_file():
-                missing_refs.append(episode_ref)
+                missing_refs.append(str(resolved))
                 continue
             key = str(resolved)
             if key in seen:
@@ -354,16 +366,16 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
             seen.add(key)
             sources.append(resolved)
 
-        if invalid_refs or missing_refs:
+        if unresolved_refs or missing_refs:
             details: list[str] = []
-            if invalid_refs:
-                unique_invalid_refs = list(dict.fromkeys(invalid_refs))
-                invalid_preview = ", ".join(unique_invalid_refs[:3])
-                if len(unique_invalid_refs) > 3:
+            if unresolved_refs:
+                unique_unresolved_refs = list(dict.fromkeys(unresolved_refs))
+                invalid_preview = ", ".join(unique_unresolved_refs[:3])
+                if len(unique_unresolved_refs) > 3:
                     invalid_preview += ", ..."
                 details.append(
-                    "Matched episode refs are not project-local prepared files under "
-                    f"{processing_root_resolved}: {invalid_preview}"
+                    "Matched episode refs could not be resolved to library sources: "
+                    f"{invalid_preview}"
                 )
             if missing_refs:
                 unique_missing_refs = list(dict.fromkeys(missing_refs))
@@ -371,9 +383,11 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
                 if len(unique_missing_refs) > 3:
                     missing_preview += ", ..."
                 details.append(
-                    f"Missing project-local prepared episode files: {missing_preview}"
+                    f"Resolved source episode files are missing: {missing_preview}"
                 )
-            details.append("Rerun /processing before exporting this project bundle.")
+            details.append(
+                "Ensure the source episode exists in the hydrated library, then rerun /processing."
+            )
             raise RuntimeError(" ".join(details))
         return sources
 

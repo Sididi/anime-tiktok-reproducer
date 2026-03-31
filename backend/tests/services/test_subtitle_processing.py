@@ -13,10 +13,10 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from app.config import settings
-from app.models import MatchList, SceneMatch
+from app.models import SceneMatch
 from app.models.project import Project
 from app.models.transcription import SceneTranscription, Transcription, Word
-from app.services.anime_library import AnimeLibraryService, SourceNormalizationResult
+from app.services.anime_library import AnimeLibraryService, SourceAudioSelectionPolicy
 from app.services.export_service import ExportService
 from app.services.forced_alignment import ForcedAlignmentService
 from app.services.processing import ProcessingService, ResolvedSceneSource
@@ -900,7 +900,7 @@ def test_build_raw_scene_image_render_plan_uses_only_overlapping_image_tracks_fr
     }
 
 
-def test_process_passes_project_output_language_to_source_normalization(
+def test_process_passes_project_output_language_to_source_audio_policy_builder(
     monkeypatch,
     tmp_path,
 ):
@@ -925,22 +925,22 @@ def test_process_passes_project_output_language_to_source_normalization(
 
     source_path = tmp_path / "episode.mp4"
     source_path.write_bytes(b"video")
-    calls: list[tuple[Path, str | None, dict[int, list[tuple[float, float]]] | None, str | None]] = []
+    calls: list[tuple[Path, str | None]] = []
 
-    async def _fake_normalize_source(
+    def _fake_build_source_audio_policy(
         cls,
         path: Path,
         *,
-        preferred_audio_language: str | None = None,
-        subtitle_image_render_windows=None,
-        project_id: str | None = None,
-    ) -> SourceNormalizationResult:
-        calls.append((path, preferred_audio_language, subtitle_image_render_windows, project_id))
-        return SourceNormalizationResult(
-            action="noop",
-            source_path=path,
-            normalized_path=path,
-            changed=False,
+        target_language: str | None = None,
+    ) -> SourceAudioSelectionPolicy:
+        calls.append((path, target_language))
+        return SourceAudioSelectionPolicy(
+            selected_stream_index=1,
+            selected_stream_position=0,
+            selected_language="fr",
+            selected_channel_count=2,
+            selected_channel_offset=0,
+            channel_type="stereo",
         )
 
     monkeypatch.setattr(
@@ -965,9 +965,6 @@ def test_process_passes_project_output_language_to_source_normalization(
     async def _fake_build_raw_scene_image_render_plan(cls, *_args, **_kwargs):
         return {source_path: {2: [(1.0, 2.0)]}}
 
-    async def _fake_collect_required_source_groups(cls, *_args, **_kwargs):
-        return [(source_path, [])]
-
     monkeypatch.setattr(
         ProcessingService,
         "detect_first_source_fps",
@@ -975,8 +972,26 @@ def test_process_passes_project_output_language_to_source_normalization(
     )
     monkeypatch.setattr(
         ProcessingService,
+        "generate_jsx_script",
+        classmethod(lambda cls, *_args, **_kwargs: "// jsx"),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
         "resolve_scene_sources",
-        classmethod(lambda cls, *_args, **_kwargs: {}),
+        classmethod(
+            lambda cls, *_args, **_kwargs: {
+                0: ResolvedSceneSource(
+                    scene_index=0,
+                    source_path=source_path,
+                    clip_name="episode",
+                    source_in_frame=0,
+                    source_out_frame=24,
+                    source_in_seconds=0.0,
+                    source_out_seconds=1.0,
+                    source_duration_seconds=1.0,
+                )
+            }
+        ),
     )
     monkeypatch.setattr(
         ProcessingService,
@@ -984,24 +999,9 @@ def test_process_passes_project_output_language_to_source_normalization(
         classmethod(_fake_build_raw_scene_image_render_plan),
     )
     monkeypatch.setattr(
-        ProcessingService,
-        "_collect_required_source_groups",
-        classmethod(_fake_collect_required_source_groups),
-    )
-    monkeypatch.setattr(
-        ProcessingService,
-        "_update_absolute_match_episode_hints",
-        classmethod(lambda cls, *_args, **_kwargs: False),
-    )
-    monkeypatch.setattr(
-        ProcessingService,
-        "_format_source_normalization_message",
-        classmethod(lambda cls, **_kwargs: "normalized"),
-    )
-    monkeypatch.setattr(
         AnimeLibraryService,
-        "normalize_source_for_processing",
-        classmethod(_fake_normalize_source),
+        "build_source_audio_selection_policy",
+        classmethod(_fake_build_source_audio_policy),
     )
 
     project = Project(id="p-audio-pref", output_language="fr")
@@ -1015,16 +1015,16 @@ def test_process_passes_project_output_language_to_source_normalization(
             matches=[],
             reference_transcription=reference_transcription,
         )
-        await anext(progress_iter)
-        await anext(progress_iter)
+        while not calls:
+            await anext(progress_iter)
         await progress_iter.aclose()
 
     asyncio.run(_run())
 
-    assert calls == [(source_path, "fr", {2: [(1.0, 2.0)]}, "p-audio-pref")]
+    assert calls == [(source_path, "fr")]
 
 
-def test_process_saves_rewritten_local_match_paths_after_source_normalization(
+def test_process_does_not_rewrite_match_paths_or_save_matches_for_source_audio_policy(
     monkeypatch,
     tmp_path,
 ):
@@ -1050,14 +1050,6 @@ def test_process_saves_rewritten_local_match_paths_after_source_normalization(
     source_path = tmp_path / "library" / "episode.mp4"
     source_path.parent.mkdir(parents=True, exist_ok=True)
     source_path.write_bytes(b"video")
-    local_processing_path = (
-        tmp_path
-        / "project"
-        / "processing_sources"
-        / "Demo Anime"
-        / "episode.mp4"
-    )
-    local_processing_path.parent.mkdir(parents=True, exist_ok=True)
 
     match = SceneMatch(
         scene_index=0,
@@ -1067,21 +1059,22 @@ def test_process_saves_rewritten_local_match_paths_after_source_normalization(
         confidence=0.9,
         speed_ratio=1.0,
     )
-    saved_payloads: list[tuple[str, MatchList]] = []
+    policy_calls: list[Path] = []
 
-    async def _fake_normalize_source(
+    def _fake_build_source_audio_policy(
         cls,
         path: Path,
         *,
-        preferred_audio_language: str | None = None,
-        subtitle_image_render_windows=None,
-        project_id: str | None = None,
-    ) -> SourceNormalizationResult:
-        return SourceNormalizationResult(
-            action="noop",
-            source_path=path,
-            normalized_path=local_processing_path,
-            changed=True,
+        target_language: str | None = None,
+    ) -> SourceAudioSelectionPolicy:
+        policy_calls.append(path)
+        return SourceAudioSelectionPolicy(
+            selected_stream_index=1,
+            selected_stream_position=0,
+            selected_language=target_language,
+            selected_channel_count=2,
+            selected_channel_offset=0,
+            channel_type="stereo",
         )
 
     monkeypatch.setattr(
@@ -1106,8 +1099,26 @@ def test_process_saves_rewritten_local_match_paths_after_source_normalization(
     )
     monkeypatch.setattr(
         ProcessingService,
+        "generate_jsx_script",
+        classmethod(lambda cls, *_args, **_kwargs: "// jsx"),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
         "resolve_scene_sources",
-        classmethod(lambda cls, *_args, **_kwargs: {}),
+        classmethod(
+            lambda cls, *_args, **_kwargs: {
+                0: ResolvedSceneSource(
+                    scene_index=0,
+                    source_path=source_path,
+                    clip_name="episode",
+                    source_in_frame=0,
+                    source_out_frame=24,
+                    source_in_seconds=0.0,
+                    source_out_seconds=1.0,
+                    source_duration_seconds=1.0,
+                )
+            }
+        ),
     )
     monkeypatch.setattr(
         ProcessingService,
@@ -1115,40 +1126,14 @@ def test_process_saves_rewritten_local_match_paths_after_source_normalization(
         classmethod(lambda cls, *_args, **_kwargs: asyncio.sleep(0, result={})),
     )
     monkeypatch.setattr(
-        ProcessingService,
-        "_collect_required_source_groups",
-        classmethod(lambda cls, *_args, **_kwargs: asyncio.sleep(0, result=[(source_path, [match])])),
-    )
-
-    def _fake_update_hints(
-        source_matches,
-        *,
-        old_source_path: Path,
-        new_source_path: Path,
-        library_type: str | None = None,
-    ) -> bool:
-        source_matches[0].episode = str(new_source_path)
-        return True
-
-    monkeypatch.setattr(
-        ProcessingService,
-        "_update_absolute_match_episode_hints",
-        staticmethod(_fake_update_hints),
-    )
-    monkeypatch.setattr(
-        ProcessingService,
-        "_format_source_normalization_message",
-        classmethod(lambda cls, **_kwargs: "normalized"),
-    )
-    monkeypatch.setattr(
         AnimeLibraryService,
-        "normalize_source_for_processing",
-        classmethod(_fake_normalize_source),
+        "build_source_audio_selection_policy",
+        classmethod(_fake_build_source_audio_policy),
     )
     monkeypatch.setattr(
         ProjectService,
         "save_matches",
-        classmethod(lambda cls, project_id, matches_payload: saved_payloads.append((project_id, matches_payload))),
+        classmethod(lambda cls, *_args, **_kwargs: pytest.fail("save_matches should not be called")),
     )
 
     project = Project(id="p-save-local", anime_name="Demo Anime", output_language="fr")
@@ -1162,42 +1147,49 @@ def test_process_saves_rewritten_local_match_paths_after_source_normalization(
             matches=[match],
             reference_transcription=reference_transcription,
         )
-        while not saved_payloads:
-            try:
-                await anext(progress_iter)
-            except StopAsyncIteration:
-                break
+        while not policy_calls:
+            await anext(progress_iter)
         await progress_iter.aclose()
 
     asyncio.run(_run())
 
-    assert len(saved_payloads) == 1
-    assert saved_payloads[0][0] == "p-save-local"
-    assert saved_payloads[0][1].matches[0].episode == str(local_processing_path)
+    assert policy_calls == [source_path]
+    assert match.episode == "episode-1"
 
 
-def test_format_source_normalization_message_reports_project_local_noop_copy():
+def test_format_source_audio_policy_message_reports_selected_stream():
     source_path = Path("/tmp/library/episode.mp4")
-    local_processing_path = Path("/tmp/project/processing_sources/episode.mp4")
-
-    message = ProcessingService._format_source_normalization_message(
+    message = ProcessingService._format_source_audio_policy_message(
         current=1,
         total=1,
-        result=SourceNormalizationResult(
-            action="noop",
-            source_path=source_path,
-            normalized_path=local_processing_path,
-            changed=True,
+        source_path=source_path,
+        policy=SourceAudioSelectionPolicy(
+            selected_stream_index=2,
+            selected_stream_position=1,
+            selected_language="ja",
+            selected_channel_count=2,
+            selected_channel_offset=2,
+            channel_type="stereo",
         ),
     )
 
-    assert message == "Prepared project-local source copy (1/1): episode.mp4"
+    assert message == "Selected source audio (1/1): episode.mp4 -> ja stream 2 (stereo)"
 
 
 def test_render_jsx_from_template_includes_dedicated_raw_scene_text_subtitle_paths():
     jsx = ProcessingService._render_jsx_from_template(
         project_id="project-123",
         scenes=[],
+        source_audio_policies={
+            "episode": {
+                "selected_stream_index": 2,
+                "selected_stream_position": 1,
+                "selected_language": "ja",
+                "selected_channel_count": 2,
+                "selected_channel_offset": 2,
+                "channel_type": "stereo",
+            }
+        },
         source_fps_num=24000,
         source_fps_den=1001,
         subtitle_timing_relative_path="subtitles/classic_timings.srt",
@@ -1220,6 +1212,8 @@ def test_render_jsx_from_template_includes_dedicated_raw_scene_text_subtitle_pat
     assert "RAW_SCENE_TEXT_SUBTITLE_SRT_PATH" in jsx
     assert 'var PROJECT_ID = "project-123";' in jsx
     assert 'var BATCH_SEQUENCE_NAME = "ATR_BATCH__project-123";' in jsx
+    assert '"episode": {' in jsx
+    assert '"selected_channel_offset": 2' in jsx
     assert 'var seqName = BATCH_SEQUENCE_NAME;' in jsx
     assert 'log("Purging project to start fresh...");' not in jsx
     assert "if (!purgeProjectCompletely())" not in jsx
@@ -1237,16 +1231,14 @@ def test_export_collects_internal_subtitle_timing_files(tmp_path):
     assert ExportService._collect_subtitle_timing_files(tmp_path) == [timing_path]
 
 
-def test_export_build_manifest_includes_project_local_episode_sources(monkeypatch, tmp_path):
+def test_export_build_manifest_includes_original_library_episode_sources(monkeypatch, tmp_path):
     project = Project(
         id="p-export-local",
         anime_name="Demo Anime",
         output_language="fr",
     )
-    project_dir = tmp_path / "projects" / project.id
-    processing_dir = project_dir / "processing_sources" / "Demo Anime"
-    processing_dir.mkdir(parents=True)
-    episode_path = processing_dir / "episode.mp4"
+    episode_path = tmp_path / "library" / "Demo Anime" / "episode.mp4"
+    episode_path.parent.mkdir(parents=True)
     episode_path.write_bytes(b"video")
 
     output_dir = tmp_path / "output"
@@ -1268,14 +1260,14 @@ def test_export_build_manifest_includes_project_local_episode_sources(monkeypatc
         classmethod(lambda cls, _project: None),
     )
     monkeypatch.setattr(
-        ProjectService,
-        "get_project_dir",
-        staticmethod(lambda _project_id: project_dir),
+        AnimeLibraryService,
+        "resolve_episode_path",
+        classmethod(lambda cls, episode_name, manifest=None, *, library_type=None: episode_path),
     )
 
     match = SceneMatch(
         scene_index=0,
-        episode=str(episode_path),
+        episode="episode-1",
         start_time=0.0,
         end_time=1.0,
         confidence=0.9,
@@ -1293,19 +1285,16 @@ def test_export_build_manifest_includes_project_local_episode_sources(monkeypatc
     assert source_entries[0].source_path == episode_path
 
 
-def test_export_collect_episode_sources_fails_for_non_local_processing_refs(monkeypatch, tmp_path):
+def test_export_collect_episode_sources_fails_for_unresolved_library_refs(monkeypatch, tmp_path):
     project = Project(
         id="p-export-strict",
         anime_name="Demo Anime",
         output_language="fr",
     )
-    project_dir = tmp_path / "projects" / project.id
-    (project_dir / "processing_sources").mkdir(parents=True)
-
     monkeypatch.setattr(
-        ProjectService,
-        "get_project_dir",
-        staticmethod(lambda _project_id: project_dir),
+        AnimeLibraryService,
+        "resolve_episode_path",
+        classmethod(lambda cls, episode_name, manifest=None, *, library_type=None: None),
     )
 
     match = SceneMatch(
@@ -1320,8 +1309,8 @@ def test_export_collect_episode_sources_fails_for_non_local_processing_refs(monk
     with pytest.raises(RuntimeError) as exc_info:
         ExportService._collect_episode_sources(project, [match])
 
-    assert "project-local prepared files" in str(exc_info.value)
-    assert "Rerun /processing" in str(exc_info.value)
+    assert "could not be resolved to library sources" in str(exc_info.value)
+    assert "hydrated library" in str(exc_info.value)
 
 
 def test_export_build_manifest_archives_subtitles(monkeypatch, tmp_path):

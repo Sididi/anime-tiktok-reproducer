@@ -121,6 +121,7 @@ class SourceMediaStream:
     stream_position: int
     codec_type: str
     codec_name: str | None
+    channels: int | None
     language: str | None
     raw_language: str | None
     title: str | None
@@ -151,24 +152,25 @@ class SourceMediaProbe:
 
 
 @dataclass(frozen=True)
-class SourceNormalizationPlan:
-    """Chosen compatibility action for one source episode."""
+class SourceAudioSelectionPolicy:
+    """Selected source-audio mapping metadata sent to the JSX template."""
 
-    action: str
-    source_path: Path
-    target_path: Path
-    probe: SourceMediaProbe
-    cleanup_source_after_commit: bool = False
+    selected_stream_index: int
+    selected_stream_position: int
+    selected_language: str | None
+    selected_channel_count: int
+    selected_channel_offset: int
+    channel_type: str
 
-
-@dataclass(frozen=True)
-class SourceNormalizationResult:
-    """Normalization result for one source episode."""
-
-    action: str
-    source_path: Path
-    normalized_path: Path
-    changed: bool
+    def to_jsx_dict(self) -> dict[str, Any]:
+        return {
+            "selected_stream_index": self.selected_stream_index,
+            "selected_stream_position": self.selected_stream_position,
+            "selected_language": self.selected_language,
+            "selected_channel_count": self.selected_channel_count,
+            "selected_channel_offset": self.selected_channel_offset,
+            "channel_type": self.channel_type,
+        }
 
 
 @dataclass(frozen=True)
@@ -887,6 +889,18 @@ class AnimeLibraryService:
             return None
         return duration
 
+    @staticmethod
+    def _parse_ffprobe_channels(raw_value: object) -> int | None:
+        if raw_value in (None, ""):
+            return None
+        try:
+            channels = int(raw_value)
+        except (TypeError, ValueError):
+            return None
+        if channels <= 0:
+            return None
+        return channels
+
     @classmethod
     def normalize_stream_language(
         cls,
@@ -988,6 +1002,7 @@ class AnimeLibraryService:
             stream_position=stream_position,
             codec_type=codec_type,
             codec_name=str(stream.get("codec_name", "")).strip().lower() or None,
+            channels=cls._parse_ffprobe_channels(stream.get("channels")),
             language=cls.normalize_stream_language(
                 raw_language,
                 title=title,
@@ -1110,6 +1125,92 @@ class AnimeLibraryService:
                 return stream
         return None
 
+    @staticmethod
+    def _ordered_audio_streams(
+        streams: tuple[SourceMediaStream, ...] | list[SourceMediaStream],
+    ) -> list[SourceMediaStream]:
+        return sorted(
+            list(streams),
+            key=lambda stream: (stream.stream_position, stream.index),
+        )
+
+    @classmethod
+    def _source_audio_channel_type(cls, channel_count: int) -> str:
+        if channel_count == 1:
+            return "mono"
+        if channel_count == 2:
+            return "stereo"
+        if channel_count == 6:
+            return "51"
+        raise RuntimeError(
+            f"Unsupported selected audio channel layout: {channel_count}. "
+            "Expected 1, 2, or 6 channels."
+        )
+
+    @classmethod
+    def build_source_audio_selection_policy(
+        cls,
+        source_path: Path,
+        *,
+        target_language: str | None = None,
+    ) -> SourceAudioSelectionPolicy:
+        probe = cls._probe_media_sync(source_path)
+        if probe is None:
+            raise RuntimeError(f"Unable to probe source media: {source_path}")
+
+        source_import_payload = cls._load_source_import_manifest_sync(source_path)
+        probe = cls._with_preferred_audio_stream(
+            probe,
+            target_language=target_language,
+            source_import_payload=source_import_payload,
+        )
+        selected_probe_stream = cls._audio_stream_by_index(
+            probe,
+            probe.selected_audio_stream_index,
+        )
+        selected_stream = (
+            probe.selected_audio_stream
+            or selected_probe_stream
+        )
+        if selected_stream is None:
+            raise RuntimeError(f"Source media has no selected audio stream: {source_path}")
+
+        selected_channel_count = cls._parse_ffprobe_channels(
+            (selected_probe_stream or selected_stream).channels
+        )
+        if selected_channel_count is None:
+            raise RuntimeError(
+                "Unable to determine selected audio channel count for "
+                f"{source_path.name} (stream {selected_stream.index})."
+            )
+
+        selected_channel_offset = 0
+        matched_stream = False
+        for stream in cls._ordered_audio_streams(probe.audio_streams):
+            if stream.index == selected_stream.index:
+                matched_stream = True
+                break
+            stream_channels = cls._parse_ffprobe_channels(stream.channels)
+            if stream_channels is None:
+                raise RuntimeError(
+                    "Unable to determine audio channel count for "
+                    f"{source_path.name} (stream {stream.index})."
+                )
+            selected_channel_offset += stream_channels
+        if not matched_stream:
+            raise RuntimeError(
+                f"Unable to locate selected audio stream {selected_stream.index} in {source_path.name}."
+            )
+
+        return SourceAudioSelectionPolicy(
+            selected_stream_index=selected_stream.index,
+            selected_stream_position=(selected_probe_stream or selected_stream).stream_position,
+            selected_language=selected_stream.language,
+            selected_channel_count=selected_channel_count,
+            selected_channel_offset=selected_channel_offset,
+            channel_type=cls._source_audio_channel_type(selected_channel_count),
+        )
+
     @classmethod
     def get_subtitle_sidecar_dir(cls, source_path: Path) -> Path:
         """Return the deterministic sidecar directory for one normalized source."""
@@ -1185,7 +1286,7 @@ class AnimeLibraryService:
                 "-show_entries",
                 (
                     "format=format_name,duration:"
-                    "stream=index,codec_type,codec_name,pix_fmt,avg_frame_rate,r_frame_rate,duration:"
+                    "stream=index,codec_type,codec_name,channels,pix_fmt,avg_frame_rate,r_frame_rate,duration:"
                     "stream_tags=language,title,handler_name:"
                     "stream_disposition=default"
                 ),
@@ -1308,169 +1409,14 @@ class AnimeLibraryService:
 
     @classmethod
     def probe_source_media_sync(cls, source_path: Path) -> SourceMediaProbe | None:
-        """Public sync probe wrapper used by normalization and tests."""
+        """Public sync probe wrapper used by source inspection and tests."""
         return cls._probe_media_sync(source_path)
-
-    @classmethod
-    def classify_source_normalization(cls, probe: SourceMediaProbe) -> str:
-        """Classify the cheapest compatibility action for Premiere-safe output.
-
-        Since format normalization now happens at indexation time (unsupported
-        sources are converted to MP4), the processing step usually only needs
-        to handle audio-track selection and container fixups.
-        """
-        video_codec = (probe.video_codec or "").strip().lower()
-        audio_codec = (probe.audio_codec or "").strip().lower()
-        has_extra_audio_streams = len(probe.audio_streams) > 1
-        has_subtitle_streams = len(probe.subtitle_streams) > 0
-        has_data_streams = len(probe.data_streams) > 0
-        premiere_compatible_container = probe.container_suffix == ".mp4"
-        premiere_compatible_video = video_codec in cls.PREMIERE_NATIVE_VIDEO_CODECS
-
-        # Already perfect: right codec, container, single audio, no junk streams.
-        if (
-            premiere_compatible_video
-            and premiere_compatible_container
-            and not has_extra_audio_streams
-            and not has_subtitle_streams
-            and not has_data_streams
-            and (not probe.has_audio or audio_codec in {"aac", "pcm_s16le", "pcm_s24le", "pcm_s32le"})
-        ):
-            return "noop"
-
-        # Source still has an incompatible video codec. Fall back to full H.264
-        # MP4 transcode.
-        if not premiere_compatible_video:
-            return "full_h264_aac_transcode"
-
-        # Container needs fixing (for example MKV/QuickTime with a native codec).
-        if not premiere_compatible_container:
-            return "remux_to_mp4"
-
-        # Multiple audio streams → need to select one and remux.
-        if has_extra_audio_streams:
-            return "remux_audio_select"
-
-        # Audio codec not Premiere-friendly for this container.
-        if probe.has_audio and audio_codec not in {"aac", "pcm_s16le", "pcm_s24le", "pcm_s32le"}:
-            return "audio_to_aac"
-
-        # Container OK but has subtitle/data streams to strip, or multiple
-        # audio streams remain.  The remux copies video and selected audio
-        # while dropping everything else.
-        return "remux_to_mp4"
 
     @staticmethod
     def _normalized_target_path(source_path: Path) -> Path:
         if source_path.suffix.lower() == ".mp4":
             return source_path
         return source_path.with_suffix(".mp4")
-
-    @classmethod
-    def _processing_normalized_target_path(
-        cls,
-        source_path: Path,
-        *,
-        project_id: str | None,
-    ) -> Path:
-        normalized_target = cls._normalized_target_path(source_path)
-        if not project_id or cls._library_context_for_path(source_path) is None:
-            return normalized_target
-
-        from .project_service import ProjectService
-
-        project_root = ProjectService.get_project_dir(project_id) / "processing_sources"
-        try:
-            library_root = cls.get_library_root().resolve()
-            relative_path = normalized_target.resolve().relative_to(library_root)
-            relative_parts = relative_path.parts[1:] if len(relative_path.parts) > 1 else relative_path.parts
-        except (OSError, ValueError):
-            relative_parts = (normalized_target.name,)
-        return project_root.joinpath(*relative_parts)
-
-    @classmethod
-    def _is_processing_normalized_target(
-        cls,
-        target_path: Path,
-        *,
-        project_id: str | None,
-    ) -> bool:
-        if not project_id:
-            return False
-
-        from .project_service import ProjectService
-
-        processing_root = ProjectService.get_project_dir(project_id) / "processing_sources"
-        try:
-            target_resolved = target_path.resolve()
-            processing_root_resolved = processing_root.resolve()
-        except OSError:
-            return False
-
-        try:
-            target_resolved.relative_to(processing_root_resolved)
-        except ValueError:
-            return False
-        return True
-
-    @classmethod
-    def _manifest_path_from_payload(
-        cls,
-        payload: dict[str, Any] | None,
-        *keys: str,
-    ) -> Path | None:
-        if not isinstance(payload, dict):
-            return None
-        for key in keys:
-            raw_value = str(payload.get(key, "")).strip()
-            if raw_value:
-                return Path(raw_value)
-        return None
-
-    @classmethod
-    def _build_processing_refresh_plan_sync(
-        cls,
-        source_path: Path,
-        *,
-        preferred_audio_language: str | None = None,
-        target_path: Path | None = None,
-    ) -> SourceNormalizationPlan | None:
-        payload = cls._load_source_import_manifest_sync(source_path)
-        rebuild_source_path = cls._manifest_path_from_payload(
-            payload,
-            "source_path",
-            "original_source_path",
-        )
-        if rebuild_source_path is None or not rebuild_source_path.exists():
-            return None
-
-        resolved_target_path = target_path or source_path
-        try:
-            if rebuild_source_path.resolve() == source_path.resolve():
-                return None
-            if resolved_target_path.resolve() != source_path.resolve():
-                return None
-        except OSError:
-            return None
-
-        rebuild_probe = cls._probe_media_sync(rebuild_source_path)
-        if rebuild_probe is None:
-            return None
-        if rebuild_probe.duration is None or rebuild_probe.video_codec is None:
-            return None
-
-        rebuild_probe = cls._with_preferred_audio_stream(
-            rebuild_probe,
-            target_language=preferred_audio_language,
-            source_import_payload=payload,
-        )
-        return SourceNormalizationPlan(
-            action=cls.classify_source_normalization(rebuild_probe),
-            source_path=rebuild_source_path,
-            target_path=resolved_target_path,
-            probe=rebuild_probe,
-            cleanup_source_after_commit=False,
-        )
 
     @classmethod
     def _serialize_source_import_audio_stream(
@@ -1480,6 +1426,7 @@ class AnimeLibraryService:
         return {
             "stream_index": stream.index,
             "stream_position": stream.stream_position,
+            "channels": stream.channels,
             "language": stream.language,
             "raw_language": stream.raw_language,
             "title": stream.title,
@@ -1516,6 +1463,7 @@ class AnimeLibraryService:
                     stream_position=stream_position,
                     codec_type="audio",
                     codec_name=None,
+                    channels=cls._parse_ffprobe_channels(raw_stream.get("channels")),
                     language=cls.normalize_stream_language(
                         raw_stream.get("language") or raw_language,
                         title=title,
@@ -1528,185 +1476,6 @@ class AnimeLibraryService:
                 )
             )
         return tuple(streams)
-
-    @classmethod
-    def _build_source_normalization_plan_sync(
-        cls,
-        source_path: Path,
-        *,
-        preferred_audio_language: str | None = None,
-        target_path: Path | None = None,
-    ) -> SourceNormalizationPlan:
-        probe = cls._probe_media_sync(source_path)
-        if probe is None:
-            raise RuntimeError(f"Unable to probe source media: {source_path}")
-        if probe.duration is None:
-            raise RuntimeError(f"Unable to determine source duration: {source_path}")
-        if probe.video_codec is None:
-            raise RuntimeError(f"Unable to determine source video codec: {source_path}")
-        source_import_payload = cls._load_source_import_manifest_sync(source_path)
-        probe = cls._with_preferred_audio_stream(
-            probe,
-            target_language=preferred_audio_language,
-            source_import_payload=source_import_payload,
-        )
-        resolved_target_path = target_path or cls._normalized_target_path(source_path)
-        return SourceNormalizationPlan(
-            action=cls.classify_source_normalization(probe),
-            source_path=source_path,
-            target_path=resolved_target_path,
-            probe=probe,
-            cleanup_source_after_commit=resolved_target_path != source_path,
-        )
-
-    @classmethod
-    def _build_processing_reimport_plan_sync(
-        cls,
-        source_path: Path,
-        *,
-        preferred_audio_language: str | None = None,
-        target_path: Path | None = None,
-    ) -> SourceNormalizationPlan | None:
-        current_probe = cls._probe_media_sync(source_path)
-        if current_probe is None:
-            return None
-        if not cls._is_valid_normalized_probe(current_probe, reference_probe=current_probe):
-            return None
-
-        payload = cls._load_source_import_manifest_sync(source_path)
-        if payload is None:
-            return None
-
-        original_source_raw = str(payload.get("original_source_path", "")).strip()
-        if not original_source_raw:
-            original_source_raw = str(payload.get("source_path", "")).strip()
-        if not original_source_raw:
-            return None
-
-        original_source_path = Path(original_source_raw)
-        try:
-            if original_source_path.resolve() == source_path.resolve():
-                return None
-        except OSError:
-            return None
-        if not original_source_path.exists():
-            return None
-
-        original_probe = cls._probe_media_sync(original_source_path)
-        if original_probe is None or len(original_probe.audio_streams) <= 1:
-            return None
-        if original_probe.duration is None or original_probe.video_codec is None:
-            return None
-
-        original_probe = cls._with_preferred_audio_stream(
-            original_probe,
-            target_language=preferred_audio_language,
-            source_import_payload=payload,
-        )
-        if cls._is_valid_normalized_probe(current_probe, reference_probe=original_probe):
-            return None
-
-        resolved_target_path = target_path or source_path
-        return SourceNormalizationPlan(
-            action=cls.classify_source_normalization(original_probe),
-            source_path=original_source_path,
-            target_path=resolved_target_path,
-            probe=original_probe,
-            cleanup_source_after_commit=False,
-        )
-
-    @classmethod
-    def _normalization_duration_tolerance_seconds(cls, probe: SourceMediaProbe) -> float:
-        fps = probe.fps or 24.0
-        return max(0.25, min(1.0, 3.0 / fps))
-
-    @classmethod
-    def _expected_normalized_duration_seconds(
-        cls,
-        reference_probe: SourceMediaProbe,
-    ) -> float | None:
-        selected_audio_stream = (
-            reference_probe.selected_audio_stream
-            or cls._audio_stream_by_index(
-                reference_probe,
-                reference_probe.selected_audio_stream_index,
-            )
-        )
-        if (
-            reference_probe.video_duration is not None
-            and selected_audio_stream is not None
-            and selected_audio_stream.duration is not None
-        ):
-            return max(reference_probe.video_duration, selected_audio_stream.duration)
-        if reference_probe.video_duration is not None and not reference_probe.has_audio:
-            return reference_probe.video_duration
-        return reference_probe.duration
-
-    @classmethod
-    def _is_valid_normalized_probe(
-        cls,
-        normalized_probe: SourceMediaProbe | None,
-        *,
-        reference_probe: SourceMediaProbe,
-    ) -> bool:
-        if normalized_probe is None:
-            return False
-        if normalized_probe.container_suffix != ".mp4":
-            return False
-        video_codec = (normalized_probe.video_codec or "").strip().lower()
-        if video_codec not in cls.PREMIERE_NATIVE_VIDEO_CODECS:
-            return False
-        if normalized_probe.duration is None:
-            return False
-        if normalized_probe.subtitle_streams:
-            return False
-        if normalized_probe.data_streams:
-            return False
-
-        normalized_audio = (normalized_probe.audio_codec or "").strip().lower()
-        premiere_audio_codecs = {"aac", "pcm_s16le", "pcm_s24le", "pcm_s32le"}
-        if reference_probe.has_audio:
-            if (
-                not normalized_probe.has_audio
-                or normalized_audio not in premiere_audio_codecs
-                or len(normalized_probe.audio_streams) != 1
-            ):
-                return False
-        elif normalized_probe.has_audio:
-            return False
-
-        selected_audio_stream = (
-            reference_probe.selected_audio_stream
-            or cls._audio_stream_by_index(
-                reference_probe,
-                reference_probe.selected_audio_stream_index,
-            )
-        )
-        if selected_audio_stream is not None and normalized_probe.audio_streams:
-            normalized_audio_stream = normalized_probe.audio_streams[0]
-            if selected_audio_stream.language and normalized_audio_stream.language:
-                if normalized_audio_stream.language != selected_audio_stream.language:
-                    return False
-            elif (
-                len(reference_probe.audio_streams) > 1
-                and selected_audio_stream.language
-                and normalized_audio_stream.language is None
-            ):
-                return False
-
-        expected_duration = cls._expected_normalized_duration_seconds(reference_probe)
-        if expected_duration is not None and normalized_probe.duration is not None:
-            tolerance = cls._normalization_duration_tolerance_seconds(reference_probe)
-            if abs(expected_duration - normalized_probe.duration) > tolerance:
-                return False
-
-        return normalized_probe.source_path.exists() and normalized_probe.source_path.stat().st_size > 0
-
-    @classmethod
-    def _build_selected_audio_map_args(cls, probe: SourceMediaProbe) -> list[str]:
-        if probe.selected_audio_stream_index is None:
-            return []
-        return ["-map", f"0:{probe.selected_audio_stream_index}"]
 
     @classmethod
     def _build_audio_stream_metadata_args(
@@ -1735,40 +1504,6 @@ class AnimeLibraryService:
             elif default_indices:
                 args.extend(["-disposition:a:" + str(idx), "0"])
         return args
-
-    @classmethod
-    def _build_selected_audio_metadata_args(
-        cls,
-        probe: SourceMediaProbe,
-    ) -> list[str]:
-        if not probe.has_audio:
-            return []
-        selected_stream = (
-            probe.selected_audio_stream
-            or cls._audio_stream_by_index(probe, probe.selected_audio_stream_index)
-        )
-        if selected_stream is None:
-            return []
-        return cls._build_audio_stream_metadata_args((selected_stream,))
-
-    @classmethod
-    def _build_remux_to_mp4_cmd(
-        cls,
-        source_path: Path,
-        output_path: Path,
-        *,
-        probe: SourceMediaProbe,
-    ) -> list[str]:
-        return cls._build_common_normalization_cmd_from_probe(
-            source_path,
-            probe=probe,
-        ) + [
-            "-c",
-            "copy",
-            "-movflags",
-            "+faststart",
-            str(output_path),
-        ]
 
     @classmethod
     def _build_library_import_remux_cmd(
@@ -1920,75 +1655,6 @@ class AnimeLibraryService:
         return cmd
 
     @classmethod
-    def _build_remux_audio_select_cmd(
-        cls,
-        source_path: Path,
-        output_path: Path,
-        *,
-        probe: SourceMediaProbe,
-    ) -> list[str]:
-        """Remux with selected audio track — video copied, audio to AAC.
-
-        Functionally identical to ``_build_audio_to_aac_cmd``; the separate
-        action name exists so that log messages distinguish *why* the remux
-        happens (multi-track selection vs. incompatible audio codec).
-        """
-        return cls._build_audio_to_aac_cmd(source_path, output_path, probe=probe)
-
-    @classmethod
-    def _build_common_normalization_cmd_from_probe(
-        cls,
-        source_path: Path,
-        *,
-        probe: SourceMediaProbe,
-    ) -> list[str]:
-        return [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(source_path),
-            "-map",
-            "0:v:0",
-            *cls._build_selected_audio_map_args(probe),
-            "-map_metadata",
-            "-1",
-            "-map_chapters",
-            "-1",
-            "-dn",
-            "-sn",
-            "-write_tmcd",
-            "0",
-        ]
-
-    @classmethod
-    def _build_audio_to_aac_cmd(
-        cls,
-        source_path: Path,
-        output_path: Path,
-        *,
-        probe: SourceMediaProbe,
-    ) -> list[str]:
-        return cls._build_common_normalization_cmd_from_probe(
-            source_path,
-            probe=probe,
-        ) + [
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            cls.SOURCE_NORMALIZATION_AUDIO_BITRATE,
-            "-ac",
-            "2",
-            "-ar",
-            cls.SOURCE_NORMALIZATION_AUDIO_RATE,
-            *cls._build_selected_audio_metadata_args(probe),
-            "-movflags",
-            "+faststart",
-            str(output_path),
-        ]
-
-    @classmethod
     def _build_audio_args(cls, *, has_audio: bool) -> list[str]:
         if not has_audio:
             return []
@@ -2002,50 +1668,6 @@ class AnimeLibraryService:
             "-ar",
             cls.SOURCE_NORMALIZATION_AUDIO_RATE,
         ]
-
-    @classmethod
-    def _build_gpu_h264_aac_cmd(
-        cls,
-        source_path: Path,
-        output_path: Path,
-        *,
-        source_codec: str | None,
-        probe: SourceMediaProbe,
-    ) -> list[str]:
-        return cls._build_gpu_h264_base_cmd(
-            source_path,
-            source_codec=source_codec,
-        ) + cls._build_selected_audio_map_args(probe) + [
-            "-map_metadata",
-            "-1",
-            "-map_chapters",
-            "-1",
-            "-dn",
-            "-sn",
-            "-write_tmcd",
-            "0",
-        ] + cls._build_audio_args(has_audio=probe.has_audio) + cls._build_selected_audio_metadata_args(probe) + [str(output_path)]
-
-    @classmethod
-    def _build_cpu_h264_aac_cmd(
-        cls,
-        source_path: Path,
-        output_path: Path,
-        *,
-        probe: SourceMediaProbe,
-    ) -> list[str]:
-        return cls._build_cpu_h264_base_cmd(source_path) + cls._build_selected_audio_map_args(
-            probe
-        ) + [
-            "-map_metadata",
-            "-1",
-            "-map_chapters",
-            "-1",
-            "-dn",
-            "-sn",
-            "-write_tmcd",
-            "0",
-        ] + cls._build_audio_args(has_audio=probe.has_audio) + cls._build_selected_audio_metadata_args(probe) + [str(output_path)]
 
     @classmethod
     def _is_valid_prepared_library_probe(
@@ -2912,303 +2534,6 @@ class AnimeLibraryService:
         if context is None:
             return None
         return context[1]
-
-    @classmethod
-    async def _postprocess_source_normalization_commit(cls, normalized_path: Path) -> None:
-        context = cls._library_context_for_path(normalized_path)
-        if context is None:
-            return
-        library_type, series_name = context
-        await cls.ensure_episode_manifest(force_refresh=True, library_type=library_type)
-        from .anime_matcher import AnimeMatcherService
-
-        AnimeMatcherService.mark_series_updated(library_type, series_name)
-
-    @classmethod
-    async def normalize_source_for_processing(
-        cls,
-        source_path: Path,
-        *,
-        preferred_audio_language: str | None = None,
-        subtitle_image_render_windows: dict[int, list[tuple[float, float]]] | None = None,
-        project_id: str | None = None,
-    ) -> SourceNormalizationResult:
-        """Normalize one source episode for Premiere Pro import.
-
-        Since format normalization now happens at indexation time, this step
-        typically only remuxes the selected audio track. The full H.264 MP4
-        transcode path remains as the fallback when a source still is not
-        library-normalized.
-        """
-        if not source_path.exists() or not source_path.is_file():
-            raise FileNotFoundError(f"Source file not found: {source_path}")
-
-        target_path = await asyncio.to_thread(
-            cls._processing_normalized_target_path,
-            source_path,
-            project_id=project_id,
-        )
-        is_processing_target = await asyncio.to_thread(
-            cls._is_processing_normalized_target,
-            target_path,
-            project_id=project_id,
-        )
-        source_import_payload = await asyncio.to_thread(
-            cls._load_source_import_manifest_sync,
-            source_path,
-        )
-        refresh_plan = None
-        if is_processing_target:
-            refresh_plan = await asyncio.to_thread(
-                cls._build_processing_refresh_plan_sync,
-                source_path,
-                preferred_audio_language=preferred_audio_language,
-                target_path=target_path,
-            )
-        plan = await asyncio.to_thread(
-            cls._build_source_normalization_plan_sync,
-            source_path,
-            preferred_audio_language=preferred_audio_language,
-            target_path=target_path,
-        )
-        reimport_plan = await asyncio.to_thread(
-            cls._build_processing_reimport_plan_sync,
-            source_path,
-            preferred_audio_language=preferred_audio_language,
-            target_path=target_path,
-        )
-        if refresh_plan is not None:
-            plan = refresh_plan
-        elif reimport_plan is not None:
-            plan = reimport_plan
-        if is_processing_target:
-            plan = replace(plan, cleanup_source_after_commit=False)
-
-        should_return_noop = plan.action == "noop"
-        if should_return_noop:
-            try:
-                should_return_noop = target_path.resolve() == plan.source_path.resolve()
-            except OSError:
-                should_return_noop = target_path == plan.source_path
-        if should_return_noop:
-            return SourceNormalizationResult(
-                action=plan.action,
-                source_path=plan.source_path,
-                normalized_path=plan.source_path,
-                changed=False,
-            )
-
-        target_path = plan.target_path
-        tmp_suffix = target_path.suffix or ".mp4"
-        tmp_path = target_path.with_name(f"{target_path.stem}.normalize.tmp{tmp_suffix}")
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-
-        manifest_original_source_path = (
-            cls._manifest_path_from_payload(
-                source_import_payload,
-                "original_source_path",
-                "source_path",
-            )
-            or plan.source_path
-        )
-        sidecar_source_path = (
-            cls.resolve_subtitle_sidecar_source_path(source_path)
-            or cls.resolve_subtitle_sidecar_source_path(plan.source_path)
-            or source_path
-        )
-
-        async def _preserve_target_metadata() -> None:
-            recorded_probe = plan.probe
-            if (
-                manifest_original_source_path != plan.source_path
-                and manifest_original_source_path.exists()
-            ):
-                manifest_probe = await asyncio.to_thread(
-                    cls._probe_media_sync,
-                    manifest_original_source_path,
-                )
-                if manifest_probe is not None:
-                    recorded_probe = cls._with_preferred_audio_stream(
-                        manifest_probe,
-                        target_language=preferred_audio_language,
-                        source_import_payload=source_import_payload,
-                    )
-            await asyncio.to_thread(
-                cls._record_source_import_manifest_sync,
-                source_path,
-                target_path,
-                source_probe=recorded_probe,
-                original_source_path=manifest_original_source_path,
-                sidecar_source_path=sidecar_source_path,
-            )
-
-        async def _preserve_target_sidecar() -> None:
-            try:
-                if plan.probe.subtitle_streams:
-                    await cls._write_subtitle_sidecar(
-                        source_path=plan.source_path,
-                        normalized_target_path=target_path,
-                        probe=plan.probe,
-                        subtitle_image_render_windows=subtitle_image_render_windows,
-                    )
-                    return
-                cloned = await asyncio.to_thread(
-                    cls._clone_subtitle_sidecar_sync,
-                    sidecar_source_path,
-                    target_path,
-                )
-                if not cloned:
-                    logger.debug(
-                        "No subtitle sidecar available to clone for %s -> %s",
-                        sidecar_source_path,
-                        target_path,
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "Failed to preserve subtitle sidecar for %s: %s",
-                    plan.source_path,
-                    exc,
-                )
-
-        if not is_processing_target and target_path != source_path and target_path.exists():
-            existing_probe = await asyncio.to_thread(cls._probe_media_sync, target_path)
-            if cls._is_valid_normalized_probe(existing_probe, reference_probe=plan.probe):
-                await _preserve_target_sidecar()
-                await _preserve_target_metadata()
-                if plan.cleanup_source_after_commit and source_path.exists():
-                    await asyncio.to_thread(source_path.unlink)
-                await cls._postprocess_source_normalization_commit(target_path)
-                return SourceNormalizationResult(
-                    action=plan.action,
-                    source_path=source_path,
-                    normalized_path=target_path,
-                    changed=True,
-                )
-            await asyncio.to_thread(target_path.unlink)
-
-        if tmp_path.exists():
-            await asyncio.to_thread(tmp_path.unlink)
-
-        try:
-            if plan.action == "noop":
-                await asyncio.to_thread(shutil.copy2, plan.source_path, tmp_path)
-            elif plan.action == "remux_to_mp4":
-                try:
-                    result = await cls._run_normalization_command(
-                        cls._build_remux_to_mp4_cmd(
-                            plan.source_path,
-                            tmp_path,
-                            probe=plan.probe,
-                        ),
-                        timeout_seconds=cls.REMUX_TIMEOUT_SECONDS,
-                    )
-                except (CommandTimeoutError, FileNotFoundError) as exc:
-                    raise RuntimeError(
-                        f"Failed to remux source for Premiere: {cls._format_media_failure(exc)}"
-                    ) from exc
-                if result.returncode != 0:
-                    raise RuntimeError(
-                        f"Failed to remux source for Premiere: {cls._format_media_failure(result)}"
-                    )
-            elif plan.action in {"audio_to_aac", "remux_audio_select"}:
-                try:
-                    cmd = (
-                        cls._build_remux_audio_select_cmd(
-                            plan.source_path,
-                            tmp_path,
-                            probe=plan.probe,
-                        )
-                        if plan.action == "remux_audio_select"
-                        else cls._build_audio_to_aac_cmd(
-                            plan.source_path,
-                            tmp_path,
-                            probe=plan.probe,
-                        )
-                    )
-                    result = await cls._run_normalization_command(
-                        cmd,
-                        timeout_seconds=cls.SOURCE_NORMALIZATION_TIMEOUT_SECONDS,
-                    )
-                except (CommandTimeoutError, FileNotFoundError) as exc:
-                    raise RuntimeError(
-                        "Failed to normalize source audio for Premiere: "
-                        f"{cls._format_media_failure(exc)}"
-                    ) from exc
-                if result.returncode != 0:
-                    raise RuntimeError(
-                        "Failed to normalize source audio for Premiere: "
-                        f"{cls._format_media_failure(result)}"
-                    )
-            elif plan.action == "full_h264_aac_transcode":
-                gpu_error: str | None = None
-                try:
-                    gpu_result = await cls._run_normalization_command(
-                        cls._build_gpu_h264_aac_cmd(
-                            plan.source_path,
-                            tmp_path,
-                            source_codec=plan.probe.video_codec,
-                            probe=plan.probe,
-                        ),
-                        timeout_seconds=cls.SOURCE_NORMALIZATION_TIMEOUT_SECONDS,
-                    )
-                except (CommandTimeoutError, FileNotFoundError) as exc:
-                    gpu_error = cls._format_media_failure(exc)
-                else:
-                    if gpu_result.returncode == 0:
-                        gpu_probe = await asyncio.to_thread(cls._probe_media_sync, tmp_path)
-                        if cls._is_valid_normalized_probe(gpu_probe, reference_probe=plan.probe):
-                            gpu_error = None
-                        else:
-                            gpu_error = f"Normalized output failed validation: {tmp_path.name}"
-                    else:
-                        gpu_error = cls._format_media_failure(gpu_result)
-
-                if gpu_error is not None:
-                    if tmp_path.exists():
-                        await asyncio.to_thread(tmp_path.unlink)
-                    try:
-                        cpu_result = await cls._run_normalization_command(
-                            cls._build_cpu_h264_aac_cmd(
-                                plan.source_path,
-                                tmp_path,
-                                probe=plan.probe,
-                            ),
-                            timeout_seconds=cls.SOURCE_NORMALIZATION_TIMEOUT_SECONDS,
-                        )
-                    except (CommandTimeoutError, FileNotFoundError) as exc:
-                        raise RuntimeError(
-                            "Failed to transcode source for Premiere "
-                            f"(GPU: {gpu_error}; CPU: {cls._format_media_failure(exc)})"
-                        ) from exc
-                    if cpu_result.returncode != 0:
-                        raise RuntimeError(
-                            "Failed to transcode source for Premiere "
-                            f"(GPU: {gpu_error}; CPU: {cls._format_media_failure(cpu_result)})"
-                        )
-            else:
-                raise RuntimeError(f"Unsupported normalization action: {plan.action}")
-
-            normalized_probe = await asyncio.to_thread(cls._probe_media_sync, tmp_path)
-            if not cls._is_valid_normalized_probe(normalized_probe, reference_probe=plan.probe):
-                raise RuntimeError(f"Normalized output failed validation: {tmp_path.name}")
-
-            await asyncio.to_thread(tmp_path.replace, target_path)
-            await _preserve_target_sidecar()
-            await _preserve_target_metadata()
-            if plan.cleanup_source_after_commit and source_path.exists():
-                await asyncio.to_thread(source_path.unlink)
-
-            await cls._postprocess_source_normalization_commit(target_path)
-            return SourceNormalizationResult(
-                action=plan.action,
-                source_path=source_path,
-                normalized_path=target_path,
-                changed=True,
-            )
-        except Exception:
-            if tmp_path.exists():
-                await asyncio.to_thread(tmp_path.unlink)
-            raise
 
     @classmethod
     def get_preview_proxy_dir(cls) -> Path:

@@ -22,7 +22,11 @@ from ..models.transcription import Word, SceneTranscription
 from ..utils.media_binaries import is_media_binary_override_error
 from ..utils.subprocess_runner import CommandTimeoutError, run_command
 from ..utils.timing import compute_adjusted_scene_end_times
-from .anime_library import AnimeLibraryService, SubtitleSidecarEntry
+from .anime_library import (
+    AnimeLibraryService,
+    SourceAudioSelectionPolicy,
+    SubtitleSidecarEntry,
+)
 from .transcriber import TranscriberService
 from .otio_timing import ClipTiming, OTIOTimingCalculator, FrameRateInfo
 from .gap_resolution import GapResolutionService
@@ -303,44 +307,24 @@ class ProcessingService:
         return fallback_path, _strip_known_media_extension(episode)
 
     @classmethod
-    async def _collect_required_source_groups(
-        cls,
-        matches: list[SceneMatch],
-        *,
-        library_type: str | None = None,
-    ) -> list[tuple[Path, list[SceneMatch]]]:
-        """Resolve and dedupe the final source episodes required by processing."""
-        manifest = await AnimeLibraryService.ensure_episode_manifest(
-            library_type=library_type,
-        )
+    @staticmethod
+    def _collect_required_source_paths(
+        resolved_scene_sources: dict[int, ResolvedSceneSource],
+    ) -> list[Path]:
+        """Return unique existing source paths used by final playback."""
         paths_by_key: dict[str, Path] = {}
-        matches_by_key: dict[str, list[SceneMatch]] = {}
         unresolved: list[str] = []
 
-        for match in matches:
-            episode = str(match.episode or "").strip()
-            if not episode:
+        for resolved_source in resolved_scene_sources.values():
+            source_path = resolved_source.source_path
+            if not source_path.exists() or not source_path.is_file():
+                unresolved.append(str(source_path))
                 continue
-
-            resolved = AnimeLibraryService.resolve_episode_path(
-                episode,
-                manifest,
-                library_type=library_type,
-            )
-            if resolved is None:
-                fallback = Path(episode)
-                if fallback.exists():
-                    resolved = fallback
-
-            if resolved is None or not resolved.exists():
-                unresolved.append(episode)
-                continue
-
-            key = str(resolved.resolve())
-            if key not in paths_by_key:
-                paths_by_key[key] = resolved
-                matches_by_key[key] = []
-            matches_by_key[key].append(match)
+            try:
+                key = str(source_path.resolve())
+            except OSError:
+                key = str(source_path)
+            paths_by_key.setdefault(key, source_path)
 
         if unresolved:
             preview = ", ".join(unresolved[:3])
@@ -348,75 +332,22 @@ class ProcessingService:
                 preview += ", ..."
             raise RuntimeError(f"Unable to resolve required source episode(s): {preview}")
 
-        return [
-            (paths_by_key[key], matches_by_key[key])
-            for key in sorted(paths_by_key)
-        ]
+        return [paths_by_key[key] for key in sorted(paths_by_key)]
 
     @staticmethod
-    def _update_absolute_match_episode_hints(
-        matches: list[SceneMatch],
-        *,
-        old_source_path: Path,
-        new_source_path: Path,
-        library_type: str | None = None,
-    ) -> bool:
-        """Rewrite match episode hints when processing swaps to a project-local source."""
-        if old_source_path.resolve() == new_source_path.resolve():
-            return False
-
-        changed = False
-        old_resolved = old_source_path.resolve()
-        new_value = str(new_source_path)
-        for match in matches:
-            episode_hint = str(match.episode or "").strip()
-            if not episode_hint:
-                continue
-            candidate = Path(episode_hint)
-            candidate_resolved: Path | None = None
-            if candidate.is_absolute():
-                try:
-                    candidate_resolved = candidate.resolve()
-                except OSError:
-                    candidate_resolved = candidate
-            else:
-                resolved = AnimeLibraryService.resolve_episode_path(
-                    episode_hint,
-                    library_type=library_type,
-                )
-                if resolved is None and candidate.exists():
-                    resolved = candidate
-                if resolved is not None:
-                    try:
-                        candidate_resolved = resolved.resolve()
-                    except OSError:
-                        candidate_resolved = resolved
-            if candidate_resolved == old_resolved:
-                match.episode = new_value
-                changed = True
-        return changed
-
-    @staticmethod
-    def _format_source_normalization_message(
+    def _format_source_audio_policy_message(
         *,
         current: int,
         total: int,
-        result,
+        source_path: Path,
+        policy: SourceAudioSelectionPolicy,
     ) -> str:
-        if not result.changed:
-            return f"Source already compatible ({current}/{total}): {result.source_path.name}"
-
-        if result.action == "noop":
-            action = "Prepared project-local source copy"
-        elif result.action == "remux_to_mp4":
-            action = "Remuxed source for Premiere"
-        elif result.action in {"audio_to_aac", "remux_audio_select"}:
-            action = "Prepared source audio track for Premiere"
-        elif result.action == "full_h264_aac_transcode":
-            action = "Transcoded source for Premiere"
-        else:
-            action = "Prepared source for Premiere"
-        return f"{action} ({current}/{total}): {result.normalized_path.name}"
+        language_label = policy.selected_language or "fallback"
+        return (
+            f"Selected source audio ({current}/{total}): {source_path.name} -> "
+            f"{language_label} stream {policy.selected_stream_position + 1} "
+            f"({policy.channel_type})"
+        )
 
     @classmethod
     def schedule_gap_candidate_prewarm(
@@ -867,6 +798,7 @@ class ProcessingService:
         matches: list[SceneMatch],
         source_rate: FrameRateInfo | None = None,
         resolved_scene_sources: dict[int, ResolvedSceneSource] | None = None,
+        source_audio_policies: dict[str, dict[str, Any]] | None = None,
         subtitle_timing_relative_path: str = "subtitles/subtitle_timings.srt",
         raw_scene_subtitle_timing_relative_path: str = "raw_scene_subtitles/text_subtitles.srt",
         raw_scene_subtitle_mogrt_relative_dir: str = "raw_scene_subtitles/text_mogrts",
@@ -894,6 +826,7 @@ class ProcessingService:
             matches: Scene matches with source timing
             source_rate: Resolved source frame rate information. If None, defaults to 23.976fps.
             resolved_scene_sources: Pre-resolved scene source timings shared with playback rebuild.
+            source_audio_policies: Per-source audio selection metadata keyed by clip basename.
             subtitle_timing_relative_path: Relative path to the classic subtitle timing SRT.
             raw_scene_subtitle_timing_relative_path: Relative path to the raw-scene subtitle timing SRT.
             raw_scene_subtitle_mogrt_relative_dir: Relative path to baked raw-scene subtitle MOGRT files.
@@ -1037,6 +970,7 @@ class ProcessingService:
         return cls._render_jsx_from_template(
             project_id=project.id,
             scenes=scenes,
+            source_audio_policies=source_audio_policies or {},
             source_fps_num=source_rate.rate.numerator,
             source_fps_den=source_rate.rate.denominator,
             subtitle_timing_relative_path=subtitle_timing_relative_path,
@@ -1076,6 +1010,7 @@ class ProcessingService:
         *,
         project_id: str,
         scenes: list[dict],
+        source_audio_policies: dict[str, dict[str, Any]],
         source_fps_num: int,
         source_fps_den: int,
         subtitle_timing_relative_path: str,
@@ -1115,6 +1050,15 @@ class ProcessingService:
 
         scenes_json = json.dumps(scenes, indent=4, ensure_ascii=False)
         scenes_json_indented = "\n".join("  " + line for line in scenes_json.split("\n"))
+        source_audio_policies_json = json.dumps(
+            source_audio_policies,
+            indent=4,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        source_audio_policies_indented = "\n".join(
+            "  " + line for line in source_audio_policies_json.split("\n")
+        )
 
         content = cls._replace_template_once(
             content,
@@ -1122,6 +1066,13 @@ class ProcessingService:
             "var scenes =\n" + scenes_json_indented + ";",
             flags=re.MULTILINE,
             label="scenes",
+        )
+        content = cls._replace_template_once(
+            content,
+            r"var SOURCE_AUDIO_POLICIES = \{[\s\S]*?\};",
+            "var SOURCE_AUDIO_POLICIES =\n" + source_audio_policies_indented + ";",
+            flags=re.MULTILINE,
+            label="SOURCE_AUDIO_POLICIES",
         )
         content = cls._replace_template_once(
             content,
@@ -2558,59 +2509,63 @@ class ProcessingService:
                 new_transcription,
                 playback_scene_sources,
             )
-            source_groups = await cls._collect_required_source_groups(
-                matches,
-                library_type=project.library_type,
+            required_source_paths = cls._collect_required_source_paths(
+                playback_scene_sources,
             )
-            total_source_groups = len(source_groups)
-            matches_updated = False
+            total_source_paths = len(required_source_paths)
+            source_audio_policies: dict[str, dict[str, Any]] = {}
+            source_audio_policy_paths: dict[str, Path] = {}
 
-            if total_source_groups == 0:
+            if total_source_paths == 0:
                 yield ProcessingProgress(
                     "processing",
-                    "source_normalization",
+                    "source_audio_policy",
                     0.45,
-                    "No source episodes require normalization.",
+                    "No source episodes require audio inspection.",
                 )
             else:
-                for idx, (resolved_source_path, source_matches) in enumerate(source_groups, start=1):
-                    before_fraction = (idx - 1) / total_source_groups
-                    after_fraction = idx / total_source_groups
+                for idx, resolved_source_path in enumerate(required_source_paths, start=1):
+                    before_fraction = (idx - 1) / total_source_paths
+                    after_fraction = idx / total_source_paths
                     yield ProcessingProgress(
                         "processing",
-                        "source_normalization",
+                        "source_audio_policy",
                         0.4 + 0.09 * before_fraction,
-                        f"Checking source compatibility ({idx}/{total_source_groups}): "
+                        f"Inspecting source audio ({idx}/{total_source_paths}): "
                         f"{resolved_source_path.name}",
                     )
-                    normalization_result = await AnimeLibraryService.normalize_source_for_processing(
+                    audio_policy = await asyncio.to_thread(
+                        AnimeLibraryService.build_source_audio_selection_policy,
                         resolved_source_path,
-                        preferred_audio_language=project.output_language,
-                        subtitle_image_render_windows=raw_scene_image_render_plan.get(
-                            resolved_source_path,
-                        ),
-                        project_id=project.id,
+                        target_language=project.output_language,
                     )
-                    if cls._update_absolute_match_episode_hints(
-                        source_matches,
-                        old_source_path=resolved_source_path,
-                        new_source_path=normalization_result.normalized_path,
-                        library_type=project.library_type,
-                    ):
-                        matches_updated = True
+                    clip_name = _strip_known_media_extension(resolved_source_path.name)
+                    existing_path = source_audio_policy_paths.get(clip_name)
+                    if existing_path is not None:
+                        try:
+                            existing_resolved = existing_path.resolve()
+                            current_resolved = resolved_source_path.resolve()
+                        except OSError:
+                            existing_resolved = existing_path
+                            current_resolved = resolved_source_path
+                        if existing_resolved != current_resolved:
+                            raise RuntimeError(
+                                "Conflicting source clip basenames for JSX audio policy: "
+                                f"{clip_name}"
+                            )
+                    source_audio_policy_paths[clip_name] = resolved_source_path
+                    source_audio_policies[clip_name] = audio_policy.to_jsx_dict()
                     yield ProcessingProgress(
                         "processing",
-                        "source_normalization",
+                        "source_audio_policy",
                         0.4 + 0.09 * after_fraction,
-                        cls._format_source_normalization_message(
+                        cls._format_source_audio_policy_message(
                             current=idx,
-                            total=total_source_groups,
-                            result=normalization_result,
+                            total=total_source_paths,
+                            source_path=resolved_source_path,
+                            policy=audio_policy,
                         ),
                     )
-
-            if matches_updated:
-                ProjectService.save_matches(project.id, MatchList(matches=matches))
 
             yield ProcessingProgress(
                 "processing",
@@ -2691,6 +2646,7 @@ class ProcessingService:
                 matches,
                 source_rate=source_rate,
                 resolved_scene_sources=resolved_scene_sources,
+                source_audio_policies=source_audio_policies,
                 subtitle_timing_relative_path=classic_subtitle_timing_relative_path,
                 raw_scene_subtitle_timing_relative_path=raw_scene_subtitle_timing_relative_path,
                 raw_scene_subtitle_mogrt_relative_dir=raw_scene_subtitle_mogrt_relative_dir,

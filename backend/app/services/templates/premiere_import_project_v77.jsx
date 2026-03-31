@@ -40,6 +40,7 @@
   var RAW_SCENE_TEXT_SUBTITLE_SRT_PATH = ROOT_DIR + "/raw_scene_subtitles/text_subtitles.srt";
   var RAW_SCENE_SUBTITLE_MANIFEST_PATH =
     ROOT_DIR + "/raw_scene_subtitles/manifest.json";
+  var SOURCE_AUDIO_POLICIES = {};
 
   // --- SCENES DATA ---
   var scenes = [
@@ -677,6 +678,8 @@
   var TRACK_ITEM_WAIT_MAX_MS = 180;
   var SPEED_RETRY_FAST_WAIT_MS = 12;
   var SPEED_RETRY_LONG_WAIT_MS = 60;
+  var SOURCE_AUDIO_POLICY_RETRY_WAIT_MS = 40;
+  var SOURCE_AUDIO_POLICY_MAX_RETRIES = 4;
   var PROJECT_ITEM_CACHE = {};
   var PROJECT_ITEM_CACHE_WARMED = false;
   var PRESET_FILE_TEXT_CACHE = {};
@@ -716,6 +719,10 @@
   var PERF_COUNTERS = {};
   var QE_TRACK_RESOLVE_CACHE = {};
   var QE_TRACK_ITEM_HINTS = {};
+  var PROJECT_ITEM_AUDIO_POLICY_CACHE = {};
+  var AUDIOCHANNELTYPE_Mono = 0;
+  var AUDIOCHANNELTYPE_Stereo = 1;
+  var AUDIOCHANNELTYPE_51 = 2;
 
   function perfNowMs() {
     return new Date().getTime();
@@ -929,6 +936,141 @@
     } catch (e) {
       delete PROJECT_ITEM_CACHE[key];
       return null;
+    }
+  }
+
+  function getSourceAudioPolicy(name) {
+    if (!name) return null;
+    var cleanName = name.toString().replace(/^\s+|\s+$/g, "");
+    if (!cleanName) return null;
+    var nameNoExt = stripKnownExtension(cleanName);
+    return SOURCE_AUDIO_POLICIES[cleanName] || SOURCE_AUDIO_POLICIES[nameNoExt] || null;
+  }
+
+  function getProjectItemAudioPolicyCacheKey(item) {
+    if (!item) return "";
+    try {
+      if (item.nodeId !== undefined && item.nodeId !== null) {
+        return "node:" + item.nodeId.toString();
+      }
+    } catch (e0) {}
+    try {
+      if (item.getMediaPath) {
+        var mediaPath = item.getMediaPath();
+        if (mediaPath) return "path:" + mediaPath.toString();
+      }
+    } catch (e1) {}
+    try {
+      if (item.name) return "name:" + item.name.toString();
+    } catch (e2) {}
+    return "";
+  }
+
+  function resolveAudioChannelType(typeName) {
+    if (typeName === "mono") return AUDIOCHANNELTYPE_Mono;
+    if (typeName === "stereo") return AUDIOCHANNELTYPE_Stereo;
+    if (typeName === "51") return AUDIOCHANNELTYPE_51;
+    return null;
+  }
+
+  function applySourceAudioPolicy(item, clipName) {
+    var policy = getSourceAudioPolicy(clipName);
+    if (!policy) return true;
+    if (!item || !item.setAudioChannelMapping) {
+      log("Warning: Source audio mapping API unavailable for " + clipName + ".");
+      return true;
+    }
+
+    var cacheKey = getProjectItemAudioPolicyCacheKey(item);
+    if (cacheKey && PROJECT_ITEM_AUDIO_POLICY_CACHE[cacheKey]) return true;
+
+    var channelType = resolveAudioChannelType(policy.channel_type);
+    var channelCount = parseInt(policy.selected_channel_count, 10);
+    var channelOffset = parseInt(policy.selected_channel_offset, 10);
+    var selectedStreamPosition = parseInt(policy.selected_stream_position, 10);
+    if (
+      channelType === null ||
+      isNaN(channelCount) ||
+      channelCount <= 0 ||
+      isNaN(channelOffset) ||
+      channelOffset < 0 ||
+      isNaN(selectedStreamPosition) ||
+      selectedStreamPosition < 0
+    ) {
+      log("Warning: Invalid source audio policy for " + clipName + ".");
+      return true;
+    }
+
+    var mapping = null;
+    for (var attempt = 0; attempt < SOURCE_AUDIO_POLICY_MAX_RETRIES; attempt++) {
+      try {
+        mapping = item.getAudioChannelMapping;
+        if (typeof mapping === "function") {
+          mapping = item.getAudioChannelMapping();
+        }
+      } catch (eGet) {
+        mapping = null;
+      }
+      if (mapping && mapping.setMappingForChannel) {
+        break;
+      }
+      mapping = null;
+      if (attempt + 1 < SOURCE_AUDIO_POLICY_MAX_RETRIES) {
+        sleep(SOURCE_AUDIO_POLICY_RETRY_WAIT_MS);
+      }
+    }
+    if (!mapping || !mapping.setMappingForChannel) {
+      log("Warning: Could not retrieve audio channel mapping for " + clipName + ".");
+      return true;
+    }
+
+    try {
+      var currentChannelType = parseInt(mapping.audioChannelsType, 10);
+      var currentClipCount = parseInt(mapping.audioClipsNumber, 10);
+      var isDefaultFirstStreamPolicy =
+        selectedStreamPosition === 0 && channelOffset === 0;
+      if (
+        isDefaultFirstStreamPolicy &&
+        currentChannelType === channelType &&
+        currentClipCount === 1
+      ) {
+        if (cacheKey) PROJECT_ITEM_AUDIO_POLICY_CACHE[cacheKey] = true;
+        return true;
+      }
+
+      mapping.audioChannelsType = channelType;
+      mapping.audioClipsNumber = 1;
+      for (var idx = 0; idx < channelCount; idx++) {
+        var mapped = mapping.setMappingForChannel(idx, channelOffset + idx);
+        if (mapped === false) {
+          throw new Error(
+            "Unsupported channel map " +
+              idx +
+              " -> " +
+              (channelOffset + idx),
+          );
+        }
+      }
+      item.setAudioChannelMapping(mapping);
+      if (cacheKey) PROJECT_ITEM_AUDIO_POLICY_CACHE[cacheKey] = true;
+      log(
+        "Applied source audio policy for " +
+          clipName +
+          " -> stream " +
+          (Number(policy.selected_stream_position || 0) + 1) +
+          (policy.selected_language
+            ? " (" + policy.selected_language + ")"
+            : ""),
+      );
+      return true;
+    } catch (eSet) {
+      log(
+        "Warning: Failed to apply source audio policy for " +
+          clipName +
+          ": " +
+          (eSet && eSet.message ? eSet.message : eSet),
+      );
+      return true;
     }
   }
 
@@ -1440,18 +1582,36 @@
     var nameNoExt = stripKnownExtension(cleanName);
 
     var item = getCachedProjectItem(cleanName);
-    if (item) return item;
+    if (item) {
+      applySourceAudioPolicy(item, cleanName);
+      return item;
+    }
     item = getCachedProjectItem(nameNoExt);
-    if (item) return item;
+    if (item) {
+      applySourceAudioPolicy(item, cleanName);
+      return item;
+    }
 
     item = findProjectItem(cleanName);
-    if (item) return item;
+    if (item) {
+      applySourceAudioPolicy(item, cleanName);
+      return item;
+    }
     item = findProjectItem(nameNoExt);
-    if (item) return item;
+    if (item) {
+      applySourceAudioPolicy(item, cleanName);
+      return item;
+    }
     item = findProjectItemLoose(cleanName);
-    if (item) return item;
+    if (item) {
+      applySourceAudioPolicy(item, cleanName);
+      return item;
+    }
     item = findProjectItemLoose(nameNoExt);
-    if (item) return item;
+    if (item) {
+      applySourceAudioPolicy(item, cleanName);
+      return item;
+    }
 
     var f = resolveClipFilePath(cleanName, nameNoExt);
     if (f) {
@@ -1476,8 +1636,9 @@
         cacheProjectItem(item);
         cacheProjectItemByName(cleanName, item);
         cacheProjectItemByName(nameNoExt, item);
+        applySourceAudioPolicy(item, cleanName);
       }
-      return item;
+      return item || null;
     }
     log("Error: Clip not found: " + cleanName);
     return null;
@@ -1562,6 +1723,7 @@
     VIDEO_EFFECT_RESOLVE_CACHE = {};
     QE_TRACK_RESOLVE_CACHE = {};
     QE_TRACK_ITEM_HINTS = {};
+    PROJECT_ITEM_AUDIO_POLICY_CACHE = {};
     perfStart("total");
 
     app.enableQE();
