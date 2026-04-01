@@ -1,7 +1,7 @@
 import os
 import asyncio
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 # Set BEFORE any import that may transitively load torch (e.g. anime_searcher).
 # torch._inductor.config reads TORCHINDUCTOR_COMPILE_THREADS at import time
@@ -28,46 +28,126 @@ from .services.storage_box_sftp_client import StorageBoxSftpClient
 logger = logging.getLogger("uvicorn.error")
 
 
+def _track_app_task(app: FastAPI, task: asyncio.Task[None]) -> None:
+    tasks: set[asyncio.Task[None]] = getattr(app.state, "startup_tasks", set())
+    app.state.startup_tasks = tasks
+    tasks.add(task)
+
+    def _cleanup(completed: asyncio.Task[None]) -> None:
+        tasks.discard(completed)
+        try:
+            completed.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("Background startup task failed")
+
+    task.add_done_callback(_cleanup)
+
+
+async def _cancel_app_tasks(app: FastAPI) -> None:
+    tasks: set[asyncio.Task[None]] = set(getattr(app.state, "startup_tasks", set()))
+    for task in tasks:
+        task.cancel()
+    for task in tasks:
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+async def _warm_storage_box_catalog(library_type: LibraryType) -> None:
+    try:
+        await LibraryHydrationService.ensure_catalog_available(library_type)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.exception("Storage Box catalog initialization failed for %s", library_type.value)
+        IntegrationHealthService.update_catalog_warmup(
+            library_type=library_type,
+            status="error",
+            detail=str(exc),
+        )
+        return
+
+    IntegrationHealthService.update_catalog_warmup(
+        library_type=library_type,
+        status="ok",
+        detail="Catalog warmup complete.",
+    )
+
+
+async def _run_storage_box_catalog_warmup() -> None:
+    if not settings.storage_box_enabled:
+        return
+
+    async with asyncio.TaskGroup() as task_group:
+        for library_type in LibraryType:
+            task_group.create_task(_warm_storage_box_catalog(library_type))
+
+
+async def _run_integration_health_check_background() -> None:
+    if not settings.integration_startup_health_check_enabled:
+        return
+
+    try:
+        result = await asyncio.to_thread(IntegrationHealthService.run_startup_health_check)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.exception("Integration health check failed during startup")
+        IntegrationHealthService.record_integration_check_failure(str(exc))
+        return
+
+    logger.info(
+        "Integration startup health completed with status=%s summary=%s",
+        result.get("status"),
+        result.get("summary_status"),
+    )
+    checks = result.get("checks", {})
+    if isinstance(checks, dict):
+        for name, payload in checks.items():
+            if not isinstance(payload, dict):
+                continue
+            logger.info(
+                "Integration check %s: status=%s detail=%s",
+                name,
+                payload.get("status", "unknown"),
+                payload.get("detail", ""),
+            )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load accounts and run integration health checks on startup."""
+    """Load local state quickly, then warm external readiness in the background."""
     AccountService.load()
     ProjectService.sync_all_project_pins()
     await LibraryHydrationService.startup_cleanup()
     await project_startup_queue.startup_cleanup()
+
+    app.state.integrations_health = IntegrationHealthService.initialize_startup_state(
+        integration_enabled=settings.integration_startup_health_check_enabled,
+        storage_box_enabled=settings.storage_box_enabled,
+        library_types=list(LibraryType),
+    )
+
     if settings.storage_box_enabled:
-        for library_type in LibraryType:
-            try:
-                await LibraryHydrationService.ensure_catalog_available(library_type)
-            except Exception:
-                logger.exception("Storage Box catalog initialization failed for %s", library_type.value)
-    if not settings.integration_startup_health_check_enabled:
-        app.state.integrations_health = {"status": "skipped", "checks": {}}
-        yield
-        await StorageBoxSftpClient.close_pool()
-        return
-    try:
-        result = await asyncio.to_thread(IntegrationHealthService.run_startup_health_check)
-        app.state.integrations_health = result
-        logger.info(
-            "Integration startup health completed with status=%s",
-            result.get("status"),
+        _track_app_task(
+            app,
+            asyncio.create_task(
+                _run_storage_box_catalog_warmup(),
+                name="storage-box-catalog-warmup",
+            ),
         )
-        checks = result.get("checks", {})
-        if isinstance(checks, dict):
-            for name, payload in checks.items():
-                if not isinstance(payload, dict):
-                    continue
-                logger.info(
-                    "Integration check %s: status=%s detail=%s",
-                    name,
-                    payload.get("status", "unknown"),
-                    payload.get("detail", ""),
-                )
-    except Exception:
-        logger.exception("Integration health check failed during startup")
-        app.state.integrations_health = {"status": "error", "checks": {}}
+    if settings.integration_startup_health_check_enabled:
+        _track_app_task(
+            app,
+            asyncio.create_task(
+                _run_integration_health_check_background(),
+                name="integration-startup-health",
+            ),
+        )
+
     yield
+    await _cancel_app_tasks(app)
     await StorageBoxSftpClient.close_pool()
 
 

@@ -114,6 +114,7 @@ class LibraryHydrationService:
 
     _series_locks: dict[tuple[str, str], asyncio.Lock] = {}
     _library_locks: dict[str, asyncio.Lock] = {}
+    _background_tasks: set[asyncio.Task[Any]] = set()
 
     @classmethod
     def _storage_cache_root(cls) -> Path:
@@ -150,6 +151,94 @@ class LibraryHydrationService:
             lock = asyncio.Lock()
             cls._library_locks[key] = lock
         return lock
+
+    @classmethod
+    def _spawn_background_task(
+        cls,
+        coroutine: Awaitable[Any],
+        *,
+        description: str,
+    ) -> asyncio.Task[Any]:
+        task = asyncio.create_task(coroutine, name=description)
+        cls._background_tasks.add(task)
+
+        def _cleanup(completed: asyncio.Task[Any]) -> None:
+            cls._background_tasks.discard(completed)
+            try:
+                completed.result()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("Background library operation failed: %s", description)
+
+        task.add_done_callback(_cleanup)
+        return task
+
+    @staticmethod
+    def _operation_is_active(operation: OperationRow | None) -> bool:
+        return bool(operation and operation.status in {OPERATION_PENDING, OPERATION_RUNNING})
+
+    @classmethod
+    def _select_operation_from_rows(
+        cls,
+        operations: list[OperationRow],
+        preferred_types: tuple[str, ...],
+    ) -> OperationRow | None:
+        by_type = {operation.operation_type: operation for operation in operations}
+        for operation_type in preferred_types:
+            operation = by_type.get(operation_type)
+            if cls._operation_is_active(operation):
+                return operation
+
+        active_operations = [
+            operation for operation in operations if cls._operation_is_active(operation)
+        ]
+        if active_operations:
+            return max(active_operations, key=lambda operation: operation.updated_at)
+
+        for operation_type in preferred_types:
+            operation = by_type.get(operation_type)
+            if operation is not None:
+                return operation
+
+        return operations[0] if operations else None
+
+    @classmethod
+    async def _selected_operation(
+        cls,
+        *,
+        library_type: LibraryType | str,
+        series_id: str,
+        preferred_types: tuple[str, ...],
+    ) -> OperationRow | None:
+        operations = await asyncio.to_thread(
+            LibraryStateDb.list_operations,
+            library_type=library_type,
+            series_id=series_id,
+        )
+        return cls._select_operation_from_rows(operations, preferred_types)
+
+    @classmethod
+    async def _describe_state(
+        cls,
+        *,
+        library_type: LibraryType | str,
+        series_id: str,
+        preferred_operation_types: tuple[str, ...],
+    ) -> dict[str, Any]:
+        scoped_type = coerce_library_type(library_type)
+        state = await asyncio.to_thread(LibraryStateDb.get_series_state, scoped_type, series_id)
+        operation = await cls._selected_operation(
+            library_type=scoped_type,
+            series_id=series_id,
+            preferred_types=preferred_operation_types,
+        )
+        project_pin_count = await asyncio.to_thread(LibraryStateDb.count_project_pins, series_id)
+        return cls._state_payload(
+            series_state=state,
+            operation=operation,
+            project_pin_count=project_pin_count,
+        )
 
     @staticmethod
     def _normalize_episode_reference(value: Any) -> str:
@@ -211,26 +300,10 @@ class LibraryHydrationService:
         library_type: LibraryType | str,
         series_id: str,
     ) -> dict[str, Any]:
-        scoped_type = coerce_library_type(library_type)
-        series_state = await asyncio.to_thread(
-            LibraryStateDb.get_series_state,
-            scoped_type,
-            series_id,
-        )
-        operation = await asyncio.to_thread(
-            LibraryStateDb.get_operation,
-            scoped_type,
-            series_id,
-            "activate",
-        )
-        project_pin_count = await asyncio.to_thread(
-            LibraryStateDb.count_project_pins,
-            series_id,
-        )
-        return cls._state_payload(
-            series_state=series_state,
-            operation=operation,
-            project_pin_count=project_pin_count,
+        return await cls._describe_state(
+            library_type=library_type,
+            series_id=series_id,
+            preferred_operation_types=("activate", "hydrate", "evict"),
         )
 
     @classmethod
@@ -560,6 +633,65 @@ class LibraryHydrationService:
                 raise
 
     @classmethod
+    async def enqueue_project_activation(
+        cls,
+        *,
+        project_id: str,
+        library_type: LibraryType | str,
+        series_id: str,
+    ) -> dict[str, Any]:
+        scoped_type = coerce_library_type(library_type)
+        await asyncio.to_thread(LibraryStateDb.add_project_pin, project_id, series_id)
+
+        if await cls.ensure_index_ready(library_type=scoped_type, series_id=series_id):
+            await asyncio.to_thread(
+                LibraryStateDb.upsert_operation,
+                library_type=scoped_type,
+                series_id=series_id,
+                operation_type="activate",
+                status=OPERATION_COMPLETE,
+                progress=1.0,
+                error=None,
+            )
+            return await cls.get_activation_state(
+                library_type=scoped_type,
+                series_id=series_id,
+            )
+
+        active_operation = await cls._selected_operation(
+            library_type=scoped_type,
+            series_id=series_id,
+            preferred_types=("activate", "hydrate", "evict"),
+        )
+        if cls._operation_is_active(active_operation):
+            return await cls.get_activation_state(
+                library_type=scoped_type,
+                series_id=series_id,
+            )
+
+        await asyncio.to_thread(
+            LibraryStateDb.upsert_operation,
+            library_type=scoped_type,
+            series_id=series_id,
+            operation_type="activate",
+            status=OPERATION_PENDING,
+            progress=0.0,
+            error=None,
+        )
+        cls._spawn_background_task(
+            cls._run_background_activation(
+                project_id=project_id,
+                library_type=scoped_type,
+                series_id=series_id,
+            ),
+            description=f"library-activate:{scoped_type.value}:{series_id}",
+        )
+        return await cls.get_activation_state(
+            library_type=scoped_type,
+            series_id=series_id,
+        )
+
+    @classmethod
     async def hydrate_series(
         cls,
         *,
@@ -696,6 +828,44 @@ class LibraryHydrationService:
             return await cls.describe_series(scoped_type, series_id)
 
     @classmethod
+    async def enqueue_hydrate_series(
+        cls,
+        *,
+        library_type: LibraryType | str,
+        series_id: str,
+        episode_keys: list[str] | None = None,
+        full_series: bool = False,
+    ) -> dict[str, Any]:
+        scoped_type = coerce_library_type(library_type)
+        active_operation = await cls._selected_operation(
+            library_type=scoped_type,
+            series_id=series_id,
+            preferred_types=("hydrate", "evict", "activate"),
+        )
+        if cls._operation_is_active(active_operation):
+            return await cls.describe_series(scoped_type, series_id)
+
+        await asyncio.to_thread(
+            LibraryStateDb.upsert_operation,
+            library_type=scoped_type,
+            series_id=series_id,
+            operation_type="hydrate",
+            status=OPERATION_PENDING,
+            progress=0.0,
+            error=None,
+        )
+        cls._spawn_background_task(
+            cls._run_background_hydration(
+                library_type=scoped_type,
+                series_id=series_id,
+                episode_keys=list(episode_keys or []),
+                full_series=full_series,
+            ),
+            description=f"library-hydrate:{scoped_type.value}:{series_id}",
+        )
+        return await cls.describe_series(scoped_type, series_id)
+
+    @classmethod
     async def toggle_permanent_pin(
         cls,
         *,
@@ -715,13 +885,18 @@ class LibraryHydrationService:
         if enabled:
             state = await asyncio.to_thread(LibraryStateDb.get_series_state, scoped_type, series_id)
             if state is None or state.hydration_status != HYDRATION_STATUS_FULLY_LOCAL:
-                hydration_started = True
-                asyncio.create_task(
-                    cls._run_background_full_hydration(
+                current = await cls.describe_series(scoped_type, series_id)
+                operation = current.get("operation")
+                if not (
+                    isinstance(operation, dict)
+                    and str(operation.get("status") or "") in {OPERATION_PENDING, OPERATION_RUNNING}
+                ):
+                    hydration_started = True
+                    await cls.enqueue_hydrate_series(
                         library_type=scoped_type,
                         series_id=series_id,
+                        full_series=True,
                     )
-                )
 
         return {
             "permanent_pin": enabled,
@@ -806,24 +981,56 @@ class LibraryHydrationService:
         return await cls.describe_series(scoped_type, series_id)
 
     @classmethod
+    async def enqueue_evict_series(
+        cls,
+        *,
+        library_type: LibraryType | str,
+        series_id: str,
+    ) -> dict[str, Any]:
+        scoped_type = coerce_library_type(library_type)
+        active_operation = await cls._selected_operation(
+            library_type=scoped_type,
+            series_id=series_id,
+            preferred_types=("evict", "hydrate", "activate"),
+        )
+        if cls._operation_is_active(active_operation):
+            return await cls.describe_series(scoped_type, series_id)
+
+        state = await asyncio.to_thread(LibraryStateDb.get_series_state, scoped_type, series_id)
+        project_pin_count = await asyncio.to_thread(LibraryStateDb.count_project_pins, series_id)
+        if state and state.permanent_pin:
+            raise RuntimeError("Series is permanently pinned and cannot be evicted.")
+        if project_pin_count > 0:
+            raise RuntimeError("Series is still pinned by at least one project and cannot be evicted.")
+
+        await asyncio.to_thread(
+            LibraryStateDb.upsert_operation,
+            library_type=scoped_type,
+            series_id=series_id,
+            operation_type="evict",
+            status=OPERATION_PENDING,
+            progress=0.0,
+            error=None,
+        )
+        cls._spawn_background_task(
+            cls._run_background_evict(
+                library_type=scoped_type,
+                series_id=series_id,
+            ),
+            description=f"library-evict:{scoped_type.value}:{series_id}",
+        )
+        return await cls.describe_series(scoped_type, series_id)
+
+    @classmethod
     async def describe_series(
         cls,
         library_type: LibraryType | str,
         series_id: str,
     ) -> dict[str, Any]:
-        scoped_type = coerce_library_type(library_type)
-        state = await asyncio.to_thread(LibraryStateDb.get_series_state, scoped_type, series_id)
-        operation = await asyncio.to_thread(
-            LibraryStateDb.get_operation,
-            scoped_type,
-            series_id,
-            "hydrate",
-        )
-        project_pin_count = await asyncio.to_thread(LibraryStateDb.count_project_pins, series_id)
-        return cls._state_payload(
-            series_state=state,
-            operation=operation,
-            project_pin_count=project_pin_count,
+        return await cls._describe_state(
+            library_type=library_type,
+            series_id=series_id,
+            preferred_operation_types=("hydrate", "evict", "activate"),
         )
 
     @classmethod
@@ -1015,27 +1222,81 @@ class LibraryHydrationService:
             raise RuntimeError("Project is missing series_id for matcher activation.")
         ready = await cls.ensure_index_ready(library_type=library_type, series_id=series_id)
         if not ready:
+            state = await cls.enqueue_project_activation(
+                project_id=project_id,
+                library_type=library_type,
+                series_id=series_id,
+            )
+            while True:
+                operation = state.get("operation")
+                if await cls.ensure_index_ready(library_type=library_type, series_id=series_id):
+                    return
+                if isinstance(operation, dict):
+                    status = str(operation.get("status") or "")
+                    if status == OPERATION_ERROR:
+                        raise RuntimeError(
+                            str(operation.get("error") or state.get("last_error") or "Library activation failed.")
+                        )
+                await asyncio.sleep(0.25)
+                state = await cls.get_activation_state(
+                    library_type=library_type,
+                    series_id=series_id,
+                )
+
+    @classmethod
+    async def _run_background_activation(
+        cls,
+        *,
+        project_id: str,
+        library_type: LibraryType | str,
+        series_id: str,
+    ) -> None:
+        try:
             await cls.activate_project_series(
                 project_id=project_id,
                 library_type=library_type,
                 series_id=series_id,
             )
+        except Exception:
+            logger.exception(
+                "Background activation failed for %s/%s",
+                library_type,
+                series_id,
+            )
 
     @classmethod
-    async def _run_background_full_hydration(
+    async def _run_background_hydration(
+        cls,
+        *,
+        library_type: LibraryType | str,
+        series_id: str,
+        episode_keys: list[str] | None = None,
+        full_series: bool = False,
+    ) -> None:
+        try:
+            await cls.hydrate_series(
+                library_type=library_type,
+                series_id=series_id,
+                episode_keys=episode_keys,
+                full_series=full_series,
+            )
+        except Exception:
+            logger.exception("Background hydration failed for %s/%s", library_type, series_id)
+
+    @classmethod
+    async def _run_background_evict(
         cls,
         *,
         library_type: LibraryType | str,
         series_id: str,
     ) -> None:
         try:
-            await cls.hydrate_series(
+            await cls.evict_series(
                 library_type=library_type,
                 series_id=series_id,
-                full_series=True,
             )
         except Exception:
-            logger.exception("Background full hydration failed for %s/%s", library_type, series_id)
+            logger.exception("Background eviction failed for %s/%s", library_type, series_id)
 
     @classmethod
     async def publish_series_release(
@@ -1576,7 +1837,11 @@ class LibraryHydrationService:
         project_pin_count: int,
     ) -> dict[str, Any]:
         return {
-            "series_id": series_state.series_id if series_state else None,
+            "series_id": (
+                series_state.series_id
+                if series_state
+                else (operation.series_id if operation is not None else None)
+            ),
             "release_id": series_state.release_id if series_state else None,
             "hydration_status": (
                 series_state.hydration_status
@@ -1592,7 +1857,11 @@ class LibraryHydrationService:
             ),
             "permanent_pin": bool(series_state.permanent_pin) if series_state else False,
             "project_pin_count": project_pin_count,
-            "last_error": series_state.last_error if series_state else None,
+            "last_error": (
+                series_state.last_error
+                if series_state
+                else (operation.error if operation is not None else None)
+            ),
             "operation": (
                 {
                     "type": operation.operation_type,
@@ -1604,5 +1873,9 @@ class LibraryHydrationService:
                 if operation is not None
                 else None
             ),
-            "updated_at": series_state.updated_at if series_state else None,
+            "updated_at": (
+                series_state.updated_at
+                if series_state
+                else (operation.updated_at if operation is not None else None)
+            ),
         }

@@ -77,6 +77,7 @@ ALIGNMENT_REPAIR_MIN_WORD_GAIN = 3
 ALIGNMENT_REPAIR_MIN_DENSITY_GAIN = 1.5
 
 logger = logging.getLogger(__name__)
+TRANSCRIPTION_HEARTBEAT_INTERVAL_SECONDS = 5.0
 
 
 class TranscriberService:
@@ -1401,7 +1402,27 @@ class TranscriberService:
             project_dir = ProjectService.get_project_dir(project_id)
             wav_path = project_dir / "audio_16khz.wav"
             if not wav_path.exists():
-                cls._extract_audio_for_whisper(video_path, wav_path)
+                yield TranscriptionProgress(
+                    "extracting_audio",
+                    0.05,
+                    "Extracting audio track for transcription...",
+                )
+                extraction_task = asyncio.create_task(
+                    asyncio.to_thread(cls._extract_audio_for_whisper, video_path, wav_path)
+                )
+                while True:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(extraction_task),
+                            timeout=TRANSCRIPTION_HEARTBEAT_INTERVAL_SECONDS,
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        yield TranscriptionProgress(
+                            "extracting_audio",
+                            0.05,
+                            "Extracting audio track for transcription...",
+                        )
 
             yield TranscriptionProgress("starting", 0.1, "Loading transcription model...")
 
@@ -1412,11 +1433,24 @@ class TranscriberService:
 
             # Run transcription in thread pool (use large-v3 for original TikTok video)
             # Pass the pre-extracted WAV directly so WhisperX doesn't create a temp copy
-            loop = asyncio.get_event_loop()
-            words, detected_lang = await loop.run_in_executor(
+            loop = asyncio.get_running_loop()
+            transcription_future = loop.run_in_executor(
                 None,
                 lambda: cls._transcribe_sync(wav_path, lang_code, "large-v3"),
             )
+            while True:
+                try:
+                    words, detected_lang = await asyncio.wait_for(
+                        asyncio.shield(transcription_future),
+                        timeout=TRANSCRIPTION_HEARTBEAT_INTERVAL_SECONDS,
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    yield TranscriptionProgress(
+                        "transcribing",
+                        0.2,
+                        "Transcribing audio (this may take a while)...",
+                    )
 
             yield TranscriptionProgress("processing", 0.8, "Assigning words to scenes...")
 
@@ -1448,13 +1482,26 @@ class TranscriberService:
 
                 from .raw_scene_detector import RawSceneDetectorService
 
-                updated_scenes, detection_result = await loop.run_in_executor(
+                diarization_future = loop.run_in_executor(
                     None,
                     lambda: RawSceneDetectorService.detect(
                         wav_path,
                         [scene.model_copy(deep=True) for scene in original_scenes],
                     ),
                 )
+                while True:
+                    try:
+                        updated_scenes, detection_result = await asyncio.wait_for(
+                            asyncio.shield(diarization_future),
+                            timeout=TRANSCRIPTION_HEARTBEAT_INTERVAL_SECONDS,
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        yield TranscriptionProgress(
+                            "processing",
+                            0.85,
+                            "Detecting raw scenes (speaker diarization)...",
+                        )
 
                 if detection_result and detection_result.has_raw_scenes:
                     matches_for_raw_backup = (

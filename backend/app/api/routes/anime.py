@@ -926,6 +926,21 @@ class HydrateSeriesRequest(BaseModel):
     full_series: bool = False
 
 
+@router.get("/{series_id}/state")
+async def get_series_state(
+    series_id: str,
+    library_type: LibraryType = Query(...),
+):
+    """Return persisted hydration/operation state for one series."""
+    try:
+        return await LibraryHydrationService.describe_series(
+            library_type=library_type,
+            series_id=series_id,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @router.post("/{series_id}/hydrate")
 async def hydrate_series(
     series_id: str,
@@ -933,7 +948,7 @@ async def hydrate_series(
 ):
     """Hydrate episodes locally from the active Storage Box release."""
     try:
-        return await LibraryHydrationService.hydrate_series(
+        return await LibraryHydrationService.enqueue_hydrate_series(
             library_type=request.library_type,
             series_id=series_id,
             episode_keys=request.episode_keys,
@@ -954,7 +969,7 @@ async def evict_series(
 ):
     """Evict local hydrated data for one series if it is not pinned."""
     try:
-        return await LibraryHydrationService.evict_series(
+        return await LibraryHydrationService.enqueue_evict_series(
             library_type=request.library_type,
             series_id=series_id,
         )

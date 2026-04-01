@@ -692,6 +692,14 @@ export const api = {
       },
     ),
 
+  getSeriesState: (
+    libraryType: import("@/types").LibraryType,
+    seriesId: string,
+  ) =>
+    request<import("@/types").LibraryActivationState>(
+      `/anime/${encodeURIComponent(seriesId)}/state?library_type=${encodeURIComponent(libraryType)}`,
+    ),
+
   evictSeries: (
     libraryType: import("@/types").LibraryType,
     seriesId: string,

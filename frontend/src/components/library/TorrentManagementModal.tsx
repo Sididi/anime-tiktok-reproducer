@@ -17,6 +17,7 @@ import type {
   EpisodeSourcesPayload,
   VerificationResult,
   ReplacementProgressEvent,
+  LibraryActivationState,
 } from "@/types/library";
 import { api } from "@/api/client";
 import { readSSEStream } from "@/utils/sse";
@@ -250,6 +251,36 @@ export function TorrentManagementModal({
     onClose();
   }, [onComplete, onClose]);
 
+  const waitForSeriesOperation = useCallback(
+    async (targetSeriesId: string): Promise<LibraryActivationState> => {
+      const deadline = Date.now() + 10 * 60 * 1000;
+      let latestState: LibraryActivationState | null = null;
+
+      while (Date.now() < deadline) {
+        const state = await api.getSeriesState(libraryType, targetSeriesId);
+        latestState = state;
+        const operation = state.operation;
+
+        if (!operation || (operation.status !== "pending" && operation.status !== "running")) {
+          if (operation?.status === "error") {
+            throw new Error(
+              operation.error || state.last_error || "L’opération Storage Box a échoué.",
+            );
+          }
+          return state;
+        }
+
+        await new Promise((resolve) => window.setTimeout(resolve, 750));
+      }
+
+      throw new Error(
+        latestState?.last_error ||
+          "L’opération Storage Box prend trop de temps. Vérifiez son état dans la bibliothèque.",
+      );
+    },
+    [libraryType],
+  );
+
   const handleHydrate = useCallback(
     async (episodeKey?: string) => {
       if (!seriesId) {
@@ -260,10 +291,20 @@ export function TorrentManagementModal({
       setError(null);
       setHydrateTarget(episodeKey ?? "all");
       try {
-        await api.hydrateSeries(libraryType, seriesId, {
+        const state = await api.hydrateSeries(libraryType, seriesId, {
           episode_keys: episodeKey ? [episodeKey] : [],
           full_series: !episodeKey,
         });
+        if (
+          state.operation &&
+          (state.operation.status === "pending" || state.operation.status === "running")
+        ) {
+          await waitForSeriesOperation(seriesId);
+        } else if (state.operation?.status === "error") {
+          throw new Error(
+            state.operation.error || state.last_error || "L’hydratation Storage Box a échoué.",
+          );
+        }
         await loadEpisodeSources();
         await onSourcesChanged?.();
       } catch (e) {
@@ -272,7 +313,7 @@ export function TorrentManagementModal({
         setHydrateTarget(null);
       }
     },
-    [libraryType, loadEpisodeSources, onSourcesChanged, seriesId],
+    [libraryType, loadEpisodeSources, onSourcesChanged, seriesId, waitForSeriesOperation],
   );
 
   // Cleanup on unmount

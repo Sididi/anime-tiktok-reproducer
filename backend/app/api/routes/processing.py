@@ -213,6 +213,43 @@ def _normalize_audio_file_to_wav(input_path: Path, output_path: Path) -> None:
     audio.export(str(output_path), format="wav")
 
 
+def _concat_audio_parts_to_wav(part_paths: list[Path], output_path: Path) -> None:
+    combined = AudioSegment.empty()
+    for part_path in part_paths:
+        combined += AudioSegment.from_file(str(part_path))
+    combined.export(str(output_path), format="wav")
+
+
+def _build_preview_audio_sync(
+    *,
+    source_audio: Path,
+    preview_path: Path,
+    music_key: str | None,
+) -> float:
+    tts_audio = AudioSegment.from_file(str(source_audio))
+
+    if music_key:
+        try:
+            music = MusicConfigService.get_music(music_key)
+        except ValueError:
+            music = None
+        if music is not None:
+            music_file = Path(music.file_path)
+            if music_file.exists():
+                music_audio = AudioSegment.from_file(str(music_file))
+                tts_len = len(tts_audio)
+                if len(music_audio) < tts_len:
+                    repeats = (tts_len // len(music_audio)) + 1
+                    music_audio = music_audio * repeats
+                music_audio = music_audio[:tts_len]
+                music_audio = music_audio + music.volume_db
+                music_audio = music_audio.fade_out(2000)
+                tts_audio = tts_audio.overlay(music_audio)
+
+    tts_audio.export(str(preview_path), format="wav")
+    return len(tts_audio) / 1000.0
+
+
 @router.get("/script/automation/config")
 async def get_script_automation_config(project_id: str):
     """Return automation config and integration readiness for /script page."""
@@ -747,14 +784,8 @@ async def stage_preview_audio(
                 await _write_upload_to_path(part, part_path)
                 part_paths.append(part_path)
 
-            def _concat():
-                combined = AudioSegment.empty()
-                for p in part_paths:
-                    combined += AudioSegment.from_file(str(p))
-                combined.export(str(staged_path), format="wav")
-
             try:
-                await asyncio.to_thread(_concat)
+                await asyncio.to_thread(_concat_audio_parts_to_wav, part_paths, staged_path)
             except Exception:
                 raise HTTPException(status_code=400, detail="Failed to process audio parts")
 
@@ -799,37 +830,23 @@ async def build_preview(project_id: str, request: PreviewBuildRequest):
         speed_tmp = project_dir / "preview_speed_tmp.wav"
         try:
             await AudioSpeedService.apply_speed(source_audio, speed_tmp, speed)
-            tts_audio = AudioSegment.from_file(str(speed_tmp))
-        finally:
+            preview_source = speed_tmp
+        except Exception as exc:
             speed_tmp.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail=f"Failed to apply TTS speed: {exc}")
     else:
-        tts_audio = AudioSegment.from_file(str(source_audio))
+        preview_source = source_audio
 
-    # Step 2: Mix music if requested
-    if request.music_key:
-        try:
-            music = MusicConfigService.get_music(request.music_key)
-            music_file = Path(music.file_path)
-            if music_file.exists():
-                music_audio = AudioSegment.from_file(str(music_file))
-                tts_len = len(tts_audio)
-                # Loop music to match TTS length
-                if len(music_audio) < tts_len:
-                    repeats = (tts_len // len(music_audio)) + 1
-                    music_audio = music_audio * repeats
-                music_audio = music_audio[:tts_len]
-                # Apply volume and fade
-                music_audio = music_audio + music.volume_db
-                music_audio = music_audio.fade_out(2000)
-                tts_audio = tts_audio.overlay(music_audio)
-        except ValueError:
-            pass  # Unknown music key, skip
-
-    def _export():
-        tts_audio.export(str(preview_path), format="wav")
-
-    await asyncio.to_thread(_export)
-    duration = len(tts_audio) / 1000.0
+    try:
+        duration = await asyncio.to_thread(
+            _build_preview_audio_sync,
+            source_audio=preview_source,
+            preview_path=preview_path,
+            music_key=request.music_key,
+        )
+    finally:
+        if speed != 1.0:
+            speed_tmp.unlink(missing_ok=True)
 
     return {
         "preview_url": f"/api/projects/{project_id}/script/preview/audio",
