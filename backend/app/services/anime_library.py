@@ -1539,6 +1539,45 @@ class AnimeLibraryService:
         ]
 
     @classmethod
+    def _build_library_import_audio_normalize_cmd(
+        cls,
+        source_path: Path,
+        output_path: Path,
+        *,
+        probe: SourceMediaProbe,
+    ) -> list[str]:
+        """Stream-copy video and transcode all audio tracks to AAC.
+
+        Used when a container holds multiple audio streams with different
+        codecs (e.g. AAC + E-AC-3) which Premiere Pro cannot handle.
+        """
+        return [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(source_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-map_metadata",
+            "-1",
+            "-map_chapters",
+            "-1",
+            "-dn",
+            "-sn",
+            "-write_tmcd",
+            "0",
+            "-c:v",
+            "copy",
+            *cls._build_audio_args(has_audio=probe.has_audio),
+            *cls._build_audio_stream_metadata_args(probe.audio_streams),
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+
+    @classmethod
     def _is_premiere_native_codec(cls, codec: str | None) -> bool:
         """Return True when video codec is natively supported by Premiere Pro."""
         return (codec or "").strip().lower() in cls.PREMIERE_NATIVE_VIDEO_CODECS
@@ -1668,6 +1707,24 @@ class AnimeLibraryService:
             "-ar",
             cls.SOURCE_NORMALIZATION_AUDIO_RATE,
         ]
+
+    @classmethod
+    def _has_mixed_audio_codecs(cls, probe: SourceMediaProbe) -> bool:
+        """True when audio tracks use non-uniform codecs needing normalization.
+
+        Premiere Pro fails to recognise secondary audio tracks when different
+        codecs coexist in the same MP4 container (e.g. AAC + E-AC-3).  We
+        flag any multi-track file where not every stream is AAC so that the
+        import pipeline can transcode all audio to AAC.
+        """
+        if len(probe.audio_streams) < 2:
+            return False
+        codecs = {
+            (s.codec_name or "").strip().lower()
+            for s in probe.audio_streams
+        }
+        codecs.discard("")
+        return codecs != {"aac"}
 
     @classmethod
     def _is_valid_prepared_library_probe(
@@ -3196,6 +3253,19 @@ class AnimeLibraryService:
             source_probe = None
         if source_probe is None or source_probe.duration is None:
             raise RuntimeError(f"Source file is unreadable: {source_path.name}")
+
+        needs_audio_normalize = (
+            not needs_direct_h264_transcode
+            and source_probe.has_audio
+            and cls._has_mixed_audio_codecs(source_probe)
+        )
+        if needs_audio_normalize:
+            action = "Normalizing audio (remux)" if not is_mp4 else "Normalizing audio"
+            logger.info(
+                "Mixed audio codecs in %s — will normalize to AAC",
+                source_path.name,
+            )
+
         tmp_dest = preferred_dest.with_name(f"{preferred_dest.stem}.import.tmp.mp4")
 
         async def _cleanup_tmp_dest() -> None:
@@ -3236,12 +3306,21 @@ class AnimeLibraryService:
                 await _cleanup_tmp_dest()
             remux_error: str | None = None
             try:
-                remux_result = await run_command(
-                    cls._build_library_import_remux_cmd(
+                remux_cmd = (
+                    cls._build_library_import_audio_normalize_cmd(
                         source_path,
                         tmp_dest,
                         probe=source_probe,
-                    ),
+                    )
+                    if needs_audio_normalize
+                    else cls._build_library_import_remux_cmd(
+                        source_path,
+                        tmp_dest,
+                        probe=source_probe,
+                    )
+                )
+                remux_result = await run_command(
+                    remux_cmd,
                     timeout_seconds=cls.REMUX_TIMEOUT_SECONDS,
                 )
             except FileNotFoundError as exc:
@@ -3271,7 +3350,46 @@ class AnimeLibraryService:
                         f"Failed to prepare source as MP4 (remux: {remux_error}; {exc})"
                     ) from exc
         elif preferred_dest != source_path:
-            await asyncio.to_thread(shutil.copy2, source_path, preferred_dest)
+            if needs_audio_normalize:
+                if tmp_dest.exists():
+                    await _cleanup_tmp_dest()
+                normalize_error: str | None = None
+                try:
+                    normalize_result = await run_command(
+                        cls._build_library_import_audio_normalize_cmd(
+                            source_path,
+                            tmp_dest,
+                            probe=source_probe,
+                        ),
+                        timeout_seconds=cls.REMUX_TIMEOUT_SECONDS,
+                    )
+                except FileNotFoundError as exc:
+                    if is_media_binary_override_error(exc):
+                        raise
+                    normalize_error = cls._format_media_failure(exc)
+                except CommandTimeoutError as exc:
+                    normalize_error = cls._format_media_failure(exc)
+                else:
+                    if normalize_result.returncode != 0:
+                        normalize_error = cls._format_media_failure(normalize_result)
+                    else:
+                        norm_probe = await asyncio.to_thread(cls._probe_media_sync, tmp_dest)
+                        if cls._is_valid_prepared_library_probe(
+                            norm_probe, reference_probe=source_probe
+                        ):
+                            await asyncio.to_thread(tmp_dest.replace, preferred_dest)
+                        else:
+                            normalize_error = (
+                                f"Audio-normalized output failed validation: {source_path.name}"
+                            )
+
+                if normalize_error is not None:
+                    await _cleanup_tmp_dest()
+                    raise RuntimeError(
+                        f"Failed to normalize audio for {source_path.name}: {normalize_error}"
+                    )
+            else:
+                await asyncio.to_thread(shutil.copy2, source_path, preferred_dest)
 
         # Extract subtitles to sidecar.  Always attempt extraction regardless
         # of transform type — remux/transcode strip subtitle streams and even

@@ -9,6 +9,7 @@ import re
 import shutil
 import tempfile
 import wave
+from contextlib import suppress
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -25,8 +26,11 @@ from ..utils.timing import compute_adjusted_scene_end_times
 from .anime_library import (
     AnimeLibraryService,
     SourceAudioSelectionPolicy,
+    SourceMediaProbe,
     SubtitleSidecarEntry,
 )
+from .storage_box_repository import StorageBoxRepository
+from .storage_box_transfer import StorageBoxTransferService
 from .transcriber import TranscriberService
 from .otio_timing import ClipTiming, OTIOTimingCalculator, FrameRateInfo
 from .gap_resolution import GapResolutionService
@@ -348,6 +352,86 @@ class ProcessingService:
             f"{language_label} stream {policy.selected_stream_position + 1} "
             f"({policy.channel_type})"
         )
+
+    @classmethod
+    async def _fix_mixed_audio_codecs_in_place(
+        cls,
+        source_path: Path,
+        *,
+        probe: SourceMediaProbe,
+        library_type: str | None = None,
+    ) -> None:
+        """Transcode mixed audio codecs to AAC in-place (one-time fix).
+
+        After fixing the local file, attempts to reupload the corrected
+        version to the storage box so subsequent downloads are clean.
+        """
+        tmp_path = source_path.with_name(f"{source_path.stem}.audio_fix.tmp.mp4")
+        try:
+            result = await run_command(
+                AnimeLibraryService._build_library_import_audio_normalize_cmd(
+                    source_path,
+                    tmp_path,
+                    probe=probe,
+                ),
+                timeout_seconds=AnimeLibraryService.REMUX_TIMEOUT_SECONDS,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Audio normalization failed: "
+                    f"{AnimeLibraryService._format_media_failure(result)}"
+                )
+            fixed_probe = await asyncio.to_thread(
+                AnimeLibraryService._probe_media_sync, tmp_path
+            )
+            if not AnimeLibraryService._is_valid_prepared_library_probe(
+                fixed_probe, reference_probe=probe
+            ):
+                raise RuntimeError(
+                    f"Audio-normalized output failed validation: {source_path.name}"
+                )
+            await asyncio.to_thread(tmp_path.replace, source_path)
+        except Exception:
+            if tmp_path.exists():
+                with suppress(OSError):
+                    await asyncio.to_thread(tmp_path.unlink)
+            raise
+
+        logger.info(
+            "Fixed mixed audio codecs in-place: %s",
+            source_path.name,
+        )
+
+        # Reupload to storage box so the fix persists remotely.
+        if StorageBoxRepository.is_enabled() and library_type is not None:
+            try:
+                series_dir = source_path.parent
+                metadata = StorageBoxRepository.read_local_series_metadata(series_dir)
+                if metadata is not None:
+                    series_id = metadata.get("series_id")
+                    display_name = metadata.get("display_name")
+                    release_id = metadata.get("release_id")
+                    if series_id and display_name and release_id:
+                        remote_path = (
+                            StorageBoxRepository._release_root(
+                                library_type, series_id, release_id
+                            )
+                            / StorageBoxRepository._payload_library_root(display_name)
+                            / source_path.name
+                        )
+                        await StorageBoxTransferService.upload_file(
+                            source_path, remote_path
+                        )
+                        logger.info(
+                            "Reuploaded audio-fixed file to storage box: %s",
+                            source_path.name,
+                        )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to reupload audio-fixed file %s to storage box: %s",
+                    source_path.name,
+                    exc,
+                )
 
     @classmethod
     def schedule_gap_candidate_prewarm(
@@ -2534,6 +2618,29 @@ class ProcessingService:
                         f"Inspecting source audio ({idx}/{total_source_paths}): "
                         f"{resolved_source_path.name}",
                     )
+
+                    # --- One-time fix: normalize mixed audio codecs to AAC ---
+                    pre_probe = await asyncio.to_thread(
+                        AnimeLibraryService._probe_media_sync,
+                        resolved_source_path,
+                    )
+                    if (
+                        pre_probe is not None
+                        and AnimeLibraryService._has_mixed_audio_codecs(pre_probe)
+                    ):
+                        yield ProcessingProgress(
+                            "processing",
+                            "source_audio_policy",
+                            0.4 + 0.09 * before_fraction,
+                            f"Normalizing mixed audio codecs ({idx}/{total_source_paths}): "
+                            f"{resolved_source_path.name}",
+                        )
+                        await cls._fix_mixed_audio_codecs_in_place(
+                            resolved_source_path,
+                            probe=pre_probe,
+                            library_type=project.library_type,
+                        )
+
                     audio_policy = await asyncio.to_thread(
                         AnimeLibraryService.build_source_audio_selection_policy,
                         resolved_source_path,
