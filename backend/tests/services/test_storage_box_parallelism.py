@@ -187,6 +187,7 @@ async def test_hydrate_index_artifacts_downloads_in_parallel(
     download_active = 0
     download_max_active = 0
     materialized_files: list[str] = []
+    progress_updates: list[tuple[int, int, str]] = []
 
     async def fake_download(cls, remote_path: PurePosixPath, local_path: Path) -> None:
         nonlocal download_active, download_max_active
@@ -216,7 +217,14 @@ async def test_hydrate_index_artifacts_downloads_in_parallel(
         classmethod(fake_materialize),
     )
 
-    await LibraryHydrationService._hydrate_index_artifacts(LibraryType.ANIME, manifest)
+    async def on_progress(completed: int, total: int, relative_path: str) -> None:
+        progress_updates.append((completed, total, relative_path))
+
+    await LibraryHydrationService._hydrate_index_artifacts(
+        LibraryType.ANIME,
+        manifest,
+        progress_callback=on_progress,
+    )
 
     assert download_max_active == 2
     assert set(materialized_files) == {
@@ -224,6 +232,7 @@ async def test_hydrate_index_artifacts_downloads_in_parallel(
         "series-1/state.fragment.json",
         "series-1/series/demo-key/faiss.index",
     }
+    assert [update[:2] for update in progress_updates] == [(1, 3), (2, 3), (3, 3)]
 
 
 @pytest.mark.asyncio
@@ -321,7 +330,12 @@ async def test_activate_project_series_skips_index_download_when_local_cache_mat
         classmethod(lambda cls, library_type, manifest: 0),
     )
 
-    async def fake_hydrate_index_artifacts(cls, library_type: LibraryType, manifest: dict) -> None:
+    async def fake_hydrate_index_artifacts(
+        cls,
+        library_type: LibraryType,
+        manifest: dict,
+        progress_callback=None,
+    ) -> None:
         nonlocal hydrate_called
         hydrate_called = True
 

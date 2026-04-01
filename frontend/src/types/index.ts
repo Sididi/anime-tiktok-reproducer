@@ -360,6 +360,7 @@ export type {
   BrowseEntry,
   BrowseResult,
   IndexationJob,
+  ProjectStartupJob,
   PurgeResult,
   LibraryActivationState,
   EpisodeSourcesPayload,

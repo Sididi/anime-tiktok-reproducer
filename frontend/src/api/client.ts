@@ -105,6 +105,22 @@ export const api = {
       }),
     }),
 
+  startProjectAsync: (
+    tiktokUrl: string,
+    animeName: string | undefined,
+    seriesId: string | undefined,
+    libraryType: import("@/types").LibraryType = "anime",
+  ) =>
+    request<import("@/types").ProjectStartupJob>("/projects/start-async", {
+      method: "POST",
+      body: JSON.stringify({
+        tiktok_url: tiktokUrl,
+        anime_name: animeName,
+        series_id: seriesId,
+        library_type: libraryType,
+      }),
+    }),
+
   listProjects: () => request<import("@/types").Project[]>("/projects"),
 
   getProject: (id: string) =>
@@ -136,6 +152,20 @@ export const api = {
     request<import("@/types").LibraryActivationState>(
       `/projects/${projectId}/library/activation`,
     ),
+
+  retryProjectStartup: (projectId: string) =>
+    request<import("@/types").ProjectStartupJob>(
+      `/projects/${projectId}/startup/retry`,
+      { method: "POST" },
+    ),
+
+  listProjectStartupJobs: () =>
+    request<{ jobs: import("@/types").ProjectStartupJob[] }>(
+      "/projects/startup/jobs",
+    ),
+
+  streamProjectStartupJobs: () =>
+    fetch(`${API_BASE}/projects/startup/jobs/stream`),
 
   // Accounts
   listAccounts: () =>

@@ -55,6 +55,23 @@ export interface IndexationJob {
   created_at: string;
 }
 
+export interface ProjectStartupJob {
+  job_id: string;
+  project_id: string;
+  anime_name: string | null;
+  series_id: string | null;
+  library_type: import("./index").LibraryType;
+  tiktok_url: string | null;
+  status: "queued" | "running" | "complete" | "error";
+  progress: number;
+  phase: string | null;
+  message: string | null;
+  error: string | null;
+  ready_url: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface LibraryActivationState {
   series_id: string | null;
   release_id: string | null;

@@ -1,8 +1,8 @@
-import { useState, useEffect, useCallback } from "react";
-import { useNavigate } from "react-router-dom";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   LibraryHeader,
   IndexJobsPanel,
+  StartupJobsPanel,
   SourceList,
   SearchBar,
   BottomBar,
@@ -20,12 +20,11 @@ import type {
   LibraryType,
   SourceDetails,
   IndexationJob,
+  ProjectStartupJob,
   SeriesDeleteReferencingProject,
 } from "@/types";
 
 export function ProjectSetup() {
-  const navigate = useNavigate();
-
   // Library state
   const [selectedLibraryType, setSelectedLibraryType] = useState<LibraryType>(
     () => (localStorage.getItem("libraryType") as LibraryType) || "anime",
@@ -39,6 +38,9 @@ export function ProjectSetup() {
   const [processing, setProcessing] = useState(false);
   const [statusText, setStatusText] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [startupJobs, setStartupJobs] = useState<ProjectStartupJob[]>([]);
+  const startupAbortRef = useRef<AbortController | null>(null);
+  const startupTabsRef = useRef<Map<string, Window | null>>(new Map());
 
   // Modals
   const [showProjectManager, setShowProjectManager] = useState(false);
@@ -98,12 +100,181 @@ export function ProjectSetup() {
   }, [selectedLibraryType]);
 
   // ---------------------------------------------------------------------------
-  // Start flow: check duplicate -> create project -> download -> detect -> nav
+  // Background startup flow
   // ---------------------------------------------------------------------------
-  const proceedWithStart = useCallback(async () => {
+  const renderStartupWindow = useCallback(
+    (
+      popup: Window | null,
+      title: string,
+      message: string,
+      isError = false,
+    ) => {
+      if (!popup || popup.closed) {
+        return;
+      }
+      try {
+        const doc = popup.document;
+        doc.title = title;
+        if (!doc.body) {
+          doc.write("<!doctype html><html><head><title></title></head><body></body></html>");
+          doc.close();
+        }
+        const body = doc.body;
+        body.innerHTML = "";
+        body.style.margin = "0";
+        body.style.fontFamily = "Inter, sans-serif";
+        body.style.background = isError ? "#1f1010" : "#0f172a";
+        body.style.color = "#f8fafc";
+
+        const wrapper = doc.createElement("div");
+        wrapper.style.minHeight = "100vh";
+        wrapper.style.display = "flex";
+        wrapper.style.alignItems = "center";
+        wrapper.style.justifyContent = "center";
+        wrapper.style.padding = "24px";
+
+        const card = doc.createElement("div");
+        card.style.width = "min(520px, 100%)";
+        card.style.borderRadius = "16px";
+        card.style.padding = "24px";
+        card.style.background = isError ? "#3b1616" : "#111827";
+        card.style.boxSizing = "border-box";
+
+        const heading = doc.createElement("h1");
+        heading.textContent = title;
+        heading.style.margin = "0 0 12px 0";
+        heading.style.fontSize = "22px";
+
+        const detail = doc.createElement("p");
+        detail.textContent = message;
+        detail.style.margin = "0";
+        detail.style.lineHeight = "1.5";
+        detail.style.color = "#cbd5e1";
+
+        card.appendChild(heading);
+        card.appendChild(detail);
+        wrapper.appendChild(card);
+        body.appendChild(wrapper);
+      } catch {
+        // Ignore popup update failures once the user navigates away.
+      }
+    },
+    [],
+  );
+
+  const openStartupWindow = useCallback(() => {
+    const popup = window.open("", "_blank");
+    renderStartupWindow(
+      popup,
+      "Project startup in progress",
+      "Preparing download, scene detection, and library activation...",
+    );
+    return popup;
+  }, [renderStartupWindow]);
+
+  const upsertStartupJob = useCallback(
+    (job: ProjectStartupJob) => {
+      setStartupJobs((prev) => {
+        const idx = prev.findIndex((entry) => entry.project_id === job.project_id);
+        if (idx >= 0) {
+          const next = [...prev];
+          next[idx] = job;
+          return next;
+        }
+        return [job, ...prev];
+      });
+
+      const popup = startupTabsRef.current.get(job.project_id) ?? null;
+      if (job.status === "complete" && job.ready_url) {
+        if (popup && !popup.closed) {
+          try {
+            popup.location.href = job.ready_url;
+          } catch {
+            window.open(job.ready_url, "_blank");
+          }
+        }
+        startupTabsRef.current.delete(job.project_id);
+        return;
+      }
+
+      if (job.status === "error") {
+        renderStartupWindow(
+          popup,
+          "Project startup failed",
+          job.error || "Startup failed.",
+          true,
+        );
+        return;
+      }
+
+      renderStartupWindow(
+        popup,
+        "Project startup in progress",
+        job.message || "Working...",
+      );
+    },
+    [renderStartupWindow],
+  );
+
+  useEffect(() => {
+    startupAbortRef.current?.abort();
+    const controller = new AbortController();
+    startupAbortRef.current = controller;
+    let reconnectTimer: number | null = null;
+
+    const scheduleReconnect = () => {
+      if (controller.signal.aborted || reconnectTimer !== null) {
+        return;
+      }
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        void connect();
+      }, 3000);
+    };
+
+    const connect = async () => {
+      try {
+        const response = await api.streamProjectStartupJobs();
+        await readSSEStream<ProjectStartupJob>(
+          response,
+          (job) => {
+            upsertStartupJob(job);
+          },
+          { signal: controller.signal },
+        );
+      } catch {
+        // Ignore transient SSE failures and reconnect below.
+      } finally {
+        scheduleReconnect();
+      }
+    };
+
+    void api
+      .listProjectStartupJobs()
+      .then(({ jobs }) => {
+        jobs.forEach((job) => {
+          upsertStartupJob(job);
+        });
+      })
+      .catch(() => {
+        // SSE bootstrap below is the primary source of truth.
+      });
+
+    void connect();
+
+    return () => {
+      controller.abort();
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+      }
+    };
+  }, [upsertStartupJob]);
+
+  const proceedWithStart = useCallback(async (popup: Window | null) => {
     if (!tiktokUrl.trim() || !selectedSource) return;
     setProcessing(true);
     setError(null);
+    setStatusText("Launching...");
 
     try {
       const selectedSourceDetails = sources.find(
@@ -113,98 +284,80 @@ export function ProjectSetup() {
         throw new Error("Selected source not found");
       }
 
-      // Create project
-      setStatusText("Creating project...");
-      const project = await api.createProject(
+      const job = await api.startProjectAsync(
         tiktokUrl,
-        undefined,
         selectedSourceDetails.name,
         selectedSourceDetails.series_id,
         selectedLibraryType,
       );
-      const activationPromise = api.activateProjectLibrary(project.id).catch(
-        (activationError) => {
-          console.error("Failed to activate library:", activationError);
-          throw activationError;
-        },
-      );
-
-      // Download video
-      setStatusText("Downloading video...");
-      const downloadResp = await api.downloadVideo(project.id, tiktokUrl);
-      await readSSEStream<{
-        status?: string;
-        error?: string | null;
-        message?: string | null;
-        progress?: number;
-      }>(
-        downloadResp,
-        (data) => {
-          if (data.progress !== undefined) {
-            setStatusText(`Downloading... ${Math.round(data.progress)}%`);
-          }
-        },
-        {
-          stopWhen: (data) => data.status === "complete",
-        },
-      );
-
-      // Detect scenes
-      setStatusText("Detecting scenes...");
-      const detectResp = await api.detectScenes(project.id);
-      await readSSEStream<{
-        status?: string;
-        error?: string | null;
-        message?: string | null;
-        progress?: number;
-      }>(
-        detectResp,
-        (data) => {
-          if (data.progress !== undefined) {
-            setStatusText(
-              `Detecting scenes... ${Math.round(data.progress * 100)}%`,
-            );
-          }
-        },
-        {
-          stopWhen: (data) => data.status === "complete",
-        },
-      );
-
-      // Check whether to skip the scenes UI
-      let skipScenesUi = false;
-      try {
-        const scenesConfig = await api.getScenesConfig(project.id);
-        skipScenesUi = Boolean(scenesConfig.skip_ui_enabled);
-      } catch {
-        skipScenesUi = false;
+      if (popup) {
+        startupTabsRef.current.set(job.project_id, popup);
       }
-
-      if (skipScenesUi) {
-        setStatusText("Preparing library...");
-        await activationPromise;
-      } else {
-        void activationPromise;
-      }
-
-      navigate(
-        skipScenesUi
-          ? `/project/${project.id}/matches`
-          : `/project/${project.id}/scenes`,
-      );
+      upsertStartupJob(job);
+      setTiktokUrl("");
     } catch (err) {
+      if (popup && !popup.closed) {
+        popup.close();
+      }
       setError((err as Error).message);
+    } finally {
       setProcessing(false);
+      setStatusText("");
     }
-  }, [tiktokUrl, selectedSource, selectedLibraryType, navigate, sources]);
+  }, [tiktokUrl, selectedSource, selectedLibraryType, sources, upsertStartupJob]);
+
+  const handleOpenStartupJob = useCallback((job: ProjectStartupJob) => {
+    if (!job.ready_url) {
+      return;
+    }
+    const popup = startupTabsRef.current.get(job.project_id) ?? null;
+    if (popup && !popup.closed) {
+      try {
+        popup.location.href = job.ready_url;
+        return;
+      } catch {
+        // Fall back to a fresh tab.
+      }
+    }
+    window.open(job.ready_url, "_blank");
+  }, []);
+
+  const handleRetryStartup = useCallback(
+    async (job: ProjectStartupJob) => {
+      setError(null);
+      const popup = openStartupWindow();
+      setProcessing(true);
+      setStatusText("Relaunching...");
+      try {
+        const nextJob = await api.retryProjectStartup(job.project_id);
+        if (popup) {
+          startupTabsRef.current.set(nextJob.project_id, popup);
+        }
+        upsertStartupJob(nextJob);
+      } catch (err) {
+        if (popup && !popup.closed) {
+          popup.close();
+        }
+        setError((err as Error).message);
+      } finally {
+        setProcessing(false);
+        setStatusText("");
+      }
+    },
+    [openStartupWindow, upsertStartupJob],
+  );
 
   const handleStart = useCallback(async () => {
     if (!tiktokUrl.trim() || !selectedSource) return;
     setError(null);
+    const popup = openStartupWindow();
 
     try {
       const result = await api.checkTiktokUrl(tiktokUrl);
       if (result.exists && result.video_id) {
+        if (popup && !popup.closed) {
+          popup.close();
+        }
         setDuplicateWarning({
           videoId: result.video_id,
           registeredAt: result.registered_at,
@@ -215,8 +368,8 @@ export function ProjectSetup() {
       // If check fails, proceed anyway
     }
 
-    proceedWithStart();
-  }, [tiktokUrl, selectedSource, proceedWithStart]);
+    void proceedWithStart(popup);
+  }, [tiktokUrl, selectedSource, openStartupWindow, proceedWithStart]);
 
   // ---------------------------------------------------------------------------
   // New source submission (async indexing)
@@ -382,6 +535,11 @@ export function ProjectSetup() {
       />
 
       <IndexJobsPanel onJobComplete={handleJobComplete} />
+      <StartupJobsPanel
+        jobs={startupJobs}
+        onOpen={handleOpenStartupJob}
+        onRetry={handleRetryStartup}
+      />
 
       <SearchBar
         searchQuery={searchQuery}
@@ -478,7 +636,7 @@ export function ProjectSetup() {
         onCancel={() => setDuplicateWarning(null)}
         onContinue={() => {
           setDuplicateWarning(null);
-          proceedWithStart();
+          void proceedWithStart(openStartupWindow());
         }}
       />
 

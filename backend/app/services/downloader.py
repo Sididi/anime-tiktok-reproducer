@@ -47,6 +47,8 @@ class DownloaderService:
     """Service for downloading TikTok videos using yt-dlp."""
 
     DOWNLOAD_TIMEOUT_SECONDS = 1800.0
+    DOWNLOAD_HEARTBEAT_INTERVAL_SECONDS = 5.0
+    DOWNLOAD_STALL_SECONDS = 60.0
     FFPROBE_TIMEOUT_SECONDS = 30.0
     MUX_TIMEOUT_SECONDS = 300.0
     AUDIO_RECOVERY_DURATION_TOLERANCE_SECONDS = 0.25
@@ -134,12 +136,31 @@ class DownloaderService:
             return None
         return cmd[location_index]
 
+    @staticmethod
+    def _extract_output_path(cmd: list[str]) -> Path | None:
+        if "-o" not in cmd:
+            return None
+        output_index = cmd.index("-o") + 1
+        if output_index >= len(cmd):
+            return None
+        return Path(cmd[output_index])
+
+    @staticmethod
+    def _safe_file_size(path: Path | None) -> int | None:
+        if path is None:
+            return None
+        try:
+            return path.stat().st_size
+        except OSError:
+            return None
+
     @classmethod
     async def _stream_download_command(
         cls,
         cmd: list[str],
         *,
         progress_message_prefix: str,
+        activity_path: Path | None = None,
     ) -> AsyncIterator[DownloadProgress | _DownloadCommandResult]:
         process: asyncio.subprocess.Process | None = None
         stderr_task: asyncio.Task[bytes] | None = None
@@ -159,6 +180,11 @@ class DownloaderService:
             last_progress = 0.0
             loop = asyncio.get_running_loop()
             deadline = loop.time() + cls.DOWNLOAD_TIMEOUT_SECONDS
+            activity_deadline = loop.time() + cls.DOWNLOAD_STALL_SECONDS
+            heartbeat_interval = cls.DOWNLOAD_HEARTBEAT_INTERVAL_SECONDS
+            watched_path = activity_path or cls._extract_output_path(cmd)
+            last_known_size = cls._safe_file_size(watched_path)
+            last_heartbeat_at = loop.time()
 
             while True:
                 if process.stdout is None:
@@ -168,11 +194,53 @@ class DownloaderService:
                 if remaining <= 0:
                     raise asyncio.TimeoutError
 
-                line = await asyncio.wait_for(process.stdout.readline(), timeout=remaining)
+                try:
+                    line = await asyncio.wait_for(
+                        process.stdout.readline(),
+                        timeout=min(heartbeat_interval, remaining),
+                    )
+                except asyncio.TimeoutError:
+                    now = loop.time()
+                    current_size = cls._safe_file_size(watched_path)
+                    if current_size is not None and (
+                        last_known_size is None or current_size > last_known_size
+                    ):
+                        last_known_size = current_size
+                        activity_deadline = now + cls.DOWNLOAD_STALL_SECONDS
+
+                    if now >= activity_deadline:
+                        aborted = True
+                        if process is not None:
+                            await terminate_process(process)
+                        yield _DownloadCommandResult(
+                            error=(
+                                "Download stalled after "
+                                f"{int(cls.DOWNLOAD_STALL_SECONDS)} seconds "
+                                "without progress output or file growth"
+                            ),
+                        )
+                        return
+
+                    if (now - last_heartbeat_at) >= heartbeat_interval:
+                        percent_text = f"{round(last_progress * 100)}%" if last_progress > 0 else "waiting"
+                        yield DownloadProgress(
+                            "downloading",
+                            last_progress,
+                            f"{progress_message_prefix}: {percent_text} (still running...)",
+                        )
+                        last_heartbeat_at = now
+                    continue
+
                 if not line:
                     break
 
                 line_str = line.decode().strip()
+                now = loop.time()
+                activity_deadline = now + cls.DOWNLOAD_STALL_SECONDS
+                last_heartbeat_at = now
+                current_size = cls._safe_file_size(watched_path)
+                if current_size is not None:
+                    last_known_size = current_size
                 if not line_str:
                     continue
 
@@ -481,6 +549,49 @@ class DownloaderService:
             yield DownloadProgress("error", 0, "", error=str(exc))
         finally:
             cls._cleanup_paths(recovery_path, mux_path)
+
+    @classmethod
+    async def download_project_video(
+        cls,
+        url: str,
+        project_id: str,
+    ) -> AsyncIterator[DownloadProgress]:
+        from ..models import ProjectPhase
+        from .project_service import ProjectService
+        from .tiktok_url_db_service import TikTokUrlDbService
+
+        project = ProjectService.load(project_id)
+        if project is None:
+            raise RuntimeError("Project not found")
+
+        project.tiktok_url = url
+        project.phase = ProjectPhase.DOWNLOADING
+        ProjectService.save(project)
+
+        async for progress in cls.download(url, project_id):
+            if progress.status == "complete":
+                video_path = cls.get_output_path(project_id)
+                video_info = await cls.get_video_info(video_path)
+
+                project = ProjectService.load(project_id)
+                if project is None:
+                    raise RuntimeError("Project not found")
+
+                project.video_path = str(video_path)
+                project.video_duration = video_info.get("duration")
+                project.video_fps = video_info.get("fps")
+                project.video_width = video_info.get("width")
+                project.video_height = video_info.get("height")
+                project.phase = ProjectPhase.SCENE_DETECTION
+                ProjectService.save(project)
+
+                await TikTokUrlDbService.register(url)
+            elif progress.status == "error":
+                project = ProjectService.load(project_id)
+                if project is not None:
+                    project.phase = ProjectPhase.SETUP
+                    ProjectService.save(project)
+            yield progress
 
     @staticmethod
     async def get_video_info(video_path: Path) -> dict:

@@ -59,6 +59,8 @@ _EXPORTS = {
     "LibraryHydrationService": (".library_hydration_service", "LibraryHydrationService"),
     "LibraryStateDb": (".library_state_db", "LibraryStateDb"),
     "IndexationPreflightService": (".indexation_preflight", "IndexationPreflightService"),
+    "ProjectStartupService": (".project_startup_service", "ProjectStartupService"),
+    "project_startup_queue": (".project_startup_service", "project_startup_queue"),
 }
 
 __all__ = list(_EXPORTS)

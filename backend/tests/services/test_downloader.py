@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -15,6 +16,10 @@ from app.services.downloader import DownloadProgress, DownloaderService, _Downlo
 
 
 async def _collect(stream) -> list[DownloadProgress]:
+    return [event async for event in stream]
+
+
+async def _collect_raw(stream) -> list[DownloadProgress | _DownloadCommandResult]:
     return [event async for event in stream]
 
 
@@ -269,3 +274,113 @@ async def test_download_falls_back_to_audio_recovery_file_when_mux_fails(
     output_path = tmp_path / "project-5" / "tiktok.mp4"
     assert output_path.read_bytes() == b"recovery-audio"
     assert events[-1].status == "complete"
+
+
+class _FakeStdout:
+    def __init__(self, process: "_FakeProcess") -> None:
+        self._process = process
+
+    async def readline(self) -> bytes:
+        if self._process.done:
+            return b""
+        await asyncio.Event().wait()
+        return b""
+
+
+class _FakeStderr:
+    async def read(self) -> bytes:
+        return b""
+
+
+class _FakeProcess:
+    def __init__(self) -> None:
+        self.done = False
+        self.returncode: int | None = None
+        self.stdout = _FakeStdout(self)
+        self.stderr = _FakeStderr()
+
+    async def wait(self) -> int:
+        while not self.done:
+            await asyncio.sleep(0.001)
+        return self.returncode or 0
+
+    def terminate(self) -> None:
+        self.done = True
+        self.returncode = -15
+
+    def kill(self) -> None:
+        self.done = True
+        self.returncode = -9
+
+
+@pytest.mark.asyncio
+async def test_stream_download_command_keeps_running_when_file_grows_slowly(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "slow.mp4"
+    process = _FakeProcess()
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        async def grow_file() -> None:
+            for payload in (b"a", b"bb", b"ccc"):
+                await asyncio.sleep(0.015)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                with output_path.open("ab") as handle:
+                    handle.write(payload)
+            process.returncode = 0
+            process.done = True
+
+        asyncio.create_task(grow_file())
+        return process
+
+    monkeypatch.setattr("app.services.downloader.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(DownloaderService, "DOWNLOAD_HEARTBEAT_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(DownloaderService, "DOWNLOAD_STALL_SECONDS", 0.05)
+    monkeypatch.setattr(DownloaderService, "DOWNLOAD_TIMEOUT_SECONDS", 1.0)
+
+    events = await _collect_raw(
+        DownloaderService._stream_download_command(
+            DownloaderService._build_primary_download_command("https://example.com/video", output_path),
+            progress_message_prefix="Downloading",
+            activity_path=output_path,
+        ),
+    )
+
+    heartbeats = [event for event in events if isinstance(event, DownloadProgress)]
+    result = events[-1]
+    assert heartbeats
+    assert any("still running" in event.message for event in heartbeats)
+    assert isinstance(result, _DownloadCommandResult)
+    assert result.error is None
+    assert result.returncode == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_download_command_fails_when_no_output_and_no_file_growth(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "stalled.mp4"
+    process = _FakeProcess()
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return process
+
+    monkeypatch.setattr("app.services.downloader.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(DownloaderService, "DOWNLOAD_HEARTBEAT_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(DownloaderService, "DOWNLOAD_STALL_SECONDS", 0.03)
+    monkeypatch.setattr(DownloaderService, "DOWNLOAD_TIMEOUT_SECONDS", 1.0)
+
+    events = await _collect_raw(
+        DownloaderService._stream_download_command(
+            DownloaderService._build_primary_download_command("https://example.com/video", output_path),
+            progress_message_prefix="Downloading",
+            activity_path=output_path,
+        ),
+    )
+
+    result = events[-1]
+    assert isinstance(result, _DownloadCommandResult)
+    assert result.error is not None
+    assert "stalled" in result.error

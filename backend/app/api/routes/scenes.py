@@ -2,10 +2,9 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import json
-from pathlib import Path
 
 from ...config import settings
-from ...models import Scene, SceneList, ProjectPhase
+from ...models import Scene, SceneList
 from ...services import ProjectService, SceneDetectorService
 
 router = APIRouter(prefix="/projects/{project_id}/scenes", tags=["scenes"])
@@ -172,34 +171,15 @@ async def detect_scenes(project_id: str, request: DetectScenesRequest | None = N
     if not project.video_path:
         raise HTTPException(status_code=400, detail="No video available")
 
-    video_path = Path(project.video_path)
-    if not video_path.exists():
-        raise HTTPException(status_code=404, detail="Video file not found")
-
-    # Update phase
-    project.phase = ProjectPhase.SCENE_DETECTION
-    ProjectService.save(project)
-
     threshold = request.threshold if request else 18.0
     min_scene_len = request.min_scene_len if request else 10
 
     async def stream_progress():
-        async for progress in SceneDetectorService.detect_scenes(
-            video_path, threshold, min_scene_len
+        async for progress in SceneDetectorService.detect_project_scenes(
+            project_id,
+            threshold,
+            min_scene_len,
         ):
-            if progress.status == "complete" and progress.scenes:
-                # Save detected scenes
-                scene_list = SceneList(scenes=progress.scenes)
-                ProjectService.save_scenes(project_id, scene_list)
-
-                # Update phase
-                project.phase = ProjectPhase.SCENE_VALIDATION
-                ProjectService.save(project)
-
-            elif progress.status == "error":
-                project.phase = ProjectPhase.SETUP
-                ProjectService.save(project)
-
             yield f"data: {json.dumps(progress.to_dict())}\n\n"
 
     return StreamingResponse(

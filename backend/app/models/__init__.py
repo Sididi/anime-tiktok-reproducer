@@ -1,5 +1,6 @@
 from ..library_types import LibraryType
 from .project import Project, ProjectPhase
+from .project_startup import ProjectStartupJob
 from .scene import Scene, SceneList
 from .match import AlternativeMatch, MatchCandidate, SceneMatch, MatchList
 from .transcription import Word, SceneTranscription, Transcription
@@ -37,6 +38,7 @@ from .torrent import (
 __all__ = [
     "LibraryType",
     "Project", "ProjectPhase", "Scene", "SceneList",
+    "ProjectStartupJob",
     "AlternativeMatch", "MatchCandidate", "SceneMatch", "MatchList",
     "Word", "SceneTranscription", "Transcription",
     "RawSceneCandidate", "RawSceneDetectionResult",

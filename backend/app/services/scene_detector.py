@@ -47,6 +47,7 @@ class SceneDetectionProgress:
 class SceneDetectorService:
     """Service for detecting scenes using PySceneDetect."""
 
+    HEARTBEAT_INTERVAL_SECONDS = 3.0
     EXTREME_SHORT_SECONDS_FLOOR = 0.08
     EXTREME_SHORT_MIN_FRAMES = 3
     HIGH_THRESHOLD_MULTIPLIER = 1.35
@@ -72,15 +73,30 @@ class SceneDetectorService:
         yield SceneDetectionProgress("starting", 0, "Opening video...")
 
         try:
-            # Run detection in thread pool to avoid blocking
-            loop = asyncio.get_event_loop()
-            scenes = await loop.run_in_executor(
+            loop = asyncio.get_running_loop()
+            detect_future = loop.run_in_executor(
                 None,
                 cls._detect_sync,
                 video_path,
                 threshold,
                 min_scene_len,
             )
+            heartbeat_count = 0
+            while True:
+                try:
+                    scenes = await asyncio.wait_for(
+                        asyncio.shield(detect_future),
+                        timeout=cls.HEARTBEAT_INTERVAL_SECONDS,
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    heartbeat_count += 1
+                    heartbeat_progress = min(0.9, 0.05 + (heartbeat_count * 0.03))
+                    yield SceneDetectionProgress(
+                        "processing",
+                        heartbeat_progress,
+                        "Analyzing scene boundaries...",
+                    )
 
             yield SceneDetectionProgress(
                 "complete",
@@ -91,6 +107,53 @@ class SceneDetectorService:
 
         except Exception as e:
             yield SceneDetectionProgress("error", 0, "", error=str(e))
+
+    @classmethod
+    async def detect_project_scenes(
+        cls,
+        project_id: str,
+        threshold: float = 18.0,
+        min_scene_len: int = 10,
+    ) -> AsyncIterator[SceneDetectionProgress]:
+        from pathlib import Path
+
+        from ..models import ProjectPhase, SceneList
+        from .project_service import ProjectService
+
+        project = ProjectService.load(project_id)
+        if project is None:
+            raise RuntimeError("Project not found")
+        if not project.video_path:
+            raise RuntimeError("No video available")
+
+        video_path = Path(project.video_path)
+        if not video_path.exists():
+            raise RuntimeError("Video file not found")
+
+        project.phase = ProjectPhase.SCENE_DETECTION
+        ProjectService.save(project)
+
+        async for progress in cls.detect_scenes(
+            video_path,
+            threshold,
+            min_scene_len,
+        ):
+            if progress.status == "complete" and progress.scenes:
+                scene_list = SceneList(scenes=progress.scenes)
+                ProjectService.save_scenes(project_id, scene_list)
+
+                project = ProjectService.load(project_id)
+                if project is None:
+                    raise RuntimeError("Project not found")
+                project.phase = ProjectPhase.SCENE_VALIDATION
+                ProjectService.save(project)
+            elif progress.status == "error":
+                project = ProjectService.load(project_id)
+                if project is not None:
+                    project.phase = ProjectPhase.SETUP
+                    ProjectService.save(project)
+
+            yield progress
 
     @staticmethod
     def _detect_sync(

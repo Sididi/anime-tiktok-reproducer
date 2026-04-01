@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import shutil
 import uuid
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from ..config import settings
 from ..library_types import LibraryType, coerce_library_type
@@ -82,6 +83,18 @@ def _sha256_file(path: Path) -> str:
         while chunk := handle.read(1024 * 1024):
             hasher.update(chunk)
     return hasher.hexdigest()
+
+
+ActivationProgressCallback = Callable[[float, str], Awaitable[None] | None]
+ArtifactProgressCallback = Callable[[int, int, str], Awaitable[None] | None]
+
+
+async def _call_progress_callback(callback, *args: Any) -> None:
+    if callback is None:
+        return
+    result = callback(*args)
+    if inspect.isawaitable(result):
+        await result
 
 
 async def _run_bounded(items: list[Any], limit: int, worker) -> None:
@@ -382,6 +395,7 @@ class LibraryHydrationService:
         project_id: str,
         library_type: LibraryType | str,
         series_id: str,
+        progress_callback: ActivationProgressCallback | None = None,
     ) -> dict[str, Any]:
         scoped_type = coerce_library_type(library_type)
         await asyncio.to_thread(LibraryStateDb.add_project_pin, project_id, series_id)
@@ -404,6 +418,7 @@ class LibraryHydrationService:
                 )
                 expected_episode_count = int(manifest.get("episode_count", len(manifest.get("episodes", []))))
                 await cls._cache_manifest(scoped_type, manifest)
+                await _call_progress_callback(progress_callback, 0.05, "Loaded release manifest.")
                 local_episode_count = await asyncio.to_thread(
                     cls._count_local_episodes_from_manifest,
                     scoped_type,
@@ -435,7 +450,42 @@ class LibraryHydrationService:
                         progress=0.15,
                         error=None,
                     )
-                    await cls._hydrate_index_artifacts(scoped_type, manifest)
+                    await _call_progress_callback(
+                        progress_callback,
+                        0.15,
+                        "Hydrating matcher cache from Storage Box...",
+                    )
+
+                    async def _artifact_progress(
+                        completed: int,
+                        total: int,
+                        relative_path: str,
+                    ) -> None:
+                        artifact_progress = completed / max(total, 1)
+                        activation_progress = 0.15 + (0.75 * artifact_progress)
+                        await asyncio.to_thread(
+                            LibraryStateDb.upsert_operation,
+                            library_type=scoped_type,
+                            series_id=series_id,
+                            operation_type="activate",
+                            status=OPERATION_RUNNING,
+                            progress=activation_progress,
+                            error=None,
+                        )
+                        await _call_progress_callback(
+                            progress_callback,
+                            activation_progress,
+                            (
+                                "Hydrating matcher cache "
+                                f"({completed}/{total}): {Path(relative_path).name}"
+                            ),
+                        )
+
+                    await cls._hydrate_index_artifacts(
+                        scoped_type,
+                        manifest,
+                        progress_callback=_artifact_progress,
+                    )
                     local_episode_count = await asyncio.to_thread(
                         cls._count_local_episodes_from_manifest,
                         scoped_type,
@@ -447,6 +497,11 @@ class LibraryHydrationService:
                         scoped_type.value,
                         series_id,
                         str(manifest["release_id"]),
+                    )
+                    await _call_progress_callback(
+                        progress_callback,
+                        0.90,
+                        "Matcher cache already ready locally.",
                     )
 
                 hydration_status = (
@@ -472,6 +527,11 @@ class LibraryHydrationService:
                     status=OPERATION_COMPLETE,
                     progress=1.0,
                     error=None,
+                )
+                await _call_progress_callback(
+                    progress_callback,
+                    1.0,
+                    "Library activation complete.",
                 )
                 return await cls.get_activation_state(
                     library_type=scoped_type,
@@ -1227,6 +1287,7 @@ class LibraryHydrationService:
         cls,
         library_type: LibraryType,
         manifest: dict[str, Any],
+        progress_callback: ArtifactProgressCallback | None = None,
     ) -> None:
         index_artifacts = [
             artifact
@@ -1244,7 +1305,12 @@ class LibraryHydrationService:
             str(manifest["release_id"]),
         )
         try:
+            completed = 0
+            total = len(index_artifacts)
+            progress_lock = asyncio.Lock()
+
             async def _download_artifact(artifact: dict[str, Any]) -> None:
+                nonlocal completed
                 relative_path = str(artifact["relative_path"])
                 local_relative_path = Path(relative_path).relative_to("payload/index")
                 download_path = temp_root / local_relative_path
@@ -1252,8 +1318,17 @@ class LibraryHydrationService:
                     release_root / relative_path,
                     download_path,
                 )
-                if _sha256_file(download_path) != str(artifact["sha256"]):
+                actual_sha = await asyncio.to_thread(_sha256_file, download_path)
+                if actual_sha != str(artifact["sha256"]):
                     raise RuntimeError(f"Checksum mismatch for {relative_path}")
+                async with progress_lock:
+                    completed += 1
+                    await _call_progress_callback(
+                        progress_callback,
+                        completed,
+                        total,
+                        relative_path,
+                    )
 
             await _run_bounded(
                 index_artifacts,
@@ -1262,7 +1337,7 @@ class LibraryHydrationService:
             )
             await cls._materialize_local_matcher_cache(library_type, manifest, temp_root)
         finally:
-            shutil.rmtree(temp_root, ignore_errors=True)
+            await asyncio.to_thread(shutil.rmtree, temp_root, True)
 
     @classmethod
     async def _materialize_local_matcher_cache(
@@ -1380,7 +1455,7 @@ class LibraryHydrationService:
 
         temp_root = cls._temp_root() / library_type.value / str(manifest["series_id"]) / "episodes" / str(episode.get("episode_key") or uuid.uuid4().hex[:8])
         if temp_root.exists():
-            shutil.rmtree(temp_root, ignore_errors=True)
+            await asyncio.to_thread(shutil.rmtree, temp_root, True)
         temp_root.mkdir(parents=True, exist_ok=True)
         release_root = StorageBoxRepository._release_root(
             library_type,
@@ -1401,7 +1476,7 @@ class LibraryHydrationService:
                     temp_path,
                 )
                 expected_sha = str(item.get("sha256") or "")
-                if expected_sha and _sha256_file(temp_path) != expected_sha:
+                if expected_sha and (await asyncio.to_thread(_sha256_file, temp_path)) != expected_sha:
                     raise RuntimeError(f"Checksum mismatch for {remote_relative_path}")
                 downloaded.append((temp_path, library_root / local_relative_path))
 
@@ -1412,7 +1487,7 @@ class LibraryHydrationService:
                     target_path.unlink()
                 temp_path.replace(target_path)
         finally:
-            shutil.rmtree(temp_root, ignore_errors=True)
+            await asyncio.to_thread(shutil.rmtree, temp_root, True)
 
         display_name = str(manifest["display_name"])
         StorageBoxRepository.write_local_series_metadata(
