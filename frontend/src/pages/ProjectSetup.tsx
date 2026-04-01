@@ -132,22 +132,44 @@ export function ProjectSetup() {
       // Download video
       setStatusText("Downloading video...");
       const downloadResp = await api.downloadVideo(project.id, tiktokUrl);
-      await readSSEStream<{ status?: string; error?: string | null; message?: string | null; progress?: number }>(downloadResp, (data) => {
-        if (data.progress !== undefined) {
-          setStatusText(`Downloading... ${Math.round(data.progress)}%`);
-        }
-      });
+      await readSSEStream<{
+        status?: string;
+        error?: string | null;
+        message?: string | null;
+        progress?: number;
+      }>(
+        downloadResp,
+        (data) => {
+          if (data.progress !== undefined) {
+            setStatusText(`Downloading... ${Math.round(data.progress)}%`);
+          }
+        },
+        {
+          stopWhen: (data) => data.status === "complete",
+        },
+      );
 
       // Detect scenes
       setStatusText("Detecting scenes...");
       const detectResp = await api.detectScenes(project.id);
-      await readSSEStream<{ status?: string; error?: string | null; message?: string | null; progress?: number }>(detectResp, (data) => {
-        if (data.progress !== undefined) {
-          setStatusText(
-            `Detecting scenes... ${Math.round(data.progress * 100)}%`,
-          );
-        }
-      });
+      await readSSEStream<{
+        status?: string;
+        error?: string | null;
+        message?: string | null;
+        progress?: number;
+      }>(
+        detectResp,
+        (data) => {
+          if (data.progress !== undefined) {
+            setStatusText(
+              `Detecting scenes... ${Math.round(data.progress * 100)}%`,
+            );
+          }
+        },
+        {
+          stopWhen: (data) => data.status === "complete",
+        },
+      );
 
       // Check whether to skip the scenes UI
       let skipScenesUi = false;

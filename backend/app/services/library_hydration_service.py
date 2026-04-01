@@ -227,10 +227,32 @@ class LibraryHydrationService:
         library_type: LibraryType | str,
         series_id: str,
     ) -> bool:
-        state = await asyncio.to_thread(LibraryStateDb.get_series_state, library_type, series_id)
-        return bool(
-            state
-            and state.hydration_status in {HYDRATION_STATUS_INDEX_READY, HYDRATION_STATUS_FULLY_LOCAL}
+        state = await asyncio.to_thread(
+            LibraryStateDb.get_series_state,
+            library_type,
+            series_id,
+        )
+        if not state or not state.release_id:
+            return False
+        if state.hydration_status not in {
+            HYDRATION_STATUS_INDEX_READY,
+            HYDRATION_STATUS_FULLY_LOCAL,
+        }:
+            return False
+
+        cached_path = cls._manifest_cache_path(library_type, series_id, state.release_id)
+        if not cached_path.exists():
+            return False
+
+        try:
+            manifest = await asyncio.to_thread(_json_load, cached_path)
+        except Exception:
+            return False
+
+        return await asyncio.to_thread(
+            cls._local_index_ready_for_manifest_sync,
+            library_type,
+            manifest,
         )
 
     @classmethod
@@ -256,13 +278,50 @@ class LibraryHydrationService:
                 scoped_type,
                 series_id,
             )
+            local_index_ready = await asyncio.to_thread(
+                cls._local_index_ready_for_manifest_sync,
+                scoped_type,
+                manifest,
+            )
             if (
                 state is not None
                 and state.release_id == str(manifest["release_id"])
                 and state.hydration_status
                 in {HYDRATION_STATUS_INDEX_READY, HYDRATION_STATUS_FULLY_LOCAL}
+                and local_index_ready
             ):
                 await cls._cache_manifest(scoped_type, manifest)
+                return manifest
+
+            local_episode_count = await asyncio.to_thread(
+                cls._count_local_episodes_from_manifest,
+                scoped_type,
+                manifest,
+            )
+
+            if local_index_ready:
+                logger.info(
+                    "Storage Box index hydration skipped for %s/%s; local matcher cache already matches release %s",
+                    scoped_type.value,
+                    series_id,
+                    str(manifest["release_id"]),
+                )
+                hydration_status = (
+                    HYDRATION_STATUS_FULLY_LOCAL
+                    if expected_episode_count > 0 and local_episode_count >= expected_episode_count
+                    else HYDRATION_STATUS_INDEX_READY
+                )
+                await cls._cache_manifest(scoped_type, manifest)
+                await asyncio.to_thread(
+                    LibraryStateDb.upsert_series_state,
+                    library_type=scoped_type,
+                    series_id=series_id,
+                    release_id=str(manifest["release_id"]),
+                    hydration_status=hydration_status,
+                    local_episode_count=local_episode_count,
+                    expected_episode_count=expected_episode_count,
+                    last_error=None,
+                )
                 return manifest
 
             try:
@@ -272,11 +331,7 @@ class LibraryHydrationService:
                     series_id=series_id,
                     release_id=str(manifest["release_id"]),
                     hydration_status=HYDRATION_STATUS_HYDRATING_INDEX,
-                    local_episode_count=await asyncio.to_thread(
-                        cls._count_local_episodes_from_manifest,
-                        scoped_type,
-                        manifest,
-                    ),
+                    local_episode_count=local_episode_count,
                     expected_episode_count=expected_episode_count,
                     last_error=None,
                 )
@@ -348,32 +403,52 @@ class LibraryHydrationService:
                     str(current["release_id"]),
                 )
                 expected_episode_count = int(manifest.get("episode_count", len(manifest.get("episodes", []))))
-                await asyncio.to_thread(
-                    LibraryStateDb.upsert_series_state,
-                    library_type=scoped_type,
-                    series_id=series_id,
-                    release_id=str(manifest["release_id"]),
-                    hydration_status=HYDRATION_STATUS_HYDRATING_INDEX,
-                    local_episode_count=0,
-                    expected_episode_count=expected_episode_count,
-                    last_error=None,
-                )
-                await asyncio.to_thread(
-                    LibraryStateDb.upsert_operation,
-                    library_type=scoped_type,
-                    series_id=series_id,
-                    operation_type="activate",
-                    status=OPERATION_RUNNING,
-                    progress=0.15,
-                    error=None,
-                )
                 await cls._cache_manifest(scoped_type, manifest)
-                await cls._hydrate_index_artifacts(scoped_type, manifest)
                 local_episode_count = await asyncio.to_thread(
                     cls._count_local_episodes_from_manifest,
                     scoped_type,
                     manifest,
                 )
+                local_index_ready = await asyncio.to_thread(
+                    cls._local_index_ready_for_manifest_sync,
+                    scoped_type,
+                    manifest,
+                )
+
+                if not local_index_ready:
+                    await asyncio.to_thread(
+                        LibraryStateDb.upsert_series_state,
+                        library_type=scoped_type,
+                        series_id=series_id,
+                        release_id=str(manifest["release_id"]),
+                        hydration_status=HYDRATION_STATUS_HYDRATING_INDEX,
+                        local_episode_count=local_episode_count,
+                        expected_episode_count=expected_episode_count,
+                        last_error=None,
+                    )
+                    await asyncio.to_thread(
+                        LibraryStateDb.upsert_operation,
+                        library_type=scoped_type,
+                        series_id=series_id,
+                        operation_type="activate",
+                        status=OPERATION_RUNNING,
+                        progress=0.15,
+                        error=None,
+                    )
+                    await cls._hydrate_index_artifacts(scoped_type, manifest)
+                    local_episode_count = await asyncio.to_thread(
+                        cls._count_local_episodes_from_manifest,
+                        scoped_type,
+                        manifest,
+                    )
+                else:
+                    logger.info(
+                        "Storage Box activation skipped index download for %s/%s; local matcher cache already matches release %s",
+                        scoped_type.value,
+                        series_id,
+                        str(manifest["release_id"]),
+                    )
+
                 hydration_status = (
                     HYDRATION_STATUS_FULLY_LOCAL
                     if expected_episode_count > 0 and local_episode_count >= expected_episode_count
@@ -791,11 +866,16 @@ class LibraryHydrationService:
             isinstance(local_metadata, dict)
             and str(local_metadata.get("series_id") or "").strip() == series_id
         )
+        local_index_ready = await asyncio.to_thread(
+            cls._local_index_ready_for_manifest_sync,
+            scoped_type,
+            manifest,
+        )
         hydration_status = (
             HYDRATION_STATUS_FULLY_LOCAL
             if expected_episode_count > 0 and local_episode_count >= expected_episode_count
             else HYDRATION_STATUS_INDEX_READY
-            if has_local_index_metadata or local_episode_count > 0
+            if has_local_index_metadata and local_index_ready
             else HYDRATION_STATUS_NOT_HYDRATED
         )
         await asyncio.to_thread(
@@ -1080,6 +1160,67 @@ class LibraryHydrationService:
             ):
                 total += 1
         return total
+
+    @classmethod
+    def _local_index_ready_for_manifest_sync(
+        cls,
+        library_type: LibraryType | str,
+        manifest: dict[str, Any],
+    ) -> bool:
+        display_name = str(manifest.get("display_name") or "").strip()
+        series_id = str(manifest.get("series_id") or "").strip()
+        release_id = str(manifest.get("release_id") or "").strip()
+        if not display_name or not series_id or not release_id:
+            return False
+
+        library_path = AnimeLibraryService.get_library_path(library_type)
+        local_series_dir = library_path / display_name
+        local_metadata = StorageBoxRepository.read_local_series_metadata(local_series_dir)
+        if not isinstance(local_metadata, dict):
+            return False
+        if str(local_metadata.get("series_id") or "").strip() != series_id:
+            return False
+        if str(local_metadata.get("release_id") or "").strip() != release_id:
+            return False
+
+        index_dir = library_path / AnimeLibraryService.INDEX_DIR_NAME
+        manifest_path = index_dir / AnimeLibraryService.MANIFEST_FILE
+        state_path = index_dir / AnimeLibraryService.STATE_FILE
+        if not manifest_path.exists() or not state_path.exists():
+            return False
+
+        try:
+            manifest_payload = _json_load(manifest_path)
+            state_payload = _json_load(state_path)
+        except Exception:
+            return False
+
+        if manifest_payload.get("version") != AnimeLibraryService.SEARCHER_INDEX_FORMAT_VERSION:
+            return False
+        if manifest_payload.get("engine_profile") != AnimeLibraryService.SEARCHER_ENGINE_PROFILE:
+            return False
+
+        series_map = manifest_payload.get("series", {})
+        if not isinstance(series_map, dict):
+            return False
+        series_entry = series_map.get(display_name)
+        if not isinstance(series_entry, dict):
+            return False
+
+        state_files = state_payload.get("files", {})
+        if not isinstance(state_files, dict):
+            return False
+
+        shard_key = str(series_entry.get("key") or "").strip()
+        if not shard_key:
+            return False
+
+        shard_dir = index_dir / "series" / shard_key
+        return (
+            shard_dir.is_dir()
+            and (shard_dir / "faiss.index").is_file()
+            and (shard_dir / "metadata.json").is_file()
+        )
 
     @classmethod
     async def _hydrate_index_artifacts(

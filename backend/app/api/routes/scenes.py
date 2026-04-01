@@ -187,8 +187,6 @@ async def detect_scenes(project_id: str, request: DetectScenesRequest | None = N
         async for progress in SceneDetectorService.detect_scenes(
             video_path, threshold, min_scene_len
         ):
-            yield f"data: {json.dumps(progress.to_dict())}\n\n"
-
             if progress.status == "complete" and progress.scenes:
                 # Save detected scenes
                 scene_list = SceneList(scenes=progress.scenes)
@@ -201,6 +199,8 @@ async def detect_scenes(project_id: str, request: DetectScenesRequest | None = N
             elif progress.status == "error":
                 project.phase = ProjectPhase.SETUP
                 ProjectService.save(project)
+
+            yield f"data: {json.dumps(progress.to_dict())}\n\n"
 
     return StreamingResponse(
         stream_progress(),

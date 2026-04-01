@@ -106,13 +106,19 @@ function SceneValidationContent() {
     try {
       const response = await api.detectScenes(projectId);
 
-      await readSSEStream<DetectionProgress>(response, (data) => {
-        setDetectionProgress(data);
+      await readSSEStream<DetectionProgress>(
+        response,
+        (data) => {
+          setDetectionProgress(data);
 
-        if (data.status === 'complete' && data.scenes) {
-          setScenes(data.scenes);
-        }
-      });
+          if (data.status === 'complete' && data.scenes) {
+            setScenes(data.scenes);
+          }
+        },
+        {
+          stopWhen: (data) => data.status === 'complete',
+        },
+      );
     } catch (err) {
       setDetectionProgress({
         status: 'error',

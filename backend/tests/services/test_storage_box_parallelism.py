@@ -17,6 +17,7 @@ from app.config import settings
 from app.library_types import LibraryType
 from app.models.project import Project
 from app.services.anime_library import AnimeLibraryService
+from app.services.library_hydration_service import HYDRATION_STATUS_INDEX_READY
 from app.services.library_hydration_service import LibraryHydrationService
 from app.services.library_hydration_service import OPERATION_COMPLETE, OPERATION_RUNNING
 from app.services.library_hydration_service import SeriesDeleteBlockedError
@@ -223,6 +224,151 @@ async def test_hydrate_index_artifacts_downloads_in_parallel(
         "series-1/state.fragment.json",
         "series-1/series/demo-key/faiss.index",
     }
+
+
+@pytest.mark.asyncio
+async def test_activate_project_series_skips_index_download_when_local_cache_matches_release(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    display_name = "Demo"
+    series_id = "series-1"
+    release_id = "release-1"
+    shard_key = "demo-key"
+
+    library_root = tmp_path / "library"
+    series_dir = library_root / display_name
+    index_dir = library_root / AnimeLibraryService.INDEX_DIR_NAME
+    shard_dir = index_dir / "series" / shard_key
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    series_dir.mkdir(parents=True, exist_ok=True)
+
+    (index_dir / AnimeLibraryService.MANIFEST_FILE).write_text(
+        json.dumps(
+            {
+                "version": AnimeLibraryService.SEARCHER_INDEX_FORMAT_VERSION,
+                "engine_profile": AnimeLibraryService.SEARCHER_ENGINE_PROFILE,
+                "config": {},
+                "series": {
+                    display_name: {
+                        "key": shard_key,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (index_dir / AnimeLibraryService.STATE_FILE).write_text(
+        json.dumps({"files": {}}),
+        encoding="utf-8",
+    )
+    (shard_dir / "faiss.index").write_bytes(b"index-bytes")
+    (shard_dir / "metadata.json").write_text("{}", encoding="utf-8")
+    StorageBoxRepository.write_local_series_metadata(
+        series_dir=series_dir,
+        series_id=series_id,
+        display_name=display_name,
+        release_id=release_id,
+    )
+
+    manifest = {
+        "series_id": series_id,
+        "release_id": release_id,
+        "display_name": display_name,
+        "episode_count": 1,
+        "episodes": [],
+        "artifacts": [],
+    }
+
+    operation_updates: list[tuple[str, float]] = []
+    state_updates: list[tuple[str, int, int]] = []
+    hydrate_called = False
+
+    monkeypatch.setattr(settings, "cache_dir", tmp_path / "cache")
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "get_library_path",
+        classmethod(lambda cls, library_type=None: library_root),
+    )
+    async def fake_get_current_release(
+        cls,
+        library_type: LibraryType,
+        series_id: str,
+    ) -> dict[str, str]:
+        return {"release_id": release_id}
+
+    async def fake_get_series_manifest(
+        cls,
+        library_type: LibraryType,
+        series_id: str,
+        release_id: str | None = None,
+    ) -> dict[str, object]:
+        return manifest
+
+    monkeypatch.setattr(
+        StorageBoxRepository,
+        "get_current_release",
+        classmethod(fake_get_current_release),
+    )
+    monkeypatch.setattr(
+        StorageBoxRepository,
+        "get_series_manifest",
+        classmethod(fake_get_series_manifest),
+    )
+    monkeypatch.setattr(
+        LibraryHydrationService,
+        "_count_local_episodes_from_manifest",
+        classmethod(lambda cls, library_type, manifest: 0),
+    )
+
+    async def fake_hydrate_index_artifacts(cls, library_type: LibraryType, manifest: dict) -> None:
+        nonlocal hydrate_called
+        hydrate_called = True
+
+    async def fake_get_activation_state(cls, *, library_type: LibraryType | str, series_id: str) -> dict[str, object]:
+        return {"series_id": series_id, "hydration_status": "index_ready"}
+
+    monkeypatch.setattr(
+        LibraryHydrationService,
+        "_hydrate_index_artifacts",
+        classmethod(fake_hydrate_index_artifacts),
+    )
+    monkeypatch.setattr(
+        LibraryHydrationService,
+        "get_activation_state",
+        classmethod(fake_get_activation_state),
+    )
+    monkeypatch.setattr(LibraryStateDb, "add_project_pin", lambda project_id, series_id: None)
+    monkeypatch.setattr(
+        LibraryStateDb,
+        "upsert_operation",
+        lambda *, library_type, series_id, operation_type, status, progress, error: operation_updates.append(
+            (status, float(progress))
+        ),
+    )
+    monkeypatch.setattr(
+        LibraryStateDb,
+        "upsert_series_state",
+        lambda *, library_type, series_id, release_id, hydration_status, local_episode_count, expected_episode_count, last_error, permanent_pin=None: state_updates.append(
+            (hydration_status, int(local_episode_count), int(expected_episode_count))
+        ),
+    )
+
+    result = await LibraryHydrationService.activate_project_series(
+        project_id="proj-1",
+        library_type=LibraryType.ANIME,
+        series_id=series_id,
+    )
+
+    assert result["hydration_status"] == "index_ready"
+    assert hydrate_called is False
+    assert operation_updates == [
+        (OPERATION_RUNNING, 0.0),
+        (OPERATION_COMPLETE, 1.0),
+    ]
+    assert state_updates == [
+        (HYDRATION_STATUS_INDEX_READY, 0, 1),
+    ]
 
 
 @pytest.mark.asyncio
