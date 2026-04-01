@@ -1710,12 +1710,11 @@ class AnimeLibraryService:
 
     @classmethod
     def _has_mixed_audio_codecs(cls, probe: SourceMediaProbe) -> bool:
-        """True when audio tracks use non-uniform codecs needing normalization.
+        """True when audio tracks use more than one distinct codec.
 
         Premiere Pro fails to recognise secondary audio tracks when different
-        codecs coexist in the same MP4 container (e.g. AAC + E-AC-3).  We
-        flag any multi-track file where not every stream is AAC so that the
-        import pipeline can transcode all audio to AAC.
+        codecs coexist in the same MP4 container (e.g. AAC + E-AC-3).
+        Uniform containers (all AAC, all E-AC-3, etc.) are fine.
         """
         if len(probe.audio_streams) < 2:
             return False
@@ -1724,7 +1723,7 @@ class AnimeLibraryService:
             for s in probe.audio_streams
         }
         codecs.discard("")
-        return codecs != {"aac"}
+        return len(codecs) > 1
 
     @classmethod
     def _is_valid_prepared_library_probe(
