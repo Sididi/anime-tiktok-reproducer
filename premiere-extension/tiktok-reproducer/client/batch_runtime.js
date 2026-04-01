@@ -193,6 +193,51 @@ function beginCleaningPhase(runtime) {
   runtime.phase = PHASES.cleaning;
 }
 
+function partitionCleanupResults(results) {
+  var summary = {
+    completed: [],
+    retryable: [],
+    terminal: [],
+  };
+
+  cloneArray(results).forEach(function (entry) {
+    var cleanupResult = entry && entry.cleanup_result ? entry.cleanup_result : null;
+    if (cleanupResult && cleanupResult.ok) {
+      summary.completed.push(entry);
+      return;
+    }
+    if (cleanupResult && cleanupResult.retryable_lock) {
+      summary.retryable.push(entry);
+      return;
+    }
+    summary.terminal.push(entry);
+  });
+
+  return summary;
+}
+
+function isBatchCleanupComplete(runtime, projectStates) {
+  if (!runtime) {
+    return false;
+  }
+
+  var phase = String(runtime.phase || "");
+  if (phase !== PHASES.cleaning && phase !== PHASES.blocked_error) {
+    return false;
+  }
+
+  var batchIds = cloneArray(runtime.export_batch_ids);
+  if (batchIds.length === 0) {
+    return false;
+  }
+
+  var states = projectStates || {};
+  return batchIds.every(function (projectId) {
+    var state = states[projectId] || null;
+    return String((state && state.status) || "") === "uploaded_cleaned";
+  });
+}
+
 function markAwaitingFinalAck(runtime) {
   if (!runtime) {
     throw new Error("Missing runtime");
@@ -224,9 +269,11 @@ module.exports = {
   createBatchRuntime: createBatchRuntime,
   getTrackedBatchProjectIds: getTrackedBatchProjectIds,
   hasProjectBeenSeen: hasProjectBeenSeen,
+  isBatchCleanupComplete: isBatchCleanupComplete,
   isProjectInCurrentBatch: isProjectInCurrentBatch,
   isProjectInExportBatch: isProjectInExportBatch,
   isProjectSleeping: isProjectSleeping,
   markAwaitingFinalAck: markAwaitingFinalAck,
   markBatchBlocked: markBatchBlocked,
+  partitionCleanupResults: partitionCleanupResults,
 };

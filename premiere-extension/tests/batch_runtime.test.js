@@ -109,3 +109,79 @@ test("acknowledgeFinalPopup promotes sleeping queue into the next intake batch",
   assert.deepEqual(runtime.export_batch_ids, []);
   assert.deepEqual(runtime.sleeping_queue, []);
 });
+
+test("partitionCleanupResults groups completed, retryable, and terminal entries", () => {
+  const results = [
+    {
+      project_id: "projectA",
+      cleanup_result: { ok: true },
+    },
+    {
+      project_id: "projectB",
+      cleanup_result: { ok: false, retryable_lock: true },
+    },
+    {
+      project_id: "projectC",
+      cleanup_result: { ok: false, retryable_lock: false },
+    },
+    {
+      project_id: "projectD",
+      cleanup_result: null,
+    },
+  ];
+
+  const summary = batchRuntime.partitionCleanupResults(results);
+
+  assert.deepEqual(
+    summary.completed.map((entry) => entry.project_id),
+    ["projectA"],
+  );
+  assert.deepEqual(
+    summary.retryable.map((entry) => entry.project_id),
+    ["projectB"],
+  );
+  assert.deepEqual(
+    summary.terminal.map((entry) => entry.project_id),
+    ["projectC", "projectD"],
+  );
+});
+
+test("isBatchCleanupComplete returns true in cleaning when all export projects are cleaned", () => {
+  const runtime = batchRuntime.createBatchRuntime();
+  runtime.phase = batchRuntime.PHASES.cleaning;
+  runtime.export_batch_ids = ["projectA", "projectB"];
+
+  const projectStates = {
+    projectA: { status: "uploaded_cleaned" },
+    projectB: { status: "uploaded_cleaned" },
+  };
+
+  assert.equal(batchRuntime.isBatchCleanupComplete(runtime, projectStates), true);
+});
+
+test("isBatchCleanupComplete returns true in blocked_error when all export projects are cleaned", () => {
+  const runtime = batchRuntime.createBatchRuntime();
+  runtime.phase = batchRuntime.PHASES.blocked_error;
+  runtime.export_batch_ids = ["projectA", "projectB"];
+
+  const projectStates = {
+    projectA: { status: "uploaded_cleaned" },
+    projectB: { status: "uploaded_cleaned" },
+  };
+
+  assert.equal(batchRuntime.isBatchCleanupComplete(runtime, projectStates), true);
+});
+
+test("isBatchCleanupComplete stays false while any export project is pending cleanup", () => {
+  const runtime = batchRuntime.createBatchRuntime();
+  runtime.phase = batchRuntime.PHASES.blocked_error;
+  runtime.export_batch_ids = ["projectA", "projectB", "projectC"];
+
+  const projectStates = {
+    projectA: { status: "uploaded_cleaned" },
+    projectB: { status: "cleanup_pending" },
+    projectC: { status: "cleanup_failed" },
+  };
+
+  assert.equal(batchRuntime.isBatchCleanupComplete(runtime, projectStates), false);
+});

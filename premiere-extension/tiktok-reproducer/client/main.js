@@ -1242,12 +1242,19 @@
     }
 
     var retryCount = Number(state.cleanup_retry_count || 0);
-    if (retryCount >= CLEANUP_RETRYABLE_MAX_PASSES) {
+    if (
+      retryCount >= CLEANUP_RETRYABLE_MAX_PASSES &&
+      source !== "manual"
+    ) {
       clearCleanupRetry(id);
       return Promise.resolve(false);
     }
 
     disarmExportMonitor(id);
+    var isBatchProject = getBatchRuntimeHelper().isProjectInExportBatch(
+      ensureBatchRuntime(),
+      id,
+    );
 
     return cleanupImportedProjectInHost(id, state.local_root, true)
       .then(function (hostSummary) {
@@ -1295,6 +1302,9 @@
             cleanup_next_retry_at: null,
           });
           log("Premiere cleanup failed for " + id + ": " + hostDetail, "warn");
+          if (isBatchProject) {
+            handleBatchFailure(id, "Premiere cleanup failed: " + hostDetail);
+          }
           return false;
         }
         return removePathSafe(state.local_root, {
@@ -1317,6 +1327,9 @@
             hostErr.message,
           "warn",
         );
+        if (isBatchProject) {
+          handleBatchFailure(id, "Premiere cleanup crashed: " + hostErr.message);
+        }
         return false;
       })
       .then(function (cleanupResult) {
@@ -1338,14 +1351,15 @@
             "success",
           );
           maybeNotifyProjectCompletion(cleanedState);
-          maybeFinalizeRecoveredBatchCleanup();
+          maybeFinalizeBatchCleanup();
           return true;
         }
 
         var detail = buildCleanupErrorDetail(cleanupResult);
         var nextRetryCount = retryCount + 1;
+        var retryableLock = !!cleanupResult.retryable_lock;
         var retryable =
-          !!cleanupResult.retryable_lock &&
+          retryableLock &&
           nextRetryCount < CLEANUP_RETRYABLE_MAX_PASSES;
         if (retryable) {
           var nextRetryAt = new Date(
@@ -1378,11 +1392,14 @@
         upsertProjectState(id, {
           status: "cleanup_failed",
           cleanup_error: detail,
-          cleanup_retryable: !!cleanupResult.retryable_lock,
+          cleanup_retryable: retryableLock,
           cleanup_retry_count: nextRetryCount,
           cleanup_next_retry_at: null,
         });
         log("Cleanup failed for " + id + ": " + detail, "warn");
+        if (!retryableLock && isBatchProject) {
+          handleBatchFailure(id, "Cleanup failed: " + detail);
+        }
         return false;
       })
       .catch(function (err) {
@@ -1393,6 +1410,9 @@
           cleanup_retryable: false,
           cleanup_next_retry_at: null,
         });
+        if (isBatchProject) {
+          handleBatchFailure(id, "Cleanup crashed: " + err.message);
+        }
         log("Cleanup retry crashed for " + id + ": " + err.message, "error");
         return false;
       });
@@ -2929,20 +2949,47 @@
         }
 
         var failures = [];
-        results.forEach(function (entry) {
-          var cleanupResult = entry.cleanup_result || null;
-          if (cleanupResult && cleanupResult.ok) {
-            upsertProjectState(entry.project_id, {
-              status: "uploaded_cleaned",
-              cleanup_deleted: true,
-              cleanup_error: null,
-              cleanup_retryable: false,
-              cleanup_retry_count: 0,
-              cleanup_next_retry_at: null,
-            });
-            return;
-          }
+        var cleanupSummary =
+          getBatchRuntimeHelper().partitionCleanupResults(results);
 
+        cleanupSummary.completed.forEach(function (entry) {
+          upsertProjectState(entry.project_id, {
+            status: "uploaded_cleaned",
+            cleanup_deleted: true,
+            cleanup_error: null,
+            cleanup_retryable: false,
+            cleanup_retry_count: 0,
+            cleanup_next_retry_at: null,
+          });
+        });
+
+        cleanupSummary.retryable.forEach(function (entry) {
+          var detail = buildCleanupErrorDetail(entry.cleanup_result || null);
+          var nextRetryAt = new Date(
+            Date.now() + CLEANUP_RETRY_DELAY_MS,
+          ).toISOString();
+          upsertProjectState(entry.project_id, {
+            status: "cleanup_pending",
+            cleanup_error: detail,
+            cleanup_retryable: true,
+            cleanup_retry_count: 1,
+            cleanup_next_retry_at: nextRetryAt,
+          });
+          log(
+            "Cleanup still locked for " +
+              entry.project_id +
+              " (attempt 1/" +
+              CLEANUP_RETRYABLE_MAX_PASSES +
+              "), retrying in " +
+              Math.round(CLEANUP_RETRY_DELAY_MS / 1000) +
+              "s",
+            "warn",
+          );
+          scheduleCleanupRetry(entry.project_id, CLEANUP_RETRY_DELAY_MS);
+        });
+
+        cleanupSummary.terminal.forEach(function (entry) {
+          var cleanupResult = entry.cleanup_result || null;
           var detail = buildCleanupErrorDetail(cleanupResult);
           failures.push({
             project_id: entry.project_id,
@@ -2951,7 +2998,7 @@
           upsertProjectState(entry.project_id, {
             status: "cleanup_failed",
             cleanup_error: detail,
-            cleanup_retryable: !!(cleanupResult && cleanupResult.retryable_lock),
+            cleanup_retryable: false,
             cleanup_retry_count: Number(
               (cleanupResult && cleanupResult.attempts) || 1,
             ),
@@ -2964,10 +3011,8 @@
             failures[0].project_id,
             "Cleanup failed: " + failures[0].detail,
           );
-          return;
         }
-
-        showFinalBatchCompletionAlert(batchIds);
+        maybeFinalizeBatchCleanup();
       })
       .catch(function (err) {
         batchIds.forEach(function (projectId) {
@@ -2999,21 +3044,18 @@
     runBatchCleanupPhase();
   }
 
-  function maybeFinalizeRecoveredBatchCleanup() {
-    if (getBatchPhase() !== getBatchRuntimeHelper().PHASES.blocked_error) {
+  function maybeFinalizeBatchCleanup() {
+    if (
+      !getBatchRuntimeHelper().isBatchCleanupComplete(
+        ensureBatchRuntime(),
+        projectStates,
+      )
+    ) {
       return;
     }
 
     var batchIds = listExportBatchProjectIds();
     if (batchIds.length === 0) {
-      return;
-    }
-
-    var pending = batchIds.filter(function (projectId) {
-      var state = getProjectState(projectId);
-      return !state || String(state.status || "") !== "uploaded_cleaned";
-    });
-    if (pending.length > 0) {
       return;
     }
 
