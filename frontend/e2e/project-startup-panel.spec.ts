@@ -217,6 +217,7 @@ test("Démarrer launches background startup and redirects the pre-opened tab", a
   );
   await page.getByRole("button", { name: "Démarrer" }).click();
 
+  await page.getByRole("button", { name: /startup/ }).click();
   await expect(page.getByText("Demo Source")).toBeVisible();
   await expect(page.getByText("Terminé")).toBeVisible();
 
@@ -261,6 +262,7 @@ test("failed startup surfaces retry and open actions", async ({ page }) => {
   );
   await page.getByRole("button", { name: "Démarrer" }).click();
 
+  await page.getByRole("button", { name: /startup/ }).click();
   await expect(page.getByText("Storage Box activation failed")).toBeVisible();
   await expect(page.getByRole("button", { name: "Ouvrir" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Relancer" })).toBeVisible();
@@ -296,5 +298,50 @@ test("popup-blocked startup keeps the open action available", async ({ page }) =
   );
   await page.getByRole("button", { name: "Démarrer" }).click();
 
+  await page.getByRole("button", { name: /startup/ }).click();
   await expect(page.getByRole("button", { name: "Ouvrir" })).toBeVisible();
+});
+
+test("series search can be cleared manually and resets on Démarrer", async ({
+  page,
+}) => {
+  await page.addInitScript(
+    installStartupMocks({
+      terminalEvent: {
+        job_id: "startup-job-1",
+        project_id: "project-1",
+        anime_name: "Demo Source",
+        series_id: "series-1",
+        library_type: "anime",
+        tiktok_url: "https://www.tiktok.com/@demo/video/123",
+        status: "complete",
+        progress: 1,
+        phase: "complete",
+        message: "Project startup complete.",
+        error: null,
+        ready_url: "/project/project-1/scenes",
+        created_at: "2026-04-01T10:00:00Z",
+        updated_at: "2026-04-01T10:00:10Z",
+      },
+    }),
+  );
+
+  await page.goto("/");
+  await page.getByText("Demo Source").click();
+
+  const searchInput = page.getByPlaceholder("Rechercher une source...");
+  await searchInput.fill("Demo");
+  await expect(page.getByRole("button", { name: "Effacer la recherche" })).toBeVisible();
+  await page.getByRole("button", { name: "Effacer la recherche" }).click();
+  await expect(searchInput).toHaveValue("");
+
+  await searchInput.fill("Demo");
+  await page.getByPlaceholder("https://www.tiktok.com/@user/video/...").fill(
+    "https://www.tiktok.com/@demo/video/123",
+  );
+  await page.getByRole("button", { name: "Démarrer" }).click();
+
+  await page.getByRole("button", { name: /startup/ }).click();
+  await expect(searchInput).toHaveValue("");
+  await expect(page.getByText("Terminé")).toBeVisible();
 });

@@ -23,7 +23,7 @@ export function StartupJobsPanel({
   onOpen,
   onRetry,
 }: StartupJobsPanelProps) {
-  const [expanded, setExpanded] = useState(true);
+  const [expanded, setExpanded] = useState(false);
 
   const sortedJobs = useMemo(
     () =>

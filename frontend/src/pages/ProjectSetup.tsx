@@ -350,6 +350,7 @@ export function ProjectSetup() {
   const handleStart = useCallback(async () => {
     if (!tiktokUrl.trim() || !selectedSource) return;
     setError(null);
+    setSearchQuery("");
     const popup = openStartupWindow();
 
     try {

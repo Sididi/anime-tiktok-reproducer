@@ -1,4 +1,4 @@
-import { Search, Plus } from "lucide-react";
+import { Search, Plus, X } from "lucide-react";
 
 interface SearchBarProps {
   searchQuery: string;
@@ -23,7 +23,19 @@ export function SearchBar({
         className="flex-1 bg-transparent border-none outline-none text-sm placeholder:text-[hsl(var(--muted-foreground))]"
       />
 
+      {searchQuery.length > 0 && (
+        <button
+          type="button"
+          aria-label="Effacer la recherche"
+          onClick={() => onSearchChange("")}
+          className="flex items-center justify-center rounded-md p-1.5 text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--secondary))] hover:text-[hsl(var(--foreground))] transition-colors shrink-0"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      )}
+
       <button
+        type="button"
         onClick={onNewSource}
         className="flex items-center gap-1.5 bg-green-600 hover:bg-green-700 text-white rounded-md px-3 py-1.5 text-sm font-medium transition-colors shrink-0"
       >
