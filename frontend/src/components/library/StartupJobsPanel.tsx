@@ -12,6 +12,19 @@ import {
 
 import type { ProjectStartupJob } from "@/types";
 
+const STARTUP_JOBS_EXPANDED_STORAGE_KEY = "project-setup.startup-jobs-expanded";
+
+function readStoredExpandedState(): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  try {
+    return window.sessionStorage.getItem(STARTUP_JOBS_EXPANDED_STORAGE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
 interface StartupJobsPanelProps {
   jobs: ProjectStartupJob[];
   onOpen: (job: ProjectStartupJob) => void;
@@ -23,7 +36,7 @@ export function StartupJobsPanel({
   onOpen,
   onRetry,
 }: StartupJobsPanelProps) {
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(readStoredExpandedState);
 
   const sortedJobs = useMemo(
     () =>
@@ -43,7 +56,20 @@ export function StartupJobsPanel({
   return (
     <div className="bg-[hsl(var(--card))] rounded-lg overflow-hidden">
       <button
-        onClick={() => setExpanded((value) => !value)}
+        onClick={() =>
+          setExpanded((value) => {
+            const nextValue = !value;
+            try {
+              window.sessionStorage.setItem(
+                STARTUP_JOBS_EXPANDED_STORAGE_KEY,
+                nextValue ? "true" : "false",
+              );
+            } catch {
+              // Ignore storage failures and keep in-memory toggle behavior.
+            }
+            return nextValue;
+          })
+        }
         className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-[hsl(var(--secondary))]/50 transition-colors"
       >
         <div
