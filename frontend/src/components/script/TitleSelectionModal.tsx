@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 
-import { api } from "@/api/client";
 import { Button } from "@/components/ui";
+import { ProjectManagedVideoPlayer } from "@/components/video";
 import type {
   MetadataTitleCandidatesPayload,
   VideoOverlay,
@@ -104,10 +104,13 @@ export function TitleSelectionModal({
         {/* TikTok video preview */}
         {projectId && (
           <div className="w-72 shrink-0 flex items-center justify-center bg-black rounded-l-lg overflow-hidden">
-            <video
-              src={api.getVideoUrl(projectId)}
-              controls
+            <ProjectManagedVideoPlayer
+              projectId={projectId}
               className="w-full h-auto max-h-[80vh] object-contain"
+              requestLoad={isOpen}
+              requestWarmup={isOpen}
+              controls
+              muted
             />
           </div>
         )}

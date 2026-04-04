@@ -18,10 +18,15 @@ import {
   Pause,
 } from "lucide-react";
 import { Button } from "@/components/ui";
-import { ClippedVideoPlayer } from "@/components/video";
+import { ProjectClippedVideoPlayer } from "@/components/video";
 import type { ClippedVideoPlayerHandle } from "@/components/video/ClippedVideoPlayer";
 import { api } from "@/api/client";
 import { cn, formatTime } from "@/utils";
+import {
+  MEDIA_PRIORITY,
+  getFastWatchPrefetchPriority,
+  getViewportPriority,
+} from "@/utils/mediaPriorities";
 import type {
   Transcription,
   RawSceneDetectionResult,
@@ -45,6 +50,7 @@ interface SceneCardProps {
   projectId: string;
   validation: SceneValidationState | undefined;
   isActive?: boolean;
+  mediaEnabled?: boolean;
   playbackRate?: number;
   controlsDisabled?: boolean;
   preloadMode?: "metadata" | "auto";
@@ -85,6 +91,7 @@ const SceneCard = forwardRef<SceneCardHandle, SceneCardProps>(function SceneCard
     projectId,
     validation,
     isActive = false,
+    mediaEnabled = true,
     playbackRate = 1,
     controlsDisabled = false,
     preloadMode = "metadata",
@@ -101,9 +108,32 @@ const SceneCard = forwardRef<SceneCardHandle, SceneCardProps>(function SceneCard
   const startGuardTimeoutRef = useRef<number | null>(null);
   const endedRef = useRef(false);
 
-  const videoUrl = api.getVideoUrl(projectId);
   const isRaw = validation?.is_raw ?? scene.is_raw;
   const sceneDuration = scene.end_time - scene.start_time;
+  const leasePriority = controlsDisabled
+    ? isActive
+      ? MEDIA_PRIORITY.ACTIVE_FAST_WATCH
+      : preloadMode === "auto"
+        ? getFastWatchPrefetchPriority(1)
+        : getViewportPriority(4)
+    : isActive
+      ? MEDIA_PRIORITY.ACTIVE
+      : preloadMode === "auto"
+        ? getViewportPriority(1)
+        : mediaEnabled
+          ? getViewportPriority(4)
+          : MEDIA_PRIORITY.OFFSCREEN;
+  const warmupLeasePriority = controlsDisabled
+    ? isActive
+      ? MEDIA_PRIORITY.ACTIVE_FAST_WATCH
+      : preloadMode === "auto"
+        ? getFastWatchPrefetchPriority(2)
+        : MEDIA_PRIORITY.OFFSCREEN
+    : isActive
+      ? MEDIA_PRIORITY.ACTIVE
+      : preloadMode === "auto"
+        ? getViewportPriority(2)
+        : MEDIA_PRIORITY.OFFSCREEN;
   const fastWatchMinReadyState =
     playbackRate >= 8
       ? HTMLMediaElement.HAVE_ENOUGH_DATA
@@ -306,15 +336,19 @@ const SceneCard = forwardRef<SceneCardHandle, SceneCardProps>(function SceneCard
 
       <div className="grid grid-cols-[180px_1fr] gap-4">
         <div className="aspect-[9/16] bg-black rounded overflow-hidden">
-          <ClippedVideoPlayer
+          <ProjectClippedVideoPlayer
             ref={videoPlayerRef}
-            src={videoUrl}
+            projectId={projectId}
             startTime={scene.start_time}
             endTime={scene.end_time}
             className={cn("w-full h-full", controlsDisabled && "pointer-events-none")}
             muted={false}
             playbackRate={playbackRate}
             eager={preloadMode === "auto"}
+            requestLoad={mediaEnabled}
+            requestWarmup={preloadMode === "auto"}
+            leasePriority={leasePriority}
+            warmupPriority={warmupLeasePriority}
             onClipEnded={handleClipEnded}
           />
         </div>
@@ -434,6 +468,28 @@ export function RawSceneValidationPage() {
     if (playbackRate >= 2) return 2;
     return 1;
   }, [playbackRate]);
+
+  const mediaEnabledSceneIndices = useMemo(() => {
+    const enabled = new Set<number>();
+    if (candidateScenes.length === 0) {
+      return enabled;
+    }
+
+    const center = activeScenePosition >= 0 ? activeScenePosition : 0;
+    const radius = fastWatchPlaying ? fastWatchPrefetchAhead + 1 : 3;
+    for (let offset = -radius; offset <= radius; offset += 1) {
+      const scene = candidateScenes[center + offset];
+      if (scene) {
+        enabled.add(scene.scene_index);
+      }
+    }
+    return enabled;
+  }, [
+    activeScenePosition,
+    candidateScenes,
+    fastWatchPlaying,
+    fastWatchPrefetchAhead,
+  ]);
 
   const clearFastWatchBuffers = useCallback(() => {
     preparedScenesRef.current.clear();
@@ -991,6 +1047,7 @@ export function RawSceneValidationPage() {
                   projectId={projectId!}
                   validation={validations[scene.scene_index]}
                   isActive={activeSceneIndex === scene.scene_index}
+                  mediaEnabled={mediaEnabledSceneIndices.has(scene.scene_index)}
                   playbackRate={playbackRate}
                   controlsDisabled={fastWatchPlaying}
                   preloadMode={

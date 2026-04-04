@@ -25,6 +25,7 @@
   var BATCH_SEQUENCE_NAME = "ATR_BATCH__project_id";
   var MUSIC_GAIN_DB = -23.0;
   var PROJECT_PURGE_BIN_NAME = "__ATR_PURGE__";
+  var PROJECT_BIN_NAME = "__ATR_PROJECT__" + PROJECT_ID;
   var BACKGROUND_PRESET_NAME = "SPM Anime Background";
   var BACKGROUND_PRESET_FILE_PATH =
     ASSETS_DIR + "/" + BACKGROUND_PRESET_NAME + ".prfpset";
@@ -680,6 +681,9 @@
   var SPEED_RETRY_LONG_WAIT_MS = 60;
   var SOURCE_AUDIO_POLICY_RETRY_WAIT_MS = 40;
   var SOURCE_AUDIO_POLICY_MAX_RETRIES = 4;
+  var PROJECT_EXECUTION_ID = new Date().getTime().toString();
+  var RAW_AUDIO_SUBCLIP_PREFIX =
+    "__ATR_RAW_AUDIO__" + PROJECT_ID + "__" + PROJECT_EXECUTION_ID + "__";
   var PROJECT_ITEM_CACHE = {};
   var PROJECT_ITEM_CACHE_WARMED = false;
   var PRESET_FILE_TEXT_CACHE = {};
@@ -720,6 +724,7 @@
   var QE_TRACK_RESOLVE_CACHE = {};
   var QE_TRACK_ITEM_HINTS = {};
   var PROJECT_ITEM_AUDIO_POLICY_CACHE = {};
+  var PROJECT_IMPORT_BIN = null;
   var AUDIOCHANNELTYPE_Mono = 0;
   var AUDIOCHANNELTYPE_Stereo = 1;
   var AUDIOCHANNELTYPE_51 = 2;
@@ -910,6 +915,36 @@
     return normalizeLooseName(name);
   }
 
+  function normalizeComparePath(value) {
+    var normalized = value ? value.toString().replace(/\\/g, "/") : "";
+    normalized = normalized.toLowerCase().replace(/\/+/g, "/");
+    if (
+      normalized.length > 1 &&
+      normalized.charAt(normalized.length - 1) === "/"
+    ) {
+      normalized = normalized.substring(0, normalized.length - 1);
+    }
+    return normalized;
+  }
+
+  function getProjectRootItem() {
+    return app && app.project ? app.project.rootItem : null;
+  }
+
+  function getProjectItemMediaPath(item) {
+    if (!item || !item.getMediaPath) return "";
+    try {
+      return normalizeComparePath(item.getMediaPath());
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function normalizeMediaPathCacheKey(mediaPath) {
+    var normalized = normalizeComparePath(mediaPath);
+    return normalized ? "path::" + normalized : "";
+  }
+
   function cacheProjectItemByName(name, item) {
     if (!name || !item) return;
     var key = normalizeNameKey(name);
@@ -917,8 +952,18 @@
     PROJECT_ITEM_CACHE[key] = item;
   }
 
+  function cacheProjectItemByMediaPath(mediaPath, item) {
+    if (!item) return;
+    var key = normalizeMediaPathCacheKey(mediaPath);
+    if (!key) return;
+    PROJECT_ITEM_CACHE[key] = item;
+  }
+
   function cacheProjectItem(item) {
-    if (!item || !item.name) return;
+    if (!item) return;
+    var mediaPath = getProjectItemMediaPath(item);
+    if (mediaPath) cacheProjectItemByMediaPath(mediaPath, item);
+    if (!item.name) return;
     var itemName = item.name.toString();
     cacheProjectItemByName(itemName, item);
     cacheProjectItemByName(stripKnownExtension(itemName), item);
@@ -937,6 +982,104 @@
       delete PROJECT_ITEM_CACHE[key];
       return null;
     }
+  }
+
+  function getCachedProjectItemByMediaPath(mediaPath) {
+    var key = normalizeMediaPathCacheKey(mediaPath);
+    if (!key) return null;
+    var item = PROJECT_ITEM_CACHE[key];
+    if (!item) return null;
+    try {
+      var _ = item.name;
+      return item;
+    } catch (e) {
+      delete PROJECT_ITEM_CACHE[key];
+      return null;
+    }
+  }
+
+  function isBinItem(item) {
+    return !!(item && item.type === ProjectItemType.BIN);
+  }
+
+  function findChildBinByName(container, name) {
+    if (!container || !container.children || !name) return null;
+    for (var i = 0; i < container.children.numItems; i++) {
+      var child = container.children[i];
+      if (!child || !isBinItem(child)) continue;
+      if (child.name === name) return child;
+    }
+    return null;
+  }
+
+  function ensureProjectBin() {
+    if (PROJECT_IMPORT_BIN) {
+      try {
+        var _ = PROJECT_IMPORT_BIN.name;
+        return PROJECT_IMPORT_BIN;
+      } catch (eCached) {
+        PROJECT_IMPORT_BIN = null;
+      }
+    }
+
+    var root = getProjectRootItem();
+    if (!root) return null;
+
+    var existing = findChildBinByName(root, PROJECT_BIN_NAME);
+    if (existing) {
+      PROJECT_IMPORT_BIN = existing;
+      return existing;
+    }
+
+    try {
+      PROJECT_IMPORT_BIN = root.createBin(PROJECT_BIN_NAME);
+    } catch (eCreate) {
+      PROJECT_IMPORT_BIN = null;
+    }
+
+    if (!PROJECT_IMPORT_BIN) {
+      PROJECT_IMPORT_BIN = findChildBinByName(root, PROJECT_BIN_NAME);
+    }
+    return PROJECT_IMPORT_BIN;
+  }
+
+  function getProjectSearchRoot() {
+    return ensureProjectBin() || getProjectRootItem();
+  }
+
+  function moveItemToProjectBin(item) {
+    var targetBin = ensureProjectBin();
+    if (!item || !targetBin || item === targetBin) return item;
+    try {
+      item.moveBin(targetBin);
+    } catch (eMove) {}
+    return item;
+  }
+
+  function walkProjectItems(container, visitor) {
+    if (!container || !container.children || !visitor) return;
+    for (var i = 0; i < container.children.numItems; i++) {
+      var item = container.children[i];
+      if (!item) continue;
+      visitor(item);
+      if (isBinItem(item)) {
+        walkProjectItems(item, visitor);
+      }
+    }
+  }
+
+  function findProjectItemByMediaPathInContainer(container, mediaPath) {
+    var normalizedPath = normalizeComparePath(mediaPath);
+    if (!container || !normalizedPath) return null;
+    var found = null;
+    walkProjectItems(container, function (item) {
+      if (found || isBinItem(item)) return;
+      if (getProjectItemMediaPath(item) === normalizedPath) {
+        found = item;
+      }
+    });
+    if (found) cacheProjectItem(found);
+    return found;
   }
 
   function getSourceAudioPolicy(name) {
@@ -1075,22 +1218,14 @@
   }
 
   function warmProjectItemCache() {
-    if (PROJECT_ITEM_CACHE_WARMED || !app.project || !app.project.rootItem)
-      return;
-    var walk = function (bin) {
-      if (!bin || !bin.children) return;
-      for (var i = 0; i < bin.children.numItems; i++) {
-        var item = bin.children[i];
-        if (!item) continue;
-        if (item.type !== ProjectItemType.BIN) {
-          cacheProjectItem(item);
-        }
-        if (item.type === ProjectItemType.BIN) {
-          walk(item);
-        }
+    if (PROJECT_ITEM_CACHE_WARMED) return;
+    var searchRoot = getProjectSearchRoot();
+    if (!searchRoot) return;
+    walkProjectItems(searchRoot, function (item) {
+      if (!isBinItem(item)) {
+        cacheProjectItem(item);
       }
-    };
-    walk(app.project.rootItem);
+    });
     PROJECT_ITEM_CACHE_WARMED = true;
   }
 
@@ -1308,6 +1443,52 @@
     return null;
   }
 
+  function deleteSequenceByName(sequenceName) {
+    if (!app || !app.project || !sequenceName) return 0;
+    var deletedCount = 0;
+    var sequences = app.project.sequences;
+    if (!sequences || sequences.numSequences === undefined) return 0;
+
+    for (var i = Number(sequences.numSequences || 0) - 1; i >= 0; i--) {
+      var sequence = sequences[i];
+      if (!sequence || sequence.name !== sequenceName) continue;
+      var deleted = false;
+      try {
+        if (app.project.deleteSequence && sequence.sequenceID !== undefined) {
+          deleted = !!app.project.deleteSequence(sequence.sequenceID);
+        }
+      } catch (e0) {}
+      if (!deleted) {
+        try {
+          if (app.project.deleteSequence) {
+            deleted = !!app.project.deleteSequence(sequence);
+          }
+        } catch (e1) {}
+      }
+      if (!deleted) {
+        try {
+          if (sequence.projectItem && sequence.projectItem.deleteBin) {
+            deleted = !!sequence.projectItem.deleteBin();
+          }
+        } catch (e2) {}
+      }
+      if (deleted) {
+        deletedCount += 1;
+      }
+    }
+
+    if (deletedCount > 0) {
+      log(
+        "Deleted " +
+          deletedCount +
+          " existing sequence(s) named '" +
+          sequenceName +
+          "' before rebuilding.",
+      );
+    }
+    return deletedCount;
+  }
+
   function setTrackItemEndSeconds(item, endSec) {
     if (!item || typeof endSec !== "number") return false;
     try {
@@ -1403,48 +1584,84 @@
     } catch (e) {}
   }
 
+  function findProjectItemInContainer(container, name) {
+    if (!container || !name) return null;
+    var found = null;
+    walkProjectItems(container, function (item) {
+      if (found || isBinItem(item)) return;
+      if (item.name === name) {
+        found = item;
+      }
+    });
+    if (found) cacheProjectItem(found);
+    return found;
+  }
+
   function findProjectItem(name) {
     var cached = getCachedProjectItem(name);
     if (cached) return cached;
-    var findInBin = function (bin) {
-      for (var i = 0; i < bin.children.numItems; i++) {
-        var item = bin.children[i];
-        if (item.name === name && item.type !== ProjectItemType.BIN) {
-          cacheProjectItem(item);
-          return item;
-        }
-        if (item.type === ProjectItemType.BIN) {
-          var found = findInBin(item);
-          if (found) return found;
-        }
+    return findProjectItemInContainer(getProjectSearchRoot(), name);
+  }
+
+  function findProjectItemLooseInContainer(container, name) {
+    var target = normalizeLooseName(name);
+    if (!container || !target) return null;
+    var found = null;
+    walkProjectItems(container, function (item) {
+      if (found || isBinItem(item)) return;
+      var itemName = item.name ? item.name.toString() : "";
+      if (normalizeLooseName(itemName) === target) {
+        found = item;
       }
-      return null;
-    };
-    return findInBin(app.project.rootItem);
+    });
+    if (found) cacheProjectItem(found);
+    return found;
   }
 
   function findProjectItemLoose(name) {
-    var target = normalizeLooseName(name);
-    if (!target) return null;
-    var findInBin = function (bin) {
-      for (var i = 0; i < bin.children.numItems; i++) {
-        var item = bin.children[i];
-        if (!item) continue;
-        if (item.type !== ProjectItemType.BIN) {
-          var itemName = item.name ? item.name.toString() : "";
-          if (normalizeLooseName(itemName) === target) {
-            cacheProjectItem(item);
-            return item;
-          }
-        }
-        if (item.type === ProjectItemType.BIN) {
-          var found = findInBin(item);
-          if (found) return found;
-        }
+    return findProjectItemLooseInContainer(getProjectSearchRoot(), name);
+  }
+
+  function findProjectItemByMediaPath(mediaPath, searchEverywhere) {
+    var normalizedPath = normalizeComparePath(mediaPath);
+    if (!normalizedPath) return null;
+
+    var cached = getCachedProjectItemByMediaPath(normalizedPath);
+    if (cached) return cached;
+
+    var searchRoot = getProjectSearchRoot();
+    var found = findProjectItemByMediaPathInContainer(searchRoot, normalizedPath);
+    if (found) return found;
+
+    if (searchEverywhere) {
+      found = findProjectItemByMediaPathInContainer(getProjectRootItem(), normalizedPath);
+      if (found) {
+        moveItemToProjectBin(found);
+        cacheProjectItem(found);
+        return found;
       }
-      return null;
-    };
-    return findInBin(app.project.rootItem);
+    }
+    return null;
+  }
+
+  function resolveExistingProjectItem(cleanName, nameNoExt, mediaPath) {
+    if (mediaPath) {
+      var byPath = findProjectItemByMediaPath(mediaPath, true);
+      if (byPath) return byPath;
+    }
+
+    var item =
+      getCachedProjectItem(cleanName) ||
+      getCachedProjectItem(nameNoExt) ||
+      findProjectItem(cleanName) ||
+      findProjectItem(nameNoExt) ||
+      findProjectItemLoose(cleanName) ||
+      findProjectItemLoose(nameNoExt);
+    if (item) {
+      moveItemToProjectBin(item);
+      cacheProjectItem(item);
+    }
+    return item;
   }
 
   function resolveClipFilePath(cleanName, nameNoExt) {
@@ -1476,7 +1693,10 @@
     if (!cleanName) return false;
     var nameNoExt = stripKnownExtension(cleanName);
     return !!(
-      getCachedProjectItem(cleanName) || getCachedProjectItem(nameNoExt)
+      getCachedProjectItem(cleanName) ||
+      getCachedProjectItem(nameNoExt) ||
+      findProjectItem(cleanName) ||
+      findProjectItem(nameNoExt)
     );
   }
 
@@ -1498,14 +1718,10 @@
       stats.requested++;
       var cleanName = nm.toString().replace(/^\s+|\s+$/g, "");
       var nameNoExt = stripKnownExtension(cleanName);
+      var f = resolveClipFilePath(cleanName, nameNoExt);
+      var mediaPath = f ? normalizeComparePath(f.fsName) : "";
 
-      var item =
-        getCachedProjectItem(cleanName) ||
-        getCachedProjectItem(nameNoExt) ||
-        findProjectItem(cleanName) ||
-        findProjectItem(nameNoExt) ||
-        findProjectItemLoose(cleanName) ||
-        findProjectItemLoose(nameNoExt);
+      var item = resolveExistingProjectItem(cleanName, nameNoExt, mediaPath);
       if (item) {
         cacheProjectItem(item);
         cacheProjectItemByName(cleanName, item);
@@ -1514,7 +1730,6 @@
         continue;
       }
 
-      var f = resolveClipFilePath(cleanName, nameNoExt);
       if (!f) {
         stats.unresolved++;
         continue;
@@ -1523,6 +1738,7 @@
       pending.push({
         cleanName: cleanName,
         nameNoExt: nameNoExt,
+        mediaPath: mediaPath,
         fileName: f.name,
         displayName: f.displayName,
       });
@@ -1533,8 +1749,9 @@
       }
     }
 
+    var targetBin = getProjectSearchRoot();
     if (importPaths.length > 0) {
-      app.project.importFiles(importPaths, true, app.project.rootItem, false);
+      app.project.importFiles(importPaths, true, targetBin, false);
       stats.importBatchCount = importPaths.length;
     }
 
@@ -1548,23 +1765,20 @@
       var retries = 0;
       while (!item && retries < 4) {
         item =
-          getCachedProjectItem(p.cleanName) ||
-          getCachedProjectItem(p.nameNoExt) ||
+          findProjectItemByMediaPath(p.mediaPath, true) ||
+          resolveExistingProjectItem(p.cleanName, p.nameNoExt, p.mediaPath) ||
           findProjectItem(p.fileName) ||
           findProjectItem(p.displayName) ||
-          findProjectItem(p.cleanName) ||
-          findProjectItem(p.nameNoExt) ||
           findProjectItem(stripKnownExtension(p.fileName)) ||
           findProjectItemLoose(p.fileName) ||
-          findProjectItemLoose(p.displayName) ||
-          findProjectItemLoose(p.cleanName) ||
-          findProjectItemLoose(p.nameNoExt);
+          findProjectItemLoose(p.displayName);
         if (!item) {
           sleep(20);
           retries++;
         }
       }
       if (item) {
+        moveItemToProjectBin(item);
         cacheProjectItem(item);
         cacheProjectItemByName(p.cleanName, item);
         cacheProjectItemByName(p.nameNoExt, item);
@@ -1580,59 +1794,36 @@
   function getOrImportClip(clipName) {
     var cleanName = clipName.replace(/^\s+|\s+$/g, "");
     var nameNoExt = stripKnownExtension(cleanName);
-
-    var item = getCachedProjectItem(cleanName);
-    if (item) {
-      applySourceAudioPolicy(item, cleanName);
-      return item;
-    }
-    item = getCachedProjectItem(nameNoExt);
-    if (item) {
-      applySourceAudioPolicy(item, cleanName);
-      return item;
-    }
-
-    item = findProjectItem(cleanName);
-    if (item) {
-      applySourceAudioPolicy(item, cleanName);
-      return item;
-    }
-    item = findProjectItem(nameNoExt);
-    if (item) {
-      applySourceAudioPolicy(item, cleanName);
-      return item;
-    }
-    item = findProjectItemLoose(cleanName);
-    if (item) {
-      applySourceAudioPolicy(item, cleanName);
-      return item;
-    }
-    item = findProjectItemLoose(nameNoExt);
-    if (item) {
-      applySourceAudioPolicy(item, cleanName);
-      return item;
-    }
-
     var f = resolveClipFilePath(cleanName, nameNoExt);
+    var mediaPath = f ? normalizeComparePath(f.fsName) : "";
+
+    var item = resolveExistingProjectItem(cleanName, nameNoExt, mediaPath);
+    if (item) {
+      applySourceAudioPolicy(item, cleanName);
+      return item;
+    }
+
     if (f) {
-      app.project.importFiles([f.fsName], true, app.project.rootItem, false);
+      var targetBin = getProjectSearchRoot();
+      app.project.importFiles([f.fsName], true, targetBin, false);
       // Small bounded retry; import indexing can be async.
       var retries = 0;
       while (!item && retries < 8) {
-        item = findProjectItem(f.name);
+        item =
+          findProjectItemByMediaPath(mediaPath, true) ||
+          resolveExistingProjectItem(cleanName, nameNoExt, mediaPath);
+        if (!item) item = findProjectItem(f.name);
         if (!item) item = findProjectItem(f.displayName);
-        if (!item) item = findProjectItem(nameNoExt);
         if (!item) item = findProjectItem(stripKnownExtension(f.name));
         if (!item) item = findProjectItemLoose(f.name);
         if (!item) item = findProjectItemLoose(f.displayName);
-        if (!item) item = findProjectItemLoose(cleanName);
-        if (!item) item = findProjectItemLoose(nameNoExt);
         if (!item) {
           sleep(40);
           retries++;
         }
       }
       if (item) {
+        moveItemToProjectBin(item);
         cacheProjectItem(item);
         cacheProjectItemByName(cleanName, item);
         cacheProjectItemByName(nameNoExt, item);
@@ -1647,7 +1838,7 @@
   function buildRawAudioSubclipName(scene) {
     if (!scene) return "";
     return (
-      "__ATR_RAW_AUDIO__" +
+      RAW_AUDIO_SUBCLIP_PREFIX +
       scene.scene_index +
       "__" +
       scene.source_in_frame +
@@ -1706,6 +1897,7 @@
         findProjectItem(subclipName) || findProjectItemLoose(subclipName);
     }
     if (subclip) {
+      moveItemToProjectBin(subclip);
       cacheProjectItem(subclip);
       cacheProjectItemByName(subclipName, subclip);
     }
@@ -1731,8 +1923,17 @@
       alert("Open a project.");
       return;
     }
+    var projectBin = ensureProjectBin();
+    if (!projectBin) {
+      log(
+        "Warning: Could not create/find project bin '" +
+          PROJECT_BIN_NAME +
+          "'. Falling back to root imports.",
+      );
+    }
 
     var seqName = BATCH_SEQUENCE_NAME;
+    deleteSequenceByName(seqName);
     var presetFile = new File(SEQUENCE_PRESET_PATH);
     var sequence;
 
@@ -1741,6 +1942,9 @@
       sequence = app.project.activeSequence;
     } else {
       sequence = app.project.createNewSequence(seqName, "ID_1");
+    }
+    if (sequence && sequence.projectItem) {
+      moveItemToProjectBin(sequence.projectItem);
     }
 
     // --- ENSURE TRACKS (V=6, A=4) ---
@@ -2058,7 +2262,7 @@
     }
 
     clearTrackClips(a4);
-    duplicateRawSceneAudioToTrack(a4, scenes);
+    duplicateRawSceneAudioToTrack(a4, scenes, qeSeq, qeTrackCache);
 
     log("Adding overlays on V5 and V6...");
     if (!placeOverlayOnTrack(v5, CATEGORY_OVERLAY_FILENAME, sequenceEndSec)) {
@@ -4666,13 +4870,327 @@
     return true;
   }
 
+  function getTrackCollectionIndex(trackCollection, targetTrack) {
+    if (!trackCollection || !targetTrack) return -1;
+    for (var i = 0; i < trackCollection.numTracks; i++) {
+      var track = trackCollection[i];
+      if (!track) continue;
+      if (track === targetTrack) return i;
+      try {
+        if (
+          track.id !== undefined &&
+          targetTrack.id !== undefined &&
+          track.id === targetTrack.id
+        ) {
+          return i;
+        }
+      } catch (e0) {}
+    }
+    return -1;
+  }
+
+  function getTrackItemNodeId(item) {
+    if (!item || item.nodeId === undefined || item.nodeId === null) return "";
+    try {
+      return item.nodeId.toString();
+    } catch (e0) {}
+    return "";
+  }
+
+  function getSourceAudioSelectedStreamPosition(clipName) {
+    var policy = getSourceAudioPolicy(clipName);
+    if (!policy) return 0;
+    var selectedStreamPosition = parseInt(policy.selected_stream_position, 10);
+    if (isNaN(selectedStreamPosition) || selectedStreamPosition < 0) return 0;
+    return selectedStreamPosition;
+  }
+
+  function isAudioTrackItemNearStart(item, startSec) {
+    if (!item || typeof startSec !== "number") return false;
+    var itemStartSec = getTrackItemStartSeconds(item);
+    if (typeof itemStartSec !== "number") return false;
+    if (Math.abs(itemStartSec - startSec) > 0.2) return false;
+
+    try {
+      if (item.mediaType && item.mediaType.toString() === "Video") return false;
+    } catch (e0) {}
+    return true;
+  }
+
+  function findAudioTrackIndexForTrackItem(sequence, item) {
+    if (!sequence || !sequence.audioTracks || !item) return -1;
+    var nodeId = getTrackItemNodeId(item);
+
+    for (var ti = 0; ti < sequence.audioTracks.numTracks; ti++) {
+      var track = sequence.audioTracks[ti];
+      if (!track || !track.clips) continue;
+      for (var ci = 0; ci < track.clips.numItems; ci++) {
+        var clip = track.clips[ci];
+        if (!clip) continue;
+        if (clip === item) return ti;
+        if (nodeId && getTrackItemNodeId(clip) === nodeId) {
+          return ti;
+        }
+      }
+    }
+    return -1;
+  }
+
+  function collectRawAudioLinkedTrackItems(
+    sequence,
+    anchorItem,
+    startSec,
+    nameRef,
+    fromTrackIndex,
+  ) {
+    var entries = [];
+    var seen = {};
+
+    var addEntry = function (item) {
+      if (!isAudioTrackItemNearStart(item, startSec)) return;
+
+      var trackIndex = findAudioTrackIndexForTrackItem(sequence, item);
+      if (trackIndex < 0) return;
+
+      var nodeId = getTrackItemNodeId(item);
+      var key = nodeId ? "node:" + nodeId : "track:" + trackIndex.toString();
+      if (seen[key]) return;
+      seen[key] = true;
+
+      entries.push({
+        clip: item,
+        trackIndex: trackIndex,
+        nodeId: nodeId,
+      });
+    };
+
+    addEntry(anchorItem);
+
+    try {
+      if (anchorItem && anchorItem.getLinkedItems) {
+        var linkedItems = anchorItem.getLinkedItems();
+        if (linkedItems) {
+          var linkedCount =
+            linkedItems.numItems !== undefined
+              ? linkedItems.numItems
+              : linkedItems.length || 0;
+          for (var li = 0; li < linkedCount; li++) {
+            var linkedItem = linkedItems[li];
+            if (!linkedItem && linkedItems.getItemAt) {
+              try {
+                linkedItem = linkedItems.getItemAt(li);
+              } catch (eLinked) {}
+            }
+            addEntry(linkedItem);
+          }
+        }
+      }
+    } catch (e0) {}
+
+    if (sequence && sequence.audioTracks) {
+      var scanStart = typeof fromTrackIndex === "number" && fromTrackIndex >= 0
+        ? fromTrackIndex
+        : 0;
+      for (var ti = scanStart; ti < sequence.audioTracks.numTracks; ti++) {
+        var track = sequence.audioTracks[ti];
+        if (!track) continue;
+        var placedItem =
+          resolvePlacedItemFast(track, startSec, nameRef, TRACK_ITEM_WAIT_MAX_MS) ||
+          findTrackItemAtStart(track, startSec, nameRef) ||
+          findTrackItemAtStart(track, startSec, null);
+        addEntry(placedItem);
+      }
+    }
+
+    entries.sort(function (a, b) {
+      return a.trackIndex - b.trackIndex;
+    });
+    return entries;
+  }
+
+  function moveQEAudioTrackItem(
+    qeSeq,
+    qeTrackCache,
+    fromTrackIndex,
+    toTrackIndex,
+    startSec,
+    nameRef,
+  ) {
+    if (
+      typeof fromTrackIndex !== "number" ||
+      typeof toTrackIndex !== "number" ||
+      fromTrackIndex < 0 ||
+      toTrackIndex < 0
+    ) {
+      return false;
+    }
+    if (fromTrackIndex === toTrackIndex) return true;
+
+    try {
+      if (!qeSeq) qeSeq = qe.project.getActiveSequence();
+    } catch (e0) {}
+    if (!qeSeq) return false;
+
+    var qeTrack = getCachedQETrack(
+      qeSeq,
+      "Audio",
+      fromTrackIndex,
+      qeTrackCache,
+    );
+    if (!qeTrack) return false;
+
+    var qeItem = findQETrackItemAtStartInTrack(qeTrack, startSec, nameRef);
+    if (!qeItem) {
+      qeItem = findQETrackItemAtStartInTrack(qeTrack, startSec, null);
+    }
+    if (!qeItem || !qeItem.moveToTrack) return false;
+
+    try {
+      qeItem.moveToTrack(toTrackIndex);
+      return true;
+    } catch (e1) {
+      log(
+        "Warning: QE moveToTrack failed for raw audio '" +
+          nameRef +
+          "' from A" +
+          (fromTrackIndex + 1) +
+          " to A" +
+          (toTrackIndex + 1) +
+          ": " +
+          (e1 && e1.message ? e1.message : e1),
+      );
+    }
+    return false;
+  }
+
+  // Premiere is still inserting multiple linked raw-audio clips for some
+  // sources, so normalize the linked group after placement and keep only the
+  // language-selected audio on A4.
+  function repairRawAudioPlacement(
+    a4,
+    scene,
+    startSec,
+    subclipName,
+    qeSeq,
+    qeTrackCache,
+  ) {
+    var sequence = app.project ? app.project.activeSequence : null;
+    if (!sequence || !sequence.audioTracks || !a4 || !scene) return true;
+
+    var a4Index = getTrackCollectionIndex(sequence.audioTracks, a4);
+    if (a4Index < 0) return false;
+
+    var selectedStreamPosition = getSourceAudioSelectedStreamPosition(
+      scene.clipName,
+    );
+    var a4Item =
+      resolvePlacedItemFast(a4, startSec, subclipName, TRACK_ITEM_WAIT_MAX_MS) ||
+      findTrackItemAtStart(a4, startSec, subclipName) ||
+      findTrackItemAtStart(a4, startSec, null);
+    var entries = collectRawAudioLinkedTrackItems(
+      sequence,
+      a4Item,
+      startSec,
+      subclipName,
+      a4Index,
+    );
+    if (entries.length <= 1 && selectedStreamPosition <= 0) return true;
+
+    var desiredTrackIndex = a4Index + selectedStreamPosition;
+    var desiredEntry = null;
+    for (var ei = 0; ei < entries.length; ei++) {
+      if (entries[ei].trackIndex === desiredTrackIndex) {
+        desiredEntry = entries[ei];
+        break;
+      }
+    }
+    if (
+      !desiredEntry &&
+      selectedStreamPosition >= 0 &&
+      selectedStreamPosition < entries.length
+    ) {
+      desiredEntry = entries[selectedStreamPosition];
+    }
+    if (!desiredEntry && entries.length > 0) {
+      desiredEntry = entries[0];
+    }
+    if (!desiredEntry || !desiredEntry.clip) {
+      log(
+        "Warning: Could not resolve desired raw audio clip for scene " +
+          scene.scene_index +
+          ".",
+      );
+      return false;
+    }
+
+    var removals = [];
+    for (var ri = 0; ri < entries.length; ri++) {
+      var entry = entries[ri];
+      if (!entry || !entry.clip) continue;
+      var isDesired =
+        desiredEntry.nodeId && entry.nodeId
+          ? desiredEntry.nodeId === entry.nodeId
+          : entry.clip === desiredEntry.clip;
+      if (!isDesired && entry.trackIndex >= a4Index) {
+        removals.push(entry);
+      }
+    }
+    removals.sort(function (a, b) {
+      return b.trackIndex - a.trackIndex;
+    });
+
+    for (var r = 0; r < removals.length; r++) {
+      var removalClip = removals[r].clip;
+      if (!removalClip) continue;
+      try {
+        removalClip.remove(false, true);
+      } catch (eRemove) {
+        log(
+          "Warning: Failed to remove extra raw audio clip on A" +
+            (removals[r].trackIndex + 1) +
+            " for scene " +
+            scene.scene_index +
+            ".",
+        );
+      }
+    }
+
+    if (desiredEntry.trackIndex !== a4Index) {
+      if (
+        !moveQEAudioTrackItem(
+          qeSeq,
+          qeTrackCache,
+          desiredEntry.trackIndex,
+          a4Index,
+          startSec,
+          subclipName,
+        )
+      ) {
+        log(
+          "Warning: Raw audio for scene " +
+            scene.scene_index +
+            " remained on A" +
+            (desiredEntry.trackIndex + 1) +
+            " after cleanup.",
+        );
+        return false;
+      }
+      sleep(20);
+    }
+
+    return true;
+  }
+
   function duplicateRawSceneAudioToTrack(
     a4,
     scenes,
+    qeSeq,
+    qeTrackCache,
   ) {
     if (!a4 || !scenes || scenes.length <= 0) return;
 
     log("Duplicating raw scene audio to A4...");
+
     for (var i = 0; i < scenes.length; i++) {
       var s = scenes[i];
       if (!s || !s.is_raw) continue;
@@ -4712,6 +5230,14 @@
             ".",
         );
       }
+      repairRawAudioPlacement(
+        a4,
+        s,
+        startSec,
+        subclipName,
+        qeSeq,
+        qeTrackCache,
+      );
     }
   }
 

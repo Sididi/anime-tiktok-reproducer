@@ -22,11 +22,21 @@ import {
   Wand2,
 } from "lucide-react";
 import { Button } from "@/components/ui";
-import { ClippedVideoPlayer, ManualMatchModal } from "@/components/video";
+import {
+  ClippedVideoPlayer,
+  ManualMatchModal,
+  ProjectClippedVideoPlayer,
+} from "@/components/video";
 import type { ClippedVideoPlayerHandle } from "@/components/video/ClippedVideoPlayer";
+import { useSourcePlaybackStrategy } from "@/hooks/useSourcePlaybackStrategy";
 import { useSceneStore } from "@/stores";
 import { api } from "@/api/client";
 import { cn, formatSpeedFactorPercent, formatTime } from "@/utils";
+import {
+  MEDIA_PRIORITY,
+  getFastWatchPrefetchPriority,
+  getViewportPriority,
+} from "@/utils/mediaPriorities";
 import type { Scene, SourceStreamDescriptor } from "@/types";
 
 interface GapInfo {
@@ -124,13 +134,6 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
   const pendingResolverRef = useRef<(() => void) | null>(null);
   const pendingTimeoutRef = useRef<number | null>(null);
   const endedRef = useRef({ tiktok: false, source: false });
-  const [sourceDescriptor, setSourceDescriptor] =
-    useState<SourceStreamDescriptor | null>(null);
-  const [sourceDescriptorLoading, setSourceDescriptorLoading] = useState(false);
-  const [sourceChunkStart, setSourceChunkStart] = useState(0);
-  const [sourceChunkDuration, setSourceChunkDuration] = useState(0);
-
-  const tiktokVideoUrl = api.getVideoUrl(projectId);
   const hasPlayableScene = Boolean(scene);
 
   // Use resolved timing if available, otherwise current
@@ -141,176 +144,104 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
 
   // Calculate if still has gap after resolution
   const hasGapAfterResolution = displaySpeed < minSpeedFactor;
-
-  const shouldUseChunkedSource = useCallback(
-    (descriptor: SourceStreamDescriptor | null): boolean => {
-      if (!descriptor) return false;
-      if (descriptor.mode === "chunked") return true;
-
-      // High-rate Fast Watch can stutter on direct HEVC decode; prefer chunked
-      // H.264 preview to stabilize playback pacing.
-      const codec = (descriptor.codec || "").toLowerCase();
-      const pixFmt = (descriptor.pix_fmt || "").toLowerCase();
-      return playbackRate >= 8 && (codec === "hevc" || pixFmt.includes("10"));
-    },
-    [playbackRate],
-  );
-
-  const isChunkedSource = shouldUseChunkedSource(sourceDescriptor);
-
-  const getChunkWindowStart = useCallback(
-    (
-      targetTime: number,
-      descriptor: SourceStreamDescriptor,
-      windowDuration: number,
-    ): number => {
-      const boundedDuration = Math.min(
-        Math.max(windowDuration, descriptor.chunk_duration),
-        MAX_DYNAMIC_CHUNK_SECONDS,
-      );
-      const maxStart = Math.max(
-        (descriptor.duration || 0) - boundedDuration,
-        0,
-      );
-      const boundedTarget = Math.min(
-        Math.max(targetTime, 0),
-        descriptor.duration || targetTime,
-      );
-      const centered = Math.max(boundedTarget - boundedDuration / 2, 0);
-      const step = Math.max(descriptor.chunk_step || 0.001, 0.001);
-      const snapped = Math.floor(centered / step) * step;
-      return Math.min(Math.max(snapped, 0), maxStart);
-    },
-    [],
-  );
+  const leasePriority = controlsDisabled
+    ? isActive
+      ? MEDIA_PRIORITY.ACTIVE_FAST_WATCH
+      : preloadMode === "auto"
+        ? getFastWatchPrefetchPriority(1)
+        : getViewportPriority(4)
+    : isActive
+      ? MEDIA_PRIORITY.ACTIVE
+      : preloadMode === "auto"
+        ? getViewportPriority(1)
+        : shouldLoadSourcePreview
+          ? getViewportPriority(4)
+          : MEDIA_PRIORITY.OFFSCREEN;
+  const warmupLeasePriority = controlsDisabled
+    ? isActive
+      ? MEDIA_PRIORITY.ACTIVE_FAST_WATCH
+      : preloadMode === "auto"
+        ? getFastWatchPrefetchPriority(2)
+        : MEDIA_PRIORITY.OFFSCREEN
+    : isActive
+      ? MEDIA_PRIORITY.ACTIVE
+      : preloadMode === "auto"
+        ? getViewportPriority(2)
+        : MEDIA_PRIORITY.OFFSCREEN;
+  const sourceStrategy = useSourcePlaybackStrategy({
+    projectId,
+    episode: gap.episode,
+    enabled: shouldLoadSourcePreview,
+    playbackRate,
+    preferChunkedHighRateHevc: true,
+    initialTargetTime: (displayStart + displayEnd) / 2,
+    minimumChunkDuration: sourceClipDuration,
+    maxChunkDuration: MAX_DYNAMIC_CHUNK_SECONDS,
+    chunkAlignment: "center",
+    getDescriptor: getSourceDescriptor,
+  });
+  const sourceDescriptor = sourceStrategy.descriptor;
+  const sourceDescriptorLoading = sourceStrategy.loading;
+  const isChunkedSource = sourceStrategy.mode === "chunked";
+  const sourceChunkStart = sourceStrategy.chunkWindowStart;
+  const sourceChunkDuration = sourceStrategy.chunkWindowDuration;
+  const sourceVideoUrl = sourceStrategy.sourceUrl;
 
   /* eslint-disable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
   useEffect(() => {
-    if (!shouldLoadSourcePreview) {
-      setSourceDescriptor(null);
-      setSourceDescriptorLoading(false);
+    if (!shouldLoadSourcePreview || !sourceDescriptor || !isChunkedSource) {
       return;
     }
 
-    let active = true;
-    setSourceDescriptorLoading(true);
-
-    void getSourceDescriptor(gap.episode)
-      .then((descriptor) => {
-        if (!active) return;
-        setSourceDescriptor(descriptor);
-
-        if (!descriptor) {
-          setSourceChunkDuration(0);
-          setSourceChunkStart(0);
-          return;
-        }
-
-        if (shouldUseChunkedSource(descriptor)) {
-          const desiredDuration = Math.min(
-            Math.max(
-              descriptor.chunk_duration,
-              sourceClipDuration + descriptor.seek_guard_seconds * 2,
-            ),
-            MAX_DYNAMIC_CHUNK_SECONDS,
-          );
-          const centeredTarget = (displayStart + displayEnd) / 2;
-          setSourceChunkDuration(desiredDuration);
-          setSourceChunkStart(
-            getChunkWindowStart(centeredTarget, descriptor, desiredDuration),
-          );
-        } else {
-          setSourceChunkDuration(0);
-          setSourceChunkStart(0);
-        }
-      })
-      .catch(() => {
-        if (!active) return;
-        setSourceDescriptor(null);
-      })
-      .finally(() => {
-        if (!active) return;
-        setSourceDescriptorLoading(false);
-      });
-
-    return () => {
-      active = false;
-    };
-  }, [
-    gap.episode,
-    getSourceDescriptor,
-    getChunkWindowStart,
-    shouldUseChunkedSource,
-    shouldLoadSourcePreview,
-  ]);
-
-  useEffect(() => {
-    if (!sourceDescriptor || !isChunkedSource) return;
-
-    const duration =
+    const requestedDuration = Math.min(
+      Math.max(
+        sourceDescriptor.chunk_duration,
+        sourceClipDuration + sourceDescriptor.seek_guard_seconds * 2,
+      ),
+      MAX_DYNAMIC_CHUNK_SECONDS,
+    );
+    const currentDuration =
       sourceChunkDuration > 0
         ? sourceChunkDuration
         : sourceDescriptor.chunk_duration;
     const guard = sourceDescriptor.seek_guard_seconds;
     const safeStart = sourceChunkStart + guard;
-    const safeEnd = sourceChunkStart + duration - guard;
+    const safeEnd = sourceChunkStart + currentDuration - guard;
 
-    if (displayStart >= safeStart && displayEnd <= safeEnd) {
+    if (
+      displayStart >= safeStart &&
+      displayEnd <= safeEnd &&
+      Math.abs(currentDuration - requestedDuration) < 0.01
+    ) {
       return;
     }
 
-    const requestedDuration = Math.min(
-      Math.max(sourceDescriptor.chunk_duration, sourceClipDuration + guard * 2),
-      MAX_DYNAMIC_CHUNK_SECONDS,
-    );
-    const centeredTarget = (displayStart + displayEnd) / 2;
-    setSourceChunkDuration(requestedDuration);
-    setSourceChunkStart(
-      getChunkWindowStart(centeredTarget, sourceDescriptor, requestedDuration),
-    );
+    sourceStrategy.retargetChunkWindow((displayStart + displayEnd) / 2, {
+      minimumDuration: requestedDuration,
+      alignment: "center",
+      maxDuration: MAX_DYNAMIC_CHUNK_SECONDS,
+    });
   }, [
     displayEnd,
     displayStart,
-    getChunkWindowStart,
-    sourceChunkDuration,
     sourceChunkStart,
     sourceClipDuration,
     sourceDescriptor,
     isChunkedSource,
+    shouldLoadSourcePreview,
+    sourceChunkDuration,
+    sourceStrategy,
   ]);
   /* eslint-enable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
 
-  const sourceVideoUrl = useMemo(() => {
-    if (isChunkedSource && sourceDescriptor) {
-      const duration =
-        sourceChunkDuration > 0
-          ? sourceChunkDuration
-          : sourceDescriptor.chunk_duration;
-      return api.getSourceChunkUrl(
-        projectId,
-        gap.episode,
-        sourceChunkStart,
-        duration,
-      );
-    }
-    return api.getSourceVideoUrl(projectId, gap.episode);
-  }, [
-    gap.episode,
-    isChunkedSource,
-    projectId,
-    sourceChunkDuration,
-    sourceChunkStart,
-    sourceDescriptor,
-  ]);
-
   const sourceStartForPlayer = isChunkedSource
-    ? Math.max(0, displayStart - sourceChunkStart)
+    ? sourceStrategy.toLocalTime(displayStart)
     : displayStart;
   const sourceEndForPlayer = isChunkedSource
     ? Math.max(
         sourceStartForPlayer + 0.05,
         Math.min(
-          displayEnd - sourceChunkStart,
+          sourceStrategy.toLocalTime(displayEnd),
           sourceChunkDuration > 0
             ? sourceChunkDuration
             : sourceDescriptor?.chunk_duration || displayEnd,
@@ -570,9 +501,9 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
           </p>
           <div className="aspect-9/16 bg-black rounded overflow-hidden">
             {scene && (
-              <ClippedVideoPlayer
+              <ProjectClippedVideoPlayer
                 ref={tiktokPlayerRef}
-                src={tiktokVideoUrl}
+                projectId={projectId}
                 startTime={scene.start_time}
                 endTime={scene.end_time}
                 className={cn(
@@ -581,6 +512,10 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
                 )}
                 playbackRate={playbackRate}
                 eager={preloadMode === "auto"}
+                requestLoad={shouldLoadSourcePreview}
+                requestWarmup={preloadMode === "auto"}
+                leasePriority={leasePriority}
+                warmupPriority={warmupLeasePriority}
                 onClipEnded={() => handleClipEnded("tiktok")}
               />
             )}
@@ -610,6 +545,10 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
                 <Loader2 className="h-4 w-4 animate-spin mr-2" />
                 Preparing source stream...
               </div>
+            ) : !sourceVideoUrl ? (
+              <div className="w-full h-full flex items-center justify-center text-xs text-white/70 px-4 text-center">
+                Source stream unavailable.
+              </div>
             ) : (
               <ClippedVideoPlayer
                 ref={sourcePlayerRef}
@@ -622,6 +561,10 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
                 )}
                 playbackRate={playbackRate}
                 eager={preloadMode === "auto"}
+                requestLoad={shouldLoadSourcePreview}
+                requestWarmup={preloadMode === "auto"}
+                leasePriority={leasePriority - 1}
+                warmupPriority={warmupLeasePriority - 1}
                 onClipEnded={() => handleClipEnded("source")}
               />
             )}

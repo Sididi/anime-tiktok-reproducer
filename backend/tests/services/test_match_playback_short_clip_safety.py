@@ -111,3 +111,21 @@ def test_encode_clip_clamps_duration_to_minimum_frame(monkeypatch, tmp_path):
     assert duration == 0.2
     assert captured["duration"] is not None
     assert captured["duration"] >= (1.0 / MatchPlaybackService._PROFILE_MAP["tiktok_fast"].fps)
+
+
+def test_source_web_compatible_rejects_hevc_10bit_stream_copy(monkeypatch, tmp_path):
+    MatchPlaybackService, _ClipPlan = _match_playback_symbols()
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"input")
+
+    class _FakeCompleted:
+        returncode = 0
+        stderr = ""
+        stdout = '{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le"}]}'
+
+    def fake_run(*args, **kwargs):
+        return _FakeCompleted()
+
+    monkeypatch.setattr("app.services.match_playback_service.subprocess.run", fake_run)
+
+    assert MatchPlaybackService._is_source_web_compatible_sync(source_path) is False

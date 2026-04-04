@@ -20,6 +20,20 @@ from ...services.match_playback_service import MatchPlaybackService
 router = APIRouter(prefix="/projects/{project_id}", tags=["matching"])
 
 
+def _etag_for_path(path: Path) -> str:
+    stat = path.stat()
+    return f'"{stat.st_mtime_ns:x}-{stat.st_size:x}"'
+
+
+def _media_headers(path: Path, *, cache_control: str) -> dict[str, str]:
+    return {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": cache_control,
+        "Cross-Origin-Resource-Policy": "cross-origin",
+        "ETag": _etag_for_path(path),
+    }
+
+
 @router.get("/matches/config")
 async def get_matches_config(project_id: str):
     """Get matches feature flags."""
@@ -542,7 +556,32 @@ async def get_matches_playback_clip(
     return FileResponse(
         path=clip_path,
         media_type="video/mp4",
-        headers={"Accept-Ranges": "bytes"},
+        headers=_media_headers(
+            clip_path,
+            cache_control="public, max-age=0, must-revalidate",
+        ),
+    )
+
+
+@router.get("/matches/playback/clips/{clip_id}")
+async def get_matches_playback_clip_by_id(project_id: str, clip_id: str):
+    """Serve one prepared playback clip by stable content-addressed clip id."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    try:
+        clip_path = MatchPlaybackService.get_clip_path_by_id(project_id, clip_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    return FileResponse(
+        path=clip_path,
+        media_type="video/mp4",
+        headers=_media_headers(
+            clip_path,
+            cache_control="public, max-age=31536000, immutable",
+        ),
     )
 
 

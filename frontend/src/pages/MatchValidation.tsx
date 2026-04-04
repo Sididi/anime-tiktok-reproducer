@@ -35,6 +35,11 @@ import { useProjectStore, useSceneStore } from "@/stores";
 import { api } from "@/api/client";
 import { readSSEStream } from "@/utils/sse";
 import { cn, formatTime } from "@/utils";
+import {
+  MEDIA_PRIORITY,
+  getFastWatchPrefetchPriority,
+  getViewportPriority,
+} from "@/utils/mediaPriorities";
 import type {
   LibraryType,
   MatchesPlaybackManifest,
@@ -132,12 +137,41 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
     const primedForFastWatchRef = useRef(false);
     const loadFailureRef = useRef(false);
 
-    const tiktokVideoUrl = playbackAsset?.tiktok.url ?? null;
+    const tiktokVideoUrl = playbackAsset?.tiktok.url
+      ? api.toMediaUrl(playbackAsset.tiktok.url)
+      : null;
     const hasMatchedScene = Boolean(match.confidence > 0 && match.episode);
     const sourceVideoUrl = hasMatchedScene
-      ? (playbackAsset?.source?.url ?? null)
+      ? (playbackAsset?.source?.url
+          ? api.toMediaUrl(playbackAsset.source.url)
+          : null)
       : null;
     const hasMatch = Boolean(hasMatchedScene && sourceVideoUrl);
+    const fastWatchMode = controlsDisabled;
+    const baseLeasePriority = fastWatchMode
+      ? isActive
+        ? MEDIA_PRIORITY.ACTIVE_FAST_WATCH
+        : preloadMode === "auto"
+          ? getFastWatchPrefetchPriority(1)
+          : getViewportPriority(4)
+      : isActive
+        ? MEDIA_PRIORITY.ACTIVE
+        : preloadMode === "auto"
+          ? getViewportPriority(1)
+          : mediaEnabled
+            ? getViewportPriority(4)
+            : MEDIA_PRIORITY.OFFSCREEN;
+    const baseWarmupPriority = fastWatchMode
+      ? isActive
+        ? MEDIA_PRIORITY.ACTIVE_FAST_WATCH
+        : preloadMode === "auto"
+          ? getFastWatchPrefetchPriority(2)
+          : MEDIA_PRIORITY.OFFSCREEN
+      : isActive
+        ? MEDIA_PRIORITY.ACTIVE
+        : preloadMode === "auto"
+          ? getViewportPriority(2)
+          : MEDIA_PRIORITY.OFFSCREEN;
 
     // Calculate durations
     const tiktokDuration = scene.end_time - scene.start_time;
@@ -495,6 +529,10 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
                   controls
                   preloadMode={preloadMode}
                   disableInteraction={controlsDisabled}
+                  requestLoad={mediaEnabled}
+                  requestWarmup={preloadMode === "auto"}
+                  leasePriority={baseLeasePriority}
+                  warmupPriority={baseWarmupPriority}
                   className="w-full h-full"
                 />
               ) : (
@@ -537,6 +575,10 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
                   controls
                   preloadMode={preloadMode}
                   disableInteraction={controlsDisabled}
+                  requestLoad={mediaEnabled}
+                  requestWarmup={preloadMode === "auto"}
+                  leasePriority={baseLeasePriority - 1}
+                  warmupPriority={baseWarmupPriority - 1}
                   className="w-full h-full"
                 />
               ) : hasMatchedScene && !sourceVideoUrl ? (

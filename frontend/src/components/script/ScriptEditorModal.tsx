@@ -2,8 +2,8 @@ import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { X } from "lucide-react";
 import { useEditor, EditorContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
-import { api } from "@/api/client";
 import { Button } from "@/components/ui";
+import { ProjectManagedVideoPlayer } from "@/components/video";
 import { SceneHeader } from "./SceneHeaderExtension";
 import {
   estimateTtsDuration,
@@ -322,10 +322,13 @@ export function ScriptEditorModal({
         {/* TikTok video preview */}
         {projectId && (
           <div className="w-72 shrink-0 flex items-center justify-center bg-black rounded-l-lg overflow-hidden">
-            <video
-              src={api.getVideoUrl(projectId)}
-              controls
+            <ProjectManagedVideoPlayer
+              projectId={projectId}
               className="w-full h-auto max-h-[90vh] object-contain"
+              requestLoad={isOpen}
+              requestWarmup={isOpen}
+              controls
+              muted
             />
           </div>
         )}

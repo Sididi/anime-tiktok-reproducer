@@ -1,23 +1,13 @@
+import { forwardRef, useImperativeHandle, useRef } from "react";
 import {
-  useRef,
-  useEffect,
-  useCallback,
-  useState,
-  forwardRef,
-  useImperativeHandle,
-  useMemo,
-} from "react";
-import { RotateCcw, Play, Loader2 } from "lucide-react";
-import { cn } from "@/utils";
-import {
-  acquire,
-  acquirePriority,
-  getActiveCount,
-  getQueueLength,
-} from "@/utils/videoConnectionPool";
+  ManagedVideoPlayer,
+  type ManagedVideoPlayerHandle,
+  type WaitUntilReadyOptions,
+} from "./ManagedVideoPlayer";
 
-interface ClippedVideoPlayerProps {
+export interface ClippedVideoPlayerProps {
   src: string;
+  fallbackSrc?: string | null;
   startTime: number;
   endTime: number;
   className?: string;
@@ -26,6 +16,13 @@ interface ClippedVideoPlayerProps {
   onClipEnded?: () => void;
   eager?: boolean;
   loadStallTimeoutMs?: number | null;
+  requestLoad?: boolean;
+  requestWarmup?: boolean;
+  leasePriority?: number;
+  warmupPriority?: number;
+  dedicatedAudio?: boolean;
+  disableInteraction?: boolean;
+  placeholderLabel?: string;
 }
 
 export interface ClippedVideoPlayerHandle {
@@ -41,36 +38,18 @@ export interface ClippedVideoPlayerHandle {
   retryLoad: () => Promise<void>;
   forceLoad: () => void;
   releaseLoad: () => void;
+  releaseAndPreventReload: () => void;
 }
 
-export interface WaitUntilReadyOptions {
-  minReadyState?: number;
-  timeoutMs?: number;
-}
+export type { WaitUntilReadyOptions };
 
-interface ReadyWaiter {
-  resolve: () => void;
-  minReadyState: number;
-  timeoutId: number;
-}
-
-const INTENTIONAL_UNLOAD_SUPPRESSION_MS = 250;
-const LOAD_STALL_TIMEOUT_MS = 12000;
-
-/**
- * A video player that strictly clips playback between startTime and endTime.
- * Uses Intersection Observer for lazy loading to prevent loading too many videos at once.
- * - Only loads video when visible in viewport
- * - Starts at startTime when loaded
- * - Pauses at endTime
- * - Allows manual replay from startTime
- */
 export const ClippedVideoPlayer = forwardRef<
   ClippedVideoPlayerHandle,
   ClippedVideoPlayerProps
 >(function ClippedVideoPlayer(
   {
     src,
+    fallbackSrc,
     startTime,
     endTime,
     className,
@@ -78,758 +57,64 @@ export const ClippedVideoPlayer = forwardRef<
     playbackRate = 1,
     onClipEnded,
     eager = false,
-    loadStallTimeoutMs = null,
+    loadStallTimeoutMs,
+    requestLoad = true,
+    requestWarmup = false,
+    leasePriority = 100,
+    warmupPriority = 100,
+    dedicatedAudio = false,
+    disableInteraction = false,
+    placeholderLabel = "Media deferred",
   },
   ref,
 ) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const readyWaitersRef = useRef<ReadyWaiter[]>([]);
-  const isMountedRef = useRef(false);
-  const endNotifiedRef = useRef(false);
-  const isClipEndedRef = useRef(false);
-  const forceLoadedRef = useRef(false);
-  const isIntersectingRef = useRef(false);
-  const hasErrorRef = useRef(false);
-  const loadRequestedRef = useRef(eager);
-  const sourceAttachedRef = useRef(false);
-  const poolReleaseRef = useRef<(() => void) | null>(null);
-  const nextAcquireIdRef = useRef(0);
-  const pendingAcquireIdRef = useRef<number | null>(null);
-  const pendingAcquirePriorityRef = useRef(false);
-  const suppressMediaErrorsRef = useRef(false);
-  const suppressMediaErrorsTimerRef = useRef<number | null>(null);
-  const [loadRequested, setLoadRequested] = useState(eager);
-  const [hasSlot, setHasSlot] = useState(false);
-  const [isSourceAttached, setIsSourceAttached] = useState(false);
-  const [isLoaded, setIsLoaded] = useState(false);
-  const [isEnded, setIsEnded] = useState(false);
-  const [hasError, setHasError] = useState(false);
-  const [retryCount, setRetryCount] = useState(0);
-  const [isRetrying, setIsRetrying] = useState(false);
-  const [preloadMode, setPreloadMode] = useState<"metadata" | "auto">(
-    "metadata",
-  );
+  void loadStallTimeoutMs;
+  const innerRef = useRef<ManagedVideoPlayerHandle>(null);
 
-  const resolveReadyWaiters = useCallback((force = false) => {
-    const waiters = readyWaitersRef.current;
-    if (waiters.length === 0) return;
-
-    const readyState =
-      videoRef.current?.readyState ?? HTMLMediaElement.HAVE_NOTHING;
-    const remainingWaiters: ReadyWaiter[] = [];
-    for (const waiter of waiters) {
-      if (force || hasErrorRef.current || readyState >= waiter.minReadyState) {
-        clearTimeout(waiter.timeoutId);
-        waiter.resolve();
-      } else {
-        remainingWaiters.push(waiter);
-      }
-    }
-    readyWaitersRef.current = remainingWaiters;
-  }, []);
-
-  // Add a small offset to startTime to compensate for keyframe seeking
-  // HTML video seeks to nearest keyframe which can be before the target time
-  // Adding ~2 frames (at 30fps = 0.067s) ensures we land on correct frame
-  const adjustedStartTime = startTime + 0.067;
-
-  const setLoadRequestedState = useCallback((value: boolean) => {
-    loadRequestedRef.current = value;
-    setLoadRequested(value);
-  }, []);
-
-  const setSourceAttachedState = useCallback((value: boolean) => {
-    sourceAttachedRef.current = value;
-    setIsSourceAttached(value);
-  }, []);
-
-  const resetClipEndedState = useCallback(() => {
-    endNotifiedRef.current = false;
-    isClipEndedRef.current = false;
-    setIsEnded(false);
-  }, []);
-
-  const markClipEnded = useCallback(() => {
-    if (!isClipEndedRef.current) {
-      isClipEndedRef.current = true;
-      setIsEnded(true);
-    }
-    // Always notify parent exactly once so orchestration can advance.
-    if (!endNotifiedRef.current) {
-      endNotifiedRef.current = true;
-      onClipEnded?.();
-    }
-  }, [onClipEnded]);
-
-  const notifyClipCompleted = useCallback(() => {
-    if (!endNotifiedRef.current) {
-      endNotifiedRef.current = true;
-      onClipEnded?.();
-    }
-  }, [onClipEnded]);
-
-  // Add cache-busting parameter on retry to bypass browser cache
-  const videoSrc = useMemo(() => {
-    if (retryCount === 0) return src;
-    const separator = src.includes("?") ? "&" : "?";
-    // Use retryCount as the cache buster (changes on each retry)
-    return `${src}${separator}_retry=${retryCount}`;
-  }, [src, retryCount]);
-
-  const clearIntentionalUnloadSuppression = useCallback(() => {
-    suppressMediaErrorsRef.current = false;
-    if (suppressMediaErrorsTimerRef.current !== null) {
-      window.clearTimeout(suppressMediaErrorsTimerRef.current);
-      suppressMediaErrorsTimerRef.current = null;
-    }
-  }, []);
-
-  const suppressIntentionalUnloadErrors = useCallback(() => {
-    suppressMediaErrorsRef.current = true;
-    if (suppressMediaErrorsTimerRef.current !== null) {
-      window.clearTimeout(suppressMediaErrorsTimerRef.current);
-    }
-    suppressMediaErrorsTimerRef.current = window.setTimeout(() => {
-      suppressMediaErrorsRef.current = false;
-      suppressMediaErrorsTimerRef.current = null;
-    }, INTENTIONAL_UNLOAD_SUPPRESSION_MS);
-  }, []);
-
-  const cancelPendingAcquire = useCallback(() => {
-    pendingAcquireIdRef.current = null;
-    pendingAcquirePriorityRef.current = false;
-  }, []);
-
-  const releasePoolSlot = useCallback(() => {
-    const release = poolReleaseRef.current;
-    poolReleaseRef.current = null;
-    if (release) {
-      release();
-    }
-    if (isMountedRef.current) {
-      setHasSlot(false);
-    }
-  }, []);
-
-  const resetLoadState = useCallback(
-    (
-      options: {
-        clearError?: boolean;
-        resetPreload?: boolean;
-      } = {},
-    ) => {
-      if (!isMountedRef.current) return;
-      setIsLoaded(false);
-      if (options.clearError ?? true) {
-        setHasError(false);
-        hasErrorRef.current = false;
-      }
-      resetClipEndedState();
-      resolveReadyWaiters(true);
-      if (options.resetPreload ?? true) {
-        setPreloadMode("metadata");
-      }
-    },
-    [resolveReadyWaiters, resetClipEndedState],
-  );
-
-  const teardownMedia = useCallback(
-    (
-      options: {
-        suppressErrors?: boolean;
-        clearError?: boolean;
-        resetPreload?: boolean;
-      } = {},
-    ) => {
-      const {
-        suppressErrors = false,
-        clearError = true,
-        resetPreload = true,
-      } = options;
-
-      cancelPendingAcquire();
-      if (suppressErrors) {
-        suppressIntentionalUnloadErrors();
-      } else {
-        clearIntentionalUnloadSuppression();
-      }
-
-      const video = videoRef.current;
-      if (video) {
-        video.pause();
-        video.removeAttribute("src");
-        video.load();
-      }
-
-      sourceAttachedRef.current = false;
-      if (isMountedRef.current) {
-        setIsSourceAttached(false);
-        resetLoadState({ clearError, resetPreload });
-      } else {
-        resolveReadyWaiters(true);
-      }
-
-      releasePoolSlot();
-    },
-    [
-      cancelPendingAcquire,
-      clearIntentionalUnloadSuppression,
-      releasePoolSlot,
-      resetLoadState,
-      resolveReadyWaiters,
-      suppressIntentionalUnloadErrors,
-    ],
-  );
-
-  const requestPoolSlot = useCallback(
-    (priority: boolean) => {
-      if (poolReleaseRef.current) {
-        if (isMountedRef.current) {
-          setHasSlot(true);
-        }
-        return;
-      }
-      if (
-        pendingAcquireIdRef.current !== null &&
-        (!priority || pendingAcquirePriorityRef.current)
-      ) {
-        return;
-      }
-
-      const acquireId = nextAcquireIdRef.current + 1;
-      nextAcquireIdRef.current = acquireId;
-      pendingAcquireIdRef.current = acquireId;
-      pendingAcquirePriorityRef.current = priority;
-      const acquireFn = priority ? acquirePriority : acquire;
-
-      void acquireFn()
-        .then((release) => {
-          const isLatest = pendingAcquireIdRef.current === acquireId;
-          if (!isLatest || !isMountedRef.current || !loadRequestedRef.current) {
-            release();
-            return;
-          }
-
-          pendingAcquireIdRef.current = null;
-          pendingAcquirePriorityRef.current = false;
-          poolReleaseRef.current = release;
-          setHasSlot(true);
-          setSourceAttachedState(true);
-        })
-        .catch(() => {
-          if (
-            pendingAcquireIdRef.current !== acquireId ||
-            !isMountedRef.current
-          ) {
-            return;
-          }
-          pendingAcquireIdRef.current = null;
-          pendingAcquirePriorityRef.current = false;
-          setHasError(true);
-          hasErrorRef.current = true;
-          setIsLoaded(true);
-          notifyClipCompleted();
-          resolveReadyWaiters(true);
-        });
-    },
-    [notifyClipCompleted, resolveReadyWaiters, setSourceAttachedState],
-  );
-
-  const triggerRetryLoad = useCallback(() => {
-    return new Promise<void>((resolve) => {
-      setIsRetrying(true);
-      setLoadRequestedState(true);
-      setPreloadMode("auto");
-      teardownMedia({ suppressErrors: true, resetPreload: false });
-
-      // Small delay to ensure video element is unmounted before creating new one
-      window.setTimeout(() => {
-        setRetryCount((c) => c + 1);
-        setIsRetrying(false);
-        resolve();
-      }, 100);
-    });
-  }, [setLoadRequestedState, teardownMedia]);
-
-  // Expose playback control methods to parent
   useImperativeHandle(
     ref,
     () => ({
-      playFromStart: () => {
-        if (videoRef.current) {
-          videoRef.current.currentTime = adjustedStartTime;
-          resetClipEndedState();
-          videoRef.current.play().catch(console.error);
-        }
-      },
-      seekToStart: () => {
-        return new Promise<void>((resolve) => {
-          const video = videoRef.current;
-          if (!video || hasErrorRef.current) {
-            resolve();
-            return;
-          }
-
-          // Avoid hanging forever when seek is impossible (e.g. failed load).
-          if (video.readyState < HTMLMediaElement.HAVE_METADATA) {
-            resolve();
-            return;
-          }
-
-          resetClipEndedState();
-          let done = false;
-          const finalize = () => {
-            if (done) return;
-            done = true;
-            window.clearTimeout(timeoutId);
-            video.removeEventListener("seeked", onSeeked);
-            video.removeEventListener("error", onError);
-            resolve();
-          };
-          const onSeeked = () => finalize();
-          const onError = () => finalize();
-          const timeoutId = window.setTimeout(finalize, 1200);
-
-          video.addEventListener("seeked", onSeeked);
-          video.addEventListener("error", onError);
-          try {
-            video.currentTime = adjustedStartTime;
-          } catch {
-            finalize();
-          }
-        });
-      },
-      play: () => {
-        if (videoRef.current) {
-          resetClipEndedState();
-          videoRef.current.play().catch(console.error);
-        }
-      },
-      playChecked: async () => {
-        const video = videoRef.current;
-        if (!video || hasErrorRef.current) {
-          return false;
-        }
-
-        resetClipEndedState();
-        video.playbackRate = playbackRate;
-
-        try {
-          await video.play();
-          return true;
-        } catch {
-          return false;
-        }
-      },
-      pause: () => {
-        videoRef.current?.pause();
-      },
-      waitUntilReady: (options) => {
-        return new Promise<void>((resolve) => {
-          const minReadyState =
-            options?.minReadyState ?? HTMLMediaElement.HAVE_CURRENT_DATA;
-          const timeoutMs = options?.timeoutMs ?? 6000;
-          const video = videoRef.current;
-          if (
-            !video ||
-            hasErrorRef.current ||
-            video.readyState >= minReadyState
-          ) {
-            resolve();
-            return;
-          }
-
-          let waiter: ReadyWaiter | null = null;
-          const timeoutId = window.setTimeout(() => {
-            if (!waiter) {
-              resolve();
-              return;
-            }
-            const idx = readyWaitersRef.current.indexOf(waiter);
-            if (idx >= 0) {
-              readyWaitersRef.current.splice(idx, 1);
-            }
-            resolve();
-          }, timeoutMs);
-
-          waiter = { resolve, minReadyState, timeoutId };
-          readyWaitersRef.current.push(waiter);
-          // Avoid deadlocks if loading fails or takes too long.
-        });
-      },
-      hasLoadError: () => hasErrorRef.current,
-      isPlaying: () => {
-        const video = videoRef.current;
-        if (!video) return false;
-        return !video.paused && !video.ended;
-      },
-      getReadyState: () => {
-        return videoRef.current?.readyState ?? HTMLMediaElement.HAVE_NOTHING;
-      },
-      retryLoad: async () => {
-        await triggerRetryLoad();
-      },
-      forceLoad: () => {
-        forceLoadedRef.current = true;
-        setPreloadMode("auto");
-        setLoadRequestedState(true);
-        requestPoolSlot(true);
-      },
-      releaseLoad: () => {
-        forceLoadedRef.current = false;
-        if (eager || isIntersectingRef.current) {
-          if (!eager) {
-            setPreloadMode("metadata");
-          }
-          return;
-        }
-        setLoadRequestedState(false);
-      },
+      playFromStart: () => innerRef.current?.playFromStart(),
+      seekToStart: () => innerRef.current?.seekToStart() ?? Promise.resolve(),
+      play: () => innerRef.current?.play(),
+      playChecked: () =>
+        innerRef.current?.playChecked() ?? Promise.resolve(false),
+      pause: () => innerRef.current?.pause(),
+      waitUntilReady: (options) =>
+        innerRef.current?.waitUntilReady(options) ?? Promise.resolve(),
+      hasLoadError: () => innerRef.current?.hasLoadError() ?? true,
+      isPlaying: () => innerRef.current?.isPlaying() ?? false,
+      getReadyState: () =>
+        innerRef.current?.getReadyState() ?? HTMLMediaElement.HAVE_NOTHING,
+      retryLoad: () => innerRef.current?.retryLoad() ?? Promise.resolve(),
+      forceLoad: () => innerRef.current?.forceLoad(),
+      releaseLoad: () => innerRef.current?.releaseLoad(),
+      releaseAndPreventReload: () =>
+        innerRef.current?.releaseAndPreventReload(),
     }),
-    [
-      eager,
-      adjustedStartTime,
-      playbackRate,
-      requestPoolSlot,
-      resetClipEndedState,
-      setLoadRequestedState,
-      triggerRetryLoad,
-    ],
+    [],
   );
-
-  useEffect(() => {
-    isMountedRef.current = true;
-    return () => {
-      isMountedRef.current = false;
-      // Read the live ref during cleanup so SPA route transitions always
-      // detach the actual mounted media element.
-      teardownMedia();
-    };
-  }, [teardownMedia]);
-
-  /* eslint-disable react-hooks/set-state-in-effect */
-  // Intersection Observer for lazy loading AND unloading
-  // Videos are loaded when entering viewport and unloaded when leaving
-  // This prevents too many concurrent video connections which causes failures
-  useEffect(() => {
-    const container = containerRef.current;
-    if (!container) return;
-
-    const observer = new IntersectionObserver(
-      (entries) => {
-        entries.forEach((entry) => {
-          isIntersectingRef.current = entry.isIntersecting;
-          setLoadRequestedState(
-            eager || entry.isIntersecting || forceLoadedRef.current,
-          );
-        });
-      },
-      {
-        rootMargin: "200px", // Load slightly before visible, unload after leaving by 200px
-        threshold: 0,
-      },
-    );
-
-    observer.observe(container);
-
-    return () => {
-      observer.disconnect();
-    };
-  }, [eager, setLoadRequestedState]);
-
-  useEffect(() => {
-    if (eager) {
-      setPreloadMode("auto");
-      setLoadRequestedState(true);
-      requestPoolSlot(true);
-      return;
-    }
-
-    if (!forceLoadedRef.current) {
-      setPreloadMode("metadata");
-      setLoadRequestedState(isIntersectingRef.current);
-    }
-  }, [eager, requestPoolSlot, setLoadRequestedState]);
-
-  useEffect(() => {
-    if (!loadRequested) {
-      teardownMedia({ suppressErrors: true });
-      return;
-    }
-
-    if (isRetrying) {
-      return;
-    }
-
-    if (poolReleaseRef.current) {
-      if (!hasSlot) {
-        setHasSlot(true);
-      }
-      if (!sourceAttachedRef.current) {
-        setSourceAttachedState(true);
-      }
-      return;
-    }
-
-    requestPoolSlot(preloadMode === "auto");
-  }, [
-    hasSlot,
-    isRetrying,
-    loadRequested,
-    preloadMode,
-    requestPoolSlot,
-    setSourceAttachedState,
-    teardownMedia,
-  ]);
-  /* eslint-enable react-hooks/set-state-in-effect */
-
-  // Set initial time when video loads
-  const handleLoadStart = useCallback(() => {
-    clearIntentionalUnloadSuppression();
-    setIsLoaded(false);
-    setHasError(false);
-    hasErrorRef.current = false;
-    resetClipEndedState();
-  }, [clearIntentionalUnloadSuppression, resetClipEndedState]);
-
-  const handleLoadedMetadata = useCallback(() => {
-    if (videoRef.current) {
-      videoRef.current.currentTime = adjustedStartTime;
-      videoRef.current.playbackRate = playbackRate;
-      setIsLoaded(true);
-      setHasError(false);
-      hasErrorRef.current = false;
-      if (videoRef.current.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-        resolveReadyWaiters();
-      }
-    }
-  }, [adjustedStartTime, playbackRate, resolveReadyWaiters]);
-
-  const handleCanPlay = useCallback(() => {
-    if (videoRef.current) {
-      resolveReadyWaiters();
-    }
-  }, [resolveReadyWaiters]);
-
-  const handleError = useCallback(
-    (e: React.SyntheticEvent<HTMLVideoElement>) => {
-      if (
-        suppressMediaErrorsRef.current ||
-        !sourceAttachedRef.current ||
-        !loadRequestedRef.current
-      ) {
-        return;
-      }
-      const video = e.currentTarget;
-      const errorCode = video.error?.code;
-      const errorMessage = video.error?.message || "Unknown error";
-      console.error(
-        `Video load error for ${src}: code=${errorCode}, message=${errorMessage}, pool_active=${getActiveCount()}, pool_queue=${getQueueLength()}`,
-      );
-      setHasError(true);
-      hasErrorRef.current = true;
-      setIsLoaded(true); // Stop showing loader
-      notifyClipCompleted();
-      resolveReadyWaiters(true);
-    },
-    [src, notifyClipCompleted, resolveReadyWaiters],
-  );
-
-  // Prevent indefinite loader state by failing fast if media never becomes ready.
-  // Opt-in only to avoid impacting high-speed orchestration flows (e.g. Fast Watch).
-  useEffect(() => {
-    if (
-      loadStallTimeoutMs === null ||
-      loadStallTimeoutMs <= 0 ||
-      !loadRequested ||
-      isLoaded ||
-      hasError ||
-      isRetrying
-    ) {
-      return;
-    }
-
-    const timeoutId = window.setTimeout(() => {
-      if (!isMountedRef.current) return;
-      if (hasErrorRef.current) return;
-
-      console.warn(
-        `Video load stalled for ${src}: pool_active=${getActiveCount()}, pool_queue=${getQueueLength()}`,
-      );
-      setHasError(true);
-      hasErrorRef.current = true;
-      setIsLoaded(true);
-      notifyClipCompleted();
-      resolveReadyWaiters(true);
-    }, loadStallTimeoutMs || LOAD_STALL_TIMEOUT_MS);
-
-    return () => {
-      window.clearTimeout(timeoutId);
-    };
-  }, [
-    hasError,
-    isLoaded,
-    isRetrying,
-    loadStallTimeoutMs,
-    loadRequested,
-    notifyClipCompleted,
-    resolveReadyWaiters,
-    src,
-  ]);
-
-  // Monitor playback to enforce end boundary only.
-  // Start boundary is handled by handleSeeked (user scrubbing) — not needed
-  // during normal playback since video always moves forward.
-  const handleTimeUpdate = useCallback(() => {
-    const video = videoRef.current;
-    if (!video) return;
-
-    if (video.currentTime >= endTime) {
-      if (!video.paused) {
-        video.pause();
-      }
-      // Avoid endless seek loops from re-applying the same end boundary.
-      if (Math.abs(video.currentTime - endTime) > 0.03) {
-        video.currentTime = endTime;
-      }
-      markClipEnded();
-    }
-  }, [endTime, markClipEnded]);
-
-  const handlePlay = useCallback(() => {
-    // Only re-seek if clearly out of bounds (with tolerance to avoid
-    // floating-point cascading seeks that cause visible stutter)
-    if (videoRef.current) {
-      videoRef.current.playbackRate = playbackRate;
-      const cur = videoRef.current.currentTime;
-      if (cur < adjustedStartTime - 0.15 || cur >= endTime) {
-        videoRef.current.currentTime = adjustedStartTime;
-      }
-      resetClipEndedState();
-    }
-  }, [adjustedStartTime, endTime, playbackRate, resetClipEndedState]);
-
-  const handleSeeked = useCallback(() => {
-    const video = videoRef.current;
-    if (!video) return;
-
-    // Use tolerance to prevent cascading re-seek loops from floating-point
-    // imprecision. Only clamp if genuinely out of bounds.
-    if (video.currentTime < adjustedStartTime - 0.15) {
-      video.currentTime = adjustedStartTime;
-      resetClipEndedState();
-    }
-    if (video.currentTime >= endTime) {
-      if (Math.abs(video.currentTime - endTime) > 0.03) {
-        video.currentTime = endTime;
-      }
-      if (!video.paused) {
-        video.pause();
-      }
-      markClipEnded();
-    }
-  }, [adjustedStartTime, endTime, markClipEnded, resetClipEndedState]);
-
-  // Reset to start when src or clip bounds change.
-  useEffect(() => {
-    if (videoRef.current && isLoaded) {
-      videoRef.current.currentTime = adjustedStartTime;
-      endNotifiedRef.current = false;
-      isClipEndedRef.current = false;
-    }
-  }, [src, adjustedStartTime, isLoaded]);
-
-  useEffect(() => {
-    if (videoRef.current) {
-      videoRef.current.playbackRate = playbackRate;
-    }
-  }, [playbackRate]);
-
-  const handleReplay = useCallback(() => {
-    if (videoRef.current) {
-      videoRef.current.currentTime = adjustedStartTime;
-      videoRef.current.playbackRate = playbackRate;
-      resetClipEndedState();
-      videoRef.current.play().catch(console.error);
-    }
-  }, [adjustedStartTime, playbackRate, resetClipEndedState]);
-
-  const handleRetry = useCallback(() => {
-    void triggerRetryLoad();
-  }, [triggerRetryLoad]);
 
   return (
-    <div
-      ref={containerRef}
-      className={cn("relative group bg-black", className)}
-    >
-      {/* Loading placeholder before video is visible */}
-      {!loadRequested && (
-        <div className="absolute inset-0 flex items-center justify-center bg-[hsl(var(--muted))]">
-          <div className="flex flex-col items-center gap-2 text-[hsl(var(--muted-foreground))]">
-            <Play className="h-8 w-8" />
-            <span className="text-xs">Scroll to load</span>
-          </div>
-        </div>
-      )}
-
-      {/* Loading indicator while video is loading or retrying */}
-      {((loadRequested && !isLoaded && !hasError) || isRetrying) && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black z-10">
-          <Loader2 className="h-8 w-8 animate-spin text-white" />
-        </div>
-      )}
-
-      {/* Error state with retry button */}
-      {hasError && !isRetrying && (
-        <div className="absolute inset-0 flex items-center justify-center bg-[hsl(var(--muted))] z-10">
-          <div className="flex flex-col items-center gap-2 text-[hsl(var(--muted-foreground))]">
-            <span className="text-xs">Failed to load</span>
-            <button
-              onClick={handleRetry}
-              className="text-xs px-2 py-1 bg-[hsl(var(--accent))] hover:bg-[hsl(var(--accent))]/80 rounded transition-colors"
-            >
-              Retry
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Video element - only render when visible and not retrying */}
-      {isSourceAttached && !isRetrying && (
-        <video
-          key={`${src}-${retryCount}`}
-          ref={videoRef}
-          src={videoSrc}
-          className="w-full h-full object-contain"
-          onLoadStart={handleLoadStart}
-          onLoadedMetadata={handleLoadedMetadata}
-          onLoadedData={handleCanPlay}
-          onCanPlay={handleCanPlay}
-          onError={handleError}
-          onTimeUpdate={handleTimeUpdate}
-          onPlay={handlePlay}
-          onSeeked={handleSeeked}
-          controls
-          muted={muted}
-          playsInline
-          preload={preloadMode}
-        />
-      )}
-
-      {/* Replay overlay when ended */}
-      {isEnded && (
-        <div
-          className="absolute inset-0 bg-black/50 flex items-center justify-center cursor-pointer z-20"
-          onClick={handleReplay}
-        >
-          <div className="flex flex-col items-center gap-2 text-white">
-            <RotateCcw className="h-10 w-10" />
-            <span className="text-sm">Replay</span>
-          </div>
-        </div>
-      )}
-    </div>
+    <ManagedVideoPlayer
+      ref={innerRef}
+      src={src}
+      fallbackSrc={fallbackSrc}
+      className={className}
+      muted={muted}
+      controls
+      disableInteraction={disableInteraction}
+      playbackRate={playbackRate}
+      onClipEnded={onClipEnded}
+      requestLoad={requestLoad}
+      requestWarmup={eager || requestWarmup}
+      attachedPriority={leasePriority}
+      warmupPriority={warmupPriority}
+      startTime={startTime}
+      endTime={endTime}
+      seekOffsetSeconds={0.067}
+      dedicatedAudio={dedicatedAudio}
+      placeholderLabel={placeholderLabel}
+    />
   );
 });

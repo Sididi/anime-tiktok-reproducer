@@ -78,6 +78,18 @@ def _series_state_file_prefix(display_name: str) -> str:
     return f"{display_name}/"
 
 
+def _human_size(size_bytes: int) -> str:
+    units = ("B", "KB", "MB", "GB", "TB")
+    size = float(max(0, size_bytes))
+    unit = units[0]
+    for unit in units:
+        if size < 1024.0 or unit == units[-1]:
+            break
+        size /= 1024.0
+    decimals = 0 if unit == "B" else 1
+    return f"{size:.{decimals}f} {unit}"
+
+
 async def _run_bounded(items: list[Any], limit: int, worker) -> None:
     semaphore = asyncio.Semaphore(max(1, limit))
 
@@ -667,6 +679,22 @@ class StorageBoxRepository:
         return local_artifacts, episode_entries, temp_root
 
     @classmethod
+    async def _try_hardlink_first(
+        cls,
+        src: PurePosixPath,
+        dst: PurePosixPath,
+    ) -> bool:
+        """Attempt a single hardlink to probe server support.
+
+        Returns ``True`` if the hardlink succeeded, ``False`` otherwise.
+        """
+        try:
+            await StorageBoxSftpClient.hardlink(src, dst)
+            return True
+        except Exception:
+            return False
+
+    @classmethod
     async def _verify_remote_artifacts(
         cls,
         *,
@@ -748,6 +776,28 @@ class StorageBoxRepository:
         staging_root = cls._staging_root(scoped_type, effective_series_id, publish_id)
         release_root = cls._release_root(scoped_type, effective_series_id, release_id)
 
+        # -- Fetch previous release manifest for incremental diffing ----------
+        previous_sha_to_remote: dict[str, PurePosixPath] = {}
+        try:
+            prev_current = await cls.get_current_release(scoped_type, effective_series_id)
+            prev_release_id = str(prev_current["release_id"])
+            prev_release_root = cls._release_root(
+                scoped_type, effective_series_id, prev_release_id,
+            )
+            prev_manifest = await cls.get_series_manifest(
+                scoped_type, effective_series_id, prev_release_id,
+            )
+            for art in prev_manifest.get("artifacts", []):
+                sha = art.get("sha256")
+                rel = art.get("relative_path")
+                if sha and rel:
+                    previous_sha_to_remote[sha] = prev_release_root / PurePosixPath(rel)
+        except Exception:
+            logger.debug(
+                "No previous release found for %s; will do full upload",
+                effective_series_id,
+            )
+
         artifacts, episodes, temp_root = await asyncio.to_thread(
             cls._collect_series_artifacts,
             library_type=scoped_type,
@@ -807,6 +857,29 @@ class StorageBoxRepository:
             }
             manifest_text = _json_dumps(manifest_payload)
 
+            # -- Partition artifacts: upload new/changed, hardlink unchanged ----
+            to_upload: list[LocalArtifact] = []
+            to_hardlink: list[tuple[LocalArtifact, PurePosixPath]] = []
+            for artifact in artifacts:
+                prev_remote = previous_sha_to_remote.get(artifact.sha256)
+                if prev_remote is not None:
+                    to_hardlink.append((artifact, prev_remote))
+                else:
+                    to_upload.append(artifact)
+
+            if to_hardlink:
+                upload_bytes = sum(a.size_bytes for a in to_upload)
+                link_bytes = sum(a.size_bytes for a, _ in to_hardlink)
+                logger.info(
+                    "Publish %s: %d artifact(s) to upload (%s), "
+                    "%d unchanged artifact(s) to hardlink (%s)",
+                    display_name,
+                    len(to_upload),
+                    _human_size(upload_bytes),
+                    len(to_hardlink),
+                    _human_size(link_bytes),
+                )
+
             async def _upload_artifact(artifact: LocalArtifact) -> None:
                 await StorageBoxTransferService.upload_file(
                     artifact.local_path,
@@ -814,10 +887,50 @@ class StorageBoxRepository:
                 )
 
             await _run_bounded(
-                artifacts,
+                to_upload,
                 settings.storage_box_upload_max_parallel,
                 _upload_artifact,
             )
+
+            # Hardlink unchanged artifacts from previous release.
+            # If hardlinks fail (server doesn't support them), fall back to
+            # a regular upload for the remaining artifacts.
+            if to_hardlink:
+                hardlink_ok = await cls._try_hardlink_first(
+                    to_hardlink[0][1],
+                    staging_root / to_hardlink[0][0].remote_relative_path,
+                )
+                if hardlink_ok:
+                    # First hardlink succeeded — do the rest in parallel.
+                    remaining = to_hardlink[1:]
+                    if remaining:
+                        async def _hardlink_artifact(
+                            item: tuple[LocalArtifact, PurePosixPath],
+                        ) -> None:
+                            artifact, source_remote = item
+                            await StorageBoxSftpClient.hardlink(
+                                source_remote,
+                                staging_root / artifact.remote_relative_path,
+                            )
+
+                        await _run_bounded(
+                            remaining,
+                            settings.storage_box_upload_max_parallel,
+                            _hardlink_artifact,
+                        )
+                else:
+                    # Hardlinks not supported — upload all unchanged artifacts.
+                    logger.warning(
+                        "Hardlink unsupported on this Storage Box; "
+                        "falling back to upload for %d artifact(s)",
+                        len(to_hardlink),
+                    )
+                    await _run_bounded(
+                        [a for a, _ in to_hardlink],
+                        settings.storage_box_upload_max_parallel,
+                        _upload_artifact,
+                    )
+
             await cls._verify_remote_artifacts(staging_root=staging_root, artifacts=artifacts)
             await StorageBoxSftpClient.write_text(
                 staging_root / "series_manifest.json",

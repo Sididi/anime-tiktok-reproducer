@@ -1,4 +1,12 @@
 const API_BASE = "/api";
+const VITE_MEDIA_ORIGIN =
+  typeof import.meta !== "undefined" &&
+  import.meta.env &&
+  typeof import.meta.env.VITE_MEDIA_ORIGIN === "string"
+    ? import.meta.env.VITE_MEDIA_ORIGIN.trim()
+    : "";
+const MEDIA_ORIGIN = VITE_MEDIA_ORIGIN || "http://127.0.0.1:8000";
+const MEDIA_API_BASE = `${MEDIA_ORIGIN}${API_BASE}`;
 const DEFAULT_INDEX_BATCH_SIZE = 64;
 const DEFAULT_INDEX_PREFETCH_BATCHES = 3;
 const DEFAULT_INDEX_TRANSFORM_WORKERS = 4;
@@ -85,7 +93,20 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   return res.json();
 }
 
+function toMediaUrl(pathOrUrl: string): string {
+  if (/^https?:\/\//i.test(pathOrUrl)) {
+    return pathOrUrl;
+  }
+  if (pathOrUrl.startsWith("/")) {
+    return `${MEDIA_ORIGIN}${pathOrUrl}`;
+  }
+  return `${MEDIA_API_BASE}${pathOrUrl.startsWith("/") ? pathOrUrl : `/${pathOrUrl}`}`;
+}
+
 export const api = {
+  getMediaOrigin: () => MEDIA_ORIGIN,
+  toMediaUrl,
+
   // Projects
   createProject: (
     tiktokUrl?: string,
@@ -253,7 +274,17 @@ export const api = {
   getVideoInfo: (projectId: string) =>
     request<import("@/types").VideoInfo>(`/projects/${projectId}/video/info`),
 
-  getVideoUrl: (projectId: string) => `${API_BASE}/projects/${projectId}/video`,
+  getVideoUrl: (projectId: string) =>
+    `${MEDIA_API_BASE}/projects/${projectId}/video`,
+
+  getProjectPreviewUrl: (projectId: string) =>
+    `${MEDIA_API_BASE}/projects/${projectId}/video/preview`,
+
+  warmProjectPreview: (projectId: string) =>
+    request<{ status: string; ready: boolean }>(
+      `/projects/${projectId}/video/preview/warmup`,
+      { method: "POST" },
+    ),
 
   // Scenes
   getScenes: (projectId: string) =>
@@ -385,17 +416,8 @@ export const api = {
       `/projects/${projectId}/matches/playback/manifest`,
     ),
 
-  getMatchesPlaybackClipUrl: (
-    projectId: string,
-    sceneIndex: number,
-    track: "tiktok" | "source",
-    fingerprint?: string,
-  ) => {
-    const suffix = fingerprint
-      ? `?fingerprint=${encodeURIComponent(fingerprint)}`
-      : "";
-    return `${API_BASE}/projects/${projectId}/matches/playback/clip/${sceneIndex}/${track}${suffix}`;
-  },
+  getMatchesPlaybackClipUrl: (projectId: string, clipId: string) =>
+    `${MEDIA_API_BASE}/projects/${projectId}/matches/playback/clips/${clipId}`,
 
   updateMatch: (
     projectId: string,
@@ -443,7 +465,16 @@ export const api = {
 
   // Source video
   getSourceVideoUrl: (projectId: string, episodePath: string) =>
-    `${API_BASE}/projects/${projectId}/video/source?path=${encodeURIComponent(episodePath)}`,
+    `${MEDIA_API_BASE}/projects/${projectId}/video/source?path=${encodeURIComponent(episodePath)}`,
+
+  getSourcePreviewUrl: (projectId: string, episodePath: string) =>
+    `${MEDIA_API_BASE}/projects/${projectId}/video/source/preview?path=${encodeURIComponent(episodePath)}`,
+
+  warmSourcePreview: (projectId: string, episodePath: string) =>
+    request<{ status: string; ready: boolean }>(
+      `/projects/${projectId}/video/source/preview/warmup?path=${encodeURIComponent(episodePath)}`,
+      { method: "POST" },
+    ),
 
   getSourceDescriptor: (projectId: string, episodePath: string) =>
     request<import("@/types").SourceStreamDescriptor>(
@@ -463,7 +494,7 @@ export const api = {
     if (chunkDuration !== undefined) {
       params.set("chunk_duration", String(chunkDuration));
     }
-    return `${API_BASE}/projects/${projectId}/video/source/chunk?${params.toString()}`;
+    return `${MEDIA_API_BASE}/projects/${projectId}/video/source/chunk?${params.toString()}`;
   },
 
   // Transcription

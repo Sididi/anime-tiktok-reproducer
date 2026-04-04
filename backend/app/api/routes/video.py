@@ -11,8 +11,37 @@ from ...services import (
     ProjectService,
     SourceChunkStreamingService,
 )
+from ...services.browser_media_service import BrowserMediaService
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["video"])
+
+
+def _etag_for_path(path: Path) -> str:
+    stat = path.stat()
+    return f'"{stat.st_mtime_ns:x}-{stat.st_size:x}"'
+
+
+def _project_media_headers(*, path: Path, cache_control: str) -> dict[str, str]:
+    return {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": cache_control,
+        "Cross-Origin-Resource-Policy": "cross-origin",
+        "ETag": _etag_for_path(path),
+    }
+
+
+def _immutable_media_headers(path: Path) -> dict[str, str]:
+    return _project_media_headers(
+        path=path,
+        cache_control="public, max-age=31536000, immutable",
+    )
+
+
+def _preview_media_headers(path: Path) -> dict[str, str]:
+    return _project_media_headers(
+        path=path,
+        cache_control="public, max-age=3600, stale-while-revalidate=86400",
+    )
 
 
 def _is_under(path: Path, root: Path) -> bool:
@@ -130,7 +159,66 @@ async def get_video(project_id: str) -> FileResponse:
     return FileResponse(
         video_path,
         media_type="video/mp4",
-        headers={"Accept-Ranges": "bytes"},
+        headers=_project_media_headers(
+            path=video_path,
+            cache_control="public, max-age=0, must-revalidate",
+        ),
+    )
+
+
+@router.post("/video/preview/warmup")
+async def warm_project_video_preview(project_id: str) -> dict[str, object]:
+    """Trigger project video preview proxy generation."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if not project.video_path:
+        raise HTTPException(status_code=404, detail="Video not yet downloaded")
+
+    video_path = Path(project.video_path)
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Video file not found")
+
+    await BrowserMediaService.trigger_preview_generation(
+        video_path,
+        profile=BrowserMediaService.PROJECT_PROFILE,
+        include_audio=True,
+    )
+    ready_path = await BrowserMediaService.wait_for_preview(
+        video_path,
+        profile=BrowserMediaService.PROJECT_PROFILE,
+        include_audio=True,
+        timeout_seconds=0.15,
+        poll_interval_seconds=0.05,
+    )
+    return {"status": "warming", "ready": ready_path is not None}
+
+
+@router.get("/video/preview")
+async def get_project_video_preview(project_id: str) -> FileResponse:
+    """Serve the browser-oriented project preview video."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if not project.video_path:
+        raise HTTPException(status_code=404, detail="Video not yet downloaded")
+
+    video_path = Path(project.video_path)
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Video file not found")
+
+    preview_path = await BrowserMediaService.resolve_preview_path(
+        video_path,
+        profile=BrowserMediaService.PROJECT_PROFILE,
+        include_audio=True,
+        allow_generate=True,
+    )
+    return FileResponse(
+        preview_path,
+        media_type="video/mp4",
+        headers=_preview_media_headers(preview_path),
     )
 
 
@@ -164,6 +252,89 @@ async def get_source_video_descriptor(
     return await SourceChunkStreamingService.get_descriptor(source_path)
 
 
+@router.post("/video/source/preview/warmup")
+async def warm_source_video_preview(
+    project_id: str,
+    path: str = Query(..., description="Path to the source episode file"),
+) -> dict[str, object]:
+    """Trigger source preview proxy generation."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    source_path = await _resolve_source_path(project, path)
+    await BrowserMediaService.trigger_preview_generation(
+        source_path,
+        profile=BrowserMediaService.SOURCE_PROFILE,
+        include_audio=False,
+    )
+    ready_path = await BrowserMediaService.wait_for_preview(
+        source_path,
+        profile=BrowserMediaService.SOURCE_PROFILE,
+        include_audio=False,
+        timeout_seconds=0.15,
+        poll_interval_seconds=0.05,
+    )
+    return {"status": "warming", "ready": ready_path is not None}
+
+
+@router.get("/video/source/preview")
+async def get_source_video_preview(
+    project_id: str,
+    path: str = Query(..., description="Path to the source episode file"),
+) -> FileResponse:
+    """Serve the browser-oriented source preview video when ready."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    source_path = await _resolve_source_path(project, path)
+    is_direct_compatible = await asyncio.to_thread(
+        BrowserMediaService.is_browser_preview_compatible_sync,
+        source_path,
+        include_audio=False,
+    )
+    if is_direct_compatible:
+        return FileResponse(
+            source_path,
+            media_type="video/mp4",
+            headers=_preview_media_headers(source_path),
+        )
+
+    preview_path = await BrowserMediaService.resolve_preview_path(
+        source_path,
+        profile=BrowserMediaService.SOURCE_PROFILE,
+        include_audio=False,
+        allow_generate=False,
+    )
+    if preview_path == source_path:
+        await BrowserMediaService.trigger_preview_generation(
+            source_path,
+            profile=BrowserMediaService.SOURCE_PROFILE,
+            include_audio=False,
+        )
+        ready_path = await BrowserMediaService.wait_for_preview(
+            source_path,
+            profile=BrowserMediaService.SOURCE_PROFILE,
+            include_audio=False,
+            timeout_seconds=0.15,
+            poll_interval_seconds=0.05,
+        )
+        if ready_path is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Source preview warming",
+                headers={"Retry-After": "1"},
+            )
+        preview_path = ready_path
+
+    return FileResponse(
+        preview_path,
+        media_type="video/mp4",
+        headers=_preview_media_headers(preview_path),
+    )
+
+
 @router.get("/video/source/chunk")
 async def get_source_video_chunk(
     project_id: str,
@@ -194,10 +365,7 @@ async def get_source_video_chunk(
     return FileResponse(
         chunk_path,
         media_type="video/mp4",
-        headers={
-            "Accept-Ranges": "bytes",
-            "Cache-Control": "public, max-age=86400, immutable",
-        },
+        headers=_immutable_media_headers(chunk_path),
     )
 
 
@@ -230,5 +398,8 @@ async def get_source_video(
     return FileResponse(
         source_path,
         media_type=_media_type_for_path(source_path),
-        headers={"Accept-Ranges": "bytes"},
+        headers=_project_media_headers(
+            path=source_path,
+            cache_control="public, max-age=0, must-revalidate",
+        ),
     )

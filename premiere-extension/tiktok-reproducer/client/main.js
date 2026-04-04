@@ -46,6 +46,7 @@
   var CLEANUP_BACKOFF_BASE_MS = 250;
   var CLEANUP_BACKOFF_MAX_MS = 4000;
   var CLEANUP_REMAINING_PREVIEW_LIMIT = 6;
+  var MAX_LOG_ENTRIES = 200;
 
   var DEFAULT_SETTINGS = {
     client_id: "",
@@ -111,10 +112,13 @@
   var batchRuntimeHelperModule = null;
   var runtimeStateHelperModule = null;
   var subtitleArchiveHelperModule = null;
+  var panelLogHelperModule = null;
+  var orchestrationMetricsHelperModule = null;
   var cleanupRetryTimers = {}; // project_id -> timeoutId
 
   var batchRuntime = null;
   var settings = null;
+  var panelLogState = null;
   var projectStates = {}; // project_id -> state
   var jobStore = {
     queue: [],
@@ -135,12 +139,25 @@
 
   function log(message, level) {
     level = level || "info";
+    if (!panelLogState) {
+      panelLogState = getPanelLogHelper().createLogState(MAX_LOG_ENTRIES);
+    }
+    var appended = getPanelLogHelper().appendLogEntry(panelLogState, {
+      level: level,
+      message: message,
+      timestamp: new Date().toLocaleTimeString(),
+    });
+    while (appended.trimmed_count > 0 && logEl.firstChild) {
+      logEl.removeChild(logEl.firstChild);
+      appended.trimmed_count -= 1;
+    }
+
     var entry = document.createElement("div");
     entry.className = "entry " + level;
 
     var ts = document.createElement("span");
     ts.className = "timestamp";
-    ts.textContent = new Date().toLocaleTimeString();
+    ts.textContent = appended.entry.timestamp;
 
     entry.appendChild(ts);
     entry.appendChild(document.createTextNode(message));
@@ -492,6 +509,22 @@
       );
     }
     return subtitleArchiveHelperModule;
+  }
+
+  function getPanelLogHelper() {
+    if (!panelLogHelperModule) {
+      panelLogHelperModule = require(getClientFilePath("panel_log.js"));
+    }
+    return panelLogHelperModule;
+  }
+
+  function getOrchestrationMetricsHelper() {
+    if (!orchestrationMetricsHelperModule) {
+      orchestrationMetricsHelperModule = require(
+        getClientFilePath("orchestration_metrics.js"),
+      );
+    }
+    return orchestrationMetricsHelperModule;
   }
 
   function ensureBatchRuntime() {
@@ -883,6 +916,10 @@
 
   function runScript(jsxPath) {
     var normalized = String(jsxPath || "").replace(/\\/g, "/");
+    var runStartedAt = Date.now();
+    var subtitleExpandStartedAt = runStartedAt;
+    var subtitleExpandElapsedMs = 0;
+    var hostStartedAt = 0;
 
     if (!fs.existsSync(jsxPath)) {
       return Promise.reject(new Error("Script not found: " + jsxPath));
@@ -893,6 +930,10 @@
 
     return ensureProjectSubtitlesExpanded(path.dirname(jsxPath))
       .then(function (preparation) {
+        subtitleExpandElapsedMs = Math.max(
+          0,
+          Date.now() - subtitleExpandStartedAt,
+        );
         if (preparation && preparation.extracted) {
           log(
             "Expanded subtitle archive before JSX run (" +
@@ -901,16 +942,25 @@
             "info",
           );
         }
+        hostStartedAt = Date.now();
         return evalHost('runScript("' + escapeForEval(normalized) + '")');
       })
       .then(function (result) {
+        var hostImportElapsedMs = hostStartedAt
+          ? Math.max(0, Date.now() - hostStartedAt)
+          : 0;
         if (result && result.indexOf("ERROR:") === 0) {
           setStatus("error");
           throw new Error(result);
         }
         log("Completed: " + path.basename(jsxPath), "success");
         updateGlobalStatus();
-        return result;
+        return {
+          host_import_elapsed_ms: hostImportElapsedMs,
+          host_result: result,
+          subtitle_expand_elapsed_ms: subtitleExpandElapsedMs,
+          total_elapsed_ms: Math.max(0, Date.now() - runStartedAt),
+        };
       })
       .catch(function (err) {
         setStatus("error");
@@ -1032,10 +1082,13 @@
 
   function upsertProjectState(projectId, patch) {
     var normalizedProjectId = String(projectId || "").trim();
-    var previous = projectStates[projectId] || {
+    var previous = projectStates[normalizedProjectId] || {
       project_id: normalizedProjectId,
       created_at: nowIso(),
     };
+    var hasMetricsPatch =
+      !!patch &&
+      Object.prototype.hasOwnProperty.call(patch, "orchestration_metrics");
 
     var merged = {};
     Object.keys(previous).forEach(function (key) {
@@ -1044,6 +1097,16 @@
     Object.keys(patch || {}).forEach(function (key) {
       merged[key] = patch[key];
     });
+    if (hasMetricsPatch) {
+      merged.orchestration_metrics = getOrchestrationMetricsHelper().mergeMetrics(
+        previous.orchestration_metrics,
+        patch.orchestration_metrics,
+      );
+    } else if (previous.orchestration_metrics) {
+      merged.orchestration_metrics = getOrchestrationMetricsHelper().normalizeMetrics(
+        previous.orchestration_metrics,
+      );
+    }
 
     merged.project_id = normalizedProjectId;
     merged.sequence_name =
@@ -1952,14 +2015,9 @@
               " files)",
             "info",
           );
-        } else if (progress.stage === "download_file_complete") {
+        } else if (progress.stage === "download_progress_summary") {
           log(
-            "Downloaded file " +
-              progress.file_index +
-              "/" +
-              progress.file_count +
-              " for " +
-              projectId,
+            String(progress.message || "Download progress for " + projectId),
             "info",
           );
         } else if (progress.stage === "subtitle_archive_extract_start") {
@@ -2021,10 +2079,12 @@
           download_file_count: result.download_file_count || null,
           download_total_bytes: result.download_total_bytes || null,
           last_error: null,
+          orchestration_metrics: result.orchestration_metrics || {},
         });
 
-        return runScript(importPath).then(function () {
+        return runScript(importPath).then(function (runOutcome) {
           ensureAutomationLeaseActive(lease, "download_import_after_jsx");
+          var readyAtIso = nowIso();
           var audioOutputPath = path.join(
             path.dirname(String(result.output_path || "")),
             AUDIO_NO_MUSIC_OUTPUT_FILENAME,
@@ -2035,9 +2095,18 @@
               String(audioOutputPath || ""),
             ],
           );
+          var orchestrationMetrics =
+            getOrchestrationMetricsHelper().finalizeReadyMetrics(
+              (
+                (getProjectState(projectId) || {}).orchestration_metrics ||
+                result.orchestration_metrics
+              ),
+              readyAtIso,
+              runOutcome && runOutcome.host_import_elapsed_ms,
+            );
           var nextState = upsertProjectState(projectId, {
             status: "ready_for_export",
-            imported_at: nowIso(),
+            imported_at: readyAtIso,
             upload_pending: false,
             pending_cleanup_choice: false,
             audio_export_enabled: true,
@@ -2045,6 +2114,7 @@
             expected_outputs: expectedOutputs,
             uploaded_outputs: {},
             upload_results_by_output: {},
+            orchestration_metrics: orchestrationMetrics,
           });
           ensureAutomationLeaseActive(lease, "download_import_ready");
           projectSelect.value = projectId;
@@ -2264,10 +2334,11 @@
       });
   }
 
-  function queueDownloadImport(projectId, source) {
+  function queueDownloadImport(projectId, source, options) {
     if (!validateProjectId(projectId)) {
       throw new Error("Invalid project id: " + projectId);
     }
+    var queueOptions = options || {};
 
     var id = String(projectId || "").trim();
     var runtime = ensureBatchRuntime();
@@ -2284,7 +2355,7 @@
       }
     }
 
-    upsertProjectState(id, {
+    var nextPatch = {
       status: acceptance.is_sleeping ? "sleeping_download" : "queued_download",
       enqueue_source: source || "manual",
       upload_pending: false,
@@ -2298,7 +2369,14 @@
       completion_notified_status: null,
       completion_notified_at: null,
       batch_queue_state: acceptance.is_sleeping ? "sleeping" : "active",
-    });
+    };
+    if (source === "http") {
+      nextPatch.orchestration_metrics =
+        getOrchestrationMetricsHelper().createInitialMetrics(
+          queueOptions.httpReceivedAt || nowIso(),
+        );
+    }
+    upsertProjectState(id, nextPatch);
 
     if (!acceptance.is_sleeping) {
       enqueueJob("download_import", {
@@ -3149,8 +3227,11 @@
     var triggerMatch = pathname.match(/^\/p\/([A-Za-z0-9_-]+)$/);
     if (triggerMatch) {
       var projectId = triggerMatch[1];
+      var httpReceivedAt = nowIso();
       try {
-        var queued = queueDownloadImport(projectId, "http");
+        var queued = queueDownloadImport(projectId, "http", {
+          httpReceivedAt: httpReceivedAt,
+        });
         respondHtml(
           res,
           202,

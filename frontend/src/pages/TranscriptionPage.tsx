@@ -1,13 +1,15 @@
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { flushSync } from "react-dom";
 import { useParams, useNavigate } from "react-router-dom";
 import { Loader2, Play, ArrowRight } from "lucide-react";
 import { Button } from "@/components/ui";
-import { ClippedVideoPlayer } from "@/components/video";
+import { ProjectClippedVideoPlayer } from "@/components/video";
 import { FloatingAudioPlayer } from "@/components/FloatingAudioPlayer";
 import { useProjectStore, useSceneStore } from "@/stores";
 import { api } from "@/api/client";
 import { formatTime, readSSEStream } from "@/utils";
+import { getProjectVideoSourceCandidates } from "@/utils/mediaSources";
+import { MEDIA_PRIORITY, getViewportPriority } from "@/utils/mediaPriorities";
 import type { Transcription } from "@/types";
 
 interface TranscriptionProgress {
@@ -61,6 +63,34 @@ export function TranscriptionPage() {
       }
     }
   }, []);
+
+  const scenePositionByIndex = useMemo(() => {
+    const map = new Map<number, number>();
+    scenes.forEach((scene, position) => {
+      map.set(scene.index, position);
+    });
+    return map;
+  }, [scenes]);
+
+  const activeScenePosition = useMemo(() => {
+    const position = scenePositionByIndex.get(activeSceneIndex);
+    return position ?? 0;
+  }, [activeSceneIndex, scenePositionByIndex]);
+  const projectVideoSources = useMemo(
+    () => (projectId ? getProjectVideoSourceCandidates(projectId) : ["", ""]),
+    [projectId],
+  );
+
+  const mediaEnabledSceneIndices = useMemo(() => {
+    const enabled = new Set<number>();
+    for (let offset = -3; offset <= 3; offset += 1) {
+      const scene = scenes[activeScenePosition + offset];
+      if (scene) {
+        enabled.add(scene.index);
+      }
+    }
+    return enabled;
+  }, [activeScenePosition, scenes]);
 
   // Load data
   useEffect(() => {
@@ -308,8 +338,16 @@ export function TranscriptionPage() {
               );
               if (!sceneTranscription) return null;
 
-              const videoUrl = api.getVideoUrl(projectId);
               const sceneDuration = scene.end_time - scene.start_time;
+              const scenePosition = scenePositionByIndex.get(scene.index) ?? 0;
+              const distance = Math.abs(scenePosition - activeScenePosition);
+              const mediaEnabled = mediaEnabledSceneIndices.has(scene.index);
+              const leasePriority =
+                activeSceneIndex === scene.index
+                  ? MEDIA_PRIORITY.ACTIVE
+                  : mediaEnabled
+                    ? getViewportPriority(distance)
+                    : MEDIA_PRIORITY.OFFSCREEN;
 
               return (
                 <div
@@ -330,12 +368,16 @@ export function TranscriptionPage() {
                   <div className="grid grid-cols-[180px_1fr] gap-4">
                     {/* Video preview */}
                     <div className="aspect-[9/16] bg-black rounded overflow-hidden">
-                      <ClippedVideoPlayer
-                        src={videoUrl}
+                      <ProjectClippedVideoPlayer
+                        projectId={projectId}
                         startTime={scene.start_time}
                         endTime={scene.end_time}
                         className="w-full h-full"
                         muted={false}
+                        requestLoad={mediaEnabled}
+                        requestWarmup={distance <= 1}
+                        leasePriority={leasePriority}
+                        warmupPriority={getViewportPriority(distance)}
                       />
                     </div>
                     {/* Transcription text */}
@@ -371,7 +413,8 @@ export function TranscriptionPage() {
 
       {transcription && projectId && (
         <FloatingAudioPlayer
-          videoUrl={api.getVideoUrl(projectId)}
+          videoUrl={projectVideoSources[0]}
+          fallbackVideoUrl={projectVideoSources[1]}
           scenes={scenes}
           onSceneChange={handleSceneChange}
           autoScroll={autoScroll}

@@ -1212,9 +1212,16 @@ def test_render_jsx_from_template_includes_dedicated_raw_scene_text_subtitle_pat
     assert "RAW_SCENE_TEXT_SUBTITLE_SRT_PATH" in jsx
     assert 'var PROJECT_ID = "project-123";' in jsx
     assert 'var BATCH_SEQUENCE_NAME = "ATR_BATCH__project-123";' in jsx
+    assert 'var PROJECT_BIN_NAME = "__ATR_PROJECT__" + PROJECT_ID;' in jsx
     assert '"episode": {' in jsx
     assert '"selected_channel_offset": 2' in jsx
     assert 'var seqName = BATCH_SEQUENCE_NAME;' in jsx
+    assert "deleteSequenceByName(seqName);" in jsx
+    assert "function deleteSequenceByName(sequenceName)" in jsx
+    assert "function ensureProjectBin()" in jsx
+    assert "moveItemToProjectBin(sequence.projectItem);" in jsx
+    assert "app.project.importFiles(importPaths, true, targetBin, false);" in jsx
+    assert 'app.project.importFiles([f.fsName], true, targetBin, false);' in jsx
     assert 'log("Purging project to start fresh...");' not in jsx
     assert "if (!purgeProjectCompletely())" not in jsx
     assert "Script Complete (v7.7 Layered - Presets + External Subtitle MOGRTs)." not in jsx
@@ -1249,13 +1256,28 @@ def test_render_jsx_from_template_clears_a4_before_raw_audio_rebuild():
     )
 
     assert "clearTrackClips(a4);" in jsx
-    assert "duplicateRawSceneAudioToTrack(a4, scenes);" in jsx
+    assert "duplicateRawSceneAudioToTrack(a4, scenes, qeSeq, qeTrackCache);" in jsx
+    assert "RAW_AUDIO_SUBCLIP_PREFIX =" in jsx
+    assert "applySourceAudioPolicy(subclip, scene.clipName);" not in jsx
+    assert "applySourceAudioPolicy(existing, scene.clipName);" not in jsx
+    assert "function collectRawAudioLinkedTrackItems(" in jsx
+    assert "anchorItem.getLinkedItems()" in jsx
+    assert "function moveQEAudioTrackItem(" in jsx
+    assert "qeItem.moveToTrack(toTrackIndex);" in jsx
+    assert "function repairRawAudioPlacement(" in jsx
+    assert "var desiredTrackIndex = a4Index + selectedStreamPosition;" in jsx
+    assert "repairRawAudioPlacement(" in jsx
     assert "function clearTrackClips(track)" in jsx
     assert "clip.remove(false, true);" in jsx
+    assert "removeSiblingAudioClips(" not in jsx
+    assert "function removeTrackItem(clip)" not in jsx
+    assert "function describeSourceAudioPolicy(clipName)" not in jsx
     assert "validateRawAudioTrack(a4, scenes, sequenceEndSec);" not in jsx
     assert "waitForTrackItemAtExactStart(" not in jsx
     assert 'var clipKey = normalizeLooseName(scene.clipName || "");' not in jsx
+    assert "a4.overwriteClip(subclip, startSec);" in jsx
     assert "a4.overwriteClip(subclip, secondsToTicks(startSec).toString());" not in jsx
+    assert "track.setTargeted(" not in jsx
 
 
 def test_export_collects_internal_subtitle_timing_files(tmp_path):
