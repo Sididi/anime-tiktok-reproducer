@@ -1098,13 +1098,13 @@
       }
     } catch (e0) {}
     try {
+      if (item.name) return "name:" + item.name.toString();
+    } catch (e1) {}
+    try {
       if (item.getMediaPath) {
         var mediaPath = item.getMediaPath();
         if (mediaPath) return "path:" + mediaPath.toString();
       }
-    } catch (e1) {}
-    try {
-      if (item.name) return "name:" + item.name.toString();
     } catch (e2) {}
     return "";
   }
@@ -1116,12 +1116,36 @@
     return null;
   }
 
+  function getAudioChannelMappingWithRetry(item) {
+    var mapping = null;
+    if (!item) return null;
+
+    for (var attempt = 0; attempt < SOURCE_AUDIO_POLICY_MAX_RETRIES; attempt++) {
+      try {
+        mapping = item.getAudioChannelMapping;
+        if (typeof mapping === "function") {
+          mapping = item.getAudioChannelMapping();
+        }
+      } catch (eGet) {
+        mapping = null;
+      }
+      if (mapping && mapping.setMappingForChannel) {
+        return mapping;
+      }
+      mapping = null;
+      if (attempt + 1 < SOURCE_AUDIO_POLICY_MAX_RETRIES) {
+        sleep(SOURCE_AUDIO_POLICY_RETRY_WAIT_MS);
+      }
+    }
+    return null;
+  }
+
   function applySourceAudioPolicy(item, clipName) {
     var policy = getSourceAudioPolicy(clipName);
     if (!policy) return true;
     if (!item || !item.setAudioChannelMapping) {
       log("Warning: Source audio mapping API unavailable for " + clipName + ".");
-      return true;
+      return false;
     }
 
     var cacheKey = getProjectItemAudioPolicyCacheKey(item);
@@ -1141,30 +1165,13 @@
       selectedStreamPosition < 0
     ) {
       log("Warning: Invalid source audio policy for " + clipName + ".");
-      return true;
+      return false;
     }
 
-    var mapping = null;
-    for (var attempt = 0; attempt < SOURCE_AUDIO_POLICY_MAX_RETRIES; attempt++) {
-      try {
-        mapping = item.getAudioChannelMapping;
-        if (typeof mapping === "function") {
-          mapping = item.getAudioChannelMapping();
-        }
-      } catch (eGet) {
-        mapping = null;
-      }
-      if (mapping && mapping.setMappingForChannel) {
-        break;
-      }
-      mapping = null;
-      if (attempt + 1 < SOURCE_AUDIO_POLICY_MAX_RETRIES) {
-        sleep(SOURCE_AUDIO_POLICY_RETRY_WAIT_MS);
-      }
-    }
+    var mapping = getAudioChannelMappingWithRetry(item);
     if (!mapping || !mapping.setMappingForChannel) {
       log("Warning: Could not retrieve audio channel mapping for " + clipName + ".");
-      return true;
+      return false;
     }
 
     try {
@@ -1213,7 +1220,7 @@
           ": " +
           (eSet && eSet.message ? eSet.message : eSet),
       );
-      return true;
+      return false;
     }
   }
 
@@ -1847,19 +1854,85 @@
     );
   }
 
+  function shouldApplySourceAudioPolicyToRawSubclip(clipName) {
+    var policy = getSourceAudioPolicy(clipName);
+    if (!policy) return false;
+
+    var selectedStreamPosition = parseInt(policy.selected_stream_position, 10);
+    var channelOffset = parseInt(policy.selected_channel_offset, 10);
+    if (
+      isNaN(selectedStreamPosition) ||
+      selectedStreamPosition < 0 ||
+      isNaN(channelOffset) ||
+      channelOffset < 0
+    ) {
+      return false;
+    }
+
+    // Raw audio-only subclips can safely receive source-channel remapping only
+    // when the desired audio is already the first/default stream. For shifted
+    // streams, preserve the legacy linked-track cleanup path on A4/A5/etc.
+    return selectedStreamPosition === 0 && channelOffset === 0;
+  }
+
+  function validateRawAudioSubclip(item, scene, subclipName) {
+    if (!item || !scene) return false;
+    if (!shouldApplySourceAudioPolicyToRawSubclip(scene.clipName)) return true;
+    if (!item.getAudioChannelMapping || !item.setAudioChannelMapping) {
+      log(
+        "Warning: Raw audio subclip audio mapping API unavailable for scene " +
+          scene.scene_index +
+          " (" +
+          subclipName +
+          ").",
+      );
+      return false;
+    }
+
+    var mapping = getAudioChannelMappingWithRetry(item);
+    if (!mapping || !mapping.setMappingForChannel) {
+      log(
+        "Warning: Raw audio subclip channel mapping was not ready for scene " +
+          scene.scene_index +
+          " (" +
+          subclipName +
+          ").",
+      );
+      return false;
+    }
+    return true;
+  }
+
   function getOrCreateRawAudioSubclip(scene) {
     if (!scene || !scene.is_raw) return null;
     var subclipName = buildRawAudioSubclipName(scene);
     if (!subclipName) return null;
 
-    var existing =
+    var existingSubclip =
       getCachedProjectItem(subclipName) ||
       findProjectItem(subclipName) ||
       findProjectItemLoose(subclipName);
-    if (existing) {
-      cacheProjectItem(existing);
-      cacheProjectItemByName(subclipName, existing);
-      return existing;
+    if (existingSubclip) {
+      moveItemToProjectBin(existingSubclip);
+      cacheProjectItem(existingSubclip);
+      cacheProjectItemByName(subclipName, existingSubclip);
+      if (!validateRawAudioSubclip(existingSubclip, scene, subclipName)) {
+        return null;
+      }
+      if (
+        shouldApplySourceAudioPolicyToRawSubclip(scene.clipName) &&
+        !applySourceAudioPolicy(existingSubclip, scene.clipName)
+      ) {
+        log(
+          "Warning: Failed to apply source audio policy to raw subclip for scene " +
+            scene.scene_index +
+            " (" +
+            subclipName +
+            ").",
+        );
+        return null;
+      }
+      return existingSubclip;
     }
 
     var sourceItem = getOrImportClip(scene.clipName);
@@ -1867,34 +1940,84 @@
       return null;
     }
 
-    var startTicks =
-      typeof scene.source_in_frame === "number"
-        ? Math.round(sourceFramesToRawTicks(scene.source_in_frame))
-        : Math.round(secondsToRawTicks(scene.source_in));
-    var endTicks =
+    var startTime = null;
+    var endTime = null;
+    if (
+      typeof scene.source_in_frame === "number" &&
       typeof scene.source_out_frame === "number"
-        ? Math.round(sourceFramesToRawTicks(scene.source_out_frame))
-        : Math.round(secondsToRawTicks(scene.source_out));
-    if (!(endTicks > startTicks)) {
-      endTicks = startTicks + Math.round(sourceFrameDurationTicks());
+    ) {
+      var safeOutFrame = scene.source_out_frame;
+      if (!(safeOutFrame > scene.source_in_frame)) {
+        safeOutFrame = scene.source_in_frame + 1;
+      }
+      startTime = buildRawTimeFromSourceFrame(scene.source_in_frame, false);
+      endTime = buildRawTimeFromSourceFrame(safeOutFrame, false);
+    } else {
+      var safeOutSeconds = scene.source_out;
+      if (!(safeOutSeconds > scene.source_in)) {
+        safeOutSeconds =
+          scene.source_in + sourceFrameDurationTicks() / TICKS_PER_SECOND;
+      }
+      startTime = buildRawTimeFromSeconds(scene.source_in);
+      endTime = buildRawTimeFromSeconds(safeOutSeconds);
     }
 
     var subclip = null;
     try {
-      // ProjectItem.createSubClip(name, startTicks, endTicks, hasHardBoundaries, takeVideo, takeAudio)
+      var hasHardBoundaries = 0;
+      var takeVideo = 0;
+      var takeAudio = 1;
+      // Adobe's docs currently disagree on the final parameter order; align
+      // with Adobe's sample code and type stubs: takeVideo, then takeAudio.
       subclip = sourceItem.createSubClip(
         subclipName,
-        startTicks.toString(),
-        endTicks.toString(),
-        1,
-        0,
-        1,
+        startTime,
+        endTime,
+        hasHardBoundaries,
+        takeVideo,
+        takeAudio,
       );
     } catch (e0) {}
 
-    if (!subclip) {
-      subclip =
-        findProjectItem(subclipName) || findProjectItemLoose(subclipName);
+    if (subclip) {
+      if (!validateRawAudioSubclip(subclip, scene, subclipName)) {
+        return null;
+      }
+      if (
+        shouldApplySourceAudioPolicyToRawSubclip(scene.clipName) &&
+        !applySourceAudioPolicy(subclip, scene.clipName)
+      ) {
+        log(
+          "Warning: Failed to apply source audio policy to raw subclip for scene " +
+            scene.scene_index +
+            " (" +
+            subclipName +
+            ").",
+        );
+        return null;
+      }
+    }
+
+    var resolvedSubclip =
+      findProjectItem(subclipName) || findProjectItemLoose(subclipName);
+    if (resolvedSubclip) {
+      subclip = resolvedSubclip;
+      if (!validateRawAudioSubclip(subclip, scene, subclipName)) {
+        return null;
+      }
+      if (
+        shouldApplySourceAudioPolicyToRawSubclip(scene.clipName) &&
+        !applySourceAudioPolicy(subclip, scene.clipName)
+      ) {
+        log(
+          "Warning: Failed to apply source audio policy to raw subclip for scene " +
+            scene.scene_index +
+            " (" +
+            subclipName +
+            ").",
+        );
+        return null;
+      }
     }
     if (subclip) {
       moveItemToProjectBin(subclip);

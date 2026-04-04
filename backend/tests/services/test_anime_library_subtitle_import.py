@@ -108,6 +108,7 @@ class TestSubtitleExtractionDuringImport(TestCase):
         probe: SourceMediaProbe | None = None,
         existing_ready: bool = False,
         remux_returncode: int = 0,
+        prepared_stem: str | None = None,
     ):
         """Set up common mocks and return (patches_dict, mock_write_sidecar, mock_run_cmd)."""
         patches = {}
@@ -120,8 +121,9 @@ class TestSubtitleExtractionDuringImport(TestCase):
             )
         )
         resolved_probe = probe or _make_probe(source_path)
+        prepared_stem = prepared_stem or source_path.stem
         prepared_probe = _make_probe(
-            dest_dir / f"{source_path.stem}.import.tmp.mp4",
+            dest_dir / f"{prepared_stem}.import.tmp.mp4",
             suffix=".mp4",
             video_codec=resolved_probe.video_codec or ("h264" if codec not in {"h264", "hevc"} else codec),
             audio_streams=resolved_probe.audio_streams,
@@ -405,6 +407,49 @@ class TestSubtitleExtractionDuringImport(TestCase):
         mock_probe.assert_not_called()
         mock_write.assert_not_awaited()
         mock_cmd.assert_not_awaited()
+
+    def test_prepare_single_source_for_library_normalizes_unsafe_episode_name(self) -> None:
+        source = Path(
+            "/tmp/test_src/【English subtitles】Special Animation ‶DEATH HALL＂ [Kw7AZkrvuKc].mkv"
+        )
+        dest_dir = Path("/tmp/test_lib/Shiyakusho (Death Hall)")
+        expected_mp4 = (
+            dest_dir
+            / "[English subtitles] Special Animation DEATH HALL [Kw7AZkrvuKc].mp4"
+        )
+
+        probe = _make_probe(source, subtitle_streams=())
+        patches, mock_write, _mock_cmd = self._setup_patches(
+            source,
+            dest_dir,
+            probe=probe,
+            prepared_stem=expected_mp4.stem,
+        )
+
+        with (
+            patches["codec"],
+            patches["existing"],
+            patches["probe"],
+            patches["run_cmd"],
+            patches["write_sidecar"],
+            patches["record_manifest"] as record_manifest,
+            patches["replace"],
+            patch.object(Path, "exists", return_value=True),
+            patch.object(AnimeLibraryService, "_existing_prepared_library_stems_sync", return_value=set()),
+            patch.object(Path, "unlink"),
+        ):
+            actual, _action, changed = self._run(
+                AnimeLibraryService._prepare_single_source_for_library(
+                    source_path=source,
+                    dest_dir=dest_dir,
+                )
+            )
+
+        self.assertEqual(actual, expected_mp4)
+        self.assertTrue(changed)
+        mock_write.assert_not_awaited()
+        record_manifest.assert_called_once()
+        self.assertEqual(record_manifest.call_args.args[1], expected_mp4)
 
     def test_mkv_remux_maps_primary_video_and_all_audio_streams_only(self) -> None:
         """Import remux keeps one video stream and every audio stream, not subtitles/data."""

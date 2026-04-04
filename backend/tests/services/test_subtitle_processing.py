@@ -1258,8 +1258,20 @@ def test_render_jsx_from_template_clears_a4_before_raw_audio_rebuild():
     assert "clearTrackClips(a4);" in jsx
     assert "duplicateRawSceneAudioToTrack(a4, scenes, qeSeq, qeTrackCache);" in jsx
     assert "RAW_AUDIO_SUBCLIP_PREFIX =" in jsx
-    assert "applySourceAudioPolicy(subclip, scene.clipName);" not in jsx
-    assert "applySourceAudioPolicy(existing, scene.clipName);" not in jsx
+    assert "function shouldApplySourceAudioPolicyToRawSubclip(" in jsx
+    assert "return selectedStreamPosition === 0 && channelOffset === 0;" in jsx
+    assert "function validateRawAudioSubclip(" in jsx
+    assert "getOrCreateRawAudioSubclip(scene)" in jsx
+    assert "buildRawTimeFromSourceFrame(scene.source_in_frame, false);" in jsx
+    assert "buildRawTimeFromSourceFrame(safeOutFrame, false);" in jsx
+    assert "buildRawTimeFromSeconds(scene.source_in);" in jsx
+    assert "buildRawTimeFromSeconds(safeOutSeconds);" in jsx
+    assert "var hasHardBoundaries = 0;" in jsx
+    assert "var takeVideo = 0;" in jsx
+    assert "var takeAudio = 1;" in jsx
+    assert "shouldApplySourceAudioPolicyToRawSubclip(scene.clipName) &&" in jsx
+    assert "applySourceAudioPolicy(subclip, scene.clipName)" in jsx
+    assert "applySourceAudioPolicy(existingSubclip, scene.clipName)" in jsx
     assert "function collectRawAudioLinkedTrackItems(" in jsx
     assert "anchorItem.getLinkedItems()" in jsx
     assert "function moveQEAudioTrackItem(" in jsx
@@ -1276,6 +1288,7 @@ def test_render_jsx_from_template_clears_a4_before_raw_audio_rebuild():
     assert "waitForTrackItemAtExactStart(" not in jsx
     assert 'var clipKey = normalizeLooseName(scene.clipName || "");' not in jsx
     assert "a4.overwriteClip(subclip, startSec);" in jsx
+    assert "a4.overwriteClip(sourceItem, startSec);" not in jsx
     assert "a4.overwriteClip(subclip, secondsToTicks(startSec).toString());" not in jsx
     assert "track.setTargeted(" not in jsx
 

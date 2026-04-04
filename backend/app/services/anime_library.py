@@ -10,6 +10,7 @@ import subprocess
 import shutil
 import threading
 import tempfile
+import unicodedata
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass, replace
@@ -290,6 +291,45 @@ class AnimeLibraryService:
         "rus": "ru",
         "russian": "ru",
     }
+    _EPISODE_FILENAME_TRANSLATION_TABLE = str.maketrans(
+        {
+            "【": "[",
+            "】": "]",
+            "「": "[",
+            "」": "]",
+            "『": "[",
+            "』": "]",
+            "（": "(",
+            "）": ")",
+            "［": "[",
+            "］": "]",
+            "｛": "{",
+            "｝": "}",
+            "“": " ",
+            "”": " ",
+            "„": " ",
+            "‟": " ",
+            "＂": " ",
+            "‶": " ",
+            "〃": " ",
+            "〝": " ",
+            "〞": " ",
+            "‘": " ",
+            "’": " ",
+            "‚": " ",
+            "‛": " ",
+            "–": "-",
+            "—": "-",
+            "―": "-",
+            "‐": "-",
+            "／": "/",
+            "：": ":",
+            "＆": "&",
+            "＋": "+",
+            "　": " ",
+        }
+    )
+    _SAFE_EPISODE_FILENAME_INVALID_RE = re.compile(r"[^A-Za-z0-9\[\]\(\) ._&+-]+")
 
     @staticmethod
     def get_library_root() -> Path:
@@ -308,6 +348,59 @@ class AnimeLibraryService:
     def get_anime_searcher_path() -> Path:
         """Get the anime_searcher module path."""
         return settings.anime_searcher_path
+
+    @classmethod
+    def normalize_indexed_episode_stem(cls, raw_stem: str) -> str:
+        """Normalize an indexed episode stem to a Premiere-safe ASCII filename."""
+        normalized = str(raw_stem or "").strip()
+        if not normalized:
+            return "episode"
+
+        normalized = normalized.translate(cls._EPISODE_FILENAME_TRANSLATION_TABLE)
+        normalized = unicodedata.normalize("NFKD", normalized)
+        normalized = "".join(
+            ch for ch in normalized if not unicodedata.combining(ch)
+        )
+        normalized = normalized.encode("ascii", "ignore").decode("ascii")
+        normalized = normalized.replace("/", " ")
+        normalized = re.sub(r"([\]\)])(?=[A-Za-z0-9])", r"\1 ", normalized)
+        normalized = re.sub(r"(?<=[A-Za-z0-9])([\[\(])", r" \1", normalized)
+        normalized = cls._SAFE_EPISODE_FILENAME_INVALID_RE.sub(" ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip(" ._")
+        return normalized or "episode"
+
+    @staticmethod
+    def _episode_filename_collision_suffix(raw_stem: str) -> str:
+        return hashlib.sha1(str(raw_stem).encode("utf-8")).hexdigest()[:8]
+
+    @classmethod
+    def normalize_indexed_episode_stem_unique(
+        cls,
+        raw_stem: str,
+        *,
+        reserved_stems: set[str] | None = None,
+        current_stem: str | None = None,
+    ) -> str:
+        """Allocate a stable safe episode stem, hashing only on same-folder collisions."""
+        candidate = cls.normalize_indexed_episode_stem(raw_stem)
+        reserved = {
+            str(stem or "").strip()
+            for stem in (reserved_stems or set())
+            if str(stem or "").strip()
+        }
+        current = str(current_stem or "").strip()
+
+        if candidate in reserved and candidate != current:
+            candidate = (
+                f"{candidate}__{cls._episode_filename_collision_suffix(raw_stem)}"
+            )
+            if candidate in reserved and candidate != current:
+                raise RuntimeError(
+                    "Unable to allocate a unique safe filename for indexed episode "
+                    f"'{raw_stem}'."
+                )
+
+        return candidate
 
     @staticmethod
     def _coerce_fps(value: object) -> float | None:
@@ -631,6 +724,52 @@ class AnimeLibraryService:
         if cls._preview_generation_lock is None:
             cls._preview_generation_lock = asyncio.Lock()
         return cls._preview_generation_lock
+
+    @classmethod
+    def _existing_prepared_library_stems_sync(cls, dest_dir: Path) -> set[str]:
+        stems: set[str] = set()
+        try:
+            entries = list(dest_dir.iterdir())
+        except (OSError, PermissionError):
+            return stems
+
+        for entry in entries:
+            if (
+                not entry.is_file()
+                or entry.suffix.lower() != ".mp4"
+                or cls.is_transient_library_video_path(entry)
+            ):
+                continue
+            stems.add(entry.stem)
+        return stems
+
+    @classmethod
+    def _preferred_prepared_library_dest_sync(
+        cls,
+        source_path: Path,
+        dest_dir: Path,
+    ) -> Path:
+        normalized_stem = cls.normalize_indexed_episode_stem(source_path.stem)
+        hashed_stem = (
+            f"{normalized_stem}__"
+            f"{cls._episode_filename_collision_suffix(source_path.stem)}"
+        )
+        base_candidate = dest_dir / f"{normalized_stem}.mp4"
+        hashed_candidate = dest_dir / f"{hashed_stem}.mp4"
+
+        for candidate in (base_candidate, hashed_candidate):
+            if candidate.exists() and cls._source_matches_prepared_sync(
+                source_path,
+                candidate,
+            ):
+                return candidate
+
+        reserved_stems = cls._existing_prepared_library_stems_sync(dest_dir)
+        allocated_stem = cls.normalize_indexed_episode_stem_unique(
+            source_path.stem,
+            reserved_stems=reserved_stems,
+        )
+        return dest_dir / f"{allocated_stem}.mp4"
 
     @classmethod
     def is_transient_library_video_path(cls, path: Path) -> bool:
@@ -3224,7 +3363,11 @@ class AnimeLibraryService:
         transcode_action = "Transcoding to H.264 MP4"
 
         # Decide destination path and action label.
-        preferred_dest = dest_dir / (source_path.stem + ".mp4")
+        preferred_dest = await asyncio.to_thread(
+            cls._preferred_prepared_library_dest_sync,
+            source_path,
+            dest_dir,
+        )
         if needs_direct_h264_transcode:
             action = transcode_action
         elif not is_mp4:

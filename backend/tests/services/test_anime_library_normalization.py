@@ -73,6 +73,24 @@ def _make_probe(
 
 
 class TestAnimeLibraryNormalization(TestCase):
+    def test_normalize_indexed_episode_stem_transliterates_problematic_unicode(self) -> None:
+        stem = "【English subtitles】Special Animation ‶DEATH HALL＂ [Kw7AZkrvuKc]"
+
+        normalized = AnimeLibraryService.normalize_indexed_episode_stem(stem)
+
+        self.assertEqual(
+            normalized,
+            "[English subtitles] Special Animation DEATH HALL [Kw7AZkrvuKc]",
+        )
+
+    def test_normalize_indexed_episode_stem_unique_appends_hash_on_collision(self) -> None:
+        normalized = AnimeLibraryService.normalize_indexed_episode_stem_unique(
+            "épisode",
+            reserved_stems={"episode"},
+        )
+
+        self.assertEqual(normalized, "episode__4e236bb2")
+
     def test_probe_media_prefers_av_duration_over_longer_data_stream_tail(self) -> None:
         source_path = Path("/tmp/fake-episode.mp4")
 
