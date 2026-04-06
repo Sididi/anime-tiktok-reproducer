@@ -29,7 +29,7 @@ def test_startup_state_transitions_from_pending_to_ok(
     )
     monkeypatch.setattr(
         IntegrationHealthService,
-        "_check_gemini_api",
+        "_check_llm_api",
         classmethod(lambda cls: {"status": "ok", "detail": "ok"}),
     )
     monkeypatch.setattr(

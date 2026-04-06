@@ -78,6 +78,14 @@ class Settings(BaseSettings):
     elevenlabs_output_format: str = "pcm_44100"
     gemini_light_model: str = "gemini-2.5-flash"
 
+    # LLM provider switch ("gemini" | "claude")
+    llm_provider: str = "gemini"
+    # Anthropic (Claude)
+    anthropic_api_key: str | None = None
+    anthropic_model: str = "claude-sonnet-4-6"
+    anthropic_light_model: str = "claude-haiku-4-5"
+    anthropic_timeout: int = 300
+
     # Google OAuth shared credentials
     google_client_id: str | None = None
     google_client_secret: str | None = None
@@ -185,6 +193,14 @@ class Settings(BaseSettings):
     @property
     def matcher_min_speed_factor(self) -> float:
         return float(self.matcher_min_speed_fraction)
+
+    @field_validator("llm_provider")
+    @classmethod
+    def _normalize_llm_provider(cls, value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized not in {"gemini", "claude"}:
+            raise ValueError("ATR_LLM_PROVIDER must be 'gemini' or 'claude'")
+        return normalized
 
     @field_validator("cep_trigger_url_template")
     @classmethod

@@ -96,11 +96,13 @@ export interface VideoOverlay {
 export interface ScriptAutomationConfig {
   enabled: boolean;
   script_title_selection_enabled: boolean;
-  gemini: {
+  llm: {
+    provider: string;
     configured: boolean;
     model: string;
   };
-  gemini_light?: {
+  llm_light?: {
+    provider: string;
     configured: boolean;
     model: string;
   };

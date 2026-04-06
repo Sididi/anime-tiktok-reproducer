@@ -20,7 +20,7 @@ from ..models import (
     Transcription,
 )
 from .elevenlabs_service import ElevenLabsService
-from .gemini_service import GeminiService
+from .llm_service import LLMService
 from .metadata import MetadataService
 from .project_service import ProjectService
 from .script_payload_service import ScriptPayloadService
@@ -789,9 +789,9 @@ class ScriptAutomationService:
             library_type=project.library_type,
         )
 
-        result = GeminiService.generate_json(
+        result = LLMService.generate_json(
             prompt,
-            model=settings.gemini_light_model,
+            model=LLMService.active_light_model(),
             response_json_schema=_OVERLAY_RESPONSE_SCHEMA,
         )
         return cls._normalize_overlay_payload(result)
@@ -864,8 +864,10 @@ class ScriptAutomationService:
             if not transcription or not transcription.scenes:
                 raise RuntimeError("No transcription found for this project")
 
-            if existing_script_json is None and not GeminiService.is_configured():
-                raise RuntimeError("Gemini API key is missing (ATR_GEMINI_API_KEY)")
+            if existing_script_json is None and not LLMService.is_configured():
+                raise RuntimeError(
+                    f"LLM API key is missing (provider={LLMService.provider_name()})"
+                )
             if not skip_tts and not ElevenLabsService.is_configured():
                 raise RuntimeError("ElevenLabs API key is missing (ATR_ELEVENLABS_API_KEY)")
 
@@ -889,14 +891,14 @@ class ScriptAutomationService:
                     target_language=target_language,
                 )
             else:
-                yield cls._event("llm_script", message="Generating script JSON with Gemini...")
+                yield cls._event("llm_script", message=f"Generating script JSON with {LLMService.provider_name().title()}...")
                 prompt = cls._build_script_prompt(
                     project=project,
                     transcription=transcription,
                     target_language=target_language,
                 )
                 raw_script_payload = await asyncio.to_thread(
-                    GeminiService.generate_json_value,
+                    LLMService.generate_json_value,
                     prompt,
                     response_json_schema=cls._script_response_schema(
                         target_language=target_language,
@@ -1039,7 +1041,7 @@ class ScriptAutomationService:
             if skip_metadata or not settings.automate_metadata_overlay_enabled:
                 yield cls._event("llm_metadata", message="Metadata generation skipped")
             else:
-                yield cls._event("llm_metadata", message="Generating metadata JSON with Gemini...")
+                yield cls._event("llm_metadata", message=f"Generating metadata JSON with {LLMService.provider_name().title()}...")
                 try:
                     metadata_prompt = MetadataService.build_prompt_from_script_payload(
                         anime_name=project.anime_name or "Inconnu",
@@ -1048,7 +1050,7 @@ class ScriptAutomationService:
                         library_type=project.library_type,
                     )
                     raw_metadata_payload = await asyncio.to_thread(
-                        GeminiService.generate_json,
+                        LLMService.generate_json,
                         metadata_prompt,
                         response_json_schema=cls._metadata_response_schema(),
                     )
@@ -1077,7 +1079,7 @@ class ScriptAutomationService:
                     )
 
             # --- Video overlay generation ---
-            if not skip_overlay and settings.automate_metadata_overlay_enabled and GeminiService.is_configured():
+            if not skip_overlay and settings.automate_metadata_overlay_enabled and LLMService.is_configured():
                 yield cls._event("generating_overlay", message="Generating video overlay...")
                 try:
                     overlay_json = await asyncio.to_thread(

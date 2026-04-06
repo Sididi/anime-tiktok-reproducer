@@ -23,7 +23,7 @@ from ...services import (
     MetadataService,
     ExportService,
     DiscordService,
-    GeminiService,
+    LLMService,
     ElevenLabsService,
     VoiceConfigService,
     ScriptAutomationService,
@@ -295,13 +295,15 @@ async def get_script_automation_config(project_id: str):
     return {
         "enabled": settings.script_automate_enabled,
         "script_title_selection_enabled": settings.script_title_selection_enabled,
-        "gemini": {
-            "configured": GeminiService.is_configured(),
-            "model": settings.gemini_model,
+        "llm": {
+            "provider": LLMService.provider_name(),
+            "configured": LLMService.is_configured(),
+            "model": LLMService.active_model(),
         },
-        "gemini_light": {
-            "configured": GeminiService.is_configured(),
-            "model": settings.gemini_light_model,
+        "llm_light": {
+            "provider": LLMService.provider_name(),
+            "configured": LLMService.is_configured(),
+            "model": LLMService.active_light_model(),
         },
         "elevenlabs": {
             "configured": ElevenLabsService.is_configured(),
@@ -720,8 +722,8 @@ async def generate_overlay(project_id: str, request: OverlayGenerateRequest):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    if not GeminiService.is_configured():
-        raise HTTPException(status_code=503, detail="Gemini API key is missing")
+    if not LLMService.is_configured():
+        raise HTTPException(status_code=503, detail="LLM API key is missing")
 
     normalized = _normalize_script_payload_or_400(
         project_id,

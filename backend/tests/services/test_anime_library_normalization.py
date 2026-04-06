@@ -287,6 +287,123 @@ class TestAnimeLibraryNormalization(TestCase):
         self.assertEqual(policy.selected_channel_count, 2)
         self.assertEqual(policy.selected_channel_offset, 2)
 
+    def test_requires_premiere_audio_normalization_for_unsupported_or_mixed_codecs(self) -> None:
+        source_path = Path("/tmp/fake-episode.mp4")
+
+        safe_aac_probe = _make_probe(
+            source_path,
+            suffix=".mp4",
+            audio_streams=(
+                _audio_stream(index=1, stream_position=0, language="ja", codec_name="aac"),
+            ),
+        )
+        safe_ac3_probe = _make_probe(
+            source_path,
+            suffix=".mp4",
+            audio_streams=(
+                _audio_stream(index=1, stream_position=0, language="ja", codec_name="ac3"),
+            ),
+        )
+        safe_eac3_probe = _make_probe(
+            source_path,
+            suffix=".mp4",
+            audio_streams=(
+                _audio_stream(index=1, stream_position=0, language="ja", codec_name="eac3"),
+            ),
+        )
+        opus_probe = _make_probe(
+            source_path,
+            suffix=".mp4",
+            audio_streams=(
+                _audio_stream(index=1, stream_position=0, language="ja", codec_name="opus"),
+            ),
+        )
+        mixed_probe = _make_probe(
+            source_path,
+            suffix=".mp4",
+            audio_streams=(
+                _audio_stream(index=1, stream_position=0, language="ja", codec_name="aac"),
+                _audio_stream(index=2, stream_position=1, language="en", codec_name="eac3"),
+            ),
+        )
+
+        self.assertFalse(AnimeLibraryService._requires_premiere_audio_normalization(safe_aac_probe))
+        self.assertFalse(AnimeLibraryService._requires_premiere_audio_normalization(safe_ac3_probe))
+        self.assertFalse(AnimeLibraryService._requires_premiere_audio_normalization(safe_eac3_probe))
+        self.assertTrue(AnimeLibraryService._requires_premiere_audio_normalization(opus_probe))
+        self.assertTrue(AnimeLibraryService._requires_premiere_audio_normalization(mixed_probe))
+
+    def test_is_valid_prepared_library_probe_rejects_unsupported_audio_codecs(self) -> None:
+        source_path = Path("/tmp/fake-episode.mp4")
+
+        opus_probe = _make_probe(
+            source_path,
+            suffix=".mp4",
+            audio_streams=(
+                _audio_stream(index=1, stream_position=0, language="ja", codec_name="opus"),
+            ),
+        )
+        aac_probe = _make_probe(
+            source_path,
+            suffix=".mp4",
+            audio_streams=(
+                _audio_stream(index=1, stream_position=0, language="ja", codec_name="aac"),
+            ),
+        )
+        ac3_probe = _make_probe(
+            source_path,
+            suffix=".mp4",
+            audio_streams=(
+                _audio_stream(index=1, stream_position=0, language="ja", codec_name="ac3"),
+            ),
+        )
+        eac3_probe = _make_probe(
+            source_path,
+            suffix=".mp4",
+            audio_streams=(
+                _audio_stream(index=1, stream_position=0, language="ja", codec_name="eac3"),
+            ),
+        )
+
+        self.assertFalse(AnimeLibraryService._is_valid_prepared_library_probe(opus_probe))
+        self.assertTrue(AnimeLibraryService._is_valid_prepared_library_probe(aac_probe))
+        self.assertTrue(AnimeLibraryService._is_valid_prepared_library_probe(ac3_probe))
+        self.assertTrue(AnimeLibraryService._is_valid_prepared_library_probe(eac3_probe))
+
+    def test_library_import_audio_normalize_command_preserves_channel_layout(self) -> None:
+        source = Path("/tmp/test_src/episode.mp4")
+        output = Path("/tmp/test_lib/Anime/episode.mp4")
+        probe = _make_probe(
+            source,
+            suffix=".mp4",
+            audio_streams=(
+                _audio_stream(
+                    index=1,
+                    stream_position=0,
+                    language="ja",
+                    codec_name="opus",
+                    channels=6,
+                ),
+                _audio_stream(
+                    index=2,
+                    stream_position=1,
+                    language="en",
+                    codec_name="opus",
+                    channels=2,
+                ),
+            ),
+        )
+
+        cmd = AnimeLibraryService._build_library_import_audio_normalize_cmd(
+            source,
+            output,
+            probe=probe,
+        )
+
+        self.assertEqual(cmd[cmd.index("-c:a") + 1], "aac")
+        self.assertNotIn("-ac", cmd)
+        self.assertIn(AnimeLibraryService.SOURCE_NORMALIZATION_AUDIO_RATE, cmd)
+
     def test_format_media_failure_prefers_meaningful_stderr_tail_over_ffmpeg_banner(self) -> None:
         result = CommandResult(
             returncode=1,

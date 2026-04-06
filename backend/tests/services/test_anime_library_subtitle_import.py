@@ -50,13 +50,15 @@ def _audio_stream(
     language: str | None,
     raw_language: str | None = None,
     is_default: bool = False,
+    codec_name: str = "aac",
+    channels: int = 2,
 ) -> SourceMediaStream:
     return SourceMediaStream(
         index=index,
         stream_position=stream_position,
         codec_type="audio",
-        codec_name="aac",
-        channels=2,
+        codec_name=codec_name,
+        channels=channels,
         language=language,
         raw_language=raw_language or language,
         title=None,
@@ -627,6 +629,116 @@ class TestSubtitleExtractionDuringImport(TestCase):
         self.assertIn(AnimeLibraryService.SOURCE_NORMALIZATION_AUDIO_RATE, gpu_cmd)
         self.assertIn(AnimeLibraryService.SOURCE_NORMALIZATION_AUDIO_RATE, cpu_cmd)
 
+    def test_uniform_opus_mp4_source_normalizes_audio_for_premiere(self) -> None:
+        """Uniform Opus MP4 audio is normalized instead of being reused as-is."""
+        source = Path("/tmp/test_src/episode.mp4")
+        dest_dir = Path("/tmp/test_lib/Anime")
+        expected_mp4 = dest_dir / "episode.mp4"
+        source_probe = _make_probe(
+            source,
+            suffix=".mp4",
+            audio_streams=(
+                _audio_stream(
+                    index=1,
+                    stream_position=0,
+                    language="ja",
+                    codec_name="opus",
+                    channels=6,
+                ),
+                _audio_stream(
+                    index=2,
+                    stream_position=1,
+                    language="en",
+                    codec_name="opus",
+                    channels=2,
+                ),
+            ),
+        )
+        normalized_probe = _make_probe(
+            dest_dir / "episode.import.tmp.mp4",
+            suffix=".mp4",
+            audio_streams=(
+                _audio_stream(
+                    index=1,
+                    stream_position=0,
+                    language="ja",
+                    codec_name="aac",
+                    channels=6,
+                ),
+                _audio_stream(
+                    index=2,
+                    stream_position=1,
+                    language="en",
+                    codec_name="aac",
+                    channels=2,
+                ),
+            ),
+        )
+        tmp_output_path = dest_dir / "episode.import.tmp.mp4"
+
+        def _probe_side_effect(path: Path):
+            if path == source:
+                return source_probe
+            if path == tmp_output_path:
+                return normalized_probe
+            raise AssertionError(f"Unexpected probe path: {path}")
+
+        mock_run_cmd = AsyncMock(
+            return_value=CommandResult(
+                returncode=0,
+                stdout=b"",
+                stderr=b"",
+            )
+        )
+
+        with (
+            patch.object(
+                AnimeLibraryService,
+                "get_primary_video_codec_sync",
+                return_value="h264",
+            ),
+            patch.object(
+                AnimeLibraryService,
+                "_source_matches_prepared_sync",
+                return_value=False,
+            ),
+            patch.object(
+                AnimeLibraryService,
+                "_probe_media_sync",
+                side_effect=_probe_side_effect,
+            ),
+            patch(
+                "app.services.anime_library.run_command",
+                mock_run_cmd,
+            ),
+            patch.object(
+                AnimeLibraryService,
+                "_write_subtitle_sidecar",
+                AsyncMock(),
+            ) as mock_write_sidecar,
+            patch.object(
+                AnimeLibraryService,
+                "_record_source_import_manifest_sync",
+            ),
+            patch.object(Path, "exists", return_value=True),
+            patch.object(Path, "unlink"),
+            patch.object(Path, "replace"),
+        ):
+            actual, action, changed = self._run(
+                AnimeLibraryService._prepare_single_source_for_library(
+                    source_path=source,
+                    dest_dir=dest_dir,
+                )
+            )
+
+        self.assertEqual(actual, expected_mp4)
+        self.assertEqual(action, "Normalizing audio")
+        self.assertTrue(changed)
+        cmd = mock_run_cmd.await_args.args[0]
+        self.assertEqual(cmd[cmd.index("-c:a") + 1], "aac")
+        self.assertNotIn("-ac", cmd)
+        mock_write_sidecar.assert_not_awaited()
+
     def test_remux_validation_failure_falls_back_to_h264_mp4_transcode(self) -> None:
         """An unreadable remux retries as a full H.264/AAC MP4 transcode."""
         source = Path("/tmp/test_src/episode.mkv")
@@ -831,6 +943,37 @@ class TestSubtitleExtractionDuringImport(TestCase):
                 AnimeLibraryService,
                 "_probe_media_sync",
                 return_value=_make_probe(prepared, suffix=".mov", video_codec="h264"),
+            ):
+                self.assertFalse(
+                    AnimeLibraryService._source_matches_prepared_sync(source, prepared)
+                )
+
+    def test_source_matches_prepared_rejects_opus_mp4_output(self) -> None:
+        """Prepared-file reuse rejects MP4 outputs with Premiere-unsafe audio codecs."""
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            tmp_dir = Path(tmp_dir_raw)
+            source = tmp_dir / "episode.mkv"
+            prepared = tmp_dir / "episode.mp4"
+            source.write_bytes(b"source")
+            prepared.write_bytes(b"prepared")
+            AnimeLibraryService._record_source_import_manifest_sync(source, prepared)
+
+            with patch.object(
+                AnimeLibraryService,
+                "_probe_media_sync",
+                return_value=_make_probe(
+                    prepared,
+                    suffix=".mp4",
+                    video_codec="h264",
+                    audio_streams=(
+                        _audio_stream(
+                            index=1,
+                            stream_position=0,
+                            language="ja",
+                            codec_name="opus",
+                        ),
+                    ),
+                ),
             ):
                 self.assertFalse(
                     AnimeLibraryService._source_matches_prepared_sync(source, prepared)

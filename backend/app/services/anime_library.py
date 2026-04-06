@@ -234,6 +234,7 @@ class AnimeLibraryService:
     GPU_H264_ENCODER = "h264_nvenc"
     LIBRARY_IMPORT_TRANSCODE_TIMEOUT_SECONDS = 7200.0
     PREMIERE_NATIVE_VIDEO_CODECS = {"h264", "hevc"}
+    PREMIERE_SAFE_MP4_AUDIO_CODECS = {"aac", "ac3", "eac3"}
     _CUDA_DECODERS: dict[str, str] = {
         "av1": "av1_cuvid",
         "h264": "h264_cuvid",
@@ -1841,8 +1842,6 @@ class AnimeLibraryService:
             "aac",
             "-b:a",
             cls.SOURCE_NORMALIZATION_AUDIO_BITRATE,
-            "-ac",
-            "2",
             "-ar",
             cls.SOURCE_NORMALIZATION_AUDIO_RATE,
         ]
@@ -1865,6 +1864,53 @@ class AnimeLibraryService:
         return len(codecs) > 1
 
     @classmethod
+    def _unsupported_prepared_audio_codecs(
+        cls,
+        probe: SourceMediaProbe | None,
+    ) -> set[str]:
+        if probe is None or not probe.has_audio:
+            return set()
+        codecs = {
+            (stream.codec_name or "").strip().lower()
+            for stream in probe.audio_streams
+            if (stream.codec_name or "").strip()
+        }
+        return {
+            codec
+            for codec in codecs
+            if codec not in cls.PREMIERE_SAFE_MP4_AUDIO_CODECS
+        }
+
+    @classmethod
+    def _requires_premiere_audio_normalization(
+        cls,
+        probe: SourceMediaProbe | None,
+    ) -> bool:
+        if probe is None or not probe.has_audio:
+            return False
+        return bool(cls._unsupported_prepared_audio_codecs(probe)) or cls._has_mixed_audio_codecs(probe)
+
+    @classmethod
+    def _describe_premiere_audio_normalization_reason(
+        cls,
+        probe: SourceMediaProbe | None,
+    ) -> str:
+        unsupported = sorted(cls._unsupported_prepared_audio_codecs(probe))
+        if unsupported:
+            label = "audio codec" if len(unsupported) == 1 else "audio codecs"
+            return f"unsupported {label}: {', '.join(unsupported)}"
+        codecs = sorted(
+            {
+                (stream.codec_name or "").strip().lower()
+                for stream in (probe.audio_streams if probe is not None else ())
+                if (stream.codec_name or "").strip()
+            }
+        )
+        if len(codecs) > 1:
+            return f"mixed audio codecs: {', '.join(codecs)}"
+        return "Premiere-incompatible audio"
+
+    @classmethod
     def _is_valid_prepared_library_probe(
         cls,
         prepared_probe: SourceMediaProbe | None,
@@ -1882,6 +1928,8 @@ class AnimeLibraryService:
         if require_h264_video and video_codec != "h264":
             return False
         if prepared_probe.duration is None or prepared_probe.duration <= 0:
+            return False
+        if cls._requires_premiere_audio_normalization(prepared_probe):
             return False
         if reference_probe is None:
             return True
@@ -3399,13 +3447,15 @@ class AnimeLibraryService:
         needs_audio_normalize = (
             not needs_direct_h264_transcode
             and source_probe.has_audio
-            and cls._has_mixed_audio_codecs(source_probe)
+            and cls._requires_premiere_audio_normalization(source_probe)
         )
         if needs_audio_normalize:
             action = "Normalizing audio (remux)" if not is_mp4 else "Normalizing audio"
+            normalize_reason = cls._describe_premiere_audio_normalization_reason(source_probe)
             logger.info(
-                "Mixed audio codecs in %s — will normalize to AAC",
+                "Premiere-incompatible audio in %s — will normalize to AAC (%s)",
                 source_path.name,
+                normalize_reason,
             )
 
         tmp_dest = preferred_dest.with_name(f"{preferred_dest.stem}.import.tmp.mp4")

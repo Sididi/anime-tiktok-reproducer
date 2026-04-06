@@ -8,7 +8,7 @@ import pytest
 from app.config import settings
 from app.models import Project, SceneTranscription, Transcription
 from app.services.elevenlabs_service import ElevenLabsService
-from app.services.gemini_service import GeminiService
+from app.services.llm_service import LLMService
 from app.services.metadata import MetadataService
 from app.services.project_service import ProjectService
 from app.services.script_automation_service import ScriptAutomationService
@@ -62,7 +62,7 @@ async def test_stream_automation_pauses_before_phase_2(monkeypatch, tmp_path: Pa
             model_id=None,
         ),
     )
-    monkeypatch.setattr(GeminiService, "is_configured", lambda: True)
+    monkeypatch.setattr(LLMService, "is_configured", lambda: True)
     monkeypatch.setattr(ElevenLabsService, "is_configured", lambda: True)
 
     events = await _collect_events(
@@ -110,24 +110,12 @@ async def test_stream_automation_coerces_top_level_scene_array_from_gemini(
             model_id=None,
         ),
     )
-    monkeypatch.setattr(GeminiService, "is_configured", lambda: True)
+    monkeypatch.setattr(LLMService, "is_configured", lambda: True)
 
-    def fake_generate_content(**kwargs):
-        return {
-            "candidates": [
-                {
-                    "content": {
-                        "parts": [
-                            {
-                                "text": '[{"scene_index": 1, "text": "Script généré depuis un tableau."}]'
-                            }
-                        ]
-                    }
-                }
-            ]
-        }
+    def fake_generate_json_value(prompt, *, response_json_schema=None):
+        return [{"scene_index": 1, "text": "Script généré depuis un tableau."}]
 
-    monkeypatch.setattr(GeminiService, "_generate_content", fake_generate_content)
+    monkeypatch.setattr(LLMService, "generate_json_value", fake_generate_json_value)
 
     events = await _collect_events(
         project_id="proj123",
@@ -186,7 +174,7 @@ async def test_stream_automation_resume_uses_edited_script_for_tts_metadata_and_
             model_id=None,
         ),
     )
-    monkeypatch.setattr(GeminiService, "is_configured", lambda: True)
+    monkeypatch.setattr(LLMService, "is_configured", lambda: True)
     monkeypatch.setattr(ElevenLabsService, "is_configured", lambda: True)
 
     def fake_prepare_tts_payload(*, script_payload, target_language=None, model_id=None):
@@ -242,7 +230,7 @@ async def test_stream_automation_resume_uses_edited_script_for_tts_metadata_and_
 
     monkeypatch.setattr(ScriptAutomationService, "prepare_tts_payload", fake_prepare_tts_payload)
     monkeypatch.setattr(MetadataService, "build_prompt_from_script_payload", fake_build_metadata_prompt)
-    monkeypatch.setattr(GeminiService, "generate_json", fake_generate_json)
+    monkeypatch.setattr(LLMService, "generate_json", fake_generate_json)
     monkeypatch.setattr(ScriptAutomationService, "generate_video_overlay", fake_generate_video_overlay)
     monkeypatch.setattr(ElevenLabsService, "synthesize", fake_synthesize)
     monkeypatch.setattr(ScriptAutomationService, "_merge_parts_to_wav", fake_merge_parts)
@@ -300,7 +288,7 @@ async def test_stream_automation_sets_metadata_warning_without_blocking_overlay(
             model_id=None,
         ),
     )
-    monkeypatch.setattr(GeminiService, "is_configured", lambda: True)
+    monkeypatch.setattr(LLMService, "is_configured", lambda: True)
 
     monkeypatch.setattr(
         MetadataService,
@@ -308,7 +296,7 @@ async def test_stream_automation_sets_metadata_warning_without_blocking_overlay(
         lambda **kwargs: "metadata-prompt",
     )
     monkeypatch.setattr(
-        GeminiService,
+        LLMService,
         "generate_json",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom metadata")),
     )
@@ -358,7 +346,7 @@ async def test_stream_automation_sets_overlay_warning_without_blocking_metadata(
             model_id=None,
         ),
     )
-    monkeypatch.setattr(GeminiService, "is_configured", lambda: True)
+    monkeypatch.setattr(LLMService, "is_configured", lambda: True)
 
     monkeypatch.setattr(
         MetadataService,
@@ -366,7 +354,7 @@ async def test_stream_automation_sets_overlay_warning_without_blocking_metadata(
         lambda **kwargs: "metadata-prompt",
     )
     monkeypatch.setattr(
-        GeminiService,
+        LLMService,
         "generate_json",
         lambda *args, **kwargs: {
             "title_candidates": [f"Titre {idx}" for idx in range(1, 11)],
@@ -424,7 +412,7 @@ async def test_stream_automation_v2_uses_previous_request_ids_between_chunks(
             model_id="eleven_multilingual_v2",
         ),
     )
-    monkeypatch.setattr(GeminiService, "is_configured", lambda: True)
+    monkeypatch.setattr(LLMService, "is_configured", lambda: True)
     monkeypatch.setattr(ElevenLabsService, "is_configured", lambda: True)
     monkeypatch.setattr(
         ScriptAutomationService,
@@ -499,7 +487,7 @@ async def test_stream_automation_v2_continues_without_stitching_when_request_id_
             model_id="eleven_multilingual_v2",
         ),
     )
-    monkeypatch.setattr(GeminiService, "is_configured", lambda: True)
+    monkeypatch.setattr(LLMService, "is_configured", lambda: True)
     monkeypatch.setattr(ElevenLabsService, "is_configured", lambda: True)
     monkeypatch.setattr(
         ScriptAutomationService,
@@ -567,7 +555,7 @@ async def test_stream_automation_v3_reuses_seed_and_prefixes_each_chunk(
             model_id="eleven_v3",
         ),
     )
-    monkeypatch.setattr(GeminiService, "is_configured", lambda: True)
+    monkeypatch.setattr(LLMService, "is_configured", lambda: True)
     monkeypatch.setattr(ElevenLabsService, "is_configured", lambda: True)
     monkeypatch.setattr(
         ScriptAutomationService,
@@ -627,7 +615,7 @@ def test_generate_video_overlay_normalizes_ten_title_hooks(monkeypatch):
     long_title = "UN HOOK TRES LONG QUI DEPASSE LARGEMENT LA LIMITE AUTORISEE POUR LE TEST"
 
     monkeypatch.setattr(
-        GeminiService,
+        LLMService,
         "generate_json",
         lambda *args, **kwargs: {
             "title_hooks": [f"{long_title} {idx}" for idx in range(10)],

@@ -17,7 +17,7 @@ from app.services.elevenlabs_service import ElevenLabsService
 from app.services.music_config_service import MusicConfigService
 from app.services.project_service import ProjectService
 from app.services.voice_config_service import VoiceConfigService
-from app.services.gemini_service import GeminiService
+from app.services.llm_service import LLMService
 
 
 @pytest.mark.asyncio
@@ -36,7 +36,7 @@ async def test_get_script_automation_config_exposes_script_title_selection_enabl
         "get_config",
         lambda: SimpleNamespace(musics={}, default_music_key=None),
     )
-    monkeypatch.setattr(GeminiService, "is_configured", lambda: True)
+    monkeypatch.setattr(LLMService, "is_configured", lambda: True)
     monkeypatch.setattr(ElevenLabsService, "is_configured", lambda: False)
 
     result = await get_script_automation_config("proj123")

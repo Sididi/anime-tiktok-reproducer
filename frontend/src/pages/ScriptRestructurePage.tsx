@@ -1972,8 +1972,8 @@ export function ScriptRestructurePage() {
           ? "Select titles to finish automation"
           : !automationConfig.enabled
             ? "Automation disabled on backend"
-            : !automationConfig.gemini.configured
-              ? "Gemini API key missing on backend"
+            : !automationConfig.llm.configured
+              ? `${automationConfig.llm.provider === "claude" ? "Anthropic" : "Gemini"} API key missing on backend`
               : !automationConfig.elevenlabs.configured
                 ? "ElevenLabs API key missing on backend"
                 : automationConfig.voice_config_error
@@ -2577,7 +2577,7 @@ export function ScriptRestructurePage() {
                 </div>
 
                 <p className="text-sm text-[hsl(var(--muted-foreground))]">
-                  Préremplit script, metadata et audio via Gemini + ElevenLabs.
+                  Préremplit script, metadata et audio via LLM + ElevenLabs.
                 </p>
 
                 <div className="space-y-1">

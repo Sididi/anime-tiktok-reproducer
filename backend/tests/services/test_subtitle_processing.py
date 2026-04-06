@@ -16,7 +16,12 @@ from app.config import settings
 from app.models import SceneMatch
 from app.models.project import Project
 from app.models.transcription import SceneTranscription, Transcription, Word
-from app.services.anime_library import AnimeLibraryService, SourceAudioSelectionPolicy
+from app.services.anime_library import (
+    AnimeLibraryService,
+    SourceAudioSelectionPolicy,
+    SourceMediaProbe,
+    SourceMediaStream,
+)
 from app.services.export_service import ExportService
 from app.services.forced_alignment import ForcedAlignmentService
 from app.services.processing import ProcessingService, ResolvedSceneSource
@@ -27,6 +32,39 @@ from app.services.voice_config_service import VoiceConfigService
 
 def _build_sentence(prefix: str, *, repeat_count: int = 28) -> str:
     return f"{prefix} " + " ".join(["story"] * repeat_count) + "."
+
+
+def _build_source_probe(
+    source_path: Path,
+    *,
+    codec_name: str,
+    channels: int,
+) -> SourceMediaProbe:
+    return SourceMediaProbe(
+        source_path=source_path,
+        container_suffix=".mp4",
+        format_name="mov,mp4,m4a,3gp,3g2,mj2",
+        video_codec="h264",
+        audio_codec=codec_name,
+        pix_fmt="yuv420p",
+        fps=23.976,
+        duration=1400.0,
+        has_audio=True,
+        audio_streams=(
+            SourceMediaStream(
+                index=1,
+                stream_position=0,
+                codec_type="audio",
+                codec_name=codec_name,
+                channels=channels,
+                language="ja",
+                raw_language="jpn",
+                title=None,
+                handler_name=None,
+                is_default=True,
+            ),
+        ),
+    )
 
 
 def test_normalize_external_subtitle_text_strips_markup_and_ass_controls():
@@ -1155,6 +1193,272 @@ def test_process_does_not_rewrite_match_paths_or_save_matches_for_source_audio_p
 
     assert policy_calls == [source_path]
     assert match.episode == "episode-1"
+
+
+def test_process_repairs_premiere_incompatible_audio_before_building_source_audio_policy(
+    monkeypatch,
+    tmp_path,
+):
+    output_dir = tmp_path / "project-output"
+    output_dir.mkdir(parents=True)
+    edited_audio_path = output_dir / "tts_edited.wav"
+    edited_audio_path.write_bytes(b"wav")
+    transcription_path = output_dir / "transcription_timing.json"
+    transcription_path.write_text(
+        json.dumps({"language": "fr", "scenes": []}),
+        encoding="utf-8",
+    )
+    (output_dir / "processing_state.json").write_text(
+        json.dumps(
+            {
+                "edited_audio_path": str(edited_audio_path),
+                "transcription_path": str(transcription_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    source_path = tmp_path / "episode.mp4"
+    source_path.write_bytes(b"video")
+    source_probe = _build_source_probe(source_path, codec_name="opus", channels=2)
+    call_order: list[str] = []
+    fixed_paths: list[Path] = []
+
+    async def _fake_fix_audio(cls, path: Path, *, probe, library_type=None):
+        assert probe == source_probe
+        fixed_paths.append(path)
+        call_order.append("fix")
+
+    def _fake_build_source_audio_policy(
+        cls,
+        path: Path,
+        *,
+        target_language: str | None = None,
+    ) -> SourceAudioSelectionPolicy:
+        call_order.append("policy")
+        return SourceAudioSelectionPolicy(
+            selected_stream_index=1,
+            selected_stream_position=0,
+            selected_language=target_language,
+            selected_channel_count=2,
+            selected_channel_offset=0,
+            channel_type="stereo",
+        )
+
+    monkeypatch.setattr(
+        ProcessingService,
+        "get_output_dir",
+        classmethod(lambda cls, _project_id: output_dir),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "check_has_saved_state",
+        classmethod(lambda cls, _project_id: True),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "check_gaps_resolved",
+        classmethod(lambda cls, _project_id: True),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "detect_first_source_fps",
+        classmethod(lambda cls, *_args, **_kwargs: asyncio.sleep(0, result=23.976)),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "generate_jsx_script",
+        classmethod(lambda cls, *_args, **_kwargs: "// jsx"),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "resolve_scene_sources",
+        classmethod(
+            lambda cls, *_args, **_kwargs: {
+                0: ResolvedSceneSource(
+                    scene_index=0,
+                    source_path=source_path,
+                    clip_name="episode",
+                    source_in_frame=0,
+                    source_out_frame=24,
+                    source_in_seconds=0.0,
+                    source_out_seconds=1.0,
+                    source_duration_seconds=1.0,
+                )
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "_build_raw_scene_image_render_plan",
+        classmethod(lambda cls, *_args, **_kwargs: asyncio.sleep(0, result={})),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "_fix_premiere_incompatible_audio_in_place",
+        classmethod(_fake_fix_audio),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_probe_media_sync",
+        classmethod(lambda cls, _path: source_probe),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "build_source_audio_selection_policy",
+        classmethod(_fake_build_source_audio_policy),
+    )
+
+    project = Project(id="p-audio-repair", output_language="fr")
+    reference_transcription = Transcription(language="fr", scenes=[])
+
+    async def _run() -> None:
+        progress_iter = ProcessingService.process(
+            project,
+            new_script={"language": "fr", "scenes": []},
+            audio_path=tmp_path / "tts.wav",
+            matches=[],
+            reference_transcription=reference_transcription,
+        )
+        while "policy" not in call_order:
+            await anext(progress_iter)
+        await progress_iter.aclose()
+
+    asyncio.run(_run())
+
+    assert fixed_paths == [source_path]
+    assert call_order == ["fix", "policy"]
+
+
+def test_process_skips_audio_repair_for_premiere_safe_source_audio(
+    monkeypatch,
+    tmp_path,
+):
+    output_dir = tmp_path / "project-output"
+    output_dir.mkdir(parents=True)
+    edited_audio_path = output_dir / "tts_edited.wav"
+    edited_audio_path.write_bytes(b"wav")
+    transcription_path = output_dir / "transcription_timing.json"
+    transcription_path.write_text(
+        json.dumps({"language": "fr", "scenes": []}),
+        encoding="utf-8",
+    )
+    (output_dir / "processing_state.json").write_text(
+        json.dumps(
+            {
+                "edited_audio_path": str(edited_audio_path),
+                "transcription_path": str(transcription_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    source_path = tmp_path / "episode.mp4"
+    source_path.write_bytes(b"video")
+    source_probe = _build_source_probe(source_path, codec_name="aac", channels=2)
+    call_order: list[str] = []
+
+    async def _unexpected_fix_audio(cls, path: Path, *, probe, library_type=None):
+        pytest.fail(f"unexpected audio repair for {path}")
+
+    def _fake_build_source_audio_policy(
+        cls,
+        path: Path,
+        *,
+        target_language: str | None = None,
+    ) -> SourceAudioSelectionPolicy:
+        call_order.append("policy")
+        return SourceAudioSelectionPolicy(
+            selected_stream_index=1,
+            selected_stream_position=0,
+            selected_language=target_language,
+            selected_channel_count=2,
+            selected_channel_offset=0,
+            channel_type="stereo",
+        )
+
+    monkeypatch.setattr(
+        ProcessingService,
+        "get_output_dir",
+        classmethod(lambda cls, _project_id: output_dir),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "check_has_saved_state",
+        classmethod(lambda cls, _project_id: True),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "check_gaps_resolved",
+        classmethod(lambda cls, _project_id: True),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "detect_first_source_fps",
+        classmethod(lambda cls, *_args, **_kwargs: asyncio.sleep(0, result=23.976)),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "generate_jsx_script",
+        classmethod(lambda cls, *_args, **_kwargs: "// jsx"),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "resolve_scene_sources",
+        classmethod(
+            lambda cls, *_args, **_kwargs: {
+                0: ResolvedSceneSource(
+                    scene_index=0,
+                    source_path=source_path,
+                    clip_name="episode",
+                    source_in_frame=0,
+                    source_out_frame=24,
+                    source_in_seconds=0.0,
+                    source_out_seconds=1.0,
+                    source_duration_seconds=1.0,
+                )
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "_build_raw_scene_image_render_plan",
+        classmethod(lambda cls, *_args, **_kwargs: asyncio.sleep(0, result={})),
+    )
+    monkeypatch.setattr(
+        ProcessingService,
+        "_fix_premiere_incompatible_audio_in_place",
+        classmethod(_unexpected_fix_audio),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "_probe_media_sync",
+        classmethod(lambda cls, _path: source_probe),
+    )
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "build_source_audio_selection_policy",
+        classmethod(_fake_build_source_audio_policy),
+    )
+
+    project = Project(id="p-audio-safe", output_language="fr")
+    reference_transcription = Transcription(language="fr", scenes=[])
+
+    async def _run() -> None:
+        progress_iter = ProcessingService.process(
+            project,
+            new_script={"language": "fr", "scenes": []},
+            audio_path=tmp_path / "tts.wav",
+            matches=[],
+            reference_transcription=reference_transcription,
+        )
+        while "policy" not in call_order:
+            await anext(progress_iter)
+        await progress_iter.aclose()
+
+    asyncio.run(_run())
+
+    assert call_order == ["policy"]
 
 
 def test_format_source_audio_policy_message_reports_selected_stream():

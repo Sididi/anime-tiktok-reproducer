@@ -14,7 +14,7 @@ from ..utils.meta_graph import extract_graph_error
 from .account_service import AccountService
 from .discord_service import DiscordService
 from .elevenlabs_service import ElevenLabsService
-from .gemini_service import GeminiService
+from .llm_service import LLMService
 from .google_drive_service import GoogleDriveService
 from .meta_token_service import MetaTokenService
 from .social_upload_service import SocialUploadService
@@ -271,8 +271,8 @@ class IntegrationHealthService:
         return {"status": "ok", "detail": detail}
 
     @classmethod
-    def _check_gemini_api(cls) -> dict[str, Any]:
-        return GeminiService.check_api_health()
+    def _check_llm_api(cls) -> dict[str, Any]:
+        return LLMService.check_api_health()
 
     @classmethod
     def _check_elevenlabs_api(cls) -> dict[str, Any]:
@@ -516,7 +516,7 @@ class IntegrationHealthService:
         global_checks = {
             "discord": cls._check_discord(),
             "google_drive": cls._check_google_drive(),
-            "gemini_api": cls._check_gemini_api(),
+            "llm_api": cls._check_llm_api(),
             "elevenlabs_api": cls._check_elevenlabs_api(),
         }
 

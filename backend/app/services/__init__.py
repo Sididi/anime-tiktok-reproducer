@@ -37,6 +37,8 @@ _EXPORTS = {
     "MetaTokenService": (".meta_token_service", "MetaTokenService"),
     "IntegrationHealthService": (".integration_health_service", "IntegrationHealthService"),
     "GeminiService": (".gemini_service", "GeminiService"),
+    "ClaudeService": (".claude_service", "ClaudeService"),
+    "LLMService": (".llm_service", "LLMService"),
     "ElevenLabsService": (".elevenlabs_service", "ElevenLabsService"),
     "VoiceConfigService": (".voice_config_service", "VoiceConfigService"),
     "ScriptAutomationService": (".script_automation_service", "ScriptAutomationService"),

@@ -354,18 +354,21 @@ class ProcessingService:
         )
 
     @classmethod
-    async def _fix_mixed_audio_codecs_in_place(
+    async def _fix_premiere_incompatible_audio_in_place(
         cls,
         source_path: Path,
         *,
         probe: SourceMediaProbe,
         library_type: str | None = None,
     ) -> None:
-        """Transcode mixed audio codecs to AAC in-place (one-time fix).
+        """Transcode Premiere-incompatible audio to AAC in-place.
 
         After fixing the local file, attempts to reupload the corrected
         version to the storage box so subsequent downloads are clean.
         """
+        normalize_reason = AnimeLibraryService._describe_premiere_audio_normalization_reason(
+            probe
+        )
         tmp_path = source_path.with_name(f"{source_path.stem}.audio_fix.tmp.mp4")
         try:
             result = await run_command(
@@ -398,8 +401,9 @@ class ProcessingService:
             raise
 
         logger.info(
-            "Fixed mixed audio codecs in-place: %s",
+            "Fixed Premiere-incompatible audio in-place: %s (%s)",
             source_path.name,
+            normalize_reason,
         )
 
         # Reupload to storage box so the fix persists remotely.
@@ -432,6 +436,21 @@ class ProcessingService:
                     source_path.name,
                     exc,
                 )
+
+    @classmethod
+    async def _fix_mixed_audio_codecs_in_place(
+        cls,
+        source_path: Path,
+        *,
+        probe: SourceMediaProbe,
+        library_type: str | None = None,
+    ) -> None:
+        """Backward-compatible wrapper for Premiere audio repair."""
+        await cls._fix_premiere_incompatible_audio_in_place(
+            source_path,
+            probe=probe,
+            library_type=library_type,
+        )
 
     @classmethod
     def schedule_gap_candidate_prewarm(
@@ -2619,23 +2638,29 @@ class ProcessingService:
                         f"{resolved_source_path.name}",
                     )
 
-                    # --- One-time fix: normalize mixed audio codecs to AAC ---
+                    # --- One-time fix: normalize Premiere-incompatible audio to AAC ---
                     pre_probe = await asyncio.to_thread(
                         AnimeLibraryService._probe_media_sync,
                         resolved_source_path,
                     )
                     if (
                         pre_probe is not None
-                        and AnimeLibraryService._has_mixed_audio_codecs(pre_probe)
+                        and AnimeLibraryService._requires_premiere_audio_normalization(pre_probe)
                     ):
+                        normalize_reason = (
+                            AnimeLibraryService._describe_premiere_audio_normalization_reason(
+                                pre_probe
+                            )
+                        )
                         yield ProcessingProgress(
                             "processing",
                             "source_audio_policy",
                             0.4 + 0.09 * before_fraction,
-                            f"Normalizing mixed audio codecs ({idx}/{total_source_paths}): "
-                            f"{resolved_source_path.name}",
+                            "Normalizing source audio "
+                            f"({idx}/{total_source_paths}): {resolved_source_path.name} "
+                            f"({normalize_reason})",
                         )
-                        await cls._fix_mixed_audio_codecs_in_place(
+                        await cls._fix_premiere_incompatible_audio_in_place(
                             resolved_source_path,
                             probe=pre_probe,
                             library_type=project.library_type,
