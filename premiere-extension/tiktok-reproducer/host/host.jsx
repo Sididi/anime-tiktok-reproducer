@@ -541,6 +541,7 @@ function __atrFindSequenceByName(sequenceName) {
     count = 0;
   }
 
+  // Pass 1: exact name match
   for (var i = 0; i < count; i += 1) {
     var sequence = sequences[i];
     if (!sequence) {
@@ -549,6 +550,20 @@ function __atrFindSequenceByName(sequenceName) {
     if (__atrGetSequenceName(sequence) === targetName) {
       return sequence;
     }
+  }
+
+  // Pass 2: fallback via projectItem.name (handles bin corruption where
+  // sequence.name may be unavailable but projectItem retains the name)
+  for (var j = 0; j < count; j += 1) {
+    var seq2 = sequences[j];
+    if (!seq2) {
+      continue;
+    }
+    try {
+      if (seq2.projectItem && __atrSafeString(seq2.projectItem.name) === targetName) {
+        return seq2;
+      }
+    } catch (eFallback) {}
   }
 
   return null;

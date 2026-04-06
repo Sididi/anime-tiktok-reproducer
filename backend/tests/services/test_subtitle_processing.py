@@ -1227,8 +1227,8 @@ def test_render_jsx_from_template_includes_dedicated_raw_scene_text_subtitle_pat
     assert "Script Complete (v7.7 Layered - Presets + External Subtitle MOGRTs)." not in jsx
 
 
-def test_render_jsx_from_template_clears_a4_before_raw_audio_rebuild():
-    jsx = ProcessingService._render_jsx_from_template(
+def _render_raw_audio_jsx(source_audio_policies: dict[str, dict] | None = None) -> str:
+    return ProcessingService._render_jsx_from_template(
         project_id="project-raw-a4",
         scenes=[
             {
@@ -1245,7 +1245,7 @@ def test_render_jsx_from_template_clears_a4_before_raw_audio_rebuild():
                 "is_raw": True,
             }
         ],
-        source_audio_policies={},
+        source_audio_policies=source_audio_policies or {},
         source_fps_num=24000,
         source_fps_den=1001,
         subtitle_timing_relative_path="subtitles/classic_timings.srt",
@@ -1255,12 +1255,21 @@ def test_render_jsx_from_template_clears_a4_before_raw_audio_rebuild():
         music_gain_db=-24.0,
     )
 
-    assert "clearTrackClips(a4);" in jsx
-    assert "duplicateRawSceneAudioToTrack(a4, scenes, qeSeq, qeTrackCache);" in jsx
+
+def test_render_jsx_from_template_clears_a4_before_raw_audio_rebuild():
+    jsx = _render_raw_audio_jsx()
+
+    assert "clearRawAudioZone(sequence, RAW_AUDIO_TRACK_START_INDEX, rawAudioZoneWidth);" in jsx
+    assert "duplicateRawSceneAudioToTrack(" in jsx
+    assert "rawAudioZoneWidth," in jsx
     assert "RAW_AUDIO_SUBCLIP_PREFIX =" in jsx
-    assert "function shouldApplySourceAudioPolicyToRawSubclip(" in jsx
-    assert "return selectedStreamPosition === 0 && channelOffset === 0;" in jsx
-    assert "function validateRawAudioSubclip(" in jsx
+    assert "var RAW_AUDIO_TRACK_START_INDEX = 3;" in jsx
+    assert "function getSourceAudioChannelTypeName(" in jsx
+    assert "function getSourceAudioSelectedChannelCount(" in jsx
+    assert "function getRawAudioBlockWidth(" in jsx
+    assert "function getRequiredRawAudioZoneWidth(" in jsx
+    assert "function getRequiredRawAudioZoneWidthForScenes(" in jsx
+    assert "function describeRawAudioPolicy(" in jsx
     assert "getOrCreateRawAudioSubclip(scene)" in jsx
     assert "buildRawTimeFromSourceFrame(scene.source_in_frame, false);" in jsx
     assert "buildRawTimeFromSourceFrame(safeOutFrame, false);" in jsx
@@ -1269,21 +1278,25 @@ def test_render_jsx_from_template_clears_a4_before_raw_audio_rebuild():
     assert "var hasHardBoundaries = 0;" in jsx
     assert "var takeVideo = 0;" in jsx
     assert "var takeAudio = 1;" in jsx
-    assert "shouldApplySourceAudioPolicyToRawSubclip(scene.clipName) &&" in jsx
-    assert "applySourceAudioPolicy(subclip, scene.clipName)" in jsx
-    assert "applySourceAudioPolicy(existingSubclip, scene.clipName)" in jsx
+    assert "var rawAudioZoneWidth = getRequiredRawAudioZoneWidthForScenes(scenes);" in jsx
+    assert "var rawAudioTrackDesiredCount = Math.max(" in jsx
+    assert "ensureAudioTracks(sequence, rawAudioTrackDesiredCount);" in jsx
     assert "function collectRawAudioLinkedTrackItems(" in jsx
     assert "anchorItem.getLinkedItems()" in jsx
+    assert "function buildRawAudioBlocks(" in jsx
     assert "function moveQEAudioTrackItem(" in jsx
     assert "qeItem.moveToTrack(toTrackIndex);" in jsx
+    assert "function moveRawAudioBlockToTrack(" in jsx
     assert "function repairRawAudioPlacement(" in jsx
-    assert "var desiredTrackIndex = a4Index + selectedStreamPosition;" in jsx
+    assert "var blockWidth = getRawAudioBlockWidth(scene.clipName);" in jsx
+    assert "var desiredBlockIndex = selectedStreamPosition;" in jsx
+    assert "var keepTrackIndexes = {};" in jsx
     assert "repairRawAudioPlacement(" in jsx
     assert "function clearTrackClips(track)" in jsx
+    assert "function clearRawAudioZone(" in jsx
     assert "clip.remove(false, true);" in jsx
     assert "removeSiblingAudioClips(" not in jsx
     assert "function removeTrackItem(clip)" not in jsx
-    assert "function describeSourceAudioPolicy(clipName)" not in jsx
     assert "validateRawAudioTrack(a4, scenes, sequenceEndSec);" not in jsx
     assert "waitForTrackItemAtExactStart(" not in jsx
     assert 'var clipKey = normalizeLooseName(scene.clipName || "");' not in jsx
@@ -1291,6 +1304,71 @@ def test_render_jsx_from_template_clears_a4_before_raw_audio_rebuild():
     assert "a4.overwriteClip(sourceItem, startSec);" not in jsx
     assert "a4.overwriteClip(subclip, secondsToTicks(startSec).toString());" not in jsx
     assert "track.setTargeted(" not in jsx
+    assert "function shouldApplySourceAudioPolicyToRawSubclip(" not in jsx
+    assert "function validateRawAudioSubclip(" not in jsx
+    assert "applySourceAudioPolicy(subclip, scene.clipName)" not in jsx
+    assert "applySourceAudioPolicy(existingSubclip, scene.clipName)" not in jsx
+    assert "var desiredTrackIndex = a4Index + selectedStreamPosition;" not in jsx
+
+
+def test_render_jsx_from_template_raw_audio_zone_supports_default_stereo_policy():
+    jsx = _render_raw_audio_jsx(
+        {
+            "S01E03-Our First Date [AA9843FE]": {
+                "selected_stream_index": 1,
+                "selected_stream_position": 0,
+                "selected_language": None,
+                "selected_channel_count": 2,
+                "selected_channel_offset": 0,
+                "channel_type": "stereo",
+            }
+        }
+    )
+
+    assert '"selected_stream_position": 0' in jsx
+    assert '"selected_channel_count": 2' in jsx
+    assert '"channel_type": "stereo"' in jsx
+    assert "return Math.max(1, (selectedStreamPosition + 1) * blockWidth);" in jsx
+
+
+def test_render_jsx_from_template_raw_audio_zone_supports_shifted_stereo_policy():
+    jsx = _render_raw_audio_jsx(
+        {
+            "S01E03-Our First Date [AA9843FE]": {
+                "selected_stream_index": 2,
+                "selected_stream_position": 1,
+                "selected_language": "ja",
+                "selected_channel_count": 2,
+                "selected_channel_offset": 2,
+                "channel_type": "stereo",
+            }
+        }
+    )
+
+    assert '"selected_stream_position": 1' in jsx
+    assert '"selected_channel_offset": 2' in jsx
+    assert '"channel_type": "stereo"' in jsx
+    assert "requested stream block " in jsx
+
+
+def test_render_jsx_from_template_raw_audio_zone_supports_default_51_policy():
+    jsx = _render_raw_audio_jsx(
+        {
+            "S01E03-Our First Date [AA9843FE]": {
+                "selected_stream_index": 1,
+                "selected_stream_position": 0,
+                "selected_language": "ja",
+                "selected_channel_count": 6,
+                "selected_channel_offset": 0,
+                "channel_type": "51",
+            }
+        }
+    )
+
+    assert '"selected_stream_position": 0' in jsx
+    assert '"selected_channel_count": 6' in jsx
+    assert '"channel_type": "51"' in jsx
+    assert 'if (channelTypeName === "51" && channelCount > 1) return channelCount;' in jsx
 
 
 def test_export_collects_internal_subtitle_timing_files(tmp_path):
