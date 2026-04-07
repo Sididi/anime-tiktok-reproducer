@@ -107,6 +107,34 @@ class ClaudeService:
         return cls._extract_text(response)
 
     @classmethod
+    def _sanitize_schema(cls, schema: dict[str, Any]) -> dict[str, Any]:
+        """Deep-clone a JSON schema and clamp constraints unsupported by Claude.
+
+        Claude's ``output_config`` rejects ``minItems`` values > 1 for arrays.
+        We clamp those to 1 so the schema is still accepted and structure is
+        enforced, while the prompt carries the exact-count requirement.
+        """
+        import copy
+
+        sanitized = copy.deepcopy(schema)
+
+        def _walk(node: Any) -> None:
+            if not isinstance(node, dict):
+                return
+            if node.get("type") == "array" and "minItems" in node:
+                if node["minItems"] > 1:
+                    node["minItems"] = 1
+            for value in node.values():
+                if isinstance(value, dict):
+                    _walk(value)
+                elif isinstance(value, list):
+                    for item in value:
+                        _walk(item)
+
+        _walk(sanitized)
+        return sanitized
+
+    @classmethod
     def generate_json_value(
         cls,
         prompt: str,
@@ -131,7 +159,7 @@ class ClaudeService:
             create_kwargs["output_config"] = {
                 "format": {
                     "type": "json_schema",
-                    "schema": response_json_schema,
+                    "schema": cls._sanitize_schema(response_json_schema),
                 }
             }
         else:

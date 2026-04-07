@@ -84,25 +84,50 @@ def test_validate_candidate_payload_rejects_wrong_title_count():
         )
 
 
-def test_validate_candidate_payload_rejects_overlong_title():
+def test_validate_candidate_payload_truncates_overlong_title():
     overlong = "x" * 63
-    with pytest.raises(ValueError, match="<= 62 characters"):
-        MetadataService.validate_candidate_payload(
-            {
-                "title_candidates": [overlong] + [f"Titre {idx}" for idx in range(2, 11)],
-                "facebook": {
-                    "description": "Description Facebook",
-                    "tags": ["anime"],
-                },
-                "instagram": {
-                    "hashtags": ["#anime"],
-                },
-                "youtube": {
-                    "description": "Description YouTube",
-                    "tags": ["anime"],
-                },
-            }
-        )
+    payload = MetadataService.validate_candidate_payload(
+        {
+            "title_candidates": [overlong] + [f"Titre {idx}" for idx in range(2, 11)],
+            "facebook": {
+                "description": "Description Facebook",
+                "tags": ["anime"],
+            },
+            "instagram": {
+                "hashtags": ["#anime"],
+            },
+            "youtube": {
+                "description": "Description YouTube",
+                "tags": ["anime"],
+            },
+        }
+    )
+    assert len(payload.title_candidates[0]) <= 62
+
+
+def test_validate_candidate_payload_truncates_at_word_boundary():
+    # 70 chars with spaces — should truncate at a word boundary
+    overlong = "Il rejette une fille parce que elle est trop gentille et il est frappé"
+    payload = MetadataService.validate_candidate_payload(
+        {
+            "title_candidates": [overlong] + [f"Titre {idx}" for idx in range(2, 11)],
+            "facebook": {
+                "description": "Description Facebook",
+                "tags": ["anime"],
+            },
+            "instagram": {
+                "hashtags": ["#anime"],
+            },
+            "youtube": {
+                "description": "Description YouTube",
+                "tags": ["anime"],
+            },
+        }
+    )
+    truncated = payload.title_candidates[0]
+    assert len(truncated) <= 62
+    # Should end at a word boundary, not mid-word
+    assert not truncated.endswith("fra")
 
 
 def test_resolve_candidate_payload_builds_final_platform_metadata():
