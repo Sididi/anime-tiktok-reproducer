@@ -1,10 +1,13 @@
 import asyncio
+import logging
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 import json
 from pathlib import Path
 import re
+
+logger = logging.getLogger("uvicorn.error")
 
 from ...config import settings
 from ...models import ProjectPhase, MatchList, SceneMatch, Scene, SceneList
@@ -226,6 +229,18 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
     if not video_path or not video_path.exists():
         raise HTTPException(status_code=400, detail="Video not found")
 
+    # Pre-match: absorb tiny scenes that produce poor matches
+    TINY_SCENE_THRESHOLD = 0.35
+    merged_scenes, tiny_merge_log = scenes.merge_tiny_scenes(TINY_SCENE_THRESHOLD)
+    if tiny_merge_log:
+        logger.info(
+            "Pre-match tiny scene merge: absorbed %d scene(s) below %.2fs",
+            len(tiny_merge_log),
+            TINY_SCENE_THRESHOLD,
+        )
+        scenes = merged_scenes
+        ProjectService.save_scenes(project_id, scenes)
+
     # Update phase
     project.phase = ProjectPhase.MATCHING
     ProjectService.save(project)
@@ -235,6 +250,16 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
     merge_continuous = request.merge_continuous
 
     async def stream_progress():
+        if tiny_merge_log:
+            yield "data: " + json.dumps({
+                "status": "matching",
+                "progress": 0.0,
+                "message": f"Merged {len(tiny_merge_log)} tiny scene(s) (< {TINY_SCENE_THRESHOLD}s)",
+                "current_scene": 0,
+                "total_scenes": len(scenes.scenes),
+                "error": None,
+            }) + "\n\n"
+
         # === PASS 1: Match all scenes ===
         first_pass_label = "Pass 1: " if merge_continuous else ""
         first_pass_matches: MatchList | None = None
