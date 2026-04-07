@@ -323,15 +323,6 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
 
             candidate = Path(episode_ref)
             if candidate.is_absolute() and candidate.exists():
-                payload = AnimeLibraryService._load_source_import_manifest_sync(candidate)
-                if isinstance(payload, dict):
-                    for key in ("original_source_path", "source_path"):
-                        raw_path = str(payload.get(key, "")).strip()
-                        if not raw_path:
-                            continue
-                        manifest_path = Path(raw_path)
-                        if manifest_path.exists():
-                            return manifest_path
                 return candidate
 
             resolved = AnimeLibraryService.resolve_episode_path(

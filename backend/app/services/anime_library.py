@@ -806,7 +806,7 @@ class AnimeLibraryService:
             for entry in library_path.rglob("*"):
                 if (
                     not entry.is_file()
-                    or entry.suffix.lower() not in cls.VIDEO_EXTENSIONS
+                    or entry.suffix.lower() != ".mp4"
                     or cls.is_transient_library_video_path(entry)
                 ):
                     continue
