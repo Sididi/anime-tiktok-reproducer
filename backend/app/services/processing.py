@@ -1686,6 +1686,34 @@ class ProcessingService:
         return resolved
 
     @classmethod
+    def _preferred_raw_scene_language_groups(
+        cls,
+        entries: list[SubtitleSidecarEntry],
+        *,
+        target_language: str | None,
+    ) -> list[tuple[str | None, list[SubtitleSidecarEntry]]]:
+        """Keep raw-scene subtitles pinned to the target language when that track exists."""
+        language_groups = AnimeLibraryService.get_preferred_subtitle_language_groups(
+            entries,
+            target_language=target_language,
+        )
+        normalized_target = AnimeLibraryService.normalize_stream_language(target_language)
+        if not normalized_target:
+            return language_groups
+
+        locked_group = next(
+            (
+                (language, language_entries)
+                for language, language_entries in language_groups
+                if language == normalized_target
+            ),
+            None,
+        )
+        if locked_group is not None:
+            return [locked_group]
+        return language_groups
+
+    @classmethod
     async def _resolve_raw_scene_sidecar_subtitles(
         cls,
         *,
@@ -1698,7 +1726,7 @@ class ProcessingService:
         rendered_cue_cache: dict[tuple[str, int], Path | None] | None = None,
         resolve_image_assets: bool,
     ) -> tuple[list[SrtEntry], list[_RawSceneImageCueCandidate]]:
-        for _language, language_entries in AnimeLibraryService.get_preferred_subtitle_language_groups(
+        for _language, language_entries in cls._preferred_raw_scene_language_groups(
             sidecar_entries,
             target_language=target_language,
         ):
@@ -1906,7 +1934,7 @@ class ProcessingService:
                 sidecar_entries = AnimeLibraryService.load_subtitle_sidecar_entries(
                     sidecar_source_path
                 )
-                language_groups = AnimeLibraryService.get_preferred_subtitle_language_groups(
+                language_groups = cls._preferred_raw_scene_language_groups(
                     sidecar_entries,
                     target_language=target_language,
                 )
@@ -1986,7 +2014,7 @@ class ProcessingService:
                 {
                     entry.stream_position
                     for _language, language_entries in (
-                        AnimeLibraryService.get_preferred_subtitle_language_groups(
+                        cls._preferred_raw_scene_language_groups(
                             synthetic_entries,
                             target_language=target_language,
                         )

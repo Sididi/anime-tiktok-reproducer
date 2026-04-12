@@ -675,6 +675,212 @@ def test_collect_raw_scene_source_subtitles_returns_text_entries_for_text_sideca
     ]
 
 
+def test_collect_raw_scene_source_subtitles_locks_to_target_language_when_present(
+    tmp_path,
+):
+    source_path = tmp_path / "episode.mkv"
+    normalized_source_path = source_path.with_suffix(".mp4")
+    sidecar_dir = AnimeLibraryService.get_subtitle_sidecar_dir(normalized_source_path)
+    sidecar_dir.mkdir(parents=True)
+    (sidecar_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "source_path": str(normalized_source_path),
+                "generated_from": str(source_path),
+                "subtitle_streams": [
+                    {
+                        "stream_index": 2,
+                        "stream_position": 0,
+                        "codec_name": "subrip",
+                        "language": "fr",
+                        "raw_language": "fre",
+                        "title": "French",
+                        "kind": "text",
+                        "asset_filename": "subtitle_stream_00_fr.srt",
+                        "status": "ok",
+                        "error": None,
+                    },
+                    {
+                        "stream_index": 3,
+                        "stream_position": 1,
+                        "codec_name": "subrip",
+                        "language": "pt",
+                        "raw_language": "por",
+                        "title": "Portuguese[BR]",
+                        "kind": "text",
+                        "asset_filename": "subtitle_stream_01_pt.srt",
+                        "status": "ok",
+                        "error": None,
+                    },
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (sidecar_dir / "subtitle_stream_00_fr.srt").write_text(
+        "1\n00:00:10,000 --> 00:00:10,800\nBonjour\n",
+        encoding="utf-8",
+    )
+    (sidecar_dir / "subtitle_stream_01_pt.srt").write_text(
+        "1\n00:00:10,800 --> 00:00:11,100\nMesmo voce nao deve aparecer\n",
+        encoding="utf-8",
+    )
+
+    project = Project(id="p-language-lock", output_language="fr")
+    transcription = Transcription(
+        language="fr",
+        scenes=[
+            SceneTranscription(
+                scene_index=0,
+                text="",
+                words=[],
+                start_time=5.0,
+                end_time=5.8,
+                is_raw=True,
+            ),
+            SceneTranscription(
+                scene_index=1,
+                text="",
+                words=[],
+                start_time=5.8,
+                end_time=6.1,
+                is_raw=True,
+            ),
+        ],
+    )
+    resolved_scene_sources = {
+        0: ResolvedSceneSource(
+            scene_index=0,
+            source_path=source_path,
+            clip_name="episode",
+            source_in_frame=240,
+            source_out_frame=259,
+            source_in_seconds=10.0,
+            source_out_seconds=10.8,
+            source_duration_seconds=0.8,
+        ),
+        1: ResolvedSceneSource(
+            scene_index=1,
+            source_path=source_path,
+            clip_name="episode",
+            source_in_frame=259,
+            source_out_frame=266,
+            source_in_seconds=10.8,
+            source_out_seconds=11.1,
+            source_duration_seconds=0.3,
+        ),
+    }
+
+    text_entries, image_entries = asyncio.run(
+        ProcessingService._collect_raw_scene_source_subtitles(
+            project,
+            transcription,
+            resolved_scene_sources,
+            tmp_path / "output",
+        )
+    )
+
+    assert image_entries == []
+    assert [(round(entry.start, 1), round(entry.end, 1), entry.text) for entry in text_entries] == [
+        (5.0, 5.8, "Bonjour"),
+    ]
+
+
+def test_collect_raw_scene_source_subtitles_preserves_fallback_when_target_language_missing(
+    tmp_path,
+):
+    source_path = tmp_path / "episode.mkv"
+    normalized_source_path = source_path.with_suffix(".mp4")
+    sidecar_dir = AnimeLibraryService.get_subtitle_sidecar_dir(normalized_source_path)
+    sidecar_dir.mkdir(parents=True)
+    (sidecar_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "source_path": str(normalized_source_path),
+                "generated_from": str(source_path),
+                "subtitle_streams": [
+                    {
+                        "stream_index": 2,
+                        "stream_position": 0,
+                        "codec_name": "subrip",
+                        "language": "en",
+                        "raw_language": "eng",
+                        "title": "English",
+                        "kind": "text",
+                        "asset_filename": "subtitle_stream_00_en.srt",
+                        "status": "ok",
+                        "error": None,
+                    },
+                    {
+                        "stream_index": 3,
+                        "stream_position": 1,
+                        "codec_name": "subrip",
+                        "language": "pt",
+                        "raw_language": "por",
+                        "title": "Portuguese[BR]",
+                        "kind": "text",
+                        "asset_filename": "subtitle_stream_01_pt.srt",
+                        "status": "ok",
+                        "error": None,
+                    },
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (sidecar_dir / "subtitle_stream_00_en.srt").write_text(
+        "1\n00:00:10,000 --> 00:00:10,800\nEnglish fallback\n",
+        encoding="utf-8",
+    )
+    (sidecar_dir / "subtitle_stream_01_pt.srt").write_text(
+        "1\n00:00:10,000 --> 00:00:10,800\nFallback portugues\n",
+        encoding="utf-8",
+    )
+
+    project = Project(id="p-fallback-still-works", output_language="fr")
+    transcription = Transcription(
+        language="fr",
+        scenes=[
+            SceneTranscription(
+                scene_index=0,
+                text="",
+                words=[],
+                start_time=5.0,
+                end_time=5.8,
+                is_raw=True,
+            )
+        ],
+    )
+    resolved_scene_sources = {
+        0: ResolvedSceneSource(
+            scene_index=0,
+            source_path=source_path,
+            clip_name="episode",
+            source_in_frame=240,
+            source_out_frame=259,
+            source_in_seconds=10.0,
+            source_out_seconds=10.8,
+            source_duration_seconds=0.8,
+        )
+    }
+
+    text_entries, image_entries = asyncio.run(
+        ProcessingService._collect_raw_scene_source_subtitles(
+            project,
+            transcription,
+            resolved_scene_sources,
+            tmp_path / "output",
+        )
+    )
+
+    assert image_entries == []
+    assert [(round(entry.start, 1), round(entry.end, 1), entry.text) for entry in text_entries] == [
+        (5.0, 5.8, "English fallback"),
+    ]
+
+
 def test_collect_raw_scene_source_subtitles_prefers_overlapping_dialogue_over_non_overlapping_signs(
     tmp_path,
 ):
