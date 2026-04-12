@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from fractions import Fraction
+from pathlib import Path
 
 import pytest
 
@@ -8,7 +10,7 @@ from app.config import settings
 from app.models.match import MatchCandidate, SceneMatch
 from app.services.anime_matcher import AnimeMatcherService
 from app.services.gap_resolution import GapInfo, GapResolutionService, _NeighborContext
-from app.services.otio_timing import OTIOTimingCalculator
+from app.services.otio_timing import ClipTiming, FrameRateInfo, OTIOTimingCalculator
 
 
 def _make_match(scene_index: int, *, start_time: float, end_time: float) -> SceneMatch:
@@ -69,6 +71,58 @@ def test_gap_detection_uses_configured_floor(monkeypatch: pytest.MonkeyPatch):
     assert gaps[0].required_speed == Fraction(3, 4)
     assert gaps[0].effective_speed == Fraction(4, 5)
     assert gaps[0].gap_duration == pytest.approx(0.25)
+
+
+def test_raw_clip_continuity_uses_enforced_timeline_end():
+    calculator = OTIOTimingCalculator(
+        sequence_rate=FrameRateInfo(timebase=60, ntsc=False),
+        source_rate=FrameRateInfo(timebase=24, ntsc=True),
+    )
+    raw_timeline_start = 10.9
+    raw_timeline_end = 13.0
+    raw_source_in = float(Fraction(100 * 1001, 24000))
+    raw_source_out = float(Fraction(148 * 1001, 24000))
+
+    raw_clip = ClipTiming(
+        scene_index=0,
+        source_path=Path("/tmp/raw.mp4"),
+        bundle_filename="raw.mp4",
+        source_in=calculator.seconds_to_source_time(raw_source_in),
+        source_out=calculator.seconds_to_source_time(raw_source_out),
+        source_rate=calculator.source_rate,
+        timeline_start=calculator.seconds_to_timeline_time(raw_timeline_start),
+        timeline_end=calculator.seconds_to_timeline_time(raw_timeline_end),
+        timeline_rate=calculator.sequence_rate,
+        speed_ratio=Fraction(1, 1),
+        effective_speed=Fraction(1, 1),
+        leaves_gap=False,
+        enforced_timeline_end=calculator.seconds_to_timeline_time(raw_timeline_end),
+    )
+    next_clip = calculator.calculate_clip_timing(
+        scene_index=1,
+        source_path=Path("/tmp/next.mp4"),
+        bundle_filename="next.mp4",
+        source_in_seconds=0.0,
+        source_out_seconds=1.0,
+        timeline_start_seconds=raw_timeline_end,
+        timeline_end_seconds=raw_timeline_end + 1.0,
+    )
+
+    issues_without_override = calculator.validate_clip_continuity(
+        [replace(raw_clip, enforced_timeline_end=None), next_clip],
+        tolerance_frames=0,
+    )
+    issues_with_override = calculator.validate_clip_continuity(
+        [raw_clip, next_clip],
+        tolerance_frames=0,
+    )
+
+    assert len(issues_without_override) == 1
+    assert issues_without_override[0].issue_type == "gap"
+    assert issues_without_override[0].duration_seconds == pytest.approx(
+        raw_timeline_end - (raw_timeline_start + (raw_source_out - raw_source_in))
+    )
+    assert issues_with_override == []
 
 
 def test_fallback_candidates_use_configured_floor(monkeypatch: pytest.MonkeyPatch):

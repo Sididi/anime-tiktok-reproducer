@@ -125,6 +125,7 @@ class ClipTiming:
     speed_ratio: Fraction  # source_duration / target_duration
     effective_speed: Fraction  # capped at configured minimum speed
     leaves_gap: bool  # True if clip ends before next marker due to speed floor
+    enforced_timeline_end: RationalTime | None = None
 
     @property
     def source_in_seconds(self) -> float:
@@ -171,12 +172,19 @@ class ClipTiming:
     @property
     def actual_duration_seconds(self) -> float:
         """Actual clip duration after speed adjustment."""
+        if self.enforced_timeline_end is not None:
+            return max(
+                self.enforced_timeline_end.to_seconds() - self.timeline_start_seconds,
+                0.0,
+            )
         source_dur = self.source_duration.to_seconds()
         return source_dur / float(self.effective_speed)
 
     @property
     def actual_end_seconds(self) -> float:
         """Actual end position on timeline after speed adjustment."""
+        if self.enforced_timeline_end is not None:
+            return self.enforced_timeline_end.to_seconds()
         return self.timeline_start_seconds + self.actual_duration_seconds
 
     @property

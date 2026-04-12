@@ -523,6 +523,41 @@ class ProcessingService:
     def _get_scene_duration_from_bounds(start_time: float, end_time: float) -> float:
         return max(float(end_time) - float(start_time), 0.0)
 
+    @classmethod
+    def _resolve_scene_playback_bounds(
+        cls,
+        scene_trans: SceneTranscription,
+        calculator: OTIOTimingCalculator,
+    ) -> tuple[float, float]:
+        """Resolve authoritative scene playback bounds on the sequence frame grid."""
+        if scene_trans.end_time > scene_trans.start_time:
+            timeline_start_raw = scene_trans.start_time
+            timeline_end_raw = scene_trans.end_time
+        elif scene_trans.words:
+            timeline_start_raw = scene_trans.words[0].start
+            timeline_end_raw = scene_trans.words[-1].end
+        else:
+            timeline_start_raw = scene_trans.start_time
+            timeline_end_raw = scene_trans.end_time
+
+        timeline_start_frames = calculator.sequence_rate.frames_from_seconds(
+            timeline_start_raw
+        )
+        timeline_end_frames = calculator.sequence_rate.frames_from_seconds(
+            timeline_end_raw
+        )
+
+        timeline_start_snapped = calculator.sequence_rate.seconds_from_frames(
+            timeline_start_frames
+        )
+        timeline_end_snapped = calculator.sequence_rate.seconds_from_frames(
+            timeline_end_frames
+        )
+        if timeline_end_snapped < timeline_start_snapped:
+            timeline_end_snapped = timeline_start_snapped
+
+        return timeline_start_snapped, timeline_end_snapped
+
     @staticmethod
     def _get_wav_frame_range(
         start_seconds: float,
@@ -969,23 +1004,13 @@ class ProcessingService:
             # start_time/end_time are authoritative final playback bounds when
             # processing has rebuilt the raw-aware timeline. Fall back to
             # legacy word-derived timing only for older persisted data.
-            if scene_trans.end_time > scene_trans.start_time:
-                timeline_start_raw = scene_trans.start_time
-                timeline_end_raw = scene_trans.end_time
-            else:
-                timeline_start_raw = scene_trans.words[0].start
-                timeline_end_raw = scene_trans.words[-1].end
-
-            # Snap timeline positions to 60fps frame grid BEFORE speed calculation
-            # This keeps speed and placement perfectly aligned to frame boundaries
-            timeline_start_frames = calculator.sequence_rate.frames_from_seconds(timeline_start_raw)
-            timeline_start_snapped = calculator.sequence_rate.seconds_from_frames(
-                timeline_start_frames
+            timeline_start_snapped, timeline_end_snapped = (
+                cls._resolve_scene_playback_bounds(scene_trans, calculator)
             )
 
             if scene_trans.is_raw:
-                timeline_end_snapped = (
-                    timeline_start_snapped + resolved_source.source_duration_seconds
+                enforced_timeline_end = calculator.seconds_to_timeline_time(
+                    timeline_end_snapped
                 )
                 clip_timing = ClipTiming(
                     scene_index=scene_trans.scene_index,
@@ -1008,15 +1033,9 @@ class ProcessingService:
                     speed_ratio=Fraction(1, 1),
                     effective_speed=Fraction(1, 1),
                     leaves_gap=False,
+                    enforced_timeline_end=enforced_timeline_end,
                 )
             else:
-                timeline_end_frames = calculator.sequence_rate.frames_from_seconds(
-                    timeline_end_raw
-                )
-                timeline_end_snapped = calculator.sequence_rate.seconds_from_frames(
-                    timeline_end_frames
-                )
-
                 # Calculate frame-perfect timing using OTIO
                 clip_timing = calculator.calculate_clip_timing(
                     scene_index=scene_trans.scene_index,

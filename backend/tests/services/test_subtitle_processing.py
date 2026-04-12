@@ -2,6 +2,7 @@ import asyncio
 import json
 import sys
 import zipfile
+from fractions import Fraction
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -65,6 +66,34 @@ def _build_source_probe(
             ),
         ),
     )
+
+
+def _capture_generated_scene_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    transcription: Transcription,
+    resolved_scene_sources: dict[int, ResolvedSceneSource],
+) -> list[dict]:
+    captured: dict[str, list[dict]] = {}
+
+    def _fake_render(cls, **kwargs):
+        captured["scenes"] = kwargs["scenes"]
+        return "// jsx"
+
+    monkeypatch.setattr(
+        ProcessingService,
+        "_render_jsx_from_template",
+        classmethod(_fake_render),
+    )
+
+    jsx = ProcessingService.generate_jsx_script(
+        Project(id="p-raw-timing", output_language="fr"),
+        transcription,
+        matches=[],
+        resolved_scene_sources=resolved_scene_sources,
+    )
+
+    assert jsx == "// jsx"
+    return captured["scenes"]
 
 
 def test_normalize_external_subtitle_text_strips_markup_and_ass_controls():
@@ -1558,6 +1587,107 @@ def _render_raw_audio_jsx(source_audio_policies: dict[str, dict] | None = None) 
         music_filename="",
         music_gain_db=-24.0,
     )
+
+
+@pytest.mark.parametrize(
+    ("raw_start_time", "raw_source_frame_count"),
+    [
+        pytest.param(10.915, 48, id="raw-scene-gap-regression"),
+        pytest.param(20.905, 41, id="raw-scene-overlap-regression"),
+    ],
+)
+def test_generate_jsx_script_snaps_raw_scene_bounds_to_next_scene_start(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_start_time: float,
+    raw_source_frame_count: int,
+):
+    source_frame_seconds = float(Fraction(1001, 24000))
+    raw_source_duration = raw_source_frame_count * source_frame_seconds
+    raw_end_time = raw_start_time + raw_source_duration
+    next_end_time = raw_end_time + 1.25
+
+    transcription = Transcription(
+        language="fr",
+        scenes=[
+            SceneTranscription(
+                scene_index=0,
+                text="",
+                words=[],
+                start_time=raw_start_time,
+                end_time=raw_end_time,
+                is_raw=True,
+            ),
+            SceneTranscription(
+                scene_index=1,
+                text="next scene",
+                words=[
+                    Word(
+                        text="next",
+                        start=raw_end_time,
+                        end=raw_end_time + 0.6,
+                        confidence=1.0,
+                    )
+                ],
+                start_time=raw_end_time,
+                end_time=next_end_time,
+                is_raw=False,
+            ),
+        ],
+    )
+    resolved_scene_sources = {
+        0: ResolvedSceneSource(
+            scene_index=0,
+            source_path=Path("/tmp/raw-scene-source.mp4"),
+            clip_name="raw-scene-source",
+            source_in_frame=100,
+            source_out_frame=100 + raw_source_frame_count,
+            source_in_seconds=100 * source_frame_seconds,
+            source_out_seconds=(100 + raw_source_frame_count) * source_frame_seconds,
+            source_duration_seconds=raw_source_duration,
+            used_alternative=False,
+        ),
+        1: ResolvedSceneSource(
+            scene_index=1,
+            source_path=Path("/tmp/next-scene-source.mp4"),
+            clip_name="next-scene-source",
+            source_in_frame=240,
+            source_out_frame=312,
+            source_in_seconds=240 * source_frame_seconds,
+            source_out_seconds=312 * source_frame_seconds,
+            source_duration_seconds=(312 - 240) * source_frame_seconds,
+            used_alternative=False,
+        ),
+    }
+
+    scenes = _capture_generated_scene_payload(
+        monkeypatch,
+        transcription,
+        resolved_scene_sources,
+    )
+
+    assert [scene["scene_index"] for scene in scenes] == [0, 1]
+
+    raw_scene = scenes[0]
+    next_scene = scenes[1]
+    expected_raw_start = int(raw_start_time * 60) / 60
+    expected_raw_end = int(raw_end_time * 60) / 60
+
+    assert raw_scene["start"] == pytest.approx(expected_raw_start, abs=1e-6)
+    assert raw_scene["end"] == pytest.approx(expected_raw_end, abs=1e-6)
+    assert raw_scene["end"] == pytest.approx(next_scene["start"], abs=1e-6)
+    assert raw_scene["target_duration"] == pytest.approx(
+        round(expected_raw_end - expected_raw_start, 4),
+        abs=1e-4,
+    )
+    assert raw_scene["clip_duration"] == pytest.approx(
+        round(raw_source_duration, 4),
+        abs=1e-4,
+    )
+    assert raw_scene["source_in_frame"] == 100
+    assert raw_scene["source_out_frame"] == 100 + raw_source_frame_count
+    assert raw_scene["speed_ratio"] == pytest.approx(1.0)
+    assert raw_scene["effective_speed"] == pytest.approx(1.0)
+    assert raw_scene["is_raw"] is True
 
 
 def test_render_jsx_from_template_clears_a4_before_raw_audio_rebuild():
