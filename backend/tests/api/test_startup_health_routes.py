@@ -27,6 +27,7 @@ def test_health_route_returns_while_startup_readiness_is_pending(
     monkeypatch.setattr(main_module.ProjectService, "sync_all_project_pins", lambda: None)
     monkeypatch.setattr(main_module.LibraryHydrationService, "startup_cleanup", fake_async_noop)
     monkeypatch.setattr(main_module.project_startup_queue, "startup_cleanup", fake_async_noop)
+    monkeypatch.setattr(main_module.project_upload_queue, "startup_cleanup", fake_async_noop)
     monkeypatch.setattr(main_module.StorageBoxSftpClient, "close_pool", fake_async_noop)
     monkeypatch.setattr(main_module.settings, "storage_box_enabled", True)
     monkeypatch.setattr(main_module.settings, "integration_startup_health_check_enabled", True)

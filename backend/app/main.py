@@ -21,6 +21,7 @@ from .services.integration_health_service import IntegrationHealthService
 from .services.library_hydration_service import LibraryHydrationService
 from .services.project_service import ProjectService
 from .services.project_startup_service import project_startup_queue
+from .services.project_upload_service import project_upload_queue
 from .services.storage_box_sftp_client import StorageBoxSftpClient
 
 
@@ -122,6 +123,7 @@ async def lifespan(app: FastAPI):
     ProjectService.sync_all_project_pins()
     await LibraryHydrationService.startup_cleanup()
     await project_startup_queue.startup_cleanup()
+    await project_upload_queue.startup_cleanup()
 
     app.state.integrations_health = IntegrationHealthService.initialize_startup_state(
         integration_enabled=settings.integration_startup_health_check_enabled,

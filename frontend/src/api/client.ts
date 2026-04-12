@@ -205,16 +205,26 @@ export const api = {
     youtubeStrategy?: string,
     copyrightAudioPath?: string,
   ) =>
-    fetch(`${API_BASE}/project-manager/projects/${projectId}/upload`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        account_id: accountId ?? null,
-        facebook_strategy: facebookStrategy ?? null,
-        youtube_strategy: youtubeStrategy ?? null,
-        copyright_audio_path: copyrightAudioPath ?? null,
-      }),
-    }),
+    request<import("@/types").ProjectUploadJob>(
+      `/project-manager/projects/${projectId}/upload`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          account_id: accountId ?? null,
+          facebook_strategy: facebookStrategy ?? null,
+          youtube_strategy: youtubeStrategy ?? null,
+          copyright_audio_path: copyrightAudioPath ?? null,
+        }),
+      },
+    ),
+
+  listProjectUploadJobs: () =>
+    request<{ jobs: import("@/types").ProjectUploadJob[] }>(
+      "/project-manager/upload-jobs",
+    ),
+
+  streamProjectUploadJobs: () =>
+    fetch(`${API_BASE}/project-manager/upload-jobs/stream`),
 
   checkFacebookDuration: (projectId: string, accountId?: string) =>
     request<import("@/types").FacebookCheckResult>(

@@ -521,7 +521,24 @@ class UploadPhaseService:
         facebook_strategy: str | None = None,
         youtube_strategy: str | None = None,
         copyright_audio_path: str | None = None,
+        reserved_slot_dt: datetime | None = None,
+        reserved_scheduled_at: datetime | None = None,
+        progress_callback: Callable[[float, str, str], None] | None = None,
     ) -> dict[str, Any]:
+        def emit_progress(progress: float, phase: str, message: str) -> None:
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(progress, phase, message)
+            except Exception:
+                logger.warning(
+                    "Upload progress callback failed: project_id=%s phase=%s",
+                    project_id,
+                    phase,
+                    exc_info=True,
+                )
+
+        emit_progress(0.05, "prepare", "Preparing upload...")
         project = ProjectService.load(project_id)
         if not project:
             raise ValueError("Project not found")
@@ -567,15 +584,20 @@ class UploadPhaseService:
 
         # Calculate scheduled time if account has slots
         if account and account.slots and account_id:
-            slot_dt, scheduled_at = SchedulingService.find_next_slot(account_id)
+            if reserved_slot_dt is not None and reserved_scheduled_at is not None:
+                slot_dt, scheduled_at = reserved_slot_dt, reserved_scheduled_at
+            else:
+                slot_dt, scheduled_at = SchedulingService.find_next_slot(account_id)
 
         # Public share the drive video before upload phase.
+        emit_progress(0.15, "prepare", "Preparing Drive upload assets...")
         GoogleDriveService.set_public_read(readiness.drive_video_id)
         drive_video_url = readiness.drive_video_web_url or GoogleDriveService.get_web_view_url(readiness.drive_video_id)
         direct_drive_download = GoogleDriveService.get_direct_download_url(readiness.drive_video_id)
 
         with tempfile.TemporaryDirectory(prefix=f"atr-upload-{project_id}-") as tmp_dir:
             local_video_path = Path(tmp_dir) / (readiness.drive_video_name or "final_video.mp4")
+            emit_progress(0.30, "download", "Downloading final video from Drive...")
             GoogleDriveService.download_file(readiness.drive_video_id, local_video_path)
 
             # When copyright audio replacement is active, re-mux the video with the
@@ -706,6 +728,7 @@ class UploadPhaseService:
                     detail=detail,
                 )
 
+            emit_progress(0.55, "platform_upload", "Uploading to social platforms...")
             max_parallel = max(1, min(settings.social_upload_max_parallel, len(selected_jobs))) if selected_jobs else 1
             with ThreadPoolExecutor(max_workers=max_parallel) as executor:
                 future_to_platform = {
@@ -731,6 +754,7 @@ class UploadPhaseService:
             ]
 
         # Remove generation message first (if any), then post final upload message.
+        emit_progress(0.85, "finalize", "Finalizing upload state...")
         if project.generation_discord_message_id:
             DiscordService.delete_message(project.generation_discord_message_id)
             project.generation_discord_message_id = None
@@ -775,6 +799,7 @@ class UploadPhaseService:
         # Cleanup upload prep caches after upload
         cls.cleanup_facebook_prep(project_id)
         cls.cleanup_youtube_prep(project_id)
+        emit_progress(1.0, "complete", "Upload complete.")
 
         return {
             "platform_results": [asdict(item) for item in platform_results],

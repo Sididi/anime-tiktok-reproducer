@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 
 from .account_service import AccountService
 from .project_service import ProjectService
@@ -16,6 +17,7 @@ class SchedulingService:
     _JITTER_MINUTES = 30
     # Maximum days to look ahead
     _MAX_LOOKAHEAD_DAYS = 90
+    _reservation_lock = Lock()
 
     @classmethod
     def find_next_slot(cls, account_id: str) -> tuple[datetime, datetime]:
@@ -80,6 +82,44 @@ class SchedulingService:
             f"No available slot found for account {account_id} "
             f"within {cls._MAX_LOOKAHEAD_DAYS} days"
         )
+
+    @classmethod
+    def reserve_next_slot(cls, project_id: str, account_id: str) -> tuple[datetime, datetime]:
+        with cls._reservation_lock:
+            project = ProjectService.load(project_id)
+            if project is None:
+                raise ValueError("Project not found")
+
+            if (
+                project.scheduled_account_id == account_id
+                and project.scheduled_slot
+                and project.scheduled_at is not None
+            ):
+                slot_dt = datetime.fromisoformat(project.scheduled_slot)
+                scheduled_at = project.scheduled_at
+                if slot_dt.tzinfo is None:
+                    slot_dt = slot_dt.replace(tzinfo=timezone.utc)
+                if scheduled_at.tzinfo is None:
+                    scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
+                return slot_dt, scheduled_at
+
+            slot_dt, scheduled_at = cls.find_next_slot(account_id)
+            project.scheduled_account_id = account_id
+            project.scheduled_slot = slot_dt.isoformat()
+            project.scheduled_at = scheduled_at
+            ProjectService.save(project)
+            return slot_dt, scheduled_at
+
+    @classmethod
+    def clear_reserved_slot(cls, project_id: str) -> None:
+        with cls._reservation_lock:
+            project = ProjectService.load(project_id)
+            if project is None:
+                return
+            project.scheduled_account_id = None
+            project.scheduled_slot = None
+            project.scheduled_at = None
+            ProjectService.save(project)
 
     @classmethod
     def _randomize_slot(cls, slot_dt: datetime, now_utc: datetime) -> datetime:

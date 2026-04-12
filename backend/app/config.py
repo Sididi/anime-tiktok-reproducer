@@ -106,6 +106,7 @@ class Settings(BaseSettings):
     youtube_category_id: str = "22"
     youtube_channel_id: str | None = None
     social_upload_max_parallel: int = 3
+    project_upload_max_concurrent: int = 3
 
     # Meta Graph API
     meta_graph_api_version: str = "v25.0"
@@ -268,6 +269,11 @@ class Settings(BaseSettings):
     @field_validator("match_playback_max_workers")
     @classmethod
     def _clamp_match_playback_max_workers(cls, value: int) -> int:
+        return max(1, min(8, value))
+
+    @field_validator("project_upload_max_concurrent")
+    @classmethod
+    def _clamp_project_upload_max_concurrent(cls, value: int) -> int:
         return max(1, min(8, value))
 
     @field_validator("storage_box_max_connections")

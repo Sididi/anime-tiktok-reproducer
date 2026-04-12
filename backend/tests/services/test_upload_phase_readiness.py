@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -10,12 +11,13 @@ sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from app.models import VideoMetadataPayload
 from app.models.project import Project
-from app.services.account_service import AccountService
+from app.services.account_service import AccountConfig, AccountService
 from app.services.discord_service import DiscordService
 from app.services.export_service import ExportService
 from app.services.google_drive_service import GoogleDriveService
 from app.services.metadata import MetadataService
 from app.services.project_service import ProjectService
+from app.services.scheduling_service import SchedulingService
 from app.services.upload_phase import UploadPhaseService
 from app.config import settings
 
@@ -252,3 +254,119 @@ def test_compute_readiness_reports_drive_verification_failure_when_lookup_errors
 
     assert "unable to verify output video in Drive" in readiness.reasons
     assert "no output video found" not in readiness.reasons
+
+
+def test_execute_upload_emits_progress_and_reuses_reserved_slot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    project = Project(
+        id="project-progress",
+        anime_name="Demo",
+        output_language="fr",
+        drive_folder_id="folder-1",
+        drive_folder_url="https://drive.google.com/drive/folders/folder-1",
+        library_type="anime",
+    )
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.write_text("{}", encoding="utf-8")
+    subtitle_path = tmp_path / "subtitles.srt"
+    subtitle_path.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nDemo\n",
+        encoding="utf-8",
+    )
+    drive_video = {
+        "id": "drive-video-1",
+        "name": "output.mp4",
+        "webViewLink": "https://drive.google.com/file/d/drive-video-1/view",
+    }
+    account = AccountConfig(
+        id="acct-1",
+        name="Demo",
+        language="fr",
+        supported_types=[project.library_type],
+        slots=["14:00"],
+    )
+    slot_dt = datetime(2026, 4, 12, 14, 0, tzinfo=timezone.utc)
+    scheduled_at = datetime(2026, 4, 12, 14, 17, tzinfo=timezone.utc)
+    progress_events: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(UploadPhaseService, "_drive_video_cache", {}, raising=False)
+    monkeypatch.setattr(ProjectService, "load", classmethod(lambda cls, project_id: project if project_id == project.id else None))
+    monkeypatch.setattr(ProjectService, "save", classmethod(lambda cls, saved_project: None))
+    monkeypatch.setattr(
+        ProjectService,
+        "get_metadata_file",
+        classmethod(lambda cls, project_id: metadata_path),
+    )
+    monkeypatch.setattr(AccountService, "list_accounts", classmethod(lambda cls: [{"id": account.id}]))
+    monkeypatch.setattr(AccountService, "get_account", classmethod(lambda cls, account_id: account if account_id == account.id else None))
+    monkeypatch.setattr(
+        ExportService,
+        "subtitle_path",
+        classmethod(lambda cls, _project: subtitle_path),
+    )
+    monkeypatch.setattr(
+        MetadataService,
+        "load",
+        classmethod(lambda cls, project_id: _metadata_payload()),
+    )
+    monkeypatch.setattr(GoogleDriveService, "set_public_read", classmethod(lambda cls, file_id: None))
+    monkeypatch.setattr(
+        GoogleDriveService,
+        "get_direct_download_url",
+        classmethod(lambda cls, file_id: f"https://download/{file_id}"),
+    )
+    monkeypatch.setattr(
+        GoogleDriveService,
+        "download_file",
+        classmethod(lambda cls, file_id, destination: destination.write_bytes(b"video")),
+    )
+    monkeypatch.setattr(
+        DiscordService,
+        "post_message",
+        classmethod(lambda cls, message: SimpleNamespace(id="discord-1")),
+    )
+    monkeypatch.setattr(
+        DiscordService,
+        "delete_message",
+        classmethod(lambda cls, message_id: None),
+    )
+    monkeypatch.setattr(settings, "n8n_webhook_url", None)
+    monkeypatch.setattr(
+        UploadPhaseService,
+        "compute_readiness",
+        classmethod(
+            lambda cls, _project: cls._build_readiness(
+                metadata_exists=True,
+                folder_id="folder-1",
+                folder_url=project.drive_folder_url,
+                video_files=[drive_video],
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        SchedulingService,
+        "find_next_slot",
+        classmethod(lambda cls, account_id: (_ for _ in ()).throw(AssertionError("reserved slot should be reused"))),
+    )
+
+    result = UploadPhaseService.execute_upload(
+        project.id,
+        account_id=account.id,
+        platforms=["instagram"],
+        reserved_slot_dt=slot_dt,
+        reserved_scheduled_at=scheduled_at,
+        progress_callback=lambda progress, phase, message: progress_events.append((phase, message)),
+    )
+
+    assert result["requested_platforms"] == ["instagram"]
+    assert result["scheduled_at"] == scheduled_at.isoformat()
+    assert [phase for phase, _ in progress_events] == [
+        "prepare",
+        "prepare",
+        "download",
+        "platform_upload",
+        "finalize",
+        "complete",
+    ]

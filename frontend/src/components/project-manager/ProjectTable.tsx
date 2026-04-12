@@ -10,7 +10,7 @@ interface ProjectTableProps {
   sortColumn: SortColumn;
   sortDirection: SortDirection;
   onToggleSort: (column: SortColumn) => void;
-  activeUploadId: string | null;
+  uploadStateByProjectId: Record<string, { active: boolean; label: string | null }>;
   activeDeleteId: string | null;
   holdingDeleteId: string | null;
   onUpload: (row: ProjectManagerRow) => void;
@@ -74,7 +74,7 @@ export function ProjectTable({
   sortColumn,
   sortDirection,
   onToggleSort,
-  activeUploadId,
+  uploadStateByProjectId,
   activeDeleteId,
   holdingDeleteId,
   onUpload,
@@ -125,7 +125,7 @@ export function ProjectTable({
               key={row.project_id}
               row={row}
               accounts={accounts}
-              activeUploadId={activeUploadId}
+              uploadState={uploadStateByProjectId[row.project_id]}
               activeDeleteId={activeDeleteId}
               holdingDeleteId={holdingDeleteId}
               onUpload={onUpload}

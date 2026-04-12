@@ -190,6 +190,19 @@ export interface ProjectManagerRow {
   scheduled_account_id: string | null;
 }
 
+export interface ProjectUploadJob {
+  job_id: string;
+  project_id: string;
+  account_id: string | null;
+  status: "queued" | "running" | "complete" | "error";
+  phase: string | null;
+  message: string | null;
+  error: string | null;
+  result: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export type UploadDurationStrategy = "cut" | "sped_up" | "skip";
 
 export interface FacebookCheckResult {

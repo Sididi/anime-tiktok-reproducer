@@ -63,6 +63,8 @@ _EXPORTS = {
     "IndexationPreflightService": (".indexation_preflight", "IndexationPreflightService"),
     "ProjectStartupService": (".project_startup_service", "ProjectStartupService"),
     "project_startup_queue": (".project_startup_service", "project_startup_queue"),
+    "ProjectUploadService": (".project_upload_service", "ProjectUploadService"),
+    "project_upload_queue": (".project_upload_service", "project_upload_queue"),
 }
 
 __all__ = list(_EXPORTS)
