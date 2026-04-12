@@ -234,6 +234,33 @@ class TestAnimeLibraryNormalization(TestCase):
         self.assertEqual(policy.selected_channel_offset, 2)
         self.assertEqual(policy.channel_type, "stereo")
 
+    def test_build_source_audio_selection_policy_keeps_english_for_dual_51_sources(self) -> None:
+        source_path = Path("/tmp/fake-dual-51-episode.mkv")
+        source_probe = _make_probe(
+            source_path,
+            audio_streams=(
+                _audio_stream(index=1, stream_position=0, language="it", channels=6),
+                _audio_stream(index=2, stream_position=1, language="en", channels=6),
+            ),
+        )
+
+        with patch.object(
+            AnimeLibraryService,
+            "_probe_media_sync",
+            return_value=source_probe,
+        ):
+            policy = AnimeLibraryService.build_source_audio_selection_policy(
+                source_path,
+                target_language="fr",
+            )
+
+        self.assertEqual(policy.selected_stream_index, 2)
+        self.assertEqual(policy.selected_stream_position, 1)
+        self.assertEqual(policy.selected_language, "en")
+        self.assertEqual(policy.selected_channel_count, 6)
+        self.assertEqual(policy.selected_channel_offset, 6)
+        self.assertEqual(policy.channel_type, "51")
+
     def test_build_source_audio_selection_policy_uses_original_audio_metadata_when_languages_are_unknown(self) -> None:
         source_path = Path("/tmp/library/episode-unknown.mp4")
         original_source_path = Path("/tmp/torrents/episode-unknown.mkv")

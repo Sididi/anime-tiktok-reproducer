@@ -1884,8 +1884,11 @@
   function getRawAudioBlockWidth(clipName) {
     var channelTypeName = getSourceAudioChannelTypeName(clipName);
     var channelCount = getSourceAudioSelectedChannelCount(clipName);
-    if (channelTypeName === "51" && channelCount > 1) return channelCount;
-    return 1;
+    if (channelTypeName !== "51") return 1;
+    if (!(channelCount > 1)) return 1;
+    // Keep the reserved raw-audio zone wide enough for multichannel placement.
+    // repairRawAudioPlacement resolves the observed track layout after import.
+    return channelCount;
   }
 
   function getRequiredRawAudioZoneWidth(clipName) {
@@ -1919,7 +1922,7 @@
       channelTypeName +
       "/stream " +
       (selectedStreamPosition + 1) +
-      "/block " +
+      "/reserve " +
       blockWidth
     );
   }
@@ -5103,24 +5106,29 @@
         entry.trackIndex !== current.endTrackIndex + 1;
       if (needsNewBlock) {
         if (current && current.entries.length > 0) {
+          current.isComplete = current.entries.length === safeWidth;
           blocks.push(current);
         }
         current = {
           entries: [],
           startTrackIndex: entry.trackIndex,
           endTrackIndex: entry.trackIndex,
+          expectedWidth: safeWidth,
+          isComplete: false,
         };
       }
 
       current.entries.push(entry);
       current.endTrackIndex = entry.trackIndex;
       if (current.entries.length >= safeWidth) {
+        current.isComplete = true;
         blocks.push(current);
         current = null;
       }
     }
 
     if (current && current.entries.length > 0) {
+      current.isComplete = current.entries.length === safeWidth;
       blocks.push(current);
     }
     return blocks;
@@ -5132,6 +5140,125 @@
     var endLabel = "A" + (block.endTrackIndex + 1);
     if (block.startTrackIndex === block.endTrackIndex) return startLabel;
     return startLabel + "-" + endLabel;
+  }
+
+  function formatRawAudioBlockList(blocks) {
+    if (!blocks || blocks.length <= 0) return "none";
+    var labels = [];
+    for (var i = 0; i < blocks.length; i++) {
+      var block = blocks[i];
+      if (!block || !block.entries || block.entries.length <= 0) continue;
+
+      var label = formatRawAudioBlock(block);
+      var expectedWidth =
+        typeof block.expectedWidth === "number" && block.expectedWidth > 0
+          ? block.expectedWidth
+          : 1;
+      if (block.entries.length !== expectedWidth) {
+        label += " (partial " + block.entries.length + "/" + expectedWidth + ")";
+      }
+      labels.push(label);
+    }
+    return labels.length > 0 ? labels.join(", ") : "none";
+  }
+
+  function hasRequiredCompleteRawAudioBlocks(
+    blocks,
+    blockWidth,
+    selectedStreamPosition,
+  ) {
+    if (!blocks || blocks.length <= 0) return false;
+
+    var desiredBlockCount =
+      typeof selectedStreamPosition === "number" && selectedStreamPosition >= 0
+        ? Math.floor(selectedStreamPosition) + 1
+        : 1;
+    if (blocks.length < desiredBlockCount) return false;
+
+    var previousBlock = null;
+    for (var i = 0; i < desiredBlockCount; i++) {
+      var block = blocks[i];
+      if (!block || !block.entries || block.entries.length !== blockWidth) {
+        return false;
+      }
+      if (
+        previousBlock &&
+        block.startTrackIndex !== previousBlock.endTrackIndex + 1
+      ) {
+        return false;
+      }
+      previousBlock = block;
+    }
+    return true;
+  }
+
+  function resolveRawAudioBlocksForRepair(
+    scene,
+    entries,
+    selectedStreamPosition,
+  ) {
+    var clipName = scene && scene.clipName ? scene.clipName : "";
+    var channelTypeName = getSourceAudioChannelTypeName(clipName);
+    var channelCount = getSourceAudioSelectedChannelCount(clipName);
+    var perTrackBlocks = buildRawAudioBlocks(entries, 1);
+
+    if (channelTypeName === "51" && channelCount > 1) {
+      var multichannelBlocks = buildRawAudioBlocks(entries, channelCount);
+      if (
+        hasRequiredCompleteRawAudioBlocks(
+          multichannelBlocks,
+          channelCount,
+          selectedStreamPosition,
+        )
+      ) {
+        log(
+          "Raw audio scene " +
+            scene.scene_index +
+            " using observed 5.1 multichannel grouping (" +
+            channelCount +
+            " track(s) per stream): " +
+            formatRawAudioBlockList(multichannelBlocks) +
+            ".",
+        );
+        return {
+          mode: "observed-multichannel",
+          blockWidth: channelCount,
+          blocks: multichannelBlocks,
+        };
+      }
+
+      log(
+        "Raw audio scene " +
+          scene.scene_index +
+          " falling back to per-track grouping for 5.1 policy because placed clips " +
+          formatRawAudioTrackEntryList(entries) +
+          " do not form " +
+          (selectedStreamPosition + 1) +
+          " contiguous block(s) of width " +
+          channelCount +
+          "; using blocks " +
+          formatRawAudioBlockList(perTrackBlocks) +
+          ".",
+      );
+      return {
+        mode: "per-track",
+        blockWidth: 1,
+        blocks: perTrackBlocks,
+      };
+    }
+
+    log(
+      "Raw audio scene " +
+        scene.scene_index +
+        " using per-track grouping: " +
+        formatRawAudioBlockList(perTrackBlocks) +
+        ".",
+    );
+    return {
+      mode: "per-track",
+      blockWidth: 1,
+      blocks: perTrackBlocks,
+    };
   }
 
   function isAudioTrackItemNearStart(item, startSec) {
@@ -5172,6 +5299,7 @@
     nameRef,
     fromTrackIndex,
     toTrackIndexExclusive,
+    allowUnnamedFallback,
   ) {
     var entries = [];
     var seen = {};
@@ -5183,6 +5311,7 @@
       typeof toTrackIndexExclusive === "number" && toTrackIndexExclusive > 0
         ? toTrackIndexExclusive
         : null;
+    var useUnnamedFallback = allowUnnamedFallback !== false;
 
     var addEntry = function (item) {
       if (!isAudioTrackItemNearStart(item, startSec)) return;
@@ -5238,8 +5367,10 @@
         if (!track) continue;
         var placedItem =
           resolvePlacedItemFast(track, startSec, nameRef, TRACK_ITEM_WAIT_MAX_MS) ||
-          findTrackItemAtStart(track, startSec, nameRef) ||
-          findTrackItemAtStart(track, startSec, null);
+          findTrackItemAtStart(track, startSec, nameRef);
+        if (!placedItem && useUnnamedFallback) {
+          placedItem = findTrackItemAtStart(track, startSec, null);
+        }
         addEntry(placedItem);
       }
     }
@@ -5247,6 +5378,66 @@
     entries.sort(function (a, b) {
       return a.trackIndex - b.trackIndex;
     });
+    return entries;
+  }
+
+  function mergeRawAudioTrackEntries(entries, additionalEntries) {
+    var merged = [];
+    var seen = {};
+
+    var addList = function (items) {
+      if (!items || items.length <= 0) return;
+      for (var i = 0; i < items.length; i++) {
+        var entry = items[i];
+        if (!entry || typeof entry.trackIndex !== "number" || !entry.clip) continue;
+
+        var key = "track:" + entry.trackIndex.toString();
+        if (seen[key]) continue;
+        seen[key] = true;
+        merged.push(entry);
+      }
+    };
+
+    addList(entries);
+    addList(additionalEntries);
+
+    merged.sort(function (a, b) {
+      return a.trackIndex - b.trackIndex;
+    });
+    return merged;
+  }
+
+  function collectRawAudioPlacedTrackItemsAcrossSequence(
+    sequence,
+    startSec,
+    nameRef,
+  ) {
+    var entries = [];
+    if (!sequence || !sequence.audioTracks || !nameRef) return entries;
+
+    for (var ti = 0; ti < sequence.audioTracks.numTracks; ti++) {
+      var track = sequence.audioTracks[ti];
+      if (!track) continue;
+
+      var matchedItem =
+        resolvePlacedItemFast(track, startSec, nameRef, TRACK_ITEM_WAIT_MAX_MS) ||
+        findTrackItemAtStart(track, startSec, nameRef);
+      if (!matchedItem) continue;
+
+      entries = mergeRawAudioTrackEntries(
+        entries,
+        collectRawAudioLinkedTrackItems(
+          sequence,
+          matchedItem,
+          startSec,
+          nameRef,
+          0,
+          null,
+          false,
+        ),
+      );
+    }
+
     return entries;
   }
 
@@ -5369,7 +5560,6 @@
         ? Math.floor(rawZoneWidth)
         : 1;
     var rawZoneEndTrackIndex = a4Index + safeRawZoneWidth;
-    var blockWidth = getRawAudioBlockWidth(scene.clipName);
     var selectedStreamPosition = getSourceAudioSelectedStreamPosition(
       scene.clipName,
     );
@@ -5385,9 +5575,26 @@
       a4Index,
       rawZoneEndTrackIndex,
     );
+    var sequenceEntries = collectRawAudioPlacedTrackItemsAcrossSequence(
+      sequence,
+      startSec,
+      subclipName,
+    );
+    if (sequenceEntries.length > entries.length) {
+      log(
+        "Raw audio scene " +
+          scene.scene_index +
+          " found placed clips outside the reserved zone; using sequence-wide placement " +
+          formatRawAudioTrackEntryList(sequenceEntries) +
+          " instead of zone entries " +
+          formatRawAudioTrackEntryList(entries) +
+          ".",
+      );
+      entries = sequenceEntries;
+    }
     if (entries.length <= 0) {
       log(
-        "Warning: No raw audio clips were found in the reserved zone for scene " +
+        "Warning: No raw audio clips were found for scene " +
           scene.scene_index +
           ".",
       );
@@ -5404,7 +5611,12 @@
         ".",
     );
 
-    var blocks = buildRawAudioBlocks(entries, blockWidth);
+    var blockResolution = resolveRawAudioBlocksForRepair(
+      scene,
+      entries,
+      selectedStreamPosition,
+    );
+    var blocks = blockResolution ? blockResolution.blocks || [] : [];
     if (blocks.length <= 0) {
       log(
         "Warning: Raw audio blocks could not be resolved for scene " +
@@ -5519,6 +5731,18 @@
           subclipName,
         )
       ) {
+        if (getSourceAudioChannelTypeName(scene.clipName) === "51") {
+          log(
+            "Raw audio block for scene " +
+              scene.scene_index +
+              " could not be moved into A" +
+              (a4Index + 1) +
+              "; leaving kept 5.1 block on " +
+              formatRawAudioBlock(desiredBlock) +
+              ".",
+          );
+          return true;
+        }
         log(
           "Warning: Raw audio block for scene " +
             scene.scene_index +
@@ -6103,6 +6327,34 @@
 
     for (var i = safeStartIndex; i < endTrackIndex; i++) {
       clearTrackClips(sequence.audioTracks[i]);
+    }
+
+    for (var j = endTrackIndex; j < sequence.audioTracks.numTracks; j++) {
+      var track = sequence.audioTracks[j];
+      if (!track || !track.clips) continue;
+      for (var ci = track.clips.numItems - 1; ci >= 0; ci--) {
+        var clip = track.clips[ci];
+        if (!clip) continue;
+
+        var clipName = "";
+        try {
+          clipName = clip.name ? clip.name.toString() : "";
+          if (!clipName && clip.projectItem && clip.projectItem.name) {
+            clipName = clip.projectItem.name.toString();
+          }
+        } catch (eName) {
+          clipName = "";
+        }
+        if (clipName.indexOf(RAW_AUDIO_SUBCLIP_PREFIX) !== 0) continue;
+
+        try {
+          clip.remove(false, true);
+        } catch (e0) {
+          try {
+            clip.remove();
+          } catch (e1) {}
+        }
+      }
     }
   }
 

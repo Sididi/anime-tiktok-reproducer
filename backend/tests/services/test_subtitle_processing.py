@@ -1716,13 +1716,20 @@ def test_render_jsx_from_template_clears_a4_before_raw_audio_rebuild():
     assert "var rawAudioTrackDesiredCount = Math.max(" in jsx
     assert "ensureAudioTracks(sequence, rawAudioTrackDesiredCount);" in jsx
     assert "function collectRawAudioLinkedTrackItems(" in jsx
+    assert "function mergeRawAudioTrackEntries(" in jsx
+    assert "function collectRawAudioPlacedTrackItemsAcrossSequence(" in jsx
     assert "anchorItem.getLinkedItems()" in jsx
     assert "function buildRawAudioBlocks(" in jsx
+    assert "function formatRawAudioBlockList(" in jsx
+    assert "function hasRequiredCompleteRawAudioBlocks(" in jsx
+    assert "function resolveRawAudioBlocksForRepair(" in jsx
     assert "function moveQEAudioTrackItem(" in jsx
     assert "qeItem.moveToTrack(toTrackIndex);" in jsx
     assert "function moveRawAudioBlockToTrack(" in jsx
     assert "function repairRawAudioPlacement(" in jsx
-    assert "var blockWidth = getRawAudioBlockWidth(scene.clipName);" in jsx
+    assert "var sequenceEntries = collectRawAudioPlacedTrackItemsAcrossSequence(" in jsx
+    assert "var blockResolution = resolveRawAudioBlocksForRepair(" in jsx
+    assert "var blocks = blockResolution ? blockResolution.blocks || [] : [];" in jsx
     assert "var desiredBlockIndex = selectedStreamPosition;" in jsx
     assert "var keepTrackIndexes = {};" in jsx
     assert "repairRawAudioPlacement(" in jsx
@@ -1785,7 +1792,7 @@ def test_render_jsx_from_template_raw_audio_zone_supports_shifted_stereo_policy(
     assert "requested stream block " in jsx
 
 
-def test_render_jsx_from_template_raw_audio_zone_supports_default_51_policy():
+def test_render_jsx_from_template_raw_audio_zone_supports_observed_51_layout_resolution():
     jsx = _render_raw_audio_jsx(
         {
             "S01E03-Our First Date [AA9843FE]": {
@@ -1802,7 +1809,12 @@ def test_render_jsx_from_template_raw_audio_zone_supports_default_51_policy():
     assert '"selected_stream_position": 0' in jsx
     assert '"selected_channel_count": 6' in jsx
     assert '"channel_type": "51"' in jsx
-    assert 'if (channelTypeName === "51" && channelCount > 1) return channelCount;' in jsx
+    assert "found placed clips outside the reserved zone; using sequence-wide placement " in jsx
+    assert "using observed 5.1 multichannel grouping (" in jsx
+    assert "falling back to per-track grouping for 5.1 policy because placed clips " in jsx
+    assert "leaving kept 5.1 block on " in jsx
+    assert "do not form " in jsx
+    assert 'if (channelTypeName === "51" && channelCount > 1) return channelCount;' not in jsx
 
 
 def test_export_collects_internal_subtitle_timing_files(tmp_path):
