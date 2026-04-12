@@ -1855,6 +1855,94 @@
     return null;
   }
 
+  function logSceneClipFailure(scene, phase, detail) {
+    if (!scene) return;
+    var clipRef = trimSpaces(scene.clipName || "");
+    var cleanClip = stripKnownExtension(clipRef);
+    var suffix = detail ? ": " + detail : ".";
+    log(
+      "Warning: Scene " +
+        scene.scene_index +
+        " " +
+        phase +
+        " failed for '" +
+        (cleanClip || clipRef || "clip") +
+        "'" +
+        suffix,
+    );
+  }
+
+  function resolveSceneClipForRetry(scene) {
+    if (!scene) return null;
+    var clipRef = trimSpaces(scene.clipName || "");
+    var cleanClip = stripKnownExtension(clipRef);
+    if (cleanClip) {
+      var byClean = getOrImportClip(cleanClip);
+      if (byClean) return byClean;
+    }
+    if (clipRef && clipRef !== cleanClip) {
+      return getOrImportClip(clipRef);
+    }
+    return null;
+  }
+
+  function resolveSceneTrackItemWithRetry(
+    track,
+    startSec,
+    scene,
+    trackLabel,
+    clip,
+    cleanName,
+    maxWaitMs,
+  ) {
+    if (!track || !scene) return null;
+    var item =
+      resolvePlacedItemFast(track, startSec, cleanName, maxWaitMs) ||
+      findTrackItemAtStart(track, startSec, cleanName) ||
+      findTrackItemAtStart(track, startSec, null);
+    if (item) return item;
+
+    logSceneClipFailure(
+      scene,
+      trackLabel + " placement",
+      "placed item missing at " + startSec.toFixed(3) + "s; retrying once",
+    );
+    var retryClip = clip || resolveSceneClipForRetry(scene);
+    if (!retryClip) {
+      logSceneClipFailure(
+        scene,
+        trackLabel + " import",
+        "retry clip lookup failed",
+      );
+      return null;
+    }
+
+    try {
+      track.overwriteClip(retryClip, startSec);
+    } catch (eRetry) {
+      logSceneClipFailure(
+        scene,
+        trackLabel + " placement",
+        eRetry && eRetry.message ? eRetry.message : eRetry,
+      );
+      return null;
+    }
+
+    sleep(20);
+    item =
+      resolvePlacedItemFast(track, startSec, cleanName, maxWaitMs) ||
+      findTrackItemAtStart(track, startSec, cleanName) ||
+      findTrackItemAtStart(track, startSec, null);
+    if (!item) {
+      logSceneClipFailure(
+        scene,
+        trackLabel + " placement",
+        "retry placed item still missing",
+      );
+    }
+    return item;
+  }
+
   function buildRawAudioSubclipName(scene) {
     if (!scene) return "";
     return (
@@ -1957,7 +2045,9 @@
       log(
         "Warning: Raw audio source item is unavailable for scene " +
           scene.scene_index +
-          " (" +
+          " ('" +
+          trimSpaces(scene.clipName || "") +
+          "' -> " +
           subclipName +
           ").",
       );
@@ -2216,166 +2306,175 @@
       var clip = getOrImportClip(s.clipName);
       var cleanName = nameCleaner(s.clipName);
 
-      if (clip) {
-        perfStart("scenes_placement");
-        // 1. PLACE ON V3 (Main)
-        if (v3) v3.overwriteClip(clip, startSec);
+      if (!clip) {
+        logSceneClipFailure(s, "source clip import", "initial lookup failed");
+        continue;
+      }
 
-        // 2. PLACE ON V1 (Background)
-        if (v1) v1.overwriteClip(clip, startSec);
+      perfStart("scenes_placement");
+      // 1. PLACE ON V3 (Main)
+      if (v3) v3.overwriteClip(clip, startSec);
 
-        // 2b. SET PER-INSTANCE IN/OUT (TrackItem) TO AVOID UNIT AMBIGUITY
-        var v3Item = null;
-        var v1Item = null;
-        var a1Item = null;
-        var a2Item = null;
-        if (v3) {
-          v3Item = resolvePlacedItemFast(
-            v3,
+      // 2. PLACE ON V1 (Background)
+      if (v1) v1.overwriteClip(clip, startSec);
+
+      // 2b. SET PER-INSTANCE IN/OUT (TrackItem) TO AVOID UNIT AMBIGUITY
+      var v3Item = null;
+      var v1Item = null;
+      var a1Item = null;
+      var a2Item = null;
+      if (v3) {
+        v3Item = resolveSceneTrackItemWithRetry(
+          v3,
+          startSec,
+          s,
+          "V3",
+          clip,
+          cleanName,
+          TRACK_ITEM_WAIT_MAX_MS,
+        );
+        v3Item = setTrackItemInOutFromItem(
+          v3Item,
+          s.source_in,
+          s.source_out,
+          s.source_in_frame,
+          s.source_out_frame,
+        );
+      }
+      if (v1) {
+        v1Item = resolveSceneTrackItemWithRetry(
+          v1,
+          startSec,
+          s,
+          "V1",
+          clip,
+          cleanName,
+          TRACK_ITEM_WAIT_MAX_MS,
+        );
+        v1Item = setTrackItemInOutFromItem(
+          v1Item,
+          s.source_in,
+          s.source_out,
+          s.source_in_frame,
+          s.source_out_frame,
+        );
+      }
+      if (a1) {
+        a1Item = resolvePlacedItemFast(
+          a1,
+          startSec,
+          cleanName,
+          TRACK_ITEM_WAIT_MAX_MS,
+        );
+        a1Item = setTrackItemInOutFromItem(
+          a1Item,
+          s.source_in,
+          s.source_out,
+          s.source_in_frame,
+          s.source_out_frame,
+        );
+      }
+      if (MUTATE_TRANSIENT_A2_SCENE_AUDIO && a2 && a2 !== a1) {
+        a2Item = resolvePlacedItemFast(
+          a2,
+          startSec,
+          cleanName,
+          TRACK_ITEM_WAIT_MAX_MS,
+        );
+        a2Item = setTrackItemInOutFromItem(
+          a2Item,
+          s.source_in,
+          s.source_out,
+          s.source_in_frame,
+          s.source_out_frame,
+        );
+      }
+      perfEnd("scenes_placement");
+
+      // 3. ENFORCE DURATION
+      // Raw scenes stay at native speed but still need an explicit timeline
+      // duration so trailing raw clips do not extend past final playback.
+      var newDurationSeconds = snapSecondsToFrame(s.target_duration);
+      enforceTrackItemDuration(v3Item, newDurationSeconds);
+      enforceTrackItemDuration(v1Item, newDurationSeconds);
+      enforceTrackItemDuration(a1Item, newDurationSeconds);
+      if (MUTATE_TRANSIENT_A2_SCENE_AUDIO) {
+        enforceTrackItemDuration(a2Item, newDurationSeconds);
+      }
+
+      // 4. APPLY SPEED (Both V1, V3, A1, and optionally A2)
+      // QE setSpeed often fails to ripple-edit duration for speedups, so we pre-resize above.
+      if (!s.is_raw && Math.abs(s.effective_speed - 1.0) > 0.01) {
+        perfStart("scenes_speed");
+        if (v3)
+          safeApplySpeedQE(
             startSec,
+            s.effective_speed,
+            2,
+            "Video",
             cleanName,
-            TRACK_ITEM_WAIT_MAX_MS,
+            sequence,
+            qeSeq,
+            qeTrackCache,
+            QE_TRACK_ITEM_HINTS,
           );
-          v3Item = setTrackItemInOutFromItem(
-            v3Item,
-            s.source_in,
-            s.source_out,
-            s.source_in_frame,
-            s.source_out_frame,
-          );
-        }
-        if (v1) {
-          v1Item = resolvePlacedItemFast(
-            v1,
+        if (v1)
+          safeApplySpeedQE(
             startSec,
+            s.effective_speed,
+            0,
+            "Video",
             cleanName,
-            TRACK_ITEM_WAIT_MAX_MS,
+            sequence,
+            qeSeq,
+            qeTrackCache,
+            QE_TRACK_ITEM_HINTS,
           );
-          v1Item = setTrackItemInOutFromItem(
-            v1Item,
-            s.source_in,
-            s.source_out,
-            s.source_in_frame,
-            s.source_out_frame,
-          );
-        }
-        if (a1) {
-          a1Item = resolvePlacedItemFast(
-            a1,
+        if (a1 && a1Item)
+          safeApplySpeedQE(
             startSec,
+            s.effective_speed,
+            0,
+            "Audio",
             cleanName,
-            TRACK_ITEM_WAIT_MAX_MS,
+            sequence,
+            qeSeq,
+            qeTrackCache,
+            QE_TRACK_ITEM_HINTS,
           );
-          a1Item = setTrackItemInOutFromItem(
-            a1Item,
-            s.source_in,
-            s.source_out,
-            s.source_in_frame,
-            s.source_out_frame,
-          );
-        }
-        if (MUTATE_TRANSIENT_A2_SCENE_AUDIO && a2 && a2 !== a1) {
-          a2Item = resolvePlacedItemFast(
-            a2,
+        if (MUTATE_TRANSIENT_A2_SCENE_AUDIO && a2 && a2Item && a2 !== a1)
+          safeApplySpeedQE(
             startSec,
+            s.effective_speed,
+            1,
+            "Audio",
             cleanName,
-            TRACK_ITEM_WAIT_MAX_MS,
+            sequence,
+            qeSeq,
+            qeTrackCache,
+            QE_TRACK_ITEM_HINTS,
           );
-          a2Item = setTrackItemInOutFromItem(
-            a2Item,
-            s.source_in,
-            s.source_out,
-            s.source_in_frame,
-            s.source_out_frame,
+        perfEnd("scenes_speed");
+      }
+
+      // 4. APPLY SCALE (Standard API)
+      perfStart("scenes_scale");
+      if (!setScaleOnItem(v3Item, 75) && v3)
+        setScaleAndPosition(v3, startSec, 75); // Main Scaled Down
+      if (!setScaleOnItem(v1Item, 183) && v1)
+        setScaleAndPosition(v1, startSec, 183); // Background Scaled Up
+      perfEnd("scenes_scale");
+
+      if (v3Item) {
+        logClipDuration(v3Item, s.target_duration, "Scene " + s.scene_index);
+      } else if (v3) {
+        var v3ItemForLog = findTrackItemAtStart(v3, startSec, cleanName);
+        if (v3ItemForLog) {
+          logClipDuration(
+            v3ItemForLog,
+            s.target_duration,
+            "Scene " + s.scene_index,
           );
-        }
-        perfEnd("scenes_placement");
-
-        // 3. ENFORCE DURATION
-        // Raw scenes stay at native speed but still need an explicit timeline
-        // duration so trailing raw clips do not extend past final playback.
-        var newDurationSeconds = snapSecondsToFrame(s.target_duration);
-        enforceTrackItemDuration(v3Item, newDurationSeconds);
-        enforceTrackItemDuration(v1Item, newDurationSeconds);
-        enforceTrackItemDuration(a1Item, newDurationSeconds);
-        if (MUTATE_TRANSIENT_A2_SCENE_AUDIO) {
-          enforceTrackItemDuration(a2Item, newDurationSeconds);
-        }
-
-        // 4. APPLY SPEED (Both V1, V3, A1, and optionally A2)
-        // QE setSpeed often fails to ripple-edit duration for speedups, so we pre-resize above.
-        if (!s.is_raw && Math.abs(s.effective_speed - 1.0) > 0.01) {
-          perfStart("scenes_speed");
-          if (v3)
-            safeApplySpeedQE(
-              startSec,
-              s.effective_speed,
-              2,
-              "Video",
-              cleanName,
-              sequence,
-              qeSeq,
-              qeTrackCache,
-              QE_TRACK_ITEM_HINTS,
-            );
-          if (v1)
-            safeApplySpeedQE(
-              startSec,
-              s.effective_speed,
-              0,
-              "Video",
-              cleanName,
-              sequence,
-              qeSeq,
-              qeTrackCache,
-              QE_TRACK_ITEM_HINTS,
-            );
-          if (a1 && a1Item)
-            safeApplySpeedQE(
-              startSec,
-              s.effective_speed,
-              0,
-              "Audio",
-              cleanName,
-              sequence,
-              qeSeq,
-              qeTrackCache,
-              QE_TRACK_ITEM_HINTS,
-            );
-          if (MUTATE_TRANSIENT_A2_SCENE_AUDIO && a2 && a2Item && a2 !== a1)
-            safeApplySpeedQE(
-              startSec,
-              s.effective_speed,
-              1,
-              "Audio",
-              cleanName,
-              sequence,
-              qeSeq,
-              qeTrackCache,
-              QE_TRACK_ITEM_HINTS,
-            );
-          perfEnd("scenes_speed");
-        }
-
-        // 4. APPLY SCALE (Standard API)
-        perfStart("scenes_scale");
-        if (!setScaleOnItem(v3Item, 75) && v3)
-          setScaleAndPosition(v3, startSec, 75); // Main Scaled Down
-        if (!setScaleOnItem(v1Item, 183) && v1)
-          setScaleAndPosition(v1, startSec, 183); // Background Scaled Up
-        perfEnd("scenes_scale");
-
-        if (v3Item) {
-          logClipDuration(v3Item, s.target_duration, "Scene " + s.scene_index);
-        } else if (v3) {
-          var v3ItemForLog = findTrackItemAtStart(v3, startSec, cleanName);
-          if (v3ItemForLog) {
-            logClipDuration(
-              v3ItemForLog,
-              s.target_duration,
-              "Scene " + s.scene_index,
-            );
-          }
         }
       }
     }
@@ -2425,6 +2524,7 @@
       }
     }
 
+    validateAndRepairRawSceneVideoPlacement(v1, v3, scenes);
     clearRawAudioZone(sequence, RAW_AUDIO_TRACK_START_INDEX, rawAudioZoneWidth);
     duplicateRawSceneAudioToTrack(
       a4,
@@ -5797,7 +5897,9 @@
         log(
           "Warning: Could not resolve raw audio source for scene " +
             s.scene_index +
-            ".",
+            " ('" +
+            trimSpaces(s.clipName || "") +
+            "').",
         );
         continue;
       }
@@ -5808,7 +5910,9 @@
         log(
           "Warning: Failed to place raw audio on A4 for scene " +
             s.scene_index +
-            ": " +
+            " ('" +
+            trimSpaces(s.clipName || "") +
+            "'): " +
             (eOverwrite && eOverwrite.message ? eOverwrite.message : eOverwrite),
         );
         continue;
@@ -5822,7 +5926,9 @@
         log(
           "Warning: Could not resolve raw audio clip on A4 for scene " +
             s.scene_index +
-            ".",
+            " ('" +
+            trimSpaces(s.clipName || "") +
+            "').",
         );
       }
       repairRawAudioPlacement(
@@ -5834,6 +5940,92 @@
         qeSeq,
         qeTrackCache,
       );
+    }
+  }
+
+  function validateAndRepairRawSceneVideoPlacement(v1, v3, scenes) {
+    if (!v3 || !scenes || scenes.length <= 0) return;
+
+    log("Validating raw scene video placement before presets...");
+    for (var i = 0; i < scenes.length; i++) {
+      var s = scenes[i];
+      if (!s || !s.is_raw) continue;
+
+      var startSec = snapSecondsToFrame(s.start);
+      var cleanName = stripKnownExtension(s.clipName || "");
+      var v3Item =
+        resolvePlacedItemFast(v3, startSec, cleanName, TRACK_ITEM_WAIT_MAX_MS) ||
+        findTrackItemAtStart(v3, startSec, cleanName) ||
+        findTrackItemAtStart(v3, startSec, null);
+      if (v3Item) continue;
+
+      logSceneClipFailure(
+        s,
+        "V3 raw placement",
+        "missing before presets; retrying",
+      );
+      var clip = resolveSceneClipForRetry(s);
+      if (!clip) {
+        logSceneClipFailure(
+          s,
+          "source clip import",
+          "raw-scene retry clip lookup failed",
+        );
+        continue;
+      }
+
+      v3Item = resolveSceneTrackItemWithRetry(
+        v3,
+        startSec,
+        s,
+        "V3 raw retry",
+        clip,
+        cleanName,
+        TRACK_ITEM_WAIT_MAX_MS,
+      );
+      v3Item = setTrackItemInOutFromItem(
+        v3Item,
+        s.source_in,
+        s.source_out,
+        s.source_in_frame,
+        s.source_out_frame,
+      );
+
+      var v1Item = null;
+      if (v1) {
+        v1Item = resolveSceneTrackItemWithRetry(
+          v1,
+          startSec,
+          s,
+          "V1 raw retry",
+          clip,
+          cleanName,
+          TRACK_ITEM_WAIT_MAX_MS,
+        );
+        v1Item = setTrackItemInOutFromItem(
+          v1Item,
+          s.source_in,
+          s.source_out,
+          s.source_in_frame,
+          s.source_out_frame,
+        );
+      }
+
+      var newDurationSeconds = snapSecondsToFrame(s.target_duration);
+      enforceTrackItemDuration(v3Item, newDurationSeconds);
+      enforceTrackItemDuration(v1Item, newDurationSeconds);
+      if (!setScaleOnItem(v3Item, 75) && v3)
+        setScaleAndPosition(v3, startSec, 75);
+      if (!setScaleOnItem(v1Item, 183) && v1)
+        setScaleAndPosition(v1, startSec, 183);
+
+      if (!v3Item) {
+        logSceneClipFailure(
+          s,
+          "V3 raw placement",
+          "retry failed before presets",
+        );
+      }
     }
   }
 

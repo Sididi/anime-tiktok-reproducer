@@ -25,6 +25,8 @@ from app.services.anime_library import (
 )
 from app.services.export_service import ExportService
 from app.services.forced_alignment import ForcedAlignmentService
+from app.services.gap_resolution import GapResolutionService
+from app.services.otio_timing import FrameRateInfo
 from app.services.processing import ProcessingService, ResolvedSceneSource
 from app.services.project_service import ProjectService
 from app.services.script_automation_service import ScriptAutomationService
@@ -102,6 +104,136 @@ def test_normalize_external_subtitle_text_strips_markup_and_ass_controls():
 
     ass_markup = r"{\an8}Texte\Nsuite &amp; fin"
     assert ProcessingService._normalize_external_subtitle_text(ass_markup) == "Texte suite & fin"
+
+
+def test_resolve_source_reference_sanitizes_unresolved_absolute_episode_ref(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    stale_episode = (
+        "/tmp/stale-library/"
+        "[bonkai77].Anohana.The.Flower.We.Saw.That.Day.Episode.04."
+        "[BD.1080p.Dual.Audio.x265.HEVC.10bit].mp4"
+    )
+
+    monkeypatch.setattr(
+        GapResolutionService,
+        "resolve_episode_path",
+        classmethod(lambda cls, *_args, **_kwargs: None),
+    )
+
+    resolved_path, clip_name = ProcessingService._resolve_source_reference(
+        stale_episode,
+        library_type="anime",
+    )
+
+    assert resolved_path == Path(stale_episode)
+    assert (
+        clip_name
+        == "[bonkai77].Anohana.The.Flower.We.Saw.That.Day.Episode.04."
+        "[BD.1080p.Dual.Audio.x265.HEVC.10bit]"
+    )
+    assert "/" not in clip_name
+    assert "\\" not in clip_name
+
+
+def test_resolve_scene_sources_sanitizes_confirmed_no_match_absolute_episode_ref(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    stale_episode = (
+        "/tmp/stale-library/"
+        "[bonkai77].Anohana.The.Flower.We.Saw.That.Day.Episode.01."
+        "[BD.1080p.Dual.Audio.x265.HEVC.10bit].mp4"
+    )
+
+    monkeypatch.setattr(
+        GapResolutionService,
+        "resolve_episode_path",
+        classmethod(lambda cls, *_args, **_kwargs: None),
+    )
+
+    match = SceneMatch(
+        scene_index=37,
+        episode=stale_episode,
+        start_time=8.0,
+        end_time=24.5,
+        confidence=1.0,
+        speed_ratio=0.503,
+        confirmed=True,
+        was_no_match=True,
+        merged_from=[41, 42, 43, 44],
+    )
+
+    resolved = ProcessingService.resolve_scene_sources(
+        [match],
+        FrameRateInfo(timebase=24, ntsc=True),
+        library_type="anime",
+    )
+
+    assert resolved[37].source_path == Path(stale_episode)
+    assert (
+        resolved[37].clip_name
+        == "[bonkai77].Anohana.The.Flower.We.Saw.That.Day.Episode.01."
+        "[BD.1080p.Dual.Audio.x265.HEVC.10bit]"
+    )
+    assert "/" not in resolved[37].clip_name
+    assert "\\" not in resolved[37].clip_name
+
+
+def test_generate_jsx_script_sanitizes_path_like_clip_names_in_scene_payload(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    transcription = Transcription(
+        language="fr",
+        scenes=[
+            SceneTranscription(
+                scene_index=0,
+                text="hello",
+                words=[
+                    Word(
+                        text="hello",
+                        start=0.0,
+                        end=0.5,
+                        confidence=1.0,
+                    )
+                ],
+                start_time=0.0,
+                end_time=0.5,
+                is_raw=False,
+            )
+        ],
+    )
+    resolved_scene_sources = {
+        0: ResolvedSceneSource(
+            scene_index=0,
+            source_path=Path("/tmp/source-episode.mp4"),
+            clip_name=(
+                "/tmp/stale-library/"
+                "[bonkai77].Anohana.The.Flower.We.Saw.That.Day.Episode.04."
+                "[BD.1080p.Dual.Audio.x265.HEVC.10bit].mp4"
+            ),
+            source_in_frame=100,
+            source_out_frame=112,
+            source_in_seconds=100 * float(Fraction(1001, 24000)),
+            source_out_seconds=112 * float(Fraction(1001, 24000)),
+            source_duration_seconds=12 * float(Fraction(1001, 24000)),
+            used_alternative=False,
+        )
+    }
+
+    scenes = _capture_generated_scene_payload(
+        monkeypatch,
+        transcription,
+        resolved_scene_sources,
+    )
+
+    assert len(scenes) == 1
+    assert (
+        scenes[0]["clipName"]
+        == "[bonkai77].Anohana.The.Flower.We.Saw.That.Day.Episode.04."
+        "[BD.1080p.Dual.Audio.x265.HEVC.10bit]"
+    )
+    assert "/" not in scenes[0]["clipName"]
+    assert "\\" not in scenes[0]["clipName"]
 
 
 def test_tts_segmentation_preserves_scene_fragments_for_hard_split(monkeypatch):
@@ -1750,6 +1882,20 @@ def test_render_jsx_from_template_clears_a4_before_raw_audio_rebuild():
     assert "applySourceAudioPolicy(subclip, scene.clipName)" not in jsx
     assert "applySourceAudioPolicy(existingSubclip, scene.clipName)" not in jsx
     assert "var desiredTrackIndex = a4Index + selectedStreamPosition;" not in jsx
+
+
+def test_render_jsx_from_template_includes_scene_retry_hooks_for_terminal_raw_scenes():
+    jsx = _render_raw_audio_jsx()
+
+    assert "function logSceneClipFailure(" in jsx
+    assert "function resolveSceneClipForRetry(" in jsx
+    assert "function resolveSceneTrackItemWithRetry(" in jsx
+    assert "resolveSceneTrackItemWithRetry(" in jsx
+    assert "function validateAndRepairRawSceneVideoPlacement(" in jsx
+    assert "validateAndRepairRawSceneVideoPlacement(v1, v3, scenes);" in jsx
+    assert '"missing before presets; retrying"' in jsx
+    assert '"raw-scene retry clip lookup failed"' in jsx
+    assert '"retry failed before presets"' in jsx
 
 
 def test_render_jsx_from_template_raw_audio_zone_supports_default_stereo_policy():

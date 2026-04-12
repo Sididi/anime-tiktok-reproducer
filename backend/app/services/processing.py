@@ -150,6 +150,7 @@ KNOWN_MEDIA_EXTENSIONS = (
     ".aiff",
     ".aif",
 )
+_PATH_LIKE_CLIP_NAME_RE = re.compile(r"(^[A-Za-z]:[/\\])|[/\\]")
 
 
 def _strip_known_media_extension(name: str) -> str:
@@ -160,6 +161,23 @@ def _strip_known_media_extension(name: str) -> str:
         if lower_name.endswith(ext):
             return clean_name[:-len(ext)]
     return clean_name
+
+
+def _sanitize_premiere_clip_name(value: str) -> str:
+    """Collapse path-like refs down to the bundle/import-safe clip basename."""
+    clean_value = str(value or "").strip()
+    if not clean_value:
+        return ""
+    basename = clean_value.replace("\\", "/").rsplit("/", 1)[-1]
+    return _strip_known_media_extension(basename)
+
+
+def _is_path_like_clip_name(value: str) -> bool:
+    """Return True when a clip identifier still looks like a filesystem path."""
+    clean_value = str(value or "").strip()
+    return bool(clean_value and _PATH_LIKE_CLIP_NAME_RE.search(clean_value))
+
+
 NEXT_WORD_SAFETY_SEC = 1.0 / 60.0
 SRT_OBVIOUS_SILENCE_GAP_SEC = 0.5
 
@@ -302,13 +320,16 @@ class ProcessingService:
             library_type=library_type,
         )
         if resolved_path and resolved_path.exists():
-            return resolved_path, resolved_path.stem
+            return resolved_path, _sanitize_premiere_clip_name(resolved_path.name)
 
         fallback_path = Path(episode)
+        fallback_clip_name = _sanitize_premiere_clip_name(
+            fallback_path.name or episode,
+        )
         if fallback_path.exists():
-            return fallback_path, _strip_known_media_extension(fallback_path.name)
+            return fallback_path, fallback_clip_name
 
-        return fallback_path, _strip_known_media_extension(episode)
+        return fallback_path, fallback_clip_name
 
     @classmethod
     @staticmethod
@@ -628,6 +649,15 @@ class ProcessingService:
                 episode,
                 library_type=library_type,
             )
+            sanitized_clip_name = _sanitize_premiere_clip_name(clip_name)
+            if sanitized_clip_name != clip_name:
+                logger.warning(
+                    "Sanitized stale episode ref for scene %s: %s -> %s",
+                    match.scene_index,
+                    clip_name,
+                    sanitized_clip_name,
+                )
+                clip_name = sanitized_clip_name
             source_in_frame = source_rate.frames_from_seconds_at_or_after(source_in_raw_sec)
             source_out_frame = source_rate.frames_from_seconds_at_or_after(source_out_raw_sec)
             if source_out_frame <= source_in_frame:
@@ -1050,6 +1080,7 @@ class ProcessingService:
 
             # Subtitle text for this scene
             subtitle_text = scene_trans.text if scene_trans.text else ""
+            clip_name = _sanitize_premiere_clip_name(resolved_source.clip_name)
 
             # Build scene data with frame-perfect values
             # effective_speed is stored as float for JSX (Premiere expects decimal)
@@ -1058,7 +1089,7 @@ class ProcessingService:
                 "start": round(timeline_start_snapped, 6),  # Frame-snapped, more precision
                 "end": round(timeline_end_snapped, 6),
                 "text": subtitle_text,
-                "clipName": resolved_source.clip_name,
+                "clipName": clip_name,
                 "source_in_frame": resolved_source.source_in_frame,
                 "source_out_frame": resolved_source.source_out_frame,
                 "source_in": round(clip_timing.source_in_seconds, 6),
@@ -1088,6 +1119,20 @@ class ProcessingService:
                     print(f"[WARNING] Unexpected {issue.duration_seconds*1000:.1f}ms gap "
                           f"between scenes {issue.between_scenes[0]} and {issue.between_scenes[1]} "
                           f"at {issue.position_seconds:.3f}s", file=sys.stderr)
+
+        invalid_clip_names = [
+            scene["clipName"]
+            for scene in scenes
+            if _is_path_like_clip_name(scene.get("clipName", ""))
+        ]
+        if invalid_clip_names:
+            preview = ", ".join(sorted(set(invalid_clip_names[:3])))
+            if len(invalid_clip_names) > 3:
+                preview += ", ..."
+            raise RuntimeError(
+                "Generated JSX scene payload contains path-like clip names: "
+                f"{preview}"
+            )
 
         return cls._render_jsx_from_template(
             project_id=project.id,

@@ -22,6 +22,23 @@ from ...services.match_playback_service import MatchPlaybackService
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["matching"])
 
+KNOWN_MEDIA_EXTENSIONS = (
+    ".mkv",
+    ".mp4",
+    ".mov",
+    ".avi",
+    ".webm",
+    ".m4v",
+    ".wav",
+    ".mp3",
+    ".m4a",
+    ".aac",
+    ".flac",
+    ".ogg",
+    ".aiff",
+    ".aif",
+)
+
 
 def _etag_for_path(path: Path) -> str:
     stat = path.stat()
@@ -35,6 +52,36 @@ def _media_headers(path: Path, *, cache_control: str) -> dict[str, str]:
         "Cross-Origin-Resource-Policy": "cross-origin",
         "ETag": _etag_for_path(path),
     }
+
+
+def _strip_known_media_extension(name: str) -> str:
+    """Strip only supported media extensions from a filename-like value."""
+    clean_name = str(name or "").strip()
+    lower_name = clean_name.lower()
+    for ext in KNOWN_MEDIA_EXTENSIONS:
+        if lower_name.endswith(ext):
+            return clean_name[:-len(ext)]
+    return clean_name
+
+
+def _canonical_episode_ref(episode: str, *, library_type: str | None = None) -> str:
+    """Persist manual episode refs as canonical bundle-safe clip identifiers."""
+    clean_episode = str(episode or "").strip()
+    if not clean_episode:
+        return clean_episode
+
+    resolved = AnimeLibraryService.resolve_episode_path(
+        clean_episode,
+        library_type=library_type,
+    )
+    if resolved is not None and resolved.exists():
+        return _strip_known_media_extension(resolved.name)
+
+    candidate = Path(clean_episode)
+    if candidate.is_absolute() or candidate.suffix or "/" in clean_episode or "\\" in clean_episode:
+        return _strip_known_media_extension(candidate.name or clean_episode)
+
+    return _strip_known_media_extension(clean_episode)
 
 
 @router.get("/matches/config")
@@ -660,7 +707,10 @@ async def update_match(project_id: str, scene_index: int, request: UpdateMatchRe
         raise HTTPException(status_code=404, detail="Match not found for scene")
 
     # Update match
-    match.episode = request.episode
+    match.episode = _canonical_episode_ref(
+        request.episode,
+        library_type=project.library_type,
+    )
     match.start_time = request.start_time
     match.end_time = request.end_time
     match.confirmed = request.confirmed
@@ -709,7 +759,10 @@ async def update_matches_batch(project_id: str, request: BatchUpdateMatchesReque
                 detail=f"Match not found for scene {update.scene_index}",
             )
 
-        match.episode = update.episode
+        match.episode = _canonical_episode_ref(
+            update.episode,
+            library_type=project.library_type,
+        )
         match.start_time = update.start_time
         match.end_time = update.end_time
         match.confirmed = update.confirmed
