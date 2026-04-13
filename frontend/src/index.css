@@ -43,6 +43,22 @@ body {
   min-height: 100vh;
 }
 
+@keyframes manual-merge-hint-breathe {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(125, 211, 252, 0.18);
+    border-color: rgba(125, 211, 252, 0.35);
+  }
+  50% {
+    box-shadow: 0 0 0 6px rgba(125, 211, 252, 0);
+    border-color: rgba(125, 211, 252, 0.6);
+  }
+}
+
+.manual-merge-hint-button:not(:disabled) {
+  animation: manual-merge-hint-breathe 2.6s ease-in-out infinite;
+}
+
 /* TipTap editor styling */
 .tiptap-editor .tiptap {
   outline: none;

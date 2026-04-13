@@ -472,6 +472,14 @@ export const api = {
       },
     ),
 
+  mergeMatchWithPrevious: (projectId: string, sceneIndex: number) =>
+    request<{
+      scenes: import("@/types").Scene[];
+      matches: import("@/types").SceneMatch[];
+    }>(`/projects/${projectId}/matches/merge-with-previous/${sceneIndex}`, {
+      method: "POST",
+    }),
+
   undoMerge: (projectId: string, sceneIndex: number) =>
     request<{
       scenes: import("@/types").Scene[];

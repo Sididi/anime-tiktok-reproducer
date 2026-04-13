@@ -18,6 +18,7 @@ const KNOWN_MEDIA_EXTENSIONS = [
 ];
 
 const SAME_EPISODE_BACKTRACK_TOLERANCE_SECONDS = 1.0;
+const MANUAL_MERGE_HINT_MAX_DURATION_SECONDS = 3.0;
 
 export type ContinuityClaimKind = "non_continuous" | "episode_change";
 
@@ -65,6 +66,82 @@ function isUsableMatch(match: SceneMatch | undefined): match is SceneMatch {
       String(match.episode || "").trim() &&
       Number.isFinite(match.start_time),
   );
+}
+
+function addEpisodeKey(keys: Set<string>, episode: string | undefined | null) {
+  const normalized = normalizeContinuityEpisodeKey(String(episode || ""));
+  if (normalized) {
+    keys.add(normalized);
+  }
+}
+
+export function collectMatchEpisodeKeys(match: SceneMatch | undefined): Set<string> {
+  const keys = new Set<string>();
+  if (!match) {
+    return keys;
+  }
+
+  if (isUsableMatch(match)) {
+    addEpisodeKey(keys, match.episode);
+  }
+
+  for (const alternative of match.alternatives || []) {
+    addEpisodeKey(keys, alternative.episode);
+  }
+
+  for (const candidate of match.start_candidates || []) {
+    addEpisodeKey(keys, candidate.episode);
+  }
+  for (const candidate of match.middle_candidates || []) {
+    addEpisodeKey(keys, candidate.episode);
+  }
+  for (const candidate of match.end_candidates || []) {
+    addEpisodeKey(keys, candidate.episode);
+  }
+
+  return keys;
+}
+
+export function deriveManualMergeHints(
+  scenes: Scene[],
+  matches: SceneMatch[],
+): Set<number> {
+  const matchesBySceneIndex = new Map(
+    matches.map((match) => [match.scene_index, match]),
+  );
+  const hintedSceneIndices = new Set<number>();
+
+  for (let position = 1; position < scenes.length; position += 1) {
+    const currentScene = scenes[position];
+    const currentDuration = Math.max(
+      0,
+      currentScene.end_time - currentScene.start_time,
+    );
+    if (currentDuration >= MANUAL_MERGE_HINT_MAX_DURATION_SECONDS) {
+      continue;
+    }
+
+    const previousScene = scenes[position - 1];
+    const currentKeys = collectMatchEpisodeKeys(
+      matchesBySceneIndex.get(currentScene.index),
+    );
+    const previousKeys = collectMatchEpisodeKeys(
+      matchesBySceneIndex.get(previousScene.index),
+    );
+
+    if (currentKeys.size === 0 || previousKeys.size === 0) {
+      continue;
+    }
+
+    for (const key of currentKeys) {
+      if (previousKeys.has(key)) {
+        hintedSceneIndices.add(currentScene.index);
+        break;
+      }
+    }
+  }
+
+  return hintedSceneIndices;
 }
 
 export function deriveMatchContinuityClaims(
