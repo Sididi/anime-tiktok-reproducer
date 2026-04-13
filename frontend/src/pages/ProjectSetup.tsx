@@ -10,6 +10,7 @@ import {
   PurgeModal,
   TorrentManagementModal,
   DeleteSourceModal,
+  RenameSourceModal,
 } from "@/components/library";
 import { FolderBrowserModal } from "@/components/FolderBrowserModal";
 import { ProjectManagerModal } from "@/components/project-manager";
@@ -49,6 +50,9 @@ export function ProjectSetup() {
   const [showFolderBrowser, setShowFolderBrowser] = useState(false);
   const [updateSourceName, setUpdateSourceName] = useState<string | null>(null);
   const [episodeSource, setEpisodeSource] = useState<SourceDetails | null>(null);
+  const [renameSource, setRenameSource] = useState<SourceDetails | null>(null);
+  const [renameLoading, setRenameLoading] = useState(false);
+  const [renameError, setRenameError] = useState<string | null>(null);
   const [deleteSource, setDeleteSource] = useState<SourceDetails | null>(null);
   const [deletingSourceId, setDeletingSourceId] = useState<string | null>(null);
   const [deleteLoading, setDeleteLoading] = useState(false);
@@ -484,6 +488,44 @@ export function ProjectSetup() {
     setDeleteBlockingProjects([]);
   }, []);
 
+  const handleOpenRenameSource = useCallback((source: SourceDetails) => {
+    setRenameSource(source);
+    setRenameError(null);
+  }, []);
+
+  const handleCloseRenameSource = useCallback(() => {
+    if (renameLoading) {
+      return;
+    }
+    setRenameSource(null);
+    setRenameError(null);
+  }, [renameLoading]);
+
+  const handleRenameSource = useCallback(
+    async (newName: string) => {
+      if (!renameSource) {
+        return;
+      }
+
+      setRenameLoading(true);
+      setRenameError(null);
+      try {
+        await api.renameSeries(
+          selectedLibraryType,
+          renameSource.series_id,
+          newName,
+        );
+        setRenameSource(null);
+        await loadSources();
+      } catch (err) {
+        setRenameError((err as Error).message);
+      } finally {
+        setRenameLoading(false);
+      }
+    },
+    [loadSources, renameSource, selectedLibraryType],
+  );
+
   const handleCloseDeleteSource = useCallback(() => {
     if (deleteLoading) {
       return;
@@ -554,6 +596,7 @@ export function ProjectSetup() {
         deletingSourceId={deletingSourceId}
         onSelectSource={setSelectedSource}
         onToggleProtection={handleToggleProtection}
+        onRenameSource={handleOpenRenameSource}
         onUpdateSource={(source) => {
           setUpdateSourceName(source.name);
           setShowFolderBrowser(true);
@@ -609,6 +652,15 @@ export function ProjectSetup() {
         blockingProjects={deleteBlockingProjects}
         onClose={handleCloseDeleteSource}
         onConfirm={handleDeleteSource}
+      />
+
+      <RenameSourceModal
+        open={!!renameSource}
+        source={renameSource}
+        loading={renameLoading}
+        error={renameError}
+        onClose={handleCloseRenameSource}
+        onSubmit={handleRenameSource}
       />
 
       <FolderBrowserModal

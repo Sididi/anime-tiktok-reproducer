@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from ..config import settings
+from ..library_types import coerce_library_type
 from ..models.project_startup import ProjectStartupJob
 
 
@@ -163,6 +164,35 @@ class ProjectStartupService:
         finally:
             if queue in self._subscribers:
                 self._subscribers.remove(queue)
+
+    async def rename_series_references(
+        self,
+        *,
+        library_type,
+        series_id: str,
+        new_name: str,
+    ) -> list[ProjectStartupJob]:
+        scoped_type = coerce_library_type(library_type)
+        renamed_jobs: list[ProjectStartupJob] = []
+        for job in self._jobs.values():
+            if job.series_id != series_id or job.library_type != scoped_type:
+                continue
+            if job.anime_name == new_name:
+                renamed_jobs.append(job)
+                continue
+            job.anime_name = new_name
+            job.updated_at = _utc_now()
+            renamed_jobs.append(job)
+
+        if not renamed_jobs:
+            return []
+
+        await asyncio.to_thread(_write_jobs_atomic, self._jobs_path, self._jobs)
+        for job in renamed_jobs:
+            payload = job.model_dump(mode="json")
+            for queue in list(self._subscribers):
+                queue.put_nowait(payload)
+        return renamed_jobs
 
     @staticmethod
     def _sync_job_from_project(job: ProjectStartupJob, project) -> None:

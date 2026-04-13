@@ -16,13 +16,17 @@ if str(BACKEND_ROOT) not in sys.path:
 from app.config import settings
 from app.library_types import LibraryType
 from app.models.project import Project
+from app.models.project_startup import ProjectStartupJob
 from app.services.anime_library import AnimeLibraryService
+from app.services.anime_matcher import AnimeMatcherService
 from app.services.library_hydration_service import HYDRATION_STATUS_INDEX_READY
 from app.services.library_hydration_service import LibraryHydrationService
 from app.services.library_hydration_service import OPERATION_COMPLETE, OPERATION_RUNNING
 from app.services.library_hydration_service import SeriesDeleteBlockedError
+from app.services.library_hydration_service import SeriesRenameConflictError
 from app.services.library_state_db import LibraryStateDb
 from app.services.project_service import ProjectService
+from app.services.project_startup_service import project_startup_queue
 from app.services.storage_box_repository import LocalArtifact, StorageBoxRepository
 from app.services.storage_box_sftp_client import StorageBoxSftpClient
 from app.services.storage_box_transfer import StorageBoxTransferService
@@ -30,6 +34,10 @@ from app.services.storage_box_transfer import StorageBoxTransferService
 
 def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+async def _async_result(value):
+    return value
 
 
 @pytest.mark.asyncio
@@ -695,3 +703,713 @@ async def test_delete_series_cleans_local_state_and_disappears_from_source_listi
     ) == []
     assert LibraryStateDb.count_project_pins("series-1") == 0
     assert details == []
+
+
+@pytest.mark.asyncio
+async def test_rename_series_rewrites_remote_json_artifacts_and_hardlinks_unchanged_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    library_root = tmp_path / "library"
+    library_root.mkdir(parents=True, exist_ok=True)
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    old_name = "Old Name"
+    new_name = "New Name"
+    series_id = "series-1"
+    old_release_id = "release-1"
+
+    old_absolute_episode = str((library_root / old_name / "ep-1.mp4").resolve())
+    new_absolute_episode = str((library_root / new_name / "ep-1.mp4").resolve())
+
+    manifest = {
+        "schema_version": 1,
+        "library_type": LibraryType.ANIME.value,
+        "series_id": series_id,
+        "release_id": old_release_id,
+        "display_name": old_name,
+        "fps": 24.0,
+        "created_at": "2026-04-01T10:00:00Z",
+        "episode_count": 1,
+        "total_size_bytes": 5,
+        "torrent_count": 1,
+        "torrent_metadata_relative_path": f"payload/library/{old_name}/.atr_torrents.json",
+        "episodes": [
+            {
+                "episode_key": "ep-1",
+                "media": {
+                    "relative_path": f"payload/library/{old_name}/ep-1.mp4",
+                    "local_relative_path": f"{old_name}/ep-1.mp4",
+                    "size_bytes": 5,
+                    "sha256": "media-sha",
+                },
+                "sidecars": [
+                    {
+                        "relative_path": f"payload/library/{old_name}/ep-1.mp4.atr_source.json",
+                        "local_relative_path": f"{old_name}/ep-1.mp4.atr_source.json",
+                        "size_bytes": 1,
+                        "sha256": "source-old",
+                        "artifact_type": "source_metadata",
+                    }
+                ],
+            }
+        ],
+        "artifacts": [
+            {
+                "relative_path": f"payload/library/{old_name}/ep-1.mp4",
+                "local_relative_path": f"{old_name}/ep-1.mp4",
+                "size_bytes": 5,
+                "sha256": "media-sha",
+                "artifact_type": "library",
+            },
+            {
+                "relative_path": f"payload/library/{old_name}/ep-1.mp4.atr_source.json",
+                "local_relative_path": f"{old_name}/ep-1.mp4.atr_source.json",
+                "size_bytes": 1,
+                "sha256": "source-old",
+                "artifact_type": "library",
+            },
+            {
+                "relative_path": f"payload/library/{old_name}/.atr_torrents.json",
+                "local_relative_path": f"{old_name}/.atr_torrents.json",
+                "size_bytes": 1,
+                "sha256": "torrent-old",
+                "artifact_type": "library",
+            },
+            {
+                "relative_path": f"payload/index/{series_id}/manifest.fragment.json",
+                "local_relative_path": None,
+                "size_bytes": 1,
+                "sha256": "fragment-old",
+                "artifact_type": "index",
+            },
+            {
+                "relative_path": f"payload/index/{series_id}/state.fragment.json",
+                "local_relative_path": None,
+                "size_bytes": 1,
+                "sha256": "state-old",
+                "artifact_type": "index",
+            },
+        ],
+    }
+
+    remote_json_payloads = {
+        f"payload/library/{old_name}/ep-1.mp4.atr_source.json": {
+            "source_path": "/downloads/original-ep-1.mkv",
+            "prepared_path": old_absolute_episode,
+            "sidecar_source_path": old_absolute_episode,
+            "original_source_path": "/downloads/original-ep-1.mkv",
+        },
+        f"payload/library/{old_name}/.atr_torrents.json": {
+            "torrents": [
+                {
+                    "files": [
+                        {
+                            "library_path": old_absolute_episode,
+                        }
+                    ]
+                }
+            ],
+            "purge_protection": False,
+        },
+        f"payload/index/{series_id}/manifest.fragment.json": {
+            "schema_version": 1,
+            "series": {
+                old_name: {
+                    "key": "rename-key",
+                    "fps": 24.0,
+                }
+            },
+        },
+        f"payload/index/{series_id}/state.fragment.json": {
+            "schema_version": 1,
+            "files": {
+                f"{old_name}/ep-1.mp4": {"frames": 1},
+            },
+        },
+    }
+
+    uploaded_payloads: dict[str, str] = {}
+    written_texts: dict[str, str] = {}
+    replace_calls: list[tuple[PurePosixPath, PurePosixPath]] = []
+    hardlink_calls: list[tuple[PurePosixPath, PurePosixPath]] = []
+    verify_calls: list[list[str]] = []
+
+    monkeypatch.setattr(settings, "cache_dir", cache_dir)
+    monkeypatch.setattr(StorageBoxSftpClient, "is_configured", classmethod(lambda cls: True))
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "get_library_path",
+        classmethod(lambda cls, library_type=None: library_root),
+    )
+    monkeypatch.setattr(
+        StorageBoxRepository,
+        "get_current_release",
+        classmethod(lambda cls, library_type, series_id: _async_result({"release_id": old_release_id})),
+    )
+    monkeypatch.setattr(
+        StorageBoxRepository,
+        "get_series_manifest",
+        classmethod(lambda cls, library_type, series_id, release_id=None: _async_result(manifest)),
+    )
+
+    async def fake_read_remote_json(
+        cls,
+        remote_path: PurePosixPath,
+        *,
+        context: str,
+    ) -> dict[str, object]:
+        relative = str(
+            PurePosixPath(remote_path).relative_to(
+                StorageBoxRepository._release_root(
+                    LibraryType.ANIME,
+                    series_id,
+                    old_release_id,
+                )
+            )
+        )
+        payload = remote_json_payloads[relative]
+        return json.loads(json.dumps(payload))
+
+    async def fake_upload_file(
+        cls,
+        local_path: Path,
+        remote_path: PurePosixPath,
+    ) -> None:
+        uploaded_payloads[str(remote_path)] = local_path.read_text(encoding="utf-8")
+
+    async def fake_write_text(
+        cls,
+        remote_path: PurePosixPath,
+        content: str,
+    ) -> None:
+        written_texts[str(remote_path)] = content
+
+    async def fake_replace_file(
+        cls,
+        src: PurePosixPath,
+        dst: PurePosixPath,
+    ) -> None:
+        replace_calls.append((PurePosixPath(src), PurePosixPath(dst)))
+
+    async def fake_try_hardlink_first(
+        cls,
+        src: PurePosixPath,
+        dst: PurePosixPath,
+    ) -> bool:
+        hardlink_calls.append((PurePosixPath(src), PurePosixPath(dst)))
+        return True
+
+    async def fake_verify_remote_artifacts(
+        cls,
+        *,
+        staging_root: PurePosixPath,
+        artifacts: list[LocalArtifact],
+    ) -> None:
+        verify_calls.append([str(staging_root / artifact.remote_relative_path) for artifact in artifacts])
+
+    monkeypatch.setattr(
+        StorageBoxRepository,
+        "_read_remote_json",
+        classmethod(fake_read_remote_json),
+    )
+    monkeypatch.setattr(
+        StorageBoxTransferService,
+        "upload_file",
+        classmethod(fake_upload_file),
+    )
+    monkeypatch.setattr(StorageBoxSftpClient, "write_text", classmethod(fake_write_text))
+    monkeypatch.setattr(StorageBoxSftpClient, "rename", classmethod(lambda cls, src, dst: _async_result(None)))
+    monkeypatch.setattr(StorageBoxSftpClient, "replace_file", classmethod(fake_replace_file))
+    monkeypatch.setattr(
+        StorageBoxRepository,
+        "_try_hardlink_first",
+        classmethod(fake_try_hardlink_first),
+    )
+    monkeypatch.setattr(
+        StorageBoxRepository,
+        "_verify_remote_artifacts",
+        classmethod(fake_verify_remote_artifacts),
+    )
+    monkeypatch.setattr(
+        StorageBoxRepository,
+        "rebuild_catalog",
+        classmethod(lambda cls, library_type: _async_result({})),
+    )
+
+    result = await StorageBoxRepository.rename_series(
+        library_type=LibraryType.ANIME,
+        series_id=series_id,
+        new_display_name=new_name,
+    )
+
+    assert result["series_id"] == series_id
+    assert result["old_name"] == old_name
+    assert result["new_name"] == new_name
+    assert result["release_id"] != old_release_id
+
+    source_upload = next(
+        value
+        for path, value in uploaded_payloads.items()
+        if path.endswith(f"payload/library/{new_name}/ep-1.mp4.atr_source.json")
+    )
+    assert new_absolute_episode in source_upload
+    assert old_absolute_episode not in source_upload
+
+    torrents_upload = next(
+        value
+        for path, value in uploaded_payloads.items()
+        if path.endswith(f"payload/library/{new_name}/.atr_torrents.json")
+    )
+    assert new_absolute_episode in torrents_upload
+    assert old_absolute_episode not in torrents_upload
+
+    manifest_fragment_upload = next(
+        value
+        for path, value in uploaded_payloads.items()
+        if path.endswith(f"payload/index/{series_id}/manifest.fragment.json")
+    )
+    assert new_name in manifest_fragment_upload
+    assert old_name not in manifest_fragment_upload
+
+    state_fragment_upload = next(
+        value
+        for path, value in uploaded_payloads.items()
+        if path.endswith(f"payload/index/{series_id}/state.fragment.json")
+    )
+    assert f"{new_name}/ep-1.mp4" in state_fragment_upload
+    assert f"{old_name}/ep-1.mp4" not in state_fragment_upload
+
+    series_manifest_text = next(
+        value
+        for path, value in written_texts.items()
+        if path.endswith("series_manifest.json")
+    )
+    rewritten_manifest = json.loads(series_manifest_text)
+    assert rewritten_manifest["display_name"] == new_name
+    assert rewritten_manifest["release_id"] == result["release_id"]
+    assert rewritten_manifest["episodes"][0]["media"]["local_relative_path"] == f"{new_name}/ep-1.mp4"
+    assert rewritten_manifest["artifacts"][0]["relative_path"] == f"payload/library/{new_name}/ep-1.mp4"
+
+    current_payload = json.loads(
+        next(value for path, value in written_texts.items() if "/current." in path)
+    )
+    assert current_payload["display_name"] == new_name
+    assert current_payload["release_id"] == result["release_id"]
+    assert replace_calls and replace_calls[0][1] == StorageBoxRepository._current_path(
+        LibraryType.ANIME,
+        series_id,
+    )
+    assert hardlink_calls == [
+        (
+            StorageBoxRepository._release_root(
+                LibraryType.ANIME,
+                series_id,
+                old_release_id,
+            ) / f"payload/library/{old_name}/ep-1.mp4",
+            PurePosixPath(
+                next(path for path in verify_calls[0] if path.endswith(f"payload/library/{new_name}/ep-1.mp4"))
+            ),
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_rename_series_updates_local_state_and_saved_references(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    old_name = "Old Name"
+    new_name = "New Name"
+    series_id = "series-1"
+    old_release_id = "release-1"
+    new_release_id = "release-2"
+
+    library_root = tmp_path / "library"
+    old_dir = library_root / old_name
+    old_dir.mkdir(parents=True, exist_ok=True)
+    (old_dir / "ep-1.mp4").write_bytes(b"episode-1")
+    StorageBoxRepository.write_local_series_metadata(
+        series_dir=old_dir,
+        series_id=series_id,
+        display_name=old_name,
+        release_id=old_release_id,
+    )
+    (old_dir / "ep-1.mp4.atr_source.json").write_text(
+        json.dumps(
+            {
+                "source_path": "/downloads/original-ep-1.mkv",
+                "prepared_path": str((old_dir / "ep-1.mp4").resolve()),
+                "sidecar_source_path": str((old_dir / "ep-1.mp4").resolve()),
+            }
+        ),
+        encoding="utf-8",
+    )
+    subtitle_dir = old_dir / "ep-1.atr_subtitles"
+    subtitle_dir.mkdir(parents=True, exist_ok=True)
+    (subtitle_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "source_path": str((old_dir / "ep-1.mp4").resolve()),
+                "generated_from": "/downloads/original-ep-1.mkv",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (old_dir / ".atr_torrents.json").write_text(
+        json.dumps(
+            {
+                "torrents": [
+                    {
+                        "files": [
+                            {
+                                "library_path": str((old_dir / "ep-1.mp4").resolve()),
+                            }
+                        ]
+                    }
+                ],
+                "purge_protection": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    index_dir = library_root / AnimeLibraryService.INDEX_DIR_NAME
+    shard_dir = index_dir / "series" / "rename-key"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    (shard_dir / "faiss.index").write_bytes(b"index")
+    (shard_dir / "metadata.json").write_text("{}", encoding="utf-8")
+    (index_dir / AnimeLibraryService.MANIFEST_FILE).write_text(
+        json.dumps(
+            {
+                "version": AnimeLibraryService.SEARCHER_INDEX_FORMAT_VERSION,
+                "engine_profile": AnimeLibraryService.SEARCHER_ENGINE_PROFILE,
+                "config": {},
+                "series": {
+                    old_name: {
+                        "key": "rename-key",
+                        "fps": 24.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (index_dir / AnimeLibraryService.STATE_FILE).write_text(
+        json.dumps(
+            {
+                "files": {
+                    f"{old_name}/ep-1.mp4": {"frames": 1},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(settings, "cache_dir", cache_dir)
+    monkeypatch.setattr(settings, "projects_dir", projects_dir)
+    monkeypatch.setattr(settings, "library_state_db_path", tmp_path / "library_state.db")
+    monkeypatch.setattr(
+        AnimeLibraryService,
+        "get_library_path",
+        classmethod(lambda cls, library_type=None: library_root),
+    )
+
+    release_state = {"release_id": old_release_id, "display_name": old_name}
+    old_manifest = {
+        "series_id": series_id,
+        "release_id": old_release_id,
+        "display_name": old_name,
+        "episode_count": 1,
+        "episodes": [
+            {
+                "episode_key": "ep-1",
+                "media": {
+                    "local_relative_path": f"{old_name}/ep-1.mp4",
+                    "size_bytes": 9,
+                },
+                "sidecars": [],
+            }
+        ],
+    }
+    new_manifest = {
+        "series_id": series_id,
+        "release_id": new_release_id,
+        "display_name": new_name,
+        "episode_count": 1,
+        "episodes": [
+            {
+                "episode_key": "ep-1",
+                "media": {
+                    "local_relative_path": f"{new_name}/ep-1.mp4",
+                    "size_bytes": 9,
+                },
+                "sidecars": [],
+            }
+        ],
+    }
+
+    AnimeMatcherService._stale_series[LibraryType.ANIME].clear()
+    LibraryStateDb.initialize()
+    LibraryStateDb.upsert_series_state(
+        library_type=LibraryType.ANIME,
+        series_id=series_id,
+        release_id=old_release_id,
+        hydration_status="fully_local",
+        local_episode_count=1,
+        expected_episode_count=1,
+    )
+
+    project = ProjectService.create(
+        anime_name=old_name,
+        series_id=series_id,
+        library_type=LibraryType.ANIME,
+    )
+    startup_job = ProjectStartupJob(
+        project_id=project.id,
+        anime_name=old_name,
+        series_id=series_id,
+        library_type=LibraryType.ANIME,
+    )
+    monkeypatch.setattr(project_startup_queue, "_jobs_path", tmp_path / "project_startup_jobs.json", raising=False)
+    monkeypatch.setattr(project_startup_queue, "_jobs", {project.id: startup_job}, raising=False)
+    monkeypatch.setattr(project_startup_queue, "_subscribers", [], raising=False)
+
+    async def fake_get_current_release(
+        cls,
+        library_type: LibraryType,
+        request_series_id: str,
+    ) -> dict[str, str]:
+        assert request_series_id == series_id
+        return {
+            "release_id": release_state["release_id"],
+            "display_name": release_state["display_name"],
+        }
+
+    async def fake_get_series_manifest(
+        cls,
+        library_type: LibraryType,
+        request_series_id: str,
+        release_id: str | None = None,
+    ) -> dict[str, object]:
+        assert request_series_id == series_id
+        effective_release_id = release_id or release_state["release_id"]
+        if effective_release_id == new_release_id:
+            return new_manifest
+        return old_manifest
+
+    async def fake_remote_rename(
+        cls,
+        *,
+        library_type: LibraryType,
+        series_id: str,
+        new_display_name: str,
+    ) -> dict[str, object]:
+        release_state["release_id"] = new_release_id
+        release_state["display_name"] = new_display_name
+        return {
+            "series_id": series_id,
+            "release_id": new_release_id,
+            "old_name": old_name,
+            "new_name": new_display_name,
+            "manifest": new_manifest,
+            "current": {
+                "release_id": new_release_id,
+                "display_name": new_display_name,
+            },
+        }
+
+    async def fake_find_catalog_entry_by_name(
+        cls,
+        library_type: LibraryType,
+        display_name: str,
+    ) -> dict[str, object] | None:
+        return None
+
+    async def fake_find_remote_series_id_by_name(
+        cls,
+        library_type: LibraryType,
+        display_name: str,
+    ) -> str | None:
+        return None
+
+    async def fake_list_catalog(
+        cls,
+        library_type: LibraryType,
+    ) -> list[dict[str, object]]:
+        return [
+            {
+                "series_id": series_id,
+                "name": release_state["display_name"],
+                "storage_release_id": release_state["release_id"],
+                "episode_count": 1,
+                "total_size_bytes": 9,
+                "fps": 24.0,
+                "torrent_count": 1,
+                "updated_at": "2026-04-01T12:00:00Z",
+            }
+        ]
+
+    monkeypatch.setattr(StorageBoxRepository, "get_current_release", classmethod(fake_get_current_release))
+    monkeypatch.setattr(StorageBoxRepository, "get_series_manifest", classmethod(fake_get_series_manifest))
+    monkeypatch.setattr(StorageBoxRepository, "rename_series", classmethod(fake_remote_rename))
+    monkeypatch.setattr(
+        StorageBoxRepository,
+        "find_catalog_entry_by_name",
+        classmethod(fake_find_catalog_entry_by_name),
+    )
+    monkeypatch.setattr(
+        StorageBoxRepository,
+        "find_remote_series_id_by_name",
+        classmethod(fake_find_remote_series_id_by_name),
+    )
+    monkeypatch.setattr(StorageBoxRepository, "list_catalog", classmethod(fake_list_catalog))
+
+    result = await LibraryHydrationService.rename_series(
+        library_type=LibraryType.ANIME,
+        series_id=series_id,
+        new_name=new_name,
+    )
+    details = await LibraryHydrationService.list_source_details(
+        library_type=LibraryType.ANIME,
+    )
+
+    new_dir = library_root / new_name
+    assert result["status"] == "renamed"
+    assert not old_dir.exists()
+    assert new_dir.exists()
+    metadata = StorageBoxRepository.read_local_series_metadata(new_dir)
+    assert metadata["series_id"] == series_id
+    assert metadata["display_name"] == new_name
+    assert metadata["release_id"] == new_release_id
+
+    source_manifest = json.loads((new_dir / "ep-1.mp4.atr_source.json").read_text(encoding="utf-8"))
+    assert source_manifest["prepared_path"] == str((new_dir / "ep-1.mp4").resolve())
+    assert source_manifest["sidecar_source_path"] == str((new_dir / "ep-1.mp4").resolve())
+    assert source_manifest["source_path"] == "/downloads/original-ep-1.mkv"
+
+    subtitle_manifest = json.loads((new_dir / "ep-1.atr_subtitles" / "manifest.json").read_text(encoding="utf-8"))
+    assert subtitle_manifest["source_path"] == str((new_dir / "ep-1.mp4").resolve())
+
+    torrents_payload = json.loads((new_dir / ".atr_torrents.json").read_text(encoding="utf-8"))
+    assert torrents_payload["torrents"][0]["files"][0]["library_path"] == str(
+        (new_dir / "ep-1.mp4").resolve()
+    )
+
+    local_manifest = json.loads((index_dir / AnimeLibraryService.MANIFEST_FILE).read_text(encoding="utf-8"))
+    assert old_name not in local_manifest["series"]
+    assert new_name in local_manifest["series"]
+
+    local_state = json.loads((index_dir / AnimeLibraryService.STATE_FILE).read_text(encoding="utf-8"))
+    assert f"{new_name}/ep-1.mp4" in local_state["files"]
+    assert f"{old_name}/ep-1.mp4" not in local_state["files"]
+
+    reloaded_project = ProjectService.load(project.id)
+    assert reloaded_project is not None
+    assert reloaded_project.anime_name == new_name
+
+    assert project_startup_queue._jobs[project.id].anime_name == new_name
+    startup_jobs_payload = json.loads((tmp_path / "project_startup_jobs.json").read_text(encoding="utf-8"))
+    assert startup_jobs_payload["jobs"][0]["anime_name"] == new_name
+
+    assert details[0]["name"] == new_name
+    assert details[0]["storage_release_id"] == new_release_id
+    assert old_name in AnimeMatcherService._stale_series[LibraryType.ANIME]
+    assert new_name in AnimeMatcherService._stale_series[LibraryType.ANIME]
+
+
+@pytest.mark.asyncio
+async def test_rename_series_rejects_conflicting_target_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_get_current_release(
+        cls,
+        library_type: LibraryType,
+        series_id: str,
+    ) -> dict[str, str]:
+        return {"release_id": "release-1"}
+
+    async def fake_get_series_manifest(
+        cls,
+        library_type: LibraryType,
+        series_id: str,
+        release_id: str | None = None,
+    ) -> dict[str, object]:
+        return {
+            "series_id": series_id,
+            "release_id": "release-1",
+            "display_name": "Old Name",
+            "episode_count": 0,
+            "episodes": [],
+        }
+
+    async def fake_find_catalog_entry_by_name(
+        cls,
+        library_type: LibraryType,
+        display_name: str,
+    ) -> dict[str, object] | None:
+        return {"series_id": "series-2"}
+
+    async def fake_remote_rename(
+        cls,
+        *,
+        library_type: LibraryType,
+        series_id: str,
+        new_display_name: str,
+    ) -> dict[str, object]:
+        raise AssertionError("remote rename should not run on name conflict")
+
+    monkeypatch.setattr(StorageBoxRepository, "get_current_release", classmethod(fake_get_current_release))
+    monkeypatch.setattr(StorageBoxRepository, "get_series_manifest", classmethod(fake_get_series_manifest))
+    monkeypatch.setattr(
+        StorageBoxRepository,
+        "find_catalog_entry_by_name",
+        classmethod(fake_find_catalog_entry_by_name),
+    )
+    monkeypatch.setattr(StorageBoxRepository, "rename_series", classmethod(fake_remote_rename))
+
+    with pytest.raises(SeriesRenameConflictError):
+        await LibraryHydrationService.rename_series(
+            library_type=LibraryType.ANIME,
+            series_id="series-1",
+            new_name="Taken Name",
+        )
+
+
+@pytest.mark.asyncio
+async def test_rename_series_rejects_active_library_operations(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(settings, "library_state_db_path", tmp_path / "library_state.db")
+    LibraryStateDb.initialize()
+    LibraryStateDb.upsert_operation(
+        library_type=LibraryType.ANIME,
+        series_id="series-1",
+        operation_type="hydrate",
+        status=OPERATION_RUNNING,
+        progress=0.4,
+        error=None,
+    )
+
+    async def fake_get_current_release(
+        cls,
+        library_type: LibraryType,
+        series_id: str,
+    ) -> dict[str, str]:
+        raise AssertionError("current release should not be queried when rename is blocked")
+
+    monkeypatch.setattr(StorageBoxRepository, "get_current_release", classmethod(fake_get_current_release))
+
+    with pytest.raises(SeriesRenameConflictError):
+        await LibraryHydrationService.rename_series(
+            library_type=LibraryType.ANIME,
+            series_id="series-1",
+            new_name="Blocked Rename",
+        )

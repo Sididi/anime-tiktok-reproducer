@@ -778,6 +778,22 @@ export const api = {
       `/anime/${encodeURIComponent(seriesId)}/episodes?library_type=${encodeURIComponent(libraryType)}`,
     ),
 
+  renameSeries: (
+    libraryType: import("@/types").LibraryType,
+    seriesId: string,
+    newName: string,
+  ) =>
+    request<import("@/types").RenameSeriesResponse>(
+      `/anime/${encodeURIComponent(seriesId)}/rename`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({
+          library_type: libraryType,
+          new_name: newName,
+        }),
+      },
+    ),
+
   deleteSeries: async (
     libraryType: import("@/types").LibraryType,
     seriesId: string,

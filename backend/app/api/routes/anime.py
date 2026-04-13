@@ -18,7 +18,10 @@ from ...services import (
     LibraryStateDb,
     StorageBoxRepository,
 )
-from ...services.library_hydration_service import SeriesDeleteBlockedError
+from ...services.library_hydration_service import (
+    SeriesDeleteBlockedError,
+    SeriesRenameConflictError,
+)
 
 router = APIRouter(prefix="/anime", tags=["anime"])
 
@@ -706,12 +709,58 @@ class SourceDetails(BaseModel):
     updated_at: str
 
 
+class RenameSeriesRequest(BaseModel):
+    library_type: LibraryType
+    new_name: str
+
+
+class RenameSeriesResponse(BaseModel):
+    status: str
+    series_id: str
+    library_type: str
+    old_name: str
+    new_name: str
+    storage_release_id: str
+
+
 @router.get("/source-details")
 async def get_source_details(
     library_type: LibraryType = Query(...),
 ) -> list[SourceDetails]:
     """Get detailed metadata for all sources in a library type."""
     return await LibraryHydrationService.list_source_details(library_type=library_type)
+
+
+@router.patch("/{series_id}/rename", response_model=RenameSeriesResponse)
+async def rename_series(
+    series_id: str,
+    request: RenameSeriesRequest,
+) -> RenameSeriesResponse:
+    try:
+        result = await LibraryHydrationService.rename_series(
+            library_type=request.library_type,
+            series_id=series_id,
+            new_name=request.new_name,
+        )
+        return RenameSeriesResponse(**result)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "series_rename_invalid",
+                "message": str(exc),
+            },
+        ) from exc
+    except SeriesRenameConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "series_rename_conflict",
+                "message": str(exc),
+            },
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------

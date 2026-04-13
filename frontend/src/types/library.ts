@@ -134,6 +134,15 @@ export interface DeleteSeriesResponse {
   library_type: import("./index").LibraryType;
 }
 
+export interface RenameSeriesResponse {
+  status: "renamed";
+  series_id: string;
+  library_type: import("./index").LibraryType;
+  old_name: string;
+  new_name: string;
+  storage_release_id: string;
+}
+
 export interface SeriesDeleteConflictDetail {
   code: string;
   message: string;

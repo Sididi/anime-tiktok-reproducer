@@ -380,6 +380,7 @@ export type {
   LibraryActivationState,
   EpisodeSourcesPayload,
   DeleteSeriesResponse,
+  RenameSeriesResponse,
   SourceTorrentMetadata,
   SeriesDeleteConflictDetail,
   SeriesDeleteReferencingProject,

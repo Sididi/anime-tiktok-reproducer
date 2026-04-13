@@ -15,9 +15,12 @@ from app.api.routes.anime import delete_series as delete_series_route
 from app.api.routes.anime import get_series_state as get_series_state_route
 from app.api.routes.anime import hydrate_series as hydrate_series_route
 from app.api.routes.anime import HydrateSeriesRequest
+from app.api.routes.anime import rename_series as rename_series_route
+from app.api.routes.anime import RenameSeriesRequest
 from app.library_types import LibraryType
 from app.services.library_hydration_service import LibraryHydrationService
 from app.services.library_hydration_service import SeriesDeleteBlockedError
+from app.services.library_hydration_service import SeriesRenameConflictError
 
 
 @pytest.mark.asyncio
@@ -123,3 +126,79 @@ async def test_hydrate_series_route_enqueues_background_hydration(
 
     assert result["series_id"] == "series-1"
     assert result["operation"]["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_rename_series_route_returns_success_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_rename_series(
+        cls,
+        *,
+        library_type: LibraryType,
+        series_id: str,
+        new_name: str,
+    ) -> dict[str, object]:
+        assert library_type == LibraryType.ANIME
+        assert series_id == "series-1"
+        assert new_name == "New Name"
+        return {
+            "status": "renamed",
+            "series_id": "series-1",
+            "library_type": "anime",
+            "old_name": "Old Name",
+            "new_name": "New Name",
+            "storage_release_id": "release-2",
+        }
+
+    monkeypatch.setattr(
+        LibraryHydrationService,
+        "rename_series",
+        classmethod(fake_rename_series),
+    )
+
+    result = await rename_series_route(
+        "series-1",
+        RenameSeriesRequest(
+            library_type=LibraryType.ANIME,
+            new_name="New Name",
+        ),
+    )
+
+    assert result.series_id == "series-1"
+    assert result.old_name == "Old Name"
+    assert result.new_name == "New Name"
+    assert result.storage_release_id == "release-2"
+
+
+@pytest.mark.asyncio
+async def test_rename_series_route_surfaces_conflict_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_rename_series(
+        cls,
+        *,
+        library_type: LibraryType,
+        series_id: str,
+        new_name: str,
+    ) -> dict[str, object]:
+        raise SeriesRenameConflictError("rename busy")
+
+    monkeypatch.setattr(
+        LibraryHydrationService,
+        "rename_series",
+        classmethod(fake_rename_series),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await rename_series_route(
+            "series-1",
+            RenameSeriesRequest(
+                library_type=LibraryType.ANIME,
+                new_name="New Name",
+            ),
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["code"] == "series_rename_conflict"
+    assert exc_info.value.detail["message"] == "rename busy"

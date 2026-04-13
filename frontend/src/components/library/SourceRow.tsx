@@ -4,6 +4,7 @@ import {
   FolderDown,
   Cable,
   Loader2,
+  Pencil,
   Trash2,
 } from "lucide-react";
 import type { SourceDetails } from "@/types";
@@ -14,6 +15,7 @@ interface SourceRowProps {
   isDeleting: boolean;
   onSelect: () => void;
   onTogglePin: () => void;
+  onRename: () => void;
   onUpdate: () => void;
   onManageEpisodes: () => void;
   onDelete: () => void;
@@ -39,6 +41,7 @@ export function SourceRow({
   isDeleting,
   onSelect,
   onTogglePin,
+  onRename,
   onUpdate,
   onManageEpisodes,
   onDelete,
@@ -56,6 +59,8 @@ export function SourceRow({
   return (
     <div
       onClick={onSelect}
+      data-selected={isSelected ? "true" : "false"}
+      data-series-id={source.series_id}
       className={`flex items-center gap-2 rounded px-3 py-2 cursor-pointer transition-colors ${
         isSelected
           ? "bg-[hsl(var(--primary))]/10 ring-1 ring-[hsl(var(--primary))]"
@@ -83,7 +88,7 @@ export function SourceRow({
       </span>
 
       {/* Actions */}
-      <div className="flex gap-1 justify-end w-44 shrink-0">
+      <div className="flex gap-1 justify-end w-52 shrink-0">
         {hasLocalEpisodes && (
           <div
             className="p-1 text-violet-400 opacity-30"
@@ -120,6 +125,20 @@ export function SourceRow({
           }
         >
           <ShieldCheck className="h-4 w-4" />
+        </button>
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            if (!isDeleting) {
+              onRename();
+            }
+          }}
+          className="p-1 rounded text-indigo-500/60 hover:bg-indigo-500/10 hover:text-indigo-400 transition-colors"
+          disabled={isDeleting}
+          title="Renommer la source"
+          aria-label="Renommer la source"
+        >
+          <Pencil className="h-4 w-4" />
         </button>
         <button
           onClick={(e) => {

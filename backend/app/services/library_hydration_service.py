@@ -60,6 +60,10 @@ class SeriesDeleteBlockedError(RuntimeError):
         }
 
 
+class SeriesRenameConflictError(RuntimeError):
+    pass
+
+
 def _json_load(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -1423,6 +1427,286 @@ class LibraryHydrationService:
             "library_type": scoped_type.value,
             "display_name": display_name or None,
         }
+
+    @classmethod
+    def _rename_local_series_dir_sync(
+        cls,
+        old_dir: Path,
+        new_dir: Path,
+    ) -> None:
+        if not old_dir.exists() or old_dir == new_dir:
+            return
+        same_location = False
+        if new_dir.exists():
+            with suppress(OSError):
+                same_location = old_dir.resolve() == new_dir.resolve()
+        if new_dir.exists() and not same_location:
+            raise RuntimeError(f"Target series directory already exists: {new_dir}")
+        if old_dir.name.casefold() == new_dir.name.casefold():
+            temp_dir = old_dir.with_name(f".atr-rename-{uuid.uuid4().hex[:8]}")
+            old_dir.rename(temp_dir)
+            temp_dir.rename(new_dir)
+            return
+        old_dir.rename(new_dir)
+
+    @classmethod
+    def _rewrite_local_series_paths_in_place_sync(
+        cls,
+        *,
+        library_type: LibraryType,
+        series_id: str,
+        old_display_name: str,
+        new_display_name: str,
+        release_id: str,
+    ) -> None:
+        library_root = AnimeLibraryService.get_library_path(library_type)
+        old_dir = library_root / old_display_name
+        new_dir = library_root / new_display_name
+        same_location = False
+        if new_dir.exists() and old_dir.exists():
+            with suppress(OSError):
+                same_location = old_dir.resolve() == new_dir.resolve()
+        if new_dir.exists() and old_dir.exists() and old_dir != new_dir and not same_location:
+            raise RuntimeError(f"Conflicting local series directories: {old_dir} and {new_dir}")
+
+        if old_dir.exists() and old_dir != new_dir:
+            cls._rename_local_series_dir_sync(old_dir, new_dir)
+
+        if new_dir.exists():
+            StorageBoxRepository.write_local_series_metadata(
+                series_dir=new_dir,
+                series_id=series_id,
+                display_name=new_display_name,
+                release_id=release_id,
+            )
+
+            for source_manifest_path in new_dir.rglob(
+                f"*{AnimeLibraryService.SOURCE_IMPORT_MANIFEST_SUFFIX}"
+            ):
+                try:
+                    payload = _json_load(source_manifest_path)
+                except Exception:
+                    continue
+                rewritten = StorageBoxRepository._rewrite_source_import_payload_for_rename(
+                    payload,
+                    library_type=library_type,
+                    old_display_name=old_display_name,
+                    new_display_name=new_display_name,
+                )
+                _json_write_atomic(source_manifest_path, rewritten)
+
+            torrents_path = new_dir / ".atr_torrents.json"
+            if torrents_path.exists():
+                try:
+                    payload = _json_load(torrents_path)
+                except Exception:
+                    payload = None
+                if isinstance(payload, dict):
+                    rewritten = StorageBoxRepository._rewrite_torrent_metadata_for_rename(
+                        payload,
+                        library_type=library_type,
+                        old_display_name=old_display_name,
+                        new_display_name=new_display_name,
+                    )
+                    _json_write_atomic(torrents_path, rewritten)
+
+            for sidecar_manifest_path in new_dir.rglob("manifest.json"):
+                if not sidecar_manifest_path.parent.name.endswith(
+                    AnimeLibraryService.SUBTITLE_SIDECAR_SUFFIX
+                ):
+                    continue
+                try:
+                    payload = _json_load(sidecar_manifest_path)
+                except Exception:
+                    continue
+                rewritten = StorageBoxRepository._rewrite_subtitle_sidecar_manifest_for_rename(
+                    payload,
+                    library_type=library_type,
+                    old_display_name=old_display_name,
+                    new_display_name=new_display_name,
+                )
+                _json_write_atomic(sidecar_manifest_path, rewritten)
+
+        index_dir = library_root / AnimeLibraryService.INDEX_DIR_NAME
+        manifest_path = index_dir / AnimeLibraryService.MANIFEST_FILE
+        state_path = index_dir / AnimeLibraryService.STATE_FILE
+
+        if manifest_path.exists():
+            try:
+                local_manifest = _json_load(manifest_path)
+            except Exception:
+                local_manifest = None
+            if isinstance(local_manifest, dict):
+                raw_series = local_manifest.get("series", {})
+                if isinstance(raw_series, dict) and old_display_name in raw_series:
+                    series_entry = raw_series.pop(old_display_name)
+                    raw_series[new_display_name] = series_entry
+                    _json_write_atomic(manifest_path, local_manifest)
+
+        if state_path.exists():
+            try:
+                local_state = _json_load(state_path)
+            except Exception:
+                local_state = None
+            if isinstance(local_state, dict):
+                raw_files = local_state.get("files", {})
+                if isinstance(raw_files, dict):
+                    local_state["files"] = {
+                        StorageBoxRepository._rewrite_local_relative_series_path(
+                            path,
+                            old_display_name=old_display_name,
+                            new_display_name=new_display_name,
+                        ): value
+                        for path, value in raw_files.items()
+                    }
+                    _json_write_atomic(state_path, local_state)
+
+    @classmethod
+    async def rename_series(
+        cls,
+        *,
+        library_type: LibraryType | str,
+        series_id: str,
+        new_name: str,
+    ) -> dict[str, Any]:
+        scoped_type = coerce_library_type(library_type)
+        target_name = str(new_name or "").strip()
+        if not target_name:
+            raise ValueError("Le nouveau nom de la série ne peut pas être vide.")
+
+        async with cls._series_lock(scoped_type, series_id):
+            active_operation = await cls._selected_operation(
+                library_type=scoped_type,
+                series_id=series_id,
+                preferred_types=("activate", "hydrate", "evict"),
+            )
+            if cls._operation_is_active(active_operation):
+                raise SeriesRenameConflictError(
+                    "Impossible de renommer la série pendant une activation, hydratation ou éviction en cours."
+                )
+
+            current = await StorageBoxRepository.get_current_release(scoped_type, series_id)
+            current_release_id = str(current.get("release_id") or "").strip()
+            manifest = await StorageBoxRepository.get_series_manifest(
+                scoped_type,
+                series_id,
+                current_release_id or None,
+            )
+            old_name = str(manifest.get("display_name") or "").strip()
+            if not old_name:
+                raise RuntimeError(f"Series '{series_id}' is missing a display name.")
+            if target_name == old_name:
+                return {
+                    "status": "renamed",
+                    "series_id": series_id,
+                    "library_type": scoped_type.value,
+                    "old_name": old_name,
+                    "new_name": old_name,
+                    "storage_release_id": current_release_id,
+                }
+
+            existing_entry = await StorageBoxRepository.find_catalog_entry_by_name(
+                scoped_type,
+                target_name,
+            )
+            if existing_entry is not None:
+                existing_series_id = str(existing_entry.get("series_id") or "").strip()
+                if existing_series_id and existing_series_id != series_id:
+                    raise SeriesRenameConflictError(
+                        f"Une autre série existe déjà avec le nom '{target_name}'."
+                    )
+            else:
+                remote_series_id = await StorageBoxRepository.find_remote_series_id_by_name(
+                    scoped_type,
+                    target_name,
+                )
+                if remote_series_id and str(remote_series_id).strip() != series_id:
+                    raise SeriesRenameConflictError(
+                        f"Une autre série existe déjà avec le nom '{target_name}'."
+                    )
+
+            library_root = AnimeLibraryService.get_library_path(scoped_type)
+            old_dir = library_root / old_name
+            target_dir = library_root / target_name
+            if target_dir.exists() and target_dir != old_dir:
+                same_location = False
+                if old_dir.exists():
+                    with suppress(OSError):
+                        same_location = old_dir.resolve() == target_dir.resolve()
+                if same_location:
+                    target_dir = old_dir
+                else:
+                    target_metadata = await asyncio.to_thread(
+                        StorageBoxRepository.read_local_series_metadata,
+                        target_dir,
+                    )
+                    target_series_id = (
+                        str(target_metadata.get("series_id") or "").strip()
+                        if isinstance(target_metadata, dict)
+                        else ""
+                    )
+                    if target_series_id != series_id:
+                        raise SeriesRenameConflictError(
+                            f"Un dossier local conflictuel existe déjà pour '{target_name}'."
+                        )
+                    if old_dir.exists():
+                        raise SeriesRenameConflictError(
+                            f"Deux dossiers locaux concurrents existent pour '{old_name}' et '{target_name}'."
+                        )
+
+            rename_result = await StorageBoxRepository.rename_series(
+                library_type=scoped_type,
+                series_id=series_id,
+                new_display_name=target_name,
+            )
+            new_release_id = str(rename_result["release_id"])
+
+            async with cls._library_lock(scoped_type):
+                await asyncio.to_thread(
+                    cls._rewrite_local_series_paths_in_place_sync,
+                    library_type=scoped_type,
+                    series_id=series_id,
+                    old_display_name=old_name,
+                    new_display_name=target_name,
+                    release_id=new_release_id,
+                )
+
+            await cls._cache_manifest(scoped_type, dict(rename_result["manifest"]))
+            await cls.sync_local_series_state(
+                library_type=scoped_type,
+                series_id=series_id,
+                release_id=new_release_id,
+            )
+            await asyncio.to_thread(
+                ProjectService.rename_series_references,
+                library_type=scoped_type,
+                series_id=series_id,
+                new_name=target_name,
+            )
+
+            from .anime_matcher import AnimeMatcherService
+            from .project_startup_service import project_startup_queue
+
+            await project_startup_queue.rename_series_references(
+                library_type=scoped_type,
+                series_id=series_id,
+                new_name=target_name,
+            )
+            AnimeMatcherService.mark_series_updated(scoped_type, old_name)
+            AnimeMatcherService.mark_series_updated(scoped_type, target_name)
+            await AnimeLibraryService.ensure_episode_manifest(
+                force_refresh=True,
+                library_type=scoped_type,
+            )
+
+            return {
+                "status": "renamed",
+                "series_id": series_id,
+                "library_type": scoped_type.value,
+                "old_name": old_name,
+                "new_name": target_name,
+                "storage_release_id": new_release_id,
+            }
 
     @classmethod
     async def _cache_manifest(

@@ -8,6 +8,7 @@ interface SourceListProps {
   deletingSourceId: string | null;
   onSelectSource: (seriesId: string) => void;
   onToggleProtection: (seriesId: string) => void;
+  onRenameSource: (source: SourceDetails) => void;
   onUpdateSource: (source: SourceDetails) => void;
   onManageTorrents: (source: SourceDetails) => void;
   onDeleteSource: (source: SourceDetails) => void;
@@ -20,6 +21,7 @@ export function SourceList({
   deletingSourceId,
   onSelectSource,
   onToggleProtection,
+  onRenameSource,
   onUpdateSource,
   onManageTorrents,
   onDeleteSource,
@@ -48,7 +50,7 @@ export function SourceList({
         <div className="w-20 shrink-0">Épisodes</div>
         <div className="w-14 shrink-0">FPS</div>
         <div className="w-16 shrink-0">Taille</div>
-        <div className="w-44 shrink-0 text-right">Actions</div>
+        <div className="w-52 shrink-0 text-right">Actions</div>
       </div>
 
       {/* Source rows */}
@@ -66,6 +68,7 @@ export function SourceList({
               isDeleting={deletingSourceId === source.series_id}
               onSelect={() => onSelectSource(source.series_id)}
               onTogglePin={() => onToggleProtection(source.series_id)}
+              onRename={() => onRenameSource(source)}
               onUpdate={() => onUpdateSource(source)}
               onManageEpisodes={() => onManageTorrents(source)}
               onDelete={() => onDeleteSource(source)}

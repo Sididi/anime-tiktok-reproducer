@@ -136,6 +136,27 @@ class ProjectService:
         ]
 
     @classmethod
+    def rename_series_references(
+        cls,
+        *,
+        library_type: LibraryType | str,
+        series_id: str,
+        new_name: str,
+    ) -> list[Project]:
+        scoped_type = coerce_library_type(library_type)
+        renamed_projects: list[Project] = []
+        for project in cls.list_all():
+            if project.series_id != series_id or project.library_type != scoped_type:
+                continue
+            if project.anime_name == new_name:
+                renamed_projects.append(project)
+                continue
+            project.anime_name = new_name
+            cls.save(project)
+            renamed_projects.append(project)
+        return renamed_projects
+
+    @classmethod
     def list_all(cls) -> list[Project]:
         """List all projects."""
         projects = []
