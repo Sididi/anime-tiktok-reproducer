@@ -244,7 +244,7 @@ def test_library_scans_ignore_transient_temp_media(monkeypatch: pytest.MonkeyPat
     series_dir = library_path / "Demo"
     series_dir.mkdir(parents=True)
 
-    real_episode = series_dir / "episode01.mkv"
+    real_episode = series_dir / "episode01.mp4"
     transient_import = series_dir / "episode01.import.tmp.mp4"
     transient_normalize = series_dir / "episode01.normalize.tmp.mp4"
     real_episode.write_bytes(b"real-episode")
@@ -268,7 +268,7 @@ def test_library_scans_ignore_transient_temp_media(monkeypatch: pytest.MonkeyPat
         json.dumps(
             {
                 "files": {
-                    "Demo/episode01.mkv": {
+                    "Demo/episode01.mp4": {
                         "mtime_ns": 1,
                         "size": real_episode.stat().st_size,
                         "frame_count": 12,

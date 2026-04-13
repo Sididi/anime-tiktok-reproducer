@@ -259,12 +259,19 @@ export const api = {
       },
     ),
 
-  buildCopyrightAudio: (projectId: string, musicKey: string | null, noMusicFileId: string) =>
+  buildCopyrightAudio: (
+    projectId: string,
+    musicKey: string | null,
+    noMusicFileId: string,
+  ) =>
     request<{ audio_path: string }>(
       `/project-manager/projects/${projectId}/copyright-build-audio`,
       {
         method: "POST",
-        body: JSON.stringify({ music_key: musicKey, no_music_file_id: noMusicFileId }),
+        body: JSON.stringify({
+          music_key: musicKey,
+          no_music_file_id: noMusicFileId,
+        }),
       },
     ),
 
@@ -699,18 +706,23 @@ export const api = {
   listIndexationJobs: () =>
     request<{ jobs: import("@/types").IndexationJob[] }>("/anime/jobs"),
 
-  streamIndexationJobs: () =>
-    fetch(`${API_BASE}/anime/jobs/stream`),
+  streamIndexationJobs: () => fetch(`${API_BASE}/anime/jobs/stream`),
 
   // Library - Purge
-  purgeLibrary: (libraryType: import("@/types").LibraryType, allTypes: boolean) =>
+  purgeLibrary: (
+    libraryType: import("@/types").LibraryType,
+    allTypes: boolean,
+  ) =>
     request<import("@/types").PurgeResult>("/anime/purge", {
       method: "POST",
       body: JSON.stringify({ library_type: libraryType, all_types: allTypes }),
     }),
 
   // Library - Purge protection
-  togglePermanentPin: (libraryType: import("@/types").LibraryType, seriesId: string) =>
+  togglePermanentPin: (
+    libraryType: import("@/types").LibraryType,
+    seriesId: string,
+  ) =>
     request<{ permanent_pin: boolean; hydration_started: boolean }>(
       `/anime/${encodeURIComponent(seriesId)}/pin?library_type=${encodeURIComponent(libraryType)}`,
       { method: "PATCH" },
@@ -741,10 +753,7 @@ export const api = {
       `/anime/${encodeURIComponent(seriesId)}/state?library_type=${encodeURIComponent(libraryType)}`,
     ),
 
-  evictSeries: (
-    libraryType: import("@/types").LibraryType,
-    seriesId: string,
-  ) =>
+  evictSeries: (libraryType: import("@/types").LibraryType, seriesId: string) =>
     request<import("@/types").LibraryActivationState>(
       `/anime/${encodeURIComponent(seriesId)}/evict`,
       {
@@ -822,17 +831,21 @@ export const api = {
   },
 
   // Library - Estimate purge size
-  estimatePurgeSize: (libraryType: import("@/types").LibraryType, allTypes: boolean) =>
+  estimatePurgeSize: (
+    libraryType: import("@/types").LibraryType,
+    allTypes: boolean,
+  ) =>
     request<{ estimated_bytes: number; source_count: number }>(
       `/anime/purge/estimate?library_type=${encodeURIComponent(libraryType)}&all_types=${allTypes}`,
     ),
 
   // TikTok URL duplicate check
   checkTiktokUrl: (url: string) =>
-    request<{ exists: boolean; video_id: string | null; registered_at: string | null }>(
-      "/tiktok-urls/check",
-      { method: "POST", body: JSON.stringify({ url }) },
-    ),
+    request<{
+      exists: boolean;
+      video_id: string | null;
+      registered_at: string | null;
+    }>("/tiktok-urls/check", { method: "POST", body: JSON.stringify({ url }) }),
 
   // Duration Warning
   acknowledgeDurationWarning: (projectId: string) =>
@@ -843,14 +856,10 @@ export const api = {
 
   // Gap Resolution
   getGapsConfig: (projectId: string) =>
-    request<GapsConfig>(
-      `/projects/${projectId}/gaps/config`,
-    ),
+    request<GapsConfig>(`/projects/${projectId}/gaps/config`),
 
   getGaps: (projectId: string) =>
-    request<GapsResponse>(
-      `/projects/${projectId}/gaps`,
-    ),
+    request<GapsResponse>(`/projects/${projectId}/gaps`),
 
   getGapCandidates: (projectId: string, sceneIndex: number) =>
     request<{ scene_index: number; candidates: GapCandidate[] }>(
@@ -1069,14 +1078,17 @@ export const api = {
     libraryType: import("@/types").LibraryType,
     replacements: Array<{ torrent_id: string; new_magnet_uri: string }>,
   ) =>
-    fetch(`${API_BASE}/anime/${encodeURIComponent(sourceName)}/torrents/replace`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        library_type: libraryType,
-        replacements,
-      }),
-    }),
+    fetch(
+      `${API_BASE}/anime/${encodeURIComponent(sourceName)}/torrents/replace`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          library_type: libraryType,
+          replacements,
+        }),
+      },
+    ),
 
   confirmReindex: (
     sourceName: string,

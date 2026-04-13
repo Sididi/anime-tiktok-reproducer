@@ -236,6 +236,13 @@ class SceneDetectorService:
                 return True
         return False
 
+    @staticmethod
+    def _min_distance_to_boundaries(boundary: float, boundaries: list[float]) -> float:
+        """Return the minimum distance from boundary to any value in boundaries."""
+        if not boundaries:
+            return float("inf")
+        return min(abs(b - boundary) for b in boundaries)
+
     @classmethod
     def _sanitize_extreme_short_ranges(
         cls,
@@ -305,6 +312,15 @@ class SceneDetectorService:
                 merge_with_previous = False
             elif right_present and not left_present:
                 merge_with_previous = True
+            elif left_present and right_present:
+                # Both boundaries are within tolerance - compare distances.
+                # The boundary CLOSER to a high_boundary survived; merge away
+                # from it (toward the one that disappeared).
+                left_dist = cls._min_distance_to_boundaries(left_boundary, high_boundaries)
+                right_dist = cls._min_distance_to_boundaries(right_boundary, high_boundaries)
+                # If right is closer, right survived → left disappeared → merge with previous
+                # If left is closer, left survived → right disappeared → merge with next
+                merge_with_previous = right_dist < left_dist
             else:
                 prev_duration = merged[idx - 1][1] - merged[idx - 1][0]
                 next_duration = merged[idx + 1][1] - merged[idx + 1][0]
