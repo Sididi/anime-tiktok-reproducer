@@ -429,6 +429,7 @@ export function ProjectManagerModal({
   const enqueueUpload = useCallback(
     async (context: PendingUploadContext, token: string) => {
       patchUploadSession(context.projectId, token, {
+        context,
         status: "enqueueing",
         message: "Queueing upload...",
       });
@@ -458,6 +459,7 @@ export function ProjectManagerModal({
   const continueUploadAfterFacebook = useCallback(
     async (context: PendingUploadContext, token: string) => {
       patchUploadSession(context.projectId, token, {
+        context,
         status: "checking_youtube",
         message: "Vérification de la durée YouTube...",
         facebookResult: undefined,
@@ -472,6 +474,7 @@ export function ProjectManagerModal({
 
         if (result.needed) {
           patchUploadSession(context.projectId, token, {
+            context,
             status: "awaiting_youtube_choice",
             message: null,
             youtubeResult: result,
@@ -492,6 +495,7 @@ export function ProjectManagerModal({
   const continueUploadAfterCopyright = useCallback(
     async (context: PendingUploadContext, token: string) => {
       patchUploadSession(context.projectId, token, {
+        context,
         status: "checking_facebook",
         message: "Vérification de la durée Facebook...",
         copyrightResult: undefined,
@@ -506,6 +510,7 @@ export function ProjectManagerModal({
 
         if (result.needed) {
           patchUploadSession(context.projectId, token, {
+            context,
             status: "awaiting_facebook_choice",
             message: null,
             facebookResult: result,
@@ -542,6 +547,7 @@ export function ProjectManagerModal({
 
         if (result.copyrighted) {
           patchUploadSession(projectId, token, {
+            context,
             status: result.no_music_available
               ? "awaiting_copyright_music"
               : "awaiting_copyright_warning",
@@ -937,12 +943,12 @@ export function ProjectManagerModal({
           <AnimatePresence>
             {promptSessions.length > 0 && (
               <motion.div
-                className="fixed inset-0 z-[60] bg-black/55 flex items-start justify-start p-6 pointer-events-none"
+                className="fixed inset-0 z-[60] bg-black/55 flex items-start justify-center p-6 pointer-events-none"
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
                 exit={{ opacity: 0 }}
               >
-                <div className="max-w-6xl max-h-full overflow-y-auto flex flex-col items-start gap-5 py-4 pointer-events-auto">
+                <div className="max-w-6xl max-h-full overflow-y-auto flex flex-col items-center gap-5 py-4 pointer-events-auto">
                   {promptSessions.map((session) => {
                     const row = rowsByProjectId[session.context.projectId];
                     const projectTitle = row?.anime_title || "Projet";

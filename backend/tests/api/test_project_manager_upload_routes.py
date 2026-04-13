@@ -18,6 +18,8 @@ def test_project_manager_upload_enqueue_route_returns_job_json(monkeypatch) -> N
     async def fake_enqueue_upload(**kwargs):
         assert kwargs["project_id"] == "project-1"
         assert kwargs["account_id"] == "acct-1"
+        assert kwargs["platforms"] == ["youtube", "facebook"]
+        assert kwargs["copyright_audio_path"] == "/tmp/replacement.wav"
         return SimpleNamespace(
             model_dump=lambda mode="json": {
                 "job_id": "upload-job-1",
@@ -43,7 +45,11 @@ def test_project_manager_upload_enqueue_route_returns_job_json(monkeypatch) -> N
     client = TestClient(_build_test_app())
     response = client.post(
         "/api/project-manager/projects/project-1/upload",
-        json={"account_id": "acct-1"},
+        json={
+            "account_id": "acct-1",
+            "platforms": ["youtube", "facebook"],
+            "copyright_audio_path": "/tmp/replacement.wav",
+        },
     )
 
     assert response.status_code == 200

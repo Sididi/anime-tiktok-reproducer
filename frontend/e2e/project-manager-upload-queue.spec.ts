@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
 const SOURCE_DETAILS = [
   {
@@ -63,19 +63,191 @@ const INITIAL_PROJECT_ROWS = [
   },
 ];
 
+type ProjectRow = (typeof INITIAL_PROJECT_ROWS)[number];
+
+interface UploadRequestBody {
+  account_id?: string | null;
+  platforms?: string[] | null;
+  facebook_strategy?: string | null;
+  youtube_strategy?: string | null;
+  copyright_audio_path?: string | null;
+}
+
+interface MockProjectConfig {
+  copyrightCheck?: Record<string, unknown>;
+  buildAudioPath?: string;
+  facebookCheck?: Record<string, unknown>;
+  youtubeCheck?: Record<string, unknown>;
+  upload?: {
+    jobId: string;
+    runningDelayMs?: number;
+    completeDelayMs?: number | null;
+    completionRowPatch?: Partial<ProjectRow>;
+    result?: Record<string, unknown> | null;
+  };
+}
+
+const STACKED_PROJECT_CONFIGS: Record<string, MockProjectConfig> = {
+  "project-alpha": {
+    copyrightCheck: {
+      copyrighted: true,
+      music_key: "track-a",
+      music_display_name: "Track A",
+      no_music_file_id: "no-music-alpha",
+      no_music_available: true,
+      available_musics: [
+        { key: "replacement-1", display_name: "Replacement One" },
+      ],
+      drive_video_id: "drive-alpha",
+    },
+    buildAudioPath: "/tmp/project-alpha-replacement.wav",
+    facebookCheck: {
+      needed: false,
+      duration_seconds: 45,
+      speed_factor: 1,
+      sped_up_available: false,
+    },
+    youtubeCheck: {
+      needed: false,
+      duration_seconds: 45,
+      speed_factor: 1,
+      sped_up_available: false,
+    },
+    upload: {
+      jobId: "upload-job-alpha",
+      runningDelayMs: 80,
+    },
+  },
+  "project-beta": {
+    copyrightCheck: { copyrighted: false },
+    facebookCheck: {
+      needed: true,
+      duration_seconds: 112,
+      speed_factor: 1.25,
+      sped_up_available: true,
+    },
+    youtubeCheck: {
+      needed: false,
+      duration_seconds: 112,
+      speed_factor: 1,
+      sped_up_available: false,
+    },
+    upload: {
+      jobId: "upload-job-beta",
+      runningDelayMs: 20,
+      completeDelayMs: 220,
+      completionRowPatch: {
+        uploaded: true,
+        uploaded_status: "green",
+        scheduled_at: "2020-01-01T00:00:00Z",
+      },
+      result: { ok: true },
+    },
+  },
+};
+
+const FACEBOOK_CHAIN_CONFIGS: Record<string, MockProjectConfig> = {
+  "project-alpha": {
+    copyrightCheck: {
+      copyrighted: true,
+      music_key: "track-a",
+      music_display_name: "Track A",
+      no_music_file_id: "no-music-alpha",
+      no_music_available: true,
+      available_musics: [
+        { key: "replacement-1", display_name: "Replacement One" },
+      ],
+      drive_video_id: "drive-alpha",
+    },
+    buildAudioPath: "/tmp/project-alpha-replacement.wav",
+    facebookCheck: {
+      needed: true,
+      duration_seconds: 112,
+      speed_factor: 1.25,
+      sped_up_available: true,
+    },
+    youtubeCheck: {
+      needed: false,
+      duration_seconds: 112,
+      speed_factor: 1,
+      sped_up_available: false,
+    },
+    upload: {
+      jobId: "upload-job-alpha-facebook",
+      runningDelayMs: 20,
+      completeDelayMs: 80,
+      completionRowPatch: {
+        uploaded: true,
+        uploaded_status: "green",
+        scheduled_at: "2026-04-12T10:00:30Z",
+      },
+      result: { ok: true },
+    },
+  },
+};
+
+const YOUTUBE_CHAIN_CONFIGS: Record<string, MockProjectConfig> = {
+  "project-alpha": {
+    copyrightCheck: {
+      copyrighted: true,
+      music_key: "track-a",
+      music_display_name: "Track A",
+      no_music_file_id: "no-music-alpha",
+      no_music_available: true,
+      available_musics: [
+        { key: "replacement-1", display_name: "Replacement One" },
+      ],
+      drive_video_id: "drive-alpha",
+    },
+    buildAudioPath: "/tmp/project-alpha-replacement.wav",
+    facebookCheck: {
+      needed: false,
+      duration_seconds: 45,
+      speed_factor: 1,
+      sped_up_available: false,
+    },
+    youtubeCheck: {
+      needed: true,
+      duration_seconds: 224,
+      speed_factor: 1.2444,
+      sped_up_available: true,
+    },
+    upload: {
+      jobId: "upload-job-alpha-youtube",
+      runningDelayMs: 20,
+      completeDelayMs: 80,
+      completionRowPatch: {
+        uploaded: true,
+        uploaded_status: "green",
+        scheduled_at: "2026-04-12T10:00:30Z",
+      },
+      result: { ok: true },
+    },
+  },
+};
+
 function installProjectManagerUploadMocks({
   sourceDetails,
   initialProjectRows,
+  projectConfigs,
 }: {
   sourceDetails: typeof SOURCE_DETAILS;
   initialProjectRows: typeof INITIAL_PROJECT_ROWS;
+  projectConfigs: Record<string, MockProjectConfig>;
 }) {
   const encoder = new TextEncoder();
   const originalFetch = window.fetch.bind(window);
+  const uploadRequestsByProject: Record<string, UploadRequestBody[]> = {};
+  const testWindow = window as Window &
+    typeof globalThis & {
+      __projectManagerUploadRequests?: Record<string, UploadRequestBody[]>;
+    };
   let projectRows = initialProjectRows.map((row) => ({ ...row }));
   let uploadController: ReadableStreamDefaultController<Uint8Array> | null =
     null;
   const pendingUploadEvents: string[] = [];
+
+  testWindow.__projectManagerUploadRequests = uploadRequestsByProject;
 
   const emitUploadJob = (payload: Record<string, unknown>) => {
     const chunk = `data: ${JSON.stringify(payload)}\n\n`;
@@ -92,6 +264,30 @@ function installProjectManagerUploadMocks({
       headers: { "Content-Type": "application/json" },
     });
 
+  const emptyEventStream = () =>
+    new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.close();
+        },
+      }),
+      {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      },
+    );
+
+  const parseJsonBody = (body: RequestInit["body"]): UploadRequestBody => {
+    if (typeof body !== "string") {
+      return {};
+    }
+    try {
+      return JSON.parse(body) as UploadRequestBody;
+    } catch {
+      return {};
+    }
+  };
+
   window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     const requestUrl =
       typeof input === "string"
@@ -105,230 +301,173 @@ function installProjectManagerUploadMocks({
       return jsonResponse(sourceDetails);
     }
 
-      if (url.pathname === "/api/anime/jobs/stream") {
-        return new Response(
-          new ReadableStream({
-            start(controller) {
-              controller.close();
-            },
-          }),
-          {
-            status: 200,
-            headers: { "Content-Type": "text/event-stream" },
+    if (url.pathname === "/api/anime/jobs/stream") {
+      return emptyEventStream();
+    }
+
+    if (
+      url.pathname === "/api/projects/startup/jobs" ||
+      url.pathname === "/api/projects/startup/jobs/stream"
+    ) {
+      if (url.pathname.endsWith("/stream")) {
+        return emptyEventStream();
+      }
+      return jsonResponse({ jobs: [] });
+    }
+
+    if (url.pathname === "/api/project-manager/projects") {
+      return jsonResponse({ projects: projectRows });
+    }
+
+    if (url.pathname === "/api/project-manager/upload-jobs") {
+      return jsonResponse({ jobs: [] });
+    }
+
+    if (url.pathname === "/api/project-manager/upload-jobs/stream") {
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            uploadController = controller;
+            pendingUploadEvents.splice(0).forEach((chunk) => {
+              controller.enqueue(encoder.encode(chunk));
+            });
           },
-        );
-      }
-
-      if (
-        url.pathname === "/api/projects/startup/jobs" ||
-        url.pathname === "/api/projects/startup/jobs/stream"
-      ) {
-        if (url.pathname.endsWith("/stream")) {
-          return new Response(
-            new ReadableStream({
-              start(controller) {
-                controller.close();
-              },
-            }),
-            {
-              status: 200,
-              headers: { "Content-Type": "text/event-stream" },
-            },
-          );
-        }
-        return jsonResponse({ jobs: [] });
-      }
-
-      if (url.pathname === "/api/project-manager/projects") {
-        return jsonResponse({ projects: projectRows });
-      }
-
-      if (url.pathname === "/api/project-manager/upload-jobs") {
-        return jsonResponse({ jobs: [] });
-      }
-
-      if (url.pathname === "/api/project-manager/upload-jobs/stream") {
-        return new Response(
-          new ReadableStream({
-            start(controller) {
-              uploadController = controller;
-              pendingUploadEvents.splice(0).forEach((chunk) => {
-                controller.enqueue(encoder.encode(chunk));
-              });
-            },
-          }),
-          {
-            status: 200,
-            headers: { "Content-Type": "text/event-stream" },
-          },
-        );
-      }
-
-      if (url.pathname === "/api/accounts") {
-        return jsonResponse({ accounts: [] });
-      }
-
-      if (url.pathname === "/api/project-manager/projects/project-alpha/copyright-check") {
-        return jsonResponse({
-          copyrighted: true,
-          music_key: "track-a",
-          music_display_name: "Track A",
-          no_music_file_id: "no-music-alpha",
-          no_music_available: true,
-          available_musics: [
-            { key: "replacement-1", display_name: "Replacement One" },
-          ],
-          drive_video_id: "drive-alpha",
-        });
-      }
-
-      if (url.pathname === "/api/project-manager/projects/project-alpha/copyright-build-audio") {
-        return jsonResponse({ audio_path: "/tmp/project-alpha-replacement.wav" });
-      }
-
-      if (url.pathname === "/api/project-manager/projects/project-alpha/facebook-check") {
-        return jsonResponse({
-          needed: false,
-          duration_seconds: 45,
-          speed_factor: 1,
-          sped_up_available: false,
-        });
-      }
-
-      if (url.pathname === "/api/project-manager/projects/project-alpha/youtube-check") {
-        return jsonResponse({
-          needed: false,
-          duration_seconds: 45,
-          speed_factor: 1,
-          sped_up_available: false,
-        });
-      }
-
-      if (url.pathname === "/api/project-manager/projects/project-beta/copyright-check") {
-        return jsonResponse({ copyrighted: false });
-      }
-
-      if (url.pathname === "/api/project-manager/projects/project-beta/facebook-check") {
-        return jsonResponse({
-          needed: true,
-          duration_seconds: 112,
-          speed_factor: 1.25,
-          sped_up_available: true,
-        });
-      }
-
-      if (url.pathname === "/api/project-manager/projects/project-beta/youtube-check") {
-        return jsonResponse({
-          needed: false,
-          duration_seconds: 112,
-          speed_factor: 1,
-          sped_up_available: false,
-        });
-      }
-
-      if (
-        url.pathname === "/api/project-manager/projects/project-alpha/upload" &&
-        init?.method === "POST"
-      ) {
-        window.setTimeout(() => {
-          emitUploadJob({
-            job_id: "upload-job-alpha",
-            project_id: "project-alpha",
-            account_id: null,
-            status: "running",
-            phase: "platform_upload",
-            message: "Uploading to social platforms...",
-            error: null,
-            result: null,
-            created_at: "2026-04-12T10:00:00Z",
-            updated_at: "2026-04-12T10:00:05Z",
-          });
-        }, 80);
-
-        return jsonResponse({
-          job_id: "upload-job-alpha",
-          project_id: "project-alpha",
-          account_id: null,
-          status: "queued",
-          phase: "queued",
-          message: "Upload queued",
-          error: null,
-          result: null,
-          created_at: "2026-04-12T10:00:00Z",
-          updated_at: "2026-04-12T10:00:00Z",
-        });
-      }
-
-      if (
-        url.pathname === "/api/project-manager/projects/project-beta/upload" &&
-        init?.method === "POST"
-      ) {
-        window.setTimeout(() => {
-          emitUploadJob({
-            job_id: "upload-job-beta",
-            project_id: "project-beta",
-            account_id: null,
-            status: "running",
-            phase: "platform_upload",
-            message: "Uploading to social platforms...",
-            error: null,
-            result: null,
-            created_at: "2026-04-12T10:00:00Z",
-            updated_at: "2026-04-12T10:00:05Z",
-          });
-        }, 20);
-        window.setTimeout(() => {
-          projectRows = projectRows.map((row) =>
-            row.project_id === "project-beta"
-              ? {
-                  ...row,
-                  uploaded: true,
-                  uploaded_status: "green",
-                  scheduled_at: "2020-01-01T00:00:00Z",
-                }
-              : row,
-          );
-          emitUploadJob({
-            job_id: "upload-job-beta",
-            project_id: "project-beta",
-            account_id: null,
-            status: "complete",
-            phase: "complete",
-            message: "Upload complete.",
-            error: null,
-            result: { ok: true },
-            created_at: "2026-04-12T10:00:00Z",
-            updated_at: "2026-04-12T10:00:30Z",
-          });
-        }, 220);
-
-        return jsonResponse({
-          job_id: "upload-job-beta",
-          project_id: "project-beta",
-          account_id: null,
-          status: "queued",
-          phase: "queued",
-          message: "Upload queued",
-          error: null,
-          result: null,
-          created_at: "2026-04-12T10:00:00Z",
-          updated_at: "2026-04-12T10:00:00Z",
-        });
-      }
-
-      if (
-        url.pathname.startsWith("/api/project-manager/projects/project-beta/facebook-preview/") ||
-        url.pathname.startsWith("/api/project-manager/projects/project-alpha/copyright-video") ||
-        url.pathname.startsWith("/api/project-manager/projects/project-alpha/copyright-audio")
-      ) {
-        return new Response("", {
+        }),
+        {
           status: 200,
-          headers: { "Content-Type": "video/mp4" },
-        });
+          headers: { "Content-Type": "text/event-stream" },
+        },
+      );
+    }
+
+    if (url.pathname === "/api/accounts") {
+      return jsonResponse({ accounts: [] });
+    }
+
+    const projectActionMatch = url.pathname.match(
+      /^\/api\/project-manager\/projects\/([^/]+)\/(copyright-check|copyright-build-audio|facebook-check|youtube-check|upload)$/,
+    );
+
+    if (projectActionMatch) {
+      const [, projectId, action] = projectActionMatch;
+      const config = projectConfigs[projectId];
+      if (!config) {
+        return new Response("Not found", { status: 404 });
       }
+
+      if (action === "copyright-check" && config.copyrightCheck) {
+        return jsonResponse(config.copyrightCheck);
+      }
+
+      if (action === "copyright-build-audio" && config.buildAudioPath) {
+        return jsonResponse({ audio_path: config.buildAudioPath });
+      }
+
+      if (action === "facebook-check" && config.facebookCheck) {
+        return jsonResponse(config.facebookCheck);
+      }
+
+      if (action === "youtube-check" && config.youtubeCheck) {
+        return jsonResponse(config.youtubeCheck);
+      }
+
+      if (action === "upload" && init?.method === "POST" && config.upload) {
+        const requestBody = parseJsonBody(init.body);
+        (uploadRequestsByProject[projectId] ||= []).push(requestBody);
+
+        const queuedJob = {
+          job_id: config.upload.jobId,
+          project_id: projectId,
+          account_id:
+            typeof requestBody.account_id === "string"
+              ? requestBody.account_id
+              : null,
+          status: "queued",
+          phase: "queued",
+          message: "Upload queued",
+          error: null,
+          result: null,
+          created_at: "2026-04-12T10:00:00Z",
+          updated_at: "2026-04-12T10:00:00Z",
+        };
+
+        window.setTimeout(() => {
+          emitUploadJob({
+            ...queuedJob,
+            status: "running",
+            phase: "platform_upload",
+            message: "Uploading to social platforms...",
+            updated_at: "2026-04-12T10:00:05Z",
+          });
+        }, config.upload.runningDelayMs ?? 20);
+
+        if (config.upload.completeDelayMs != null) {
+          window.setTimeout(() => {
+            if (config.upload?.completionRowPatch) {
+              projectRows = projectRows.map((row) =>
+                row.project_id === projectId
+                  ? { ...row, ...config.upload?.completionRowPatch }
+                  : row,
+              );
+            }
+            emitUploadJob({
+              ...queuedJob,
+              status: "complete",
+              phase: "complete",
+              message: "Upload complete.",
+              result: config.upload?.result ?? { ok: true },
+              updated_at: "2026-04-12T10:00:30Z",
+            });
+          }, config.upload.completeDelayMs);
+        }
+
+        return jsonResponse(queuedJob);
+      }
+
+      return new Response("Not found", { status: 404 });
+    }
+
+    if (
+      /^\/api\/project-manager\/projects\/[^/]+\/copyright-audio$/.test(
+        url.pathname,
+      )
+    ) {
+      return new Response("", {
+        status: 200,
+        headers: { "Content-Type": "audio/wav" },
+      });
+    }
+
+    if (
+      /^\/api\/project-manager\/projects\/[^/]+\/copyright-video$/.test(
+        url.pathname,
+      ) ||
+      /^\/api\/project-manager\/projects\/[^/]+\/facebook-preview\/(original|sped_up)$/.test(
+        url.pathname,
+      ) ||
+      /^\/api\/project-manager\/projects\/[^/]+\/youtube-preview\/(original|sped_up)$/.test(
+        url.pathname,
+      )
+    ) {
+      return new Response("", {
+        status: 200,
+        headers: { "Content-Type": "video/mp4" },
+      });
+    }
 
     return originalFetch(input, init);
   };
+}
+
+async function latestUploadRequest(page: Page, projectId: string) {
+  return page.evaluate((id) => {
+    const testWindow = window as Window &
+      typeof globalThis & {
+        __projectManagerUploadRequests?: Record<string, UploadRequestBody[]>;
+      };
+    const requests = testWindow.__projectManagerUploadRequests?.[id] ?? [];
+    return requests[requests.length - 1] ?? null;
+  }, projectId);
 }
 
 test("Project Manager stacks upload prompts and keeps other uploads alive through refresh", async ({
@@ -337,6 +476,7 @@ test("Project Manager stacks upload prompts and keeps other uploads alive throug
   await page.addInitScript(installProjectManagerUploadMocks, {
     sourceDetails: SOURCE_DETAILS,
     initialProjectRows: INITIAL_PROJECT_ROWS,
+    projectConfigs: STACKED_PROJECT_CONFIGS,
   });
 
   await page.goto("/");
@@ -373,4 +513,74 @@ test("Project Manager stacks upload prompts and keeps other uploads alive throug
     .toBeTruthy();
 
   await expect(alphaRow.getByRole("button", { name: "Uploading" })).toBeVisible();
+});
+
+test("Project Manager keeps copyright audio path through Facebook duration prompt", async ({
+  page,
+}) => {
+  await page.addInitScript(installProjectManagerUploadMocks, {
+    sourceDetails: SOURCE_DETAILS,
+    initialProjectRows: [INITIAL_PROJECT_ROWS[0]],
+    projectConfigs: FACEBOOK_CHAIN_CONFIGS,
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Projects" }).click();
+
+  const alphaRow = page.locator("tr").filter({ hasText: "Project Alpha" });
+  await expect(alphaRow).toBeVisible();
+
+  await alphaRow.getByRole("button", { name: "Upload" }).click();
+  await expect(page.getByText("Remplacement de la musique")).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Utiliser cet audio" }),
+  ).toBeEnabled();
+
+  await page.getByRole("button", { name: "Utiliser cet audio" }).click();
+  await expect(
+    page.getByText("Vidéo trop longue pour Facebook"),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Couper à 1:30" }).click();
+
+  await expect
+    .poll(async () => latestUploadRequest(page, "project-alpha"))
+    .toMatchObject({
+      facebook_strategy: "cut",
+      copyright_audio_path: "/tmp/project-alpha-replacement.wav",
+    });
+});
+
+test("Project Manager keeps copyright audio path through YouTube duration prompt", async ({
+  page,
+}) => {
+  await page.addInitScript(installProjectManagerUploadMocks, {
+    sourceDetails: SOURCE_DETAILS,
+    initialProjectRows: [INITIAL_PROJECT_ROWS[0]],
+    projectConfigs: YOUTUBE_CHAIN_CONFIGS,
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Projects" }).click();
+
+  const alphaRow = page.locator("tr").filter({ hasText: "Project Alpha" });
+  await expect(alphaRow).toBeVisible();
+
+  await alphaRow.getByRole("button", { name: "Upload" }).click();
+  await expect(page.getByText("Remplacement de la musique")).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Utiliser cet audio" }),
+  ).toBeEnabled();
+
+  await page.getByRole("button", { name: "Utiliser cet audio" }).click();
+  await expect(
+    page.getByText("Vidéo trop longue pour YouTube"),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Couper à 3:00" }).click();
+
+  await expect
+    .poll(async () => latestUploadRequest(page, "project-alpha"))
+    .toMatchObject({
+      youtube_strategy: "cut",
+      copyright_audio_path: "/tmp/project-alpha-replacement.wav",
+    });
 });

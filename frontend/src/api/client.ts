@@ -771,7 +771,17 @@ export const api = {
     );
 
     if (res.ok) {
-      return res.json() as Promise<import("@/types").DeleteSeriesResponse>;
+      // Some deployments return 204 (or an empty body) for DELETE.
+      // Treat that as success instead of throwing on JSON parsing.
+      const text = await res.text();
+      if (!text.trim()) {
+        return {
+          status: "deleted",
+          series_id: seriesId,
+          library_type: libraryType,
+        } as import("@/types").DeleteSeriesResponse;
+      }
+      return JSON.parse(text) as import("@/types").DeleteSeriesResponse;
     }
 
     const error = await res.json().catch(() => ({ detail: "Request failed" }));
