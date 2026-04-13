@@ -25,6 +25,8 @@ import {
   Merge,
   Cable,
   Download,
+  ChevronUp,
+  ChevronDown,
 } from "lucide-react";
 import { Button } from "@/components/ui";
 import { MatchesClipPlayer, ManualMatchModal } from "@/components/video";
@@ -35,6 +37,10 @@ import { useProjectStore, useSceneStore } from "@/stores";
 import { api } from "@/api/client";
 import { readSSEStream } from "@/utils/sse";
 import { cn, formatTime } from "@/utils";
+import {
+  deriveMatchContinuityClaims,
+  type ContinuityClaim,
+} from "@/utils/matchContinuity";
 import {
   MEDIA_PRIORITY,
   getFastWatchPrefetchPriority,
@@ -93,6 +99,8 @@ interface MatchCardProps {
     message: string;
   } | null;
   warningMessage?: string | null;
+  continuityClaim?: ContinuityClaim | null;
+  onClaimJump?: (sceneIndex: number) => void;
   onUndoMerge?: (sceneIndex: number) => void;
 }
 
@@ -125,6 +133,8 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
       onManualMatch,
       pendingUpdate = null,
       warningMessage = null,
+      continuityClaim = null,
+      onClaimJump,
       onUndoMerge,
     },
     ref,
@@ -183,6 +193,16 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
         ? HTMLMediaElement.HAVE_FUTURE_DATA
         : HTMLMediaElement.HAVE_CURRENT_DATA;
     const fastWatchReadyTimeoutMs = playbackRate >= 4 ? 9000 : 7000;
+    const continuityTintClass =
+      continuityClaim?.kind === "non_continuous"
+        ? "bg-amber-500/8 border border-amber-500/15"
+        : continuityClaim?.kind === "episode_change"
+          ? "bg-sky-500/8 border border-sky-500/15"
+          : "bg-[hsl(var(--card))]";
+    const continuityBadgeClass =
+      continuityClaim?.kind === "non_continuous"
+        ? "bg-amber-500/10 text-amber-300 border border-amber-500/20"
+        : "bg-sky-500/10 text-sky-300 border border-sky-500/20";
 
     const handleManualSave = useCallback(
       async (
@@ -461,13 +481,15 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
       };
     }, []);
 
-    return (
+    const mainCard = (
       <div
         className={cn(
-          "bg-[hsl(var(--card))] rounded-lg p-4 space-y-4",
+          "rounded-lg p-4 space-y-4",
+          continuityTintClass,
           isActive && "ring-2 ring-[hsl(var(--primary))]",
         )}
         data-scene-index={scene.index}
+        data-continuity-kind={continuityClaim?.kind}
       >
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
@@ -494,6 +516,17 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
                 <Undo2 className="h-3 w-3" />
                 Undo
               </button>
+            )}
+            {continuityClaim && (
+              <span
+                className={cn(
+                  "text-xs px-1.5 py-0.5 rounded",
+                  continuityBadgeClass,
+                )}
+                title={continuityClaim.tooltip}
+              >
+                {continuityClaim.badge}
+              </span>
             )}
           </div>
           {hasMatchedScene ? (
@@ -659,6 +692,50 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
           episodes={episodes}
           onSave={handleManualSave}
         />
+      </div>
+    );
+
+    if (!continuityClaim) {
+      return mainCard;
+    }
+
+    return (
+      <div className="flex items-stretch gap-2">
+        <div className="flex-1 min-w-0">{mainCard}</div>
+        <div className="w-10 shrink-0 rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--muted))] flex flex-col items-center justify-center gap-1 p-1">
+          <button
+            type="button"
+            aria-label="Previous claimed scene"
+            title="Previous claimed scene"
+            disabled={
+              continuityClaim.prevClaimSceneIndex === null || !onClaimJump
+            }
+            onClick={() => {
+              if (continuityClaim.prevClaimSceneIndex !== null) {
+                onClaimJump?.(continuityClaim.prevClaimSceneIndex);
+              }
+            }}
+            className="h-7 w-7 rounded-md border border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))] flex items-center justify-center transition-colors enabled:hover:bg-[hsl(var(--secondary))] enabled:hover:text-[hsl(var(--foreground))] disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            <ChevronUp className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            aria-label="Next claimed scene"
+            title="Next claimed scene"
+            disabled={
+              continuityClaim.nextClaimSceneIndex === null || !onClaimJump
+            }
+            onClick={() => {
+              if (continuityClaim.nextClaimSceneIndex !== null) {
+                onClaimJump?.(continuityClaim.nextClaimSceneIndex);
+              }
+            }}
+            className="h-7 w-7 rounded-md border border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))] flex items-center justify-center transition-colors enabled:hover:bg-[hsl(var(--secondary))] enabled:hover:text-[hsl(var(--foreground))] disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            <ChevronDown className="h-4 w-4" />
+          </button>
+        </div>
       </div>
     );
   },
@@ -1938,6 +2015,11 @@ export function MatchValidation() {
     return new Map(matches.map((match) => [match.scene_index, match]));
   }, [matches]);
 
+  const continuitySummary = useMemo(
+    () => deriveMatchContinuityClaims(scenes, matches),
+    [scenes, matches],
+  );
+
   const playbackBySceneIndex = useMemo(() => {
     if (!playbackManifest?.scenes)
       return new Map<number, ScenePlaybackSceneAsset>();
@@ -1982,6 +2064,18 @@ export function MatchValidation() {
       }
     },
     [scenes, scrollToScene, fastWatchPlaying, playFastWatchFromScene],
+  );
+
+  const handleClaimJump = useCallback(
+    (sceneIndex: number) => {
+      setActiveSceneIndex(sceneIndex);
+      scrollToScene(sceneIndex, true);
+
+      if (fastWatchPlaying) {
+        void playFastWatchFromScene(sceneIndex);
+      }
+    },
+    [fastWatchPlaying, playFastWatchFromScene, scrollToScene],
   );
 
   if (loading) {
@@ -2308,6 +2402,10 @@ export function MatchValidation() {
                     onManualMatch={handleManualMatch}
                     pendingUpdate={pendingSceneUpdates[scene.index] || null}
                     warningMessage={sceneWarnings[scene.index] || null}
+                    continuityClaim={
+                      continuitySummary.claimsBySceneIndex[scene.index] || null
+                    }
+                    onClaimJump={handleClaimJump}
                     onUndoMerge={handleUndoMerge}
                   />
                 </div>
