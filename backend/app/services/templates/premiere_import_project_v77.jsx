@@ -41,7 +41,11 @@
   var RAW_SCENE_TEXT_SUBTITLE_SRT_PATH = ROOT_DIR + "/raw_scene_subtitles/text_subtitles.srt";
   var RAW_SCENE_SUBTITLE_MANIFEST_PATH =
     ROOT_DIR + "/raw_scene_subtitles/manifest.json";
+  var PROJECT_CONTEXT_PATH = ROOT_DIR + "/.atr_project_context.json";
   var SOURCE_AUDIO_POLICIES = {};
+  var PROJECT_CONTEXT_CACHE = null;
+  var PROJECT_PROXY_PLAN_CACHE = null;
+  var PROJECT_PROXY_TARGETS_BY_PATH = {};
 
   // --- SCENES DATA ---
   var scenes = [
@@ -1762,7 +1766,7 @@
 
     var targetBin = getProjectSearchRoot();
     if (importPaths.length > 0) {
-      app.project.importFiles(importPaths, true, targetBin, false);
+      importMediaPathsWithProxyRouting(importPaths, targetBin);
       stats.importBatchCount = importPaths.length;
     }
 
@@ -1825,7 +1829,7 @@
         return preExisting;
       }
       var targetBin = getProjectSearchRoot();
-      app.project.importFiles([f.fsName], true, targetBin, false);
+      importMediaPathsWithProxyRouting([f.fsName], targetBin);
       // Small bounded retry; import indexing can be async.
       var retries = 0;
       while (!item && retries < 8) {
@@ -2765,6 +2769,117 @@
     } catch (e1) {
       return null;
     }
+  }
+
+  function loadProjectContext() {
+    if (PROJECT_CONTEXT_CACHE !== null) return PROJECT_CONTEXT_CACHE;
+    PROJECT_CONTEXT_CACHE = readJsonFile(PROJECT_CONTEXT_PATH) || {};
+    return PROJECT_CONTEXT_CACHE;
+  }
+
+  function normalizeProxyPlan(rawPlan) {
+    var plan = {
+      enabled: false,
+      targets: [],
+    };
+    if (!rawPlan) return plan;
+    plan.enabled = !!rawPlan.enabled;
+    if (rawPlan.required_codec) {
+      plan.required_codec = rawPlan.required_codec.toString().toLowerCase();
+    }
+    if (rawPlan.required_scale_divisor) {
+      plan.required_scale_divisor = rawPlan.required_scale_divisor;
+    }
+    if (rawPlan.detection_mode) {
+      plan.detection_mode = rawPlan.detection_mode.toString();
+    }
+    if (rawPlan.ffprobe_warning) {
+      plan.ffprobe_warning = rawPlan.ffprobe_warning.toString();
+    }
+    if (rawPlan.targets && rawPlan.targets.length) {
+      for (var i = 0; i < rawPlan.targets.length; i++) {
+        var target = rawPlan.targets[i];
+        if (!target || !target.media_path) continue;
+        plan.targets.push(target);
+      }
+    }
+    return plan;
+  }
+
+  function getProjectProxyPlan() {
+    if (PROJECT_PROXY_PLAN_CACHE !== null) return PROJECT_PROXY_PLAN_CACHE;
+    PROJECT_PROXY_PLAN_CACHE = normalizeProxyPlan(
+      (loadProjectContext() || {}).proxy_plan,
+    );
+    PROJECT_PROXY_TARGETS_BY_PATH = {};
+    for (var i = 0; i < PROJECT_PROXY_PLAN_CACHE.targets.length; i++) {
+      var target = PROJECT_PROXY_PLAN_CACHE.targets[i];
+      var key = normalizeComparePath(target.media_path);
+      if (!key) continue;
+      PROJECT_PROXY_TARGETS_BY_PATH[key] = target;
+    }
+    return PROJECT_PROXY_PLAN_CACHE;
+  }
+
+  function getProxyPlanTargetForMediaPath(mediaPath) {
+    var plan = getProjectProxyPlan();
+    if (!plan.enabled) return null;
+    var key = normalizeComparePath(mediaPath);
+    if (!key) return null;
+    return PROJECT_PROXY_TARGETS_BY_PATH[key] || null;
+  }
+
+  function importMediaPathsWithProxyRouting(importPaths, targetBin) {
+    var plan = getProjectProxyPlan();
+    var proxyNeeded = [];
+    var passthrough = [];
+    var seenProxy = {};
+    var seenPassthrough = {};
+    var bin = targetBin || getProjectSearchRoot();
+    var importedCount = 0;
+
+    if (!importPaths || !importPaths.length || !app || !app.project) {
+      return importedCount;
+    }
+
+    for (var i = 0; i < importPaths.length; i++) {
+      var candidatePath = importPaths[i];
+      var normalizedPath = normalizeComparePath(candidatePath);
+      if (!normalizedPath) continue;
+      var target = getProxyPlanTargetForMediaPath(normalizedPath);
+      if (target && target.needs_proxy) {
+        if (!seenProxy[normalizedPath]) {
+          seenProxy[normalizedPath] = true;
+          proxyNeeded.push(candidatePath);
+        }
+      } else if (!seenPassthrough[normalizedPath]) {
+        seenPassthrough[normalizedPath] = true;
+        passthrough.push(candidatePath);
+      }
+    }
+
+    if (passthrough.length > 0) {
+      app.project.importFiles(passthrough, true, bin, false);
+      importedCount += passthrough.length;
+    }
+
+    if (proxyNeeded.length > 0) {
+      try {
+        if (app.project.setEnableTranscodeOnIngest) {
+          app.project.setEnableTranscodeOnIngest(true);
+        }
+        app.project.importFiles(proxyNeeded, true, bin, false);
+        importedCount += proxyNeeded.length;
+      } finally {
+        try {
+          if (app.project.setEnableTranscodeOnIngest) {
+            app.project.setEnableTranscodeOnIngest(false);
+          }
+        } catch (eRestoreIngest) {}
+      }
+    }
+
+    return importedCount;
   }
 
   function buildMogrtSubtitlePlacement(kind, idx, mogrtPath, startSec, endSec) {

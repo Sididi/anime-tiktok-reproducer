@@ -204,6 +204,18 @@ class SocialUploadService:
         return f"https://graph.facebook.com/{settings.meta_graph_api_version}"
 
     @classmethod
+    def _create_upload_session(cls) -> requests.Session:
+        """Create an optimized session for upload operations with connection pooling."""
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=4,
+            pool_maxsize=8,
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
+
+    @classmethod
     def _platform_deadline(cls, deadline: float | None = None) -> float:
         if deadline is not None:
             return deadline
@@ -646,6 +658,21 @@ class SocialUploadService:
         return "fr"
 
     @classmethod
+    def _youtube_chunksize(cls, file_size: int) -> int:
+        """Adaptive chunk size for YouTube uploads based on file size.
+
+        Larger chunks reduce round-trip overhead for big files.
+        Google API supports up to 64MB chunks.
+        """
+        if file_size >= 256 * 1024 * 1024:  # 256MB+
+            return 32 * 1024 * 1024  # 32MB chunks
+        elif file_size >= 100 * 1024 * 1024:  # 100MB+
+            return 24 * 1024 * 1024  # 24MB chunks
+        elif file_size >= 50 * 1024 * 1024:  # 50MB+
+            return 16 * 1024 * 1024  # 16MB chunks
+        return 8 * 1024 * 1024  # 8MB for smaller files
+
+    @classmethod
     def upload_youtube(
         cls,
         *,
@@ -784,7 +811,7 @@ class SocialUploadService:
                     },
                     media_body=MediaFileUpload(
                         str(prepared_video_path),
-                        chunksize=8 * 1024 * 1024,
+                        chunksize=cls._youtube_chunksize(prepared_video_path.stat().st_size),
                         resumable=True,
                     ),
                 )
@@ -1486,7 +1513,7 @@ class SocialUploadService:
                     prepared_video_path = prep.video_path
                     allow_drive_url_fast_path = bool(video_url and not prep.transcoded)
 
-                with requests.Session() as session:
+                with cls._create_upload_session() as session:
                     source_mode = "local"
                     video_id: str | None = None
 
@@ -1520,52 +1547,24 @@ class SocialUploadService:
                                 video_id = str(candidate)
                                 source_mode = "drive_url"
 
-                    # Fallback path: upload bytes from local file.
+                    # Fallback path: use chunked Reels API upload for better performance.
                     if not video_id:
-                        def _upload_video_once() -> requests.Response:
-                            with prepared_video_path.open("rb") as source:
-                                return session.post(
-                                    f"{base}/{page_id}/videos",
-                                    data={
-                                        "title": metadata.facebook.title,
-                                        "description": metadata.facebook.description,
-                                        "published": "true",
-                                        "access_token": token,
-                                    },
-                                    files={"source": source},
-                                    timeout=cls._request_timeout_seconds(
-                                        deadline=deadline,
-                                        platform="Facebook",
-                                        operation="video upload",
-                                        binary=True,
-                                    ),
-                                )
-
-                        resp = cls._request_with_retries(
-                            _upload_video_once,
-                            max_attempts=3,
+                        chunked_video_id, chunked_error = cls._upload_facebook_immediate_chunked(
+                            session=session,
+                            base=base,
+                            page_id=page_id,
+                            token=token,
+                            video_path=prepared_video_path,
+                            metadata=metadata,
                             deadline=deadline,
-                            platform="Facebook",
-                            operation="video upload",
                         )
-                        if resp.status_code >= 400:
-                            detail = _extract_graph_error(resp)
-                            if cls._is_page_token_required_error(resp):
-                                detail = (
-                                    f"{detail} "
-                                    "(configured token is not page-scoped for video publishing; "
-                                    "provide a real page access token or allow derivation from page fields)."
-                                )
+                        if chunked_error:
                             return PlatformUploadResult(
                                 platform="facebook",
                                 status="failed",
-                                detail=f"Video upload failed: {detail}",
+                                detail=f"Video upload failed: {chunked_error}",
                             )
-                        payload = resp.json()
-                        candidate = payload.get("id")
-                        if not candidate:
-                            raise RuntimeError(f"Unexpected Facebook response: {payload}")
-                        video_id = str(candidate)
+                        video_id = chunked_video_id
 
                     # Caption upload (required for platform success in this workflow).
                     cap_resp = cls._upload_facebook_caption_with_wait(
@@ -1581,7 +1580,7 @@ class SocialUploadService:
             if cap_resp.status_code >= 400:
                 # If subtitle upload is unavailable, this platform is skipped by policy.
                 try:
-                    with requests.Session() as session:
+                    with cls._create_upload_session() as session:
                         session.delete(
                             f"{base}/{video_id}",
                             params={"access_token": token},
@@ -1650,7 +1649,7 @@ class SocialUploadService:
 
         try:
             base = cls._graph_base()
-            with requests.Session() as session:
+            with cls._create_upload_session() as session:
                 container_id = cls._create_instagram_container_resumable(
                     session=session,
                     base=base,
@@ -1809,7 +1808,7 @@ class SocialUploadService:
 
                 last_retryable_finish_error: str | None = None
                 for flow_attempt in range(1, max_flow_attempts + 1):
-                    with requests.Session() as session:
+                    with cls._create_upload_session() as session:
                         # Phase 1: Start — initialize upload session
                         start_resp = cls._request_with_retries(
                             lambda: session.post(
@@ -2047,6 +2046,218 @@ class SocialUploadService:
                 status="failed",
                 detail=str(exc),
             )
+
+    @classmethod
+    def _upload_facebook_immediate_chunked(
+        cls,
+        *,
+        session: requests.Session,
+        base: str,
+        page_id: str,
+        token: str,
+        video_path: Path,
+        metadata: VideoMetadataPayload,
+        deadline: float | None = None,
+    ) -> tuple[str | None, str | None]:
+        """Upload video to Facebook using 3-phase Reels API for immediate publish.
+
+        Returns (video_id, error_detail). On success error_detail is None.
+        On failure video_id is None and error_detail contains the error message.
+        """
+        file_size = video_path.stat().st_size
+        if file_size <= 0:
+            return None, "Video file is empty (0 bytes)"
+
+        max_flow_attempts = 2
+        last_error: str | None = None
+
+        for flow_attempt in range(1, max_flow_attempts + 1):
+            # Phase 1: Start — initialize upload session
+            start_resp = cls._request_with_retries(
+                lambda: session.post(
+                    f"{base}/{page_id}/video_reels",
+                    data={
+                        "upload_phase": "start",
+                        "access_token": token,
+                    },
+                    timeout=cls._request_timeout_seconds(
+                        deadline=deadline,
+                        platform="Facebook",
+                        operation="reel start",
+                    ),
+                ),
+                max_attempts=3,
+                deadline=deadline,
+                platform="Facebook",
+                operation="reel start",
+            )
+            if start_resp.status_code >= 400:
+                return None, f"Reel start phase failed: {_extract_graph_error(start_resp)}"
+
+            start_payload = start_resp.json()
+            video_id = start_payload.get("video_id")
+            upload_url = start_payload.get("upload_url")
+            if not video_id:
+                return None, f"Reel start phase returned no video_id: {start_payload}"
+            if not upload_url:
+                return None, f"Reel start phase returned no upload_url: {start_payload}"
+
+            # Phase 2: Upload binary to rupload endpoint
+            upload_resp = cls._upload_facebook_reel_binary(
+                session=session,
+                upload_url=str(upload_url),
+                token=token,
+                video_path=video_path,
+                file_size=file_size,
+                offset=0,
+                max_attempts=2,
+                deadline=deadline,
+            )
+            if upload_resp.status_code >= 400:
+                last_error = f"Reel upload phase failed ({upload_resp.status_code}): {upload_resp.text[:300]}"
+                cls._cleanup_failed_facebook_video(
+                    session=session,
+                    base=base,
+                    token=token,
+                    video_id=str(video_id),
+                    deadline=deadline,
+                )
+                if flow_attempt < max_flow_attempts:
+                    cls._sleep_with_deadline(
+                        min(30, 5 * flow_attempt),
+                        deadline=deadline,
+                        platform="Facebook",
+                        operation="immediate reel retry backoff",
+                    )
+                    continue
+                return None, last_error
+
+            upload_problem = cls._facebook_reel_upload_response_problem(upload_resp)
+            if upload_problem:
+                last_error = f"Reel upload phase returned invalid payload: {upload_problem}"
+                cls._cleanup_failed_facebook_video(
+                    session=session,
+                    base=base,
+                    token=token,
+                    video_id=str(video_id),
+                    deadline=deadline,
+                )
+                if flow_attempt < max_flow_attempts:
+                    cls._sleep_with_deadline(
+                        min(30, 5 * flow_attempt),
+                        deadline=deadline,
+                        platform="Facebook",
+                        operation="immediate reel retry backoff",
+                    )
+                    continue
+                return None, last_error
+
+            # Check upload is ready before finishing
+            upload_ready, upload_ready_detail = cls._ensure_facebook_reel_upload_ready_for_finish(
+                session=session,
+                base=base,
+                video_id=str(video_id),
+                upload_url=str(upload_url),
+                token=token,
+                video_path=video_path,
+                file_size=file_size,
+                deadline=deadline,
+            )
+            if not upload_ready:
+                last_error = f"Reel upload did not reach a finishable state: {upload_ready_detail}"
+                cls._cleanup_failed_facebook_video(
+                    session=session,
+                    base=base,
+                    token=token,
+                    video_id=str(video_id),
+                    deadline=deadline,
+                )
+                if flow_attempt < max_flow_attempts:
+                    cls._sleep_with_deadline(
+                        min(30, 5 * flow_attempt),
+                        deadline=deadline,
+                        platform="Facebook",
+                        operation="immediate reel retry backoff",
+                    )
+                    continue
+                return None, last_error
+
+            # Phase 3: Finish with video_state=PUBLISHED for immediate publish
+            finish_resp = cls._request_with_retries(
+                lambda: session.post(
+                    f"{base}/{page_id}/video_reels",
+                    data={
+                        "upload_phase": "finish",
+                        "video_id": video_id,
+                        "access_token": token,
+                        "video_state": "PUBLISHED",
+                        "title": metadata.facebook.title,
+                        "description": metadata.facebook.description,
+                    },
+                    timeout=cls._request_timeout_seconds(
+                        deadline=deadline,
+                        platform="Facebook",
+                        operation="reel finish",
+                    ),
+                ),
+                max_attempts=3,
+                deadline=deadline,
+                platform="Facebook",
+                operation="reel finish",
+            )
+            if finish_resp.status_code >= 400:
+                finish_error = _extract_graph_error(finish_resp)
+                status_payload = cls._get_facebook_video_status_payload(
+                    session=session,
+                    base=base,
+                    video_id=str(video_id),
+                    token=token,
+                    deadline=deadline,
+                )
+                if status_payload:
+                    finish_error = (
+                        f"{finish_error} | "
+                        f"video_status={cls._summarize_facebook_video_status(status_payload)}"
+                    )
+                if (
+                    flow_attempt < max_flow_attempts
+                    and cls._is_facebook_reel_finish_retryable_error(finish_resp)
+                ):
+                    last_error = finish_error
+                    logger.warning(
+                        "Facebook immediate reel finish transient failure on attempt %s/%s (video_id=%s): %s. Retrying.",
+                        flow_attempt,
+                        max_flow_attempts,
+                        video_id,
+                        finish_error,
+                    )
+                    cls._cleanup_failed_facebook_video(
+                        session=session,
+                        base=base,
+                        token=token,
+                        video_id=str(video_id),
+                        deadline=deadline,
+                    )
+                    cls._sleep_with_deadline(
+                        min(30, 5 * flow_attempt),
+                        deadline=deadline,
+                        platform="Facebook",
+                        operation="immediate reel retry backoff",
+                    )
+                    continue
+                return None, f"Reel finish phase failed: {finish_error}"
+
+            finish_payload = finish_resp.json()
+            if not cls._is_facebook_reel_finish_payload_valid(
+                finish_payload=finish_payload,
+                expected_video_id=str(video_id),
+            ):
+                return None, f"Reel finish phase returned ambiguous payload: {finish_payload}"
+
+            # Success
+            return str(video_id), None
+
+        return None, last_error or "Upload failed after retries"
 
     @classmethod
     def _upload_facebook_reel_binary(
