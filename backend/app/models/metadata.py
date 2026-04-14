@@ -1,7 +1,7 @@
 from pydantic import BaseModel, ConfigDict, field_validator
 
 
-METADATA_TITLE_CANDIDATE_COUNT = 10
+METADATA_TITLE_CANDIDATE_COUNT = 8
 METADATA_TITLE_MAX_CHARS = 62
 TIKTOK_FIXED_HASHTAGS = ["#Anime", "#animerecommendations"]
 

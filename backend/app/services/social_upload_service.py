@@ -300,6 +300,23 @@ class SocialUploadService:
         return Request(session=session)
 
     @classmethod
+    def _build_google_http(
+        cls,
+        *,
+        timeout_seconds: float,
+    ) -> httplib2.Http:
+        http = httplib2.Http(timeout=max(float(timeout_seconds), 1.0))
+        # googleapiclient.build_http() excludes HTTP 308 from redirect handling
+        # because Google APIs use 308 for resumable uploads, not redirects.
+        try:
+            redirect_codes = getattr(http, "redirect_codes", None)
+            if redirect_codes is not None and 308 in redirect_codes:
+                http.redirect_codes = redirect_codes - {308}
+        except Exception:
+            pass
+        return http
+
+    @classmethod
     def _build_youtube_client(
         cls,
         *,
@@ -313,7 +330,7 @@ class SocialUploadService:
         )
         http = google_auth_httplib2.AuthorizedHttp(
             credentials,
-            http=httplib2.Http(timeout=timeout_seconds),
+            http=cls._build_google_http(timeout_seconds=timeout_seconds),
         )
         return build("youtube", "v3", http=http, cache_discovery=False)
 

@@ -33,8 +33,8 @@ _OVERLAY_RESPONSE_SCHEMA: dict[str, Any] = {
     "properties": {
         "title_hooks": {
             "type": "array",
-            "minItems": 10,
-            "maxItems": 10,
+            "minItems": 8,
+            "maxItems": 8,
             "items": {"type": "string"},
         },
         "category": {"type": "string"},
@@ -173,9 +173,9 @@ class ScriptAutomationService:
             for item in raw_hooks
             if isinstance(item, str) and item.strip()
         ]
-        if len(title_hooks) != 10:
+        if len(title_hooks) != 8:
             raise RuntimeError(
-                f"Overlay JSON must contain exactly 10 non-empty title hooks ({len(title_hooks)} received)"
+                f"Overlay JSON must contain exactly 8 non-empty title hooks ({len(title_hooks)} received)"
             )
 
         category = str(payload.get("category", "")).strip()
