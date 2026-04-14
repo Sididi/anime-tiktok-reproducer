@@ -15,6 +15,49 @@ var __atrCleanupMaxBinPasses = 5;
 var __atrTempAudioSequencePrefix = "ATR_AUDIO_NO_MUSIC_TMP__";
 var __atrProjectPurgeBinName = "__ATR_PURGE__";
 
+/**
+ * JSON.stringify polyfill for ExtendScript (ES3).
+ * ExtendScript lacks native JSON support in some Premiere Pro versions.
+ * Based on Douglas Crockford's JSON2 (public domain).
+ */
+if (typeof JSON === "undefined") {
+  JSON = {};
+}
+if (typeof JSON.stringify !== "function") {
+  JSON.stringify = function (value) {
+    var type = typeof value;
+    if (type === "string") {
+      return '"' + value.replace(/[\\\"\x00-\x1f]/g, function (c) {
+        var hex = c.charCodeAt(0).toString(16);
+        return c === '"' ? '\\"' : c === "\\" ? "\\\\" : "\\u" + ("0000" + hex).slice(-4);
+      }) + '"';
+    }
+    if (type === "number" || type === "boolean") {
+      return String(value);
+    }
+    if (value === null) {
+      return "null";
+    }
+    if (value instanceof Array) {
+      var arrResult = [];
+      for (var i = 0; i < value.length; i++) {
+        arrResult.push(JSON.stringify(value[i]));
+      }
+      return "[" + arrResult.join(",") + "]";
+    }
+    if (type === "object") {
+      var objResult = [];
+      for (var key in value) {
+        if (value.hasOwnProperty(key)) {
+          objResult.push(JSON.stringify(key) + ":" + JSON.stringify(value[key]));
+        }
+      }
+      return "{" + objResult.join(",") + "}";
+    }
+    return "null";
+  };
+}
+
 function __atrSafeString(value) {
   if (value === undefined || value === null) {
     return "";
@@ -900,10 +943,7 @@ function purgeActiveProject() {
       }
     }
 
-    if (JSON && JSON.stringify) {
-      return JSON.stringify(result);
-    }
-    return result.ok ? "OK" : "ERROR";
+    return JSON.stringify(result);
   } catch (e) {
     return "ERROR: " + e.message + " (line " + e.line + ")";
   }
@@ -1089,14 +1129,11 @@ function startManagedExport(projectId, sequenceName, outputPath, presetPath) {
       });
     }
 
-    if (JSON && JSON.stringify) {
-      return JSON.stringify({
-        video_job_id: __atrSafeString(videoJobID),
-        audio_job_id: __atrSafeString(audioJobID),
-        audio_enabled: !!exportAudioNoMusic,
-      });
-    }
-    return __atrSafeString(videoJobID);
+    return JSON.stringify({
+      video_job_id: __atrSafeString(videoJobID),
+      audio_job_id: __atrSafeString(audioJobID),
+      audio_enabled: !!exportAudioNoMusic,
+    });
   } catch (e) {
     return "ERROR: " + e.message + " (line " + e.line + ")";
   }
@@ -1111,10 +1148,7 @@ function pullEncoderEvents() {
   try {
     var events = __atrEncoderEvents.slice(0);
     __atrEncoderEvents = [];
-    if (JSON && JSON.stringify) {
-      return JSON.stringify(events);
-    }
-    return "[]";
+    return JSON.stringify(events);
   } catch (e) {
     return "[]";
   }
@@ -1156,10 +1190,7 @@ function cleanupImportedProjectMedia(localRootPath) {
       result.error = "Imported Premiere project items remain after cleanup";
     }
 
-    if (JSON && JSON.stringify) {
-      return JSON.stringify(result);
-    }
-    return "OK";
+    return JSON.stringify(result);
   } catch (e) {
     return "ERROR: " + e.message + " (line " + e.line + ")";
   }

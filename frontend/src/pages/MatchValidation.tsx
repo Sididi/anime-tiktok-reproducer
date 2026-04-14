@@ -84,6 +84,8 @@ interface MatchCardProps {
   projectId: string;
   episodes: string[];
   playbackAsset: ScenePlaybackSceneAsset | null;
+  playbackReady?: boolean;
+  playbackPreparing?: boolean;
   isActive?: boolean;
   mediaEnabled?: boolean;
   playbackRate?: number;
@@ -130,6 +132,8 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
       projectId,
       episodes,
       playbackAsset,
+      playbackReady = false,
+      playbackPreparing = false,
       isActive = false,
       mediaEnabled = true,
       playbackRate = 1,
@@ -215,6 +219,7 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
     const mergeWithPreviousTitle = manualMergeHint
       ? "Likely continuity with previous scene. Merge with previous scene."
       : "Merge with previous scene";
+    const clipsPreparing = playbackPreparing || !playbackReady;
 
     const handleManualSave = useCallback(
       async (
@@ -562,7 +567,11 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
               TikTok Clip
             </p>
             <div className="aspect-[9/16] bg-black rounded overflow-hidden flex items-center justify-center">
-              {!mediaEnabled ? (
+              {clipsPreparing ? (
+                <div className="text-xs text-[hsl(var(--muted-foreground))]">
+                  Preparing clip...
+                </div>
+              ) : !mediaEnabled ? (
                 <div className="text-xs text-[hsl(var(--muted-foreground))] text-center px-3">
                   Media deferred (lazy window)
                 </div>
@@ -607,6 +616,10 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
                 <div className="flex flex-col items-center gap-2 text-[hsl(var(--muted-foreground))] p-4">
                   <Loader2 className="h-6 w-6 animate-spin text-[hsl(var(--primary))]" />
                   <p className="text-xs text-center">{pendingUpdate.message}</p>
+                </div>
+              ) : clipsPreparing && hasMatchedScene ? (
+                <div className="text-xs text-[hsl(var(--muted-foreground))]">
+                  Preparing source clip...
                 </div>
               ) : !mediaEnabled && hasMatch ? (
                 <div className="text-xs text-[hsl(var(--muted-foreground))] text-center px-3">
@@ -2465,7 +2478,7 @@ export function MatchValidation() {
         )}
 
         {/* Show matches */}
-        {isPlaybackReady && (
+        {matches.length > 0 && (
           <div className="space-y-4">
             {scenes.map((scene, scenePosition) => {
               const match = matchesBySceneIndex.get(scene.index);
@@ -2494,6 +2507,8 @@ export function MatchValidation() {
                     playbackAsset={
                       playbackBySceneIndex.get(scene.index) ?? null
                     }
+                    playbackReady={isPlaybackReady}
+                    playbackPreparing={playbackPreparing}
                     isActive={activeSceneIndex === scene.index}
                     mediaEnabled={mediaEnabled}
                     playbackRate={playbackRate}

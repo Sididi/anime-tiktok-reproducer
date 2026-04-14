@@ -20,6 +20,18 @@ class SchedulingService:
     _reservation_lock = Lock()
 
     @classmethod
+    def _earliest_allowed_publish_time(cls) -> datetime:
+        return datetime.now(timezone.utc) + timedelta(minutes=cls._MIN_LEAD_MINUTES)
+
+    @classmethod
+    def _normalize_utc_datetime(cls, value: datetime) -> datetime:
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+    @classmethod
+    def _can_reuse_reserved_slot(cls, scheduled_at: datetime) -> bool:
+        return cls._normalize_utc_datetime(scheduled_at) >= cls._earliest_allowed_publish_time()
+
+    @classmethod
     def find_next_slot(cls, account_id: str) -> tuple[datetime, datetime]:
         """
         Find the next available slot for the given account.
@@ -51,7 +63,7 @@ class SchedulingService:
                 reserved_slots.add(project.scheduled_slot)
 
         now_utc = datetime.now(timezone.utc)
-        earliest_allowed = now_utc + timedelta(minutes=cls._MIN_LEAD_MINUTES)
+        earliest_allowed = cls._earliest_allowed_publish_time()
 
         # Iterate days starting from today
         current_date = now_utc.date()
@@ -96,12 +108,13 @@ class SchedulingService:
                 and project.scheduled_at is not None
             ):
                 slot_dt = datetime.fromisoformat(project.scheduled_slot)
-                scheduled_at = project.scheduled_at
+                scheduled_at = cls._normalize_utc_datetime(project.scheduled_at)
                 if slot_dt.tzinfo is None:
                     slot_dt = slot_dt.replace(tzinfo=timezone.utc)
-                if scheduled_at.tzinfo is None:
-                    scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
-                return slot_dt, scheduled_at
+                else:
+                    slot_dt = slot_dt.astimezone(timezone.utc)
+                if cls._can_reuse_reserved_slot(scheduled_at):
+                    return slot_dt, scheduled_at
 
             slot_dt, scheduled_at = cls.find_next_slot(account_id)
             project.scheduled_account_id = account_id

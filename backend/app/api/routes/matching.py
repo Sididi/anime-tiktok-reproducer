@@ -145,6 +145,38 @@ def _resolve_anime_source_dir(library_root: Path, anime_name: str) -> Path | Non
     return None
 
 
+def _build_episode_source_dirs(project) -> list[Path]:
+    """
+    Build candidate source directories for manual episode selection.
+
+    Prefer explicit project source paths when they still exist. Otherwise fall
+    back to the resolved anime folder, then to the library root so manual match
+    tooling never ends up with an empty episode list just because folder
+    resolution missed.
+    """
+    source_dirs: list[Path] = []
+    explicit_paths = [Path(src) for src in project.source_paths if Path(src).exists()]
+    if explicit_paths:
+        return explicit_paths
+
+    library_root = AnimeLibraryService.get_library_path(project.library_type)
+    if not library_root.exists():
+        return []
+
+    if project.anime_name:
+        scoped_dir = _resolve_anime_source_dir(
+            library_root,
+            project.anime_name,
+        )
+        if scoped_dir is not None:
+            source_dirs.append(scoped_dir)
+
+    if not source_dirs:
+        source_dirs.append(library_root)
+
+    return source_dirs
+
+
 @router.post("/sources")
 async def set_sources(project_id: str, request: SetSourcesRequest):
     """Set source episode paths for the project."""
@@ -180,24 +212,11 @@ async def list_episodes(project_id: str):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm", ".mov"}
+    VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".m4v"}
     episodes: list[str] = []
 
-    # Use project source_paths if configured. Otherwise, scope to project anime in
-    # the library so manual editors only offer episodes for this anime.
-    source_dirs: list[Path] = []
     library_root = AnimeLibraryService.get_library_path(project.library_type)
-    if project.source_paths:
-        source_dirs = [Path(src) for src in project.source_paths]
-    elif library_root.exists():
-        if project.anime_name:
-            scoped_dir = _resolve_anime_source_dir(
-                library_root,
-                project.anime_name,
-            )
-            source_dirs = [scoped_dir] if scoped_dir else []
-        else:
-            source_dirs = [library_root]
+    source_dirs = _build_episode_source_dirs(project)
 
     def _is_under(path: Path, root: Path) -> bool:
         try:
@@ -232,6 +251,7 @@ async def list_episodes(project_id: str):
     )
 
     for src_path in source_dirs:
+        manifest_hits_before = len(episodes)
         if (
             manifest is not None
             and library_root is not None
@@ -245,7 +265,12 @@ async def list_episodes(project_id: str):
                     episodes.append(episode)
                 elif src_resolved.is_file() and episode_path.resolve() == src_resolved:
                     episodes.append(episode)
-        else:
+
+        # The cached manifest can lag behind the actual library contents for a
+        # scoped series folder. When it yields nothing for that source, fall
+        # back to a direct filesystem scan so manual match selection still has
+        # episodes to offer.
+        if len(episodes) == manifest_hits_before:
             episodes.extend(await asyncio.to_thread(_scan_source_dir_sync, src_path))
 
     # Remove duplicates and sort

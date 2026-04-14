@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from zoneinfo import ZoneInfo
 import logging
 import shutil
@@ -524,6 +524,7 @@ class UploadPhaseService:
         reserved_slot_dt: datetime | None = None,
         reserved_scheduled_at: datetime | None = None,
         progress_callback: Callable[[float, str, str], None] | None = None,
+        platform_result_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         def emit_progress(progress: float, phase: str, message: str) -> None:
             if progress_callback is None:
@@ -535,6 +536,19 @@ class UploadPhaseService:
                     "Upload progress callback failed: project_id=%s phase=%s",
                     project_id,
                     phase,
+                    exc_info=True,
+                )
+
+        def emit_platform_result(result: PlatformUploadResult) -> None:
+            if platform_result_callback is None:
+                return
+            try:
+                platform_result_callback(asdict(result))
+            except Exception:
+                logger.warning(
+                    "Upload platform result callback failed: project_id=%s platform=%s",
+                    project_id,
+                    result.platform,
                     exc_info=True,
                 )
 
@@ -727,24 +741,73 @@ class UploadPhaseService:
                     status="skipped",
                     detail=detail,
                 )
+                emit_platform_result(results_by_platform[platform])
 
             emit_progress(0.55, "platform_upload", "Uploading to social platforms...")
             max_parallel = max(1, min(settings.social_upload_max_parallel, len(selected_jobs))) if selected_jobs else 1
-            with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+            executor = ThreadPoolExecutor(max_workers=max_parallel)
+            timed_out_platforms = False
+            try:
                 future_to_platform = {
                     executor.submit(job): platform
                     for platform, job in selected_jobs.items()
                 }
-                for future in as_completed(future_to_platform):
-                    platform = future_to_platform[future]
-                    try:
-                        results_by_platform[platform] = future.result()
-                    except Exception as exc:
+                pending = set(future_to_platform)
+                deadline = time.monotonic() + max(
+                    float(settings.project_manager_platform_phase_timeout_seconds),
+                    0.001,
+                )
+
+                while pending:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        timed_out_platforms = True
+                        break
+
+                    done, pending = wait(
+                        pending,
+                        timeout=remaining,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    if not done:
+                        timed_out_platforms = True
+                        break
+
+                    for future in done:
+                        platform = future_to_platform[future]
+                        try:
+                            results_by_platform[platform] = future.result()
+                        except Exception as exc:
+                            results_by_platform[platform] = PlatformUploadResult(
+                                platform=platform,
+                                status="failed",
+                                detail=str(exc),
+                            )
+                        emit_platform_result(results_by_platform[platform])
+
+                if pending:
+                    timed_out_platforms = True
+                    timeout_seconds = max(
+                        int(settings.project_manager_platform_phase_timeout_seconds),
+                        1,
+                    )
+                    for future in list(pending):
+                        platform = future_to_platform[future]
+                        future.cancel()
                         results_by_platform[platform] = PlatformUploadResult(
                             platform=platform,
                             status="failed",
-                            detail=str(exc),
+                            detail=(
+                                f"{platform.title()} platform job timed out after "
+                                f"{timeout_seconds}s."
+                            ),
                         )
+                        emit_platform_result(results_by_platform[platform])
+            finally:
+                executor.shutdown(
+                    wait=not timed_out_platforms,
+                    cancel_futures=timed_out_platforms,
+                )
 
             # Keep deterministic ordering in reports/messages.
             platform_results = [

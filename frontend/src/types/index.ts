@@ -194,10 +194,14 @@ export interface ProjectUploadJob {
   job_id: string;
   project_id: string;
   account_id: string | null;
+  platforms?: string[] | null;
+  facebook_strategy?: UploadDurationStrategy | null;
+  youtube_strategy?: UploadDurationStrategy | null;
   status: "queued" | "running" | "complete" | "error";
   phase: string | null;
   message: string | null;
   error: string | null;
+  platform_results?: Record<string, unknown>[] | null;
   result: Record<string, unknown> | null;
   created_at: string;
   updated_at: string;

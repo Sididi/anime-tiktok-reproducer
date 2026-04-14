@@ -78,11 +78,37 @@ def _search_episode_sync(episode_name: str, source_dirs: list[Path], video_exten
     return None
 
 
+def _normalize_name(value: str) -> str:
+    return "".join(ch for ch in value.lower() if ch.isalnum())
+
+
+def _resolve_anime_source_dir(library_root: Path, anime_name: str) -> Path | None:
+    if not library_root.exists() or not library_root.is_dir():
+        return None
+
+    direct = library_root / anime_name
+    if direct.exists() and direct.is_dir():
+        return direct
+
+    target = _normalize_name(anime_name)
+    for child in library_root.iterdir():
+        if child.is_dir() and _normalize_name(child.name) == target:
+            return child
+
+    return None
+
+
 def _build_source_dirs(project) -> list[Path]:
-    if project.source_paths:
-        return [Path(src) for src in project.source_paths]
+    explicit_paths = [Path(src) for src in project.source_paths if Path(src).exists()]
+    if explicit_paths:
+        return explicit_paths
+
     library_root = AnimeLibraryService.get_library_path(project.library_type)
     if library_root.exists():
+        if project.anime_name:
+            scoped_dir = _resolve_anime_source_dir(library_root, project.anime_name)
+            if scoped_dir is not None:
+                return [scoped_dir]
         return [library_root]
     return []
 

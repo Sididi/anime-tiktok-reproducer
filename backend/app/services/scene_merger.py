@@ -947,6 +947,79 @@ class SceneMergerService:
         return json.loads(backup_path.read_text())
 
     @classmethod
+    def _restore_match_from_backup_or_merged(
+        cls,
+        *,
+        restored_scene_index: int,
+        original_scene: Scene,
+        original_match: SceneMatch | None,
+        merged_scene: Scene,
+        merged_match: SceneMatch,
+    ) -> SceneMatch:
+        """
+        Restore a sub-scene match, falling back to the merged match when needed.
+
+        Auto-fill/manual adjustments can happen after the initial merge backup is
+        saved. If the backup still contains a no-match placeholder for a
+        sub-scene, derive a proportional source clip from the current merged
+        scene so undo does not regress back to an empty source.
+        """
+        backup_match = original_match.model_copy(deep=True) if original_match else None
+        if backup_match and backup_match.episode:
+            backup_match.scene_index = restored_scene_index
+            backup_match.merged_from = None
+            return backup_match
+
+        if merged_match.episode:
+            merged_scene_duration = merged_scene.end_time - merged_scene.start_time
+            merged_source_duration = merged_match.end_time - merged_match.start_time
+            if merged_scene_duration > 0 and merged_source_duration > 0:
+                offset_start = max(0.0, original_scene.start_time - merged_scene.start_time)
+                offset_end = max(offset_start, original_scene.end_time - merged_scene.start_time)
+                ratio_start = min(max(offset_start / merged_scene_duration, 0.0), 1.0)
+                ratio_end = min(max(offset_end / merged_scene_duration, ratio_start), 1.0)
+                source_start = merged_match.start_time + ratio_start * merged_source_duration
+                source_end = merged_match.start_time + ratio_end * merged_source_duration
+            else:
+                source_start = merged_match.start_time
+                source_end = merged_match.end_time
+
+            # When the backup is still a stale no-match placeholder, inherit the
+            # merged scene metadata so manual re-selection keeps working.
+            restored_match = merged_match.model_copy(deep=True)
+            restored_match.scene_index = restored_scene_index
+            restored_match.episode = merged_match.episode
+            restored_match.start_time = round(source_start, 6)
+            restored_match.end_time = round(source_end, 6)
+            restored_match.confidence = merged_match.confidence
+            restored_match.confirmed = merged_match.confirmed
+            restored_match.merged_from = None
+
+            restored_scene_duration = original_scene.end_time - original_scene.start_time
+            restored_source_duration = restored_match.end_time - restored_match.start_time
+            restored_match.speed_ratio = (
+                restored_scene_duration / restored_source_duration
+                if restored_source_duration > 0
+                else 1.0
+            )
+            return restored_match
+
+        if backup_match is not None:
+            backup_match.scene_index = restored_scene_index
+            backup_match.merged_from = None
+            return backup_match
+
+        return SceneMatch(
+            scene_index=restored_scene_index,
+            episode="",
+            start_time=0,
+            end_time=0,
+            confidence=0,
+            speed_ratio=1.0,
+            was_no_match=True,
+        )
+
+    @classmethod
     def undo_merge(
         cls,
         project_id: str,
@@ -996,28 +1069,37 @@ class SceneMergerService:
                             start_time=orig_scene.start_time,
                             end_time=orig_scene.end_time,
                         ))
-                    if orig_idx < len(original_matches):
-                        orig_match = original_matches[orig_idx].model_copy()
-                        orig_match.scene_index = len(new_matches)
-                        new_matches.append(orig_match)
                     else:
-                        new_matches.append(SceneMatch(
-                            scene_index=len(new_matches),
-                            episode="",
-                            start_time=0,
-                            end_time=0,
-                            confidence=0,
-                            speed_ratio=1.0,
-                            was_no_match=True,
-                        ))
+                        orig_scene = Scene(
+                            index=orig_idx,
+                            start_time=scene.start_time,
+                            end_time=scene.end_time,
+                        )
+
+                    orig_match = (
+                        original_matches[orig_idx]
+                        if orig_idx < len(original_matches)
+                        else None
+                    )
+                    new_matches.append(
+                        cls._restore_match_from_backup_or_merged(
+                            restored_scene_index=len(new_matches),
+                            original_scene=orig_scene,
+                            original_match=orig_match,
+                            merged_scene=scene,
+                            merged_match=target_match,
+                        )
+                    )
             else:
                 new_scenes.append(Scene(
                     index=len(new_scenes),
                     start_time=scene.start_time,
                     end_time=scene.end_time,
                 ))
-                match_copy = match.model_copy()
+                match_copy = match.model_copy(deep=True)
                 match_copy.scene_index = len(new_matches)
+                if match_copy.merged_from:
+                    match_copy.merged_from = cls._normalize_original_indices(match_copy.merged_from)
                 new_matches.append(match_copy)
 
         restored_scenes = SceneList(scenes=new_scenes)

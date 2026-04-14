@@ -106,7 +106,11 @@ class Settings(BaseSettings):
     youtube_category_id: str = "22"
     youtube_channel_id: str | None = None
     social_upload_max_parallel: int = 3
+    social_upload_http_timeout_seconds: int = 120
+    social_upload_binary_timeout_seconds: int = 900
+    social_upload_platform_timeout_seconds: int = 1200
     project_upload_max_concurrent: int = 3
+    project_manager_platform_phase_timeout_seconds: int = 1260
 
     # Meta Graph API
     meta_graph_api_version: str = "v25.0"
@@ -275,6 +279,16 @@ class Settings(BaseSettings):
     @classmethod
     def _clamp_project_upload_max_concurrent(cls, value: int) -> int:
         return max(1, min(8, value))
+
+    @field_validator(
+        "social_upload_http_timeout_seconds",
+        "social_upload_binary_timeout_seconds",
+        "social_upload_platform_timeout_seconds",
+        "project_manager_platform_phase_timeout_seconds",
+    )
+    @classmethod
+    def _clamp_social_upload_timeouts(cls, value: int) -> int:
+        return max(1, min(24 * 3600, value))
 
     @field_validator("storage_box_max_connections")
     @classmethod

@@ -107,9 +107,12 @@ function ManualMatchModalContent({
   const sourcePlayerRef = useRef<ManagedVideoPlayerHandle>(null);
   const pendingSeekTimeRef = useRef<number | null>(null);
   const resumePlaybackAfterLoadRef = useRef(false);
+  const [fallbackEpisodes, setFallbackEpisodes] = useState<string[]>([]);
+
+  const availableEpisodes = episodes.length > 0 ? episodes : fallbackEpisodes;
 
   const initialEpisode = resolveEpisode(
-    episodes,
+    availableEpisodes,
     match?.episode && match.confidence > 0 ? match.episode : null,
   );
 
@@ -221,19 +224,47 @@ function ManualMatchModalContent({
     () =>
       [...(match?.alternatives ?? [])]
         .sort((left, right) => right.confidence - left.confidence)
-        .map((candidate) => resolveEpisode(episodes, candidate.episode))
+        .map((candidate) => resolveEpisode(availableEpisodes, candidate.episode))
         .filter((episode) => Boolean(episode) && episode !== selectedEpisode)
         .filter((episode, index, all) => all.indexOf(episode) === index)
         .slice(0, 2),
-    [episodes, match?.alternatives, selectedEpisode],
+    [availableEpisodes, match?.alternatives, selectedEpisode],
   );
 
   /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
+    if (episodes.length > 0) {
+      setFallbackEpisodes([]);
+    }
+  }, [episodes]);
+
+  useEffect(() => {
+    if (!isOpen || episodes.length > 0) return;
+
+    let cancelled = false;
+    void api
+      .getEpisodes(projectId)
+      .then(({ episodes: loadedEpisodes }) => {
+        if (!cancelled) {
+          setFallbackEpisodes(loadedEpisodes);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setFallbackEpisodes([]);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [episodes.length, isOpen, projectId]);
+
+  useEffect(() => {
     if (!isOpen) return;
 
     const nextEpisode = resolveEpisode(
-      episodes,
+      availableEpisodes,
       match?.episode && match.confidence > 0 ? match.episode : null,
     );
 
@@ -250,7 +281,7 @@ function ManualMatchModalContent({
       setEndTime(formatTime(sceneDuration));
       pendingSeekTimeRef.current = 0;
     }
-  }, [episodes, isOpen, match, resetSourcePlaybackState, sceneDuration]);
+  }, [availableEpisodes, isOpen, match, resetSourcePlaybackState, sceneDuration]);
   /* eslint-enable react-hooks/set-state-in-effect */
 
   useEffect(() => {
@@ -388,7 +419,10 @@ function ManualMatchModalContent({
 
   const handleSelectCandidate = useCallback(
     (candidate: AlternativeMatch) => {
-      const matchingEpisode = resolveEpisode(episodes, candidate.episode);
+      const matchingEpisode = resolveEpisode(
+        availableEpisodes,
+        candidate.episode,
+      );
 
       setStartTime(formatTime(candidate.start_time));
       setEndTime(formatTime(candidate.end_time));
@@ -406,7 +440,7 @@ function ManualMatchModalContent({
 
       seekSourceGlobal(candidate.start_time, true);
     },
-    [episodes, resetSourcePlaybackState, seekSourceGlobal, selectedEpisode],
+    [availableEpisodes, resetSourcePlaybackState, seekSourceGlobal, selectedEpisode],
   );
 
   const sourceControlsDisabled =
@@ -531,7 +565,7 @@ function ManualMatchModalContent({
                   }}
                   className="w-full rounded border border-[hsl(var(--border))] bg-[hsl(var(--input))] p-2 text-sm"
                 >
-                  {episodes.map((episode) => (
+                  {availableEpisodes.map((episode) => (
                     <option key={episode} value={episode}>
                       {episode.split("/").pop()}
                     </option>

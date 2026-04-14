@@ -110,6 +110,26 @@ class ProjectUploadService:
     def get_job(self, project_id: str) -> ProjectUploadJob | None:
         return self._jobs.get(project_id)
 
+    @staticmethod
+    def _ordered_platform_results(
+        platform_results: list[dict[str, Any]] | None,
+        requested_platforms: list[str] | None,
+    ) -> list[dict[str, Any]] | None:
+        if platform_results is None:
+            return None
+        ordered = [dict(item) for item in platform_results if isinstance(item, dict)]
+        if not requested_platforms:
+            return ordered
+
+        order = {platform: index for index, platform in enumerate(requested_platforms)}
+        ordered.sort(
+            key=lambda item: (
+                order.get(str(item.get("platform") or ""), len(order)),
+                str(item.get("platform") or ""),
+            )
+        )
+        return ordered
+
     async def enqueue_upload(
         self,
         *,
@@ -133,10 +153,14 @@ class ProjectUploadService:
             job.job_id = uuid.uuid4().hex[:16]
             job.created_at = _utc_now()
         job.account_id = account_id
+        job.platforms = list(platforms) if platforms is not None else None
+        job.facebook_strategy = facebook_strategy
+        job.youtube_strategy = youtube_strategy
         job.status = "queued"
         job.phase = "queued"
         job.message = "Upload queued"
         job.error = None
+        job.platform_results = None
         job.result = None
 
         self._requests[project_id] = UploadRequestSpec(
@@ -182,6 +206,7 @@ class ProjectUploadService:
         phase: str | None = None,
         message: str | None = None,
         error: str | None = None,
+        platform_results: list[dict[str, Any]] | None | object = _UNSET,
         result: dict[str, Any] | None | object = _UNSET,
     ) -> None:
         if status is not None:
@@ -194,6 +219,13 @@ class ProjectUploadService:
             job.error = error
         elif error is not None:
             job.error = error
+        if platform_results is not _UNSET:
+            job.platform_results = (
+                self._ordered_platform_results(
+                    platform_results if isinstance(platform_results, list) else None,
+                    job.platforms,
+                )
+            )
         if result is not _UNSET:
             job.result = result if isinstance(result, dict) or result is None else None
         await self._publish_job(job)
@@ -217,6 +249,7 @@ class ProjectUploadService:
                 phase="prepare",
                 message="Preparing upload...",
                 error=None,
+                platform_results=[],
             )
 
             if request.account_id:
@@ -254,6 +287,36 @@ class ProjectUploadService:
 
                 loop.call_soon_threadsafe(_schedule_update)
 
+            def platform_result_callback(platform_result: dict[str, Any]) -> None:
+                if not isinstance(platform_result, dict):
+                    return
+
+                def _schedule_update() -> None:
+                    current_job = self._jobs.get(project_id)
+                    if current_job is None or current_job.job_id != job_id:
+                        return
+                    existing_results = [
+                        dict(item)
+                        for item in (current_job.platform_results or [])
+                        if isinstance(item, dict)
+                    ]
+                    platform_key = str(platform_result.get("platform") or "").strip().lower()
+                    if platform_key:
+                        existing_results = [
+                            item
+                            for item in existing_results
+                            if str(item.get("platform") or "").strip().lower() != platform_key
+                        ]
+                    existing_results.append(dict(platform_result))
+                    asyncio.create_task(
+                        self._set_job_state(
+                            current_job,
+                            platform_results=existing_results,
+                        )
+                    )
+
+                loop.call_soon_threadsafe(_schedule_update)
+
             result = await asyncio.to_thread(
                 UploadPhaseService.execute_upload,
                 project_id,
@@ -265,6 +328,7 @@ class ProjectUploadService:
                 reserved_slot_dt=reserved_slot_dt,
                 reserved_scheduled_at=reserved_scheduled_at,
                 progress_callback=progress_callback,
+                platform_result_callback=platform_result_callback,
             )
             await self._set_job_state(
                 job,
@@ -272,6 +336,7 @@ class ProjectUploadService:
                 phase="complete",
                 message="Upload complete.",
                 error=None,
+                platform_results=result.get("platform_results") if isinstance(result, dict) else None,
                 result=result,
             )
         except Exception as exc:

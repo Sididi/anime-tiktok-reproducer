@@ -257,13 +257,23 @@ export function ProjectManagerModal({
     }, TERMINAL_RELOAD_DEBOUNCE_MS);
   }, [loadData]);
 
+  const uploadJobsRef = useRef<Record<string, ProjectUploadJob>>({});
   const upsertUploadJob = useCallback(
     (job: ProjectUploadJob) => {
+      const existing = uploadJobsRef.current[job.project_id];
+      // Only schedule reload when a job reaches a NEW terminal state,
+      // not when SSE reconnects and re-streams the same terminal jobs.
+      const isNewTerminalState =
+        (job.status === "complete" || job.status === "error") &&
+        existing?.status !== job.status;
+
+      uploadJobsRef.current[job.project_id] = job;
       setUploadJobs((prev) => ({
         ...prev,
         [job.project_id]: job,
       }));
-      if (job.status === "complete" || job.status === "error") {
+
+      if (isNewTerminalState) {
         scheduleRowsReload();
       }
     },
