@@ -219,6 +219,7 @@ class ExportService:
             "SPM Anime Background.prfpset",
             "SPM Anime Foreground.prfpset",
             "SPM Anime Category Title.prfpset",
+            "ATR Proxy H264.epr",
         )
     _LANG_TO_LOCALE = {
         "fr": "fr_FR",

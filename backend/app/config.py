@@ -148,12 +148,15 @@ class Settings(BaseSettings):
     storage_box_password: str | None = None
     storage_box_root: str = ""
     storage_box_known_hosts_path: Path | None = None
-    storage_box_max_connections: int = 3
-    storage_box_upload_max_parallel: int = 2
-    storage_box_download_max_parallel: int = 3
+    storage_box_max_connections: int = 8
+    storage_box_upload_max_parallel: int = 6
+    storage_box_download_max_parallel: int = 6
     storage_box_transfer_mode: str = "auto"
-    storage_box_rsync_min_file_size_mb: int = 16
+    storage_box_rsync_min_file_size_mb: int = 4
     storage_box_rsync_timeout_seconds: int = 7200
+    # lftp segmented transfer settings (for large files)
+    storage_box_lftp_segments: int = 4
+    storage_box_lftp_min_file_size_mb: int = 50
 
     @property
     def drive_google_client_id(self) -> str | None:

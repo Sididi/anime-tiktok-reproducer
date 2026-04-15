@@ -11,14 +11,15 @@ from typing import Literal
 
 from ..config import settings
 from ..utils.subprocess_runner import CommandTimeoutError, run_command
+from .storage_box_lftp import StorageBoxLftpService
 from .storage_box_sftp_client import StorageBoxSftpClient
 
 
 logger = logging.getLogger("uvicorn.error")
 
 
-TransferMode = Literal["auto", "sftp", "rsync"]
-SelectedMode = Literal["sftp", "rsync"]
+TransferMode = Literal["auto", "sftp", "rsync", "lftp"]
+SelectedMode = Literal["sftp", "rsync", "lftp"]
 
 
 class StorageBoxTransferService:
@@ -34,6 +35,10 @@ class StorageBoxTransferService:
     @classmethod
     def _rsync_min_size_bytes(cls) -> int:
         return settings.storage_box_rsync_min_file_size_mb * 1024 * 1024
+
+    @classmethod
+    def _lftp_min_size_bytes(cls) -> int:
+        return settings.storage_box_lftp_min_file_size_mb * 1024 * 1024
 
     @classmethod
     def _ssh_binary(cls) -> str | None:
@@ -130,16 +135,13 @@ class StorageBoxTransferService:
             "--partial",
             "--protect-args",
             "--info=stats2",
+            "--compress-level=0",  # Skip compression (video files already compressed)
+            "--block-size=131072",  # 128KB blocks for large files (vs 700 byte default)
             "-e",
             shlex.join(cls._build_ssh_command()),
         ]
         command.append("--append-verify" if resume else "--whole-file")
-        command.extend(
-            [
-            src,
-            dst,
-            ]
-        )
+        command.extend([src, dst])
         return command
 
     @classmethod
@@ -259,15 +261,34 @@ class StorageBoxTransferService:
     ) -> tuple[SelectedMode, str, int | None]:
         configured_mode = cls._configured_mode()
         size_bytes = cls._local_size(local_path)
+
         if configured_mode == "sftp":
             return "sftp", "configured_sftp_mode", size_bytes
 
         if not local_path.is_file():
-            reason = f"rsync bulk transfer requires a regular file: {local_path}"
-            if configured_mode == "rsync":
+            reason = f"bulk transfer requires a regular file: {local_path}"
+            if configured_mode in ("rsync", "lftp"):
                 raise RuntimeError(reason)
             return "sftp", reason, size_bytes
 
+        # Try lftp for large files (segmented parallel transfer)
+        if configured_mode == "lftp" or (
+            configured_mode == "auto"
+            and size_bytes is not None
+            and size_bytes >= cls._lftp_min_size_bytes()
+        ):
+            if StorageBoxLftpService.is_available():
+                lftp_preflight = await StorageBoxLftpService.preflight()
+                if bool(lftp_preflight["available"]):
+                    return "lftp", "lftp_ready", size_bytes
+                elif configured_mode == "lftp":
+                    raise RuntimeError(
+                        f"Storage Box lftp mode is unavailable: {lftp_preflight['reason']}"
+                    )
+            elif configured_mode == "lftp":
+                raise RuntimeError("Storage Box lftp mode is unavailable: lftp not installed")
+
+        # Try rsync for medium files
         if configured_mode == "auto" and (size_bytes is None or size_bytes < cls._rsync_min_size_bytes()):
             return "sftp", "below_rsync_size_threshold", size_bytes
 
@@ -296,6 +317,25 @@ class StorageBoxTransferService:
             return "sftp", "configured_sftp_mode", await cls._remote_size(remote_path)
 
         size_bytes = await cls._remote_size(remote_path)
+
+        # Try lftp for large files (segmented parallel transfer)
+        if configured_mode == "lftp" or (
+            configured_mode == "auto"
+            and size_bytes is not None
+            and size_bytes >= cls._lftp_min_size_bytes()
+        ):
+            if StorageBoxLftpService.is_available():
+                lftp_preflight = await StorageBoxLftpService.preflight()
+                if bool(lftp_preflight["available"]):
+                    return "lftp", "lftp_ready", size_bytes
+                elif configured_mode == "lftp":
+                    raise RuntimeError(
+                        f"Storage Box lftp mode is unavailable: {lftp_preflight['reason']}"
+                    )
+            elif configured_mode == "lftp":
+                raise RuntimeError("Storage Box lftp mode is unavailable: lftp not installed")
+
+        # Try rsync for medium files
         if configured_mode == "auto":
             if size_bytes is None:
                 return "sftp", "remote_size_unavailable", None
@@ -386,6 +426,8 @@ class StorageBoxTransferService:
         started = time.perf_counter()
         if mode == "sftp":
             await StorageBoxSftpClient.upload_file(local_path, remote)
+        elif mode == "lftp":
+            await StorageBoxLftpService.upload_file(local_path, remote)
         else:
             resume = await cls._remote_exists(remote)
             result = await run_command(
@@ -428,6 +470,8 @@ class StorageBoxTransferService:
         started = time.perf_counter()
         if mode == "sftp":
             await StorageBoxSftpClient.download_file(remote, local_path)
+        elif mode == "lftp":
+            await StorageBoxLftpService.download_file(remote, local_path)
         else:
             resume = bool(local_path.exists() and (cls._local_size(local_path) or 0) > 0)
             result = await run_command(
@@ -447,4 +491,181 @@ class StorageBoxTransferService:
             remote_path=remote,
             size_bytes=cls._local_size(local_path) or size_bytes,
             elapsed_seconds=elapsed,
+        )
+
+    @classmethod
+    async def upload_directory(
+        cls,
+        local_dir: Path,
+        remote_dir: str | PurePosixPath,
+        *,
+        parallel_files: int | None = None,
+        delete_remote: bool = False,
+    ) -> None:
+        """Upload entire directory using lftp mirror (preferred) or batched transfers.
+
+        Args:
+            local_dir: Local directory to upload
+            remote_dir: Remote directory path
+            parallel_files: Number of parallel file transfers (default: from config)
+            delete_remote: If True, delete remote files not in local directory
+        """
+        remote = StorageBoxSftpClient.normalize_remote_path(remote_dir)
+
+        if parallel_files is None:
+            parallel_files = settings.storage_box_upload_max_parallel
+
+        # Prefer lftp mirror for directory uploads (most efficient)
+        if StorageBoxLftpService.is_available():
+            lftp_preflight = await StorageBoxLftpService.preflight()
+            if bool(lftp_preflight["available"]):
+                logger.info(
+                    "Storage Box directory upload using lftp mirror local=%s remote=%s parallel=%d",
+                    local_dir,
+                    remote.as_posix(),
+                    parallel_files,
+                )
+                await StorageBoxLftpService.upload_directory(
+                    local_dir,
+                    remote,
+                    parallel_files=parallel_files,
+                    delete_remote=delete_remote,
+                )
+                return
+
+        # Fallback: collect files and upload with bounded parallelism
+        logger.info(
+            "Storage Box directory upload using batched transfers local=%s remote=%s parallel=%d",
+            local_dir,
+            remote.as_posix(),
+            parallel_files,
+        )
+
+        files_to_upload: list[tuple[Path, PurePosixPath]] = []
+        for local_file in local_dir.rglob("*"):
+            if local_file.is_file():
+                relative = local_file.relative_to(local_dir)
+                remote_file = remote / PurePosixPath(*relative.parts)
+                files_to_upload.append((local_file, remote_file))
+
+        if not files_to_upload:
+            logger.info("Storage Box directory upload: no files to upload")
+            return
+
+        import asyncio
+
+        semaphore = asyncio.Semaphore(max(1, parallel_files))
+
+        async def _upload_one(item: tuple[Path, PurePosixPath]) -> None:
+            async with semaphore:
+                local_file, remote_file = item
+                await cls.upload_file(local_file, remote_file)
+
+        async with asyncio.TaskGroup() as tg:
+            for item in files_to_upload:
+                tg.create_task(_upload_one(item))
+
+        logger.info(
+            "Storage Box directory upload complete local=%s remote=%s files=%d",
+            local_dir,
+            remote.as_posix(),
+            len(files_to_upload),
+        )
+
+    @classmethod
+    async def download_directory(
+        cls,
+        remote_dir: str | PurePosixPath,
+        local_dir: Path,
+        *,
+        parallel_files: int | None = None,
+        delete_local: bool = False,
+    ) -> None:
+        """Download entire directory using lftp mirror (preferred) or batched transfers.
+
+        Args:
+            remote_dir: Remote directory path
+            local_dir: Local directory to download to
+            parallel_files: Number of parallel file transfers (default: from config)
+            delete_local: If True, delete local files not in remote directory
+        """
+        remote = StorageBoxSftpClient.normalize_remote_path(remote_dir)
+
+        if parallel_files is None:
+            parallel_files = settings.storage_box_download_max_parallel
+
+        # Prefer lftp mirror for directory downloads (most efficient)
+        if StorageBoxLftpService.is_available():
+            lftp_preflight = await StorageBoxLftpService.preflight()
+            if bool(lftp_preflight["available"]):
+                logger.info(
+                    "Storage Box directory download using lftp mirror remote=%s local=%s parallel=%d",
+                    remote.as_posix(),
+                    local_dir,
+                    parallel_files,
+                )
+                await StorageBoxLftpService.download_directory(
+                    remote,
+                    local_dir,
+                    parallel_files=parallel_files,
+                    delete_local=delete_local,
+                )
+                return
+
+        # Fallback: list remote files and download with bounded parallelism
+        logger.info(
+            "Storage Box directory download using batched transfers remote=%s local=%s parallel=%d",
+            remote.as_posix(),
+            local_dir,
+            parallel_files,
+        )
+
+        local_dir.mkdir(parents=True, exist_ok=True)
+
+        remote_entries = await StorageBoxSftpClient.scandir(remote)
+        files_to_download: list[tuple[PurePosixPath, Path]] = []
+
+        for entry in remote_entries:
+            filename = getattr(entry, "filename", None)
+            if filename is None:
+                continue
+            attrs = getattr(entry, "attrs", None)
+            is_dir = attrs is not None and getattr(attrs, "type", None) == 2  # SFTP directory type
+
+            if is_dir:
+                # Recursively handle subdirectories
+                sub_remote = remote / filename
+                sub_local = local_dir / filename
+                await cls.download_directory(
+                    sub_remote,
+                    sub_local,
+                    parallel_files=parallel_files,
+                    delete_local=delete_local,
+                )
+            else:
+                remote_file = remote / filename
+                local_file = local_dir / filename
+                files_to_download.append((remote_file, local_file))
+
+        if not files_to_download:
+            return
+
+        import asyncio
+
+        semaphore = asyncio.Semaphore(max(1, parallel_files))
+
+        async def _download_one(item: tuple[PurePosixPath, Path]) -> None:
+            async with semaphore:
+                remote_file, local_file = item
+                await cls.download_file(remote_file, local_file)
+
+        async with asyncio.TaskGroup() as tg:
+            for item in files_to_download:
+                tg.create_task(_download_one(item))
+
+        logger.info(
+            "Storage Box directory download complete remote=%s local=%s files=%d",
+            remote.as_posix(),
+            local_dir,
+            len(files_to_download),
         )
