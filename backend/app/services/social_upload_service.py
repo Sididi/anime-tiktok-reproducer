@@ -1858,8 +1858,10 @@ class SocialUploadService:
                             video_path=prepared_video_path,
                             file_size=file_size,
                             offset=0,
-                            max_attempts=2,
+                            max_attempts=3,
                             deadline=deadline,
+                            video_id=str(video_id),
+                            base=base,
                         )
                         if upload_resp.status_code >= 400:
                             return PlatformUploadResult(
@@ -2110,8 +2112,10 @@ class SocialUploadService:
                 video_path=video_path,
                 file_size=file_size,
                 offset=0,
-                max_attempts=2,
+                max_attempts=3,
                 deadline=deadline,
+                video_id=str(video_id),
+                base=base,
             )
             if upload_resp.status_code >= 400:
                 last_error = f"Reel upload phase failed ({upload_resp.status_code}): {upload_resp.text[:300]}"
@@ -2271,39 +2275,161 @@ class SocialUploadService:
         offset: int,
         max_attempts: int = 2,
         deadline: float | None = None,
+        video_id: str | None = None,
+        base: str | None = None,
     ) -> requests.Response:
-        offset = max(0, min(offset, file_size))
-        remaining = max(0, file_size - offset)
+        """Upload binary to Facebook with connection-error-aware resume.
 
-        def _upload_binary() -> requests.Response:
-            with video_path.open("rb") as f:
-                if offset:
-                    f.seek(offset)
-                return session.post(
-                    upload_url,
-                    headers={
-                        "Authorization": f"OAuth {token}",
-                        "offset": str(offset),
-                        "file_size": str(file_size),
-                        "Content-Type": "application/octet-stream",
-                        "Content-Length": str(remaining),
-                    },
-                    data=f,
-                    timeout=cls._request_timeout_seconds(
+        When a connection error (RemoteDisconnected, ConnectionResetError, etc.) occurs,
+        this method queries Facebook for bytes_transferred and resumes from that offset
+        rather than restarting from scratch.
+        """
+        current_offset = max(0, min(offset, file_size))
+        last_exc: Exception | None = None
+        last_response: requests.Response | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            cls._ensure_deadline_remaining(
+                deadline=deadline,
+                platform="Facebook",
+                operation="reel binary upload",
+            )
+
+            remaining = max(0, file_size - current_offset)
+
+            def _make_upload_request(off: int, rem: int) -> requests.Response:
+                with video_path.open("rb") as f:
+                    if off:
+                        f.seek(off)
+                    return session.post(
+                        upload_url,
+                        headers={
+                            "Authorization": f"OAuth {token}",
+                            "offset": str(off),
+                            "file_size": str(file_size),
+                            "Content-Type": "application/octet-stream",
+                            "Content-Length": str(rem),
+                        },
+                        data=f,
+                        timeout=cls._request_timeout_seconds(
+                            deadline=deadline,
+                            platform="Facebook",
+                            operation="reel binary upload",
+                            binary=True,
+                        ),
+                    )
+
+            try:
+                response = _make_upload_request(current_offset, remaining)
+                last_response = response
+
+                # Check for retryable status codes
+                if response.status_code in cls._RETRY_STATUS_CODES and attempt < max_attempts:
+                    cls._sleep_backoff(
+                        attempt,
                         deadline=deadline,
                         platform="Facebook",
                         operation="reel binary upload",
-                        binary=True,
-                    ),
+                    )
+                    continue
+
+                return response
+
+            except requests.Timeout as exc:
+                last_exc = exc
+                logger.warning(
+                    "Facebook binary upload timeout on attempt %s/%s (offset=%s/%s): %s",
+                    attempt, max_attempts, current_offset, file_size, exc,
+                )
+                if attempt >= max_attempts:
+                    raise TimeoutError(
+                        cls._platform_timeout_detail("Facebook", "reel binary upload")
+                    ) from exc
+
+            except requests.RequestException as exc:
+                last_exc = exc
+                logger.warning(
+                    "Facebook binary upload connection error on attempt %s/%s (offset=%s/%s): %s",
+                    attempt, max_attempts, current_offset, file_size, exc,
                 )
 
-        return cls._request_with_retries(
-            _upload_binary,
-            max_attempts=max_attempts,
-            deadline=deadline,
-            platform="Facebook",
-            operation="reel binary upload",
-        )
+                # On connection errors, try to query Facebook for actual bytes transferred
+                # and resume from there instead of restarting from scratch
+                if video_id and base and attempt < max_attempts:
+                    resumed_offset = cls._get_facebook_bytes_transferred(
+                        session=session,
+                        base=base,
+                        video_id=video_id,
+                        token=token,
+                        deadline=deadline,
+                    )
+                    if resumed_offset is not None and resumed_offset > current_offset:
+                        logger.info(
+                            "Facebook upload resuming from bytes_transferred=%s (was at offset=%s)",
+                            resumed_offset, current_offset,
+                        )
+                        current_offset = resumed_offset
+
+                if attempt >= max_attempts:
+                    raise
+
+            # Backoff before retry
+            cls._sleep_backoff(
+                attempt,
+                deadline=deadline,
+                platform="Facebook",
+                operation="reel binary upload",
+            )
+
+        if last_exc:
+            raise last_exc
+        if last_response is not None:
+            return last_response
+        raise RuntimeError("Facebook binary upload failed unexpectedly")
+
+    @classmethod
+    def _get_facebook_bytes_transferred(
+        cls,
+        *,
+        session: requests.Session,
+        base: str,
+        video_id: str,
+        token: str,
+        deadline: float | None = None,
+    ) -> int | None:
+        """Query Facebook for the current bytes_transferred of an upload session."""
+        try:
+            status_payload = cls._get_facebook_video_status_payload(
+                session=session,
+                base=base,
+                video_id=video_id,
+                token=token,
+                deadline=deadline,
+            )
+            if not status_payload:
+                return None
+
+            status = status_payload.get("status")
+            if not isinstance(status, dict):
+                return None
+
+            uploading_phase = status.get("uploading_phase")
+            if not isinstance(uploading_phase, dict):
+                return None
+
+            # Facebook uses both spellings: bytes_transfered and bytes_transferred
+            bytes_transferred_raw = (
+                uploading_phase.get("bytes_transfered")
+                if uploading_phase.get("bytes_transfered") is not None
+                else uploading_phase.get("bytes_transferred")
+            )
+            if bytes_transferred_raw is None:
+                return None
+
+            return int(bytes_transferred_raw)
+        except Exception as exc:
+            logger.debug("Failed to query Facebook bytes_transferred: %s", exc)
+            return None
 
     @classmethod
     def _cleanup_failed_facebook_video(
@@ -2606,8 +2732,10 @@ class SocialUploadService:
                     video_path=video_path,
                     file_size=file_size,
                     offset=bytes_transferred_value,
-                    max_attempts=2,
+                    max_attempts=3,
                     deadline=deadline,
+                    video_id=video_id,
+                    base=base,
                 )
                 resume_attempted = True
                 if resume_resp.status_code >= 400:
