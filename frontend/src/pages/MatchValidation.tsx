@@ -653,17 +653,15 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
                   <p className="text-xs text-center opacity-60">
                     {match.alternatives?.length || 0} AI candidates available
                   </p>
-                  {episodes.length > 0 && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => setShowManualModal(true)}
-                      className="w-full mt-2"
-                    >
-                      <Edit className="h-3 w-3 mr-1" />
-                      Find Match
-                    </Button>
-                  )}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setShowManualModal(true)}
+                    className="w-full mt-2"
+                  >
+                    <Edit className="h-3 w-3 mr-1" />
+                    Find Match
+                  </Button>
                 </div>
               )}
             </div>

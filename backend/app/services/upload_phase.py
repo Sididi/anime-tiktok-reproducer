@@ -1140,24 +1140,9 @@ class UploadPhaseService:
         speed_factor = duration_seconds / max_duration
         sped_up_available = speed_factor <= max_speed + 1e-6
 
-        if sped_up_available:
-            sped_up_path = prep_dir / "sped_up.mp4"
-            if not sped_up_path.exists():
-                logger.info(
-                    "%s check: transcoding sped-up version for project %s (x%.2f)",
-                    platform_label,
-                    project_id,
-                    speed_factor,
-                )
-                error = transcode_to_limit(
-                    input_path=original_path,
-                    output_path=sped_up_path,
-                    speed_factor=speed_factor,
-                    has_audio=probe.has_audio,
-                )
-                if error:
-                    logger.warning("%s check: sped-up transcoding failed: %s", platform_label, error)
-                    sped_up_available = False
+        # Note: We no longer transcode the sped-up preview here.
+        # The frontend uses HTML5 playbackRate for instant preview.
+        # Actual transcoding happens at upload time if user chooses "sped_up" strategy.
 
         return {
             "needed": True,

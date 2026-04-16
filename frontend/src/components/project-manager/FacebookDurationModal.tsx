@@ -35,6 +35,7 @@ export function FacebookDurationModal({
   stacked = false,
 }: FacebookDurationModalProps) {
   const cutVideoRef = useRef<HTMLVideoElement>(null);
+  const spedUpVideoRef = useRef<HTMLVideoElement>(null);
   const maxDuration = 90;
 
   const handleCutTimeUpdate = useCallback(() => {
@@ -44,6 +45,13 @@ export function FacebookDurationModal({
       video.currentTime = maxDuration;
     }
   }, []);
+
+  const handleSpedUpLoadedMetadata = useCallback(() => {
+    const video = spedUpVideoRef.current;
+    if (video) {
+      video.playbackRate = speedFactor;
+    }
+  }, [speedFactor]);
 
   useEffect(() => {
     if (!open || stacked) return;
@@ -62,7 +70,6 @@ export function FacebookDurationModal({
   }
 
   const originalUrl = api.getFacebookPreviewUrl(projectId, "original");
-  const spedUpUrl = api.getFacebookPreviewUrl(projectId, "sped_up");
   const accelPercent = ((speedFactor - 1) * 100).toFixed(0);
 
   const card = (
@@ -140,10 +147,12 @@ export function FacebookDurationModal({
           <div className="flex flex-col gap-3">
             <div className="relative bg-black rounded-lg overflow-hidden aspect-9/16 max-h-[55vh]">
               <video
-                src={spedUpUrl}
+                ref={spedUpVideoRef}
+                src={originalUrl}
                 className="w-full h-full object-contain"
                 controls
                 preload="metadata"
+                onLoadedMetadata={handleSpedUpLoadedMetadata}
               />
               <div className="absolute top-2 left-2 bg-black/70 text-white text-xs font-medium px-2 py-1 rounded-md flex items-center gap-1.5">
                 <Zap className="h-3 w-3" />
