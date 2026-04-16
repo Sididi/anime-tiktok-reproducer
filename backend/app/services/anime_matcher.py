@@ -874,7 +874,7 @@ class AnimeMatcherService:
                     cls._search_image_batch,
                     [start_frame, middle_frame, end_frame],
                     top_n=25,
-                    threshold=0.25,
+                    threshold=None,
                     flip=False,
                     series=anime_name,
                 )
