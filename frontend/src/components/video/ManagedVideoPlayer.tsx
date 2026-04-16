@@ -142,6 +142,17 @@ export const ManagedVideoPlayer = forwardRef<
   const suppressReloadRef = useRef(false);
   const playingRef = useRef(false);
   const activeSourceIndexRef = useRef(0);
+
+  const onPhaseChangeRef = useRef(onPhaseChange);
+  const onTimeUpdateRef = useRef(onTimeUpdate);
+  const onLoadedMetadataRef = useRef(onLoadedMetadata);
+  const onClipEndedRef = useRef(onClipEnded);
+  useEffect(() => {
+    onPhaseChangeRef.current = onPhaseChange;
+    onTimeUpdateRef.current = onTimeUpdate;
+    onLoadedMetadataRef.current = onLoadedMetadata;
+    onClipEndedRef.current = onClipEnded;
+  });
   const [grant, setGrant] = useState<MediaSessionGrant>({
     attachedGranted: false,
     warmupGranted: false,
@@ -197,16 +208,16 @@ export const ManagedVideoPlayer = forwardRef<
         | "error",
     ) => {
       setPhase(next);
-      onPhaseChange?.(next);
+      onPhaseChangeRef.current?.(next);
     },
-    [onPhaseChange],
+    [],
   );
 
   const markEnded = useCallback(() => {
     if (endedNotifiedRef.current) return;
     endedNotifiedRef.current = true;
-    onClipEnded?.();
-  }, [onClipEnded]);
+    onClipEndedRef.current?.();
+  }, []);
 
   const applyPendingSeek = useCallback(() => {
     const video = videoRef.current;
@@ -222,7 +233,7 @@ export const ManagedVideoPlayer = forwardRef<
     const targetTime = clampTime(requestedTime, effectiveStartTime, maxTime ?? null);
     pendingSeekRef.current = null;
     video.currentTime = targetTime;
-    onTimeUpdate?.(targetTime);
+    onTimeUpdateRef.current?.(targetTime);
 
     if (!pendingAutoplayRef.current) {
       return;
@@ -233,7 +244,7 @@ export const ManagedVideoPlayer = forwardRef<
       playingRef.current = false;
       updatePhase("ready");
     });
-  }, [effectiveStartTime, endTime, onTimeUpdate, playbackRate, updatePhase]);
+  }, [effectiveStartTime, endTime, playbackRate, updatePhase]);
 
   const markReady = useCallback(() => {
     if (hasError) return;
@@ -373,13 +384,8 @@ export const ManagedVideoPlayer = forwardRef<
     setHasError(false);
     updatePhase(effectiveRequestLoad ? "leasing" : "poster");
     setRenderVersion((value) => value + 1);
-  }, [
-    effectiveRequestLoad,
-    effectiveStartTime,
-    endTime,
-    sourceCandidates,
-    updatePhase,
-  ]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- updatePhase is stable; including it would remount the <video> on every parent render
+  }, [effectiveRequestLoad, effectiveStartTime, endTime, sourceCandidates]);
 
   useEffect(() => {
     if (videoRef.current) {
@@ -402,11 +408,11 @@ export const ManagedVideoPlayer = forwardRef<
     const video = videoRef.current;
     if (!video) return;
     video.playbackRate = playbackRate;
-    onLoadedMetadata?.(video.duration);
+    onLoadedMetadataRef.current?.(video.duration);
     pendingSeekRef.current =
       pendingSeekRef.current === null ? effectiveStartTime : pendingSeekRef.current;
     applyPendingSeek();
-  }, [applyPendingSeek, effectiveStartTime, onLoadedMetadata, playbackRate]);
+  }, [applyPendingSeek, effectiveStartTime, playbackRate]);
 
   const handleLoadedData = useCallback(() => {
     const video = videoRef.current;
@@ -466,7 +472,7 @@ export const ManagedVideoPlayer = forwardRef<
   const handleTimeUpdate = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
-    onTimeUpdate?.(video.currentTime);
+    onTimeUpdateRef.current?.(video.currentTime);
 
     if (endTime === undefined) {
       return;
@@ -483,7 +489,7 @@ export const ManagedVideoPlayer = forwardRef<
       updatePhase("ready");
       markEnded();
     }
-  }, [endTime, markEnded, onTimeUpdate, updatePhase]);
+  }, [endTime, markEnded, updatePhase]);
 
   const handlePlay = useCallback(() => {
     const video = videoRef.current;

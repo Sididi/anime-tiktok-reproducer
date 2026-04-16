@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/api/client";
 import type { SourceStreamDescriptor } from "@/types";
 
@@ -178,6 +178,11 @@ export function useSourcePlaybackStrategy({
     [descriptor, playbackRate, preferChunkedHighRateHevc],
   );
 
+  const initialTargetTimeRef = useRef(initialTargetTime);
+  useEffect(() => {
+    initialTargetTimeRef.current = initialTargetTime;
+  });
+
   useEffect(() => {
     if (!enabled || !episode) {
       setDescriptor(null);
@@ -216,11 +221,15 @@ export function useSourcePlaybackStrategy({
           );
           setChunkWindowDuration(nextDuration);
           setChunkWindowStart(
-            computeSourceChunkWindowStart(initialTargetTime, nextDescriptor, {
-              windowDuration: nextDuration,
-              alignment: chunkAlignment,
-              maxDuration: maxChunkDuration,
-            }),
+            computeSourceChunkWindowStart(
+              initialTargetTimeRef.current,
+              nextDescriptor,
+              {
+                windowDuration: nextDuration,
+                alignment: chunkAlignment,
+                maxDuration: maxChunkDuration,
+              },
+            ),
           );
           return;
         }
@@ -249,7 +258,6 @@ export function useSourcePlaybackStrategy({
     chunkAlignment,
     enabled,
     episode,
-    initialTargetTime,
     loadDescriptor,
     maxChunkDuration,
     minimumChunkDuration,
@@ -338,17 +346,31 @@ export function useSourcePlaybackStrategy({
     [chunkWindowStart, mode],
   );
 
-  return {
-    descriptor,
-    loading,
-    mode,
-    sourceUrl,
-    chunkWindowStart,
-    chunkWindowDuration,
-    retargetChunkWindow,
-    containsTime,
-    toLocalTime,
-    toGlobalTime,
-  };
+  return useMemo<SourcePlaybackStrategy>(
+    () => ({
+      descriptor,
+      loading,
+      mode,
+      sourceUrl,
+      chunkWindowStart,
+      chunkWindowDuration,
+      retargetChunkWindow,
+      containsTime,
+      toLocalTime,
+      toGlobalTime,
+    }),
+    [
+      chunkWindowDuration,
+      chunkWindowStart,
+      containsTime,
+      descriptor,
+      loading,
+      mode,
+      retargetChunkWindow,
+      sourceUrl,
+      toGlobalTime,
+      toLocalTime,
+    ],
+  );
 }
 

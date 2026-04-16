@@ -260,28 +260,45 @@ function ManualMatchModalContent({
     };
   }, [episodes.length, isOpen, projectId]);
 
+  const matchEpisode = match?.episode;
+  const matchConfidence = match?.confidence;
+  const matchStartTime = match?.start_time;
+  const matchEndTime = match?.end_time;
+
   useEffect(() => {
     if (!isOpen) return;
 
+    const hasConfidentMatch =
+      matchConfidence !== undefined && matchConfidence > 0;
+
     const nextEpisode = resolveEpisode(
       availableEpisodes,
-      match?.episode && match.confidence > 0 ? match.episode : null,
+      hasConfidentMatch ? matchEpisode ?? null : null,
     );
 
     resetSourcePlaybackState();
     setSelectedEpisode(nextEpisode);
     setSourcePhase(nextEpisode ? "leasing" : "poster");
 
-    if (match?.confidence && match.confidence > 0) {
-      setStartTime(formatTime(match.start_time));
-      setEndTime(formatTime(match.end_time));
-      pendingSeekTimeRef.current = match.start_time;
+    if (hasConfidentMatch && matchStartTime !== undefined && matchEndTime !== undefined) {
+      setStartTime(formatTime(matchStartTime));
+      setEndTime(formatTime(matchEndTime));
+      pendingSeekTimeRef.current = matchStartTime;
     } else {
       setStartTime("00:00.00");
       setEndTime(formatTime(sceneDuration));
       pendingSeekTimeRef.current = 0;
     }
-  }, [availableEpisodes, isOpen, match, resetSourcePlaybackState, sceneDuration]);
+  }, [
+    availableEpisodes,
+    isOpen,
+    matchConfidence,
+    matchEndTime,
+    matchEpisode,
+    matchStartTime,
+    resetSourcePlaybackState,
+    sceneDuration,
+  ]);
   /* eslint-enable react-hooks/set-state-in-effect */
 
   useEffect(() => {
