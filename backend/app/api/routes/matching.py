@@ -407,8 +407,17 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
                 + "\n\n"
             )
 
-            pairs = SceneMergerService.detect_continuous_pairs(scenes, first_pass_matches)
-            chains = SceneMergerService.build_merge_chains(pairs, scenes, first_pass_matches) if pairs else []
+            index_fps = AnimeMatcherService.get_index_fps()
+            pairs = SceneMergerService.detect_continuous_pairs(
+                scenes, first_pass_matches, index_fps=index_fps,
+            )
+            chains = (
+                SceneMergerService.build_merge_chains(
+                    pairs, scenes, first_pass_matches, index_fps=index_fps,
+                )
+                if pairs
+                else []
+            )
 
             if chains:
                 # === MERGE ===

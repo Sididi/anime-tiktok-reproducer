@@ -10,13 +10,19 @@ from .project_service import ProjectService
 class SceneMergerService:
     """Detects continuous scenes in anime source and merges them."""
 
-    # A tighter margin avoids merging intentional quick cuts while still allowing
-    # minor timestamp jitter between adjacent source candidates.
-    CONTINUITY_GAP_TOLERANCE = 0.30  # seconds
+    # Floor tolerance for pair continuity. The effective tolerance is scaled up
+    # to at least one index-grid step via `_continuity_gap_tolerance(index_fps)`
+    # so that two truly-continuous scenes are never rejected purely because the
+    # indexer sampled them on adjacent grid ticks.
+    CONTINUITY_GAP_TOLERANCE = 0.30  # seconds (floor)
     CONTINUITY_EPSILON = 1e-3  # allow tiny numerical jitter
     # Minimum direct pair continuity score required before considering a merge.
     # Keeps weak/noisy candidate overlap from creating accidental chains.
-    MIN_PAIR_CONTINUITY_SCORE = 0.22
+    MIN_PAIR_CONTINUITY_SCORE = 0.30
+    # Require ≥2 distinct (end, start) candidate pairs to agree on an episode
+    # before accepting pair continuity. A single coincidental same-episode hit
+    # at the right distance is not enough evidence for a merge.
+    MIN_EPISODE_SUPPORT = 2
     MIN_ALT_CONFIDENCE = 0.25
     MIN_RAW_CANDIDATE_CONFIDENCE = 0.30
     CANDIDATE_TIME_ROUNDING = 3
@@ -29,6 +35,21 @@ class SceneMergerService:
     # evidence to avoid collapsing distinct scenes.
     CHAIN_BRIDGE_STRONG_SCORE = 0.32
     CHAIN_BRIDGE_MIN_SUPPORT = 6
+
+    @classmethod
+    def _continuity_gap_tolerance(cls, index_fps: float | None) -> float:
+        """Effective continuity-gap tolerance given the library's index FPS.
+
+        The indexer samples reference frames on a uniform 1/index_fps grid.
+        Two scenes that are genuinely continuous in the source land on
+        adjacent ticks of that grid, so their apparent gap is bounded below
+        by the grid step. A static 0.30s floor (chosen for 1 FPS indexing)
+        under-tolerates 2 FPS indexing (0.5s step) and fails to merge real
+        continuities. We widen to 1.1 × grid step whenever that's larger.
+        """
+        if index_fps is None or index_fps <= 0:
+            return cls.CONTINUITY_GAP_TOLERANCE
+        return max(cls.CONTINUITY_GAP_TOLERANCE, 1.1 / index_fps)
 
     @classmethod
     def _get_scene_half_duration(
@@ -53,6 +74,8 @@ class SceneMergerService:
         cls,
         scenes: SceneList,
         matches: MatchList,
+        *,
+        index_fps: float | None = None,
     ) -> list[tuple[int, int]]:
         """
         Find adjacent scene pairs that are continuous in the anime source.
@@ -60,10 +83,15 @@ class SceneMergerService:
         For each adjacent pair (N, N+1), checks if scene N's end timing
         is close to scene N+1's start timing in the same episode.
 
+        Args:
+            index_fps: The FPS the library was indexed at. Used to widen the
+                continuity gap tolerance to at least one index-grid step.
+
         Returns:
             List of (scene_index, scene_index+1) tuples that are continuous.
         """
         pairs: list[tuple[int, int]] = []
+        gap_tolerance = cls._continuity_gap_tolerance(index_fps)
 
         for i in range(len(scenes.scenes) - 1):
             match_n = matches.matches[i] if i < len(matches.matches) else None
@@ -89,7 +117,11 @@ class SceneMergerService:
                 continue
 
             # Check if the pair has any continuity signal.
-            if cls._get_best_pair_continuity(n_end_candidates, n1_start_candidates):
+            if cls._get_best_pair_continuity(
+                n_end_candidates,
+                n1_start_candidates,
+                gap_tolerance=gap_tolerance,
+            ):
                 pairs.append((i, i + 1))
 
         return pairs
@@ -227,6 +259,8 @@ class SceneMergerService:
         cls,
         n_end_candidates: list[tuple[str, float, float]],
         n1_start_candidates: list[tuple[str, float, float]],
+        *,
+        gap_tolerance: float | None = None,
     ) -> tuple[str, float] | None:
         """
         Resolve the strongest continuity episode for one adjacent scene pair.
@@ -234,6 +268,7 @@ class SceneMergerService:
         Returns:
             (episode, score) when at least one forward-continuous combination exists.
         """
+        tol = gap_tolerance if gap_tolerance is not None else cls.CONTINUITY_GAP_TOLERANCE
         episode_scores: dict[str, list[float]] = {}
         episode_support: dict[str, int] = {}
 
@@ -244,13 +279,13 @@ class SceneMergerService:
 
                 # Require forward progression: next scene starts at/after current scene ends.
                 gap = start_t - end_t
-                if not (-cls.CONTINUITY_EPSILON <= gap <= cls.CONTINUITY_GAP_TOLERANCE):
+                if not (-cls.CONTINUITY_EPSILON <= gap <= tol):
                     continue
 
                 # Reward high-confidence candidates and small positive gaps.
                 # Gaps near 0s score highest; near tolerance score lower.
-                if cls.CONTINUITY_GAP_TOLERANCE > 0:
-                    gap_weight = 1.0 - min(max(gap, 0.0) / cls.CONTINUITY_GAP_TOLERANCE, 1.0)
+                if tol > 0:
+                    gap_weight = 1.0 - min(max(gap, 0.0) / tol, 1.0)
                 else:
                     gap_weight = 1.0
                 conf_weight = (end_conf + start_conf) / 2.0
@@ -278,6 +313,11 @@ class SceneMergerService:
         )
         best_score = aggregated_scores[best_episode]
         if best_score < cls.MIN_PAIR_CONTINUITY_SCORE:
+            return None
+        # Require ≥2 independent candidate combinations to vote for this
+        # episode. A lone coincidental hit can satisfy the score threshold but
+        # is not reliable evidence of continuity.
+        if episode_support.get(best_episode, 0) < cls.MIN_EPISODE_SUPPORT:
             return None
 
         return best_episode, best_score
@@ -549,6 +589,8 @@ class SceneMergerService:
         pairs: list[tuple[int, int]],
         scenes: SceneList,
         matches: MatchList,
+        *,
+        index_fps: float | None = None,
     ) -> list[list[int]]:
         """
         Build transitive merge chains from continuous pairs.
@@ -559,6 +601,8 @@ class SceneMergerService:
         """
         if not pairs:
             return []
+
+        gap_tolerance = cls._continuity_gap_tolerance(index_fps)
 
         # Resolve best continuity episode+score per adjacent pair.
         pair_continuity: dict[int, tuple[str, float]] = {}
@@ -579,7 +623,11 @@ class SceneMergerService:
                 scene_index=b,
                 scenes=scenes,
             )
-            continuity = cls._get_best_pair_continuity(curr_end, next_start)
+            continuity = cls._get_best_pair_continuity(
+                curr_end,
+                next_start,
+                gap_tolerance=gap_tolerance,
+            )
             if continuity:
                 pair_continuity[a] = continuity
 
