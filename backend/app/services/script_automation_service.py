@@ -904,6 +904,7 @@ class ScriptAutomationService:
                         target_language=target_language,
                         scene_count=len(transcription.scenes),
                     ),
+                    enable_thinking=True,
                 )
                 script_payload = cls._normalize_script_payload(
                     payload=cls._coerce_generated_script_payload(

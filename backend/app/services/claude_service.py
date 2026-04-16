@@ -12,6 +12,11 @@ from ..config import settings
 logger = logging.getLogger(__name__)
 
 
+# Extended thinking configuration
+THINKING_BUDGET_TOKENS: int = 10000
+THINKING_MAX_TOKENS: int = 24000
+
+
 class ClaudeService:
     """Wrapper around Anthropic Claude API (anthropic SDK)."""
 
@@ -86,19 +91,31 @@ class ClaudeService:
         *,
         model: str | None = None,
         max_output_tokens: int | None = None,
+        enable_thinking: bool = False,
     ) -> str:
         client = cls._get_client()
         chosen_model = (model or settings.anthropic_model).strip()
         if not chosen_model:
             raise RuntimeError("Anthropic model is not configured (ATR_ANTHROPIC_MODEL)")
 
+        create_kwargs: dict[str, Any] = {
+            "model": chosen_model,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+
+        if enable_thinking:
+            # Extended thinking: temperature must be omitted (defaults to 1)
+            create_kwargs["max_tokens"] = max_output_tokens or THINKING_MAX_TOKENS
+            create_kwargs["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": THINKING_BUDGET_TOKENS,
+            }
+        else:
+            create_kwargs["max_tokens"] = max_output_tokens or 16000
+            create_kwargs["temperature"] = 0.35
+
         try:
-            response = client.messages.create(
-                model=chosen_model,
-                max_tokens=max_output_tokens or 16000,
-                temperature=0.35,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            response = client.messages.create(**create_kwargs)
         except anthropic.APITimeoutError:
             raise RuntimeError(
                 f"Claude API timeout after {settings.anthropic_timeout}s"
@@ -113,6 +130,7 @@ class ClaudeService:
         *,
         model: str | None = None,
         response_json_schema: dict[str, Any] | None = None,
+        enable_thinking: bool = False,
     ) -> Any:
         """Generate a JSON value from Claude.
 
@@ -122,6 +140,10 @@ class ClaudeService:
         (``minItems`` > 1, ``maxItems``, ``maxLength``, …).  Instead we rely
         on a system prompt that forces pure-JSON output and on the user prompt
         which already specifies the exact structure and constraints.
+
+        When ``enable_thinking`` is True, extended thinking mode is enabled
+        with a budget of THINKING_BUDGET_TOKENS. This helps with complex
+        multi-constraint reasoning tasks like script generation.
         """
         client = cls._get_client()
         chosen_model = (model or settings.anthropic_model).strip()
@@ -130,14 +152,23 @@ class ClaudeService:
 
         create_kwargs: dict[str, Any] = {
             "model": chosen_model,
-            "max_tokens": 16000,
-            "temperature": 0.35,
             "system": (
                 "You must respond with valid JSON only. "
                 "No markdown fences, no explanation."
             ),
             "messages": [{"role": "user", "content": prompt}],
         }
+
+        if enable_thinking:
+            # Extended thinking: temperature must be omitted (defaults to 1)
+            create_kwargs["max_tokens"] = THINKING_MAX_TOKENS
+            create_kwargs["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": THINKING_BUDGET_TOKENS,
+            }
+        else:
+            create_kwargs["max_tokens"] = 16000
+            create_kwargs["temperature"] = 0.35
 
         try:
             response = client.messages.create(**create_kwargs)
@@ -156,11 +187,13 @@ class ClaudeService:
         *,
         model: str | None = None,
         response_json_schema: dict[str, Any] | None = None,
+        enable_thinking: bool = False,
     ) -> dict[str, Any]:
         parsed = cls.generate_json_value(
             prompt,
             model=model,
             response_json_schema=response_json_schema,
+            enable_thinking=enable_thinking,
         )
         if isinstance(parsed, dict):
             return parsed

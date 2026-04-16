@@ -12,6 +12,11 @@ from ..config import settings
 logger = logging.getLogger(__name__)
 
 
+# Thinking configuration
+THINKING_LEVEL: str = "high"  # For Gemini 3.x series
+THINKING_BUDGET_TOKENS: int = 10000  # For Gemini 2.5 series
+
+
 class GeminiService:
     """Wrapper around Google Gemini API (AI Studio key auth)."""
 
@@ -20,6 +25,30 @@ class GeminiService:
     @classmethod
     def is_configured(cls) -> bool:
         return bool((settings.gemini_api_key or "").strip())
+
+    @staticmethod
+    def _get_thinking_config(model: str, enable: bool) -> dict[str, Any] | None:
+        """Return appropriate thinking config based on model family.
+
+        - Gemini 3.x series uses thinkingLevel ("low", "medium", "high")
+        - Gemini 2.5 series uses thinkingBudget (token count)
+        - Older models don't support thinking
+        """
+        if not enable:
+            return None
+
+        model_lower = model.lower()
+
+        # Gemini 3.x series uses thinkingLevel
+        if any(x in model_lower for x in ["gemini-3", "3.1", "3.0"]):
+            return {"thinkingLevel": THINKING_LEVEL}
+
+        # Gemini 2.5 series uses thinkingBudget
+        if "2.5" in model_lower:
+            return {"thinkingBudget": THINKING_BUDGET_TOKENS}
+
+        # Older models don't support thinking
+        return None
 
     @classmethod
     def _generate_content(
@@ -31,6 +60,7 @@ class GeminiService:
         model: str | None = None,
         temperature: float = 0.35,
         max_output_tokens: int | None = None,
+        enable_thinking: bool = False,
     ) -> dict[str, Any]:
         api_key = (settings.gemini_api_key or "").strip()
         if not api_key:
@@ -48,6 +78,11 @@ class GeminiService:
             generation_config["responseJsonSchema"] = response_json_schema
         if max_output_tokens is not None:
             generation_config["maxOutputTokens"] = int(max_output_tokens)
+
+        # Add thinking config if enabled and supported by the model
+        thinking_config = cls._get_thinking_config(chosen_model, enable_thinking)
+        if thinking_config is not None:
+            generation_config["thinkingConfig"] = thinking_config
 
         payload: dict[str, Any] = {
             "contents": [{"parts": [{"text": prompt}]}],
@@ -215,12 +250,14 @@ class GeminiService:
         *,
         model: str | None = None,
         max_output_tokens: int | None = None,
+        enable_thinking: bool = False,
     ) -> str:
         payload = cls._generate_content(
             prompt=prompt,
             response_mime_type="text/plain",
             model=model,
             max_output_tokens=max_output_tokens,
+            enable_thinking=enable_thinking,
         )
         return cls._extract_text(payload)
 
@@ -231,11 +268,13 @@ class GeminiService:
         *,
         model: str | None = None,
         response_json_schema: dict[str, Any] | None = None,
+        enable_thinking: bool = False,
     ) -> dict[str, Any]:
         parsed = cls.generate_json_value(
             prompt,
             model=model,
             response_json_schema=response_json_schema,
+            enable_thinking=enable_thinking,
         )
         if isinstance(parsed, dict):
             return parsed
@@ -248,6 +287,7 @@ class GeminiService:
         *,
         model: str | None = None,
         response_json_schema: dict[str, Any] | None = None,
+        enable_thinking: bool = False,
     ) -> Any:
         has_schema = response_json_schema is not None
         used_schema = response_json_schema
@@ -258,6 +298,7 @@ class GeminiService:
                 response_mime_type="application/json",
                 model=model,
                 response_json_schema=used_schema,
+                enable_thinking=enable_thinking,
             )
         except RuntimeError as exc:
             if not cls._is_schema_retryable_error(str(exc), has_schema=has_schema):
@@ -268,6 +309,7 @@ class GeminiService:
                 response_mime_type="application/json",
                 model=model,
                 response_json_schema=None,
+                enable_thinking=enable_thinking,
             )
             used_schema = None
 
@@ -281,6 +323,7 @@ class GeminiService:
                 response_mime_type="application/json",
                 model=model,
                 response_json_schema=None,
+                enable_thinking=enable_thinking,
             )
             raw = cls._extract_text(payload)
 

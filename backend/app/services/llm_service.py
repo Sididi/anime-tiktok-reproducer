@@ -34,11 +34,13 @@ class LLMService:
         *,
         model: str | None = None,
         max_output_tokens: int | None = None,
+        enable_thinking: bool = False,
     ) -> str:
         return cls._provider().generate_text(
             prompt,
             model=model,
             max_output_tokens=max_output_tokens,
+            enable_thinking=enable_thinking,
         )
 
     @classmethod
@@ -48,11 +50,13 @@ class LLMService:
         *,
         model: str | None = None,
         response_json_schema: dict[str, Any] | None = None,
+        enable_thinking: bool = False,
     ) -> dict[str, Any]:
         return cls._provider().generate_json(
             prompt,
             model=model,
             response_json_schema=response_json_schema,
+            enable_thinking=enable_thinking,
         )
 
     @classmethod
@@ -62,11 +66,13 @@ class LLMService:
         *,
         model: str | None = None,
         response_json_schema: dict[str, Any] | None = None,
+        enable_thinking: bool = False,
     ) -> Any:
         return cls._provider().generate_json_value(
             prompt,
             model=model,
             response_json_schema=response_json_schema,
+            enable_thinking=enable_thinking,
         )
 
     @classmethod
