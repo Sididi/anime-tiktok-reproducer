@@ -258,13 +258,14 @@ export interface VideoInfo {
 }
 
 export interface SourceStreamDescriptor {
-  mode: "passthrough" | "chunked";
+  mode: "passthrough" | "hls";
   duration: number;
   codec: string;
   pix_fmt: string;
   chunk_duration: number;
   chunk_step: number;
   seek_guard_seconds: number;
+  hls_manifest_url?: string;
 }
 
 export interface MatchCandidate {

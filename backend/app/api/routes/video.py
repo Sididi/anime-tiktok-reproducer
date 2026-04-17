@@ -1,15 +1,16 @@
 import asyncio
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 from ...config import settings
 from ...services import (
     AnimeLibraryService,
     ProjectService,
     SourceChunkStreamingService,
+    SourceHlsStreamingService,
 )
 from ...services.browser_media_service import BrowserMediaService
 
@@ -275,7 +276,19 @@ async def get_source_video_descriptor(
         raise HTTPException(status_code=404, detail="Project not found")
 
     source_path = await _resolve_source_path(project, path)
-    return await SourceChunkStreamingService.get_descriptor(source_path)
+    descriptor = await SourceChunkStreamingService.get_descriptor(source_path)
+
+    source_hash = await asyncio.to_thread(
+        SourceHlsStreamingService.build_source_hash_sync,
+        source_path,
+    )
+    descriptor = dict(descriptor)
+    descriptor["mode"] = "hls"
+    descriptor["hls_manifest_url"] = (
+        f"/api/projects/{project_id}/video/source/hls/{source_hash}/playlist.m3u8"
+        f"?path={quote(path, safe='')}"
+    )
+    return descriptor
 
 
 @router.post("/video/source/preview/warmup")
@@ -428,4 +441,89 @@ async def get_source_video(
             path=source_path,
             cache_control="public, max-age=0, must-revalidate",
         ),
+    )
+
+
+def _hls_common_headers() -> dict[str, str]:
+    return {
+        "Cross-Origin-Resource-Policy": "cross-origin",
+        "Accept-Ranges": "bytes",
+    }
+
+
+@router.get("/video/source/hls/{source_hash}/playlist.m3u8")
+async def get_source_hls_playlist(
+    project_id: str,
+    source_hash: str,
+    path: str = Query(..., description="Path to the source episode file"),
+) -> Response:
+    """Serve the HLS manifest for a non-passthrough source, encoding on demand."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    source_path = await _resolve_source_path(project, path)
+    expected_hash = await asyncio.to_thread(
+        SourceHlsStreamingService.build_source_hash_sync,
+        source_path,
+    )
+    if expected_hash != source_hash:
+        raise HTTPException(status_code=404, detail="Stale HLS manifest URL")
+
+    try:
+        _, playlist_path, encode_done = await SourceHlsStreamingService.ensure_playlist(source_path)
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="HLS preview warming",
+            headers={"Retry-After": "1"},
+        ) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    try:
+        body = await asyncio.to_thread(playlist_path.read_bytes)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="HLS manifest unavailable") from exc
+
+    cache_control = (
+        "public, max-age=3600, stale-while-revalidate=86400"
+        if encode_done or SourceHlsStreamingService.is_complete(source_hash)
+        else "no-cache"
+    )
+    headers = _hls_common_headers()
+    headers["Cache-Control"] = cache_control
+    return Response(
+        content=body,
+        media_type="application/vnd.apple.mpegurl",
+        headers=headers,
+    )
+
+
+@router.get("/video/source/hls/{source_hash}/{segment_name}")
+async def get_source_hls_segment(
+    project_id: str,
+    source_hash: str,
+    segment_name: str,
+) -> FileResponse:
+    """Serve a single HLS segment from the cached encode directory."""
+    if not segment_name.endswith(".ts"):
+        raise HTTPException(status_code=404, detail="Unknown HLS segment")
+
+    try:
+        segment_path = await asyncio.to_thread(
+            SourceHlsStreamingService.resolve_segment,
+            source_hash,
+            segment_name,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    headers = _hls_common_headers()
+    headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    headers["ETag"] = _etag_for_path(segment_path)
+    return FileResponse(
+        segment_path,
+        media_type="video/mp2t",
+        headers=headers,
     )

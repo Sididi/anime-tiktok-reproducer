@@ -64,7 +64,6 @@ interface GapCandidate {
 }
 
 const CANDIDATE_MATCH_EPSILON = 1e-4;
-const MAX_DYNAMIC_CHUNK_SECONDS = 120;
 const DEFAULT_MIN_SPEED_FACTOR = 0.75;
 
 interface GapCardProps {
@@ -140,7 +139,6 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
   const displayStart = resolvedTiming?.start ?? gap.current_start;
   const displayEnd = resolvedTiming?.end ?? gap.current_end;
   const displaySpeed = resolvedTiming?.speed ?? gap.effective_speed;
-  const sourceClipDuration = Math.max(0.1, displayEnd - displayStart);
 
   // Calculate if still has gap after resolution
   const hasGapAfterResolution = displaySpeed < minSpeedFactor;
@@ -172,82 +170,13 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
     projectId,
     episode: gap.episode,
     enabled: shouldLoadSourcePreview,
-    playbackRate,
-    preferChunkedHighRateHevc: true,
-    initialTargetTime: (displayStart + displayEnd) / 2,
-    minimumChunkDuration: sourceClipDuration,
-    maxChunkDuration: MAX_DYNAMIC_CHUNK_SECONDS,
-    chunkAlignment: "center",
     getDescriptor: getSourceDescriptor,
   });
-  const sourceDescriptor = sourceStrategy.descriptor;
   const sourceDescriptorLoading = sourceStrategy.loading;
-  const isChunkedSource = sourceStrategy.mode === "chunked";
-  const sourceChunkStart = sourceStrategy.chunkWindowStart;
-  const sourceChunkDuration = sourceStrategy.chunkWindowDuration;
   const sourceVideoUrl = sourceStrategy.sourceUrl;
 
-  /* eslint-disable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
-  useEffect(() => {
-    if (!shouldLoadSourcePreview || !sourceDescriptor || !isChunkedSource) {
-      return;
-    }
-
-    const requestedDuration = Math.min(
-      Math.max(
-        sourceDescriptor.chunk_duration,
-        sourceClipDuration + sourceDescriptor.seek_guard_seconds * 2,
-      ),
-      MAX_DYNAMIC_CHUNK_SECONDS,
-    );
-    const currentDuration =
-      sourceChunkDuration > 0
-        ? sourceChunkDuration
-        : sourceDescriptor.chunk_duration;
-    const guard = sourceDescriptor.seek_guard_seconds;
-    const safeStart = sourceChunkStart + guard;
-    const safeEnd = sourceChunkStart + currentDuration - guard;
-
-    if (
-      displayStart >= safeStart &&
-      displayEnd <= safeEnd &&
-      Math.abs(currentDuration - requestedDuration) < 0.01
-    ) {
-      return;
-    }
-
-    sourceStrategy.retargetChunkWindow((displayStart + displayEnd) / 2, {
-      minimumDuration: requestedDuration,
-      alignment: "center",
-      maxDuration: MAX_DYNAMIC_CHUNK_SECONDS,
-    });
-  }, [
-    displayEnd,
-    displayStart,
-    sourceChunkStart,
-    sourceClipDuration,
-    sourceDescriptor,
-    isChunkedSource,
-    shouldLoadSourcePreview,
-    sourceChunkDuration,
-    sourceStrategy,
-  ]);
-  /* eslint-enable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
-
-  const sourceStartForPlayer = isChunkedSource
-    ? sourceStrategy.toLocalTime(displayStart)
-    : displayStart;
-  const sourceEndForPlayer = isChunkedSource
-    ? Math.max(
-        sourceStartForPlayer + 0.05,
-        Math.min(
-          sourceStrategy.toLocalTime(displayEnd),
-          sourceChunkDuration > 0
-            ? sourceChunkDuration
-            : sourceDescriptor?.chunk_duration || displayEnd,
-        ),
-      )
-    : displayEnd;
+  const sourceStartForPlayer = displayStart;
+  const sourceEndForPlayer = displayEnd;
 
   const fastWatchMinReadyState =
     playbackRate >= 8

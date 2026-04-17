@@ -134,15 +134,13 @@ function ManualMatchModalContent({
     useState<ManagedVideoPhase>("poster");
 
   const sceneDuration = scene.end_time - scene.start_time;
-  const parsedStartTime = useMemo(() => parseTime(startTime) ?? 0, [startTime]);
   const sourceStrategy = useSourcePlaybackStrategy({
     projectId,
     episode: selectedEpisode,
     enabled: isOpen && Boolean(selectedEpisode),
-    initialTargetTime: parsedStartTime,
   });
   const sourceDescriptor = sourceStrategy.descriptor;
-  const chunkStreamingMode = sourceStrategy.mode === "chunked";
+  const hlsStreamingMode = sourceStrategy.mode === "hls";
   const sourceVideoUrl = sourceStrategy.sourceUrl;
 
   const resetSourcePlaybackState = useCallback(() => {
@@ -177,23 +175,9 @@ function ManualMatchModalContent({
       pendingSeekTimeRef.current = bounded;
       resumePlaybackAfterLoadRef.current = autoplay;
       setCurrentTime(bounded);
-
-      if (chunkStreamingMode && sourceDescriptor) {
-        if (sourceStrategy.containsTime(bounded)) {
-          void sourcePlayerRef.current?.seekTo(
-            sourceStrategy.toLocalTime(bounded),
-            autoplay,
-          );
-          return;
-        }
-
-        sourceStrategy.retargetChunkWindow(bounded);
-        return;
-      }
-
       void sourcePlayerRef.current?.seekTo(bounded, autoplay);
     },
-    [chunkStreamingMode, clampSourceTime, sourceDescriptor, sourceStrategy],
+    [clampSourceTime],
   );
 
   const { normalAlternatives, riskyAlternatives } = useMemo(() => {
@@ -323,20 +307,20 @@ function ManualMatchModalContent({
   }, [extraEpisodesToWarm, isOpen, projectId, selectedEpisode]);
 
   useEffect(() => {
-    if (chunkStreamingMode && sourceDescriptor?.duration) {
+    if (sourceDescriptor?.duration) {
       setDuration(sourceDescriptor.duration);
     }
-  }, [chunkStreamingMode, sourceDescriptor]);
+  }, [sourceDescriptor]);
 
   const handleSourceMetadata = useCallback(
     (loadedDuration: number) => {
-      if (chunkStreamingMode && sourceDescriptor?.duration) {
+      if (sourceDescriptor?.duration) {
         setDuration(sourceDescriptor.duration);
         return;
       }
       setDuration(loadedDuration);
     },
-    [chunkStreamingMode, sourceDescriptor],
+    [sourceDescriptor],
   );
 
   const syncPendingSourceSeek = useCallback(() => {
@@ -350,28 +334,20 @@ function ManualMatchModalContent({
     pendingSeekTimeRef.current = null;
     setCurrentTime(boundedStart);
 
-    const localTarget = sourceStrategy.toLocalTime(boundedStart);
-
     void sourcePlayerRef.current?.seekTo(
-      localTarget,
+      boundedStart,
       resumePlaybackAfterLoadRef.current,
     );
     if (resumePlaybackAfterLoadRef.current) {
       resumePlaybackAfterLoadRef.current = false;
     }
-  }, [
-    chunkStreamingMode,
-    clampSourceTime,
-    match,
-    sourceStrategy,
-    startTime,
-  ]);
+  }, [clampSourceTime, match, startTime]);
 
   const handleSourceTimeUpdate = useCallback(
     (playerTime: number) => {
-      setCurrentTime(clampSourceTime(sourceStrategy.toGlobalTime(playerTime)));
+      setCurrentTime(clampSourceTime(playerTime));
     },
-    [clampSourceTime, sourceStrategy],
+    [clampSourceTime],
   );
 
   const handleSourcePhaseChange = useCallback(
@@ -619,7 +595,7 @@ function ManualMatchModalContent({
                         )}
                       </div>
                     )}
-                    {chunkStreamingMode && sourcePhase !== "error" && sourceVideoUrl && (
+                    {hlsStreamingMode && sourcePhase !== "error" && sourceVideoUrl && (
                       <div className="absolute right-1 top-1 z-10 rounded bg-black/60 px-1.5 py-0.5 text-[10px] text-white">
                         Streaming preview
                       </div>
