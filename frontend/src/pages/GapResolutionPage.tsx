@@ -170,13 +170,18 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
     projectId,
     episode: gap.episode,
     enabled: shouldLoadSourcePreview,
+    targetTime: displayStart,
     getDescriptor: getSourceDescriptor,
   });
   const sourceDescriptorLoading = sourceStrategy.loading;
   const sourceVideoUrl = sourceStrategy.sourceUrl;
+  const sourceStartOffset = sourceStrategy.startOffset;
 
-  const sourceStartForPlayer = displayStart;
-  const sourceEndForPlayer = displayEnd;
+  const sourceStartForPlayer = Math.max(0, displayStart - sourceStartOffset);
+  const sourceEndForPlayer = Math.max(
+    sourceStartForPlayer,
+    displayEnd - sourceStartOffset,
+  );
 
   const fastWatchMinReadyState =
     playbackRate >= 8

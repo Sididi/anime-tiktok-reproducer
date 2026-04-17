@@ -501,10 +501,19 @@ export const api = {
       { method: "POST" },
     ),
 
-  getSourceDescriptor: (projectId: string, episodePath: string) =>
-    request<import("@/types").SourceStreamDescriptor>(
-      `/projects/${projectId}/video/source/descriptor?path=${encodeURIComponent(episodePath)}`,
-    ),
+  getSourceDescriptor: (
+    projectId: string,
+    episodePath: string,
+    options?: { targetTime?: number },
+  ) => {
+    const params = new URLSearchParams({ path: episodePath });
+    if (options?.targetTime !== undefined && Number.isFinite(options.targetTime)) {
+      params.set("target", options.targetTime.toFixed(3));
+    }
+    return request<import("@/types").SourceStreamDescriptor>(
+      `/projects/${projectId}/video/source/descriptor?${params.toString()}`,
+    );
+  },
 
   getSourceChunkUrl: (
     projectId: string,

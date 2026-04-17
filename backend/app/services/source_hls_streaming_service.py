@@ -29,6 +29,9 @@ class SourceHlsStreamingService:
     TARGET_HEIGHT = 480
     SEGMENT_DURATION_SECONDS = 4.0
 
+    START_OFFSET_BOUNDARY_SECONDS = 30.0
+    START_OFFSET_PREROLL_SECONDS = 5.0
+
     GLOBAL_MAX_WORKERS = 2
     ENCODE_TIMEOUT_SECONDS = 30 * 60.0
     FIRST_SEGMENT_WAIT_SECONDS = 15.0
@@ -73,13 +76,28 @@ class SourceHlsStreamingService:
             return lock
 
     @classmethod
-    def build_source_hash_sync(cls, source_path: Path) -> str:
+    def snap_start_offset_sync(cls, target_time: float | None) -> float:
+        if target_time is None or target_time <= cls.START_OFFSET_PREROLL_SECONDS:
+            return 0.0
+        candidate = max(0.0, float(target_time) - cls.START_OFFSET_PREROLL_SECONDS)
+        boundary = cls.START_OFFSET_BOUNDARY_SECONDS
+        if boundary <= 0:
+            return round(candidate, 3)
+        return round((candidate // boundary) * boundary, 3)
+
+    @classmethod
+    def build_source_hash_sync(
+        cls,
+        source_path: Path,
+        start_offset: float = 0.0,
+    ) -> str:
         resolved = source_path.resolve()
         stat = resolved.stat()
+        offset_label = f"{max(0.0, float(start_offset)):.3f}"
         payload = (
             f"{cls.PROFILE_VERSION}|{resolved}|{stat.st_size}|{stat.st_mtime_ns}|"
             f"{cls.PROFILE_NAME}|{cls.TARGET_WIDTH}x{cls.TARGET_HEIGHT}|"
-            f"seg={cls.SEGMENT_DURATION_SECONDS}"
+            f"seg={cls.SEGMENT_DURATION_SECONDS}|ss={offset_label}"
         )
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
@@ -128,6 +146,7 @@ class SourceHlsStreamingService:
         *,
         source_path: Path,
         encode_dir: Path,
+        start_offset: float,
     ) -> list[str]:
         source_codec = (AnimeLibraryService.get_primary_video_codec_sync(source_path) or "").lower().strip()
 
@@ -148,6 +167,9 @@ class SourceHlsStreamingService:
             cmd.extend(["-c:v", "h264_cuvid"])
         elif source_codec == "hevc":
             cmd.extend(["-c:v", "hevc_cuvid"])
+
+        if start_offset > 0:
+            cmd.extend(["-ss", f"{start_offset:.3f}"])
 
         cmd.extend(
             [
@@ -209,6 +231,7 @@ class SourceHlsStreamingService:
         *,
         source_path: Path,
         encode_dir: Path,
+        start_offset: float,
     ) -> list[str]:
         cmd = [
             "ffmpeg",
@@ -216,6 +239,10 @@ class SourceHlsStreamingService:
             "-hide_banner",
             "-loglevel",
             "error",
+        ]
+        if start_offset > 0:
+            cmd.extend(["-ss", f"{start_offset:.3f}"])
+        cmd.extend([
             "-i",
             str(source_path),
             "-map",
@@ -260,7 +287,7 @@ class SourceHlsStreamingService:
             "-f",
             "hls",
             str(encode_dir / cls.PLAYLIST_NAME),
-        ]
+        ])
         return rewrite_media_command(cmd)
 
     @classmethod
@@ -269,9 +296,14 @@ class SourceHlsStreamingService:
         *,
         source_path: Path,
         encode_dir: Path,
+        start_offset: float,
     ) -> bool:
         if SourceChunkStreamingService._is_nvenc_available_sync():
-            gpu_cmd = cls._build_gpu_command(source_path=source_path, encode_dir=encode_dir)
+            gpu_cmd = cls._build_gpu_command(
+                source_path=source_path,
+                encode_dir=encode_dir,
+                start_offset=start_offset,
+            )
             try:
                 result = subprocess.run(
                     gpu_cmd,
@@ -289,7 +321,11 @@ class SourceHlsStreamingService:
                 stale.unlink(missing_ok=True)
             cls._playlist_path_for_dir(encode_dir).unlink(missing_ok=True)
 
-        cpu_cmd = cls._build_cpu_command(source_path=source_path, encode_dir=encode_dir)
+        cpu_cmd = cls._build_cpu_command(
+            source_path=source_path,
+            encode_dir=encode_dir,
+            start_offset=start_offset,
+        )
         try:
             result = subprocess.run(
                 cpu_cmd,
@@ -304,7 +340,13 @@ class SourceHlsStreamingService:
         return result.returncode == 0 and cls._playlist_path_for_dir(encode_dir).exists()
 
     @classmethod
-    def _encode_once_sync(cls, *, source_path: Path, encode_dir: Path) -> Path:
+    def _encode_once_sync(
+        cls,
+        *,
+        source_path: Path,
+        encode_dir: Path,
+        start_offset: float,
+    ) -> Path:
         lock = cls._get_source_lock(source_path)
         with lock:
             if cls._is_encode_done(encode_dir):
@@ -316,7 +358,11 @@ class SourceHlsStreamingService:
             (encode_dir / cls.LOCK_MARKER).write_text(f"{os.getpid()}|{time.time()}")
 
             try:
-                ok = cls._run_ffmpeg_sync(source_path=source_path, encode_dir=encode_dir)
+                ok = cls._run_ffmpeg_sync(
+                    source_path=source_path,
+                    encode_dir=encode_dir,
+                    start_offset=start_offset,
+                )
             finally:
                 (encode_dir / cls.LOCK_MARKER).unlink(missing_ok=True)
 
@@ -330,13 +376,20 @@ class SourceHlsStreamingService:
             return cls._playlist_path_for_dir(encode_dir)
 
     @classmethod
-    async def _encode_async(cls, *, source_path: Path, encode_dir: Path) -> Path:
+    async def _encode_async(
+        cls,
+        *,
+        source_path: Path,
+        encode_dir: Path,
+        start_offset: float,
+    ) -> Path:
         semaphore = cls._get_global_semaphore()
         async with semaphore:
             return await asyncio.to_thread(
                 cls._encode_once_sync,
                 source_path=source_path,
                 encode_dir=encode_dir,
+                start_offset=start_offset,
             )
 
     @classmethod
@@ -346,6 +399,7 @@ class SourceHlsStreamingService:
         source_path: Path,
         source_hash: str,
         encode_dir: Path,
+        start_offset: float,
     ) -> asyncio.Task[Path]:
         async with cls._encoder_lock:
             existing = cls._encoders_inflight.get(source_hash)
@@ -353,7 +407,11 @@ class SourceHlsStreamingService:
                 return existing
 
             task: asyncio.Task[Path] = asyncio.create_task(
-                cls._encode_async(source_path=source_path, encode_dir=encode_dir)
+                cls._encode_async(
+                    source_path=source_path,
+                    encode_dir=encode_dir,
+                    start_offset=start_offset,
+                )
             )
             cls._encoders_inflight[source_hash] = task
 
@@ -384,23 +442,32 @@ class SourceHlsStreamingService:
         raise TimeoutError("Timed out waiting for HLS first segment")
 
     @classmethod
-    async def ensure_playlist(cls, source_path: Path) -> tuple[str, Path, bool]:
-        """Ensure the encode is started; return (hash, playlist_path, encode_done)."""
-        source_hash = await asyncio.to_thread(cls.build_source_hash_sync, source_path)
+    async def ensure_playlist(
+        cls,
+        source_path: Path,
+        *,
+        start_offset: float = 0.0,
+    ) -> tuple[str, Path, bool, float]:
+        """Ensure the encode is started; return (hash, playlist_path, encode_done, start_offset)."""
+        offset = max(0.0, float(start_offset))
+        source_hash = await asyncio.to_thread(
+            cls.build_source_hash_sync, source_path, offset
+        )
         encode_dir = cls._dir_for_hash(source_hash)
 
         if cls._is_encode_done(encode_dir) and cls._playlist_path_for_dir(encode_dir).exists():
             await asyncio.to_thread(cls._touch_access_time_sync, encode_dir)
-            return source_hash, cls._playlist_path_for_dir(encode_dir), True
+            return source_hash, cls._playlist_path_for_dir(encode_dir), True, offset
 
         task = await cls._ensure_encoder_task(
             source_path=source_path,
             source_hash=source_hash,
             encode_dir=encode_dir,
+            start_offset=offset,
         )
 
         if cls._is_encode_done(encode_dir) and cls._playlist_path_for_dir(encode_dir).exists():
-            return source_hash, cls._playlist_path_for_dir(encode_dir), True
+            return source_hash, cls._playlist_path_for_dir(encode_dir), True, offset
 
         await cls._wait_for_first_segment(encode_dir=encode_dir, task=task)
 
@@ -409,7 +476,7 @@ class SourceHlsStreamingService:
             raise RuntimeError("HLS playlist missing after first-segment wait")
 
         done = cls._is_encode_done(encode_dir)
-        return source_hash, playlist_path, done
+        return source_hash, playlist_path, done, offset
 
     @classmethod
     def resolve_segment(cls, source_hash: str, filename: str) -> Path:

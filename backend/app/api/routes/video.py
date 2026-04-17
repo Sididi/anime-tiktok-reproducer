@@ -269,6 +269,11 @@ async def get_video_info(project_id: str) -> dict:
 async def get_source_video_descriptor(
     project_id: str,
     path: str = Query(..., description="Path to the source episode file"),
+    target: float | None = Query(
+        default=None,
+        description="Target playback time in seconds; encoder seeks near it.",
+        ge=0.0,
+    ),
 ) -> dict[str, object]:
     """Return source streaming descriptor for manual preview workflows."""
     project = ProjectService.load(project_id)
@@ -278,15 +283,18 @@ async def get_source_video_descriptor(
     source_path = await _resolve_source_path(project, path)
     descriptor = await SourceChunkStreamingService.get_descriptor(source_path)
 
+    start_offset = SourceHlsStreamingService.snap_start_offset_sync(target)
     source_hash = await asyncio.to_thread(
         SourceHlsStreamingService.build_source_hash_sync,
         source_path,
+        start_offset,
     )
     descriptor = dict(descriptor)
     descriptor["mode"] = "hls"
+    descriptor["hls_start_offset"] = start_offset
     descriptor["hls_manifest_url"] = (
         f"/api/projects/{project_id}/video/source/hls/{source_hash}/playlist.m3u8"
-        f"?path={quote(path, safe='')}"
+        f"?path={quote(path, safe='')}&start={start_offset:.3f}"
     )
     return descriptor
 
@@ -456,6 +464,11 @@ async def get_source_hls_playlist(
     project_id: str,
     source_hash: str,
     path: str = Query(..., description="Path to the source episode file"),
+    start: float = Query(
+        default=0.0,
+        ge=0.0,
+        description="Start offset in seconds for the HLS encode window.",
+    ),
 ) -> Response:
     """Serve the HLS manifest for a non-passthrough source, encoding on demand."""
     project = ProjectService.load(project_id)
@@ -466,12 +479,15 @@ async def get_source_hls_playlist(
     expected_hash = await asyncio.to_thread(
         SourceHlsStreamingService.build_source_hash_sync,
         source_path,
+        start,
     )
     if expected_hash != source_hash:
         raise HTTPException(status_code=404, detail="Stale HLS manifest URL")
 
     try:
-        _, playlist_path, encode_done = await SourceHlsStreamingService.ensure_playlist(source_path)
+        _, playlist_path, encode_done, _ = await SourceHlsStreamingService.ensure_playlist(
+            source_path, start_offset=start
+        )
     except TimeoutError as exc:
         raise HTTPException(
             status_code=503,

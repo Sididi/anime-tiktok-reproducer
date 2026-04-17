@@ -266,6 +266,7 @@ export interface SourceStreamDescriptor {
   chunk_step: number;
   seek_guard_seconds: number;
   hls_manifest_url?: string;
+  hls_start_offset?: number;
 }
 
 export interface MatchCandidate {

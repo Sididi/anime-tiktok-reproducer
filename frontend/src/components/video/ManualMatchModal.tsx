@@ -134,14 +134,18 @@ function ManualMatchModalContent({
     useState<ManagedVideoPhase>("poster");
 
   const sceneDuration = scene.end_time - scene.start_time;
+  const descriptorTargetTime =
+    match?.confidence && match.confidence > 0 ? match.start_time : undefined;
   const sourceStrategy = useSourcePlaybackStrategy({
     projectId,
     episode: selectedEpisode,
     enabled: isOpen && Boolean(selectedEpisode),
+    targetTime: descriptorTargetTime,
   });
   const sourceDescriptor = sourceStrategy.descriptor;
   const hlsStreamingMode = sourceStrategy.mode === "hls";
   const sourceVideoUrl = sourceStrategy.sourceUrl;
+  const sourceStartOffset = sourceStrategy.startOffset;
 
   const resetSourcePlaybackState = useCallback(() => {
     setSourcePhase("poster");
@@ -175,9 +179,10 @@ function ManualMatchModalContent({
       pendingSeekTimeRef.current = bounded;
       resumePlaybackAfterLoadRef.current = autoplay;
       setCurrentTime(bounded);
-      void sourcePlayerRef.current?.seekTo(bounded, autoplay);
+      const localTarget = Math.max(0, bounded - sourceStartOffset);
+      void sourcePlayerRef.current?.seekTo(localTarget, autoplay);
     },
-    [clampSourceTime],
+    [clampSourceTime, sourceStartOffset],
   );
 
   const { normalAlternatives, riskyAlternatives } = useMemo(() => {
@@ -334,20 +339,21 @@ function ManualMatchModalContent({
     pendingSeekTimeRef.current = null;
     setCurrentTime(boundedStart);
 
+    const localTarget = Math.max(0, boundedStart - sourceStartOffset);
     void sourcePlayerRef.current?.seekTo(
-      boundedStart,
+      localTarget,
       resumePlaybackAfterLoadRef.current,
     );
     if (resumePlaybackAfterLoadRef.current) {
       resumePlaybackAfterLoadRef.current = false;
     }
-  }, [clampSourceTime, match, startTime]);
+  }, [clampSourceTime, match, sourceStartOffset, startTime]);
 
   const handleSourceTimeUpdate = useCallback(
     (playerTime: number) => {
-      setCurrentTime(clampSourceTime(playerTime));
+      setCurrentTime(clampSourceTime(playerTime + sourceStartOffset));
     },
-    [clampSourceTime],
+    [clampSourceTime, sourceStartOffset],
   );
 
   const handleSourcePhaseChange = useCallback(
