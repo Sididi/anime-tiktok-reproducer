@@ -1,18 +1,18 @@
 import asyncio
+import json
+import subprocess
 from pathlib import Path
-from urllib.parse import quote, unquote
+from urllib.parse import unquote
 
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse
 
-from ...config import settings
 from ...services import (
     AnimeLibraryService,
     ProjectService,
-    SourceChunkStreamingService,
-    SourceHlsStreamingService,
 )
 from ...services.browser_media_service import BrowserMediaService
+from ...utils.media_binaries import get_media_subprocess_env, rewrite_media_command
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["video"])
 
@@ -29,13 +29,6 @@ def _project_media_headers(*, path: Path, cache_control: str) -> dict[str, str]:
         "Cross-Origin-Resource-Policy": "cross-origin",
         "ETag": _etag_for_path(path),
     }
-
-
-def _immutable_media_headers(path: Path) -> dict[str, str]:
-    return _project_media_headers(
-        path=path,
-        cache_control="public, max-age=31536000, immutable",
-    )
 
 
 def _preview_media_headers(path: Path) -> dict[str, str]:
@@ -169,6 +162,50 @@ def _media_type_for_path(path: Path) -> str:
     return media_types.get(suffix, "video/mp4")
 
 
+def _probe_source_metadata_sync(source_path: Path) -> dict[str, object]:
+    """Return `{duration, codec, pix_fmt}` via one ffprobe call."""
+    cmd = rewrite_media_command(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,pix_fmt:format=duration",
+            "-of",
+            "json",
+            str(source_path),
+        ]
+    )
+    duration = 0.0
+    codec = ""
+    pix_fmt = ""
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=get_media_subprocess_env(cmd),
+        )
+        if result.returncode == 0:
+            payload = json.loads(result.stdout)
+            streams = payload.get("streams") or []
+            if streams and isinstance(streams[0], dict):
+                codec = str(streams[0].get("codec_name", "")).strip()
+                pix_fmt = str(streams[0].get("pix_fmt", "")).strip()
+            fmt = payload.get("format") or {}
+            try:
+                duration = float(fmt.get("duration") or 0.0)
+            except (TypeError, ValueError):
+                duration = 0.0
+    except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        pass
+    return {"duration": duration, "codec": codec, "pix_fmt": pix_fmt}
+
+
 @router.get("/video")
 async def get_video(project_id: str) -> FileResponse:
     """Stream the project's video file."""
@@ -269,34 +306,14 @@ async def get_video_info(project_id: str) -> dict:
 async def get_source_video_descriptor(
     project_id: str,
     path: str = Query(..., description="Path to the source episode file"),
-    target: float | None = Query(
-        default=None,
-        description="Target playback time in seconds; encoder seeks near it.",
-        ge=0.0,
-    ),
 ) -> dict[str, object]:
-    """Return source streaming descriptor for manual preview workflows."""
+    """Return basic metadata for a source episode (duration, codec, pix_fmt)."""
     project = ProjectService.load(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
     source_path = await _resolve_source_path(project, path)
-    descriptor = await SourceChunkStreamingService.get_descriptor(source_path)
-
-    start_offset = SourceHlsStreamingService.snap_start_offset_sync(target)
-    source_hash = await asyncio.to_thread(
-        SourceHlsStreamingService.build_source_hash_sync,
-        source_path,
-        start_offset,
-    )
-    descriptor = dict(descriptor)
-    descriptor["mode"] = "hls"
-    descriptor["hls_start_offset"] = start_offset
-    descriptor["hls_manifest_url"] = (
-        f"/api/projects/{project_id}/video/source/hls/{source_hash}/playlist.m3u8"
-        f"?path={quote(path, safe='')}&start={start_offset:.3f}"
-    )
-    return descriptor
+    return await asyncio.to_thread(_probe_source_metadata_sync, source_path)
 
 
 @router.post("/video/source/preview/warmup")
@@ -382,65 +399,17 @@ async def get_source_video_preview(
     )
 
 
-@router.get("/video/source/chunk")
-async def get_source_video_chunk(
-    project_id: str,
-    path: str = Query(..., description="Path to the source episode file"),
-    chunk_start: float = Query(..., ge=0.0, description="Chunk start time in seconds"),
-    chunk_duration: float | None = Query(
-        default=None,
-        gt=0.0,
-        description="Optional chunk duration in seconds",
-    ),
-) -> FileResponse:
-    """Serve one browser-safe source chunk for preview streaming."""
-    project = ProjectService.load(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    source_path = await _resolve_source_path(project, path)
-
-    try:
-        chunk_path = await SourceChunkStreamingService.get_chunk(
-            source_path=source_path,
-            chunk_start=chunk_start,
-            chunk_duration=chunk_duration,
-        )
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    return FileResponse(
-        chunk_path,
-        media_type="video/mp4",
-        headers=_immutable_media_headers(chunk_path),
-    )
-
-
 @router.get("/video/source")
 async def get_source_video(
     project_id: str,
     path: str = Query(..., description="Path to the source episode file"),
 ) -> FileResponse:
-    """
-    Stream a source anime episode file when browser-compatible.
-
-    For non-compatible sources, clients must use the descriptor/chunk endpoints.
-    """
+    """Stream a source anime episode directly to the browser."""
     project = ProjectService.load(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
     source_path = await _resolve_source_path(project, path)
-
-    descriptor = await SourceChunkStreamingService.get_descriptor(source_path)
-    if descriptor.get("mode") != "passthrough":
-        raise HTTPException(
-            status_code=415,
-            detail=(
-                "Source video is not browser-compatible. "
-                "Use /video/source/descriptor and /video/source/chunk for chunked streaming."
-            ),
-        )
 
     return FileResponse(
         source_path,
@@ -449,97 +418,4 @@ async def get_source_video(
             path=source_path,
             cache_control="public, max-age=0, must-revalidate",
         ),
-    )
-
-
-def _hls_common_headers() -> dict[str, str]:
-    return {
-        "Cross-Origin-Resource-Policy": "cross-origin",
-        "Accept-Ranges": "bytes",
-    }
-
-
-@router.get("/video/source/hls/{source_hash}/playlist.m3u8")
-async def get_source_hls_playlist(
-    project_id: str,
-    source_hash: str,
-    path: str = Query(..., description="Path to the source episode file"),
-    start: float = Query(
-        default=0.0,
-        ge=0.0,
-        description="Start offset in seconds for the HLS encode window.",
-    ),
-) -> Response:
-    """Serve the HLS manifest for a non-passthrough source, encoding on demand."""
-    project = ProjectService.load(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    source_path = await _resolve_source_path(project, path)
-    expected_hash = await asyncio.to_thread(
-        SourceHlsStreamingService.build_source_hash_sync,
-        source_path,
-        start,
-    )
-    if expected_hash != source_hash:
-        raise HTTPException(status_code=404, detail="Stale HLS manifest URL")
-
-    try:
-        _, playlist_path, encode_done, _ = await SourceHlsStreamingService.ensure_playlist(
-            source_path, start_offset=start
-        )
-    except TimeoutError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="HLS preview warming",
-            headers={"Retry-After": "1"},
-        ) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    try:
-        body = await asyncio.to_thread(playlist_path.read_bytes)
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail="HLS manifest unavailable") from exc
-
-    cache_control = (
-        "public, max-age=3600, stale-while-revalidate=86400"
-        if encode_done or SourceHlsStreamingService.is_complete(source_hash)
-        else "no-cache"
-    )
-    headers = _hls_common_headers()
-    headers["Cache-Control"] = cache_control
-    return Response(
-        content=body,
-        media_type="application/vnd.apple.mpegurl",
-        headers=headers,
-    )
-
-
-@router.get("/video/source/hls/{source_hash}/{segment_name}")
-async def get_source_hls_segment(
-    project_id: str,
-    source_hash: str,
-    segment_name: str,
-) -> FileResponse:
-    """Serve a single HLS segment from the cached encode directory."""
-    if not segment_name.endswith(".ts"):
-        raise HTTPException(status_code=404, detail="Unknown HLS segment")
-
-    try:
-        segment_path = await asyncio.to_thread(
-            SourceHlsStreamingService.resolve_segment,
-            source_hash,
-            segment_name,
-        )
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    headers = _hls_common_headers()
-    headers["Cache-Control"] = "public, max-age=31536000, immutable"
-    headers["ETag"] = _etag_for_path(segment_path)
-    return FileResponse(
-        segment_path,
-        media_type="video/mp2t",
-        headers=headers,
     )

@@ -501,35 +501,10 @@ export const api = {
       { method: "POST" },
     ),
 
-  getSourceDescriptor: (
-    projectId: string,
-    episodePath: string,
-    options?: { targetTime?: number },
-  ) => {
-    const params = new URLSearchParams({ path: episodePath });
-    if (options?.targetTime !== undefined && Number.isFinite(options.targetTime)) {
-      params.set("target", options.targetTime.toFixed(3));
-    }
-    return request<import("@/types").SourceStreamDescriptor>(
-      `/projects/${projectId}/video/source/descriptor?${params.toString()}`,
-    );
-  },
-
-  getSourceChunkUrl: (
-    projectId: string,
-    episodePath: string,
-    chunkStart: number,
-    chunkDuration?: number,
-  ) => {
-    const params = new URLSearchParams({
-      path: episodePath,
-      chunk_start: String(chunkStart),
-    });
-    if (chunkDuration !== undefined) {
-      params.set("chunk_duration", String(chunkDuration));
-    }
-    return `${MEDIA_API_BASE}/projects/${projectId}/video/source/chunk?${params.toString()}`;
-  },
+  getSourceDescriptor: (projectId: string, episodePath: string) =>
+    request<import("@/types").SourceStreamDescriptor>(
+      `/projects/${projectId}/video/source/descriptor?path=${encodeURIComponent(episodePath)}`,
+    ),
 
   // Transcription
   startTranscription: (projectId: string, language = "auto") => {

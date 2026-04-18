@@ -134,18 +134,13 @@ function ManualMatchModalContent({
     useState<ManagedVideoPhase>("poster");
 
   const sceneDuration = scene.end_time - scene.start_time;
-  const descriptorTargetTime =
-    match?.confidence && match.confidence > 0 ? match.start_time : undefined;
   const sourceStrategy = useSourcePlaybackStrategy({
     projectId,
     episode: selectedEpisode,
     enabled: isOpen && Boolean(selectedEpisode),
-    targetTime: descriptorTargetTime,
   });
   const sourceDescriptor = sourceStrategy.descriptor;
-  const hlsStreamingMode = sourceStrategy.mode === "hls";
   const sourceVideoUrl = sourceStrategy.sourceUrl;
-  const sourceStartOffset = sourceStrategy.startOffset;
 
   const resetSourcePlaybackState = useCallback(() => {
     setSourcePhase("poster");
@@ -179,10 +174,9 @@ function ManualMatchModalContent({
       pendingSeekTimeRef.current = bounded;
       resumePlaybackAfterLoadRef.current = autoplay;
       setCurrentTime(bounded);
-      const localTarget = Math.max(0, bounded - sourceStartOffset);
-      void sourcePlayerRef.current?.seekTo(localTarget, autoplay);
+      void sourcePlayerRef.current?.seekTo(bounded, autoplay);
     },
-    [clampSourceTime, sourceStartOffset],
+    [clampSourceTime],
   );
 
   const { normalAlternatives, riskyAlternatives } = useMemo(() => {
@@ -339,21 +333,20 @@ function ManualMatchModalContent({
     pendingSeekTimeRef.current = null;
     setCurrentTime(boundedStart);
 
-    const localTarget = Math.max(0, boundedStart - sourceStartOffset);
     void sourcePlayerRef.current?.seekTo(
-      localTarget,
+      boundedStart,
       resumePlaybackAfterLoadRef.current,
     );
     if (resumePlaybackAfterLoadRef.current) {
       resumePlaybackAfterLoadRef.current = false;
     }
-  }, [clampSourceTime, match, sourceStartOffset, startTime]);
+  }, [clampSourceTime, match, startTime]);
 
   const handleSourceTimeUpdate = useCallback(
     (playerTime: number) => {
-      setCurrentTime(clampSourceTime(playerTime + sourceStartOffset));
+      setCurrentTime(clampSourceTime(playerTime));
     },
-    [clampSourceTime, sourceStartOffset],
+    [clampSourceTime],
   );
 
   const handleSourcePhaseChange = useCallback(
@@ -599,11 +592,6 @@ function ManualMatchModalContent({
                         ) : (
                           <span>Source stream unavailable.</span>
                         )}
-                      </div>
-                    )}
-                    {hlsStreamingMode && sourcePhase !== "error" && sourceVideoUrl && (
-                      <div className="absolute right-1 top-1 z-10 rounded bg-black/60 px-1.5 py-0.5 text-[10px] text-white">
-                        Streaming preview
                       </div>
                     )}
                   </div>

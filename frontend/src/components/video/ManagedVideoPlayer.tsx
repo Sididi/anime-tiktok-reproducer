@@ -7,7 +7,6 @@ import {
   useRef,
   useState,
 } from "react";
-import Hls from "hls.js";
 import { Loader2, Play, RotateCcw } from "lucide-react";
 import { cn } from "@/utils";
 import {
@@ -15,11 +14,6 @@ import {
   type MediaSessionGrant,
 } from "@/utils/mediaCoordinator";
 import { buildVideoSourceCandidates } from "@/utils/mediaSources";
-
-function isHlsManifestUrl(url: string): boolean {
-  const clean = url.split("?")[0]?.toLowerCase() ?? "";
-  return clean.endsWith(".m3u8");
-}
 
 export interface WaitUntilReadyOptions {
   minReadyState?: number;
@@ -176,14 +170,6 @@ export const ManagedVideoPlayer = forwardRef<
     [fallbackSrc, src],
   );
   const activeSrc = sourceCandidates[activeSourceIndex] ?? src;
-  const activeIsHls = isHlsManifestUrl(activeSrc);
-  const canPlayHlsNative =
-    typeof document !== "undefined" &&
-    !!document
-      .createElement("video")
-      .canPlayType("application/vnd.apple.mpegurl");
-  const useHlsJs = activeIsHls && !canPlayHlsNative && Hls.isSupported();
-  const hlsRef = useRef<Hls | null>(null);
 
   const effectiveStartTime = useMemo(
     () => Math.max(0, startTime + seekOffsetSeconds),
@@ -261,7 +247,10 @@ export const ManagedVideoPlayer = forwardRef<
   }, [effectiveStartTime, endTime, playbackRate, updatePhase]);
 
   const markReady = useCallback(() => {
-    if (hasError) return;
+    retryAttemptedRef.current = false;
+    if (hasError) {
+      setHasError(false);
+    }
     if (playingRef.current) {
       updatePhase("playing");
     } else {
@@ -406,43 +395,6 @@ export const ManagedVideoPlayer = forwardRef<
       videoRef.current.playbackRate = playbackRate;
     }
   }, [playbackRate]);
-
-  useEffect(() => {
-    if (!useHlsJs || !activeSrc) {
-      if (hlsRef.current) {
-        hlsRef.current.destroy();
-        hlsRef.current = null;
-      }
-      return;
-    }
-
-    const video = videoRef.current;
-    if (!video || !grant.attachedGranted) return;
-
-    const hls = new Hls({
-      enableWorker: true,
-      lowLatencyMode: false,
-      backBufferLength: 30,
-      maxBufferLength: 30,
-      maxMaxBufferLength: 60,
-    });
-    hlsRef.current = hls;
-    hls.on(Hls.Events.ERROR, (_event, data) => {
-      if (!data.fatal) return;
-      handleError();
-    });
-    hls.loadSource(activeSrc);
-    hls.attachMedia(video);
-
-    return () => {
-      hls.destroy();
-      if (hlsRef.current === hls) {
-        hlsRef.current = null;
-      }
-    };
-    // renderVersion intentionally included so a forced reload reattaches hls.js
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSrc, grant.attachedGranted, renderVersion, useHlsJs]);
 
   const handleLoadStart = useCallback(() => {
     if (hasError) {
@@ -869,7 +821,7 @@ export const ManagedVideoPlayer = forwardRef<
         <video
           key={`${activeSrc}-${renderVersion}`}
           ref={videoRef}
-          src={useHlsJs ? undefined : activeSrc}
+          src={activeSrc}
           className={cn(
             "h-full w-full object-contain",
             disableInteraction && "pointer-events-none",
