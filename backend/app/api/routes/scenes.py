@@ -157,7 +157,7 @@ async def merge_scenes(project_id: str, request: MergeScenesRequest) -> ScenesRe
 
 
 class DetectScenesRequest(BaseModel):
-    threshold: float = 18.0
+    threshold: float = 16.0
     min_scene_len: int = 10
 
 
@@ -171,7 +171,7 @@ async def detect_scenes(project_id: str, request: DetectScenesRequest | None = N
     if not project.video_path:
         raise HTTPException(status_code=400, detail="No video available")
 
-    threshold = request.threshold if request else 18.0
+    threshold = request.threshold if request else 16.0
     min_scene_len = request.min_scene_len if request else 10
 
     async def stream_progress():

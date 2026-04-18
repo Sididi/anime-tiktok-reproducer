@@ -351,7 +351,7 @@ export const api = {
   },
 
   // Scene Detection
-  detectScenes: (projectId: string, threshold = 18.0, minSceneLen = 10) => {
+  detectScenes: (projectId: string, threshold = 16.0, minSceneLen = 10) => {
     return fetch(`${API_BASE}/projects/${projectId}/scenes/detect`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
