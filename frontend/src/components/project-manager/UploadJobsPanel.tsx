@@ -12,15 +12,17 @@ import type { ProjectManagerRow, ProjectUploadJob } from "@/types";
 
 const UPLOAD_JOBS_EXPANDED_STORAGE_KEY = "project-manager.upload-jobs-expanded";
 
+const SESSION_START_MS = Date.now();
+
 function readStoredExpandedState(): boolean {
   if (typeof window === "undefined") {
-    return true;
+    return false;
   }
   try {
     const stored = window.sessionStorage.getItem(UPLOAD_JOBS_EXPANDED_STORAGE_KEY);
-    return stored == null ? true : stored === "true";
+    return stored == null ? false : stored === "true";
   } catch {
-    return true;
+    return false;
   }
 }
 
@@ -37,9 +39,15 @@ export function UploadJobsPanel({
 
   const sortedJobs = useMemo(
     () =>
-      [...jobs].sort((a, b) =>
-        String(b.updated_at).localeCompare(String(a.updated_at)),
-      ),
+      [...jobs]
+        .filter((job) => {
+          if (job.status === "queued" || job.status === "running") return true;
+          const updatedMs = new Date(job.updated_at).getTime();
+          return Number.isFinite(updatedMs) && updatedMs >= SESSION_START_MS;
+        })
+        .sort((a, b) =>
+          String(b.updated_at).localeCompare(String(a.updated_at)),
+        ),
     [jobs],
   );
   const activeJobs = sortedJobs.filter(
