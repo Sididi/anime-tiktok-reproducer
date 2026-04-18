@@ -732,6 +732,18 @@ class AnimeMatcherService:
                 seen_union_topk.add(c.episode)
                 utk_added += 1
 
+        # Deduplicate alternatives sharing identical (start_time, end_time):
+        # the three algorithms independently propose intervals and routinely
+        # converge on the same boundaries. Keep the highest-confidence entry
+        # per interval so reviewers don't wade through redundant candidates.
+        dedup: dict[tuple[float, float], AlternativeMatch] = {}
+        for alt in alternatives:
+            key = (alt.start_time, alt.end_time)
+            existing = dedup.get(key)
+            if existing is None or alt.confidence > existing.confidence:
+                dedup[key] = alt
+        alternatives = list(dedup.values())
+
         # Final sort: weighted_avg first, then best_frame, then union_topk
         # Within each algorithm, sort by confidence
         algorithm_order = {'weighted_avg': 0, 'best_frame': 1, 'union_topk': 2}
