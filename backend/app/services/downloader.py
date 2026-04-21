@@ -61,7 +61,7 @@ class DownloaderService:
         "bv*/"
         "b"
     )
-    AUDIO_RECOVERY_FORMAT_SELECTOR = "download"
+    AUDIO_RECOVERY_FORMAT_SELECTOR = "play/download/b[acodec!=none]/b"
     AUDIO_REQUIRED_ERROR_MESSAGE = (
         "Downloaded video has no audio stream. "
         "This TikTok may not have audio or the audio stream is unavailable. "
