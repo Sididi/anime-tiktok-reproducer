@@ -96,6 +96,8 @@ export interface VideoOverlay {
 export interface ScriptAutomationConfig {
   enabled: boolean;
   script_title_selection_enabled: boolean;
+  static_overlay_title_enabled: boolean;
+  static_overlay_title: string | null;
   llm: {
     provider: string;
     configured: boolean;

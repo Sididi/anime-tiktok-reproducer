@@ -712,13 +712,34 @@ export function ScriptRestructurePage() {
           }
 
           const overlay = settingsResult.video_overlay;
+          let savedTitle = "";
+          let savedCategory = "";
           if (overlay) {
             if (typeof overlay.title === "string") {
+              savedTitle = overlay.title;
               setOverlayTitle(overlay.title);
             }
             if (typeof overlay.category === "string") {
+              savedCategory = overlay.category;
               setOverlayCategory(overlay.category);
             }
+          }
+
+          if (
+            loadedAutomation?.static_overlay_title_enabled &&
+            loadedAutomation.static_overlay_title &&
+            !savedTitle.trim()
+          ) {
+            const staticTitle = loadedAutomation.static_overlay_title;
+            setOverlayTitle(staticTitle);
+            api
+              .updateScriptSettings(projectId, {
+                video_overlay: {
+                  title: staticTitle,
+                  category: savedCategory,
+                },
+              })
+              .catch(() => {});
           }
         } catch {
           // Non-critical: keep existing defaults from automation config
@@ -1388,6 +1409,7 @@ export function ScriptRestructurePage() {
           skip_metadata: skipMetadata,
           skip_tts: skipTts,
           pause_after_script: shouldPause,
+          skip_overlay: !!overlayTitle.trim(),
         },
         controller.signal,
       );
@@ -1515,6 +1537,7 @@ export function ScriptRestructurePage() {
     hydrateAutomationParts,
     queueTitleSelection,
     validateBeforeTts,
+    overlayTitle,
   ]);
 
   // Resume automation after validation pause (phase 2: TTS + metadata + overlay)
@@ -1565,7 +1588,7 @@ export function ScriptRestructurePage() {
             skip_metadata: false,
             skip_tts: false,
             pause_after_script: false,
-            skip_overlay: false,
+            skip_overlay: !!overlayTitle.trim(),
           },
           controller.signal,
         );
@@ -1649,6 +1672,7 @@ export function ScriptRestructurePage() {
       handleJsonChange,
       hydrateAutomationParts,
       queueTitleSelection,
+      overlayTitle,
     ],
   );
 
@@ -2761,7 +2785,7 @@ export function ScriptRestructurePage() {
                     disabled={
                       !jsonValid ||
                       overlayGenerating ||
-                      !!(overlayTitle || overlayCategory)
+                      !!overlayTitle
                     }
                     className="h-7 text-xs"
                   >
@@ -2836,7 +2860,7 @@ export function ScriptRestructurePage() {
                   <li className="flex items-center gap-2">
                     <div
                       className={`h-3 w-3 rounded-full ${
-                        overlayTitle || overlayCategory
+                        overlayTitle
                           ? "bg-green-500"
                           : "bg-[hsl(var(--border))]"
                       }`}

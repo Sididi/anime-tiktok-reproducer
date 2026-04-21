@@ -93,7 +93,7 @@ const INITIAL_STEPS: ProcessingStep[] = [
   },
 ];
 
-const DRIVE_UPLOAD_STREAM_TIMEOUT_MS = 10 * 60 * 1000;
+const DRIVE_UPLOAD_STALL_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_MIN_SPEED_FACTOR = 0.75;
 
 export function ProcessingPage() {
@@ -398,10 +398,15 @@ export function ProcessingPage() {
     );
     const controller = new AbortController();
     let timedOut = false;
-    const timeoutId = window.setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, DRIVE_UPLOAD_STREAM_TIMEOUT_MS);
+    let stallTimeoutId: number | undefined;
+    const resetStallTimeout = () => {
+      if (stallTimeoutId !== undefined) window.clearTimeout(stallTimeoutId);
+      stallTimeoutId = window.setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, DRIVE_UPLOAD_STALL_TIMEOUT_MS);
+    };
+    resetStallTimeout();
 
     try {
       const response = await api.uploadExportToGDrive(projectId, {
@@ -410,6 +415,7 @@ export function ProcessingPage() {
       const finalEvent = await readSSEStream<ProcessingProgress>(
         response,
         (data) => {
+          resetStallTimeout();
           const nextMessage = formatDriveUploadMessage(data);
           if (nextMessage) setActionMessage(nextMessage);
         },
@@ -446,8 +452,9 @@ export function ProcessingPage() {
     } catch (err) {
       const message = (err as Error).message;
       if (timedOut) {
+        const stallMinutes = Math.round(DRIVE_UPLOAD_STALL_TIMEOUT_MS / 60000);
         setError(
-          "Drive upload timed out while waiting for stream completion. Please retry.",
+          `Drive upload stalled: no progress update received for ${stallMinutes} minutes. Please retry.`,
         );
       } else if (
         message === "Upload already in progress for this project" ||
@@ -458,7 +465,7 @@ export function ProcessingPage() {
         setError(message);
       }
     } finally {
-      window.clearTimeout(timeoutId);
+      if (stallTimeoutId !== undefined) window.clearTimeout(stallTimeoutId);
       setDriveLoading(false);
     }
   }, [projectId, driveLoading, bundleLoading]);

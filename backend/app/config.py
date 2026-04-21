@@ -65,6 +65,9 @@ class Settings(BaseSettings):
     # When True, "grand" mode: uses White border 10px mogrt and V3 scale 75%.
     # When False (default), uses White border 5px and V3 scale 68%.
     grand_mode_enabled: bool = False
+    # When True, /script video overlay "title" is pre-filled statically based on the
+    # project library type (no LLM call, no 8-proposition modal).
+    static_overlay_title_enabled: bool = False
     scenes_skip_ui_enabled: bool = False
     transcription_full_auto_enabled: bool = False
     gaps_full_auto_enabled: bool = False

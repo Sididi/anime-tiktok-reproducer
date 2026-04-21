@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from pydub import AudioSegment
 
 from ...config import settings
+from ...library_types import resolve_static_overlay_title
 from ...models import ProjectPhase
 from ...services import (
     ProjectService,
@@ -292,9 +293,17 @@ async def get_script_automation_config(project_id: str):
     except Exception as exc:
         music_error = str(exc)
 
+    static_overlay_title = (
+        resolve_static_overlay_title(project.library_type)
+        if settings.static_overlay_title_enabled
+        else None
+    )
+
     return {
         "enabled": settings.script_automate_enabled,
         "script_title_selection_enabled": settings.script_title_selection_enabled,
+        "static_overlay_title_enabled": settings.static_overlay_title_enabled,
+        "static_overlay_title": static_overlay_title,
         "llm": {
             "provider": LLMService.provider_name(),
             "configured": LLMService.is_configured(),
