@@ -61,7 +61,7 @@ const LANGUAGE_OPTIONS = [
 
 type TargetLanguage = "fr" | "en" | "es";
 
-const METADATA_TITLE_CANDIDATE_COUNT = 10;
+const METADATA_TITLE_CANDIDATE_COUNT = 8;
 const METADATA_TITLE_MAX_CHARS = 62;
 const TIKTOK_FIXED_HASHTAGS = ["#Anime", "#animerecommendations"];
 

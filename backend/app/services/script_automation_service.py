@@ -13,6 +13,7 @@ from typing import Any, AsyncIterator
 from pydub import AudioSegment
 
 from ..config import settings
+from ..library_types import resolve_static_overlay_title
 from ..models import (
     METADATA_TITLE_CANDIDATE_COUNT,
     METADATA_TITLE_MAX_CHARS,
@@ -794,7 +795,18 @@ class ScriptAutomationService:
             model=LLMService.active_light_model(),
             response_json_schema=_OVERLAY_RESPONSE_SCHEMA,
         )
-        return cls._normalize_overlay_payload(result)
+        overlay = cls._normalize_overlay_payload(result)
+
+        static_title = cls._truncate_overlay_title(
+            resolve_static_overlay_title(project.library_type)
+        )
+        if static_title and not any(
+            hook.strip().casefold() == static_title.casefold()
+            for hook in overlay["title_hooks"]
+        ):
+            overlay["title_hooks"].append(static_title)
+
+        return overlay
 
     @classmethod
     def get_latest_run(cls, project_id: str) -> dict[str, Any] | None:
