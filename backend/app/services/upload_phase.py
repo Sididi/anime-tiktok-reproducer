@@ -343,6 +343,13 @@ class UploadPhaseService:
                 "created_at": project.created_at.isoformat() if project.created_at else None,
                 "scheduled_at": project.scheduled_at.isoformat() if project.scheduled_at else None,
                 "scheduled_account_id": project.scheduled_account_id,
+                "platform_schedules": {
+                    platform: {
+                        "slot": ps.slot.isoformat(),
+                        "scheduled_at": ps.scheduled_at.isoformat(),
+                    }
+                    for platform, ps in (project.platform_schedules or {}).items()
+                },
             }
 
         if not projects:
@@ -446,14 +453,16 @@ class UploadPhaseService:
         youtube_description: str,
         youtube_tags: list[str],
         tiktok_description: str,
-        scheduled_at: datetime | None = None,
+        platform_scheduled_at: dict[str, datetime] | None = None,
         is_final: bool = False,
     ) -> str:
+        schedules = platform_scheduled_at or {}
+        tiktok_scheduled_at = schedules.get("tiktok")
         anime_title = project.anime_name or "Inconnu"
         header_state = "terminé" if is_final else "en cours"
         header = f"**{anime_title}**: Upload {header_state} pour le projet `{project.id}`"
-        if scheduled_at:
-            header += f" (programmé le *{cls._format_french_datetime(scheduled_at)}*)"
+        if tiktok_scheduled_at:
+            header += f" (programmé le *{cls._format_french_datetime(tiktok_scheduled_at)}*)"
         lines = [
             header,
             f"__**Lien vidéo:**__ {drive_download_url}",
@@ -498,7 +507,13 @@ class UploadPhaseService:
                 lines.append("```")
 
         lines.append("")
-        lines.append("TikTok description:")
+        if tiktok_scheduled_at:
+            lines.append(
+                f":clock3: __TikTok__ (à poster manuellement à "
+                f"{cls._format_french_datetime(tiktok_scheduled_at)}):"
+            )
+        else:
+            lines.append("TikTok description:")
         lines.append(f"`{tiktok_description}`")
         return "\n".join(lines)
 
@@ -521,7 +536,9 @@ class UploadPhaseService:
         for platform in requested_platforms:
             reason: str | None = None
             if platform == "youtube":
-                if account is not None and account.youtube is None:
+                if account is not None and (
+                    account.youtube is None or not account.youtube.refresh_token
+                ):
                     reason = default_detail
             elif platform == "facebook":
                 if account is not None and account.meta is None:
@@ -568,8 +585,7 @@ class UploadPhaseService:
         facebook_strategy: str | None = None,
         youtube_strategy: str | None = None,
         copyright_audio_path: str | None = None,
-        reserved_slot_dt: datetime | None = None,
-        reserved_scheduled_at: datetime | None = None,
+        reserved_slots: dict[str, tuple[datetime, datetime]] | None = None,
         progress_callback: Callable[[float, str, str], None] | None = None,
         platform_result_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
@@ -595,8 +611,7 @@ class UploadPhaseService:
 
         # Validate account if provided
         account = None
-        scheduled_at: datetime | None = None
-        slot_dt: datetime | None = None
+        platform_scheduled_at: dict[str, datetime] = {}
         project_library_type = coerce_library_type(project.library_type)
         if account_id:
             account = AccountService.get_account(account_id)
@@ -630,12 +645,17 @@ class UploadPhaseService:
             raise ValueError("Subtitle file is missing")
         subtitle_locale = ExportService.language_to_locale(project.output_language)
 
-        # Calculate scheduled time if account has slots
-        if account and account.slots and account_id:
-            if reserved_slot_dt is not None and reserved_scheduled_at is not None:
-                slot_dt, scheduled_at = reserved_slot_dt, reserved_scheduled_at
-            else:
-                slot_dt, scheduled_at = SchedulingService.find_next_slot(account_id)
+        # Calculate per-platform scheduled times if account has slots for that platform.
+        if account and account_id:
+            for _platform in ("youtube", "facebook", "instagram", "tiktok"):
+                if not account.slots_for(_platform):
+                    continue
+                _pre = (reserved_slots or {}).get(_platform)
+                if _pre is not None:
+                    _, _sched = _pre
+                else:
+                    _, _sched = SchedulingService.find_next_slot_for_platform(account_id, _platform)
+                platform_scheduled_at[_platform] = _sched
 
         # Public share the drive video before upload phase.
         emit_progress(0.15, "prepare", "Preparing Drive upload assets...")
@@ -664,7 +684,7 @@ class UploadPhaseService:
                     youtube_description=metadata.youtube.description,
                     youtube_tags=metadata.youtube.tags,
                     tiktok_description=metadata.tiktok.description,
-                    scheduled_at=scheduled_at,
+                    platform_scheduled_at=platform_scheduled_at,
                     is_final=is_final,
                 )
                 with discord_edit_lock:
@@ -725,7 +745,7 @@ class UploadPhaseService:
                     youtube_description=metadata.youtube.description,
                     youtube_tags=metadata.youtube.tags,
                     tiktok_description=metadata.tiktok.description,
-                    scheduled_at=scheduled_at,
+                    platform_scheduled_at=platform_scheduled_at,
                     is_final=False,
                 )
             )
@@ -771,11 +791,16 @@ class UploadPhaseService:
             jobs: dict[str, Any] = {}
 
             # YouTube job
-            if "youtube" in requested_platforms and account and account.youtube and account_id:
+            if (
+                "youtube" in requested_platforms
+                and account and account.youtube and account.youtube.refresh_token
+                and account_id
+            ):
                 yt_creds = AccountService.get_youtube_credentials(account_id)
                 yt_config = account.youtube
                 _yt_strategy = youtube_strategy
                 _yt_prep_dir = cls._youtube_prep_dir(project_id)
+                _yt_scheduled_at = platform_scheduled_at.get("youtube")
                 jobs["youtube"] = lambda: SocialUploadService.upload_youtube(
                     video_path=local_video_path,
                     subtitle_path=subtitle_path,
@@ -783,7 +808,7 @@ class UploadPhaseService:
                     target_language=project.output_language,
                     metadata=metadata,
                     credentials=yt_creds,
-                    scheduled_at=scheduled_at,
+                    scheduled_at=_yt_scheduled_at,
                     category_id=yt_config.category_id,
                     channel_id=yt_config.channel_id,
                     youtube_strategy=_yt_strategy,
@@ -813,6 +838,7 @@ class UploadPhaseService:
                     _fb_strategy = facebook_strategy  # capture for lambda
                     _fb_prep_dir = cls._facebook_prep_dir(project_id)
                     _fb_video_url = None if force_local_upload else direct_drive_download
+                    _fb_scheduled_at = platform_scheduled_at.get("facebook")
                     jobs["facebook"] = lambda: SocialUploadService.upload_facebook(
                         video_path=local_video_path,
                         subtitle_path=subtitle_path,
@@ -821,17 +847,18 @@ class UploadPhaseService:
                         video_url=_fb_video_url,
                         page_id=meta_creds.page_id,
                         page_access_token=meta_creds.facebook_page_access_token,
-                        scheduled_at=scheduled_at,
+                        scheduled_at=_fb_scheduled_at,
                         facebook_strategy=_fb_strategy,
                         facebook_prep_dir=_fb_prep_dir,
                     )
 
                 # Instagram: disabled when n8n webhook is not configured.
                 if "instagram" in requested_platforms and instagram_enabled:
-                    if scheduled_at:
+                    _ig_scheduled_at = platform_scheduled_at.get("instagram")
+                    if _ig_scheduled_at:
                         ig_deferred = cls._send_n8n_instagram_webhook(
                             project_id=project_id,
-                            scheduled_at=scheduled_at,
+                            scheduled_at=_ig_scheduled_at,
                             drive_video_id=readiness.drive_video_id,
                             metadata=metadata,
                             ig_user_id=meta_creds.instagram_business_account_id,
@@ -960,7 +987,7 @@ class UploadPhaseService:
                         youtube_description=metadata.youtube.description,
                         youtube_tags=metadata.youtube.tags,
                         tiktok_description=metadata.tiktok.description,
-                        scheduled_at=scheduled_at,
+                        platform_scheduled_at=platform_scheduled_at,
                         is_final=True,
                     )
                 )
@@ -984,13 +1011,10 @@ class UploadPhaseService:
             "direct_drive_download": direct_drive_download,
         }
 
-        # Save scheduling info
+        # Save scheduling info. Per-platform reservations are already persisted
+        # by SchedulingService; only the top-level account attribution matters here.
         if account_id:
             project.scheduled_account_id = account_id
-        if scheduled_at:
-            project.scheduled_at = scheduled_at
-        if slot_dt:
-            project.scheduled_slot = slot_dt.isoformat()
 
         ProjectService.save(project)
 
@@ -1005,7 +1029,10 @@ class UploadPhaseService:
             "drive_video_url": drive_video_url,
             "direct_drive_download": direct_drive_download,
             "discord_message_id": project.final_upload_discord_message_id,
-            "scheduled_at": scheduled_at.isoformat() if scheduled_at else None,
+            "platform_scheduled_at": {
+                platform: dt.isoformat() for platform, dt in platform_scheduled_at.items()
+            },
+            "scheduled_at": project.scheduled_at.isoformat() if project.scheduled_at else None,
         }
 
     @classmethod

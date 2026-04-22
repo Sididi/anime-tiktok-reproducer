@@ -23,6 +23,13 @@ class ProjectPhase(str, Enum):
     COMPLETE = "complete"
 
 
+class PlatformSchedule(BaseModel):
+    """Per-platform slot reservation on a Project."""
+
+    slot: datetime
+    scheduled_at: datetime
+
+
 class Project(BaseModel):
     """A TikTok reproducer project."""
 
@@ -61,6 +68,7 @@ class Project(BaseModel):
     voice_key: str | None = None
 
     # Scheduling
-    scheduled_at: datetime | None = None
+    scheduled_at: datetime | None = None  # derived aggregate: max of platform_schedules[*].scheduled_at
     scheduled_account_id: str | None = None
-    scheduled_slot: str | None = None
+    scheduled_slot: str | None = None  # legacy; no longer written by new code
+    platform_schedules: dict[str, PlatformSchedule] = Field(default_factory=dict)

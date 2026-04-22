@@ -11,10 +11,49 @@ from typing import Any
 
 from ..config import settings
 from ..models.project_upload import ProjectUploadJob
-from .account_service import AccountService
+from .account_service import AccountConfig, AccountService
 from .project_service import ProjectService
 from .scheduling_service import SchedulingService
 from .upload_phase import UploadPhaseService
+
+
+def _platforms_to_reserve(
+    account: AccountConfig,
+    requested_platforms: list[str] | None,
+) -> list[str]:
+    """Which platforms should get a slot reservation for this upload.
+
+    TikTok is reserved whenever TikTok slots are configured (it's independent
+    of the upload request — the upload pipeline never uploads to TikTok).
+    Other platforms only reserve when requested AND their prerequisites hold.
+    """
+    requested_lower = (
+        {p.strip().lower() for p in requested_platforms} if requested_platforms else None
+    )
+
+    def _requested(platform: str) -> bool:
+        return requested_lower is None or platform in requested_lower
+
+    platforms: list[str] = []
+    if (
+        _requested("youtube")
+        and account.youtube is not None
+        and account.youtube.refresh_token
+        and account.slots_for("youtube")
+    ):
+        platforms.append("youtube")
+    if _requested("facebook") and account.meta is not None and account.slots_for("facebook"):
+        platforms.append("facebook")
+    if (
+        _requested("instagram")
+        and account.meta is not None
+        and account.slots_for("instagram")
+        and bool((settings.n8n_webhook_url or "").strip())
+    ):
+        platforms.append("instagram")
+    if account.slots_for("tiktok"):
+        platforms.append("tiktok")
+    return platforms
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -232,8 +271,7 @@ class ProjectUploadService:
 
     async def _run_job(self, project_id: str, job_id: str) -> None:
         await self._semaphore.acquire()
-        reserved_slot_dt = None
-        reserved_scheduled_at = None
+        reserved_slots: dict[str, tuple[datetime, datetime]] = {}
         try:
             job = self._jobs.get(project_id)
             if job is None or job.job_id != job_id:
@@ -254,18 +292,21 @@ class ProjectUploadService:
 
             if request.account_id:
                 account = AccountService.get_account(request.account_id)
-                if account is not None and account.slots:
-                    reserved_slot_dt, reserved_scheduled_at = await asyncio.to_thread(
-                        SchedulingService.reserve_next_slot,
-                        project_id,
-                        request.account_id,
-                    )
-                    await self._set_job_state(
-                        job,
-                        status="running",
-                        phase="scheduled",
-                        message="Reserved scheduled upload slot.",
-                    )
+                if account is not None:
+                    platforms_to_reserve = _platforms_to_reserve(account, request.platforms)
+                    if platforms_to_reserve:
+                        reserved_slots = await asyncio.to_thread(
+                            SchedulingService.reserve_all_platform_slots,
+                            project_id,
+                            request.account_id,
+                            platforms_to_reserve,
+                        )
+                        await self._set_job_state(
+                            job,
+                            status="running",
+                            phase="scheduled",
+                            message="Reserved scheduled upload slot.",
+                        )
 
             loop = asyncio.get_running_loop()
 
@@ -325,8 +366,7 @@ class ProjectUploadService:
                 facebook_strategy=request.facebook_strategy,
                 youtube_strategy=request.youtube_strategy,
                 copyright_audio_path=request.copyright_audio_path,
-                reserved_slot_dt=reserved_slot_dt,
-                reserved_scheduled_at=reserved_scheduled_at,
+                reserved_slots=reserved_slots,
                 progress_callback=progress_callback,
                 platform_result_callback=platform_result_callback,
             )
@@ -340,11 +380,11 @@ class ProjectUploadService:
                 result=result,
             )
         except Exception as exc:
-            if reserved_slot_dt is not None or reserved_scheduled_at is not None:
+            if reserved_slots:
                 try:
-                    await asyncio.to_thread(SchedulingService.clear_reserved_slot, project_id)
+                    await asyncio.to_thread(SchedulingService.clear_reserved_slots, project_id)
                 except Exception:
-                    logger.exception("Failed to clear reserved upload slot for %s", project_id)
+                    logger.exception("Failed to clear reserved upload slots for %s", project_id)
             current_job = self._jobs.get(project_id)
             if current_job is not None and current_job.job_id == job_id:
                 await self._set_job_state(
