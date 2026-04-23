@@ -157,7 +157,7 @@ class Settings(BaseSettings):
     storage_box_transfer_mode: str = "auto"
     storage_box_rsync_min_file_size_mb: int = 4
     storage_box_rsync_timeout_seconds: int = 7200
-    # lftp segmented transfer settings (for large files)
+    # lftp settings (explicit lftp mode and directory mirror flows)
     storage_box_lftp_segments: int = 4
     storage_box_lftp_min_file_size_mb: int = 50
 
@@ -249,8 +249,8 @@ class Settings(BaseSettings):
     @classmethod
     def _normalize_storage_box_transfer_mode(cls, value: str) -> str:
         normalized = str(value or "").strip().lower() or "auto"
-        if normalized not in {"auto", "sftp", "rsync"}:
-            raise ValueError("ATR_STORAGE_BOX_TRANSFER_MODE must be one of auto, sftp, rsync")
+        if normalized not in {"auto", "sftp", "rsync", "lftp"}:
+            raise ValueError("ATR_STORAGE_BOX_TRANSFER_MODE must be one of auto, sftp, rsync, lftp")
         return normalized
 
     @field_validator("library_state_db_path")

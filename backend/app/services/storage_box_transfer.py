@@ -230,7 +230,13 @@ class StorageBoxTransferService:
         text = stderr.decode("utf-8", "replace").strip()
         if not text:
             return "command failed without stderr"
-        return text.splitlines()[-1]
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return "command failed without stderr"
+        summary = " | ".join(lines[-5:])
+        if len(summary) > 2000:
+            return f"...{summary[-1997:]}"
+        return summary
 
     @staticmethod
     def _local_size(path: Path) -> int | None:
@@ -271,12 +277,8 @@ class StorageBoxTransferService:
                 raise RuntimeError(reason)
             return "sftp", reason, size_bytes
 
-        # Try lftp for large files (segmented parallel transfer)
-        if configured_mode == "lftp" or (
-            configured_mode == "auto"
-            and size_bytes is not None
-            and size_bytes >= cls._lftp_min_size_bytes()
-        ):
+        # Explicit lftp mode remains available for opt-in use.
+        if configured_mode == "lftp":
             if StorageBoxLftpService.is_available():
                 lftp_preflight = await StorageBoxLftpService.preflight()
                 if bool(lftp_preflight["available"]):
@@ -318,12 +320,8 @@ class StorageBoxTransferService:
 
         size_bytes = await cls._remote_size(remote_path)
 
-        # Try lftp for large files (segmented parallel transfer)
-        if configured_mode == "lftp" or (
-            configured_mode == "auto"
-            and size_bytes is not None
-            and size_bytes >= cls._lftp_min_size_bytes()
-        ):
+        # Explicit lftp mode remains available for opt-in use.
+        if configured_mode == "lftp":
             if StorageBoxLftpService.is_available():
                 lftp_preflight = await StorageBoxLftpService.preflight()
                 if bool(lftp_preflight["available"]):
@@ -412,6 +410,7 @@ class StorageBoxTransferService:
         local_path: Path,
         remote_path: str | PurePosixPath,
     ) -> None:
+        configured_mode = cls._configured_mode()
         remote = StorageBoxSftpClient.normalize_remote_path(remote_path)
         mode, reason, size_bytes = await cls._select_upload_mode(local_path)
         cls._log_selection(
@@ -430,14 +429,38 @@ class StorageBoxTransferService:
             await StorageBoxLftpService.upload_file(local_path, remote)
         else:
             resume = await cls._remote_exists(remote)
-            result = await run_command(
-                cls._build_upload_rsync_command(local_path, remote, resume=resume),
-                timeout_seconds=settings.storage_box_rsync_timeout_seconds,
-            )
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"Storage Box rsync upload failed for {local_path}: {cls._summarize_command_error(result.stderr)}"
+            try:
+                result = await run_command(
+                    cls._build_upload_rsync_command(local_path, remote, resume=resume),
+                    timeout_seconds=settings.storage_box_rsync_timeout_seconds,
                 )
+            except Exception:
+                if configured_mode == "rsync":
+                    raise
+                logger.warning(
+                    "Storage Box rsync upload command failed for %s -> %s; falling back to sftp",
+                    local_path,
+                    remote.as_posix(),
+                    exc_info=True,
+                )
+                await StorageBoxSftpClient.upload_file(local_path, remote)
+                mode = "sftp"
+            else:
+                if result.returncode != 0:
+                    detail = cls._summarize_command_error(result.stderr)
+                    if configured_mode == "rsync":
+                        raise RuntimeError(
+                            f"Storage Box rsync upload failed for {local_path}: {detail}"
+                        )
+                    logger.warning(
+                        "Storage Box rsync upload failed for %s -> %s; "
+                        "falling back to sftp: %s",
+                        local_path,
+                        remote.as_posix(),
+                        detail,
+                    )
+                    await StorageBoxSftpClient.upload_file(local_path, remote)
+                    mode = "sftp"
 
         elapsed = time.perf_counter() - started
         cls._log_success(
@@ -455,6 +478,7 @@ class StorageBoxTransferService:
         remote_path: str | PurePosixPath,
         local_path: Path,
     ) -> None:
+        configured_mode = cls._configured_mode()
         remote = StorageBoxSftpClient.normalize_remote_path(remote_path)
         local_path.parent.mkdir(parents=True, exist_ok=True)
         mode, reason, size_bytes = await cls._select_download_mode(remote)
@@ -474,14 +498,38 @@ class StorageBoxTransferService:
             await StorageBoxLftpService.download_file(remote, local_path)
         else:
             resume = bool(local_path.exists() and (cls._local_size(local_path) or 0) > 0)
-            result = await run_command(
-                cls._build_download_rsync_command(remote, local_path, resume=resume),
-                timeout_seconds=settings.storage_box_rsync_timeout_seconds,
-            )
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"Storage Box rsync download failed for {remote.as_posix()}: {cls._summarize_command_error(result.stderr)}"
+            try:
+                result = await run_command(
+                    cls._build_download_rsync_command(remote, local_path, resume=resume),
+                    timeout_seconds=settings.storage_box_rsync_timeout_seconds,
                 )
+            except Exception:
+                if configured_mode == "rsync":
+                    raise
+                logger.warning(
+                    "Storage Box rsync download command failed for %s -> %s; falling back to sftp",
+                    remote.as_posix(),
+                    local_path,
+                    exc_info=True,
+                )
+                await StorageBoxSftpClient.download_file(remote, local_path)
+                mode = "sftp"
+            else:
+                if result.returncode != 0:
+                    detail = cls._summarize_command_error(result.stderr)
+                    if configured_mode == "rsync":
+                        raise RuntimeError(
+                            f"Storage Box rsync download failed for {remote.as_posix()}: {detail}"
+                        )
+                    logger.warning(
+                        "Storage Box rsync download failed for %s -> %s; "
+                        "falling back to sftp: %s",
+                        remote.as_posix(),
+                        local_path,
+                        detail,
+                    )
+                    await StorageBoxSftpClient.download_file(remote, local_path)
+                    mode = "sftp"
 
         elapsed = time.perf_counter() - started
         cls._log_success(

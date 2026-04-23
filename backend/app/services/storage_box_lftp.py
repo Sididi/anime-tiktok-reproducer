@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shlex
 import shutil
 import tempfile
 import time
@@ -85,17 +86,33 @@ class StorageBoxLftpService:
         if ssh_key_path is None:
             raise RuntimeError("SSH key path required for lftp")
 
-        opts = [
-            f"-i {ssh_key_path}",
-            "-o StrictHostKeyChecking=yes",
-            "-o BatchMode=yes",
-            "-o IdentitiesOnly=yes",
+        command = [
+            "ssh",
+            "-p",
+            str(settings.storage_box_port),
+            "-i",
+            str(ssh_key_path),
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "IdentitiesOnly=yes",
         ]
         if settings.storage_box_known_hosts_path:
             known_hosts = settings.storage_box_known_hosts_path.expanduser()
-            opts.append(f"-o UserKnownHostsFile={known_hosts}")
+            command.extend(
+                [
+                    "-o",
+                    f"UserKnownHostsFile={known_hosts}",
+                ]
+            )
 
-        return f"ssh -p {settings.storage_box_port} " + " ".join(opts)
+        return shlex.join(command)
+
+    @staticmethod
+    def _quote(value: str | Path | PurePosixPath) -> str:
+        return shlex.quote(str(value))
 
     @classmethod
     def _build_lftp_script(
@@ -112,6 +129,7 @@ class StorageBoxLftpService:
 
         lines = [
             f'set sftp:connect-program "{cls._build_ssh_options()}"',
+            "set cmd:fail-exit yes",
             "set net:timeout 30",
             "set net:max-retries 3",
             "set net:reconnect-interval-base 5",
@@ -119,6 +137,7 @@ class StorageBoxLftpService:
             f"set pget:default-n {segments}",
             f"set mirror:parallel-transfer-count {min(segments, 4)}",
             "set xfer:clobber on",
+            f"open {cls._quote(cls._build_connection_url())}",
         ]
         lines.extend(commands)
         lines.append("quit")
@@ -167,7 +186,6 @@ class StorageBoxLftpService:
                 lftp_binary,
                 "-f",
                 script_path,
-                cls._build_connection_url(),
             ]
             return await run_command(cmd, timeout_seconds=timeout_seconds)
         finally:
@@ -195,7 +213,7 @@ class StorageBoxLftpService:
                 cls._preflight_cache[key] = (False, reason)
                 return {"available": False, "reason": reason, "cached": False}
 
-            script = cls._build_lftp_script(["ls"])
+            script = cls._build_lftp_script(["pwd"])
             try:
                 result = await cls._run_lftp_script(script, timeout_seconds=30)
             except CommandTimeoutError:
@@ -253,8 +271,10 @@ class StorageBoxLftpService:
         remote_dir = str(remote.parent) if str(remote.parent) != "." else ""
         commands = []
         if remote_dir:
-            commands.append(f"mkdir -p {remote_dir}")
-        commands.append(f"put -c -O {remote_dir or '.'} {local_path}")
+            commands.append(f"mkdir -p {cls._quote(remote_dir)}")
+        commands.append(
+            f"put -c -O {cls._quote(remote_dir or '.')} {cls._quote(local_path)}"
+        )
 
         script = cls._build_lftp_script(commands, segments=segments)
         started = time.perf_counter()
@@ -299,11 +319,15 @@ class StorageBoxLftpService:
 
         local_path.parent.mkdir(parents=True, exist_ok=True)
         commands = [
-            f"pget -c -n {segments} -O {local_path.parent} {remote.as_posix()}",
+            f"pget -c -n {segments} -O {cls._quote(local_path.parent)} "
+            f"{cls._quote(remote.as_posix())}",
         ]
 
         if local_path.name != remote.name:
-            commands.append(f"!mv {local_path.parent / remote.name} {local_path}")
+            commands.append(
+                f"!mv {cls._quote(local_path.parent / remote.name)} "
+                f"{cls._quote(local_path)}"
+            )
 
         script = cls._build_lftp_script(commands, segments=segments)
         started = time.perf_counter()
@@ -353,7 +377,8 @@ class StorageBoxLftpService:
             mirror_opts.append("--delete")
 
         commands = [
-            f"mirror {' '.join(mirror_opts)} {local_dir} {remote.as_posix()}",
+            f"mirror {' '.join(mirror_opts)} "
+            f"{cls._quote(local_dir)} {cls._quote(remote.as_posix())}",
         ]
 
         script = cls._build_lftp_script(commands)
@@ -403,7 +428,8 @@ class StorageBoxLftpService:
             mirror_opts.append("--delete")
 
         commands = [
-            f"mirror {' '.join(mirror_opts)} {remote.as_posix()} {local_dir}",
+            f"mirror {' '.join(mirror_opts)} "
+            f"{cls._quote(remote.as_posix())} {cls._quote(local_dir)}",
         ]
 
         script = cls._build_lftp_script(commands)
