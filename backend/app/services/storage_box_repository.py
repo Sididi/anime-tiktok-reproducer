@@ -556,8 +556,13 @@ class StorageBoxRepository:
         payload_index_root = cls._payload_index_root(series_id)
 
         local_artifacts: list[LocalArtifact] = []
-        episode_entries: list[dict[str, Any]] = []
+        artifacts_by_relative: dict[Path, LocalArtifact] = {}
+        top_level_video_artifacts: list[LocalArtifact] = []
 
+        # Single pass: every file under series_dir is classified into artifacts
+        # AND, when it is a top-level media file, into the episode set. Using one
+        # scan avoids a race where the set of artifacts and the set of episodes
+        # are observed at different moments and disagree.
         for path in sorted(series_dir.rglob("*")):
             if not path.is_file():
                 continue
@@ -565,55 +570,44 @@ class StorageBoxRepository:
                 continue
             relative = path.relative_to(series_dir)
             remote_relative = payload_library_root / PurePosixPath(relative.as_posix())
-            local_artifacts.append(
-                LocalArtifact(
-                    local_path=path,
-                    remote_relative_path=remote_relative,
-                    size_bytes=path.stat().st_size,
-                    sha256=_sha256_file(path),
-                    artifact_type="library",
-                    local_relative_path=f"{display_name}/{relative.as_posix()}",
-                )
+            artifact = LocalArtifact(
+                local_path=path,
+                remote_relative_path=remote_relative,
+                size_bytes=path.stat().st_size,
+                sha256=_sha256_file(path),
+                artifact_type="library",
+                local_relative_path=f"{display_name}/{relative.as_posix()}",
             )
+            local_artifacts.append(artifact)
+            artifacts_by_relative[relative] = artifact
+            if len(relative.parts) == 1 and path.suffix.lower() in MEDIA_EXTENSIONS:
+                top_level_video_artifacts.append(artifact)
 
-        video_files = [
-            path
-            for path in sorted(series_dir.iterdir())
-            if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS
-        ]
-        by_local_path = {
-            artifact.local_path.resolve(): artifact
-            for artifact in local_artifacts
-        }
-
-        for media_path in video_files:
-            media_artifact = by_local_path.get(media_path.resolve())
-            if media_artifact is None:
-                continue
+        episode_entries: list[dict[str, Any]] = []
+        for media_artifact in top_level_video_artifacts:
+            media_path = media_artifact.local_path
             episode_key = media_path.stem
-            source_sidecar = series_dir / f"{media_path.name}{AnimeLibraryService.SOURCE_IMPORT_MANIFEST_SUFFIX}"
-            subtitle_dir = AnimeLibraryService.get_subtitle_sidecar_dir(media_path)
             sidecars: list[dict[str, Any]] = []
 
-            if source_sidecar.exists():
-                source_artifact = by_local_path.get(source_sidecar.resolve())
-                if source_artifact is not None:
-                    sidecars.append(
-                        {
-                            "relative_path": source_artifact.remote_relative_path.as_posix(),
-                            "local_relative_path": source_artifact.local_relative_path,
-                            "size_bytes": source_artifact.size_bytes,
-                            "sha256": source_artifact.sha256,
-                            "artifact_type": "source_metadata",
-                        }
-                    )
-            if subtitle_dir.exists():
-                for subtitle_file in sorted(subtitle_dir.rglob("*")):
-                    if not subtitle_file.is_file():
-                        continue
-                    subtitle_artifact = by_local_path.get(subtitle_file.resolve())
-                    if subtitle_artifact is None:
-                        continue
+            source_sidecar_relative = Path(
+                f"{media_path.name}{AnimeLibraryService.SOURCE_IMPORT_MANIFEST_SUFFIX}"
+            )
+            source_artifact = artifacts_by_relative.get(source_sidecar_relative)
+            if source_artifact is not None:
+                sidecars.append(
+                    {
+                        "relative_path": source_artifact.remote_relative_path.as_posix(),
+                        "local_relative_path": source_artifact.local_relative_path,
+                        "size_bytes": source_artifact.size_bytes,
+                        "sha256": source_artifact.sha256,
+                        "artifact_type": "source_metadata",
+                    }
+                )
+
+            subtitle_dir = AnimeLibraryService.get_subtitle_sidecar_dir(media_path)
+            subtitle_prefix = f"{subtitle_dir.name}/"
+            for rel, subtitle_artifact in sorted(artifacts_by_relative.items()):
+                if rel.as_posix().startswith(subtitle_prefix):
                     sidecars.append(
                         {
                             "relative_path": subtitle_artifact.remote_relative_path.as_posix(),
@@ -1328,6 +1322,7 @@ class StorageBoxRepository:
         library_type: LibraryType | str,
         display_name: str,
         series_id: str | None = None,
+        expected_min_episodes: int | None = None,
     ) -> dict[str, Any]:
         scoped_type = coerce_library_type(library_type)
         if not cls.is_enabled():
@@ -1379,6 +1374,14 @@ class StorageBoxRepository:
         )
 
         try:
+            if expected_min_episodes is not None and len(episodes) < expected_min_episodes:
+                raise RuntimeError(
+                    f"Publish aborted for '{display_name}': collected "
+                    f"{len(episodes)} episode(s) but caller expected at least "
+                    f"{expected_min_episodes}. The series directory may have "
+                    f"been mutated (evicted, deleted, or concurrently modified) "
+                    f"during the update."
+                )
             torrent_metadata_relative_path: str | None = None
             torrent_count = 0
             for artifact in artifacts:

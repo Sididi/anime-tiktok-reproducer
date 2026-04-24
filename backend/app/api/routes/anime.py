@@ -3,6 +3,7 @@
 import asyncio
 import json
 import shutil
+from contextlib import AsyncExitStack
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
@@ -491,54 +492,76 @@ async def update_anime(request: UpdateAnimeRequest):
         )
 
     async def stream_progress():
-        final_complete: dict | None = None
-        saw_error = False
-        async for progress in AnimeLibraryService.update_anime(
-            library_type=request.library_type,
-            anime_name=request.anime_name,
-            source_paths=source_files,
-            batch_size=request.batch_size,
-            prefetch_batches=request.prefetch_batches,
-            transform_workers=request.transform_workers,
-            decode_backend=request.decode_backend,
-            precision=request.precision,
-            require_gpu=request.require_gpu,
-        ):
-            if progress.status == "error":
-                saw_error = True
-                yield f"data: {json.dumps(progress.to_dict())}\n\n"
-                return
-            if progress.status == "complete":
-                final_complete = progress.to_dict()
-                break
-            yield f"data: {json.dumps(progress.to_dict())}\n\n"
+        async with AsyncExitStack() as stack:
+            # Hold the series lock across the entire update+publish so the flow
+            # cannot race with evict_series / delete_series / hydrate_series /
+            # another concurrent update on the same series. Without this, files
+            # could be deleted between indexing and publish, producing a
+            # successful-looking publish with a truncated episode list.
+            if series_id:
+                await stack.enter_async_context(
+                    LibraryHydrationService._series_lock(
+                        request.library_type, series_id
+                    )
+                )
 
-        if saw_error:
-            return
-        yield f"data: {json.dumps({'status': 'indexing', 'progress': 0.97, 'message': 'Publishing updated release...', 'anime_name': request.anime_name})}\n\n"
-        try:
-            publish_result = await LibraryHydrationService.publish_series_release(
+            final_complete: dict | None = None
+            saw_error = False
+            async for progress in AnimeLibraryService.update_anime(
                 library_type=request.library_type,
-                display_name=request.anime_name,
-                series_id=series_id,
+                anime_name=request.anime_name,
+                source_paths=source_files,
+                batch_size=request.batch_size,
+                prefetch_batches=request.prefetch_batches,
+                transform_workers=request.transform_workers,
+                decode_backend=request.decode_backend,
+                precision=request.precision,
+                require_gpu=request.require_gpu,
+            ):
+                if progress.status == "error":
+                    saw_error = True
+                    yield f"data: {json.dumps(progress.to_dict())}\n\n"
+                    return
+                if progress.status == "complete":
+                    final_complete = progress.to_dict()
+                    break
+                yield f"data: {json.dumps(progress.to_dict())}\n\n"
+
+            if saw_error:
+                return
+            yield f"data: {json.dumps({'status': 'indexing', 'progress': 0.97, 'message': 'Publishing updated release...', 'anime_name': request.anime_name})}\n\n"
+
+            expected_min_episodes: int | None = None
+            if final_complete is not None:
+                prepared = final_complete.get("prepared_library_paths") or []
+                if isinstance(prepared, list) and prepared:
+                    expected_min_episodes = len(prepared)
+
+            try:
+                publish_result = await LibraryHydrationService.publish_series_release(
+                    library_type=request.library_type,
+                    display_name=request.anime_name,
+                    series_id=series_id,
+                    already_locked=bool(series_id),
+                    expected_min_episodes=expected_min_episodes,
+                )
+            except Exception as exc:
+                yield f"data: {json.dumps({'status': 'error', 'progress': 0.0, 'message': str(exc), 'error': str(exc), 'anime_name': request.anime_name})}\n\n"
+                return
+            AnimeMatcherService.mark_series_updated(
+                request.library_type,
+                request.anime_name,
             )
-        except Exception as exc:
-            yield f"data: {json.dumps({'status': 'error', 'progress': 0.0, 'message': str(exc), 'error': str(exc), 'anime_name': request.anime_name})}\n\n"
-            return
-        AnimeMatcherService.mark_series_updated(
-            request.library_type,
-            request.anime_name,
-        )
-        if final_complete is None:
-            final_complete = {
-                "status": "complete",
-                "progress": 1.0,
-                "message": f"Successfully updated {request.anime_name}",
-                "anime_name": request.anime_name,
-            }
-        final_complete["series_id"] = str(publish_result["series_id"])
-        final_complete["storage_release_id"] = str(publish_result["release_id"])
-        yield f"data: {json.dumps(final_complete)}\n\n"
+            if final_complete is None:
+                final_complete = {
+                    "status": "complete",
+                    "progress": 1.0,
+                    "message": f"Successfully updated {request.anime_name}",
+                    "anime_name": request.anime_name,
+                }
+            final_complete["series_id"] = str(publish_result["series_id"])
+            final_complete["storage_release_id"] = str(publish_result["release_id"])
+            yield f"data: {json.dumps(final_complete)}\n\n"
 
     return StreamingResponse(
         stream_progress(),

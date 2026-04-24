@@ -1309,6 +1309,8 @@ class LibraryHydrationService:
         library_type: LibraryType | str,
         display_name: str,
         series_id: str | None = None,
+        already_locked: bool = False,
+        expected_min_episodes: int | None = None,
     ) -> dict[str, Any]:
         scoped_type = coerce_library_type(library_type)
 
@@ -1317,6 +1319,7 @@ class LibraryHydrationService:
                 library_type=scoped_type,
                 display_name=display_name,
                 series_id=series_id,
+                expected_min_episodes=expected_min_episodes,
             )
             await cls.sync_local_series_state(
                 library_type=scoped_type,
@@ -1325,7 +1328,7 @@ class LibraryHydrationService:
             )
             return publish_result
 
-        if series_id:
+        if series_id and not already_locked:
             async with cls._series_lock(scoped_type, series_id):
                 return await _publish()
         return await _publish()
