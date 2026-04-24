@@ -11,33 +11,15 @@ accounts:
     supported_types:
       - "anime"
     avatar: "anime_fr.jpg"       # filename in avatars/ directory
-    # Default slots (UTC hours). Any platform without its own `slots:` uses these.
+    # Upload slots in UTC (HH:MM). Shared by every platform on this account.
     slots:
       - "14:00"
       - "18:00"
       - "21:00"
     youtube:
       refresh_token: "1//0..."
-      channel_id: "UC..."        # optional: enforce upload target + drives shared-pool key
+      channel_id: "UC..."        # optional: enforce upload target + shared-pool key
       category_id: "22"          # optional: defaults to global ATR_YOUTUBE_CATEGORY_ID
-      # slots:                   # optional: REPLACES top-level slots for YouTube only
-      #   - "16:00"
-    # Per-platform slot overrides are optional. If present, REPLACE the top-level
-    # slots for that platform. Accounts that share a social identity pool slots:
-    # - YouTube pooled by `channel_id`
-    # - Facebook pooled by `meta.facebook_page_id`
-    # - Instagram pooled by `meta.instagram_business_account_id`
-    # - TikTok is never pooled (no credentials / identity).
-    # facebook:
-    #   slots:
-    #     - "12:00"
-    #     - "20:00"
-    # instagram:
-    #   slots:
-    #     - "19:30"
-    # tiktok:                    # TikTok is manual-post; slot appears in Discord as a reminder
-    #   slots:
-    #     - "21:30"
     meta:
       token_mode: "system_user"  # "system_user" or "long_lived_user"
       facebook_page_id: "123..."
@@ -45,6 +27,19 @@ accounts:
       instagram_business_account_id: "456..."
       instagram_access_token: "IGA..."  # optional: defaults to facebook_page_access_token
 
+  # Optional example: per-platform slot overrides.
+  #
+  # A `youtube:` / `facebook:` / `instagram:` / `tiktok:` block with its own
+  # `slots:` REPLACES the top-level slots for that platform only. Omit the
+  # block (or omit its `slots:`) to inherit the defaults above.
+  #
+  # Accounts sharing a social identity pool their reservations so two accounts
+  # can't book the same slot:
+  #   - YouTube   pooled by `youtube.channel_id`
+  #   - Facebook  pooled by `meta.facebook_page_id`
+  #   - Instagram pooled by `meta.instagram_business_account_id`
+  #   - TikTok    never pooled (manual post; slot is a Discord reminder)
+  #
   # anime_en:
   #   name: "Anime EN"
   #   language: "en"
@@ -56,6 +51,8 @@ accounts:
   #     - "20:00"
   #   youtube:
   #     refresh_token: "1//0..."
+  #     slots:                   # YouTube-only override
+  #       - "16:00"
   #   meta:
   #     token_mode: "system_user"
   #     facebook_page_id: "789..."
