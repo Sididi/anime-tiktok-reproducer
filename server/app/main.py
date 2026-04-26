@@ -47,6 +47,7 @@ def create_app() -> FastAPI:
             app.state.settings = settings
             app.state.job_store = job_store
             yield
+            app.state.discord = None
 
     app = FastAPI(title="TikTok Server", lifespan=lifespan)
     # Bind for tests that don't go through lifespan. `discord` is None until the
