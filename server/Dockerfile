@@ -20,7 +20,11 @@ COPY avatars ./avatars
 
 # data/ is a volume mount in production.
 RUN mkdir -p /app/data
-VOLUME ["/app/data"]
+
+# Run as a non-root user; only /app/data needs write access at runtime.
+RUN addgroup --system app && adduser --system --ingroup app app \
+    && chown -R app:app /app
+USER app
 
 EXPOSE 8000
 
