@@ -45,7 +45,7 @@ class Settings:
     discord: DiscordConfig
     avatars_dir: Path
     # Maps mobile bearer token -> device id; built from env at load time.
-    _device_tokens: dict[str, str] = field(default_factory=dict)
+    _device_tokens: dict[str, str] = field(default_factory=dict, repr=False)
 
     def resolve_device_for_token(self, token: str) -> str | None:
         return self._device_tokens.get(token)

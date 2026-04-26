@@ -71,3 +71,9 @@ accounts:
     )
     with pytest.raises(ConfigError, match="missing.png"):
         Settings.load(config_path=bad, avatars_dir=tmp_server_dir / "avatars")
+
+
+def test_missing_config_file_raises(tmp_server_dir: Path, example_env):
+    missing = tmp_server_dir / "does-not-exist.yaml"
+    with pytest.raises(ConfigError, match="not found"):
+        Settings.load(config_path=missing, avatars_dir=tmp_server_dir / "avatars")
