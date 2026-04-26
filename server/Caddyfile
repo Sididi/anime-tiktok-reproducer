@@ -1,6 +1,0 @@
-# Place this file at /etc/caddy/Caddyfile on the VPS (or include from there).
-# Caddy auto-provisions a Let's Encrypt cert for the domain.
-tiktok.sididi.tv {
-    encode gzip
-    reverse_proxy 127.0.0.1:8000
-}
