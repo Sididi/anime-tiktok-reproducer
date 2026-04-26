@@ -9,6 +9,7 @@ from pathlib import Path
 from fastapi import FastAPI
 
 from app.api.health import router as health_router
+from app.api.internal import router as internal_router
 from app.config import Settings
 from app.services.discord_client import DiscordClient
 from app.services.job_store import JobStore
@@ -34,10 +35,17 @@ def create_app() -> FastAPI:
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
-        async with DiscordClient(bot_token=settings.discord.bot_token) as discord:
+        # If a test has already injected a mock discord client, skip the real one.
+        if app.state.discord is None:
+            async with DiscordClient(bot_token=settings.discord.bot_token) as discord:
+                app.state.settings = settings
+                app.state.job_store = job_store
+                app.state.discord = discord
+                yield
+                app.state.discord = None
+        else:
             app.state.settings = settings
             app.state.job_store = job_store
-            app.state.discord = discord
             yield
 
     app = FastAPI(title="TikTok Server", lifespan=lifespan)
@@ -48,6 +56,7 @@ def create_app() -> FastAPI:
     app.state.job_store = job_store
     app.state.discord = None
     app.include_router(health_router)
+    app.include_router(internal_router)
     return app
 
 
