@@ -1,6 +1,7 @@
 """Server settings loader: YAML structural config + environment secrets."""
 from __future__ import annotations
 
+import hmac
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,7 +49,10 @@ class Settings:
     _device_tokens: dict[str, str] = field(default_factory=dict, repr=False)
 
     def resolve_device_for_token(self, token: str) -> str | None:
-        return self._device_tokens.get(token)
+        for known_token, device_id in self._device_tokens.items():
+            if hmac.compare_digest(token, known_token):
+                return device_id
+        return None
 
     @classmethod
     def load(cls, *, config_path: Path, avatars_dir: Path) -> "Settings":
