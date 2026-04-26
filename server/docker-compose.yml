@@ -1,0 +1,15 @@
+services:
+  server:
+    build: .
+    image: tiktok-server:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - jobs-data:/app/data
+      - ./config/config.yaml:/app/config/config.yaml:ro
+    ports:
+      - "127.0.0.1:8000:8000"   # only Caddy reaches it on the VPS
+
+volumes:
+  jobs-data:
