@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import tempfile
+from dataclasses import fields as _dc_fields
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -57,6 +58,10 @@ class JobStore:
             return TikTokJob.from_dict(d) if d else None
 
     async def update(self, project_id: str, **fields) -> TikTokJob:
+        valid = {f.name for f in _dc_fields(TikTokJob)}
+        unknown = set(fields) - valid
+        if unknown:
+            raise ValueError(f"Unknown TikTokJob field(s): {sorted(unknown)}")
         async with self._lock:
             jobs = self._read()
             if project_id not in jobs:

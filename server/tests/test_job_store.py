@@ -125,3 +125,17 @@ async def test_concurrent_writes_serialize(tmp_path: Path):
     final = await store.get("proj_1")
     assert final is not None
     assert final.anime_title.startswith("v")
+
+
+async def test_update_rejects_unknown_field(tmp_path: Path):
+    store = JobStore(tmp_path / "jobs.json")
+    await store.create(_make_job())
+    with pytest.raises(ValueError, match="stattus"):
+        await store.update("proj_1", stattus="acked")  # typo for status
+
+
+async def test_corrupt_file_treated_as_empty(tmp_path: Path):
+    p = tmp_path / "jobs.json"
+    p.write_text("{not valid json}")
+    store = JobStore(p)
+    assert await store.get("anything") is None
