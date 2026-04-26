@@ -1,0 +1,119 @@
+"""Tests for app.services.embed_builder.build_embed."""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from app.config import AccountConfig, DeviceConfig
+from app.models.job import PlatformStatus, TikTokJob
+from app.services.embed_builder import build_embed
+
+
+def _job_fixture() -> TikTokJob:
+    now = datetime(2026, 4, 26, 21, 0, tzinfo=timezone.utc)
+    return TikTokJob(
+        project_id="2ee46c92a4ce",
+        job_id="j_abc",
+        account_id="anime_fr",
+        device_id="iphone_13_pro",
+        anime_title="One Piece Episode 1063 — TikTok 2x3",
+        description="Posted today!",
+        drive_video_url="https://drive.google.com/uc?id=xyz",
+        slot_time=now,
+        platforms_requested=["youtube", "facebook", "instagram", "tiktok"],
+        status="pending",
+        platform_statuses={
+            "youtube": PlatformStatus(status="uploaded", url="https://youtu.be/abc"),
+            "facebook": PlatformStatus(status="skipped", detail="Not configured"),
+            "instagram": PlatformStatus(status="uploading"),
+            "tiktok": PlatformStatus(status="pending"),
+        },
+        discord_message_id=None,
+        reminder_message_id=None,
+        acked_at=None,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def _accounts() -> dict[str, AccountConfig]:
+    return {
+        "anime_fr": AccountConfig(
+            id="anime_fr",
+            name="Anime FR",
+            language="fr",
+            device="iphone_13_pro",
+            avatar="anime_fr.jpg",
+        )
+    }
+
+
+def _devices() -> dict[str, DeviceConfig]:
+    return {"iphone_13_pro": DeviceConfig(id="iphone_13_pro", platform="ios")}
+
+
+def test_embed_has_author_with_avatar_url():
+    embed = build_embed(
+        _job_fixture(), _accounts(), _devices(), "https://tiktok.sididi.tv"
+    )
+    assert embed["author"]["name"] == "Anime FR"
+    assert (
+        embed["author"]["icon_url"]
+        == "https://tiktok.sididi.tv/api/avatars/anime_fr.jpg"
+    )
+
+
+def test_embed_title_is_anime_title():
+    embed = build_embed(
+        _job_fixture(), _accounts(), _devices(), "https://tiktok.sididi.tv"
+    )
+    assert embed["title"] == "One Piece Episode 1063 — TikTok 2x3"
+
+
+def test_embed_inline_fields_include_device_and_project():
+    embed = build_embed(
+        _job_fixture(), _accounts(), _devices(), "https://tiktok.sididi.tv"
+    )
+    fields = {f["name"]: f for f in embed["fields"]}
+    assert any("iphone_13_pro" in f["value"] for f in fields.values())
+    assert any("2ee46c92a4ce" in f["value"] for f in fields.values())
+
+
+def test_embed_platforms_field_renders_all_statuses():
+    embed = build_embed(
+        _job_fixture(), _accounts(), _devices(), "https://tiktok.sididi.tv"
+    )
+    fields = {f["name"]: f["value"] for f in embed["fields"]}
+    plats = fields["Plateformes"]
+    assert "✅" in plats and "YouTube" in plats and "youtu.be/abc" in plats
+    assert "⚠️" in plats and "Facebook" in plats and "Not configured" in plats
+    assert "⏳" in plats and "Instagram" in plats
+    assert "🎯" in plats and "TikTok" in plats and "Pending" in plats
+
+
+def test_embed_description_field_uses_code_block():
+    embed = build_embed(
+        _job_fixture(), _accounts(), _devices(), "https://tiktok.sididi.tv"
+    )
+    fields = {f["name"]: f["value"] for f in embed["fields"]}
+    assert fields["Description TikTok"].startswith("```")
+    assert "Posted today!" in fields["Description TikTok"]
+    assert fields["Description TikTok"].endswith("```")
+
+
+def test_embed_includes_drive_link():
+    embed = build_embed(
+        _job_fixture(), _accounts(), _devices(), "https://tiktok.sididi.tv"
+    )
+    fields = {f["name"]: f["value"] for f in embed["fields"]}
+    assert "drive.google.com/uc?id=xyz" in fields["Lien vidéo"]
+
+
+def test_embed_after_ack_marks_tiktok_uploaded():
+    job = _job_fixture()
+    job.status = "acked"
+    job.acked_at = datetime(2026, 4, 26, 21, 4, tzinfo=timezone.utc)
+    job.platform_statuses["tiktok"] = PlatformStatus(status="uploaded")
+    embed = build_embed(job, _accounts(), _devices(), "https://tiktok.sididi.tv")
+    fields = {f["name"]: f["value"] for f in embed["fields"]}
+    plats = fields["Plateformes"]
+    assert "✅ TikTok" in plats
