@@ -1,6 +1,7 @@
 """Pure function: build a Discord embed dict from a TikTokJob + config."""
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from app.config import AccountConfig, DeviceConfig
@@ -29,7 +30,7 @@ _STATUS_EMOJI = {
 }
 
 
-def _format_french_datetime(dt) -> str:
+def _format_french_datetime(dt: datetime) -> str:
     return (
         f"{_FR_DAYS[dt.weekday()]} {dt.day} {_FR_MONTHS[dt.month - 1]} "
         f"{dt.year} à {dt.strftime('%H:%M')} UTC"
@@ -61,6 +62,9 @@ def build_embed(
     devices: dict[str, DeviceConfig],
     public_base_url: str,
 ) -> dict[str, Any]:
+    # `devices` is reserved for future use (e.g., per-device emoji or platform label);
+    # all current rendering reads `device_id` directly off the job.
+    _ = devices  # silences linters; keep parameter for call-site symmetry
     account = accounts[job.account_id]
     avatar_url = f"{public_base_url.rstrip('/')}/api/avatars/{account.avatar}"
 
@@ -75,7 +79,7 @@ def build_embed(
         {"name": "Plateformes", "value": "\n".join(plat_lines), "inline": False},
         {
             "name": "Description TikTok",
-            "value": f"```\n{job.description}\n```",
+            "value": f"```\n{job.description.replace('```', 'ʼʼʼ')}\n```",
             "inline": False,
         },
         {"name": "Lien vidéo", "value": job.drive_video_url, "inline": False},

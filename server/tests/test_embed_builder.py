@@ -117,3 +117,18 @@ def test_embed_after_ack_marks_tiktok_uploaded():
     fields = {f["name"]: f["value"] for f in embed["fields"]}
     plats = fields["Plateformes"]
     assert "✅ TikTok" in plats
+
+
+def test_embed_description_escapes_triple_backticks():
+    job = _job_fixture()
+    job.description = "Look at this code: ```python\nprint('hi')\n```"
+    embed = build_embed(job, _accounts(), _devices(), "https://tiktok.sididi.tv")
+    fields = {f["name"]: f["value"] for f in embed["fields"]}
+    desc_field = fields["Description TikTok"]
+    # The outer fence intact:
+    assert desc_field.startswith("```\n")
+    assert desc_field.endswith("\n```")
+    # Inner triple-backticks replaced:
+    inner = desc_field[4:-4]  # strip outer fences
+    assert "```" not in inner
+    assert "ʼʼʼ" in inner
