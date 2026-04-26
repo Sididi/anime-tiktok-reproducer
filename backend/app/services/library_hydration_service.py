@@ -7,7 +7,7 @@ import json
 import logging
 import shutil
 import uuid
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -351,9 +351,15 @@ class LibraryHydrationService:
         *,
         library_type: LibraryType | str,
         series_id: str,
+        already_locked: bool = False,
     ) -> dict[str, Any]:
         scoped_type = coerce_library_type(library_type)
-        async with cls._series_lock(scoped_type, series_id):
+        lock_ctx = (
+            nullcontext()
+            if already_locked
+            else cls._series_lock(scoped_type, series_id)
+        )
+        async with lock_ctx:
             current = await StorageBoxRepository.get_current_release(scoped_type, series_id)
             manifest = await StorageBoxRepository.get_series_manifest(
                 scoped_type,

@@ -128,6 +128,7 @@ class IndexationQueueService:
                     await LibraryHydrationService.ensure_series_index_hydrated(
                         library_type=job.library_type,
                         series_id=job.series_id,
+                        already_locked=True,
                     )
                     source_files = self._collect_direct_video_files(Path(job.source_path))
                     if not source_files:
