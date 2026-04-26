@@ -4,7 +4,6 @@ from __future__ import annotations
 from unittest.mock import AsyncMock
 
 import httpx
-import pytest
 
 from app.services.reminder_service import post_reminder
 

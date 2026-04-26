@@ -19,7 +19,7 @@ class PlatformStatus:
         return {"status": self.status, "url": self.url, "detail": self.detail}
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "PlatformStatus":
+    def from_dict(cls, d: dict[str, Any]) -> PlatformStatus:
         return cls(status=d["status"], url=d.get("url"), detail=d.get("detail"))
 
 
@@ -65,7 +65,7 @@ class TikTokJob:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "TikTokJob":
+    def from_dict(cls, d: dict[str, Any]) -> TikTokJob:
         return cls(
             project_id=d["project_id"],
             job_id=d["job_id"],

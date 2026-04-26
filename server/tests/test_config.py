@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from app.config import Settings, ConfigError
+from app.config import ConfigError, Settings
 
 
 def test_load_minimal_valid_config(example_yaml: Path, example_env, tmp_server_dir: Path):

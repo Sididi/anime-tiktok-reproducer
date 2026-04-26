@@ -55,7 +55,7 @@ class Settings:
         return None
 
     @classmethod
-    def load(cls, *, config_path: Path, avatars_dir: Path) -> "Settings":
+    def load(cls, *, config_path: Path, avatars_dir: Path) -> Settings:
         if not config_path.is_file():
             raise ConfigError(f"Config file not found: {config_path}")
 

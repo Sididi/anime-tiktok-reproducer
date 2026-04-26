@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import logging
 import secrets
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
@@ -38,7 +39,7 @@ class CreateJobResponse(BaseModel):
 
 class PlatformStatusRequest(BaseModel):
     platform: str
-    status: str
+    status: Literal["pending", "uploading", "uploaded", "skipped", "failed"]
     url: str | None = None
     detail: str | None = None
 
@@ -50,6 +51,7 @@ class GenericMessageRequest(BaseModel):
 
 
 class GenericMessageEditRequest(BaseModel):
+    channel_id: str | None = None
     content: str | None = None
     embed: dict | None = None
 
@@ -70,7 +72,7 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
             job_id=existing.job_id, discord_message_id=existing.discord_message_id
         )
 
-    now = datetime.now(tz=timezone.utc)
+    now = datetime.now(tz=UTC)
     platform_statuses = {
         p: PlatformStatus(status="pending") for p in req.platforms_requested
     }
@@ -205,15 +207,19 @@ async def patch_discord_message(
 ) -> dict:
     settings = request.app.state.settings
     discord = request.app.state.discord
+    channel_id = req.channel_id or settings.discord.upload_channel_id
     await discord.edit_message(
-        settings.discord.upload_channel_id, message_id, content=req.content, embed=req.embed
+        channel_id, message_id, content=req.content, embed=req.embed
     )
     return {"ok": True}
 
 
 @router.delete("/discord/messages/{message_id}")
-async def delete_discord_message(message_id: str, request: Request) -> dict:
+async def delete_discord_message(
+    message_id: str, request: Request, channel_id: str | None = None
+) -> dict:
     settings = request.app.state.settings
     discord = request.app.state.discord
-    await discord.delete_message(settings.discord.upload_channel_id, message_id)
+    target_channel = channel_id or settings.discord.upload_channel_id
+    await discord.delete_message(target_channel, message_id)
     return {"ok": True}

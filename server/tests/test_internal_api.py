@@ -1,11 +1,9 @@
 """Tests for /api/internal/* endpoints."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock
 
-import pytest
 from fastapi.testclient import TestClient
 
 
@@ -147,3 +145,18 @@ def test_unauthenticated_rejected(
     with TestClient(app) as client:
         r = client.post("/api/internal/jobs", json=JOB_PAYLOAD)
     assert r.status_code == 401
+
+
+def test_platform_status_rejects_invalid_status(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    discord.post_message.side_effect = ["msg_embed", "msg_reminder"]
+    with TestClient(app) as client:
+        client.post("/api/internal/jobs", json=JOB_PAYLOAD, headers=INTERNAL_AUTH)
+        r = client.post(
+            "/api/internal/jobs/p1/platform-status",
+            json={"platform": "youtube", "status": "bogus"},
+            headers=INTERNAL_AUTH,
+        )
+    assert r.status_code == 422  # Pydantic validation error

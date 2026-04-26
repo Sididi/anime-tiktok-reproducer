@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient
 
-
 JOB_PAYLOAD = {
     "project_id": "p1",
     "account_id": "anime_fr",

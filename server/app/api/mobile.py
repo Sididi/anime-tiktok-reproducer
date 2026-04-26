@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
@@ -94,7 +94,7 @@ async def ack(
     updated = await store.update(
         job.project_id,
         status="acked",
-        acked_at=datetime.now(tz=timezone.utc),
+        acked_at=datetime.now(tz=UTC),
         platform_statuses=new_statuses,
     )
 

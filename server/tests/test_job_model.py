@@ -1,7 +1,7 @@
 """Tests for app.models.job."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from app.models.job import PlatformStatus, TikTokJob
 
@@ -15,7 +15,7 @@ def _make_job(**overrides) -> TikTokJob:
         anime_title="One Piece Episode 1063",
         description="Description text",
         drive_video_url="https://drive.google.com/uc?export=download&id=xyz",
-        slot_time=datetime(2026, 4, 26, 21, 0, tzinfo=timezone.utc),
+        slot_time=datetime(2026, 4, 26, 21, 0, tzinfo=UTC),
         platforms_requested=["youtube", "facebook", "instagram", "tiktok"],
         status="pending",
         platform_statuses={
@@ -24,8 +24,8 @@ def _make_job(**overrides) -> TikTokJob:
         discord_message_id=None,
         reminder_message_id=None,
         acked_at=None,
-        created_at=datetime(2026, 4, 26, 21, 0, 1, tzinfo=timezone.utc),
-        updated_at=datetime(2026, 4, 26, 21, 0, 1, tzinfo=timezone.utc),
+        created_at=datetime(2026, 4, 26, 21, 0, 1, tzinfo=UTC),
+        updated_at=datetime(2026, 4, 26, 21, 0, 1, tzinfo=UTC),
     )
     defaults.update(overrides)
     return TikTokJob(**defaults)
@@ -51,7 +51,7 @@ def test_platform_status_round_trip():
 def test_job_with_acked_state():
     job = _make_job(
         status="acked",
-        acked_at=datetime(2026, 4, 26, 21, 5, tzinfo=timezone.utc),
+        acked_at=datetime(2026, 4, 26, 21, 5, tzinfo=UTC),
     )
     d = job.to_dict()
     assert d["status"] == "acked"

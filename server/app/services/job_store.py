@@ -6,7 +6,7 @@ import json
 import os
 import tempfile
 from dataclasses import fields as _dc_fields
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from app.models.job import TikTokJob
@@ -69,7 +69,7 @@ class JobStore:
             job = TikTokJob.from_dict(jobs[project_id])
             for k, v in fields.items():
                 setattr(job, k, v)
-            job.updated_at = datetime.now(tz=timezone.utc)
+            job.updated_at = datetime.now(tz=UTC)
             jobs[project_id] = job.to_dict()
             self._write(jobs)
             return job

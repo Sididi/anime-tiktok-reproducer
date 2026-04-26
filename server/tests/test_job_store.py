@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -12,7 +12,7 @@ from app.services.job_store import JobStore
 
 
 def _make_job(project_id: str = "proj_1", device_id: str = "iphone_13_pro") -> TikTokJob:
-    now = datetime(2026, 4, 26, 21, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 4, 26, 21, 0, tzinfo=UTC)
     return TikTokJob(
         project_id=project_id,
         job_id=f"j_{project_id}",
@@ -66,7 +66,7 @@ async def test_update(tmp_path: Path):
     updated = await store.update(
         job.project_id,
         status="acked",
-        acked_at=datetime(2026, 4, 26, 21, 5, tzinfo=timezone.utc),
+        acked_at=datetime(2026, 4, 26, 21, 5, tzinfo=UTC),
     )
     assert updated.status == "acked"
     assert updated.acked_at is not None

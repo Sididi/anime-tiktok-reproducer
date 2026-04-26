@@ -19,7 +19,7 @@ class DiscordClient:
         self._max_retries = max_retries
         self._client: httpx.AsyncClient | None = None
 
-    async def __aenter__(self) -> "DiscordClient":
+    async def __aenter__(self) -> DiscordClient:
         self._client = httpx.AsyncClient(
             base_url=_BASE,
             headers={"Authorization": f"Bot {self._token}"},

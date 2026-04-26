@@ -1,7 +1,7 @@
 """Tests for app.services.embed_builder.build_embed."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from app.config import AccountConfig, DeviceConfig
 from app.models.job import PlatformStatus, TikTokJob
@@ -9,7 +9,7 @@ from app.services.embed_builder import build_embed
 
 
 def _job_fixture() -> TikTokJob:
-    now = datetime(2026, 4, 26, 21, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 4, 26, 21, 0, tzinfo=UTC)
     return TikTokJob(
         project_id="2ee46c92a4ce",
         job_id="j_abc",
@@ -111,7 +111,7 @@ def test_embed_includes_drive_link():
 def test_embed_after_ack_marks_tiktok_uploaded():
     job = _job_fixture()
     job.status = "acked"
-    job.acked_at = datetime(2026, 4, 26, 21, 4, tzinfo=timezone.utc)
+    job.acked_at = datetime(2026, 4, 26, 21, 4, tzinfo=UTC)
     job.platform_statuses["tiktok"] = PlatformStatus(status="uploaded")
     embed = build_embed(job, _accounts(), _devices(), "https://tiktok.sididi.tv")
     fields = {f["name"]: f["value"] for f in embed["fields"]}
