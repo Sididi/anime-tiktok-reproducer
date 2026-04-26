@@ -101,6 +101,8 @@ curl -sI http://127.0.0.1 | head -1
 
 You have three reasonable options. Pick one.
 
+**Branch caveat (first deploy only).** The first time you deploy, the `server/` subtree may live on a feature branch (e.g. `feat/vps-server`) that hasn't been merged to `main` yet. The commands below default to `main`; if `main` doesn't yet contain `server/`, replace `main` with the relevant feature branch in the `git checkout` step. After the smoke test passes, merge the branch to `main` on your dev machine, push, and `git checkout main && git pull` on the VPS.
+
 ### Option A — Full clone of the monorepo (simplest)
 
 ```bash
@@ -108,7 +110,9 @@ sudo mkdir -p /opt
 cd /opt
 sudo git clone <git-url-of-anime-tiktok-reproducer> tiktok
 sudo chown -R $USER:$USER tiktok
-cd tiktok/server
+cd tiktok
+git checkout main      # or feat/vps-server for the first deploy
+cd server
 ```
 
 Disk cost: the full project (modules, frontend, etc.) is on the VPS. Acceptable for personal use. The Docker build uses only `server/` as its build context, so the rest is dead weight on disk only.
@@ -123,7 +127,7 @@ sudo chown -R $USER:$USER tiktok
 cd tiktok
 git sparse-checkout init --cone
 git sparse-checkout set server
-git checkout main
+git checkout main      # or feat/vps-server for the first deploy
 cd server
 ```
 
