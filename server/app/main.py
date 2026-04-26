@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from app.api.health import router as health_router
 from app.api.internal import router as internal_router
 from app.api.mobile import router as mobile_router
+from app.api.public import router as public_router
 from app.config import Settings
 from app.services.discord_client import DiscordClient
 from app.services.job_store import JobStore
@@ -60,6 +61,7 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(internal_router)
     app.include_router(mobile_router)
+    app.include_router(public_router)
     return app
 
 
