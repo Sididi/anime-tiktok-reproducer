@@ -41,9 +41,12 @@ def create_app() -> FastAPI:
             yield
 
     app = FastAPI(title="TikTok Server", lifespan=lifespan)
-    # Bind for tests that don't go through lifespan
+    # Bind for tests that don't go through lifespan. `discord` is None until the
+    # lifespan starts; tests that need it should either run inside `with TestClient(app)`
+    # or assign `app.state.discord = AsyncMock()` directly.
     app.state.settings = settings
     app.state.job_store = job_store
+    app.state.discord = None
     app.include_router(health_router)
     return app
 
