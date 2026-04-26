@@ -9,7 +9,9 @@ services:
       - jobs-data:/app/data
       - ./config/config.yaml:/app/config/config.yaml:ro
     ports:
-      - "127.0.0.1:8000:8000"   # only Caddy reaches it on the VPS
+      # Host-side: 38271 (random unprivileged port). Container-side: 8000.
+      # Only nginx (on the same host) reaches the VPS via 127.0.0.1:38271.
+      - "127.0.0.1:38271:8000"
 
 volumes:
   jobs-data:

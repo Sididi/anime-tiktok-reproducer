@@ -211,7 +211,7 @@ docker compose logs --tail 50
 Verify the upstream is healthy:
 
 ```bash
-curl -s http://127.0.0.1:8000/healthz | jq
+curl -s http://127.0.0.1:38271/healthz | jq
 # Expected: {"status":"ok","jobs_pending":0}
 
 # And via nginx (still HTTP)
@@ -376,7 +376,7 @@ docker compose up -d --build
 
 ```bash
 # Is the upstream up?
-curl -sI http://127.0.0.1:8000/healthz
+curl -sI http://127.0.0.1:38271/healthz
 docker compose ps
 docker compose logs --tail 20
 ```
