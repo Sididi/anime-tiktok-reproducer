@@ -1,0 +1,23 @@
+# Slim VPS config: structural data only. Secrets live in .env.
+#
+# Cross-checks:
+#   - every account.device must reference a key in `devices`
+#   - every account.avatar must be a filename present in ../avatars/
+#   - every device id must have an env var ATR_MOBILE_TOKEN_<UPPER(id)> set
+devices:
+  iphone_13_pro:
+    platform: "ios"
+  pixel_8:
+    platform: "android"
+
+accounts:
+  anime_fr:
+    name: "Anime FR"
+    language: "fr"
+    device: "iphone_13_pro"
+    avatar: "anime_fr.jpg"
+  anime_en:
+    name: "Anime EN"
+    language: "en"
+    device: "iphone_13_pro"
+    avatar: "anime_en.png"
