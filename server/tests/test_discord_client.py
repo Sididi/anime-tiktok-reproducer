@@ -23,7 +23,7 @@ async def test_post_message_sends_bot_auth_and_returns_id():
 
 
 @respx.mock
-async def test_post_message_with_embed_and_files_uses_multipart():
+async def test_post_message_with_embed_and_message_reference():
     route = respx.post("https://discord.com/api/v10/channels/c1/messages").mock(
         return_value=httpx.Response(200, json={"id": "msg_43"})
     )
@@ -34,6 +34,9 @@ async def test_post_message_with_embed_and_files_uses_multipart():
             message_reference={"type": 1, "channel_id": "c0", "message_id": "m0"},
         )
     assert route.called
+    sent_body = route.calls.last.request.content
+    assert b'"embeds":[' in sent_body
+    assert b'"message_reference":{' in sent_body
 
 
 @respx.mock
