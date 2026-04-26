@@ -90,12 +90,12 @@ async def ack(
     if job.status == "acked":
         return {"ok": True, "status": "acked"}
 
-    job.platform_statuses["tiktok"] = PlatformStatus(status="uploaded")
+    new_statuses = {**job.platform_statuses, "tiktok": PlatformStatus(status="uploaded")}
     updated = await store.update(
         job.project_id,
         status="acked",
         acked_at=datetime.now(tz=timezone.utc),
-        platform_statuses=job.platform_statuses,
+        platform_statuses=new_statuses,
     )
 
     if updated.discord_message_id:
