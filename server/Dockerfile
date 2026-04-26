@@ -28,4 +28,6 @@ USER app
 
 EXPOSE 8000
 
-CMD ["uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Call the venv's uvicorn directly. Using `uv run` here would try to write a
+# cache to $HOME/.cache/uv, but the system `app` user has no real home dir.
+CMD [".venv/bin/uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
