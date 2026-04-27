@@ -10,7 +10,7 @@ from typing import Any
 import yaml
 from google.oauth2.credentials import Credentials
 
-from ..config import settings
+from ..config import PROJECT_ROOT, settings
 from ..library_types import DEFAULT_LIBRARY_TYPE, LibraryType, coerce_library_type
 from .meta_token_service import MetaTokenService, MetaUploadCredentials
 
@@ -132,7 +132,9 @@ class AccountService:
 
     @classmethod
     def _avatars_dir(cls) -> Path:
-        return cls._config_path().parent / "avatars"
+        # Avatars live in server/avatars/ so the same files back both the dev
+        # frontend (via this service) and the VPS-served /api/avatars/ route.
+        return PROJECT_ROOT / "server" / "avatars"
 
     @classmethod
     def _parse_account(cls, account_id: str, raw: dict[str, Any]) -> AccountConfig:
