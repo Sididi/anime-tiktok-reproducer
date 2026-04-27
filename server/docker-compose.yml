@@ -1,0 +1,17 @@
+services:
+  server:
+    build: .
+    image: tiktok-server:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - jobs-data:/app/data
+      - ./config/config.yaml:/app/config/config.yaml:ro
+    ports:
+      # Host-side: 38271 (random unprivileged port). Container-side: 8000.
+      # Only nginx (on the same host) reaches the VPS via 127.0.0.1:38271.
+      - "127.0.0.1:38271:8000"
+
+volumes:
+  jobs-data:
