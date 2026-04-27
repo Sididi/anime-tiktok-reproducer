@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { api } from "@/api/client";
 import { readSSEStream } from "@/utils/sse";
+import { formatNetworkProgressLine } from "@/utils/networkProgress";
 import type { IndexationJob } from "@/types";
 
 interface IndexJobsPanelProps {
@@ -191,6 +192,11 @@ export function IndexJobsPanel({ onJobComplete }: IndexJobsPanelProps) {
                           )}
                       </div>
                     )}
+                    {networkProgressLine(job) && (
+                      <div className="pl-6 text-[11px] text-[hsl(var(--muted-foreground))]">
+                        {networkProgressLine(job)}
+                      </div>
+                    )}
                   </motion.div>
                 ))}
               </AnimatePresence>
@@ -268,4 +274,14 @@ function showCurrentFileDetails(job: IndexationJob): boolean {
     job.phase === "indexing" &&
     Boolean(job.current_file)
   );
+}
+
+function networkProgressLine(job: IndexationJob): string | null {
+  return formatNetworkProgressLine({
+    network_bytes_transferred: job.network_bytes_transferred,
+    network_bytes_total: job.network_bytes_total,
+    network_mib_per_sec: job.network_mib_per_sec,
+    network_eta_seconds: job.network_eta_seconds,
+    network_active_transfers: job.network_active_transfers,
+  });
 }

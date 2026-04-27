@@ -12,6 +12,7 @@ from .anime_library import AnimeLibraryService
 from .anime_matcher import AnimeMatcherService
 from .indexation_preflight import IndexationPreflightService
 from .library_hydration_service import LibraryHydrationService
+from .storage_box_progress import ProgressSnapshot
 from .storage_box_repository import StorageBoxRepository
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".webm", ".ts", ".m4v"}
@@ -77,6 +78,25 @@ class IndexationQueueService:
         job.effective_batch_size = None
         job.effective_decode_backend = None
         job.retry_reason = None
+        self._reset_network_progress_fields(job)
+
+    def _reset_network_progress_fields(self, job: IndexationJob) -> None:
+        job.network_bytes_transferred = None
+        job.network_bytes_total = None
+        job.network_mib_per_sec = None
+        job.network_eta_seconds = None
+        job.network_active_transfers = 0
+
+    def _make_network_progress_callback(self, job: IndexationJob):
+        async def _on_progress(snapshot: ProgressSnapshot) -> None:
+            job.network_bytes_transferred = snapshot.bytes_transferred
+            job.network_bytes_total = snapshot.bytes_total
+            job.network_mib_per_sec = snapshot.mib_per_sec
+            job.network_eta_seconds = snapshot.eta_seconds
+            job.network_active_transfers = snapshot.active_transfers
+            self._broadcast(job)
+
+        return _on_progress
 
     @classmethod
     def _terminal_oom_message(cls, message: str) -> str:
@@ -181,6 +201,7 @@ class IndexationQueueService:
                         job.phase = "upload_release"
                         job.message = "Uploading release to Storage Box..."
                         job.progress = max(job.progress, 0.98)
+                        self._reset_network_progress_fields(job)
                         self._broadcast(job)
                         prepared = progress.prepared_library_paths or []
                         expected_min_episodes = (
@@ -196,6 +217,7 @@ class IndexationQueueService:
                                 job.job_type == "update" and bool(job.series_id)
                             ),
                             expected_min_episodes=expected_min_episodes,
+                            progress_callback=self._make_network_progress_callback(job),
                         )
                         job.series_id = str(publish_result["series_id"])
                         job.storage_release_id = str(publish_result["release_id"])
@@ -203,6 +225,7 @@ class IndexationQueueService:
                         job.progress = 1.0
                         job.status = "complete"
                         job.error = None
+                        self._reset_network_progress_fields(job)
                         AnimeMatcherService.mark_series_updated(
                             job.library_type, job.source_name
                         )

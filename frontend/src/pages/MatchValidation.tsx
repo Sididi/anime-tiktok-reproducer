@@ -38,6 +38,7 @@ import { useProjectStore, useSceneStore } from "@/stores";
 import { api } from "@/api/client";
 import { readSSEStream } from "@/utils/sse";
 import { cn, formatTime } from "@/utils";
+import { formatNetworkProgressLine } from "@/utils/networkProgress";
 import {
   deriveMatchContinuityClaims,
   deriveManualMergeHints,
@@ -837,9 +838,14 @@ export function MatchValidation() {
     message: string;
   } | null>(null);
   const [downloadPhase, setDownloadPhase] = useState<{
-    phase: "check" | "recover" | "download" | "remux";
+    phase: "check" | "recover" | "download" | "remux" | "hydrate_index" | "hydrate_episode";
     message: string;
     progress: number;
+    network_bytes_transferred?: number | null;
+    network_bytes_total?: number | null;
+    network_mib_per_sec?: number | null;
+    network_eta_seconds?: number | null;
+    network_active_transfers?: number | null;
   } | null>(null);
   const [showTorrentModal, setShowTorrentModal] = useState(false);
   const [skipUiEnabled, setSkipUiEnabled] = useState(false);
@@ -1153,6 +1159,11 @@ export function MatchValidation() {
         message?: string;
         progress?: number;
         error?: string;
+        network_bytes_transferred?: number | null;
+        network_bytes_total?: number | null;
+        network_mib_per_sec?: number | null;
+        network_eta_seconds?: number | null;
+        network_active_transfers?: number | null;
       }>(response, (data) => {
         if (data.status === "torrent_failed") {
           setTorrentFailure({
@@ -1164,9 +1175,20 @@ export function MatchValidation() {
         }
         if (data.phase && data.status !== "complete" && data.status !== "error") {
           setDownloadPhase({
-            phase: data.phase as "check" | "recover" | "download" | "remux",
+            phase: data.phase as
+              | "check"
+              | "recover"
+              | "download"
+              | "remux"
+              | "hydrate_index"
+              | "hydrate_episode",
             message: data.message || "",
             progress: data.progress ?? 0,
+            network_bytes_transferred: data.network_bytes_transferred ?? null,
+            network_bytes_total: data.network_bytes_total ?? null,
+            network_mib_per_sec: data.network_mib_per_sec ?? null,
+            network_eta_seconds: data.network_eta_seconds ?? null,
+            network_active_transfers: data.network_active_transfers ?? null,
           });
         }
       });
@@ -2367,39 +2389,60 @@ export function MatchValidation() {
         )}
 
         {/* Deferred download / recovery phase */}
-        {downloadPhase && (
-          <div className="bg-[hsl(var(--card))] rounded-lg p-8 text-center space-y-4 border border-amber-500/30">
-            {downloadPhase.phase === "download" ? (
-              <Download className="h-10 w-10 mx-auto animate-pulse text-amber-500" />
-            ) : downloadPhase.phase === "recover" || downloadPhase.phase === "remux" ? (
-              <Loader2 className="h-10 w-10 mx-auto animate-spin text-green-500" />
-            ) : (
-              <Loader2 className="h-10 w-10 mx-auto animate-spin text-amber-500" />
-            )}
-            <div>
-              <h2 className="text-lg font-semibold">
-                {downloadPhase.phase === "recover"
-                  ? "Recovering Source Files"
-                  : downloadPhase.phase === "download"
-                    ? "Downloading Missing Episodes"
-                    : downloadPhase.phase === "remux"
-                      ? "Preparing Downloaded Files"
-                      : "Checking Source Files"}
-              </h2>
-              <p className="text-sm text-[hsl(var(--muted-foreground))]">
-                {downloadPhase.message}
-              </p>
+        {downloadPhase && (() => {
+          const networkLine = formatNetworkProgressLine({
+            network_bytes_transferred: downloadPhase.network_bytes_transferred,
+            network_bytes_total: downloadPhase.network_bytes_total,
+            network_mib_per_sec: downloadPhase.network_mib_per_sec,
+            network_eta_seconds: downloadPhase.network_eta_seconds,
+            network_active_transfers: downloadPhase.network_active_transfers,
+          });
+          return (
+            <div className="bg-[hsl(var(--card))] rounded-lg p-8 text-center space-y-4 border border-amber-500/30">
+              {downloadPhase.phase === "download" ||
+              downloadPhase.phase === "hydrate_episode" ||
+              downloadPhase.phase === "hydrate_index" ? (
+                <Download className="h-10 w-10 mx-auto animate-pulse text-amber-500" />
+              ) : downloadPhase.phase === "recover" ||
+                downloadPhase.phase === "remux" ? (
+                <Loader2 className="h-10 w-10 mx-auto animate-spin text-green-500" />
+              ) : (
+                <Loader2 className="h-10 w-10 mx-auto animate-spin text-amber-500" />
+              )}
+              <div>
+                <h2 className="text-lg font-semibold">
+                  {downloadPhase.phase === "recover"
+                    ? "Recovering Source Files"
+                    : downloadPhase.phase === "download"
+                      ? "Downloading Missing Episodes"
+                      : downloadPhase.phase === "remux"
+                        ? "Preparing Downloaded Files"
+                        : downloadPhase.phase === "hydrate_index"
+                          ? "Loading Matcher Index"
+                          : downloadPhase.phase === "hydrate_episode"
+                            ? "Hydrating Episodes from Storage Box"
+                            : "Checking Source Files"}
+                </h2>
+                <p className="text-sm text-[hsl(var(--muted-foreground))]">
+                  {downloadPhase.message}
+                </p>
+                {networkLine && (
+                  <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
+                    {networkLine}
+                  </p>
+                )}
+              </div>
+              <div className="h-2 bg-[hsl(var(--muted))] rounded-full overflow-hidden max-w-md mx-auto">
+                <div
+                  className="h-full bg-amber-500 transition-all duration-300"
+                  style={{
+                    width: `${Math.max(0, Math.min(1, downloadPhase.progress)) * 100}%`,
+                  }}
+                />
+              </div>
             </div>
-            <div className="h-2 bg-[hsl(var(--muted))] rounded-full overflow-hidden max-w-md mx-auto">
-              <div
-                className="h-full bg-amber-500 transition-all duration-300"
-                style={{
-                  width: `${Math.max(0, Math.min(1, downloadPhase.progress)) * 100}%`,
-                }}
-              />
-            </div>
-          </div>
-        )}
+          );
+        })()}
 
         {/* Playback warmup */}
         {!downloadPhase && matches.length > 0 &&

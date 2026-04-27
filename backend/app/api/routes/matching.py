@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from contextlib import suppress
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -551,30 +552,90 @@ async def deferred_download(project_id: str):
     })
 
     async def stream_progress():
-        try:
-            if series_id:
-                yield f"data: {json.dumps({'status': 'running', 'phase': 'hydrate_index', 'message': 'Ensuring local matcher cache is ready...', 'progress': 0.05})}\n\n"
-                await LibraryHydrationService.ensure_matcher_ready_for_project(
-                    project_id=project.id,
-                    library_type=project.library_type,
-                    series_id=series_id,
-                )
-                yield f"data: {json.dumps({'status': 'running', 'phase': 'hydrate_episode', 'message': 'Hydrating missing episodes from Storage Box...', 'progress': 0.15})}\n\n"
-                try:
-                    await LibraryHydrationService.hydrate_series(
+        event_queue: asyncio.Queue[dict | None] = asyncio.Queue()
+        latest_network: dict[str, object] = {}
+
+        async def _enqueue(event: dict) -> None:
+            await event_queue.put(event)
+
+        async def _on_network_progress(snapshot) -> None:
+            latest_network.clear()
+            latest_network.update(
+                network_bytes_transferred=snapshot.bytes_transferred,
+                network_bytes_total=snapshot.bytes_total,
+                network_mib_per_sec=snapshot.mib_per_sec,
+                network_eta_seconds=snapshot.eta_seconds,
+                network_active_transfers=snapshot.active_transfers,
+            )
+            await _enqueue({
+                "status": "running",
+                "phase": "hydrate_episode",
+                "message": "Hydrating missing episodes from Storage Box...",
+                "progress": 0.5,
+                **latest_network,
+            })
+
+        async def _produce() -> None:
+            try:
+                if series_id:
+                    await _enqueue({
+                        "status": "running",
+                        "phase": "hydrate_index",
+                        "message": "Ensuring local matcher cache is ready...",
+                        "progress": 0.05,
+                    })
+                    await LibraryHydrationService.ensure_matcher_ready_for_project(
+                        project_id=project.id,
                         library_type=project.library_type,
                         series_id=series_id,
-                        episode_keys=episode_paths,
-                        full_series=False,
                     )
-                except Exception as exc:
-                    yield f"data: {json.dumps({'status': 'warning', 'phase': 'hydrate_episode', 'message': f'Storage Box hydration failed, falling back: {exc}', 'progress': 0.2})}\n\n"
-            async for event in DeferredDownloadService.recover_missing_episodes(
-                episode_paths, library_root, anime_name
-            ):
+                    await _enqueue({
+                        "status": "running",
+                        "phase": "hydrate_episode",
+                        "message": "Hydrating missing episodes from Storage Box...",
+                        "progress": 0.15,
+                    })
+                    try:
+                        await LibraryHydrationService.hydrate_series(
+                            library_type=project.library_type,
+                            series_id=series_id,
+                            episode_keys=episode_paths,
+                            full_series=False,
+                            progress_callback=_on_network_progress,
+                        )
+                    except Exception as exc:
+                        await _enqueue({
+                            "status": "warning",
+                            "phase": "hydrate_episode",
+                            "message": f"Storage Box hydration failed, falling back: {exc}",
+                            "progress": 0.2,
+                        })
+                async for event in DeferredDownloadService.recover_missing_episodes(
+                    episode_paths, library_root, anime_name
+                ):
+                    await _enqueue(event)
+            except Exception as e:
+                await _enqueue({
+                    "status": "error",
+                    "phase": "download",
+                    "error": str(e),
+                    "message": str(e),
+                })
+            finally:
+                await event_queue.put(None)
+
+        producer_task = asyncio.create_task(_produce())
+        try:
+            while True:
+                event = await event_queue.get()
+                if event is None:
+                    break
                 yield f"data: {json.dumps(event)}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'status': 'error', 'phase': 'download', 'error': str(e), 'message': str(e)})}\n\n"
+        finally:
+            if not producer_task.done():
+                producer_task.cancel()
+                with suppress(BaseException):
+                    await producer_task
 
     return StreamingResponse(
         stream_progress(),

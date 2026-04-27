@@ -18,6 +18,10 @@ from typing import Any
 from ..config import settings
 from ..library_types import LibraryType, coerce_library_type
 from .anime_library import AnimeLibraryService
+from .storage_box_progress import (
+    ProgressCallback,
+    StorageBoxTransferProgress,
+)
 from .storage_box_sftp_client import StorageBoxSftpClient
 from .storage_box_transfer import StorageBoxTransferService
 
@@ -1323,6 +1327,7 @@ class StorageBoxRepository:
         display_name: str,
         series_id: str | None = None,
         expected_min_episodes: int | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> dict[str, Any]:
         scoped_type = coerce_library_type(library_type)
         if not cls.is_enabled():
@@ -1455,17 +1460,30 @@ class StorageBoxRepository:
                     _human_size(link_bytes),
                 )
 
+            upload_total_bytes = sum(a.size_bytes for a in to_upload)
+            session = await StorageBoxTransferProgress.open_session(
+                f"publish:{publish_id}",
+                direction="upload",
+                total_bytes=upload_total_bytes,
+                on_update=progress_callback,
+            ) if progress_callback is not None else None
+
             async def _upload_artifact(artifact: LocalArtifact) -> None:
                 await StorageBoxTransferService.upload_file(
                     artifact.local_path,
                     staging_root / artifact.remote_relative_path,
+                    session=session,
                 )
 
-            await _run_bounded(
-                to_upload,
-                settings.storage_box_upload_max_parallel,
-                _upload_artifact,
-            )
+            try:
+                await _run_bounded(
+                    to_upload,
+                    settings.storage_box_upload_max_parallel,
+                    _upload_artifact,
+                )
+            finally:
+                if session is not None:
+                    await StorageBoxTransferProgress.close_session(session)
 
             # Hardlink unchanged artifacts from previous release.
             # If hardlinks fail (server doesn't support them), fall back to

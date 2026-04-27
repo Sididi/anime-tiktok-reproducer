@@ -113,4 +113,9 @@ class IndexationJob(BaseModel):
     linked_torrents: int = 0  # number of torrents linked after indexation
     series_id: str | None = None
     storage_release_id: str | None = None
+    network_bytes_transferred: int | None = None
+    network_bytes_total: int | None = None
+    network_mib_per_sec: float | None = None
+    network_eta_seconds: float | None = None
+    network_active_transfers: int = 0
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

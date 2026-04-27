@@ -52,6 +52,11 @@ export interface IndexationJob {
   linked_torrents: number;
   series_id: string | null;
   storage_release_id: string | null;
+  network_bytes_transferred: number | null;
+  network_bytes_total: number | null;
+  network_mib_per_sec: number | null;
+  network_eta_seconds: number | null;
+  network_active_transfers: number;
   created_at: string;
 }
 

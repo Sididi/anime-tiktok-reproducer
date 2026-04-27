@@ -16,6 +16,11 @@ from ..library_types import LibraryType, coerce_library_type
 from .anime_library import AnimeLibraryService
 from .library_state_db import LibraryStateDb, OperationRow, SeriesStateRow
 from .project_service import ProjectService
+from .storage_box_progress import (
+    ProgressCallback,
+    StorageBoxTransferProgress,
+    TransferSession,
+)
 from .storage_box_repository import StorageBoxRepository
 from .storage_box_transfer import StorageBoxTransferService
 
@@ -352,6 +357,7 @@ class LibraryHydrationService:
         library_type: LibraryType | str,
         series_id: str,
         already_locked: bool = False,
+        network_progress_callback: ProgressCallback | None = None,
     ) -> dict[str, Any]:
         scoped_type = coerce_library_type(library_type)
         lock_ctx = (
@@ -432,7 +438,11 @@ class LibraryHydrationService:
                     last_error=None,
                 )
                 await cls._cache_manifest(scoped_type, manifest)
-                await cls._hydrate_index_artifacts(scoped_type, manifest)
+                await cls._hydrate_index_artifacts(
+                    scoped_type,
+                    manifest,
+                    network_progress_callback=network_progress_callback,
+                )
                 local_episode_count = await asyncio.to_thread(
                     cls._count_local_episodes_from_manifest,
                     scoped_type,
@@ -709,6 +719,7 @@ class LibraryHydrationService:
         series_id: str,
         episode_keys: list[str] | None = None,
         full_series: bool = False,
+        progress_callback: ProgressCallback | None = None,
     ) -> dict[str, Any]:
         scoped_type = coerce_library_type(library_type)
         async with cls._series_lock(scoped_type, series_id):
@@ -758,9 +769,27 @@ class LibraryHydrationService:
                 completed = 0
                 progress_lock = asyncio.Lock()
 
+                total_bytes = 0
+                for episode_entry in selected_episodes:
+                    media = episode_entry.get("media") or {}
+                    if isinstance(media, dict):
+                        total_bytes += int(media.get("size_bytes") or 0)
+                    sidecars = episode_entry.get("sidecars") or []
+                    if isinstance(sidecars, list):
+                        for sidecar in sidecars:
+                            if isinstance(sidecar, dict):
+                                total_bytes += int(sidecar.get("size_bytes") or 0)
+
+                session = await StorageBoxTransferProgress.open_session(
+                    f"hydrate-series:{scoped_type.value}:{series_id}:{uuid.uuid4().hex[:8]}",
+                    direction="download",
+                    total_bytes=total_bytes,
+                    on_update=progress_callback,
+                ) if progress_callback is not None else None
+
                 async def _hydrate_with_progress(episode: dict[str, Any]) -> None:
                     nonlocal completed
-                    await cls._hydrate_episode(scoped_type, manifest, episode)
+                    await cls._hydrate_episode(scoped_type, manifest, episode, session)
                     async with progress_lock:
                         completed += 1
                         await asyncio.to_thread(
@@ -773,11 +802,15 @@ class LibraryHydrationService:
                             error=None,
                         )
 
-                await _run_bounded(
-                    selected_episodes,
-                    settings.storage_box_download_max_parallel,
-                    _hydrate_with_progress,
-                )
+                try:
+                    await _run_bounded(
+                        selected_episodes,
+                        settings.storage_box_download_max_parallel,
+                        _hydrate_with_progress,
+                    )
+                finally:
+                    if session is not None:
+                        await StorageBoxTransferProgress.close_session(session)
 
                 local_episode_count = await asyncio.to_thread(
                     cls._count_local_episodes_from_manifest,
@@ -1317,6 +1350,7 @@ class LibraryHydrationService:
         series_id: str | None = None,
         already_locked: bool = False,
         expected_min_episodes: int | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> dict[str, Any]:
         scoped_type = coerce_library_type(library_type)
 
@@ -1326,6 +1360,7 @@ class LibraryHydrationService:
                 display_name=display_name,
                 series_id=series_id,
                 expected_min_episodes=expected_min_episodes,
+                progress_callback=progress_callback,
             )
             await cls.sync_local_series_state(
                 library_type=scoped_type,
@@ -1842,6 +1877,7 @@ class LibraryHydrationService:
         library_type: LibraryType,
         manifest: dict[str, Any],
         progress_callback: ArtifactProgressCallback | None = None,
+        network_progress_callback: ProgressCallback | None = None,
     ) -> None:
         index_artifacts = [
             artifact
@@ -1858,6 +1894,15 @@ class LibraryHydrationService:
             str(manifest["series_id"]),
             str(manifest["release_id"]),
         )
+        total_bytes = sum(
+            int(artifact.get("size_bytes") or 0) for artifact in index_artifacts
+        )
+        session = await StorageBoxTransferProgress.open_session(
+            f"hydrate-index:{manifest['series_id']}:{uuid.uuid4().hex[:8]}",
+            direction="download",
+            total_bytes=total_bytes,
+            on_update=network_progress_callback,
+        ) if network_progress_callback is not None else None
         try:
             completed = 0
             total = len(index_artifacts)
@@ -1871,6 +1916,7 @@ class LibraryHydrationService:
                 await StorageBoxTransferService.download_file(
                     release_root / relative_path,
                     download_path,
+                    session=session,
                 )
                 actual_sha = await asyncio.to_thread(_sha256_file, download_path)
                 if actual_sha != str(artifact["sha256"]):
@@ -1891,6 +1937,8 @@ class LibraryHydrationService:
             )
             await cls._materialize_local_matcher_cache(library_type, manifest, temp_root)
         finally:
+            if session is not None:
+                await StorageBoxTransferProgress.close_session(session)
             await asyncio.to_thread(shutil.rmtree, temp_root, True)
 
     @classmethod
@@ -1988,6 +2036,7 @@ class LibraryHydrationService:
         library_type: LibraryType,
         manifest: dict[str, Any],
         episode: dict[str, Any],
+        session: TransferSession | None = None,
     ) -> None:
         media = episode.get("media", {})
         if not isinstance(media, dict):
@@ -2028,6 +2077,7 @@ class LibraryHydrationService:
                 await StorageBoxTransferService.download_file(
                     release_root / remote_relative_path,
                     temp_path,
+                    session=session,
                 )
                 expected_sha = str(item.get("sha256") or "")
                 if expected_sha and (await asyncio.to_thread(_sha256_file, temp_path)) != expected_sha:
