@@ -4,13 +4,13 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from app.config import Settings
 from app.models.job import PlatformStatus, Job
 from app.services.job_store import JobStore
 from app.services.reminder_scheduler import (
-    dispatch_due_reminders,
+    dispatch_due_actions,
     run_scheduler_loop,
 )
 
@@ -55,7 +55,7 @@ async def test_dispatch_skips_jobs_not_yet_due(
     await store.create(_make_job(slot_time=future))
     discord = AsyncMock()
 
-    posted = await dispatch_due_reminders(store=store, settings=settings, discord=discord)
+    posted = await dispatch_due_actions(store=store, settings=settings, discord=discord)
 
     assert posted == 0
     discord.post_message.assert_not_called()
@@ -72,7 +72,7 @@ async def test_dispatch_fires_due_jobs_and_marks_them(
     discord = AsyncMock()
     discord.post_message.side_effect = ["m_rich", "m_forward"]
 
-    posted = await dispatch_due_reminders(store=store, settings=settings, discord=discord)
+    posted = await dispatch_due_actions(store=store, settings=settings, discord=discord)
 
     assert posted == 1
     refreshed = await store.get("p1")
@@ -90,11 +90,10 @@ async def test_dispatch_skips_already_reminded_jobs(
     await store.create(_make_job(slot_time=past, reminder_message_id="already_sent"))
 
     discord = AsyncMock()
-    posted = await dispatch_due_reminders(store=store, settings=settings, discord=discord)
+    posted = await dispatch_due_actions(store=store, settings=settings, discord=discord)
 
     assert posted == 0
     discord.post_message.assert_not_called()
-
 
 
 async def test_dispatch_retries_on_next_tick_when_post_fails(
@@ -112,13 +111,13 @@ async def test_dispatch_retries_on_next_tick_when_post_fails(
     # so the scheduler doesn't update the store.
     discord.post_message.side_effect = Exception("Discord 5xx")
 
-    posted = await dispatch_due_reminders(store=store, settings=settings, discord=discord)
+    posted = await dispatch_due_actions(store=store, settings=settings, discord=discord)
     assert posted == 0
     assert (await store.get("p1")).reminder_message_id is None
 
     # Second tick: success.
     discord.post_message.side_effect = ["m_rich", "m_forward"]
-    posted2 = await dispatch_due_reminders(store=store, settings=settings, discord=discord)
+    posted2 = await dispatch_due_actions(store=store, settings=settings, discord=discord)
     assert posted2 == 1
     assert (await store.get("p1")).reminder_message_id == "m_rich"
 
@@ -145,3 +144,107 @@ async def test_run_scheduler_loop_stops_on_event(
     await asyncio.wait_for(task, timeout=1.0)
     # Loop exited cleanly via stop_event.
     assert task.done()
+
+
+# ---------------------------------------------------------------------------
+# Instagram dispatch tests
+# ---------------------------------------------------------------------------
+
+async def test_dispatch_instagram_happy_path(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
+    store = JobStore(tmp_path / "jobs.json")
+    past = datetime.now(tz=timezone.utc) - timedelta(minutes=5)
+    job = _make_job(slot_time=past, project_id="ig-job")
+    job.platforms_requested = ["instagram"]
+    job.instagram_payload = {
+        "ig_user_id": "ig_user_42",
+        "ig_access_token": "token",
+        "caption": "Hello",
+        "graph_api_version": "v25.0",
+    }
+    job.platform_statuses = {"instagram": PlatformStatus(status="pending")}
+    await store.create(job)
+
+    discord = AsyncMock()
+
+    with patch(
+        "app.services.reminder_scheduler.publish_to_instagram",
+        new=AsyncMock(return_value=type("R", (), {
+            "success": True, "permalink": "https://instagram.com/reel/x", "detail": None,
+        })()),
+    ):
+        actions = await dispatch_due_actions(
+            store=store, settings=settings, discord=discord
+        )
+
+    assert actions == 1
+    refreshed = await store.get("ig-job")
+    assert refreshed is not None
+    ig = refreshed.platform_statuses["instagram"]
+    assert ig.status == "uploaded"
+    assert ig.url == "https://instagram.com/reel/x"
+    assert ig.attempts == 1
+    # Embed re-render attempted
+    discord.edit_message.assert_called()
+
+
+async def test_dispatch_instagram_retries_until_max(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    """5 failed attempts -> mark failed + post failure ping."""
+    settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
+    store = JobStore(tmp_path / "jobs.json")
+    past = datetime.now(tz=timezone.utc) - timedelta(minutes=5)
+    job = _make_job(slot_time=past, project_id="ig-fail")
+    job.platforms_requested = ["instagram"]
+    job.instagram_payload = {
+        "ig_user_id": "x", "ig_access_token": "x", "caption": "x",
+    }
+    job.platform_statuses = {"instagram": PlatformStatus(status="pending")}
+    await store.create(job)
+
+    discord = AsyncMock()
+
+    fail = AsyncMock(return_value=type("R", (), {
+        "success": False, "permalink": None, "detail": "Meta 503",
+    })())
+
+    with patch("app.services.reminder_scheduler.publish_to_instagram", new=fail):
+        # Fire 5 ticks. The first 4 should leave status='pending' with bumped attempts;
+        # the 5th should mark 'failed' and post the ping.
+        for _ in range(5):
+            await dispatch_due_actions(store=store, settings=settings, discord=discord)
+
+    refreshed = await store.get("ig-fail")
+    ig = refreshed.platform_statuses["instagram"]
+    assert ig.status == "failed"
+    assert ig.attempts == 5
+    assert "Meta 503" in (ig.detail or "")
+    # Failure ping posted
+    discord.post_message.assert_called()
+
+
+async def test_dispatch_instagram_skips_already_uploaded(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
+    store = JobStore(tmp_path / "jobs.json")
+    past = datetime.now(tz=timezone.utc) - timedelta(minutes=5)
+    job = _make_job(slot_time=past, project_id="ig-done")
+    job.platforms_requested = ["instagram"]
+    job.instagram_payload = {"ig_user_id": "x", "ig_access_token": "x", "caption": "x"}
+    job.platform_statuses = {"instagram": PlatformStatus(status="uploaded", url="https://x")}
+    await store.create(job)
+
+    discord = AsyncMock()
+    fail = AsyncMock()  # would fail loudly if called
+
+    with patch("app.services.reminder_scheduler.publish_to_instagram", new=fail):
+        actions = await dispatch_due_actions(
+            store=store, settings=settings, discord=discord
+        )
+
+    assert actions == 0
+    fail.assert_not_called()
