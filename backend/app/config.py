@@ -48,8 +48,9 @@ class Settings(BaseSettings):
     match_playback_max_workers_per_episode: int = 1
     min_playback_speed_factor: float = 0.75
 
-    # Discord webhook integration
-    discord_webhook_url: str | None = None
+    # TikTok server (VPS) integration — replaces previous Discord webhook
+    tiktok_server_base_url: str | None = None
+    tiktok_server_internal_token: str | None = None
     cep_trigger_url_template: str = "http://localhost:48653/p/{project_id}"
 
     # HuggingFace (pyannote diarization for raw scene detection)
