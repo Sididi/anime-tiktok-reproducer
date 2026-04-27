@@ -41,6 +41,7 @@ class TikTokJob:
     acked_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    reminder_forward_message_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -59,6 +60,7 @@ class TikTokJob:
             },
             "discord_message_id": self.discord_message_id,
             "reminder_message_id": self.reminder_message_id,
+            "reminder_forward_message_id": self.reminder_forward_message_id,
             "acked_at": self.acked_at.isoformat() if self.acked_at else None,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
@@ -82,6 +84,7 @@ class TikTokJob:
             },
             discord_message_id=d.get("discord_message_id"),
             reminder_message_id=d.get("reminder_message_id"),
+            reminder_forward_message_id=d.get("reminder_forward_message_id"),
             acked_at=datetime.fromisoformat(d["acked_at"]) if d.get("acked_at") else None,
             created_at=datetime.fromisoformat(d["created_at"]),
             updated_at=datetime.fromisoformat(d["updated_at"]),
