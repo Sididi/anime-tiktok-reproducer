@@ -387,11 +387,12 @@ The bot needs `Add Reactions` permission in the upload channel. Verify in Discor
 
 ---
 
-## 11. What to do next
+## 11. Phase A — VPS upgrade (after the mobile-app drop)
 
-After this deployment is verified end-to-end:
+After pulling Phase A (or main once Phase A is merged) and rebuilding:
 
-1. Save `ATR_TIKTOK_SERVER_INTERNAL_TOKEN` somewhere your dev machine can reach it (it's needed for Plan B).
-2. Save each `ATR_MOBILE_TOKEN_<DEVICE>` somewhere you can paste it into a phone's app settings (needed for Plan C).
-3. Merge the `feat/vps-server` branch to `main` once you're satisfied.
-4. Move on to **Plan B** (main backend swap) — that work depends on this VPS being reachable from your dev machine.
+1. Remove `ATR_MOBILE_TOKEN_*` lines from the VPS `.env` (orphan vars are harmless but tidier to clean up).
+2. Optional: remove the `devices:` block from `config/config.yaml` (now ignored — `device:` on each account is now a free-form display label, not validated).
+3. Restart: `cd /opt/tiktok/server && git pull && docker compose up -d --build`
+4. Verify: `curl https://tiktok.sididi.tv/healthz` still returns OK.
+5. Verify the mobile routes are gone: `curl -o /dev/null -w "%{http_code}\n" https://tiktok.sididi.tv/api/mobile/me` should print `404`.

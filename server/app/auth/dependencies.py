@@ -21,11 +21,3 @@ async def require_internal_token(
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
-async def require_device_token(
-    request: Request, authorization: str = Header(default="")
-) -> str:
-    token = _bearer(authorization)
-    device_id = request.app.state.settings.resolve_device_for_token(token)
-    if device_id is None:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    return device_id

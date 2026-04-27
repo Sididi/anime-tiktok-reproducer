@@ -33,9 +33,6 @@ def example_avatar(tmp_server_dir: Path) -> Path:
 def example_yaml(tmp_server_dir: Path, example_avatar: Path) -> Path:
     """A minimal but valid config YAML."""
     yaml_text = """\
-devices:
-  iphone_13_pro:
-    platform: "ios"
 accounts:
   anime_fr:
     name: "Anime FR"
@@ -52,7 +49,6 @@ accounts:
 def example_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Sets the env vars referenced by the example_yaml fixture."""
     monkeypatch.setenv("ATR_TIKTOK_SERVER_INTERNAL_TOKEN", "internal_secret")
-    monkeypatch.setenv("ATR_MOBILE_TOKEN_IPHONE_13_PRO", "mobile_secret")
     monkeypatch.setenv("ATR_DISCORD_BOT_TOKEN", "bot_secret")
     monkeypatch.setenv("ATR_DISCORD_GUILD_ID", "111")
     monkeypatch.setenv("ATR_DISCORD_UPLOAD_CHANNEL_ID", "222")

@@ -1,15 +1,11 @@
 # Slim VPS config: structural data only. Secrets live in .env.
 #
-# Cross-checks:
-#   - every account.device must reference a key in `devices`
+# Validation at startup:
 #   - every account.avatar must be a filename present in ../avatars/
-#   - every device id must have an env var ATR_MOBILE_TOKEN_<UPPER(id)> set
-devices:
-  iphone_13_pro:
-    platform: "ios"
-  pixel_8:
-    platform: "android"
-
+#
+# `device` is a free-form label shown in the Discord embed's "📱 Device"
+# field. It's not validated; pick whatever name helps you remember which
+# phone the operator uses for that account.
 accounts:
   anime_fr:
     name: "Anime FR"

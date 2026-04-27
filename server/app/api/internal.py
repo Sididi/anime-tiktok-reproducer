@@ -97,7 +97,7 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
 
     embed_msg_id: str | None = None
     try:
-        embed = build_embed(job, settings.accounts, settings.devices, settings.public_base_url)
+        embed = build_embed(job, settings.accounts, settings.public_base_url)
         embed_msg_id = await discord.post_message(
             settings.discord.upload_channel_id, embed=embed
         )
@@ -135,9 +135,7 @@ async def platform_status(
 
     if updated.discord_message_id:
         try:
-            embed = build_embed(
-                updated, settings.accounts, settings.devices, settings.public_base_url
-            )
+            embed = build_embed(updated, settings.accounts, settings.public_base_url)
             await discord.edit_message(
                 settings.discord.upload_channel_id,
                 updated.discord_message_id,

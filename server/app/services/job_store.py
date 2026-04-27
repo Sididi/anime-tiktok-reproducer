@@ -81,15 +81,11 @@ class JobStore:
                 del jobs[project_id]
                 self._write(jobs)
 
-    async def list_for_device(
-        self, device_id: str, *, status: str | None = None
-    ) -> list[TikTokJob]:
+    async def list_all(self, *, status: str | None = None) -> list[TikTokJob]:
         async with self._lock:
             jobs = self._read()
             result: list[TikTokJob] = []
             for d in jobs.values():
-                if d["device_id"] != device_id:
-                    continue
                 if status is not None and d["status"] != status:
                     continue
                 result.append(TikTokJob.from_dict(d))

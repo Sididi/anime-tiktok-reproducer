@@ -7,7 +7,7 @@ import pytest
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
-from app.auth.dependencies import require_device_token, require_internal_token
+from app.auth.dependencies import require_internal_token
 from app.config import Settings
 
 
@@ -24,10 +24,6 @@ def app(example_yaml: Path, example_env, tmp_server_dir: Path) -> FastAPI:
     @a.get("/internal", dependencies=[Depends(require_internal_token)])
     async def internal_route():
         return {"ok": True}
-
-    @a.get("/mobile")
-    async def mobile_route(device_id: str = Depends(require_device_token)):
-        return {"device_id": device_id}
 
     return a
 
@@ -48,16 +44,3 @@ def test_internal_route_accepts_correct_token(app: FastAPI):
     client = TestClient(app)
     r = client.get("/internal", headers={"Authorization": "Bearer internal_secret"})
     assert r.status_code == 200
-
-
-def test_mobile_route_returns_resolved_device(app: FastAPI):
-    client = TestClient(app)
-    r = client.get("/mobile", headers={"Authorization": "Bearer mobile_secret"})
-    assert r.status_code == 200
-    assert r.json() == {"device_id": "iphone_13_pro"}
-
-
-def test_mobile_route_rejects_unknown_token(app: FastAPI):
-    client = TestClient(app)
-    r = client.get("/mobile", headers={"Authorization": "Bearer nope"})
-    assert r.status_code == 401

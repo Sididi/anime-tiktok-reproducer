@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from app.config import AccountConfig, DeviceConfig
+from app.config import AccountConfig
 from app.models.job import PlatformStatus, TikTokJob
 
 # Months in French for footer/description rendering.
@@ -68,12 +68,8 @@ def _format_platform_line(platform: str, ps: PlatformStatus) -> str:
 def build_embed(
     job: TikTokJob,
     accounts: dict[str, AccountConfig],
-    devices: dict[str, DeviceConfig],
     public_base_url: str,
 ) -> dict[str, Any]:
-    # `devices` is reserved for future use (e.g., per-device emoji or platform label);
-    # all current rendering reads `device_id` directly off the job.
-    _ = devices  # silences linters; keep parameter for call-site symmetry
     account = accounts[job.account_id]
     avatar_url = f"{public_base_url.rstrip('/')}/api/avatars/{account.avatar}"
 

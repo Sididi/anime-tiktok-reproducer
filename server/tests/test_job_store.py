@@ -90,19 +90,19 @@ async def test_delete_missing_is_noop(tmp_path: Path):
     await store.delete("never_existed")  # must not raise
 
 
-async def test_list_for_device_filters_by_device_and_status(tmp_path: Path):
+async def test_list_all_filters_by_status(tmp_path: Path):
     store = JobStore(tmp_path / "jobs.json")
-    await store.create(_make_job(project_id="a", device_id="iphone_13_pro"))
-    await store.create(_make_job(project_id="b", device_id="pixel_8"))
-    j_acked = _make_job(project_id="c", device_id="iphone_13_pro")
+    await store.create(_make_job(project_id="a"))
+    await store.create(_make_job(project_id="b"))
+    j_acked = _make_job(project_id="c")
     j_acked.status = "acked"
     await store.create(j_acked)
 
-    pending_iphone = await store.list_for_device("iphone_13_pro", status="pending")
-    assert {j.project_id for j in pending_iphone} == {"a"}
+    pending = await store.list_all(status="pending")
+    assert {j.project_id for j in pending} == {"a", "b"}
 
-    all_iphone = await store.list_for_device("iphone_13_pro")
-    assert {j.project_id for j in all_iphone} == {"a", "c"}
+    every = await store.list_all()
+    assert {j.project_id for j in every} == {"a", "b", "c"}
 
 
 async def test_persists_across_instances(tmp_path: Path):

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from app.config import AccountConfig, DeviceConfig
+from app.config import AccountConfig
 from app.models.job import PlatformStatus, TikTokJob
 from app.services.embed_builder import build_embed
 
@@ -47,13 +47,10 @@ def _accounts() -> dict[str, AccountConfig]:
     }
 
 
-def _devices() -> dict[str, DeviceConfig]:
-    return {"iphone_13_pro": DeviceConfig(id="iphone_13_pro", platform="ios")}
-
 
 def test_embed_has_author_with_avatar_url():
     embed = build_embed(
-        _job_fixture(), _accounts(), _devices(), "https://tiktok.sididi.tv"
+        _job_fixture(), _accounts(), "https://tiktok.sididi.tv"
     )
     assert embed["author"]["name"] == "Anime FR"
     assert (
@@ -64,14 +61,14 @@ def test_embed_has_author_with_avatar_url():
 
 def test_embed_title_is_anime_title():
     embed = build_embed(
-        _job_fixture(), _accounts(), _devices(), "https://tiktok.sididi.tv"
+        _job_fixture(), _accounts(), "https://tiktok.sididi.tv"
     )
     assert embed["title"] == "One Piece Episode 1063 — TikTok 2x3"
 
 
 def test_embed_inline_fields_include_device_and_project():
     embed = build_embed(
-        _job_fixture(), _accounts(), _devices(), "https://tiktok.sididi.tv"
+        _job_fixture(), _accounts(), "https://tiktok.sididi.tv"
     )
     fields = {f["name"]: f for f in embed["fields"]}
     assert any("iphone_13_pro" in f["value"] for f in fields.values())
@@ -80,7 +77,7 @@ def test_embed_inline_fields_include_device_and_project():
 
 def test_embed_platforms_field_renders_all_statuses():
     embed = build_embed(
-        _job_fixture(), _accounts(), _devices(), "https://tiktok.sididi.tv"
+        _job_fixture(), _accounts(), "https://tiktok.sididi.tv"
     )
     fields = {f["name"]: f["value"] for f in embed["fields"]}
     plats = fields["Plateformes"]
@@ -92,7 +89,7 @@ def test_embed_platforms_field_renders_all_statuses():
 
 def test_embed_description_field_uses_code_block():
     embed = build_embed(
-        _job_fixture(), _accounts(), _devices(), "https://tiktok.sididi.tv"
+        _job_fixture(), _accounts(), "https://tiktok.sididi.tv"
     )
     fields = {f["name"]: f["value"] for f in embed["fields"]}
     assert fields["Description TikTok"].startswith("```")
@@ -102,7 +99,7 @@ def test_embed_description_field_uses_code_block():
 
 def test_embed_includes_drive_link():
     embed = build_embed(
-        _job_fixture(), _accounts(), _devices(), "https://tiktok.sididi.tv"
+        _job_fixture(), _accounts(), "https://tiktok.sididi.tv"
     )
     fields = {f["name"]: f["value"] for f in embed["fields"]}
     assert "drive.google.com/uc?id=xyz" in fields["Lien vidéo"]
@@ -113,7 +110,7 @@ def test_embed_after_ack_marks_tiktok_uploaded():
     job.status = "acked"
     job.acked_at = datetime(2026, 4, 26, 21, 4, tzinfo=UTC)
     job.platform_statuses["tiktok"] = PlatformStatus(status="uploaded")
-    embed = build_embed(job, _accounts(), _devices(), "https://tiktok.sididi.tv")
+    embed = build_embed(job, _accounts(), "https://tiktok.sididi.tv")
     fields = {f["name"]: f["value"] for f in embed["fields"]}
     plats = fields["Plateformes"]
     assert "✅ TikTok" in plats
@@ -122,7 +119,7 @@ def test_embed_after_ack_marks_tiktok_uploaded():
 def test_embed_description_escapes_triple_backticks():
     job = _job_fixture()
     job.description = "Look at this code: ```python\nprint('hi')\n```"
-    embed = build_embed(job, _accounts(), _devices(), "https://tiktok.sididi.tv")
+    embed = build_embed(job, _accounts(), "https://tiktok.sididi.tv")
     fields = {f["name"]: f["value"] for f in embed["fields"]}
     desc_field = fields["Description TikTok"]
     # The outer fence intact:

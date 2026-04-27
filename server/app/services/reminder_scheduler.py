@@ -33,46 +33,45 @@ async def dispatch_due_reminders(
     """
     current = now or datetime.now(tz=timezone.utc)
     posted = 0
-    for device_id in settings.devices:
-        for job in await store.list_for_device(device_id, status="pending"):
-            if job.reminder_message_id is not None:
-                continue  # already reminded
-            if job.slot_time > current:
-                continue  # not yet due
-            account = settings.accounts.get(job.account_id)
-            if account is None:
-                logger.warning(
-                    "Job %s references unknown account %s; skipping reminder",
-                    job.project_id,
-                    job.account_id,
-                )
-                continue
+    for job in await store.list_all(status="pending"):
+        if job.reminder_message_id is not None:
+            continue  # already reminded
+        if job.slot_time > current:
+            continue  # not yet due
+        account = settings.accounts.get(job.account_id)
+        if account is None:
+            logger.warning(
+                "Job %s references unknown account %s; skipping reminder",
+                job.project_id,
+                job.account_id,
+            )
+            continue
 
-            rich_id, forward_id = await post_reminder(
-                discord,
-                job=job,
-                account=account,
-                public_base_url=settings.public_base_url,
-                upload_channel_id=settings.discord.upload_channel_id,
-                reminder_channel_id=settings.discord.reminder_channel_id,
-                role_id=settings.discord.reminder_role_id,
-                guild_id=settings.discord.guild_id,
-            )
-            if rich_id is None:
-                # Will retry on next tick.
-                continue
-            await store.update(
-                job.project_id,
-                reminder_message_id=rich_id,
-                reminder_forward_message_id=forward_id,
-            )
-            posted += 1
-            logger.info(
-                "Reminder dispatched for %s (rich=%s forward=%s)",
-                job.project_id,
-                rich_id,
-                forward_id,
-            )
+        rich_id, forward_id = await post_reminder(
+            discord,
+            job=job,
+            account=account,
+            public_base_url=settings.public_base_url,
+            upload_channel_id=settings.discord.upload_channel_id,
+            reminder_channel_id=settings.discord.reminder_channel_id,
+            role_id=settings.discord.reminder_role_id,
+            guild_id=settings.discord.guild_id,
+        )
+        if rich_id is None:
+            # Will retry on next tick.
+            continue
+        await store.update(
+            job.project_id,
+            reminder_message_id=rich_id,
+            reminder_forward_message_id=forward_id,
+        )
+        posted += 1
+        logger.info(
+            "Reminder dispatched for %s (rich=%s forward=%s)",
+            job.project_id,
+            rich_id,
+            forward_id,
+        )
     return posted
 
 
