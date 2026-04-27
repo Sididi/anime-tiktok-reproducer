@@ -89,7 +89,7 @@ class DiscordService:
 
     @classmethod
     @_swallow("Discord delete_message")
-    def delete_message(cls, message_id: str) -> bool:
+    def delete_message(cls, message_id: str) -> bool | None:
         if not message_id:
             return False
         with _client() as c:
