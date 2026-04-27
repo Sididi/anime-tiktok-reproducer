@@ -52,12 +52,6 @@ class Settings(BaseSettings):
     tiktok_server_base_url: str | None = None
     tiktok_server_internal_token: str | None = None
 
-    # Discord webhook for n8n's deferred-Instagram post-completion notification.
-    # This is the ONLY remaining direct Discord webhook usage (n8n runs
-    # elsewhere and can't reach the VPS internal API). All in-process Discord
-    # operations go through DiscordService → VPS server.
-    discord_webhook_url: str | None = None
-
     cep_trigger_url_template: str = "http://localhost:48653/p/{project_id}"
 
     # HuggingFace (pyannote diarization for raw scene detection)
@@ -140,9 +134,6 @@ class Settings(BaseSettings):
     instagram_access_token: str | None = None
     instagram_publish_poll_interval_seconds: int = 5
     instagram_publish_timeout_seconds: int = 15 * 60
-
-    # n8n webhook for deferred Instagram publishing at scheduled time
-    n8n_webhook_url: str | None = None
 
     # qBittorrent
     qbittorrent_url: str = "http://localhost:8080"

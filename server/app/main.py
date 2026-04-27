@@ -15,6 +15,7 @@ from app.api.public import router as public_router
 from app.config import Settings
 from app.services.discord_client import DiscordClient
 from app.services.job_store import JobStore
+from app.services.reaction_listener import ReactionListener
 from app.services.reminder_scheduler import run_scheduler_loop
 
 logger = logging.getLogger(__name__)
@@ -68,11 +69,19 @@ def create_app() -> FastAPI:
                 app.state.settings = settings
                 app.state.job_store = job_store
                 app.state.discord = discord
+                listener = ReactionListener(
+                    bot_token=settings.discord.bot_token,
+                    store=job_store,
+                    settings=settings,
+                    rest_discord_client=discord,
+                )
+                await listener.start()
                 sched_task, stop_event = await _start_scheduler(discord)
                 try:
                     yield
                 finally:
                     await _stop_scheduler(sched_task, stop_event)
+                    await listener.stop()
                     app.state.discord = None
         else:
             app.state.settings = settings

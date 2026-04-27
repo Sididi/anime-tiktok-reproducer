@@ -1,4 +1,4 @@
-"""Pure function: build a Discord embed dict from a TikTokJob + config."""
+"""Pure function: build a Discord embed dict from a Job + config."""
 from __future__ import annotations
 
 from datetime import datetime
@@ -6,7 +6,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from app.config import AccountConfig
-from app.models.job import PlatformStatus, TikTokJob
+from app.models.job import PlatformStatus, Job
 
 # Months in French for footer/description rendering.
 _FR_MONTHS = [
@@ -66,7 +66,7 @@ def _format_platform_line(platform: str, ps: PlatformStatus) -> str:
 
 
 def build_embed(
-    job: TikTokJob,
+    job: Job,
     accounts: dict[str, AccountConfig],
     public_base_url: str,
 ) -> dict[str, Any]:

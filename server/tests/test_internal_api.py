@@ -101,13 +101,13 @@ def test_delete_job_removes_reminder_and_forward_when_present(
 ):
     """If the scheduler has already fired the reminder + forward, delete_job
     must remove all three messages (embed, reminder, forward)."""
-    from app.models.job import PlatformStatus, TikTokJob
+    from app.models.job import PlatformStatus, Job
     from datetime import datetime, timezone as _tz
 
     app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
     # Pre-populate the store with a job that already has all three msg ids.
     now = datetime(2026, 4, 27, 21, 0, tzinfo=_tz.utc)
-    job = TikTokJob(
+    job = Job(
         project_id="p1",
         job_id="j_x",
         account_id="anime_fr",
@@ -117,12 +117,10 @@ def test_delete_job_removes_reminder_and_forward_when_present(
         drive_video_url="u",
         slot_time=now,
         platforms_requested=["tiktok"],
-        status="pending",
         platform_statuses={"tiktok": PlatformStatus(status="pending")},
         discord_message_id="msg_embed",
         reminder_message_id="msg_rich",
         reminder_forward_message_id="msg_forward",
-        acked_at=None,
         created_at=now,
         updated_at=now,
     )
@@ -208,3 +206,52 @@ def test_platform_status_rejects_invalid_status(
             headers=INTERNAL_AUTH,
         )
     assert r.status_code == 422  # Pydantic validation error
+
+
+def test_create_job_persists_instagram_payload(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    discord.post_message.return_value = "msg_embed"
+
+    payload = {
+        **JOB_PAYLOAD,
+        "platforms_requested": ["youtube", "instagram", "tiktok"],
+        "instagram": {
+            "ig_user_id": "ig_user_42",
+            "ig_access_token": "ig_token_secret",
+            "caption": "Hello from IG",
+            "graph_api_version": "v25.0",
+        },
+    }
+    with TestClient(app) as client:
+        r = client.post("/api/internal/jobs", json=payload, headers=INTERNAL_AUTH)
+    assert r.status_code == 200
+
+    # Verify the IG payload is persisted on the job.
+    import asyncio
+    job = asyncio.run(app.state.job_store.get("p1"))
+    assert job is not None
+    assert job.instagram_payload == {
+        "ig_user_id": "ig_user_42",
+        "ig_access_token": "ig_token_secret",
+        "caption": "Hello from IG",
+        "graph_api_version": "v25.0",
+    }
+
+
+def test_create_job_without_instagram_field_persists_none(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    """Backwards-compatibility: omitting `instagram` from the payload is fine."""
+    app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    discord.post_message.return_value = "msg_embed"
+
+    with TestClient(app) as client:
+        r = client.post("/api/internal/jobs", json=JOB_PAYLOAD, headers=INTERNAL_AUTH)
+    assert r.status_code == 200
+
+    import asyncio
+    job = asyncio.run(app.state.job_store.get("p1"))
+    assert job is not None
+    assert job.instagram_payload is None

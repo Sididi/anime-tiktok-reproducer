@@ -12,8 +12,6 @@ import tempfile
 import os
 import time
 
-import requests
-
 from ..config import settings
 from ..library_types import coerce_library_type
 from ..models import Project
@@ -389,7 +387,6 @@ class UploadPhaseService:
         cls,
         requested_platforms: tuple[str, ...],
         account: AccountConfig | None,
-        instagram_enabled: bool,
     ) -> dict[str, PlatformUploadResult]:
         """Determine which requested platforms are known to be unrunnable upfront.
 
@@ -411,9 +408,7 @@ class UploadPhaseService:
                 if account is not None and account.meta is None:
                     reason = default_detail
             elif platform == "instagram":
-                if not instagram_enabled:
-                    reason = "Instagram upload disabled: ATR_N8N_WEBHOOK_URL is not configured"
-                elif account is not None and account.meta is None:
+                if account is not None and account.meta is None:
                     reason = default_detail
             if reason is not None:
                 skips[platform] = PlatformUploadResult(
@@ -530,10 +525,8 @@ class UploadPhaseService:
         drive_video_url = readiness.drive_video_web_url or GoogleDriveService.get_web_view_url(readiness.drive_video_id)
         direct_drive_download = GoogleDriveService.get_direct_download_url(readiness.drive_video_id)
 
-        instagram_enabled = bool((settings.n8n_webhook_url or "").strip())
-
         results_by_platform: dict[str, PlatformUploadResult] = dict(
-            cls._compute_upfront_skips(requested_platforms, account, instagram_enabled)
+            cls._compute_upfront_skips(requested_platforms, account)
         )
         discord_message_id: str | None = None
 
@@ -591,6 +584,21 @@ class UploadPhaseService:
                 )
             project.final_upload_discord_message_id = None
 
+        # Build Instagram payload for the VPS scheduler (deferred publish at slot_time).
+        ig_payload: dict | None = None
+        if account and account.meta and account.meta.instagram_business_account_id:
+            ig_token = (
+                account.meta.instagram_access_token
+                or account.meta.facebook_page_access_token
+            )
+            if ig_token:
+                ig_payload = {
+                    "ig_user_id": account.meta.instagram_business_account_id,
+                    "ig_access_token": ig_token,
+                    "caption": metadata.instagram.caption,
+                    "graph_api_version": settings.meta_graph_api_version,
+                }
+
         discord_message_id = None
         try:
             job_response = DiscordService.create_job(
@@ -604,6 +612,7 @@ class UploadPhaseService:
                 description=metadata.tiktok.description,
                 drive_video_url=direct_drive_download or drive_video_url,
                 platforms_requested=list(requested_platforms),
+                instagram=ig_payload,
             )
         except Exception:
             logger.warning(
@@ -709,26 +718,18 @@ class UploadPhaseService:
                         facebook_prep_dir=_fb_prep_dir,
                     )
 
-                # Instagram: disabled when n8n webhook is not configured.
-                if "instagram" in requested_platforms and instagram_enabled:
-                    _ig_scheduled_at = platform_scheduled_at.get("instagram")
-                    if _ig_scheduled_at:
-                        ig_deferred = cls._send_n8n_instagram_webhook(
-                            project_id=project_id,
-                            scheduled_at=_ig_scheduled_at,
-                            drive_video_id=readiness.drive_video_id,
-                            metadata=metadata,
-                            ig_user_id=meta_creds.instagram_business_account_id,
-                            ig_access_token=meta_creds.instagram_access_token,
+                # Instagram: deferred to the VPS scheduler via create_job above.
+                # The ig_payload (built earlier) carries the credentials; the VPS
+                # publishes at slot_time. If no IG creds were available, record a
+                # skipped result so the embed is accurate.
+                if "instagram" in requested_platforms and "instagram" not in results_by_platform:
+                    if ig_payload is None:
+                        results_by_platform["instagram"] = PlatformUploadResult(
+                            platform="instagram",
+                            status="skipped",
+                            detail="No Instagram credentials configured for this account",
                         )
-                        jobs["instagram"] = lambda: ig_deferred
-                    else:
-                        jobs["instagram"] = lambda: SocialUploadService.upload_instagram(
-                            video_path=local_video_path,
-                            metadata=metadata,
-                            ig_user_id=meta_creds.instagram_business_account_id,
-                            ig_access_token=meta_creds.instagram_access_token,
-                        )
+                        emit_platform_result(results_by_platform["instagram"])
             elif not account:
                 # Global (backwards compat)
                 if "facebook" in requested_platforms:
@@ -744,11 +745,14 @@ class UploadPhaseService:
                         facebook_strategy=_fb_strategy_global,
                         facebook_prep_dir=_fb_prep_dir_global,
                     )
-                if "instagram" in requested_platforms and instagram_enabled:
-                    jobs["instagram"] = lambda: SocialUploadService.upload_instagram(
-                        video_path=local_video_path,
-                        metadata=metadata,
+                # Instagram deferred to VPS scheduler (no account = no IG creds).
+                if "instagram" in requested_platforms and "instagram" not in results_by_platform:
+                    results_by_platform["instagram"] = PlatformUploadResult(
+                        platform="instagram",
+                        status="skipped",
+                        detail="No Instagram credentials configured for this account",
                     )
+                    emit_platform_result(results_by_platform["instagram"])
 
             selected_jobs = {platform: jobs[platform] for platform in requested_platforms if platform in jobs}
 
@@ -883,74 +887,6 @@ class UploadPhaseService:
             },
             "scheduled_at": project.scheduled_at.isoformat() if project.scheduled_at else None,
         }
-
-    @classmethod
-    def _send_n8n_payload(
-        cls,
-        *,
-        platform: str,
-        payload: dict[str, Any],
-        success_detail: str,
-    ) -> PlatformUploadResult:
-        webhook_url = settings.n8n_webhook_url
-        if not webhook_url:
-            return PlatformUploadResult(
-                platform=platform,
-                status="skipped",
-                detail="n8n webhook URL not configured",
-            )
-        try:
-            resp = requests.post(webhook_url, json=payload, timeout=15)
-            if resp.status_code >= 400:
-                return PlatformUploadResult(
-                    platform=platform,
-                    status="failed",
-                    detail=f"n8n webhook returned {resp.status_code}: {resp.text[:200]}",
-                )
-            return PlatformUploadResult(
-                platform=platform,
-                status="uploaded",
-                detail=success_detail,
-            )
-        except Exception as exc:
-            return PlatformUploadResult(
-                platform=platform,
-                status="failed",
-                detail=f"n8n webhook call failed: {exc}",
-            )
-
-    @classmethod
-    def _send_n8n_instagram_webhook(
-        cls,
-        *,
-        project_id: str,
-        scheduled_at: datetime,
-        drive_video_id: str,
-        metadata: "VideoMetadataPayload",
-        ig_user_id: str,
-        ig_access_token: str,
-    ) -> PlatformUploadResult:
-        """Send self-contained webhook to n8n for deferred Instagram publish."""
-        payload = {
-            "project_id": project_id,
-            "scheduled_at": scheduled_at.isoformat(),
-            "drive_video_id": drive_video_id,
-            "graph_api_version": settings.meta_graph_api_version,
-            "instagram": {
-                "ig_user_id": ig_user_id,
-                "ig_access_token": ig_access_token,
-                "caption": metadata.instagram.caption,
-            },
-            "discord_webhook_url": settings.discord_webhook_url,
-        }
-        return cls._send_n8n_payload(
-            platform="instagram",
-            payload=payload,
-            success_detail=(
-                f"Deferred to n8n; scheduled for "
-                f"{cls._format_french_datetime(scheduled_at)}"
-            ),
-        )
 
     # ── Platform duration checks (pre-upload) ─────────────────────────────
 

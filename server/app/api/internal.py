@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from app.auth.dependencies import require_internal_token
-from app.models.job import PlatformStatus, TikTokJob
+from app.models.job import PlatformStatus, Job
 from app.services.embed_builder import build_embed
 
 logger = logging.getLogger(__name__)
@@ -21,6 +21,13 @@ router = APIRouter(
 )
 
 
+class InstagramPayload(BaseModel):
+    ig_user_id: str
+    ig_access_token: str
+    caption: str
+    graph_api_version: str = "v25.0"
+
+
 class CreateJobRequest(BaseModel):
     project_id: str
     account_id: str
@@ -29,6 +36,7 @@ class CreateJobRequest(BaseModel):
     description: str
     drive_video_url: str
     platforms_requested: list[str]
+    instagram: InstagramPayload | None = None
 
 
 class CreateJobResponse(BaseModel):
@@ -75,7 +83,7 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
     platform_statuses = {
         p: PlatformStatus(status="pending") for p in req.platforms_requested
     }
-    job = TikTokJob(
+    job = Job(
         project_id=req.project_id,
         job_id=f"j_{secrets.token_hex(4)}",
         account_id=req.account_id,
@@ -85,12 +93,11 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
         drive_video_url=req.drive_video_url,
         slot_time=req.slot_time,
         platforms_requested=list(req.platforms_requested),
-        status="pending",
         platform_statuses=platform_statuses,
         discord_message_id=None,
         reminder_message_id=None,
         reminder_forward_message_id=None,
-        acked_at=None,
+        instagram_payload=req.instagram.model_dump() if req.instagram else None,
         created_at=now,
         updated_at=now,
     )

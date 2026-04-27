@@ -396,3 +396,100 @@ After pulling Phase A (or main once Phase A is merged) and rebuilding:
 3. Restart: `cd /opt/tiktok/server && git pull && docker compose up -d --build`
 4. Verify: `curl https://tiktok.sididi.tv/healthz` still returns OK.
 5. Verify the mobile routes are gone: `curl -o /dev/null -w "%{http_code}\n" https://tiktok.sididi.tv/api/mobile/me` should print `404`.
+
+---
+
+## 12. Phase B — Instagram via VPS + reaction listener
+
+Phase B introduces three behavioral changes that need attention at deploy time:
+
+1. **`Job` model rename + new fields** — the on-disk schema in `data/jobs.json` is incompatible with the previous shape. **Wipe `jobs.json` on deploy.**
+2. **Instagram publishing moves from n8n to the VPS scheduler** — at slot_time, the scheduler calls Meta Graph API directly. n8n integration is fully retired (you can shut down/remove your n8n workflow).
+3. **Discord reaction listener** — the bot now connects to Discord's gateway WebSocket (in addition to its existing REST calls). It listens for `✅` reactions on the upload-channel embed OR the rich reminder, and uses that signal to mark TikTok manually-posted + cancel an unfired reminder.
+
+### Pre-deploy checklist
+
+**Confirm there are no in-flight pending jobs.** Quickest check from your dev machine:
+```bash
+ssh youruser@vps 'sudo cat /var/lib/docker/volumes/server_jobs-data/_data/jobs.json' | python3 -m json.tool
+```
+If `"jobs": {}` (or the file is missing), you're clear. Otherwise, finish or delete pending jobs first — they won't deserialize cleanly under the new schema.
+
+**Discord bot permissions.** The bot needs the following on every channel where it operates (upload + reminder channels at minimum):
+- `View Channel`
+- `Send Messages`
+- `Embed Links`
+- `Add Reactions`
+- `Read Message History`
+- `Manage Messages` (so the listener can delete reminder messages on ack)
+
+If you used a permission integer earlier without `Read Message History` or `Manage Messages`, update the bot role's permissions in your Discord server before deploying.
+
+**Discord intents.** `discord.py` requires the `GUILD_MESSAGE_REACTIONS` intent. This is **not a privileged intent**, so it's available to all bots without TikTok-style review. The listener requests `discord.Intents.default()` + `reactions=True`. No portal config needed.
+
+### Deploy steps
+
+```bash
+ssh youruser@vps
+cd /opt/tiktok
+git fetch origin
+git checkout main      # or feat/phase-b-instagram if not yet merged
+git pull
+cd server
+
+# Wipe old jobs.json (model rename = clean break)
+docker compose down
+docker volume rm $(docker compose config --volumes 2>/dev/null | head -1) 2>/dev/null || \
+  sudo rm -f /var/lib/docker/volumes/*jobs-data*/_data/jobs.json
+
+# Rebuild and start
+docker compose up -d --build
+docker compose logs --tail 50
+```
+
+You should see lines like:
+```
+INFO ... Scheduler started (interval=30.0s)
+INFO ... ReactionListener gateway connection starting
+INFO ... discord.client logged in as Tiktok Reproducer#XXXX
+```
+
+If the gateway fails to connect, check:
+- The bot token is valid (`echo $ATR_DISCORD_BOT_TOKEN` from inside the container).
+- The bot is invited to the guild and not banned.
+
+### Verify the new flow
+
+1. **Health check still works:**
+   ```bash
+   curl -s https://tiktok.sididi.tv/healthz | jq
+   # Expected: {"status":"ok","jobs_pending":0}
+   ```
+
+2. **Process a real test project with Instagram in `platforms_requested`** (low-stakes, deletable). At video-upload time:
+   - The embed appears in the upload channel — Instagram line shows `⏳ Instagram — Pending`.
+   - **No** request is sent to n8n (you can verify by checking your n8n logs are silent).
+
+3. **At slot_time** (verify in container logs `docker compose logs -f`):
+   - For TikTok: the rich reminder + forward appear in the reminder channel.
+   - For Instagram: `Instagram publish succeeded for <project_id>` log line. The embed's IG line transitions to `✅ Instagram — https://instagram.com/reel/...`.
+
+4. **React with ✅ on the upload-channel embed** (yourself, from any phone). The bot:
+   - Edits the embed: TikTok line becomes `✅ TikTok — Posté`.
+   - Adds its own ✅ reaction (visual confirmation).
+   - If reminder was already in the channel: deletes it.
+   - If reminder hadn't fired yet: scheduler skips it on the next tick.
+
+5. **Cascade delete still works** — `DELETE /api/internal/jobs/<pid>` removes the embed + any reminder messages.
+
+### Roll back
+
+If anything breaks:
+```bash
+cd /opt/tiktok
+git checkout <previous-main-sha>
+cd server
+docker compose up -d --build
+```
+
+The previous state still works for TikTok-only flow. Instagram via n8n was working before this; if you need IG to work during a rollback window, re-enable your n8n workflow + restore `ATR_N8N_WEBHOOK_URL` + `ATR_DISCORD_WEBHOOK_URL` in your dev `.env`.

@@ -47,8 +47,9 @@ def _platforms_to_reserve(
     if (
         _requested("instagram")
         and account.meta is not None
+        and account.meta.instagram_business_account_id
+        and (account.meta.instagram_access_token or account.meta.facebook_page_access_token)
         and account.slots_for("instagram")
-        and bool((settings.n8n_webhook_url or "").strip())
     ):
         platforms.append("instagram")
     if account.slots_for("tiktok"):

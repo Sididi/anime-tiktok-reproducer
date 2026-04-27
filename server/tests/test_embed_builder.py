@@ -4,13 +4,13 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from app.config import AccountConfig
-from app.models.job import PlatformStatus, TikTokJob
+from app.models.job import PlatformStatus, Job
 from app.services.embed_builder import build_embed
 
 
-def _job_fixture() -> TikTokJob:
+def _job_fixture() -> Job:
     now = datetime(2026, 4, 26, 21, 0, tzinfo=UTC)
-    return TikTokJob(
+    return Job(
         project_id="2ee46c92a4ce",
         job_id="j_abc",
         account_id="anime_fr",
@@ -20,7 +20,6 @@ def _job_fixture() -> TikTokJob:
         drive_video_url="https://drive.google.com/uc?id=xyz",
         slot_time=now,
         platforms_requested=["youtube", "facebook", "instagram", "tiktok"],
-        status="pending",
         platform_statuses={
             "youtube": PlatformStatus(status="uploaded", url="https://youtu.be/abc"),
             "facebook": PlatformStatus(status="skipped", detail="Not configured"),
@@ -29,7 +28,6 @@ def _job_fixture() -> TikTokJob:
         },
         discord_message_id=None,
         reminder_message_id=None,
-        acked_at=None,
         created_at=now,
         updated_at=now,
     )
@@ -107,9 +105,10 @@ def test_embed_includes_drive_link():
 
 def test_embed_after_ack_marks_tiktok_uploaded():
     job = _job_fixture()
-    job.status = "acked"
-    job.acked_at = datetime(2026, 4, 26, 21, 4, tzinfo=UTC)
-    job.platform_statuses["tiktok"] = PlatformStatus(status="uploaded")
+    job.platform_statuses["tiktok"] = PlatformStatus(
+        status="uploaded",
+        completed_at=datetime(2026, 4, 26, 21, 4, tzinfo=UTC),
+    )
     embed = build_embed(job, _accounts(), "https://tiktok.sididi.tv")
     fields = {f["name"]: f["value"] for f in embed["fields"]}
     plats = fields["Plateformes"]
