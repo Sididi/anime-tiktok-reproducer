@@ -21,6 +21,13 @@ router = APIRouter(
 )
 
 
+class InstagramPayload(BaseModel):
+    ig_user_id: str
+    ig_access_token: str
+    caption: str
+    graph_api_version: str = "v25.0"
+
+
 class CreateJobRequest(BaseModel):
     project_id: str
     account_id: str
@@ -29,6 +36,7 @@ class CreateJobRequest(BaseModel):
     description: str
     drive_video_url: str
     platforms_requested: list[str]
+    instagram: InstagramPayload | None = None
 
 
 class CreateJobResponse(BaseModel):
@@ -89,6 +97,7 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
         discord_message_id=None,
         reminder_message_id=None,
         reminder_forward_message_id=None,
+        instagram_payload=req.instagram.model_dump() if req.instagram else None,
         created_at=now,
         updated_at=now,
     )
