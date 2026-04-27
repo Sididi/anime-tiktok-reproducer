@@ -1206,7 +1206,9 @@ class UploadPhaseService:
         cleanup_warnings: list[str] = []
         try:
             if project.final_upload_discord_message_id:
-                DiscordService.delete_message(project.final_upload_discord_message_id)
+                # delete_job cascades: removes both the embed and the reminder
+                # message on the VPS in one call.
+                DiscordService.delete_job(project_id)
             elif project.generation_discord_message_id:
                 DiscordService.delete_message(project.generation_discord_message_id)
         except Exception as exc:
