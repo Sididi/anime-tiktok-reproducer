@@ -10,7 +10,6 @@ import logging
 import shutil
 import tempfile
 import os
-import threading
 import time
 
 import requests
