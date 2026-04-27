@@ -32,32 +32,35 @@ JOB_PAYLOAD = {
 INTERNAL_AUTH = {"Authorization": "Bearer internal_secret"}
 
 
-def test_create_job_posts_embed_and_reminder(
+def test_create_job_posts_only_embed_not_reminder(
     monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
 ):
+    """Reminder is now deferred to the background scheduler; create_job
+    should post ONLY the embed, never the reminder."""
     app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
-    discord.post_message.side_effect = ["msg_embed", "msg_reminder"]
+    discord.post_message.return_value = "msg_embed"
 
     with TestClient(app) as client:
         r = client.post("/api/internal/jobs", json=JOB_PAYLOAD, headers=INTERNAL_AUTH)
     assert r.status_code == 200
     body = r.json()
     assert body["discord_message_id"] == "msg_embed"
-    # Two posts: embed in upload channel, reminder in reminder channel.
-    assert discord.post_message.call_count == 2
+    # ONLY the embed in the upload channel. The reminder is fired later by
+    # the scheduler when slot_time arrives.
+    assert discord.post_message.call_count == 1
 
 
 def test_create_job_idempotent(
     monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
 ):
     app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
-    discord.post_message.side_effect = ["msg_embed", "msg_reminder"]
+    discord.post_message.return_value = "msg_embed"
     with TestClient(app) as client:
         r1 = client.post("/api/internal/jobs", json=JOB_PAYLOAD, headers=INTERNAL_AUTH)
         r2 = client.post("/api/internal/jobs", json=JOB_PAYLOAD, headers=INTERNAL_AUTH)
     assert r1.json()["discord_message_id"] == "msg_embed"
     assert r2.json()["discord_message_id"] == "msg_embed"  # same, no re-post
-    assert discord.post_message.call_count == 2
+    assert discord.post_message.call_count == 1
 
 
 def test_platform_status_edits_embed(
@@ -79,14 +82,59 @@ def test_platform_status_edits_embed(
 def test_delete_job_removes_messages(
     monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
 ):
+    """create_job posts only the embed; delete_job should remove just it.
+
+    Reminder + reminder-forward messages are deleted iff they exist; for a job
+    where the scheduler hasn't run yet, only the embed exists."""
     app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
-    discord.post_message.side_effect = ["msg_embed", "msg_reminder"]
+    discord.post_message.return_value = "msg_embed"
     with TestClient(app) as client:
         client.post("/api/internal/jobs", json=JOB_PAYLOAD, headers=INTERNAL_AUTH)
         r = client.delete("/api/internal/jobs/p1", headers=INTERNAL_AUTH)
     assert r.status_code == 200
-    # embed delete + reminder delete
-    assert discord.delete_message.call_count == 2
+    # Only the embed message exists pre-scheduler.
+    assert discord.delete_message.call_count == 1
+
+
+def test_delete_job_removes_reminder_and_forward_when_present(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    """If the scheduler has already fired the reminder + forward, delete_job
+    must remove all three messages (embed, reminder, forward)."""
+    from app.models.job import PlatformStatus, TikTokJob
+    from datetime import datetime, timezone as _tz
+
+    app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    # Pre-populate the store with a job that already has all three msg ids.
+    now = datetime(2026, 4, 27, 21, 0, tzinfo=_tz.utc)
+    job = TikTokJob(
+        project_id="p1",
+        job_id="j_x",
+        account_id="anime_fr",
+        device_id="iphone_13_pro",
+        anime_title="X",
+        description="d",
+        drive_video_url="u",
+        slot_time=now,
+        platforms_requested=["tiktok"],
+        status="pending",
+        platform_statuses={"tiktok": PlatformStatus(status="pending")},
+        discord_message_id="msg_embed",
+        reminder_message_id="msg_rich",
+        reminder_forward_message_id="msg_forward",
+        acked_at=None,
+        created_at=now,
+        updated_at=now,
+    )
+
+    import asyncio
+    asyncio.run(app.state.job_store.create(job))
+
+    with TestClient(app) as client:
+        r = client.delete("/api/internal/jobs/p1", headers=INTERNAL_AUTH)
+    assert r.status_code == 200
+    # embed + reminder + forward
+    assert discord.delete_message.call_count == 3
 
 
 def test_delete_missing_returns_200(

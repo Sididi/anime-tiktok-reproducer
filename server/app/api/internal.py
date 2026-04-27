@@ -12,7 +12,6 @@ from pydantic import BaseModel
 from app.auth.dependencies import require_internal_token
 from app.models.job import PlatformStatus, TikTokJob
 from app.services.embed_builder import build_embed
-from app.services.reminder_service import post_reminder
 
 logger = logging.getLogger(__name__)
 
@@ -90,37 +89,24 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
         platform_statuses=platform_statuses,
         discord_message_id=None,
         reminder_message_id=None,
+        reminder_forward_message_id=None,
         acked_at=None,
         created_at=now,
         updated_at=now,
     )
 
     embed_msg_id: str | None = None
-    reminder_msg_id: str | None = None
     try:
         embed = build_embed(job, settings.accounts, settings.devices, settings.public_base_url)
         embed_msg_id = await discord.post_message(
             settings.discord.upload_channel_id, embed=embed
         )
         job.discord_message_id = embed_msg_id
-        try:
-            reminder_msg_id = await post_reminder(
-                discord,
-                upload_channel_id=settings.discord.upload_channel_id,
-                reminder_channel_id=settings.discord.reminder_channel_id,
-                embed_message_id=embed_msg_id,
-                anime_title=job.anime_title,
-                account_name=account.name,
-                device_name=account.device,
-                role_id=settings.discord.reminder_role_id,
-                guild_id=settings.discord.guild_id,
-            )
-            job.reminder_message_id = reminder_msg_id
-        except Exception as e:
-            logger.warning("Reminder post failed for %s: %s", job.project_id, e)
     except Exception as e:
         logger.warning("Embed post failed for %s: %s", job.project_id, e)
 
+    # Reminder is NOT posted here. The background scheduler
+    # (app.services.reminder_scheduler) fires it at slot_time.
     await store.create(job)
     return CreateJobResponse(job_id=job.job_id, discord_message_id=embed_msg_id)
 
@@ -187,6 +173,14 @@ async def delete_job(project_id: str, request: Request) -> dict:
             )
         except Exception as e:
             logger.warning("Reminder delete failed for %s: %s", project_id, e)
+    if job.reminder_forward_message_id:
+        try:
+            await discord.delete_message(
+                settings.discord.reminder_channel_id,
+                job.reminder_forward_message_id,
+            )
+        except Exception as e:
+            logger.warning("Reminder forward delete failed for %s: %s", project_id, e)
 
     await store.delete(project_id)
     return {"ok": True, "deleted": True}

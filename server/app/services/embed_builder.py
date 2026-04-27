@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.config import AccountConfig, DeviceConfig
 from app.models.job import PlatformStatus, TikTokJob
@@ -30,11 +31,19 @@ _STATUS_EMOJI = {
 }
 
 
-def _format_french_datetime(dt: datetime) -> str:
+def format_french_datetime(dt: datetime, *, tz: str = "UTC") -> str:
+    """Render `dt` in French. `tz` is the IANA timezone to display in."""
+    target = ZoneInfo(tz)
+    local = dt.astimezone(target)
+    label = "UTC" if tz == "UTC" else (local.tzname() or tz)
     return (
-        f"{_FR_DAYS[dt.weekday()]} {dt.day} {_FR_MONTHS[dt.month - 1]} "
-        f"{dt.year} à {dt.strftime('%H:%M')} UTC"
+        f"{_FR_DAYS[local.weekday()]} {local.day} {_FR_MONTHS[local.month - 1]} "
+        f"{local.year} à {local.strftime('%H:%M')} {label}"
     )
+
+
+# Backwards-compat private alias for the original caller.
+_format_french_datetime = format_french_datetime
 
 
 def _format_platform_line(platform: str, ps: PlatformStatus) -> str:

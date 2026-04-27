@@ -1,73 +1,152 @@
 """Tests for app.services.reminder_service."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 import httpx
 
-from app.services.reminder_service import post_reminder
+from app.config import AccountConfig
+from app.models.job import PlatformStatus, TikTokJob
+from app.services.reminder_service import build_reminder_embed, post_reminder
 
 
-async def test_forward_path_uses_message_reference_and_role_ping():
-    """Q1: native forward succeeds first try."""
+def _account() -> AccountConfig:
+    return AccountConfig(
+        id="anime_fr",
+        name="Anime FR",
+        language="fr",
+        device="iphone_13_pro",
+        avatar="anime_fr.jpg",
+    )
+
+
+def _job(*, discord_message_id: str | None = "m_embed") -> TikTokJob:
+    now = datetime(2026, 4, 27, 21, 0, tzinfo=timezone.utc)
+    return TikTokJob(
+        project_id="p1",
+        job_id="j_x",
+        account_id="anime_fr",
+        device_id="iphone_13_pro",
+        anime_title="One Piece 1063",
+        description="Posted today",
+        drive_video_url="https://drive/x",
+        slot_time=now,
+        platforms_requested=["youtube", "tiktok"],
+        status="pending",
+        platform_statuses={"tiktok": PlatformStatus(status="pending")},
+        discord_message_id=discord_message_id,
+        reminder_message_id=None,
+        acked_at=None,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def test_build_reminder_embed_renders_paris_time_and_account():
+    embed = build_reminder_embed(_job(), _account(), "https://tiktok.sididi.tv")
+    assert embed["author"]["name"] == "Anime FR"
+    assert embed["author"]["icon_url"].endswith("/api/avatars/anime_fr.jpg")
+    assert embed["title"] == "One Piece 1063"
+    # Paris time at 21:00 UTC on 2026-04-27 → 23:00 CEST
+    assert "23:00" in embed["description"]
+    field_names = {f["name"] for f in embed["fields"]}
+    assert "📱 Device" in field_names
+    assert "📺 Compte" in field_names
+    assert "Description TikTok" in field_names
+
+
+def test_build_reminder_embed_escapes_triple_backticks():
+    job = _job()
+    job.description = "Inject ```evil``` here"
+    embed = build_reminder_embed(job, _account(), "https://tiktok.sididi.tv")
+    desc_field = next(f for f in embed["fields"] if f["name"] == "Description TikTok")
+    assert "```evil```" not in desc_field["value"]
+    assert "ʼʼʼ" in desc_field["value"]
+
+
+async def test_post_reminder_posts_rich_then_forward():
     discord = AsyncMock()
-    discord.post_message.return_value = "rem_42"
+    discord.post_message.side_effect = ["m_rich", "m_forward"]
 
-    msg_id = await post_reminder(
+    rich_id, forward_id = await post_reminder(
         discord,
+        job=_job(),
+        account=_account(),
+        public_base_url="https://tiktok.sididi.tv",
         upload_channel_id="c_upload",
         reminder_channel_id="c_reminder",
-        embed_message_id="m_embed",
-        anime_title="One Piece 1063",
-        account_name="Anime FR",
-        device_name="iphone_13_pro",
         role_id="r_99",
         guild_id="g_1",
     )
 
-    assert msg_id == "rem_42"
-    assert discord.post_message.call_count == 1
-    args = discord.post_message.call_args
-    assert args.kwargs["message_reference"] == {
+    assert rich_id == "m_rich"
+    assert forward_id == "m_forward"
+    assert discord.post_message.call_count == 2
+
+    # First call is the rich message: role ping + embed, no message_reference.
+    first = discord.post_message.call_args_list[0]
+    assert first.args == ("c_reminder",)
+    assert "<@&r_99>" in first.kwargs["content"]
+    assert first.kwargs["embed"]["title"] == "One Piece 1063"
+    assert first.kwargs.get("message_reference") is None
+
+    # Second call is the forward: message_reference, no embed.
+    second = discord.post_message.call_args_list[1]
+    assert second.kwargs["message_reference"] == {
         "type": 1,
         "channel_id": "c_upload",
         "message_id": "m_embed",
     }
-    assert "<@&r_99>" in args.kwargs["content"]
-    assert "Anime FR" in args.kwargs["content"]
 
 
-async def test_falls_back_to_url_when_forward_fails():
-    """Q2 fallback: any error on forward -> retry without message_reference."""
-
-    async def post_side_effect(*args, **kwargs):
+async def test_post_reminder_falls_back_to_url_when_forward_fails():
+    async def side_effect(*args, **kwargs):
         if kwargs.get("message_reference"):
             raise httpx.HTTPStatusError(
-                "forbidden", request=httpx.Request("POST", "u"),
-                response=httpx.Response(403)
+                "forbidden",
+                request=httpx.Request("POST", "u"),
+                response=httpx.Response(403),
             )
-        return "rem_43"
+        return "m_rich" if "embed" in kwargs else "m_forward_url"
 
     discord = AsyncMock()
-    discord.post_message.side_effect = post_side_effect
+    discord.post_message.side_effect = side_effect
 
-    msg_id = await post_reminder(
+    rich_id, forward_id = await post_reminder(
         discord,
+        job=_job(),
+        account=_account(),
+        public_base_url="https://tiktok.sididi.tv",
         upload_channel_id="c_upload",
         reminder_channel_id="c_reminder",
-        embed_message_id="m_embed",
-        anime_title="One Piece 1063",
-        account_name="Anime FR",
-        device_name="iphone_13_pro",
         role_id="r_99",
         guild_id="g_1",
     )
 
-    assert msg_id == "rem_43"
-    assert discord.post_message.call_count == 2
-    fallback_call = discord.post_message.call_args
-    assert fallback_call.kwargs.get("message_reference") is None
-    fallback_url = (
-        "https://discord.com/channels/g_1/c_upload/m_embed"
+    assert rich_id == "m_rich"
+    assert forward_id == "m_forward_url"
+    # Three calls: rich, forward (fails), URL fallback
+    assert discord.post_message.call_count == 3
+    last = discord.post_message.call_args_list[-1]
+    assert "https://discord.com/channels/g_1/c_upload/m_embed" in last.kwargs["content"]
+
+
+async def test_post_reminder_skips_forward_when_no_embed_id():
+    discord = AsyncMock()
+    discord.post_message.return_value = "m_rich"
+
+    rich_id, forward_id = await post_reminder(
+        discord,
+        job=_job(discord_message_id=None),
+        account=_account(),
+        public_base_url="https://tiktok.sididi.tv",
+        upload_channel_id="c_upload",
+        reminder_channel_id="c_reminder",
+        role_id="r_99",
+        guild_id="g_1",
     )
-    assert fallback_url in fallback_call.kwargs["content"]
+
+    assert rich_id == "m_rich"
+    assert forward_id is None
+    assert discord.post_message.call_count == 1
