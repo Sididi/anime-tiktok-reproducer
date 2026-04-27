@@ -524,7 +524,7 @@ class IntegrationHealthService:
         account_checks: dict[str, dict[str, Any]] = {}
         if accounts:
             for acc in accounts:
-                acc_id = acc["id"]
+                acc_id = acc.id
                 acc_result: dict[str, Any] = {}
                 account_cfg = AccountService.get_account(acc_id)
                 if account_cfg and account_cfg.youtube:

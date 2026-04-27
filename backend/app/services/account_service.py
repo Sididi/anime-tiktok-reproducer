@@ -71,6 +71,7 @@ class AccountConfig:
     id: str
     name: str
     language: str
+    device: str
     supported_types: list[LibraryType] = field(default_factory=lambda: [DEFAULT_LIBRARY_TYPE])
     avatar: str | None = None
     slots: list[str] = field(default_factory=list)
@@ -181,6 +182,13 @@ class AccountService:
             else None
         )
 
+        device = raw.get("device")
+        if not device or not isinstance(device, str):
+            raise ValueError(
+                f"Account {account_id!r}: missing required field 'device'. "
+                f"Set device: \"<device_id>\" matching a device in the VPS server's config."
+            )
+
         slots_raw = raw.get("slots", [])
         slots = [str(s) for s in slots_raw] if isinstance(slots_raw, list) else []
         supported_types_raw = raw.get("supported_types")
@@ -202,6 +210,7 @@ class AccountService:
             id=account_id,
             name=str(raw.get("name", account_id)),
             language=str(raw.get("language", "")),
+            device=device,
             supported_types=supported_types,
             avatar=str(raw.get("avatar")) if raw.get("avatar") else None,
             slots=slots,
@@ -234,6 +243,8 @@ class AccountService:
                 continue
             try:
                 result[str(account_id)] = cls._parse_account(str(account_id), account_raw)
+            except ValueError:
+                raise
             except Exception:
                 logger.exception("Failed to parse account %s", account_id)
         logger.info("Loaded %d account(s) from %s", len(result), path)
@@ -253,8 +264,19 @@ class AccountService:
         return cls._accounts
 
     @classmethod
-    def list_accounts(cls) -> list[dict[str, Any]]:
+    def invalidate(cls) -> None:
+        """Clear the in-memory account cache so the next call reloads from disk."""
+        with cls._lock:
+            cls._accounts = None
+
+    @classmethod
+    def list_accounts(cls) -> list[AccountConfig]:
         accounts = cls._ensure_loaded()
+        return list(accounts.values())
+
+    @classmethod
+    def list_accounts_as_dicts(cls) -> list[dict[str, Any]]:
+        """Return accounts serialised as dicts (used by the HTTP API layer)."""
         return [
             {
                 "id": acc.id,
@@ -265,7 +287,7 @@ class AccountService:
                 "slots": acc.slots,
                 "slots_by_platform": {p: acc.slots_for(p) for p in PLATFORM_KEYS},
             }
-            for acc in accounts.values()
+            for acc in cls.list_accounts()
         ]
 
     @classmethod

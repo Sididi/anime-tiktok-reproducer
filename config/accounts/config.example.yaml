@@ -11,6 +11,7 @@ accounts:
     supported_types:
       - "anime"
     avatar: "anime_fr.jpg"       # filename in avatars/ directory
+    device: "iphone_13_pro"     # must match a device id in the VPS server's config
     # Upload slots in UTC (HH:MM). Shared by every platform on this account.
     slots:
       - "14:00"
@@ -46,6 +47,7 @@ accounts:
   #   supported_types:
   #     - "anime"
   #   avatar: "anime_en.png"
+  #   device: "pixel_8_pro"       # must match a device id in the VPS server's config
   #   slots:
   #     - "15:00"
   #     - "20:00"
