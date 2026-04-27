@@ -673,7 +673,7 @@ class GoogleDriveService:
 
     @classmethod
     def get_direct_download_url(cls, file_id: str) -> str:
-        return f"https://drive.google.com/uc?export=download&id={file_id}"
+        return f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
 
     @classmethod
     def get_web_view_url(cls, file_id: str) -> str:

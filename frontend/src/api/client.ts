@@ -1,4 +1,17 @@
 const API_BASE = "/api";
+const VITE_MEDIA_ORIGIN =
+  typeof import.meta !== "undefined" &&
+  import.meta.env &&
+  typeof import.meta.env.VITE_MEDIA_ORIGIN === "string"
+    ? import.meta.env.VITE_MEDIA_ORIGIN.trim()
+    : "";
+const MEDIA_ORIGIN = VITE_MEDIA_ORIGIN || "http://127.0.0.1:8000";
+const MEDIA_API_BASE = `${MEDIA_ORIGIN}${API_BASE}`;
+const DEFAULT_INDEX_BATCH_SIZE = 64;
+const DEFAULT_INDEX_PREFETCH_BATCHES = 3;
+const DEFAULT_INDEX_TRANSFORM_WORKERS = 4;
+const DEFAULT_INDEX_DECODE_BACKEND = "auto";
+const DEFAULT_INDEX_PRECISION = "auto";
 
 // Gap resolution types
 interface GapInfo {
@@ -25,6 +38,30 @@ interface GapCandidate {
   snap_description: string;
 }
 
+interface GapsConfig {
+  full_auto_enabled: boolean;
+  min_speed_factor: number;
+}
+
+interface GapsResponse {
+  has_gaps: boolean;
+  gaps: GapInfo[];
+  total_gap_duration: number;
+  min_speed_factor: number;
+}
+
+export class SeriesDeleteConflictError extends Error {
+  code: string;
+  referencingProjects: import("@/types").SeriesDeleteReferencingProject[];
+
+  constructor(detail: import("@/types").SeriesDeleteConflictDetail) {
+    super(detail.message || "Suppression bloquee");
+    this.name = "SeriesDeleteConflictError";
+    this.code = detail.code;
+    this.referencingProjects = detail.referencing_projects;
+  }
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     headers: {
@@ -36,13 +73,40 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 
   if (!res.ok) {
     const error = await res.json().catch(() => ({ detail: "Request failed" }));
-    throw new Error(error.detail || "Request failed");
+    const detail = error?.detail;
+    if (typeof detail === "string") {
+      throw new Error(detail || "Request failed");
+    }
+    if (detail && typeof detail === "object") {
+      const message =
+        ("message" in detail && typeof detail.message === "string"
+          ? detail.message
+          : null) ||
+        ("code" in detail && typeof detail.code === "string"
+          ? detail.code
+          : null);
+      throw new Error(message || "Request failed");
+    }
+    throw new Error("Request failed");
   }
 
   return res.json();
 }
 
+function toMediaUrl(pathOrUrl: string): string {
+  if (/^https?:\/\//i.test(pathOrUrl)) {
+    return pathOrUrl;
+  }
+  if (pathOrUrl.startsWith("/")) {
+    return `${MEDIA_ORIGIN}${pathOrUrl}`;
+  }
+  return `${MEDIA_API_BASE}${pathOrUrl.startsWith("/") ? pathOrUrl : `/${pathOrUrl}`}`;
+}
+
 export const api = {
+  getMediaOrigin: () => MEDIA_ORIGIN,
+  toMediaUrl,
+
   // Projects
   createProject: (
     tiktokUrl?: string,
@@ -56,6 +120,22 @@ export const api = {
       body: JSON.stringify({
         tiktok_url: tiktokUrl,
         source_path: sourcePath,
+        anime_name: animeName,
+        series_id: seriesId,
+        library_type: libraryType,
+      }),
+    }),
+
+  startProjectAsync: (
+    tiktokUrl: string,
+    animeName: string | undefined,
+    seriesId: string | undefined,
+    libraryType: import("@/types").LibraryType = "anime",
+  ) =>
+    request<import("@/types").ProjectStartupJob>("/projects/start-async", {
+      method: "POST",
+      body: JSON.stringify({
+        tiktok_url: tiktokUrl,
         anime_name: animeName,
         series_id: seriesId,
         library_type: libraryType,
@@ -94,6 +174,20 @@ export const api = {
       `/projects/${projectId}/library/activation`,
     ),
 
+  retryProjectStartup: (projectId: string) =>
+    request<import("@/types").ProjectStartupJob>(
+      `/projects/${projectId}/startup/retry`,
+      { method: "POST" },
+    ),
+
+  listProjectStartupJobs: () =>
+    request<{ jobs: import("@/types").ProjectStartupJob[] }>(
+      "/projects/startup/jobs",
+    ),
+
+  streamProjectStartupJobs: () =>
+    fetch(`${API_BASE}/projects/startup/jobs/stream`),
+
   // Accounts
   listAccounts: () =>
     request<{ accounts: import("@/types").Account[] }>("/accounts"),
@@ -111,16 +205,26 @@ export const api = {
     youtubeStrategy?: string,
     copyrightAudioPath?: string,
   ) =>
-    fetch(`${API_BASE}/project-manager/projects/${projectId}/upload`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        account_id: accountId ?? null,
-        facebook_strategy: facebookStrategy ?? null,
-        youtube_strategy: youtubeStrategy ?? null,
-        copyright_audio_path: copyrightAudioPath ?? null,
-      }),
-    }),
+    request<import("@/types").ProjectUploadJob>(
+      `/project-manager/projects/${projectId}/upload`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          account_id: accountId ?? null,
+          facebook_strategy: facebookStrategy ?? null,
+          youtube_strategy: youtubeStrategy ?? null,
+          copyright_audio_path: copyrightAudioPath ?? null,
+        }),
+      },
+    ),
+
+  listProjectUploadJobs: () =>
+    request<{ jobs: import("@/types").ProjectUploadJob[] }>(
+      "/project-manager/upload-jobs",
+    ),
+
+  streamProjectUploadJobs: () =>
+    fetch(`${API_BASE}/project-manager/upload-jobs/stream`),
 
   checkFacebookDuration: (projectId: string, accountId?: string) =>
     request<import("@/types").FacebookCheckResult>(
@@ -155,12 +259,19 @@ export const api = {
       },
     ),
 
-  buildCopyrightAudio: (projectId: string, musicKey: string | null, noMusicFileId: string) =>
+  buildCopyrightAudio: (
+    projectId: string,
+    musicKey: string | null,
+    noMusicFileId: string,
+  ) =>
     request<{ audio_path: string }>(
       `/project-manager/projects/${projectId}/copyright-build-audio`,
       {
         method: "POST",
-        body: JSON.stringify({ music_key: musicKey, no_music_file_id: noMusicFileId }),
+        body: JSON.stringify({
+          music_key: musicKey,
+          no_music_file_id: noMusicFileId,
+        }),
       },
     ),
 
@@ -180,7 +291,17 @@ export const api = {
   getVideoInfo: (projectId: string) =>
     request<import("@/types").VideoInfo>(`/projects/${projectId}/video/info`),
 
-  getVideoUrl: (projectId: string) => `${API_BASE}/projects/${projectId}/video`,
+  getVideoUrl: (projectId: string) =>
+    `${MEDIA_API_BASE}/projects/${projectId}/video`,
+
+  getProjectPreviewUrl: (projectId: string) =>
+    `${MEDIA_API_BASE}/projects/${projectId}/video/preview`,
+
+  warmProjectPreview: (projectId: string) =>
+    request<{ status: string; ready: boolean }>(
+      `/projects/${projectId}/video/preview/warmup`,
+      { method: "POST" },
+    ),
 
   // Scenes
   getScenes: (projectId: string) =>
@@ -230,7 +351,7 @@ export const api = {
   },
 
   // Scene Detection
-  detectScenes: (projectId: string, threshold = 18.0, minSceneLen = 10) => {
+  detectScenes: (projectId: string, threshold = 16.0, minSceneLen = 10) => {
     return fetch(`${API_BASE}/projects/${projectId}/scenes/detect`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -312,17 +433,8 @@ export const api = {
       `/projects/${projectId}/matches/playback/manifest`,
     ),
 
-  getMatchesPlaybackClipUrl: (
-    projectId: string,
-    sceneIndex: number,
-    track: "tiktok" | "source",
-    fingerprint?: string,
-  ) => {
-    const suffix = fingerprint
-      ? `?fingerprint=${encodeURIComponent(fingerprint)}`
-      : "";
-    return `${API_BASE}/projects/${projectId}/matches/playback/clip/${sceneIndex}/${track}${suffix}`;
-  },
+  getMatchesPlaybackClipUrl: (projectId: string, clipId: string) =>
+    `${MEDIA_API_BASE}/projects/${projectId}/matches/playback/clips/${clipId}`,
 
   updateMatch: (
     projectId: string,
@@ -360,6 +472,14 @@ export const api = {
       },
     ),
 
+  mergeMatchWithPrevious: (projectId: string, sceneIndex: number) =>
+    request<{
+      scenes: import("@/types").Scene[];
+      matches: import("@/types").SceneMatch[];
+    }>(`/projects/${projectId}/matches/merge-with-previous/${sceneIndex}`, {
+      method: "POST",
+    }),
+
   undoMerge: (projectId: string, sceneIndex: number) =>
     request<{
       scenes: import("@/types").Scene[];
@@ -370,28 +490,21 @@ export const api = {
 
   // Source video
   getSourceVideoUrl: (projectId: string, episodePath: string) =>
-    `${API_BASE}/projects/${projectId}/video/source?path=${encodeURIComponent(episodePath)}`,
+    `${MEDIA_API_BASE}/projects/${projectId}/video/source?path=${encodeURIComponent(episodePath)}`,
+
+  getSourcePreviewUrl: (projectId: string, episodePath: string) =>
+    `${MEDIA_API_BASE}/projects/${projectId}/video/source/preview?path=${encodeURIComponent(episodePath)}`,
+
+  warmSourcePreview: (projectId: string, episodePath: string) =>
+    request<{ status: string; ready: boolean }>(
+      `/projects/${projectId}/video/source/preview/warmup?path=${encodeURIComponent(episodePath)}`,
+      { method: "POST" },
+    ),
 
   getSourceDescriptor: (projectId: string, episodePath: string) =>
     request<import("@/types").SourceStreamDescriptor>(
       `/projects/${projectId}/video/source/descriptor?path=${encodeURIComponent(episodePath)}`,
     ),
-
-  getSourceChunkUrl: (
-    projectId: string,
-    episodePath: string,
-    chunkStart: number,
-    chunkDuration?: number,
-  ) => {
-    const params = new URLSearchParams({
-      path: episodePath,
-      chunk_start: String(chunkStart),
-    });
-    if (chunkDuration !== undefined) {
-      params.set("chunk_duration", String(chunkDuration));
-    }
-    return `${API_BASE}/projects/${projectId}/video/source/chunk?${params.toString()}`;
-  },
 
   // Transcription
   startTranscription: (projectId: string, language = "auto") => {
@@ -437,6 +550,35 @@ export const api = {
       },
     ),
 
+  // Raw Scene Validation
+  getRawScenes: (projectId: string) =>
+    request<{
+      detection: import("@/types").RawSceneDetectionResult | null;
+      transcription: import("@/types").Transcription | null;
+    }>(`/projects/${projectId}/raw-scenes`),
+
+  validateRawScenes: (
+    projectId: string,
+    validations: Array<{ scene_index: number; is_raw: boolean; text?: string }>,
+  ) =>
+    request<{ status: string; transcription: import("@/types").Transcription }>(
+      `/projects/${projectId}/raw-scenes/validate`,
+      {
+        method: "POST",
+        body: JSON.stringify({ validations }),
+      },
+    ),
+
+  confirmRawScenes: (projectId: string) =>
+    request<{ status: string }>(`/projects/${projectId}/raw-scenes/confirm`, {
+      method: "POST",
+    }),
+
+  resetRawScenes: (projectId: string) =>
+    request<{ status: string }>(`/projects/${projectId}/raw-scenes/reset`, {
+      method: "POST",
+    }),
+
   // Anime Library
   listIndexedAnime: (libraryType: import("@/types").LibraryType) =>
     request<{ series: string[]; count: number }>(
@@ -457,9 +599,11 @@ export const api = {
         library_type: libraryType,
         anime_name: animeName,
         fps,
-        batch_size: 64,
-        prefetch_batches: 3,
-        transform_workers: 4,
+        batch_size: DEFAULT_INDEX_BATCH_SIZE,
+        prefetch_batches: DEFAULT_INDEX_PREFETCH_BATCHES,
+        transform_workers: DEFAULT_INDEX_TRANSFORM_WORKERS,
+        decode_backend: DEFAULT_INDEX_DECODE_BACKEND,
+        precision: DEFAULT_INDEX_PRECISION,
         require_gpu: true,
       }),
     });
@@ -472,7 +616,7 @@ export const api = {
     }),
 
   validateBatchFolders: (
-    paths: string[],
+    items: Array<string | { path: string; name?: string }>,
     libraryType: import("@/types").LibraryType,
   ) =>
     request<{
@@ -481,17 +625,31 @@ export const api = {
         name: string;
         has_videos: boolean;
         suggested_path: string | null;
-        index_status: "new" | "exact_match" | "conflict";
+        resolution:
+          | "new"
+          | "exact_match"
+          | "update_required"
+          | "needs_fix"
+          | "blocked_orphan";
+        series_id: string | null;
+        storage_release_id: string | null;
         conflict_details: {
           new_episodes: string[];
           removed_episodes: string[];
           existing_episode_count: number;
           existing_torrent_count: number;
         } | null;
+        orphan_reason: string | null;
+        invalid_video_files: string[] | null;
       }>;
     }>("/anime/validate-batch-folders", {
       method: "POST",
-      body: JSON.stringify({ paths, library_type: libraryType }),
+      body: JSON.stringify({
+        items: items.map((item) =>
+          typeof item === "string" ? { path: item } : item,
+        ),
+        library_type: libraryType,
+      }),
     }),
 
   browseDirectories: (path?: string) =>
@@ -522,22 +680,41 @@ export const api = {
       }),
     }),
 
+  updateAnimeAsync: (
+    sourcePath: string,
+    libraryType: import("@/types").LibraryType,
+    animeName: string,
+  ) =>
+    request<{ job_id: string }>("/anime/update-async", {
+      method: "POST",
+      body: JSON.stringify({
+        source_path: sourcePath,
+        library_type: libraryType,
+        anime_name: animeName,
+      }),
+    }),
+
   // Library - Jobs
   listIndexationJobs: () =>
     request<{ jobs: import("@/types").IndexationJob[] }>("/anime/jobs"),
 
-  streamIndexationJobs: () =>
-    fetch(`${API_BASE}/anime/jobs/stream`),
+  streamIndexationJobs: () => fetch(`${API_BASE}/anime/jobs/stream`),
 
   // Library - Purge
-  purgeLibrary: (libraryType: import("@/types").LibraryType, allTypes: boolean) =>
+  purgeLibrary: (
+    libraryType: import("@/types").LibraryType,
+    allTypes: boolean,
+  ) =>
     request<import("@/types").PurgeResult>("/anime/purge", {
       method: "POST",
       body: JSON.stringify({ library_type: libraryType, all_types: allTypes }),
     }),
 
   // Library - Purge protection
-  togglePermanentPin: (libraryType: import("@/types").LibraryType, seriesId: string) =>
+  togglePermanentPin: (
+    libraryType: import("@/types").LibraryType,
+    seriesId: string,
+  ) =>
     request<{ permanent_pin: boolean; hydration_started: boolean }>(
       `/anime/${encodeURIComponent(seriesId)}/pin?library_type=${encodeURIComponent(libraryType)}`,
       { method: "PATCH" },
@@ -560,10 +737,15 @@ export const api = {
       },
     ),
 
-  evictSeries: (
+  getSeriesState: (
     libraryType: import("@/types").LibraryType,
     seriesId: string,
   ) =>
+    request<import("@/types").LibraryActivationState>(
+      `/anime/${encodeURIComponent(seriesId)}/state?library_type=${encodeURIComponent(libraryType)}`,
+    ),
+
+  evictSeries: (libraryType: import("@/types").LibraryType, seriesId: string) =>
     request<import("@/types").LibraryActivationState>(
       `/anime/${encodeURIComponent(seriesId)}/evict`,
       {
@@ -580,18 +762,98 @@ export const api = {
       `/anime/${encodeURIComponent(seriesId)}/episodes?library_type=${encodeURIComponent(libraryType)}`,
     ),
 
+  renameSeries: (
+    libraryType: import("@/types").LibraryType,
+    seriesId: string,
+    newName: string,
+  ) =>
+    request<import("@/types").RenameSeriesResponse>(
+      `/anime/${encodeURIComponent(seriesId)}/rename`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({
+          library_type: libraryType,
+          new_name: newName,
+        }),
+      },
+    ),
+
+  deleteSeries: async (
+    libraryType: import("@/types").LibraryType,
+    seriesId: string,
+  ) => {
+    const res = await fetch(
+      `${API_BASE}/anime/${encodeURIComponent(seriesId)}?library_type=${encodeURIComponent(libraryType)}`,
+      { method: "DELETE" },
+    );
+
+    if (res.ok) {
+      // Some deployments return 204 (or an empty body) for DELETE.
+      // Treat that as success instead of throwing on JSON parsing.
+      const text = await res.text();
+      if (!text.trim()) {
+        return {
+          status: "deleted",
+          series_id: seriesId,
+          library_type: libraryType,
+        } as import("@/types").DeleteSeriesResponse;
+      }
+      return JSON.parse(text) as import("@/types").DeleteSeriesResponse;
+    }
+
+    const error = await res.json().catch(() => ({ detail: "Request failed" }));
+    const detail = error?.detail;
+    if (
+      res.status === 409 &&
+      detail &&
+      typeof detail === "object" &&
+      Array.isArray(detail.referencing_projects)
+    ) {
+      throw new SeriesDeleteConflictError({
+        code:
+          typeof detail.code === "string"
+            ? detail.code
+            : "series_delete_blocked",
+        message:
+          typeof detail.message === "string"
+            ? detail.message
+            : "Cette source est encore referencee par des projets.",
+        referencing_projects:
+          detail.referencing_projects as import("@/types").SeriesDeleteReferencingProject[],
+      });
+    }
+    if (typeof detail === "string") {
+      throw new Error(detail || "Request failed");
+    }
+    if (detail && typeof detail === "object") {
+      const message =
+        ("message" in detail && typeof detail.message === "string"
+          ? detail.message
+          : null) ||
+        ("code" in detail && typeof detail.code === "string"
+          ? detail.code
+          : null);
+      throw new Error(message || "Request failed");
+    }
+    throw new Error("Request failed");
+  },
+
   // Library - Estimate purge size
-  estimatePurgeSize: (libraryType: import("@/types").LibraryType, allTypes: boolean) =>
+  estimatePurgeSize: (
+    libraryType: import("@/types").LibraryType,
+    allTypes: boolean,
+  ) =>
     request<{ estimated_bytes: number; source_count: number }>(
       `/anime/purge/estimate?library_type=${encodeURIComponent(libraryType)}&all_types=${allTypes}`,
     ),
 
   // TikTok URL duplicate check
   checkTiktokUrl: (url: string) =>
-    request<{ exists: boolean; video_id: string | null; registered_at: string | null }>(
-      "/tiktok-urls/check",
-      { method: "POST", body: JSON.stringify({ url }) },
-    ),
+    request<{
+      exists: boolean;
+      video_id: string | null;
+      registered_at: string | null;
+    }>("/tiktok-urls/check", { method: "POST", body: JSON.stringify({ url }) }),
 
   // Duration Warning
   acknowledgeDurationWarning: (projectId: string) =>
@@ -602,14 +864,10 @@ export const api = {
 
   // Gap Resolution
   getGapsConfig: (projectId: string) =>
-    request<{ full_auto_enabled: boolean }>(
-      `/projects/${projectId}/gaps/config`,
-    ),
+    request<GapsConfig>(`/projects/${projectId}/gaps/config`),
 
   getGaps: (projectId: string) =>
-    request<{ has_gaps: boolean; gaps: GapInfo[]; total_gap_duration: number }>(
-      `/projects/${projectId}/gaps`,
-    ),
+    request<GapsResponse>(`/projects/${projectId}/gaps`),
 
   getGapCandidates: (projectId: string, sceneIndex: number) =>
     request<{ scene_index: number; candidates: GapCandidate[] }>(
@@ -828,14 +1086,17 @@ export const api = {
     libraryType: import("@/types").LibraryType,
     replacements: Array<{ torrent_id: string; new_magnet_uri: string }>,
   ) =>
-    fetch(`${API_BASE}/anime/${encodeURIComponent(sourceName)}/torrents/replace`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        library_type: libraryType,
-        replacements,
-      }),
-    }),
+    fetch(
+      `${API_BASE}/anime/${encodeURIComponent(sourceName)}/torrents/replace`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          library_type: libraryType,
+          replacements,
+        }),
+      },
+    ),
 
   confirmReindex: (
     sourceName: string,

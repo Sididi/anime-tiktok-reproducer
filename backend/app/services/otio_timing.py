@@ -13,6 +13,13 @@ from typing import NamedTuple
 
 from opentimelineio.opentime import RationalTime, TimeRange
 
+from ..config import settings
+
+
+class classproperty(property):
+    def __get__(self, obj, owner=None):
+        return self.fget(owner)
+
 
 class FrameRateInfo(NamedTuple):
     """Frame rate information with proper rational representation.
@@ -116,8 +123,9 @@ class ClipTiming:
 
     # Speed information
     speed_ratio: Fraction  # source_duration / target_duration
-    effective_speed: Fraction  # capped at 0.75 minimum
+    effective_speed: Fraction  # capped at configured minimum speed
     leaves_gap: bool  # True if clip ends before next marker due to speed floor
+    enforced_timeline_end: RationalTime | None = None
 
     @property
     def source_in_seconds(self) -> float:
@@ -164,12 +172,19 @@ class ClipTiming:
     @property
     def actual_duration_seconds(self) -> float:
         """Actual clip duration after speed adjustment."""
+        if self.enforced_timeline_end is not None:
+            return max(
+                self.enforced_timeline_end.to_seconds() - self.timeline_start_seconds,
+                0.0,
+            )
         source_dur = self.source_duration.to_seconds()
         return source_dur / float(self.effective_speed)
 
     @property
     def actual_end_seconds(self) -> float:
         """Actual end position on timeline after speed adjustment."""
+        if self.enforced_timeline_end is not None:
+            return self.enforced_timeline_end.to_seconds()
         return self.timeline_start_seconds + self.actual_duration_seconds
 
     @property
@@ -199,16 +214,22 @@ class OTIOTimingCalculator:
     DEFAULT_SEQUENCE_RATE = FrameRateInfo(timebase=60, ntsc=False)
     # Default source rate: 23.976fps (common anime frame rate)
     DEFAULT_SOURCE_RATE = FrameRateInfo(timebase=24, ntsc=True)
-    # Minimum speed (75% = 0.75)
-    MIN_SPEED = Fraction(75, 100)
+    # Legacy default minimum speed; the runtime floor is read from settings.
+    DEFAULT_MIN_SPEED = Fraction(75, 100)
+
+    @classproperty
+    def MIN_SPEED(cls) -> Fraction:
+        return settings.min_playback_speed_fraction
 
     def __init__(
         self,
         sequence_rate: FrameRateInfo | None = None,
         source_rate: FrameRateInfo | None = None,
+        min_speed: Fraction | None = None,
     ):
         self.sequence_rate = sequence_rate or self.DEFAULT_SEQUENCE_RATE
         self.source_rate = source_rate or self.DEFAULT_SOURCE_RATE
+        self.min_speed = min_speed or settings.min_playback_speed_fraction
 
     def seconds_to_timeline_time(self, seconds: float) -> RationalTime:
         """Convert seconds to RationalTime at sequence rate."""
@@ -223,7 +244,7 @@ class OTIOTimingCalculator:
         source_duration_seconds: float,
         target_duration_seconds: float,
     ) -> tuple[Fraction, Fraction, bool]:
-        """Calculate speed ratio with 75% floor constraint.
+        """Calculate speed ratio with the configured minimum floor constraint.
 
         Args:
             source_duration_seconds: Duration of source clip
@@ -232,7 +253,7 @@ class OTIOTimingCalculator:
         Returns:
             Tuple of (speed_ratio, effective_speed, leaves_gap)
             - speed_ratio: raw calculation (source / target)
-            - effective_speed: capped at MIN_SPEED
+            - effective_speed: capped at the configured minimum speed
             - leaves_gap: True if speed was capped (clip won't fill target)
         """
         if target_duration_seconds <= 0:
@@ -247,8 +268,8 @@ class OTIOTimingCalculator:
 
         # Apply floor constraint
         leaves_gap = False
-        if speed_ratio < self.MIN_SPEED:
-            effective_speed = self.MIN_SPEED
+        if speed_ratio < self.min_speed:
+            effective_speed = self.min_speed
             leaves_gap = True
         else:
             effective_speed = speed_ratio

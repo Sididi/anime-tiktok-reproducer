@@ -46,6 +46,7 @@
   var CLEANUP_BACKOFF_BASE_MS = 250;
   var CLEANUP_BACKOFF_MAX_MS = 4000;
   var CLEANUP_REMAINING_PREVIEW_LIMIT = 6;
+  var MAX_LOG_ENTRIES = 200;
 
   var DEFAULT_SETTINGS = {
     client_id: "",
@@ -108,13 +109,16 @@
   var encoderJobMap = {}; // job_id -> { project_id, lease }
   var encoderPollTimer = null;
   var driveTasksFallback = null;
-  var automationControlHelperModule = null;
+  var batchRuntimeHelperModule = null;
   var runtimeStateHelperModule = null;
   var subtitleArchiveHelperModule = null;
+  var panelLogHelperModule = null;
+  var orchestrationMetricsHelperModule = null;
   var cleanupRetryTimers = {}; // project_id -> timeoutId
 
-  var automationRuntime = null;
+  var batchRuntime = null;
   var settings = null;
+  var panelLogState = null;
   var projectStates = {}; // project_id -> state
   var jobStore = {
     queue: [],
@@ -135,12 +139,25 @@
 
   function log(message, level) {
     level = level || "info";
+    if (!panelLogState) {
+      panelLogState = getPanelLogHelper().createLogState(MAX_LOG_ENTRIES);
+    }
+    var appended = getPanelLogHelper().appendLogEntry(panelLogState, {
+      level: level,
+      message: message,
+      timestamp: new Date().toLocaleTimeString(),
+    });
+    while (appended.trimmed_count > 0 && logEl.firstChild) {
+      logEl.removeChild(logEl.firstChild);
+      appended.trimmed_count -= 1;
+    }
+
     var entry = document.createElement("div");
     entry.className = "entry " + level;
 
     var ts = document.createElement("span");
     ts.className = "timestamp";
-    ts.textContent = new Date().toLocaleTimeString();
+    ts.textContent = appended.entry.timestamp;
 
     entry.appendChild(ts);
     entry.appendChild(document.createTextNode(message));
@@ -471,13 +488,11 @@
     return path.join(resolveClientDir(), fileName);
   }
 
-  function getAutomationControlHelper() {
-    if (!automationControlHelperModule) {
-      automationControlHelperModule = require(
-        getClientFilePath("automation_control.js"),
-      );
+  function getBatchRuntimeHelper() {
+    if (!batchRuntimeHelperModule) {
+      batchRuntimeHelperModule = require(getClientFilePath("batch_runtime.js"));
     }
-    return automationControlHelperModule;
+    return batchRuntimeHelperModule;
   }
 
   function getRuntimeStateHelper() {
@@ -496,31 +511,48 @@
     return subtitleArchiveHelperModule;
   }
 
-  function ensureAutomationRuntime() {
-    if (!automationRuntime) {
-      automationRuntime = getAutomationControlHelper().createAutomationRuntime();
+  function getPanelLogHelper() {
+    if (!panelLogHelperModule) {
+      panelLogHelperModule = require(getClientFilePath("panel_log.js"));
     }
-    return automationRuntime;
+    return panelLogHelperModule;
+  }
+
+  function getOrchestrationMetricsHelper() {
+    if (!orchestrationMetricsHelperModule) {
+      orchestrationMetricsHelperModule = require(
+        getClientFilePath("orchestration_metrics.js"),
+      );
+    }
+    return orchestrationMetricsHelperModule;
+  }
+
+  function ensureBatchRuntime() {
+    if (!batchRuntime) {
+      batchRuntime = getBatchRuntimeHelper().createBatchRuntime();
+    }
+    return batchRuntime;
   }
 
   function captureAutomationLease(projectId) {
-    return getAutomationControlHelper().captureLease(
-      ensureAutomationRuntime(),
-      projectId,
-    );
+    return {
+      project_id: String(projectId || "").trim(),
+    };
   }
 
   function isAutomationLeaseActive(lease) {
-    return getAutomationControlHelper().isLeaseActive(
-      ensureAutomationRuntime(),
-      lease,
-    );
+    return !!lease;
   }
 
   function isAutomationProjectActive(projectId) {
-    return getAutomationControlHelper().isProjectActive(
-      ensureAutomationRuntime(),
-      projectId,
+    var id = String(projectId || "").trim();
+    var runtime = ensureBatchRuntime();
+    if (!id || getBatchRuntimeHelper().isProjectSleeping(runtime, id)) {
+      return false;
+    }
+    return (
+      getBatchRuntimeHelper().isProjectInCurrentBatch(runtime, id) ||
+      getBatchRuntimeHelper().isProjectInExportBatch(runtime, id)
     );
   }
 
@@ -718,6 +750,30 @@
     }
   }
 
+  function buildProjectSequenceName(projectId) {
+    return getBatchRuntimeHelper().buildSequenceName(projectId);
+  }
+
+  function getBatchPhase() {
+    return String((ensureBatchRuntime().phase || "")).trim();
+  }
+
+  function listCurrentBatchProjectIds() {
+    return ensureBatchRuntime().current_batch_ids.slice(0);
+  }
+
+  function listExportBatchProjectIds() {
+    return ensureBatchRuntime().export_batch_ids.slice(0);
+  }
+
+  function listSleepingProjectIds() {
+    return ensureBatchRuntime().sleeping_queue.slice(0);
+  }
+
+  function getTrackedBatchProjectIds() {
+    return getBatchRuntimeHelper().getTrackedBatchProjectIds(ensureBatchRuntime());
+  }
+
   // --- Settings ---
 
   function loadSettings() {
@@ -860,6 +916,10 @@
 
   function runScript(jsxPath) {
     var normalized = String(jsxPath || "").replace(/\\/g, "/");
+    var runStartedAt = Date.now();
+    var subtitleExpandStartedAt = runStartedAt;
+    var subtitleExpandElapsedMs = 0;
+    var hostStartedAt = 0;
 
     if (!fs.existsSync(jsxPath)) {
       return Promise.reject(new Error("Script not found: " + jsxPath));
@@ -870,6 +930,10 @@
 
     return ensureProjectSubtitlesExpanded(path.dirname(jsxPath))
       .then(function (preparation) {
+        subtitleExpandElapsedMs = Math.max(
+          0,
+          Date.now() - subtitleExpandStartedAt,
+        );
         if (preparation && preparation.extracted) {
           log(
             "Expanded subtitle archive before JSX run (" +
@@ -878,16 +942,25 @@
             "info",
           );
         }
+        hostStartedAt = Date.now();
         return evalHost('runScript("' + escapeForEval(normalized) + '")');
       })
       .then(function (result) {
+        var hostImportElapsedMs = hostStartedAt
+          ? Math.max(0, Date.now() - hostStartedAt)
+          : 0;
         if (result && result.indexOf("ERROR:") === 0) {
           setStatus("error");
           throw new Error(result);
         }
         log("Completed: " + path.basename(jsxPath), "success");
         updateGlobalStatus();
-        return result;
+        return {
+          host_import_elapsed_ms: hostImportElapsedMs,
+          host_result: result,
+          subtitle_expand_elapsed_ms: subtitleExpandElapsedMs,
+          total_elapsed_ms: Math.max(0, Date.now() - runStartedAt),
+        };
       })
       .catch(function (err) {
         setStatus("error");
@@ -1008,10 +1081,14 @@
   }
 
   function upsertProjectState(projectId, patch) {
-    var previous = projectStates[projectId] || {
-      project_id: projectId,
+    var normalizedProjectId = String(projectId || "").trim();
+    var previous = projectStates[normalizedProjectId] || {
+      project_id: normalizedProjectId,
       created_at: nowIso(),
     };
+    var hasMetricsPatch =
+      !!patch &&
+      Object.prototype.hasOwnProperty.call(patch, "orchestration_metrics");
 
     var merged = {};
     Object.keys(previous).forEach(function (key) {
@@ -1020,10 +1097,29 @@
     Object.keys(patch || {}).forEach(function (key) {
       merged[key] = patch[key];
     });
+    if (hasMetricsPatch) {
+      merged.orchestration_metrics = getOrchestrationMetricsHelper().mergeMetrics(
+        previous.orchestration_metrics,
+        patch.orchestration_metrics,
+      );
+    } else if (previous.orchestration_metrics) {
+      merged.orchestration_metrics = getOrchestrationMetricsHelper().normalizeMetrics(
+        previous.orchestration_metrics,
+      );
+    }
 
+    merged.project_id = normalizedProjectId;
+    merged.sequence_name =
+      String(merged.sequence_name || "").trim() ||
+      buildProjectSequenceName(normalizedProjectId);
+    merged.batch_phase = getBatchPhase();
+    merged.is_sleeping = getBatchRuntimeHelper().isProjectSleeping(
+      ensureBatchRuntime(),
+      normalizedProjectId,
+    );
     merged.updated_at = nowIso();
-    projectStates[projectId] = merged;
-    writeJsonAtomic(projectStatePath(projectId), merged);
+    projectStates[normalizedProjectId] = merged;
+    writeJsonAtomic(projectStatePath(normalizedProjectId), merged);
     renderProjectSelect();
     renderProjectStates();
     return merged;
@@ -1168,44 +1264,7 @@
   }
 
   function maybeNotifyProjectCompletion(state) {
-    if (!state || !state.project_id) {
-      return state;
-    }
-
-    var status = String(state.status || "");
-    if (status !== "uploaded" && status !== "uploaded_cleaned") {
-      return state;
-    }
-    if (state.completion_notified_status === status) {
-      return state;
-    }
-
-    var message;
-    if (status === "uploaded_cleaned") {
-      message =
-        "Tiktok Reproducer finished project " +
-        state.project_id +
-        ": generation, upload, and cleanup are complete.";
-    } else {
-      message =
-        "Tiktok Reproducer finished project " +
-        state.project_id +
-        ": generation and upload are complete.";
-    }
-
-    try {
-      window.alert(message);
-    } catch (e) {
-      log(
-        "Completion alert failed for " + state.project_id + ": " + e.message,
-        "warn",
-      );
-    }
-
-    return upsertProjectState(state.project_id, {
-      completion_notified_status: status,
-      completion_notified_at: nowIso(),
-    });
+    return state || null;
   }
 
   function scheduleCleanupRetry(projectId, delayMs) {
@@ -1246,12 +1305,19 @@
     }
 
     var retryCount = Number(state.cleanup_retry_count || 0);
-    if (retryCount >= CLEANUP_RETRYABLE_MAX_PASSES) {
+    if (
+      retryCount >= CLEANUP_RETRYABLE_MAX_PASSES &&
+      source !== "manual"
+    ) {
       clearCleanupRetry(id);
       return Promise.resolve(false);
     }
 
     disarmExportMonitor(id);
+    var isBatchProject = getBatchRuntimeHelper().isProjectInExportBatch(
+      ensureBatchRuntime(),
+      id,
+    );
 
     return cleanupImportedProjectInHost(id, state.local_root, true)
       .then(function (hostSummary) {
@@ -1299,6 +1365,9 @@
             cleanup_next_retry_at: null,
           });
           log("Premiere cleanup failed for " + id + ": " + hostDetail, "warn");
+          if (isBatchProject) {
+            handleBatchFailure(id, "Premiere cleanup failed: " + hostDetail);
+          }
           return false;
         }
         return removePathSafe(state.local_root, {
@@ -1321,6 +1390,9 @@
             hostErr.message,
           "warn",
         );
+        if (isBatchProject) {
+          handleBatchFailure(id, "Premiere cleanup crashed: " + hostErr.message);
+        }
         return false;
       })
       .then(function (cleanupResult) {
@@ -1342,13 +1414,15 @@
             "success",
           );
           maybeNotifyProjectCompletion(cleanedState);
+          maybeFinalizeBatchCleanup();
           return true;
         }
 
         var detail = buildCleanupErrorDetail(cleanupResult);
         var nextRetryCount = retryCount + 1;
+        var retryableLock = !!cleanupResult.retryable_lock;
         var retryable =
-          !!cleanupResult.retryable_lock &&
+          retryableLock &&
           nextRetryCount < CLEANUP_RETRYABLE_MAX_PASSES;
         if (retryable) {
           var nextRetryAt = new Date(
@@ -1381,11 +1455,14 @@
         upsertProjectState(id, {
           status: "cleanup_failed",
           cleanup_error: detail,
-          cleanup_retryable: !!cleanupResult.retryable_lock,
+          cleanup_retryable: retryableLock,
           cleanup_retry_count: nextRetryCount,
           cleanup_next_retry_at: null,
         });
         log("Cleanup failed for " + id + ": " + detail, "warn");
+        if (!retryableLock && isBatchProject) {
+          handleBatchFailure(id, "Cleanup failed: " + detail);
+        }
         return false;
       })
       .catch(function (err) {
@@ -1396,6 +1473,9 @@
           cleanup_retryable: false,
           cleanup_next_retry_at: null,
         });
+        if (isBatchProject) {
+          handleBatchFailure(id, "Cleanup crashed: " + err.message);
+        }
         log("Cleanup retry crashed for " + id + ": " + err.message, "error");
         return false;
       });
@@ -1409,6 +1489,28 @@
 
   function persistJobs() {
     return;
+  }
+
+  function setBatchPhase(nextPhase) {
+    ensureBatchRuntime().phase = String(nextPhase || "").trim();
+  }
+
+  function syncProjectBatchMetadata(projectIds) {
+    var seen = {};
+    (projectIds || []).forEach(function (projectId) {
+      var id = String(projectId || "").trim();
+      if (!id || seen[id] || !projectStates[id]) {
+        return;
+      }
+      seen[id] = true;
+      upsertProjectState(id, {});
+    });
+  }
+
+  function syncTrackedBatchProjectMetadata() {
+    syncProjectBatchMetadata(
+      getTrackedBatchProjectIds().concat(listSleepingProjectIds()),
+    );
   }
 
   function generateJobId(type) {
@@ -1487,6 +1589,17 @@
     jobStore.queue.forEach(function (job) {
       rows.push({ job: job, active: false });
     });
+    listSleepingProjectIds().forEach(function (projectId) {
+      rows.push({
+        job: {
+          type: "sleeping_queue",
+          payload: {
+            project_id: projectId,
+          },
+        },
+        active: false,
+      });
+    });
 
     if (rows.length === 0) {
       var empty = document.createElement("li");
@@ -1547,6 +1660,23 @@
     return removed;
   }
 
+  function dropEncoderJobsForProject(projectId) {
+    var normalizedProjectId = String(projectId || "").trim();
+    var removed = 0;
+    Object.keys(encoderJobMap).forEach(function (jobId) {
+      var mapped = encoderJobMap[jobId];
+      var mappedProjectId = String(
+        mapped && mapped.project_id ? mapped.project_id : mapped || "",
+      ).trim();
+      if (!mappedProjectId || mappedProjectId !== normalizedProjectId) {
+        return;
+      }
+      delete encoderJobMap[jobId];
+      removed += 1;
+    });
+    return removed;
+  }
+
   function deactivateAutomationForOtherProjects(activeProjectId) {
     var disarmedMonitors = 0;
     var clearedRetries = 0;
@@ -1578,69 +1708,7 @@
     if (!nextProjectId) {
       throw new Error("Missing project id for precedence switch");
     }
-
-    var activation = getAutomationControlHelper().activateProjectOwnership(
-      ensureAutomationRuntime(),
-      nextProjectId,
-    );
-
-    if (!activation.changed) {
-      return activation.lease;
-    }
-
-    var activeController = jobStore.active && jobStore.active.controller;
-    var activeProjectId = String(
-      (jobStore.active &&
-        jobStore.active.payload &&
-        jobStore.active.payload.project_id) ||
-        "",
-    ).trim();
-    var canceledActive = false;
-    if (activeProjectId && activeProjectId !== nextProjectId) {
-      canceledActive = cancelJobController(
-        activeController,
-        "superseded by " + nextProjectId,
-      );
-      jobStore.active = null;
-    }
-
-    var removedQueued = dropQueuedJobsForOtherProjects(nextProjectId);
-    var deactivated = deactivateAutomationForOtherProjects(nextProjectId);
-    var removedEncoderJobs = dropEncoderJobsForOtherProjects(nextProjectId);
-
-    renderQueue();
-    updateGlobalStatus();
-    processJobQueue();
-
-    var details = [];
-    if (activation.previous_project_id) {
-      details.push("previous=" + activation.previous_project_id);
-    }
-    if (canceledActive) {
-      details.push("active_job=canceled");
-    }
-    if (removedQueued > 0) {
-      details.push("queued_jobs_removed=" + removedQueued);
-    }
-    if (deactivated.disarmed_monitors > 0) {
-      details.push("monitors_disarmed=" + deactivated.disarmed_monitors);
-    }
-    if (deactivated.cleared_retries > 0) {
-      details.push("cleanup_retries_cleared=" + deactivated.cleared_retries);
-    }
-    if (removedEncoderJobs > 0) {
-      details.push("encoder_jobs_cleared=" + removedEncoderJobs);
-    }
-
-    log(
-      "Project " +
-        nextProjectId +
-        " took hard precedence" +
-        (details.length > 0 ? " (" + details.join(", ") + ")" : ""),
-      "info",
-    );
-
-    return activation.lease;
+    return captureAutomationLease(nextProjectId);
   }
 
   function processJobQueue() {
@@ -1688,6 +1756,9 @@
         delete job.controller;
         persistJobs();
         renderQueue();
+        if (job.type === "upload_output") {
+          maybeAdvanceBatchAfterUpload();
+        }
         processJobQueue();
       });
   }
@@ -1944,14 +2015,9 @@
               " files)",
             "info",
           );
-        } else if (progress.stage === "download_file_complete") {
+        } else if (progress.stage === "download_progress_summary") {
           log(
-            "Downloaded file " +
-              progress.file_index +
-              "/" +
-              progress.file_count +
-              " for " +
-              projectId,
+            String(progress.message || "Download progress for " + projectId),
             "info",
           );
         } else if (progress.stage === "subtitle_archive_extract_start") {
@@ -2013,39 +2079,46 @@
           download_file_count: result.download_file_count || null,
           download_total_bytes: result.download_total_bytes || null,
           last_error: null,
+          orchestration_metrics: result.orchestration_metrics || {},
         });
 
-        return runScript(importPath).then(function () {
+        return runScript(importPath).then(function (runOutcome) {
           ensureAutomationLeaseActive(lease, "download_import_after_jsx");
-          var enableAudioNoMusic = !!(
-            exportAudioNoMusicCheckbox && exportAudioNoMusicCheckbox.checked
-          );
+          var readyAtIso = nowIso();
           var audioOutputPath = path.join(
             path.dirname(String(result.output_path || "")),
             AUDIO_NO_MUSIC_OUTPUT_FILENAME,
           );
           var expectedOutputs = normalizeOutputPathList(
-            enableAudioNoMusic
-              ? [
-                  String(result.output_path || ""),
-                  String(audioOutputPath || ""),
-                ]
-              : [String(result.output_path || "")],
+            [
+              String(result.output_path || ""),
+              String(audioOutputPath || ""),
+            ],
           );
+          var orchestrationMetrics =
+            getOrchestrationMetricsHelper().finalizeReadyMetrics(
+              (
+                (getProjectState(projectId) || {}).orchestration_metrics ||
+                result.orchestration_metrics
+              ),
+              readyAtIso,
+              runOutcome && runOutcome.host_import_elapsed_ms,
+            );
           var nextState = upsertProjectState(projectId, {
             status: "ready_for_export",
-            imported_at: nowIso(),
+            imported_at: readyAtIso,
             upload_pending: false,
-            pending_cleanup_choice: !!deleteAfterUploadCheckbox.checked,
-            audio_export_enabled: enableAudioNoMusic,
-            audio_output_path: enableAudioNoMusic ? audioOutputPath : "",
+            pending_cleanup_choice: false,
+            audio_export_enabled: true,
+            audio_output_path: audioOutputPath,
             expected_outputs: expectedOutputs,
             uploaded_outputs: {},
             upload_results_by_output: {},
+            orchestration_metrics: orchestrationMetrics,
           });
           ensureAutomationLeaseActive(lease, "download_import_ready");
-          armExportMonitor(nextState.project_id);
           projectSelect.value = projectId;
+          return nextState;
         });
       })
       .catch(function (err) {
@@ -2114,7 +2187,7 @@
     upsertProjectState(projectId, {
       status: "uploading",
       upload_pending: false,
-      pending_cleanup_choice: !!cleanupAfterUpload,
+      pending_cleanup_choice: false,
       upload_reason: reason,
       output_path: selectedOutputPath,
       expected_outputs: expectedOutputs,
@@ -2236,126 +2309,9 @@
           return null;
         }
 
-        if (cleanupAfterUpload) {
-          ensureAutomationLeaseActive(lease, "upload_output_cleanup_start");
-          disarmExportMonitor(projectId);
-          clearCleanupRetry(projectId);
-          return cleanupImportedProjectInHost(
-            projectId,
-            newState.local_root,
-            false,
-          )
-            .then(function (hostSummary) {
-              ensureAutomationLeaseActive(lease, "upload_output_host_cleanup");
-              upsertProjectState(projectId, {
-                host_cleanup_result: hostSummary || null,
-                host_cleanup_error: null,
-              });
-              if (hostSummary && hostSummary.ok === false) {
-                var hostDetail = buildHostCleanupErrorDetail(hostSummary);
-                upsertProjectState(projectId, {
-                  status: "cleanup_pending",
-                  cleanup_error: hostDetail,
-                  cleanup_retryable: true,
-                  cleanup_retry_count: 1,
-                  cleanup_next_retry_at: new Date(
-                    Date.now() + CLEANUP_RETRY_DELAY_MS,
-                  ).toISOString(),
-                });
-                log(
-                  "Upload succeeded but Premiere cleanup is pending for " +
-                    projectId +
-                    ". Retrying automatically.",
-                  "warn",
-                );
-                scheduleCleanupRetry(projectId, CLEANUP_RETRY_DELAY_MS);
-                return null;
-              }
-                return removePathSafe(newState.local_root, {
-                  maxAttempts: CLEANUP_IMMEDIATE_MAX_ATTEMPTS,
-                });
-              })
-            .catch(function (hostErr) {
-              ensureAutomationLeaseActive(
-                lease,
-                "upload_output_host_cleanup_error",
-              );
-              upsertProjectState(projectId, {
-                host_cleanup_error: hostErr.message,
-                status: "cleanup_failed",
-                cleanup_error: hostErr.message,
-                cleanup_retryable: false,
-                cleanup_retry_count: 1,
-                cleanup_next_retry_at: null,
-              });
-              log(
-                "Premiere cleanup warning for " +
-                  projectId +
-                  ": " +
-                  hostErr.message,
-                "warn",
-              );
-              return null;
-            })
-            .then(function (cleanupResult) {
-              ensureAutomationLeaseActive(lease, "upload_output_cleanup_finish");
-              if (!cleanupResult) {
-                return;
-              }
-              if (cleanupResult.ok) {
-                var cleanedState = upsertProjectState(projectId, {
-                  status: "uploaded_cleaned",
-                  cleanup_deleted: true,
-                  cleanup_error: null,
-                  cleanup_retryable: false,
-                  cleanup_retry_count: 0,
-                  cleanup_next_retry_at: null,
-                });
-                log("Local folder removed for " + projectId, "info");
-                maybeNotifyProjectCompletion(cleanedState);
-                return;
-              }
-
-              var detail = buildCleanupErrorDetail(cleanupResult);
-              if (cleanupResult.retryable_lock) {
-                upsertProjectState(projectId, {
-                  status: "cleanup_pending",
-                  cleanup_error: detail,
-                  cleanup_retryable: true,
-                  cleanup_retry_count: 1,
-                  cleanup_next_retry_at: new Date(
-                    Date.now() + CLEANUP_RETRY_DELAY_MS,
-                  ).toISOString(),
-                });
-                log(
-                  "Upload succeeded but cleanup is pending for " +
-                    projectId +
-                    " (locked by another process). Retrying automatically.",
-                  "warn",
-                );
-                scheduleCleanupRetry(projectId, CLEANUP_RETRY_DELAY_MS);
-                return;
-              }
-
-              upsertProjectState(projectId, {
-                status: "cleanup_failed",
-                cleanup_error: detail,
-                cleanup_retryable: false,
-                cleanup_retry_count: Number(cleanupResult.attempts || 1),
-                cleanup_next_retry_at: null,
-              });
-              log(
-                "Upload succeeded but cleanup failed for " +
-                  projectId +
-                  ": " +
-                  detail,
-                "warn",
-              );
-            });
-        }
         ensureAutomationLeaseActive(lease, "upload_output_post_complete");
-        armExportMonitor(projectId);
-        maybeNotifyProjectCompletion(newState);
+        disarmExportMonitor(projectId);
+        maybeAdvanceBatchAfterUpload();
         return null;
       })
       .catch(function (err) {
@@ -2373,28 +2329,34 @@
           upload_pending: false,
           last_error: err.message,
         });
+        handleBatchFailure(projectId, "Upload failed: " + err.message);
         throw err;
       });
   }
 
-  function queueDownloadImport(projectId, source) {
+  function queueDownloadImport(projectId, source, options) {
     if (!validateProjectId(projectId)) {
       throw new Error("Invalid project id: " + projectId);
     }
+    var queueOptions = options || {};
 
-    takeHardPrecedence(projectId, source || "manual");
-    if (isJobQueued("download_import", projectId)) {
-      log("Download/import already queued for " + projectId, "warn");
+    var id = String(projectId || "").trim();
+    var runtime = ensureBatchRuntime();
+    var acceptance = getBatchRuntimeHelper().acceptProject(runtime, id);
+    if (!acceptance.accepted) {
+      log("Duplicate project ignored for this Premiere session: " + id, "warn");
       return false;
     }
 
-    enqueueJob("download_import", {
-      project_id: projectId,
-      source: source || "manual",
-    });
+    if (!acceptance.is_sleeping) {
+      if (isJobQueued("download_import", id)) {
+        log("Download/import already queued for " + id, "warn");
+        return false;
+      }
+    }
 
-    upsertProjectState(projectId, {
-      status: "queued_download",
+    var nextPatch = {
+      status: acceptance.is_sleeping ? "sleeping_download" : "queued_download",
       enqueue_source: source || "manual",
       upload_pending: false,
       cleanup_deleted: false,
@@ -2406,9 +2368,26 @@
       cleanup_next_retry_at: null,
       completion_notified_status: null,
       completion_notified_at: null,
-    });
+      batch_queue_state: acceptance.is_sleeping ? "sleeping" : "active",
+    };
+    if (source === "http") {
+      nextPatch.orchestration_metrics =
+        getOrchestrationMetricsHelper().createInitialMetrics(
+          queueOptions.httpReceivedAt || nowIso(),
+        );
+    }
+    upsertProjectState(id, nextPatch);
 
-    projectSelect.value = projectId;
+    if (!acceptance.is_sleeping) {
+      enqueueJob("download_import", {
+        project_id: id,
+        source: source || "manual",
+      });
+    }
+
+    projectSelect.value = id;
+    syncTrackedBatchProjectMetadata();
+    renderQueue();
 
     return true;
   }
@@ -2438,18 +2417,17 @@
       return false;
     }
 
-    var cleanupChoice = !!deleteAfterUploadCheckbox.checked;
     enqueueJob("upload_output", {
       project_id: projectId,
       output_path: selectedOutputPath,
-      cleanup_after_upload: cleanupChoice,
+      cleanup_after_upload: false,
       reason: reason || "watch",
     });
 
     upsertProjectState(projectId, {
       upload_pending: true,
       output_path: selectedOutputPath,
-      pending_cleanup_choice: cleanupChoice,
+      pending_cleanup_choice: false,
       upload_reason: reason || "watch",
     });
 
@@ -2808,6 +2786,15 @@
       li.appendChild(lineTop);
 
       var details = [];
+      if (state.batch_phase) {
+        details.push("Batch: " + state.batch_phase);
+      }
+      if (state.is_sleeping) {
+        details.push("Sleeping: yes");
+      }
+      if (state.sequence_name) {
+        details.push("Sequence: " + state.sequence_name);
+      }
       if (state.drive_folder_id) {
         details.push("Drive: " + state.drive_folder_id);
       }
@@ -2864,6 +2851,295 @@
     resetProjectState(projectId);
   }
 
+  function hasPendingUploadJobs() {
+    if (jobStore.active && String(jobStore.active.type || "") === "upload_output") {
+      return true;
+    }
+    return jobStore.queue.some(function (job) {
+      return job && String(job.type || "") === "upload_output";
+    });
+  }
+
+  function getIncompleteBatchUploadProjectIds() {
+    return listExportBatchProjectIds().filter(function (projectId) {
+      var state = getProjectState(projectId);
+      return !state || !hasAllExpectedUploads(state);
+    });
+  }
+
+  function handleBatchFailure(projectId, detail) {
+    var phases = getBatchRuntimeHelper().PHASES;
+    var phase = getBatchPhase();
+    if (
+      phase !== phases.exporting &&
+      phase !== phases.cleaning &&
+      phase !== phases.blocked_error
+    ) {
+      return;
+    }
+
+    getBatchRuntimeHelper().markBatchBlocked(ensureBatchRuntime());
+    syncTrackedBatchProjectMetadata();
+    if (detail) {
+      log(
+        "Batch blocked" +
+          (projectId ? " for " + projectId : "") +
+          ": " +
+          detail,
+        "error",
+      );
+    }
+    updateGlobalStatus();
+  }
+
+  function cleanupBatchLocalRoots(batchIds, hostSummary) {
+    var results = [];
+    var chain = Promise.resolve();
+
+    batchIds.forEach(function (projectId) {
+      chain = chain.then(function () {
+        var state = getProjectState(projectId);
+        if (!state || !state.local_root) {
+          results.push({
+            project_id: projectId,
+            cleanup_result: {
+              ok: false,
+              error: new Error("Missing local project folder"),
+            },
+          });
+          return null;
+        }
+
+        return removePathSafe(state.local_root, {
+          maxAttempts: CLEANUP_IMMEDIATE_MAX_ATTEMPTS,
+        }).then(function (cleanupResult) {
+          results.push({
+            project_id: projectId,
+            host_summary: hostSummary || null,
+            cleanup_result: cleanupResult,
+          });
+        });
+      });
+    });
+
+    return chain.then(function () {
+      return results;
+    });
+  }
+
+  function resumeSleepingQueueAfterFinalAck() {
+    var promoted = getBatchRuntimeHelper().acknowledgeFinalPopup(
+      ensureBatchRuntime(),
+    );
+    promoted.forEach(function (projectId) {
+      if (isJobQueued("download_import", projectId)) {
+        return;
+      }
+      upsertProjectState(projectId, {
+        status: "queued_download",
+        enqueue_source: "sleeping_queue",
+        batch_queue_state: "active",
+      });
+      enqueueJob("download_import", {
+        project_id: projectId,
+        source: "sleeping_queue",
+      });
+    });
+    syncTrackedBatchProjectMetadata();
+    renderQueue();
+    updateGlobalStatus();
+    processJobQueue();
+  }
+
+  function showFinalBatchCompletionAlert(batchIds) {
+    var projectCount = Number((batchIds && batchIds.length) || 0);
+    getBatchRuntimeHelper().markAwaitingFinalAck(ensureBatchRuntime());
+    syncTrackedBatchProjectMetadata();
+    try {
+      window.alert(
+        "Tiktok Reproducer finished batch generation, export, upload, and cleanup for " +
+          projectCount +
+          " project(s).",
+      );
+    } catch (e) {
+      log("Final batch alert failed: " + e.message, "warn");
+    }
+    resumeSleepingQueueAfterFinalAck();
+  }
+
+  function runBatchCleanupPhase() {
+    var phases = getBatchRuntimeHelper().PHASES;
+    var batchIds = listExportBatchProjectIds();
+    if (
+      batchIds.length === 0 ||
+      getBatchPhase() === phases.cleaning ||
+      getBatchPhase() === phases.awaiting_final_ack
+    ) {
+      return;
+    }
+
+    getBatchRuntimeHelper().beginCleaningPhase(ensureBatchRuntime());
+    batchIds.forEach(function (projectId) {
+      disarmExportMonitor(projectId);
+      clearCleanupRetry(projectId);
+      upsertProjectState(projectId, {
+        status: "cleaning",
+        host_cleanup_error: null,
+        host_cleanup_result: null,
+        cleanup_error: null,
+        cleanup_retryable: false,
+        cleanup_retry_count: 0,
+        cleanup_next_retry_at: null,
+      });
+    });
+    log(
+      "All batch uploads are complete. Starting global cleanup for " +
+        batchIds.length +
+        " project(s).",
+      "info",
+    );
+
+    cleanupImportedProjectInHost("batch", "", false)
+      .then(function (hostSummary) {
+        batchIds.forEach(function (projectId) {
+          upsertProjectState(projectId, {
+            host_cleanup_result: hostSummary || null,
+            host_cleanup_error: null,
+          });
+        });
+        if (hostSummary && hostSummary.ok === false) {
+          var hostDetail = buildHostCleanupErrorDetail(hostSummary);
+          batchIds.forEach(function (projectId) {
+            upsertProjectState(projectId, {
+              status: "cleanup_failed",
+              cleanup_error: hostDetail,
+              host_cleanup_result: hostSummary || null,
+            });
+          });
+          handleBatchFailure("batch", hostDetail);
+          return null;
+        }
+        return cleanupBatchLocalRoots(batchIds, hostSummary);
+      })
+      .then(function (results) {
+        if (!results) {
+          return;
+        }
+
+        var failures = [];
+        var cleanupSummary =
+          getBatchRuntimeHelper().partitionCleanupResults(results);
+
+        cleanupSummary.completed.forEach(function (entry) {
+          upsertProjectState(entry.project_id, {
+            status: "uploaded_cleaned",
+            cleanup_deleted: true,
+            cleanup_error: null,
+            cleanup_retryable: false,
+            cleanup_retry_count: 0,
+            cleanup_next_retry_at: null,
+          });
+        });
+
+        cleanupSummary.retryable.forEach(function (entry) {
+          var detail = buildCleanupErrorDetail(entry.cleanup_result || null);
+          var nextRetryAt = new Date(
+            Date.now() + CLEANUP_RETRY_DELAY_MS,
+          ).toISOString();
+          upsertProjectState(entry.project_id, {
+            status: "cleanup_pending",
+            cleanup_error: detail,
+            cleanup_retryable: true,
+            cleanup_retry_count: 1,
+            cleanup_next_retry_at: nextRetryAt,
+          });
+          log(
+            "Cleanup still locked for " +
+              entry.project_id +
+              " (attempt 1/" +
+              CLEANUP_RETRYABLE_MAX_PASSES +
+              "), retrying in " +
+              Math.round(CLEANUP_RETRY_DELAY_MS / 1000) +
+              "s",
+            "warn",
+          );
+          scheduleCleanupRetry(entry.project_id, CLEANUP_RETRY_DELAY_MS);
+        });
+
+        cleanupSummary.terminal.forEach(function (entry) {
+          var cleanupResult = entry.cleanup_result || null;
+          var detail = buildCleanupErrorDetail(cleanupResult);
+          failures.push({
+            project_id: entry.project_id,
+            detail: detail,
+          });
+          upsertProjectState(entry.project_id, {
+            status: "cleanup_failed",
+            cleanup_error: detail,
+            cleanup_retryable: false,
+            cleanup_retry_count: Number(
+              (cleanupResult && cleanupResult.attempts) || 1,
+            ),
+            cleanup_next_retry_at: null,
+          });
+        });
+
+        if (failures.length > 0) {
+          handleBatchFailure(
+            failures[0].project_id,
+            "Cleanup failed: " + failures[0].detail,
+          );
+        }
+        maybeFinalizeBatchCleanup();
+      })
+      .catch(function (err) {
+        batchIds.forEach(function (projectId) {
+          upsertProjectState(projectId, {
+            status: "cleanup_failed",
+            cleanup_error: err.message,
+            host_cleanup_error: err.message,
+            cleanup_retryable: false,
+            cleanup_next_retry_at: null,
+          });
+        });
+        handleBatchFailure("batch", "Cleanup crashed: " + err.message);
+      });
+  }
+
+  function maybeAdvanceBatchAfterUpload() {
+    if (getBatchPhase() !== getBatchRuntimeHelper().PHASES.exporting) {
+      return;
+    }
+    if (listExportBatchProjectIds().length === 0) {
+      return;
+    }
+    if (hasPendingUploadJobs()) {
+      return;
+    }
+    if (getIncompleteBatchUploadProjectIds().length > 0) {
+      return;
+    }
+    runBatchCleanupPhase();
+  }
+
+  function maybeFinalizeBatchCleanup() {
+    if (
+      !getBatchRuntimeHelper().isBatchCleanupComplete(
+        ensureBatchRuntime(),
+        projectStates,
+      )
+    ) {
+      return;
+    }
+
+    var batchIds = listExportBatchProjectIds();
+    if (batchIds.length === 0) {
+      return;
+    }
+
+    showFinalBatchCompletionAlert(batchIds);
+  }
+
   // --- Local HTTP server ---
 
   function respondJson(res, statusCode, payload) {
@@ -2886,8 +3162,9 @@
     res.end(html);
   }
 
-  function buildTriggerAcceptedHtml(projectId, queued) {
+  function buildTriggerAcceptedHtml(projectId, queued, reason) {
     var queuedText = queued ? "true" : "false";
+    var reasonText = String(reason || "").trim();
     return [
       "<!doctype html><html><head><meta charset='utf-8'><title>Tiktok Reproducer Trigger</title></head><body>",
       "<h3>Job recu</h3>",
@@ -2896,6 +3173,9 @@
       "</code></p>",
       "<p>Queued: ",
       queuedText,
+      "</p>",
+      "<p>Reason: ",
+      reasonText || "accepted",
       "</p>",
       "<p>Cette page va se fermer automatiquement.</p>",
       "<script>",
@@ -2927,6 +3207,9 @@
       server_error: localServerError,
       port: settings.port,
       drive_configured: isDriveConfigured(),
+      batch_phase: getBatchPhase(),
+      active_batch_projects: getTrackedBatchProjectIds().length,
+      sleeping_projects: listSleepingProjectIds().length,
       active_job: jobStore.active ? jobStore.active.type : null,
       queued_jobs: jobStore.queue.length,
     };
@@ -2944,9 +3227,20 @@
     var triggerMatch = pathname.match(/^\/p\/([A-Za-z0-9_-]+)$/);
     if (triggerMatch) {
       var projectId = triggerMatch[1];
+      var httpReceivedAt = nowIso();
       try {
-        var queued = queueDownloadImport(projectId, "http");
-        respondHtml(res, 202, buildTriggerAcceptedHtml(projectId, queued));
+        var queued = queueDownloadImport(projectId, "http", {
+          httpReceivedAt: httpReceivedAt,
+        });
+        respondHtml(
+          res,
+          202,
+          buildTriggerAcceptedHtml(
+            projectId,
+            queued,
+            queued ? "accepted" : "already_tracked",
+          ),
+        );
         log("HTTP trigger received for project " + projectId, "info");
       } catch (err) {
         respondHtml(
@@ -3284,19 +3578,40 @@
         "Encoder error for " + projectId + " (job " + jobId + "): " + errorText,
         "error",
       );
+      handleBatchFailure(projectId, "Encoder error: " + errorText);
     }
   }
 
   function startManagedExportForSelectedProject() {
-    var projectId = String(projectSelect.value || "").trim();
-    if (!projectId) {
-      log("No project selected for managed export", "warn");
+    var runtime = ensureBatchRuntime();
+    var exportReadiness = getBatchRuntimeHelper().canStartExport(
+      runtime,
+      projectStates,
+      jobStore,
+    );
+    if (!exportReadiness.current_batch_ids.length) {
+      log("No batch is ready for Export via CEP", "warn");
       return;
     }
-
-    var state = getProjectState(projectId);
-    if (!state || !state.output_path) {
-      log("Selected project has no output path yet", "error");
+    if (!exportReadiness.ok) {
+      var blockerSummary = exportReadiness.blockers
+        .map(function (blocker) {
+          if (blocker.type === "project_status") {
+            return blocker.project_id + "=" + blocker.status;
+          }
+          if (blocker.type === "active_job") {
+            return "active_job=" + blocker.job_type;
+          }
+          if (blocker.type === "queued_job") {
+            return "queued_job=" + blocker.job_type;
+          }
+          return blocker.type || "unknown";
+        })
+        .join(", ");
+      log(
+        "Export via CEP blocked until intake is fully ready: " + blockerSummary,
+        "warn",
+      );
       return;
     }
 
@@ -3313,15 +3628,8 @@
       return;
     }
 
-    var enableAudioNoMusic = !!(
-      exportAudioNoMusicCheckbox && exportAudioNoMusicCheckbox.checked
-    );
-    var audioOutputPath = path.join(
-      path.dirname(String(state.output_path)),
-      AUDIO_NO_MUSIC_OUTPUT_FILENAME,
-    );
     var audioPresetPath = String(settings.audio_preset_epr_path || "").trim();
-    if (enableAudioNoMusic && !audioPresetPath) {
+    if (!audioPresetPath) {
       log("Missing audio preset path for no-music export", "error");
       setSettingsStatus(
         "Audio preset .epr path is required for audio export",
@@ -3329,116 +3637,164 @@
       );
       return;
     }
-    if (enableAudioNoMusic && !fs.existsSync(audioPresetPath)) {
+    if (!fs.existsSync(audioPresetPath)) {
       log("Audio preset file not found: " + audioPresetPath, "error");
       setSettingsStatus("Audio preset path is invalid", true);
       return;
     }
 
-    var expectedOutputs = [String(state.output_path)];
-    if (enableAudioNoMusic) {
-      expectedOutputs.push(String(audioOutputPath));
-    }
-    expectedOutputs = normalizeOutputPathList(expectedOutputs);
-
-    var hostCall = [
-      "startManagedExport(",
-      '"',
-      escapeForEval(projectId),
-      '",',
-      '"',
-      escapeForEval(String(state.output_path).replace(/\\/g, "/")),
-      '",',
-      '"',
-      escapeForEval(String(presetPath).replace(/\\/g, "/")),
-      '",',
-      enableAudioNoMusic ? "1," : "0,",
-      '"',
-      escapeForEval(String(audioOutputPath).replace(/\\/g, "/")),
-      '",',
-      '"',
-      escapeForEval(String(audioPresetPath).replace(/\\/g, "/")),
-      '"',
-      ")",
-    ].join("");
-
-    var lease = takeHardPrecedence(projectId, "managed_export");
+    var batchIds = getBatchRuntimeHelper().beginExportPhase(runtime);
+    syncTrackedBatchProjectMetadata();
     setStatus("running");
+    log(
+      "Starting batch export for " + batchIds.length + " project(s)",
+      "info",
+    );
 
-    evalHost(hostCall)
-      .then(function (result) {
-        ensureAutomationLeaseActive(lease, "managed_export_result");
-        if (result && result.indexOf("ERROR:") === 0) {
-          throw new Error(result);
+    var sequence = Promise.resolve();
+    batchIds.forEach(function (projectId) {
+      sequence = sequence.then(function () {
+        var state = getProjectState(projectId);
+        if (!state || !state.output_path) {
+          throw new Error("Project is missing output path: " + projectId);
         }
 
-        var jobId = String(result || "").trim();
-        var videoJobId = "";
-        var audioJobId = "";
-
-        if (jobId && jobId.charAt(0) === "{") {
-          try {
-            var parsed = JSON.parse(jobId);
-            videoJobId = String(parsed.video_job_id || "").trim();
-            audioJobId = String(parsed.audio_job_id || "").trim();
-          } catch (parseErr) {
-            // fallback to legacy payload below
-          }
+        if (hasAllExpectedUploads(state)) {
+          upsertProjectState(projectId, {
+            status: "uploaded",
+            pending_cleanup_choice: false,
+            audio_export_enabled: true,
+            last_error: null,
+          });
+          log(
+            "Skipping export for already uploaded project " + projectId,
+            "info",
+          );
+          return null;
         }
 
-        if (!videoJobId && !audioJobId) {
-          videoJobId = jobId;
-        }
-
-        if (!videoJobId) {
-          throw new Error("Host did not return an encoder job ID");
-        }
-
-        encoderJobMap[videoJobId] = {
-          project_id: projectId,
-          lease: lease,
-        };
-        if (audioJobId) {
-          encoderJobMap[audioJobId] = {
-            project_id: projectId,
-            lease: lease,
-          };
-        }
-        upsertProjectState(projectId, {
-          status: "exporting",
-          export_job_id: videoJobId,
-          video_export_job_id: videoJobId,
-          audio_export_job_id: audioJobId || null,
-          encoder_progress: 0,
-          pending_cleanup_choice: !!deleteAfterUploadCheckbox.checked,
-          audio_export_enabled: enableAudioNoMusic,
-          audio_output_path: enableAudioNoMusic ? audioOutputPath : "",
-          expected_outputs: expectedOutputs,
-          uploaded_outputs: {},
-          upload_results_by_output: {},
-          last_error: null,
-        });
-        log(
-          "Managed export started for " +
-            projectId +
-            " (video job " +
-            videoJobId +
-            (audioJobId ? ", audio job " + audioJobId : "") +
-            ")",
-          "info",
+        var audioOutputPath = path.join(
+          path.dirname(String(state.output_path)),
+          AUDIO_NO_MUSIC_OUTPUT_FILENAME,
         );
+        var expectedOutputs = normalizeOutputPathList([
+          String(state.output_path),
+          String(audioOutputPath),
+        ]);
+        var sequenceName = String(
+          state.sequence_name || buildProjectSequenceName(projectId),
+        );
+        var hostCall = [
+          "startManagedExport(",
+          '"',
+          escapeForEval(projectId),
+          '",',
+          '"',
+          escapeForEval(String(sequenceName).replace(/\\/g, "/")),
+          '",',
+          '"',
+          escapeForEval(String(state.output_path).replace(/\\/g, "/")),
+          '",',
+          '"',
+          escapeForEval(String(presetPath).replace(/\\/g, "/")),
+          '",',
+          "1,",
+          '"',
+          escapeForEval(String(audioOutputPath).replace(/\\/g, "/")),
+          '",',
+          '"',
+          escapeForEval(String(audioPresetPath).replace(/\\/g, "/")),
+          '"',
+          ")",
+        ].join("");
+
+        disarmExportMonitor(projectId);
+        resetMonitorCandidateSelection(projectId);
+        armExportMonitor(projectId);
+        dropEncoderJobsForProject(projectId);
+
+        return evalHost(hostCall).then(function (result) {
+          if (result && result.indexOf("ERROR:") === 0) {
+            throw new Error(result);
+          }
+
+          var jobId = String(result || "").trim();
+          var videoJobId = "";
+          var audioJobId = "";
+
+          if (jobId && jobId.charAt(0) === "{") {
+            try {
+              var parsed = JSON.parse(jobId);
+              videoJobId = String(parsed.video_job_id || "").trim();
+              audioJobId = String(parsed.audio_job_id || "").trim();
+            } catch (parseErr) {
+              // fallback to legacy payload below
+            }
+          }
+
+          if (!videoJobId && !audioJobId) {
+            videoJobId = jobId;
+          }
+          if (!videoJobId) {
+            throw new Error("Host did not return an encoder job ID");
+          }
+
+          encoderJobMap[videoJobId] = {
+            project_id: projectId,
+            lease: captureAutomationLease(projectId),
+          };
+          if (audioJobId) {
+            encoderJobMap[audioJobId] = {
+              project_id: projectId,
+              lease: captureAutomationLease(projectId),
+            };
+          }
+
+          upsertProjectState(projectId, {
+            status: "exporting",
+            export_job_id: videoJobId,
+            video_export_job_id: videoJobId,
+            audio_export_job_id: audioJobId || null,
+            encoder_progress: 0,
+            pending_cleanup_choice: false,
+            audio_export_enabled: true,
+            audio_output_path: audioOutputPath,
+            expected_outputs: expectedOutputs,
+            uploaded_outputs: state && state.status === "uploaded"
+              ? clonePlainObject(state.uploaded_outputs || {})
+              : {},
+            upload_results_by_output:
+              state && state.status === "uploaded"
+                ? clonePlainObject(state.upload_results_by_output || {})
+                : {},
+            last_upload_result:
+              state && state.status === "uploaded"
+                ? state.last_upload_result || null
+                : null,
+            last_error: null,
+          });
+          log(
+            "Managed export started for " +
+              projectId +
+              " (video job " +
+              videoJobId +
+              (audioJobId ? ", audio job " + audioJobId : "") +
+              ")",
+            "info",
+          );
+          return null;
+        });
+      });
+    });
+
+    sequence
+      .then(function () {
+        maybeAdvanceBatchAfterUpload();
         updateGlobalStatus();
       })
       .catch(function (err) {
-        if (isAutomationCanceledError(err) || !isAutomationLeaseActive(lease)) {
-          updateGlobalStatus();
-          return;
-        }
-        upsertProjectState(projectId, {
-          status: "error",
-          last_error: err.message,
-        });
-        log("Managed export failed to start: " + err.message, "error");
+        handleBatchFailure("batch", "Export start failed: " + err.message);
+        log("Managed batch export failed to start: " + err.message, "error");
         updateGlobalStatus();
       });
   }
@@ -3448,6 +3804,20 @@
   function updateGlobalStatus() {
     if (localServerError) {
       setStatus("error");
+      return;
+    }
+
+    if (getBatchPhase() === getBatchRuntimeHelper().PHASES.blocked_error) {
+      setStatus("error");
+      return;
+    }
+
+    if (
+      getBatchPhase() === getBatchRuntimeHelper().PHASES.exporting ||
+      getBatchPhase() === getBatchRuntimeHelper().PHASES.cleaning ||
+      getBatchPhase() === getBatchRuntimeHelper().PHASES.awaiting_final_ack
+    ) {
+      setStatus("running");
       return;
     }
 
@@ -3592,6 +3962,7 @@
 
     settings = loadSettings();
     jobStore = loadJobs();
+    batchRuntime = getBatchRuntimeHelper().createBatchRuntime();
     projectStates = loadNormalizedProjectStates();
 
     setSettingsSectionCollapsed(true);

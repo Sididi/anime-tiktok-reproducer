@@ -22,11 +22,21 @@ import {
   Wand2,
 } from "lucide-react";
 import { Button } from "@/components/ui";
-import { ClippedVideoPlayer, ManualMatchModal } from "@/components/video";
+import {
+  ClippedVideoPlayer,
+  ManualMatchModal,
+  ProjectClippedVideoPlayer,
+} from "@/components/video";
 import type { ClippedVideoPlayerHandle } from "@/components/video/ClippedVideoPlayer";
+import { useSourcePlaybackStrategy } from "@/hooks/useSourcePlaybackStrategy";
 import { useSceneStore } from "@/stores";
 import { api } from "@/api/client";
-import { cn, formatTime } from "@/utils";
+import { cn, formatSpeedFactorPercent, formatTime } from "@/utils";
+import {
+  MEDIA_PRIORITY,
+  getFastWatchPrefetchPriority,
+  getViewportPriority,
+} from "@/utils/mediaPriorities";
 import type { Scene, SourceStreamDescriptor } from "@/types";
 
 interface GapInfo {
@@ -54,7 +64,7 @@ interface GapCandidate {
 }
 
 const CANDIDATE_MATCH_EPSILON = 1e-4;
-const MAX_DYNAMIC_CHUNK_SECONDS = 120;
+const DEFAULT_MIN_SPEED_FACTOR = 0.75;
 
 interface GapCardProps {
   gap: GapInfo;
@@ -72,6 +82,7 @@ interface GapCardProps {
   isActive?: boolean;
   shouldLoadSourcePreview?: boolean;
   playbackRate?: number;
+  minSpeedFactor: number;
   controlsDisabled?: boolean;
   preloadMode?: "metadata" | "auto";
   ensureEpisodesLoaded: () => Promise<string[]>;
@@ -106,6 +117,7 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
     isActive = false,
     shouldLoadSourcePreview = false,
     playbackRate = 1,
+    minSpeedFactor,
     controlsDisabled = false,
     preloadMode = "metadata",
     ensureEpisodesLoaded,
@@ -121,199 +133,50 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
   const pendingResolverRef = useRef<(() => void) | null>(null);
   const pendingTimeoutRef = useRef<number | null>(null);
   const endedRef = useRef({ tiktok: false, source: false });
-  const [sourceDescriptor, setSourceDescriptor] =
-    useState<SourceStreamDescriptor | null>(null);
-  const [sourceDescriptorLoading, setSourceDescriptorLoading] = useState(false);
-  const [sourceChunkStart, setSourceChunkStart] = useState(0);
-  const [sourceChunkDuration, setSourceChunkDuration] = useState(0);
-
-  const tiktokVideoUrl = api.getVideoUrl(projectId);
   const hasPlayableScene = Boolean(scene);
 
   // Use resolved timing if available, otherwise current
   const displayStart = resolvedTiming?.start ?? gap.current_start;
   const displayEnd = resolvedTiming?.end ?? gap.current_end;
   const displaySpeed = resolvedTiming?.speed ?? gap.effective_speed;
-  const sourceClipDuration = Math.max(0.1, displayEnd - displayStart);
 
   // Calculate if still has gap after resolution
-  const hasGapAfterResolution = displaySpeed < 0.75;
-
-  const shouldUseChunkedSource = useCallback(
-    (descriptor: SourceStreamDescriptor | null): boolean => {
-      if (!descriptor) return false;
-      if (descriptor.mode === "chunked") return true;
-
-      // High-rate Fast Watch can stutter on direct HEVC decode; prefer chunked
-      // H.264 preview to stabilize playback pacing.
-      const codec = (descriptor.codec || "").toLowerCase();
-      const pixFmt = (descriptor.pix_fmt || "").toLowerCase();
-      return playbackRate >= 8 && (codec === "hevc" || pixFmt.includes("10"));
-    },
-    [playbackRate],
-  );
-
-  const isChunkedSource = shouldUseChunkedSource(sourceDescriptor);
-
-  const getChunkWindowStart = useCallback(
-    (
-      targetTime: number,
-      descriptor: SourceStreamDescriptor,
-      windowDuration: number,
-    ): number => {
-      const boundedDuration = Math.min(
-        Math.max(windowDuration, descriptor.chunk_duration),
-        MAX_DYNAMIC_CHUNK_SECONDS,
-      );
-      const maxStart = Math.max(
-        (descriptor.duration || 0) - boundedDuration,
-        0,
-      );
-      const boundedTarget = Math.min(
-        Math.max(targetTime, 0),
-        descriptor.duration || targetTime,
-      );
-      const centered = Math.max(boundedTarget - boundedDuration / 2, 0);
-      const step = Math.max(descriptor.chunk_step || 0.001, 0.001);
-      const snapped = Math.floor(centered / step) * step;
-      return Math.min(Math.max(snapped, 0), maxStart);
-    },
-    [],
-  );
-
-  /* eslint-disable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
-  useEffect(() => {
-    if (!shouldLoadSourcePreview) {
-      setSourceDescriptor(null);
-      setSourceDescriptorLoading(false);
-      return;
-    }
-
-    let active = true;
-    setSourceDescriptorLoading(true);
-
-    void getSourceDescriptor(gap.episode)
-      .then((descriptor) => {
-        if (!active) return;
-        setSourceDescriptor(descriptor);
-
-        if (!descriptor) {
-          setSourceChunkDuration(0);
-          setSourceChunkStart(0);
-          return;
-        }
-
-        if (shouldUseChunkedSource(descriptor)) {
-          const desiredDuration = Math.min(
-            Math.max(
-              descriptor.chunk_duration,
-              sourceClipDuration + descriptor.seek_guard_seconds * 2,
-            ),
-            MAX_DYNAMIC_CHUNK_SECONDS,
-          );
-          const centeredTarget = (displayStart + displayEnd) / 2;
-          setSourceChunkDuration(desiredDuration);
-          setSourceChunkStart(
-            getChunkWindowStart(centeredTarget, descriptor, desiredDuration),
-          );
-        } else {
-          setSourceChunkDuration(0);
-          setSourceChunkStart(0);
-        }
-      })
-      .catch(() => {
-        if (!active) return;
-        setSourceDescriptor(null);
-      })
-      .finally(() => {
-        if (!active) return;
-        setSourceDescriptorLoading(false);
-      });
-
-    return () => {
-      active = false;
-    };
-  }, [
-    gap.episode,
-    getSourceDescriptor,
-    getChunkWindowStart,
-    shouldUseChunkedSource,
-    shouldLoadSourcePreview,
-  ]);
-
-  useEffect(() => {
-    if (!sourceDescriptor || !isChunkedSource) return;
-
-    const duration =
-      sourceChunkDuration > 0
-        ? sourceChunkDuration
-        : sourceDescriptor.chunk_duration;
-    const guard = sourceDescriptor.seek_guard_seconds;
-    const safeStart = sourceChunkStart + guard;
-    const safeEnd = sourceChunkStart + duration - guard;
-
-    if (displayStart >= safeStart && displayEnd <= safeEnd) {
-      return;
-    }
-
-    const requestedDuration = Math.min(
-      Math.max(sourceDescriptor.chunk_duration, sourceClipDuration + guard * 2),
-      MAX_DYNAMIC_CHUNK_SECONDS,
-    );
-    const centeredTarget = (displayStart + displayEnd) / 2;
-    setSourceChunkDuration(requestedDuration);
-    setSourceChunkStart(
-      getChunkWindowStart(centeredTarget, sourceDescriptor, requestedDuration),
-    );
-  }, [
-    displayEnd,
-    displayStart,
-    getChunkWindowStart,
-    sourceChunkDuration,
-    sourceChunkStart,
-    sourceClipDuration,
-    sourceDescriptor,
-    isChunkedSource,
-  ]);
-  /* eslint-enable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
-
-  const sourceVideoUrl = useMemo(() => {
-    if (isChunkedSource && sourceDescriptor) {
-      const duration =
-        sourceChunkDuration > 0
-          ? sourceChunkDuration
-          : sourceDescriptor.chunk_duration;
-      return api.getSourceChunkUrl(
-        projectId,
-        gap.episode,
-        sourceChunkStart,
-        duration,
-      );
-    }
-    return api.getSourceVideoUrl(projectId, gap.episode);
-  }, [
-    gap.episode,
-    isChunkedSource,
+  const hasGapAfterResolution = displaySpeed < minSpeedFactor;
+  const leasePriority = controlsDisabled
+    ? isActive
+      ? MEDIA_PRIORITY.ACTIVE_FAST_WATCH
+      : preloadMode === "auto"
+        ? getFastWatchPrefetchPriority(1)
+        : getViewportPriority(4)
+    : isActive
+      ? MEDIA_PRIORITY.ACTIVE
+      : preloadMode === "auto"
+        ? getViewportPriority(1)
+        : shouldLoadSourcePreview
+          ? getViewportPriority(4)
+          : MEDIA_PRIORITY.OFFSCREEN;
+  const warmupLeasePriority = controlsDisabled
+    ? isActive
+      ? MEDIA_PRIORITY.ACTIVE_FAST_WATCH
+      : preloadMode === "auto"
+        ? getFastWatchPrefetchPriority(2)
+        : MEDIA_PRIORITY.OFFSCREEN
+    : isActive
+      ? MEDIA_PRIORITY.ACTIVE
+      : preloadMode === "auto"
+        ? getViewportPriority(2)
+        : MEDIA_PRIORITY.OFFSCREEN;
+  const sourceStrategy = useSourcePlaybackStrategy({
     projectId,
-    sourceChunkDuration,
-    sourceChunkStart,
-    sourceDescriptor,
-  ]);
+    episode: gap.episode,
+    enabled: shouldLoadSourcePreview,
+    getDescriptor: getSourceDescriptor,
+  });
+  const sourceDescriptorLoading = sourceStrategy.loading;
+  const sourceVideoUrl = sourceStrategy.sourceUrl;
 
-  const sourceStartForPlayer = isChunkedSource
-    ? Math.max(0, displayStart - sourceChunkStart)
-    : displayStart;
-  const sourceEndForPlayer = isChunkedSource
-    ? Math.max(
-        sourceStartForPlayer + 0.05,
-        Math.min(
-          displayEnd - sourceChunkStart,
-          sourceChunkDuration > 0
-            ? sourceChunkDuration
-            : sourceDescriptor?.chunk_duration || displayEnd,
-        ),
-      )
-    : displayEnd;
+  const sourceStartForPlayer = displayStart;
+  const sourceEndForPlayer = displayEnd;
 
   const fastWatchMinReadyState =
     playbackRate >= 8
@@ -498,11 +361,11 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
       // Calculate speed for this timing
       const duration = endTime - startTime;
       const speed = duration / gap.target_duration;
-      const effectiveSpeed = Math.max(0.75, Math.min(1.6, speed));
+      const effectiveSpeed = Math.max(minSpeedFactor, Math.min(1.6, speed));
 
       onUpdate(gap.scene_index, startTime, endTime, effectiveSpeed);
     },
-    [gap.scene_index, gap.target_duration, onUpdate],
+    [gap.scene_index, gap.target_duration, minSpeedFactor, onUpdate],
   );
 
   const handleOpenManual = useCallback(async () => {
@@ -522,7 +385,7 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
   }, [playBothFromStart]);
 
   const formatSpeed = (speed: number) => {
-    return `${Math.round(speed * 100)}%`;
+    return formatSpeedFactorPercent(speed);
   };
 
   return (
@@ -567,9 +430,9 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
           </p>
           <div className="aspect-9/16 bg-black rounded overflow-hidden">
             {scene && (
-              <ClippedVideoPlayer
+              <ProjectClippedVideoPlayer
                 ref={tiktokPlayerRef}
-                src={tiktokVideoUrl}
+                projectId={projectId}
                 startTime={scene.start_time}
                 endTime={scene.end_time}
                 className={cn(
@@ -578,6 +441,10 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
                 )}
                 playbackRate={playbackRate}
                 eager={preloadMode === "auto"}
+                requestLoad={shouldLoadSourcePreview}
+                requestWarmup={preloadMode === "auto"}
+                leasePriority={leasePriority}
+                warmupPriority={warmupLeasePriority}
                 onClipEnded={() => handleClipEnded("tiktok")}
               />
             )}
@@ -607,6 +474,10 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
                 <Loader2 className="h-4 w-4 animate-spin mr-2" />
                 Preparing source stream...
               </div>
+            ) : !sourceVideoUrl ? (
+              <div className="w-full h-full flex items-center justify-center text-xs text-white/70 px-4 text-center">
+                Source stream unavailable.
+              </div>
             ) : (
               <ClippedVideoPlayer
                 ref={sourcePlayerRef}
@@ -619,6 +490,10 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
                 )}
                 playbackRate={playbackRate}
                 eager={preloadMode === "auto"}
+                requestLoad={shouldLoadSourcePreview}
+                requestWarmup={preloadMode === "auto"}
+                leasePriority={leasePriority - 1}
+                warmupPriority={warmupLeasePriority - 1}
                 onClipEnded={() => handleClipEnded("source")}
               />
             )}
@@ -686,7 +561,7 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
           </div>
           {hasGapAfterResolution && (
             <p className="text-xs text-red-500 mt-1">
-              ⚠️ Still has gap (speed &lt; 75%)
+              ⚠️ Still has gap (speed &lt; {formatSpeed(minSpeedFactor)})
             </p>
           )}
         </div>
@@ -729,7 +604,7 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
                         candidate.effective_speed >= 0.95 &&
                         candidate.effective_speed <= 1.05
                           ? "text-green-500"
-                          : candidate.effective_speed < 0.75
+                          : candidate.effective_speed < minSpeedFactor
                             ? "text-red-500"
                             : "text-amber-500"
                       }`}
@@ -790,7 +665,7 @@ const GapCard = forwardRef<GapCardHandle, GapCardProps>(function GapCard(
               ? "bg-amber-500/20 text-amber-500 border border-amber-500/50"
               : "text-amber-500"
           }`}
-          title="Skip this gap (keep 75% speed)"
+          title={`Skip this gap (keep ${formatSpeed(minSpeedFactor)} speed)`}
         >
           <SkipForward className="h-4 w-4" />
         </Button>
@@ -840,6 +715,9 @@ export function GapResolutionPage() {
   const [episodes, setEpisodes] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [minSpeedFactor, setMinSpeedFactor] = useState(
+    DEFAULT_MIN_SPEED_FACTOR,
+  );
   const [resolvedGaps, setResolvedGaps] = useState<
     Map<number, { start: number; end: number; speed: number }>
   >(new Map());
@@ -1306,23 +1184,24 @@ export function GapResolutionPage() {
       setLoading(true);
       setError(null);
       setGaps([]);
+      setMinSpeedFactor(DEFAULT_MIN_SPEED_FACTOR);
       setCandidatesByScene({});
       setLoadingCandidates(false);
       try {
-        const gapsRequest = fetch(`/api/projects/${projectId}/gaps`);
-        await Promise.all([loadScenes(projectId), gapsRequest]);
-
-        const gapsResponse = await gapsRequest;
-        if (!gapsResponse.ok) {
-          throw new Error("Failed to load gaps");
-        }
-
-        const gapsData = await gapsResponse.json();
+        const [, gapsData] = await Promise.all([
+          loadScenes(projectId),
+          api.getGaps(projectId),
+        ]);
         const loadedGaps: GapInfo[] = gapsData.gaps || [];
         if (cancelled) {
           return;
         }
 
+        setMinSpeedFactor(
+          Number.isFinite(gapsData.min_speed_factor)
+            ? gapsData.min_speed_factor
+            : DEFAULT_MIN_SPEED_FACTOR,
+        );
         setGaps(loadedGaps);
         setLoading(false);
 
@@ -1668,8 +1547,8 @@ export function GapResolutionPage() {
               <AlertTriangle className="h-5 w-5 text-amber-500 shrink-0 mt-0.5" />
               <div className="space-y-1">
                 <p className="text-sm font-medium">
-                  {totalGaps} clip{totalGaps !== 1 ? "s" : ""} hit the 75% speed
-                  floor
+                  {totalGaps} clip{totalGaps !== 1 ? "s" : ""} hit the{" "}
+                  {formatSpeedFactorPercent(minSpeedFactor)} speed floor
                 </p>
                 <p className="text-xs text-[hsl(var(--muted-foreground))]">
                   These clips need more source footage to avoid gaps in the
@@ -1760,6 +1639,7 @@ export function GapResolutionPage() {
                   projectId={projectId!}
                   episodes={episodes}
                   getSourceDescriptor={getSourceDescriptorCached}
+                  minSpeedFactor={minSpeedFactor}
                   isResolved={isResolved || isSkipped}
                   isSkipped={isSkipped}
                   resolvedTiming={resolvedTiming}

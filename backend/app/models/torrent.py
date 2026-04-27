@@ -87,6 +87,7 @@ class ReplacementProgress(BaseModel):
 
 class IndexationJob(BaseModel):
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:16])
+    job_type: Literal["index", "update"] = "index"
     source_name: str
     library_type: LibraryType
     source_path: str
@@ -95,7 +96,19 @@ class IndexationJob(BaseModel):
     progress: float = 0.0
     phase: str | None = None
     message: str | None = None
+    current_file: str | None = None
+    total_files: int = 0
+    completed_files: int = 0
+    current_file_progress: float | None = None
+    current_file_frames_processed: int | None = None
+    current_file_total_frames: int | None = None
+    current_file_batches_processed: int | None = None
+    requested_batch_size: int | None = None
+    effective_batch_size: int | None = None
+    effective_decode_backend: str | None = None
+    retry_reason: str | None = None
     error: str | None = None
+    warnings: list[str] = Field(default_factory=list)
     unmatched_files: list[str] = []  # files not linked to any torrent
     linked_torrents: int = 0  # number of torrents linked after indexation
     series_id: str | None = None

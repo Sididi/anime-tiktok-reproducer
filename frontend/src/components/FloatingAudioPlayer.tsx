@@ -1,9 +1,13 @@
 import { useRef, useState, useCallback, useEffect } from "react";
 import { Play, Pause, Volume2, VolumeX } from "lucide-react";
 import type { Scene } from "@/types";
+import { getBrowserMediaCoordinator } from "@/utils/mediaCoordinator";
+import { buildVideoSourceCandidates } from "@/utils/mediaSources";
+import { MEDIA_PRIORITY } from "@/utils/mediaPriorities";
 
 interface FloatingAudioPlayerProps {
   videoUrl: string;
+  fallbackVideoUrl?: string;
   scenes: Scene[];
   onSceneChange?: (index: number) => void;
   autoScroll: boolean;
@@ -18,12 +22,16 @@ function formatTimeCompact(seconds: number): string {
 
 export function FloatingAudioPlayer({
   videoUrl,
+  fallbackVideoUrl,
   scenes,
   onSceneChange,
   autoScroll,
   onAutoScrollChange,
 }: FloatingAudioPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const resumeAfterAttachRef = useRef(false);
+  const pendingCurrentTimeRef = useRef(0);
+  const retryAttemptedRef = useRef(false);
   const progressRef = useRef<HTMLDivElement>(null);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -32,10 +40,23 @@ export function FloatingAudioPlayer({
   const [volume, setVolume] = useState(1);
   const [muted, setMuted] = useState(false);
   const [activeSceneIdx, setActiveSceneIdx] = useState(-1);
+  const [pageVisible, setPageVisible] = useState(
+    document.visibilityState === "visible",
+  );
+  const [attachedGranted, setAttachedGranted] = useState(false);
+  const [renderVersion, setRenderVersion] = useState(0);
+  const [sourceIndex, setSourceIndex] = useState(0);
+  const shouldRequestLoad = pageVisible || playing;
+  const sourceCandidates = buildVideoSourceCandidates(videoUrl, fallbackVideoUrl);
+  const activeVideoUrl = sourceCandidates[sourceIndex] ?? videoUrl;
 
   const togglePlay = useCallback(() => {
     const video = videoRef.current;
-    if (!video) return;
+    if (!video) {
+      resumeAfterAttachRef.current = true;
+      setPlaying(true);
+      return;
+    }
     if (video.paused) {
       video.play().catch(console.error);
       setPlaying(true);
@@ -65,10 +86,43 @@ export function FloatingAudioPlayer({
   }, [scenes, activeSceneIdx, onSceneChange]);
 
   const handleLoadedMetadata = useCallback(() => {
-    if (videoRef.current) {
-      setDuration(videoRef.current.duration);
+    const video = videoRef.current;
+    if (!video) return;
+    setDuration(video.duration);
+    video.currentTime = pendingCurrentTimeRef.current;
+    video.playbackRate = speed;
+    video.volume = volume;
+    video.muted = muted;
+    if (resumeAfterAttachRef.current) {
+      resumeAfterAttachRef.current = false;
+      void video.play().catch(console.error);
     }
-  }, []);
+  }, [muted, speed, volume]);
+
+  const handleError = useCallback(() => {
+    const video = videoRef.current;
+    if (video) {
+      pendingCurrentTimeRef.current = video.currentTime;
+      setCurrentTime(video.currentTime);
+    }
+    resumeAfterAttachRef.current = playing;
+
+    if (!retryAttemptedRef.current) {
+      retryAttemptedRef.current = true;
+      setRenderVersion((value) => value + 1);
+      return;
+    }
+
+    const nextSourceIndex = sourceIndex + 1;
+    if (nextSourceIndex < sourceCandidates.length) {
+      retryAttemptedRef.current = false;
+      setSourceIndex(nextSourceIndex);
+      setRenderVersion((value) => value + 1);
+      return;
+    }
+
+    setPlaying(false);
+  }, [playing, sourceCandidates.length, sourceIndex]);
 
   const handleProgressClick = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
@@ -77,7 +131,10 @@ export function FloatingAudioPlayer({
       if (!bar || !video || !duration) return;
       const rect = bar.getBoundingClientRect();
       const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-      video.currentTime = ratio * duration;
+      const nextTime = ratio * duration;
+      pendingCurrentTimeRef.current = nextTime;
+      video.currentTime = nextTime;
+      setCurrentTime(nextTime);
     },
     [duration]
   );
@@ -113,6 +170,16 @@ export function FloatingAudioPlayer({
     }
   }, [muted]);
 
+  useEffect(() => {
+    pendingCurrentTimeRef.current = currentTime;
+  }, [currentTime]);
+
+  useEffect(() => {
+    retryAttemptedRef.current = false;
+    setSourceIndex(0);
+    setRenderVersion((value) => value + 1);
+  }, [fallbackVideoUrl, videoUrl]);
+
   // Keyboard shortcut: Space to play/pause
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
@@ -130,20 +197,96 @@ export function FloatingAudioPlayer({
     return () => window.removeEventListener("keydown", handleKey);
   }, [togglePlay]);
 
+  useEffect(() => {
+    const handleVisibility = () => {
+      setPageVisible(document.visibilityState === "visible");
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
+  }, []);
+
+  const sessionUpdateRef = useRef<((next: Partial<{
+    requestLoad: boolean;
+    requestWarmup: boolean;
+    attachedPriority: number;
+    warmupPriority: number;
+    kind: "video" | "audio";
+  }>) => void) | null>(null);
+
+  useEffect(() => {
+    const coordinator = getBrowserMediaCoordinator();
+    const handle = coordinator.registerSession(
+      {
+        id: "floating-audio-player",
+        requestLoad: shouldRequestLoad,
+        requestWarmup: false,
+        attachedPriority: MEDIA_PRIORITY.DEDICATED_AUDIO,
+        warmupPriority: 0,
+        kind: "audio",
+      },
+      (grant) => {
+        setAttachedGranted(grant.attachedGranted);
+      },
+    );
+    sessionUpdateRef.current = handle.update;
+    return () => {
+      handle.release();
+      sessionUpdateRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    sessionUpdateRef.current?.({
+      requestLoad: shouldRequestLoad,
+      requestWarmup: false,
+      attachedPriority: MEDIA_PRIORITY.DEDICATED_AUDIO,
+      warmupPriority: 0,
+      kind: "audio",
+    });
+  }, [shouldRequestLoad]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.playbackRate = speed;
+  }, [speed, attachedGranted]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.volume = volume;
+    video.muted = muted;
+  }, [attachedGranted, muted, volume]);
+
+  useEffect(() => {
+    if (attachedGranted) return;
+    const video = videoRef.current;
+    if (!video) return;
+    pendingCurrentTimeRef.current = video.currentTime;
+    setCurrentTime(video.currentTime);
+    video.pause();
+  }, [attachedGranted]);
+
   const progress = duration > 0 ? (currentTime / duration) * 100 : 0;
 
   return (
     <div className="fixed bottom-0 left-0 right-0 z-50 bg-[hsl(var(--card))] border-t border-[hsl(var(--border))] shadow-lg">
-      {/* Hidden video element (audio source) */}
-      <video
-        ref={videoRef}
-        src={videoUrl}
-        className="hidden"
-        onTimeUpdate={handleTimeUpdate}
-        onLoadedMetadata={handleLoadedMetadata}
-        onEnded={() => setPlaying(false)}
-        preload="metadata"
-      />
+      {shouldRequestLoad && attachedGranted && (
+        <video
+          ref={videoRef}
+          key={`${activeVideoUrl}-${renderVersion}`}
+          src={activeVideoUrl}
+          className="hidden"
+          onTimeUpdate={handleTimeUpdate}
+          onLoadedMetadata={handleLoadedMetadata}
+          onError={handleError}
+          onEnded={() => setPlaying(false)}
+          preload="metadata"
+          crossOrigin="anonymous"
+        />
+      )}
 
       {/* Progress bar (clickable) */}
       <div

@@ -26,3 +26,9 @@ export function parseTime(timeStr: string): number | null {
 
   return mins * 60 + secs + ms / 100;
 }
+
+export function formatSpeedFactorPercent(factor: number): string {
+  const percent = factor * 100;
+  if (!Number.isFinite(percent)) return "0%";
+  return `${percent.toFixed(2).replace(/\.?0+$/, "")}%`;
+}

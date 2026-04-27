@@ -10,11 +10,23 @@ from typing import Any
 import yaml
 from google.oauth2.credentials import Credentials
 
-from ..config import settings
+from ..config import PROJECT_ROOT, settings
 from ..library_types import DEFAULT_LIBRARY_TYPE, LibraryType, coerce_library_type
 from .meta_token_service import MetaTokenService, MetaUploadCredentials
 
 logger = logging.getLogger("uvicorn.error")
+
+
+PLATFORM_KEYS: tuple[str, ...] = ("youtube", "facebook", "instagram", "tiktok")
+
+
+def _normalize_slots(value: Any) -> list[str] | None:
+    """Return None when absent, [] when present-but-invalid, list[str] otherwise."""
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value]
 
 
 @dataclass
@@ -27,6 +39,22 @@ class AccountYouTubeConfig:
     refresh_token: str
     channel_id: str | None = None
     category_id: str | None = None
+    slots: list[str] | None = None
+
+
+@dataclass
+class AccountFacebookConfig:
+    slots: list[str] | None = None
+
+
+@dataclass
+class AccountInstagramConfig:
+    slots: list[str] | None = None
+
+
+@dataclass
+class AccountTikTokConfig:
+    slots: list[str] | None = None
 
 
 @dataclass
@@ -43,11 +71,53 @@ class AccountConfig:
     id: str
     name: str
     language: str
+    device: str
     supported_types: list[LibraryType] = field(default_factory=lambda: [DEFAULT_LIBRARY_TYPE])
     avatar: str | None = None
     slots: list[str] = field(default_factory=list)
     youtube: AccountYouTubeConfig | None = None
     meta: AccountMetaConfig | None = None
+    facebook: AccountFacebookConfig | None = None
+    instagram: AccountInstagramConfig | None = None
+    tiktok: AccountTikTokConfig | None = None
+
+    def slots_for(self, platform: str) -> list[str]:
+        """Return slot strings for a platform with replace-semantics.
+
+        A per-platform `slots` list (even empty) completely replaces the top-level
+        `slots:`. A platform block without `slots` (or no platform block at all)
+        inherits the top-level list.
+        """
+        override: list[str] | None = None
+        if platform == "youtube" and self.youtube is not None:
+            override = self.youtube.slots
+        elif platform == "facebook" and self.facebook is not None:
+            override = self.facebook.slots
+        elif platform == "instagram" and self.instagram is not None:
+            override = self.instagram.slots
+        elif platform == "tiktok" and self.tiktok is not None:
+            override = self.tiktok.slots
+        return list(override) if override is not None else list(self.slots)
+
+    def pool_key_for(self, platform: str) -> str | None:
+        """Shared-pool identity for (this account, platform), or None if unshared.
+
+        Two accounts share a platform's reservation pool iff both return the same
+        non-None key. None means the account is always alone in its pool for that
+        platform.
+        """
+        if platform == "youtube":
+            cid = self.youtube.channel_id if self.youtube else None
+            return f"youtube:{cid}" if cid else None
+        if platform == "facebook":
+            pid = self.meta.facebook_page_id if self.meta else None
+            return f"facebook:{pid}" if pid else None
+        if platform == "instagram":
+            igid = self.meta.instagram_business_account_id if self.meta else None
+            return f"instagram:{igid}" if igid else None
+        if platform == "tiktok":
+            return None
+        return None
 
 
 class AccountService:
@@ -62,18 +132,25 @@ class AccountService:
 
     @classmethod
     def _avatars_dir(cls) -> Path:
-        return cls._config_path().parent / "avatars"
+        # Avatars live in server/avatars/ so the same files back both the dev
+        # frontend (via this service) and the VPS-served /api/avatars/ route.
+        return PROJECT_ROOT / "server" / "avatars"
 
     @classmethod
     def _parse_account(cls, account_id: str, raw: dict[str, Any]) -> AccountConfig:
         youtube_raw = raw.get("youtube")
         youtube = None
-        if isinstance(youtube_raw, dict) and youtube_raw.get("refresh_token"):
-            youtube = AccountYouTubeConfig(
-                refresh_token=str(youtube_raw["refresh_token"]),
-                channel_id=str(youtube_raw["channel_id"]) if youtube_raw.get("channel_id") else None,
-                category_id=str(youtube_raw["category_id"]) if youtube_raw.get("category_id") else None,
-            )
+        if isinstance(youtube_raw, dict):
+            refresh_token = youtube_raw.get("refresh_token")
+            yt_slots = _normalize_slots(youtube_raw.get("slots"))
+            # Allow a credential-less youtube block when slot overrides are defined.
+            if refresh_token or yt_slots is not None:
+                youtube = AccountYouTubeConfig(
+                    refresh_token=str(refresh_token) if refresh_token else "",
+                    channel_id=str(youtube_raw["channel_id"]) if youtube_raw.get("channel_id") else None,
+                    category_id=str(youtube_raw["category_id"]) if youtube_raw.get("category_id") else None,
+                    slots=yt_slots,
+                )
 
         meta_raw = raw.get("meta")
         meta = None
@@ -84,6 +161,34 @@ class AccountService:
                 facebook_page_access_token=str(meta_raw["facebook_page_access_token"]) if meta_raw.get("facebook_page_access_token") else None,
                 instagram_business_account_id=str(meta_raw["instagram_business_account_id"]) if meta_raw.get("instagram_business_account_id") else None,
                 instagram_access_token=str(meta_raw["instagram_access_token"]) if meta_raw.get("instagram_access_token") else None,
+            )
+
+        facebook_raw = raw.get("facebook")
+        facebook = (
+            AccountFacebookConfig(slots=_normalize_slots(facebook_raw.get("slots")))
+            if isinstance(facebook_raw, dict)
+            else None
+        )
+
+        instagram_raw = raw.get("instagram")
+        instagram = (
+            AccountInstagramConfig(slots=_normalize_slots(instagram_raw.get("slots")))
+            if isinstance(instagram_raw, dict)
+            else None
+        )
+
+        tiktok_raw = raw.get("tiktok")
+        tiktok = (
+            AccountTikTokConfig(slots=_normalize_slots(tiktok_raw.get("slots")))
+            if isinstance(tiktok_raw, dict)
+            else None
+        )
+
+        device = raw.get("device")
+        if not device or not isinstance(device, str):
+            raise ValueError(
+                f"Account {account_id!r}: missing required field 'device'. "
+                f"Set device: \"<device_id>\" matching a device in the VPS server's config."
             )
 
         slots_raw = raw.get("slots", [])
@@ -107,11 +212,15 @@ class AccountService:
             id=account_id,
             name=str(raw.get("name", account_id)),
             language=str(raw.get("language", "")),
+            device=device,
             supported_types=supported_types,
             avatar=str(raw.get("avatar")) if raw.get("avatar") else None,
             slots=slots,
             youtube=youtube,
             meta=meta,
+            facebook=facebook,
+            instagram=instagram,
+            tiktok=tiktok,
         )
 
     @classmethod
@@ -136,6 +245,8 @@ class AccountService:
                 continue
             try:
                 result[str(account_id)] = cls._parse_account(str(account_id), account_raw)
+            except ValueError:
+                raise
             except Exception:
                 logger.exception("Failed to parse account %s", account_id)
         logger.info("Loaded %d account(s) from %s", len(result), path)
@@ -155,8 +266,19 @@ class AccountService:
         return cls._accounts
 
     @classmethod
-    def list_accounts(cls) -> list[dict[str, Any]]:
+    def invalidate(cls) -> None:
+        """Clear the in-memory account cache so the next call reloads from disk."""
+        with cls._lock:
+            cls._accounts = None
+
+    @classmethod
+    def list_accounts(cls) -> list[AccountConfig]:
         accounts = cls._ensure_loaded()
+        return list(accounts.values())
+
+    @classmethod
+    def list_accounts_as_dicts(cls) -> list[dict[str, Any]]:
+        """Return accounts serialised as dicts (used by the HTTP API layer)."""
         return [
             {
                 "id": acc.id,
@@ -165,14 +287,20 @@ class AccountService:
                 "supported_types": [item.value for item in acc.supported_types],
                 "avatar_url": f"/api/accounts/{acc.id}/avatar",
                 "slots": acc.slots,
+                "slots_by_platform": {p: acc.slots_for(p) for p in PLATFORM_KEYS},
             }
-            for acc in accounts.values()
+            for acc in cls.list_accounts()
         ]
 
     @classmethod
     def get_account(cls, account_id: str) -> AccountConfig | None:
         accounts = cls._ensure_loaded()
         return accounts.get(account_id)
+
+    @classmethod
+    def all_accounts(cls) -> dict[str, AccountConfig]:
+        """Return a shallow copy of the loaded account cache."""
+        return dict(cls._ensure_loaded())
 
     @classmethod
     def get_avatar_path(cls, account_id: str) -> tuple[Path | None, str]:

@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 
 import { Button } from "@/components/ui";
+import { ProjectManagedVideoPlayer } from "@/components/video";
 import type {
   MetadataTitleCandidatesPayload,
   VideoOverlay,
@@ -8,6 +9,7 @@ import type {
 
 interface TitleSelectionModalProps {
   isOpen: boolean;
+  projectId?: string;
   metadataCandidates?: MetadataTitleCandidatesPayload | null;
   metadataError?: string | null;
   overlay?: VideoOverlay | null;
@@ -38,7 +40,7 @@ function SelectionList({
             onClick={() => onSelect(option)}
             className={`w-full rounded-md border px-4 py-3 text-left text-sm transition ${
               isSelected
-                ? "border-[hsl(var(--primary))] bg-[hsl(var(--primary))/0.12]"
+                ? "border-[hsl(var(--primary))] bg-[hsl(var(--primary))/0.12] ring-2 ring-[hsl(var(--primary))]"
                 : "border-[hsl(var(--border))] bg-transparent hover:bg-[hsl(var(--muted))]"
             }`}
           >
@@ -55,6 +57,7 @@ function SelectionList({
 
 export function TitleSelectionModal({
   isOpen,
+  projectId,
   metadataCandidates,
   metadataError,
   overlay,
@@ -94,84 +97,101 @@ export function TitleSelectionModal({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
       <div
-        className={`w-full rounded-lg bg-[hsl(var(--card))] p-5 shadow-xl ${
-          twoPaneLayout ? "max-w-6xl" : "max-w-3xl"
+        className={`flex w-full rounded-lg bg-[hsl(var(--card))] shadow-xl ${
+          twoPaneLayout ? "max-w-7xl" : "max-w-4xl"
         }`}
       >
-        <div className="mb-4">
-          <h2 className="text-lg font-semibold">Select Titles</h2>
-          <p className="mt-1 text-sm text-[hsl(var(--muted-foreground))]">
-            Choose the metadata and overlay titles to keep.
-          </p>
-        </div>
+        {/* TikTok video preview */}
+        {projectId && (
+          <div className="w-72 shrink-0 flex items-center justify-center bg-black rounded-l-lg overflow-hidden">
+            <ProjectManagedVideoPlayer
+              projectId={projectId}
+              className="w-full h-auto max-h-[80vh] object-contain"
+              requestLoad={isOpen}
+              requestWarmup={isOpen}
+              controls
+              muted
+            />
+          </div>
+        )}
 
-        <div className={`gap-4 ${twoPaneLayout ? "grid md:grid-cols-2" : "space-y-4"}`}>
-          {hasMetadataPane && (
-            <section className="rounded-lg border border-[hsl(var(--border))] p-4">
-              <div className="mb-4">
-                <h3 className="font-medium">Metadata Title</h3>
-                <p className="mt-1 text-sm text-[hsl(var(--muted-foreground))]">
-                  This title will be reused across YouTube, Facebook, Instagram, and TikTok.
-                </p>
-              </div>
+        {/* Main content */}
+        <div className="flex-1 min-w-0 p-5">
+          <div className="mb-4">
+            <h2 className="text-lg font-semibold">Select Titles</h2>
+            <p className="mt-1 text-sm text-[hsl(var(--muted-foreground))]">
+              Choose the metadata and overlay titles to keep.
+            </p>
+          </div>
 
-              {metadataError ? (
-                <div className="rounded-md bg-amber-500/10 p-3 text-sm text-amber-600">
-                  {metadataError}
-                </div>
-              ) : (
-                <SelectionList
-                  options={metadataOptions}
-                  selected={effectiveMetadataTitle}
-                  onSelect={setSelectedMetadataTitle}
-                />
-              )}
-            </section>
-          )}
-
-          {hasOverlayPane && (
-            <section className="rounded-lg border border-[hsl(var(--border))] p-4">
-              <div className="mb-4">
-                <h3 className="font-medium">Overlay Title</h3>
-                <p className="mt-1 text-sm text-[hsl(var(--muted-foreground))]">
-                  Choose the hook displayed inside the generated video overlay.
-                </p>
-                {overlay?.category ? (
-                  <p className="mt-2 text-xs uppercase tracking-[0.18em] text-[hsl(var(--muted-foreground))]">
-                    Category: {overlay.category}
+          <div className={`gap-4 ${twoPaneLayout ? "grid md:grid-cols-2" : "space-y-4"}`}>
+            {hasMetadataPane && (
+              <section className="rounded-lg border border-[hsl(var(--border))] p-4">
+                <div className="mb-4">
+                  <h3 className="font-medium">Metadata Title</h3>
+                  <p className="mt-1 text-sm text-[hsl(var(--muted-foreground))]">
+                    This title will be reused across YouTube, Facebook, Instagram, and TikTok.
                   </p>
-                ) : null}
-              </div>
-
-              {overlayError ? (
-                <div className="rounded-md bg-amber-500/10 p-3 text-sm text-amber-600">
-                  {overlayError}
                 </div>
-              ) : (
-                <SelectionList
-                  options={overlayOptions}
-                  selected={effectiveOverlayTitle}
-                  onSelect={setSelectedOverlayTitle}
-                />
-              )}
-            </section>
-          )}
-        </div>
 
-        <div className="mt-4 flex justify-end">
-          <Button
-            onClick={() =>
-            onConfirm({
-                metadataTitle:
-                  metadataOptions.length > 0 ? effectiveMetadataTitle : undefined,
-                overlayTitle:
-                  overlayOptions.length > 0 ? effectiveOverlayTitle : undefined,
-              })
-            }
-            disabled={!canConfirmMetadata || !canConfirmOverlay}
-          >
-            Apply Selection
-          </Button>
+                {metadataError ? (
+                  <div className="rounded-md bg-amber-500/10 p-3 text-sm text-amber-600">
+                    {metadataError}
+                  </div>
+                ) : (
+                  <SelectionList
+                    options={metadataOptions}
+                    selected={effectiveMetadataTitle}
+                    onSelect={setSelectedMetadataTitle}
+                  />
+                )}
+              </section>
+            )}
+
+            {hasOverlayPane && (
+              <section className="rounded-lg border border-[hsl(var(--border))] p-4">
+                <div className="mb-4">
+                  <h3 className="font-medium">Overlay Title</h3>
+                  <p className="mt-1 text-sm text-[hsl(var(--muted-foreground))]">
+                    Choose the hook displayed inside the generated video overlay.
+                  </p>
+                  {overlay?.category ? (
+                    <p className="mt-2 text-xs uppercase tracking-[0.18em] text-[hsl(var(--muted-foreground))]">
+                      Category: {overlay.category}
+                    </p>
+                  ) : null}
+                </div>
+
+                {overlayError ? (
+                  <div className="rounded-md bg-amber-500/10 p-3 text-sm text-amber-600">
+                    {overlayError}
+                  </div>
+                ) : (
+                  <SelectionList
+                    options={overlayOptions}
+                    selected={effectiveOverlayTitle}
+                    onSelect={setSelectedOverlayTitle}
+                  />
+                )}
+              </section>
+            )}
+          </div>
+
+          <div className="mt-4 flex justify-end">
+            <Button
+              onClick={() =>
+              onConfirm({
+                  metadataTitle:
+                    metadataOptions.length > 0 ? effectiveMetadataTitle : undefined,
+                  overlayTitle:
+                    overlayOptions.length > 0 ? effectiveOverlayTitle : undefined,
+                })
+              }
+              disabled={!canConfirmMetadata || !canConfirmOverlay}
+            >
+              Apply Selection
+            </Button>
+          </div>
         </div>
       </div>
     </div>

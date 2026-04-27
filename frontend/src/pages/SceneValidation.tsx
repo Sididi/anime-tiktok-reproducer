@@ -77,6 +77,7 @@ function SceneValidationContent() {
   const [detecting, setDetecting] = useState(false);
   const [detectionProgress, setDetectionProgress] = useState<DetectionProgress | null>(null);
   const [skipUiEnabled, setSkipUiEnabled] = useState(false);
+  const [threshold, setThreshold] = useState(16.0);
 
   const currentScene = getSceneAtTime(currentTime);
 
@@ -104,15 +105,21 @@ function SceneValidationContent() {
     setDetectionProgress({ status: 'starting', progress: 0, message: 'Starting detection...', error: null });
 
     try {
-      const response = await api.detectScenes(projectId);
+      const response = await api.detectScenes(projectId, threshold);
 
-      await readSSEStream<DetectionProgress>(response, (data) => {
-        setDetectionProgress(data);
+      await readSSEStream<DetectionProgress>(
+        response,
+        (data) => {
+          setDetectionProgress(data);
 
-        if (data.status === 'complete' && data.scenes) {
-          setScenes(data.scenes);
-        }
-      });
+          if (data.status === 'complete' && data.scenes) {
+            setScenes(data.scenes);
+          }
+        },
+        {
+          stopWhen: (data) => data.status === 'complete',
+        },
+      );
     } catch (err) {
       setDetectionProgress({
         status: 'error',
@@ -123,7 +130,7 @@ function SceneValidationContent() {
     } finally {
       setDetecting(false);
     }
-  }, [projectId, setScenes]);
+  }, [projectId, setScenes, threshold]);
 
   const handleSeek = useCallback(
     (time: number) => {
@@ -328,6 +335,22 @@ function SceneValidationContent() {
               {scenes.length} scenes
             </span>
             <ShortcutsHelp />
+            <label
+              className="flex items-center gap-1.5 text-sm text-[hsl(var(--muted-foreground))]"
+              title="PySceneDetect ContentDetector threshold. Lower = more sensitive (more cuts). Default 16."
+            >
+              Threshold
+              <input
+                type="number"
+                min={4}
+                max={30}
+                step={0.5}
+                value={threshold}
+                onChange={(e) => setThreshold(Number(e.target.value))}
+                disabled={detecting}
+                className="w-16 px-2 py-1 text-sm bg-[hsl(var(--card))] border border-[hsl(var(--border))] rounded disabled:opacity-50"
+              />
+            </label>
             <Button
               variant="outline"
               size="sm"

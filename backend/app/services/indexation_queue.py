@@ -3,12 +3,14 @@
 import asyncio
 import json
 import logging
+from contextlib import AsyncExitStack
 from pathlib import Path
 
 from ..library_types import LibraryType
 from ..models.torrent import IndexationJob
 from .anime_library import AnimeLibraryService
 from .anime_matcher import AnimeMatcherService
+from .indexation_preflight import IndexationPreflightService
 from .library_hydration_service import LibraryHydrationService
 from .storage_box_repository import StorageBoxRepository
 
@@ -18,7 +20,7 @@ logger = logging.getLogger("uvicorn.error")
 
 
 class IndexationQueueService:
-    MAX_CONCURRENT = 1
+    MAX_CONCURRENT = 2
 
     def __init__(self) -> None:
         self._jobs: dict[str, IndexationJob] = {}
@@ -31,82 +33,203 @@ class IndexationQueueService:
         library_type: LibraryType,
         anime_name: str | None,
         fps: float,
+        job_type: str = "index",
+        series_id: str | None = None,
     ) -> str:
         source_name = anime_name or Path(source_path).name
+        normalized_target = IndexationPreflightService.normalize_target_name(source_name)
         for existing_job in self._jobs.values():
             if (
                 existing_job.library_type == library_type
-                and existing_job.source_name == source_name
+                and IndexationPreflightService.normalize_target_name(existing_job.source_name)
+                == normalized_target
                 and existing_job.status in {"queued", "indexing"}
             ):
                 return existing_job.id
 
         job = IndexationJob(
+            job_type=job_type,
             source_name=source_name,
             library_type=library_type,
             source_path=source_path,
             fps=fps,
+            series_id=series_id,
         )
         self._jobs[job.id] = job
         self._broadcast(job)
         asyncio.create_task(self._run_job(job))
         return job.id
 
+    @classmethod
+    def _is_cuda_oom_error(cls, message: str | None) -> bool:
+        return AnimeLibraryService._is_cuda_oom_error(message)
+
+    def _reset_job_transient_fields(self, job: IndexationJob) -> None:
+        job.error = None
+        job.current_file = None
+        job.total_files = 0
+        job.completed_files = 0
+        job.current_file_progress = None
+        job.current_file_frames_processed = None
+        job.current_file_total_frames = None
+        job.current_file_batches_processed = None
+        job.requested_batch_size = None
+        job.effective_batch_size = None
+        job.effective_decode_backend = None
+        job.retry_reason = None
+
+    @classmethod
+    def _terminal_oom_message(cls, message: str) -> str:
+        return AnimeLibraryService._terminal_cuda_oom_message(message)
+
+    def _finalize_job_error(self, job: IndexationJob, message: str) -> None:
+        self._reset_job_transient_fields(job)
+        job.status = "error"
+        job.phase = "error"
+        job.message = None
+        job.error = (
+            self._terminal_oom_message(message)
+            if self._is_cuda_oom_error(message)
+            else message
+        )
+        self._broadcast(job)
+
     async def _run_job(self, job: IndexationJob) -> None:
         await self._semaphore.acquire()
         try:
-            job.status = "indexing"
-            self._broadcast(job)
-            async for progress in AnimeLibraryService.index_anime(
-                source_folder=Path(job.source_path),
-                library_type=job.library_type,
-                anime_name=job.source_name,
-                fps=job.fps,
-            ):
-                job.progress = progress.progress
-                job.phase = progress.status
-                job.message = progress.message
-                if progress.status == "complete":
-                    job.phase = "link_sources"
-                    job.message = "Linking fallback torrent sources..."
+            async with AsyncExitStack() as stack:
+                self._reset_job_transient_fields(job)
+                job.status = "indexing"
+                job.phase = "starting"
+                self._broadcast(job)
+                if job.job_type == "update":
+                    job.phase = "hydrate_index"
+                    job.message = "Hydrating matcher cache from Storage Box..."
+                    job.progress = 0.02
                     self._broadcast(job)
-                    await self._link_torrents(job)
-                    job.phase = "package_release"
-                    job.message = "Packaging release for Storage Box..."
-                    job.progress = max(job.progress, 0.96)
-                    self._broadcast(job)
-                    job.phase = "upload_release"
-                    job.message = "Uploading release to Storage Box..."
-                    job.progress = max(job.progress, 0.98)
-                    self._broadcast(job)
-                    publish_result = await StorageBoxRepository.publish_series(
-                        library_type=job.library_type,
-                        display_name=job.source_name,
+                    if not job.series_id:
+                        resolved_series_id = await StorageBoxRepository.find_remote_series_id_by_name(
+                            job.library_type,
+                            job.source_name,
+                        )
+                        job.series_id = str(resolved_series_id or "")
+                    if not job.series_id:
+                        raise RuntimeError(
+                            f"Remote series not found for update target '{job.source_name}'."
+                        )
+                    # Hold the series lock across the entire update+publish so
+                    # the flow cannot race with eviction, deletion, hydration,
+                    # or another concurrent update on the same series.
+                    await stack.enter_async_context(
+                        LibraryHydrationService._series_lock(
+                            job.library_type, job.series_id
+                        )
                     )
-                    job.series_id = str(publish_result["series_id"])
-                    job.storage_release_id = str(publish_result["release_id"])
-                    await LibraryHydrationService.sync_local_series_state(
+                    await LibraryHydrationService.ensure_series_index_hydrated(
                         library_type=job.library_type,
                         series_id=job.series_id,
-                        release_id=job.storage_release_id,
+                        already_locked=True,
                     )
-                    job.message = "Published release to Storage Box"
-                    job.progress = 1.0
-                    job.status = "complete"
-                    AnimeMatcherService.mark_series_updated(
-                        job.library_type, job.source_name
+                    source_files = self._collect_direct_video_files(Path(job.source_path))
+                    if not source_files:
+                        raise RuntimeError(f"No video files found in {job.source_path}")
+                    progress_stream = AnimeLibraryService.update_anime(
+                        library_type=job.library_type,
+                        anime_name=job.source_name,
+                        source_paths=source_files,
                     )
-                elif progress.status == "error":
-                    job.status = "error"
-                    job.error = progress.error
-                self._broadcast(job)
+                else:
+                    progress_stream = AnimeLibraryService.index_anime(
+                        source_folder=Path(job.source_path),
+                        library_type=job.library_type,
+                        anime_name=job.source_name,
+                        fps=job.fps,
+                    )
+
+                async for progress in progress_stream:
+                    job.progress = progress.progress
+                    job.phase = progress.status
+                    job.message = progress.message
+                    job.current_file = progress.current_file or None
+                    job.total_files = progress.total_files
+                    job.completed_files = progress.completed_files
+                    job.current_file_progress = progress.current_file_progress
+                    job.current_file_frames_processed = progress.current_file_frames_processed
+                    job.current_file_total_frames = progress.current_file_total_frames
+                    job.current_file_batches_processed = progress.current_file_batches_processed
+                    if progress.requested_batch_size is not None:
+                        job.requested_batch_size = progress.requested_batch_size
+                    if progress.effective_batch_size is not None:
+                        job.effective_batch_size = progress.effective_batch_size
+                    if progress.effective_decode_backend is not None:
+                        job.effective_decode_backend = progress.effective_decode_backend
+                    if progress.retry_reason is not None:
+                        job.retry_reason = progress.retry_reason
+                    if progress.warnings:
+                        for warning in progress.warnings:
+                            if warning not in job.warnings:
+                                job.warnings.append(warning)
+                    if progress.status == "complete":
+                        job.phase = "link_sources"
+                        job.message = "Linking fallback torrent sources..."
+                        self._broadcast(job)
+                        await self._link_torrents(job)
+                        job.phase = "package_release"
+                        job.message = "Packaging release for Storage Box..."
+                        job.progress = max(job.progress, 0.96)
+                        self._broadcast(job)
+                        job.phase = "upload_release"
+                        job.message = "Uploading release to Storage Box..."
+                        job.progress = max(job.progress, 0.98)
+                        self._broadcast(job)
+                        prepared = progress.prepared_library_paths or []
+                        expected_min_episodes = (
+                            len(prepared)
+                            if prepared and job.job_type == "update"
+                            else None
+                        )
+                        publish_result = await LibraryHydrationService.publish_series_release(
+                            library_type=job.library_type,
+                            display_name=job.source_name,
+                            series_id=job.series_id or None,
+                            already_locked=(
+                                job.job_type == "update" and bool(job.series_id)
+                            ),
+                            expected_min_episodes=expected_min_episodes,
+                        )
+                        job.series_id = str(publish_result["series_id"])
+                        job.storage_release_id = str(publish_result["release_id"])
+                        job.message = "Published release to Storage Box"
+                        job.progress = 1.0
+                        job.status = "complete"
+                        job.error = None
+                        AnimeMatcherService.mark_series_updated(
+                            job.library_type, job.source_name
+                        )
+                    elif progress.status == "error":
+                        self._finalize_job_error(
+                            job,
+                            progress.error or progress.message or "Indexation failed",
+                        )
+                        return
+                    self._broadcast(job)
         except Exception as e:
-            job.status = "error"
-            job.error = str(e)
-            self._broadcast(job)
+            self._finalize_job_error(job, str(e))
             logger.exception("Indexation job %s failed", job.id)
         finally:
             self._semaphore.release()
+
+    @staticmethod
+    def _collect_direct_video_files(source_folder: Path) -> list[Path]:
+        return sorted(
+            entry
+            for entry in source_folder.iterdir()
+            if (
+                entry.is_file()
+                and entry.suffix.lower() in VIDEO_EXTENSIONS
+                and not AnimeLibraryService.is_transient_library_video_path(entry)
+            )
+        )
 
     async def _link_torrents(self, job: IndexationJob) -> None:
         """Best-effort torrent linking after successful indexation."""

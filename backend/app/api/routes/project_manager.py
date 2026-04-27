@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from ...services import UploadPhaseService
 from ...services.google_drive_service import GoogleDriveService
+from ...services.project_upload_service import project_upload_queue
 from ...services.project_service import ProjectService
 
 
@@ -55,26 +56,42 @@ async def run_upload_phase(
     project_id: str,
     payload: UploadProjectRequest | None = Body(default=None),
 ):
-    """Upload a ready project to configured platforms."""
-    async def stream_progress():
-        req = payload or UploadProjectRequest()
-        yield f"data: {json.dumps({'status': 'processing', 'step': 'prepare', 'progress': 0.1, 'message': 'Preparing upload phase...'})}\n\n"
-        try:
-            result = await asyncio.to_thread(
-                UploadPhaseService.execute_upload,
-                project_id,
-                account_id=req.account_id,
-                platforms=req.platforms,
-                facebook_strategy=req.facebook_strategy,
-                youtube_strategy=req.youtube_strategy,
-                copyright_audio_path=req.copyright_audio_path,
-            )
-            yield f"data: {json.dumps({'status': 'complete', 'step': 'complete', 'progress': 1.0, 'message': 'Upload phase complete', 'result': result})}\n\n"
-        except Exception as exc:
-            yield f"data: {json.dumps({'status': 'error', 'step': 'upload', 'progress': 0.0, 'error': str(exc), 'message': 'Upload phase failed'})}\n\n"
+    """Queue a project upload and return the persisted background job."""
+    req = payload or UploadProjectRequest()
+    try:
+        job = await project_upload_queue.enqueue_upload(
+            project_id=project_id,
+            account_id=req.account_id,
+            platforms=req.platforms,
+            facebook_strategy=req.facebook_strategy,
+            youtube_strategy=req.youtube_strategy,
+            copyright_audio_path=req.copyright_audio_path,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return job.model_dump(mode="json")
+
+
+@router.get("/upload-jobs")
+async def list_project_upload_jobs():
+    """List persisted Project Manager upload jobs."""
+    return {
+        "jobs": [job.model_dump(mode="json") for job in project_upload_queue.list_jobs()],
+    }
+
+
+@router.get("/upload-jobs/stream")
+async def stream_project_upload_jobs():
+    """Stream Project Manager upload jobs over SSE."""
+
+    async def generate():
+        async for data in project_upload_queue.stream_all_jobs():
+            yield f"data: {json.dumps(data)}\n\n"
 
     return StreamingResponse(
-        stream_progress(),
+        generate(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )

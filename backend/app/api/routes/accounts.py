@@ -10,7 +10,7 @@ router = APIRouter(prefix="/accounts", tags=["accounts"])
 @router.get("")
 async def list_accounts():
     """List all configured accounts."""
-    return {"accounts": AccountService.list_accounts()}
+    return {"accounts": AccountService.list_accounts_as_dicts()}
 
 
 @router.get("/{account_id}/avatar")

@@ -36,6 +36,56 @@ FONT_DIR = Path(__file__).resolve().parents[3] / "assets" / "fonts"
 TITLE_FONT_PATH = FONT_DIR / "Inter-BlackItalic.ttf"
 CAT_FONT_PATH = FONT_DIR / "Inter-Black.ttf"
 
+# --- Emoji rendering ---
+EMOJI_FONT_PATH = Path("/usr/share/fonts/noto/NotoColorEmoji.ttf")
+EMOJI_FONT_NATIVE_SIZE = 109  # only valid size for this CBDT bitmap font
+EMOJI_TARGET_HEIGHT = 55  # px — slightly taller than caps height (43px), looks natural
+
+
+def _is_emoji(ch: str) -> bool:
+    """Return True if the character is an emoji or emoji-adjacent modifier."""
+    cp = ord(ch)
+    return (
+        cp == 0x200D  # ZWJ
+        or 0xFE00 <= cp <= 0xFE0F  # variation selectors
+        or 0x1F600 <= cp <= 0x1F64F  # emoticons
+        or 0x1F300 <= cp <= 0x1F5FF  # misc symbols and pictographs
+        or 0x1F680 <= cp <= 0x1F6FF  # transport and map
+        or 0x1F900 <= cp <= 0x1F9FF  # supplemental symbols
+        or 0x1FA00 <= cp <= 0x1FA6F  # chess symbols
+        or 0x1FA70 <= cp <= 0x1FAFF  # symbols and pictographs extended-A
+        or 0x2600 <= cp <= 0x26FF  # misc symbols (sun, cloud, etc.)
+        or 0x2700 <= cp <= 0x27BF  # dingbats
+        or 0x231A <= cp <= 0x231B  # watch, hourglass
+        or 0x23E9 <= cp <= 0x23F3  # media controls
+        or 0x23F8 <= cp <= 0x23FA  # more media controls
+        or 0x25AA <= cp <= 0x25AB  # small squares
+        or cp == 0x25B6 or cp == 0x25C0  # play buttons
+        or 0x25FB <= cp <= 0x25FE  # squares
+        or 0x2934 <= cp <= 0x2935  # arrows
+        or cp == 0x3030 or cp == 0x303D  # wavy dash, part alternation mark
+        or 0x1F1E0 <= cp <= 0x1F1FF  # flags
+    )
+
+
+def _split_emoji_segments(text: str) -> list[tuple[str, bool]]:
+    """Split text into runs of (content, is_emoji) tuples."""
+    if not text:
+        return []
+    segments: list[tuple[str, bool]] = []
+    buf = text[0]
+    cur_emoji = _is_emoji(text[0])
+    for ch in text[1:]:
+        ch_emoji = _is_emoji(ch)
+        if ch_emoji == cur_emoji:
+            buf += ch
+        else:
+            segments.append((buf, cur_emoji))
+            buf = ch
+            cur_emoji = ch_emoji
+    segments.append((buf, cur_emoji))
+    return segments
+
 
 class TitleImageGeneratorService:
     """Generates transparent PNG overlays for title and category text."""
@@ -76,6 +126,42 @@ class TitleImageGeneratorService:
         return ImageFont.load_default()
 
     @classmethod
+    def _load_emoji_font(cls) -> ImageFont.FreeTypeFont | None:
+        """Load NotoColorEmoji at its native bitmap size, or None if unavailable."""
+        if EMOJI_FONT_PATH.exists():
+            try:
+                return ImageFont.truetype(str(EMOJI_FONT_PATH), EMOJI_FONT_NATIVE_SIZE)
+            except OSError:
+                return None
+        return None
+
+    @classmethod
+    def _render_emoji_glyph(
+        cls,
+        emoji_text: str,
+        emoji_font: ImageFont.FreeTypeFont,
+    ) -> Image.Image:
+        """Render emoji at native size, crop to content, scale to target height."""
+        bbox = emoji_font.getbbox(emoji_text)
+        native_w = bbox[2] - bbox[0]
+        native_h = bbox[3] - bbox[1]
+        pad = 4
+        temp = Image.new("RGBA", (native_w + pad * 2, native_h + pad * 2), (0, 0, 0, 0))
+        temp_draw = ImageDraw.Draw(temp)
+        temp_draw.text(
+            (pad - bbox[0], pad - bbox[1]),
+            emoji_text,
+            font=emoji_font,
+            embedded_color=True,
+        )
+        content_bbox = temp.getbbox()
+        if content_bbox:
+            temp = temp.crop(content_bbox)
+        scale = EMOJI_TARGET_HEIGHT / temp.height if temp.height > 0 else 1.0
+        target_w = max(1, int(temp.width * scale))
+        return temp.resize((target_w, EMOJI_TARGET_HEIGHT), Image.LANCZOS)
+
+    @classmethod
     def _merge_french_punctuation(cls, words: list[str]) -> list[str]:
         """Merge standalone French punctuation (? ! : ;) with preceding word.
 
@@ -92,21 +178,38 @@ class TitleImageGeneratorService:
 
     @classmethod
     def _measure_text(
-        cls, text: str, font: ImageFont.FreeTypeFont, letter_spacing: float = 0
+        cls,
+        text: str,
+        font: ImageFont.FreeTypeFont,
+        letter_spacing: float = 0,
+        emoji_font: ImageFont.FreeTypeFont | None = None,
     ) -> float:
-        """Measure text width accounting for optional letter spacing."""
+        """Measure text width accounting for optional letter spacing and emoji."""
         if not text:
             return 0
-        if letter_spacing == 0:
-            return font.getlength(text)
-        # Sum advance widths with custom spacing, preserving font kerning
+        if emoji_font is None:
+            if letter_spacing == 0:
+                return font.getlength(text)
+            total = 0.0
+            for i, ch in enumerate(text):
+                if i < len(text) - 1:
+                    total += font.getlength(text[i:i+2]) - font.getlength(text[i+1])
+                    total += letter_spacing
+                else:
+                    total += font.getlength(ch)
+            return total
+
+        # Emoji-aware path
+        segments = _split_emoji_segments(text)
         total = 0.0
-        for i, ch in enumerate(text):
-            if i < len(text) - 1:
-                total += font.getlength(text[i:i+2]) - font.getlength(text[i+1])
-                total += letter_spacing
+        for seg_idx, (seg_text, is_emoji) in enumerate(segments):
+            if is_emoji:
+                glyph = cls._render_emoji_glyph(seg_text, emoji_font)
+                total += glyph.width
             else:
-                total += font.getlength(ch)
+                total += cls._measure_text(seg_text, font, letter_spacing)
+            if seg_idx < len(segments) - 1:
+                total += letter_spacing
         return total
 
     @classmethod
@@ -118,21 +221,49 @@ class TitleImageGeneratorService:
         font: ImageFont.FreeTypeFont,
         fill: tuple,
         letter_spacing: float,
+        emoji_font: ImageFont.FreeTypeFont | None = None,
+        img: Image.Image | None = None,
     ) -> None:
-        """Draw text character by character with custom letter spacing."""
+        """Draw text character by character with custom letter spacing and emoji."""
         x, y = xy
-        for i, ch in enumerate(text):
-            draw.text((x, y), ch, fill=fill, font=font)
-            if i < len(text) - 1:
-                x += font.getlength(text[i:i+2]) - font.getlength(text[i+1]) + letter_spacing
+
+        if emoji_font is None or img is None:
+            for i, ch in enumerate(text):
+                draw.text((x, y), ch, fill=fill, font=font)
+                if i < len(text) - 1:
+                    x += font.getlength(text[i:i+2]) - font.getlength(text[i+1]) + letter_spacing
+            return
+
+        # Emoji-aware path
+        caps_bbox = font.getbbox("A")
+        caps_top = caps_bbox[1]
+        caps_h = caps_bbox[3] - caps_bbox[1]
+
+        segments = _split_emoji_segments(text)
+        for seg_idx, (seg_text, is_emoji) in enumerate(segments):
+            if is_emoji:
+                glyph = cls._render_emoji_glyph(seg_text, emoji_font)
+                emoji_y = int(y) + caps_top + (caps_h - EMOJI_TARGET_HEIGHT) // 2
+                img.alpha_composite(glyph, (int(x), emoji_y))
+                x += glyph.width
+                if seg_idx < len(segments) - 1:
+                    x += letter_spacing
+            else:
+                for i, ch in enumerate(seg_text):
+                    draw.text((x, y), ch, fill=fill, font=font)
+                    if i < len(seg_text) - 1:
+                        x += font.getlength(seg_text[i:i+2]) - font.getlength(seg_text[i+1]) + letter_spacing
+                    elif seg_idx < len(segments) - 1:
+                        x += font.getlength(ch) + letter_spacing
 
     @classmethod
     def _wrap_text(
         cls, text: str, font: ImageFont.FreeTypeFont, max_width: int,
         letter_spacing: float = 0,
+        emoji_font: ImageFont.FreeTypeFont | None = None,
     ) -> list[str]:
         """Word-wrap text to fit max_width, max 2 lines. Balanced split."""
-        if cls._measure_text(text, font, letter_spacing) <= max_width:
+        if cls._measure_text(text, font, letter_spacing, emoji_font) <= max_width:
             return [text]
 
         words = cls._merge_french_punctuation(text.split())
@@ -145,8 +276,8 @@ class TitleImageGeneratorService:
         for i in range(1, len(words)):
             line1 = " ".join(words[:i])
             line2 = " ".join(words[i:])
-            w1 = cls._measure_text(line1, font, letter_spacing)
-            w2 = cls._measure_text(line2, font, letter_spacing)
+            w1 = cls._measure_text(line1, font, letter_spacing, emoji_font)
+            w2 = cls._measure_text(line2, font, letter_spacing, emoji_font)
             if w1 <= max_width and w2 <= max_width:
                 diff = abs(w1 - w2)
                 if diff < best_diff:
@@ -161,18 +292,19 @@ class TitleImageGeneratorService:
     def _render_title(cls, title: str, output_path: Path) -> None:
         """Render title text on white panel to transparent PNG."""
         font = cls._load_font(TITLE_FONT_SIZE, TITLE_FONT_PATH)
+        emoji_font = cls._load_emoji_font()
         img = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
 
         ls = TITLE_LETTER_SPACING
         max_text_width = WIDTH - 2 * (TITLE_SCREEN_MARGIN + TITLE_PAD_H)
-        lines = cls._wrap_text(title.upper(), font, max_text_width, ls)
+        lines = cls._wrap_text(title.upper(), font, max_text_width, ls, emoji_font)
 
         # Calculate panel dimensions
         total_text_h = TITLE_LINE_HEIGHT * len(lines)
         panel_h = total_text_h + TITLE_PAD_V * 2
 
-        text_w = max(cls._measure_text(line, font, ls) for line in lines)
+        text_w = max(cls._measure_text(line, font, ls, emoji_font) for line in lines)
         panel_w = int(text_w) + TITLE_PAD_H * 2
 
         panel_x = (WIDTH - panel_w) // 2
@@ -187,10 +319,13 @@ class TitleImageGeneratorService:
 
         # Draw text lines centered in panel
         for i, line in enumerate(lines):
-            tw = cls._measure_text(line, font, ls)
+            tw = cls._measure_text(line, font, ls, emoji_font)
             tx = (WIDTH - tw) / 2
             ty = panel_y + TITLE_PAD_V + i * TITLE_LINE_HEIGHT
-            cls._draw_spaced_text(draw, (tx, ty), line, font, TITLE_TEXT_COLOR, ls)
+            cls._draw_spaced_text(
+                draw, (tx, ty), line, font, TITLE_TEXT_COLOR, ls,
+                emoji_font=emoji_font, img=img,
+            )
 
         img.save(output_path, "PNG")
 

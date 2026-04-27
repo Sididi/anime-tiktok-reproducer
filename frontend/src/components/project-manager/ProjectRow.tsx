@@ -13,7 +13,10 @@ import type { ProjectManagerRow, Account } from "@/types";
 interface ProjectRowProps {
   row: ProjectManagerRow;
   accounts: Account[];
-  activeUploadId: string | null;
+  uploadState?: {
+    active: boolean;
+    label: string | null;
+  };
   activeDeleteId: string | null;
   holdingDeleteId: string | null;
   onUpload: (row: ProjectManagerRow) => void;
@@ -28,7 +31,7 @@ interface ProjectRowProps {
 export function ProjectRow({
   row,
   accounts,
-  activeUploadId,
+  uploadState,
   activeDeleteId,
   holdingDeleteId,
   onUpload,
@@ -72,11 +75,14 @@ export function ProjectRow({
     <Button
       size="sm"
       onClick={() => onUpload(row)}
-      disabled={!canUpload || activeUploadId !== null}
+      disabled={!canUpload || !!uploadState?.active}
       className="active:scale-95 transition-transform"
     >
-      {activeUploadId === row.project_id ? (
-        <Loader2 className="h-4 w-4 animate-spin" />
+      {uploadState?.active ? (
+        <>
+          <Loader2 className="h-4 w-4 animate-spin mr-1.5" />
+          {uploadState.label || "Uploading"}
+        </>
       ) : (
         <>
           <UploadCloud className="h-4 w-4 mr-1.5" />

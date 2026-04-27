@@ -7,21 +7,25 @@ import { api } from "@/api/client";
 interface CopyrightMusicModalProps {
   open: boolean;
   projectId: string;
+  projectTitle?: string | null;
   musicDisplayName: string;
   noMusicFileId: string;
   availableMusics: { key: string; display_name: string }[];
   onConfirm: (copyrightAudioPath: string | null) => void;
   onCancel: () => void;
+  stacked?: boolean;
 }
 
 export function CopyrightMusicModal({
   open,
   projectId,
+  projectTitle,
   musicDisplayName,
   noMusicFileId,
   availableMusics,
   onConfirm,
   onCancel,
+  stacked = false,
 }: CopyrightMusicModalProps) {
   const [selectedMusicKey, setSelectedMusicKey] = useState<string | null>(null);
   const [audioPath, setAudioPath] = useState<string | null>(null);
@@ -83,28 +87,25 @@ export function CopyrightMusicModal({
     [projectId, noMusicFileId],
   );
 
-  // On open, build the "no music" version immediately; on close, stop preview
   useEffect(() => {
     if (open) {
       setSelectedMusicKey(null);
       setAudioPath(null);
       setAudioVersion(0);
-      buildAudio(null);
+      void buildAudio(null);
     } else {
       stopPreviewAudio();
     }
   }, [open, buildAudio, stopPreviewAudio]);
 
-  // When music selection changes
   const handleMusicChange = useCallback(
     (key: string | null) => {
       setSelectedMusicKey(key);
-      buildAudio(key);
+      void buildAudio(key);
     },
     [buildAudio],
   );
 
-  // Sync audio with video
   useEffect(() => {
     const video = videoRef.current;
     const audio = audioRef.current;
@@ -112,7 +113,7 @@ export function CopyrightMusicModal({
 
     const onPlay = () => {
       audio.currentTime = video.currentTime;
-      audio.play();
+      void audio.play();
     };
     const onPause = () => audio.pause();
     const onSeeked = () => {
@@ -129,9 +130,8 @@ export function CopyrightMusicModal({
     };
   }, [audioVersion]);
 
-  // Escape key closes the modal
   useEffect(() => {
-    if (!open) return;
+    if (!open || stacked) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.stopPropagation();
@@ -140,7 +140,11 @@ export function CopyrightMusicModal({
     };
     document.addEventListener("keydown", handleKeyDown, true);
     return () => document.removeEventListener("keydown", handleKeyDown, true);
-  }, [open, onCancel]);
+  }, [open, onCancel, stacked]);
+
+  if (!open) {
+    return null;
+  }
 
   const musicOptions = availableMusics.map((m) => ({
     key: m.key,
@@ -148,125 +152,128 @@ export function CopyrightMusicModal({
     previewUrl: api.previewMusicUrl(projectId, m.key),
   }));
 
+  const card = (
+    <motion.div
+      className="bg-[hsl(var(--card))] border border-[hsl(var(--border))] rounded-xl p-6 shadow-2xl flex flex-col gap-5"
+      style={{ maxWidth: "48rem", width: "100%" }}
+      initial={{ scale: 0.95, opacity: 0 }}
+      animate={{ scale: 1, opacity: 1 }}
+      exit={{ scale: 0.95, opacity: 0 }}
+      transition={{ duration: 0.2 }}
+      onClick={(e) => e.stopPropagation()}
+    >
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="flex items-center gap-2">
+            <Music className="h-5 w-5 text-[hsl(var(--destructive))]" />
+            <h3 className="text-lg font-semibold">
+              Remplacement de la musique
+            </h3>
+          </div>
+          <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1 font-mono">
+            {projectTitle || "Projet"} · {projectId}
+          </p>
+          <p className="text-sm text-[hsl(var(--muted-foreground))] mt-2">
+            La musique &ldquo;{musicDisplayName}&rdquo; est sous copyright.
+            Choisissez une musique de remplacement ou continuez sans musique.
+          </p>
+        </div>
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={onCancel}
+          className="shrink-0"
+        >
+          <X className="h-4 w-4" />
+        </Button>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+        <div className="flex flex-col gap-3">
+          <label className="text-sm font-medium">
+            Musique de remplacement
+          </label>
+          <SearchableSelect
+            options={musicOptions}
+            value={selectedMusicKey}
+            onChange={handleMusicChange}
+            placeholder="Choisir une musique..."
+            allowNone
+            noneLabel="Pas de musique"
+            disabled={building}
+            onPreview={playPreview}
+            onPreviewStop={stopPreviewAudio}
+            previewingKey={previewingKey}
+          />
+          {building && (
+            <div className="flex items-center gap-2 text-sm text-[hsl(var(--muted-foreground))]">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Construction de l&apos;audio...
+            </div>
+          )}
+        </div>
+
+        <div className="flex flex-col gap-3">
+          <label className="text-sm font-medium">
+            Apercu
+          </label>
+          <div className="relative bg-black rounded-lg overflow-hidden aspect-9/16 max-h-[50vh]">
+            <video
+              ref={videoRef}
+              src={api.getCopyrightVideoUrl(projectId)}
+              className="w-full h-full object-contain"
+              controls
+              muted
+              preload="metadata"
+            />
+            {building && (
+              <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
+                <Loader2 className="h-8 w-8 animate-spin text-white" />
+              </div>
+            )}
+          </div>
+          <audio
+            ref={audioRef}
+            src={`${api.getCopyrightAudioUrl(projectId)}?v=${audioVersion}`}
+            preload="auto"
+          />
+        </div>
+      </div>
+
+      <div className="flex justify-end gap-3 pt-1">
+        <Button
+          variant="ghost"
+          onClick={onCancel}
+          className="active:scale-95 transition-transform"
+        >
+          Annuler
+        </Button>
+        <Button
+          onClick={() => onConfirm(audioPath)}
+          disabled={building || !audioPath}
+          className="active:scale-95 transition-transform"
+        >
+          Utiliser cet audio
+        </Button>
+      </div>
+    </motion.div>
+  );
+
+  if (stacked) {
+    return <div className="w-full max-w-5xl">{card}</div>;
+  }
+
   return (
     <AnimatePresence>
-      {open && (
-        <motion.div
-          className="fixed inset-0 z-60 bg-black/70 flex items-center justify-center p-6"
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          onClick={onCancel}
-        >
-          <motion.div
-            className="bg-[hsl(var(--card))] border border-[hsl(var(--border))] rounded-xl p-6 shadow-2xl flex flex-col gap-5"
-            style={{ maxWidth: "48rem", width: "100%" }}
-            initial={{ scale: 0.95, opacity: 0 }}
-            animate={{ scale: 1, opacity: 1 }}
-            exit={{ scale: 0.95, opacity: 0 }}
-            transition={{ duration: 0.2 }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            {/* Header */}
-            <div className="flex items-center justify-between">
-              <div>
-                <div className="flex items-center gap-2">
-                  <Music className="h-5 w-5 text-[hsl(var(--destructive))]" />
-                  <h3 className="text-lg font-semibold">
-                    Remplacement de la musique
-                  </h3>
-                </div>
-                <p className="text-sm text-[hsl(var(--muted-foreground))] mt-1">
-                  La musique &ldquo;{musicDisplayName}&rdquo; est sous copyright.
-                  Choisissez une musique de remplacement ou continuez sans musique.
-                </p>
-              </div>
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={onCancel}
-                className="shrink-0"
-              >
-                <X className="h-4 w-4" />
-              </Button>
-            </div>
-
-            {/* Two-column layout */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-              {/* Left: Music selector */}
-              <div className="flex flex-col gap-3">
-                <label className="text-sm font-medium">
-                  Musique de remplacement
-                </label>
-                <SearchableSelect
-                  options={musicOptions}
-                  value={selectedMusicKey}
-                  onChange={handleMusicChange}
-                  placeholder="Choisir une musique..."
-                  allowNone
-                  noneLabel="Pas de musique"
-                  disabled={building}
-                  onPreview={playPreview}
-                  onPreviewStop={stopPreviewAudio}
-                  previewingKey={previewingKey}
-                />
-                {building && (
-                  <div className="flex items-center gap-2 text-sm text-[hsl(var(--muted-foreground))]">
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                    Construction de l&apos;audio...
-                  </div>
-                )}
-              </div>
-
-              {/* Right: Video + audio preview */}
-              <div className="flex flex-col gap-3">
-                <label className="text-sm font-medium">
-                  Apercu
-                </label>
-                <div className="relative bg-black rounded-lg overflow-hidden aspect-9/16 max-h-[50vh]">
-                  <video
-                    ref={videoRef}
-                    src={api.getCopyrightVideoUrl(projectId)}
-                    className="w-full h-full object-contain"
-                    controls
-                    muted
-                    preload="metadata"
-                  />
-                  {building && (
-                    <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
-                      <Loader2 className="h-8 w-8 animate-spin text-white" />
-                    </div>
-                  )}
-                </div>
-                {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
-                <audio
-                  ref={audioRef}
-                  src={`${api.getCopyrightAudioUrl(projectId)}?v=${audioVersion}`}
-                  preload="auto"
-                />
-              </div>
-            </div>
-
-            {/* Footer */}
-            <div className="flex justify-end gap-3 pt-1">
-              <Button
-                variant="ghost"
-                onClick={onCancel}
-                className="active:scale-95 transition-transform"
-              >
-                Annuler
-              </Button>
-              <Button
-                onClick={() => onConfirm(audioPath)}
-                disabled={building}
-                className="active:scale-95 transition-transform"
-              >
-                Confirmer et continuer
-              </Button>
-            </div>
-          </motion.div>
-        </motion.div>
-      )}
+      <motion.div
+        className="fixed inset-0 z-60 bg-black/70 flex items-center justify-center p-6"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        onClick={onCancel}
+      >
+        {card}
+      </motion.div>
     </AnimatePresence>
   );
 }

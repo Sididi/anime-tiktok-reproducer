@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 from ..config import settings
 from ..models import Project, SceneMatch
-from .gap_resolution import GapResolutionService
+from .anime_library import AnimeLibraryService
 from .google_drive_service import GoogleDriveService
 from .music_config_service import MusicConfigService
 from .project_service import ProjectService
@@ -219,6 +219,7 @@ class ExportService:
             "SPM Anime Background.prfpset",
             "SPM Anime Foreground.prfpset",
             "SPM Anime Category Title.prfpset",
+            "ATR Proxy H264.epr",
         )
     _LANG_TO_LOCALE = {
         "fr": "fr_FR",
@@ -316,22 +317,70 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
         project: Project,
         matches: list[SceneMatch],
     ) -> list[Path]:
-        seen: set[str] = set()
-        sources: list[Path] = []
-        for match in matches:
-            if not match.episode:
-                continue
-            resolved = GapResolutionService.resolve_episode_path(
-                match.episode,
+        def _resolve_export_source_path(episode_ref: str) -> Path | None:
+            episode_ref = str(episode_ref or "").strip()
+            if not episode_ref:
+                return None
+
+            candidate = Path(episode_ref)
+            if candidate.is_absolute() and candidate.exists():
+                return candidate
+
+            resolved = AnimeLibraryService.resolve_episode_path(
+                episode_ref,
                 library_type=project.library_type,
             )
-            if not resolved or not resolved.exists():
+            if resolved is not None and resolved.exists():
+                return resolved
+
+            if candidate.exists():
+                return candidate
+            return None
+
+        seen: set[str] = set()
+        sources: list[Path] = []
+        unresolved_refs: list[str] = []
+        missing_refs: list[str] = []
+        for match in matches:
+            episode_ref = str(match.episode or "").strip()
+            if not episode_ref:
                 continue
-            key = str(resolved.resolve())
+            resolved = _resolve_export_source_path(episode_ref)
+            if resolved is None:
+                unresolved_refs.append(episode_ref)
+                continue
+            if not resolved.exists() or not resolved.is_file():
+                missing_refs.append(str(resolved))
+                continue
+            key = str(resolved)
             if key in seen:
                 continue
             seen.add(key)
             sources.append(resolved)
+
+        if unresolved_refs or missing_refs:
+            details: list[str] = []
+            if unresolved_refs:
+                unique_unresolved_refs = list(dict.fromkeys(unresolved_refs))
+                invalid_preview = ", ".join(unique_unresolved_refs[:3])
+                if len(unique_unresolved_refs) > 3:
+                    invalid_preview += ", ..."
+                details.append(
+                    "Matched episode refs could not be resolved to library sources: "
+                    f"{invalid_preview}"
+                )
+            if missing_refs:
+                unique_missing_refs = list(dict.fromkeys(missing_refs))
+                missing_preview = ", ".join(unique_missing_refs[:3])
+                if len(unique_missing_refs) > 3:
+                    missing_preview += ", ..."
+                details.append(
+                    f"Resolved source episode files are missing: {missing_preview}"
+                )
+            details.append(
+                "Ensure the source episode exists in the hydrated library, then rerun /processing."
+            )
+            raise RuntimeError(" ".join(details))
         return sources
 
     @classmethod
@@ -403,6 +452,16 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
         )
 
     @classmethod
+    def _collect_raw_scene_subtitle_files(cls, output_dir: Path) -> list[Path]:
+        raw_dir = output_dir / "raw_scene_subtitles"
+        if not raw_dir.exists():
+            return []
+        return sorted(
+            [path for path in raw_dir.rglob("*") if path.is_file()],
+            key=lambda path: str(path.relative_to(raw_dir)).lower(),
+        )
+
+    @classmethod
     def build_manifest(cls, project: Project, matches: list[SceneMatch]) -> tuple[str, list[ManifestEntry]]:
         output_dir = cls.get_output_dir(project.id)
         if not output_dir.exists():
@@ -423,6 +482,7 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
             output_dir,
             relative_path=f"{folder}/subtitles/{cls.SUBTITLES_ARCHIVE_FILENAME}",
         )
+        raw_scene_subtitle_files = cls._collect_raw_scene_subtitle_files(output_dir)
 
         subtitle_name = subtitle_path.name
         entries: list[ManifestEntry] = [
@@ -493,6 +553,16 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
 
         if subtitles_archive_entry is not None:
             entries.append(subtitles_archive_entry)
+
+        raw_scene_subtitle_root = output_dir / "raw_scene_subtitles"
+        for raw_scene_subtitle_file in raw_scene_subtitle_files:
+            relative = raw_scene_subtitle_file.relative_to(raw_scene_subtitle_root).as_posix()
+            entries.append(
+                ManifestEntry(
+                    relative_path=f"{folder}/raw_scene_subtitles/{relative}",
+                    source_path=raw_scene_subtitle_file,
+                )
+            )
 
         entries.append(
             ManifestEntry(

@@ -8,11 +8,12 @@ from functools import partial
 from pathlib import Path
 from typing import AsyncIterator
 
+import numpy as np
 from PIL import Image, ImageOps
 
 from ..config import settings
 from ..library_types import LibraryType, coerce_library_type
-from ..models import AlternativeMatch, MatchCandidate, MatchList, SceneMatch, SceneList
+from ..models import AlternativeMatch, MatchCandidate, MatchList, Scene, SceneMatch, SceneList
 
 
 @dataclass
@@ -203,6 +204,160 @@ class AnimeMatcherService:
             cap.release()
 
     @classmethod
+    def get_index_fps(cls) -> float:
+        """Return the FPS the loaded library was indexed at.
+
+        Falls back to 1.0 (anime_searcher's DEFAULT_FPS) when no manifest FPS
+        is available so callers that gate behavior on grid step stay safe.
+        """
+        if cls._index_manager is not None:
+            try:
+                fps = cls._index_manager.get_default_fps()
+            except Exception:
+                fps = None
+            if fps is not None and float(fps) > 0:
+                return float(fps)
+        return 1.0
+
+    @classmethod
+    def _get_video_fps(cls, video_path: Path) -> float | None:
+        cv2 = cls._require_cv2()
+        cap = cv2.VideoCapture(str(video_path))
+        try:
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            return float(fps) if fps and fps > 0 else None
+        finally:
+            cap.release()
+
+    @classmethod
+    def _collect_frames_in_window(
+        cls,
+        video_path: Path,
+        start_ts: float,
+        end_ts: float,
+        max_frames: int = 48,
+    ) -> list[tuple[float, Image.Image]]:
+        """Decode frames whose timestamps fall in [start_ts, end_ts].
+
+        Uses OpenCV's keyframe-based seek then iterates forward frame-by-frame.
+        Timestamps returned are the decoded frames' actual PTS (from
+        CAP_PROP_POS_MSEC read before the decode advances the position).
+        """
+        cv2 = cls._require_cv2()
+        start_ts = max(0.0, start_ts)
+        cap = cv2.VideoCapture(str(video_path))
+        frames: list[tuple[float, Image.Image]] = []
+        try:
+            cap.set(cv2.CAP_PROP_POS_MSEC, start_ts * 1000.0)
+            while len(frames) < max_frames:
+                pos_ts = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+                if pos_ts > end_ts:
+                    break
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if pos_ts < start_ts:
+                    # Seek landed on an earlier keyframe; skip until we enter the window.
+                    continue
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames.append((pos_ts, Image.fromarray(frame_rgb)))
+        finally:
+            cap.release()
+        return frames
+
+    @classmethod
+    def _refine_boundaries(
+        cls,
+        video_path: Path,
+        scene: Scene,
+        matched_episode: str,
+        matched_start_ts: float,
+        matched_end_ts: float,
+        library_type: LibraryType | str,
+    ) -> tuple[float, float] | None:
+        """Refine (start_ts, end_ts) to native source FPS using argmax cosine.
+
+        The 2-FPS index grid caps boundary precision at 0.5s. Post-match we
+        decode the matched source episode at its own native FPS in a small
+        window around each boundary, re-embed those frames, and pick the one
+        whose SSCD embedding best matches the TikTok scene's actual first /
+        last frame. Reduces boundary error from ~250ms to ~1 source frame.
+
+        Returns None on failure; caller should keep the unrefined timestamps.
+        """
+        if cls._embedder is None:
+            return None
+
+        # Resolve the source episode file. Import inline to avoid a top-level
+        # cycle (AnimeLibraryService imports a lot).
+        from .anime_library import AnimeLibraryService
+
+        episode_path = AnimeLibraryService.resolve_episode_path(
+            matched_episode,
+            library_type=library_type,
+        )
+        if episode_path is None or not episode_path.exists():
+            return None
+
+        scene_duration = scene.end_time - scene.start_time
+        if scene_duration <= 0:
+            return None
+
+        # Use a small inward offset so we sample actual content, not transitions.
+        tiny_offset = min(0.05, scene_duration / 10.0)
+        tiktok_start_t = scene.start_time + tiny_offset
+        tiktok_end_t = max(tiktok_start_t + 1e-3, scene.end_time - tiny_offset)
+
+        tiktok_frames = cls.extract_frames(video_path, [tiktok_start_t, tiktok_end_t])
+        if not all(tiktok_frames):
+            return None
+        tiktok_start_frame, tiktok_end_frame = tiktok_frames
+
+        # Widen the refinement window slightly beyond the 2-FPS half-grid so
+        # the true boundary is definitely inside the search range even when
+        # matched_*_ts landed on the wrong side of a cut.
+        index_step = 1.0 / max(cls.get_index_fps(), 1e-3)
+        window = max(0.5, index_step + 0.15)
+
+        start_frames = cls._collect_frames_in_window(
+            episode_path,
+            matched_start_ts - window,
+            matched_start_ts + window,
+        )
+        end_frames = cls._collect_frames_in_window(
+            episode_path,
+            matched_end_ts - window,
+            matched_end_ts + window,
+        )
+        if not start_frames or not end_frames:
+            return None
+
+        embedder = cls._embedder
+        query_embeddings = embedder.embed_batch([tiktok_start_frame, tiktok_end_frame])
+        if query_embeddings.shape[0] < 2:
+            return None
+        q_start, q_end = query_embeddings[0], query_embeddings[1]
+
+        start_imgs = [f[1] for f in start_frames]
+        end_imgs = [f[1] for f in end_frames]
+        start_embs = embedder.embed_batch(start_imgs)
+        end_embs = embedder.embed_batch(end_imgs)
+
+        # SSCD embeddings are L2-normalized — inner product == cosine.
+        start_scores = start_embs @ q_start
+        end_scores = end_embs @ q_end
+
+        refined_start = float(start_frames[int(np.argmax(start_scores))][0])
+        refined_end = float(end_frames[int(np.argmax(end_scores))][0])
+
+        # If refinement collapses or reverses the interval, keep the original
+        # timestamps — a degenerate pick is worse than the coarse grid.
+        if refined_end - refined_start <= 0.1:
+            return None
+
+        return refined_start, refined_end
+
+    @classmethod
     def _search_image_batch(
         cls,
         images: list[Image.Image],
@@ -271,7 +426,7 @@ class AnimeMatcherService:
 
         The algorithm looks for candidates from the same episode where the timestamps
         follow each other in order (start < middle < end) with a speed ratio between
-        70% and 160% of original speed.
+        the configured matcher floor and 160% of original speed.
 
         Args:
             start_candidates: Top 5 matches for scene start frame
@@ -282,7 +437,7 @@ class AnimeMatcherService:
         Returns:
             SceneMatch if a consistent match is found, None otherwise
         """
-        MIN_SPEED = 0.70  # 70% - slowed down
+        MIN_SPEED = settings.matcher_min_speed_factor
         MAX_SPEED = 1.60  # 160% - sped up
 
         best_match: SceneMatch | None = None
@@ -310,18 +465,31 @@ class AnimeMatcherService:
                     if not (MIN_SPEED <= speed_ratio <= MAX_SPEED):
                         continue
 
-                    # Calculate confidence based on similarities and temporal consistency
+                    # Confidence combines three signals (all on [0, 1]):
+                    #   avg_similarity: raw retrieval quality across probes.
+                    #   min_similarity: the weakest probe — penalizes triples where
+                    #                   one frame is a bad match, even if the other
+                    #                   two are strong (classic sequence-match fix).
+                    #   temporal_score: how close middle is to the geometric center;
+                    #                   rewards clean temporal geometry.
                     avg_similarity = (
                         start.similarity + middle.similarity + end.similarity
                     ) / 3
+                    min_similarity = min(
+                        start.similarity, middle.similarity, end.similarity
+                    )
 
-                    # Bonus for middle frame being roughly in the middle
                     expected_middle = start.timestamp + source_duration / 2
-                    actual_middle = middle.timestamp
-                    middle_deviation = abs(actual_middle - expected_middle) / source_duration
-                    temporal_bonus = max(0, 1 - middle_deviation * 2) * 0.1
+                    middle_deviation = (
+                        abs(middle.timestamp - expected_middle) / source_duration
+                    )
+                    temporal_score = max(0.0, 1.0 - middle_deviation * 2)
 
-                    confidence = avg_similarity + temporal_bonus
+                    confidence = (
+                        0.70 * avg_similarity
+                        + 0.20 * min_similarity
+                        + 0.10 * temporal_score
+                    )
 
                     if confidence > best_confidence:
                         best_confidence = confidence
@@ -368,14 +536,8 @@ class AnimeMatcherService:
         """
         alternatives: list[AlternativeMatch] = []
 
-        # ============ Algorithm 1: Weighted Average (up to 3) ============
-        # Aggregate votes by episode across all frame positions
-        seen_weighted_avg: set[str] = set()
-        episode_votes: dict[str, dict] = defaultdict(lambda: {
-            'total_similarity': 0.0,
-            'vote_count': 0,
-            'timestamps': [],
-        })
+        MIN_SPEED = settings.matcher_min_speed_factor
+        MAX_SPEED = 1.60
 
         all_candidates = [
             ('start', start_candidates),
@@ -383,45 +545,101 @@ class AnimeMatcherService:
             ('end', end_candidates),
         ]
 
+        # ============ Algorithm 1: Weighted Average (up to 3) ============
+        # Aggregate candidates per position per episode so we can verify a
+        # temporally-consistent triple exists before proposing an interval.
+        # Prior to this guard, an episode whose start-frame hit and middle-frame
+        # hit landed in entirely different scenes (same character, different
+        # moment) produced intervals spanning hundreds of seconds — the "long
+        # clip" bug.
+        episode_pos: dict[str, dict[str, list[tuple[float, float]]]] = defaultdict(
+            lambda: {'start': [], 'middle': [], 'end': []}
+        )
+        episode_total_sim: dict[str, float] = defaultdict(float)
+        episode_vote_count: dict[str, int] = defaultdict(int)
+
         for position, candidates in all_candidates:
             for candidate in candidates:
                 ep = candidate.episode
-                episode_votes[ep]['total_similarity'] += candidate.similarity
-                episode_votes[ep]['vote_count'] += 1
-                episode_votes[ep]['timestamps'].append((position, candidate.timestamp))
+                episode_pos[ep][position].append(
+                    (candidate.timestamp, candidate.similarity)
+                )
+                episode_total_sim[ep] += candidate.similarity
+                episode_vote_count[ep] += 1
 
+        seen_weighted_avg: set[str] = set()
         weighted_avg_alts: list[tuple[float, AlternativeMatch]] = []
-        for episode, data in episode_votes.items():
-            if data['vote_count'] == 0:
+
+        for episode in episode_pos:
+            pos = episode_pos[episode]
+            vote_count = episode_vote_count[episode]
+            if vote_count == 0:
                 continue
+            avg_similarity = episode_total_sim[episode] / vote_count
 
-            avg_similarity = data['total_similarity'] / data['vote_count']
-            timestamps = sorted(data['timestamps'], key=lambda x: x[1])
+            # Search for the highest-scoring valid (s, m, e) triple, then a valid
+            # (s, e) pair, then fall back to midpoint projection.
+            best_interval: tuple[float, float, float] | None = None
+            best_interval_score = -1.0
 
-            # Estimate start/end times from available timestamps
-            min_ts = min(t[1] for t in timestamps)
-            max_ts = max(t[1] for t in timestamps)
+            if pos['start'] and pos['middle'] and pos['end']:
+                for s_ts, s_sim in pos['start']:
+                    for m_ts, m_sim in pos['middle']:
+                        if s_ts >= m_ts:
+                            continue
+                        for e_ts, e_sim in pos['end']:
+                            if m_ts >= e_ts:
+                                continue
+                            src_dur = e_ts - s_ts
+                            if src_dur <= 0:
+                                continue
+                            sr = scene_duration / src_dur
+                            if not (MIN_SPEED <= sr <= MAX_SPEED):
+                                continue
+                            score = s_sim + m_sim + e_sim
+                            if score > best_interval_score:
+                                best_interval_score = score
+                                best_interval = (s_ts, e_ts, sr)
 
-            if max_ts - min_ts > 0.5:
-                start_time = min_ts
-                end_time = max_ts
+            if best_interval is None and pos['start'] and pos['end']:
+                for s_ts, s_sim in pos['start']:
+                    for e_ts, e_sim in pos['end']:
+                        if s_ts >= e_ts:
+                            continue
+                        src_dur = e_ts - s_ts
+                        sr = scene_duration / src_dur
+                        if not (MIN_SPEED <= sr <= MAX_SPEED):
+                            continue
+                        score = s_sim + e_sim
+                        if score > best_interval_score:
+                            best_interval_score = score
+                            best_interval = (s_ts, e_ts, sr)
+
+            if best_interval is not None:
+                start_time, end_time, speed_ratio = best_interval
             else:
-                mid_ts = (min_ts + max_ts) / 2
-                start_time = mid_ts - scene_duration / 2
-                end_time = mid_ts + scene_duration / 2
-
-            source_duration = end_time - start_time
-            speed_ratio = scene_duration / source_duration if source_duration > 0 else 1.0
+                # No ordered pair/triple passes the speed bounds. Project from
+                # the single best-similarity candidate, centering a scene-length
+                # interval on it. Keeps speed_ratio honestly at 1.0.
+                all_ts_sim: list[tuple[float, float]] = []
+                for p in ('start', 'middle', 'end'):
+                    all_ts_sim.extend(pos[p])
+                if not all_ts_sim:
+                    continue
+                best_ts, _ = max(all_ts_sim, key=lambda x: x[1])
+                start_time = max(0.0, best_ts - scene_duration / 2)
+                end_time = start_time + scene_duration
+                speed_ratio = 1.0
 
             # Score: vote_count * 10 + avg_similarity (favor more votes)
-            score = data['vote_count'] * 10 + avg_similarity
+            score = vote_count * 10 + avg_similarity
             weighted_avg_alts.append((score, AlternativeMatch(
                 episode=episode,
-                start_time=max(0, start_time),
+                start_time=max(0.0, start_time),
                 end_time=end_time,
                 confidence=avg_similarity,
                 speed_ratio=speed_ratio,
-                vote_count=data['vote_count'],
+                vote_count=vote_count,
                 algorithm='weighted_avg',
             )))
 
@@ -454,12 +672,14 @@ class AnimeMatcherService:
                 start_time = best.timestamp - scene_duration
                 end_time = best.timestamp
 
+            clamped_start = max(0.0, start_time)
+            source_duration = max(1e-3, end_time - clamped_start)
             best_frame_alts.append((best.similarity, AlternativeMatch(
                 episode=best.episode,
-                start_time=max(0, start_time),
+                start_time=clamped_start,
                 end_time=end_time,
                 confidence=best.similarity,
-                speed_ratio=1.0,  # Assuming 1:1 speed since we estimate from duration
+                speed_ratio=scene_duration / source_duration,
                 vote_count=1,
                 algorithm='best_frame',
             )))
@@ -498,17 +718,31 @@ class AnimeMatcherService:
                     start_time = c.timestamp - scene_duration
                     end_time = c.timestamp
 
+                clamped_start = max(0.0, start_time)
+                source_duration = max(1e-3, end_time - clamped_start)
                 alternatives.append(AlternativeMatch(
                     episode=c.episode,
-                    start_time=max(0, start_time),
+                    start_time=clamped_start,
                     end_time=end_time,
                     confidence=c.similarity,
-                    speed_ratio=1.0,
+                    speed_ratio=scene_duration / source_duration,
                     vote_count=1,
                     algorithm='union_topk',
                 ))
                 seen_union_topk.add(c.episode)
                 utk_added += 1
+
+        # Deduplicate alternatives sharing identical (start_time, end_time):
+        # the three algorithms independently propose intervals and routinely
+        # converge on the same boundaries. Keep the highest-confidence entry
+        # per interval so reviewers don't wade through redundant candidates.
+        dedup: dict[tuple[float, float], AlternativeMatch] = {}
+        for alt in alternatives:
+            key = (alt.start_time, alt.end_time)
+            existing = dedup.get(key)
+            if existing is None or alt.confidence > existing.confidence:
+                dedup[key] = alt
+        alternatives = list(dedup.values())
 
         # Final sort: weighted_avg first, then best_frame, then union_topk
         # Within each algorithm, sort by confidence
@@ -642,13 +876,18 @@ class AnimeMatcherService:
                     )
                     continue
 
-                # Batched query embedding/search for start/middle/end frames.
+                # Retrieve deep top-K for the triple search so recycled animation
+                # doesn't silently bury the correct reference frame below rank 5.
+                # Alternatives are computed from the top-5 slice to keep their
+                # noise profile stable.
+                # Flip augmentation is off: anime isn't broadcast mirrored, so
+                # mirroring only adds symmetry-coincidence false positives.
                 search_batch = partial(
                     cls._search_image_batch,
                     [start_frame, middle_frame, end_frame],
-                    top_n=5,
+                    top_n=25,
                     threshold=None,
-                    flip=True,
+                    flip=False,
                     series=anime_name,
                 )
                 start_results, middle_results, end_results = await loop.run_in_executor(
@@ -672,7 +911,7 @@ class AnimeMatcherService:
                 middle_candidates = to_candidates(middle_results)
                 end_candidates = to_candidates(end_results)
 
-                # Find temporal match
+                # Find temporal match across the deep candidate pool.
                 match = cls._find_temporal_match(
                     start_candidates,
                     middle_candidates,
@@ -680,25 +919,49 @@ class AnimeMatcherService:
                     scene.duration,
                 )
 
+                # Alternatives operate on the top-5 slice per position.
+                alt_start = start_candidates[:5]
+                alt_middle = middle_candidates[:5]
+                alt_end = end_candidates[:5]
+
                 if match:
+                    # Refine boundaries to native-frame precision (addresses the
+                    # 2-FPS index Nyquist floor — the dominant timing failure).
+                    refined = await loop.run_in_executor(
+                        None,
+                        cls._refine_boundaries,
+                        video_path,
+                        scene,
+                        match.episode,
+                        match.start_time,
+                        match.end_time,
+                        library_type,
+                    )
+                    if refined is not None:
+                        refined_start, refined_end = refined
+                        refined_duration = refined_end - refined_start
+                        if refined_duration > 0:
+                            match.start_time = refined_start
+                            match.end_time = refined_end
+                            match.speed_ratio = scene.duration / refined_duration
+
                     match.scene_index = scene.index
                     match.start_candidates = start_candidates
                     match.middle_candidates = middle_candidates
                     match.end_candidates = end_candidates
-                    # Also compute alternatives for matched scenes (for editing)
                     match.alternatives = cls._compute_alternatives(
-                        start_candidates,
-                        middle_candidates,
-                        end_candidates,
+                        alt_start,
+                        alt_middle,
+                        alt_end,
                         scene.duration,
                     )
                     matches.matches.append(match)
                 else:
                     # No match found - compute alternatives for manual selection
                     alternatives = cls._compute_alternatives(
-                        start_candidates,
-                        middle_candidates,
-                        end_candidates,
+                        alt_start,
+                        alt_middle,
+                        alt_end,
                         scene.duration,
                     )
                     matches.matches.append(

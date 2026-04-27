@@ -11,6 +11,8 @@ import tempfile
 import time
 from typing import Callable, Any
 
+import google_auth_httplib2
+import httplib2
 import requests
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -25,6 +27,16 @@ from ..utils.meta_graph import extract_graph_error as _extract_graph_error
 from .meta_token_service import MetaTokenService
 
 logger = logging.getLogger("uvicorn.error")
+
+
+class _TimeoutSession(requests.Session):
+    def __init__(self, default_timeout_seconds: float) -> None:
+        super().__init__()
+        self._default_timeout_seconds = max(float(default_timeout_seconds), 1.0)
+
+    def request(self, *args, **kwargs):
+        kwargs.setdefault("timeout", self._default_timeout_seconds)
+        return super().request(*args, **kwargs)
 
 
 @dataclass
@@ -192,8 +204,215 @@ class SocialUploadService:
         return f"https://graph.facebook.com/{settings.meta_graph_api_version}"
 
     @classmethod
-    def _sleep_backoff(cls, attempt: int) -> None:
-        time.sleep(cls._RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)))
+    def _create_upload_session(cls) -> requests.Session:
+        """Create an optimized session for upload operations with connection pooling."""
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=4,
+            pool_maxsize=8,
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
+
+    @classmethod
+    def _platform_deadline(cls, deadline: float | None = None) -> float:
+        if deadline is not None:
+            return deadline
+        return time.monotonic() + max(float(settings.social_upload_platform_timeout_seconds), 1.0)
+
+    @classmethod
+    def _platform_timeout_detail(cls, platform: str, operation: str) -> str:
+        timeout_seconds = max(int(settings.social_upload_platform_timeout_seconds), 1)
+        return f"{platform} upload timed out during {operation} after {timeout_seconds}s."
+
+    @classmethod
+    def _ensure_deadline_remaining(
+        cls,
+        *,
+        deadline: float | None,
+        platform: str,
+        operation: str,
+    ) -> None:
+        if deadline is None:
+            return
+        if deadline - time.monotonic() <= 0:
+            raise TimeoutError(cls._platform_timeout_detail(platform, operation))
+
+    @classmethod
+    def _request_timeout_seconds(
+        cls,
+        *,
+        deadline: float | None,
+        platform: str,
+        operation: str,
+        binary: bool = False,
+    ) -> float:
+        cls._ensure_deadline_remaining(
+            deadline=deadline,
+            platform=platform,
+            operation=operation,
+        )
+        configured = float(
+            settings.social_upload_binary_timeout_seconds
+            if binary
+            else settings.social_upload_http_timeout_seconds
+        )
+        if deadline is None:
+            return max(configured, 1.0)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(cls._platform_timeout_detail(platform, operation))
+        return max(1.0, min(configured, remaining))
+
+    @classmethod
+    def _sleep_backoff(
+        cls,
+        attempt: int,
+        *,
+        deadline: float | None = None,
+        platform: str = "Platform",
+        operation: str = "request retry",
+    ) -> None:
+        delay_seconds = cls._RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
+        if deadline is None:
+            time.sleep(delay_seconds)
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(cls._platform_timeout_detail(platform, operation))
+        time.sleep(min(delay_seconds, max(remaining, 0.0)))
+
+    @classmethod
+    def _sleep_with_deadline(
+        cls,
+        seconds: float,
+        *,
+        deadline: float | None,
+        platform: str,
+        operation: str,
+    ) -> None:
+        if deadline is None:
+            time.sleep(seconds)
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(cls._platform_timeout_detail(platform, operation))
+        time.sleep(min(seconds, remaining))
+
+    @classmethod
+    def _google_auth_request(cls, *, deadline: float | None, platform: str) -> Request:
+        session = _TimeoutSession(
+            cls._request_timeout_seconds(
+                deadline=deadline,
+                platform=platform,
+                operation="credential refresh",
+            )
+        )
+        return Request(session=session)
+
+    @classmethod
+    def _build_google_http(
+        cls,
+        *,
+        timeout_seconds: float,
+    ) -> httplib2.Http:
+        http = httplib2.Http(timeout=max(float(timeout_seconds), 1.0))
+        # googleapiclient.build_http() excludes HTTP 308 from redirect handling
+        # because Google APIs use 308 for resumable uploads, not redirects.
+        try:
+            redirect_codes = getattr(http, "redirect_codes", None)
+            if redirect_codes is not None and 308 in redirect_codes:
+                http.redirect_codes = redirect_codes - {308}
+        except Exception:
+            pass
+        return http
+
+    @classmethod
+    def _build_youtube_client(
+        cls,
+        *,
+        credentials: Credentials,
+        deadline: float | None,
+    ):
+        timeout_seconds = cls._request_timeout_seconds(
+            deadline=deadline,
+            platform="YouTube",
+            operation="client setup",
+        )
+        http = google_auth_httplib2.AuthorizedHttp(
+            credentials,
+            http=cls._build_google_http(timeout_seconds=timeout_seconds),
+        )
+        return build("youtube", "v3", http=http, cache_discovery=False)
+
+    @classmethod
+    def _set_google_service_timeout(
+        cls,
+        service: Any,
+        *,
+        deadline: float | None,
+        platform: str,
+        operation: str,
+        binary: bool = False,
+    ) -> None:
+        timeout_seconds = cls._request_timeout_seconds(
+            deadline=deadline,
+            platform=platform,
+            operation=operation,
+            binary=binary,
+        )
+        authorized_http = getattr(service, "_http", None)
+        raw_http = getattr(authorized_http, "http", None)
+        if raw_http is not None and hasattr(raw_http, "timeout"):
+            raw_http.timeout = timeout_seconds
+
+    @classmethod
+    def _execute_google_request(
+        cls,
+        service: Any,
+        request: Any,
+        *,
+        deadline: float | None,
+        platform: str,
+        operation: str,
+    ):
+        cls._ensure_deadline_remaining(
+            deadline=deadline,
+            platform=platform,
+            operation=operation,
+        )
+        cls._set_google_service_timeout(
+            service,
+            deadline=deadline,
+            platform=platform,
+            operation=operation,
+        )
+        return request.execute(num_retries=0)
+
+    @classmethod
+    def _execute_google_upload_next_chunk(
+        cls,
+        service: Any,
+        request: Any,
+        *,
+        deadline: float | None,
+        platform: str,
+        operation: str,
+    ):
+        cls._ensure_deadline_remaining(
+            deadline=deadline,
+            platform=platform,
+            operation=operation,
+        )
+        cls._set_google_service_timeout(
+            service,
+            deadline=deadline,
+            platform=platform,
+            operation=operation,
+            binary=True,
+        )
+        return request.next_chunk(num_retries=0)
 
     @classmethod
     def _request_with_retries(
@@ -201,22 +420,51 @@ class SocialUploadService:
         request_fn: Callable[[], requests.Response],
         *,
         max_attempts: int | None = None,
+        deadline: float | None = None,
+        platform: str = "Platform",
+        operation: str = "request",
     ) -> requests.Response:
         attempts = max_attempts or cls._MAX_REQUEST_ATTEMPTS
         last_exc: Exception | None = None
 
         for attempt in range(1, attempts + 1):
+            cls._ensure_deadline_remaining(
+                deadline=deadline,
+                platform=platform,
+                operation=operation,
+            )
             try:
                 response = request_fn()
+            except requests.Timeout as exc:
+                last_exc = exc
+                if attempt >= attempts:
+                    raise TimeoutError(cls._platform_timeout_detail(platform, operation)) from exc
+                cls._sleep_backoff(
+                    attempt,
+                    deadline=deadline,
+                    platform=platform,
+                    operation=operation,
+                )
+                continue
             except requests.RequestException as exc:
                 last_exc = exc
                 if attempt >= attempts:
                     raise
-                cls._sleep_backoff(attempt)
+                cls._sleep_backoff(
+                    attempt,
+                    deadline=deadline,
+                    platform=platform,
+                    operation=operation,
+                )
                 continue
 
             if response.status_code in cls._RETRY_STATUS_CODES and attempt < attempts:
-                cls._sleep_backoff(attempt)
+                cls._sleep_backoff(
+                    attempt,
+                    deadline=deadline,
+                    platform=platform,
+                    operation=operation,
+                )
                 continue
             return response
 
@@ -282,7 +530,7 @@ class SocialUploadService:
         )
 
     @classmethod
-    def _google_credentials(cls) -> Credentials:
+    def _google_credentials(cls, *, deadline: float | None = None) -> Credentials:
         if not cls.is_youtube_configured():
             raise RuntimeError(
                 "YouTube OAuth is not configured. Set ATR_GOOGLE_CLIENT_ID, "
@@ -300,19 +548,36 @@ class SocialUploadService:
                 "https://www.googleapis.com/auth/youtube.force-ssl",
             ],
         )
-        creds.refresh(Request())
+        refresh_request = cls._google_auth_request(deadline=deadline, platform="YouTube")
+        try:
+            creds.refresh(refresh_request)
+        finally:
+            session = getattr(refresh_request, "session", None)
+            if session is not None and hasattr(session, "close"):
+                session.close()
         return creds
 
     @classmethod
-    def youtube_credentials(cls) -> Credentials:
-        return cls._google_credentials()
+    def youtube_credentials(cls, *, deadline: float | None = None) -> Credentials:
+        return cls._google_credentials(deadline=deadline)
 
     @classmethod
-    def _list_mine_youtube_channels(cls, youtube) -> list[dict[str, Any]]:
+    def _list_mine_youtube_channels(
+        cls,
+        youtube,
+        *,
+        deadline: float | None = None,
+    ) -> list[dict[str, Any]]:
         channels: list[dict[str, Any]] = []
         request = youtube.channels().list(part="id,snippet", mine=True, maxResults=50)
         while request is not None:
-            response = request.execute()
+            response = cls._execute_google_request(
+                youtube,
+                request,
+                deadline=deadline,
+                platform="YouTube",
+                operation="channel lookup",
+            )
             batch = response.get("items", [])
             if isinstance(batch, list):
                 channels.extend(item for item in batch if isinstance(item, dict))
@@ -325,8 +590,13 @@ class SocialUploadService:
         return value or None
 
     @classmethod
-    def _validate_youtube_target_channel(cls, youtube) -> tuple[str | None, str | None]:
-        channels = cls._list_mine_youtube_channels(youtube)
+    def _validate_youtube_target_channel(
+        cls,
+        youtube,
+        *,
+        deadline: float | None = None,
+    ) -> tuple[str | None, str | None]:
+        channels = cls._list_mine_youtube_channels(youtube, deadline=deadline)
         if not channels:
             return (
                 None,
@@ -352,8 +622,20 @@ class SocialUploadService:
         )
 
     @classmethod
-    def _uploaded_video_channel_id(cls, youtube, video_id: str) -> str | None:
-        response = youtube.videos().list(part="snippet", id=video_id, maxResults=1).execute()
+    def _uploaded_video_channel_id(
+        cls,
+        youtube,
+        video_id: str,
+        *,
+        deadline: float | None = None,
+    ) -> str | None:
+        response = cls._execute_google_request(
+            youtube,
+            youtube.videos().list(part="snippet", id=video_id, maxResults=1),
+            deadline=deadline,
+            platform="YouTube",
+            operation="uploaded video verification",
+        )
         items = response.get("items", [])
         if not isinstance(items, list) or not items:
             return None
@@ -376,6 +658,21 @@ class SocialUploadService:
         return "fr"
 
     @classmethod
+    def _youtube_chunksize(cls, file_size: int) -> int:
+        """Adaptive chunk size for YouTube uploads based on file size.
+
+        Larger chunks reduce round-trip overhead for big files.
+        Google API supports up to 64MB chunks.
+        """
+        if file_size >= 256 * 1024 * 1024:  # 256MB+
+            return 32 * 1024 * 1024  # 32MB chunks
+        elif file_size >= 100 * 1024 * 1024:  # 100MB+
+            return 24 * 1024 * 1024  # 24MB chunks
+        elif file_size >= 50 * 1024 * 1024:  # 50MB+
+            return 16 * 1024 * 1024  # 16MB chunks
+        return 8 * 1024 * 1024  # 8MB for smaller files
+
+    @classmethod
     def upload_youtube(
         cls,
         *,
@@ -390,7 +687,9 @@ class SocialUploadService:
         channel_id: str | None = None,
         youtube_strategy: str | None = None,
         youtube_prep_dir: Path | None = None,
+        deadline: float | None = None,
     ) -> PlatformUploadResult:
+        deadline = cls._platform_deadline(deadline)
         strategy = (youtube_strategy or "auto").strip().lower()
         if strategy == "skip":
             return PlatformUploadResult(
@@ -452,16 +751,23 @@ class SocialUploadService:
                         )
                     prepared_video_path = prep.video_path
 
-                creds = credentials if credentials is not None else cls._google_credentials()
+                creds = credentials if credentials is not None else cls._google_credentials(deadline=deadline)
                 if credentials is not None:
-                    from google.auth.transport.requests import Request as _Request
-
-                    creds.refresh(_Request())
-                youtube = build("youtube", "v3", credentials=creds, cache_discovery=False)
+                    refresh_request = cls._google_auth_request(deadline=deadline, platform="YouTube")
+                    try:
+                        creds.refresh(refresh_request)
+                    finally:
+                        session = getattr(refresh_request, "session", None)
+                        if session is not None and hasattr(session, "close"):
+                            session.close()
+                youtube = cls._build_youtube_client(credentials=creds, deadline=deadline)
                 if channel_id is not None:
                     expected_channel_id = channel_id or None
                 else:
-                    expected_channel_id, channel_error = cls._validate_youtube_target_channel(youtube)
+                    expected_channel_id, channel_error = cls._validate_youtube_target_channel(
+                        youtube,
+                        deadline=deadline,
+                    )
                     if channel_error:
                         return PlatformUploadResult(
                             platform="youtube",
@@ -503,15 +809,37 @@ class SocialUploadService:
                         },
                         "status": status_body,
                     },
-                    media_body=MediaFileUpload(str(prepared_video_path), chunksize=-1, resumable=True),
+                    media_body=MediaFileUpload(
+                        str(prepared_video_path),
+                        chunksize=cls._youtube_chunksize(prepared_video_path.stat().st_size),
+                        resumable=True,
+                    ),
                 )
-                response = upload_request.execute()
+                response = None
+                while response is None:
+                    _, response = cls._execute_google_upload_next_chunk(
+                        youtube,
+                        upload_request,
+                        deadline=deadline,
+                        platform="YouTube",
+                        operation="video upload",
+                    )
                 video_id = response["id"]
                 if expected_channel_id:
-                    actual_channel_id = cls._uploaded_video_channel_id(youtube, video_id)
+                    actual_channel_id = cls._uploaded_video_channel_id(
+                        youtube,
+                        video_id,
+                        deadline=deadline,
+                    )
                     if actual_channel_id != expected_channel_id:
                         try:
-                            youtube.videos().delete(id=video_id).execute()
+                            cls._execute_google_request(
+                                youtube,
+                                youtube.videos().delete(id=video_id),
+                                deadline=deadline,
+                                platform="YouTube",
+                                operation="unexpected-channel cleanup",
+                            )
                         except Exception:
                             pass
                         return PlatformUploadResult(
@@ -523,18 +851,27 @@ class SocialUploadService:
                             ),
                         )
 
-                youtube.captions().insert(
-                    part="snippet",
-                    body={
-                        "snippet": {
-                            "videoId": video_id,
-                            "language": youtube_language,
-                            "name": youtube_language,
-                            "isDraft": False,
-                        }
-                    },
-                    media_body=MediaFileUpload(str(subtitle_path), mimetype="application/octet-stream"),
-                ).execute()
+                cls._execute_google_request(
+                    youtube,
+                    youtube.captions().insert(
+                        part="snippet",
+                        body={
+                            "snippet": {
+                                "videoId": video_id,
+                                "language": youtube_language,
+                                "name": youtube_language,
+                                "isDraft": False,
+                            }
+                        },
+                        media_body=MediaFileUpload(
+                            str(subtitle_path),
+                            mimetype="application/octet-stream",
+                        ),
+                    ),
+                    deadline=deadline,
+                    platform="YouTube",
+                    operation="caption upload",
+                )
 
                 detail_parts = []
                 if scheduled_at:
@@ -1064,7 +1401,9 @@ class SocialUploadService:
         scheduled_at: datetime | None = None,
         facebook_strategy: str | None = None,
         facebook_prep_dir: Path | None = None,
+        deadline: float | None = None,
     ) -> PlatformUploadResult:
+        deadline = cls._platform_deadline(deadline)
         # Handle explicit user strategy choice
         strategy = (facebook_strategy or "auto").strip().lower()
         if strategy == "skip":
@@ -1107,6 +1446,7 @@ class SocialUploadService:
                 scheduled_at=scheduled_at,
                 facebook_strategy=strategy,
                 facebook_prep_dir=facebook_prep_dir,
+                deadline=deadline,
             )
 
         # Immediate publish: use standard /videos endpoint
@@ -1173,7 +1513,7 @@ class SocialUploadService:
                     prepared_video_path = prep.video_path
                     allow_drive_url_fast_path = bool(video_url and not prep.transcoded)
 
-                with requests.Session() as session:
+                with cls._create_upload_session() as session:
                     source_mode = "local"
                     video_id: str | None = None
 
@@ -1189,9 +1529,16 @@ class SocialUploadService:
                                     "access_token": token,
                                     "file_url": video_url,
                                 },
-                                timeout=120,
+                                timeout=cls._request_timeout_seconds(
+                                    deadline=deadline,
+                                    platform="Facebook",
+                                    operation="drive URL video upload",
+                                ),
                             ),
                             max_attempts=3,
+                            deadline=deadline,
+                            platform="Facebook",
+                            operation="drive URL video upload",
                         )
                         if url_resp.status_code < 400:
                             payload = url_resp.json()
@@ -1200,41 +1547,24 @@ class SocialUploadService:
                                 video_id = str(candidate)
                                 source_mode = "drive_url"
 
-                    # Fallback path: upload bytes from local file.
+                    # Fallback path: use chunked Reels API upload for better performance.
                     if not video_id:
-                        def _upload_video_once() -> requests.Response:
-                            with prepared_video_path.open("rb") as source:
-                                return session.post(
-                                    f"{base}/{page_id}/videos",
-                                    data={
-                                        "title": metadata.facebook.title,
-                                        "description": metadata.facebook.description,
-                                        "published": "true",
-                                        "access_token": token,
-                                    },
-                                    files={"source": source},
-                                    timeout=1200,
-                                )
-
-                        resp = cls._request_with_retries(_upload_video_once, max_attempts=3)
-                        if resp.status_code >= 400:
-                            detail = _extract_graph_error(resp)
-                            if cls._is_page_token_required_error(resp):
-                                detail = (
-                                    f"{detail} "
-                                    "(configured token is not page-scoped for video publishing; "
-                                    "provide a real page access token or allow derivation from page fields)."
-                                )
+                        chunked_video_id, chunked_error = cls._upload_facebook_immediate_chunked(
+                            session=session,
+                            base=base,
+                            page_id=page_id,
+                            token=token,
+                            video_path=prepared_video_path,
+                            metadata=metadata,
+                            deadline=deadline,
+                        )
+                        if chunked_error:
                             return PlatformUploadResult(
                                 platform="facebook",
                                 status="failed",
-                                detail=f"Video upload failed: {detail}",
+                                detail=f"Video upload failed: {chunked_error}",
                             )
-                        payload = resp.json()
-                        candidate = payload.get("id")
-                        if not candidate:
-                            raise RuntimeError(f"Unexpected Facebook response: {payload}")
-                        video_id = str(candidate)
+                        video_id = chunked_video_id
 
                     # Caption upload (required for platform success in this workflow).
                     cap_resp = cls._upload_facebook_caption_with_wait(
@@ -1244,16 +1574,21 @@ class SocialUploadService:
                         token=token,
                         subtitle_path=subtitle_path,
                         subtitle_locale=subtitle_locale,
+                        deadline=deadline,
                     )
 
             if cap_resp.status_code >= 400:
                 # If subtitle upload is unavailable, this platform is skipped by policy.
                 try:
-                    with requests.Session() as session:
+                    with cls._create_upload_session() as session:
                         session.delete(
                             f"{base}/{video_id}",
                             params={"access_token": token},
-                            timeout=20,
+                            timeout=cls._request_timeout_seconds(
+                                deadline=deadline,
+                                platform="Facebook",
+                                operation="cleanup failed upload",
+                            ),
                         )
                 except Exception:
                     pass
@@ -1285,7 +1620,9 @@ class SocialUploadService:
         metadata: VideoMetadataPayload,
         ig_user_id: str | None = None,
         ig_access_token: str | None = None,
+        deadline: float | None = None,
     ) -> PlatformUploadResult:
+        deadline = cls._platform_deadline(deadline)
         # Use explicit per-account credentials if provided, else fall back to global
         if ig_user_id and ig_access_token:
             token = ig_access_token
@@ -1312,7 +1649,7 @@ class SocialUploadService:
 
         try:
             base = cls._graph_base()
-            with requests.Session() as session:
+            with cls._create_upload_session() as session:
                 container_id = cls._create_instagram_container_resumable(
                     session=session,
                     base=base,
@@ -1320,6 +1657,7 @@ class SocialUploadService:
                     token=token,
                     caption=metadata.instagram.caption,
                     video_path=video_path,
+                    deadline=deadline,
                 )
                 media_id, permalink = cls._publish_instagram_container(
                     session=session,
@@ -1327,6 +1665,7 @@ class SocialUploadService:
                     ig_user_id=ig_user_id,
                     token=token,
                     container_id=container_id,
+                    deadline=deadline,
                 )
 
             return PlatformUploadResult(
@@ -1355,8 +1694,10 @@ class SocialUploadService:
         scheduled_at: datetime,
         facebook_strategy: str = "auto",
         facebook_prep_dir: Path | None = None,
+        deadline: float | None = None,
     ) -> PlatformUploadResult:
         """Schedule a Facebook Reel via 3-phase Reels API (video_state=SCHEDULED)."""
+        deadline = cls._platform_deadline(deadline)
         base = cls._graph_base()
         max_flow_attempts = 2
 
@@ -1467,7 +1808,7 @@ class SocialUploadService:
 
                 last_retryable_finish_error: str | None = None
                 for flow_attempt in range(1, max_flow_attempts + 1):
-                    with requests.Session() as session:
+                    with cls._create_upload_session() as session:
                         # Phase 1: Start — initialize upload session
                         start_resp = cls._request_with_retries(
                             lambda: session.post(
@@ -1476,9 +1817,16 @@ class SocialUploadService:
                                     "upload_phase": "start",
                                     "access_token": token,
                                 },
-                                timeout=60,
+                                timeout=cls._request_timeout_seconds(
+                                    deadline=deadline,
+                                    platform="Facebook",
+                                    operation="reel start",
+                                ),
                             ),
                             max_attempts=3,
+                            deadline=deadline,
+                            platform="Facebook",
+                            operation="reel start",
                         )
                         if start_resp.status_code >= 400:
                             return PlatformUploadResult(
@@ -1510,7 +1858,10 @@ class SocialUploadService:
                             video_path=prepared_video_path,
                             file_size=file_size,
                             offset=0,
-                            max_attempts=2,
+                            max_attempts=3,
+                            deadline=deadline,
+                            video_id=str(video_id),
+                            base=base,
                         )
                         if upload_resp.status_code >= 400:
                             return PlatformUploadResult(
@@ -1535,6 +1886,7 @@ class SocialUploadService:
                             token=token,
                             video_path=prepared_video_path,
                             file_size=file_size,
+                            deadline=deadline,
                         )
                         if not upload_ready:
                             if flow_attempt < max_flow_attempts:
@@ -1552,8 +1904,14 @@ class SocialUploadService:
                                     base=base,
                                     token=token,
                                     video_id=str(video_id),
+                                    deadline=deadline,
                                 )
-                                time.sleep(min(30, 5 * flow_attempt))
+                                cls._sleep_with_deadline(
+                                    min(30, 5 * flow_attempt),
+                                    deadline=deadline,
+                                    platform="Facebook",
+                                    operation="scheduled reel retry backoff",
+                                )
                                 continue
                             return PlatformUploadResult(
                                 platform="facebook",
@@ -1574,9 +1932,16 @@ class SocialUploadService:
                                     "title": metadata.facebook.title,
                                     "description": metadata.facebook.description,
                                 },
-                                timeout=120,
+                                timeout=cls._request_timeout_seconds(
+                                    deadline=deadline,
+                                    platform="Facebook",
+                                    operation="reel finish",
+                                ),
                             ),
                             max_attempts=3,
+                            deadline=deadline,
+                            platform="Facebook",
+                            operation="reel finish",
                         )
                         if finish_resp.status_code >= 400:
                             finish_error = _extract_graph_error(finish_resp)
@@ -1585,6 +1950,7 @@ class SocialUploadService:
                                 base=base,
                                 video_id=str(video_id),
                                 token=token,
+                                deadline=deadline,
                             )
                             if status_payload:
                                 finish_error = (
@@ -1608,8 +1974,14 @@ class SocialUploadService:
                                     base=base,
                                     token=token,
                                     video_id=str(video_id),
+                                    deadline=deadline,
                                 )
-                                time.sleep(min(30, 5 * flow_attempt))
+                                cls._sleep_with_deadline(
+                                    min(30, 5 * flow_attempt),
+                                    deadline=deadline,
+                                    platform="Facebook",
+                                    operation="scheduled reel retry backoff",
+                                )
                                 continue
                             return PlatformUploadResult(
                                 platform="facebook",
@@ -1636,6 +2008,7 @@ class SocialUploadService:
                             token=token,
                             subtitle_path=subtitle_path,
                             subtitle_locale=subtitle_locale,
+                            deadline=deadline,
                         )
                         caption_detail = ""
                         if cap_resp.status_code >= 400:
@@ -1677,6 +2050,220 @@ class SocialUploadService:
             )
 
     @classmethod
+    def _upload_facebook_immediate_chunked(
+        cls,
+        *,
+        session: requests.Session,
+        base: str,
+        page_id: str,
+        token: str,
+        video_path: Path,
+        metadata: VideoMetadataPayload,
+        deadline: float | None = None,
+    ) -> tuple[str | None, str | None]:
+        """Upload video to Facebook using 3-phase Reels API for immediate publish.
+
+        Returns (video_id, error_detail). On success error_detail is None.
+        On failure video_id is None and error_detail contains the error message.
+        """
+        file_size = video_path.stat().st_size
+        if file_size <= 0:
+            return None, "Video file is empty (0 bytes)"
+
+        max_flow_attempts = 2
+        last_error: str | None = None
+
+        for flow_attempt in range(1, max_flow_attempts + 1):
+            # Phase 1: Start — initialize upload session
+            start_resp = cls._request_with_retries(
+                lambda: session.post(
+                    f"{base}/{page_id}/video_reels",
+                    data={
+                        "upload_phase": "start",
+                        "access_token": token,
+                    },
+                    timeout=cls._request_timeout_seconds(
+                        deadline=deadline,
+                        platform="Facebook",
+                        operation="reel start",
+                    ),
+                ),
+                max_attempts=3,
+                deadline=deadline,
+                platform="Facebook",
+                operation="reel start",
+            )
+            if start_resp.status_code >= 400:
+                return None, f"Reel start phase failed: {_extract_graph_error(start_resp)}"
+
+            start_payload = start_resp.json()
+            video_id = start_payload.get("video_id")
+            upload_url = start_payload.get("upload_url")
+            if not video_id:
+                return None, f"Reel start phase returned no video_id: {start_payload}"
+            if not upload_url:
+                return None, f"Reel start phase returned no upload_url: {start_payload}"
+
+            # Phase 2: Upload binary to rupload endpoint
+            upload_resp = cls._upload_facebook_reel_binary(
+                session=session,
+                upload_url=str(upload_url),
+                token=token,
+                video_path=video_path,
+                file_size=file_size,
+                offset=0,
+                max_attempts=3,
+                deadline=deadline,
+                video_id=str(video_id),
+                base=base,
+            )
+            if upload_resp.status_code >= 400:
+                last_error = f"Reel upload phase failed ({upload_resp.status_code}): {upload_resp.text[:300]}"
+                cls._cleanup_failed_facebook_video(
+                    session=session,
+                    base=base,
+                    token=token,
+                    video_id=str(video_id),
+                    deadline=deadline,
+                )
+                if flow_attempt < max_flow_attempts:
+                    cls._sleep_with_deadline(
+                        min(30, 5 * flow_attempt),
+                        deadline=deadline,
+                        platform="Facebook",
+                        operation="immediate reel retry backoff",
+                    )
+                    continue
+                return None, last_error
+
+            upload_problem = cls._facebook_reel_upload_response_problem(upload_resp)
+            if upload_problem:
+                last_error = f"Reel upload phase returned invalid payload: {upload_problem}"
+                cls._cleanup_failed_facebook_video(
+                    session=session,
+                    base=base,
+                    token=token,
+                    video_id=str(video_id),
+                    deadline=deadline,
+                )
+                if flow_attempt < max_flow_attempts:
+                    cls._sleep_with_deadline(
+                        min(30, 5 * flow_attempt),
+                        deadline=deadline,
+                        platform="Facebook",
+                        operation="immediate reel retry backoff",
+                    )
+                    continue
+                return None, last_error
+
+            # Check upload is ready before finishing
+            upload_ready, upload_ready_detail = cls._ensure_facebook_reel_upload_ready_for_finish(
+                session=session,
+                base=base,
+                video_id=str(video_id),
+                upload_url=str(upload_url),
+                token=token,
+                video_path=video_path,
+                file_size=file_size,
+                deadline=deadline,
+            )
+            if not upload_ready:
+                last_error = f"Reel upload did not reach a finishable state: {upload_ready_detail}"
+                cls._cleanup_failed_facebook_video(
+                    session=session,
+                    base=base,
+                    token=token,
+                    video_id=str(video_id),
+                    deadline=deadline,
+                )
+                if flow_attempt < max_flow_attempts:
+                    cls._sleep_with_deadline(
+                        min(30, 5 * flow_attempt),
+                        deadline=deadline,
+                        platform="Facebook",
+                        operation="immediate reel retry backoff",
+                    )
+                    continue
+                return None, last_error
+
+            # Phase 3: Finish with video_state=PUBLISHED for immediate publish
+            finish_resp = cls._request_with_retries(
+                lambda: session.post(
+                    f"{base}/{page_id}/video_reels",
+                    data={
+                        "upload_phase": "finish",
+                        "video_id": video_id,
+                        "access_token": token,
+                        "video_state": "PUBLISHED",
+                        "title": metadata.facebook.title,
+                        "description": metadata.facebook.description,
+                    },
+                    timeout=cls._request_timeout_seconds(
+                        deadline=deadline,
+                        platform="Facebook",
+                        operation="reel finish",
+                    ),
+                ),
+                max_attempts=3,
+                deadline=deadline,
+                platform="Facebook",
+                operation="reel finish",
+            )
+            if finish_resp.status_code >= 400:
+                finish_error = _extract_graph_error(finish_resp)
+                status_payload = cls._get_facebook_video_status_payload(
+                    session=session,
+                    base=base,
+                    video_id=str(video_id),
+                    token=token,
+                    deadline=deadline,
+                )
+                if status_payload:
+                    finish_error = (
+                        f"{finish_error} | "
+                        f"video_status={cls._summarize_facebook_video_status(status_payload)}"
+                    )
+                if (
+                    flow_attempt < max_flow_attempts
+                    and cls._is_facebook_reel_finish_retryable_error(finish_resp)
+                ):
+                    last_error = finish_error
+                    logger.warning(
+                        "Facebook immediate reel finish transient failure on attempt %s/%s (video_id=%s): %s. Retrying.",
+                        flow_attempt,
+                        max_flow_attempts,
+                        video_id,
+                        finish_error,
+                    )
+                    cls._cleanup_failed_facebook_video(
+                        session=session,
+                        base=base,
+                        token=token,
+                        video_id=str(video_id),
+                        deadline=deadline,
+                    )
+                    cls._sleep_with_deadline(
+                        min(30, 5 * flow_attempt),
+                        deadline=deadline,
+                        platform="Facebook",
+                        operation="immediate reel retry backoff",
+                    )
+                    continue
+                return None, f"Reel finish phase failed: {finish_error}"
+
+            finish_payload = finish_resp.json()
+            if not cls._is_facebook_reel_finish_payload_valid(
+                finish_payload=finish_payload,
+                expected_video_id=str(video_id),
+            ):
+                return None, f"Reel finish phase returned ambiguous payload: {finish_payload}"
+
+            # Success
+            return str(video_id), None
+
+        return None, last_error or "Upload failed after retries"
+
+    @classmethod
     def _upload_facebook_reel_binary(
         cls,
         *,
@@ -1687,28 +2274,162 @@ class SocialUploadService:
         file_size: int,
         offset: int,
         max_attempts: int = 2,
+        deadline: float | None = None,
+        video_id: str | None = None,
+        base: str | None = None,
     ) -> requests.Response:
-        offset = max(0, min(offset, file_size))
-        remaining = max(0, file_size - offset)
+        """Upload binary to Facebook with connection-error-aware resume.
 
-        def _upload_binary() -> requests.Response:
-            with video_path.open("rb") as f:
-                if offset:
-                    f.seek(offset)
-                return session.post(
-                    upload_url,
-                    headers={
-                        "Authorization": f"OAuth {token}",
-                        "offset": str(offset),
-                        "file_size": str(file_size),
-                        "Content-Type": "application/octet-stream",
-                        "Content-Length": str(remaining),
-                    },
-                    data=f,
-                    timeout=1800,
+        When a connection error (RemoteDisconnected, ConnectionResetError, etc.) occurs,
+        this method queries Facebook for bytes_transferred and resumes from that offset
+        rather than restarting from scratch.
+        """
+        current_offset = max(0, min(offset, file_size))
+        last_exc: Exception | None = None
+        last_response: requests.Response | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            cls._ensure_deadline_remaining(
+                deadline=deadline,
+                platform="Facebook",
+                operation="reel binary upload",
+            )
+
+            remaining = max(0, file_size - current_offset)
+
+            def _make_upload_request(off: int, rem: int) -> requests.Response:
+                with video_path.open("rb") as f:
+                    if off:
+                        f.seek(off)
+                    return session.post(
+                        upload_url,
+                        headers={
+                            "Authorization": f"OAuth {token}",
+                            "offset": str(off),
+                            "file_size": str(file_size),
+                            "Content-Type": "application/octet-stream",
+                            "Content-Length": str(rem),
+                        },
+                        data=f,
+                        timeout=cls._request_timeout_seconds(
+                            deadline=deadline,
+                            platform="Facebook",
+                            operation="reel binary upload",
+                            binary=True,
+                        ),
+                    )
+
+            try:
+                response = _make_upload_request(current_offset, remaining)
+                last_response = response
+
+                # Check for retryable status codes
+                if response.status_code in cls._RETRY_STATUS_CODES and attempt < max_attempts:
+                    cls._sleep_backoff(
+                        attempt,
+                        deadline=deadline,
+                        platform="Facebook",
+                        operation="reel binary upload",
+                    )
+                    continue
+
+                return response
+
+            except requests.Timeout as exc:
+                last_exc = exc
+                logger.warning(
+                    "Facebook binary upload timeout on attempt %s/%s (offset=%s/%s): %s",
+                    attempt, max_attempts, current_offset, file_size, exc,
+                )
+                if attempt >= max_attempts:
+                    raise TimeoutError(
+                        cls._platform_timeout_detail("Facebook", "reel binary upload")
+                    ) from exc
+
+            except requests.RequestException as exc:
+                last_exc = exc
+                logger.warning(
+                    "Facebook binary upload connection error on attempt %s/%s (offset=%s/%s): %s",
+                    attempt, max_attempts, current_offset, file_size, exc,
                 )
 
-        return cls._request_with_retries(_upload_binary, max_attempts=max_attempts)
+                # On connection errors, try to query Facebook for actual bytes transferred
+                # and resume from there instead of restarting from scratch
+                if video_id and base and attempt < max_attempts:
+                    resumed_offset = cls._get_facebook_bytes_transferred(
+                        session=session,
+                        base=base,
+                        video_id=video_id,
+                        token=token,
+                        deadline=deadline,
+                    )
+                    if resumed_offset is not None and resumed_offset > current_offset:
+                        logger.info(
+                            "Facebook upload resuming from bytes_transferred=%s (was at offset=%s)",
+                            resumed_offset, current_offset,
+                        )
+                        current_offset = resumed_offset
+
+                if attempt >= max_attempts:
+                    raise
+
+            # Backoff before retry
+            cls._sleep_backoff(
+                attempt,
+                deadline=deadline,
+                platform="Facebook",
+                operation="reel binary upload",
+            )
+
+        if last_exc:
+            raise last_exc
+        if last_response is not None:
+            return last_response
+        raise RuntimeError("Facebook binary upload failed unexpectedly")
+
+    @classmethod
+    def _get_facebook_bytes_transferred(
+        cls,
+        *,
+        session: requests.Session,
+        base: str,
+        video_id: str,
+        token: str,
+        deadline: float | None = None,
+    ) -> int | None:
+        """Query Facebook for the current bytes_transferred of an upload session."""
+        try:
+            status_payload = cls._get_facebook_video_status_payload(
+                session=session,
+                base=base,
+                video_id=video_id,
+                token=token,
+                deadline=deadline,
+            )
+            if not status_payload:
+                return None
+
+            status = status_payload.get("status")
+            if not isinstance(status, dict):
+                return None
+
+            uploading_phase = status.get("uploading_phase")
+            if not isinstance(uploading_phase, dict):
+                return None
+
+            # Facebook uses both spellings: bytes_transfered and bytes_transferred
+            bytes_transferred_raw = (
+                uploading_phase.get("bytes_transfered")
+                if uploading_phase.get("bytes_transfered") is not None
+                else uploading_phase.get("bytes_transferred")
+            )
+            if bytes_transferred_raw is None:
+                return None
+
+            return int(bytes_transferred_raw)
+        except Exception as exc:
+            logger.debug("Failed to query Facebook bytes_transferred: %s", exc)
+            return None
 
     @classmethod
     def _cleanup_failed_facebook_video(
@@ -1718,12 +2439,17 @@ class SocialUploadService:
         base: str,
         token: str,
         video_id: str,
+        deadline: float | None = None,
     ) -> None:
         try:
             session.delete(
                 f"{base}/{video_id}",
                 params={"access_token": token},
-                timeout=30,
+                timeout=cls._request_timeout_seconds(
+                    deadline=deadline,
+                    platform="Facebook",
+                    operation="failed reel cleanup",
+                ),
             )
         except Exception:
             pass
@@ -1855,6 +2581,7 @@ class SocialUploadService:
         base: str,
         video_id: str,
         token: str,
+        deadline: float | None = None,
     ) -> dict[str, Any] | None:
         status_resp = cls._request_with_retries(
             lambda: session.get(
@@ -1863,9 +2590,16 @@ class SocialUploadService:
                     "fields": "status",
                     "access_token": token,
                 },
-                timeout=60,
+                timeout=cls._request_timeout_seconds(
+                    deadline=deadline,
+                    platform="Facebook",
+                    operation="reel status poll",
+                ),
             ),
             max_attempts=3,
+            deadline=deadline,
+            platform="Facebook",
+            operation="reel status poll",
         )
         if status_resp.status_code >= 400:
             return None
@@ -1936,6 +2670,7 @@ class SocialUploadService:
         token: str,
         video_path: Path,
         file_size: int,
+        deadline: float | None = None,
     ) -> tuple[bool, str]:
         resume_attempted = False
         for attempt in range(1, 6):
@@ -1944,6 +2679,7 @@ class SocialUploadService:
                 base=base,
                 video_id=video_id,
                 token=token,
+                deadline=deadline,
             )
             if not status_payload:
                 return False, "unable to fetch video status from Graph"
@@ -1996,7 +2732,10 @@ class SocialUploadService:
                     video_path=video_path,
                     file_size=file_size,
                     offset=bytes_transferred_value,
-                    max_attempts=2,
+                    max_attempts=3,
+                    deadline=deadline,
+                    video_id=video_id,
+                    base=base,
                 )
                 resume_attempted = True
                 if resume_resp.status_code >= 400:
@@ -2006,13 +2745,19 @@ class SocialUploadService:
                         f"({resume_resp.status_code}): {resume_resp.text[:300]} ({status_summary})",
                     )
             if attempt < 5:
-                time.sleep(min(20, attempt * 2))
+                cls._sleep_with_deadline(
+                    min(20, attempt * 2),
+                    deadline=deadline,
+                    platform="Facebook",
+                    operation="reel status polling",
+                )
 
         final_status_payload = cls._get_facebook_video_status_payload(
             session=session,
             base=base,
             video_id=video_id,
             token=token,
+            deadline=deadline,
         )
         final_summary = (
             cls._summarize_facebook_video_status(final_status_payload)
@@ -2083,6 +2828,7 @@ class SocialUploadService:
         token: str,
         subtitle_path: Path,
         subtitle_locale: str,
+        deadline: float | None = None,
     ) -> requests.Response:
         attempts = 6
         last_response: requests.Response | None = None
@@ -2099,16 +2845,31 @@ class SocialUploadService:
                             # Meta expects captions_file as text/plain or application/octet-stream.
                             "captions_file": (subtitle_path.name, captions_file, "text/plain")
                         },
-                        timeout=120,
+                        timeout=cls._request_timeout_seconds(
+                            deadline=deadline,
+                            platform="Facebook",
+                            operation="caption upload",
+                        ),
                     )
 
-            cap_resp = cls._request_with_retries(_upload_caption_once, max_attempts=3)
+            cap_resp = cls._request_with_retries(
+                _upload_caption_once,
+                max_attempts=3,
+                deadline=deadline,
+                platform="Facebook",
+                operation="caption upload",
+            )
             last_response = cap_resp
             if cap_resp.status_code < 400:
                 return cap_resp
             if attempt >= attempts or not cls._is_facebook_caption_retryable(cap_resp):
                 return cap_resp
-            time.sleep(min(30, attempt * 5))
+            cls._sleep_with_deadline(
+                min(30, attempt * 5),
+                deadline=deadline,
+                platform="Facebook",
+                operation="caption retry backoff",
+            )
 
         if last_response is None:
             raise RuntimeError("Facebook caption upload failed before a response was received")
@@ -2140,6 +2901,7 @@ class SocialUploadService:
         caption: str,
         video_path: Path,
         extra_params: dict[str, str] | None = None,
+        deadline: float | None = None,
     ) -> str:
         container_data = {
             "media_type": "REELS",
@@ -2154,9 +2916,16 @@ class SocialUploadService:
             lambda: session.post(
                 f"{base}/{ig_user_id}/media",
                 data=container_data,
-                timeout=120,
+                timeout=cls._request_timeout_seconds(
+                    deadline=deadline,
+                    platform="Instagram",
+                    operation="container creation",
+                ),
             ),
             max_attempts=3,
+            deadline=deadline,
+            platform="Instagram",
+            operation="container creation",
         )
         if container_resp.status_code >= 400:
             raise RuntimeError(
@@ -2183,10 +2952,21 @@ class SocialUploadService:
                         "Content-Type": "application/octet-stream",
                     },
                     data=source,
-                    timeout=1800,
+                    timeout=cls._request_timeout_seconds(
+                        deadline=deadline,
+                        platform="Instagram",
+                        operation="reel binary upload",
+                        binary=True,
+                    ),
                 )
 
-        upload_resp = cls._request_with_retries(_upload_once, max_attempts=2)
+        upload_resp = cls._request_with_retries(
+            _upload_once,
+            max_attempts=2,
+            deadline=deadline,
+            platform="Instagram",
+            operation="reel binary upload",
+        )
 
         if upload_resp.status_code >= 400 and not cls._is_instagram_resumable_upload_indeterminate(upload_resp):
             raise RuntimeError(
@@ -2206,6 +2986,7 @@ class SocialUploadService:
         caption: str,
         video_url: str,
         extra_params: dict[str, str] | None = None,
+        deadline: float | None = None,
     ) -> str:
         container_data = {
             "media_type": "REELS",
@@ -2220,9 +3001,16 @@ class SocialUploadService:
             lambda: session.post(
                 f"{base}/{ig_user_id}/media",
                 data=container_data,
-                timeout=120,
+                timeout=cls._request_timeout_seconds(
+                    deadline=deadline,
+                    platform="Instagram",
+                    operation="video URL container creation",
+                ),
             ),
             max_attempts=3,
+            deadline=deadline,
+            platform="Instagram",
+            operation="video URL container creation",
         )
         if container_resp.status_code >= 400:
             raise RuntimeError(
@@ -2243,12 +3031,14 @@ class SocialUploadService:
         ig_user_id: str,
         token: str,
         container_id: str,
+        deadline: float | None = None,
     ) -> tuple[str, str]:
         cls._poll_instagram_container_ready(
             session=session,
             base=base,
             container_id=container_id,
             token=token,
+            deadline=deadline,
         )
 
         publish_resp = cls._request_with_retries(
@@ -2258,9 +3048,16 @@ class SocialUploadService:
                     "creation_id": container_id,
                     "access_token": token,
                 },
-                timeout=120,
+                timeout=cls._request_timeout_seconds(
+                    deadline=deadline,
+                    platform="Instagram",
+                    operation="media publish",
+                ),
             ),
             max_attempts=3,
+            deadline=deadline,
+            platform="Instagram",
+            operation="media publish",
         )
         if publish_resp.status_code >= 400:
             raise RuntimeError(f"media_publish failed: {_extract_graph_error(publish_resp)}")
@@ -2274,9 +3071,16 @@ class SocialUploadService:
             lambda: session.get(
                 f"{base}/{media_id}",
                 params={"fields": "permalink", "access_token": token},
-                timeout=60,
+                timeout=cls._request_timeout_seconds(
+                    deadline=deadline,
+                    platform="Instagram",
+                    operation="permalink lookup",
+                ),
             ),
             max_attempts=2,
+            deadline=deadline,
+            platform="Instagram",
+            operation="permalink lookup",
         )
         if media_info.status_code < 400:
             permalink = str(media_info.json().get("permalink") or "").strip() or None
@@ -2292,18 +3096,21 @@ class SocialUploadService:
         base: str,
         container_id: str,
         token: str,
+        deadline: float | None = None,
     ) -> None:
         timeout_seconds = max(settings.instagram_publish_timeout_seconds, 30)
         interval_seconds = max(settings.instagram_publish_poll_interval_seconds, 2)
-        deadline = time.monotonic() + timeout_seconds
+        deadline = cls._platform_deadline(deadline)
+        poll_deadline = min(deadline, time.monotonic() + timeout_seconds)
         last_status = ""
 
-        while time.monotonic() < deadline:
+        while time.monotonic() < poll_deadline:
             payload = cls._get_instagram_container_status_payload(
                 session=session,
                 base=base,
                 container_id=container_id,
                 token=token,
+                deadline=deadline,
             )
             status_code = str(payload.get("status_code") or "").upper()
             status_text = str(payload.get("status") or "")
@@ -2336,7 +3143,12 @@ class SocialUploadService:
             if effective_status:
                 last_status = effective_status
 
-            time.sleep(interval_seconds)
+            cls._sleep_with_deadline(
+                interval_seconds,
+                deadline=deadline,
+                platform="Instagram",
+                operation="container status polling",
+            )
 
         suffix = f" (last status: {last_status})" if last_status else ""
         raise TimeoutError(
@@ -2351,6 +3163,7 @@ class SocialUploadService:
         base: str,
         container_id: str,
         token: str,
+        deadline: float | None = None,
     ) -> dict[str, Any]:
         field_candidates = (
             "status_code,status,error_message,video_status",
@@ -2368,9 +3181,16 @@ class SocialUploadService:
                         "fields": fields,
                         "access_token": token,
                     },
-                    timeout=60,
+                    timeout=cls._request_timeout_seconds(
+                        deadline=deadline,
+                        platform="Instagram",
+                        operation="container status lookup",
+                    ),
                 ),
                 max_attempts=3,
+                deadline=deadline,
+                platform="Instagram",
+                operation="container status lookup",
             )
             if status_resp.status_code < 400:
                 payload = status_resp.json()

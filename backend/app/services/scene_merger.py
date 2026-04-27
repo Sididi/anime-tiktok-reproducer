@@ -10,13 +10,19 @@ from .project_service import ProjectService
 class SceneMergerService:
     """Detects continuous scenes in anime source and merges them."""
 
-    # A tighter margin avoids merging intentional quick cuts while still allowing
-    # minor timestamp jitter between adjacent source candidates.
-    CONTINUITY_GAP_TOLERANCE = 0.30  # seconds
+    # Floor tolerance for pair continuity. The effective tolerance is scaled up
+    # to at least one index-grid step via `_continuity_gap_tolerance(index_fps)`
+    # so that two truly-continuous scenes are never rejected purely because the
+    # indexer sampled them on adjacent grid ticks.
+    CONTINUITY_GAP_TOLERANCE = 0.30  # seconds (floor)
     CONTINUITY_EPSILON = 1e-3  # allow tiny numerical jitter
     # Minimum direct pair continuity score required before considering a merge.
     # Keeps weak/noisy candidate overlap from creating accidental chains.
-    MIN_PAIR_CONTINUITY_SCORE = 0.22
+    MIN_PAIR_CONTINUITY_SCORE = 0.30
+    # Require ≥2 distinct (end, start) candidate pairs to agree on an episode
+    # before accepting pair continuity. A single coincidental same-episode hit
+    # at the right distance is not enough evidence for a merge.
+    MIN_EPISODE_SUPPORT = 2
     MIN_ALT_CONFIDENCE = 0.25
     MIN_RAW_CANDIDATE_CONFIDENCE = 0.30
     CANDIDATE_TIME_ROUNDING = 3
@@ -29,6 +35,21 @@ class SceneMergerService:
     # evidence to avoid collapsing distinct scenes.
     CHAIN_BRIDGE_STRONG_SCORE = 0.32
     CHAIN_BRIDGE_MIN_SUPPORT = 6
+
+    @classmethod
+    def _continuity_gap_tolerance(cls, index_fps: float | None) -> float:
+        """Effective continuity-gap tolerance given the library's index FPS.
+
+        The indexer samples reference frames on a uniform 1/index_fps grid.
+        Two scenes that are genuinely continuous in the source land on
+        adjacent ticks of that grid, so their apparent gap is bounded below
+        by the grid step. A static 0.30s floor (chosen for 1 FPS indexing)
+        under-tolerates 2 FPS indexing (0.5s step) and fails to merge real
+        continuities. We widen to 1.1 × grid step whenever that's larger.
+        """
+        if index_fps is None or index_fps <= 0:
+            return cls.CONTINUITY_GAP_TOLERANCE
+        return max(cls.CONTINUITY_GAP_TOLERANCE, 1.1 / index_fps)
 
     @classmethod
     def _get_scene_half_duration(
@@ -53,6 +74,8 @@ class SceneMergerService:
         cls,
         scenes: SceneList,
         matches: MatchList,
+        *,
+        index_fps: float | None = None,
     ) -> list[tuple[int, int]]:
         """
         Find adjacent scene pairs that are continuous in the anime source.
@@ -60,10 +83,15 @@ class SceneMergerService:
         For each adjacent pair (N, N+1), checks if scene N's end timing
         is close to scene N+1's start timing in the same episode.
 
+        Args:
+            index_fps: The FPS the library was indexed at. Used to widen the
+                continuity gap tolerance to at least one index-grid step.
+
         Returns:
             List of (scene_index, scene_index+1) tuples that are continuous.
         """
         pairs: list[tuple[int, int]] = []
+        gap_tolerance = cls._continuity_gap_tolerance(index_fps)
 
         for i in range(len(scenes.scenes) - 1):
             match_n = matches.matches[i] if i < len(matches.matches) else None
@@ -89,7 +117,11 @@ class SceneMergerService:
                 continue
 
             # Check if the pair has any continuity signal.
-            if cls._get_best_pair_continuity(n_end_candidates, n1_start_candidates):
+            if cls._get_best_pair_continuity(
+                n_end_candidates,
+                n1_start_candidates,
+                gap_tolerance=gap_tolerance,
+            ):
                 pairs.append((i, i + 1))
 
         return pairs
@@ -227,6 +259,8 @@ class SceneMergerService:
         cls,
         n_end_candidates: list[tuple[str, float, float]],
         n1_start_candidates: list[tuple[str, float, float]],
+        *,
+        gap_tolerance: float | None = None,
     ) -> tuple[str, float] | None:
         """
         Resolve the strongest continuity episode for one adjacent scene pair.
@@ -234,6 +268,7 @@ class SceneMergerService:
         Returns:
             (episode, score) when at least one forward-continuous combination exists.
         """
+        tol = gap_tolerance if gap_tolerance is not None else cls.CONTINUITY_GAP_TOLERANCE
         episode_scores: dict[str, list[float]] = {}
         episode_support: dict[str, int] = {}
 
@@ -244,13 +279,13 @@ class SceneMergerService:
 
                 # Require forward progression: next scene starts at/after current scene ends.
                 gap = start_t - end_t
-                if not (-cls.CONTINUITY_EPSILON <= gap <= cls.CONTINUITY_GAP_TOLERANCE):
+                if not (-cls.CONTINUITY_EPSILON <= gap <= tol):
                     continue
 
                 # Reward high-confidence candidates and small positive gaps.
                 # Gaps near 0s score highest; near tolerance score lower.
-                if cls.CONTINUITY_GAP_TOLERANCE > 0:
-                    gap_weight = 1.0 - min(max(gap, 0.0) / cls.CONTINUITY_GAP_TOLERANCE, 1.0)
+                if tol > 0:
+                    gap_weight = 1.0 - min(max(gap, 0.0) / tol, 1.0)
                 else:
                     gap_weight = 1.0
                 conf_weight = (end_conf + start_conf) / 2.0
@@ -278,6 +313,11 @@ class SceneMergerService:
         )
         best_score = aggregated_scores[best_episode]
         if best_score < cls.MIN_PAIR_CONTINUITY_SCORE:
+            return None
+        # Require ≥2 independent candidate combinations to vote for this
+        # episode. A lone coincidental hit can satisfy the score threshold but
+        # is not reliable evidence of continuity.
+        if episode_support.get(best_episode, 0) < cls.MIN_EPISODE_SUPPORT:
             return None
 
         return best_episode, best_score
@@ -549,6 +589,8 @@ class SceneMergerService:
         pairs: list[tuple[int, int]],
         scenes: SceneList,
         matches: MatchList,
+        *,
+        index_fps: float | None = None,
     ) -> list[list[int]]:
         """
         Build transitive merge chains from continuous pairs.
@@ -559,6 +601,8 @@ class SceneMergerService:
         """
         if not pairs:
             return []
+
+        gap_tolerance = cls._continuity_gap_tolerance(index_fps)
 
         # Resolve best continuity episode+score per adjacent pair.
         pair_continuity: dict[int, tuple[str, float]] = {}
@@ -579,7 +623,11 @@ class SceneMergerService:
                 scene_index=b,
                 scenes=scenes,
             )
-            continuity = cls._get_best_pair_continuity(curr_end, next_start)
+            continuity = cls._get_best_pair_continuity(
+                curr_end,
+                next_start,
+                gap_tolerance=gap_tolerance,
+            )
             if continuity:
                 pair_continuity[a] = continuity
 
@@ -690,6 +738,247 @@ class SceneMergerService:
         return merged_scenes, merged_match_list, backup
 
     @classmethod
+    def _ordered_matches_for_scenes(
+        cls,
+        scenes: SceneList,
+        matches: MatchList,
+    ) -> list[SceneMatch]:
+        """Return matches aligned to scene order and validate 1:1 coverage."""
+        match_by_scene_index: dict[int, SceneMatch] = {}
+        for match in matches.matches:
+            if match.scene_index in match_by_scene_index:
+                raise ValueError(f"Duplicate match for scene {match.scene_index}")
+            match_by_scene_index[match.scene_index] = match
+
+        ordered_matches: list[SceneMatch] = []
+        for scene in scenes.scenes:
+            match = match_by_scene_index.get(scene.index)
+            if match is None:
+                raise ValueError(f"Missing match for scene {scene.index}")
+            ordered_matches.append(match)
+
+        if len(ordered_matches) != len(matches.matches):
+            raise ValueError("Match list does not align with current scenes")
+
+        return ordered_matches
+
+    @classmethod
+    def _empty_match(
+        cls,
+        scene_index: int,
+        *,
+        merged_from: list[int] | None = None,
+    ) -> SceneMatch:
+        """Create a placeholder match for scenes that still need re-matching."""
+        return SceneMatch(
+            scene_index=scene_index,
+            episode="",
+            start_time=0,
+            end_time=0,
+            confidence=0,
+            speed_ratio=1.0,
+            was_no_match=True,
+            merged_from=merged_from,
+        )
+
+    @classmethod
+    def _build_backup_payload(
+        cls,
+        scenes: SceneList,
+        ordered_matches: list[SceneMatch],
+    ) -> dict:
+        """Build the canonical backup payload used by undo-merge."""
+        return {
+            "scenes": [scene.model_dump() for scene in scenes.scenes],
+            "matches": [match.model_dump() for match in ordered_matches],
+            "chains": [],
+        }
+
+    @staticmethod
+    def _normalize_original_indices(indices: list[int] | None) -> list[int]:
+        if not indices:
+            return []
+        normalized: list[int] = []
+        seen: set[int] = set()
+        for index in indices:
+            clean_index = int(index)
+            if clean_index in seen:
+                continue
+            seen.add(clean_index)
+            normalized.append(clean_index)
+        return normalized
+
+    @classmethod
+    def _resolve_original_groups(
+        cls,
+        ordered_matches: list[SceneMatch],
+        backup: dict,
+    ) -> list[list[int]]:
+        """
+        Map each current scene to the original scene indices from the backup.
+
+        Current matches stay in original order, so individual scenes can be
+        reconstructed by walking the backup timeline and consuming merged_from
+        groups as they appear.
+        """
+        backup_scenes = backup.get("scenes")
+        if not isinstance(backup_scenes, list) or not backup_scenes:
+            raise ValueError("Merge backup is missing original scenes")
+
+        total_original = len(backup_scenes)
+        cursor = 0
+        groups: list[list[int]] = []
+
+        for match in ordered_matches:
+            if match.merged_from:
+                original_group = cls._normalize_original_indices(match.merged_from)
+                if not original_group:
+                    raise ValueError("Merged scene is missing original provenance")
+                if original_group[0] != cursor:
+                    raise ValueError("Current merged scenes are incompatible with backup")
+                cursor = original_group[-1] + 1
+                groups.append(original_group)
+            else:
+                if cursor >= total_original:
+                    raise ValueError("Current scenes exceed merge backup range")
+                groups.append([cursor])
+                cursor += 1
+
+        if cursor != total_original:
+            raise ValueError("Current scenes do not fully cover the merge backup")
+
+        return groups
+
+    @classmethod
+    def _refresh_backup_for_individual_participants(
+        cls,
+        backup: dict,
+        scenes: SceneList,
+        ordered_matches: list[SceneMatch],
+        original_groups: list[list[int]],
+        participant_indices: list[int],
+    ) -> None:
+        """
+        Refresh backup entries for individual scenes before a new merge.
+
+        This preserves the latest manual match adjustments for scenes that have
+        not yet been merged, while keeping existing merged groups anchored to
+        their original pre-merge state for undo.
+        """
+        backup_scenes = backup.get("scenes")
+        backup_matches = backup.get("matches")
+        if not isinstance(backup_scenes, list) or not isinstance(backup_matches, list):
+            raise ValueError("Merge backup is missing original matches")
+
+        for participant_index in participant_indices:
+            match = ordered_matches[participant_index]
+            if match.merged_from:
+                continue
+
+            original_group = original_groups[participant_index]
+            if len(original_group) != 1:
+                raise ValueError("Individual scene resolved to multiple original indices")
+
+            original_index = original_group[0]
+            if original_index >= len(backup_scenes) or original_index >= len(backup_matches):
+                raise ValueError("Merge backup does not cover current individual scene")
+
+            scene_dump = scenes.scenes[participant_index].model_dump()
+            scene_dump["index"] = original_index
+            backup_scenes[original_index] = scene_dump
+
+            match_dump = match.model_copy(deep=True)
+            match_dump.scene_index = original_index
+            backup_matches[original_index] = match_dump.model_dump()
+
+    @classmethod
+    def prepare_manual_merge_with_previous(
+        cls,
+        project_id: str,
+        scene_index: int,
+        scenes: SceneList,
+        matches: MatchList,
+    ) -> tuple[SceneList, MatchList, dict, int]:
+        """
+        Merge one scene into the previous scene without applying pass 2.
+
+        Returns the merged scene/match lists, the updated undo backup payload,
+        and the merged scene index that must be re-matched.
+        """
+        if scene_index <= 0:
+            raise ValueError("The first scene cannot be merged with a previous scene")
+        if scene_index >= len(scenes.scenes):
+            raise ValueError("Invalid scene index")
+
+        ordered_matches = cls._ordered_matches_for_scenes(scenes, matches)
+        if len(ordered_matches) != len(scenes.scenes):
+            raise ValueError("Matches must cover every scene before manual merge")
+
+        backup = cls.load_pre_merge_backup(project_id)
+        if not backup:
+            backup = cls._build_backup_payload(scenes, ordered_matches)
+
+        original_groups = cls._resolve_original_groups(ordered_matches, backup)
+        cls._refresh_backup_for_individual_participants(
+            backup,
+            scenes,
+            ordered_matches,
+            original_groups,
+            [scene_index - 1, scene_index],
+        )
+
+        merged_from = cls._normalize_original_indices(
+            original_groups[scene_index - 1] + original_groups[scene_index]
+        )
+        merged_scene_index = scene_index - 1
+
+        new_scenes: list[Scene] = []
+        new_matches: list[SceneMatch] = []
+
+        i = 0
+        while i < len(scenes.scenes):
+            if i == merged_scene_index:
+                previous_scene = scenes.scenes[merged_scene_index]
+                current_scene = scenes.scenes[scene_index]
+                new_scenes.append(
+                    Scene(
+                        index=len(new_scenes),
+                        start_time=previous_scene.start_time,
+                        end_time=current_scene.end_time,
+                    )
+                )
+                new_matches.append(
+                    cls._empty_match(
+                        len(new_matches),
+                        merged_from=merged_from,
+                    )
+                )
+                i += 2
+                continue
+
+            scene = scenes.scenes[i]
+            new_scenes.append(
+                Scene(
+                    index=len(new_scenes),
+                    start_time=scene.start_time,
+                    end_time=scene.end_time,
+                )
+            )
+
+            match_copy = ordered_matches[i].model_copy(deep=True)
+            match_copy.scene_index = len(new_matches)
+            new_matches.append(match_copy)
+            i += 1
+
+        merged_scenes = SceneList(scenes=new_scenes)
+        merged_scenes.renumber()
+        if not merged_scenes.validate_continuity():
+            raise ValueError("Manual merge broke scene continuity")
+
+        merged_matches = MatchList(matches=new_matches)
+        return merged_scenes, merged_matches, backup, merged_scene_index
+
+    @classmethod
     def save_pre_merge_backup(cls, project_id: str, backup: dict) -> None:
         """Save pre-merge backup to project directory."""
         project_dir = ProjectService.get_project_dir(project_id)
@@ -704,6 +993,79 @@ class SceneMergerService:
         if not backup_path.exists():
             return None
         return json.loads(backup_path.read_text())
+
+    @classmethod
+    def _restore_match_from_backup_or_merged(
+        cls,
+        *,
+        restored_scene_index: int,
+        original_scene: Scene,
+        original_match: SceneMatch | None,
+        merged_scene: Scene,
+        merged_match: SceneMatch,
+    ) -> SceneMatch:
+        """
+        Restore a sub-scene match, falling back to the merged match when needed.
+
+        Auto-fill/manual adjustments can happen after the initial merge backup is
+        saved. If the backup still contains a no-match placeholder for a
+        sub-scene, derive a proportional source clip from the current merged
+        scene so undo does not regress back to an empty source.
+        """
+        backup_match = original_match.model_copy(deep=True) if original_match else None
+        if backup_match and backup_match.episode:
+            backup_match.scene_index = restored_scene_index
+            backup_match.merged_from = None
+            return backup_match
+
+        if merged_match.episode:
+            merged_scene_duration = merged_scene.end_time - merged_scene.start_time
+            merged_source_duration = merged_match.end_time - merged_match.start_time
+            if merged_scene_duration > 0 and merged_source_duration > 0:
+                offset_start = max(0.0, original_scene.start_time - merged_scene.start_time)
+                offset_end = max(offset_start, original_scene.end_time - merged_scene.start_time)
+                ratio_start = min(max(offset_start / merged_scene_duration, 0.0), 1.0)
+                ratio_end = min(max(offset_end / merged_scene_duration, ratio_start), 1.0)
+                source_start = merged_match.start_time + ratio_start * merged_source_duration
+                source_end = merged_match.start_time + ratio_end * merged_source_duration
+            else:
+                source_start = merged_match.start_time
+                source_end = merged_match.end_time
+
+            # When the backup is still a stale no-match placeholder, inherit the
+            # merged scene metadata so manual re-selection keeps working.
+            restored_match = merged_match.model_copy(deep=True)
+            restored_match.scene_index = restored_scene_index
+            restored_match.episode = merged_match.episode
+            restored_match.start_time = round(source_start, 6)
+            restored_match.end_time = round(source_end, 6)
+            restored_match.confidence = merged_match.confidence
+            restored_match.confirmed = merged_match.confirmed
+            restored_match.merged_from = None
+
+            restored_scene_duration = original_scene.end_time - original_scene.start_time
+            restored_source_duration = restored_match.end_time - restored_match.start_time
+            restored_match.speed_ratio = (
+                restored_scene_duration / restored_source_duration
+                if restored_source_duration > 0
+                else 1.0
+            )
+            return restored_match
+
+        if backup_match is not None:
+            backup_match.scene_index = restored_scene_index
+            backup_match.merged_from = None
+            return backup_match
+
+        return SceneMatch(
+            scene_index=restored_scene_index,
+            episode="",
+            start_time=0,
+            end_time=0,
+            confidence=0,
+            speed_ratio=1.0,
+            was_no_match=True,
+        )
 
     @classmethod
     def undo_merge(
@@ -755,28 +1117,37 @@ class SceneMergerService:
                             start_time=orig_scene.start_time,
                             end_time=orig_scene.end_time,
                         ))
-                    if orig_idx < len(original_matches):
-                        orig_match = original_matches[orig_idx].model_copy()
-                        orig_match.scene_index = len(new_matches)
-                        new_matches.append(orig_match)
                     else:
-                        new_matches.append(SceneMatch(
-                            scene_index=len(new_matches),
-                            episode="",
-                            start_time=0,
-                            end_time=0,
-                            confidence=0,
-                            speed_ratio=1.0,
-                            was_no_match=True,
-                        ))
+                        orig_scene = Scene(
+                            index=orig_idx,
+                            start_time=scene.start_time,
+                            end_time=scene.end_time,
+                        )
+
+                    orig_match = (
+                        original_matches[orig_idx]
+                        if orig_idx < len(original_matches)
+                        else None
+                    )
+                    new_matches.append(
+                        cls._restore_match_from_backup_or_merged(
+                            restored_scene_index=len(new_matches),
+                            original_scene=orig_scene,
+                            original_match=orig_match,
+                            merged_scene=scene,
+                            merged_match=target_match,
+                        )
+                    )
             else:
                 new_scenes.append(Scene(
                     index=len(new_scenes),
                     start_time=scene.start_time,
                     end_time=scene.end_time,
                 ))
-                match_copy = match.model_copy()
+                match_copy = match.model_copy(deep=True)
                 match_copy.scene_index = len(new_matches)
+                if match_copy.merged_from:
+                    match_copy.merged_from = cls._normalize_original_indices(match_copy.merged_from)
                 new_matches.append(match_copy)
 
         restored_scenes = SceneList(scenes=new_scenes)

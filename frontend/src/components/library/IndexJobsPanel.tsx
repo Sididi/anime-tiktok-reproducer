@@ -94,8 +94,7 @@ export function IndexJobsPanel({ onJobComplete }: IndexJobsPanelProps) {
       >
         <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
         <span className="text-[hsl(var(--muted-foreground))]">
-          {activeJobs.length} opération{activeJobs.length !== 1 ? "s" : ""} de
-          librairie en cours
+          {activeJobs.length} indexation{activeJobs.length !== 1 ? "s" : ""} en cours
         </span>
         <ChevronDown
           className={`ml-auto h-3.5 w-3.5 text-[hsl(var(--muted-foreground))] transition-transform ${
@@ -123,41 +122,75 @@ export function IndexJobsPanel({ onJobComplete }: IndexJobsPanelProps) {
                     animate={{ opacity: 1, y: 0 }}
                     exit={{ opacity: 0, scale: 0.95 }}
                     transition={{ duration: 0.2 }}
-                    className="flex items-center gap-2 bg-[hsl(var(--background))] rounded px-3 py-2"
+                    className="flex flex-col gap-1 bg-[hsl(var(--background))] rounded px-3 py-2"
                   >
-                    <StatusIcon status={job.status} />
-                    <span className="text-sm font-medium truncate min-w-0 flex-shrink">
-                      {job.source_name}
-                    </span>
-                    <span className="text-xs text-[hsl(var(--muted-foreground))] shrink-0">
-                      {statusLabel(job)}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <StatusIcon status={job.status} />
+                      <span className="text-sm font-medium truncate min-w-0 flex-1">
+                        {job.source_name}
+                      </span>
+                      <span className="text-xs text-[hsl(var(--muted-foreground))] shrink-0">
+                        {statusLabel(job)}
+                      </span>
+                      {job.status === "complete" &&
+                        (job.warnings?.length > 0 ||
+                          job.unmatched_files?.length > 0) && (
+                          <div
+                            className="shrink-0"
+                            title={jobWarningTooltip(job)}
+                          >
+                            <AlertTriangle className="h-3.5 w-3.5 text-amber-500" />
+                          </div>
+                        )}
+                      <span className="text-xs text-[hsl(var(--muted-foreground))] w-9 text-right shrink-0">
+                        {job.status === "complete"
+                          ? "100%"
+                          : job.status === "error"
+                            ? ""
+                            : `${Math.round(job.progress * 100)}%`}
+                      </span>
+                    </div>
                     {(job.status === "indexing" || job.status === "queued") && (
-                      <div className="flex-1 h-1 bg-[hsl(var(--secondary))] rounded-full min-w-[60px]">
-                        <div
-                          className="h-full bg-green-500 rounded-full transition-all duration-300"
-                          style={{
-                            width: `${Math.round(job.progress * 100)}%`,
-                          }}
-                        />
+                      <div className="pl-6">
+                        <div className="h-1 bg-[hsl(var(--secondary))] rounded-full min-w-[60px]">
+                          <div
+                            className="h-full bg-green-500 rounded-full transition-all duration-300"
+                            style={{
+                              width: `${Math.round(job.progress * 100)}%`,
+                            }}
+                          />
+                        </div>
                       </div>
                     )}
-                    <span className="text-xs text-[hsl(var(--muted-foreground))] w-9 text-right shrink-0">
-                      {job.status === "complete"
-                        ? "100%"
-                        : job.status === "error"
-                          ? ""
-                          : `${Math.round(job.progress * 100)}%`}
-                    </span>
-                    {job.status === "complete" &&
-                      job.unmatched_files?.length > 0 && (
-                        <div
-                          className="shrink-0"
-                          title={`${job.unmatched_files.length} fichier(s) non lié(s) à un torrent`}
+                    {showCurrentFileDetails(job) && (
+                      <div className="pl-6 flex items-center gap-2 text-[11px] text-[hsl(var(--muted-foreground))] min-w-0">
+                        <span
+                          className="truncate min-w-0"
+                          title={job.current_file || undefined}
                         >
-                          <AlertTriangle className="h-3.5 w-3.5 text-amber-500" />
-                        </div>
-                      )}
+                          {job.current_file}
+                        </span>
+                        {job.current_file_progress !== null && (
+                          <span className="shrink-0">
+                            {Math.round(job.current_file_progress * 100)}%
+                          </span>
+                        )}
+                        {job.current_file_frames_processed !== null &&
+                          job.current_file_total_frames !== null && (
+                            <span className="shrink-0">
+                              {job.current_file_frames_processed}/
+                              {job.current_file_total_frames} frames
+                            </span>
+                          )}
+                        {job.current_file_progress === null &&
+                          job.current_file_frames_processed === null &&
+                          job.current_file_batches_processed !== null && (
+                            <span className="shrink-0">
+                              batch {job.current_file_batches_processed}
+                            </span>
+                          )}
+                      </div>
+                    )}
                   </motion.div>
                 ))}
               </AnimatePresence>
@@ -187,22 +220,52 @@ function StatusIcon({ status }: { status: IndexationJob["status"] }) {
 function statusLabel(job: IndexationJob): string {
   switch (job.status) {
     case "queued":
-      return "En attente";
+      return job.job_type === "update" ? "Mise à jour en attente" : "En attente";
     case "indexing":
+      if (job.phase === "indexing" && job.total_files > 0) {
+        return `${job.completed_files}/${job.total_files} fichier${job.total_files > 1 ? "s" : ""}`;
+      }
+      if (job.phase === "hydrate_index") return job.message || "Hydratation de l'index...";
       if (job.phase === "link_sources") return job.message || "Association des sources...";
       if (job.phase === "package_release") return job.message || "Préparation de la release...";
       if (job.phase === "upload_release") return job.message || "Upload vers le Storage Box...";
-      return job.message || "Indexation...";
+      return job.message || (job.job_type === "update" ? "Mise à jour..." : "Indexation...");
     case "complete": {
+      if (job.warnings?.length > 0) {
+        return ignoredFilesLabel(job.warnings.length);
+      }
       if (job.unmatched_files?.length > 0) {
         return `Terminé — ${job.unmatched_files.length} fichier(s) sans torrent`;
       }
       if (job.linked_torrents > 0) {
         return `Terminé — ${job.linked_torrents} torrent(s) lié(s)`;
       }
-      return "Terminé";
+      return job.job_type === "update" ? "Mise à jour terminée" : "Terminé";
     }
     case "error":
       return job.error || "Erreur";
   }
+}
+
+function ignoredFilesLabel(count: number): string {
+  return `Terminé — ${count} fichier${count > 1 ? "s" : ""} ignoré${count > 1 ? "s" : ""}`;
+}
+
+function jobWarningTooltip(job: IndexationJob): string {
+  const parts: string[] = [];
+  if (job.warnings?.length > 0) {
+    parts.push(job.warnings.join("\n"));
+  }
+  if (job.unmatched_files?.length > 0) {
+    parts.push(`${job.unmatched_files.length} fichier(s) non lié(s) à un torrent`);
+  }
+  return parts.join("\n\n");
+}
+
+function showCurrentFileDetails(job: IndexationJob): boolean {
+  return (
+    job.status === "indexing" &&
+    job.phase === "indexing" &&
+    Boolean(job.current_file)
+  );
 }

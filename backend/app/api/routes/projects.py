@@ -135,7 +135,7 @@ async def activate_project_library(project_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Project does not have a selected series_id")
 
     try:
-        return await LibraryHydrationService.activate_project_series(
+        return await LibraryHydrationService.enqueue_project_activation(
             project_id=project.id,
             library_type=project.library_type,
             series_id=project.series_id,

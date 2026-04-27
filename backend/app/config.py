@@ -1,4 +1,5 @@
 import os
+from fractions import Fraction
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
@@ -16,7 +17,6 @@ class Settings(BaseSettings):
         env_prefix="ATR_",
         env_file=(PROJECT_ROOT / ".env", BACKEND_ROOT / ".env"),
         env_file_encoding="utf-8",
-        extra="ignore",
     )
 
     # Paths
@@ -46,10 +46,22 @@ class Settings(BaseSettings):
     source_normalization_profile: str = "h264_mp4_aac"
     match_playback_max_workers: int = 4
     match_playback_max_workers_per_episode: int = 1
+    min_playback_speed_factor: float = 0.75
 
-    # Discord webhook integration
+    # TikTok server (VPS) integration — replaces previous Discord webhook
+    tiktok_server_base_url: str | None = None
+    tiktok_server_internal_token: str | None = None
+
+    # Discord webhook for n8n's deferred-Instagram post-completion notification.
+    # This is the ONLY remaining direct Discord webhook usage (n8n runs
+    # elsewhere and can't reach the VPS internal API). All in-process Discord
+    # operations go through DiscordService → VPS server.
     discord_webhook_url: str | None = None
+
     cep_trigger_url_template: str = "http://localhost:48653/p/{project_id}"
+
+    # HuggingFace (pyannote diarization for raw scene detection)
+    hf_token: str | None = None
 
     # Script automation (Gemini + ElevenLabs)
     script_automate_enabled: bool = True
@@ -61,6 +73,9 @@ class Settings(BaseSettings):
     # When True, "grand" mode: uses White border 10px mogrt and V3 scale 75%.
     # When False (default), uses White border 5px and V3 scale 68%.
     grand_mode_enabled: bool = False
+    # When True, /script video overlay "title" is pre-filled statically based on the
+    # project library type (no LLM call, no 8-proposition modal).
+    static_overlay_title_enabled: bool = False
     scenes_skip_ui_enabled: bool = False
     transcription_full_auto_enabled: bool = False
     gaps_full_auto_enabled: bool = False
@@ -73,6 +88,14 @@ class Settings(BaseSettings):
     elevenlabs_model_id: str = "eleven_multilingual_v2"
     elevenlabs_output_format: str = "pcm_44100"
     gemini_light_model: str = "gemini-2.5-flash"
+
+    # LLM provider switch ("gemini" | "claude")
+    llm_provider: str = "gemini"
+    # Anthropic (Claude)
+    anthropic_api_key: str | None = None
+    anthropic_model: str = "claude-sonnet-4-6"
+    anthropic_light_model: str = "claude-haiku-4-5"
+    anthropic_timeout: int = 300
 
     # Google OAuth shared credentials
     google_client_id: str | None = None
@@ -94,6 +117,11 @@ class Settings(BaseSettings):
     youtube_category_id: str = "22"
     youtube_channel_id: str | None = None
     social_upload_max_parallel: int = 3
+    social_upload_http_timeout_seconds: int = 120
+    social_upload_binary_timeout_seconds: int = 900
+    social_upload_platform_timeout_seconds: int = 1200
+    project_upload_max_concurrent: int = 3
+    project_manager_platform_phase_timeout_seconds: int = 1260
 
     # Meta Graph API
     meta_graph_api_version: str = "v25.0"
@@ -131,9 +159,15 @@ class Settings(BaseSettings):
     storage_box_password: str | None = None
     storage_box_root: str = ""
     storage_box_known_hosts_path: Path | None = None
-    storage_box_max_connections: int = 3
-    storage_box_upload_max_parallel: int = 2
-    storage_box_download_max_parallel: int = 3
+    storage_box_max_connections: int = 8
+    storage_box_upload_max_parallel: int = 6
+    storage_box_download_max_parallel: int = 6
+    storage_box_transfer_mode: str = "auto"
+    storage_box_rsync_min_file_size_mb: int = 4
+    storage_box_rsync_timeout_seconds: int = 7200
+    # lftp settings (explicit lftp mode and directory mirror flows)
+    storage_box_lftp_segments: int = 4
+    storage_box_lftp_min_file_size_mb: int = 50
 
     @property
     def drive_google_client_id(self) -> str | None:
@@ -167,11 +201,40 @@ class Settings(BaseSettings):
     def youtube_google_token_uri(self) -> str:
         return self.google_token_uri
 
+    @property
+    def min_playback_speed_fraction(self) -> Fraction:
+        return Fraction(str(self.min_playback_speed_factor)).limit_denominator(100000)
+
+    @property
+    def matcher_min_speed_fraction(self) -> Fraction:
+        return self.min_playback_speed_fraction - Fraction(1, 10)
+
+    @property
+    def matcher_min_speed_factor(self) -> float:
+        return float(self.matcher_min_speed_fraction)
+
+    @field_validator("llm_provider")
+    @classmethod
+    def _normalize_llm_provider(cls, value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized not in {"gemini", "claude"}:
+            raise ValueError("ATR_LLM_PROVIDER must be 'gemini' or 'claude'")
+        return normalized
+
     @field_validator("cep_trigger_url_template")
     @classmethod
     def _validate_cep_trigger_url_template(cls, value: str) -> str:
         if "{project_id}" not in value:
             raise ValueError("ATR_CEP_TRIGGER_URL_TEMPLATE must contain '{project_id}'")
+        return value
+
+    @field_validator("min_playback_speed_factor")
+    @classmethod
+    def _validate_min_playback_speed_factor(cls, value: float) -> float:
+        if value <= 0.10 or value > 1.0:
+            raise ValueError(
+                "ATR_MIN_PLAYBACK_SPEED_FACTOR must be greater than 0.10 and at most 1.0"
+            )
         return value
 
     @field_validator("ffmpeg_binary", "ffprobe_binary")
@@ -189,6 +252,14 @@ class Settings(BaseSettings):
             return None
         stripped = value.strip()
         return stripped or None
+
+    @field_validator("storage_box_transfer_mode")
+    @classmethod
+    def _normalize_storage_box_transfer_mode(cls, value: str) -> str:
+        normalized = str(value or "").strip().lower() or "auto"
+        if normalized not in {"auto", "sftp", "rsync", "lftp"}:
+            raise ValueError("ATR_STORAGE_BOX_TRANSFER_MODE must be one of auto, sftp, rsync, lftp")
+        return normalized
 
     @field_validator("library_state_db_path")
     @classmethod
@@ -217,6 +288,41 @@ class Settings(BaseSettings):
     @classmethod
     def _clamp_match_playback_max_workers(cls, value: int) -> int:
         return max(1, min(8, value))
+
+    @field_validator("project_upload_max_concurrent")
+    @classmethod
+    def _clamp_project_upload_max_concurrent(cls, value: int) -> int:
+        return max(1, min(8, value))
+
+    @field_validator(
+        "social_upload_http_timeout_seconds",
+        "social_upload_binary_timeout_seconds",
+        "social_upload_platform_timeout_seconds",
+        "project_manager_platform_phase_timeout_seconds",
+    )
+    @classmethod
+    def _clamp_social_upload_timeouts(cls, value: int) -> int:
+        return max(1, min(24 * 3600, value))
+
+    @field_validator("storage_box_max_connections")
+    @classmethod
+    def _clamp_storage_box_max_connections(cls, value: int) -> int:
+        return max(1, min(16, value))
+
+    @field_validator("storage_box_upload_max_parallel", "storage_box_download_max_parallel")
+    @classmethod
+    def _clamp_storage_box_parallelism(cls, value: int) -> int:
+        return max(1, min(16, value))
+
+    @field_validator("storage_box_rsync_min_file_size_mb")
+    @classmethod
+    def _clamp_storage_box_rsync_min_file_size_mb(cls, value: int) -> int:
+        return max(1, min(1024, value))
+
+    @field_validator("storage_box_rsync_timeout_seconds")
+    @classmethod
+    def _clamp_storage_box_rsync_timeout_seconds(cls, value: int) -> int:
+        return max(30, min(24 * 3600, value))
 
     @field_validator("match_playback_max_workers_per_episode")
     @classmethod

@@ -2,6 +2,7 @@ from fastapi import APIRouter
 
 from .accounts import router as accounts_router
 from .projects import router as projects_router
+from .startup import router as startup_router
 from .video import router as video_router
 from .scenes import router as scenes_router
 from .download import router as download_router
@@ -10,6 +11,7 @@ from .transcription import router as transcription_router
 from .processing import router as processing_router
 from .anime import router as anime_router
 from .gaps import router as gaps_router
+from .raw_scenes import router as raw_scenes_router
 from .project_manager import router as project_manager_router
 from .integrations import router as integrations_router
 from .tiktok_url_db import router as tiktok_url_db_router
@@ -19,6 +21,7 @@ from .tiktok_url_db import router as tiktok_url_db_router
 api_router = APIRouter(prefix="/api")
 api_router.include_router(accounts_router)
 api_router.include_router(projects_router)
+api_router.include_router(startup_router)
 api_router.include_router(video_router)
 api_router.include_router(scenes_router)
 api_router.include_router(download_router)
@@ -27,6 +30,7 @@ api_router.include_router(transcription_router)
 api_router.include_router(processing_router)
 api_router.include_router(anime_router)
 api_router.include_router(gaps_router)
+api_router.include_router(raw_scenes_router)
 api_router.include_router(project_manager_router)
 api_router.include_router(integrations_router)
 api_router.include_router(tiktok_url_db_router)

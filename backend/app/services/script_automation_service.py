@@ -13,6 +13,7 @@ from typing import Any, AsyncIterator
 from pydub import AudioSegment
 
 from ..config import settings
+from ..library_types import resolve_static_overlay_title
 from ..models import (
     METADATA_TITLE_CANDIDATE_COUNT,
     METADATA_TITLE_MAX_CHARS,
@@ -20,7 +21,7 @@ from ..models import (
     Transcription,
 )
 from .elevenlabs_service import ElevenLabsService
-from .gemini_service import GeminiService
+from .llm_service import LLMService
 from .metadata import MetadataService
 from .project_service import ProjectService
 from .script_payload_service import ScriptPayloadService
@@ -33,8 +34,8 @@ _OVERLAY_RESPONSE_SCHEMA: dict[str, Any] = {
     "properties": {
         "title_hooks": {
             "type": "array",
-            "minItems": 10,
-            "maxItems": 10,
+            "minItems": 8,
+            "maxItems": 8,
             "items": {"type": "string"},
         },
         "category": {"type": "string"},
@@ -54,6 +55,7 @@ class ScriptAutomationService:
     MAX_OVERLAY_TITLE_CHARS = 45
 
     TTS_TARGET = 625
+    TTS_V3_TARGET = 550
     TTS_MIN = 500
     TTS_SOFT_MAX = 750
     TTS_HARD_MAX = 800
@@ -172,9 +174,9 @@ class ScriptAutomationService:
             for item in raw_hooks
             if isinstance(item, str) and item.strip()
         ]
-        if len(title_hooks) != 10:
+        if len(title_hooks) != 8:
             raise RuntimeError(
-                f"Overlay JSON must contain exactly 10 non-empty title hooks ({len(title_hooks)} received)"
+                f"Overlay JSON must contain exactly 8 non-empty title hooks ({len(title_hooks)} received)"
             )
 
         category = str(payload.get("category", "")).strip()
@@ -188,11 +190,43 @@ class ScriptAutomationService:
         }
 
     @classmethod
+    def resolve_tts_model_id(
+        cls,
+        *,
+        model_id: str | None = None,
+        voice_key: str | None = None,
+    ) -> str:
+        selected_model = (model_id or "").strip()
+        if selected_model:
+            return selected_model
+
+        normalized_voice_key = (voice_key or "").strip()
+        if normalized_voice_key:
+            try:
+                voice = VoiceConfigService.get_voice(normalized_voice_key)
+            except Exception:
+                pass
+            else:
+                voice_model_id = (voice.model_id or "").strip()
+                if voice_model_id:
+                    return voice_model_id
+
+        return (settings.elevenlabs_model_id or "").strip()
+
+    @classmethod
+    def resolve_tts_target(cls, model_id: str | None = None) -> int:
+        normalized_model = cls.resolve_tts_model_id(model_id=model_id).lower()
+        if normalized_model.startswith("eleven_v3"):
+            return cls.TTS_V3_TARGET
+        return cls.TTS_TARGET
+
+    @classmethod
     def prepare_tts_payload(
         cls,
         *,
         script_payload: dict[str, Any],
         target_language: str | None = None,
+        model_id: str | None = None,
     ) -> dict[str, Any]:
         scenes = script_payload.get("scenes")
         if not isinstance(scenes, list) or not scenes:
@@ -224,7 +258,10 @@ class ScriptAutomationService:
             "language": language,
             "scenes": normalized_scenes,
         }
-        segments = cls._segment_scenes_for_tts_payload(normalized_payload)
+        segments = cls._segment_scenes_for_tts_payload(
+            normalized_payload,
+            model_id=model_id,
+        )
         normalized_full_text = " ".join(scene["text"] for scene in normalized_scenes if scene["text"]).strip()
         return {
             "language": language,
@@ -486,11 +523,17 @@ class ScriptAutomationService:
         )
 
     @classmethod
-    def _segment_scenes_for_tts_payload(cls, script_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    def _segment_scenes_for_tts_payload(
+        cls,
+        script_payload: dict[str, Any],
+        *,
+        model_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Segment script scenes for TTS and keep scene index mapping."""
         scenes = script_payload.get("scenes", [])
         if not isinstance(scenes, list) or not scenes:
             return []
+        target = cls.resolve_tts_target(model_id)
 
         def _create_empty_segment(segment_id: int) -> dict[str, Any]:
             return cls._build_segment_from_fragments(segment_id=segment_id, scene_fragments=[])
@@ -591,7 +634,7 @@ class ScriptAutomationService:
                 close_now = (
                     current_len >= cls.TTS_SOFT_MAX
                     or with_next_len > cls.TTS_SOFT_MAX
-                    or abs(current_len - cls.TTS_TARGET) <= abs(with_next_len - cls.TTS_TARGET)
+                    or abs(current_len - target) <= abs(with_next_len - target)
                 )
             else:
                 # Prefer short sentence-complete chunks over drifting toward hard cap.
@@ -650,8 +693,16 @@ class ScriptAutomationService:
         return segments
 
     @classmethod
-    def _segment_scenes_for_tts(cls, script_payload: dict[str, Any]) -> list[str]:
-        return [str(segment.get("text", "")).strip() for segment in cls._segment_scenes_for_tts_payload(script_payload)]
+    def _segment_scenes_for_tts(
+        cls,
+        script_payload: dict[str, Any],
+        *,
+        model_id: str | None = None,
+    ) -> list[str]:
+        return [
+            str(segment.get("text", "")).strip()
+            for segment in cls._segment_scenes_for_tts_payload(script_payload, model_id=model_id)
+        ]
 
     @classmethod
     def _output_extension(cls) -> str:
@@ -739,12 +790,23 @@ class ScriptAutomationService:
             library_type=project.library_type,
         )
 
-        result = GeminiService.generate_json(
+        result = LLMService.generate_json(
             prompt,
-            model=settings.gemini_light_model,
+            model=LLMService.active_light_model(),
             response_json_schema=_OVERLAY_RESPONSE_SCHEMA,
         )
-        return cls._normalize_overlay_payload(result)
+        overlay = cls._normalize_overlay_payload(result)
+
+        static_title = cls._truncate_overlay_title(
+            resolve_static_overlay_title(project.library_type)
+        )
+        if static_title and not any(
+            hook.strip().casefold() == static_title.casefold()
+            for hook in overlay["title_hooks"]
+        ):
+            overlay["title_hooks"].append(static_title)
+
+        return overlay
 
     @classmethod
     def get_latest_run(cls, project_id: str) -> dict[str, Any] | None:
@@ -814,8 +876,10 @@ class ScriptAutomationService:
             if not transcription or not transcription.scenes:
                 raise RuntimeError("No transcription found for this project")
 
-            if existing_script_json is None and not GeminiService.is_configured():
-                raise RuntimeError("Gemini API key is missing (ATR_GEMINI_API_KEY)")
+            if existing_script_json is None and not LLMService.is_configured():
+                raise RuntimeError(
+                    f"LLM API key is missing (provider={LLMService.provider_name()})"
+                )
             if not skip_tts and not ElevenLabsService.is_configured():
                 raise RuntimeError("ElevenLabs API key is missing (ATR_ELEVENLABS_API_KEY)")
 
@@ -839,19 +903,20 @@ class ScriptAutomationService:
                     target_language=target_language,
                 )
             else:
-                yield cls._event("llm_script", message="Generating script JSON with Gemini...")
+                yield cls._event("llm_script", message=f"Generating script JSON with {LLMService.provider_name().title()}...")
                 prompt = cls._build_script_prompt(
                     project=project,
                     transcription=transcription,
                     target_language=target_language,
                 )
                 raw_script_payload = await asyncio.to_thread(
-                    GeminiService.generate_json_value,
+                    LLMService.generate_json_value,
                     prompt,
                     response_json_schema=cls._script_response_schema(
                         target_language=target_language,
                         scene_count=len(transcription.scenes),
                     ),
+                    enable_thinking=True,
                 )
                 script_payload = cls._normalize_script_payload(
                     payload=cls._coerce_generated_script_payload(
@@ -896,7 +961,14 @@ class ScriptAutomationService:
                 yield cls._event("tts_generating", message="TTS generation skipped")
             else:
                 yield cls._event("tts_segmenting", message="Segmenting script for TTS...")
-                prepared_tts = cls.prepare_tts_payload(script_payload=script_payload, target_language=target_language)
+                effective_model = cls.resolve_tts_model_id(model_id=voice.model_id)
+                normalized_model = effective_model.lower()
+                is_v3_model = normalized_model.startswith("eleven_v3")
+                prepared_tts = cls.prepare_tts_payload(
+                    script_payload=script_payload,
+                    target_language=target_language,
+                    model_id=effective_model,
+                )
                 segments = prepared_tts.get("segments", [])
                 chunks = [str(segment.get("text", "")).strip() for segment in segments]
                 if not chunks:
@@ -928,11 +1000,6 @@ class ScriptAutomationService:
                         char_count=segment_char_count,
                     )
 
-                    effective_model = (voice.model_id or settings.elevenlabs_model_id).strip()
-                    normalized_model = effective_model.lower()
-                    is_v3_model = normalized_model.startswith("eleven_v3")
-                    supports_request_stitching = normalized_model == "eleven_multilingual_v2"
-
                     outgoing_text = chunk
                     seed: int | None = None
                     previous_request_ids: list[str] | None = None
@@ -941,26 +1008,31 @@ class ScriptAutomationService:
                             v3_seed = secrets.randbits(32)
                         seed = v3_seed
                         outgoing_text = f"{cls.V3_CONTROL_PREFIX} {chunk}"
-                    elif supports_request_stitching and previous_request_id:
+                    elif previous_request_id:
                         previous_request_ids = [previous_request_id]
+
+                    synthesize_kwargs: dict[str, Any] = {
+                        "voice_id": voice.elevenlabs_voice_id,
+                        "text": outgoing_text,
+                        "model_id": effective_model,
+                        "output_format": settings.elevenlabs_output_format,
+                        "voice_settings": voice.voice_settings or None,
+                    }
+                    if previous_request_ids is not None:
+                        synthesize_kwargs["previous_request_ids"] = previous_request_ids
+                    if seed is not None:
+                        synthesize_kwargs["seed"] = seed
 
                     synthesis_result = await asyncio.to_thread(
                         ElevenLabsService.synthesize,
-                        voice_id=voice.elevenlabs_voice_id,
-                        text=outgoing_text,
-                        model_id=effective_model,
-                        output_format=settings.elevenlabs_output_format,
-                        voice_settings=voice.voice_settings or None,
-                        previous_request_ids=previous_request_ids,
-                        seed=seed,
+                        **synthesize_kwargs,
                     )
                     audio_bytes = (
                         synthesis_result
                         if isinstance(synthesis_result, bytes)
                         else synthesis_result.audio_bytes
                     )
-                    if supports_request_stitching:
-                        previous_request_id = getattr(synthesis_result, "request_id", None) or None
+                    previous_request_id = getattr(synthesis_result, "request_id", None) or None
                     if cls._is_pcm_format():
                         audio_bytes = cls._wrap_pcm_as_wav(audio_bytes)
                     part_path = parts_dir / f"part_{idx}.{extension}"
@@ -982,7 +1054,7 @@ class ScriptAutomationService:
             if skip_metadata or not settings.automate_metadata_overlay_enabled:
                 yield cls._event("llm_metadata", message="Metadata generation skipped")
             else:
-                yield cls._event("llm_metadata", message="Generating metadata JSON with Gemini...")
+                yield cls._event("llm_metadata", message=f"Generating metadata JSON with {LLMService.provider_name().title()}...")
                 try:
                     metadata_prompt = MetadataService.build_prompt_from_script_payload(
                         anime_name=project.anime_name or "Inconnu",
@@ -991,7 +1063,7 @@ class ScriptAutomationService:
                         library_type=project.library_type,
                     )
                     raw_metadata_payload = await asyncio.to_thread(
-                        GeminiService.generate_json,
+                        LLMService.generate_json,
                         metadata_prompt,
                         response_json_schema=cls._metadata_response_schema(),
                     )
@@ -1020,7 +1092,7 @@ class ScriptAutomationService:
                     )
 
             # --- Video overlay generation ---
-            if not skip_overlay and settings.automate_metadata_overlay_enabled and GeminiService.is_configured():
+            if not skip_overlay and settings.automate_metadata_overlay_enabled and LLMService.is_configured():
                 yield cls._event("generating_overlay", message="Generating video overlay...")
                 try:
                     overlay_json = await asyncio.to_thread(

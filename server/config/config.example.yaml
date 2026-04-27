@@ -1,0 +1,19 @@
+# Slim VPS config: structural data only. Secrets live in .env.
+#
+# Validation at startup:
+#   - every account.avatar must be a filename present in ../avatars/
+#
+# `device` is a free-form label shown in the Discord embed's "📱 Device"
+# field. It's not validated; pick whatever name helps you remember which
+# phone the operator uses for that account.
+accounts:
+  anime_fr:
+    name: "Anime FR"
+    language: "fr"
+    device: "iphone_13_pro"
+    avatar: "anime_fr.jpg"
+  anime_en:
+    name: "Anime EN"
+    language: "en"
+    device: "iphone_13_pro"
+    avatar: "anime_en.png"

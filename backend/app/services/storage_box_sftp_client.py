@@ -229,6 +229,24 @@ class StorageBoxSftpClient:
             await sftp.rename(str(src_path), str(dst_path))
 
     @classmethod
+    async def hardlink(
+        cls,
+        src: str | PurePosixPath,
+        dst: str | PurePosixPath,
+    ) -> None:
+        """Create a hard link on the remote server (dst -> src).
+
+        Raises ``SFTPNoSuchFile`` or ``SFTPOpUnsupported`` (or a generic
+        ``SFTPError``) when the server does not support the
+        ``hardlink@openssh.com`` extension.
+        """
+        src_path = cls.normalize_remote_path(src)
+        dst_path = cls.normalize_remote_path(dst)
+        async with cls.sftp_session() as sftp:
+            await sftp.makedirs(str(dst_path.parent), exist_ok=True)
+            await sftp.link(str(src_path), str(dst_path))
+
+    @classmethod
     async def remove_file(cls, remote_path: str | PurePosixPath) -> None:
         remote = cls.normalize_remote_path(remote_path)
         async with cls.sftp_session() as sftp:

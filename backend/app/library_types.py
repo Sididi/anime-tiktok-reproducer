@@ -20,6 +20,13 @@ LIBRARY_TYPE_LABELS: dict[LibraryType, str] = {
     LibraryType.DESSIN_ANIME: "Dessin Animé",
 }
 
+STATIC_OVERLAY_TITLES: dict[LibraryType, str] = {
+    LibraryType.ANIME: "CET ANIME EST INCROYABLE !",
+    LibraryType.FILMS_SERIES: "CE FILM EST INCROYABLE !",
+    LibraryType.DESSIN_ANIME: "CE DESSIN ANIMÉ EST INCROYABLE !",
+    LibraryType.SIMPSONS: "CET EPISODE EST INCROYABLE !",
+}
+
 
 def coerce_library_type(value: LibraryType | str | None) -> LibraryType:
     if isinstance(value, LibraryType):
@@ -27,6 +34,11 @@ def coerce_library_type(value: LibraryType | str | None) -> LibraryType:
     if value is None:
         return DEFAULT_LIBRARY_TYPE
     return LibraryType(str(value).strip().lower())
+
+
+def resolve_static_overlay_title(library_type: LibraryType | str | None) -> str:
+    resolved = coerce_library_type(library_type)
+    return STATIC_OVERLAY_TITLES.get(resolved, STATIC_OVERLAY_TITLES[LibraryType.ANIME])
 
 
 def resolve_scoped_library_path(

@@ -1,8 +1,11 @@
 from ..library_types import LibraryType
-from .project import Project, ProjectPhase
+from .project import PlatformSchedule, Project, ProjectPhase
+from .project_startup import ProjectStartupJob
+from .project_upload import ProjectUploadJob
 from .scene import Scene, SceneList
 from .match import AlternativeMatch, MatchCandidate, SceneMatch, MatchList
 from .transcription import Word, SceneTranscription, Transcription
+from .raw_scene import RawSceneCandidate, RawSceneDetectionResult
 from .subtitle import (
     SubtitleStyleType,
     SubtitleWord,
@@ -35,9 +38,11 @@ from .torrent import (
 
 __all__ = [
     "LibraryType",
-    "Project", "ProjectPhase", "Scene", "SceneList",
+    "PlatformSchedule", "Project", "ProjectPhase", "Scene", "SceneList",
+    "ProjectStartupJob", "ProjectUploadJob",
     "AlternativeMatch", "MatchCandidate", "SceneMatch", "MatchList",
     "Word", "SceneTranscription", "Transcription",
+    "RawSceneCandidate", "RawSceneDetectionResult",
     "SubtitleStyleType", "SubtitleWord", "KaraokeEffect", "SubtitleStyle",
     "SubtitleGenerationRequest", "SubtitlePreviewRequest", "SubtitleGenerationProgress",
     "FacebookMetadata", "InstagramMetadata", "MetadataCandidateFacebook",

@@ -11,6 +11,7 @@ import {
 import { Button } from "@/components/ui";
 import { useProjectStore } from "@/stores";
 import { api } from "@/api/client";
+import { formatSpeedFactorPercent } from "@/utils";
 import { formatDriveUploadMessage } from "@/utils/driveUploadProgress";
 import { readSSEStream } from "@/utils/sse";
 import { DurationWarningModal } from "@/components/DurationWarningModal";
@@ -50,7 +51,7 @@ interface ProcessingProgress {
   // Duration warning fields
   duration_warning?: boolean;
   audio_duration_seconds?: number;
-  empty_scenes_duration_seconds?: number;
+  raw_scenes_duration_seconds?: number;
   total_duration_seconds?: number;
 }
 
@@ -92,7 +93,8 @@ const INITIAL_STEPS: ProcessingStep[] = [
   },
 ];
 
-const DRIVE_UPLOAD_STREAM_TIMEOUT_MS = 10 * 60 * 1000;
+const DRIVE_UPLOAD_STALL_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_MIN_SPEED_FACTOR = 0.75;
 
 export function ProcessingPage() {
   const { projectId } = useParams<{ projectId: string }>();
@@ -111,6 +113,9 @@ export function ProcessingPage() {
   const [gapsDetected, setGapsDetected] = useState(false);
   const [gapsAutoEnabled, setGapsAutoEnabled] = useState(false);
   const [gdriveAutoEnabled, setGdriveAutoEnabled] = useState(false);
+  const [gapMinSpeedFactor, setGapMinSpeedFactor] = useState(
+    DEFAULT_MIN_SPEED_FACTOR,
+  );
   const [gapInfo, setGapInfo] = useState<{
     count: number;
     duration: number;
@@ -118,7 +123,7 @@ export function ProcessingPage() {
   const [durationWarning, setDurationWarning] = useState(false);
   const [durationWarningData, setDurationWarningData] = useState<{
     audioSeconds: number;
-    emptyScenesSeconds: number;
+    rawScenesSeconds: number;
     totalSeconds: number;
   } | null>(null);
   const [steps, setSteps] = useState<ProcessingStep[]>(INITIAL_STEPS);
@@ -144,8 +149,14 @@ export function ProcessingPage() {
         try {
           const gapsConfig = await api.getGapsConfig(projectId);
           setGapsAutoEnabled(Boolean(gapsConfig.full_auto_enabled));
+          setGapMinSpeedFactor(
+            Number.isFinite(gapsConfig.min_speed_factor)
+              ? gapsConfig.min_speed_factor
+              : DEFAULT_MIN_SPEED_FACTOR,
+          );
         } catch {
           setGapsAutoEnabled(false);
+          setGapMinSpeedFactor(DEFAULT_MIN_SPEED_FACTOR);
         }
         try {
           const processingConfig = await api.getProcessingConfig(projectId);
@@ -177,6 +188,7 @@ export function ProcessingPage() {
     setError(null);
     setGapsDetected(false);
     setGapInfo(null);
+    setGapMinSpeedFactor(DEFAULT_MIN_SPEED_FACTOR);
     setDurationWarning(false);
     setDurationWarningData(null);
     setSteps(INITIAL_STEPS);
@@ -229,7 +241,7 @@ export function ProcessingPage() {
             setDurationWarning(true);
             setDurationWarningData({
               audioSeconds: data.audio_duration_seconds || 0,
-              emptyScenesSeconds: data.empty_scenes_duration_seconds || 0,
+              rawScenesSeconds: data.raw_scenes_duration_seconds || 0,
               totalSeconds: data.total_duration_seconds || 0,
             });
             setSteps((prev) =>
@@ -386,10 +398,15 @@ export function ProcessingPage() {
     );
     const controller = new AbortController();
     let timedOut = false;
-    const timeoutId = window.setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, DRIVE_UPLOAD_STREAM_TIMEOUT_MS);
+    let stallTimeoutId: number | undefined;
+    const resetStallTimeout = () => {
+      if (stallTimeoutId !== undefined) window.clearTimeout(stallTimeoutId);
+      stallTimeoutId = window.setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, DRIVE_UPLOAD_STALL_TIMEOUT_MS);
+    };
+    resetStallTimeout();
 
     try {
       const response = await api.uploadExportToGDrive(projectId, {
@@ -398,6 +415,7 @@ export function ProcessingPage() {
       const finalEvent = await readSSEStream<ProcessingProgress>(
         response,
         (data) => {
+          resetStallTimeout();
           const nextMessage = formatDriveUploadMessage(data);
           if (nextMessage) setActionMessage(nextMessage);
         },
@@ -434,8 +452,9 @@ export function ProcessingPage() {
     } catch (err) {
       const message = (err as Error).message;
       if (timedOut) {
+        const stallMinutes = Math.round(DRIVE_UPLOAD_STALL_TIMEOUT_MS / 60000);
         setError(
-          "Drive upload timed out while waiting for stream completion. Please retry.",
+          `Drive upload stalled: no progress update received for ${stallMinutes} minutes. Please retry.`,
         );
       } else if (
         message === "Upload already in progress for this project" ||
@@ -446,7 +465,7 @@ export function ProcessingPage() {
         setError(message);
       }
     } finally {
-      window.clearTimeout(timeoutId);
+      if (stallTimeoutId !== undefined) window.clearTimeout(stallTimeoutId);
       setDriveLoading(false);
     }
   }, [projectId, driveLoading, bundleLoading]);
@@ -541,7 +560,8 @@ export function ProcessingPage() {
               <div className="space-y-2 flex-1">
                 <p className="text-sm font-medium">
                   {gapInfo.count} clip{gapInfo.count !== 1 ? "s" : ""} hit the
-                  75% speed floor
+                  {" "}
+                  {formatSpeedFactorPercent(gapMinSpeedFactor)} speed floor
                 </p>
                 <p className="text-xs text-[hsl(var(--muted-foreground))]">
                   Total gap duration: {gapInfo.duration.toFixed(2)}s. You can
@@ -685,7 +705,7 @@ export function ProcessingPage() {
       <DurationWarningModal
         open={durationWarning && durationWarningData !== null}
         audioSeconds={durationWarningData?.audioSeconds ?? 0}
-        emptyScenesSeconds={durationWarningData?.emptyScenesSeconds ?? 0}
+        rawScenesSeconds={durationWarningData?.rawScenesSeconds ?? 0}
         totalSeconds={durationWarningData?.totalSeconds ?? 0}
         onGoBack={() => navigate(`/project/${projectId}/script`)}
         onContinue={async () => {

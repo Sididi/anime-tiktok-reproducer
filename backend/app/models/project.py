@@ -17,9 +17,17 @@ class ProjectPhase(str, Enum):
     MATCHING = "matching"
     MATCH_VALIDATION = "match_validation"
     TRANSCRIPTION = "transcription"
+    RAW_SCENE_VALIDATION = "raw_scene_validation"
     SCRIPT_RESTRUCTURE = "script_restructure"
     PROCESSING = "processing"
     COMPLETE = "complete"
+
+
+class PlatformSchedule(BaseModel):
+    """Per-platform slot reservation on a Project."""
+
+    slot: datetime
+    scheduled_at: datetime
 
 
 class Project(BaseModel):
@@ -51,8 +59,6 @@ class Project(BaseModel):
     final_upload_discord_message_id: str | None = None
     upload_completed_at: datetime | None = None
     upload_last_result: dict[str, Any] | None = None
-    discord_upload_message_crossed: bool = False
-
     # Script phase settings
     music_key: str | None = None
     tts_speed: float | None = None
@@ -60,6 +66,7 @@ class Project(BaseModel):
     voice_key: str | None = None
 
     # Scheduling
-    scheduled_at: datetime | None = None
+    scheduled_at: datetime | None = None  # derived aggregate: max of platform_schedules[*].scheduled_at
     scheduled_account_id: str | None = None
-    scheduled_slot: str | None = None
+    scheduled_slot: str | None = None  # legacy; no longer written by new code
+    platform_schedules: dict[str, PlatformSchedule] = Field(default_factory=dict)

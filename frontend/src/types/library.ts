@@ -30,6 +30,7 @@ export interface BrowseResult {
 
 export interface IndexationJob {
   id: string;
+  job_type: "index" | "update";
   source_name: string;
   library_type: import("./index").LibraryType;
   source_path: string;
@@ -38,12 +39,37 @@ export interface IndexationJob {
   progress: number;
   phase: string | null;
   message: string | null;
+  current_file: string | null;
+  total_files: number;
+  completed_files: number;
+  current_file_progress: number | null;
+  current_file_frames_processed: number | null;
+  current_file_total_frames: number | null;
+  current_file_batches_processed: number | null;
   error: string | null;
+  warnings: string[];
   unmatched_files: string[];
   linked_torrents: number;
   series_id: string | null;
   storage_release_id: string | null;
   created_at: string;
+}
+
+export interface ProjectStartupJob {
+  job_id: string;
+  project_id: string;
+  anime_name: string | null;
+  series_id: string | null;
+  library_type: import("./index").LibraryType;
+  tiktok_url: string | null;
+  status: "queued" | "running" | "complete" | "error";
+  progress: number;
+  phase: string | null;
+  message: string | null;
+  error: string | null;
+  ready_url: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface LibraryActivationState {
@@ -92,6 +118,35 @@ export interface PurgeResult {
   purged_sources: string[];
   freed_bytes: number;
   skipped_protected: string[];
+}
+
+export interface SeriesDeleteReferencingProject {
+  project_id: string;
+  anime_title: string | null;
+  phase: import("./index").ProjectPhase;
+  scheduled_at: string | null;
+  upload_completed_at: string | null;
+}
+
+export interface DeleteSeriesResponse {
+  status: "deleted";
+  series_id: string;
+  library_type: import("./index").LibraryType;
+}
+
+export interface RenameSeriesResponse {
+  status: "renamed";
+  series_id: string;
+  library_type: import("./index").LibraryType;
+  old_name: string;
+  new_name: string;
+  storage_release_id: string;
+}
+
+export interface SeriesDeleteConflictDetail {
+  code: string;
+  message: string;
+  referencing_projects: SeriesDeleteReferencingProject[];
 }
 
 // --- Torrent management types ---

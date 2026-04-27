@@ -15,6 +15,49 @@ var __atrCleanupMaxBinPasses = 5;
 var __atrTempAudioSequencePrefix = "ATR_AUDIO_NO_MUSIC_TMP__";
 var __atrProjectPurgeBinName = "__ATR_PURGE__";
 
+/**
+ * JSON.stringify polyfill for ExtendScript (ES3).
+ * ExtendScript lacks native JSON support in some Premiere Pro versions.
+ * Based on Douglas Crockford's JSON2 (public domain).
+ */
+if (typeof JSON === "undefined") {
+  JSON = {};
+}
+if (typeof JSON.stringify !== "function") {
+  JSON.stringify = function (value) {
+    var type = typeof value;
+    if (type === "string") {
+      return '"' + value.replace(/[\\\"\x00-\x1f]/g, function (c) {
+        var hex = c.charCodeAt(0).toString(16);
+        return c === '"' ? '\\"' : c === "\\" ? "\\\\" : "\\u" + ("0000" + hex).slice(-4);
+      }) + '"';
+    }
+    if (type === "number" || type === "boolean") {
+      return String(value);
+    }
+    if (value === null) {
+      return "null";
+    }
+    if (value instanceof Array) {
+      var arrResult = [];
+      for (var i = 0; i < value.length; i++) {
+        arrResult.push(JSON.stringify(value[i]));
+      }
+      return "[" + arrResult.join(",") + "]";
+    }
+    if (type === "object") {
+      var objResult = [];
+      for (var key in value) {
+        if (value.hasOwnProperty(key)) {
+          objResult.push(JSON.stringify(key) + ":" + JSON.stringify(value[key]));
+        }
+      }
+      return "{" + objResult.join(",") + "}";
+    }
+    return "null";
+  };
+}
+
 function __atrSafeString(value) {
   if (value === undefined || value === null) {
     return "";
@@ -523,7 +566,53 @@ function __atrRemoveTrackByIndex(tracks, indexToRemove) {
   }
 }
 
-function __atrCloneActiveSequence() {
+function __atrFindSequenceByName(sequenceName) {
+  var targetName = __atrSafeString(sequenceName);
+  if (!targetName) {
+    return null;
+  }
+
+  var sequences = app && app.project ? app.project.sequences : null;
+  if (!sequences) {
+    return null;
+  }
+
+  var count = 0;
+  try {
+    count = Number(sequences.numSequences || 0);
+  } catch (eCount) {
+    count = 0;
+  }
+
+  // Pass 1: exact name match
+  for (var i = 0; i < count; i += 1) {
+    var sequence = sequences[i];
+    if (!sequence) {
+      continue;
+    }
+    if (__atrGetSequenceName(sequence) === targetName) {
+      return sequence;
+    }
+  }
+
+  // Pass 2: fallback via projectItem.name (handles bin corruption where
+  // sequence.name may be unavailable but projectItem retains the name)
+  for (var j = 0; j < count; j += 1) {
+    var seq2 = sequences[j];
+    if (!seq2) {
+      continue;
+    }
+    try {
+      if (seq2.projectItem && __atrSafeString(seq2.projectItem.name) === targetName) {
+        return seq2;
+      }
+    } catch (eFallback) {}
+  }
+
+  return null;
+}
+
+function __atrCloneSequence(sourceSequence) {
   var sequences = app && app.project ? app.project.sequences : null;
   if (!sequences) {
     throw new Error("No sequence collection available");
@@ -536,9 +625,8 @@ function __atrCloneActiveSequence() {
     beforeCount = 0;
   }
 
-  var sourceSequence = app.project.activeSequence;
   if (!sourceSequence || !sourceSequence.clone) {
-    throw new Error("Active sequence cannot be cloned");
+    throw new Error("Sequence cannot be cloned");
   }
 
   var cloned = sourceSequence.clone();
@@ -855,10 +943,7 @@ function purgeActiveProject() {
       }
     }
 
-    if (JSON && JSON.stringify) {
-      return JSON.stringify(result);
-    }
-    return result.ok ? "OK" : "ERROR";
+    return JSON.stringify(result);
   } catch (e) {
     return "ERROR: " + e.message + " (line " + e.line + ")";
   }
@@ -901,22 +986,32 @@ function setPanelPersistent() {
  * Start managed export via Adobe Media Encoder and return job ID.
  *
  * @param {string} projectId
+ * @param {string} sequenceName
  * @param {string} outputPath
  * @param {string} presetPath
  * @returns {string} jobID or ERROR message
  */
-function startManagedExport(projectId, outputPath, presetPath) {
+function startManagedExport(projectId, sequenceName, outputPath, presetPath) {
   try {
-    if (!app || !app.project || !app.project.activeSequence) {
-      return "ERROR: No active sequence in current project";
+    if (!app || !app.project) {
+      return "ERROR: No active Premiere project";
+    }
+
+    var targetSequenceName = __atrSafeString(sequenceName);
+    if (!targetSequenceName) {
+      return "ERROR: Missing sequence name";
+    }
+    var targetSequence = __atrFindSequenceByName(targetSequenceName);
+    if (!targetSequence) {
+      return "ERROR: Sequence not found: " + targetSequenceName;
     }
 
     var exportAudioNoMusic =
-      Number(arguments.length >= 4 ? arguments[3] : 0) === 1;
+      Number(arguments.length >= 5 ? arguments[4] : 0) === 1;
     var audioOutputPath =
-      arguments.length >= 5 ? __atrSafeString(arguments[4]) : "";
-    var audioPresetPath =
       arguments.length >= 6 ? __atrSafeString(arguments[5]) : "";
+    var audioPresetPath =
+      arguments.length >= 7 ? __atrSafeString(arguments[6]) : "";
 
     var normalizedPresetPath = __atrNormalizePath(presetPath);
     var presetFile = new File(normalizedPresetPath);
@@ -948,7 +1043,7 @@ function startManagedExport(projectId, outputPath, presetPath) {
     }
 
     var videoJobID = __atrEncodeSequence(
-      app.project.activeSequence,
+      targetSequence,
       outputFsPath,
       presetFsPath,
     );
@@ -999,7 +1094,7 @@ function startManagedExport(projectId, outputPath, presetPath) {
         audioOutFile.fsName || normalizedAudioOutputPath,
       );
 
-      var tempSequence = __atrCloneActiveSequence();
+      var tempSequence = __atrCloneSequence(targetSequence);
       var tempSequenceName =
         __atrTempAudioSequencePrefix +
         __atrSafeString(projectId) +
@@ -1034,14 +1129,11 @@ function startManagedExport(projectId, outputPath, presetPath) {
       });
     }
 
-    if (JSON && JSON.stringify) {
-      return JSON.stringify({
-        video_job_id: __atrSafeString(videoJobID),
-        audio_job_id: __atrSafeString(audioJobID),
-        audio_enabled: !!exportAudioNoMusic,
-      });
-    }
-    return __atrSafeString(videoJobID);
+    return JSON.stringify({
+      video_job_id: __atrSafeString(videoJobID),
+      audio_job_id: __atrSafeString(audioJobID),
+      audio_enabled: !!exportAudioNoMusic,
+    });
   } catch (e) {
     return "ERROR: " + e.message + " (line " + e.line + ")";
   }
@@ -1056,10 +1148,7 @@ function pullEncoderEvents() {
   try {
     var events = __atrEncoderEvents.slice(0);
     __atrEncoderEvents = [];
-    if (JSON && JSON.stringify) {
-      return JSON.stringify(events);
-    }
-    return "[]";
+    return JSON.stringify(events);
   } catch (e) {
     return "[]";
   }
@@ -1101,10 +1190,7 @@ function cleanupImportedProjectMedia(localRootPath) {
       result.error = "Imported Premiere project items remain after cleanup";
     }
 
-    if (JSON && JSON.stringify) {
-      return JSON.stringify(result);
-    }
-    return "OK";
+    return JSON.stringify(result);
   } catch (e) {
     return "ERROR: " + e.message + " (line " + e.line + ")";
   }

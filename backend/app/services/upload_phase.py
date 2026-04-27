@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from zoneinfo import ZoneInfo
 import logging
 import shutil
@@ -17,7 +17,7 @@ import requests
 from ..config import settings
 from ..library_types import coerce_library_type
 from ..models import Project
-from .account_service import AccountService
+from .account_service import AccountConfig, AccountService
 from .discord_service import DiscordService
 from .export_service import ExportService
 from .google_drive_service import GoogleDriveService
@@ -253,7 +253,6 @@ class UploadPhaseService:
     @classmethod
     def list_manager_rows(cls) -> list[dict[str, Any]]:
         projects = ProjectService.list_all()
-        cls._cross_overdue_upload_messages(projects)
         folder_candidates_by_name: dict[str, dict[str, Any]] = {}
         drive_root_videos: dict[str, list[dict[str, Any]]] = {}
         drive_batch_lookup_failed = False
@@ -342,6 +341,13 @@ class UploadPhaseService:
                 "created_at": project.created_at.isoformat() if project.created_at else None,
                 "scheduled_at": project.scheduled_at.isoformat() if project.scheduled_at else None,
                 "scheduled_account_id": project.scheduled_account_id,
+                "platform_schedules": {
+                    platform: {
+                        "slot": ps.slot.isoformat(),
+                        "scheduled_at": ps.scheduled_at.isoformat(),
+                    }
+                    for platform, ps in (project.platform_schedules or {}).items()
+                },
             }
 
         if not projects:
@@ -368,61 +374,6 @@ class UploadPhaseService:
     }
 
     @classmethod
-    def _cross_out_discord_message(cls, project: Project) -> bool:
-        """Apply strikethrough to the project's final upload Discord message.
-
-        Returns True if successfully crossed out.
-        """
-        message_id = project.final_upload_discord_message_id
-        if not message_id or not DiscordService.is_configured():
-            return False
-        existing = DiscordService.get_message(message_id)
-        if existing:
-            content = existing.content
-            direct_url = (project.upload_last_result or {}).get("direct_drive_download", "")
-            if direct_url and direct_url in content:
-                content = content.replace(direct_url, f"<{direct_url}>")
-            struck_lines = [f"~~{line}~~" if line.strip() else "" for line in content.splitlines()]
-            DiscordService.edit_message(message_id, "\n".join(struck_lines))
-        else:
-            DiscordService.edit_message(message_id, "~~Upload removed~~")
-        return True
-
-    @classmethod
-    def _cross_overdue_upload_messages(cls, projects: list[Project]) -> None:
-        """Cross out Discord upload messages for projects whose scheduled_at has passed."""
-        if not DiscordService.is_configured():
-            return
-        now = datetime.now(tz=timezone.utc)
-        candidates = [
-            p for p in projects
-            if p.final_upload_discord_message_id
-            and p.scheduled_at is not None
-            and p.scheduled_at <= now
-            and not p.discord_upload_message_crossed
-        ]
-        if not candidates:
-            return
-
-        def _cross_one(project: Project) -> None:
-            try:
-                if cls._cross_out_discord_message(project):
-                    project.discord_upload_message_crossed = True
-                    ProjectService.save(project)
-            except Exception:
-                logger.warning(
-                    "Failed to cross Discord message for project %s",
-                    project.id,
-                    exc_info=True,
-                )
-
-        if len(candidates) == 1:
-            _cross_one(candidates[0])
-        else:
-            with ThreadPoolExecutor(max_workers=min(4, len(candidates))) as executor:
-                list(executor.map(_cross_one, candidates))
-
-    @classmethod
     def _format_french_datetime(cls, dt: datetime) -> str:
         aware = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
         french_dt = aware.astimezone(cls._FRENCH_TZ)
@@ -434,63 +385,43 @@ class UploadPhaseService:
         )
 
     @classmethod
-    def _format_upload_discord_message(
+    def _compute_upfront_skips(
         cls,
-        *,
-        project: Project,
-        drive_download_url: str,
-        platform_results: list[PlatformUploadResult],
-        youtube_title: str,
-        youtube_description: str,
-        youtube_tags: list[str],
-        tiktok_description: str,
-        scheduled_at: datetime | None = None,
-    ) -> str:
-        anime_title = project.anime_name or "Inconnu"
-        header = f"**{anime_title}**: Upload terminé pour le projet `{project.id}`"
-        if scheduled_at:
-            header += f" (programmé le *{cls._format_french_datetime(scheduled_at)}*)"
-        lines = [
-            header,
-            f"__**Lien vidéo:**__ {drive_download_url}",
-            "",
-            "Plateformes:",
-        ]
-        for result in platform_results:
-            icon = ":white_check_mark:" if result.status == "uploaded" else ":warning:" if result.status == "skipped" else ":x:"
-            platform_display = cls._PLATFORM_DISPLAY.get(result.platform, result.platform)
-            if result.status == "uploaded":
-                url_part = f" - <{result.url}>" if result.url else ""
-                lines.append(f"{icon} {platform_display}: Uploaded{url_part}")
-            elif result.status == "skipped":
-                detail_part = f" ({result.detail})" if result.detail else ""
-                lines.append(f"{icon} {platform_display}: Skipped{detail_part}")
-            else:
-                detail_part = f" ({result.detail})" if result.detail else ""
-                lines.append(f"{icon} {platform_display}: Failed{detail_part}")
+        requested_platforms: tuple[str, ...],
+        account: AccountConfig | None,
+        instagram_enabled: bool,
+    ) -> dict[str, PlatformUploadResult]:
+        """Determine which requested platforms are known to be unrunnable upfront.
 
-        youtube_quota_hit = any(
-            item.platform == "youtube" and item.status == "failed" and item.quota_exceeded
-            for item in platform_results
-        )
-        if youtube_quota_hit:
-            lines.append("")
-            lines.append(
-                "YouTube quota limit reached (default quota ~10,000/day; upload+captions can consume ~2,000/video, about 5 videos/day)."
-            )
-            lines.append("YouTube metadata for manual retry:")
-            lines.append("```")
-            lines.append(f"Title: {youtube_title}")
-            lines.append("")
-            lines.append(youtube_description)
-            lines.append("")
-            lines.append(f"Tags: {', '.join(youtube_tags)}")
-            lines.append("```")
-
-        lines.append("")
-        lines.append("TikTok description:")
-        lines.append(f"`{tiktok_description}`")
-        return "\n".join(lines)
+        Mirrors the configuration checks in ``execute_upload`` that decide whether
+        each platform gets a job: if a platform cannot run at all, we seed a
+        ``"skipped"`` result now so the early Discord message (posted before the
+        parallel upload phase) already reflects it.
+        """
+        skips: dict[str, PlatformUploadResult] = {}
+        default_detail = "Platform is not configured for this upload context"
+        for platform in requested_platforms:
+            reason: str | None = None
+            if platform == "youtube":
+                if account is not None and (
+                    account.youtube is None or not account.youtube.refresh_token
+                ):
+                    reason = default_detail
+            elif platform == "facebook":
+                if account is not None and account.meta is None:
+                    reason = default_detail
+            elif platform == "instagram":
+                if not instagram_enabled:
+                    reason = "Instagram upload disabled: ATR_N8N_WEBHOOK_URL is not configured"
+                elif account is not None and account.meta is None:
+                    reason = default_detail
+            if reason is not None:
+                skips[platform] = PlatformUploadResult(
+                    platform=platform,
+                    status="skipped",
+                    detail=reason,
+                )
+        return skips
 
     @classmethod
     def _normalize_platforms(cls, platforms: list[str] | None) -> tuple[str, ...]:
@@ -521,7 +452,24 @@ class UploadPhaseService:
         facebook_strategy: str | None = None,
         youtube_strategy: str | None = None,
         copyright_audio_path: str | None = None,
+        reserved_slots: dict[str, tuple[datetime, datetime]] | None = None,
+        progress_callback: Callable[[float, str, str], None] | None = None,
+        platform_result_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
+        def emit_progress(progress: float, phase: str, message: str) -> None:
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(progress, phase, message)
+            except Exception:
+                logger.warning(
+                    "Upload progress callback failed: project_id=%s phase=%s",
+                    project_id,
+                    phase,
+                    exc_info=True,
+                )
+
+        emit_progress(0.05, "prepare", "Preparing upload...")
         project = ProjectService.load(project_id)
         if not project:
             raise ValueError("Project not found")
@@ -530,8 +478,7 @@ class UploadPhaseService:
 
         # Validate account if provided
         account = None
-        scheduled_at: datetime | None = None
-        slot_dt: datetime | None = None
+        platform_scheduled_at: dict[str, datetime] = {}
         project_library_type = coerce_library_type(project.library_type)
         if account_id:
             account = AccountService.get_account(account_id)
@@ -565,17 +512,123 @@ class UploadPhaseService:
             raise ValueError("Subtitle file is missing")
         subtitle_locale = ExportService.language_to_locale(project.output_language)
 
-        # Calculate scheduled time if account has slots
-        if account and account.slots and account_id:
-            slot_dt, scheduled_at = SchedulingService.find_next_slot(account_id)
+        # Calculate per-platform scheduled times if account has slots for that platform.
+        if account and account_id:
+            for _platform in ("youtube", "facebook", "instagram", "tiktok"):
+                if not account.slots_for(_platform):
+                    continue
+                _pre = (reserved_slots or {}).get(_platform)
+                if _pre is not None:
+                    _, _sched = _pre
+                else:
+                    _, _sched = SchedulingService.find_next_slot_for_platform(account_id, _platform)
+                platform_scheduled_at[_platform] = _sched
 
         # Public share the drive video before upload phase.
+        emit_progress(0.15, "prepare", "Preparing Drive upload assets...")
         GoogleDriveService.set_public_read(readiness.drive_video_id)
         drive_video_url = readiness.drive_video_web_url or GoogleDriveService.get_web_view_url(readiness.drive_video_id)
         direct_drive_download = GoogleDriveService.get_direct_download_url(readiness.drive_video_id)
 
+        instagram_enabled = bool((settings.n8n_webhook_url or "").strip())
+
+        results_by_platform: dict[str, PlatformUploadResult] = dict(
+            cls._compute_upfront_skips(requested_platforms, account, instagram_enabled)
+        )
+        discord_message_id: str | None = None
+
+        def emit_platform_result(result: PlatformUploadResult) -> None:
+            if platform_result_callback is not None:
+                try:
+                    platform_result_callback(asdict(result))
+                except Exception:
+                    logger.warning(
+                        "Upload platform result callback failed: project_id=%s platform=%s",
+                        project_id,
+                        result.platform,
+                        exc_info=True,
+                    )
+            try:
+                DiscordService.update_job_platform(
+                    project_id,
+                    result.platform,
+                    status=result.status,
+                    url=result.url,
+                    detail=result.detail,
+                )
+            except Exception:
+                logger.warning(
+                    "Discord platform update failed for %s/%s",
+                    project_id,
+                    result.platform,
+                    exc_info=True,
+                )
+
+        for skip_result in results_by_platform.values():
+            emit_platform_result(skip_result)
+
+        # Clean up any stale Discord messages from prior runs before posting a fresh
+        # "upload in progress" message.  We used to delete these at finalize-time,
+        # but since we now post the message early, cleanup has to happen early too.
+        if project.generation_discord_message_id:
+            try:
+                DiscordService.delete_message(project.generation_discord_message_id)
+            except Exception:
+                logger.warning(
+                    "Failed to delete generation Discord message for project %s",
+                    project_id,
+                    exc_info=True,
+                )
+            project.generation_discord_message_id = None
+        if project.final_upload_discord_message_id:
+            try:
+                DiscordService.delete_job(project_id)
+            except Exception:
+                logger.warning(
+                    "Failed to delete stale upload job for project %s",
+                    project_id,
+                    exc_info=True,
+                )
+            project.final_upload_discord_message_id = None
+
+        discord_message_id = None
+        try:
+            job_response = DiscordService.create_job(
+                project_id=project_id,
+                # Use the live account_id arg (validated above), not
+                # project.scheduled_account_id which is only persisted at the
+                # END of execute_upload — None on first upload.
+                account_id=account_id or project.scheduled_account_id or "",
+                slot_time=project.scheduled_at or datetime.now(timezone.utc),
+                anime_title=project.anime_name or "Unknown",
+                description=metadata.tiktok.description,
+                drive_video_url=direct_drive_download or drive_video_url,
+                platforms_requested=list(requested_platforms),
+            )
+        except Exception:
+            logger.warning(
+                "Discord create_job failed for project %s",
+                project_id,
+                exc_info=True,
+            )
+            job_response = None
+
+        if job_response is not None:
+            discord_message_id = job_response.get("discord_message_id")
+            if discord_message_id:
+                project.final_upload_discord_message_id = discord_message_id
+                try:
+                    ProjectService.save(project)
+                except Exception:
+                    logger.warning(
+                        "Failed to persist Discord message id for project %s",
+                        project_id,
+                        exc_info=True,
+                    )
+
         with tempfile.TemporaryDirectory(prefix=f"atr-upload-{project_id}-") as tmp_dir:
             local_video_path = Path(tmp_dir) / (readiness.drive_video_name or "final_video.mp4")
+            emit_progress(0.30, "download", "Downloading final video from Drive...")
             GoogleDriveService.download_file(readiness.drive_video_id, local_video_path)
 
             # When copyright audio replacement is active, re-mux the video with the
@@ -593,14 +646,18 @@ class UploadPhaseService:
                 force_local_upload = True
 
             jobs: dict[str, Any] = {}
-            instagram_enabled = bool((settings.n8n_webhook_url or "").strip())
 
             # YouTube job
-            if "youtube" in requested_platforms and account and account.youtube and account_id:
+            if (
+                "youtube" in requested_platforms
+                and account and account.youtube and account.youtube.refresh_token
+                and account_id
+            ):
                 yt_creds = AccountService.get_youtube_credentials(account_id)
                 yt_config = account.youtube
                 _yt_strategy = youtube_strategy
                 _yt_prep_dir = cls._youtube_prep_dir(project_id)
+                _yt_scheduled_at = platform_scheduled_at.get("youtube")
                 jobs["youtube"] = lambda: SocialUploadService.upload_youtube(
                     video_path=local_video_path,
                     subtitle_path=subtitle_path,
@@ -608,7 +665,7 @@ class UploadPhaseService:
                     target_language=project.output_language,
                     metadata=metadata,
                     credentials=yt_creds,
-                    scheduled_at=scheduled_at,
+                    scheduled_at=_yt_scheduled_at,
                     category_id=yt_config.category_id,
                     channel_id=yt_config.channel_id,
                     youtube_strategy=_yt_strategy,
@@ -638,6 +695,7 @@ class UploadPhaseService:
                     _fb_strategy = facebook_strategy  # capture for lambda
                     _fb_prep_dir = cls._facebook_prep_dir(project_id)
                     _fb_video_url = None if force_local_upload else direct_drive_download
+                    _fb_scheduled_at = platform_scheduled_at.get("facebook")
                     jobs["facebook"] = lambda: SocialUploadService.upload_facebook(
                         video_path=local_video_path,
                         subtitle_path=subtitle_path,
@@ -646,17 +704,18 @@ class UploadPhaseService:
                         video_url=_fb_video_url,
                         page_id=meta_creds.page_id,
                         page_access_token=meta_creds.facebook_page_access_token,
-                        scheduled_at=scheduled_at,
+                        scheduled_at=_fb_scheduled_at,
                         facebook_strategy=_fb_strategy,
                         facebook_prep_dir=_fb_prep_dir,
                     )
 
                 # Instagram: disabled when n8n webhook is not configured.
                 if "instagram" in requested_platforms and instagram_enabled:
-                    if scheduled_at:
+                    _ig_scheduled_at = platform_scheduled_at.get("instagram")
+                    if _ig_scheduled_at:
                         ig_deferred = cls._send_n8n_instagram_webhook(
                             project_id=project_id,
-                            scheduled_at=scheduled_at,
+                            scheduled_at=_ig_scheduled_at,
                             drive_video_id=readiness.drive_video_id,
                             metadata=metadata,
                             ig_user_id=meta_creds.instagram_business_account_id,
@@ -691,37 +750,73 @@ class UploadPhaseService:
                         metadata=metadata,
                     )
 
-            results_by_platform: dict[str, PlatformUploadResult] = {}
             selected_jobs = {platform: jobs[platform] for platform in requested_platforms if platform in jobs}
 
-            for platform in requested_platforms:
-                if platform in jobs:
-                    continue
-                detail = "Platform is not configured for this upload context"
-                if platform == "instagram" and not instagram_enabled:
-                    detail = "Instagram upload disabled: ATR_N8N_WEBHOOK_URL is not configured"
-                results_by_platform[platform] = PlatformUploadResult(
-                    platform=platform,
-                    status="skipped",
-                    detail=detail,
-                )
-
+            emit_progress(0.55, "platform_upload", "Uploading to social platforms...")
             max_parallel = max(1, min(settings.social_upload_max_parallel, len(selected_jobs))) if selected_jobs else 1
-            with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+            executor = ThreadPoolExecutor(max_workers=max_parallel)
+            timed_out_platforms = False
+            try:
                 future_to_platform = {
                     executor.submit(job): platform
                     for platform, job in selected_jobs.items()
                 }
-                for future in as_completed(future_to_platform):
-                    platform = future_to_platform[future]
-                    try:
-                        results_by_platform[platform] = future.result()
-                    except Exception as exc:
+                pending = set(future_to_platform)
+                deadline = time.monotonic() + max(
+                    float(settings.project_manager_platform_phase_timeout_seconds),
+                    0.001,
+                )
+
+                while pending:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        timed_out_platforms = True
+                        break
+
+                    done, pending = wait(
+                        pending,
+                        timeout=remaining,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    if not done:
+                        timed_out_platforms = True
+                        break
+
+                    for future in done:
+                        platform = future_to_platform[future]
+                        try:
+                            results_by_platform[platform] = future.result()
+                        except Exception as exc:
+                            results_by_platform[platform] = PlatformUploadResult(
+                                platform=platform,
+                                status="failed",
+                                detail=str(exc),
+                            )
+                        emit_platform_result(results_by_platform[platform])
+
+                if pending:
+                    timed_out_platforms = True
+                    timeout_seconds = max(
+                        int(settings.project_manager_platform_phase_timeout_seconds),
+                        1,
+                    )
+                    for future in list(pending):
+                        platform = future_to_platform[future]
+                        future.cancel()
                         results_by_platform[platform] = PlatformUploadResult(
                             platform=platform,
                             status="failed",
-                            detail=str(exc),
+                            detail=(
+                                f"{platform.title()} platform job timed out after "
+                                f"{timeout_seconds}s."
+                            ),
                         )
+                        emit_platform_result(results_by_platform[platform])
+            finally:
+                executor.shutdown(
+                    wait=not timed_out_platforms,
+                    cancel_futures=timed_out_platforms,
+                )
 
             # Keep deterministic ordering in reports/messages.
             platform_results = [
@@ -730,30 +825,33 @@ class UploadPhaseService:
                 if platform in results_by_platform
             ]
 
-        # Remove generation message first (if any), then post final upload message.
-        if project.generation_discord_message_id:
-            DiscordService.delete_message(project.generation_discord_message_id)
-            project.generation_discord_message_id = None
-        if project.final_upload_discord_message_id:
-            DiscordService.delete_message(project.final_upload_discord_message_id)
-            project.final_upload_discord_message_id = None
+        emit_progress(0.85, "finalize", "Finalizing upload state...")
 
-        final_message = DiscordService.post_message(
-            cls._format_upload_discord_message(
-                project=project,
-                drive_download_url=direct_drive_download or drive_video_url,
-                platform_results=platform_results,
-                youtube_title=metadata.youtube.title,
-                youtube_description=metadata.youtube.description,
-                youtube_tags=metadata.youtube.tags,
-                tiktok_description=metadata.tiktok.description,
-                scheduled_at=scheduled_at,
-            )
+        # YouTube quota fallback: if YouTube hit quota, post a follow-up generic
+        # message with retry metadata so the operator can manually upload later.
+        youtube_quota_hit = any(
+            r.platform == "youtube" and r.status == "failed" and getattr(r, "quota_exceeded", False)
+            for r in results_by_platform.values()
         )
+        if youtube_quota_hit:
+            quota_msg = (
+                f"YouTube quota limit reached for **{project.anime_name or project_id}**. "
+                "Manual retry metadata:\n```\n"
+                f"Title: {metadata.youtube.title}\n\n"
+                f"{metadata.youtube.description}\n\n"
+                f"Tags: {', '.join(metadata.youtube.tags)}\n```"
+            )
+            try:
+                DiscordService.post_message(quota_msg)
+            except Exception:
+                logger.warning(
+                    "YouTube quota fallback message failed for %s",
+                    project_id,
+                    exc_info=True,
+                )
 
         project.drive_folder_id = readiness.drive_folder_id
         project.drive_folder_url = readiness.drive_folder_url
-        project.final_upload_discord_message_id = final_message.id if final_message else project.final_upload_discord_message_id
         project.upload_completed_at = datetime.now(timezone.utc)
         project.upload_last_result = {
             "platforms": [asdict(item) for item in platform_results],
@@ -762,19 +860,17 @@ class UploadPhaseService:
             "direct_drive_download": direct_drive_download,
         }
 
-        # Save scheduling info
+        # Save scheduling info. Per-platform reservations are already persisted
+        # by SchedulingService; only the top-level account attribution matters here.
         if account_id:
             project.scheduled_account_id = account_id
-        if scheduled_at:
-            project.scheduled_at = scheduled_at
-        if slot_dt:
-            project.scheduled_slot = slot_dt.isoformat()
 
         ProjectService.save(project)
 
         # Cleanup upload prep caches after upload
         cls.cleanup_facebook_prep(project_id)
         cls.cleanup_youtube_prep(project_id)
+        emit_progress(1.0, "complete", "Upload complete.")
 
         return {
             "platform_results": [asdict(item) for item in platform_results],
@@ -782,7 +878,10 @@ class UploadPhaseService:
             "drive_video_url": drive_video_url,
             "direct_drive_download": direct_drive_download,
             "discord_message_id": project.final_upload_discord_message_id,
-            "scheduled_at": scheduled_at.isoformat() if scheduled_at else None,
+            "platform_scheduled_at": {
+                platform: dt.isoformat() for platform, dt in platform_scheduled_at.items()
+            },
+            "scheduled_at": project.scheduled_at.isoformat() if project.scheduled_at else None,
         }
 
     @classmethod
@@ -1052,24 +1151,9 @@ class UploadPhaseService:
         speed_factor = duration_seconds / max_duration
         sped_up_available = speed_factor <= max_speed + 1e-6
 
-        if sped_up_available:
-            sped_up_path = prep_dir / "sped_up.mp4"
-            if not sped_up_path.exists():
-                logger.info(
-                    "%s check: transcoding sped-up version for project %s (x%.2f)",
-                    platform_label,
-                    project_id,
-                    speed_factor,
-                )
-                error = transcode_to_limit(
-                    input_path=original_path,
-                    output_path=sped_up_path,
-                    speed_factor=speed_factor,
-                    has_audio=probe.has_audio,
-                )
-                if error:
-                    logger.warning("%s check: sped-up transcoding failed: %s", platform_label, error)
-                    sped_up_available = False
+        # Note: We no longer transcode the sped-up preview here.
+        # The frontend uses HTML5 playbackRate for instant preview.
+        # Actual transcoding happens at upload time if user chooses "sped_up" strategy.
 
         return {
             "needed": True,
@@ -1125,7 +1209,9 @@ class UploadPhaseService:
         cleanup_warnings: list[str] = []
         try:
             if project.final_upload_discord_message_id:
-                DiscordService.delete_message(project.final_upload_discord_message_id)
+                # delete_job cascades: removes both the embed and the reminder
+                # message on the VPS in one call.
+                DiscordService.delete_job(project_id)
             elif project.generation_discord_message_id:
                 DiscordService.delete_message(project.generation_discord_message_id)
         except Exception as exc:

@@ -23,8 +23,11 @@ import {
   Wand2,
   Undo2,
   Merge,
+  Plus,
   Cable,
   Download,
+  ChevronUp,
+  ChevronDown,
 } from "lucide-react";
 import { Button } from "@/components/ui";
 import { MatchesClipPlayer, ManualMatchModal } from "@/components/video";
@@ -35,6 +38,16 @@ import { useProjectStore, useSceneStore } from "@/stores";
 import { api } from "@/api/client";
 import { readSSEStream } from "@/utils/sse";
 import { cn, formatTime } from "@/utils";
+import {
+  deriveMatchContinuityClaims,
+  deriveManualMergeHints,
+  type ContinuityClaim,
+} from "@/utils/matchContinuity";
+import {
+  MEDIA_PRIORITY,
+  getFastWatchPrefetchPriority,
+  getViewportPriority,
+} from "@/utils/mediaPriorities";
 import type {
   LibraryType,
   MatchesPlaybackManifest,
@@ -71,6 +84,8 @@ interface MatchCardProps {
   projectId: string;
   episodes: string[];
   playbackAsset: ScenePlaybackSceneAsset | null;
+  playbackReady?: boolean;
+  playbackPreparing?: boolean;
   isActive?: boolean;
   mediaEnabled?: boolean;
   playbackRate?: number;
@@ -88,7 +103,12 @@ interface MatchCardProps {
     message: string;
   } | null;
   warningMessage?: string | null;
+  continuityClaim?: ContinuityClaim | null;
+  onClaimJump?: (sceneIndex: number) => void;
   onUndoMerge?: (sceneIndex: number) => void;
+  onMergeWithPrevious?: (sceneIndex: number) => void;
+  manualMergeHint?: boolean;
+  structureActionsDisabled?: boolean;
 }
 
 const MAX_MEDIA_SCENES = 16;
@@ -112,6 +132,8 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
       projectId,
       episodes,
       playbackAsset,
+      playbackReady = false,
+      playbackPreparing = false,
       isActive = false,
       mediaEnabled = true,
       playbackRate = 1,
@@ -120,7 +142,12 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
       onManualMatch,
       pendingUpdate = null,
       warningMessage = null,
+      continuityClaim = null,
+      onClaimJump,
       onUndoMerge,
+      onMergeWithPrevious,
+      manualMergeHint = false,
+      structureActionsDisabled = false,
     },
     ref,
   ) {
@@ -132,12 +159,41 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
     const primedForFastWatchRef = useRef(false);
     const loadFailureRef = useRef(false);
 
-    const tiktokVideoUrl = playbackAsset?.tiktok.url ?? null;
+    const tiktokVideoUrl = playbackAsset?.tiktok.url
+      ? api.toMediaUrl(playbackAsset.tiktok.url)
+      : null;
     const hasMatchedScene = Boolean(match.confidence > 0 && match.episode);
     const sourceVideoUrl = hasMatchedScene
-      ? (playbackAsset?.source?.url ?? null)
+      ? (playbackAsset?.source?.url
+          ? api.toMediaUrl(playbackAsset.source.url)
+          : null)
       : null;
     const hasMatch = Boolean(hasMatchedScene && sourceVideoUrl);
+    const fastWatchMode = controlsDisabled;
+    const baseLeasePriority = fastWatchMode
+      ? isActive
+        ? MEDIA_PRIORITY.ACTIVE_FAST_WATCH
+        : preloadMode === "auto"
+          ? getFastWatchPrefetchPriority(1)
+          : getViewportPriority(4)
+      : isActive
+        ? MEDIA_PRIORITY.ACTIVE
+        : preloadMode === "auto"
+          ? getViewportPriority(1)
+          : mediaEnabled
+            ? getViewportPriority(4)
+            : MEDIA_PRIORITY.OFFSCREEN;
+    const baseWarmupPriority = fastWatchMode
+      ? isActive
+        ? MEDIA_PRIORITY.ACTIVE_FAST_WATCH
+        : preloadMode === "auto"
+          ? getFastWatchPrefetchPriority(2)
+          : MEDIA_PRIORITY.OFFSCREEN
+      : isActive
+        ? MEDIA_PRIORITY.ACTIVE
+        : preloadMode === "auto"
+          ? getViewportPriority(2)
+          : MEDIA_PRIORITY.OFFSCREEN;
 
     // Calculate durations
     const tiktokDuration = scene.end_time - scene.start_time;
@@ -149,6 +205,21 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
         ? HTMLMediaElement.HAVE_FUTURE_DATA
         : HTMLMediaElement.HAVE_CURRENT_DATA;
     const fastWatchReadyTimeoutMs = playbackRate >= 4 ? 9000 : 7000;
+    const continuityTintClass =
+      continuityClaim?.kind === "non_continuous"
+        ? "bg-amber-500/8 border border-amber-500/15"
+        : continuityClaim?.kind === "episode_change"
+          ? "bg-sky-500/8 border border-sky-500/15"
+          : "bg-[hsl(var(--card))]";
+    const continuityBadgeClass =
+      continuityClaim?.kind === "non_continuous"
+        ? "bg-amber-500/10 text-amber-300 border border-amber-500/20"
+        : "bg-sky-500/10 text-sky-300 border border-sky-500/20";
+    const canMergeWithPrevious = scene.index > 0 && Boolean(onMergeWithPrevious);
+    const mergeWithPreviousTitle = manualMergeHint
+      ? "Likely continuity with previous scene. Merge with previous scene."
+      : "Merge with previous scene";
+    const clipsPreparing = playbackPreparing || !playbackReady;
 
     const handleManualSave = useCallback(
       async (
@@ -427,13 +498,15 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
       };
     }, []);
 
-    return (
+    const mainCard = (
       <div
         className={cn(
-          "bg-[hsl(var(--card))] rounded-lg p-4 space-y-4",
+          "rounded-lg p-4 space-y-4",
+          continuityTintClass,
           isActive && "ring-2 ring-[hsl(var(--primary))]",
         )}
         data-scene-index={scene.index}
+        data-continuity-kind={continuityClaim?.kind}
       >
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
@@ -454,12 +527,24 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
             {match.merged_from && onUndoMerge && (
               <button
                 onClick={() => onUndoMerge(scene.index)}
-                className="flex items-center gap-1 text-xs px-1.5 py-0.5 rounded hover:bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))] transition-colors"
+                disabled={structureActionsDisabled}
+                className="flex items-center gap-1 text-xs px-1.5 py-0.5 rounded hover:bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 title="Undo merge and restore original scenes"
               >
                 <Undo2 className="h-3 w-3" />
                 Undo
               </button>
+            )}
+            {continuityClaim && (
+              <span
+                className={cn(
+                  "text-xs px-1.5 py-0.5 rounded",
+                  continuityBadgeClass,
+                )}
+                title={continuityClaim.tooltip}
+              >
+                {continuityClaim.badge}
+              </span>
             )}
           </div>
           {hasMatchedScene ? (
@@ -482,7 +567,11 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
               TikTok Clip
             </p>
             <div className="aspect-[9/16] bg-black rounded overflow-hidden flex items-center justify-center">
-              {!mediaEnabled ? (
+              {clipsPreparing ? (
+                <div className="text-xs text-[hsl(var(--muted-foreground))]">
+                  Preparing clip...
+                </div>
+              ) : !mediaEnabled ? (
                 <div className="text-xs text-[hsl(var(--muted-foreground))] text-center px-3">
                   Media deferred (lazy window)
                 </div>
@@ -495,6 +584,10 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
                   controls
                   preloadMode={preloadMode}
                   disableInteraction={controlsDisabled}
+                  requestLoad={mediaEnabled}
+                  requestWarmup={preloadMode === "auto"}
+                  leasePriority={baseLeasePriority}
+                  warmupPriority={baseWarmupPriority}
                   className="w-full h-full"
                 />
               ) : (
@@ -524,6 +617,10 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
                   <Loader2 className="h-6 w-6 animate-spin text-[hsl(var(--primary))]" />
                   <p className="text-xs text-center">{pendingUpdate.message}</p>
                 </div>
+              ) : clipsPreparing && hasMatchedScene ? (
+                <div className="text-xs text-[hsl(var(--muted-foreground))]">
+                  Preparing source clip...
+                </div>
               ) : !mediaEnabled && hasMatch ? (
                 <div className="text-xs text-[hsl(var(--muted-foreground))] text-center px-3">
                   Media deferred (lazy window)
@@ -537,6 +634,10 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
                   controls
                   preloadMode={preloadMode}
                   disableInteraction={controlsDisabled}
+                  requestLoad={mediaEnabled}
+                  requestWarmup={preloadMode === "auto"}
+                  leasePriority={baseLeasePriority - 1}
+                  warmupPriority={baseWarmupPriority - 1}
                   className="w-full h-full"
                 />
               ) : hasMatchedScene && !sourceVideoUrl ? (
@@ -552,17 +653,15 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
                   <p className="text-xs text-center opacity-60">
                     {match.alternatives?.length || 0} AI candidates available
                   </p>
-                  {episodes.length > 0 && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => setShowManualModal(true)}
-                      className="w-full mt-2"
-                    >
-                      <Edit className="h-3 w-3 mr-1" />
-                      Find Match
-                    </Button>
-                  )}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setShowManualModal(true)}
+                    className="w-full mt-2"
+                  >
+                    <Edit className="h-3 w-3 mr-1" />
+                    Find Match
+                  </Button>
                 </div>
               )}
             </div>
@@ -619,6 +718,79 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
         />
       </div>
     );
+
+    const cardWithManualMerge = (
+      <div className={cn("relative", canMergeWithPrevious && "pt-5")}>
+        {canMergeWithPrevious && (
+          <button
+            type="button"
+            aria-label="Merge with previous scene"
+            title={mergeWithPreviousTitle}
+            disabled={structureActionsDisabled}
+            data-manual-merge-button="true"
+            data-manual-merge-scene-index={scene.index}
+            data-manual-merge-hint={manualMergeHint ? "true" : "false"}
+            onClick={() => onMergeWithPrevious?.(scene.index)}
+            className={cn(
+              "absolute left-1/2 top-0 z-20 flex h-8 w-8 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border bg-[hsl(var(--card))] shadow-sm transition-colors",
+              "border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))]",
+              !structureActionsDisabled &&
+                "hover:bg-[hsl(var(--secondary))] hover:text-[hsl(var(--foreground))] hover:border-[hsl(var(--primary))]",
+              manualMergeHint &&
+                "manual-merge-hint-button border-sky-400/40 text-sky-300",
+              structureActionsDisabled && "cursor-not-allowed opacity-50",
+            )}
+          >
+            <Plus className="h-3.5 w-3.5" />
+          </button>
+        )}
+        {mainCard}
+      </div>
+    );
+
+    if (!continuityClaim) {
+      return cardWithManualMerge;
+    }
+
+    return (
+      <div className="flex items-stretch gap-2">
+        <div className="flex-1 min-w-0">{cardWithManualMerge}</div>
+        <div className="w-10 shrink-0 rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--muted))] flex flex-col items-center justify-center gap-1 p-1">
+          <button
+            type="button"
+            aria-label="Previous claimed scene"
+            title="Previous claimed scene"
+            disabled={
+              continuityClaim.prevClaimSceneIndex === null || !onClaimJump
+            }
+            onClick={() => {
+              if (continuityClaim.prevClaimSceneIndex !== null) {
+                onClaimJump?.(continuityClaim.prevClaimSceneIndex);
+              }
+            }}
+            className="h-7 w-7 rounded-md border border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))] flex items-center justify-center transition-colors enabled:hover:bg-[hsl(var(--secondary))] enabled:hover:text-[hsl(var(--foreground))] disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            <ChevronUp className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            aria-label="Next claimed scene"
+            title="Next claimed scene"
+            disabled={
+              continuityClaim.nextClaimSceneIndex === null || !onClaimJump
+            }
+            onClick={() => {
+              if (continuityClaim.nextClaimSceneIndex !== null) {
+                onClaimJump?.(continuityClaim.nextClaimSceneIndex);
+              }
+            }}
+            className="h-7 w-7 rounded-md border border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))] flex items-center justify-center transition-colors enabled:hover:bg-[hsl(var(--secondary))] enabled:hover:text-[hsl(var(--foreground))] disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            <ChevronDown className="h-4 w-4" />
+          </button>
+        </div>
+      </div>
+    );
   },
 );
 
@@ -628,7 +800,7 @@ export function MatchValidation() {
   const { projectId } = useParams<{ projectId: string }>();
   const navigate = useNavigate();
   const { project, loadProject } = useProjectStore();
-  const { scenes, loadScenes } = useSceneStore();
+  const { scenes, loadScenes, setScenes } = useSceneStore();
 
   const [matches, setMatches] = useState<SceneMatch[]>([]);
   const [episodes, setEpisodes] = useState<string[]>([]);
@@ -656,6 +828,7 @@ export function MatchValidation() {
     type: "error" | "warning" | "success";
     message: string;
   } | null>(null);
+  const [structureUpdating, setStructureUpdating] = useState(false);
   const [mergeContinuous, setMergeContinuous] = useState(true);
   // Torrent failure state (deferred download stall detection)
   const [torrentFailure, setTorrentFailure] = useState<{
@@ -1108,6 +1281,26 @@ export function MatchValidation() {
       }
     },
     [projectId],
+  );
+
+  const applyStructuralSceneChange = useCallback(
+    async (
+      nextScenes: Scene[],
+      nextMatches: SceneMatch[],
+      focusSceneIndex: number,
+    ) => {
+      setScenes(nextScenes);
+      setMatches(nextMatches);
+      setActiveSceneIndex(focusSceneIndex);
+      setPlaybackManifest(null);
+      setPlaybackProgress(null);
+      setPlaybackError(null);
+      await preparePlaybackClips(true);
+      window.requestAnimationFrame(() => {
+        scrollToScene(focusSceneIndex, true);
+      });
+    },
+    [preparePlaybackClips, scrollToScene, setScenes],
   );
 
   // Load data
@@ -1738,29 +1931,66 @@ export function MatchValidation() {
     async (sceneIndex: number) => {
       if (!projectId) return;
       try {
+        setStructureUpdating(true);
         stopFastWatch();
         setPendingSceneUpdates({});
         setSceneWarnings({});
+        setToast(null);
         const result = await api.undoMerge(projectId, sceneIndex);
-        // Reload scenes and matches after undo
-        await loadScenes(projectId);
         const matchesWithTracking = result.matches.map((m) => ({
           ...m,
           was_no_match: m.was_no_match ?? (m.confidence === 0 && !m.episode),
         }));
-        setMatches(matchesWithTracking);
         if (matchesWithTracking.length > 0) {
-          await preparePlaybackClips(true);
+          await applyStructuralSceneChange(
+            result.scenes,
+            matchesWithTracking,
+            Math.min(sceneIndex, Math.max(0, result.scenes.length - 1)),
+          );
         } else {
+          setScenes(result.scenes);
+          setMatches(matchesWithTracking);
+          setActiveSceneIndex(-1);
           setPlaybackManifest(null);
           setPlaybackProgress(null);
           setPlaybackError(null);
         }
       } catch (err) {
-        setError((err as Error).message);
+        showToast("error", (err as Error).message);
+      } finally {
+        setStructureUpdating(false);
       }
     },
-    [projectId, loadScenes, stopFastWatch, preparePlaybackClips],
+    [projectId, stopFastWatch, applyStructuralSceneChange, setScenes, showToast],
+  );
+
+  const handleMergeWithPrevious = useCallback(
+    async (sceneIndex: number) => {
+      if (!projectId || sceneIndex <= 0) return;
+
+      try {
+        setStructureUpdating(true);
+        stopFastWatch();
+        setPendingSceneUpdates({});
+        setSceneWarnings({});
+        setToast(null);
+        const result = await api.mergeMatchWithPrevious(projectId, sceneIndex);
+        const matchesWithTracking = result.matches.map((m) => ({
+          ...m,
+          was_no_match: m.was_no_match ?? (m.confidence === 0 && !m.episode),
+        }));
+        await applyStructuralSceneChange(
+          result.scenes,
+          matchesWithTracking,
+          sceneIndex - 1,
+        );
+      } catch (err) {
+        showToast("error", (err as Error).message);
+      } finally {
+        setStructureUpdating(false);
+      }
+    },
+    [projectId, stopFastWatch, applyStructuralSceneChange, showToast],
   );
 
   // Count confirmed matches (those with valid match data)
@@ -1896,6 +2126,17 @@ export function MatchValidation() {
     return new Map(matches.map((match) => [match.scene_index, match]));
   }, [matches]);
 
+  const continuitySummary = useMemo(
+    () => deriveMatchContinuityClaims(scenes, matches),
+    [scenes, matches],
+  );
+  const manualMergeHints = useMemo(
+    () => deriveManualMergeHints(scenes, matches),
+    [scenes, matches],
+  );
+  const structureActionsDisabled =
+    matching || structureUpdating || playbackPreparing;
+
   const playbackBySceneIndex = useMemo(() => {
     if (!playbackManifest?.scenes)
       return new Map<number, ScenePlaybackSceneAsset>();
@@ -1940,6 +2181,18 @@ export function MatchValidation() {
       }
     },
     [scenes, scrollToScene, fastWatchPlaying, playFastWatchFromScene],
+  );
+
+  const handleClaimJump = useCallback(
+    (sceneIndex: number) => {
+      setActiveSceneIndex(sceneIndex);
+      scrollToScene(sceneIndex, true);
+
+      if (fastWatchPlaying) {
+        void playFastWatchFromScene(sceneIndex);
+      }
+    },
+    [fastWatchPlaying, playFastWatchFromScene, scrollToScene],
   );
 
   if (loading) {
@@ -2223,7 +2476,7 @@ export function MatchValidation() {
         )}
 
         {/* Show matches */}
-        {isPlaybackReady && (
+        {matches.length > 0 && (
           <div className="space-y-4">
             {scenes.map((scene, scenePosition) => {
               const match = matchesBySceneIndex.get(scene.index);
@@ -2252,6 +2505,8 @@ export function MatchValidation() {
                     playbackAsset={
                       playbackBySceneIndex.get(scene.index) ?? null
                     }
+                    playbackReady={isPlaybackReady}
+                    playbackPreparing={playbackPreparing}
                     isActive={activeSceneIndex === scene.index}
                     mediaEnabled={mediaEnabled}
                     playbackRate={playbackRate}
@@ -2266,7 +2521,14 @@ export function MatchValidation() {
                     onManualMatch={handleManualMatch}
                     pendingUpdate={pendingSceneUpdates[scene.index] || null}
                     warningMessage={sceneWarnings[scene.index] || null}
+                    continuityClaim={
+                      continuitySummary.claimsBySceneIndex[scene.index] || null
+                    }
+                    onClaimJump={handleClaimJump}
                     onUndoMerge={handleUndoMerge}
+                    onMergeWithPrevious={handleMergeWithPrevious}
+                    manualMergeHint={manualMergeHints.has(scene.index)}
+                    structureActionsDisabled={structureActionsDisabled}
                   />
                 </div>
               );

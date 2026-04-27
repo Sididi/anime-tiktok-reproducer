@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import shutil
+from contextlib import AsyncExitStack
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
@@ -12,13 +14,277 @@ from ...library_types import LibraryType
 from ...services import (
     AnimeLibraryService,
     AnimeMatcherService,
+    IndexationPreflightService,
     LibraryHydrationService,
+    LibraryStateDb,
     StorageBoxRepository,
+)
+from ...services.library_hydration_service import (
+    SeriesDeleteBlockedError,
+    SeriesRenameConflictError,
 )
 
 router = APIRouter(prefix="/anime", tags=["anime"])
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".webm", ".mov", ".m4v"}
+
+
+def _preflight_error_payload(
+    *,
+    code: str,
+    message: str,
+    resolution: str,
+    name: str,
+    series_id: str | None = None,
+    storage_release_id: str | None = None,
+    conflict_details: dict | None = None,
+    orphan_reason: str | None = None,
+    invalid_video_files: list[str] | None = None,
+) -> dict:
+    return {
+        "code": code,
+        "message": message,
+        "resolution": resolution,
+        "name": name,
+        "series_id": series_id,
+        "storage_release_id": storage_release_id,
+        "conflict_details": conflict_details,
+        "orphan_reason": orphan_reason,
+        "invalid_video_files": invalid_video_files,
+    }
+
+
+def _format_invalid_video_files_message(name: str, invalid_video_files: list[str]) -> str:
+    preview = ", ".join(invalid_video_files[:5])
+    if len(invalid_video_files) > 5:
+        preview += f", et {len(invalid_video_files) - 5} autre(s)"
+    return (
+        f"'{name}' contient uniquement des fichiers vidéo illisibles ou corrompus. "
+        f"Fichiers détectés: {preview}"
+    )
+
+
+def _raise_index_preflight_error(result: dict) -> None:
+    resolution = str(result.get("resolution") or "")
+    name = str(result.get("name") or "source")
+    payload = None
+    status_code = 409
+    if resolution == "exact_match":
+        payload = _preflight_error_payload(
+            code="already_indexed_exact_match",
+            message=f"'{name}' est déjà indexée avec le même contenu distant.",
+            resolution=resolution,
+            name=name,
+            series_id=result.get("series_id"),
+            storage_release_id=result.get("storage_release_id"),
+        )
+    elif resolution == "update_required":
+        payload = _preflight_error_payload(
+            code="already_indexed_update_required",
+            message=f"'{name}' existe déjà. Utilisez la mise à jour au lieu d'une nouvelle indexation.",
+            resolution=resolution,
+            name=name,
+            series_id=result.get("series_id"),
+            storage_release_id=result.get("storage_release_id"),
+            conflict_details=result.get("conflict_details"),
+        )
+    elif resolution == "blocked_orphan":
+        payload = _preflight_error_payload(
+            code="blocked_orphan",
+            message=str(
+                result.get("orphan_reason")
+                or "Un dossier local orphelin bloque cette indexation."
+            ),
+            resolution=resolution,
+            name=name,
+            series_id=result.get("series_id"),
+            storage_release_id=result.get("storage_release_id"),
+            orphan_reason=result.get("orphan_reason"),
+        )
+    elif resolution == "needs_fix":
+        status_code = 400
+        invalid_video_files = [
+            str(value).strip()
+            for value in (result.get("invalid_video_files") or [])
+            if str(value).strip()
+        ]
+        payload = _preflight_error_payload(
+            code="invalid_video_files" if invalid_video_files else "needs_fix",
+            message=(
+                _format_invalid_video_files_message(name, invalid_video_files)
+                if invalid_video_files
+                else (
+                    f"'{name}' ne contient pas directement de fichiers vidéo. "
+                    "Choisissez le sous-dossier qui contient les épisodes."
+                )
+            ),
+            resolution=resolution,
+            name=name,
+            invalid_video_files=invalid_video_files or None,
+        )
+
+    if payload is not None:
+        raise HTTPException(status_code=status_code, detail=payload)
+
+
+def _raise_update_preflight_error(result: dict) -> None:
+    resolution = str(result.get("resolution") or "")
+    name = str(result.get("name") or "source")
+    payload = None
+    status_code = 409
+    if resolution == "new":
+        payload = _preflight_error_payload(
+            code="update_target_missing",
+            message=f"'{name}' n'existe pas encore. Utilisez une nouvelle indexation.",
+            resolution=resolution,
+            name=name,
+        )
+    elif resolution == "exact_match":
+        payload = _preflight_error_payload(
+            code="update_no_changes",
+            message=f"'{name}' ne contient aucun changement à publier.",
+            resolution=resolution,
+            name=name,
+            series_id=result.get("series_id"),
+            storage_release_id=result.get("storage_release_id"),
+        )
+    elif resolution == "blocked_orphan":
+        payload = _preflight_error_payload(
+            code="blocked_orphan",
+            message=str(
+                result.get("orphan_reason")
+                or "Un dossier local orphelin bloque cette mise à jour."
+            ),
+            resolution=resolution,
+            name=name,
+            series_id=result.get("series_id"),
+            storage_release_id=result.get("storage_release_id"),
+            orphan_reason=result.get("orphan_reason"),
+        )
+    elif resolution == "needs_fix":
+        status_code = 400
+        invalid_video_files = [
+            str(value).strip()
+            for value in (result.get("invalid_video_files") or [])
+            if str(value).strip()
+        ]
+        payload = _preflight_error_payload(
+            code="invalid_video_files" if invalid_video_files else "needs_fix",
+            message=(
+                _format_invalid_video_files_message(name, invalid_video_files)
+                if invalid_video_files
+                else (
+                    f"'{name}' ne contient pas directement de fichiers vidéo. "
+                    "Choisissez le sous-dossier qui contient les épisodes."
+                )
+            ),
+            resolution=resolution,
+            name=name,
+            invalid_video_files=invalid_video_files or None,
+        )
+
+    if payload is not None:
+        raise HTTPException(status_code=status_code, detail=payload)
+
+
+def _json_write_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(
+        json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    tmp_path.replace(path)
+
+
+def _series_dir_size_bytes(series_dir: Path) -> int:
+    return sum(path.stat().st_size for path in series_dir.rglob("*") if path.is_file())
+
+
+def _purge_local_orphan_series_sync(
+    library_type: LibraryType,
+    source_dir: Path,
+) -> None:
+    display_name = source_dir.name
+    library_root = AnimeLibraryService.get_library_path(library_type)
+    if source_dir.exists():
+        shutil.rmtree(source_dir, ignore_errors=True)
+
+    index_dir = library_root / AnimeLibraryService.INDEX_DIR_NAME
+    manifest_path = index_dir / AnimeLibraryService.MANIFEST_FILE
+    state_path = index_dir / AnimeLibraryService.STATE_FILE
+    if not manifest_path.exists() or not state_path.exists():
+        return
+
+    try:
+        local_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        local_state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+
+    shard_key = None
+    raw_series = local_manifest.get("series", {})
+    if isinstance(raw_series, dict):
+        series_entry = raw_series.pop(display_name, None)
+        if isinstance(series_entry, dict):
+            shard_key = str(series_entry.get("key") or "").strip() or None
+        _json_write_atomic(manifest_path, local_manifest)
+
+    raw_files = local_state.get("files", {})
+    if isinstance(raw_files, dict):
+        prefix = f"{display_name}/"
+        local_state["files"] = {
+            path: value
+            for path, value in raw_files.items()
+            if not (path == display_name or str(path).startswith(prefix))
+        }
+        _json_write_atomic(state_path, local_state)
+
+    if shard_key:
+        shutil.rmtree(index_dir / "series" / shard_key, ignore_errors=True)
+
+
+def _scan_local_purge_candidates(
+    library_type: LibraryType,
+    details_by_series: dict[str, dict],
+) -> list[dict]:
+    library_root = AnimeLibraryService.get_library_path(library_type)
+    if not library_root.exists():
+        return []
+
+    state_by_series = LibraryStateDb.list_series_states(library_type)
+    candidates: list[dict] = []
+    for source_dir in library_root.iterdir():
+        if not source_dir.is_dir() or source_dir.name.startswith("."):
+            continue
+
+        metadata = StorageBoxRepository.read_local_series_metadata(source_dir)
+        series_id = None
+        if isinstance(metadata, dict):
+            raw_series_id = str(metadata.get("series_id") or "").strip()
+            if raw_series_id:
+                series_id = raw_series_id
+
+        detail = details_by_series.get(series_id) if series_id else None
+        state = state_by_series.get(series_id) if series_id else None
+        project_pin_count = (
+            LibraryStateDb.count_project_pins(series_id) if series_id else 0
+        )
+        permanent_pin = bool(detail["permanent_pin"]) if detail else bool(
+            state.permanent_pin
+        ) if state else False
+        size_bytes = _series_dir_size_bytes(source_dir)
+        candidates.append(
+            {
+                "name": str(detail["name"]) if detail else source_dir.name,
+                "series_id": series_id,
+                "project_pin_count": int(detail["project_pin_count"]) if detail else project_pin_count,
+                "permanent_pin": bool(detail["permanent_pin"]) if detail else permanent_pin,
+                "size_bytes": size_bytes,
+                "path": str(source_dir),
+            }
+        )
+    return candidates
 
 
 @router.get("/browse")
@@ -129,6 +395,12 @@ async def index_anime(request: IndexAnimeRequest):
         raise HTTPException(status_code=400, detail=f"Source path is not a directory: {request.source_path}")
 
     target_anime_name = request.anime_name or source_folder.name
+    preflight = await IndexationPreflightService.preflight_source(
+        source_path=source_folder,
+        library_type=request.library_type,
+        anime_name=target_anime_name,
+    )
+    _raise_index_preflight_error(preflight)
 
     async def stream_progress():
         final_complete: dict | None = None
@@ -158,14 +430,9 @@ async def index_anime(request: IndexAnimeRequest):
             return
         yield f"data: {json.dumps({'status': 'indexing', 'progress': 0.97, 'message': 'Packaging release...', 'anime_name': target_anime_name})}\n\n"
         try:
-            publish_result = await StorageBoxRepository.publish_series(
+            publish_result = await LibraryHydrationService.publish_series_release(
                 library_type=request.library_type,
                 display_name=target_anime_name,
-            )
-            await LibraryHydrationService.sync_local_series_state(
-                library_type=request.library_type,
-                series_id=str(publish_result["series_id"]),
-                release_id=str(publish_result["release_id"]),
             )
         except Exception as exc:
             yield f"data: {json.dumps({'status': 'error', 'progress': 0.0, 'message': str(exc), 'error': str(exc), 'anime_name': target_anime_name})}\n\n"
@@ -214,60 +481,87 @@ async def update_anime(request: UpdateAnimeRequest):
         raise HTTPException(status_code=400, detail="No source_paths provided.")
 
     source_files = [Path(path) for path in request.source_paths]
+    series_id = await StorageBoxRepository.find_remote_series_id_by_name(
+        request.library_type,
+        request.anime_name,
+    )
+    if series_id:
+        await LibraryHydrationService.ensure_series_index_hydrated(
+            library_type=request.library_type,
+            series_id=series_id,
+        )
 
     async def stream_progress():
-        final_complete: dict | None = None
-        saw_error = False
-        async for progress in AnimeLibraryService.update_anime(
-            library_type=request.library_type,
-            anime_name=request.anime_name,
-            source_paths=source_files,
-            batch_size=request.batch_size,
-            prefetch_batches=request.prefetch_batches,
-            transform_workers=request.transform_workers,
-            decode_backend=request.decode_backend,
-            precision=request.precision,
-            require_gpu=request.require_gpu,
-        ):
-            if progress.status == "error":
-                saw_error = True
-                yield f"data: {json.dumps(progress.to_dict())}\n\n"
-                return
-            if progress.status == "complete":
-                final_complete = progress.to_dict()
-                break
-            yield f"data: {json.dumps(progress.to_dict())}\n\n"
+        async with AsyncExitStack() as stack:
+            # Hold the series lock across the entire update+publish so the flow
+            # cannot race with evict_series / delete_series / hydrate_series /
+            # another concurrent update on the same series. Without this, files
+            # could be deleted between indexing and publish, producing a
+            # successful-looking publish with a truncated episode list.
+            if series_id:
+                await stack.enter_async_context(
+                    LibraryHydrationService._series_lock(
+                        request.library_type, series_id
+                    )
+                )
 
-        if saw_error:
-            return
-        yield f"data: {json.dumps({'status': 'indexing', 'progress': 0.97, 'message': 'Publishing updated release...', 'anime_name': request.anime_name})}\n\n"
-        try:
-            publish_result = await StorageBoxRepository.publish_series(
+            final_complete: dict | None = None
+            saw_error = False
+            async for progress in AnimeLibraryService.update_anime(
                 library_type=request.library_type,
-                display_name=request.anime_name,
+                anime_name=request.anime_name,
+                source_paths=source_files,
+                batch_size=request.batch_size,
+                prefetch_batches=request.prefetch_batches,
+                transform_workers=request.transform_workers,
+                decode_backend=request.decode_backend,
+                precision=request.precision,
+                require_gpu=request.require_gpu,
+            ):
+                if progress.status == "error":
+                    saw_error = True
+                    yield f"data: {json.dumps(progress.to_dict())}\n\n"
+                    return
+                if progress.status == "complete":
+                    final_complete = progress.to_dict()
+                    break
+                yield f"data: {json.dumps(progress.to_dict())}\n\n"
+
+            if saw_error:
+                return
+            yield f"data: {json.dumps({'status': 'indexing', 'progress': 0.97, 'message': 'Publishing updated release...', 'anime_name': request.anime_name})}\n\n"
+
+            expected_min_episodes: int | None = None
+            if final_complete is not None:
+                prepared = final_complete.get("prepared_library_paths") or []
+                if isinstance(prepared, list) and prepared:
+                    expected_min_episodes = len(prepared)
+
+            try:
+                publish_result = await LibraryHydrationService.publish_series_release(
+                    library_type=request.library_type,
+                    display_name=request.anime_name,
+                    series_id=series_id,
+                    already_locked=bool(series_id),
+                    expected_min_episodes=expected_min_episodes,
+                )
+            except Exception as exc:
+                yield f"data: {json.dumps({'status': 'error', 'progress': 0.0, 'message': str(exc), 'error': str(exc), 'anime_name': request.anime_name})}\n\n"
+                return
+            AnimeMatcherService.mark_series_updated(
+                request.library_type,
+                request.anime_name,
             )
-            await LibraryHydrationService.sync_local_series_state(
-                library_type=request.library_type,
-                series_id=str(publish_result["series_id"]),
-                release_id=str(publish_result["release_id"]),
-            )
-        except Exception as exc:
-            yield f"data: {json.dumps({'status': 'error', 'progress': 0.0, 'message': str(exc), 'error': str(exc), 'anime_name': request.anime_name})}\n\n"
-            return
-        AnimeMatcherService.mark_series_updated(
-            request.library_type,
-            request.anime_name,
-        )
-        if final_complete is None:
-            final_complete = {
-                "status": "complete",
-                "progress": 1.0,
-                "message": f"Successfully updated {request.anime_name}",
-                "anime_name": request.anime_name,
-            }
-        final_complete["series_id"] = str(publish_result["series_id"])
-        final_complete["storage_release_id"] = str(publish_result["release_id"])
-        yield f"data: {json.dumps(final_complete)}\n\n"
+            if final_complete is None:
+                final_complete = {
+                    "status": "complete",
+                    "progress": 1.0,
+                    "message": f"Successfully updated {request.anime_name}",
+                    "anime_name": request.anime_name,
+                }
+            final_complete["series_id"] = str(publish_result["series_id"])
+            final_complete["storage_release_id"] = str(publish_result["release_id"])
+            yield f"data: {json.dumps(final_complete)}\n\n"
 
     return StreamingResponse(
         stream_progress(),
@@ -341,7 +635,8 @@ async def check_folders(request: CheckFoldersRequest):
 
 
 class ValidateBatchFoldersRequest(BaseModel):
-    paths: list[str]
+    paths: list[str] = []
+    items: list[dict] = []
     library_type: LibraryType
 
 
@@ -357,8 +652,11 @@ class FolderValidationResult(BaseModel):
     name: str
     has_videos: bool
     suggested_path: str | None = None
-    index_status: str = "new"  # "new" | "exact_match" | "conflict"
+    resolution: str = "new"
+    series_id: str | None = None
+    storage_release_id: str | None = None
     conflict_details: ConflictDetails | None = None
+    orphan_reason: str | None = None
 
 
 def _find_first_video_dir(root: Path) -> str | None:
@@ -398,110 +696,22 @@ def _validate_batch_folders_sync(
     paths: list[str],
     library_type: LibraryType,
 ) -> list[dict]:
-    library_path = AnimeLibraryService.get_library_path(library_type=library_type)
-
-    # Load state.json once for indexed episode comparison
-    index_dir = library_path / ".index"
-    state_files: dict = {}
-    try:
-        state_payload = json.loads(
-            (index_dir / "state.json").read_text(encoding="utf-8")
+    items = [{"path": path} for path in paths]
+    return asyncio.run(
+        IndexationPreflightService.validate_batch_items(
+            items=items,
+            library_type=library_type,
         )
-        if isinstance(state_payload, dict):
-            files = state_payload.get("files", {})
-            if isinstance(files, dict):
-                state_files = files
-    except (OSError, json.JSONDecodeError):
-        pass
-
-    results = []
-    for folder_path in paths:
-        p = Path(folder_path)
-        if not p.exists() or not p.is_dir():
-            continue
-
-        name = p.name
-
-        # Check direct video files in the source folder
-        try:
-            source_videos = sorted(
-                f.name
-                for f in p.iterdir()
-                if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS
-            )
-        except (PermissionError, OSError):
-            source_videos = []
-
-        has_videos = len(source_videos) > 0
-
-        suggested = None
-        if not has_videos:
-            suggested = _find_first_video_dir(p)
-
-        # Check if already indexed
-        source_dir = library_path / name
-        index_status = "new"
-        conflict_details = None
-
-        if source_dir.exists() and source_dir.is_dir():
-            # Get video files on disk in the library directory
-            try:
-                library_videos = sorted(
-                    f.name
-                    for f in source_dir.iterdir()
-                    if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS
-                )
-            except (PermissionError, OSError):
-                library_videos = []
-
-            # Get torrent count
-            torrent_count = 0
-            torrents_path = source_dir / ".atr_torrents.json"
-            try:
-                t_payload = json.loads(torrents_path.read_text(encoding="utf-8"))
-                if isinstance(t_payload, dict):
-                    torrent_count = len(t_payload.get("torrents", []))
-            except (OSError, json.JSONDecodeError):
-                pass
-
-            # Compare source folder videos with library videos
-            source_set = _batch_episode_stems(source_videos) if has_videos else set()
-            library_set = _batch_episode_stems(library_videos)
-
-            new_episodes = sorted(source_set - library_set)
-            removed_episodes = sorted(library_set - source_set)
-
-            if not new_episodes and not removed_episodes:
-                index_status = "exact_match"
-            else:
-                # Conflict details list logical episode ids, not container-specific filenames.
-                index_status = "conflict"
-                conflict_details = {
-                    "new_episodes": new_episodes,
-                    "removed_episodes": removed_episodes,
-                    "existing_episode_count": len(library_videos),
-                    "existing_torrent_count": torrent_count,
-                }
-
-        results.append({
-            "path": folder_path,
-            "name": name,
-            "has_videos": has_videos,
-            "suggested_path": suggested,
-            "index_status": index_status,
-            "conflict_details": conflict_details,
-        })
-
-    return results
+    )
 
 
 @router.post("/validate-batch-folders")
 async def validate_batch_folders(request: ValidateBatchFoldersRequest):
     """Validate a batch of folders for indexation, detecting conflicts."""
-    results = await asyncio.to_thread(
-        _validate_batch_folders_sync,
-        request.paths,
-        request.library_type,
+    raw_items = request.items or [{"path": path} for path in request.paths]
+    results = await IndexationPreflightService.validate_batch_items(
+        items=raw_items,
+        library_type=request.library_type,
     )
     return {"results": results}
 
@@ -522,12 +732,58 @@ class SourceDetails(BaseModel):
     updated_at: str
 
 
+class RenameSeriesRequest(BaseModel):
+    library_type: LibraryType
+    new_name: str
+
+
+class RenameSeriesResponse(BaseModel):
+    status: str
+    series_id: str
+    library_type: str
+    old_name: str
+    new_name: str
+    storage_release_id: str
+
+
 @router.get("/source-details")
 async def get_source_details(
     library_type: LibraryType = Query(...),
 ) -> list[SourceDetails]:
     """Get detailed metadata for all sources in a library type."""
     return await LibraryHydrationService.list_source_details(library_type=library_type)
+
+
+@router.patch("/{series_id}/rename", response_model=RenameSeriesResponse)
+async def rename_series(
+    series_id: str,
+    request: RenameSeriesRequest,
+) -> RenameSeriesResponse:
+    try:
+        result = await LibraryHydrationService.rename_series(
+            library_type=request.library_type,
+            series_id=series_id,
+            new_name=request.new_name,
+        )
+        return RenameSeriesResponse(**result)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "series_rename_invalid",
+                "message": str(exc),
+            },
+        ) from exc
+    except SeriesRenameConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "series_rename_conflict",
+                "message": str(exc),
+            },
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -549,11 +805,52 @@ async def index_anime_async(request: IndexAnimeAsyncRequest):
     source_folder = Path(request.source_path)
     if not source_folder.exists() or not source_folder.is_dir():
         raise HTTPException(status_code=400, detail=f"Invalid source: {request.source_path}")
+    target_anime_name = request.anime_name or source_folder.name
+    preflight = await IndexationPreflightService.preflight_source(
+        source_path=source_folder,
+        library_type=request.library_type,
+        anime_name=target_anime_name,
+    )
+    _raise_index_preflight_error(preflight)
+    job_id = await indexation_queue.enqueue(
+        source_path=request.source_path,
+        library_type=request.library_type,
+        anime_name=target_anime_name,
+        fps=request.fps,
+        job_type="index",
+        series_id=None,
+    )
+    return {"job_id": job_id}
+
+
+class UpdateAnimeAsyncRequest(BaseModel):
+    source_path: str
+    library_type: LibraryType
+    anime_name: str
+
+
+@router.post("/update-async")
+async def update_anime_async(request: UpdateAnimeAsyncRequest):
+    """Enqueue an async update job for an existing remote series."""
+    from ...services.indexation_queue import indexation_queue
+
+    source_folder = Path(request.source_path)
+    if not source_folder.exists() or not source_folder.is_dir():
+        raise HTTPException(status_code=400, detail=f"Invalid source: {request.source_path}")
+
+    preflight = await IndexationPreflightService.preflight_source(
+        source_path=source_folder,
+        library_type=request.library_type,
+        anime_name=request.anime_name,
+    )
+    _raise_update_preflight_error(preflight)
     job_id = await indexation_queue.enqueue(
         source_path=request.source_path,
         library_type=request.library_type,
         anime_name=request.anime_name,
-        fps=request.fps,
+        fps=2.0,
+        job_type="update",
+        series_id=str(preflight.get("series_id") or ""),
     )
     return {"job_id": job_id}
 
@@ -601,25 +898,36 @@ async def purge_library(request: PurgeRequest):
 
     for library_type in types_to_purge:
         details = await LibraryHydrationService.list_source_details(library_type=library_type)
-        for entry in details:
-            if entry["permanent_pin"] or int(entry["project_pin_count"]) > 0:
-                skipped_protected.append(entry["name"])
+        details_by_series = {
+            str(entry["series_id"]): entry
+            for entry in details
+            if str(entry.get("series_id") or "").strip()
+        }
+        candidates = await asyncio.to_thread(
+            _scan_local_purge_candidates,
+            library_type,
+            details_by_series,
+        )
+        for candidate in candidates:
+            if candidate["permanent_pin"] or int(candidate["project_pin_count"]) > 0:
+                skipped_protected.append(candidate["name"])
                 continue
-            series_dir = AnimeLibraryService.get_library_path(library_type) / entry["name"]
-            if series_dir.exists():
-                freed_bytes += sum(
-                    path.stat().st_size
-                    for path in series_dir.rglob("*")
-                    if path.is_file()
-                )
+            freed_bytes += int(candidate["size_bytes"])
             try:
-                await LibraryHydrationService.evict_series(
-                    library_type=library_type,
-                    series_id=entry["series_id"],
-                )
-                purged_sources.append(entry["name"])
+                if candidate["series_id"]:
+                    await LibraryHydrationService.evict_series(
+                        library_type=library_type,
+                        series_id=str(candidate["series_id"]),
+                    )
+                else:
+                    await asyncio.to_thread(
+                        _purge_local_orphan_series_sync,
+                        library_type,
+                        Path(candidate["path"]),
+                    )
+                purged_sources.append(candidate["name"])
             except Exception as exc:
-                skipped_protected.append(f"{entry['name']} ({exc})")
+                skipped_protected.append(f"{candidate['name']} ({exc})")
 
     return {
         "purged_sources": purged_sources,
@@ -639,18 +947,24 @@ async def estimate_purge(
     source_count = 0
     for current_type in types_to_check:
         details = await LibraryHydrationService.list_source_details(library_type=current_type)
-        for entry in details:
-            if entry["permanent_pin"] or int(entry["project_pin_count"]) > 0:
+        details_by_series = {
+            str(entry["series_id"]): entry
+            for entry in details
+            if str(entry.get("series_id") or "").strip()
+        }
+        candidates = await asyncio.to_thread(
+            _scan_local_purge_candidates,
+            current_type,
+            details_by_series,
+        )
+        for candidate in candidates:
+            if candidate["permanent_pin"] or int(candidate["project_pin_count"]) > 0:
                 continue
-            series_dir = AnimeLibraryService.get_library_path(current_type) / entry["name"]
-            if not series_dir.exists():
+            size_bytes = int(candidate["size_bytes"])
+            if size_bytes <= 0:
                 continue
             source_count += 1
-            estimated_bytes += sum(
-                path.stat().st_size
-                for path in series_dir.rglob("*")
-                if path.is_file()
-            )
+            estimated_bytes += size_bytes
     return {"estimated_bytes": estimated_bytes, "source_count": source_count}
 
 
@@ -684,6 +998,21 @@ class HydrateSeriesRequest(BaseModel):
     full_series: bool = False
 
 
+@router.get("/{series_id}/state")
+async def get_series_state(
+    series_id: str,
+    library_type: LibraryType = Query(...),
+):
+    """Return persisted hydration/operation state for one series."""
+    try:
+        return await LibraryHydrationService.describe_series(
+            library_type=library_type,
+            series_id=series_id,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @router.post("/{series_id}/hydrate")
 async def hydrate_series(
     series_id: str,
@@ -691,7 +1020,7 @@ async def hydrate_series(
 ):
     """Hydrate episodes locally from the active Storage Box release."""
     try:
-        return await LibraryHydrationService.hydrate_series(
+        return await LibraryHydrationService.enqueue_hydrate_series(
             library_type=request.library_type,
             series_id=series_id,
             episode_keys=request.episode_keys,
@@ -712,12 +1041,38 @@ async def evict_series(
 ):
     """Evict local hydrated data for one series if it is not pinned."""
     try:
-        return await LibraryHydrationService.evict_series(
+        return await LibraryHydrationService.enqueue_evict_series(
             library_type=request.library_type,
             series_id=series_id,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.delete("/{series_id}")
+async def delete_series(
+    series_id: str,
+    library_type: LibraryType = Query(...),
+):
+    """Permanently delete a series from local storage and the Storage Box."""
+    try:
+        result = await LibraryHydrationService.delete_series(
+            library_type=library_type,
+            series_id=series_id,
+        )
+        AnimeMatcherService.mark_series_updated(
+            library_type,
+            result.get("display_name"),
+        )
+        return {
+            "status": "deleted",
+            "series_id": series_id,
+            "library_type": library_type.value,
+        }
+    except SeriesDeleteBlockedError as exc:
+        raise HTTPException(status_code=409, detail=exc.to_payload()) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

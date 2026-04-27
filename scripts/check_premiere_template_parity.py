@@ -18,6 +18,12 @@ def _normalize(text: str) -> str:
 
     # Dynamic runtime values injected by backend.
     out = re.sub(r"var scenes = \[[\s\S]*?\];", "var scenes = <SCENES>;", out, count=1)
+    out = re.sub(
+        r"var SOURCE_AUDIO_POLICIES = \{[\s\S]*?\};",
+        "var SOURCE_AUDIO_POLICIES = <SOURCE_AUDIO_POLICIES>;",
+        out,
+        count=1,
+    )
     out = re.sub(r"var SOURCE_FPS_NUM = \d+;", "var SOURCE_FPS_NUM = <SOURCE_FPS_NUM>;", out, count=1)
     out = re.sub(r"var SOURCE_FPS_DEN = \d+;", "var SOURCE_FPS_DEN = <SOURCE_FPS_DEN>;", out, count=1)
     out = re.sub(r'var MUSIC_FILENAME = "[^"]*";', 'var MUSIC_FILENAME = "<MUSIC_FILENAME>";', out, count=1)

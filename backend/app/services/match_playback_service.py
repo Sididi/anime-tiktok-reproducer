@@ -98,7 +98,7 @@ class MatchPlaybackService:
     MANIFESTS_DIR = "manifests"
     CLIP_STORE_DIR = "clip_store"
     MANIFEST_VERSION = "v3"
-    ENCODE_PROFILE_VERSION = "v3|max_speed_profiles"
+    ENCODE_PROFILE_VERSION = "v4|source_h264_only"
     FFMPEG_TIMEOUT_SECONDS = 300
     CLIP_ID_TIME_PRECISION = 3
     ULTRA_LONG_SOURCE_SECONDS = 60.0
@@ -106,6 +106,8 @@ class MatchPlaybackService:
     CLIP_STORE_STALE_SECONDS = 7 * 24 * 3600
     WEB_COMPATIBLE_CODECS = {"h264", "hevc"}
     WEB_COMPATIBLE_PIX_FMTS = {"yuv420p", "yuvj420p", "yuv420p10le"}
+    STREAM_COPY_CODECS = {"h264"}
+    STREAM_COPY_PIX_FMTS = {"yuv420p", "yuvj420p"}
     _SOURCE_WEB_COMPAT_CACHE_MAX = 256
     _prepare_locks: dict[str, asyncio.Lock] = {}
     _nvenc_checked = False
@@ -660,8 +662,8 @@ class MatchPlaybackService:
         codec = str(streams[0].get("codec_name", "")).lower()
         pix_fmt = str(streams[0].get("pix_fmt", "")).lower()
         compat = (
-            codec in cls.WEB_COMPATIBLE_CODECS
-            and pix_fmt in cls.WEB_COMPATIBLE_PIX_FMTS
+            codec in cls.STREAM_COPY_CODECS
+            and pix_fmt in cls.STREAM_COPY_PIX_FMTS
         )
         return cls._cache_web_compat(cache_key, compat)
 
@@ -926,14 +928,9 @@ class MatchPlaybackService:
         cls,
         *,
         project_id: str,
-        scene_index: int,
-        track: ClipTrack,
-        fingerprint: str,
+        clip_id: str,
     ) -> str:
-        return (
-            f"/api/projects/{project_id}/matches/playback/clip/{scene_index}/{track}"
-            f"?fingerprint={fingerprint}"
-        )
+        return f"/api/projects/{project_id}/matches/playback/clips/{clip_id}"
 
     @classmethod
     def _default_manifest(cls) -> dict:
@@ -975,6 +972,8 @@ class MatchPlaybackService:
         if not manifest:
             return False
         if not manifest.get("ready"):
+            return False
+        if manifest.get("encode_profile") != cls.ENCODE_PROFILE_VERSION:
             return False
         scenes = manifest.get("scenes")
         if not isinstance(scenes, list):
@@ -1191,9 +1190,7 @@ class MatchPlaybackService:
                 "track": "tiktok",
                 "url": cls._build_clip_url(
                     project_id=project_id,
-                    scene_index=scene_plan.scene_index,
-                    track="tiktok",
-                    fingerprint=fingerprint,
+                    clip_id=scene_plan.tiktok.clip_id,
                 ),
                 "duration": tiktok_duration,
                 "ready": tiktok_status == "ready",
@@ -1212,9 +1209,7 @@ class MatchPlaybackService:
                 "track": "source",
                 "url": cls._build_clip_url(
                     project_id=project_id,
-                    scene_index=scene_plan.scene_index,
-                    track="source",
-                    fingerprint=fingerprint,
+                    clip_id=scene_plan.source.clip_id,
                 ),
                 "duration": source_duration,
                 "ready": source_status == "ready",
@@ -1905,3 +1900,13 @@ class MatchPlaybackService:
                     except FileNotFoundError:
                         pass
             raise exc
+
+    @classmethod
+    def get_clip_path_by_id(cls, project_id: str, clip_id: str) -> Path:
+        if not clip_id or not cls._looks_like_fingerprint(clip_id):
+            raise FileNotFoundError("Invalid clip id")
+
+        clip_path = cls._clip_file(project_id, clip_id)
+        if not clip_path.exists() or clip_path.stat().st_size == 0:
+            raise FileNotFoundError("Prepared clip file missing")
+        return clip_path

@@ -6,6 +6,7 @@ export type ProjectPhase =
   | "matching"
   | "match_validation"
   | "transcription"
+  | "raw_scene_validation"
   | "script_restructure"
   | "processing"
   | "complete";
@@ -95,11 +96,15 @@ export interface VideoOverlay {
 export interface ScriptAutomationConfig {
   enabled: boolean;
   script_title_selection_enabled: boolean;
-  gemini: {
+  static_overlay_title_enabled: boolean;
+  static_overlay_title: string | null;
+  llm: {
+    provider: string;
     configured: boolean;
     model: string;
   };
-  gemini_light?: {
+  llm_light?: {
+    provider: string;
     configured: boolean;
     model: string;
   };
@@ -187,6 +192,23 @@ export interface ProjectManagerRow {
   scheduled_account_id: string | null;
 }
 
+export interface ProjectUploadJob {
+  job_id: string;
+  project_id: string;
+  account_id: string | null;
+  platforms?: string[] | null;
+  facebook_strategy?: UploadDurationStrategy | null;
+  youtube_strategy?: UploadDurationStrategy | null;
+  status: "queued" | "running" | "complete" | "error";
+  phase: string | null;
+  message: string | null;
+  error: string | null;
+  platform_results?: Record<string, unknown>[] | null;
+  result: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export type UploadDurationStrategy = "cut" | "sped_up" | "skip";
 
 export interface FacebookCheckResult {
@@ -238,13 +260,9 @@ export interface VideoInfo {
 }
 
 export interface SourceStreamDescriptor {
-  mode: "passthrough" | "chunked";
   duration: number;
   codec: string;
   pix_fmt: string;
-  chunk_duration: number;
-  chunk_step: number;
-  seek_guard_seconds: number;
 }
 
 export interface MatchCandidate {
@@ -328,6 +346,25 @@ export interface SceneTranscription {
   words: Word[];
   start_time: number;
   end_time: number;
+  is_raw: boolean;
+}
+
+export interface RawSceneCandidate {
+  scene_index: number;
+  start_time: number;
+  end_time: number;
+  confidence: number;
+  reason: string;
+  was_split: boolean;
+  original_scene_index: number | null;
+}
+
+export interface RawSceneDetectionResult {
+  has_raw_scenes: boolean;
+  candidates: RawSceneCandidate[];
+  tts_speaker_id: string;
+  speaker_count: number;
+  scene_parent_indices: number[];
 }
 
 export interface Transcription {
@@ -340,10 +377,15 @@ export type {
   BrowseEntry,
   BrowseResult,
   IndexationJob,
+  ProjectStartupJob,
   PurgeResult,
   LibraryActivationState,
   EpisodeSourcesPayload,
+  DeleteSeriesResponse,
+  RenameSeriesResponse,
   SourceTorrentMetadata,
+  SeriesDeleteConflictDetail,
+  SeriesDeleteReferencingProject,
   TorrentEntry,
   TorrentFileMapping,
   ReplacementProgressEvent,

@@ -4,7 +4,7 @@ from pathlib import Path
 from datetime import datetime
 
 from ..config import settings
-from ..library_types import DEFAULT_LIBRARY_TYPE, LibraryType
+from ..library_types import DEFAULT_LIBRARY_TYPE, LibraryType, coerce_library_type
 from ..models import Project, ProjectPhase, SceneList
 from .library_state_db import LibraryStateDb
 
@@ -19,15 +19,21 @@ def _validate_project_id(project_id: str) -> None:
         )
 
 
-def _coerce_legacy_project_payload(payload: dict) -> dict:
-    if payload.get("phase") == "raw_scene_validation":
-        payload = dict(payload)
-        payload["phase"] = ProjectPhase.SCRIPT_RESTRUCTURE.value
-    return payload
-
-
 class ProjectService:
     """Service for managing projects."""
+
+    @staticmethod
+    def should_keep_project_pin(project: Project) -> bool:
+        """Keep local residency only while a project is still actively generating."""
+        if not project.series_id:
+            return False
+        if project.upload_completed_at is not None:
+            return False
+        if project.scheduled_at is not None:
+            return False
+        if project.phase == ProjectPhase.COMPLETE:
+            return False
+        return True
 
     @staticmethod
     def get_project_dir(project_id: str) -> Path:
@@ -70,7 +76,6 @@ class ProjectService:
         project_dir.mkdir(parents=True, exist_ok=True)
 
         cls.save(project)
-        cls.sync_project_pin(project)
         return project
 
     @classmethod
@@ -79,6 +84,7 @@ class ProjectService:
         project.updated_at = datetime.now()
         project_file = cls.get_project_file(project.id)
         project_file.write_text(project.model_dump_json(indent=2))
+        cls.sync_project_pin(project)
 
     @classmethod
     def load(cls, project_id: str) -> Project | None:
@@ -86,9 +92,7 @@ class ProjectService:
         project_file = cls.get_project_file(project_id)
         if not project_file.exists():
             return None
-        return Project.model_validate(
-            _coerce_legacy_project_payload(json.loads(project_file.read_text()))
-        )
+        return Project.model_validate_json(project_file.read_text())
 
     @classmethod
     def delete(cls, project_id: str) -> bool:
@@ -106,8 +110,51 @@ class ProjectService:
     @classmethod
     def sync_project_pin(cls, project: Project) -> None:
         LibraryStateDb.remove_project_pins(project.id)
-        if project.series_id:
+        if cls.should_keep_project_pin(project):
             LibraryStateDb.add_project_pin(project.id, project.series_id)
+
+    @classmethod
+    def sync_all_project_pins(cls) -> None:
+        """Rebuild project pins from saved projects using current pin rules."""
+        LibraryStateDb.clear_all_project_pins()
+        for project in cls.list_all():
+            if cls.should_keep_project_pin(project):
+                LibraryStateDb.add_project_pin(project.id, project.series_id)
+
+    @classmethod
+    def list_referencing_series(
+        cls,
+        *,
+        library_type: LibraryType | str,
+        series_id: str,
+    ) -> list[Project]:
+        scoped_type = coerce_library_type(library_type)
+        return [
+            project
+            for project in cls.list_all()
+            if project.series_id == series_id and project.library_type == scoped_type
+        ]
+
+    @classmethod
+    def rename_series_references(
+        cls,
+        *,
+        library_type: LibraryType | str,
+        series_id: str,
+        new_name: str,
+    ) -> list[Project]:
+        scoped_type = coerce_library_type(library_type)
+        renamed_projects: list[Project] = []
+        for project in cls.list_all():
+            if project.series_id != series_id or project.library_type != scoped_type:
+                continue
+            if project.anime_name == new_name:
+                renamed_projects.append(project)
+                continue
+            project.anime_name = new_name
+            cls.save(project)
+            renamed_projects.append(project)
+        return renamed_projects
 
     @classmethod
     def list_all(cls) -> list[Project]:

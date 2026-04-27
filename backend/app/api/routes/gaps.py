@@ -1,26 +1,35 @@
-"""Gap resolution routes for extending clips that hit the 75% speed floor."""
+"""Gap resolution routes for extending clips that hit the configured speed floor."""
 
 import json
 from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from ...config import Settings
+from ...config import settings
 from ...services import ProjectService
 from ...services.gap_resolution import GapResolutionService
 from ...utils.timing import compute_adjusted_scene_end_times
 
 router = APIRouter(prefix="/projects/{project_id}/gaps", tags=["gap-resolution"])
-settings = Settings()
+
+
+class GapsConfigResponse(BaseModel):
+    """Gap feature flags and timing configuration."""
+
+    full_auto_enabled: bool
+    min_speed_factor: float
 
 
 @router.get("/config")
-async def get_gaps_config(project_id: str):
+async def get_gaps_config(project_id: str) -> GapsConfigResponse:
     """Get gaps feature flags."""
     project = ProjectService.load(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    return {"full_auto_enabled": settings.gaps_full_auto_enabled}
+    return GapsConfigResponse(
+        full_auto_enabled=settings.gaps_full_auto_enabled,
+        min_speed_factor=settings.min_playback_speed_factor,
+    )
 
 
 
@@ -30,6 +39,7 @@ class GapsResponse(BaseModel):
     has_gaps: bool
     gaps: list[dict]
     total_gap_duration: float
+    min_speed_factor: float
 
 
 class GapCandidatesResponse(BaseModel):
@@ -60,7 +70,7 @@ class ComputeSpeedResponse(BaseModel):
 
     effective_speed: float
     raw_speed: float
-    has_gap: bool  # True if raw_speed < 0.75
+    has_gap: bool  # True if raw_speed is below the configured floor
 
 
 @router.get("")
@@ -79,7 +89,12 @@ async def get_gaps(project_id: str) -> GapsResponse:
     # Load matches
     matches = ProjectService.load_matches(project_id)
     if not matches:
-        return GapsResponse(has_gaps=False, gaps=[], total_gap_duration=0.0)
+        return GapsResponse(
+            has_gaps=False,
+            gaps=[],
+            total_gap_duration=0.0,
+            min_speed_factor=settings.min_playback_speed_factor,
+        )
 
     # Load transcription (from the gap detection step - should have been saved)
     transcription_path = project_dir / "gap_detection_transcription.json"
@@ -87,13 +102,23 @@ async def get_gaps(project_id: str) -> GapsResponse:
         # Try regular transcription
         transcription_path = project_dir / "output" / "transcription_timing.json"
         if not transcription_path.exists():
-            return GapsResponse(has_gaps=False, gaps=[], total_gap_duration=0.0)
+            return GapsResponse(
+                has_gaps=False,
+                gaps=[],
+                total_gap_duration=0.0,
+                min_speed_factor=settings.min_playback_speed_factor,
+            )
 
     try:
         transcription_data = json.loads(transcription_path.read_text())
         scene_timings = transcription_data.get("scenes", [])
     except (json.JSONDecodeError, KeyError):
-        return GapsResponse(has_gaps=False, gaps=[], total_gap_duration=0.0)
+        return GapsResponse(
+            has_gaps=False,
+            gaps=[],
+            total_gap_duration=0.0,
+            min_speed_factor=settings.min_playback_speed_factor,
+        )
 
     # Calculate gaps
     gaps = GapResolutionService.calculate_gaps(matches.matches, scene_timings)
@@ -104,6 +129,7 @@ async def get_gaps(project_id: str) -> GapsResponse:
         has_gaps=len(gaps) > 0,
         gaps=[g.to_dict() for g in gaps],
         total_gap_duration=total_gap_duration,
+        min_speed_factor=settings.min_playback_speed_factor,
     )
 
 
@@ -473,7 +499,7 @@ async def compute_speed(project_id: str, request: ComputeSpeedRequest) -> Comput
     return ComputeSpeedResponse(
         effective_speed=float(effective_speed_frac),  # Convert Fraction to float
         raw_speed=float(raw_speed_frac),  # Convert Fraction to float
-        has_gap=raw_speed_frac < GapResolutionService.MIN_SPEED,
+        has_gap=raw_speed_frac < GapResolutionService.min_speed(),
     )
 
 

@@ -4,11 +4,14 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import subprocess
 import shutil
 import threading
 import tempfile
+import unicodedata
+from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -42,6 +45,15 @@ class IndexProgress:
     error: str | None = None
     anime_name: str | None = None
     prepared_library_paths: list[str] | None = None
+    warnings: list[str] | None = None
+    current_file_progress: float | None = None
+    current_file_frames_processed: int | None = None
+    current_file_total_frames: int | None = None
+    current_file_batches_processed: int | None = None
+    requested_batch_size: int | None = None
+    effective_batch_size: int | None = None
+    effective_decode_backend: str | None = None
+    retry_reason: str | None = None
 
     def to_dict(self) -> dict:
         payload = {
@@ -57,7 +69,49 @@ class IndexProgress:
             payload["anime_name"] = self.anime_name
         if self.prepared_library_paths is not None:
             payload["prepared_library_paths"] = self.prepared_library_paths
+        if self.warnings is not None:
+            payload["warnings"] = self.warnings
+        if self.current_file_progress is not None:
+            payload["current_file_progress"] = self.current_file_progress
+        if self.current_file_frames_processed is not None:
+            payload["current_file_frames_processed"] = self.current_file_frames_processed
+        if self.current_file_total_frames is not None:
+            payload["current_file_total_frames"] = self.current_file_total_frames
+        if self.current_file_batches_processed is not None:
+            payload["current_file_batches_processed"] = self.current_file_batches_processed
+        if self.requested_batch_size is not None:
+            payload["requested_batch_size"] = self.requested_batch_size
+        if self.effective_batch_size is not None:
+            payload["effective_batch_size"] = self.effective_batch_size
+        if self.effective_decode_backend is not None:
+            payload["effective_decode_backend"] = self.effective_decode_backend
+        if self.retry_reason is not None:
+            payload["retry_reason"] = self.retry_reason
         return payload
+
+
+@dataclass
+class SearcherExecutionMetadata:
+    """Mutable metadata describing the active anime_searcher subprocess run."""
+
+    requested_batch_size: int
+    effective_batch_size: int
+    requested_decode_backend: str
+    effective_decode_backend: str | None = None
+    retry_reason: str | None = None
+    retry_warning: str | None = None
+
+
+@dataclass(frozen=True)
+class SourceVideoScan:
+    """Readable vs unreadable source candidates discovered in one scan."""
+
+    readable_files: tuple[Path, ...] = ()
+    invalid_files: tuple[Path, ...] = ()
+
+    @property
+    def has_direct_videos(self) -> bool:
+        return bool(self.readable_files or self.invalid_files)
 
 
 @dataclass(frozen=True)
@@ -68,11 +122,13 @@ class SourceMediaStream:
     stream_position: int
     codec_type: str
     codec_name: str | None
+    channels: int | None
     language: str | None
     raw_language: str | None
     title: str | None
     handler_name: str | None
     is_default: bool = False
+    duration: float | None = None
 
 
 @dataclass(frozen=True)
@@ -92,26 +148,30 @@ class SourceMediaProbe:
     subtitle_streams: tuple[SourceMediaStream, ...] = ()
     data_streams: tuple[SourceMediaStream, ...] = ()
     selected_audio_stream_index: int | None = None
+    video_duration: float | None = None
+    selected_audio_stream: SourceMediaStream | None = None
 
 
 @dataclass(frozen=True)
-class SourceNormalizationPlan:
-    """Chosen compatibility action for one source episode."""
+class SourceAudioSelectionPolicy:
+    """Selected source-audio mapping metadata sent to the JSX template."""
 
-    action: str
-    source_path: Path
-    target_path: Path
-    probe: SourceMediaProbe
+    selected_stream_index: int
+    selected_stream_position: int
+    selected_language: str | None
+    selected_channel_count: int
+    selected_channel_offset: int
+    channel_type: str
 
-
-@dataclass(frozen=True)
-class SourceNormalizationResult:
-    """Normalization result for one source episode."""
-
-    action: str
-    source_path: Path
-    normalized_path: Path
-    changed: bool
+    def to_jsx_dict(self) -> dict[str, Any]:
+        return {
+            "selected_stream_index": self.selected_stream_index,
+            "selected_stream_position": self.selected_stream_position,
+            "selected_language": self.selected_language,
+            "selected_channel_count": self.selected_channel_count,
+            "selected_channel_offset": self.selected_channel_offset,
+            "channel_type": self.channel_type,
+        }
 
 
 @dataclass(frozen=True)
@@ -126,6 +186,7 @@ class SubtitleSidecarEntry:
     title: str | None
     kind: str
     asset_filename: str | None
+    handler_name: str | None = None
     cue_manifest_filename: str | None = None
     status: str = "ok"
     error: str | None = None
@@ -160,6 +221,8 @@ class AnimeLibraryService:
     INDEX_TIMEOUT_SECONDS = 7200.0
     SEARCHER_INDEX_FORMAT_VERSION = 4
     SEARCHER_ENGINE_PROFILE = "sscd_exact_resize_v1"
+    SEARCHER_CUDA_OOM_BATCH_RETRY_LIMIT = 1
+    SEARCHER_CUDA_OOM_RETRY_REASON = "cuda_oom_batch_downshift"
     PREVIEW_PROXY_TIMEOUT_SECONDS = 3600.0
     SOURCE_NORMALIZATION_TIMEOUT_SECONDS = 7200.0
     SUBTITLE_EXTRACTION_TIMEOUT_SECONDS = 1800.0
@@ -169,14 +232,22 @@ class AnimeLibraryService:
     SOURCE_NORMALIZATION_PROFILE_H264_MP4_AAC = "h264_mp4_aac"
     GPU_HWACCEL = "cuda"
     GPU_H264_ENCODER = "h264_nvenc"
-    PRORES_TRANSCODE_TIMEOUT_SECONDS = 7200.0
+    LIBRARY_IMPORT_TRANSCODE_TIMEOUT_SECONDS = 7200.0
     PREMIERE_NATIVE_VIDEO_CODECS = {"h264", "hevc"}
+    PREMIERE_SAFE_MP4_AUDIO_CODECS = {"aac", "ac3", "eac3"}
     _CUDA_DECODERS: dict[str, str] = {
         "av1": "av1_cuvid",
         "h264": "h264_cuvid",
         "hevc": "hevc_cuvid",
         "vp9": "vp9_cuvid",
     }
+    _CUDA_OOM_MARKERS = (
+        "cuda out of memory",
+        "torch.cuda.outofmemoryerror",
+        "tried to allocate",
+        "pytorch_cuda_alloc_conf",
+        "expandable_segments:true",
+    )
 
     _episode_manifest_cache: dict[str, dict] = {}
     _episode_manifest_locks: dict[str, asyncio.Lock] = {}
@@ -221,6 +292,45 @@ class AnimeLibraryService:
         "rus": "ru",
         "russian": "ru",
     }
+    _EPISODE_FILENAME_TRANSLATION_TABLE = str.maketrans(
+        {
+            "【": "[",
+            "】": "]",
+            "「": "[",
+            "」": "]",
+            "『": "[",
+            "』": "]",
+            "（": "(",
+            "）": ")",
+            "［": "[",
+            "］": "]",
+            "｛": "{",
+            "｝": "}",
+            "“": " ",
+            "”": " ",
+            "„": " ",
+            "‟": " ",
+            "＂": " ",
+            "‶": " ",
+            "〃": " ",
+            "〝": " ",
+            "〞": " ",
+            "‘": " ",
+            "’": " ",
+            "‚": " ",
+            "‛": " ",
+            "–": "-",
+            "—": "-",
+            "―": "-",
+            "‐": "-",
+            "／": "/",
+            "：": ":",
+            "＆": "&",
+            "＋": "+",
+            "　": " ",
+        }
+    )
+    _SAFE_EPISODE_FILENAME_INVALID_RE = re.compile(r"[^A-Za-z0-9\[\]\(\) ._&+-]+")
 
     @staticmethod
     def get_library_root() -> Path:
@@ -239,6 +349,59 @@ class AnimeLibraryService:
     def get_anime_searcher_path() -> Path:
         """Get the anime_searcher module path."""
         return settings.anime_searcher_path
+
+    @classmethod
+    def normalize_indexed_episode_stem(cls, raw_stem: str) -> str:
+        """Normalize an indexed episode stem to a Premiere-safe ASCII filename."""
+        normalized = str(raw_stem or "").strip()
+        if not normalized:
+            return "episode"
+
+        normalized = normalized.translate(cls._EPISODE_FILENAME_TRANSLATION_TABLE)
+        normalized = unicodedata.normalize("NFKD", normalized)
+        normalized = "".join(
+            ch for ch in normalized if not unicodedata.combining(ch)
+        )
+        normalized = normalized.encode("ascii", "ignore").decode("ascii")
+        normalized = normalized.replace("/", " ")
+        normalized = re.sub(r"([\]\)])(?=[A-Za-z0-9])", r"\1 ", normalized)
+        normalized = re.sub(r"(?<=[A-Za-z0-9])([\[\(])", r" \1", normalized)
+        normalized = cls._SAFE_EPISODE_FILENAME_INVALID_RE.sub(" ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip(" ._")
+        return normalized or "episode"
+
+    @staticmethod
+    def _episode_filename_collision_suffix(raw_stem: str) -> str:
+        return hashlib.sha1(str(raw_stem).encode("utf-8")).hexdigest()[:8]
+
+    @classmethod
+    def normalize_indexed_episode_stem_unique(
+        cls,
+        raw_stem: str,
+        *,
+        reserved_stems: set[str] | None = None,
+        current_stem: str | None = None,
+    ) -> str:
+        """Allocate a stable safe episode stem, hashing only on same-folder collisions."""
+        candidate = cls.normalize_indexed_episode_stem(raw_stem)
+        reserved = {
+            str(stem or "").strip()
+            for stem in (reserved_stems or set())
+            if str(stem or "").strip()
+        }
+        current = str(current_stem or "").strip()
+
+        if candidate in reserved and candidate != current:
+            candidate = (
+                f"{candidate}__{cls._episode_filename_collision_suffix(raw_stem)}"
+            )
+            if candidate in reserved and candidate != current:
+                raise RuntimeError(
+                    "Unable to allocate a unique safe filename for indexed episode "
+                    f"'{raw_stem}'."
+                )
+
+        return candidate
 
     @staticmethod
     def _coerce_fps(value: object) -> float | None:
@@ -285,6 +448,138 @@ class AnimeLibraryService:
                                 config.get("default_fps")
                             )
         return None
+
+    @classmethod
+    def _is_cuda_oom_error(cls, message: str | None) -> bool:
+        if not message:
+            return False
+        normalized = message.casefold()
+        return all(marker in normalized for marker in ("cuda", "memory")) or any(
+            marker in normalized for marker in cls._CUDA_OOM_MARKERS
+        )
+
+    @classmethod
+    def _terminal_cuda_oom_message(cls, message: str) -> str:
+        guidance = (
+            " Retry also failed; this job exceeded available VRAM under the current parallel load."
+        )
+        return message if message.endswith(guidance.strip()) else f"{message}{guidance}"
+
+    @staticmethod
+    def _with_cli_flag(cmd: list[str], flag: str, value: str) -> list[str]:
+        updated = list(cmd)
+        if flag in updated:
+            flag_index = updated.index(flag)
+            if flag_index + 1 < len(updated):
+                updated[flag_index + 1] = value
+                return updated
+        updated.extend([flag, value])
+        return updated
+
+    @classmethod
+    def _annotate_searcher_progress(
+        cls,
+        progress: IndexProgress,
+        *,
+        anime_name: str,
+        metadata: SearcherExecutionMetadata,
+    ) -> IndexProgress:
+        progress.anime_name = anime_name
+        progress.requested_batch_size = metadata.requested_batch_size
+        progress.effective_batch_size = metadata.effective_batch_size
+        progress.effective_decode_backend = (
+            progress.effective_decode_backend
+            or metadata.effective_decode_backend
+            or metadata.requested_decode_backend
+        )
+        progress.retry_reason = metadata.retry_reason
+        return progress
+
+    @classmethod
+    async def _stream_searcher_index_command(
+        cls,
+        *,
+        cmd: list[str],
+        cwd: Path,
+        total_files: int,
+        anime_name: str,
+        metadata: SearcherExecutionMetadata,
+        progress_start: float,
+        progress_span: float,
+    ) -> AsyncIterator[IndexProgress]:
+        current_batch_size = metadata.effective_batch_size
+        retry_attempts = 0
+
+        while True:
+            current_cmd = cls._with_cli_flag(
+                cmd,
+                "--batch-size",
+                str(current_batch_size),
+            )
+            retry_requested = False
+
+            async for raw_progress in cls._stream_searcher_command(
+                cmd=current_cmd,
+                cwd=cwd,
+                total_files=total_files,
+                status="indexing",
+                progress_start=progress_start,
+                progress_span=progress_span,
+            ):
+                if raw_progress.effective_decode_backend:
+                    metadata.effective_decode_backend = raw_progress.effective_decode_backend
+
+                progress = cls._annotate_searcher_progress(
+                    raw_progress,
+                    anime_name=anime_name,
+                    metadata=metadata,
+                )
+
+                if progress.status != "error":
+                    yield progress
+                    continue
+
+                error_message = progress.error or progress.message or "anime_searcher command failed"
+                reduced_batch_size = max(1, current_batch_size // 2)
+                should_retry = (
+                    cls._is_cuda_oom_error(error_message)
+                    and retry_attempts < cls.SEARCHER_CUDA_OOM_BATCH_RETRY_LIMIT
+                    and reduced_batch_size < current_batch_size
+                )
+                if should_retry:
+                    retry_attempts += 1
+                    current_batch_size = reduced_batch_size
+                    metadata.effective_batch_size = current_batch_size
+                    metadata.retry_reason = cls.SEARCHER_CUDA_OOM_RETRY_REASON
+                    metadata.retry_warning = (
+                        "CUDA OOM detected under the current parallel load; retrying "
+                        f"with reduced batch size ({metadata.requested_batch_size} -> {current_batch_size}) "
+                        "while keeping fp32."
+                    )
+                    yield cls._annotate_searcher_progress(
+                        IndexProgress(
+                            status="indexing",
+                            message=metadata.retry_warning,
+                            progress=max(progress.progress, progress_start),
+                            total_files=total_files,
+                            completed_files=progress.completed_files,
+                            current_file=progress.current_file,
+                            warnings=[metadata.retry_warning],
+                        ),
+                        anime_name=anime_name,
+                        metadata=metadata,
+                    )
+                    retry_requested = True
+                    break
+
+                if cls._is_cuda_oom_error(error_message):
+                    progress.error = cls._terminal_cuda_oom_message(error_message)
+                yield progress
+                return
+
+            if not retry_requested:
+                metadata.effective_batch_size = current_batch_size
+                return
 
     @classmethod
     def _parse_searcher_progress_line(
@@ -341,6 +636,53 @@ class AnimeLibraryService:
             total_files_value = int(payload.get("total_files", total_files))
         except (TypeError, ValueError):
             total_files_value = total_files
+        try:
+            current_file_progress = payload.get("current_file_progress")
+            current_file_progress_value = (
+                None
+                if current_file_progress is None
+                else max(0.0, min(1.0, float(current_file_progress)))
+            )
+        except (TypeError, ValueError):
+            current_file_progress_value = None
+        try:
+            current_file_frames_processed = payload.get("current_file_frames_processed")
+            current_file_frames_processed_value = (
+                None
+                if current_file_frames_processed is None
+                else int(current_file_frames_processed)
+            )
+        except (TypeError, ValueError):
+            current_file_frames_processed_value = None
+        try:
+            current_file_total_frames = payload.get("current_file_total_frames")
+            current_file_total_frames_value = (
+                None if current_file_total_frames is None else int(current_file_total_frames)
+            )
+        except (TypeError, ValueError):
+            current_file_total_frames_value = None
+        try:
+            current_file_batches_processed = payload.get("current_file_batches_processed")
+            current_file_batches_processed_value = (
+                None
+                if current_file_batches_processed is None
+                else int(current_file_batches_processed)
+            )
+        except (TypeError, ValueError):
+            current_file_batches_processed_value = None
+        effective_decode_backend = payload.get("decode_backend")
+        effective_decode_backend_value = (
+            None
+            if effective_decode_backend in {None, ""}
+            else str(effective_decode_backend)
+        )
+        try:
+            effective_batch_size = payload.get("batch_size")
+            effective_batch_size_value = (
+                None if effective_batch_size is None else int(effective_batch_size)
+            )
+        except (TypeError, ValueError):
+            effective_batch_size_value = None
 
         return IndexProgress(
             status=status,
@@ -349,6 +691,12 @@ class AnimeLibraryService:
             progress=progress_start + progress_span * progress_value,
             total_files=total_files_value,
             completed_files=completed_files,
+            current_file_progress=current_file_progress_value,
+            current_file_frames_processed=current_file_frames_processed_value,
+            current_file_total_frames=current_file_total_frames_value,
+            current_file_batches_processed=current_file_batches_processed_value,
+            effective_batch_size=effective_batch_size_value,
+            effective_decode_backend=effective_decode_backend_value,
         )
 
     @classmethod
@@ -379,6 +727,60 @@ class AnimeLibraryService:
         return cls._preview_generation_lock
 
     @classmethod
+    def _existing_prepared_library_stems_sync(cls, dest_dir: Path) -> set[str]:
+        stems: set[str] = set()
+        try:
+            entries = list(dest_dir.iterdir())
+        except (OSError, PermissionError):
+            return stems
+
+        for entry in entries:
+            if (
+                not entry.is_file()
+                or entry.suffix.lower() != ".mp4"
+                or cls.is_transient_library_video_path(entry)
+            ):
+                continue
+            stems.add(entry.stem)
+        return stems
+
+    @classmethod
+    def _preferred_prepared_library_dest_sync(
+        cls,
+        source_path: Path,
+        dest_dir: Path,
+    ) -> Path:
+        normalized_stem = cls.normalize_indexed_episode_stem(source_path.stem)
+        hashed_stem = (
+            f"{normalized_stem}__"
+            f"{cls._episode_filename_collision_suffix(source_path.stem)}"
+        )
+        base_candidate = dest_dir / f"{normalized_stem}.mp4"
+        hashed_candidate = dest_dir / f"{hashed_stem}.mp4"
+
+        for candidate in (base_candidate, hashed_candidate):
+            if candidate.exists() and cls._source_matches_prepared_sync(
+                source_path,
+                candidate,
+            ):
+                return candidate
+
+        reserved_stems = cls._existing_prepared_library_stems_sync(dest_dir)
+        allocated_stem = cls.normalize_indexed_episode_stem_unique(
+            source_path.stem,
+            reserved_stems=reserved_stems,
+        )
+        return dest_dir / f"{allocated_stem}.mp4"
+
+    @classmethod
+    def is_transient_library_video_path(cls, path: Path) -> bool:
+        """Return True for importer-owned temporary media artifacts."""
+        if path.suffix.lower() not in cls.VIDEO_EXTENSIONS:
+            return False
+        stem = path.stem.lower()
+        return stem.endswith(".import.tmp") or stem.endswith(".normalize.tmp")
+
+    @classmethod
     def _get_preview_proxy_lock(cls, source_path: Path) -> threading.Lock:
         """Return a per-source lock to serialize sync preview proxy generation."""
         key = str(source_path.resolve())
@@ -402,7 +804,11 @@ class AnimeLibraryService:
 
         if library_path.exists():
             for entry in library_path.rglob("*"):
-                if not entry.is_file() or entry.suffix.lower() not in cls.VIDEO_EXTENSIONS:
+                if (
+                    not entry.is_file()
+                    or entry.suffix.lower() != ".mp4"
+                    or cls.is_transient_library_video_path(entry)
+                ):
                     continue
                 resolved = str(entry.resolve())
                 episodes.append(resolved)
@@ -529,6 +935,65 @@ class AnimeLibraryService:
         profile = str(settings.source_normalization_profile or "").strip().lower()
         return profile or cls.SOURCE_NORMALIZATION_PROFILE_H264_MP4_AAC
 
+    @classmethod
+    def _list_direct_video_files_sync(cls, folder: Path) -> list[Path]:
+        try:
+            return sorted(
+                entry
+                for entry in folder.iterdir()
+                if (
+                    entry.is_file()
+                    and entry.suffix.lower() in cls.VIDEO_EXTENSIONS
+                    and not cls.is_transient_library_video_path(entry)
+                )
+            )
+        except (OSError, PermissionError):
+            return []
+
+    @classmethod
+    def _scan_source_video_paths_sync(cls, source_paths: list[Path]) -> SourceVideoScan:
+        readable_files: list[Path] = []
+        invalid_files: list[Path] = []
+        seen_paths: set[str] = set()
+
+        for source_path in source_paths:
+            try:
+                key = str(source_path.resolve())
+            except OSError:
+                key = str(source_path)
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+
+            probe = cls._probe_media_sync(source_path)
+            if probe is None or probe.duration is None:
+                invalid_files.append(source_path)
+            else:
+                readable_files.append(source_path)
+
+        return SourceVideoScan(
+            readable_files=tuple(readable_files),
+            invalid_files=tuple(invalid_files),
+        )
+
+    @classmethod
+    def scan_direct_video_files_sync(cls, folder: Path) -> SourceVideoScan:
+        return cls._scan_source_video_paths_sync(cls._list_direct_video_files_sync(folder))
+
+    @staticmethod
+    def _invalid_source_warning(source_path: Path) -> str:
+        return f"Ignored unreadable source file: {source_path.name}"
+
+    @staticmethod
+    def _invalid_source_error_detail(invalid_files: tuple[Path, ...]) -> str:
+        names = [path.name for path in invalid_files if path.name]
+        if not names:
+            return "Unreadable source files were detected."
+        preview = ", ".join(names[:5])
+        if len(names) > 5:
+            preview += f", and {len(names) - 5} more"
+        return f"Unreadable source files: {preview}"
+
     @staticmethod
     def _parse_ffprobe_rate(raw_value: object) -> float | None:
         raw = str(raw_value or "").strip()
@@ -563,6 +1028,18 @@ class AnimeLibraryService:
         if duration <= 0:
             return None
         return duration
+
+    @staticmethod
+    def _parse_ffprobe_channels(raw_value: object) -> int | None:
+        if raw_value in (None, ""):
+            return None
+        try:
+            channels = int(raw_value)
+        except (TypeError, ValueError):
+            return None
+        if channels <= 0:
+            return None
+        return channels
 
     @classmethod
     def normalize_stream_language(
@@ -665,6 +1142,7 @@ class AnimeLibraryService:
             stream_position=stream_position,
             codec_type=codec_type,
             codec_name=str(stream.get("codec_name", "")).strip().lower() or None,
+            channels=cls._parse_ffprobe_channels(stream.get("channels")),
             language=cls.normalize_stream_language(
                 raw_language,
                 title=title,
@@ -674,6 +1152,7 @@ class AnimeLibraryService:
             title=title,
             handler_name=handler_name,
             is_default=bool(disposition.get("default", 0)),
+            duration=cls._parse_ffprobe_duration(stream.get("duration")),
         )
 
     @classmethod
@@ -684,7 +1163,20 @@ class AnimeLibraryService:
         target_language: str | None = None,
     ) -> SourceMediaStream | None:
         """Select the single audio stream kept in normalized sources."""
-        if not probe.audio_streams:
+        return cls._select_preferred_audio_stream_from_streams(
+            probe.audio_streams,
+            target_language=target_language,
+        )
+
+    @classmethod
+    def _select_preferred_audio_stream_from_streams(
+        cls,
+        streams: tuple[SourceMediaStream, ...] | list[SourceMediaStream],
+        *,
+        target_language: str | None = None,
+    ) -> SourceMediaStream | None:
+        """Select the preferred audio stream from an ordered stream list."""
+        if not streams:
             return None
 
         preferred_languages: list[str] = []
@@ -700,14 +1192,14 @@ class AnimeLibraryService:
             seen_languages.add(preferred_lang)
 
         for preferred_lang in preferred_languages:
-            for stream in probe.audio_streams:
+            for stream in streams:
                 if stream.language == preferred_lang:
                     return stream
 
-        default_stream = next((stream for stream in probe.audio_streams if stream.is_default), None)
+        default_stream = next((stream for stream in streams if stream.is_default), None)
         if default_stream is not None:
             return default_stream
-        return min(probe.audio_streams, key=lambda stream: (stream.stream_position, stream.index))
+        return min(streams, key=lambda stream: (stream.stream_position, stream.index))
 
     @classmethod
     def _with_preferred_audio_stream(
@@ -715,11 +1207,28 @@ class AnimeLibraryService:
         probe: SourceMediaProbe,
         *,
         target_language: str | None,
+        source_import_payload: dict[str, Any] | None = None,
     ) -> SourceMediaProbe:
         preferred_audio_stream = cls.select_preferred_audio_stream(
             probe,
             target_language=target_language,
         )
+        selected_audio_stream = preferred_audio_stream
+        if len(probe.audio_streams) > 1:
+            import_audio_streams = cls._load_source_import_audio_streams(source_import_payload)
+            if import_audio_streams and not any(stream.language for stream in probe.audio_streams):
+                preferred_original_stream = cls._select_preferred_audio_stream_from_streams(
+                    import_audio_streams,
+                    target_language=target_language,
+                )
+                if preferred_original_stream is not None:
+                    mapped_current_stream = cls._audio_stream_by_position(
+                        probe,
+                        preferred_original_stream.stream_position,
+                    )
+                    if mapped_current_stream is not None:
+                        preferred_audio_stream = mapped_current_stream
+                        selected_audio_stream = preferred_original_stream
         audio_codec = None
         selected_audio_stream_index = None
         if preferred_audio_stream is not None:
@@ -729,6 +1238,7 @@ class AnimeLibraryService:
             probe,
             audio_codec=audio_codec,
             selected_audio_stream_index=selected_audio_stream_index,
+            selected_audio_stream=selected_audio_stream,
         )
 
     @staticmethod
@@ -742,6 +1252,104 @@ class AnimeLibraryService:
             if stream.index == stream_index:
                 return stream
         return None
+
+    @staticmethod
+    def _audio_stream_by_position(
+        probe: SourceMediaProbe,
+        stream_position: int | None,
+    ) -> SourceMediaStream | None:
+        if stream_position is None:
+            return None
+        for stream in probe.audio_streams:
+            if stream.stream_position == stream_position:
+                return stream
+        return None
+
+    @staticmethod
+    def _ordered_audio_streams(
+        streams: tuple[SourceMediaStream, ...] | list[SourceMediaStream],
+    ) -> list[SourceMediaStream]:
+        return sorted(
+            list(streams),
+            key=lambda stream: (stream.stream_position, stream.index),
+        )
+
+    @classmethod
+    def _source_audio_channel_type(cls, channel_count: int) -> str:
+        if channel_count == 1:
+            return "mono"
+        if channel_count == 2:
+            return "stereo"
+        if channel_count == 6:
+            return "51"
+        raise RuntimeError(
+            f"Unsupported selected audio channel layout: {channel_count}. "
+            "Expected 1, 2, or 6 channels."
+        )
+
+    @classmethod
+    def build_source_audio_selection_policy(
+        cls,
+        source_path: Path,
+        *,
+        target_language: str | None = None,
+    ) -> SourceAudioSelectionPolicy:
+        probe = cls._probe_media_sync(source_path)
+        if probe is None:
+            raise RuntimeError(f"Unable to probe source media: {source_path}")
+
+        source_import_payload = cls._load_source_import_manifest_sync(source_path)
+        probe = cls._with_preferred_audio_stream(
+            probe,
+            target_language=target_language,
+            source_import_payload=source_import_payload,
+        )
+        selected_probe_stream = cls._audio_stream_by_index(
+            probe,
+            probe.selected_audio_stream_index,
+        )
+        selected_stream = (
+            probe.selected_audio_stream
+            or selected_probe_stream
+        )
+        if selected_stream is None:
+            raise RuntimeError(f"Source media has no selected audio stream: {source_path}")
+
+        selected_channel_count = cls._parse_ffprobe_channels(
+            (selected_probe_stream or selected_stream).channels
+        )
+        if selected_channel_count is None:
+            raise RuntimeError(
+                "Unable to determine selected audio channel count for "
+                f"{source_path.name} (stream {selected_stream.index})."
+            )
+
+        selected_channel_offset = 0
+        matched_stream = False
+        for stream in cls._ordered_audio_streams(probe.audio_streams):
+            if stream.index == selected_stream.index:
+                matched_stream = True
+                break
+            stream_channels = cls._parse_ffprobe_channels(stream.channels)
+            if stream_channels is None:
+                raise RuntimeError(
+                    "Unable to determine audio channel count for "
+                    f"{source_path.name} (stream {stream.index})."
+                )
+            selected_channel_offset += stream_channels
+        if not matched_stream:
+            raise RuntimeError(
+                f"Unable to locate selected audio stream {selected_stream.index} in {source_path.name}."
+            )
+
+        return SourceAudioSelectionPolicy(
+            selected_stream_index=selected_stream.index,
+            selected_stream_position=(selected_probe_stream or selected_stream).stream_position,
+            selected_language=selected_stream.language,
+            selected_channel_count=selected_channel_count,
+            selected_channel_offset=selected_channel_offset,
+            channel_type=cls._source_audio_channel_type(selected_channel_count),
+        )
 
     @classmethod
     def get_subtitle_sidecar_dir(cls, source_path: Path) -> Path:
@@ -771,9 +1379,30 @@ class AnimeLibraryService:
 
     @classmethod
     def resolve_subtitle_sidecar_source_path(cls, source_path: Path) -> Path | None:
-        for candidate in cls._subtitle_sidecar_lookup_paths(source_path):
+        queue = deque(cls._subtitle_sidecar_lookup_paths(source_path))
+        seen: set[str] = set()
+
+        while queue:
+            candidate = queue.popleft()
+            key = str(candidate.resolve()) if candidate.exists() else str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+
             if cls.get_subtitle_sidecar_manifest_path(candidate).exists():
                 return candidate
+
+            payload = cls._load_source_import_manifest_sync(candidate)
+            if not isinstance(payload, dict):
+                continue
+            linked_sidecar_source_raw = str(payload.get("sidecar_source_path", "")).strip()
+            linked_sidecar_source = Path(linked_sidecar_source_raw) if linked_sidecar_source_raw else None
+            if linked_sidecar_source is not None:
+                queue.extend(cls._subtitle_sidecar_lookup_paths(linked_sidecar_source))
+            original_source_raw = str(payload.get("source_path", "")).strip()
+            original_source = Path(original_source_raw) if original_source_raw else None
+            if original_source is not None:
+                queue.extend(cls._subtitle_sidecar_lookup_paths(original_source))
         return None
 
     @classmethod
@@ -797,7 +1426,7 @@ class AnimeLibraryService:
                 "-show_entries",
                 (
                     "format=format_name,duration:"
-                    "stream=index,codec_type,codec_name,pix_fmt,avg_frame_rate,r_frame_rate,duration:"
+                    "stream=index,codec_type,codec_name,channels,pix_fmt,avg_frame_rate,r_frame_rate,duration:"
                     "stream_tags=language,title,handler_name:"
                     "stream_disposition=default"
                 ),
@@ -911,6 +1540,7 @@ class AnimeLibraryService:
             audio_streams=tuple(audio_streams),
             subtitle_streams=tuple(subtitle_streams),
             data_streams=tuple(data_streams),
+            video_duration=video_duration,
         )
         return cls._with_preferred_audio_stream(
             base_probe,
@@ -919,228 +1549,127 @@ class AnimeLibraryService:
 
     @classmethod
     def probe_source_media_sync(cls, source_path: Path) -> SourceMediaProbe | None:
-        """Public sync probe wrapper used by normalization and tests."""
+        """Public sync probe wrapper used by source inspection and tests."""
         return cls._probe_media_sync(source_path)
-
-    @classmethod
-    def classify_source_normalization(cls, probe: SourceMediaProbe) -> str:
-        """Classify the cheapest compatibility action for Premiere-safe output.
-
-        Since format normalization now happens at indexation time (incompatible
-        codecs are transcoded to ProRes, MKV→MP4 remuxed), the processing step
-        only needs to handle audio track selection and container fixups.
-        """
-        video_codec = (probe.video_codec or "").strip().lower()
-        audio_codec = (probe.audio_codec or "").strip().lower()
-        has_extra_audio_streams = len(probe.audio_streams) > 1
-        has_subtitle_streams = len(probe.subtitle_streams) > 0
-        has_data_streams = len(probe.data_streams) > 0
-        premiere_compatible_container = probe.container_suffix in {".mp4", ".mov"}
-        premiere_compatible_video = video_codec in cls.PREMIERE_NATIVE_VIDEO_CODECS or video_codec == "prores"
-
-        # Already perfect: right codec, container, single audio, no junk streams.
-        if (
-            premiere_compatible_video
-            and premiere_compatible_container
-            and not has_extra_audio_streams
-            and not has_subtitle_streams
-            and not has_data_streams
-            and (not probe.has_audio or audio_codec in {"aac", "pcm_s16le", "pcm_s24le", "pcm_s32le"})
-        ):
-            return "noop"
-
-        # Legacy: source still has an incompatible video codec (indexed before
-        # the ProRes-at-indexation feature).  Fall back to full h264 transcode.
-        if not premiere_compatible_video:
-            return "full_h264_aac_transcode"
-
-        # Container needs fixing (e.g. MKV with Premiere-native codec).
-        if not premiere_compatible_container:
-            return "remux_to_mp4"
-
-        # Multiple audio streams → need to select one and remux.
-        if has_extra_audio_streams:
-            return "remux_audio_select"
-
-        # Audio codec not Premiere-friendly for this container.
-        if probe.has_audio and audio_codec not in {"aac", "pcm_s16le", "pcm_s24le", "pcm_s32le"}:
-            return "audio_to_aac"
-
-        # Container OK but has subtitle/data streams to strip, or multiple
-        # audio streams remain.  The remux copies video and selected audio
-        # while dropping everything else.
-        return "remux_to_mp4"
 
     @staticmethod
     def _normalized_target_path(source_path: Path) -> Path:
-        suffix = source_path.suffix.lower()
-        if suffix in {".mp4", ".mov"}:
+        if source_path.suffix.lower() == ".mp4":
             return source_path
         return source_path.with_suffix(".mp4")
 
     @classmethod
-    def _build_source_normalization_plan_sync(
+    def _serialize_source_import_audio_stream(
         cls,
-        source_path: Path,
-        *,
-        preferred_audio_language: str | None = None,
-    ) -> SourceNormalizationPlan:
-        probe = cls._probe_media_sync(source_path)
-        if probe is None:
-            raise RuntimeError(f"Unable to probe source media: {source_path}")
-        if probe.duration is None:
-            raise RuntimeError(f"Unable to determine source duration: {source_path}")
-        if probe.video_codec is None:
-            raise RuntimeError(f"Unable to determine source video codec: {source_path}")
-        probe = cls._with_preferred_audio_stream(
-            probe,
-            target_language=preferred_audio_language,
-        )
-        return SourceNormalizationPlan(
-            action=cls.classify_source_normalization(probe),
-            source_path=source_path,
-            target_path=cls._normalized_target_path(source_path),
-            probe=probe,
-        )
+        stream: SourceMediaStream,
+    ) -> dict[str, Any]:
+        return {
+            "stream_index": stream.index,
+            "stream_position": stream.stream_position,
+            "channels": stream.channels,
+            "language": stream.language,
+            "raw_language": stream.raw_language,
+            "title": stream.title,
+            "handler_name": stream.handler_name,
+            "is_default": stream.is_default,
+        }
 
     @classmethod
-    def _build_processing_reimport_plan_sync(
+    def _load_source_import_audio_streams(
         cls,
-        source_path: Path,
-        *,
-        preferred_audio_language: str | None = None,
-    ) -> SourceNormalizationPlan | None:
-        current_probe = cls._probe_media_sync(source_path)
-        if current_probe is None:
-            return None
-        if not cls._is_valid_normalized_probe(current_probe, reference_probe=current_probe):
-            return None
+        payload: dict[str, Any] | None,
+    ) -> tuple[SourceMediaStream, ...]:
+        if not isinstance(payload, dict):
+            return ()
+        raw_streams = payload.get("audio_streams", [])
+        if not isinstance(raw_streams, list):
+            return ()
 
-        payload = cls._load_source_import_manifest_sync(source_path)
-        if payload is None:
-            return None
-
-        original_source_raw = str(payload.get("source_path", "")).strip()
-        if not original_source_raw:
-            return None
-
-        original_source_path = Path(original_source_raw)
-        try:
-            if original_source_path.resolve() == source_path.resolve():
-                return None
-        except OSError:
-            return None
-        if not original_source_path.exists():
-            return None
-
-        original_probe = cls._probe_media_sync(original_source_path)
-        if original_probe is None or len(original_probe.audio_streams) <= 1:
-            return None
-        if original_probe.duration is None or original_probe.video_codec is None:
-            return None
-
-        original_probe = cls._with_preferred_audio_stream(
-            original_probe,
-            target_language=preferred_audio_language,
-        )
-        if cls._is_valid_normalized_probe(current_probe, reference_probe=original_probe):
-            return None
-
-        return SourceNormalizationPlan(
-            action=cls.classify_source_normalization(original_probe),
-            source_path=original_source_path,
-            target_path=source_path,
-            probe=original_probe,
-        )
+        streams: list[SourceMediaStream] = []
+        for raw_stream in raw_streams:
+            if not isinstance(raw_stream, dict):
+                continue
+            try:
+                stream_index = int(raw_stream.get("stream_index"))
+                stream_position = int(raw_stream.get("stream_position"))
+            except (TypeError, ValueError):
+                continue
+            title = str(raw_stream.get("title", "")).strip() or None
+            handler_name = str(raw_stream.get("handler_name", "")).strip() or None
+            raw_language = str(raw_stream.get("raw_language", "")).strip() or None
+            streams.append(
+                SourceMediaStream(
+                    index=stream_index,
+                    stream_position=stream_position,
+                    codec_type="audio",
+                    codec_name=None,
+                    channels=cls._parse_ffprobe_channels(raw_stream.get("channels")),
+                    language=cls.normalize_stream_language(
+                        raw_stream.get("language") or raw_language,
+                        title=title,
+                        handler_name=handler_name,
+                    ),
+                    raw_language=raw_language,
+                    title=title,
+                    handler_name=handler_name,
+                    is_default=bool(raw_stream.get("is_default", False)),
+                )
+            )
+        return tuple(streams)
 
     @classmethod
-    def _normalization_duration_tolerance_seconds(cls, probe: SourceMediaProbe) -> float:
-        fps = probe.fps or 24.0
-        return max(0.25, min(1.0, 3.0 / fps))
-
-    @classmethod
-    def _is_valid_normalized_probe(
+    def _build_audio_stream_metadata_args(
         cls,
-        normalized_probe: SourceMediaProbe | None,
-        *,
-        reference_probe: SourceMediaProbe,
-    ) -> bool:
-        if normalized_probe is None:
-            return False
-        if normalized_probe.container_suffix not in {".mp4", ".mov"}:
-            return False
-        video_codec = (normalized_probe.video_codec or "").strip().lower()
-        if video_codec not in cls.PREMIERE_NATIVE_VIDEO_CODECS and video_codec != "prores":
-            return False
-        if normalized_probe.duration is None:
-            return False
-        if normalized_probe.subtitle_streams:
-            return False
-        if normalized_probe.data_streams:
-            return False
-
-        normalized_audio = (normalized_probe.audio_codec or "").strip().lower()
-        premiere_audio_codecs = {"aac", "pcm_s16le", "pcm_s24le", "pcm_s32le"}
-        if reference_probe.has_audio:
-            if (
-                not normalized_probe.has_audio
-                or normalized_audio not in premiere_audio_codecs
-                or len(normalized_probe.audio_streams) != 1
-            ):
-                return False
-        elif normalized_probe.has_audio:
-            return False
-
-        selected_audio_stream = cls._audio_stream_by_index(
-            reference_probe,
-            reference_probe.selected_audio_stream_index,
-        )
-        if selected_audio_stream is not None and normalized_probe.audio_streams:
-            normalized_audio_stream = normalized_probe.audio_streams[0]
-            if (
-                selected_audio_stream.language
-                and normalized_audio_stream.language
-                and normalized_audio_stream.language != selected_audio_stream.language
-            ):
-                return False
-
-        if reference_probe.duration is not None and normalized_probe.duration is not None:
-            tolerance = cls._normalization_duration_tolerance_seconds(reference_probe)
-            if abs(reference_probe.duration - normalized_probe.duration) > tolerance:
-                return False
-
-        return normalized_probe.source_path.exists() and normalized_probe.source_path.stat().st_size > 0
-
-    @classmethod
-    def _build_selected_audio_map_args(cls, probe: SourceMediaProbe) -> list[str]:
-        if probe.selected_audio_stream_index is None:
-            return []
-        return ["-map", f"0:{probe.selected_audio_stream_index}"]
-
-    @classmethod
-    def _build_remux_to_mp4_cmd(
-        cls,
-        source_path: Path,
-        output_path: Path,
-        *,
-        probe: SourceMediaProbe,
+        audio_streams: tuple[SourceMediaStream, ...] | list[SourceMediaStream],
     ) -> list[str]:
-        return cls._build_common_normalization_cmd_from_probe(
-            source_path,
-            probe=probe,
-        ) + [
-            "-c",
-            "copy",
-            "-movflags",
-            "+faststart",
-            str(output_path),
-        ]
+        args: list[str] = []
+        default_indices = {
+            idx for idx, stream in enumerate(audio_streams) if stream.is_default
+        }
+        for idx, stream in enumerate(audio_streams):
+            language = (
+                str(stream.raw_language or "").strip().lower()
+                or cls.normalize_stream_language(
+                    stream.language,
+                    title=stream.title,
+                    handler_name=stream.handler_name,
+                )
+                or "und"
+            )
+            args.extend(["-metadata:s:a:" + str(idx), f"language={language}"])
+            if stream.title:
+                args.extend(["-metadata:s:a:" + str(idx), f"title={stream.title}"])
+            if stream.is_default:
+                args.extend(["-disposition:a:" + str(idx), "default"])
+            elif default_indices:
+                args.extend(["-disposition:a:" + str(idx), "0"])
+        return args
+
+    @classmethod
+    def _build_video_copy_bsf_args(cls, video_codec: str | None) -> list[str]:
+        """Bitstream filter to apply when stream-copying video into MP4.
+
+        Some HEVC/H.264 sources (notably MKV releases that store parameter
+        sets in-band) round-trip through ffmpeg's MP4 muxer in a way that
+        produces files which mux without error but then fail re-probe with
+        ``Invalid data found when processing input``. Routing the bitstream
+        through the matching ``*_mp4toannexb`` filter normalizes parameter
+        sets so the resulting MP4 is decodable.
+        """
+        codec = (video_codec or "").strip().lower()
+        if codec == "hevc":
+            return ["-bsf:v", "hevc_mp4toannexb"]
+        if codec == "h264":
+            return ["-bsf:v", "h264_mp4toannexb"]
+        return []
 
     @classmethod
     def _build_library_import_remux_cmd(
         cls,
         source_path: Path,
         output_path: Path,
+        *,
+        probe: SourceMediaProbe,
     ) -> list[str]:
         return [
             "ffmpeg",
@@ -1161,6 +1690,53 @@ class AnimeLibraryService:
             "0",
             "-c",
             "copy",
+            *cls._build_video_copy_bsf_args(probe.video_codec),
+            *cls._build_audio_stream_metadata_args(probe.audio_streams),
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+
+    @classmethod
+    def _build_library_import_audio_normalize_cmd(
+        cls,
+        source_path: Path,
+        output_path: Path,
+        *,
+        probe: SourceMediaProbe,
+    ) -> list[str]:
+        """Stream-copy video and bring audio tracks into a Premiere-friendly state.
+
+        Used when a container holds multiple audio streams with different
+        codecs (e.g. AAC + E-AC-3) which Premiere Pro cannot handle. AAC
+        streams are stream-copied to skip pointless re-encoding; only
+        non-AAC streams are transcoded. The video bitstream is routed
+        through the matching mp4toannexb BSF so HEVC/H.264 parameter sets
+        survive the MP4 round-trip on releases that otherwise produce
+        un-decodable output.
+        """
+        return [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(source_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-map_metadata",
+            "-1",
+            "-map_chapters",
+            "-1",
+            "-dn",
+            "-sn",
+            "-write_tmcd",
+            "0",
+            "-c:v",
+            "copy",
+            *cls._build_video_copy_bsf_args(probe.video_codec),
+            *cls._build_audio_args(audio_streams=probe.audio_streams),
+            *cls._build_audio_stream_metadata_args(probe.audio_streams),
             "-movflags",
             "+faststart",
             str(output_path),
@@ -1172,91 +1748,88 @@ class AnimeLibraryService:
         return (codec or "").strip().lower() in cls.PREMIERE_NATIVE_VIDEO_CODECS
 
     @classmethod
-    def _build_gpu_prores_cmd(
+    def _build_gpu_library_import_h264_cmd(
         cls,
         source_path: Path,
         output_path: Path,
         *,
         source_codec: str | None = None,
+        probe: SourceMediaProbe,
     ) -> list[str]:
-        """GPU-decode → CPU ProRes 422 LT encode."""
+        """Build a GPU-first library-import transcode to H.264/AAC MP4."""
         codec = (source_codec or "").strip().lower()
-        cmd: list[str] = ["ffmpeg", "-y"]
+        cmd: list[str] = [
+            "ffmpeg",
+            "-y",
+            "-hwaccel",
+            cls.GPU_HWACCEL,
+            "-hwaccel_output_format",
+            cls.GPU_HWACCEL,
+        ]
         cuda_decoder = cls._CUDA_DECODERS.get(codec)
         if cuda_decoder:
-            cmd.extend(["-hwaccel", cls.GPU_HWACCEL, "-c:v", cuda_decoder])
-        cmd.extend([
-            "-i", str(source_path),
-            "-map", "0:v:0",
-            "-map", "0:a?",
-            "-map_metadata", "-1",
-            "-map_chapters", "-1",
-            "-dn", "-sn",
-            "-write_tmcd", "0",
-            "-c:v", "prores_ks",
-            "-profile:v", "1",
-            "-vendor", "apl0",
-            "-pix_fmt", "yuv422p10le",
-            "-c:a", "copy",
-            str(output_path),
-        ])
+            cmd.extend(["-c:v", cuda_decoder])
+        cmd.extend(
+            [
+                "-i",
+                str(source_path),
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-map_metadata",
+                "-1",
+                "-map_chapters",
+                "-1",
+                "-dn",
+                "-sn",
+                "-write_tmcd",
+                "0",
+                "-vf",
+                "scale_cuda=format=nv12",
+                "-c:v",
+                cls.GPU_H264_ENCODER,
+                "-preset",
+                "p5",
+                "-rc",
+                "constqp",
+                "-qp",
+                "23",
+                "-b:v",
+                "0",
+                "-profile:v",
+                "high",
+            ]
+        )
+        cmd.extend(cls._build_audio_args(audio_streams=probe.audio_streams))
+        cmd.extend(cls._build_audio_stream_metadata_args(probe.audio_streams))
+        cmd.extend(
+            [
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ]
+        )
         return cmd
 
     @classmethod
-    def _build_cpu_prores_cmd(
-        cls,
-        source_path: Path,
-        output_path: Path,
-    ) -> list[str]:
-        """CPU-only ProRes 422 LT encode (fallback when GPU decode unavailable)."""
-        return [
-            "ffmpeg", "-y",
-            "-i", str(source_path),
-            "-map", "0:v:0",
-            "-map", "0:a?",
-            "-map_metadata", "-1",
-            "-map_chapters", "-1",
-            "-dn", "-sn",
-            "-write_tmcd", "0",
-            "-c:v", "prores_ks",
-            "-profile:v", "1",
-            "-vendor", "apl0",
-            "-pix_fmt", "yuv422p10le",
-            "-c:a", "copy",
-            str(output_path),
-        ]
-
-    @classmethod
-    def _build_remux_audio_select_cmd(
+    def _build_cpu_library_import_h264_cmd(
         cls,
         source_path: Path,
         output_path: Path,
         *,
         probe: SourceMediaProbe,
     ) -> list[str]:
-        """Remux with selected audio track — video copied, audio to AAC.
-
-        Functionally identical to ``_build_audio_to_aac_cmd``; the separate
-        action name exists so that log messages distinguish *why* the remux
-        happens (multi-track selection vs. incompatible audio codec).
-        """
-        return cls._build_audio_to_aac_cmd(source_path, output_path, probe=probe)
-
-    @classmethod
-    def _build_common_normalization_cmd_from_probe(
-        cls,
-        source_path: Path,
-        *,
-        probe: SourceMediaProbe,
-    ) -> list[str]:
-        return [
+        """Build a CPU fallback library-import transcode to H.264/AAC MP4."""
+        cmd = [
             "ffmpeg",
             "-y",
             "-i",
             str(source_path),
             "-map",
             "0:v:0",
-            *cls._build_selected_audio_map_args(probe),
+            "-map",
+            "0:a?",
             "-map_metadata",
             "-1",
             "-map_chapters",
@@ -1265,93 +1838,149 @@ class AnimeLibraryService:
             "-sn",
             "-write_tmcd",
             "0",
-        ]
-
-    @classmethod
-    def _build_audio_to_aac_cmd(
-        cls,
-        source_path: Path,
-        output_path: Path,
-        *,
-        probe: SourceMediaProbe,
-    ) -> list[str]:
-        return cls._build_common_normalization_cmd_from_probe(
-            source_path,
-            probe=probe,
-        ) + [
             "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            cls.SOURCE_NORMALIZATION_AUDIO_BITRATE,
-            "-ac",
-            "2",
-            "-ar",
-            cls.SOURCE_NORMALIZATION_AUDIO_RATE,
-            "-movflags",
-            "+faststart",
-            str(output_path),
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
         ]
+        cmd.extend(cls._build_audio_args(audio_streams=probe.audio_streams))
+        cmd.extend(cls._build_audio_stream_metadata_args(probe.audio_streams))
+        cmd.extend(
+            [
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ]
+        )
+        return cmd
 
     @classmethod
-    def _build_audio_args(cls, *, has_audio: bool) -> list[str]:
-        if not has_audio:
+    def _build_audio_args(
+        cls,
+        *,
+        audio_streams: tuple[SourceMediaStream, ...] | list[SourceMediaStream],
+    ) -> list[str]:
+        """Build per-output-stream audio codec args.
+
+        Streams already encoded as AAC are stream-copied to avoid pointless
+        CPU work; non-AAC streams are transcoded to AAC for Premiere Pro.
+        """
+        if not audio_streams:
             return []
-        return [
-            "-c:a",
-            "aac",
-            "-b:a",
-            cls.SOURCE_NORMALIZATION_AUDIO_BITRATE,
-            "-ac",
-            "2",
-            "-ar",
-            cls.SOURCE_NORMALIZATION_AUDIO_RATE,
-        ]
+        args: list[str] = []
+        for idx, stream in enumerate(audio_streams):
+            codec = (stream.codec_name or "").strip().lower()
+            if codec == "aac":
+                args.extend([f"-c:a:{idx}", "copy"])
+            else:
+                args.extend(
+                    [
+                        f"-c:a:{idx}",
+                        "aac",
+                        f"-b:a:{idx}",
+                        cls.SOURCE_NORMALIZATION_AUDIO_BITRATE,
+                        f"-ar:a:{idx}",
+                        cls.SOURCE_NORMALIZATION_AUDIO_RATE,
+                    ]
+                )
+        return args
 
     @classmethod
-    def _build_gpu_h264_aac_cmd(
-        cls,
-        source_path: Path,
-        output_path: Path,
-        *,
-        source_codec: str | None,
-        probe: SourceMediaProbe,
-    ) -> list[str]:
-        return cls._build_gpu_h264_base_cmd(
-            source_path,
-            source_codec=source_codec,
-        ) + cls._build_selected_audio_map_args(probe) + [
-            "-map_metadata",
-            "-1",
-            "-map_chapters",
-            "-1",
-            "-dn",
-            "-sn",
-            "-write_tmcd",
-            "0",
-        ] + cls._build_audio_args(has_audio=probe.has_audio) + [str(output_path)]
+    def _has_mixed_audio_codecs(cls, probe: SourceMediaProbe) -> bool:
+        """True when audio tracks use more than one distinct codec.
+
+        Premiere Pro fails to recognise secondary audio tracks when different
+        codecs coexist in the same MP4 container (e.g. AAC + E-AC-3).
+        Uniform containers (all AAC, all E-AC-3, etc.) are fine.
+        """
+        if len(probe.audio_streams) < 2:
+            return False
+        codecs = {
+            (s.codec_name or "").strip().lower()
+            for s in probe.audio_streams
+        }
+        codecs.discard("")
+        return len(codecs) > 1
 
     @classmethod
-    def _build_cpu_h264_aac_cmd(
+    def _unsupported_prepared_audio_codecs(
         cls,
-        source_path: Path,
-        output_path: Path,
+        probe: SourceMediaProbe | None,
+    ) -> set[str]:
+        if probe is None or not probe.has_audio:
+            return set()
+        codecs = {
+            (stream.codec_name or "").strip().lower()
+            for stream in probe.audio_streams
+            if (stream.codec_name or "").strip()
+        }
+        return {
+            codec
+            for codec in codecs
+            if codec not in cls.PREMIERE_SAFE_MP4_AUDIO_CODECS
+        }
+
+    @classmethod
+    def _requires_premiere_audio_normalization(
+        cls,
+        probe: SourceMediaProbe | None,
+    ) -> bool:
+        if probe is None or not probe.has_audio:
+            return False
+        return bool(cls._unsupported_prepared_audio_codecs(probe)) or cls._has_mixed_audio_codecs(probe)
+
+    @classmethod
+    def _describe_premiere_audio_normalization_reason(
+        cls,
+        probe: SourceMediaProbe | None,
+    ) -> str:
+        unsupported = sorted(cls._unsupported_prepared_audio_codecs(probe))
+        if unsupported:
+            label = "audio codec" if len(unsupported) == 1 else "audio codecs"
+            return f"unsupported {label}: {', '.join(unsupported)}"
+        codecs = sorted(
+            {
+                (stream.codec_name or "").strip().lower()
+                for stream in (probe.audio_streams if probe is not None else ())
+                if (stream.codec_name or "").strip()
+            }
+        )
+        if len(codecs) > 1:
+            return f"mixed audio codecs: {', '.join(codecs)}"
+        return "Premiere-incompatible audio"
+
+    @classmethod
+    def _is_valid_prepared_library_probe(
+        cls,
+        prepared_probe: SourceMediaProbe | None,
         *,
-        probe: SourceMediaProbe,
-    ) -> list[str]:
-        return cls._build_cpu_h264_base_cmd(source_path) + cls._build_selected_audio_map_args(
-            probe
-        ) + [
-            "-map_metadata",
-            "-1",
-            "-map_chapters",
-            "-1",
-            "-dn",
-            "-sn",
-            "-write_tmcd",
-            "0",
-        ] + cls._build_audio_args(has_audio=probe.has_audio) + [str(output_path)]
+        reference_probe: SourceMediaProbe | None = None,
+        require_h264_video: bool = False,
+    ) -> bool:
+        if prepared_probe is None:
+            return False
+        if prepared_probe.container_suffix != ".mp4":
+            return False
+        video_codec = (prepared_probe.video_codec or "").strip().lower()
+        if video_codec not in cls.PREMIERE_NATIVE_VIDEO_CODECS:
+            return False
+        if require_h264_video and video_codec != "h264":
+            return False
+        if prepared_probe.duration is None or prepared_probe.duration <= 0:
+            return False
+        if cls._requires_premiere_audio_normalization(prepared_probe):
+            return False
+        if reference_probe is None:
+            return True
+        if prepared_probe.has_audio != reference_probe.has_audio:
+            return False
+        if reference_probe.has_audio and len(prepared_probe.audio_streams) != len(reference_probe.audio_streams):
+            return False
+        return True
 
     @staticmethod
     def _format_media_failure(result: object) -> str:
@@ -1368,7 +1997,57 @@ class AnimeLibraryService:
             or stdout.decode("utf-8", errors="replace").strip()
             or "unknown ffmpeg error"
         )
-        return detail[:500]
+        lines = [
+            line.strip()
+            for line in detail.replace("\r", "\n").splitlines()
+            if line.strip()
+        ]
+        noisy_prefixes = (
+            "ffmpeg version",
+            "built with",
+            "configuration:",
+            "libav",
+            "Input #",
+            "Metadata:",
+            "Duration:",
+            "Stream #",
+            "Press [q] to stop",
+            "frame=",
+            "size=",
+        )
+        filtered_lines = [
+            line for line in lines
+            if not any(line.startswith(prefix) for prefix in noisy_prefixes)
+        ]
+        candidate_lines = filtered_lines or lines
+        meaningful_markers = (
+            "only supported",
+            "not supported",
+            "not currently supported",
+            "could not write header",
+            "incorrect codec parameters",
+            "unknown encoder",
+            "error opening output files",
+            "invalid data found",
+        )
+        preferred_lines = [
+            line for line in candidate_lines
+            if any(marker in line.lower() for marker in meaningful_markers)
+        ]
+        if preferred_lines:
+            selected_lines = preferred_lines[-2:]
+            for line in candidate_lines[-3:]:
+                lowered = line.lower()
+                if (
+                    line not in selected_lines
+                    and (
+                        "nothing was written into output file" in lowered
+                        or "conversion failed" in lowered
+                    )
+                ):
+                    selected_lines.append(line)
+            return " | ".join(selected_lines)[:500]
+        return " | ".join(candidate_lines[-3:])[:500]
 
     @classmethod
     async def _run_normalization_command(
@@ -1378,6 +2057,79 @@ class AnimeLibraryService:
         timeout_seconds: float,
     ):
         return await run_command(cmd, timeout_seconds=timeout_seconds)
+
+    @classmethod
+    async def _run_library_import_h264_transcode(
+        cls,
+        source_path: Path,
+        output_path: Path,
+        *,
+        source_codec: str | None,
+        probe: SourceMediaProbe,
+    ) -> None:
+        gpu_error: str | None = None
+        try:
+            gpu_result = await run_command(
+                rewrite_media_command(
+                    cls._build_gpu_library_import_h264_cmd(
+                        source_path,
+                        output_path,
+                        source_codec=source_codec,
+                        probe=probe,
+                    )
+                ),
+                timeout_seconds=cls.LIBRARY_IMPORT_TRANSCODE_TIMEOUT_SECONDS,
+            )
+        except FileNotFoundError as exc:
+            if is_media_binary_override_error(exc):
+                raise
+            gpu_error = cls._format_media_failure(exc)
+        except CommandTimeoutError as exc:
+            gpu_error = cls._format_media_failure(exc)
+        else:
+            if gpu_result.returncode == 0:
+                gpu_probe = await asyncio.to_thread(cls._probe_media_sync, output_path)
+                if cls._is_valid_prepared_library_probe(
+                    gpu_probe,
+                    reference_probe=probe,
+                    require_h264_video=True,
+                ):
+                    return
+                with suppress(OSError):
+                    await asyncio.to_thread(output_path.unlink)
+                gpu_error = f"Transcoded H.264 MP4 output failed validation: {source_path.name}"
+            else:
+                gpu_error = cls._format_media_failure(gpu_result)
+
+        try:
+            cpu_result = await run_command(
+                rewrite_media_command(
+                    cls._build_cpu_library_import_h264_cmd(
+                        source_path,
+                        output_path,
+                        probe=probe,
+                    )
+                ),
+                timeout_seconds=cls.LIBRARY_IMPORT_TRANSCODE_TIMEOUT_SECONDS,
+            )
+        except FileNotFoundError as exc:
+            if is_media_binary_override_error(exc):
+                raise
+            raise RuntimeError(
+                "Failed to transcode source to H.264 MP4 "
+                f"(GPU: {gpu_error}; CPU: {cls._format_media_failure(exc)})"
+            ) from exc
+        except CommandTimeoutError as exc:
+            raise RuntimeError(
+                "Failed to transcode source to H.264 MP4 "
+                f"(GPU: {gpu_error}; CPU: {cls._format_media_failure(exc)})"
+            ) from exc
+
+        if cpu_result.returncode != 0:
+            raise RuntimeError(
+                "Failed to transcode source to H.264 MP4 "
+                f"(GPU: {gpu_error}; CPU: {cls._format_media_failure(cpu_result)})"
+            )
 
     @classmethod
     def get_subtitle_sidecar_asset_path(
@@ -1511,6 +2263,7 @@ class AnimeLibraryService:
                 continue
             raw_language = str(raw_entry.get("raw_language", "")).strip() or None
             title = str(raw_entry.get("title", "")).strip() or None
+            handler_name = str(raw_entry.get("handler_name", "")).strip() or None
             stored_language = str(raw_entry.get("language", "")).strip() or None
             try:
                 entries.append(
@@ -1521,9 +2274,11 @@ class AnimeLibraryService:
                         language=cls.normalize_stream_language(
                             stored_language or raw_language,
                             title=title,
+                            handler_name=handler_name,
                         ),
                         raw_language=raw_language,
                         title=title,
+                        handler_name=handler_name,
                         kind=str(raw_entry.get("kind", "")).strip().lower() or "unsupported",
                         asset_filename=str(raw_entry.get("asset_filename", "")).strip() or None,
                         cue_manifest_filename=(
@@ -1540,11 +2295,73 @@ class AnimeLibraryService:
     @staticmethod
     def _subtitle_entry_title_rank(entry: SubtitleSidecarEntry) -> int:
         title = str(entry.title or "").lower()
-        if "full" in title:
-            return 0
-        if "sign" in title or "song" in title:
+        if any(token in title for token in ("sign", "song", "forced")):
+            return 2
+        if any(token in title for token in ("sdh", "closed caption", "closed-caption", "cc")):
             return 1
-        return 2
+        if any(token in title for token in ("dialogue", "dialog", "full", "default", "plain")):
+            return 0
+        return 0
+
+    @classmethod
+    def get_preferred_subtitle_language_groups(
+        cls,
+        entries: list[SubtitleSidecarEntry],
+        *,
+        target_language: str | None,
+    ) -> list[tuple[str | None, list[SubtitleSidecarEntry]]]:
+        usable_entries = [
+            entry
+            for entry in entries
+            if entry.status == "ok"
+            and entry.kind in {"text", "image"}
+            and entry.asset_filename
+        ]
+        if not usable_entries:
+            return []
+
+        groups: dict[str | None, list[SubtitleSidecarEntry]] = {}
+        first_position_by_language: dict[str | None, int] = {}
+        for entry in usable_entries:
+            groups.setdefault(entry.language, []).append(entry)
+            first_position_by_language.setdefault(entry.language, entry.stream_position)
+
+        normalized_target = cls.normalize_stream_language(target_language)
+        ordered_languages: list[str | None] = []
+        seen_languages: set[str | None] = set()
+        for preferred_language in (normalized_target, "en"):
+            if preferred_language not in groups or preferred_language in seen_languages:
+                continue
+            ordered_languages.append(preferred_language)
+            seen_languages.add(preferred_language)
+
+        fallback_languages = sorted(
+            [
+                language
+                for language in groups
+                if language not in seen_languages
+            ],
+            key=lambda language: (
+                first_position_by_language.get(language, 10**9),
+                language or "zzzz",
+            ),
+        )
+        ordered_languages.extend(fallback_languages)
+
+        return [
+            (
+                language,
+                sorted(
+                    groups[language],
+                    key=lambda entry: (
+                        0 if entry.kind == "text" else 1,
+                        cls._subtitle_entry_title_rank(entry),
+                        entry.stream_position,
+                    ),
+                ),
+            )
+            for language in ordered_languages
+        ]
 
     @classmethod
     def select_preferred_subtitle_entry(
@@ -1553,38 +2370,21 @@ class AnimeLibraryService:
         *,
         target_language: str | None,
     ) -> SubtitleSidecarEntry | None:
-        normalized_target = cls.normalize_stream_language(target_language)
-        allowed_languages = [lang for lang in (normalized_target, "en") if lang]
-        seen_languages: set[str] = set()
-        ordered_languages: list[str] = []
-        for language in allowed_languages:
-            if language in seen_languages:
-                continue
-            seen_languages.add(language)
-            ordered_languages.append(language)
-
-        candidates = [
-            entry
-            for entry in entries
-            if entry.status == "ok"
-            and entry.kind in {"text", "image"}
-            and entry.language in ordered_languages
-            and entry.asset_filename
-        ]
-        if not candidates:
+        language_groups = cls.get_preferred_subtitle_language_groups(
+            entries,
+            target_language=target_language,
+        )
+        if not language_groups:
             return None
+        candidates = language_groups[0][1]
 
         def _rank(entry: SubtitleSidecarEntry) -> tuple[int, int, int, int]:
-            language_rank = ordered_languages.index(entry.language or "en")
             kind_rank = 0 if entry.kind == "text" else 1
-            english_title_rank = (
-                cls._subtitle_entry_title_rank(entry) if entry.language == "en" else 0
-            )
             return (
-                language_rank,
                 kind_rank,
-                english_title_rank,
+                cls._subtitle_entry_title_rank(entry),
                 entry.stream_position,
+                entry.stream_index,
             )
 
         return min(candidates, key=_rank)
@@ -1807,6 +2607,7 @@ class AnimeLibraryService:
                 "language": stream.language,
                 "raw_language": stream.raw_language,
                 "title": stream.title,
+                "handler_name": stream.handler_name,
                 "kind": kind,
                 "asset_filename": None,
                 "cue_manifest_filename": None,
@@ -1885,6 +2686,7 @@ class AnimeLibraryService:
                                         language=stream.language,
                                         raw_language=stream.raw_language,
                                         title=stream.title,
+                                        handler_name=stream.handler_name,
                                         kind=kind,
                                         asset_filename=asset_name,
                                     ),
@@ -1958,6 +2760,43 @@ class AnimeLibraryService:
         )
 
     @classmethod
+    def _clone_subtitle_sidecar_sync(
+        cls,
+        source_path: Path,
+        target_path: Path,
+    ) -> bool:
+        sidecar_source_path = cls.resolve_subtitle_sidecar_source_path(source_path)
+        if sidecar_source_path is None:
+            return False
+
+        source_dir = cls.get_subtitle_sidecar_dir(sidecar_source_path)
+        manifest_path = source_dir / "manifest.json"
+        if not source_dir.exists() or not manifest_path.exists():
+            return False
+
+        target_dir = cls.get_subtitle_sidecar_dir(target_path)
+        tmp_dir = target_dir.with_name(f"{target_dir.name}.tmp")
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.copytree(source_dir, tmp_dir)
+
+        try:
+            payload = json.loads((tmp_dir / "manifest.json").read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            payload = {}
+        if isinstance(payload, dict):
+            payload["source_path"] = str(target_path)
+            (tmp_dir / "manifest.json").write_text(
+                json.dumps(payload, indent=2),
+                encoding="utf-8",
+            )
+
+        if target_dir.exists():
+            shutil.rmtree(target_dir, ignore_errors=True)
+        tmp_dir.replace(target_dir)
+        return True
+
+    @classmethod
     def _library_context_for_path(
         cls,
         source_path: Path,
@@ -1981,215 +2820,6 @@ class AnimeLibraryService:
         if context is None:
             return None
         return context[1]
-
-    @classmethod
-    async def _postprocess_source_normalization_commit(cls, normalized_path: Path) -> None:
-        context = cls._library_context_for_path(normalized_path)
-        if context is None:
-            return
-        library_type, series_name = context
-        await cls.ensure_episode_manifest(force_refresh=True, library_type=library_type)
-        from .anime_matcher import AnimeMatcherService
-
-        AnimeMatcherService.mark_series_updated(library_type, series_name)
-
-    @classmethod
-    async def normalize_source_for_processing(
-        cls,
-        source_path: Path,
-        *,
-        preferred_audio_language: str | None = None,
-        subtitle_image_render_windows: dict[int, list[tuple[float, float]]] | None = None,
-    ) -> SourceNormalizationResult:
-        """Normalize one source episode for Premiere Pro import.
-
-        Since format normalization now happens at indexation (incompatible codecs
-        → ProRes, MKV → MP4), this step typically only remuxes the selected
-        audio track.  The full_h264_aac_transcode path is kept for backward
-        compatibility with sources indexed before the ProRes feature.
-        """
-        if not source_path.exists() or not source_path.is_file():
-            raise FileNotFoundError(f"Source file not found: {source_path}")
-
-        plan = await asyncio.to_thread(
-            cls._build_source_normalization_plan_sync,
-            source_path,
-            preferred_audio_language=preferred_audio_language,
-        )
-        if plan.action == "noop":
-            reimport_plan = await asyncio.to_thread(
-                cls._build_processing_reimport_plan_sync,
-                source_path,
-                preferred_audio_language=preferred_audio_language,
-            )
-            if reimport_plan is not None:
-                plan = reimport_plan
-            else:
-                return SourceNormalizationResult(
-                    action=plan.action,
-                    source_path=plan.source_path,
-                    normalized_path=plan.source_path,
-                    changed=False,
-                )
-
-        target_path = plan.target_path
-        tmp_suffix = target_path.suffix or ".mp4"
-        tmp_path = target_path.with_name(f"{target_path.stem}.normalize.tmp{tmp_suffix}")
-
-        if target_path != source_path and target_path.exists():
-            existing_probe = await asyncio.to_thread(cls._probe_media_sync, target_path)
-            if cls._is_valid_normalized_probe(existing_probe, reference_probe=plan.probe):
-                try:
-                    await cls._write_subtitle_sidecar(
-                        source_path=plan.source_path,
-                        normalized_target_path=target_path,
-                        probe=plan.probe,
-                        subtitle_image_render_windows=subtitle_image_render_windows,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to preserve subtitle sidecar for %s: %s",
-                        plan.source_path,
-                        exc,
-                    )
-                await asyncio.to_thread(source_path.unlink)
-                await cls._postprocess_source_normalization_commit(target_path)
-                return SourceNormalizationResult(
-                    action=plan.action,
-                    source_path=source_path,
-                    normalized_path=target_path,
-                    changed=True,
-                )
-            await asyncio.to_thread(target_path.unlink)
-
-        if tmp_path.exists():
-            await asyncio.to_thread(tmp_path.unlink)
-
-        try:
-            if plan.action == "remux_to_mp4":
-                try:
-                    result = await cls._run_normalization_command(
-                        cls._build_remux_to_mp4_cmd(
-                            plan.source_path,
-                            tmp_path,
-                            probe=plan.probe,
-                        ),
-                        timeout_seconds=cls.REMUX_TIMEOUT_SECONDS,
-                    )
-                except (CommandTimeoutError, FileNotFoundError) as exc:
-                    raise RuntimeError(
-                        f"Failed to remux source for Premiere: {cls._format_media_failure(exc)}"
-                    ) from exc
-                if result.returncode != 0:
-                    raise RuntimeError(
-                        f"Failed to remux source for Premiere: {cls._format_media_failure(result)}"
-                    )
-            elif plan.action in {"audio_to_aac", "remux_audio_select"}:
-                try:
-                    cmd = (
-                        cls._build_remux_audio_select_cmd(
-                            plan.source_path,
-                            tmp_path,
-                            probe=plan.probe,
-                        )
-                        if plan.action == "remux_audio_select"
-                        else cls._build_audio_to_aac_cmd(
-                            plan.source_path,
-                            tmp_path,
-                            probe=plan.probe,
-                        )
-                    )
-                    result = await cls._run_normalization_command(
-                        cmd,
-                        timeout_seconds=cls.SOURCE_NORMALIZATION_TIMEOUT_SECONDS,
-                    )
-                except (CommandTimeoutError, FileNotFoundError) as exc:
-                    raise RuntimeError(
-                        "Failed to normalize source audio for Premiere: "
-                        f"{cls._format_media_failure(exc)}"
-                    ) from exc
-                if result.returncode != 0:
-                    raise RuntimeError(
-                        "Failed to normalize source audio for Premiere: "
-                        f"{cls._format_media_failure(result)}"
-                    )
-            elif plan.action == "full_h264_aac_transcode":
-                gpu_error: str | None = None
-                try:
-                    gpu_result = await cls._run_normalization_command(
-                        cls._build_gpu_h264_aac_cmd(
-                            plan.source_path,
-                            tmp_path,
-                            source_codec=plan.probe.video_codec,
-                            probe=plan.probe,
-                        ),
-                        timeout_seconds=cls.SOURCE_NORMALIZATION_TIMEOUT_SECONDS,
-                    )
-                except (CommandTimeoutError, FileNotFoundError) as exc:
-                    gpu_error = cls._format_media_failure(exc)
-                else:
-                    if gpu_result.returncode == 0:
-                        gpu_error = None
-                    else:
-                        gpu_error = cls._format_media_failure(gpu_result)
-
-                if gpu_error is not None:
-                    if tmp_path.exists():
-                        await asyncio.to_thread(tmp_path.unlink)
-                    try:
-                        cpu_result = await cls._run_normalization_command(
-                            cls._build_cpu_h264_aac_cmd(
-                                plan.source_path,
-                                tmp_path,
-                                probe=plan.probe,
-                            ),
-                            timeout_seconds=cls.SOURCE_NORMALIZATION_TIMEOUT_SECONDS,
-                        )
-                    except (CommandTimeoutError, FileNotFoundError) as exc:
-                        raise RuntimeError(
-                            "Failed to transcode source for Premiere "
-                            f"(GPU: {gpu_error}; CPU: {cls._format_media_failure(exc)})"
-                        ) from exc
-                    if cpu_result.returncode != 0:
-                        raise RuntimeError(
-                            "Failed to transcode source for Premiere "
-                            f"(GPU: {gpu_error}; CPU: {cls._format_media_failure(cpu_result)})"
-                        )
-            else:
-                raise RuntimeError(f"Unsupported normalization action: {plan.action}")
-
-            normalized_probe = await asyncio.to_thread(cls._probe_media_sync, tmp_path)
-            if not cls._is_valid_normalized_probe(normalized_probe, reference_probe=plan.probe):
-                raise RuntimeError(f"Normalized output failed validation: {tmp_path.name}")
-
-            try:
-                await cls._write_subtitle_sidecar(
-                    source_path=plan.source_path,
-                    normalized_target_path=target_path,
-                    probe=plan.probe,
-                    subtitle_image_render_windows=subtitle_image_render_windows,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Failed to preserve subtitle sidecar for %s: %s",
-                    plan.source_path,
-                    exc,
-                )
-            await asyncio.to_thread(tmp_path.replace, target_path)
-            if target_path != source_path and source_path.exists():
-                await asyncio.to_thread(source_path.unlink)
-
-            await cls._postprocess_source_normalization_commit(target_path)
-            return SourceNormalizationResult(
-                action=plan.action,
-                source_path=source_path,
-                normalized_path=target_path,
-                changed=True,
-            )
-        except Exception:
-            if tmp_path.exists():
-                await asyncio.to_thread(tmp_path.unlink)
-            raise
 
     @classmethod
     def get_preview_proxy_dir(cls) -> Path:
@@ -2734,19 +3364,35 @@ class AnimeLibraryService:
         return payload if isinstance(payload, dict) else None
 
     @classmethod
-    def _record_source_import_manifest_sync(cls, source_path: Path, prepared_path: Path) -> None:
+    def _record_source_import_manifest_sync(
+        cls,
+        source_path: Path,
+        prepared_path: Path,
+        *,
+        source_probe: SourceMediaProbe | None = None,
+        original_source_path: Path | None = None,
+        sidecar_source_path: Path | None = None,
+    ) -> None:
         source_stat = source_path.stat()
         manifest_path = cls.get_source_import_manifest_path(prepared_path)
+        resolved_original_source_path = original_source_path or source_path
+        manifest_payload: dict[str, Any] = {
+            "source_path": str(source_path.resolve()),
+            "source_size": source_stat.st_size,
+            "source_mtime_ns": source_stat.st_mtime_ns,
+            "prepared_path": str(prepared_path.resolve()),
+            "original_source_path": str(resolved_original_source_path.resolve()),
+            "sidecar_source_path": str((sidecar_source_path or source_path).resolve()),
+        }
+        if source_probe is None:
+            source_probe = cls._probe_media_sync(resolved_original_source_path)
+        if source_probe is not None and source_probe.audio_streams:
+            manifest_payload["audio_streams"] = [
+                cls._serialize_source_import_audio_stream(stream)
+                for stream in source_probe.audio_streams
+            ]
         manifest_path.write_text(
-            json.dumps(
-                {
-                    "source_path": str(source_path.resolve()),
-                    "source_size": source_stat.st_size,
-                    "source_mtime_ns": source_stat.st_mtime_ns,
-                    "prepared_path": str(prepared_path.resolve()),
-                },
-                indent=2,
-            ),
+            json.dumps(manifest_payload, indent=2),
             encoding="utf-8",
         )
 
@@ -2762,7 +3408,7 @@ class AnimeLibraryService:
             return False
 
         prepared_probe = cls._probe_media_sync(prepared_path)
-        if prepared_probe is None or prepared_probe.duration is None:
+        if not cls._is_valid_prepared_library_probe(prepared_probe):
             return False
 
         try:
@@ -2783,9 +3429,7 @@ class AnimeLibraryService:
         source_probe = cls._probe_media_sync(source_path)
         if source_probe is None:
             return False
-        if prepared_probe.has_audio != source_probe.has_audio:
-            return False
-        if source_probe.has_audio and len(prepared_probe.audio_streams) != len(source_probe.audio_streams):
+        if not cls._is_valid_prepared_library_probe(prepared_probe, reference_probe=source_probe):
             return False
 
         return (
@@ -2804,18 +3448,22 @@ class AnimeLibraryService:
         source_codec = await asyncio.to_thread(cls.get_primary_video_codec_sync, source_path)
         codec_lower = (source_codec or "").strip().lower()
         is_premiere_native = cls._is_premiere_native_codec(codec_lower)
-        is_mkv = source_path.suffix.lower() == ".mkv"
-        needs_prores_transcode = not is_premiere_native
+        source_suffix = source_path.suffix.lower()
+        is_mp4 = source_suffix == ".mp4"
+        needs_direct_h264_transcode = not is_premiere_native
+        transcode_action = "Transcoding to H.264 MP4"
 
         # Decide destination path and action label.
-        if needs_prores_transcode:
-            preferred_dest = dest_dir / (source_path.stem + ".mov")
-            action = f"Transcoding {codec_lower or 'unknown'} to ProRes"
-        elif is_mkv:
-            preferred_dest = dest_dir / (source_path.stem + ".mp4")
+        preferred_dest = await asyncio.to_thread(
+            cls._preferred_prepared_library_dest_sync,
+            source_path,
+            dest_dir,
+        )
+        if needs_direct_h264_transcode:
+            action = transcode_action
+        elif not is_mp4:
             action = "Remuxing"
         else:
-            preferred_dest = dest_dir / source_path.name
             action = "Copying"
 
         actual_dest = preferred_dest
@@ -2828,184 +3476,155 @@ class AnimeLibraryService:
         if existing_ready:
             return preferred_dest, "Using existing", False
 
-        # Always probe source for subtitle streams (extraction needed for all
-        # transform types: remux drops subs, transcode drops subs, and even
-        # plain copies may come from containers with embedded subs).
+        # Probe source once up front so unreadable inputs never get copied into
+        # the library via fallback paths.
         source_probe: SourceMediaProbe | None = None
         try:
             source_probe = await asyncio.to_thread(cls._probe_media_sync, source_path)
         except Exception as exc:
             logger.debug("Could not probe %s for subtitles: %s", source_path.name, exc)
             source_probe = None
+        if source_probe is None or source_probe.duration is None:
+            raise RuntimeError(f"Source file is unreadable: {source_path.name}")
 
-        if needs_prores_transcode:
-            # --- ProRes 422 LT transcode for Premiere-incompatible codecs ---
-            tmp_suffix = ".import.tmp.mov"
-            tmp_dest = preferred_dest.with_name(f"{preferred_dest.stem}{tmp_suffix}")
+        needs_audio_normalize = (
+            not needs_direct_h264_transcode
+            and source_probe.has_audio
+            and cls._requires_premiere_audio_normalization(source_probe)
+        )
+        if needs_audio_normalize:
+            action = "Normalizing audio (remux)" if not is_mp4 else "Normalizing audio"
+            normalize_reason = cls._describe_premiere_audio_normalization_reason(source_probe)
+            logger.info(
+                "Premiere-incompatible audio in %s — will normalize to AAC (%s)",
+                source_path.name,
+                normalize_reason,
+            )
+
+        tmp_dest = preferred_dest.with_name(f"{preferred_dest.stem}.import.tmp.mp4")
+
+        async def _cleanup_tmp_dest() -> None:
             if tmp_dest.exists():
                 with suppress(OSError):
                     await asyncio.to_thread(tmp_dest.unlink)
 
-            gpu_error: str | None = None
+        async def _commit_transcoded_tmp_dest() -> None:
             try:
-                gpu_result = await run_command(
-                    rewrite_media_command(
-                        cls._build_gpu_prores_cmd(source_path, tmp_dest, source_codec=source_codec)
-                    ),
-                    timeout_seconds=cls.PRORES_TRANSCODE_TIMEOUT_SECONDS,
+                await cls._run_library_import_h264_transcode(
+                    source_path,
+                    tmp_dest,
+                    source_codec=source_codec,
+                    probe=source_probe,
                 )
-            except (CommandTimeoutError, FileNotFoundError) as exc:
-                gpu_error = cls._format_media_failure(exc)
-            else:
-                if gpu_result.returncode != 0:
-                    gpu_error = cls._format_media_failure(gpu_result)
+            except Exception:
+                await _cleanup_tmp_dest()
+                raise
+            transcode_probe = await asyncio.to_thread(cls._probe_media_sync, tmp_dest)
+            if not cls._is_valid_prepared_library_probe(
+                transcode_probe,
+                reference_probe=source_probe,
+                require_h264_video=True,
+            ):
+                await _cleanup_tmp_dest()
+                raise RuntimeError(
+                    f"Transcoded H.264 MP4 output failed validation: {source_path.name}"
+                )
+            await asyncio.to_thread(tmp_dest.replace, preferred_dest)
 
-            if gpu_error is not None:
-                if tmp_dest.exists():
-                    with suppress(OSError):
-                        await asyncio.to_thread(tmp_dest.unlink)
-                try:
-                    cpu_result = await run_command(
-                        rewrite_media_command(
-                            cls._build_cpu_prores_cmd(source_path, tmp_dest)
-                        ),
-                        timeout_seconds=cls.PRORES_TRANSCODE_TIMEOUT_SECONDS,
-                    )
-                except (CommandTimeoutError, FileNotFoundError) as exc:
-                    logger.error(
-                        "ProRes transcode failed for %s (GPU: %s; CPU: %s)",
-                        source_path.name,
-                        gpu_error,
-                        cls._format_media_failure(exc),
-                    )
-                    # Fall back to plain copy so indexing can still proceed.
-                    fallback_dest = dest_dir / source_path.name
-                    if fallback_dest != source_path or not fallback_dest.exists():
-                        await asyncio.to_thread(shutil.copy2, source_path, fallback_dest)
-                    actual_dest = fallback_dest
-                    action = f"Copying (ProRes failed)"
-                    cpu_result = None
-                else:
-                    if cpu_result.returncode != 0:
-                        logger.error(
-                            "ProRes transcode failed for %s (GPU: %s; CPU: %s)",
-                            source_path.name,
-                            gpu_error,
-                            cls._format_media_failure(cpu_result),
-                        )
-                        fallback_dest = dest_dir / source_path.name
-                        if fallback_dest != source_path or not fallback_dest.exists():
-                            await asyncio.to_thread(shutil.copy2, source_path, fallback_dest)
-                        actual_dest = fallback_dest
-                        action = f"Copying (ProRes failed)"
-                        cpu_result = None
-
-            # Validate & commit transcoded file.
-            if actual_dest == preferred_dest and tmp_dest.exists():
-                transcode_probe = await asyncio.to_thread(cls._probe_media_sync, tmp_dest)
-                if (
-                    transcode_probe is not None
-                    and transcode_probe.duration is not None
-                    and transcode_probe.duration > 0
-                ):
-                    await asyncio.to_thread(tmp_dest.replace, preferred_dest)
-                else:
-                    logger.warning(
-                        "ProRes transcode output failed validation for %s",
-                        source_path.name,
-                    )
-                    with suppress(OSError):
-                        await asyncio.to_thread(tmp_dest.unlink)
-                    fallback_dest = dest_dir / source_path.name
-                    if fallback_dest != source_path or not fallback_dest.exists():
-                        await asyncio.to_thread(shutil.copy2, source_path, fallback_dest)
-                    actual_dest = fallback_dest
-                    action = f"Copying (ProRes failed)"
-
-        elif is_mkv:
-            # --- Remux MKV → MP4 (stream copy) for Premiere-native codecs ---
-            tmp_dest = preferred_dest.with_name(f"{preferred_dest.stem}.import.tmp.mp4")
+        if needs_direct_h264_transcode:
             if tmp_dest.exists():
-                with suppress(OSError):
-                    await asyncio.to_thread(tmp_dest.unlink)
+                await _cleanup_tmp_dest()
+            await _commit_transcoded_tmp_dest()
+        elif not is_mp4:
+            # --- Remux native video to MP4, then fall back to full H.264 MP4 transcode ---
+            if tmp_dest.exists():
+                await _cleanup_tmp_dest()
+            remux_error: str | None = None
             try:
+                remux_cmd = (
+                    cls._build_library_import_audio_normalize_cmd(
+                        source_path,
+                        tmp_dest,
+                        probe=source_probe,
+                    )
+                    if needs_audio_normalize
+                    else cls._build_library_import_remux_cmd(
+                        source_path,
+                        tmp_dest,
+                        probe=source_probe,
+                    )
+                )
                 remux_result = await run_command(
-                    cls._build_library_import_remux_cmd(source_path, tmp_dest),
+                    remux_cmd,
                     timeout_seconds=cls.REMUX_TIMEOUT_SECONDS,
                 )
-            except CommandTimeoutError:
-                import sys
-
-                print(
-                    f"[WARNING] ffmpeg remux timed out for {source_path.name}, falling back to copy",
-                    file=sys.stderr,
-                )
-                fallback_dest = dest_dir / source_path.name
-                if fallback_dest != source_path or not fallback_dest.exists():
-                    await asyncio.to_thread(shutil.copy2, source_path, fallback_dest)
-                if preferred_dest.exists():
-                    with suppress(OSError):
-                        await asyncio.to_thread(preferred_dest.unlink)
-                actual_dest = fallback_dest
             except FileNotFoundError as exc:
                 if is_media_binary_override_error(exc):
                     raise
-                import sys
-
-                print("[WARNING] ffmpeg not found, falling back to copy", file=sys.stderr)
-                fallback_dest = dest_dir / source_path.name
-                if fallback_dest != source_path or not fallback_dest.exists():
-                    await asyncio.to_thread(shutil.copy2, source_path, fallback_dest)
-                if preferred_dest.exists():
-                    with suppress(OSError):
-                        await asyncio.to_thread(preferred_dest.unlink)
-                actual_dest = fallback_dest
+                remux_error = cls._format_media_failure(exc)
+            except CommandTimeoutError as exc:
+                remux_error = cls._format_media_failure(exc)
             else:
-                remux_valid = False
+                remux_probe = None
                 if remux_result.returncode == 0:
                     remux_probe = await asyncio.to_thread(cls._probe_media_sync, tmp_dest)
-                    remux_valid = (
-                        remux_probe is not None
-                        and remux_probe.duration is not None
-                        and (
-                            source_probe is None
-                            or (
-                                remux_probe.has_audio == source_probe.has_audio
-                                and (
-                                    not source_probe.has_audio
-                                    or len(remux_probe.audio_streams) == len(source_probe.audio_streams)
-                                )
-                            )
-                        )
-                    )
-                if not remux_valid:
-                    if tmp_dest.exists():
-                        with suppress(OSError):
-                            await asyncio.to_thread(tmp_dest.unlink)
-                    import sys
-
-                    if remux_result.returncode != 0:
-                        print(
-                            f"[WARNING] ffmpeg remux failed for {source_path.name}: "
-                            f"{remux_result.stderr.decode()[:200]}",
-                            file=sys.stderr,
-                        )
-                    else:
-                        print(
-                            f"[WARNING] ffmpeg remux output failed validation for {source_path.name}",
-                            file=sys.stderr,
-                        )
-                    fallback_dest = dest_dir / source_path.name
-                    if fallback_dest != source_path or not fallback_dest.exists():
-                        await asyncio.to_thread(shutil.copy2, source_path, fallback_dest)
-                    if preferred_dest.exists():
-                        with suppress(OSError):
-                            await asyncio.to_thread(preferred_dest.unlink)
-                    actual_dest = fallback_dest
-                else:
+                if cls._is_valid_prepared_library_probe(remux_probe, reference_probe=source_probe):
                     await asyncio.to_thread(tmp_dest.replace, preferred_dest)
+                else:
+                    remux_error = cls._format_media_failure(remux_result)
+                    if remux_result.returncode == 0:
+                        remux_error = f"Prepared MP4 output failed validation for {source_path.name}"
+
+            if remux_error is not None:
+                await _cleanup_tmp_dest()
+                action = transcode_action
+                try:
+                    await _commit_transcoded_tmp_dest()
+                except RuntimeError as exc:
+                    raise RuntimeError(
+                        f"Failed to prepare source as MP4 (remux: {remux_error}; {exc})"
+                    ) from exc
         elif preferred_dest != source_path:
-            await asyncio.to_thread(shutil.copy2, source_path, preferred_dest)
+            if needs_audio_normalize:
+                if tmp_dest.exists():
+                    await _cleanup_tmp_dest()
+                normalize_error: str | None = None
+                try:
+                    normalize_result = await run_command(
+                        cls._build_library_import_audio_normalize_cmd(
+                            source_path,
+                            tmp_dest,
+                            probe=source_probe,
+                        ),
+                        timeout_seconds=cls.REMUX_TIMEOUT_SECONDS,
+                    )
+                except FileNotFoundError as exc:
+                    if is_media_binary_override_error(exc):
+                        raise
+                    normalize_error = cls._format_media_failure(exc)
+                except CommandTimeoutError as exc:
+                    normalize_error = cls._format_media_failure(exc)
+                else:
+                    if normalize_result.returncode != 0:
+                        normalize_error = cls._format_media_failure(normalize_result)
+                    else:
+                        norm_probe = await asyncio.to_thread(cls._probe_media_sync, tmp_dest)
+                        if cls._is_valid_prepared_library_probe(
+                            norm_probe, reference_probe=source_probe
+                        ):
+                            await asyncio.to_thread(tmp_dest.replace, preferred_dest)
+                        else:
+                            normalize_error = (
+                                f"Audio-normalized output failed validation: {source_path.name}"
+                            )
+
+                if normalize_error is not None:
+                    await _cleanup_tmp_dest()
+                    raise RuntimeError(
+                        f"Failed to normalize audio for {source_path.name}: {normalize_error}"
+                    )
+            else:
+                await asyncio.to_thread(shutil.copy2, source_path, preferred_dest)
 
         # Extract subtitles to sidecar.  Always attempt extraction regardless
         # of transform type — remux/transcode strip subtitle streams and even
@@ -3033,7 +3652,12 @@ class AnimeLibraryService:
                 await asyncio.to_thread(source_path.unlink)
 
         if actual_dest.exists():
-            await asyncio.to_thread(cls._record_source_import_manifest_sync, source_path, actual_dest)
+            await asyncio.to_thread(
+                cls._record_source_import_manifest_sync,
+                source_path,
+                actual_dest,
+                source_probe=source_probe,
+            )
 
         return actual_dest, action, True
 
@@ -3047,7 +3671,7 @@ class AnimeLibraryService:
             if file_stat.st_size == 0:
                 return f"Prepared file is empty: {dest_file.name}"
             prepared_probe = await asyncio.to_thread(cls._probe_media_sync, dest_file)
-            if prepared_probe is None or prepared_probe.duration is None:
+            if not cls._is_valid_prepared_library_probe(prepared_probe):
                 return f"Prepared file is unreadable: {dest_file.name}"
         return None
 
@@ -3066,6 +3690,22 @@ class AnimeLibraryService:
             return Path(handle.name)
 
     @classmethod
+    def _anime_searcher_subprocess_env(cls, cmd: list[str]) -> dict[str, str]:
+        env = get_media_subprocess_env(cmd)
+        merged_env = dict(os.environ) if env is None else dict(env)
+        allocator_conf = str(merged_env.get("PYTORCH_CUDA_ALLOC_CONF") or "").strip()
+        allocator_hint = "expandable_segments:True"
+        allocator_parts = [
+            part.strip()
+            for part in allocator_conf.split(",")
+            if part.strip()
+        ]
+        if allocator_hint not in allocator_parts:
+            allocator_parts.append(allocator_hint)
+        merged_env["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(allocator_parts)
+        return merged_env
+
+    @classmethod
     async def _stream_searcher_command(
         cls,
         *,
@@ -3081,13 +3721,33 @@ class AnimeLibraryService:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(cwd),
-            env=get_media_subprocess_env(cmd),
+            env=cls._anime_searcher_subprocess_env(cmd),
+            start_new_session=True,
         )
 
-        stdout_lines: list[str] = []
-        stderr_task = asyncio.create_task(
-            process.stderr.read() if process.stderr is not None else asyncio.sleep(0, result=b"")
-        )
+        stdout_tail: deque[str] = deque(maxlen=5)
+        stdout_line_count = 0
+        stderr_chunks: deque[str] = deque()
+        stderr_bytes = 0
+        stderr_limit = 8192
+
+        async def _drain_stderr() -> str:
+            nonlocal stderr_bytes
+            if process.stderr is None:
+                return ""
+            while True:
+                chunk = await process.stderr.read(4096)
+                if not chunk:
+                    break
+                decoded = chunk.decode("utf-8", errors="replace")
+                stderr_chunks.append(decoded)
+                stderr_bytes += len(decoded.encode("utf-8", errors="replace"))
+                while stderr_chunks and stderr_bytes > stderr_limit:
+                    dropped = stderr_chunks.popleft()
+                    stderr_bytes -= len(dropped.encode("utf-8", errors="replace"))
+            return "".join(stderr_chunks).strip()
+
+        stderr_task = asyncio.create_task(_drain_stderr())
         loop = asyncio.get_running_loop()
         deadline = loop.time() + cls.INDEX_TIMEOUT_SECONDS
         aborted = False
@@ -3104,21 +3764,22 @@ class AnimeLibraryService:
                 if not line:
                     break
                 decoded = line.decode()
-                stdout_lines.append(decoded)
+                stdout_line_count += 1
+                stdout_tail.append(decoded)
                 progress = cls._parse_searcher_progress_line(
                     line=decoded,
                     status=status,
                     total_files=total_files,
                     progress_start=progress_start,
                     progress_span=progress_span,
-                    text_line_index=len(stdout_lines),
+                    text_line_index=stdout_line_count,
                 )
                 if progress is None:
                     continue
                 if progress.status == "error":
                     saw_explicit_error = True
                     aborted = True
-                    await terminate_process(process)
+                    await terminate_process(process, kill_group=True)
                     yield progress
                     return
                 yield progress
@@ -3129,11 +3790,11 @@ class AnimeLibraryService:
             await asyncio.wait_for(process.wait(), timeout=remaining)
         except asyncio.CancelledError:
             aborted = True
-            await terminate_process(process)
+            await terminate_process(process, kill_group=True)
             raise
         except asyncio.TimeoutError:
             aborted = True
-            await terminate_process(process)
+            await terminate_process(process, kill_group=True)
             yield IndexProgress(
                 status="error",
                 error=(
@@ -3143,16 +3804,13 @@ class AnimeLibraryService:
             )
             return
         finally:
-            if aborted and not stderr_task.done():
-                stderr_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await stderr_task
+            if aborted and process.returncode is None:
+                await terminate_process(process, kill_group=True)
 
         stderr = await stderr_task
         if process.returncode != 0 and not saw_explicit_error:
-            stdout_tail = "".join(stdout_lines[-5:]).strip()
-            stderr_text = stderr.decode().strip()
-            detail = stderr_text or stdout_tail or "unknown error"
+            stdout_text = "".join(stdout_tail).strip()
+            detail = stderr or stdout_text or "unknown error"
             yield IndexProgress(
                 status="error",
                 error=f"anime_searcher command failed: {detail}",
@@ -3239,15 +3897,25 @@ class AnimeLibraryService:
             )
             return
 
-        def _collect_video_files() -> list[Path]:
-            return [
-                f for f in source_folder.iterdir()
-                if f.is_file() and f.suffix.lower() in cls.VIDEO_EXTENSIONS
-            ]
-
-        video_files = await asyncio.to_thread(_collect_video_files)
+        source_scan = await asyncio.to_thread(cls.scan_direct_video_files_sync, source_folder)
+        video_files = list(source_scan.readable_files)
+        skipped_warnings = [
+            cls._invalid_source_warning(path)
+            for path in source_scan.invalid_files
+        ]
 
         if not video_files:
+            if source_scan.invalid_files:
+                yield IndexProgress(
+                    status="error",
+                    error=(
+                        f"No readable video files found in {source_folder}. "
+                        f"{cls._invalid_source_error_detail(source_scan.invalid_files)}"
+                    ),
+                    anime_name=anime_name,
+                    warnings=skipped_warnings or None,
+                )
+                return
             yield IndexProgress(
                 status="error",
                 error=f"No video files found in {source_folder}",
@@ -3257,6 +3925,20 @@ class AnimeLibraryService:
 
         total_files = len(video_files)
         prepared_files: list[Path] = []
+
+        if skipped_warnings:
+            skipped_count = len(skipped_warnings)
+            yield IndexProgress(
+                status="copying",
+                message=(
+                    f"Skipping {skipped_count} unreadable source file"
+                    f"{'s' if skipped_count != 1 else ''} before import"
+                ),
+                progress=0.0,
+                total_files=total_files,
+                anime_name=anime_name,
+                warnings=skipped_warnings,
+            )
 
         if dest_path != source_folder:
             yield IndexProgress(
@@ -3337,6 +4019,9 @@ class AnimeLibraryService:
             progress=0.35,
             total_files=total_files,
             anime_name=anime_name,
+            requested_batch_size=batch_size,
+            effective_batch_size=batch_size,
+            effective_decode_backend=decode_backend,
         )
 
         cmd = [
@@ -3356,20 +4041,29 @@ class AnimeLibraryService:
         if require_gpu:
             cmd.append("--require-gpu")
 
-        async for progress in cls._stream_searcher_command(
+        searcher_metadata = SearcherExecutionMetadata(
+            requested_batch_size=batch_size,
+            effective_batch_size=batch_size,
+            requested_decode_backend=decode_backend,
+        )
+
+        async for progress in cls._stream_searcher_index_command(
             cmd=cmd,
             cwd=searcher_path,
             total_files=total_files,
-            status="indexing",
+            anime_name=anime_name,
+            metadata=searcher_metadata,
             progress_start=0.35,
             progress_span=0.60,
         ):
-            progress.anime_name = anime_name
             yield progress
             if progress.status == "error":
                 return
 
         await cls.ensure_episode_manifest(force_refresh=True, library_type=scoped_type)
+        completion_warnings = list(skipped_warnings)
+        if searcher_metadata.retry_warning and searcher_metadata.retry_warning not in completion_warnings:
+            completion_warnings.append(searcher_metadata.retry_warning)
 
         yield IndexProgress(
             status="complete",
@@ -3379,6 +4073,13 @@ class AnimeLibraryService:
             completed_files=total_files,
             anime_name=anime_name,
             prepared_library_paths=[str(path) for path in prepared_files],
+            warnings=completion_warnings or None,
+            requested_batch_size=batch_size,
+            effective_batch_size=searcher_metadata.effective_batch_size,
+            effective_decode_backend=(
+                searcher_metadata.effective_decode_backend or decode_backend
+            ),
+            retry_reason=searcher_metadata.retry_reason,
         )
 
     @classmethod
@@ -3451,10 +4152,50 @@ class AnimeLibraryService:
                 return
             video_files.append(candidate)
 
+        source_scan = await asyncio.to_thread(cls._scan_source_video_paths_sync, video_files)
+        video_files = list(source_scan.readable_files)
+        skipped_warnings = [
+            cls._invalid_source_warning(path)
+            for path in source_scan.invalid_files
+        ]
+
+        if not video_files:
+            if source_scan.invalid_files:
+                yield IndexProgress(
+                    status="error",
+                    error=(
+                        f"No readable source files provided for incremental update. "
+                        f"{cls._invalid_source_error_detail(source_scan.invalid_files)}"
+                    ),
+                    anime_name=anime_name,
+                    warnings=skipped_warnings or None,
+                )
+                return
+            yield IndexProgress(
+                status="error",
+                error="No source files provided for incremental update.",
+                anime_name=anime_name,
+            )
+            return
+
         total_files = len(video_files)
         dest_dir = library_path / anime_name
         dest_dir.mkdir(parents=True, exist_ok=True)
         prepared_files: list[Path] = []
+
+        if skipped_warnings:
+            skipped_count = len(skipped_warnings)
+            yield IndexProgress(
+                status="copying",
+                message=(
+                    f"Skipping {skipped_count} unreadable source file"
+                    f"{'s' if skipped_count != 1 else ''} before update"
+                ),
+                progress=0.0,
+                total_files=total_files,
+                anime_name=anime_name,
+                warnings=skipped_warnings,
+            )
 
         yield IndexProgress(
             status="copying",
@@ -3516,6 +4257,9 @@ class AnimeLibraryService:
                 progress=0.35,
                 total_files=total_files,
                 anime_name=anime_name,
+                requested_batch_size=batch_size,
+                effective_batch_size=batch_size,
+                effective_decode_backend=decode_backend,
             )
 
             cmd = [
@@ -3535,15 +4279,21 @@ class AnimeLibraryService:
             if require_gpu:
                 cmd.append("--require-gpu")
 
-            async for progress in cls._stream_searcher_command(
+            searcher_metadata = SearcherExecutionMetadata(
+                requested_batch_size=batch_size,
+                effective_batch_size=batch_size,
+                requested_decode_backend=decode_backend,
+            )
+
+            async for progress in cls._stream_searcher_index_command(
                 cmd=cmd,
                 cwd=searcher_path,
                 total_files=total_files,
-                status="indexing",
+                anime_name=anime_name,
+                metadata=searcher_metadata,
                 progress_start=0.35,
                 progress_span=0.60,
             ):
-                progress.anime_name = anime_name
                 yield progress
                 if progress.status == "error":
                     return
@@ -3552,6 +4302,9 @@ class AnimeLibraryService:
                 manifest_path.unlink()
 
         await cls.ensure_episode_manifest(force_refresh=True, library_type=scoped_type)
+        completion_warnings = list(skipped_warnings)
+        if searcher_metadata.retry_warning and searcher_metadata.retry_warning not in completion_warnings:
+            completion_warnings.append(searcher_metadata.retry_warning)
         yield IndexProgress(
             status="complete",
             message=f"Successfully updated {anime_name}",
@@ -3560,6 +4313,13 @@ class AnimeLibraryService:
             completed_files=total_files,
             anime_name=anime_name,
             prepared_library_paths=[str(path) for path in prepared_files],
+            warnings=completion_warnings or None,
+            requested_batch_size=batch_size,
+            effective_batch_size=searcher_metadata.effective_batch_size,
+            effective_decode_backend=(
+                searcher_metadata.effective_decode_backend or decode_backend
+            ),
+            retry_reason=searcher_metadata.retry_reason,
         )
 
     @classmethod
@@ -3797,7 +4557,11 @@ class AnimeLibraryService:
                 video_files_on_disk = [
                     f
                     for f in series_dir.iterdir()
-                    if f.is_file() and f.suffix.lower() in cls.VIDEO_EXTENSIONS
+                    if (
+                        f.is_file()
+                        and f.suffix.lower() in cls.VIDEO_EXTENSIONS
+                        and not cls.is_transient_library_video_path(f)
+                    )
                 ]
             except OSError:
                 pass

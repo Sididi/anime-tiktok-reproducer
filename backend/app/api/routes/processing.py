@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from pydub import AudioSegment
 
 from ...config import settings
+from ...library_types import resolve_static_overlay_title
 from ...models import ProjectPhase
 from ...services import (
     ProjectService,
@@ -23,7 +24,7 @@ from ...services import (
     MetadataService,
     ExportService,
     DiscordService,
-    GeminiService,
+    LLMService,
     ElevenLabsService,
     VoiceConfigService,
     ScriptAutomationService,
@@ -106,6 +107,10 @@ def _normalize_script_payload_or_400(
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+def _resolve_project_tts_model_id(project) -> str:
+    return ScriptAutomationService.resolve_tts_model_id(voice_key=project.voice_key)
 
 
 def _notify_drive_upload_complete(project_id: str, _folder_url: str) -> None:
@@ -209,6 +214,43 @@ def _normalize_audio_file_to_wav(input_path: Path, output_path: Path) -> None:
     audio.export(str(output_path), format="wav")
 
 
+def _concat_audio_parts_to_wav(part_paths: list[Path], output_path: Path) -> None:
+    combined = AudioSegment.empty()
+    for part_path in part_paths:
+        combined += AudioSegment.from_file(str(part_path))
+    combined.export(str(output_path), format="wav")
+
+
+def _build_preview_audio_sync(
+    *,
+    source_audio: Path,
+    preview_path: Path,
+    music_key: str | None,
+) -> float:
+    tts_audio = AudioSegment.from_file(str(source_audio))
+
+    if music_key:
+        try:
+            music = MusicConfigService.get_music(music_key)
+        except ValueError:
+            music = None
+        if music is not None:
+            music_file = Path(music.file_path)
+            if music_file.exists():
+                music_audio = AudioSegment.from_file(str(music_file))
+                tts_len = len(tts_audio)
+                if len(music_audio) < tts_len:
+                    repeats = (tts_len // len(music_audio)) + 1
+                    music_audio = music_audio * repeats
+                music_audio = music_audio[:tts_len]
+                music_audio = music_audio + music.volume_db
+                music_audio = music_audio.fade_out(2000)
+                tts_audio = tts_audio.overlay(music_audio)
+
+    tts_audio.export(str(preview_path), format="wav")
+    return len(tts_audio) / 1000.0
+
+
 @router.get("/script/automation/config")
 async def get_script_automation_config(project_id: str):
     """Return automation config and integration readiness for /script page."""
@@ -251,16 +293,26 @@ async def get_script_automation_config(project_id: str):
     except Exception as exc:
         music_error = str(exc)
 
+    static_overlay_title = (
+        resolve_static_overlay_title(project.library_type)
+        if settings.static_overlay_title_enabled
+        else None
+    )
+
     return {
         "enabled": settings.script_automate_enabled,
         "script_title_selection_enabled": settings.script_title_selection_enabled,
-        "gemini": {
-            "configured": GeminiService.is_configured(),
-            "model": settings.gemini_model,
+        "static_overlay_title_enabled": settings.static_overlay_title_enabled,
+        "static_overlay_title": static_overlay_title,
+        "llm": {
+            "provider": LLMService.provider_name(),
+            "configured": LLMService.is_configured(),
+            "model": LLMService.active_model(),
         },
-        "gemini_light": {
-            "configured": GeminiService.is_configured(),
-            "model": settings.gemini_light_model,
+        "llm_light": {
+            "provider": LLMService.provider_name(),
+            "configured": LLMService.is_configured(),
+            "model": LLMService.active_light_model(),
         },
         "elevenlabs": {
             "configured": ElevenLabsService.is_configured(),
@@ -388,10 +440,12 @@ async def prepare_script_tts(project_id: str, request: ScriptTtsPrepareRequest):
     )
 
     try:
+        effective_model_id = _resolve_project_tts_model_id(project)
         prepared_payload = await asyncio.to_thread(
             ScriptAutomationService.prepare_tts_payload,
             script_payload=normalized.public_payload,
             target_language=request.target_language,
+            model_id=effective_model_id,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -450,10 +504,12 @@ async def upload_restructured_script(
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
     normalized_script = _normalize_script_payload_or_400(project_id, script_data)
+    effective_model_id = _resolve_project_tts_model_id(project)
     try:
         prepared_tts = ScriptAutomationService.prepare_tts_payload(
             script_payload=normalized_script.public_payload,
             target_language=normalized_script.language,
+            model_id=effective_model_id,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -487,6 +543,7 @@ async def upload_restructured_script(
             project_id,
             script_payload=normalized_script.public_payload,
             mode="single_audio",
+            model_id=effective_model_id,
         )
     else:
         expected_segment_count = len(prepared_tts.get("segments") or [])
@@ -550,6 +607,7 @@ async def upload_restructured_script(
             project_id,
             script_payload=normalized_script.public_payload,
             mode="audio_parts",
+            model_id=effective_model_id,
             stored_part_paths=[
                 str(path.relative_to(project_dir))
                 for path in stored_part_paths
@@ -673,8 +731,8 @@ async def generate_overlay(project_id: str, request: OverlayGenerateRequest):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    if not GeminiService.is_configured():
-        raise HTTPException(status_code=503, detail="Gemini API key is missing")
+    if not LLMService.is_configured():
+        raise HTTPException(status_code=503, detail="LLM API key is missing")
 
     normalized = _normalize_script_payload_or_400(
         project_id,
@@ -737,14 +795,8 @@ async def stage_preview_audio(
                 await _write_upload_to_path(part, part_path)
                 part_paths.append(part_path)
 
-            def _concat():
-                combined = AudioSegment.empty()
-                for p in part_paths:
-                    combined += AudioSegment.from_file(str(p))
-                combined.export(str(staged_path), format="wav")
-
             try:
-                await asyncio.to_thread(_concat)
+                await asyncio.to_thread(_concat_audio_parts_to_wav, part_paths, staged_path)
             except Exception:
                 raise HTTPException(status_code=400, detail="Failed to process audio parts")
 
@@ -789,37 +841,23 @@ async def build_preview(project_id: str, request: PreviewBuildRequest):
         speed_tmp = project_dir / "preview_speed_tmp.wav"
         try:
             await AudioSpeedService.apply_speed(source_audio, speed_tmp, speed)
-            tts_audio = AudioSegment.from_file(str(speed_tmp))
-        finally:
+            preview_source = speed_tmp
+        except Exception as exc:
             speed_tmp.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail=f"Failed to apply TTS speed: {exc}")
     else:
-        tts_audio = AudioSegment.from_file(str(source_audio))
+        preview_source = source_audio
 
-    # Step 2: Mix music if requested
-    if request.music_key:
-        try:
-            music = MusicConfigService.get_music(request.music_key)
-            music_file = Path(music.file_path)
-            if music_file.exists():
-                music_audio = AudioSegment.from_file(str(music_file))
-                tts_len = len(tts_audio)
-                # Loop music to match TTS length
-                if len(music_audio) < tts_len:
-                    repeats = (tts_len // len(music_audio)) + 1
-                    music_audio = music_audio * repeats
-                music_audio = music_audio[:tts_len]
-                # Apply volume and fade
-                music_audio = music_audio + music.volume_db
-                music_audio = music_audio.fade_out(2000)
-                tts_audio = tts_audio.overlay(music_audio)
-        except ValueError:
-            pass  # Unknown music key, skip
-
-    def _export():
-        tts_audio.export(str(preview_path), format="wav")
-
-    await asyncio.to_thread(_export)
-    duration = len(tts_audio) / 1000.0
+    try:
+        duration = await asyncio.to_thread(
+            _build_preview_audio_sync,
+            source_audio=preview_source,
+            preview_path=preview_path,
+            music_key=request.music_key,
+        )
+    finally:
+        if speed != 1.0:
+            speed_tmp.unlink(missing_ok=True)
 
     return {
         "preview_url": f"/api/projects/{project_id}/script/preview/audio",

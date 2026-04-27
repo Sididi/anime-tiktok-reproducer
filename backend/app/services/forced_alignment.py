@@ -82,17 +82,26 @@ class ForcedAlignmentService:
         return json.loads(manifest_path.read_text(encoding="utf-8"))
 
     @classmethod
+    def _resolve_project_tts_model_id(cls, project_id: str) -> str:
+        project = ProjectService.load(project_id)
+        voice_key = project.voice_key if project is not None else None
+        return ScriptAutomationService.resolve_tts_model_id(voice_key=voice_key)
+
+    @classmethod
     def save_upload_manifest(
         cls,
         project_id: str,
         *,
         script_payload: dict[str, Any],
         mode: str,
+        model_id: str | None = None,
         stored_part_paths: list[str] | None = None,
     ) -> dict[str, Any]:
+        effective_model_id = model_id or cls._resolve_project_tts_model_id(project_id)
         prepared = ScriptAutomationService.prepare_tts_payload(
             script_payload=script_payload,
             target_language=script_payload.get("language"),
+            model_id=effective_model_id,
         )
         segments = prepared.get("segments") or []
 
@@ -188,10 +197,16 @@ class ForcedAlignmentService:
         )
 
     @classmethod
-    def build_single_audio_manifest(cls, *, script_payload: dict[str, Any]) -> dict[str, Any]:
+    def build_single_audio_manifest(
+        cls,
+        *,
+        script_payload: dict[str, Any],
+        model_id: str | None = None,
+    ) -> dict[str, Any]:
         prepared = ScriptAutomationService.prepare_tts_payload(
             script_payload=script_payload,
             target_language=script_payload.get("language"),
+            model_id=model_id,
         )
         return {
             "version": 1,
@@ -236,9 +251,11 @@ class ForcedAlignmentService:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         try:
+            effective_model_id = cls._resolve_project_tts_model_id(project_id)
             manifest = cls._validate_manifest_against_script(
                 manifest=prepared_audio.manifest,
                 script_payload=script_payload,
+                model_id=effective_model_id,
             )
             align_language = cls._resolve_alignment_language(manifest.get("language"))
             if prepared_audio.mode == "audio_parts":
@@ -292,6 +309,9 @@ class ForcedAlignmentService:
         previous_end = -1.0
 
         for scene in transcription.scenes:
+            if scene.is_raw:
+                continue
+
             if scene.text.strip() and not scene.words:
                 issues.append(f"Scene {scene.scene_index} has text but no aligned words")
                 continue
@@ -329,8 +349,12 @@ class ForcedAlignmentService:
         *,
         manifest: dict[str, Any],
         script_payload: dict[str, Any],
+        model_id: str | None = None,
     ) -> dict[str, Any]:
-        expected = cls.build_single_audio_manifest(script_payload=script_payload)
+        expected = cls.build_single_audio_manifest(
+            script_payload=script_payload,
+            model_id=model_id,
+        )
         expected_segments = expected.get("segments", [])
         actual_segments = manifest.get("segments", [])
         if len(actual_segments) != len(expected_segments):
@@ -767,18 +791,24 @@ class ForcedAlignmentService:
             scene_text = str(scene_data.get("text") or "")
             words = scene_word_map.get(scene_index, [])
             reference_scene = reference_by_index.get(scene_index)
+            is_raw = bool(scene_data.get("is_raw"))
+            if reference_scene is not None:
+                is_raw = is_raw or reference_scene.is_raw
 
             if words:
                 words = sorted(words, key=lambda word: (word.start, word.end))
                 start_time = words[0].start
                 end_time = words[-1].end
-            else:
+            elif is_raw:
                 if reference_scene is not None:
                     start_time = reference_scene.start_time
                     end_time = reference_scene.end_time
                 else:
                     start_time = float(scene_data.get("start_time") or 0.0)
                     end_time = float(scene_data.get("end_time") or 0.0)
+            else:
+                start_time = 0.0
+                end_time = 0.0
                 if scene_text.strip():
                     issues.append(f"Scene {scene_index} has no aligned lexical words")
 
@@ -789,6 +819,7 @@ class ForcedAlignmentService:
                     words=words,
                     start_time=start_time,
                     end_time=end_time,
+                    is_raw=is_raw,
                 )
             )
 
@@ -800,11 +831,11 @@ class ForcedAlignmentService:
 
     @classmethod
     def _enforce_monotonic_words(cls, transcription: Transcription) -> None:
-        """Adjust word timings to be strictly monotonic across scenes with words."""
+        """Adjust word timings to be strictly monotonic across non-raw scenes."""
         min_duration = 0.02
         previous_end = 0.0
         for scene in transcription.scenes:
-            if not scene.words:
+            if scene.is_raw or not scene.words:
                 continue
             for word in scene.words:
                 if word.start < previous_end:

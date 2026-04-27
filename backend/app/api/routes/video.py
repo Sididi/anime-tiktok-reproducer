@@ -1,18 +1,41 @@
 import asyncio
+import json
+import subprocess
 from pathlib import Path
 from urllib.parse import unquote
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 
-from ...config import settings
 from ...services import (
     AnimeLibraryService,
     ProjectService,
-    SourceChunkStreamingService,
 )
+from ...services.browser_media_service import BrowserMediaService
+from ...utils.media_binaries import get_media_subprocess_env, rewrite_media_command
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["video"])
+
+
+def _etag_for_path(path: Path) -> str:
+    stat = path.stat()
+    return f'"{stat.st_mtime_ns:x}-{stat.st_size:x}"'
+
+
+def _project_media_headers(*, path: Path, cache_control: str) -> dict[str, str]:
+    return {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": cache_control,
+        "Cross-Origin-Resource-Policy": "cross-origin",
+        "ETag": _etag_for_path(path),
+    }
+
+
+def _preview_media_headers(path: Path) -> dict[str, str]:
+    return _project_media_headers(
+        path=path,
+        cache_control="public, max-age=3600, stale-while-revalidate=86400",
+    )
 
 
 def _is_under(path: Path, root: Path) -> bool:
@@ -49,11 +72,37 @@ def _search_episode_sync(episode_name: str, source_dirs: list[Path], video_exten
     return None
 
 
+def _normalize_name(value: str) -> str:
+    return "".join(ch for ch in value.lower() if ch.isalnum())
+
+
+def _resolve_anime_source_dir(library_root: Path, anime_name: str) -> Path | None:
+    if not library_root.exists() or not library_root.is_dir():
+        return None
+
+    direct = library_root / anime_name
+    if direct.exists() and direct.is_dir():
+        return direct
+
+    target = _normalize_name(anime_name)
+    for child in library_root.iterdir():
+        if child.is_dir() and _normalize_name(child.name) == target:
+            return child
+
+    return None
+
+
 def _build_source_dirs(project) -> list[Path]:
-    if project.source_paths:
-        return [Path(src) for src in project.source_paths]
+    explicit_paths = [Path(src) for src in project.source_paths if Path(src).exists()]
+    if explicit_paths:
+        return explicit_paths
+
     library_root = AnimeLibraryService.get_library_path(project.library_type)
     if library_root.exists():
+        if project.anime_name:
+            scoped_dir = _resolve_anime_source_dir(library_root, project.anime_name)
+            if scoped_dir is not None:
+                return [scoped_dir]
         return [library_root]
     return []
 
@@ -113,6 +162,50 @@ def _media_type_for_path(path: Path) -> str:
     return media_types.get(suffix, "video/mp4")
 
 
+def _probe_source_metadata_sync(source_path: Path) -> dict[str, object]:
+    """Return `{duration, codec, pix_fmt}` via one ffprobe call."""
+    cmd = rewrite_media_command(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,pix_fmt:format=duration",
+            "-of",
+            "json",
+            str(source_path),
+        ]
+    )
+    duration = 0.0
+    codec = ""
+    pix_fmt = ""
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=get_media_subprocess_env(cmd),
+        )
+        if result.returncode == 0:
+            payload = json.loads(result.stdout)
+            streams = payload.get("streams") or []
+            if streams and isinstance(streams[0], dict):
+                codec = str(streams[0].get("codec_name", "")).strip()
+                pix_fmt = str(streams[0].get("pix_fmt", "")).strip()
+            fmt = payload.get("format") or {}
+            try:
+                duration = float(fmt.get("duration") or 0.0)
+            except (TypeError, ValueError):
+                duration = 0.0
+    except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        pass
+    return {"duration": duration, "codec": codec, "pix_fmt": pix_fmt}
+
+
 @router.get("/video")
 async def get_video(project_id: str) -> FileResponse:
     """Stream the project's video file."""
@@ -130,7 +223,66 @@ async def get_video(project_id: str) -> FileResponse:
     return FileResponse(
         video_path,
         media_type="video/mp4",
-        headers={"Accept-Ranges": "bytes"},
+        headers=_project_media_headers(
+            path=video_path,
+            cache_control="public, max-age=0, must-revalidate",
+        ),
+    )
+
+
+@router.post("/video/preview/warmup")
+async def warm_project_video_preview(project_id: str) -> dict[str, object]:
+    """Trigger project video preview proxy generation."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if not project.video_path:
+        raise HTTPException(status_code=404, detail="Video not yet downloaded")
+
+    video_path = Path(project.video_path)
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Video file not found")
+
+    await BrowserMediaService.trigger_preview_generation(
+        video_path,
+        profile=BrowserMediaService.PROJECT_PROFILE,
+        include_audio=True,
+    )
+    ready_path = await BrowserMediaService.wait_for_preview(
+        video_path,
+        profile=BrowserMediaService.PROJECT_PROFILE,
+        include_audio=True,
+        timeout_seconds=0.15,
+        poll_interval_seconds=0.05,
+    )
+    return {"status": "warming", "ready": ready_path is not None}
+
+
+@router.get("/video/preview")
+async def get_project_video_preview(project_id: str) -> FileResponse:
+    """Serve the browser-oriented project preview video."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if not project.video_path:
+        raise HTTPException(status_code=404, detail="Video not yet downloaded")
+
+    video_path = Path(project.video_path)
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Video file not found")
+
+    preview_path = await BrowserMediaService.resolve_preview_path(
+        video_path,
+        profile=BrowserMediaService.PROJECT_PROFILE,
+        include_audio=True,
+        allow_generate=True,
+    )
+    return FileResponse(
+        preview_path,
+        media_type="video/mp4",
+        headers=_preview_media_headers(preview_path),
     )
 
 
@@ -155,49 +307,95 @@ async def get_source_video_descriptor(
     project_id: str,
     path: str = Query(..., description="Path to the source episode file"),
 ) -> dict[str, object]:
-    """Return source streaming descriptor for manual preview workflows."""
+    """Return basic metadata for a source episode (duration, codec, pix_fmt)."""
     project = ProjectService.load(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
     source_path = await _resolve_source_path(project, path)
-    return await SourceChunkStreamingService.get_descriptor(source_path)
+    return await asyncio.to_thread(_probe_source_metadata_sync, source_path)
 
 
-@router.get("/video/source/chunk")
-async def get_source_video_chunk(
+@router.post("/video/source/preview/warmup")
+async def warm_source_video_preview(
     project_id: str,
     path: str = Query(..., description="Path to the source episode file"),
-    chunk_start: float = Query(..., ge=0.0, description="Chunk start time in seconds"),
-    chunk_duration: float | None = Query(
-        default=None,
-        gt=0.0,
-        description="Optional chunk duration in seconds",
-    ),
-) -> FileResponse:
-    """Serve one browser-safe source chunk for preview streaming."""
+) -> dict[str, object]:
+    """Trigger source preview proxy generation."""
     project = ProjectService.load(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
     source_path = await _resolve_source_path(project, path)
+    await BrowserMediaService.trigger_preview_generation(
+        source_path,
+        profile=BrowserMediaService.SOURCE_PROFILE,
+        include_audio=False,
+    )
+    ready_path = await BrowserMediaService.wait_for_preview(
+        source_path,
+        profile=BrowserMediaService.SOURCE_PROFILE,
+        include_audio=False,
+        timeout_seconds=0.15,
+        poll_interval_seconds=0.05,
+    )
+    return {"status": "warming", "ready": ready_path is not None}
 
-    try:
-        chunk_path = await SourceChunkStreamingService.get_chunk(
-            source_path=source_path,
-            chunk_start=chunk_start,
-            chunk_duration=chunk_duration,
+
+@router.get("/video/source/preview")
+async def get_source_video_preview(
+    project_id: str,
+    path: str = Query(..., description="Path to the source episode file"),
+) -> FileResponse:
+    """Serve the browser-oriented source preview video when ready."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    source_path = await _resolve_source_path(project, path)
+    is_direct_compatible = await asyncio.to_thread(
+        BrowserMediaService.is_browser_preview_compatible_sync,
+        source_path,
+        include_audio=False,
+    )
+    if is_direct_compatible:
+        return FileResponse(
+            source_path,
+            media_type="video/mp4",
+            headers=_preview_media_headers(source_path),
         )
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    preview_path = await BrowserMediaService.resolve_preview_path(
+        source_path,
+        profile=BrowserMediaService.SOURCE_PROFILE,
+        include_audio=False,
+        allow_generate=False,
+    )
+    if preview_path == source_path:
+        await BrowserMediaService.trigger_preview_generation(
+            source_path,
+            profile=BrowserMediaService.SOURCE_PROFILE,
+            include_audio=False,
+        )
+        ready_path = await BrowserMediaService.wait_for_preview(
+            source_path,
+            profile=BrowserMediaService.SOURCE_PROFILE,
+            include_audio=False,
+            timeout_seconds=0.15,
+            poll_interval_seconds=0.05,
+        )
+        if ready_path is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Source preview warming",
+                headers={"Retry-After": "1"},
+            )
+        preview_path = ready_path
 
     return FileResponse(
-        chunk_path,
+        preview_path,
         media_type="video/mp4",
-        headers={
-            "Accept-Ranges": "bytes",
-            "Cache-Control": "public, max-age=86400, immutable",
-        },
+        headers=_preview_media_headers(preview_path),
     )
 
 
@@ -206,29 +404,18 @@ async def get_source_video(
     project_id: str,
     path: str = Query(..., description="Path to the source episode file"),
 ) -> FileResponse:
-    """
-    Stream a source anime episode file when browser-compatible.
-
-    For non-compatible sources, clients must use the descriptor/chunk endpoints.
-    """
+    """Stream a source anime episode directly to the browser."""
     project = ProjectService.load(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
     source_path = await _resolve_source_path(project, path)
 
-    descriptor = await SourceChunkStreamingService.get_descriptor(source_path)
-    if descriptor.get("mode") != "passthrough":
-        raise HTTPException(
-            status_code=415,
-            detail=(
-                "Source video is not browser-compatible. "
-                "Use /video/source/descriptor and /video/source/chunk for chunked streaming."
-            ),
-        )
-
     return FileResponse(
         source_path,
         media_type=_media_type_for_path(source_path),
-        headers={"Accept-Ranges": "bytes"},
+        headers=_project_media_headers(
+            path=source_path,
+            cache_control="public, max-age=0, must-revalidate",
+        ),
     )

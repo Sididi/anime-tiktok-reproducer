@@ -47,19 +47,20 @@ class SceneDetectionProgress:
 class SceneDetectorService:
     """Service for detecting scenes using PySceneDetect."""
 
+    HEARTBEAT_INTERVAL_SECONDS = 3.0
     EXTREME_SHORT_SECONDS_FLOOR = 0.08
     EXTREME_SHORT_MIN_FRAMES = 3
-    HIGH_THRESHOLD_MULTIPLIER = 1.35
-    HIGH_THRESHOLD_DELTA = 6.0
-    HIGH_THRESHOLD_MAX = 60.0
-    BOUNDARY_TOLERANCE_FLOOR = 0.02
+    SSCD_TIE_EPSILON = 1e-3
 
     @classmethod
     async def detect_scenes(
         cls,
         video_path: Path,
-        threshold: float = 18.0,
+        threshold: float = 16.0,
         min_scene_len: int = 10,
+        library_path: Path | None = None,
+        library_type: object = None,
+        anime_name: str | None = None,
     ) -> AsyncIterator[SceneDetectionProgress]:
         """
         Detect scenes in a video and yield progress updates.
@@ -68,19 +69,42 @@ class SceneDetectorService:
             video_path: Path to the video file
             threshold: ContentDetector threshold (lower = more sensitive)
             min_scene_len: Minimum scene length in frames
+            library_path / library_type / anime_name: when provided, the
+                extreme-short-scene sanitizer uses the anime_searcher index
+                (via AnimeMatcherService._init_searcher) to pick the merge
+                direction by SSCD similarity. Without them it falls back to
+                merging with the larger neighbour.
         """
         yield SceneDetectionProgress("starting", 0, "Opening video...")
 
         try:
-            # Run detection in thread pool to avoid blocking
-            loop = asyncio.get_event_loop()
-            scenes = await loop.run_in_executor(
+            loop = asyncio.get_running_loop()
+            detect_future = loop.run_in_executor(
                 None,
                 cls._detect_sync,
                 video_path,
                 threshold,
                 min_scene_len,
+                library_path,
+                library_type,
+                anime_name,
             )
+            heartbeat_count = 0
+            while True:
+                try:
+                    scenes = await asyncio.wait_for(
+                        asyncio.shield(detect_future),
+                        timeout=cls.HEARTBEAT_INTERVAL_SECONDS,
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    heartbeat_count += 1
+                    heartbeat_progress = min(0.9, 0.05 + (heartbeat_count * 0.03))
+                    yield SceneDetectionProgress(
+                        "processing",
+                        heartbeat_progress,
+                        "Analyzing scene boundaries...",
+                    )
 
             yield SceneDetectionProgress(
                 "complete",
@@ -92,11 +116,70 @@ class SceneDetectorService:
         except Exception as e:
             yield SceneDetectionProgress("error", 0, "", error=str(e))
 
+    @classmethod
+    async def detect_project_scenes(
+        cls,
+        project_id: str,
+        threshold: float = 16.0,
+        min_scene_len: int = 10,
+    ) -> AsyncIterator[SceneDetectionProgress]:
+        from pathlib import Path
+
+        from ..models import ProjectPhase, SceneList
+        from .project_service import ProjectService
+
+        project = ProjectService.load(project_id)
+        if project is None:
+            raise RuntimeError("Project not found")
+        if not project.video_path:
+            raise RuntimeError("No video available")
+
+        video_path = Path(project.video_path)
+        if not video_path.exists():
+            raise RuntimeError("Video file not found")
+
+        from .anime_library import AnimeLibraryService
+
+        library_path = AnimeLibraryService.get_library_path(project.library_type)
+        library_type = project.library_type
+        anime_name = project.anime_name
+
+        project.phase = ProjectPhase.SCENE_DETECTION
+        ProjectService.save(project)
+
+        async for progress in cls.detect_scenes(
+            video_path,
+            threshold,
+            min_scene_len,
+            library_path=library_path,
+            library_type=library_type,
+            anime_name=anime_name,
+        ):
+            if progress.status == "complete" and progress.scenes:
+                scene_list = SceneList(scenes=progress.scenes)
+                ProjectService.save_scenes(project_id, scene_list)
+
+                project = ProjectService.load(project_id)
+                if project is None:
+                    raise RuntimeError("Project not found")
+                project.phase = ProjectPhase.SCENE_VALIDATION
+                ProjectService.save(project)
+            elif progress.status == "error":
+                project = ProjectService.load(project_id)
+                if project is not None:
+                    project.phase = ProjectPhase.SETUP
+                    ProjectService.save(project)
+
+            yield progress
+
     @staticmethod
     def _detect_sync(
         video_path: Path,
         threshold: float,
         min_scene_len: int,
+        library_path: Path | None = None,
+        library_type: object = None,
+        anime_name: str | None = None,
     ) -> list[Scene]:
         """Synchronous scene detection."""
         ranges, _, fps = SceneDetectorService._detect_ranges(
@@ -108,9 +191,10 @@ class SceneDetectorService:
         sanitized_ranges = SceneDetectorService._sanitize_extreme_short_ranges(
             video_path=video_path,
             ranges=ranges,
-            threshold=threshold,
-            min_scene_len=min_scene_len,
             fps=fps,
+            library_path=library_path,
+            library_type=library_type,
+            anime_name=anime_name,
         )
 
         return [
@@ -155,35 +239,24 @@ class SceneDetectorService:
             return max(cls.EXTREME_SHORT_SECONDS_FLOOR, cls.EXTREME_SHORT_MIN_FRAMES / fps)
         return cls.EXTREME_SHORT_SECONDS_FLOOR
 
-    @staticmethod
-    def _extract_internal_boundaries(ranges: list[tuple[float, float]]) -> list[float]:
-        if len(ranges) <= 1:
-            return []
-        return [ranges[i][1] for i in range(len(ranges) - 1)]
-
-    @classmethod
-    def _boundary_present(
-        cls,
-        boundary: float,
-        boundaries: list[float],
-        tolerance: float,
-    ) -> bool:
-        for candidate in boundaries:
-            if abs(candidate - boundary) <= tolerance:
-                return True
-        return False
-
     @classmethod
     def _sanitize_extreme_short_ranges(
         cls,
         *,
         video_path: Path,
         ranges: list[tuple[float, float]],
-        threshold: float,
-        min_scene_len: int,
         fps: float | None,
+        library_path: Path | None,
+        library_type: object,
+        anime_name: str | None,
     ) -> list[tuple[float, float]]:
-        """Merge only extremely short outlier scenes with an adjacent scene."""
+        """Merge extremely short outlier scenes with the visually closest neighbour.
+
+        When library context is provided, merge direction is chosen by SSCD
+        cosine similarity (via the anime_searcher QueryProcessor already used
+        by /matches). Otherwise — or on any loading/embedding failure — falls
+        back to merging with the larger neighbour.
+        """
         if len(ranges) <= 1:
             return ranges
 
@@ -192,13 +265,11 @@ class SceneDetectorService:
         if not has_short:
             return ranges
 
-        high_threshold = min(
-            cls.HIGH_THRESHOLD_MAX,
-            max(threshold + cls.HIGH_THRESHOLD_DELTA, threshold * cls.HIGH_THRESHOLD_MULTIPLIER),
+        searcher_ready = cls._ensure_anime_searcher(
+            library_path=library_path,
+            library_type=library_type,
+            anime_name=anime_name,
         )
-        high_ranges, _, _ = cls._detect_ranges(video_path, high_threshold, min_scene_len)
-        high_boundaries = cls._extract_internal_boundaries(high_ranges)
-        boundary_tolerance = max(cls.BOUNDARY_TOLERANCE_FLOOR, short_threshold / 2.0)
 
         merged = list(ranges)
         idx = 0
@@ -210,7 +281,7 @@ class SceneDetectorService:
                 continue
 
             if idx == 0:
-                next_start, next_end = merged[1]
+                _, next_end = merged[1]
                 merged[1] = (start, next_end)
                 merged.pop(0)
                 idx = 0
@@ -223,38 +294,103 @@ class SceneDetectorService:
                 idx = max(0, idx - 1)
                 continue
 
-            left_boundary = start
-            right_boundary = end
+            prev_start, prev_end = merged[idx - 1]
+            next_start, next_end = merged[idx + 1]
 
-            left_present = cls._boundary_present(
-                left_boundary,
-                high_boundaries,
-                boundary_tolerance,
+            merge_with_previous = cls._pick_merge_direction(
+                video_path=video_path,
+                short_range=(start, end),
+                prev_range=(prev_start, prev_end),
+                next_range=(next_start, next_end),
+                searcher_ready=searcher_ready,
             )
-            right_present = cls._boundary_present(
-                right_boundary,
-                high_boundaries,
-                boundary_tolerance,
-            )
-
-            merge_with_previous: bool
-            if left_present and not right_present:
-                merge_with_previous = False
-            elif right_present and not left_present:
-                merge_with_previous = True
-            else:
-                prev_duration = merged[idx - 1][1] - merged[idx - 1][0]
-                next_duration = merged[idx + 1][1] - merged[idx + 1][0]
-                merge_with_previous = prev_duration >= next_duration
 
             if merge_with_previous:
-                prev_start, _ = merged[idx - 1]
                 merged[idx - 1] = (prev_start, end)
                 merged.pop(idx)
                 idx = max(0, idx - 1)
             else:
-                _, next_end = merged[idx + 1]
                 merged[idx] = (start, next_end)
                 merged.pop(idx + 1)
 
         return merged
+
+    @staticmethod
+    def _ensure_anime_searcher(
+        *,
+        library_path: Path | None,
+        library_type: object,
+        anime_name: str | None,
+    ) -> bool:
+        """Load the anime_searcher singletons using the same path /matches uses.
+
+        Returns True if the QueryProcessor is ready for embedding.
+        """
+        if library_path is None or library_type is None:
+            return False
+        try:
+            from .anime_matcher import AnimeMatcherService
+
+            return AnimeMatcherService._init_searcher(
+                library_path,
+                library_type,
+                anime_name,
+            )
+        except Exception:
+            return False
+
+    @classmethod
+    def _pick_merge_direction(
+        cls,
+        *,
+        video_path: Path,
+        short_range: tuple[float, float],
+        prev_range: tuple[float, float],
+        next_range: tuple[float, float],
+        searcher_ready: bool,
+    ) -> bool:
+        """Return True if the short scene should merge with its previous neighbour.
+
+        When the anime_searcher singletons are loaded, picks direction by SSCD
+        cosine similarity via the QueryProcessor's embedder (same path as
+        /matches — see `_search_image_batch`). Falls back to the
+        larger-neighbour rule on tie or any failure.
+        """
+        prev_duration = prev_range[1] - prev_range[0]
+        next_duration = next_range[1] - next_range[0]
+        duration_fallback = prev_duration >= next_duration
+
+        if not searcher_ready:
+            return duration_fallback
+
+        def midpoint(r: tuple[float, float]) -> float:
+            return (r[0] + r[1]) / 2.0
+
+        try:
+            from .anime_matcher import AnimeMatcherService
+
+            processor = AnimeMatcherService._query_processor
+            if processor is None:
+                return duration_fallback
+
+            frames = AnimeMatcherService.extract_frames(
+                video_path,
+                [midpoint(prev_range), midpoint(short_range), midpoint(next_range)],
+            )
+            if any(f is None for f in frames):
+                return duration_fallback
+
+            prepared = [img.convert("RGB") for img in frames]
+            embeddings = processor.embedder.embed_batch(prepared)
+            if embeddings.shape[0] < 3:
+                return duration_fallback
+
+            prev_emb, short_emb, next_emb = embeddings[0], embeddings[1], embeddings[2]
+            sim_prev = float(short_emb @ prev_emb)
+            sim_next = float(short_emb @ next_emb)
+
+            if abs(sim_prev - sim_next) < cls.SSCD_TIE_EPSILON:
+                return duration_fallback
+            return sim_prev > sim_next
+        except Exception:
+            return duration_fallback

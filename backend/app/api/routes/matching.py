@@ -1,10 +1,13 @@
 import asyncio
+import logging
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 import json
 from pathlib import Path
 import re
+
+logger = logging.getLogger("uvicorn.error")
 
 from ...config import settings
 from ...models import ProjectPhase, MatchList, SceneMatch, Scene, SceneList
@@ -18,6 +21,80 @@ from ...services import (
 from ...services.match_playback_service import MatchPlaybackService
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["matching"])
+
+KNOWN_MEDIA_EXTENSIONS = (
+    ".mkv",
+    ".mp4",
+    ".mov",
+    ".avi",
+    ".webm",
+    ".m4v",
+    ".wav",
+    ".mp3",
+    ".m4a",
+    ".aac",
+    ".flac",
+    ".ogg",
+    ".aiff",
+    ".aif",
+)
+
+
+def _etag_for_path(path: Path) -> str:
+    stat = path.stat()
+    return f'"{stat.st_mtime_ns:x}-{stat.st_size:x}"'
+
+
+def _media_headers(path: Path, *, cache_control: str) -> dict[str, str]:
+    return {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": cache_control,
+        "Cross-Origin-Resource-Policy": "cross-origin",
+        "ETag": _etag_for_path(path),
+    }
+
+
+def _strip_known_media_extension(name: str) -> str:
+    """Strip only supported media extensions from a filename-like value."""
+    clean_name = str(name or "").strip()
+    lower_name = clean_name.lower()
+    for ext in KNOWN_MEDIA_EXTENSIONS:
+        if lower_name.endswith(ext):
+            return clean_name[:-len(ext)]
+    return clean_name
+
+
+def _canonical_episode_ref(episode: str, *, library_type: str | None = None) -> str:
+    """Persist manual episode refs as canonical bundle-safe clip identifiers."""
+    clean_episode = str(episode or "").strip()
+    if not clean_episode:
+        return clean_episode
+
+    resolved = AnimeLibraryService.resolve_episode_path(
+        clean_episode,
+        library_type=library_type,
+    )
+    if resolved is not None and resolved.exists():
+        return _strip_known_media_extension(resolved.name)
+
+    candidate = Path(clean_episode)
+    if candidate.is_absolute() or candidate.suffix or "/" in clean_episode or "\\" in clean_episode:
+        return _strip_known_media_extension(candidate.name or clean_episode)
+
+    return _strip_known_media_extension(clean_episode)
+
+
+def _serialize_scenes(scenes: SceneList) -> list[dict[str, float | int]]:
+    """Serialize scenes with derived duration for frontend consumers."""
+    return [
+        {
+            "index": scene.index,
+            "start_time": scene.start_time,
+            "end_time": scene.end_time,
+            "duration": scene.duration,
+        }
+        for scene in scenes.scenes
+    ]
 
 
 @router.get("/matches/config")
@@ -68,6 +145,38 @@ def _resolve_anime_source_dir(library_root: Path, anime_name: str) -> Path | Non
     return None
 
 
+def _build_episode_source_dirs(project) -> list[Path]:
+    """
+    Build candidate source directories for manual episode selection.
+
+    Prefer explicit project source paths when they still exist. Otherwise fall
+    back to the resolved anime folder, then to the library root so manual match
+    tooling never ends up with an empty episode list just because folder
+    resolution missed.
+    """
+    source_dirs: list[Path] = []
+    explicit_paths = [Path(src) for src in project.source_paths if Path(src).exists()]
+    if explicit_paths:
+        return explicit_paths
+
+    library_root = AnimeLibraryService.get_library_path(project.library_type)
+    if not library_root.exists():
+        return []
+
+    if project.anime_name:
+        scoped_dir = _resolve_anime_source_dir(
+            library_root,
+            project.anime_name,
+        )
+        if scoped_dir is not None:
+            source_dirs.append(scoped_dir)
+
+    if not source_dirs:
+        source_dirs.append(library_root)
+
+    return source_dirs
+
+
 @router.post("/sources")
 async def set_sources(project_id: str, request: SetSourcesRequest):
     """Set source episode paths for the project."""
@@ -103,24 +212,11 @@ async def list_episodes(project_id: str):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm", ".mov"}
+    VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".m4v"}
     episodes: list[str] = []
 
-    # Use project source_paths if configured. Otherwise, scope to project anime in
-    # the library so manual editors only offer episodes for this anime.
-    source_dirs: list[Path] = []
     library_root = AnimeLibraryService.get_library_path(project.library_type)
-    if project.source_paths:
-        source_dirs = [Path(src) for src in project.source_paths]
-    elif library_root.exists():
-        if project.anime_name:
-            scoped_dir = _resolve_anime_source_dir(
-                library_root,
-                project.anime_name,
-            )
-            source_dirs = [scoped_dir] if scoped_dir else []
-        else:
-            source_dirs = [library_root]
+    source_dirs = _build_episode_source_dirs(project)
 
     def _is_under(path: Path, root: Path) -> bool:
         try:
@@ -155,6 +251,7 @@ async def list_episodes(project_id: str):
     )
 
     for src_path in source_dirs:
+        manifest_hits_before = len(episodes)
         if (
             manifest is not None
             and library_root is not None
@@ -168,7 +265,12 @@ async def list_episodes(project_id: str):
                     episodes.append(episode)
                 elif src_resolved.is_file() and episode_path.resolve() == src_resolved:
                     episodes.append(episode)
-        else:
+
+        # The cached manifest can lag behind the actual library contents for a
+        # scoped series folder. When it yields nothing for that source, fall
+        # back to a direct filesystem scan so manual match selection still has
+        # episodes to offer.
+        if len(episodes) == manifest_hits_before:
             episodes.extend(await asyncio.to_thread(_scan_source_dir_sync, src_path))
 
     # Remove duplicates and sort
@@ -212,6 +314,18 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
     if not video_path or not video_path.exists():
         raise HTTPException(status_code=400, detail="Video not found")
 
+    # Pre-match: absorb tiny scenes that produce poor matches
+    TINY_SCENE_THRESHOLD = 0.35
+    merged_scenes, tiny_merge_log = scenes.merge_tiny_scenes(TINY_SCENE_THRESHOLD)
+    if tiny_merge_log:
+        logger.info(
+            "Pre-match tiny scene merge: absorbed %d scene(s) below %.2fs",
+            len(tiny_merge_log),
+            TINY_SCENE_THRESHOLD,
+        )
+        scenes = merged_scenes
+        ProjectService.save_scenes(project_id, scenes)
+
     # Update phase
     project.phase = ProjectPhase.MATCHING
     ProjectService.save(project)
@@ -221,6 +335,16 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
     merge_continuous = request.merge_continuous
 
     async def stream_progress():
+        if tiny_merge_log:
+            yield "data: " + json.dumps({
+                "status": "matching",
+                "progress": 0.0,
+                "message": f"Merged {len(tiny_merge_log)} tiny scene(s) (< {TINY_SCENE_THRESHOLD}s)",
+                "current_scene": 0,
+                "total_scenes": len(scenes.scenes),
+                "error": None,
+            }) + "\n\n"
+
         # === PASS 1: Match all scenes ===
         first_pass_label = "Pass 1: " if merge_continuous else ""
         first_pass_matches: MatchList | None = None
@@ -283,8 +407,17 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
                 + "\n\n"
             )
 
-            pairs = SceneMergerService.detect_continuous_pairs(scenes, first_pass_matches)
-            chains = SceneMergerService.build_merge_chains(pairs, scenes, first_pass_matches) if pairs else []
+            index_fps = AnimeMatcherService.get_index_fps()
+            pairs = SceneMergerService.detect_continuous_pairs(
+                scenes, first_pass_matches, index_fps=index_fps,
+            )
+            chains = (
+                SceneMergerService.build_merge_chains(
+                    pairs, scenes, first_pass_matches, index_fps=index_fps,
+                )
+                if pairs
+                else []
+            )
 
             if chains:
                 # === MERGE ===
@@ -542,7 +675,32 @@ async def get_matches_playback_clip(
     return FileResponse(
         path=clip_path,
         media_type="video/mp4",
-        headers={"Accept-Ranges": "bytes"},
+        headers=_media_headers(
+            clip_path,
+            cache_control="public, max-age=0, must-revalidate",
+        ),
+    )
+
+
+@router.get("/matches/playback/clips/{clip_id}")
+async def get_matches_playback_clip_by_id(project_id: str, clip_id: str):
+    """Serve one prepared playback clip by stable content-addressed clip id."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    try:
+        clip_path = MatchPlaybackService.get_clip_path_by_id(project_id, clip_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    return FileResponse(
+        path=clip_path,
+        media_type="video/mp4",
+        headers=_media_headers(
+            clip_path,
+            cache_control="public, max-age=31536000, immutable",
+        ),
     )
 
 
@@ -558,6 +716,97 @@ async def get_matches(project_id: str):
         return {"matches": []}
 
     return {"matches": [m.model_dump() for m in matches.matches]}
+
+
+@router.post("/matches/merge-with-previous/{scene_index}")
+async def merge_with_previous(project_id: str, scene_index: int):
+    """Manually merge one scene into the previous scene and re-match only it."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    scenes = ProjectService.load_scenes(project_id)
+    if not scenes or not scenes.scenes:
+        raise HTTPException(status_code=404, detail="No scenes found")
+
+    matches = ProjectService.load_matches(project_id)
+    if not matches or not matches.matches:
+        raise HTTPException(status_code=404, detail="No matches found")
+
+    if scene_index <= 0 or scene_index >= len(scenes.scenes):
+        raise HTTPException(status_code=400, detail="Invalid scene index")
+
+    if project.series_id:
+        try:
+            await LibraryHydrationService.ensure_matcher_ready_for_project(
+                project_id=project.id,
+                library_type=project.library_type,
+                series_id=project.series_id,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    source_path = AnimeLibraryService.get_library_path(project.library_type)
+    if not source_path.exists():
+        raise HTTPException(status_code=400, detail="Source path not found")
+
+    video_path = Path(project.video_path) if project.video_path else None
+    if not video_path or not video_path.exists():
+        raise HTTPException(status_code=400, detail="Video not found")
+
+    try:
+        merged_scenes, merged_matches, backup, merged_scene_index = (
+            SceneMergerService.prepare_manual_merge_with_previous(
+                project_id,
+                scene_index,
+                scenes,
+                matches,
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    SceneMergerService.save_pre_merge_backup(project_id, backup)
+
+    rematched_matches: MatchList | None = None
+    async for progress in AnimeMatcherService.match_scenes(
+        video_path,
+        merged_scenes,
+        source_path,
+        project.library_type,
+        anime_name=project.anime_name,
+        scene_indices_to_match=[merged_scene_index],
+        existing_matches=merged_matches,
+    ):
+        if progress.status == "complete" and progress.matches:
+            merged_from = merged_matches.matches[merged_scene_index].merged_from
+            if merged_scene_index < len(progress.matches.matches):
+                progress.matches.matches[merged_scene_index].merged_from = merged_from
+            rematched_matches = progress.matches
+            continue
+
+        if progress.status == "error":
+            raise HTTPException(
+                status_code=500,
+                detail=progress.error or "Failed to re-match merged scene",
+            )
+
+    if not rematched_matches:
+        raise HTTPException(
+            status_code=500,
+            detail="Merged scene re-match completed without results",
+        )
+
+    ProjectService.save_scenes(project_id, merged_scenes)
+    ProjectService.save_matches(project_id, rematched_matches)
+
+    project.phase = ProjectPhase.MATCH_VALIDATION
+    ProjectService.save(project)
+
+    return {
+        "scenes": _serialize_scenes(merged_scenes),
+        "matches": [m.model_dump() for m in rematched_matches.matches],
+    }
 
 
 class UpdateMatchRequest(BaseModel):
@@ -596,7 +845,10 @@ async def update_match(project_id: str, scene_index: int, request: UpdateMatchRe
         raise HTTPException(status_code=404, detail="Match not found for scene")
 
     # Update match
-    match.episode = request.episode
+    match.episode = _canonical_episode_ref(
+        request.episode,
+        library_type=project.library_type,
+    )
     match.start_time = request.start_time
     match.end_time = request.end_time
     match.confirmed = request.confirmed
@@ -645,7 +897,10 @@ async def update_matches_batch(project_id: str, request: BatchUpdateMatchesReque
                 detail=f"Match not found for scene {update.scene_index}",
             )
 
-        match.episode = update.episode
+        match.episode = _canonical_episode_ref(
+            update.episode,
+            library_type=project.library_type,
+        )
         match.start_time = update.start_time
         match.end_time = update.end_time
         match.confirmed = update.confirmed
@@ -680,6 +935,6 @@ async def undo_merge(project_id: str, scene_index: int):
 
     restored_scenes, restored_matches = result
     return {
-        "scenes": [s.model_dump() for s in restored_scenes.scenes],
+        "scenes": _serialize_scenes(restored_scenes),
         "matches": [m.model_dump() for m in restored_matches.matches],
     }

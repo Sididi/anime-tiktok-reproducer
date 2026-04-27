@@ -1,7 +1,7 @@
 from pydantic import BaseModel, ConfigDict, field_validator
 
 
-METADATA_TITLE_CANDIDATE_COUNT = 10
+METADATA_TITLE_CANDIDATE_COUNT = 8
 METADATA_TITLE_MAX_CHARS = 62
 TIKTOK_FIXED_HASHTAGS = ["#Anime", "#animerecommendations"]
 
@@ -165,10 +165,13 @@ class MetadataTitleCandidatesPayload(_StrictModel):
                 "title_candidates must contain exactly "
                 f"{METADATA_TITLE_CANDIDATE_COUNT} titles"
             )
+        truncated: list[str] = []
         for title in cleaned:
             if len(title) > METADATA_TITLE_MAX_CHARS:
-                raise ValueError(
-                    "title_candidates entries must be "
-                    f"<= {METADATA_TITLE_MAX_CHARS} characters"
-                )
-        return cleaned
+                cut = title[:METADATA_TITLE_MAX_CHARS]
+                last_space = cut.rfind(" ")
+                if last_space > METADATA_TITLE_MAX_CHARS // 2:
+                    cut = cut[:last_space].rstrip()
+                title = cut.rstrip()
+            truncated.append(title)
+        return truncated
