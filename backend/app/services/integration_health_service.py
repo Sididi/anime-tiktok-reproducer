@@ -257,8 +257,20 @@ class IntegrationHealthService:
     @classmethod
     def _check_discord(cls) -> dict[str, Any]:
         if not DiscordService.is_configured():
-            return {"status": "skipped", "detail": "Discord webhook not configured"}
-        return {"status": "ok", "detail": "Discord webhook is configured"}
+            return {"status": "skipped", "detail": "TikTok server not configured"}
+        # Active probe: ping the VPS /healthz to confirm it's reachable.
+        base = settings.tiktok_server_base_url or ""
+        try:
+            import httpx
+            with httpx.Client(timeout=5.0) as c:
+                r = c.get(f"{base.rstrip('/')}/healthz")
+                r.raise_for_status()
+            return {"status": "ok", "detail": f"TikTok server reachable at {base}"}
+        except Exception as exc:
+            return {
+                "status": "degraded",
+                "detail": f"TikTok server unreachable at {base}: {exc}",
+            }
 
     @classmethod
     def _check_google_drive(cls) -> dict[str, Any]:
