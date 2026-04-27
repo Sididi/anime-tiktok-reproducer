@@ -109,6 +109,7 @@ class DiscordService:
         description: str,
         drive_video_url: str,
         platforms_requested: list[str],
+        instagram: dict | None = None,
     ) -> dict[str, Any] | None:
         body = {
             "project_id": project_id,
@@ -119,6 +120,8 @@ class DiscordService:
             "drive_video_url": drive_video_url,
             "platforms_requested": list(platforms_requested),
         }
+        if instagram is not None:
+            body["instagram"] = instagram
         with _client() as c:
             r = c.post("/api/internal/jobs", json=body)
             r.raise_for_status()

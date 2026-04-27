@@ -126,3 +126,29 @@ def test_post_message_swallows_network_errors():
     )
     # Must not raise
     assert DiscordService.post_message("x") is None
+
+
+@respx.mock
+def test_create_job_with_instagram_payload():
+    route = respx.post("https://tiktok.sididi.tv/api/internal/jobs").mock(
+        return_value=httpx.Response(200, json={"job_id": "j_x", "discord_message_id": "m_1"})
+    )
+    DiscordService.create_job(
+        project_id="p1",
+        account_id="anime_fr",
+        slot_time=datetime(2026, 4, 27, 21, 0, tzinfo=timezone.utc),
+        anime_title="Title",
+        description="Desc",
+        drive_video_url="https://drive/x",
+        platforms_requested=["instagram"],
+        instagram={
+            "ig_user_id": "ig_42",
+            "ig_access_token": "ig_token",
+            "caption": "hi",
+            "graph_api_version": "v25.0",
+        },
+    )
+    assert route.called
+    sent = route.calls.last.request.content
+    assert b'"instagram":{' in sent or b'"instagram": {' in sent
+    assert b'"ig_user_id":"ig_42"' in sent or b'"ig_user_id": "ig_42"' in sent
