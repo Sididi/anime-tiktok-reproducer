@@ -595,7 +595,10 @@ class UploadPhaseService:
         try:
             job_response = DiscordService.create_job(
                 project_id=project_id,
-                account_id=project.scheduled_account_id or "",
+                # Use the live account_id arg (validated above), not
+                # project.scheduled_account_id which is only persisted at the
+                # END of execute_upload — None on first upload.
+                account_id=account_id or project.scheduled_account_id or "",
                 slot_time=project.scheduled_at or datetime.now(timezone.utc),
                 anime_title=project.anime_name or "Unknown",
                 description=metadata.tiktok.description,
