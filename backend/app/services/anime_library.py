@@ -1646,6 +1646,24 @@ class AnimeLibraryService:
         return args
 
     @classmethod
+    def _build_video_copy_bsf_args(cls, video_codec: str | None) -> list[str]:
+        """Bitstream filter to apply when stream-copying video into MP4.
+
+        Some HEVC/H.264 sources (notably MKV releases that store parameter
+        sets in-band) round-trip through ffmpeg's MP4 muxer in a way that
+        produces files which mux without error but then fail re-probe with
+        ``Invalid data found when processing input``. Routing the bitstream
+        through the matching ``*_mp4toannexb`` filter normalizes parameter
+        sets so the resulting MP4 is decodable.
+        """
+        codec = (video_codec or "").strip().lower()
+        if codec == "hevc":
+            return ["-bsf:v", "hevc_mp4toannexb"]
+        if codec == "h264":
+            return ["-bsf:v", "h264_mp4toannexb"]
+        return []
+
+    @classmethod
     def _build_library_import_remux_cmd(
         cls,
         source_path: Path,
@@ -1672,6 +1690,7 @@ class AnimeLibraryService:
             "0",
             "-c",
             "copy",
+            *cls._build_video_copy_bsf_args(probe.video_codec),
             *cls._build_audio_stream_metadata_args(probe.audio_streams),
             "-movflags",
             "+faststart",
@@ -1686,10 +1705,15 @@ class AnimeLibraryService:
         *,
         probe: SourceMediaProbe,
     ) -> list[str]:
-        """Stream-copy video and transcode all audio tracks to AAC.
+        """Stream-copy video and bring audio tracks into a Premiere-friendly state.
 
         Used when a container holds multiple audio streams with different
-        codecs (e.g. AAC + E-AC-3) which Premiere Pro cannot handle.
+        codecs (e.g. AAC + E-AC-3) which Premiere Pro cannot handle. AAC
+        streams are stream-copied to skip pointless re-encoding; only
+        non-AAC streams are transcoded. The video bitstream is routed
+        through the matching mp4toannexb BSF so HEVC/H.264 parameter sets
+        survive the MP4 round-trip on releases that otherwise produce
+        un-decodable output.
         """
         return [
             "ffmpeg",
@@ -1710,7 +1734,8 @@ class AnimeLibraryService:
             "0",
             "-c:v",
             "copy",
-            *cls._build_audio_args(has_audio=probe.has_audio),
+            *cls._build_video_copy_bsf_args(probe.video_codec),
+            *cls._build_audio_args(audio_streams=probe.audio_streams),
             *cls._build_audio_stream_metadata_args(probe.audio_streams),
             "-movflags",
             "+faststart",
@@ -1776,7 +1801,7 @@ class AnimeLibraryService:
                 "high",
             ]
         )
-        cmd.extend(cls._build_audio_args(has_audio=probe.has_audio))
+        cmd.extend(cls._build_audio_args(audio_streams=probe.audio_streams))
         cmd.extend(cls._build_audio_stream_metadata_args(probe.audio_streams))
         cmd.extend(
             [
@@ -1822,7 +1847,7 @@ class AnimeLibraryService:
             "-pix_fmt",
             "yuv420p",
         ]
-        cmd.extend(cls._build_audio_args(has_audio=probe.has_audio))
+        cmd.extend(cls._build_audio_args(audio_streams=probe.audio_streams))
         cmd.extend(cls._build_audio_stream_metadata_args(probe.audio_streams))
         cmd.extend(
             [
@@ -1834,17 +1859,35 @@ class AnimeLibraryService:
         return cmd
 
     @classmethod
-    def _build_audio_args(cls, *, has_audio: bool) -> list[str]:
-        if not has_audio:
+    def _build_audio_args(
+        cls,
+        *,
+        audio_streams: tuple[SourceMediaStream, ...] | list[SourceMediaStream],
+    ) -> list[str]:
+        """Build per-output-stream audio codec args.
+
+        Streams already encoded as AAC are stream-copied to avoid pointless
+        CPU work; non-AAC streams are transcoded to AAC for Premiere Pro.
+        """
+        if not audio_streams:
             return []
-        return [
-            "-c:a",
-            "aac",
-            "-b:a",
-            cls.SOURCE_NORMALIZATION_AUDIO_BITRATE,
-            "-ar",
-            cls.SOURCE_NORMALIZATION_AUDIO_RATE,
-        ]
+        args: list[str] = []
+        for idx, stream in enumerate(audio_streams):
+            codec = (stream.codec_name or "").strip().lower()
+            if codec == "aac":
+                args.extend([f"-c:a:{idx}", "copy"])
+            else:
+                args.extend(
+                    [
+                        f"-c:a:{idx}",
+                        "aac",
+                        f"-b:a:{idx}",
+                        cls.SOURCE_NORMALIZATION_AUDIO_BITRATE,
+                        f"-ar:a:{idx}",
+                        cls.SOURCE_NORMALIZATION_AUDIO_RATE,
+                    ]
+                )
+        return args
 
     @classmethod
     def _has_mixed_audio_codecs(cls, probe: SourceMediaProbe) -> bool:
