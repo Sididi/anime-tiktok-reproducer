@@ -101,13 +101,13 @@ def test_delete_job_removes_reminder_and_forward_when_present(
 ):
     """If the scheduler has already fired the reminder + forward, delete_job
     must remove all three messages (embed, reminder, forward)."""
-    from app.models.job import PlatformStatus, TikTokJob
+    from app.models.job import PlatformStatus, Job
     from datetime import datetime, timezone as _tz
 
     app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
     # Pre-populate the store with a job that already has all three msg ids.
     now = datetime(2026, 4, 27, 21, 0, tzinfo=_tz.utc)
-    job = TikTokJob(
+    job = Job(
         project_id="p1",
         job_id="j_x",
         account_id="anime_fr",
@@ -117,12 +117,10 @@ def test_delete_job_removes_reminder_and_forward_when_present(
         drive_video_url="u",
         slot_time=now,
         platforms_requested=["tiktok"],
-        status="pending",
         platform_statuses={"tiktok": PlatformStatus(status="pending")},
         discord_message_id="msg_embed",
         reminder_message_id="msg_rich",
         reminder_forward_message_id="msg_forward",
-        acked_at=None,
         created_at=now,
         updated_at=now,
     )

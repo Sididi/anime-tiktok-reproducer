@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 from app.config import Settings
-from app.models.job import PlatformStatus, TikTokJob
+from app.models.job import PlatformStatus, Job
 from app.services.job_store import JobStore
 from app.services.reminder_scheduler import (
     dispatch_due_reminders,
@@ -24,11 +24,11 @@ def _make_job(
     project_id: str = "p1",
     slot_time: datetime,
     reminder_message_id: str | None = None,
-    status: str = "pending",
+    platform_status: str = "pending",
     discord_message_id: str | None = "embed_id",
-) -> TikTokJob:
+) -> Job:
     now = datetime(2026, 4, 27, 12, 0, tzinfo=timezone.utc)
-    return TikTokJob(
+    return Job(
         project_id=project_id,
         job_id=f"j_{project_id}",
         account_id="anime_fr",
@@ -38,11 +38,9 @@ def _make_job(
         drive_video_url="https://drive/x",
         slot_time=slot_time,
         platforms_requested=["tiktok"],
-        status=status,  # type: ignore[arg-type]
-        platform_statuses={"tiktok": PlatformStatus(status="pending")},
+        platform_statuses={"tiktok": PlatformStatus(status=platform_status)},
         discord_message_id=discord_message_id,
         reminder_message_id=reminder_message_id,
-        acked_at=None,
         created_at=now,
         updated_at=now,
     )
@@ -97,20 +95,6 @@ async def test_dispatch_skips_already_reminded_jobs(
     assert posted == 0
     discord.post_message.assert_not_called()
 
-
-async def test_dispatch_skips_acked_jobs(
-    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path
-):
-    """An acked job is filtered out by status='pending' on list_for_device."""
-    settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
-    store = JobStore(tmp_path / "jobs.json")
-    past = datetime.now(tz=timezone.utc) - timedelta(hours=1)
-    await store.create(_make_job(slot_time=past, status="acked"))
-
-    discord = AsyncMock()
-    posted = await dispatch_due_reminders(store=store, settings=settings, discord=discord)
-
-    assert posted == 0
 
 
 async def test_dispatch_retries_on_next_tick_when_post_fails(

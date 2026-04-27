@@ -33,7 +33,7 @@ async def dispatch_due_reminders(
     """
     current = now or datetime.now(tz=timezone.utc)
     posted = 0
-    for job in await store.list_all(status="pending"):
+    for job in await store.list_all():
         if job.reminder_message_id is not None:
             continue  # already reminded
         if job.slot_time > current:

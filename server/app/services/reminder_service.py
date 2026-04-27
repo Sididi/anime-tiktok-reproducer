@@ -15,7 +15,7 @@ import logging
 from typing import Any
 
 from app.config import AccountConfig
-from app.models.job import TikTokJob
+from app.models.job import Job
 from app.services.embed_builder import format_french_datetime
 
 logger = logging.getLogger(__name__)
@@ -29,7 +29,7 @@ def _ping_text(*, role_id: str, anime_title: str, account_name: str) -> str:
 
 
 def build_reminder_embed(
-    job: TikTokJob,
+    job: Job,
     account: AccountConfig,
     public_base_url: str,
     *,
@@ -58,7 +58,7 @@ def build_reminder_embed(
 async def post_reminder(
     discord,
     *,
-    job: TikTokJob,
+    job: Job,
     account: AccountConfig,
     public_base_url: str,
     upload_channel_id: str,

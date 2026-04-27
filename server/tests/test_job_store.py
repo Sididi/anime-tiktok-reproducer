@@ -7,13 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from app.models.job import PlatformStatus, TikTokJob
+from app.models.job import PlatformStatus, Job
 from app.services.job_store import JobStore
 
 
-def _make_job(project_id: str = "proj_1", device_id: str = "iphone_13_pro") -> TikTokJob:
+def _make_job(project_id: str = "proj_1", device_id: str = "iphone_13_pro") -> Job:
     now = datetime(2026, 4, 26, 21, 0, tzinfo=UTC)
-    return TikTokJob(
+    return Job(
         project_id=project_id,
         job_id=f"j_{project_id}",
         account_id="anime_fr",
@@ -23,11 +23,9 @@ def _make_job(project_id: str = "proj_1", device_id: str = "iphone_13_pro") -> T
         drive_video_url="https://drive/x",
         slot_time=now,
         platforms_requested=["tiktok"],
-        status="pending",
         platform_statuses={"tiktok": PlatformStatus(status="pending")},
         discord_message_id=None,
         reminder_message_id=None,
-        acked_at=None,
         created_at=now,
         updated_at=now,
     )
@@ -60,22 +58,23 @@ async def test_create_duplicate_is_noop(tmp_path: Path):
 
 
 async def test_update(tmp_path: Path):
+    from app.models.job import PlatformStatus
     store = JobStore(tmp_path / "jobs.json")
     job = _make_job()
     await store.create(job)
+    completed = datetime(2026, 4, 26, 21, 5, tzinfo=UTC)
     updated = await store.update(
         job.project_id,
-        status="acked",
-        acked_at=datetime(2026, 4, 26, 21, 5, tzinfo=UTC),
+        platform_statuses={"tiktok": PlatformStatus(status="uploaded", completed_at=completed)},
     )
-    assert updated.status == "acked"
-    assert updated.acked_at is not None
+    assert updated.platform_statuses["tiktok"].status == "uploaded"
+    assert updated.platform_statuses["tiktok"].completed_at == completed
 
 
 async def test_update_missing_raises(tmp_path: Path):
     store = JobStore(tmp_path / "jobs.json")
     with pytest.raises(KeyError):
-        await store.update("missing", status="acked")
+        await store.update("missing", anime_title="new title")
 
 
 async def test_delete(tmp_path: Path):
@@ -90,16 +89,11 @@ async def test_delete_missing_is_noop(tmp_path: Path):
     await store.delete("never_existed")  # must not raise
 
 
-async def test_list_all_filters_by_status(tmp_path: Path):
+async def test_list_all_returns_all_jobs(tmp_path: Path):
     store = JobStore(tmp_path / "jobs.json")
     await store.create(_make_job(project_id="a"))
     await store.create(_make_job(project_id="b"))
-    j_acked = _make_job(project_id="c")
-    j_acked.status = "acked"
-    await store.create(j_acked)
-
-    pending = await store.list_all(status="pending")
-    assert {j.project_id for j in pending} == {"a", "b"}
+    await store.create(_make_job(project_id="c"))
 
     every = await store.list_all()
     assert {j.project_id for j in every} == {"a", "b", "c"}

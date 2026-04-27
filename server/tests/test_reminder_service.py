@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 import httpx
 
 from app.config import AccountConfig
-from app.models.job import PlatformStatus, TikTokJob
+from app.models.job import PlatformStatus, Job
 from app.services.reminder_service import build_reminder_embed, post_reminder
 
 
@@ -21,9 +21,9 @@ def _account() -> AccountConfig:
     )
 
 
-def _job(*, discord_message_id: str | None = "m_embed") -> TikTokJob:
+def _job(*, discord_message_id: str | None = "m_embed") -> Job:
     now = datetime(2026, 4, 27, 21, 0, tzinfo=timezone.utc)
-    return TikTokJob(
+    return Job(
         project_id="p1",
         job_id="j_x",
         account_id="anime_fr",
@@ -33,11 +33,9 @@ def _job(*, discord_message_id: str | None = "m_embed") -> TikTokJob:
         drive_video_url="https://drive/x",
         slot_time=now,
         platforms_requested=["youtube", "tiktok"],
-        status="pending",
         platform_statuses={"tiktok": PlatformStatus(status="pending")},
         discord_message_id=discord_message_id,
         reminder_message_id=None,
-        acked_at=None,
         created_at=now,
         updated_at=now,
     )
