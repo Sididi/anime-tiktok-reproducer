@@ -51,6 +51,13 @@ class Settings(BaseSettings):
     # TikTok server (VPS) integration — replaces previous Discord webhook
     tiktok_server_base_url: str | None = None
     tiktok_server_internal_token: str | None = None
+
+    # Discord webhook for n8n's deferred-Instagram post-completion notification.
+    # This is the ONLY remaining direct Discord webhook usage (n8n runs
+    # elsewhere and can't reach the VPS internal API). All in-process Discord
+    # operations go through DiscordService → VPS server.
+    discord_webhook_url: str | None = None
+
     cep_trigger_url_template: str = "http://localhost:48653/p/{project_id}"
 
     # HuggingFace (pyannote diarization for raw scene detection)
