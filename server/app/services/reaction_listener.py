@@ -92,19 +92,19 @@ class ReactionListener:
         existing_tiktok = job.platform_statuses.get(
             "tiktok", PlatformStatus(status="pending")
         )
-        new_statuses = {
-            **job.platform_statuses,
-            "tiktok": PlatformStatus(
+        # merge_platform_status is atomic under the lock — won't clobber a
+        # concurrent IG publish writing to platform_statuses['instagram'].
+        await self._store.merge_platform_status(
+            job.project_id, "tiktok",
+            PlatformStatus(
                 status="uploaded",
                 completed_at=now,
                 attempts=existing_tiktok.attempts,
             ),
-        }
-        updates: dict = {"platform_statuses": new_statuses}
-        # Cancel the reminder if it hasn't fired yet.
+        )
+        # Cancel the reminder if it hasn't fired yet (separate, orthogonal field).
         if job.reminder_message_id is None:
-            updates["reminder_cancelled"] = True
-        await self._store.update(job.project_id, **updates)
+            await self._store.update(job.project_id, reminder_cancelled=True)
 
         # Re-render upload-channel embed + add bot's own ✅ reaction.
         if job.discord_message_id:

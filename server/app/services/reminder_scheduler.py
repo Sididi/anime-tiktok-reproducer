@@ -118,11 +118,13 @@ async def _dispatch_instagram_publish(
         return False
 
     next_attempts = current.attempts + 1
-    # Bump status to uploading + attempts before the call
-    new_uploading = PlatformStatus(status="uploading", attempts=next_attempts)
-    await store.update(
-        job.project_id,
-        platform_statuses={**job.platform_statuses, "instagram": new_uploading},
+    # Bump status to uploading + attempts before the call.
+    # Use merge_platform_status (atomic read-merge-write under the lock) so a
+    # concurrent reaction-handler write to platform_statuses['tiktok'] isn't
+    # clobbered by a stale snapshot during the 5-minute IG poll window.
+    await store.merge_platform_status(
+        job.project_id, "instagram",
+        PlatformStatus(status="uploading", attempts=next_attempts),
     )
 
     result = await publish_to_instagram(
@@ -135,14 +137,14 @@ async def _dispatch_instagram_publish(
 
     now = datetime.now(tz=timezone.utc)
     if result.success:
-        await store.update(
-            job.project_id,
-            platform_statuses={**job.platform_statuses, "instagram": PlatformStatus(
+        await store.merge_platform_status(
+            job.project_id, "instagram",
+            PlatformStatus(
                 status="uploaded",
                 url=result.permalink,
                 attempts=next_attempts,
                 completed_at=now,
-            )},
+            ),
         )
         await _rerender_embed(job.project_id, store, settings, discord)
         logger.info(
@@ -154,14 +156,14 @@ async def _dispatch_instagram_publish(
 
     # Failure path
     if next_attempts >= _IG_MAX_ATTEMPTS:
-        await store.update(
-            job.project_id,
-            platform_statuses={**job.platform_statuses, "instagram": PlatformStatus(
+        await store.merge_platform_status(
+            job.project_id, "instagram",
+            PlatformStatus(
                 status="failed",
                 detail=result.detail,
                 attempts=next_attempts,
                 completed_at=now,
-            )},
+            ),
         )
         await _rerender_embed(job.project_id, store, settings, discord)
         await _post_failure_ping(job, settings, discord, result.detail or "publish failed")
@@ -171,13 +173,13 @@ async def _dispatch_instagram_publish(
         )
     else:
         # Reset to pending so next tick retries; preserve detail for visibility
-        await store.update(
-            job.project_id,
-            platform_statuses={**job.platform_statuses, "instagram": PlatformStatus(
+        await store.merge_platform_status(
+            job.project_id, "instagram",
+            PlatformStatus(
                 status="pending",
                 detail=result.detail,
                 attempts=next_attempts,
-            )},
+            ),
         )
         logger.info(
             "Instagram publish attempt %d/%d failed for %s: %s — will retry next tick",

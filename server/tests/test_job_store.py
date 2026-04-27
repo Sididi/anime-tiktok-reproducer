@@ -133,3 +133,40 @@ async def test_corrupt_file_treated_as_empty(tmp_path: Path):
     p.write_text("{not valid json}")
     store = JobStore(p)
     assert await store.get("anything") is None
+
+
+async def test_merge_platform_status_preserves_other_keys(tmp_path: Path):
+    """Concurrency safety: merging instagram status does not clobber tiktok."""
+    store = JobStore(tmp_path / "jobs.json")
+    job = _make_job()
+    job.platform_statuses = {
+        "tiktok": PlatformStatus(status="pending"),
+        "instagram": PlatformStatus(status="pending"),
+    }
+    await store.create(job)
+
+    # Simulate two writers updating different platforms.
+    await store.merge_platform_status(
+        job.project_id, "instagram", PlatformStatus(status="uploading", attempts=1)
+    )
+    await store.merge_platform_status(
+        job.project_id, "tiktok", PlatformStatus(status="uploaded")
+    )
+    # Even if a third caller had a stale snapshot of platform_statuses, the
+    # merge would preserve both prior writes:
+    await store.merge_platform_status(
+        job.project_id, "instagram", PlatformStatus(status="uploaded", url="https://x")
+    )
+
+    fresh = await store.get(job.project_id)
+    assert fresh.platform_statuses["tiktok"].status == "uploaded"
+    assert fresh.platform_statuses["instagram"].status == "uploaded"
+    assert fresh.platform_statuses["instagram"].url == "https://x"
+
+
+async def test_merge_platform_status_missing_job_raises(tmp_path: Path):
+    store = JobStore(tmp_path / "jobs.json")
+    with pytest.raises(KeyError):
+        await store.merge_platform_status(
+            "missing", "instagram", PlatformStatus(status="pending")
+        )

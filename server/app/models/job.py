@@ -1,4 +1,4 @@
-"""Data shapes for TikTok-flow jobs. No I/O, no dependencies on services."""
+"""Data shapes for the platform-agnostic Job. No I/O, no dependencies on services."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
