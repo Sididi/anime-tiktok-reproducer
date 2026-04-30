@@ -51,6 +51,8 @@ class AnimeMatcherService:
     _query_processor = None
     _loaded_library_path: Path | None = None
     _loaded_library_type: LibraryType | None = None
+    _loaded_index_signature: tuple[tuple[str, int, int], ...] | None = None
+    _loaded_series_index_signatures: dict[str, tuple[tuple[str, int, int], ...]] = {}
     # Series that were updated on disk and require cache refresh before matching.
     _stale_series: dict[LibraryType, set[str]] = defaultdict(set)
 
@@ -64,6 +66,61 @@ class AnimeMatcherService:
         if not series_name:
             return
         cls._stale_series[coerce_library_type(library_type)].add(series_name)
+
+    @staticmethod
+    def _file_signature(path: Path) -> tuple[str, int, int]:
+        try:
+            stat = path.stat()
+        except OSError:
+            return (str(path), -1, -1)
+        return (str(path), stat.st_mtime_ns, stat.st_size)
+
+    @classmethod
+    def _index_signature(
+        cls,
+        library_path: Path,
+        anime_name: str | None,
+    ) -> tuple[tuple[str, int, int], ...]:
+        """Return a cheap on-disk signature for cache invalidation.
+
+        Storage Box activation can replace a series shard without going through
+        the indexer endpoints that call ``mark_series_updated``. Tracking the
+        manifest plus the requested shard files prevents the in-memory matcher
+        from searching a stale two-episode cache after a newer online index has
+        been hydrated.
+        """
+        index_dir = library_path / ".index"
+        manifest_path = index_dir / "manifest.json"
+        state_path = index_dir / "state.json"
+        paths = [manifest_path, state_path]
+
+        if anime_name and manifest_path.exists():
+            try:
+                import json
+
+                with open(manifest_path, encoding="utf-8") as f:
+                    manifest = json.load(f)
+                series_entry = manifest.get("series", {}).get(anime_name, {})
+                shard_key = (
+                    str(series_entry.get("key") or "").strip()
+                    if isinstance(series_entry, dict)
+                    else ""
+                )
+                if shard_key:
+                    shard_dir = index_dir / "series" / shard_key
+                    paths.extend(
+                        [
+                            shard_dir / "faiss.index",
+                            shard_dir / "metadata.json",
+                        ]
+                    )
+            except Exception:
+                # If the manifest is temporarily unreadable, include only the
+                # top-level files and let IndexManager report the load error if
+                # a reload is required.
+                pass
+
+        return tuple(cls._file_signature(path) for path in paths)
 
     @staticmethod
     def _require_cv2():
@@ -109,14 +166,39 @@ class AnimeMatcherService:
             and anime_name is not None
             and anime_name not in cls._index_manager.get_series_list()
         )
+        current_index_signature = cls._index_signature(library_path, None)
+        current_series_signature = (
+            cls._index_signature(library_path, anime_name)
+            if anime_name is not None
+            else None
+        )
+        index_changed_on_disk = (
+            cache_ready
+            and cls._loaded_index_signature is not None
+            and current_index_signature != cls._loaded_index_signature
+        )
+        series_index_changed_on_disk = (
+            cache_ready
+            and anime_name is not None
+            and current_series_signature is not None
+            and anime_name in cls._loaded_series_index_signatures
+            and current_series_signature != cls._loaded_series_index_signatures[anime_name]
+        )
         if (
             cache_ready
             and not (
                 needs_refresh_for_series
                 or needs_refresh_for_unscoped_match
                 or missing_scoped_series
+                or index_changed_on_disk
+                or series_index_changed_on_disk
             )
         ):
+            if anime_name is not None and current_series_signature is not None:
+                cls._loaded_series_index_signatures.setdefault(
+                    anime_name,
+                    current_series_signature,
+                )
             return True
 
         try:
@@ -139,6 +221,13 @@ class AnimeMatcherService:
             cls._query_processor = QueryProcessor(cls._index_manager, cls._embedder)
             cls._loaded_library_path = library_path
             cls._loaded_library_type = scoped_type
+            cls._loaded_index_signature = cls._index_signature(library_path, None)
+            cls._loaded_series_index_signatures = {}
+            for series_name in cls._index_manager.get_series_list():
+                cls._loaded_series_index_signatures[series_name] = cls._index_signature(
+                    library_path,
+                    series_name,
+                )
             # Full reload brings all series up to date.
             stale_series.clear()
 
