@@ -54,6 +54,7 @@ class Job:
     reminder_forward_message_id: str | None = None
     reminder_cancelled: bool = False
     instagram_payload: dict | None = None
+    platform_scheduled_at: dict[str, datetime] = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
 
@@ -67,6 +68,10 @@ class Job:
             "description": self.description,
             "drive_video_url": self.drive_video_url,
             "slot_time": self.slot_time.isoformat(),
+            "platform_scheduled_at": {
+                platform: scheduled_at.isoformat()
+                for platform, scheduled_at in self.platform_scheduled_at.items()
+            },
             "platforms_requested": list(self.platforms_requested),
             "platform_statuses": {
                 p: ps.to_dict() for p, ps in self.platform_statuses.items()
@@ -91,6 +96,10 @@ class Job:
             description=d["description"],
             drive_video_url=d["drive_video_url"],
             slot_time=datetime.fromisoformat(d["slot_time"]),
+            platform_scheduled_at={
+                platform: datetime.fromisoformat(scheduled_at)
+                for platform, scheduled_at in d.get("platform_scheduled_at", {}).items()
+            },
             platforms_requested=list(d["platforms_requested"]),
             platform_statuses={
                 p: PlatformStatus.from_dict(ps) for p, ps in d["platform_statuses"].items()

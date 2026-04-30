@@ -32,6 +32,7 @@ class CreateJobRequest(BaseModel):
     project_id: str
     account_id: str
     slot_time: datetime
+    platform_scheduled_at: dict[str, datetime] | None = None
     anime_title: str
     description: str
     drive_video_url: str
@@ -92,6 +93,7 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
         description=req.description,
         drive_video_url=req.drive_video_url,
         slot_time=req.slot_time,
+        platform_scheduled_at=dict(req.platform_scheduled_at or {}),
         platforms_requested=list(req.platforms_requested),
         platform_statuses=platform_statuses,
         discord_message_id=None,

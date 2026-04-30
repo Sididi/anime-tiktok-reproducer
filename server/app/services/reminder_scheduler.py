@@ -1,7 +1,7 @@
-"""Background scheduler that fires platform-specific actions at slot_time.
+"""Background scheduler that fires platform-specific actions at their due time.
 
-Polls every `interval` seconds; for each job whose slot_time has passed,
-iterates `platforms_requested` and runs the per-platform action:
+Polls every `interval` seconds; for each job, iterates `platforms_requested`
+and runs due per-platform actions:
 
 - tiktok    → post reminder (rich embed + forward) in the reminder channel.
               Skipped if `reminder_message_id` is already set or
@@ -31,6 +31,7 @@ from app.services.reminder_service import post_reminder
 logger = logging.getLogger(__name__)
 
 _IG_MAX_ATTEMPTS = 5
+_LEGACY_IG_CONTAINER_ERROR = "container status_code = ERROR"
 
 
 async def dispatch_due_actions(
@@ -41,12 +42,12 @@ async def dispatch_due_actions(
     now: datetime | None = None,
 ) -> int:
     """Run per-platform actions for any due job. Returns count of actions taken."""
-    current = now or datetime.now(tz=timezone.utc)
+    current = _normalize_utc(now or datetime.now(tz=timezone.utc))
     actions = 0
     for job in await store.list_all():
-        if job.slot_time > current:
-            continue
         for platform in job.platforms_requested:
+            if _platform_due_time(job, platform) > current:
+                continue
             if platform == "tiktok":
                 if await _dispatch_tiktok_reminder(job, store, settings, discord):
                     actions += 1
@@ -55,6 +56,17 @@ async def dispatch_due_actions(
                     actions += 1
             # youtube + facebook: nothing to do (main backend handles those)
     return actions
+
+
+def _platform_due_time(job: Job, platform: str) -> datetime:
+    due_time = job.platform_scheduled_at.get(platform) or job.slot_time
+    return _normalize_utc(due_time)
+
+
+def _normalize_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 async def _dispatch_tiktok_reminder(
@@ -115,6 +127,15 @@ async def _dispatch_instagram_publish(
     current = job.platform_statuses.get("instagram", PlatformStatus(status="pending"))
     # Already terminal — nothing to do
     if current.status in ("uploaded", "failed", "skipped"):
+        if _should_retry_legacy_instagram_failure(current):
+            logger.info(
+                "Retrying legacy Instagram container failure for %s via public proxy",
+                job.project_id,
+            )
+        else:
+            return False
+
+    if current.status in ("uploaded", "skipped"):
         return False
 
     next_attempts = current.attempts + 1
@@ -131,7 +152,7 @@ async def _dispatch_instagram_publish(
         ig_user_id=payload["ig_user_id"],
         ig_access_token=payload["ig_access_token"],
         caption=payload["caption"],
-        video_url=job.drive_video_url,
+        video_url=_instagram_video_url(job, settings),
         graph_api_version=payload.get("graph_api_version", "v25.0"),
     )
 
@@ -200,6 +221,18 @@ async def _post_failure_ping(
         await discord.post_message(settings.discord.reminder_channel_id, content=msg)
     except Exception:
         logger.exception("Failed to post Instagram failure ping")
+
+
+def _instagram_video_url(job: Job, settings: Settings) -> str:
+    return f"{settings.public_base_url.rstrip('/')}/api/videos/{job.project_id}"
+
+
+def _should_retry_legacy_instagram_failure(status: PlatformStatus) -> bool:
+    return (
+        status.status == "failed"
+        and status.detail == _LEGACY_IG_CONTAINER_ERROR
+        and status.attempts >= _IG_MAX_ATTEMPTS
+    )
 
 
 async def _rerender_embed(

@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import datetime, timezone
+import asyncio
 
+import httpx
+import respx
 from fastapi.testclient import TestClient
 
 
@@ -43,3 +47,48 @@ def test_path_traversal_rejected(
     with TestClient(app) as client:
         r = client.get("/api/avatars/..%2F..%2Fetc%2Fpasswd")
     assert r.status_code in (400, 404)
+
+
+@respx.mock
+def test_video_proxy_streams_job_video(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    from app.models.job import Job, PlatformStatus
+
+    app = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    source_url = "https://drive.usercontent.google.com/download?id=file_123&export=download&confirm=t"
+    project_id = "video-proxy-job"
+    asyncio.run(
+        app.state.job_store.create(
+            Job(
+                project_id=project_id,
+                job_id="j_video",
+                account_id="anime_fr",
+                device_id="iphone",
+                anime_title="Video Proxy",
+                description="desc",
+                drive_video_url=source_url,
+                slot_time=datetime.now(tz=timezone.utc),
+                platforms_requested=["instagram"],
+                platform_statuses={"instagram": PlatformStatus(status="pending")},
+                discord_message_id=None,
+                reminder_message_id=None,
+            )
+        )
+    )
+
+    with TestClient(app) as client:
+        upstream = respx.get(source_url).mock(
+            return_value=httpx.Response(
+                200,
+                content=b"video bytes",
+                headers={"content-type": "video/mp4", "content-length": "11"},
+            )
+        )
+
+        r = client.get(f"/api/videos/{project_id}")
+
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("video/mp4")
+    assert r.content == b"video bytes"
+    assert upstream.called

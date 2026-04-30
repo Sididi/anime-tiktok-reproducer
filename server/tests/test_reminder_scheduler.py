@@ -174,7 +174,7 @@ async def test_dispatch_instagram_happy_path(
         new=AsyncMock(return_value=type("R", (), {
             "success": True, "permalink": "https://instagram.com/reel/x", "detail": None,
         })()),
-    ):
+    ) as publish_mock:
         actions = await dispatch_due_actions(
             store=store, settings=settings, discord=discord
         )
@@ -186,8 +186,95 @@ async def test_dispatch_instagram_happy_path(
     assert ig.status == "uploaded"
     assert ig.url == "https://instagram.com/reel/x"
     assert ig.attempts == 1
+    assert publish_mock.await_args.kwargs["video_url"].endswith("/api/videos/ig-job")
     # Embed re-render attempted
     discord.edit_message.assert_called()
+
+
+async def test_dispatch_instagram_uses_platform_scheduled_time(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
+    store = JobStore(tmp_path / "jobs.json")
+    instagram_due = datetime(2026, 4, 26, 6, 1, tzinfo=timezone.utc)
+    tiktok_due = datetime(2026, 4, 26, 21, 0, tzinfo=timezone.utc)
+    job = _make_job(slot_time=tiktok_due, project_id="ig-platform-time")
+    job.platforms_requested = ["instagram", "tiktok"]
+    job.platform_scheduled_at = {
+        "instagram": instagram_due,
+        "tiktok": tiktok_due,
+    }
+    job.instagram_payload = {"ig_user_id": "x", "ig_access_token": "x", "caption": "x"}
+    job.platform_statuses = {
+        "instagram": PlatformStatus(status="pending"),
+        "tiktok": PlatformStatus(status="pending"),
+    }
+    await store.create(job)
+
+    discord = AsyncMock()
+    discord.post_message.side_effect = ["m_rich", "m_forward"]
+
+    with patch(
+        "app.services.reminder_scheduler.publish_to_instagram",
+        new=AsyncMock(return_value=type("R", (), {
+            "success": True,
+            "permalink": "https://instagram.com/reel/early",
+            "detail": None,
+        })()),
+    ) as publish_mock:
+        actions = await dispatch_due_actions(
+            store=store,
+            settings=settings,
+            discord=discord,
+            now=datetime(2026, 4, 26, 6, 2, tzinfo=timezone.utc),
+        )
+
+    assert actions == 1
+    assert publish_mock.await_count == 1
+    refreshed = await store.get("ig-platform-time")
+    assert refreshed.platform_statuses["instagram"].status == "uploaded"
+    assert refreshed.reminder_message_id is None
+    discord.post_message.assert_not_called()
+
+
+async def test_dispatch_legacy_instagram_uses_slot_time(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
+    store = JobStore(tmp_path / "jobs.json")
+    slot_time = datetime(2026, 4, 26, 21, 0, tzinfo=timezone.utc)
+    job = _make_job(slot_time=slot_time, project_id="ig-legacy-time")
+    job.platforms_requested = ["instagram"]
+    job.instagram_payload = {"ig_user_id": "x", "ig_access_token": "x", "caption": "x"}
+    job.platform_statuses = {"instagram": PlatformStatus(status="pending")}
+    await store.create(job)
+
+    discord = AsyncMock()
+
+    with patch(
+        "app.services.reminder_scheduler.publish_to_instagram",
+        new=AsyncMock(return_value=type("R", (), {
+            "success": True,
+            "permalink": "https://instagram.com/reel/legacy",
+            "detail": None,
+        })()),
+    ) as publish_mock:
+        early_actions = await dispatch_due_actions(
+            store=store,
+            settings=settings,
+            discord=discord,
+            now=datetime(2026, 4, 26, 6, 2, tzinfo=timezone.utc),
+        )
+        due_actions = await dispatch_due_actions(
+            store=store,
+            settings=settings,
+            discord=discord,
+            now=datetime(2026, 4, 26, 21, 1, tzinfo=timezone.utc),
+        )
+
+    assert early_actions == 0
+    assert due_actions == 1
+    assert publish_mock.await_count == 1
 
 
 async def test_dispatch_instagram_retries_until_max(
@@ -248,3 +335,43 @@ async def test_dispatch_instagram_skips_already_uploaded(
 
     assert actions == 0
     fail.assert_not_called()
+
+
+async def test_dispatch_instagram_retries_legacy_container_error_once(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
+    store = JobStore(tmp_path / "jobs.json")
+    past = datetime.now(tz=timezone.utc) - timedelta(minutes=5)
+    job = _make_job(slot_time=past, project_id="ig-legacy-error")
+    job.platforms_requested = ["instagram"]
+    job.instagram_payload = {"ig_user_id": "x", "ig_access_token": "x", "caption": "x"}
+    job.platform_statuses = {
+        "instagram": PlatformStatus(
+            status="failed",
+            detail="container status_code = ERROR",
+            attempts=5,
+        )
+    }
+    await store.create(job)
+
+    discord = AsyncMock()
+
+    with patch(
+        "app.services.reminder_scheduler.publish_to_instagram",
+        new=AsyncMock(return_value=type("R", (), {
+            "success": True,
+            "permalink": "https://instagram.com/reel/recovered",
+            "detail": None,
+        })()),
+    ) as publish_mock:
+        actions = await dispatch_due_actions(
+            store=store, settings=settings, discord=discord
+        )
+
+    refreshed = await store.get("ig-legacy-error")
+    ig = refreshed.platform_statuses["instagram"]
+    assert actions == 1
+    assert ig.status == "uploaded"
+    assert ig.attempts == 6
+    assert publish_mock.await_count == 1

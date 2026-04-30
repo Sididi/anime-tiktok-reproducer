@@ -152,3 +152,29 @@ def test_create_job_with_instagram_payload():
     sent = route.calls.last.request.content
     assert b'"instagram":{' in sent or b'"instagram": {' in sent
     assert b'"ig_user_id":"ig_42"' in sent or b'"ig_user_id": "ig_42"' in sent
+
+
+@respx.mock
+def test_create_job_sends_platform_scheduled_at():
+    route = respx.post("https://tiktok.sididi.tv/api/internal/jobs").mock(
+        return_value=httpx.Response(200, json={"job_id": "j_x", "discord_message_id": "m_1"})
+    )
+    DiscordService.create_job(
+        project_id="p1",
+        account_id="anime_fr",
+        slot_time=datetime(2026, 4, 27, 20, 17, tzinfo=timezone.utc),
+        anime_title="Title",
+        description="Desc",
+        drive_video_url="https://drive/x",
+        platforms_requested=["instagram", "tiktok"],
+        platform_scheduled_at={
+            "instagram": datetime(2026, 4, 27, 6, 1, tzinfo=timezone.utc),
+            "tiktok": datetime(2026, 4, 27, 20, 17, tzinfo=timezone.utc),
+        },
+    )
+
+    assert route.called
+    sent = route.calls.last.request.content
+    assert b'"platform_scheduled_at":{' in sent or b'"platform_scheduled_at": {' in sent
+    assert b'"instagram":"2026-04-27T06:01:00+00:00"' in sent
+    assert b'"tiktok":"2026-04-27T20:17:00+00:00"' in sent

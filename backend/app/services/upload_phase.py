@@ -601,18 +601,24 @@ class UploadPhaseService:
 
         discord_message_id = None
         try:
+            discord_slot_time = (
+                platform_scheduled_at.get("tiktok")
+                or project.scheduled_at
+                or datetime.now(timezone.utc)
+            )
             job_response = DiscordService.create_job(
                 project_id=project_id,
                 # Use the live account_id arg (validated above), not
                 # project.scheduled_account_id which is only persisted at the
                 # END of execute_upload — None on first upload.
                 account_id=account_id or project.scheduled_account_id or "",
-                slot_time=project.scheduled_at or datetime.now(timezone.utc),
+                slot_time=discord_slot_time,
                 anime_title=project.anime_name or "Unknown",
                 description=metadata.tiktok.description,
                 drive_video_url=direct_drive_download or drive_video_url,
                 platforms_requested=list(requested_platforms),
                 instagram=ig_payload,
+                platform_scheduled_at=platform_scheduled_at,
             )
         except Exception:
             logger.warning(

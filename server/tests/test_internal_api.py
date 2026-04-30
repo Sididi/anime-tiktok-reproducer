@@ -240,6 +240,36 @@ def test_create_job_persists_instagram_payload(
     }
 
 
+def test_create_job_persists_platform_scheduled_at(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    discord.post_message.return_value = "msg_embed"
+
+    payload = {
+        **JOB_PAYLOAD,
+        "platforms_requested": ["instagram", "tiktok"],
+        "platform_scheduled_at": {
+            "instagram": "2026-04-26T06:01:00+00:00",
+            "tiktok": "2026-04-26T21:00:00+00:00",
+        },
+        "instagram": {
+            "ig_user_id": "ig_user_42",
+            "ig_access_token": "ig_token_secret",
+            "caption": "Hello from IG",
+        },
+    }
+    with TestClient(app) as client:
+        r = client.post("/api/internal/jobs", json=payload, headers=INTERNAL_AUTH)
+    assert r.status_code == 200
+
+    import asyncio
+    job = asyncio.run(app.state.job_store.get("p1"))
+    assert job is not None
+    assert job.platform_scheduled_at["instagram"].isoformat() == "2026-04-26T06:01:00+00:00"
+    assert job.platform_scheduled_at["tiktok"].isoformat() == "2026-04-26T21:00:00+00:00"
+
+
 def test_create_job_without_instagram_field_persists_none(
     monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
 ):

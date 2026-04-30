@@ -109,7 +109,14 @@ async def test_polling_sees_error_status():
         return_value=httpx.Response(200, json={"id": CONTAINER_ID})
     )
     respx.get(f"{BASE}/{CONTAINER_ID}").mock(
-        return_value=httpx.Response(200, json={"status_code": "ERROR", "id": CONTAINER_ID})
+        return_value=httpx.Response(
+            200,
+            json={
+                "status_code": "ERROR",
+                "status": "The video URL is not reachable.",
+                "id": CONTAINER_ID,
+            },
+        )
     )
 
     result = await publish_to_instagram(
@@ -117,7 +124,9 @@ async def test_polling_sees_error_status():
     )
 
     assert result.success is False
-    assert result.detail == "container status_code = ERROR"
+    assert result.detail == (
+        "container status_code = ERROR; status = The video URL is not reachable."
+    )
 
 
 @respx.mock

@@ -110,6 +110,7 @@ class DiscordService:
         drive_video_url: str,
         platforms_requested: list[str],
         instagram: dict | None = None,
+        platform_scheduled_at: dict[str, datetime] | None = None,
     ) -> dict[str, Any] | None:
         body = {
             "project_id": project_id,
@@ -122,6 +123,11 @@ class DiscordService:
         }
         if instagram is not None:
             body["instagram"] = instagram
+        if platform_scheduled_at is not None:
+            body["platform_scheduled_at"] = {
+                platform: scheduled_at.isoformat()
+                for platform, scheduled_at in platform_scheduled_at.items()
+            }
         with _client() as c:
             r = c.post("/api/internal/jobs", json=body)
             r.raise_for_status()

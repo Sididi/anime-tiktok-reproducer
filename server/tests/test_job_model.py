@@ -30,14 +30,30 @@ def _make_job(**overrides) -> Job:
 
 
 def test_job_round_trips_through_dict():
-    job = _make_job()
+    job = _make_job(
+        platform_scheduled_at={
+            "instagram": datetime(2026, 4, 26, 6, 0, tzinfo=UTC),
+            "tiktok": datetime(2026, 4, 26, 21, 0, tzinfo=UTC),
+        }
+    )
     d = job.to_dict()
     assert d["project_id"] == "proj_1"
     assert d["slot_time"] == "2026-04-26T21:00:00+00:00"
+    assert d["platform_scheduled_at"]["instagram"] == "2026-04-26T06:00:00+00:00"
     assert d["platform_statuses"]["tiktok"]["status"] == "pending"
 
     restored = Job.from_dict(d)
     assert restored == job
+
+
+def test_job_round_trip_without_platform_scheduled_at():
+    job = _make_job()
+    d = job.to_dict()
+    d.pop("platform_scheduled_at")
+
+    restored = Job.from_dict(d)
+
+    assert restored.platform_scheduled_at == {}
 
 
 def test_platform_status_round_trip():
