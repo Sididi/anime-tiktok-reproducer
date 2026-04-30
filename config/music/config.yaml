@@ -47,3 +47,8 @@ music:
     display_name: "Kentenshi Paranoia"
     file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/kentenshi paranoia.wav"
     volume_db: -28
+
+  montagem_batchi:
+    display_name: "Montagem Batchi"
+    file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/montagem batchi.wav"
+    volume_db: -28
