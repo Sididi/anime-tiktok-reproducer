@@ -34,7 +34,18 @@
   var DEFAULT_PORT = 48653;
   var OUTPUT_FILENAME = "output.mp4";
   var AUDIO_NO_MUSIC_OUTPUT_FILENAME = "output_no_music.wav";
+  var PANEL_BUILD_ID = "2026-04-29-async-proxy-v8";
+  var PROJECT_CONTEXT_FILENAME = ".atr_project_context.json";
+  var PROXY_OUTPUT_SUFFIX = "__atr_proxy.mp4";
   var ATR_OUTPUT_PATTERN = /^ATR_.*\.mp4$/i;
+  var KNOWN_VIDEO_EXTENSIONS = {
+    ".avi": true,
+    ".m4v": true,
+    ".mkv": true,
+    ".mov": true,
+    ".mp4": true,
+    ".webm": true,
+  };
   var EXPORT_STABLE_MS = 10000;
   var EXPORT_POLL_INTERVAL_MS = 5000;
   var ENCODER_POLL_INTERVAL_MS = 1000;
@@ -46,6 +57,7 @@
   var CLEANUP_BACKOFF_BASE_MS = 250;
   var CLEANUP_BACKOFF_MAX_MS = 4000;
   var CLEANUP_REMAINING_PREVIEW_LIMIT = 6;
+  var PROXY_RECONCILE_MAX_ATTACH_ATTEMPTS = 120;
   var MAX_LOG_ENTRIES = 200;
 
   var DEFAULT_SETTINGS = {
@@ -58,6 +70,7 @@
     audio_preset_epr_path: "",
     delete_after_upload_default: true,
     export_audio_no_music_default: true,
+    auto_proxy_non_h264_default: false,
   };
 
   var statusIndicator = document.getElementById("status-indicator");
@@ -87,6 +100,9 @@
   var settingAudioPresetEpr = document.getElementById(
     "setting-audio-preset-epr",
   );
+  var autoProxyNonH264Checkbox = document.getElementById(
+    "chk-auto-proxy-non-h264",
+  );
   var settingsStatus = document.getElementById("settings-status");
   var settingsSection = document.getElementById("settings-section");
   var settingsToggle = document.getElementById("settings-toggle");
@@ -107,6 +123,9 @@
 
   var exportMonitors = {}; // project_id -> monitor
   var encoderJobMap = {}; // job_id -> { project_id, lease }
+  var proxyRenderProcessMap = {}; // job_id -> { project_id, process, output_path }
+  var proxyLeaseMap = {}; // project_id -> lease
+  var proxyReconcileState = {}; // project_id -> { started_at_ms, last_attempt_ms }
   var encoderPollTimer = null;
   var driveTasksFallback = null;
   var batchRuntimeHelperModule = null;
@@ -124,6 +143,10 @@
     queue: [],
     active: null,
   };
+  var ffprobeAvailabilityChecked = false;
+  var ffprobeAvailable = false;
+  var ffmpegAvailabilityChecked = false;
+  var ffmpegAvailable = false;
 
   // --- Utility ---
 
@@ -488,6 +511,18 @@
     return path.join(resolveClientDir(), fileName);
   }
 
+  function getExtensionRootPath() {
+    try {
+      return path.normalize(cs.getSystemPath(SystemPath.EXTENSION));
+    } catch (e) {
+      return resolveClientDir();
+    }
+  }
+
+  function getExtensionFilePath(fileName) {
+    return path.join(getExtensionRootPath(), fileName);
+  }
+
   function getBatchRuntimeHelper() {
     if (!batchRuntimeHelperModule) {
       batchRuntimeHelperModule = require(getClientFilePath("batch_runtime.js"));
@@ -796,6 +831,7 @@
     merged.delete_after_upload_default = !!merged.delete_after_upload_default;
     merged.export_audio_no_music_default =
       !!merged.export_audio_no_music_default;
+    merged.auto_proxy_non_h264_default = !!merged.auto_proxy_non_h264_default;
 
     return merged;
   }
@@ -816,6 +852,9 @@
     deleteAfterUploadCheckbox.checked = !!settings.delete_after_upload_default;
     exportAudioNoMusicCheckbox.checked =
       !!settings.export_audio_no_music_default;
+    if (autoProxyNonH264Checkbox) {
+      autoProxyNonH264Checkbox.checked = !!settings.auto_proxy_non_h264_default;
+    }
   }
 
   function readSettingsForm() {
@@ -834,7 +873,995 @@
       audio_preset_epr_path: String(settingAudioPresetEpr.value || "").trim(),
       delete_after_upload_default: !!deleteAfterUploadCheckbox.checked,
       export_audio_no_music_default: !!exportAudioNoMusicCheckbox.checked,
+      auto_proxy_non_h264_default: !!(
+        autoProxyNonH264Checkbox && autoProxyNonH264Checkbox.checked
+      ),
     };
+  }
+
+  function getProjectContextPath(localRootPath) {
+    var normalizedRoot = String(localRootPath || "").trim();
+    if (!normalizedRoot) {
+      return "";
+    }
+    return path.join(normalizedRoot, PROJECT_CONTEXT_FILENAME);
+  }
+
+  function readProjectContext(localRootPath) {
+    var contextPath = getProjectContextPath(localRootPath);
+    if (!contextPath) {
+      return {};
+    }
+    return readJson(contextPath, {}) || {};
+  }
+
+  function writeProjectContext(localRootPath, nextContext) {
+    var contextPath = getProjectContextPath(localRootPath);
+    if (!contextPath) {
+      return {};
+    }
+    writeJsonAtomic(contextPath, nextContext || {});
+    return nextContext || {};
+  }
+
+  function normalizeSlashes(targetPath) {
+    return String(targetPath || "").replace(/\\/g, "/");
+  }
+
+  function normalizeRelativePath(rootPath, childPath) {
+    return normalizeSlashes(
+      path.relative(String(rootPath || ""), String(childPath || "")),
+    );
+  }
+
+  function parseFfprobeRate(rateValue) {
+    var raw = String(rateValue || "").trim();
+    if (!raw || raw === "0" || raw === "0/0") {
+      return 0;
+    }
+    if (raw.indexOf("/") !== -1) {
+      var parts = raw.split("/");
+      var numerator = Number(parts[0] || 0);
+      var denominator = Number(parts[1] || 0);
+      if (!numerator || !denominator) {
+        return 0;
+      }
+      return numerator / denominator;
+    }
+    var parsed = Number(raw);
+    return isNaN(parsed) ? 0 : parsed;
+  }
+
+  function ensureEvenPositive(value) {
+    var rounded = Math.max(2, Math.round(Number(value) || 0));
+    if (rounded % 2 !== 0) {
+      rounded += 1;
+    }
+    return rounded;
+  }
+
+  function computeQuarterResolution(value) {
+    return ensureEvenPositive((Number(value) || 0) / 4);
+  }
+
+  function isCodecH264(codecName) {
+    var normalized = String(codecName || "").trim().toLowerCase();
+    return normalized === "h264" || normalized === "avc1";
+  }
+
+  function isKnownVideoPath(filePath) {
+    var ext = String(path.extname(String(filePath || "")) || "").toLowerCase();
+    return !!KNOWN_VIDEO_EXTENSIONS[ext];
+  }
+
+  function collectFilesRecursive(rootPath) {
+    var normalizedRoot = String(rootPath || "").trim();
+    var out = [];
+    if (!normalizedRoot || !fs.existsSync(normalizedRoot)) {
+      return out;
+    }
+
+    function walk(dirPath) {
+      var entries = [];
+      try {
+        entries = fs.readdirSync(dirPath);
+      } catch (e) {
+        return;
+      }
+      entries.sort();
+      entries.forEach(function (entryName) {
+        var entryPath = path.join(dirPath, entryName);
+        var stat = null;
+        try {
+          stat = fs.statSync(entryPath);
+        } catch (statErr) {
+          stat = null;
+        }
+        if (!stat) {
+          return;
+        }
+        if (stat.isDirectory()) {
+          walk(entryPath);
+          return;
+        }
+        if (stat.isFile()) {
+          out.push(entryPath);
+        }
+      });
+    }
+
+    walk(normalizedRoot);
+    return out;
+  }
+
+  function isFfprobeAvailable() {
+    if (ffprobeAvailabilityChecked) {
+      return ffprobeAvailable;
+    }
+    ffprobeAvailabilityChecked = true;
+    try {
+      childProcess.execFileSync("ffprobe", ["-version"], {
+        stdio: ["ignore", "ignore", "ignore"],
+        windowsHide: true,
+      });
+      ffprobeAvailable = true;
+    } catch (e) {
+      ffprobeAvailable = false;
+    }
+    return ffprobeAvailable;
+  }
+
+  function isFfmpegAvailable() {
+    if (ffmpegAvailabilityChecked) {
+      return ffmpegAvailable;
+    }
+    ffmpegAvailabilityChecked = true;
+    try {
+      childProcess.execFileSync("ffmpeg", ["-version"], {
+        stdio: ["ignore", "ignore", "ignore"],
+        windowsHide: true,
+      });
+      ffmpegAvailable = true;
+    } catch (e) {
+      ffmpegAvailable = false;
+    }
+    return ffmpegAvailable;
+  }
+
+  function probeVideoWithFfprobe(filePath) {
+    var args = [
+      "-v",
+      "error",
+      "-print_format",
+      "json",
+      "-show_streams",
+      "-show_format",
+      String(filePath || ""),
+    ];
+    var raw = childProcess.execFileSync("ffprobe", args, {
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    var parsed = JSON.parse(raw || "{}");
+    var streams = Array.isArray(parsed.streams) ? parsed.streams : [];
+    var videoStream = null;
+    var audioStream = null;
+    var audioStreamCount = 0;
+    for (var i = 0; i < streams.length; i += 1) {
+      if (String((streams[i] && streams[i].codec_type) || "") === "video") {
+        videoStream = streams[i];
+      } else if (
+        String((streams[i] && streams[i].codec_type) || "") === "audio"
+      ) {
+        audioStreamCount += 1;
+        if (!audioStream) {
+          audioStream = streams[i];
+        }
+      }
+    }
+    if (!videoStream) {
+      return {
+        hasVideo: false,
+      };
+    }
+    var fps =
+      parseFfprobeRate(videoStream.avg_frame_rate) ||
+      parseFfprobeRate(videoStream.r_frame_rate);
+    return {
+      hasVideo: true,
+      codec_name: String(videoStream.codec_name || "").toLowerCase(),
+      width: Math.max(0, Number(videoStream.width || 0)),
+      height: Math.max(0, Number(videoStream.height || 0)),
+      fps: fps > 0 ? fps : 0,
+      audio_codec_name: audioStream
+        ? String(audioStream.codec_name || "").toLowerCase()
+        : "",
+      audio_channels: Math.max(
+        0,
+        Number(audioStream && audioStream.channels ? audioStream.channels : 0),
+      ),
+      audio_sample_rate: Math.max(
+        0,
+        Number(
+          audioStream && audioStream.sample_rate ? audioStream.sample_rate : 0,
+        ),
+      ),
+      audio_stream_count: audioStreamCount,
+    };
+  }
+
+  function buildProxyPlanForLocalProject(localRootPath, projectId) {
+    var normalizedRoot = String(localRootPath || "").trim();
+    var enabled = !!settings.auto_proxy_non_h264_default;
+    var plan = {
+      enabled: enabled,
+      project_id: String(projectId || "").trim(),
+      auto_enable_proxy_view: true,
+      required_codec: "h264",
+      required_scale_divisor: 4,
+      detection_mode: "ffprobe",
+      targets: [],
+    };
+
+    if (!enabled || !normalizedRoot) {
+      return plan;
+    }
+
+    var sourcesRoot = path.join(normalizedRoot, "sources");
+    if (!fs.existsSync(sourcesRoot)) {
+      return plan;
+    }
+
+    var canUseFfprobe = isFfprobeAvailable();
+    if (!canUseFfprobe) {
+      plan.detection_mode = "extension_only";
+      plan.ffprobe_warning =
+        "ffprobe is unavailable; proxy classification is using file extensions only.";
+    }
+
+    collectFilesRecursive(sourcesRoot).forEach(function (absolutePath) {
+      if (!isKnownVideoPath(absolutePath)) {
+        return;
+      }
+
+      var target = {
+        media_path: normalizeSlashes(absolutePath),
+        relative_source_path: normalizeRelativePath(normalizedRoot, absolutePath),
+        source_codec: "",
+        needs_proxy: false,
+      };
+
+      if (canUseFfprobe) {
+        try {
+          var probe = probeVideoWithFfprobe(absolutePath);
+          if (!probe || !probe.hasVideo) {
+            return;
+          }
+          target.source_codec = String(probe.codec_name || "").toLowerCase();
+          target.source_width = Math.max(0, Number(probe.width || 0));
+          target.source_height = Math.max(0, Number(probe.height || 0));
+          target.source_fps = Number(probe.fps || 0);
+          target.source_audio_codec = String(
+            probe.audio_codec_name || "",
+          ).toLowerCase();
+          target.source_audio_channels = Math.max(
+            0,
+            Number(probe.audio_channels || 0),
+          );
+          target.source_audio_sample_rate = Math.max(
+            0,
+            Number(probe.audio_sample_rate || 0),
+          );
+          target.source_audio_stream_count = Math.max(
+            0,
+            Number(probe.audio_stream_count || 0),
+          );
+          if (target.source_width > 0) {
+            target.expected_proxy_width = computeQuarterResolution(
+              target.source_width,
+            );
+          }
+          if (target.source_height > 0) {
+            target.expected_proxy_height = computeQuarterResolution(
+              target.source_height,
+            );
+          }
+          target.needs_proxy = !isCodecH264(target.source_codec);
+        } catch (probeErr) {
+          target.ffprobe_error = probeErr.message;
+          target.needs_proxy =
+            String(path.extname(absolutePath) || "").toLowerCase() !== ".mp4";
+        }
+      } else {
+        target.needs_proxy =
+          String(path.extname(absolutePath) || "").toLowerCase() !== ".mp4";
+      }
+
+      plan.targets.push(target);
+    });
+
+    return plan;
+  }
+
+  function persistProxyPlanToContext(localRootPath, proxyPlan) {
+    var nextContext = readProjectContext(localRootPath);
+    nextContext.proxy_plan = proxyPlan || {
+      enabled: false,
+      targets: [],
+    };
+    return writeProjectContext(localRootPath, nextContext);
+  }
+
+  function summarizeProxyPlan(proxyPlan) {
+    var summary = {
+      total_video_targets: 0,
+      proxy_needed_count: 0,
+    };
+    var targets = proxyPlan && Array.isArray(proxyPlan.targets)
+      ? proxyPlan.targets
+      : [];
+    summary.total_video_targets = targets.length;
+    targets.forEach(function (target) {
+      if (target && target.needs_proxy) {
+        summary.proxy_needed_count += 1;
+      }
+    });
+    return summary;
+  }
+
+  function computeManagedProxyOutputPath(localRootPath, target) {
+    var rootPath = String(localRootPath || "");
+    var relativeSourcePath = normalizeSlashes(
+      (target && target.relative_source_path) || "",
+    );
+    var sourceName = path.basename(
+      relativeSourcePath || String((target && target.media_path) || ""),
+    );
+    var parsed = path.parse(sourceName);
+    var baseName = parsed.name || sourceName;
+    var parentRelative = normalizeSlashes(path.dirname(relativeSourcePath || ""));
+    var relativeProxyDir = "proxies";
+    if (parentRelative && parentRelative !== "." && parentRelative !== "/") {
+      relativeProxyDir = path.join.apply(
+        path,
+        ["proxies"].concat(parentRelative.split("/").filter(Boolean)),
+      );
+    }
+    return path.join(rootPath, relativeProxyDir, baseName + PROXY_OUTPUT_SUFFIX);
+  }
+
+  function buildFfmpegProxyArgs(target, outputPath, audioMode) {
+    var width = ensureEvenPositive(
+      Number(target && target.expected_proxy_width) || 480,
+    );
+    var height = ensureEvenPositive(
+      Number(target && target.expected_proxy_height) || 270,
+    );
+    var args = [
+      "-hide_banner",
+      "-y",
+      "-i",
+      String((target && target.media_path) || ""),
+      "-map",
+      "0:v:0",
+    ];
+    var hasAudio =
+      Math.max(0, Number(target && target.source_audio_stream_count || 0)) > 0;
+    if (hasAudio) {
+      args.push("-map", "0:a?");
+    } else {
+      args.push("-an");
+    }
+    args.push(
+      "-vf",
+      "scale=" + width + ":" + height + ":flags=bicubic",
+      "-c:v",
+      "libx264",
+      "-preset",
+      "veryfast",
+      "-crf",
+      "28",
+      "-pix_fmt",
+      "yuv420p",
+      "-fps_mode",
+      "passthrough",
+    );
+    if (hasAudio) {
+      if (audioMode === "aac") {
+        args.push("-c:a", "aac");
+        if (Number(target && target.source_audio_sample_rate || 0) > 0) {
+          args.push("-ar", String(Number(target.source_audio_sample_rate)));
+        }
+        if (Number(target && target.source_audio_channels || 0) > 0) {
+          args.push("-ac", String(Number(target.source_audio_channels)));
+        }
+        args.push("-b:a", Number(target.source_audio_channels || 0) > 2 ? "192k" : "128k");
+      } else {
+        args.push("-c:a", "copy");
+      }
+    }
+    args.push("-map_metadata", "0", "-map_chapters", "-1", "-movflags", "+faststart");
+    args.push(String(outputPath || ""));
+    return args;
+  }
+
+  function cancelLocalProxyRenderProcessesForExport() {
+    var canceled = 0;
+    Object.keys(proxyRenderProcessMap).forEach(function (jobId) {
+      var entry = proxyRenderProcessMap[jobId];
+      if (!entry) {
+        return;
+      }
+      entry.canceled = true;
+      canceled += 1;
+      try {
+        if (entry.process && !entry.process.killed) {
+          entry.process.kill();
+        }
+      } catch (killErr) {}
+      delete proxyRenderProcessMap[jobId];
+    });
+    return canceled;
+  }
+
+  function updateProxyJobCompletion(projectId, jobId, errMessage) {
+    var state = getProjectState(projectId) || {};
+    var proxyJobIds = Array.isArray(state.proxy_job_ids)
+      ? state.proxy_job_ids.slice(0)
+      : [];
+    var remainingJobIds = proxyJobIds.filter(function (candidateJobId) {
+      return String(candidateJobId || "") !== String(jobId || "");
+    });
+    var patch = {
+      proxy_job_ids: remainingJobIds,
+      proxy_pending_count: Math.max(
+        0,
+        Number(state.proxy_pending_count || 0) - 1,
+      ),
+      proxy_last_run_at: nowIso(),
+    };
+    if (errMessage) {
+      patch.proxy_status = remainingJobIds.length > 0 ? "proxying" : "warning";
+      patch.proxy_error = errMessage;
+    } else if (String(state.proxy_status || "").trim() !== "canceled") {
+      patch.proxy_status = "proxying";
+      patch.proxy_error = null;
+    }
+    upsertProjectState(projectId, patch);
+  }
+
+  function spawnFfmpegProxyJob(projectId, localRootPath, target, lease, audioMode) {
+    var outputPath = computeManagedProxyOutputPath(localRootPath, target);
+    ensureDir(path.dirname(outputPath));
+    var jobId =
+      "ffmpeg_proxy_" +
+      String(projectId || "project") +
+      "_" +
+      Date.now() +
+      "_" +
+      Math.random().toString(16).slice(2);
+    var args = buildFfmpegProxyArgs(target, outputPath, audioMode || "copy");
+    var child = childProcess.spawn("ffmpeg", args, {
+      stdio: ["ignore", "ignore", "pipe"],
+      windowsHide: true,
+    });
+    var entry = {
+      project_id: projectId,
+      process: child,
+      output_path: outputPath,
+      media_path: target.media_path,
+      lease: lease || null,
+      audio_mode: audioMode || "copy",
+      canceled: false,
+      last_stderr: "",
+    };
+    proxyRenderProcessMap[jobId] = entry;
+    encoderJobMap[jobId] = {
+      project_id: String(projectId || "").trim(),
+      lease: lease || null,
+      render_kind: "proxy",
+      engine: "ffmpeg",
+    };
+    if (child.stderr) {
+      child.stderr.on("data", function (chunk) {
+        entry.last_stderr = (entry.last_stderr + String(chunk || "")).slice(-1600);
+      });
+    }
+    child.on("error", function (err) {
+      delete proxyRenderProcessMap[jobId];
+      delete encoderJobMap[jobId];
+      updateProxyJobCompletion(projectId, jobId, err.message || "ffmpeg failed");
+    });
+    child.on("close", function (code) {
+      var latestEntry = proxyRenderProcessMap[jobId] || entry;
+      delete proxyRenderProcessMap[jobId];
+      delete encoderJobMap[jobId];
+      if (latestEntry.canceled) {
+        return;
+      }
+      if (!isAutomationProjectActive(projectId)) {
+        return;
+      }
+      if (code !== 0) {
+        if ((latestEntry.audio_mode || "copy") === "copy") {
+          try {
+            if (fs.existsSync(outputPath)) {
+              fs.unlinkSync(outputPath);
+            }
+          } catch (unlinkCopyErr) {}
+          log(
+            "Proxy audio copy failed for " +
+              projectId +
+              "; retrying proxy render with AAC audio",
+            "warn",
+          );
+          var retryJobId = spawnFfmpegProxyJob(
+            projectId,
+            localRootPath,
+            target,
+            lease,
+            "aac",
+          );
+          var retryState = getProjectState(projectId) || {};
+          var retryJobIds = Array.isArray(retryState.proxy_job_ids)
+            ? retryState.proxy_job_ids.slice(0)
+            : [];
+          retryJobIds = retryJobIds.filter(function (candidateJobId) {
+            return String(candidateJobId || "") !== String(jobId || "");
+          });
+          if (retryJobIds.indexOf(retryJobId) === -1) {
+            retryJobIds.push(retryJobId);
+          }
+          upsertProjectState(projectId, {
+            proxy_job_ids: retryJobIds,
+            proxy_pending_count: Math.max(
+              1,
+              Number(retryState.proxy_pending_count || 1),
+            ),
+            proxy_status: "proxying",
+            proxy_error: null,
+            proxy_last_run_at: nowIso(),
+          });
+          return;
+        }
+        try {
+          if (fs.existsSync(outputPath)) {
+            fs.unlinkSync(outputPath);
+          }
+        } catch (unlinkErr) {}
+        updateProxyJobCompletion(
+          projectId,
+          jobId,
+          "ffmpeg proxy render failed for " +
+            path.basename(String(target.media_path || "")) +
+            ": " +
+            (latestEntry.last_stderr || "exit code " + code),
+        );
+        return;
+      }
+      updateProxyJobCompletion(projectId, jobId, null);
+      log(
+        "Proxy render completed for " +
+          projectId +
+          " (" +
+          path.basename(outputPath) +
+          ")",
+        "info",
+      );
+    });
+    return jobId;
+  }
+
+  function scheduleProxyRenderingSidecar(projectId, localRootPath, proxyPlan, lease) {
+    proxyLeaseMap[String(projectId || "").trim()] = lease || null;
+    if (!proxyPlan || !proxyPlan.enabled) {
+      return Promise.resolve({
+        ok: true,
+        scheduled: false,
+        project_id: projectId,
+        target_count: 0,
+        job_ids: [],
+      });
+    }
+    if (!isFfmpegAvailable()) {
+      return Promise.reject(
+        new Error("ffmpeg is unavailable; cannot create attachable proxies"),
+      );
+    }
+    var targets = Array.isArray(proxyPlan.targets) ? proxyPlan.targets : [];
+    var jobIds = [];
+    var existingOutputs = 0;
+    targets.forEach(function (target) {
+      if (!target || !target.needs_proxy) {
+        return;
+      }
+      var outputPath = computeManagedProxyOutputPath(localRootPath, target);
+      if (fs.existsSync(outputPath)) {
+        existingOutputs += 1;
+        return;
+      }
+      jobIds.push(spawnFfmpegProxyJob(projectId, localRootPath, target, lease, "copy"));
+    });
+    if (jobIds.length > 0) {
+      registerProxyEncoderJobs(projectId, jobIds, lease);
+      log(
+        "Queued " +
+          jobIds.length +
+          " timing-preserving proxy render(s) for " +
+          projectId,
+        "info",
+      );
+    } else if (existingOutputs > 0) {
+      log(
+        "Found " +
+          existingOutputs +
+          " existing proxy output(s) for " +
+          projectId +
+          "; waiting for attach",
+        "info",
+      );
+    }
+    return Promise.resolve({
+      ok: true,
+      scheduled: jobIds.length > 0,
+      project_id: projectId,
+      target_count: targets.length,
+      job_ids: jobIds,
+      existing_outputs: existingOutputs,
+    });
+  }
+
+  function patchImportProjectForAsyncProxies(importPath) {
+    var normalizedImportPath = String(importPath || "").trim();
+    if (!normalizedImportPath || !fs.existsSync(normalizedImportPath)) {
+      return {
+        patched: false,
+        reason: "missing_import_project",
+      };
+    }
+
+    var source = fs.readFileSync(normalizedImportPath, "utf8");
+    if (source.indexOf("ATR_ASYNC_PROXY_IMPORT_PATCH") !== -1) {
+      return {
+        patched: false,
+        reason: "already_patched",
+      };
+    }
+
+    var functionStart = source.indexOf(
+      "function importMediaPathsWithProxyRouting(importPaths, targetBin) {",
+    );
+    if (functionStart < 0) {
+      return {
+        patched: false,
+        reason: "proxy_routing_function_not_found",
+      };
+    }
+
+    var nextFunction = source.indexOf(
+      "\n  function buildMogrtSubtitlePlacement",
+      functionStart,
+    );
+    if (nextFunction < 0) {
+      return {
+        patched: false,
+        reason: "proxy_routing_function_end_not_found",
+      };
+    }
+
+    var replacement = [
+      "function importMediaPathsWithProxyRouting(importPaths, targetBin) {",
+      "    // ATR_ASYNC_PROXY_IMPORT_PATCH: import high-res media normally;",
+      "    // proxy rendering and attach are owned by the CEP sidecar flow.",
+      "    var passthrough = [];",
+      "    var seenPassthrough = {};",
+      "    var bin = targetBin || getProjectSearchRoot();",
+      "    var importedCount = 0;",
+      "",
+      "    if (!importPaths || !importPaths.length || !app || !app.project) {",
+      "      return importedCount;",
+      "    }",
+      "",
+      "    try {",
+      "      if (app.project.setEnableTranscodeOnIngest) {",
+      "        app.project.setEnableTranscodeOnIngest(false);",
+      "      }",
+      "    } catch (eDisableIngest) {}",
+      "",
+      "    for (var i = 0; i < importPaths.length; i++) {",
+      "      var candidatePath = importPaths[i];",
+      "      var normalizedPath = normalizeComparePath(candidatePath);",
+      "      if (!normalizedPath || seenPassthrough[normalizedPath]) continue;",
+      "      seenPassthrough[normalizedPath] = true;",
+      "      passthrough.push(candidatePath);",
+      "    }",
+      "",
+      "    if (passthrough.length > 0) {",
+      "      app.project.importFiles(passthrough, true, bin, false);",
+      "      importedCount += passthrough.length;",
+      "    }",
+      "",
+      "    return importedCount;",
+      "  }",
+      "",
+    ].join("\n");
+
+    var nextSource =
+      source.substring(0, functionStart) +
+      replacement +
+      source.substring(nextFunction);
+    fs.writeFileSync(normalizedImportPath, nextSource, "utf8");
+    return {
+      patched: true,
+      reason: "patched",
+    };
+  }
+
+  function registerProxyEncoderJobs(projectId, jobIds, lease) {
+    var ids = Array.isArray(jobIds) ? jobIds : [];
+    ids.forEach(function (jobId) {
+      var normalizedJobId = String(jobId || "").trim();
+      if (!normalizedJobId) {
+        return;
+      }
+      encoderJobMap[normalizedJobId] = {
+        project_id: String(projectId || "").trim(),
+        lease: lease || null,
+        render_kind: "proxy",
+      };
+    });
+  }
+
+  function ensureAtrProjectProxiesInHost(projectId, localRootPath, proxyPlan, lease) {
+    proxyLeaseMap[String(projectId || "").trim()] = lease || null;
+    var normalizedRoot = normalizeSlashes(localRootPath);
+    var proxyPresetTemplatePath = normalizeSlashes(
+      getExtensionFilePath("assets/ATR Proxy H264.epr"),
+    );
+    var plan = proxyPlan || {
+      enabled: false,
+      targets: [],
+    };
+
+    if (!plan.enabled) {
+      return Promise.resolve({
+        ok: true,
+        scheduled: false,
+      });
+    }
+
+    var hostCall =
+      'scheduleAtrProjectProxies("' +
+      escapeForEval(normalizedRoot) +
+      '","' +
+      escapeForEval(JSON.stringify(plan)) +
+      '","' +
+      escapeForEval(proxyPresetTemplatePath) +
+      '")';
+
+    return evalHost(hostCall).then(function (result) {
+      var raw = String(result || "");
+      if (raw.indexOf("ERROR:") === 0) {
+        throw new Error(raw);
+      }
+      var parsed = {};
+      try {
+        parsed = JSON.parse(raw || "{}");
+      } catch (parseErr) {
+        throw new Error("Invalid proxy host response: " + raw);
+      }
+      if (
+        !parsed.scheduled &&
+        (Object.prototype.hasOwnProperty.call(parsed, "queued") ||
+          Object.prototype.hasOwnProperty.call(parsed, "attached") ||
+          Object.prototype.hasOwnProperty.call(parsed, "errors"))
+      ) {
+        handleProxySummaryEvent({
+          type: "proxy_summary",
+          project_id: String(projectId || "").trim(),
+          detail: parsed,
+        });
+      }
+      return parsed;
+    });
+  }
+
+  function scheduleAtrProjectProxyEncodingInHost(
+    projectId,
+    localRootPath,
+    proxyPlan,
+    lease,
+  ) {
+    proxyLeaseMap[String(projectId || "").trim()] = lease || null;
+    var normalizedRoot = normalizeSlashes(localRootPath);
+    var proxyPresetTemplatePath = normalizeSlashes(
+      getExtensionFilePath("assets/ATR Proxy H264.epr"),
+    );
+    var plan = proxyPlan || {
+      enabled: false,
+      targets: [],
+    };
+
+    if (!plan.enabled) {
+      return Promise.resolve({
+        ok: true,
+        scheduled: false,
+      });
+    }
+
+    var hostCall =
+      'scheduleAtrProjectProxyEncoding("' +
+      escapeForEval(normalizedRoot) +
+      '","' +
+      escapeForEval(JSON.stringify(plan)) +
+      '","' +
+      escapeForEval(proxyPresetTemplatePath) +
+      '")';
+
+    return evalHost(hostCall).then(function (result) {
+      var raw = String(result || "");
+      if (raw.indexOf("ERROR:") === 0) {
+        throw new Error(raw);
+      }
+      var parsed = {};
+      try {
+        parsed = JSON.parse(raw || "{}");
+      } catch (parseErr) {
+        throw new Error("Invalid proxy schedule response: " + raw);
+      }
+      if (
+        !parsed.scheduled &&
+        (Object.prototype.hasOwnProperty.call(parsed, "queued") ||
+          Object.prototype.hasOwnProperty.call(parsed, "existing_outputs") ||
+          Object.prototype.hasOwnProperty.call(parsed, "errors"))
+      ) {
+        handleProxySummaryEvent({
+          type: "proxy_summary",
+          project_id: String(projectId || "").trim(),
+          detail: parsed,
+        });
+      }
+      return parsed;
+    });
+  }
+
+  function queueAtrProjectProxiesInHost(projectId, localRootPath, proxyPlan, lease) {
+    proxyLeaseMap[String(projectId || "").trim()] = lease || null;
+    var normalizedRoot = normalizeSlashes(localRootPath);
+    var proxyPresetTemplatePath = normalizeSlashes(
+      getExtensionFilePath("assets/ATR Proxy H264.epr"),
+    );
+    var plan = proxyPlan || {
+      enabled: false,
+      targets: [],
+    };
+
+    if (!plan.enabled) {
+      return Promise.resolve({
+        ok: true,
+        queued: 0,
+        skipped_h264: 0,
+        existing_outputs: 0,
+        errors: [],
+        job_ids: [],
+      });
+    }
+
+    var hostCall =
+      'queueAtrProjectProxyEncoding("' +
+      escapeForEval(normalizedRoot) +
+      '","' +
+      escapeForEval(JSON.stringify(plan)) +
+      '","' +
+      escapeForEval(proxyPresetTemplatePath) +
+      '")';
+
+    return evalHost(hostCall).then(function (result) {
+      var raw = String(result || "");
+      if (raw.indexOf("ERROR:") === 0) {
+        throw new Error(raw);
+      }
+      try {
+        return JSON.parse(raw || "{}");
+      } catch (parseErr) {
+        throw new Error("Invalid proxy queue response: " + raw);
+      }
+    });
+  }
+
+  function reconcileAtrProjectProxiesInHost(projectId, localRootPath, proxyPlan) {
+    var normalizedRoot = normalizeSlashes(localRootPath);
+    var plan = proxyPlan || {
+      enabled: false,
+      targets: [],
+    };
+
+    if (!plan.enabled) {
+      return Promise.resolve({
+        ok: true,
+        attached: 0,
+        already_compliant: 0,
+        pending: 0,
+        missing_items: 0,
+        missing_outputs: 0,
+        attach_pending: 0,
+        errors: [],
+        attach_pending_errors: [],
+        ignored_items: 0,
+        completed_targets: 0,
+        total_targets: 0,
+      });
+    }
+
+    var hostCall =
+      'reconcileAtrProjectProxies("' +
+      escapeForEval(normalizedRoot) +
+      '","' +
+      escapeForEval(JSON.stringify(plan)) +
+      '")';
+
+    return evalHost(hostCall).then(function (result) {
+      var raw = String(result || "");
+      if (raw.indexOf("ERROR:") === 0) {
+        throw new Error(raw);
+      }
+      try {
+        return JSON.parse(raw || "{}");
+      } catch (parseErr) {
+        throw new Error("Invalid proxy reconcile response: " + raw);
+      }
+    });
+  }
+
+  function prepareMediaEncoderForExportInHost() {
+    return evalHost("cancelAtrProxyRenderingAndClearMediaEncoder()").then(
+      function (result) {
+        var raw = String(result || "");
+        if (raw.indexOf("ERROR:") === 0) {
+          throw new Error(raw);
+        }
+        try {
+          return JSON.parse(raw || "{}");
+        } catch (parseErr) {
+          throw new Error("Invalid AME clear response: " + raw);
+        }
+      },
+    );
+  }
+
+  function clearLocalProxyTrackingForExport() {
+    var droppedJobs = cancelLocalProxyRenderProcessesForExport();
+    Object.keys(encoderJobMap).forEach(function (jobId) {
+      var mapped = encoderJobMap[jobId];
+      var renderKind = String((mapped && mapped.render_kind) || "").trim();
+      if (renderKind === "proxy") {
+        delete encoderJobMap[jobId];
+        droppedJobs += 1;
+      }
+    });
+    proxyLeaseMap = {};
+    proxyReconcileState = {};
+
+    Object.keys(projectStates).forEach(function (projectId) {
+      var state = projectStates[projectId] || {};
+      var proxyStatus = String(state.proxy_status || "").trim();
+      if (
+        proxyStatus !== "starting" &&
+        proxyStatus !== "proxying" &&
+        proxyStatus !== "planned"
+      ) {
+        return;
+      }
+      upsertProjectState(projectId, {
+        proxy_status: "canceled",
+        proxy_error: null,
+        proxy_pending_count: 0,
+        proxy_job_ids: [],
+        proxy_last_run_at: nowIso(),
+      });
+    });
+
+    return droppedJobs;
   }
 
   function setSettingsStatus(message, isError) {
@@ -1109,6 +2136,7 @@
     }
 
     merged.project_id = normalizedProjectId;
+    merged.panel_build_id = PANEL_BUILD_ID;
     merged.sequence_name =
       String(merged.sequence_name || "").trim() ||
       buildProjectSequenceName(normalizedProjectId);
@@ -1189,6 +2217,11 @@
       upload_results_by_output: {},
       completion_notified_status: null,
       completion_notified_at: null,
+      proxy_status: null,
+      proxy_error: null,
+      proxy_pending_count: 0,
+      proxy_job_ids: [],
+      proxy_summary: null,
     });
 
     log(
@@ -1983,6 +3016,11 @@
       cleanup_next_retry_at: null,
       completion_notified_status: null,
       completion_notified_at: null,
+      proxy_status: null,
+      proxy_error: null,
+      proxy_pending_count: 0,
+      proxy_job_ids: [],
+      proxy_summary: null,
     });
 
     var downloadPayload = buildDrivePayloadBase();
@@ -2060,6 +3098,11 @@
       .then(function (result) {
         ensureAutomationLeaseActive(lease, "download_import_complete");
         var importPath = path.join(result.local_root, "import_project.jsx");
+        var proxyPlan = buildProxyPlanForLocalProject(
+          result.local_root,
+          projectId,
+        );
+        var proxySummary = summarizeProxyPlan(proxyPlan);
         if (!fs.existsSync(importPath)) {
           throw new Error(
             "import_project.jsx not found in downloaded folder: " +
@@ -2080,7 +3123,123 @@
           download_total_bytes: result.download_total_bytes || null,
           last_error: null,
           orchestration_metrics: result.orchestration_metrics || {},
+          proxy_status:
+            proxyPlan.enabled && proxySummary.proxy_needed_count > 0
+              ? "starting"
+              : null,
+          proxy_error: null,
+          proxy_pending_count: 0,
+          proxy_job_ids: [],
+          proxy_summary: proxySummary,
         });
+
+        persistProxyPlanToContext(result.local_root, proxyPlan);
+        try {
+          var importPatch = patchImportProjectForAsyncProxies(importPath);
+          if (importPatch.patched) {
+            log(
+              "Patched import_project.jsx for asynchronous proxy handling",
+              "info",
+            );
+          } else if (
+            proxyPlan.enabled &&
+            proxySummary.proxy_needed_count > 0 &&
+            importPatch.reason !== "already_patched"
+          ) {
+            log(
+              "Could not patch import_project.jsx proxy routing: " +
+                importPatch.reason,
+              "warn",
+            );
+          }
+        } catch (importPatchErr) {
+          log(
+            "Could not patch import_project.jsx proxy routing: " +
+              importPatchErr.message,
+            "warn",
+          );
+        }
+
+        if (proxyPlan.enabled) {
+          if (proxyPlan.ffprobe_warning) {
+            log(
+              "Proxy planning warning for " +
+                projectId +
+                ": " +
+                proxyPlan.ffprobe_warning,
+              "warn",
+            );
+          }
+          log(
+            "Proxy plan for " +
+              projectId +
+              ": " +
+              Number(proxySummary.proxy_needed_count || 0) +
+              "/" +
+              Number(proxySummary.total_video_targets || 0) +
+              " video file(s) need proxies",
+            "info",
+          );
+        }
+
+        if (proxyPlan.enabled && proxySummary.proxy_needed_count > 0) {
+          scheduleProxyRenderingSidecar(
+            projectId,
+            result.local_root,
+            proxyPlan,
+            lease,
+          )
+            .then(function (scheduleResult) {
+              if (!isAutomationProjectActive(projectId)) {
+                return;
+              }
+              if (
+                String((getProjectState(projectId) || {}).proxy_status || "").trim() ===
+                "canceled"
+              ) {
+                return;
+              }
+              log(
+                "Proxy rendering scheduled asynchronously for " + projectId,
+                "info",
+              );
+              upsertProjectState(projectId, {
+                proxy_status: scheduleResult && scheduleResult.scheduled
+                  ? "starting"
+                  : "proxying",
+                proxy_error: null,
+                proxy_pending_count:
+                  scheduleResult && Array.isArray(scheduleResult.job_ids)
+                    ? scheduleResult.job_ids.length
+                    : 0,
+                proxy_job_ids:
+                  scheduleResult && Array.isArray(scheduleResult.job_ids)
+                    ? scheduleResult.job_ids
+                    : [],
+                proxy_last_run_at: nowIso(),
+              });
+            })
+            .catch(function (proxyErr) {
+              log(
+                "Automatic proxy scheduling failed for " +
+                  projectId +
+                  ": " +
+                  proxyErr.message,
+                "warn",
+              );
+              if (
+                String((getProjectState(projectId) || {}).proxy_status || "").trim() ===
+                "canceled"
+              ) {
+                return;
+              }
+              upsertProjectState(projectId, {
+                proxy_status: "warning",
+                proxy_error: proxyErr.message,
+                proxy_last_run_at: nowIso(),
+              });
+            });
+        }
 
         return runScript(importPath).then(function (runOutcome) {
           ensureAutomationLeaseActive(lease, "download_import_after_jsx");
@@ -2104,6 +3263,18 @@
               readyAtIso,
               runOutcome && runOutcome.host_import_elapsed_ms,
             );
+          var previousProxyState = getProjectState(projectId) || {};
+          var nextProxyStatus = null;
+          if (proxyPlan.enabled && proxySummary.proxy_needed_count > 0) {
+            nextProxyStatus = String(previousProxyState.proxy_status || "").trim();
+            if (
+              nextProxyStatus !== "proxying" &&
+              nextProxyStatus !== "warning" &&
+              nextProxyStatus !== "ready"
+            ) {
+              nextProxyStatus = "starting";
+            }
+          }
           var nextState = upsertProjectState(projectId, {
             status: "ready_for_export",
             imported_at: readyAtIso,
@@ -2115,9 +3286,33 @@
             uploaded_outputs: {},
             upload_results_by_output: {},
             orchestration_metrics: orchestrationMetrics,
+            proxy_status: nextProxyStatus,
+            proxy_error:
+              proxyPlan.enabled && proxySummary.proxy_needed_count > 0
+                ? previousProxyState.proxy_error || null
+                : null,
+            proxy_pending_count:
+              proxyPlan.enabled && proxySummary.proxy_needed_count > 0
+                ? Math.max(0, Number(previousProxyState.proxy_pending_count || 0))
+                : 0,
+            proxy_job_ids:
+              proxyPlan.enabled && proxySummary.proxy_needed_count > 0
+                ? Array.isArray(previousProxyState.proxy_job_ids)
+                  ? previousProxyState.proxy_job_ids.slice(0)
+                  : []
+                : [],
+            proxy_summary:
+              proxyPlan.enabled && proxySummary.proxy_needed_count > 0
+                ? previousProxyState.proxy_summary || proxySummary
+                : proxySummary,
+            proxy_last_run_at:
+              proxyPlan.enabled && proxySummary.proxy_needed_count > 0
+                ? previousProxyState.proxy_last_run_at || readyAtIso
+                : null,
           });
           ensureAutomationLeaseActive(lease, "download_import_ready");
           projectSelect.value = projectId;
+
           return nextState;
         });
       })
@@ -2801,6 +3996,17 @@
       if (state.output_path) {
         details.push("Output: " + state.output_path);
       }
+      if (state.proxy_status) {
+        var proxyLabel = "Proxy: " + state.proxy_status;
+        if (Number(state.proxy_pending_count || 0) > 0) {
+          proxyLabel +=
+            " (" + Number(state.proxy_pending_count || 0) + " pending)";
+        }
+        details.push(proxyLabel);
+      }
+      if (state.proxy_error) {
+        details.push("Proxy error: " + state.proxy_error);
+      }
       if (state.last_error) {
         details.push("Error: " + state.last_error);
       }
@@ -3443,7 +4649,322 @@
         .catch(function () {
           // ignore poll failures
         });
+
+      reconcileProxyingProjects();
     }, ENCODER_POLL_INTERVAL_MS);
+  }
+
+  function reconcileProxyingProjects() {
+    Object.keys(projectStates).forEach(function (projectId) {
+      var state = projectStates[projectId] || {};
+      var proxyStatus = String(state.proxy_status || "").trim();
+      var previousProxySummary = state.proxy_summary || {};
+      var shouldRetryWarning =
+        proxyStatus === "warning" &&
+        Math.max(0, Number(previousProxySummary.total_targets || 0)) > 0 &&
+        Math.max(0, Number(previousProxySummary.completed_targets || 0)) <
+          Math.max(0, Number(previousProxySummary.total_targets || 0));
+      if (
+        proxyStatus !== "proxying" &&
+        proxyStatus !== "starting" &&
+        !shouldRetryWarning
+      ) {
+        return;
+      }
+      if (!state.local_root) {
+        return;
+      }
+
+      var runtime = proxyReconcileState[projectId] || {
+        started_at_ms: 0,
+        last_attempt_ms: 0,
+        attach_attempts: 0,
+        in_flight: false,
+      };
+      if (runtime.in_flight) {
+        proxyReconcileState[projectId] = runtime;
+        return;
+      }
+      var nowMs = Date.now();
+      if (!runtime.started_at_ms) {
+        runtime.started_at_ms = nowMs;
+      }
+      if (nowMs - runtime.started_at_ms < 5000) {
+        proxyReconcileState[projectId] = runtime;
+        return;
+      }
+      if (nowMs - runtime.last_attempt_ms < 5000) {
+        proxyReconcileState[projectId] = runtime;
+        return;
+      }
+      runtime.last_attempt_ms = nowMs;
+      runtime.in_flight = true;
+      proxyReconcileState[projectId] = runtime;
+
+      var context = readProjectContext(state.local_root);
+      var proxyPlan = context && context.proxy_plan ? context.proxy_plan : null;
+      if (!proxyPlan || !proxyPlan.enabled) {
+        runtime.in_flight = false;
+        proxyReconcileState[projectId] = runtime;
+        return;
+      }
+
+      reconcileAtrProjectProxiesInHost(projectId, state.local_root, proxyPlan)
+        .then(function (summary) {
+          var latestState = getProjectState(projectId) || {};
+          if (String(latestState.proxy_status || "").trim() === "canceled") {
+            delete proxyReconcileState[projectId];
+            return;
+          }
+          runtime.in_flight = false;
+          var errors = Array.isArray(summary.errors)
+            ? summary.errors.slice(0)
+            : [];
+          var totalTargets = Math.max(0, Number(summary.total_targets || 0));
+          var completedTargets = Math.max(
+            0,
+            Number(summary.completed_targets || 0),
+          );
+          var pendingTargets = Math.max(0, Number(summary.pending || 0));
+          var missingOutputs = Math.max(0, Number(summary.missing_outputs || 0));
+          var attachPending = Math.max(0, Number(summary.attach_pending || 0));
+          var pendingAttachErrors = Array.isArray(summary.attach_pending_errors)
+            ? summary.attach_pending_errors
+            : [];
+          var reconcileJobIds = Array.isArray(summary.job_ids)
+            ? summary.job_ids
+                .map(function (jobId) {
+                  return String(jobId || "").trim();
+                })
+                .filter(Boolean)
+            : [];
+          if (reconcileJobIds.length > 0) {
+            registerProxyEncoderJobs(
+              projectId,
+              reconcileJobIds,
+              proxyLeaseMap[projectId] || null,
+            );
+          }
+          var mergedProxyJobIds = Array.isArray(latestState.proxy_job_ids)
+            ? latestState.proxy_job_ids
+                .map(function (jobId) {
+                  return String(jobId || "").trim();
+                })
+                .filter(Boolean)
+            : [];
+          reconcileJobIds.forEach(function (jobId) {
+            if (mergedProxyJobIds.indexOf(jobId) === -1) {
+              mergedProxyJobIds.push(jobId);
+            }
+          });
+          var nextStatus = proxyStatus;
+
+          if (completedTargets > 0 && completedTargets >= totalTargets) {
+            nextStatus = "ready";
+            delete proxyReconcileState[projectId];
+          } else if (
+            pendingTargets > 0 &&
+            missingOutputs <= 0 &&
+            attachPending > 0
+          ) {
+            runtime.attach_attempts = Math.max(
+              0,
+              Number(runtime.attach_attempts || 0),
+            ) + 1;
+            proxyReconcileState[projectId] = runtime;
+            if (
+              runtime.attach_attempts >= PROXY_RECONCILE_MAX_ATTACH_ATTEMPTS
+            ) {
+              nextStatus = "warning";
+              errors.push("Proxy attach retry limit reached");
+              delete proxyReconcileState[projectId];
+            } else {
+              nextStatus = "proxying";
+              proxyReconcileState[projectId] = runtime;
+              if (
+                runtime.attach_attempts === 1 ||
+                runtime.attach_attempts % 12 === 0
+              ) {
+                log(
+                  "Proxy attach pending for " +
+                    projectId +
+                    (pendingAttachErrors.length > 0
+                      ? ": " + pendingAttachErrors.join(" | ")
+                      : ""),
+                  "info",
+                );
+              }
+            }
+          } else if (errors.length > 0 && pendingTargets <= 0) {
+            nextStatus = "warning";
+            proxyReconcileState[projectId] = runtime;
+          } else if (totalTargets > 0) {
+            nextStatus = "proxying";
+            runtime.attach_attempts = 0;
+            proxyReconcileState[projectId] = runtime;
+          } else {
+            proxyReconcileState[projectId] = runtime;
+          }
+
+          upsertProjectState(projectId, {
+            proxy_status: nextStatus,
+            proxy_error: errors.length > 0 ? errors.join(" | ") : null,
+            proxy_pending_count:
+              nextStatus === "ready"
+                ? 0
+                : Math.max(pendingTargets, mergedProxyJobIds.length),
+            proxy_job_ids: nextStatus === "ready" ? [] : mergedProxyJobIds,
+            proxy_summary: summary,
+            proxy_last_run_at: nowIso(),
+          });
+
+          if (reconcileJobIds.length > 0) {
+            log(
+              "Queued " +
+                reconcileJobIds.length +
+                " proxy repair job(s) for " +
+                projectId,
+              "info",
+            );
+          }
+          if (completedTargets > 0) {
+            log(
+              "Proxy reconcile for " +
+                projectId +
+                ": " +
+                completedTargets +
+                "/" +
+                totalTargets +
+                " attached or already compliant",
+              nextStatus === "ready" ? "success" : "info",
+            );
+          }
+          if (errors.length > 0) {
+            log(
+              "Proxy reconcile reported " +
+                errors.length +
+                " issue(s) for " +
+                projectId,
+              "warn",
+            );
+          }
+        })
+        .catch(function (err) {
+          runtime.in_flight = false;
+          proxyReconcileState[projectId] = runtime;
+          upsertProjectState(projectId, {
+            proxy_status: "warning",
+            proxy_error: err.message,
+            proxy_last_run_at: nowIso(),
+          });
+          log(
+            "Proxy reconcile failed for " + projectId + ": " + err.message,
+            "warn",
+          );
+        });
+    });
+  }
+
+  function handleHostTraceEvent(eventItem) {
+    if (!eventItem || eventItem.type !== "trace") {
+      return;
+    }
+
+    var projectId = String(eventItem.project_id || "").trim();
+    var detail = eventItem.detail || {};
+    var message = String(detail.message || "").trim();
+    var level = String(detail.level || "info").trim() || "info";
+
+    if (!message) {
+      return;
+    }
+
+    log(
+      (projectId ? "Proxy host " + projectId + ": " : "Proxy host: ") + message,
+      level,
+    );
+  }
+
+  function handleProxySummaryEvent(eventItem) {
+    if (!eventItem || eventItem.type !== "proxy_summary") {
+      return;
+    }
+
+    var projectId = String(eventItem.project_id || "").trim();
+    if (!projectId) {
+      return;
+    }
+
+    var summary = eventItem.detail || {};
+    var errors = Array.isArray(summary.errors) ? summary.errors : [];
+    var jobIds = Array.isArray(summary.job_ids) ? summary.job_ids : [];
+    var existingOutputs = Math.max(0, Number(summary.existing_outputs || 0));
+    var previousState = getProjectState(projectId) || {};
+    if (String(previousState.proxy_status || "").trim() === "canceled") {
+      return;
+    }
+    var plannedCount = Number(
+      (previousState.proxy_summary && previousState.proxy_summary.proxy_needed_count) ||
+        0,
+    );
+    var proxyStatus = null;
+
+    registerProxyEncoderJobs(projectId, jobIds, proxyLeaseMap[projectId] || null);
+
+    if (summary.ffprobe_warning) {
+      log(
+        "Proxying warning for " + projectId + ": " + summary.ffprobe_warning,
+        "warn",
+      );
+    }
+    if (jobIds.length > 0) {
+      proxyStatus = "proxying";
+      log(
+        "Queued " + Number(jobIds.length || 0) + " proxy job(s) for " + projectId,
+        "info",
+      );
+    } else if (existingOutputs > 0) {
+      proxyStatus = "proxying";
+      log(
+        "Found " +
+          existingOutputs +
+          " existing proxy output(s) for " +
+          projectId +
+          "; waiting for attach",
+        "info",
+      );
+    } else if (errors.length > 0) {
+      proxyStatus = "warning";
+      log(
+        "Proxy audit reported " + errors.length + " issue(s) for " + projectId,
+        "warn",
+      );
+    } else if (
+      Number(summary.attached || 0) > 0 ||
+      Number(summary.already_compliant || 0) > 0
+    ) {
+      proxyStatus = "ready";
+      log(
+        "Proxy audit for " +
+          projectId +
+          ": attached=" +
+          Number(summary.attached || 0) +
+          ", already_compliant=" +
+          Number(summary.already_compliant || 0),
+        "success",
+      );
+    } else if (plannedCount > 0) {
+      proxyStatus = "warning";
+    }
+
+    upsertProjectState(projectId, {
+      proxy_status: proxyStatus,
+      proxy_error: errors.length > 0 ? errors.join(" | ") : null,
+      proxy_pending_count: jobIds.length,
+      proxy_job_ids: jobIds,
+      proxy_summary: summary,
+      proxy_last_run_at: nowIso(),
+    });
   }
 
   function handleEncoderEvent(eventItem) {
@@ -3451,20 +4972,35 @@
       return;
     }
 
+    if (eventItem.type === "trace") {
+      handleHostTraceEvent(eventItem);
+      return;
+    }
+    if (eventItem.type === "proxy_summary") {
+      handleProxySummaryEvent(eventItem);
+      return;
+    }
+
     var jobId = String(eventItem.job_id || "");
-    var mappedJob = jobId ? encoderJobMap[jobId] || null : null;
-    var projectId = String(
-      mappedJob && mappedJob.project_id ? mappedJob.project_id : "",
-    ).trim();
-    var jobLease = mappedJob && mappedJob.lease ? mappedJob.lease : null;
     var renderKind = String(
       (eventItem.detail && eventItem.detail.render_kind) || "video",
     );
+    var mappedJob = jobId ? encoderJobMap[jobId] || null : null;
+    var fallbackProjectId = String(eventItem.project_id || "").trim();
+    var projectId = String(
+      mappedJob && mappedJob.project_id ? mappedJob.project_id : fallbackProjectId,
+    ).trim();
+    var jobLease =
+      mappedJob && mappedJob.lease
+        ? mappedJob.lease
+        : renderKind === "proxy"
+          ? proxyLeaseMap[projectId] || null
+          : null;
     var outputPath = String(
       (eventItem.detail && eventItem.detail.output_path) || "",
     ).trim();
 
-    if (!jobId || !mappedJob || !projectId) {
+    if (!jobId || !projectId) {
       return;
     }
 
@@ -3474,8 +5010,16 @@
       }
       return;
     }
+    if (renderKind !== "proxy" && !mappedJob) {
+      return;
+    }
     if (!jobLease || !isAutomationProjectActive(projectId)) {
       delete encoderJobMap[jobId];
+      return;
+    }
+
+    if (renderKind === "proxy") {
+      handleProxyEncoderEvent(eventItem, jobId, projectId);
       return;
     }
 
@@ -3582,6 +5126,117 @@
     }
   }
 
+  function handleProxyEncoderEvent(eventItem, jobId, projectId) {
+    var state = getProjectState(projectId) || {};
+    if (String(state.proxy_status || "").trim() === "canceled") {
+      delete encoderJobMap[jobId];
+      return;
+    }
+    var pendingCount = Math.max(0, Number(state.proxy_pending_count || 0));
+    var proxyJobIds = Array.isArray(state.proxy_job_ids)
+      ? state.proxy_job_ids.slice(0)
+      : [];
+    var remainingJobIds = proxyJobIds.filter(function (candidateJobId) {
+      return String(candidateJobId || "") !== String(jobId || "");
+    });
+    var outputPath = String(
+      (eventItem.detail && eventItem.detail.output_path) || "",
+    ).trim();
+
+    if (eventItem.type === "queued") {
+      log(
+        "Proxy encoder queued for " + projectId + " (job " + jobId + ")",
+        "info",
+      );
+      upsertProjectState(projectId, {
+        proxy_status: "proxying",
+      });
+      return;
+    }
+
+    if (eventItem.type === "progress") {
+      if (pendingCount > 0) {
+        upsertProjectState(projectId, {
+          proxy_status: "proxying",
+        });
+      }
+      return;
+    }
+
+    if (eventItem.type === "complete") {
+      delete encoderJobMap[jobId];
+      var nextPending = Math.max(0, pendingCount - 1);
+      var attachedOk = !!(eventItem.detail && eventItem.detail.proxy_attached);
+      var attachPending = !!(
+        eventItem.detail && eventItem.detail.proxy_attach_pending
+      );
+      var attachError = String(
+        (eventItem.detail && eventItem.detail.proxy_attach_error) || "",
+      ).trim();
+      upsertProjectState(projectId, {
+        proxy_status:
+          nextPending > 0 || attachPending
+            ? "proxying"
+            : attachedOk
+              ? "ready"
+              : "warning",
+        proxy_pending_count: nextPending,
+        proxy_error: attachPending ? null : attachError || null,
+        proxy_job_ids: remainingJobIds,
+      });
+      if (attachedOk) {
+        log(
+          "Proxy attached for " +
+            projectId +
+            " (" +
+            path.basename(outputPath || "proxy") +
+            ")",
+          "success",
+        );
+      } else if (attachPending) {
+        log(
+          "Proxy encode completed for " +
+            projectId +
+            " and is waiting for Premiere import before attach",
+          "info",
+        );
+      } else {
+        log(
+          "Proxy encode completed for " +
+            projectId +
+            " but attach failed: " +
+            (attachError || "unknown error"),
+          "warn",
+        );
+      }
+      return;
+    }
+
+    if (eventItem.type === "error") {
+      delete encoderJobMap[jobId];
+      var nextPendingError = Math.max(0, pendingCount - 1);
+      var errorText =
+        eventItem.detail && eventItem.detail.error
+          ? String(eventItem.detail.error)
+          : "Proxy encoder error";
+      upsertProjectState(projectId, {
+        proxy_status: nextPendingError > 0 ? "proxying" : "warning",
+        proxy_pending_count: nextPendingError,
+        proxy_error: errorText,
+        proxy_job_ids: remainingJobIds,
+      });
+      log(
+        "Proxy encoder error for " +
+          projectId +
+          " (job " +
+          jobId +
+          "): " +
+          errorText,
+        "warn",
+      );
+    }
+  }
+
   function startManagedExportForSelectedProject() {
     var runtime = ensureBatchRuntime();
     var exportReadiness = getBatchRuntimeHelper().canStartExport(
@@ -3643,17 +5298,43 @@
       return;
     }
 
-    var batchIds = getBatchRuntimeHelper().beginExportPhase(runtime);
-    syncTrackedBatchProjectMetadata();
     setStatus("running");
-    log(
-      "Starting batch export for " + batchIds.length + " project(s)",
-      "info",
-    );
+    log("Clearing Adobe Media Encoder before Export via CEP", "info");
+    var locallyDroppedProxyJobs = clearLocalProxyTrackingForExport();
 
-    var sequence = Promise.resolve();
-    batchIds.forEach(function (projectId) {
-      sequence = sequence.then(function () {
+    prepareMediaEncoderForExportInHost()
+      .then(function (clearResult) {
+        var clearErrors =
+          clearResult && Array.isArray(clearResult.errors)
+            ? clearResult.errors
+            : [];
+        if (!clearResult || clearResult.ok === false || !clearResult.cleared_queue) {
+          throw new Error(
+            clearErrors.length > 0
+              ? clearErrors.join(" | ")
+              : "Adobe Media Encoder queue was not cleared",
+          );
+        }
+
+        log(
+          "Media Encoder cleared; canceled " +
+            Number(
+              clearResult.canceled_proxy_jobs || locallyDroppedProxyJobs || 0,
+            ) +
+            " proxy job(s)",
+          "info",
+        );
+
+        var batchIds = getBatchRuntimeHelper().beginExportPhase(runtime);
+        syncTrackedBatchProjectMetadata();
+        log(
+          "Starting batch export for " + batchIds.length + " project(s)",
+          "info",
+        );
+
+        var sequence = Promise.resolve();
+        batchIds.forEach(function (projectId) {
+          sequence = sequence.then(function () {
         var state = getProjectState(projectId);
         if (!state || !state.output_path) {
           throw new Error("Project is missing output path: " + projectId);
@@ -3785,9 +5466,10 @@
           return null;
         });
       });
-    });
+        });
 
-    sequence
+        return sequence;
+      })
       .then(function () {
         maybeAdvanceBatchAfterUpload();
         updateGlobalStatus();
@@ -4010,6 +5692,15 @@
       });
     }
 
+    if (autoProxyNonH264Checkbox) {
+      autoProxyNonH264Checkbox.addEventListener("change", function () {
+        settings.auto_proxy_non_h264_default =
+          !!autoProxyNonH264Checkbox.checked;
+        saveSettings(settings);
+        setSettingsStatus("Default proxy behavior updated", false);
+      });
+    }
+
     projectSelect.addEventListener("change", function () {
       var selectedId = String(projectSelect.value || "");
       var selectedState = getProjectState(selectedId);
@@ -4059,7 +5750,10 @@
 
     processJobQueue();
 
-    log("Tiktok Reproducer automation initialized", "info");
+    log(
+      "Tiktok Reproducer automation initialized (" + PANEL_BUILD_ID + ")",
+      "info",
+    );
     updateGlobalStatus();
   }
 

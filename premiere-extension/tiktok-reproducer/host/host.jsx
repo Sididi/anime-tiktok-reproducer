@@ -6,14 +6,25 @@
  */
 
 var ATR_EXTENSION_ID = "com.animetiktok.tiktokreproducer.panel";
+var ATR_HOST_BUILD_ID = "2026-04-29-async-proxy-v8";
 var __atrEncoderEvents = [];
 var __atrEncoderJobProjectMap = {};
 var __atrEncoderJobMetaMap = {};
 var __atrTempAudioSequenceByJob = {};
+var __atrProxyJobMap = {};
+var __atrProxyRepairQueuedMap = {};
+var __atrProxyRepairJobKeyMap = {};
+var __atrPendingProxyKickoffs = {};
+var __atrProxyPresetPathCache = {};
 var __atrEncoderCallbacksBound = false;
 var __atrCleanupMaxBinPasses = 5;
 var __atrTempAudioSequencePrefix = "ATR_AUDIO_NO_MUSIC_TMP__";
 var __atrProjectPurgeBinName = "__ATR_PURGE__";
+var __atrProxyPresetTemplateName = "ATR Proxy H264.epr";
+var __atrProxyOutputSuffix = "__atr_proxy.mp4";
+var __atrProxyRepairOutputSuffix = "__atr_proxy_projectitem.mp4";
+var __atrTicksPerSecond = 254016000000;
+var __atrProxyKickoffSeq = 0;
 
 /**
  * JSON.stringify polyfill for ExtendScript (ES3).
@@ -57,6 +68,11 @@ if (typeof JSON.stringify !== "function") {
     return "null";
   };
 }
+if (typeof JSON.parse !== "function") {
+  JSON.parse = function (text) {
+    return eval("(" + String(text || "") + ")");
+  };
+}
 
 function __atrSafeString(value) {
   if (value === undefined || value === null) {
@@ -93,6 +109,902 @@ function __atrPathStartsWith(pathValue, rootValue) {
     return true;
   }
   return pathValue.indexOf(rootValue + "/") === 0;
+}
+
+function __atrGetExtensionRootPath() {
+  try {
+    return __atrNormalizePath(new File($.fileName).parent.parent.fsName);
+  } catch (e) {
+    return "";
+  }
+}
+
+function __atrTrimTrailingSlash(pathValue) {
+  var normalized = __atrNormalizePath(pathValue);
+  if (
+    normalized.length > 1 &&
+    normalized.charAt(normalized.length - 1) === "/"
+  ) {
+    return normalized.substring(0, normalized.length - 1);
+  }
+  return normalized;
+}
+
+function __atrJoinPath(basePath, relativePath) {
+  var left = __atrTrimTrailingSlash(basePath);
+  var right = __atrNormalizePath(relativePath).replace(/^\/+/, "");
+  if (!left) {
+    return right;
+  }
+  if (!right) {
+    return left;
+  }
+  return left + "/" + right;
+}
+
+function __atrGetParentPath(filePath) {
+  var normalized = __atrTrimTrailingSlash(filePath);
+  var slash = normalized.lastIndexOf("/");
+  if (slash <= 0) {
+    return normalized;
+  }
+  return normalized.substring(0, slash);
+}
+
+function __atrGetBasename(filePath) {
+  var normalized = __atrTrimTrailingSlash(filePath);
+  var slash = normalized.lastIndexOf("/");
+  if (slash === -1) {
+    return normalized;
+  }
+  return normalized.substring(slash + 1);
+}
+
+function __atrStripExtension(fileName) {
+  var value = __atrSafeString(fileName);
+  var dot = value.lastIndexOf(".");
+  if (dot <= 0) {
+    return value;
+  }
+  return value.substring(0, dot);
+}
+
+function __atrEnsureFolder(folderPath) {
+  if (!folderPath) {
+    return false;
+  }
+  var folder = new Folder(folderPath);
+  if (folder.exists) {
+    return true;
+  }
+  var parent = folder.parent;
+  if (parent && !parent.exists && !__atrEnsureFolder(parent.fsName)) {
+    return false;
+  }
+  return !!folder.create();
+}
+
+function __atrReadTextFile(filePath) {
+  if (!filePath) {
+    return "";
+  }
+  var file = new File(filePath);
+  if (!file.exists || !file.open("r")) {
+    return "";
+  }
+  var content = "";
+  try {
+    content = file.read();
+  } catch (e) {
+    content = "";
+  }
+  file.close();
+  return content;
+}
+
+function __atrWriteTextFile(filePath, content) {
+  if (!filePath) {
+    return false;
+  }
+  var parentPath = __atrGetParentPath(filePath);
+  if (parentPath && !__atrEnsureFolder(parentPath)) {
+    return false;
+  }
+  var file = new File(filePath);
+  if (!file.open("w")) {
+    return false;
+  }
+  try {
+    file.encoding = "UTF8";
+    file.write(content || "");
+  } catch (e) {
+    try {
+      file.close();
+    } catch (eClose0) {}
+    return false;
+  }
+  file.close();
+  return true;
+}
+
+function __atrWalkProjectItems(containerItem, visitor) {
+  var childCount = __atrGetProjectItemChildCount(containerItem);
+  for (var i = 0; i < childCount; i += 1) {
+    var child = containerItem.children[i];
+    if (!child) {
+      continue;
+    }
+    visitor(child);
+    if (__atrGetProjectItemChildCount(child) > 0) {
+      __atrWalkProjectItems(child, visitor);
+    }
+  }
+}
+
+function __atrPushUniqueProjectItem(items, seen, item) {
+  if (!item) {
+    return;
+  }
+  var key = "";
+  try {
+    key = __atrSafeString(item.nodeId || "");
+  } catch (eNode) {
+    key = "";
+  }
+  if (!key) {
+    key =
+      __atrGetProjectItemMediaPath(item) +
+      "::" +
+      __atrSafeString(item.name || "");
+  }
+  if (!key || seen[key]) {
+    return;
+  }
+  seen[key] = true;
+  items.push(item);
+}
+
+function __atrGetProjectItemName(projectItem) {
+  try {
+    return __atrSafeString(projectItem && projectItem.name ? projectItem.name : "");
+  } catch (eName) {
+    return "";
+  }
+}
+
+function __atrIsAtrRawAudioProjectItem(projectItem) {
+  var itemName = __atrGetProjectItemName(projectItem);
+  return itemName.indexOf("__ATR_RAW_AUDIO__") === 0;
+}
+
+function __atrProjectItemCanAcceptProxy(projectItem) {
+  try {
+    return !!(projectItem && projectItem.canProxy && projectItem.canProxy());
+  } catch (eCanProxy) {
+    return false;
+  }
+}
+
+function __atrNameMatchesMediaPath(nameValue, mediaPath) {
+  var itemName = __atrSafeString(nameValue).toLowerCase();
+  var baseName = __atrGetBasename(mediaPath).toLowerCase();
+  var strippedBaseName = __atrStripExtension(baseName).toLowerCase();
+  var strippedItemName = __atrStripExtension(itemName).toLowerCase();
+  return !!(
+    itemName &&
+    baseName &&
+    (itemName === baseName ||
+      strippedItemName === strippedBaseName ||
+      itemName.indexOf(baseName) !== -1 ||
+      itemName.indexOf(strippedBaseName) !== -1)
+  );
+}
+
+function __atrProjectItemNameMatchesMediaPath(projectItem, mediaPath) {
+  return __atrNameMatchesMediaPath(__atrGetProjectItemName(projectItem), mediaPath);
+}
+
+function __atrGetSequenceCount() {
+  try {
+    return Number(app && app.project && app.project.sequences ? app.project.sequences.numSequences || app.project.sequences.length || 0 : 0);
+  } catch (eSeqCount) {
+    return 0;
+  }
+}
+
+function __atrGetTrackCollectionCount(trackCollection) {
+  try {
+    return Number(trackCollection ? trackCollection.numTracks || trackCollection.length || 0 : 0);
+  } catch (eTrackCount) {
+    return 0;
+  }
+}
+
+function __atrGetTrackClipCount(track) {
+  try {
+    return Number(track && track.clips ? track.clips.numItems || track.clips.length || 0 : 0);
+  } catch (eClipCount) {
+    return 0;
+  }
+}
+
+function __atrGetTrackItemProjectItem(trackItem) {
+  try {
+    if (trackItem && trackItem.projectItem) {
+      return trackItem.projectItem;
+    }
+  } catch (eProjectItem) {}
+  return null;
+}
+
+function __atrFindTimelineVideoProjectItemsByMediaPath(mediaPath, items, seen) {
+  var wanted = __atrNormalizeComparePath(mediaPath);
+  var sequenceCount = __atrGetSequenceCount();
+  for (var s = 0; s < sequenceCount; s += 1) {
+    var sequence = null;
+    try {
+      sequence = app.project.sequences[s];
+    } catch (eSequence) {
+      sequence = null;
+    }
+    if (!sequence || !sequence.videoTracks) {
+      continue;
+    }
+    var trackCount = __atrGetTrackCollectionCount(sequence.videoTracks);
+    for (var t = 0; t < trackCount; t += 1) {
+      var track = null;
+      try {
+        track = sequence.videoTracks[t];
+      } catch (eTrack) {
+        track = null;
+      }
+      if (!track || !track.clips) {
+        continue;
+      }
+      var clipCount = __atrGetTrackClipCount(track);
+      for (var c = 0; c < clipCount; c += 1) {
+        var clip = null;
+        try {
+          clip = track.clips[c];
+        } catch (eClip) {
+          clip = null;
+        }
+        var projectItem = __atrGetTrackItemProjectItem(clip);
+        if (!projectItem) {
+          continue;
+        }
+        var itemMediaPath = __atrGetProjectItemMediaPath(projectItem);
+        var clipName = "";
+        try {
+          clipName = __atrSafeString(clip && clip.name ? clip.name : "");
+        } catch (eClipName) {
+          clipName = "";
+        }
+        if (
+          itemMediaPath === wanted ||
+          __atrProjectItemNameMatchesMediaPath(projectItem, mediaPath) ||
+          __atrNameMatchesMediaPath(clipName, mediaPath)
+        ) {
+          __atrPushUniqueProjectItem(items, seen, projectItem);
+        }
+      }
+    }
+  }
+}
+
+function __atrCollectProjectItemCandidateNames(items, limit) {
+  var names = [];
+  var maxNames = Math.max(0, Number(limit || 0));
+  for (var i = 0; i < items.length && names.length < maxNames; i += 1) {
+    var itemName = __atrGetProjectItemName(items[i]);
+    if (itemName) {
+      names.push(itemName);
+    }
+  }
+  return names.join(", ");
+}
+
+function __atrFindProjectItemsByMediaPath(mediaPath) {
+  var root = app && app.project ? app.project.rootItem : null;
+  var normalizedMediaPath = __atrNormalizePath(mediaPath);
+  var wanted = __atrNormalizeComparePath(normalizedMediaPath);
+  var found = [];
+  var seen = {};
+  if (!root || !wanted) {
+    return found;
+  }
+
+  var candidatePaths = [];
+  candidatePaths.push(normalizedMediaPath);
+  try {
+    var mediaFile = new File(normalizedMediaPath);
+    var fsName = __atrSafeString(mediaFile.fsName || "");
+    if (fsName) {
+      candidatePaths.push(fsName);
+    }
+  } catch (eFile) {}
+
+  if (root.findItemsMatchingMediaPath) {
+    for (var i = 0; i < candidatePaths.length; i += 1) {
+      var candidate = __atrSafeString(candidatePaths[i]);
+      if (!candidate) {
+        continue;
+      }
+      try {
+        var matches = root.findItemsMatchingMediaPath(candidate, 1);
+        var matchCount = 0;
+        try {
+          matchCount = Number(matches && (matches.numItems || matches.length) || 0);
+        } catch (eMatchCount) {
+          matchCount = 0;
+        }
+        if (matches && matchCount > 0) {
+          for (var j = 0; j < matchCount; j += 1) {
+            __atrPushUniqueProjectItem(found, seen, matches[j]);
+          }
+        }
+      } catch (eFind) {}
+    }
+  }
+
+  __atrWalkProjectItems(root, function (item) {
+    if (__atrGetProjectItemChildCount(item) > 0) {
+      return;
+    }
+    if (__atrGetProjectItemMediaPath(item) === wanted) {
+      __atrPushUniqueProjectItem(found, seen, item);
+    }
+  });
+
+  __atrFindTimelineVideoProjectItemsByMediaPath(normalizedMediaPath, found, seen);
+
+  __atrWalkProjectItems(root, function (itemByName) {
+    if (__atrGetProjectItemChildCount(itemByName) > 0) {
+      return;
+    }
+    if (__atrProjectItemNameMatchesMediaPath(itemByName, normalizedMediaPath)) {
+      __atrPushUniqueProjectItem(found, seen, itemByName);
+    }
+  });
+
+  return found;
+}
+
+function __atrFindProjectItemByMediaPath(mediaPath) {
+  var items = __atrFindProjectItemsByMediaPath(mediaPath);
+  return items.length > 0 ? items[0] : null;
+}
+
+function __atrNormalizeProxyTarget(rawTarget) {
+  var mediaPath = __atrNormalizePath(rawTarget && rawTarget.media_path);
+  if (!mediaPath) {
+    return null;
+  }
+  return {
+    media_path: mediaPath,
+    relative_source_path: __atrNormalizePath(
+      rawTarget && rawTarget.relative_source_path,
+    ),
+    source_codec: __atrSafeString(rawTarget && rawTarget.source_codec).toLowerCase(),
+    source_width: Math.max(0, Number(rawTarget && rawTarget.source_width || 0)),
+    source_height: Math.max(0, Number(rawTarget && rawTarget.source_height || 0)),
+    source_fps: Number(rawTarget && rawTarget.source_fps || 0),
+    source_audio_codec: __atrSafeString(
+      rawTarget && rawTarget.source_audio_codec,
+    ).toLowerCase(),
+    source_audio_channels: Math.max(
+      0,
+      Number(rawTarget && rawTarget.source_audio_channels || 0),
+    ),
+    source_audio_sample_rate: Math.max(
+      0,
+      Number(rawTarget && rawTarget.source_audio_sample_rate || 0),
+    ),
+    source_audio_stream_count: Math.max(
+      0,
+      Number(rawTarget && rawTarget.source_audio_stream_count || 0),
+    ),
+    expected_proxy_width: Math.max(
+      0,
+      Number(rawTarget && rawTarget.expected_proxy_width || 0),
+    ),
+    expected_proxy_height: Math.max(
+      0,
+      Number(rawTarget && rawTarget.expected_proxy_height || 0),
+    ),
+    needs_proxy: !!(rawTarget && rawTarget.needs_proxy),
+  };
+}
+
+function __atrParseProxyPlan(proxyPlanJson) {
+  var parsed = null;
+  if (!proxyPlanJson) {
+    return {
+      enabled: false,
+      targets: [],
+    };
+  }
+  try {
+    parsed =
+      typeof proxyPlanJson === "string" ? JSON.parse(proxyPlanJson) : proxyPlanJson;
+  } catch (e) {
+    parsed = null;
+  }
+  if (!parsed) {
+    return {
+      enabled: false,
+      targets: [],
+    };
+  }
+  var plan = {
+    enabled: !!parsed.enabled,
+    project_id: __atrSafeString(parsed.project_id),
+    auto_enable_proxy_view: !!parsed.auto_enable_proxy_view,
+    required_codec: __atrSafeString(parsed.required_codec).toLowerCase(),
+    required_scale_divisor: Math.max(
+      1,
+      Number(parsed.required_scale_divisor || 4),
+    ),
+    targets: [],
+  };
+  if (parsed.ffprobe_warning) {
+    plan.ffprobe_warning = __atrSafeString(parsed.ffprobe_warning);
+  }
+  if (parsed.targets && parsed.targets.length) {
+    for (var i = 0; i < parsed.targets.length; i += 1) {
+      var normalizedTarget = __atrNormalizeProxyTarget(parsed.targets[i]);
+      if (normalizedTarget) {
+        plan.targets.push(normalizedTarget);
+      }
+    }
+  }
+  return plan;
+}
+
+function __atrLooksLikeManagedProxyPath(proxyPath, localRootPath) {
+  var normalizedProxy = __atrNormalizeComparePath(proxyPath);
+  var normalizedRoot = __atrNormalizeComparePath(localRootPath);
+  var proxyName = __atrGetBasename(normalizedProxy);
+  return !!(
+    normalizedProxy &&
+    normalizedRoot &&
+    __atrPathStartsWith(normalizedProxy, normalizedRoot) &&
+    normalizedProxy.indexOf("/proxies/") !== -1 &&
+    (proxyName.indexOf(__atrProxyOutputSuffix.toLowerCase()) !== -1 ||
+      proxyName.indexOf(__atrProxyRepairOutputSuffix.toLowerCase()) !== -1 ||
+      proxyName.indexOf("__atr_proxy") !== -1)
+  );
+}
+
+function __atrComputeManagedProxyOutputPath(localRootPath, target) {
+  var rootPath = __atrTrimTrailingSlash(localRootPath);
+  var relativeSourcePath = __atrNormalizePath(target && target.relative_source_path);
+  var sourceFileName = __atrGetBasename(relativeSourcePath || target.media_path);
+  var baseName = __atrStripExtension(sourceFileName);
+  var parentRelative = __atrGetParentPath(relativeSourcePath);
+  var relativeProxyDir = "proxies";
+  if (parentRelative && parentRelative !== "." && parentRelative !== "/") {
+    relativeProxyDir = __atrJoinPath(relativeProxyDir, parentRelative);
+  }
+  return __atrJoinPath(
+    rootPath,
+    __atrJoinPath(relativeProxyDir, baseName + __atrProxyOutputSuffix),
+  );
+}
+
+function __atrComputeManagedProxyRepairOutputPath(localRootPath, target) {
+  var rootPath = __atrTrimTrailingSlash(localRootPath);
+  var relativeSourcePath = __atrNormalizePath(target && target.relative_source_path);
+  var sourceFileName = __atrGetBasename(relativeSourcePath || target.media_path);
+  var baseName = __atrStripExtension(sourceFileName);
+  var parentRelative = __atrGetParentPath(relativeSourcePath);
+  var relativeProxyDir = "proxies";
+  if (parentRelative && parentRelative !== "." && parentRelative !== "/") {
+    relativeProxyDir = __atrJoinPath(relativeProxyDir, parentRelative);
+  }
+  return __atrJoinPath(
+    rootPath,
+    __atrJoinPath(relativeProxyDir, baseName + __atrProxyRepairOutputSuffix),
+  );
+}
+
+function __atrEscapeRegex(value) {
+  return __atrSafeString(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function __atrReplaceExporterParamValue(xmlText, paramId, nextValue) {
+  var blockPattern = /<ExporterParam\b[\s\S]*?<\/ExporterParam>/g;
+  var identifierPattern = new RegExp(
+    "<ParamIdentifier>" + __atrEscapeRegex(paramId) + "</ParamIdentifier>",
+  );
+  var replaced = false;
+
+  return __atrSafeString(xmlText).replace(blockPattern, function (blockText) {
+    if (replaced || !identifierPattern.test(blockText)) {
+      return blockText;
+    }
+    replaced = true;
+    return blockText.replace(
+      /<ParamValue>[^<]*<\/ParamValue>/,
+      "<ParamValue>" + __atrSafeString(nextValue) + "</ParamValue>",
+    );
+  });
+}
+
+function __atrReplaceExporterParamTag(xmlText, paramId, tagName, nextValue) {
+  var blockPattern = /<ExporterParam\b[\s\S]*?<\/ExporterParam>/g;
+  var identifierPattern = new RegExp(
+    "<ParamIdentifier>" + __atrEscapeRegex(paramId) + "</ParamIdentifier>",
+  );
+  var tagPattern = new RegExp(
+    "<" + __atrEscapeRegex(tagName) + ">[^<]*</" + __atrEscapeRegex(tagName) + ">",
+  );
+  var replaced = false;
+
+  return __atrSafeString(xmlText).replace(blockPattern, function (blockText) {
+    if (replaced || !identifierPattern.test(blockText)) {
+      return blockText;
+    }
+    replaced = true;
+    return blockText.replace(
+      tagPattern,
+      "<" +
+        __atrSafeString(tagName) +
+        ">" +
+        __atrSafeString(nextValue) +
+        "</" +
+        __atrSafeString(tagName) +
+        ">",
+    );
+  });
+}
+
+function __atrIsSuccessfulAttachResult(result) {
+  return result === 0 || result === true || result === "0";
+}
+
+function __atrProjectItemProxyMatchState(projectItem, proxyPath) {
+  if (!projectItem || !proxyPath) {
+    return 0;
+  }
+  if (!projectItem.hasProxy || !projectItem.getProxyPath) {
+    return -1;
+  }
+  try {
+    if (!projectItem.hasProxy()) {
+      return 0;
+    }
+    var currentProxyPath = __atrNormalizeComparePath(projectItem.getProxyPath());
+    var expectedProxyPath = __atrNormalizeComparePath(proxyPath);
+    if (currentProxyPath && expectedProxyPath && currentProxyPath === expectedProxyPath) {
+      return 1;
+    }
+    try {
+      var proxyFile = new File(proxyPath);
+      var proxyFsPath = __atrNormalizeComparePath(proxyFile.fsName || "");
+      if (proxyFsPath && currentProxyPath === proxyFsPath) {
+        return 1;
+      }
+    } catch (eFile) {}
+    return 0;
+  } catch (eProxyPath) {
+    return -1;
+  }
+}
+
+function __atrTryAttachProxy(projectItem, proxyPath) {
+  var response = {
+    ok: false,
+    error: "",
+    attached_path: "",
+    last_result: "",
+  };
+  if (!projectItem || !proxyPath) {
+    response.error = "Missing project item or proxy path";
+    return response;
+  }
+
+  var normalizedProxyPath = __atrNormalizePath(proxyPath);
+  var proxyFile = new File(normalizedProxyPath);
+  var candidatePaths = [];
+  var fsPath = __atrSafeString(proxyFile.fsName || "");
+  if (fsPath) {
+    candidatePaths.push(fsPath);
+  }
+  if (normalizedProxyPath) {
+    candidatePaths.push(normalizedProxyPath);
+    candidatePaths.push(normalizedProxyPath.replace(/\//g, "\\"));
+  }
+
+  var seen = {};
+  for (var i = 0; i < candidatePaths.length; i += 1) {
+    var candidate = __atrSafeString(candidatePaths[i]);
+    if (!candidate || seen[candidate]) {
+      continue;
+    }
+    seen[candidate] = true;
+
+    if (__atrProjectItemProxyMatchState(projectItem, candidate) === 1) {
+      response.ok = true;
+      response.attached_path = candidate;
+      return response;
+    }
+
+    try {
+      if (projectItem.refreshMedia) {
+        projectItem.refreshMedia();
+      }
+    } catch (eRefresh) {}
+
+    try {
+      var attachResult = projectItem.attachProxy(candidate, 0);
+      response.last_result = __atrSafeString(attachResult);
+      for (var verifyAttempt = 0; verifyAttempt < 4; verifyAttempt += 1) {
+        try {
+          if (projectItem.refreshMedia) {
+            projectItem.refreshMedia();
+          }
+        } catch (eRefreshAfterAttach) {}
+        if (verifyAttempt > 0) {
+          try {
+            $.sleep(250);
+          } catch (eSleepVerify) {}
+        }
+        var matchState = __atrProjectItemProxyMatchState(projectItem, candidate);
+        if (matchState === 1) {
+          response.ok = true;
+          response.attached_path = candidate;
+          return response;
+        }
+      }
+      if (__atrIsSuccessfulAttachResult(attachResult)) {
+        response.ok = true;
+        response.attached_path = candidate;
+        return response;
+      }
+      response.error =
+        "attachProxy returned " +
+        (response.last_result ? response.last_result : "empty/undefined") +
+        " and proxy path did not verify";
+    } catch (eAttachCandidate) {
+      response.error = __atrSafeString(
+        eAttachCandidate.message || eAttachCandidate,
+      );
+    }
+  }
+
+  if (!response.error) {
+    response.error = "attachProxy returned false";
+  }
+  return response;
+}
+
+function __atrResolveProxyPresetTemplatePath(localRootPath, explicitTemplatePath) {
+  var candidates = [
+    __atrNormalizePath(explicitTemplatePath),
+    __atrJoinPath(localRootPath, "assets/" + __atrProxyPresetTemplateName),
+    __atrJoinPath(
+      __atrGetExtensionRootPath(),
+      "assets/" + __atrProxyPresetTemplateName,
+    ),
+    __atrJoinPath(
+      __atrNormalizePath(new File($.fileName).parent.fsName),
+      "../assets/" + __atrProxyPresetTemplateName,
+    ),
+  ];
+
+  for (var i = 0; i < candidates.length; i += 1) {
+    var candidatePath = __atrNormalizePath(candidates[i]);
+    if (!candidatePath) {
+      continue;
+    }
+    var candidateFile = new File(candidatePath);
+    if (candidateFile.exists) {
+      return {
+        path: candidatePath,
+        error: "",
+      };
+    }
+  }
+
+  var checkedCandidates = [];
+  for (var j = 0; j < candidates.length; j += 1) {
+    if (candidates[j]) {
+      checkedCandidates.push(__atrNormalizePath(candidates[j]));
+    }
+  }
+
+  return {
+    path: "",
+    error:
+      "Proxy preset template not found in bundle or extension assets (" +
+      __atrProxyPresetTemplateName +
+      "). Checked: " +
+      checkedCandidates.join(" | "),
+  };
+}
+
+function __atrBuildProxyPresetPath(localRootPath, target, explicitTemplatePath) {
+  var width = Math.max(
+    2,
+    Number(target && target.expected_proxy_width || 0) || 480,
+  );
+  var height = Math.max(
+    2,
+    Number(target && target.expected_proxy_height || 0) || 270,
+  );
+  var fps = Number(target && target.source_fps || 0);
+  if (!fps || fps <= 0) {
+    fps = 23.976;
+  }
+  var fpsTicks = Math.max(1, Math.round(__atrTicksPerSecond / fps));
+  var audioChannels = Math.max(
+    0,
+    Number(target && target.source_audio_channels || 0),
+  );
+  var audioSampleRate = Math.max(
+    0,
+    Number(target && target.source_audio_sample_rate || 0),
+  );
+  var audioStreamCount = Math.max(
+    0,
+    Number(target && target.source_audio_stream_count || 0),
+  );
+  var hasAudio = audioStreamCount > 0 && audioChannels > 0;
+  var audioBitrate = audioChannels >= 6 ? "256" : audioChannels > 2 ? "192" : "96";
+  var audioKey = hasAudio
+    ? "a" + audioChannels + "_" + (audioSampleRate || 0)
+    : "noaudio";
+  var cacheKey = [
+    __atrNormalizeComparePath(localRootPath),
+    width,
+    height,
+    fpsTicks,
+    audioStreamCount,
+    audioChannels,
+    audioSampleRate,
+  ].join("x");
+  if (__atrProxyPresetPathCache[cacheKey]) {
+    return {
+      path: __atrProxyPresetPathCache[cacheKey],
+      error: "",
+    };
+  }
+
+  var templateResult = __atrResolveProxyPresetTemplatePath(
+    localRootPath,
+    explicitTemplatePath,
+  );
+  if (!templateResult.path) {
+    return {
+      path: "",
+      error: templateResult.error,
+    };
+  }
+
+  var templateXml = __atrReadTextFile(templateResult.path);
+  if (!templateXml) {
+    return {
+      path: "",
+      error: "Proxy preset template is unreadable: " + templateResult.path,
+    };
+  }
+
+  var presetXml = templateXml;
+  presetXml = presetXml.replace(
+    /<PresetName>[^<]*<\/PresetName>/,
+    "<PresetName>ATR Proxy H264 " +
+      width +
+      "x" +
+      height +
+      " " +
+      audioKey +
+      "</PresetName>",
+  );
+  presetXml = presetXml.replace(
+    /<DoAudio>[^<]*<\/DoAudio>/,
+    "<DoAudio>" + (hasAudio ? "true" : "false") + "</DoAudio>",
+  );
+  presetXml = presetXml.replace(
+    /<UseMaximumRenderQuality>[^<]*<\/UseMaximumRenderQuality>/,
+    "<UseMaximumRenderQuality>false</UseMaximumRenderQuality>",
+  );
+  presetXml = __atrReplaceExporterParamValue(
+    presetXml,
+    "ADBEVideoWidth",
+    width,
+  );
+  presetXml = __atrReplaceExporterParamValue(
+    presetXml,
+    "ADBEVideoHeight",
+    height,
+  );
+  presetXml = __atrReplaceExporterParamValue(
+    presetXml,
+    "ADBEVideoFPS",
+    fpsTicks,
+  );
+  presetXml = __atrReplaceExporterParamTag(
+    presetXml,
+    "ADBEVideoWidth",
+    "ParamIsDisabled",
+    "false",
+  );
+  presetXml = __atrReplaceExporterParamTag(
+    presetXml,
+    "ADBEVideoHeight",
+    "ParamIsDisabled",
+    "false",
+  );
+  presetXml = __atrReplaceExporterParamTag(
+    presetXml,
+    "ADBEVideoFPS",
+    "ParamIsDisabled",
+    "false",
+  );
+  presetXml = __atrReplaceExporterParamValue(
+    presetXml,
+    "ADBEVideoMinBitrate",
+    "0.4",
+  );
+  presetXml = __atrReplaceExporterParamValue(
+    presetXml,
+    "ADBEVideoTargetBitrate",
+    "1.2",
+  );
+  presetXml = __atrReplaceExporterParamValue(
+    presetXml,
+    "ADBEVideoMaxBitrate",
+    "2.0",
+  );
+  presetXml = __atrReplaceExporterParamValue(
+    presetXml,
+    "ADBEAudioBitrate",
+    audioBitrate,
+  );
+  if (audioChannels > 0) {
+    presetXml = __atrReplaceExporterParamValue(
+      presetXml,
+      "ADBEAudioNumChannels",
+      String(audioChannels),
+    );
+  }
+  if (audioSampleRate > 0) {
+    presetXml = __atrReplaceExporterParamValue(
+      presetXml,
+      "ADBEAudioRatePerSecond",
+      String(audioSampleRate),
+    );
+  }
+  presetXml = __atrReplaceExporterParamValue(
+    presetXml,
+    "ADBEMPEGKeyframeRate",
+    "30",
+  );
+
+  var presetPath = __atrJoinPath(
+    localRootPath,
+    "proxies/__atr_proxy_presets/atr_proxy_" +
+      width +
+      "x" +
+      height +
+      "_" +
+      fpsTicks +
+      "_" +
+      audioKey +
+      ".epr",
+  );
+  if (!__atrWriteTextFile(presetPath, presetXml)) {
+    return {
+      path: "",
+      error: "Failed to write generated proxy preset: " + presetPath,
+    };
+  }
+  __atrProxyPresetPathCache[cacheKey] = presetPath;
+  return {
+    path: presetPath,
+    error: "",
+  };
 }
 
 function __atrGetProjectItemMediaPath(projectItem) {
@@ -389,7 +1301,10 @@ function __atrPushEncoderEvent(type, jobID, detail) {
     type: __atrSafeString(type),
     job_id: __atrSafeString(jobID),
     project_id: __atrSafeString(
-      (meta && meta.project_id) || __atrEncoderJobProjectMap[jobID] || "",
+      (detail && detail.project_id) ||
+        (meta && meta.project_id) ||
+        __atrEncoderJobProjectMap[jobID] ||
+        "",
     ),
     timestamp: new Date().toISOString ? new Date().toISOString() : "",
     detail: detail || {},
@@ -398,6 +1313,30 @@ function __atrPushEncoderEvent(type, jobID, detail) {
     event.detail.render_kind = __atrSafeString(meta.render_kind);
   }
   __atrEncoderEvents.push(event);
+}
+
+function __atrPushHostTrace(projectId, message, level, detail) {
+  var payload = detail || {};
+  payload.project_id = __atrSafeString(projectId);
+  payload.message = __atrSafeString(message);
+  payload.level = __atrSafeString(level || "info");
+  payload.host_build_id = ATR_HOST_BUILD_ID;
+  __atrPushEncoderEvent("trace", "", payload);
+}
+
+function __atrPushProxySummary(projectId, summary) {
+  var payload = summary || {};
+  payload.project_id = __atrSafeString(projectId);
+  payload.host_build_id = ATR_HOST_BUILD_ID;
+  __atrPushEncoderEvent("proxy_summary", "", payload);
+}
+
+function __atrEscapeForCodeString(value) {
+  return __atrSafeString(value)
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\r/g, "\\r")
+    .replace(/\n/g, "\\n");
 }
 
 function __atrRememberEncoderJob(
@@ -416,6 +1355,357 @@ function __atrRememberEncoderJob(
   };
 }
 
+function __atrRememberProxyJob(jobID, projectId, mediaPath, proxyPath, localRootPath, autoEnableProxyView) {
+  __atrProxyJobMap[jobID] = {
+    project_id: __atrSafeString(projectId),
+    media_path: __atrNormalizePath(mediaPath),
+    proxy_path: __atrNormalizePath(proxyPath),
+    local_root_path: __atrNormalizePath(localRootPath),
+    auto_enable_proxy_view: !!autoEnableProxyView,
+  };
+}
+
+function __atrAttachProxyToMatchingItems(projectId, mediaPath, proxyPath, localRootPath) {
+  var response = {
+    proxy_attached: false,
+    proxy_attach_pending: false,
+    proxy_attach_error: "",
+    media_path: __atrSafeString(mediaPath),
+    output_path: __atrSafeString(proxyPath),
+    item_count: 0,
+    eligible_count: 0,
+    ignored_count: 0,
+    attached_count: 0,
+    already_compliant_count: 0,
+    completed_count: 0,
+    errors: [],
+  };
+
+  var proxyFile = new File(__atrNormalizePath(proxyPath));
+  var proxyFsPath = __atrSafeString(proxyFile.fsName || proxyPath);
+  var items = __atrFindProjectItemsByMediaPath(mediaPath);
+  response.item_count = items.length;
+  if (!items.length) {
+    response.proxy_attach_pending = true;
+    response.proxy_attach_error =
+      "Unable to find imported project item for " + mediaPath;
+    __atrPushHostTrace(
+      projectId,
+      "Proxy attach could not find project item for " + mediaPath,
+      "warn",
+    );
+    return response;
+  }
+
+  for (var i = 0; i < items.length; i += 1) {
+    var item = items[i];
+    var itemName = __atrGetProjectItemName(item);
+    if (!item || __atrIsAtrRawAudioProjectItem(item)) {
+      response.ignored_count += 1;
+      continue;
+    }
+    if (!__atrProjectItemCanAcceptProxy(item)) {
+      response.ignored_count += 1;
+      continue;
+    }
+
+    response.eligible_count += 1;
+    if (localRootPath && item.hasProxy && item.getProxyPath) {
+      try {
+        if (
+          item.hasProxy() &&
+          __atrLooksLikeManagedProxyPath(item.getProxyPath(), localRootPath)
+        ) {
+          response.already_compliant_count += 1;
+          response.completed_count += 1;
+          continue;
+        }
+      } catch (eManagedProxyState) {}
+    }
+
+    var matchState = __atrProjectItemProxyMatchState(item, proxyFsPath);
+    if (matchState === 1) {
+      response.already_compliant_count += 1;
+      response.completed_count += 1;
+      continue;
+    }
+
+    try {
+      var attachAttempt = __atrTryAttachProxy(item, proxyFsPath);
+      if (attachAttempt.ok) {
+        response.attached_count += 1;
+        response.completed_count += 1;
+      } else {
+        response.errors.push(
+          "Failed to attach proxy" +
+            (itemName ? " to " + itemName : "") +
+            ": " +
+            __atrSafeString(attachAttempt.error || "attachProxy returned false"),
+        );
+      }
+    } catch (eAttach) {
+      response.errors.push(
+        "Failed to attach proxy" +
+          (itemName ? " to " + itemName : "") +
+          ": " +
+          __atrSafeString(eAttach.message || eAttach),
+      );
+    }
+  }
+
+  response.proxy_attached =
+    response.eligible_count > 0 &&
+    response.completed_count >= response.eligible_count;
+  if (!response.proxy_attached) {
+    response.proxy_attach_pending = true;
+    response.proxy_attach_error = response.errors.join(" | ");
+    if (!response.proxy_attach_error && response.eligible_count <= 0) {
+      response.proxy_attach_error =
+        "No proxy-capable video project item found yet for " +
+        __atrGetBasename(mediaPath) +
+        (items.length > 0
+          ? "; ignored candidates: " +
+            __atrCollectProjectItemCandidateNames(items, 6)
+          : "");
+    }
+  }
+  return response;
+}
+
+function __atrAttachGeneratedProxyForJob(jobID, outputPath) {
+  var job = __atrProxyJobMap[jobID] || null;
+  var response = {
+    proxy_attached: false,
+    proxy_attach_pending: false,
+    proxy_attach_error: "",
+    media_path: "",
+    output_path: __atrSafeString(outputPath),
+    attached_count: 0,
+    eligible_count: 0,
+    already_compliant_count: 0,
+  };
+  if (!job) {
+    return response;
+  }
+
+  response.media_path = __atrSafeString(job.media_path);
+  var proxyPath = __atrNormalizePath(outputPath || job.proxy_path);
+  var proxyFile = new File(proxyPath);
+  var proxyFsPath = __atrSafeString(proxyFile.fsName || proxyPath);
+
+  try {
+    var attachAttempt = __atrAttachProxyToMatchingItems(
+      job.project_id,
+      job.media_path,
+      proxyFsPath,
+      job.local_root_path,
+    );
+    response.proxy_attached = !!attachAttempt.proxy_attached;
+    response.proxy_attach_pending = !!attachAttempt.proxy_attach_pending;
+    response.proxy_attach_error = __atrSafeString(
+      attachAttempt.proxy_attach_error,
+    );
+    response.attached_count = Number(attachAttempt.attached_count || 0);
+    response.eligible_count = Number(attachAttempt.eligible_count || 0);
+    response.ignored_count = Number(attachAttempt.ignored_count || 0);
+    response.already_compliant_count = Number(
+      attachAttempt.already_compliant_count || 0,
+    );
+  } catch (eAttach) {
+    response.proxy_attached = false;
+    response.proxy_attach_pending = true;
+    response.proxy_attach_error = __atrSafeString(eAttach.message || eAttach);
+  }
+
+  __atrPushHostTrace(
+    job.project_id,
+    response.proxy_attached
+      ? "Proxy attached for " + __atrGetBasename(proxyFsPath)
+      : "Proxy attach failed for " +
+          __atrGetBasename(proxyFsPath) +
+          (response.proxy_attach_error
+            ? ": " + response.proxy_attach_error
+            : ""),
+    response.proxy_attached
+      ? "info"
+      : response.proxy_attach_pending
+        ? "info"
+        : "warn",
+  );
+
+  if (
+    response.proxy_attached &&
+    job.auto_enable_proxy_view &&
+    app &&
+    app.setEnableProxies
+  ) {
+    try {
+      app.setEnableProxies(1);
+    } catch (eEnableProxyView) {}
+  }
+
+  if (!response.proxy_attached && !response.proxy_attach_error) {
+    response.proxy_attach_error = "attachProxy returned false";
+  }
+  return response;
+}
+
+function __atrBuildProxyRepairKey(projectId, mediaPath) {
+  return (
+    __atrSafeString(projectId) +
+    "::" +
+    __atrNormalizeComparePath(mediaPath)
+  );
+}
+
+function __atrFindProxyCapableProjectItemByMediaPath(mediaPath) {
+  var items = __atrFindProjectItemsByMediaPath(mediaPath);
+  for (var i = 0; i < items.length; i += 1) {
+    var item = items[i];
+    if (
+      item &&
+      !__atrIsAtrRawAudioProjectItem(item) &&
+      __atrProjectItemCanAcceptProxy(item)
+    ) {
+      return item;
+    }
+  }
+  return null;
+}
+
+function __atrResolveRepairOutputPath(baseRepairPath) {
+  var normalizedRepairPath = __atrNormalizePath(baseRepairPath);
+  var repairFile = new File(normalizedRepairPath);
+  if (!repairFile.exists) {
+    return normalizedRepairPath;
+  }
+  try {
+    if (repairFile.remove()) {
+      return normalizedRepairPath;
+    }
+  } catch (eRemoveRepair) {}
+
+  var parentPath = __atrGetParentPath(normalizedRepairPath);
+  var baseName = __atrStripExtension(__atrGetBasename(normalizedRepairPath));
+  return __atrJoinPath(
+    parentPath,
+    baseName + "_" + new Date().getTime() + ".mp4",
+  );
+}
+
+function __atrQueueProjectItemProxyRepair(
+  projectId,
+  target,
+  normalizedRootPath,
+  proxyPresetTemplatePath,
+  autoEnableProxyView,
+) {
+  var response = {
+    ok: false,
+    queued: false,
+    job_id: "",
+    output_path: "",
+    error: "",
+  };
+  var repairKey = __atrBuildProxyRepairKey(projectId, target && target.media_path);
+  if (__atrProxyRepairQueuedMap[repairKey]) {
+    response.ok = true;
+    return response;
+  }
+
+  if (!app || !app.encoder) {
+    response.error = "app.encoder is unavailable for proxy repair";
+    return response;
+  }
+
+  var projectItem = __atrFindProxyCapableProjectItemByMediaPath(target.media_path);
+  if (!projectItem) {
+    response.error =
+      "No proxy-capable imported project item found for " + target.media_path;
+    return response;
+  }
+
+  var presetResult = __atrBuildProxyPresetPath(
+    normalizedRootPath,
+    target,
+    proxyPresetTemplatePath,
+  );
+  var presetPath = presetResult && presetResult.path ? presetResult.path : "";
+  if (!presetPath) {
+    response.error =
+      "Failed to build proxy repair preset for " +
+      target.media_path +
+      (presetResult && presetResult.error ? " (" + presetResult.error + ")" : "");
+    return response;
+  }
+
+  var repairPath = __atrResolveRepairOutputPath(
+    __atrComputeManagedProxyRepairOutputPath(normalizedRootPath, target),
+  );
+  var repairFolderPath = __atrGetParentPath(repairPath);
+  if (repairFolderPath && !__atrEnsureFolder(repairFolderPath)) {
+    response.error = "Failed to create proxy repair folder for " + repairPath;
+    return response;
+  }
+
+  __atrPushHostTrace(
+    projectId,
+    "Queueing ProjectItem proxy repair for " + __atrGetBasename(target.media_path),
+    "info",
+  );
+
+  try {
+    app.encoder.launchEncoder();
+    if (!__atrBindEncoderCallbacks()) {
+      response.error = "Unable to bind AME encoder callbacks for proxy repair";
+      return response;
+    }
+
+    var repairFile = new File(repairPath);
+    var repairFsPath = __atrSafeString(repairFile.fsName || repairPath);
+    var presetFile = new File(presetPath);
+    var presetFsPath = __atrSafeString(presetFile.fsName || presetPath);
+    var jobID = __atrEncodeProjectItem(projectItem, repairFsPath, presetFsPath);
+    __atrRememberEncoderJob(
+      jobID,
+      projectId || __atrSafeString(app.project ? app.project.name || "" : ""),
+      "proxy",
+      repairFsPath,
+      presetFsPath,
+    );
+    __atrRememberProxyJob(
+      jobID,
+      projectId || __atrSafeString(app.project ? app.project.name || "" : ""),
+      target.media_path,
+      repairPath,
+      normalizedRootPath,
+      autoEnableProxyView,
+    );
+    __atrProxyJobMap[jobID].proxy_repair = true;
+    __atrProxyJobMap[jobID].repair_key = repairKey;
+    __atrProxyRepairQueuedMap[repairKey] = true;
+    __atrProxyRepairJobKeyMap[jobID] = repairKey;
+
+    if (app.encoder.startBatch) {
+      app.encoder.startBatch();
+    }
+
+    response.ok = true;
+    response.queued = true;
+    response.job_id = __atrSafeString(jobID);
+    response.output_path = repairFsPath;
+    __atrPushHostTrace(
+      projectId,
+      "Queued ProjectItem proxy repair job " + response.job_id,
+      "info",
+    );
+  } catch (eRepair) {
+    response.error = __atrSafeString(eRepair.message || eRepair);
+  }
+
+  return response;
+}
+
 function __atrForgetEncoderJob(jobID) {
   var tempSequenceName = __atrSafeString(
     __atrTempAudioSequenceByJob[jobID] || "",
@@ -432,6 +1722,12 @@ function __atrForgetEncoderJob(jobID) {
   try {
     delete __atrEncoderJobMetaMap[jobID];
   } catch (e2) {}
+  try {
+    delete __atrProxyJobMap[jobID];
+  } catch (e3) {}
+  try {
+    delete __atrProxyRepairJobKeyMap[jobID];
+  } catch (e4) {}
 }
 
 function __atrBindEncoderCallbacks() {
@@ -453,6 +1749,13 @@ function __atrBindEncoderCallbacks() {
 }
 
 function ATR_onEncoderJobQueued(jobID) {
+  var projectId = __atrSafeString(__atrEncoderJobProjectMap[jobID] || "");
+  __atrPushHostTrace(projectId, "AME queued job " + __atrSafeString(jobID), "info");
+  try {
+    if (app && app.encoder && app.encoder.startBatch) {
+      app.encoder.startBatch();
+    }
+  } catch (eStartBatch) {}
   __atrPushEncoderEvent("queued", jobID, {});
 }
 
@@ -467,13 +1770,43 @@ function ATR_onEncoderJobProgress(jobID, progress) {
 }
 
 function ATR_onEncoderJobComplete(jobID, outputPath) {
-  __atrPushEncoderEvent("complete", jobID, {
+  var projectId = __atrSafeString(__atrEncoderJobProjectMap[jobID] || "");
+  __atrPushHostTrace(
+    projectId,
+    "AME completed job " + __atrSafeString(jobID),
+    "info",
+  );
+  var detail = {
     output_path: __atrSafeString(outputPath),
-  });
+  };
+  var meta = __atrEncoderJobMetaMap[jobID] || null;
+  if (meta && meta.render_kind === "proxy") {
+    var proxyAttach = __atrAttachGeneratedProxyForJob(jobID, outputPath);
+    detail.proxy_attached = !!proxyAttach.proxy_attached;
+    detail.proxy_attach_pending = !!proxyAttach.proxy_attach_pending;
+    detail.proxy_attach_error = __atrSafeString(proxyAttach.proxy_attach_error);
+    detail.media_path = __atrSafeString(proxyAttach.media_path);
+    detail.attached_count = Number(proxyAttach.attached_count || 0);
+    detail.eligible_count = Number(proxyAttach.eligible_count || 0);
+    detail.already_compliant_count = Number(
+      proxyAttach.already_compliant_count || 0,
+    );
+    detail.ignored_count = Number(proxyAttach.ignored_count || 0);
+  }
+  __atrPushEncoderEvent("complete", jobID, detail);
   __atrForgetEncoderJob(jobID);
 }
 
 function ATR_onEncoderJobError(jobID, errorDetail) {
+  var projectId = __atrSafeString(__atrEncoderJobProjectMap[jobID] || "");
+  __atrPushHostTrace(
+    projectId,
+    "AME error for job " +
+      __atrSafeString(jobID) +
+      ": " +
+      __atrSafeString(errorDetail),
+    "error",
+  );
   __atrPushEncoderEvent("error", jobID, {
     error: __atrSafeString(errorDetail),
   });
@@ -1129,6 +2462,17 @@ function startManagedExport(projectId, sequenceName, outputPath, presetPath) {
       });
     }
 
+    if (app.encoder && app.encoder.startBatch) {
+      try {
+        app.encoder.startBatch();
+      } catch (eStartBatch) {
+        return (
+          "ERROR: Failed to start AME batch: " +
+          __atrSafeString(eStartBatch.message || eStartBatch)
+        );
+      }
+    }
+
     return JSON.stringify({
       video_job_id: __atrSafeString(videoJobID),
       audio_job_id: __atrSafeString(audioJobID),
@@ -1137,6 +2481,1112 @@ function startManagedExport(projectId, sequenceName, outputPath, presetPath) {
   } catch (e) {
     return "ERROR: " + e.message + " (line " + e.line + ")";
   }
+}
+
+function __atrEncodeFile(filePath, outputFsPath, presetFsPath) {
+  var normalizedFilePath = __atrNormalizePath(filePath);
+  var sourceFile = new File(normalizedFilePath);
+  var sourceFsPath = __atrSafeString(sourceFile.fsName || normalizedFilePath);
+  var jobID = null;
+  try {
+    jobID = app.encoder.encodeFile(sourceFsPath, outputFsPath, presetFsPath, 0, 0);
+  } catch (eFive) {
+    try {
+      jobID = app.encoder.encodeFile(sourceFsPath, outputFsPath, presetFsPath, 0);
+    } catch (eFour) {
+      jobID = app.encoder.encodeFile(sourceFsPath, outputFsPath, presetFsPath);
+    }
+  }
+
+  if (!jobID && jobID !== 0) {
+    throw new Error("encodeFile returned an empty job ID");
+  }
+  return jobID;
+}
+
+function __atrEncodeProjectItem(projectItem, outputFsPath, presetFsPath) {
+  var jobID = null;
+  try {
+    jobID = app.encoder.encodeProjectItem(
+      projectItem,
+      outputFsPath,
+      presetFsPath,
+      0,
+      0,
+    );
+  } catch (eFive) {
+    try {
+      jobID = app.encoder.encodeProjectItem(
+        projectItem,
+        outputFsPath,
+        presetFsPath,
+        0,
+      );
+    } catch (eFour) {
+      jobID = app.encoder.encodeProjectItem(
+        projectItem,
+        outputFsPath,
+        presetFsPath,
+      );
+    }
+  }
+
+  if (!jobID && jobID !== 0) {
+    throw new Error("encodeProjectItem returned an empty job ID");
+  }
+  return jobID;
+}
+
+function __atrRunScheduledProxyKickoff(kickoffId) {
+  var normalizedKickoffId = __atrSafeString(kickoffId);
+  var payload = __atrPendingProxyKickoffs[normalizedKickoffId] || null;
+  if (!payload) {
+    return;
+  }
+
+  try {
+    delete __atrPendingProxyKickoffs[normalizedKickoffId];
+  } catch (eDeleteKickoff) {}
+
+  var plan = __atrParseProxyPlan(payload.proxyPlanJson);
+  var projectId =
+    plan.project_id || __atrSafeString(app && app.project ? app.project.name : "");
+  __atrPushHostTrace(
+    projectId,
+    "Proxy kickoff started (" + normalizedKickoffId + ")",
+    "info",
+  );
+
+  var result = ensureAtrProjectProxies(
+    payload.localRootPath,
+    payload.proxyPlanJson,
+    payload.proxyPresetTemplatePath,
+  );
+
+  if (result && String(result).indexOf("ERROR:") === 0) {
+    __atrPushHostTrace(projectId, "Proxy kickoff failed: " + result, "error");
+    __atrPushProxySummary(projectId, {
+      ok: false,
+      queued: 0,
+      attached: 0,
+      skipped_h264: 0,
+      already_compliant: 0,
+      replaced_noncompliant: 0,
+      errors: [String(result)],
+      job_ids: [],
+    });
+    return;
+  }
+
+  var parsed = {};
+  try {
+    parsed = JSON.parse(result || "{}");
+  } catch (eParse) {
+    parsed = {
+      ok: false,
+      queued: 0,
+      attached: 0,
+      skipped_h264: 0,
+      already_compliant: 0,
+      replaced_noncompliant: 0,
+      errors: ["Invalid proxy kickoff result: " + __atrSafeString(result)],
+      job_ids: [],
+    };
+  }
+
+  __atrPushProxySummary(projectId, parsed);
+  __atrPushHostTrace(
+    projectId,
+    "Proxy kickoff finished: queued=" +
+      Number(parsed.queued || 0) +
+      ", attached=" +
+      Number(parsed.attached || 0) +
+      ", errors=" +
+      (parsed.errors && parsed.errors.length ? parsed.errors.length : 0),
+    parsed.ok === false ? "warn" : "info",
+  );
+}
+
+function __atrRunScheduledProxyEncoding(kickoffId) {
+  var normalizedKickoffId = __atrSafeString(kickoffId);
+  var payload = __atrPendingProxyKickoffs[normalizedKickoffId] || null;
+  if (!payload) {
+    return;
+  }
+
+  try {
+    delete __atrPendingProxyKickoffs[normalizedKickoffId];
+  } catch (eDeleteKickoff) {}
+
+  var plan = __atrParseProxyPlan(payload.proxyPlanJson);
+  var projectId =
+    plan.project_id || __atrSafeString(app && app.project ? app.project.name : "");
+  __atrPushHostTrace(
+    projectId,
+    "Pre-import proxy encoding kickoff started (" + normalizedKickoffId + ")",
+    "info",
+  );
+
+  var result = queueAtrProjectProxyEncoding(
+    payload.localRootPath,
+    payload.proxyPlanJson,
+    payload.proxyPresetTemplatePath,
+  );
+
+  if (result && String(result).indexOf("ERROR:") === 0) {
+    __atrPushHostTrace(projectId, "Proxy encoding kickoff failed: " + result, "error");
+    __atrPushProxySummary(projectId, {
+      ok: false,
+      queued: 0,
+      skipped_h264: 0,
+      existing_outputs: 0,
+      errors: [String(result)],
+      job_ids: [],
+    });
+    return;
+  }
+
+  var parsed = {};
+  try {
+    parsed = JSON.parse(result || "{}");
+  } catch (eParse) {
+    parsed = {
+      ok: false,
+      queued: 0,
+      skipped_h264: 0,
+      existing_outputs: 0,
+      errors: ["Invalid proxy encoding kickoff result: " + __atrSafeString(result)],
+      job_ids: [],
+    };
+  }
+
+  __atrPushProxySummary(projectId, parsed);
+  __atrPushHostTrace(
+    projectId,
+    "Pre-import proxy encoding kickoff finished: queued=" +
+      Number(parsed.queued || 0) +
+      ", existing=" +
+      Number(parsed.existing_outputs || 0) +
+      ", errors=" +
+      (parsed.errors && parsed.errors.length ? parsed.errors.length : 0),
+    parsed.ok === false ? "warn" : "info",
+  );
+}
+
+function scheduleAtrProjectProxyEncoding(localRootPath, proxyPlanJson, proxyPresetTemplatePath) {
+  try {
+    var plan = __atrParseProxyPlan(proxyPlanJson);
+    var projectId =
+      plan.project_id || __atrSafeString(app && app.project ? app.project.name : "");
+    var targetCount = plan.targets ? plan.targets.length : 0;
+
+    if (!plan.enabled || !targetCount) {
+      return JSON.stringify({
+        ok: true,
+        scheduled: false,
+        project_id: projectId,
+        target_count: targetCount,
+      });
+    }
+
+    __atrPushHostTrace(
+      projectId,
+      "Scheduling pre-import proxy encoding for " + targetCount + " target(s)",
+      "info",
+    );
+
+    if (app && app.scheduleTask) {
+      __atrProxyKickoffSeq += 1;
+      var kickoffId =
+        "atr_proxy_encode_" + new Date().getTime() + "_" + __atrProxyKickoffSeq;
+      __atrPendingProxyKickoffs[kickoffId] = {
+        localRootPath: __atrSafeString(localRootPath),
+        proxyPlanJson: proxyPlanJson,
+        proxyPresetTemplatePath: __atrSafeString(proxyPresetTemplatePath),
+      };
+      app.scheduleTask(
+        '__atrRunScheduledProxyEncoding("' +
+          __atrEscapeForCodeString(kickoffId) +
+          '")',
+        50,
+        false,
+      );
+      __atrPushHostTrace(
+        projectId,
+        "Pre-import proxy encoding scheduled (" + kickoffId + ")",
+        "info",
+      );
+      return JSON.stringify({
+        ok: true,
+        scheduled: true,
+        project_id: projectId,
+        kickoff_id: kickoffId,
+        target_count: targetCount,
+      });
+    }
+
+    __atrPushHostTrace(
+      projectId,
+      "app.scheduleTask unavailable; running pre-import proxy encoding inline",
+      "warn",
+    );
+    var inlineResult = queueAtrProjectProxyEncoding(
+      localRootPath,
+      proxyPlanJson,
+      proxyPresetTemplatePath,
+    );
+    if (inlineResult && String(inlineResult).indexOf("ERROR:") === 0) {
+      return inlineResult;
+    }
+    try {
+      __atrPushProxySummary(projectId, JSON.parse(inlineResult || "{}"));
+    } catch (eInlineParse) {}
+    return inlineResult;
+  } catch (e) {
+    return "ERROR: " + e.message + " (line " + e.line + ")";
+  }
+}
+
+function queueAtrProjectProxyEncoding(localRootPath, proxyPlanJson, proxyPresetTemplatePath) {
+  try {
+    var normalizedRootPath = __atrNormalizePath(localRootPath);
+    if (!normalizedRootPath) {
+      return "ERROR: Missing local project root";
+    }
+
+    var plan = __atrParseProxyPlan(proxyPlanJson);
+    var result = {
+      ok: true,
+      queued: 0,
+      skipped_h264: 0,
+      existing_outputs: 0,
+      errors: [],
+      job_ids: [],
+    };
+    if (plan.ffprobe_warning) {
+      result.ffprobe_warning = plan.ffprobe_warning;
+    }
+    if (!plan.enabled || !plan.targets.length) {
+      return JSON.stringify(result);
+    }
+
+    __atrPushHostTrace(
+      plan.project_id,
+      "Proxy pre-import queue entered for " + plan.targets.length + " target(s)",
+      "info",
+    );
+
+    if (!app || !app.encoder) {
+      return "ERROR: app.encoder is unavailable";
+    }
+
+    __atrPushHostTrace(plan.project_id, "Launching Adobe Media Encoder", "info");
+    app.encoder.launchEncoder();
+    __atrPushHostTrace(plan.project_id, "Binding AME encoder callbacks", "info");
+    if (!__atrBindEncoderCallbacks()) {
+      return "ERROR: Unable to bind AME encoder callbacks";
+    }
+
+    for (var i = 0; i < plan.targets.length; i += 1) {
+      var target = plan.targets[i];
+      if (!target) {
+        continue;
+      }
+
+      if (!target.needs_proxy) {
+        result.skipped_h264 += 1;
+        continue;
+      }
+
+      __atrPushHostTrace(
+        plan.project_id,
+        "Proxy queue target " +
+          (i + 1) +
+          "/" +
+          plan.targets.length +
+          ": " +
+          __atrGetBasename(target.media_path),
+        "info",
+      );
+
+      var desiredProxyPath = __atrComputeManagedProxyOutputPath(
+        normalizedRootPath,
+        target,
+      );
+      var desiredProxyFile = new File(desiredProxyPath);
+      if (desiredProxyFile.exists) {
+        result.existing_outputs += 1;
+        continue;
+      }
+
+      var presetResult = __atrBuildProxyPresetPath(
+        normalizedRootPath,
+        target,
+        proxyPresetTemplatePath,
+      );
+      var presetPath = presetResult && presetResult.path ? presetResult.path : "";
+      if (!presetPath) {
+        result.errors.push(
+          "Failed to build proxy preset for " +
+            target.media_path +
+            (presetResult && presetResult.error
+              ? " (" + presetResult.error + ")"
+              : ""),
+        );
+        result.ok = false;
+        continue;
+      }
+
+      var proxyFolderPath = __atrGetParentPath(desiredProxyPath);
+      if (proxyFolderPath && !__atrEnsureFolder(proxyFolderPath)) {
+        result.errors.push(
+          "Failed to create proxy folder for " + desiredProxyPath,
+        );
+        result.ok = false;
+        continue;
+      }
+
+      __atrPushHostTrace(
+        plan.project_id,
+        "Queueing proxy encode for " + __atrGetBasename(target.media_path),
+        "info",
+      );
+      var desiredProxyOutputFile = new File(desiredProxyPath);
+      var desiredProxyOutputFsPath = __atrSafeString(
+        desiredProxyOutputFile.fsName || desiredProxyPath,
+      );
+      var presetFile = new File(presetPath);
+      var presetFsPath = __atrSafeString(presetFile.fsName || presetPath);
+      var jobID = __atrEncodeFile(
+        target.media_path,
+        desiredProxyOutputFsPath,
+        presetFsPath,
+      );
+      __atrRememberEncoderJob(
+        jobID,
+        plan.project_id || __atrSafeString(app.project ? app.project.name : ""),
+        "proxy",
+        desiredProxyOutputFsPath,
+        presetFsPath,
+      );
+      __atrRememberProxyJob(
+        jobID,
+        plan.project_id || __atrSafeString(app.project ? app.project.name : ""),
+        target.media_path,
+        desiredProxyPath,
+        normalizedRootPath,
+        plan.auto_enable_proxy_view,
+      );
+      __atrPushHostTrace(
+        plan.project_id,
+        "Queued proxy encode job " + __atrSafeString(jobID),
+        "info",
+      );
+      result.queued += 1;
+      result.job_ids.push(__atrSafeString(jobID));
+    }
+
+    if (result.queued > 0 && app.encoder && app.encoder.startBatch) {
+      __atrPushHostTrace(
+        plan.project_id,
+        "Starting AME batch for " + result.queued + " proxy job(s)",
+        "info",
+      );
+      try {
+        app.encoder.startBatch();
+      } catch (eStartBatchQueued) {
+        result.ok = false;
+        result.errors.push(
+          "Failed to start AME batch: " +
+            __atrSafeString(eStartBatchQueued.message || eStartBatchQueued),
+        );
+        __atrPushHostTrace(
+          plan.project_id,
+          "Failed to start AME batch: " +
+            __atrSafeString(eStartBatchQueued.message || eStartBatchQueued),
+          "error",
+        );
+      }
+    }
+
+    return JSON.stringify(result);
+  } catch (e) {
+    return "ERROR: " + e.message + " (line " + e.line + ")";
+  }
+}
+
+function scheduleAtrProjectProxies(localRootPath, proxyPlanJson, proxyPresetTemplatePath) {
+  try {
+    var plan = __atrParseProxyPlan(proxyPlanJson);
+    var projectId =
+      plan.project_id || __atrSafeString(app && app.project ? app.project.name : "");
+    var targetCount = plan.targets ? plan.targets.length : 0;
+
+    if (!plan.enabled || !targetCount) {
+      return JSON.stringify({
+        ok: true,
+        scheduled: false,
+        project_id: projectId,
+        target_count: targetCount,
+      });
+    }
+
+    __atrPushHostTrace(
+      projectId,
+      "Scheduling proxy kickoff for " + targetCount + " target(s)",
+      "info",
+    );
+
+    if (app && app.scheduleTask) {
+      __atrProxyKickoffSeq += 1;
+      var kickoffId =
+        "atr_proxy_" + new Date().getTime() + "_" + __atrProxyKickoffSeq;
+      __atrPendingProxyKickoffs[kickoffId] = {
+        localRootPath: __atrSafeString(localRootPath),
+        proxyPlanJson: proxyPlanJson,
+        proxyPresetTemplatePath: __atrSafeString(proxyPresetTemplatePath),
+      };
+      app.scheduleTask(
+        '__atrRunScheduledProxyKickoff("' +
+          __atrEscapeForCodeString(kickoffId) +
+          '")',
+        50,
+        false,
+      );
+      __atrPushHostTrace(
+        projectId,
+        "Proxy kickoff scheduled (" + kickoffId + ")",
+        "info",
+      );
+      return JSON.stringify({
+        ok: true,
+        scheduled: true,
+        project_id: projectId,
+        kickoff_id: kickoffId,
+        target_count: targetCount,
+      });
+    }
+
+    __atrPushHostTrace(
+      projectId,
+      "app.scheduleTask unavailable; running proxy kickoff inline",
+      "warn",
+    );
+    return ensureAtrProjectProxies(
+      localRootPath,
+      proxyPlanJson,
+      proxyPresetTemplatePath,
+    );
+  } catch (e) {
+    return "ERROR: " + e.message + " (line " + e.line + ")";
+  }
+}
+
+function ensureAtrProjectProxies(localRootPath, proxyPlanJson, proxyPresetTemplatePath) {
+  try {
+    if (!app || !app.project) {
+      return "ERROR: No active Premiere project";
+    }
+
+    var normalizedRootPath = __atrNormalizePath(localRootPath);
+    if (!normalizedRootPath) {
+      return "ERROR: Missing local project root";
+    }
+
+    var plan = __atrParseProxyPlan(proxyPlanJson);
+    var result = {
+      ok: true,
+      queued: 0,
+      attached: 0,
+      skipped_h264: 0,
+      already_compliant: 0,
+      replaced_noncompliant: 0,
+      errors: [],
+      job_ids: [],
+    };
+    if (plan.ffprobe_warning) {
+      result.ffprobe_warning = plan.ffprobe_warning;
+    }
+    if (!plan.enabled || !plan.targets.length) {
+      return JSON.stringify(result);
+    }
+
+    __atrPushHostTrace(
+      plan.project_id,
+      "Proxy audit entered for " + plan.targets.length + " target(s)",
+      "info",
+    );
+
+    if (!app.encoder) {
+      return "ERROR: app.encoder is unavailable";
+    }
+
+    __atrPushHostTrace(plan.project_id, "Launching Adobe Media Encoder", "info");
+    app.encoder.launchEncoder();
+    __atrPushHostTrace(plan.project_id, "Binding AME encoder callbacks", "info");
+    if (!__atrBindEncoderCallbacks()) {
+      return "ERROR: Unable to bind AME encoder callbacks";
+    }
+
+    for (var i = 0; i < plan.targets.length; i += 1) {
+      var target = plan.targets[i];
+      if (!target) {
+        continue;
+      }
+
+      if (!target.needs_proxy) {
+        result.skipped_h264 += 1;
+        continue;
+      }
+
+      __atrPushHostTrace(
+        plan.project_id,
+        "Proxy audit target " +
+          (i + 1) +
+          "/" +
+          plan.targets.length +
+          ": " +
+          __atrGetBasename(target.media_path),
+        "info",
+      );
+
+      var projectItem = __atrFindProjectItemByMediaPath(target.media_path);
+      if (!projectItem) {
+        result.errors.push(
+          "Imported project item not found for " + target.media_path,
+        );
+        result.ok = false;
+        continue;
+      }
+
+      if (!projectItem.canProxy || !projectItem.canProxy()) {
+        result.errors.push(
+          "Project item cannot accept a proxy: " +
+            __atrSafeString(projectItem.name),
+        );
+        result.ok = false;
+        continue;
+      }
+
+      var desiredProxyPath = __atrComputeManagedProxyOutputPath(
+        normalizedRootPath,
+        target,
+      );
+      var currentProxyPath = "";
+      try {
+        if (projectItem.hasProxy && projectItem.hasProxy()) {
+          currentProxyPath = __atrNormalizePath(projectItem.getProxyPath());
+        }
+      } catch (eCurrentProxy) {
+        currentProxyPath = "";
+      }
+
+      var desiredProxyFile = new File(desiredProxyPath);
+      var desiredExists = !!desiredProxyFile.exists;
+      var desiredMatchesCurrent =
+        __atrNormalizeComparePath(currentProxyPath) ===
+        __atrNormalizeComparePath(desiredProxyPath);
+
+      if (desiredMatchesCurrent && desiredExists) {
+        result.already_compliant += 1;
+        continue;
+      }
+
+      if (desiredExists) {
+        try {
+          var desiredProxyFsPath = __atrSafeString(
+            desiredProxyFile.fsName || desiredProxyPath,
+          );
+          var attachExisting = __atrTryAttachProxy(
+            projectItem,
+            desiredProxyFsPath,
+          );
+          if (!attachExisting.ok) {
+            throw new Error(attachExisting.error || "attachProxy returned false");
+          }
+          result.attached += 1;
+          if (currentProxyPath) {
+            result.replaced_noncompliant += 1;
+          }
+          continue;
+        } catch (eAttachExisting) {
+          result.errors.push(
+            "Failed to attach existing proxy for " +
+              target.media_path +
+              ": " +
+              __atrSafeString(eAttachExisting.message || eAttachExisting),
+          );
+          result.ok = false;
+          continue;
+        }
+      }
+
+      var presetResult = __atrBuildProxyPresetPath(
+        normalizedRootPath,
+        target,
+        proxyPresetTemplatePath,
+      );
+      var presetPath = presetResult && presetResult.path ? presetResult.path : "";
+      if (!presetPath) {
+        result.errors.push(
+          "Failed to build proxy preset for " +
+            target.media_path +
+            (presetResult && presetResult.error
+              ? " (" + presetResult.error + ")"
+              : ""),
+        );
+        result.ok = false;
+        continue;
+      }
+
+      var proxyFolderPath = __atrGetParentPath(desiredProxyPath);
+      if (proxyFolderPath && !__atrEnsureFolder(proxyFolderPath)) {
+        result.errors.push(
+          "Failed to create proxy folder for " + desiredProxyPath,
+        );
+        result.ok = false;
+        continue;
+      }
+
+      __atrPushHostTrace(
+        plan.project_id,
+        "Queueing proxy encode for " + __atrGetBasename(target.media_path),
+        "info",
+      );
+      var desiredProxyOutputFile = new File(desiredProxyPath);
+      var desiredProxyOutputFsPath = __atrSafeString(
+        desiredProxyOutputFile.fsName || desiredProxyPath,
+      );
+      var presetFile = new File(presetPath);
+      var presetFsPath = __atrSafeString(presetFile.fsName || presetPath);
+      var jobID = __atrEncodeProjectItem(
+        projectItem,
+        desiredProxyOutputFsPath,
+        presetFsPath,
+      );
+      __atrRememberEncoderJob(
+        jobID,
+        plan.project_id || __atrSafeString(app.project.name || ""),
+        "proxy",
+        desiredProxyOutputFsPath,
+        presetFsPath,
+      );
+      __atrRememberProxyJob(
+        jobID,
+        plan.project_id || __atrSafeString(app.project.name || ""),
+        target.media_path,
+        desiredProxyPath,
+        normalizedRootPath,
+        plan.auto_enable_proxy_view,
+      );
+      __atrPushHostTrace(
+        plan.project_id,
+        "Queued proxy encode job " + __atrSafeString(jobID),
+        "info",
+      );
+      result.queued += 1;
+      result.job_ids.push(__atrSafeString(jobID));
+      if (currentProxyPath && !__atrLooksLikeManagedProxyPath(currentProxyPath, normalizedRootPath)) {
+        result.replaced_noncompliant += 1;
+      }
+    }
+
+    if (
+      plan.auto_enable_proxy_view &&
+      (result.attached > 0 || result.already_compliant > 0) &&
+      app.setEnableProxies
+    ) {
+      try {
+        app.setEnableProxies(1);
+      } catch (eEnableProxyView) {}
+    }
+
+    if (result.queued > 0 && app.encoder && app.encoder.startBatch) {
+      __atrPushHostTrace(
+        plan.project_id,
+        "Starting AME batch for " + result.queued + " proxy job(s)",
+        "info",
+      );
+      try {
+        app.encoder.startBatch();
+      } catch (eStartBatchQueued) {
+        result.ok = false;
+        result.errors.push(
+          "Failed to start AME batch: " +
+            __atrSafeString(eStartBatchQueued.message || eStartBatchQueued),
+        );
+        __atrPushHostTrace(
+          plan.project_id,
+          "Failed to start AME batch: " +
+            __atrSafeString(eStartBatchQueued.message || eStartBatchQueued),
+          "error",
+        );
+      }
+    }
+
+    return JSON.stringify(result);
+  } catch (e) {
+    return "ERROR: " + e.message + " (line " + e.line + ")";
+  }
+}
+
+function reconcileAtrProjectProxies(localRootPath, proxyPlanJson) {
+  try {
+    if (!app || !app.project) {
+      return "ERROR: No active Premiere project";
+    }
+
+    var normalizedRootPath = __atrNormalizePath(localRootPath);
+    if (!normalizedRootPath) {
+      return "ERROR: Missing local project root";
+    }
+
+    var plan = __atrParseProxyPlan(proxyPlanJson);
+    var result = {
+      ok: true,
+      attached: 0,
+      already_compliant: 0,
+      pending: 0,
+      missing_items: 0,
+      missing_outputs: 0,
+      attach_pending: 0,
+      eligible_items: 0,
+      ignored_items: 0,
+      errors: [],
+      attach_pending_errors: [],
+      completed_targets: 0,
+      total_targets: 0,
+      repair_queued: 0,
+      job_ids: [],
+    };
+    if (!plan.enabled || !plan.targets.length) {
+      return JSON.stringify(result);
+    }
+
+    for (var i = 0; i < plan.targets.length; i += 1) {
+      var target = plan.targets[i];
+      if (!target || !target.needs_proxy) {
+        continue;
+      }
+      result.total_targets += 1;
+
+      var desiredProxyPath = __atrComputeManagedProxyOutputPath(
+        normalizedRootPath,
+        target,
+      );
+      var repairProxyPath = __atrComputeManagedProxyRepairOutputPath(
+        normalizedRootPath,
+        target,
+      );
+      var repairProxyFile = new File(repairProxyPath);
+      var desiredProxyFile = new File(desiredProxyPath);
+      if (!desiredProxyFile.exists && !repairProxyFile.exists) {
+        result.pending += 1;
+        result.missing_outputs += 1;
+        continue;
+      }
+      var repairKey = __atrBuildProxyRepairKey(plan.project_id, target.media_path);
+      if (__atrProxyRepairQueuedMap[repairKey] && !repairProxyFile.exists) {
+        result.pending += 1;
+        result.attach_pending += 1;
+        result.attach_pending_errors.push(
+          target.media_path + ": ProjectItem proxy repair is still rendering",
+        );
+        continue;
+      }
+
+      try {
+        var attachResult = null;
+        if (repairProxyFile.exists) {
+          var repairProxyFsPath = __atrSafeString(
+            repairProxyFile.fsName || repairProxyPath,
+          );
+          attachResult = __atrAttachProxyToMatchingItems(
+            plan.project_id,
+            target.media_path,
+            repairProxyFsPath,
+            normalizedRootPath,
+          );
+        }
+
+        if (
+          (!attachResult || !attachResult.proxy_attached) &&
+          desiredProxyFile.exists
+        ) {
+          var desiredProxyFsPath = __atrSafeString(
+            desiredProxyFile.fsName || desiredProxyPath,
+          );
+          attachResult = __atrAttachProxyToMatchingItems(
+            plan.project_id,
+            target.media_path,
+            desiredProxyFsPath,
+            normalizedRootPath,
+          );
+        }
+
+        if (!attachResult) {
+          result.pending += 1;
+          continue;
+        }
+
+        result.attached += Number(attachResult.attached_count || 0);
+        result.already_compliant += Number(
+          attachResult.already_compliant_count || 0,
+        );
+        result.eligible_items += Number(attachResult.eligible_count || 0);
+        result.ignored_items += Number(attachResult.ignored_count || 0);
+        if (Number(attachResult.item_count || 0) <= 0) {
+          result.missing_items += 1;
+        }
+        if (attachResult.proxy_attached) {
+          result.completed_targets += 1;
+          continue;
+        }
+        if (attachResult.proxy_attach_pending) {
+          result.pending += 1;
+          result.attach_pending += 1;
+          if (attachResult.proxy_attach_error) {
+            result.attach_pending_errors.push(
+              target.media_path +
+                ": " +
+                __atrSafeString(attachResult.proxy_attach_error),
+            );
+          }
+        } else {
+          result.ok = false;
+          if (attachResult.proxy_attach_error) {
+            result.errors.push(
+              "Failed to attach proxy for " +
+                target.media_path +
+                ": " +
+                __atrSafeString(attachResult.proxy_attach_error),
+            );
+          }
+        }
+      } catch (eAttach) {
+        result.errors.push(
+          "Failed to attach proxy for " +
+            target.media_path +
+            ": " +
+            __atrSafeString(eAttach.message || eAttach),
+        );
+        result.ok = false;
+        result.pending += 1;
+        result.attach_pending += 1;
+      }
+    }
+
+    if (
+      plan.auto_enable_proxy_view &&
+      (result.attached > 0 || result.already_compliant > 0) &&
+      app.setEnableProxies
+    ) {
+      try {
+        app.setEnableProxies(1);
+      } catch (eEnableProxyView) {}
+    }
+
+    return JSON.stringify(result);
+  } catch (e) {
+    return "ERROR: " + e.message + " (line " + e.line + ")";
+  }
+}
+
+function __atrCountTrackedProxyJobs() {
+  var count = 0;
+  for (var jobID in __atrProxyJobMap) {
+    if (__atrProxyJobMap.hasOwnProperty(jobID)) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function __atrClearTrackedProxyState() {
+  var canceledJobs = 0;
+  for (var proxyJobID in __atrProxyJobMap) {
+    if (__atrProxyJobMap.hasOwnProperty(proxyJobID)) {
+      canceledJobs += 1;
+      try {
+        delete __atrProxyJobMap[proxyJobID];
+      } catch (eDeleteProxy) {}
+      try {
+        delete __atrEncoderJobProjectMap[proxyJobID];
+      } catch (eDeleteProject) {}
+      try {
+        delete __atrEncoderJobMetaMap[proxyJobID];
+      } catch (eDeleteMeta) {}
+    }
+  }
+
+  for (var metaJobID in __atrEncoderJobMetaMap) {
+    if (
+      __atrEncoderJobMetaMap.hasOwnProperty(metaJobID) &&
+      __atrEncoderJobMetaMap[metaJobID] &&
+      __atrEncoderJobMetaMap[metaJobID].render_kind === "proxy"
+    ) {
+      try {
+        delete __atrEncoderJobProjectMap[metaJobID];
+      } catch (eDeleteProject2) {}
+      try {
+        delete __atrEncoderJobMetaMap[metaJobID];
+      } catch (eDeleteMeta2) {}
+    }
+  }
+
+  __atrProxyRepairQueuedMap = {};
+  __atrProxyRepairJobKeyMap = {};
+
+  var canceledKickoffs = 0;
+  for (var kickoffId in __atrPendingProxyKickoffs) {
+    if (__atrPendingProxyKickoffs.hasOwnProperty(kickoffId)) {
+      canceledKickoffs += 1;
+      try {
+        delete __atrPendingProxyKickoffs[kickoffId];
+      } catch (eDeleteKickoff) {}
+    }
+  }
+
+  return {
+    canceled_proxy_jobs: canceledJobs,
+    canceled_scheduled_kickoffs: canceledKickoffs,
+  };
+}
+
+function __atrBuildAmeClearQueueScript() {
+  return [
+    "(function(){",
+    "function s(v){try{return String(v||'');}catch(e){return '';}}",
+    "function q(v){return '\"'+s(v).replace(/\\\\/g,'\\\\\\\\').replace(/\"/g,'\\\\\"').replace(/\\r/g,'\\\\r').replace(/\\n/g,'\\\\n')+'\"';}",
+    "function a(values){var out=[];for(var i=0;i<values.length;i++){out.push(q(values[i]));}return '['+out.join(',')+']';}",
+    "function out(r){if(typeof JSON!=='undefined'&&JSON.stringify){return JSON.stringify(r);}return '{\"ok\":'+(r.ok?'true':'false')+',\"stopped\":'+(r.stopped?'true':'false')+',\"cleared_queue\":'+(r.cleared_queue?'true':'false')+',\"errors\":'+a(r.errors)+',\"warnings\":'+a(r.warnings)+'}';}",
+    "var r={ok:true,stopped:false,cleared_queue:false,errors:[],warnings:[]};",
+    "try{var h=app&&app.getEncoderHost?app.getEncoderHost():null;if(h&&h.stopBatch){h.stopBatch();r.stopped=true;}}catch(eStopHost){r.warnings.push('AME encoderHost stopBatch failed: '+s(eStopHost.message||eStopHost));}",
+    "try{if(!r.stopped){var f=app&&app.getFrontend?app.getFrontend():null;if(f&&f.stopBatch){var stopped=f.stopBatch();r.stopped=(stopped===undefined)||!!stopped;}}if(!r.stopped){r.warnings.push('AME stopBatch unavailable or returned false');}}catch(eStop){r.ok=false;r.errors.push('AME stopBatch failed: '+s(eStop.message||eStop));}",
+    "try{if(r.stopped&&app&&app.wait){app.wait(500);}}catch(eWait){}",
+    "try{var ex=app&&app.getExporter?app.getExporter():null;if(ex&&ex.removeAllBatchItems){var cleared=ex.removeAllBatchItems();r.cleared_queue=(cleared===undefined)||!!cleared;if(!r.cleared_queue){r.ok=false;r.errors.push('AME removeAllBatchItems returned false');}}else{r.ok=false;r.errors.push('AME removeAllBatchItems unavailable');}}catch(eClear){r.ok=false;r.errors.push('AME removeAllBatchItems failed: '+s(eClear.message||eClear));}",
+    "return out(r);",
+    "}())",
+  ].join("");
+}
+
+function __atrClearAmeQueueThroughBridgeTalk() {
+  var result = {
+    ok: false,
+    stopped: false,
+    cleared_queue: false,
+    errors: [],
+    warnings: [],
+  };
+
+  if (typeof BridgeTalk === "undefined") {
+    result.errors.push("BridgeTalk is unavailable");
+    return result;
+  }
+
+  var done = false;
+  var responseText = "";
+  try {
+    var bt = new BridgeTalk();
+    bt.target = "ame";
+    bt.body = __atrBuildAmeClearQueueScript();
+    bt.onResult = function (response) {
+      responseText = __atrSafeString(response && response.body);
+      done = true;
+    };
+    bt.onError = function (error) {
+      result.errors.push(
+        "BridgeTalk AME clear failed: " +
+          __atrSafeString(error && (error.body || error.message || error)),
+      );
+      done = true;
+    };
+    if (!bt.send(10)) {
+      result.errors.push("BridgeTalk could not send AME clear request");
+      return result;
+    }
+  } catch (eSend) {
+    result.errors.push(
+      "BridgeTalk AME clear crashed: " + __atrSafeString(eSend.message || eSend),
+    );
+    return result;
+  }
+
+  var deadline = new Date().getTime() + 10000;
+  while (!done && new Date().getTime() < deadline) {
+    try {
+      if (BridgeTalk.pump) {
+        BridgeTalk.pump();
+      }
+    } catch (ePump) {}
+    try {
+      $.sleep(100);
+    } catch (eSleep) {}
+  }
+
+  if (!done) {
+    result.errors.push("Timed out while clearing Adobe Media Encoder queue");
+    return result;
+  }
+
+  if (!responseText) {
+    if (result.errors.length <= 0) {
+      result.errors.push("Adobe Media Encoder returned an empty clear response");
+    }
+    return result;
+  }
+
+  try {
+    var parsed = JSON.parse(responseText);
+    result.ok = !!parsed.ok;
+    result.stopped = !!parsed.stopped;
+    result.cleared_queue = !!parsed.cleared_queue;
+    result.errors = parsed.errors && parsed.errors.length ? parsed.errors : [];
+    result.warnings =
+      parsed.warnings && parsed.warnings.length ? parsed.warnings : [];
+  } catch (eParse) {
+    result.errors.push(
+      "Invalid Adobe Media Encoder clear response: " + responseText,
+    );
+  }
+  return result;
+}
+
+function cancelAtrProxyRenderingAndClearMediaEncoder() {
+  var response = {
+    ok: true,
+    canceled_proxy_jobs: __atrCountTrackedProxyJobs(),
+    canceled_scheduled_kickoffs: 0,
+    cleared_queue: false,
+    errors: [],
+    warnings: [],
+  };
+
+  var localClear = __atrClearTrackedProxyState();
+  response.canceled_proxy_jobs = Number(localClear.canceled_proxy_jobs || 0);
+  response.canceled_scheduled_kickoffs = Number(
+    localClear.canceled_scheduled_kickoffs || 0,
+  );
+
+  var clearResult = __atrClearAmeQueueThroughBridgeTalk();
+  response.cleared_queue = !!clearResult.cleared_queue;
+  response.warnings = clearResult.warnings || [];
+  response.errors = clearResult.errors || [];
+  if (!clearResult.ok || !clearResult.cleared_queue) {
+    response.ok = false;
+    if (response.errors.length <= 0) {
+      response.errors.push("Adobe Media Encoder queue was not cleared");
+    }
+    return JSON.stringify(response);
+  }
+
+  __atrPushHostTrace(
+    "",
+    "Canceled proxy rendering and cleared Adobe Media Encoder queue",
+    "info",
+    response,
+  );
+  return JSON.stringify(response);
 }
 
 /**
