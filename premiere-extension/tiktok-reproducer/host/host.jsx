@@ -3470,6 +3470,72 @@ function __atrBuildAmeClearQueueScript() {
   ].join("");
 }
 
+function __atrEnsureAmeRunning(result) {
+  if (typeof BridgeTalk === "undefined") {
+    result.errors.push("BridgeTalk is unavailable");
+    return false;
+  }
+
+  var alreadyRunning = false;
+  try {
+    alreadyRunning = !!(BridgeTalk.isRunning && BridgeTalk.isRunning("ame"));
+  } catch (eRunningCheck) {
+    alreadyRunning = false;
+  }
+
+  if (!alreadyRunning) {
+    var launched = false;
+    try {
+      if (typeof app !== "undefined" && app && app.encoder && app.encoder.launchEncoder) {
+        app.encoder.launchEncoder();
+        launched = true;
+      }
+    } catch (eLaunchEncoder) {
+      result.warnings.push(
+        "app.encoder.launchEncoder failed: " +
+          __atrSafeString(eLaunchEncoder.message || eLaunchEncoder),
+      );
+    }
+    if (!launched) {
+      try {
+        if (BridgeTalk.launch) {
+          BridgeTalk.launch("ame");
+          launched = true;
+        }
+      } catch (eLaunchBt) {
+        result.warnings.push(
+          "BridgeTalk.launch('ame') failed: " +
+            __atrSafeString(eLaunchBt.message || eLaunchBt),
+        );
+      }
+    }
+  }
+
+  var deadline = new Date().getTime() + 90000;
+  while (new Date().getTime() < deadline) {
+    var running = false;
+    try {
+      running = !!(BridgeTalk.isRunning && BridgeTalk.isRunning("ame"));
+    } catch (eRunningPoll) {
+      running = false;
+    }
+    if (running) {
+      return true;
+    }
+    try {
+      if (BridgeTalk.pump) {
+        BridgeTalk.pump();
+      }
+    } catch (ePumpLaunch) {}
+    try {
+      $.sleep(250);
+    } catch (eSleepLaunch) {}
+  }
+
+  result.errors.push("Adobe Media Encoder did not start within 90 seconds");
+  return false;
+}
+
 function __atrClearAmeQueueThroughBridgeTalk() {
   var result = {
     ok: false,
@@ -3481,6 +3547,10 @@ function __atrClearAmeQueueThroughBridgeTalk() {
 
   if (typeof BridgeTalk === "undefined") {
     result.errors.push("BridgeTalk is unavailable");
+    return result;
+  }
+
+  if (!__atrEnsureAmeRunning(result)) {
     return result;
   }
 
@@ -3501,7 +3571,7 @@ function __atrClearAmeQueueThroughBridgeTalk() {
       );
       done = true;
     };
-    if (!bt.send(10)) {
+    if (!bt.send(60)) {
       result.errors.push("BridgeTalk could not send AME clear request");
       return result;
     }
