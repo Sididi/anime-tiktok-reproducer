@@ -1349,9 +1349,15 @@ class StorageBoxRepository:
         release_root = cls._release_root(scoped_type, effective_series_id, release_id)
 
         # -- Fetch previous release manifest for incremental diffing ----------
+        # is_brand_new_series stays True until we confirm the remote already
+        # has a current.json for this series_id. On failure that flag decides
+        # whether we wipe just the staging dir or the entire series root —
+        # see the except branch at the end of the publish.
         previous_sha_to_remote: dict[str, PurePosixPath] = {}
+        is_brand_new_series = True
         try:
             prev_current = await cls.get_current_release(scoped_type, effective_series_id)
+            is_brand_new_series = False
             prev_release_id = str(prev_current["release_id"])
             prev_release_root = cls._release_root(
                 scoped_type, effective_series_id, prev_release_id,
@@ -1562,8 +1568,19 @@ class StorageBoxRepository:
                 "current": current_payload,
             }
         except Exception:
-            with suppress(Exception):
-                await StorageBoxSftpClient.remove_tree(staging_root)
+            if is_brand_new_series:
+                # First publish for this series_id never wrote a current.json,
+                # so the entire series root only contains our partial staging.
+                # Wipe the whole tree to avoid leaking an orphan series dir
+                # (the next publish would generate a fresh series_id and never
+                # reuse this one).
+                with suppress(Exception):
+                    await StorageBoxSftpClient.remove_tree(
+                        cls._series_root(scoped_type, effective_series_id)
+                    )
+            else:
+                with suppress(Exception):
+                    await StorageBoxSftpClient.remove_tree(staging_root)
             raise
         finally:
             shutil.rmtree(temp_root, ignore_errors=True)

@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 _IG_MAX_ATTEMPTS = 5
 _LEGACY_IG_CONTAINER_ERROR = "container status_code = ERROR"
+_URL_INGEST_IG_CONTAINER_ERROR = "error code 2207077"
 
 
 async def dispatch_due_actions(
@@ -228,10 +229,14 @@ def _instagram_video_url(job: Job, settings: Settings) -> str:
 
 
 def _should_retry_legacy_instagram_failure(status: PlatformStatus) -> bool:
+    detail = status.detail or ""
     return (
         status.status == "failed"
-        and status.detail == _LEGACY_IG_CONTAINER_ERROR
-        and status.attempts >= _IG_MAX_ATTEMPTS
+        and (
+            detail == _LEGACY_IG_CONTAINER_ERROR
+            or _URL_INGEST_IG_CONTAINER_ERROR in detail
+        )
+        and status.attempts == _IG_MAX_ATTEMPTS
     )
 
 

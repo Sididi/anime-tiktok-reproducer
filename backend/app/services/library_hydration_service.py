@@ -293,6 +293,18 @@ class LibraryHydrationService:
             await asyncio.to_thread(shutil.rmtree, temp_root, True)
         temp_root.mkdir(parents=True, exist_ok=True)
 
+        # StorageBoxRepository.publish_series / rename_series stage artifacts
+        # under settings.cache_dir/storage_box_release_* and storage_box_rename_*
+        # tempdirs. Those are removed in a `finally` block on normal exit, but
+        # SIGKILL or a crashed reload leaves them behind. Sweep them on
+        # startup so the cache doesn't grow unbounded across crashes.
+        cache_root = settings.cache_dir
+        if cache_root.exists():
+            for prefix in ("storage_box_release_", "storage_box_rename_"):
+                for stale in cache_root.glob(f"{prefix}*"):
+                    if stale.is_dir():
+                        await asyncio.to_thread(shutil.rmtree, stale, True)
+
     @classmethod
     async def ensure_catalog_available(cls, library_type: LibraryType | str) -> None:
         if not StorageBoxRepository.is_enabled():
