@@ -5,7 +5,8 @@ import httpx
 import pytest
 import respx
 
-from app.services.instagram_publisher import publish_to_instagram
+from app.services import instagram_publisher
+from app.services.instagram_publisher import _UploadResponse, _upload_headers, publish_to_instagram
 
 BASE = "https://graph.facebook.com/v25.0"
 IG_USER_ID = "ig_user_123"
@@ -40,8 +41,12 @@ def _mock_resumable_create():
     )
 
 
-def _mock_resumable_upload():
-    return respx.post(UPLOAD_URI).mock(return_value=httpx.Response(200, json={"success": True}))
+@pytest.fixture(autouse=True)
+def mock_resumable_upload(monkeypatch):
+    async def upload(**kwargs):
+        return _UploadResponse(status_code=200, body='{"success": true}')
+
+    monkeypatch.setattr(instagram_publisher, "_upload_resumable_binary", upload)
 
 
 @respx.mock
@@ -49,7 +54,6 @@ async def test_happy_path():
     """Full happy path: container → IN_PROGRESS → FINISHED → publish → permalink."""
     download_route = _mock_video_download()
     create_route = _mock_resumable_create()
-    upload_route = _mock_resumable_upload()
     status_responses = [
         httpx.Response(200, json={"status_code": "IN_PROGRESS", "id": CONTAINER_ID}),
         httpx.Response(200, json={"status_code": "FINISHED", "id": CONTAINER_ID}),
@@ -73,11 +77,6 @@ async def test_happy_path():
     assert result.detail is None
     assert download_route.called
     assert create_route.called
-    assert upload_route.called
-    upload_request = upload_route.calls.last.request
-    assert upload_request.headers["content-length"] == str(len(b"fake mp4 bytes"))
-    assert upload_request.headers["x-entity-length"] == str(len(b"fake mp4 bytes"))
-    assert "transfer-encoding" not in upload_request.headers
     assert status_route.call_count == 2
     assert publish_route.called
     assert permalink_route.called
@@ -88,7 +87,6 @@ async def test_polling_waits_multiple_ticks():
     """Status returns IN_PROGRESS 3 times before FINISHED — verifies multiple polls."""
     _mock_video_download()
     _mock_resumable_create()
-    _mock_resumable_upload()
     status_responses = [
         httpx.Response(200, json={"status_code": "IN_PROGRESS", "id": CONTAINER_ID}),
         httpx.Response(200, json={"status_code": "IN_PROGRESS", "id": CONTAINER_ID}),
@@ -114,6 +112,81 @@ async def test_polling_waits_multiple_ticks():
 
 
 @respx.mock
+async def test_status_poll_rate_limit_retries():
+    _mock_video_download()
+    _mock_resumable_create()
+    status_route = respx.get(f"{BASE}/{CONTAINER_ID}").mock(
+        side_effect=[
+            httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "message": "(#4) Application request limit reached",
+                        "code": 4,
+                    }
+                },
+            ),
+            httpx.Response(200, json={"status_code": "FINISHED", "id": CONTAINER_ID}),
+        ]
+    )
+    respx.post(f"{BASE}/{IG_USER_ID}/media_publish").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID})
+    )
+    respx.get(f"{BASE}/{MEDIA_ID}").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID, "permalink": PERMALINK_URL})
+    )
+
+    result = await publish_to_instagram(
+        **_COMMON, poll_interval=0.01, poll_timeout=1.0
+    )
+
+    assert result.success is True
+    assert status_route.call_count == 2
+
+
+@respx.mock
+async def test_resumable_upload_processing_failed_error_polls_container(monkeypatch):
+    """Meta can return an indeterminate rupload error while the container proceeds."""
+    async def upload(**kwargs):
+        return _UploadResponse(
+            status_code=400,
+            body=(
+                '{"debug_info":{"retriable":false,"type":"ProcessingFailedError",'
+                '"message":"Request processing failed"}}'
+            ),
+        )
+
+    monkeypatch.setattr(instagram_publisher, "_upload_resumable_binary", upload)
+    _mock_video_download()
+    _mock_resumable_create()
+    status_route = respx.get(f"{BASE}/{CONTAINER_ID}").mock(
+        return_value=httpx.Response(200, json={"status_code": "FINISHED"})
+    )
+    respx.post(f"{BASE}/{IG_USER_ID}/media_publish").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID})
+    )
+    respx.get(f"{BASE}/{MEDIA_ID}").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID, "permalink": PERMALINK_URL})
+    )
+
+    result = await publish_to_instagram(
+        **_COMMON, poll_interval=0.01, poll_timeout=1.0
+    )
+
+    assert result.success is True
+    assert result.permalink == PERMALINK_URL
+    assert status_route.called
+
+
+def test_upload_headers_include_entity_length_without_transfer_encoding():
+    headers = _upload_headers(ACCESS_TOKEN, len(b"fake mp4 bytes"))
+
+    assert headers["Content-Length"] == str(len(b"fake mp4 bytes"))
+    assert headers["X-Entity-Length"] == str(len(b"fake mp4 bytes"))
+    assert "Transfer-Encoding" not in headers
+
+
+@respx.mock
 async def test_container_creation_fails_http_400():
     """Container creation returns 400 → success=False with failure detail."""
     _mock_video_download()
@@ -135,7 +208,6 @@ async def test_polling_sees_error_status():
     """Container status returns ERROR → success=False."""
     _mock_video_download()
     _mock_resumable_create()
-    _mock_resumable_upload()
     respx.get(f"{BASE}/{CONTAINER_ID}").mock(
         return_value=httpx.Response(
             200,
@@ -162,7 +234,6 @@ async def test_polling_timeout():
     """Status stuck IN_PROGRESS forever → returns success=False with poll timeout."""
     _mock_video_download()
     _mock_resumable_create()
-    _mock_resumable_upload()
     # Always return IN_PROGRESS
     respx.get(f"{BASE}/{CONTAINER_ID}").mock(
         return_value=httpx.Response(200, json={"status_code": "IN_PROGRESS", "id": CONTAINER_ID})
@@ -181,7 +252,6 @@ async def test_publish_api_returns_5xx():
     """media_publish returns 500 → success=False mentioning publish failure."""
     _mock_video_download()
     _mock_resumable_create()
-    _mock_resumable_upload()
     respx.get(f"{BASE}/{CONTAINER_ID}").mock(
         return_value=httpx.Response(200, json={"status_code": "FINISHED", "id": CONTAINER_ID})
     )
@@ -203,7 +273,6 @@ async def test_permalink_fetch_fails_after_publish():
     """Permalink fetch fails → still success=True, permalink=None (best-effort)."""
     _mock_video_download()
     _mock_resumable_create()
-    _mock_resumable_upload()
     respx.get(f"{BASE}/{CONTAINER_ID}").mock(
         return_value=httpx.Response(200, json={"status_code": "FINISHED", "id": CONTAINER_ID})
     )

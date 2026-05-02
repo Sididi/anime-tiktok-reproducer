@@ -156,6 +156,13 @@ class Settings(BaseSettings):
     storage_box_transfer_mode: str = "auto"
     storage_box_rsync_min_file_size_mb: int = 4
     storage_box_rsync_timeout_seconds: int = 7200
+    # Retry settings for transient SFTP/network errors (VPN flaps, NAT timeouts,
+    # brief Hetzner reachability dips). Per-operation retry — the retried
+    # operation re-acquires a fresh SSH session, so a half-dead pooled
+    # connection is replaced.
+    storage_box_retry_max_attempts: int = 5
+    storage_box_retry_base_delay_seconds: float = 1.0
+    storage_box_retry_max_delay_seconds: float = 30.0
     # lftp settings (explicit lftp mode and directory mirror flows)
     storage_box_lftp_segments: int = 4
     storage_box_lftp_min_file_size_mb: int = 50
@@ -309,6 +316,21 @@ class Settings(BaseSettings):
     @classmethod
     def _clamp_storage_box_rsync_min_file_size_mb(cls, value: int) -> int:
         return max(1, min(1024, value))
+
+    @field_validator("storage_box_retry_max_attempts")
+    @classmethod
+    def _clamp_storage_box_retry_max_attempts(cls, value: int) -> int:
+        return max(1, min(20, value))
+
+    @field_validator("storage_box_retry_base_delay_seconds")
+    @classmethod
+    def _clamp_storage_box_retry_base_delay_seconds(cls, value: float) -> float:
+        return max(0.1, min(60.0, value))
+
+    @field_validator("storage_box_retry_max_delay_seconds")
+    @classmethod
+    def _clamp_storage_box_retry_max_delay_seconds(cls, value: float) -> float:
+        return max(1.0, min(600.0, value))
 
     @field_validator("storage_box_rsync_timeout_seconds")
     @classmethod

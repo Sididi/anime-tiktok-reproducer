@@ -17,6 +17,19 @@ THINKING_BUDGET_TOKENS: int = 10000
 THINKING_MAX_TOKENS: int = 24000
 
 
+def _is_adaptive_thinking_model(model: str) -> bool:
+    """Models that require adaptive thinking and reject sampling parameters.
+
+    Opus 4.7 removed ``thinking.type=enabled`` / ``budget_tokens`` and the
+    ``temperature`` / ``top_p`` / ``top_k`` sampling fields. They must be
+    replaced with ``thinking.type=adaptive`` and (optionally)
+    ``output_config.effort``. Sonnet 4.6 and Opus 4.6 still accept the
+    older shape, so we only adapt for the Opus 4.7+ family.
+    """
+    normalized = (model or "").strip().lower()
+    return "opus-4-7" in normalized
+
+
 class ClaudeService:
     """Wrapper around Anthropic Claude API (anthropic SDK)."""
 
@@ -103,16 +116,23 @@ class ClaudeService:
             "messages": [{"role": "user", "content": prompt}],
         }
 
+        adaptive = _is_adaptive_thinking_model(chosen_model)
+
         if enable_thinking:
-            # Extended thinking: temperature must be omitted (defaults to 1)
             create_kwargs["max_tokens"] = max_output_tokens or THINKING_MAX_TOKENS
-            create_kwargs["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": THINKING_BUDGET_TOKENS,
-            }
+            if adaptive:
+                # Opus 4.7+: adaptive thinking only; sampling params disallowed.
+                create_kwargs["thinking"] = {"type": "adaptive"}
+            else:
+                # Sonnet 4.6 / Opus 4.6: extended thinking with explicit budget.
+                create_kwargs["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": THINKING_BUDGET_TOKENS,
+                }
         else:
             create_kwargs["max_tokens"] = max_output_tokens or 16000
-            create_kwargs["temperature"] = 0.35
+            if not adaptive:
+                create_kwargs["temperature"] = 0.35
 
         try:
             response = client.messages.create(**create_kwargs)
@@ -159,16 +179,23 @@ class ClaudeService:
             "messages": [{"role": "user", "content": prompt}],
         }
 
+        adaptive = _is_adaptive_thinking_model(chosen_model)
+
         if enable_thinking:
-            # Extended thinking: temperature must be omitted (defaults to 1)
             create_kwargs["max_tokens"] = THINKING_MAX_TOKENS
-            create_kwargs["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": THINKING_BUDGET_TOKENS,
-            }
+            if adaptive:
+                # Opus 4.7+: adaptive thinking only; sampling params disallowed.
+                create_kwargs["thinking"] = {"type": "adaptive"}
+            else:
+                # Sonnet 4.6 / Opus 4.6: extended thinking with explicit budget.
+                create_kwargs["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": THINKING_BUDGET_TOKENS,
+                }
         else:
             create_kwargs["max_tokens"] = 16000
-            create_kwargs["temperature"] = 0.35
+            if not adaptive:
+                create_kwargs["temperature"] = 0.35
 
         try:
             response = client.messages.create(**create_kwargs)

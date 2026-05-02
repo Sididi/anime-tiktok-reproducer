@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
+import random
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import AsyncIterator, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable, TypeVar
 
 from ..config import settings
 
@@ -18,6 +20,87 @@ except ImportError:  # pragma: no cover - exercised only when dependency missing
 logger = logging.getLogger("uvicorn.error")
 
 ProgressHandler = Callable[[str, str, int, int], None]
+
+T = TypeVar("T")
+
+# OS-level errnos that indicate transient TCP/network drops, not real failures.
+# Common when a VPN flaps, a NAT entry times out, or the remote host is
+# briefly unreachable. We retry these.
+_TRANSIENT_OS_ERRNOS = {
+    errno.ECONNRESET,
+    errno.ECONNABORTED,
+    errno.EPIPE,
+    errno.ETIMEDOUT,
+    errno.EHOSTUNREACH,
+    errno.ENETUNREACH,
+    errno.ENETDOWN,
+    errno.ENETRESET,
+}
+
+
+def _is_transient_error(exc: BaseException) -> bool:
+    if asyncssh is not None:
+        # ConnectionLost: SSH layer reports the transport went away mid-op.
+        # DisconnectError: peer sent SSH_MSG_DISCONNECT (e.g., idle timeout).
+        if isinstance(exc, (asyncssh.misc.ConnectionLost, asyncssh.misc.DisconnectError)):
+            return True
+    if isinstance(exc, asyncio.TimeoutError):
+        return True
+    if isinstance(
+        exc,
+        (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, EOFError),
+    ):
+        return True
+    if isinstance(exc, OSError):
+        return getattr(exc, "errno", None) in _TRANSIENT_OS_ERRNOS
+    return False
+
+
+async def _retry_transient(
+    operation: str,
+    factory: Callable[[], Awaitable[T]],
+) -> T:
+    """Run ``factory`` with exponential backoff retry on transient errors.
+
+    The factory is re-invoked on each retry, so callers that acquire a
+    pooled SSH session inside the factory will get a fresh session after a
+    drop. Non-transient errors (auth failure, SFTP permission denied, etc.)
+    propagate immediately.
+    """
+    max_attempts = settings.storage_box_retry_max_attempts
+    base_delay = settings.storage_box_retry_base_delay_seconds
+    max_delay = settings.storage_box_retry_max_delay_seconds
+
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return await factory()
+        except Exception as exc:
+            if not _is_transient_error(exc):
+                raise
+            if attempt >= max_attempts:
+                logger.warning(
+                    "Storage Box %s exhausted retries (%d attempts): %s: %s",
+                    operation,
+                    attempt,
+                    type(exc).__name__,
+                    exc,
+                )
+                raise
+            delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+            jittered = delay * (0.5 + random.random())
+            logger.warning(
+                "Storage Box %s transient failure (attempt %d/%d), "
+                "retrying in %.1fs: %s: %s",
+                operation,
+                attempt,
+                max_attempts,
+                jittered,
+                type(exc).__name__,
+                exc,
+            )
+            await asyncio.sleep(jittered)
 
 
 @dataclass
@@ -168,65 +251,104 @@ class StorageBoxSftpClient:
     @classmethod
     async def exists(cls, remote_path: str | PurePosixPath) -> bool:
         remote = cls.normalize_remote_path(remote_path)
-        async with cls.sftp_session() as sftp:
-            return await sftp.exists(str(remote))
+
+        async def _do() -> bool:
+            async with cls.sftp_session() as sftp:
+                return await sftp.exists(str(remote))
+
+        return await _retry_transient(f"exists {remote.as_posix()}", _do)
 
     @classmethod
     async def stat(cls, remote_path: str | PurePosixPath):
         remote = cls.normalize_remote_path(remote_path)
-        async with cls.sftp_session() as sftp:
-            return await sftp.stat(str(remote))
+
+        async def _do():
+            async with cls.sftp_session() as sftp:
+                return await sftp.stat(str(remote))
+
+        return await _retry_transient(f"stat {remote.as_posix()}", _do)
 
     @classmethod
     async def makedirs(cls, remote_path: str | PurePosixPath) -> None:
         remote = cls.normalize_remote_path(remote_path)
-        async with cls.sftp_session() as sftp:
-            await sftp.makedirs(str(remote), exist_ok=True)
+
+        async def _do() -> None:
+            async with cls.sftp_session() as sftp:
+                await sftp.makedirs(str(remote), exist_ok=True)
+
+        await _retry_transient(f"makedirs {remote.as_posix()}", _do)
 
     @classmethod
     async def listdir(cls, remote_path: str | PurePosixPath) -> list[str]:
         remote = cls.normalize_remote_path(remote_path)
-        async with cls.sftp_session() as sftp:
-            entries = list(await sftp.listdir(str(remote)))
-            return [entry for entry in entries if entry not in {".", ".."}]
+
+        async def _do() -> list[str]:
+            async with cls.sftp_session() as sftp:
+                entries = list(await sftp.listdir(str(remote)))
+                return [entry for entry in entries if entry not in {".", ".."}]
+
+        return await _retry_transient(f"listdir {remote.as_posix()}", _do)
 
     @classmethod
     async def scandir(cls, remote_path: str | PurePosixPath):
         remote = cls.normalize_remote_path(remote_path)
-        async with cls.sftp_session() as sftp:
-            entries = [entry async for entry in sftp.scandir(str(remote))]
-            return [entry for entry in entries if getattr(entry, "filename", None) not in {".", ".."}]
+
+        async def _do():
+            async with cls.sftp_session() as sftp:
+                entries = [entry async for entry in sftp.scandir(str(remote))]
+                return [entry for entry in entries if getattr(entry, "filename", None) not in {".", ".."}]
+
+        return await _retry_transient(f"scandir {remote.as_posix()}", _do)
 
     @classmethod
     async def rename(cls, src: str | PurePosixPath, dst: str | PurePosixPath) -> None:
         src_path = cls.normalize_remote_path(src)
         dst_path = cls.normalize_remote_path(dst)
-        async with cls.sftp_session() as sftp:
-            await sftp.makedirs(str(dst_path.parent), exist_ok=True)
-            await sftp.rename(str(src_path), str(dst_path))
+
+        async def _do() -> None:
+            async with cls.sftp_session() as sftp:
+                await sftp.makedirs(str(dst_path.parent), exist_ok=True)
+                await sftp.rename(str(src_path), str(dst_path))
+
+        await _retry_transient(
+            f"rename {src_path.as_posix()} -> {dst_path.as_posix()}",
+            _do,
+        )
 
     @classmethod
     async def replace_file(cls, src: str | PurePosixPath, dst: str | PurePosixPath) -> None:
         src_path = cls.normalize_remote_path(src)
         dst_path = cls.normalize_remote_path(dst)
-        async with cls.sftp_session() as sftp:
-            await sftp.makedirs(str(dst_path.parent), exist_ok=True)
-            posix_rename = getattr(sftp, "posix_rename", None)
-            if callable(posix_rename):
+
+        async def _do() -> None:
+            async with cls.sftp_session() as sftp:
+                await sftp.makedirs(str(dst_path.parent), exist_ok=True)
+                posix_rename = getattr(sftp, "posix_rename", None)
+                if callable(posix_rename):
+                    try:
+                        await posix_rename(str(src_path), str(dst_path))
+                        return
+                    except Exception as exc:
+                        # POSIX rename can be unsupported on some servers; fall
+                        # back to remove+rename. But re-raise transient errors
+                        # so the outer retry can handle them.
+                        if _is_transient_error(exc):
+                            raise
+                        logger.warning(
+                            "Storage Box POSIX rename failed for %s -> %s; falling back to remove+rename",
+                            src_path,
+                            dst_path,
+                        )
                 try:
-                    await posix_rename(str(src_path), str(dst_path))
-                    return
+                    await sftp.remove(str(dst_path))
                 except Exception:
-                    logger.warning(
-                        "Storage Box POSIX rename failed for %s -> %s; falling back to remove+rename",
-                        src_path,
-                        dst_path,
-                    )
-            try:
-                await sftp.remove(str(dst_path))
-            except Exception:
-                pass
-            await sftp.rename(str(src_path), str(dst_path))
+                    pass
+                await sftp.rename(str(src_path), str(dst_path))
+
+        await _retry_transient(
+            f"replace_file {src_path.as_posix()} -> {dst_path.as_posix()}",
+            _do,
+        )
 
     @classmethod
     async def hardlink(
@@ -238,25 +360,41 @@ class StorageBoxSftpClient:
 
         Raises ``SFTPNoSuchFile`` or ``SFTPOpUnsupported`` (or a generic
         ``SFTPError``) when the server does not support the
-        ``hardlink@openssh.com`` extension.
+        ``hardlink@openssh.com`` extension. Those propagate immediately —
+        ``_retry_transient`` only retries connection-level errors.
         """
         src_path = cls.normalize_remote_path(src)
         dst_path = cls.normalize_remote_path(dst)
-        async with cls.sftp_session() as sftp:
-            await sftp.makedirs(str(dst_path.parent), exist_ok=True)
-            await sftp.link(str(src_path), str(dst_path))
+
+        async def _do() -> None:
+            async with cls.sftp_session() as sftp:
+                await sftp.makedirs(str(dst_path.parent), exist_ok=True)
+                await sftp.link(str(src_path), str(dst_path))
+
+        await _retry_transient(
+            f"hardlink {src_path.as_posix()} -> {dst_path.as_posix()}",
+            _do,
+        )
 
     @classmethod
     async def remove_file(cls, remote_path: str | PurePosixPath) -> None:
         remote = cls.normalize_remote_path(remote_path)
-        async with cls.sftp_session() as sftp:
-            await sftp.remove(str(remote))
+
+        async def _do() -> None:
+            async with cls.sftp_session() as sftp:
+                await sftp.remove(str(remote))
+
+        await _retry_transient(f"remove_file {remote.as_posix()}", _do)
 
     @classmethod
     async def remove_tree(cls, remote_path: str | PurePosixPath) -> None:
         remote = cls.normalize_remote_path(remote_path)
-        async with cls.sftp_session() as sftp:
-            await sftp.rmtree(str(remote))
+
+        async def _do() -> None:
+            async with cls.sftp_session() as sftp:
+                await sftp.rmtree(str(remote))
+
+        await _retry_transient(f"remove_tree {remote.as_posix()}", _do)
 
     @classmethod
     async def upload_file(
@@ -267,13 +405,20 @@ class StorageBoxSftpClient:
         progress_handler: ProgressHandler | None = None,
     ) -> None:
         remote = cls.normalize_remote_path(remote_path)
-        async with cls.sftp_session() as sftp:
-            await sftp.makedirs(str(remote.parent), exist_ok=True)
-            await sftp.put(
-                str(local_path),
-                str(remote),
-                progress_handler=progress_handler,
-            )
+
+        async def _do() -> None:
+            async with cls.sftp_session() as sftp:
+                await sftp.makedirs(str(remote.parent), exist_ok=True)
+                await sftp.put(
+                    str(local_path),
+                    str(remote),
+                    progress_handler=progress_handler,
+                )
+
+        await _retry_transient(
+            f"upload {local_path.name} -> {remote.as_posix()}",
+            _do,
+        )
 
     @classmethod
     async def download_file(
@@ -285,12 +430,19 @@ class StorageBoxSftpClient:
     ) -> None:
         remote = cls.normalize_remote_path(remote_path)
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        async with cls.sftp_session() as sftp:
-            await sftp.get(
-                str(remote),
-                str(local_path),
-                progress_handler=progress_handler,
-            )
+
+        async def _do() -> None:
+            async with cls.sftp_session() as sftp:
+                await sftp.get(
+                    str(remote),
+                    str(local_path),
+                    progress_handler=progress_handler,
+                )
+
+        await _retry_transient(
+            f"download {remote.as_posix()} -> {local_path.name}",
+            _do,
+        )
 
     @classmethod
     async def write_text(
@@ -299,10 +451,14 @@ class StorageBoxSftpClient:
         content: str,
     ) -> None:
         remote = cls.normalize_remote_path(remote_path)
-        async with cls.sftp_session() as sftp:
-            await sftp.makedirs(str(remote.parent), exist_ok=True)
-            async with sftp.open(str(remote), "w") as handle:
-                await handle.write(content)
+
+        async def _do() -> None:
+            async with cls.sftp_session() as sftp:
+                await sftp.makedirs(str(remote.parent), exist_ok=True)
+                async with sftp.open(str(remote), "w") as handle:
+                    await handle.write(content)
+
+        await _retry_transient(f"write_text {remote.as_posix()}", _do)
 
     @classmethod
     async def read_text(
@@ -310,9 +466,13 @@ class StorageBoxSftpClient:
         remote_path: str | PurePosixPath,
     ) -> str:
         remote = cls.normalize_remote_path(remote_path)
-        async with cls.sftp_session() as sftp:
-            async with sftp.open(str(remote), "r") as handle:
-                return await handle.read()
+
+        async def _do() -> str:
+            async with cls.sftp_session() as sftp:
+                async with sftp.open(str(remote), "r") as handle:
+                    return await handle.read()
+
+        return await _retry_transient(f"read_text {remote.as_posix()}", _do)
 
     @classmethod
     async def health_check(cls) -> dict[str, object]:

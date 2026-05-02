@@ -14,9 +14,12 @@ if the best-effort permalink lookup fails.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import tempfile
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -33,8 +36,20 @@ class InstagramPublishResult:
     detail: str | None = None
 
 
-_DEFAULT_POLL_INTERVAL_SECONDS = 5.0
+@dataclass
+class _UploadResponse:
+    status_code: int
+    body: str
+
+
+class _RetryableStatusPollError(RuntimeError):
+    pass
+
+
+_DEFAULT_POLL_INTERVAL_SECONDS = 15.0
 _DEFAULT_POLL_TIMEOUT_SECONDS = 5 * 60.0  # 5 minutes
+_RATE_LIMIT_POLL_INTERVAL_SECONDS = 60.0
+_MAX_POLL_INTERVAL_SECONDS = 300.0
 
 
 def _response_detail(response: httpx.Response) -> str:
@@ -56,6 +71,15 @@ def _response_detail(response: httpx.Response) -> str:
             parts.append(f"subcode={subcode}")
         if parts:
             return " ".join(parts)
+    return str(payload)[:500]
+
+
+def _upload_response_detail(response: _UploadResponse) -> str:
+    try:
+        payload = json.loads(response.body)
+    except ValueError:
+        body = response.body.strip()
+        return body[:500] if body else f"HTTP {response.status_code}"
     return str(payload)[:500]
 
 
@@ -116,6 +140,87 @@ def _is_container_field_error(response: httpx.Response) -> bool:
     return code == 100 and (subcode == 2207065 or any(m in message for m in markers))
 
 
+def _is_retryable_graph_response(response: httpx.Response) -> bool:
+    if response.status_code in {429, 500, 502, 503, 504}:
+        return True
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict):
+        return False
+    code = int(error.get("code") or 0) if error.get("code") is not None else 0
+    message = str(error.get("message") or "").lower()
+    return code in {4, 17, 32, 613} or "request limit" in message
+
+
+def _is_resumable_upload_indeterminate_body(body: str) -> bool:
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return False
+    debug_info = payload.get("debug_info") if isinstance(payload, dict) else None
+    if not isinstance(debug_info, dict):
+        return False
+    debug_type = str(debug_info.get("type") or "").strip().lower()
+    debug_message = str(debug_info.get("message") or "").strip().lower()
+    return (
+        debug_type == "processingfailederror"
+        and "request processing failed" in debug_message
+    )
+
+
+def _upload_headers(ig_access_token: str, file_size: int) -> dict[str, str]:
+    return {
+        "Authorization": f"OAuth {ig_access_token}",
+        "offset": "0",
+        "file_size": str(file_size),
+        "Content-Length": str(file_size),
+        "X-Entity-Length": str(file_size),
+        "Content-Type": "application/octet-stream",
+    }
+
+
+def _upload_resumable_binary_sync(
+    *,
+    upload_uri: str,
+    ig_access_token: str,
+    video_path: Path,
+    timeout_seconds: float,
+) -> _UploadResponse:
+    file_size = video_path.stat().st_size
+    request = urllib.request.Request(
+        upload_uri,
+        data=video_path.read_bytes(),
+        method="POST",
+        headers=_upload_headers(ig_access_token, file_size),
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            body = response.read().decode("utf-8", "replace")
+            return _UploadResponse(status_code=response.status, body=body)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")
+        return _UploadResponse(status_code=e.code, body=body)
+
+
+async def _upload_resumable_binary(
+    *,
+    upload_uri: str,
+    ig_access_token: str,
+    video_path: Path,
+    timeout_seconds: float = 900.0,
+) -> _UploadResponse:
+    return await asyncio.to_thread(
+        _upload_resumable_binary_sync,
+        upload_uri=upload_uri,
+        ig_access_token=ig_access_token,
+        video_path=video_path,
+        timeout_seconds=timeout_seconds,
+    )
+
+
 async def _download_video(client: httpx.AsyncClient, video_url: str) -> Path:
     fd, tmp = tempfile.mkstemp(prefix="ig-reel-", suffix=".mp4")
     os.close(fd)
@@ -142,9 +247,9 @@ async def _get_status_payload(
     ig_access_token: str,
 ) -> dict[str, Any]:
     field_candidates = (
-        "status_code,status,error_message,video_status",
-        "status_code,status,video_status",
         "status_code,status",
+        "status_code,status,video_status",
+        "status_code,status,error_message,video_status",
         "status_code",
     )
     last_error_detail = ""
@@ -156,6 +261,8 @@ async def _get_status_payload(
         try:
             status_resp.raise_for_status()
         except httpx.HTTPStatusError as e:
+            if _is_retryable_graph_response(e.response):
+                raise _RetryableStatusPollError(_response_detail(e.response)) from e
             if _is_container_field_error(e.response):
                 last_error_detail = _response_detail(e.response)
                 continue
@@ -171,6 +278,22 @@ def _effective_status(payload: dict[str, Any]) -> str:
     if code:
         return code
     return str(payload.get("status") or "").upper()
+
+
+def _next_retry_poll_interval(
+    current_interval: float,
+    *,
+    elapsed: float,
+    poll_timeout: float,
+) -> float:
+    remaining = poll_timeout - elapsed
+    if remaining <= 0:
+        return current_interval
+    target = min(
+        max(_RATE_LIMIT_POLL_INTERVAL_SECONDS, current_interval * 2),
+        _MAX_POLL_INTERVAL_SECONDS,
+    )
+    return max(0.0, min(target, remaining))
 
 
 async def publish_to_instagram(
@@ -227,28 +350,27 @@ async def publish_to_instagram(
             )
 
         try:
-            file_size = video_path.stat().st_size
-            video_bytes = await asyncio.to_thread(video_path.read_bytes)
-            upload = await client.post(
-                str(upload_uri),
-                headers={
-                    "Authorization": f"OAuth {ig_access_token}",
-                    "offset": "0",
-                    "file_size": str(file_size),
-                    "Content-Length": str(file_size),
-                    "X-Entity-Length": str(file_size),
-                    "Content-Type": "application/octet-stream",
-                },
-                content=video_bytes,
+            upload = await _upload_resumable_binary(
+                upload_uri=str(upload_uri),
+                ig_access_token=ig_access_token,
+                video_path=video_path,
             )
-            upload.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            video_path.unlink(missing_ok=True)
-            return InstagramPublishResult(
-                success=False,
-                detail=f"resumable upload failed: {_response_detail(e.response)}",
-            )
-        except (httpx.HTTPError, OSError) as e:
+            if upload.status_code >= 400:
+                if not _is_resumable_upload_indeterminate_body(upload.body):
+                    video_path.unlink(missing_ok=True)
+                    return InstagramPublishResult(
+                        success=False,
+                        detail=(
+                            "resumable upload failed: "
+                            f"{_upload_response_detail(upload)}"
+                        ),
+                    )
+                logger.info(
+                    "Instagram resumable upload returned indeterminate processing "
+                    "response for container %s; polling container status",
+                    container_id,
+                )
+        except (OSError, TimeoutError) as e:
             video_path.unlink(missing_ok=True)
             return InstagramPublishResult(
                 success=False, detail=f"resumable upload failed: {e}"
@@ -259,9 +381,10 @@ async def publish_to_instagram(
                 video_path = None
 
         elapsed = 0.0
+        next_poll_interval = poll_interval
         while elapsed < poll_timeout:
-            await asyncio.sleep(poll_interval)
-            elapsed += poll_interval
+            await asyncio.sleep(next_poll_interval)
+            elapsed += next_poll_interval
             try:
                 status_payload = await _get_status_payload(
                     client,
@@ -275,6 +398,14 @@ async def publish_to_instagram(
                     success=False,
                     detail=f"status poll failed: {_response_detail(e.response)}",
                 )
+            except _RetryableStatusPollError as e:
+                logger.info("Instagram status poll retryable error: %s", e)
+                next_poll_interval = _next_retry_poll_interval(
+                    next_poll_interval,
+                    elapsed=elapsed,
+                    poll_timeout=poll_timeout,
+                )
+                continue
             except httpx.HTTPError as e:
                 return InstagramPublishResult(
                     success=False, detail=f"status poll failed: {e}"
@@ -289,6 +420,7 @@ async def publish_to_instagram(
                 return InstagramPublishResult(
                     success=False, detail=_status_detail(status_payload)
                 )
+            next_poll_interval = poll_interval
         else:
             return InstagramPublishResult(success=False, detail="poll timeout")
 
