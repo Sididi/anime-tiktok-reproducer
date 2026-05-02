@@ -134,15 +134,6 @@ async def _download_video(client: httpx.AsyncClient, video_url: str) -> Path:
         raise
 
 
-async def _file_chunks(path: Path, chunk_size: int = 1024 * 1024):
-    with path.open("rb") as f:
-        while True:
-            chunk = await asyncio.to_thread(f.read, chunk_size)
-            if not chunk:
-                break
-            yield chunk
-
-
 async def _get_status_payload(
     client: httpx.AsyncClient,
     *,
@@ -237,15 +228,18 @@ async def publish_to_instagram(
 
         try:
             file_size = video_path.stat().st_size
+            video_bytes = await asyncio.to_thread(video_path.read_bytes)
             upload = await client.post(
                 str(upload_uri),
                 headers={
                     "Authorization": f"OAuth {ig_access_token}",
                     "offset": "0",
                     "file_size": str(file_size),
+                    "Content-Length": str(file_size),
+                    "X-Entity-Length": str(file_size),
                     "Content-Type": "application/octet-stream",
                 },
-                content=_file_chunks(video_path),
+                content=video_bytes,
             )
             upload.raise_for_status()
         except httpx.HTTPStatusError as e:

@@ -375,3 +375,43 @@ async def test_dispatch_instagram_retries_legacy_container_error_once(
     assert ig.status == "uploaded"
     assert ig.attempts == 6
     assert publish_mock.await_count == 1
+
+
+async def test_dispatch_instagram_retries_resumable_header_error_once(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
+    store = JobStore(tmp_path / "jobs.json")
+    past = datetime.now(tz=timezone.utc) - timedelta(minutes=5)
+    job = _make_job(slot_time=past, project_id="ig-header-error")
+    job.platforms_requested = ["instagram"]
+    job.instagram_payload = {"ig_user_id": "x", "ig_access_token": "x", "caption": "x"}
+    job.platform_statuses = {
+        "instagram": PlatformStatus(
+            status="failed",
+            detail="resumable upload failed: Invalid Header format",
+            attempts=6,
+        )
+    }
+    await store.create(job)
+
+    discord = AsyncMock()
+
+    with patch(
+        "app.services.reminder_scheduler.publish_to_instagram",
+        new=AsyncMock(return_value=type("R", (), {
+            "success": True,
+            "permalink": "https://instagram.com/reel/recovered",
+            "detail": None,
+        })()),
+    ) as publish_mock:
+        actions = await dispatch_due_actions(
+            store=store, settings=settings, discord=discord
+        )
+
+    refreshed = await store.get("ig-header-error")
+    ig = refreshed.platform_statuses["instagram"]
+    assert actions == 1
+    assert ig.status == "uploaded"
+    assert ig.attempts == 7
+    assert publish_mock.await_count == 1

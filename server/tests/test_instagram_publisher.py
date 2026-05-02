@@ -74,6 +74,10 @@ async def test_happy_path():
     assert download_route.called
     assert create_route.called
     assert upload_route.called
+    upload_request = upload_route.calls.last.request
+    assert upload_request.headers["content-length"] == str(len(b"fake mp4 bytes"))
+    assert upload_request.headers["x-entity-length"] == str(len(b"fake mp4 bytes"))
+    assert "transfer-encoding" not in upload_request.headers
     assert status_route.call_count == 2
     assert publish_route.called
     assert permalink_route.called

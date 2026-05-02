@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 _IG_MAX_ATTEMPTS = 5
 _LEGACY_IG_CONTAINER_ERROR = "container status_code = ERROR"
 _URL_INGEST_IG_CONTAINER_ERROR = "error code 2207077"
+_RESUMABLE_HEADER_ERROR = "Invalid Header format"
 
 
 async def dispatch_due_actions(
@@ -230,13 +231,17 @@ def _instagram_video_url(job: Job, settings: Settings) -> str:
 
 def _should_retry_legacy_instagram_failure(status: PlatformStatus) -> bool:
     detail = status.detail or ""
+    retryable_attempts = {
+        _LEGACY_IG_CONTAINER_ERROR: _IG_MAX_ATTEMPTS,
+        _URL_INGEST_IG_CONTAINER_ERROR: _IG_MAX_ATTEMPTS,
+        _RESUMABLE_HEADER_ERROR: _IG_MAX_ATTEMPTS + 1,
+    }
     return (
         status.status == "failed"
-        and (
-            detail == _LEGACY_IG_CONTAINER_ERROR
-            or _URL_INGEST_IG_CONTAINER_ERROR in detail
+        and any(
+            marker in detail and status.attempts == attempts
+            for marker, attempts in retryable_attempts.items()
         )
-        and status.attempts == _IG_MAX_ATTEMPTS
     )
 
 
