@@ -52,3 +52,8 @@ music:
     display_name: "Montagem Batchi"
     file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/montagem batchi.wav"
     volume_db: -28
+
+  joyful_chess:
+    display_name: "Joyful Chess"
+    file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/joyful chess.wav"
+    volume_db: -28
