@@ -17,7 +17,7 @@ interface NewSourceModalProps {
     name: string | undefined,
     type: LibraryType,
     fps: number,
-  ) => void;
+  ) => void | Promise<void>;
   onBatchSubmit?: (
     items: Array<{ path: string; name: string; jobType: "index" | "update" }>,
     type: LibraryType,
@@ -70,6 +70,7 @@ export function NewSourceModal({
   const [batchPaths, setBatchPaths] = useState<string[]>([]);
   const [batchBrowserOpen, setBatchBrowserOpen] = useState(false);
   const [batchProcessing, setBatchProcessing] = useState(false);
+  const [singleSubmitting, setSingleSubmitting] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
 
   // Batch validation flow state
@@ -92,9 +93,15 @@ export function NewSourceModal({
 
   if (!open) return null;
 
-  const handleSubmit = () => {
-    if (!path) return;
-    onSubmit(path, name.trim() || undefined, selectedType, fps);
+  const handleSubmit = async () => {
+    if (!path || singleSubmitting) return;
+    setValidationError(null);
+    setSingleSubmitting(true);
+    try {
+      await onSubmit(path, name.trim() || undefined, selectedType, fps);
+    } finally {
+      setSingleSubmitting(false);
+    }
   };
 
   const handleClose = () => {
@@ -112,6 +119,7 @@ export function NewSourceModal({
     setCurrentConflictIndex(-1);
     setResolvedItems([]);
     setBatchProcessing(false);
+    setSingleSubmitting(false);
     setValidationError(null);
     onClose();
   };
@@ -533,15 +541,19 @@ export function NewSourceModal({
               disabled={
                 batchMode
                   ? batchPaths.length === 0 || batchProcessing
-                  : !path
+                  : !path || singleSubmitting
               }
               className={`bg-[hsl(var(--primary))] text-white rounded-md px-4 py-2 text-sm font-medium transition-colors ${
-                (batchMode ? batchPaths.length === 0 || batchProcessing : !path)
+                (
+                  batchMode
+                    ? batchPaths.length === 0 || batchProcessing
+                    : !path || singleSubmitting
+                )
                   ? "opacity-50 cursor-not-allowed"
                   : "hover:bg-[hsl(var(--primary))]/90"
               }`}
             >
-              {batchProcessing ? "Validation..." : "Indexer"}
+              {batchProcessing || singleSubmitting ? "Validation..." : "Indexer"}
             </button>
           </div>
         </div>

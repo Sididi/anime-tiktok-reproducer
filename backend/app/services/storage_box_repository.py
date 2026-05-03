@@ -366,15 +366,20 @@ class StorageBoxRepository:
         except Exception:
             return None
 
+        async def _fetch_current(sid: str) -> tuple[str, dict[str, Any] | None]:
+            try:
+                return sid, await cls.get_current_release(library_type, sid)
+            except Exception:
+                return sid, None
+
+        fetched = await asyncio.gather(*(_fetch_current(sid) for sid in series_ids))
+
         best_priority: tuple[str, str, str] | None = None
         best_series_id: str | None = None
 
-        for candidate_series_id in series_ids:
-            try:
-                current = await cls.get_current_release(library_type, candidate_series_id)
-            except Exception:
+        for candidate_series_id, current in fetched:
+            if current is None:
                 continue
-
             if cls._normalized_catalog_name(current.get("display_name")) != normalized_name:
                 continue
 
