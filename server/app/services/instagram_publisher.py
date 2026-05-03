@@ -53,6 +53,7 @@ _DEFAULT_POLL_INTERVAL_SECONDS = 60.0
 _DEFAULT_POLL_TIMEOUT_SECONDS = 15 * 60.0
 _RATE_LIMIT_POLL_INTERVAL_SECONDS = 60.0
 _MAX_POLL_INTERVAL_SECONDS = 300.0
+_DEFAULT_CONTENT_PUBLISHING_QUOTA_TOTAL = 50
 _MAX_CAPTION_CHARS = 2200
 _MAX_HASHTAGS = 30
 _MAX_MENTIONS = 20
@@ -251,13 +252,21 @@ def _content_publishing_quota_detail(payload: dict[str, Any]) -> str | None:
             first_config = first.get("config")
             if isinstance(first_config, dict):
                 quota_total = first_config.get("quota_total")
-    if quota_usage is None or quota_total is None:
-        return "content publishing quota response missing quota fields"
+    if quota_usage is None:
+        logger.warning(
+            "Instagram content_publishing_limit response did not include quota_usage; "
+            "continuing without quota enforcement (keys=%s)",
+            sorted(str(k) for k in payload),
+        )
+        return None
+    if quota_total is None:
+        quota_total = _DEFAULT_CONTENT_PUBLISHING_QUOTA_TOTAL
     with contextlib.suppress(TypeError, ValueError):
         used = int(quota_usage)
         total = int(quota_total)
         if total > 0 and used >= total:
             return f"content publishing quota exhausted ({used}/{total})"
+        logger.info("Instagram content publishing quota usage is %d/%d", used, total)
     return None
 
 

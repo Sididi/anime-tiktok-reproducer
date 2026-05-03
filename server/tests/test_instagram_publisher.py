@@ -373,6 +373,24 @@ async def test_preflight_checks_account_and_quota():
 
 
 @respx.mock
+async def test_preflight_accepts_quota_usage_without_config_total():
+    respx.get(f"{BASE}/{IG_USER_ID}").mock(
+        return_value=httpx.Response(200, json={"id": IG_USER_ID})
+    )
+    respx.get(f"{BASE}/{IG_USER_ID}/content_publishing_limit").mock(
+        return_value=httpx.Response(200, json={"quota_usage": 12})
+    )
+
+    async with httpx.AsyncClient() as client:
+        await _preflight_instagram_account(
+            client,
+            base=BASE,
+            ig_user_id=IG_USER_ID,
+            ig_access_token=ACCESS_TOKEN,
+        )
+
+
+@respx.mock
 async def test_preflight_fails_when_quota_exhausted():
     respx.get(f"{BASE}/{IG_USER_ID}").mock(
         return_value=httpx.Response(200, json={"id": IG_USER_ID})
@@ -385,6 +403,25 @@ async def test_preflight_fails_when_quota_exhausted():
 
     async with httpx.AsyncClient() as client:
         with pytest.raises(RuntimeError, match="quota exhausted"):
+            await _preflight_instagram_account(
+                client,
+                base=BASE,
+                ig_user_id=IG_USER_ID,
+                ig_access_token=ACCESS_TOKEN,
+            )
+
+
+@respx.mock
+async def test_preflight_fails_when_default_quota_exhausted_without_config_total():
+    respx.get(f"{BASE}/{IG_USER_ID}").mock(
+        return_value=httpx.Response(200, json={"id": IG_USER_ID})
+    )
+    respx.get(f"{BASE}/{IG_USER_ID}/content_publishing_limit").mock(
+        return_value=httpx.Response(200, json={"quota_usage": 50})
+    )
+
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(RuntimeError, match="50/50"):
             await _preflight_instagram_account(
                 client,
                 base=BASE,

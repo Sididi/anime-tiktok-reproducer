@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import tempfile
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -19,6 +20,7 @@ from app.services.reaction_listener import ReactionListener
 from app.services.reminder_scheduler import run_scheduler_loop
 
 logger = logging.getLogger(__name__)
+_INSTAGRAM_TEMP_DOWNLOAD_GLOB = "ig-reel-*.mp4"
 
 
 def _resolve_paths() -> tuple[Path, Path, Path]:
@@ -31,6 +33,23 @@ def _resolve_paths() -> tuple[Path, Path, Path]:
     return config_path, avatars_dir, data_dir
 
 
+def _cleanup_instagram_temp_downloads(temp_dir: Path | None = None) -> int:
+    """Remove IG upload temp files left behind by a process crash/restart."""
+    root = temp_dir or Path(tempfile.gettempdir())
+    removed = 0
+    for path in root.glob(_INSTAGRAM_TEMP_DOWNLOAD_GLOB):
+        if not path.is_file():
+            continue
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            logger.warning("Failed to remove orphan Instagram temp download %s", path)
+    if removed:
+        logger.info("Removed %d orphan Instagram temp download(s)", removed)
+    return removed
+
+
 def create_app() -> FastAPI:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
@@ -38,6 +57,7 @@ def create_app() -> FastAPI:
     settings = Settings.load(config_path=config_path, avatars_dir=avatars_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     job_store = JobStore(data_dir / "jobs.json")
+    _cleanup_instagram_temp_downloads()
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):

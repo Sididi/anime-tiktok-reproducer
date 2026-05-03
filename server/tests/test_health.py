@@ -21,3 +21,23 @@ def test_healthz_returns_status_ok(
     body = r.json()
     assert body["status"] == "ok"
     assert "jobs_pending" in body
+
+
+def test_create_app_cleans_orphan_instagram_temp_downloads(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path, tmp_path: Path
+):
+    orphan = tmp_path / "ig-reel-orphan.mp4"
+    unrelated = tmp_path / "other.mp4"
+    orphan.write_bytes(b"orphan")
+    unrelated.write_bytes(b"keep")
+
+    monkeypatch.setenv("ATR_TIKTOK_SERVER_CONFIG_PATH", str(example_yaml))
+    monkeypatch.setenv("ATR_TIKTOK_SERVER_AVATARS_DIR", str(tmp_server_dir / "avatars"))
+    monkeypatch.setenv("ATR_TIKTOK_SERVER_DATA_DIR", str(tmp_server_dir / "data"))
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+    from app.main import create_app  # noqa: PLC0415
+
+    create_app()
+
+    assert not orphan.exists()
+    assert unrelated.exists()
