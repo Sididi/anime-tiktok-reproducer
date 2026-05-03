@@ -1,9 +1,9 @@
 """Tests for /api/avatars/*."""
 from __future__ import annotations
 
-from pathlib import Path
-from datetime import datetime, timezone
 import asyncio
+from datetime import UTC, datetime
+from pathlib import Path
 
 import httpx
 import respx
@@ -14,7 +14,7 @@ def _make_app(monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
     monkeypatch.setenv("ATR_TIKTOK_SERVER_CONFIG_PATH", str(example_yaml))
     monkeypatch.setenv("ATR_TIKTOK_SERVER_AVATARS_DIR", str(tmp_server_dir / "avatars"))
     monkeypatch.setenv("ATR_TIKTOK_SERVER_DATA_DIR", str(tmp_server_dir / "data"))
-    from app.main import create_app
+    from app.main import create_app  # noqa: PLC0415
 
     return create_app()
 
@@ -53,7 +53,7 @@ def test_path_traversal_rejected(
 def test_video_proxy_streams_job_video(
     monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
 ):
-    from app.models.job import Job, PlatformStatus
+    from app.models.job import Job, PlatformStatus  # noqa: PLC0415
 
     app = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
     source_url = "https://drive.usercontent.google.com/download?id=file_123&export=download&confirm=t"
@@ -68,7 +68,7 @@ def test_video_proxy_streams_job_video(
                 anime_title="Video Proxy",
                 description="desc",
                 drive_video_url=source_url,
-                slot_time=datetime.now(tz=timezone.utc),
+                slot_time=datetime.now(tz=UTC),
                 platforms_requested=["instagram"],
                 platform_statuses={"instagram": PlatformStatus(status="pending")},
                 discord_message_id=None,

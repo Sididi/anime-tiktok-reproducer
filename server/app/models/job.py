@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 PlatformStatusName = Literal["pending", "uploading", "uploaded", "skipped", "failed"]
@@ -55,8 +55,8 @@ class Job:
     reminder_cancelled: bool = False
     instagram_payload: dict | None = None
     platform_scheduled_at: dict[str, datetime] = field(default_factory=dict)
-    created_at: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
-    updated_at: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
+    created_at: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
 
     def to_dict(self) -> dict[str, Any]:
         return {

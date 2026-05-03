@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from app.auth.dependencies import require_internal_token
-from app.models.job import PlatformStatus, Job
+from app.models.job import Job, PlatformStatus
 from app.services.embed_builder import build_embed
 
 logger = logging.getLogger(__name__)
@@ -26,6 +26,10 @@ class InstagramPayload(BaseModel):
     ig_access_token: str
     caption: str
     graph_api_version: str = "v25.0"
+    poll_interval_seconds: float | None = None
+    poll_timeout_seconds: float | None = None
+    share_to_feed: bool | None = None
+    thumb_offset: int | None = None
 
 
 class CreateJobRequest(BaseModel):
@@ -99,7 +103,7 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
         discord_message_id=None,
         reminder_message_id=None,
         reminder_forward_message_id=None,
-        instagram_payload=req.instagram.model_dump() if req.instagram else None,
+        instagram_payload=req.instagram.model_dump(exclude_none=True) if req.instagram else None,
         created_at=now,
         updated_at=now,
     )

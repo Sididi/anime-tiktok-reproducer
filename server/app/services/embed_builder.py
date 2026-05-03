@@ -6,7 +6,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from app.config import AccountConfig
-from app.models.job import PlatformStatus, Job
+from app.models.job import Job, PlatformStatus
 
 # Months in French for footer/description rendering.
 _FR_MONTHS = [

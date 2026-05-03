@@ -14,12 +14,15 @@ if the best-effort permalink lookup fails.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
+import re
+import shutil
+import subprocess
 import tempfile
-import urllib.error
-import urllib.request
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -46,10 +49,23 @@ class _RetryableStatusPollError(RuntimeError):
     pass
 
 
-_DEFAULT_POLL_INTERVAL_SECONDS = 15.0
-_DEFAULT_POLL_TIMEOUT_SECONDS = 5 * 60.0  # 5 minutes
+_DEFAULT_POLL_INTERVAL_SECONDS = 60.0
+_DEFAULT_POLL_TIMEOUT_SECONDS = 15 * 60.0
 _RATE_LIMIT_POLL_INTERVAL_SECONDS = 60.0
 _MAX_POLL_INTERVAL_SECONDS = 300.0
+_MAX_CAPTION_CHARS = 2200
+_MAX_HASHTAGS = 30
+_MAX_MENTIONS = 20
+_MAX_REEL_BYTES = 300 * 1024 * 1024
+_MIN_REEL_DURATION_SECONDS = 3.0
+_MAX_REEL_DURATION_SECONDS = 15 * 60.0
+_ALLOWED_VIDEO_CODECS = {"h264", "hevc"}
+_ALLOWED_AUDIO_CODECS = {"aac"}
+_ALLOWED_CONTAINERS = {"mov", "mp4", "m4v", "quicktime"}
+
+
+def _stage_detail(stage: str, detail: str) -> str:
+    return f"{stage}: {detail}"
 
 
 def _response_detail(response: httpx.Response) -> str:
@@ -64,11 +80,17 @@ def _response_detail(response: httpx.Response) -> str:
         message = error.get("message")
         code = error.get("code")
         subcode = error.get("error_subcode")
+        fbtrace_id = error.get("fbtrace_id") or payload.get("fbtrace_id")
+        error_user_msg = error.get("error_user_msg")
         parts = [str(message)] if message else []
+        if error_user_msg and error_user_msg != message:
+            parts.append(f"user_msg={error_user_msg}")
         if code is not None:
             parts.append(f"code={code}")
         if subcode is not None:
             parts.append(f"subcode={subcode}")
+        if fbtrace_id:
+            parts.append(f"fbtrace_id={fbtrace_id}")
         if parts:
             return " ".join(parts)
     return str(payload)[:500]
@@ -80,6 +102,28 @@ def _upload_response_detail(response: _UploadResponse) -> str:
     except ValueError:
         body = response.body.strip()
         return body[:500] if body else f"HTTP {response.status_code}"
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(error, dict):
+        message = error.get("message")
+        code = error.get("code")
+        subcode = error.get("error_subcode")
+        fbtrace_id = error.get("fbtrace_id") or payload.get("fbtrace_id")
+        parts = [str(message)] if message else [f"HTTP {response.status_code}"]
+        if code is not None:
+            parts.append(f"code={code}")
+        if subcode is not None:
+            parts.append(f"subcode={subcode}")
+        if fbtrace_id:
+            parts.append(f"fbtrace_id={fbtrace_id}")
+        return " ".join(parts)
+    debug_info = payload.get("debug_info") if isinstance(payload, dict) else None
+    if isinstance(debug_info, dict):
+        message = debug_info.get("message")
+        debug_type = debug_info.get("type")
+        parts = [str(message)] if message else [f"HTTP {response.status_code}"]
+        if debug_type:
+            parts.append(f"type={debug_type}")
+        return " ".join(parts)
     return str(payload)[:500]
 
 
@@ -182,6 +226,178 @@ def _upload_headers(ig_access_token: str, file_size: int) -> dict[str, str]:
     }
 
 
+def _validate_caption(caption: str) -> str | None:
+    if len(caption) > _MAX_CAPTION_CHARS:
+        return f"caption is {len(caption)} chars; max is {_MAX_CAPTION_CHARS}"
+    hashtags = re.findall(r"(?<!\w)#[\w]+", caption)
+    if len(hashtags) > _MAX_HASHTAGS:
+        return f"caption has {len(hashtags)} hashtags; max is {_MAX_HASHTAGS}"
+    mentions = re.findall(r"(?<!\w)@[\w.]+", caption)
+    if len(mentions) > _MAX_MENTIONS:
+        return f"caption has {len(mentions)} mentions; max is {_MAX_MENTIONS}"
+    return None
+
+
+def _content_publishing_quota_detail(payload: dict[str, Any]) -> str | None:
+    quota_usage = payload.get("quota_usage")
+    quota_total = None
+    config = payload.get("config")
+    if isinstance(config, dict):
+        quota_total = config.get("quota_total")
+    if quota_usage is None and isinstance(payload.get("data"), list) and payload["data"]:
+        first = payload["data"][0]
+        if isinstance(first, dict):
+            quota_usage = first.get("quota_usage")
+            first_config = first.get("config")
+            if isinstance(first_config, dict):
+                quota_total = first_config.get("quota_total")
+    if quota_usage is None or quota_total is None:
+        return "content publishing quota response missing quota fields"
+    with contextlib.suppress(TypeError, ValueError):
+        used = int(quota_usage)
+        total = int(quota_total)
+        if total > 0 and used >= total:
+            return f"content publishing quota exhausted ({used}/{total})"
+    return None
+
+
+async def _preflight_instagram_account(
+    client: httpx.AsyncClient,
+    *,
+    base: str,
+    ig_user_id: str,
+    ig_access_token: str,
+) -> None:
+    account = await client.get(
+        f"{base}/{ig_user_id}",
+        params={"fields": "id", "access_token": ig_access_token},
+    )
+    account.raise_for_status()
+
+    quota = await client.get(
+        f"{base}/{ig_user_id}/content_publishing_limit",
+        params={"access_token": ig_access_token},
+    )
+    quota.raise_for_status()
+    payload = quota.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("content publishing limit response was not an object")
+    if detail := _content_publishing_quota_detail(payload):
+        raise RuntimeError(detail)
+
+
+def _float_or_none(value: Any) -> float | None:
+    with contextlib.suppress(TypeError, ValueError):
+        return float(value)
+    return None
+
+
+def _validate_video_streams(payload: dict[str, Any]) -> str | None:  # noqa: PLR0911
+    fmt = payload.get("format") if isinstance(payload.get("format"), dict) else {}
+    format_name = str(fmt.get("format_name") or "").lower()
+    if format_name and not any(c in format_name for c in _ALLOWED_CONTAINERS):
+        return f"container {format_name!r} is not MP4/MOV"
+
+    duration = _float_or_none(fmt.get("duration"))
+    if duration is not None and not (
+        _MIN_REEL_DURATION_SECONDS <= duration <= _MAX_REEL_DURATION_SECONDS
+    ):
+        return (
+            f"duration {duration:.2f}s outside "
+            f"{_MIN_REEL_DURATION_SECONDS:.0f}-{_MAX_REEL_DURATION_SECONDS:.0f}s"
+        )
+
+    streams = payload.get("streams") if isinstance(payload.get("streams"), list) else []
+    video_stream = next(
+        (s for s in streams if isinstance(s, dict) and s.get("codec_type") == "video"),
+        None,
+    )
+    if not isinstance(video_stream, dict):
+        return "missing video stream"
+    video_codec = str(video_stream.get("codec_name") or "").lower()
+    if video_codec and video_codec not in _ALLOWED_VIDEO_CODECS:
+        return f"video codec {video_codec!r} is not H.264/HEVC"
+    width = int(video_stream.get("width") or 0)
+    if width > 1920:
+        return f"video width {width}px exceeds 1920px"
+    frame_rate = _parse_frame_rate(video_stream.get("avg_frame_rate"))
+    if frame_rate is None:
+        frame_rate = _parse_frame_rate(video_stream.get("r_frame_rate"))
+    if frame_rate is not None and not (23 <= frame_rate <= 60):
+        return f"frame rate {frame_rate:.2f} FPS outside 23-60 FPS"
+
+    audio_stream = next(
+        (s for s in streams if isinstance(s, dict) and s.get("codec_type") == "audio"),
+        None,
+    )
+    if isinstance(audio_stream, dict):
+        audio_codec = str(audio_stream.get("codec_name") or "").lower()
+        if audio_codec and audio_codec not in _ALLOWED_AUDIO_CODECS:
+            return f"audio codec {audio_codec!r} is not AAC"
+    return None
+
+
+def _parse_frame_rate(value: Any) -> float | None:
+    if not value:
+        return None
+    text = str(value)
+    if "/" in text:
+        numerator, denominator = text.split("/", 1)
+        with contextlib.suppress(ValueError, ZeroDivisionError):
+            den = float(denominator)
+            if den:
+                return float(numerator) / den
+        return None
+    return _float_or_none(text)
+
+
+async def _validate_video(video_path: Path) -> str | None:  # noqa: PLR0911
+    file_size = video_path.stat().st_size
+    if file_size <= 0:
+        return "downloaded video is empty"
+    if file_size > _MAX_REEL_BYTES:
+        return f"file size {file_size} bytes exceeds {_MAX_REEL_BYTES} bytes"
+
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        logger.warning("ffprobe unavailable; Instagram video validation is limited")
+        return None
+
+    def run_probe() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+                str(video_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    try:
+        probe = await asyncio.to_thread(run_probe)
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.warning("ffprobe failed; Instagram video validation is limited: %s", e)
+        return None
+    if probe.returncode != 0:
+        stderr = probe.stderr.strip()
+        return f"ffprobe failed: {stderr[:300] if stderr else probe.returncode}"
+    try:
+        payload = json.loads(probe.stdout)
+    except ValueError as e:
+        return f"ffprobe returned invalid JSON: {e}"
+    if not isinstance(payload, dict):
+        return "ffprobe response was not an object"
+    return _validate_video_streams(payload)
+
+
 def _upload_resumable_binary_sync(
     *,
     upload_uri: str,
@@ -190,19 +406,18 @@ def _upload_resumable_binary_sync(
     timeout_seconds: float,
 ) -> _UploadResponse:
     file_size = video_path.stat().st_size
-    request = urllib.request.Request(
-        upload_uri,
-        data=video_path.read_bytes(),
-        method="POST",
-        headers=_upload_headers(ig_access_token, file_size),
-    )
     try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            body = response.read().decode("utf-8", "replace")
-            return _UploadResponse(status_code=response.status, body=body)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", "replace")
-        return _UploadResponse(status_code=e.code, body=body)
+        with video_path.open("rb") as f:
+            response = httpx.post(
+                upload_uri,
+                headers=_upload_headers(ig_access_token, file_size),
+                content=f,
+                timeout=httpx.Timeout(timeout_seconds, read=timeout_seconds),
+                follow_redirects=True,
+            )
+        return _UploadResponse(status_code=response.status_code, body=response.text)
+    except httpx.HTTPError as e:
+        raise OSError(str(e)) from e
 
 
 async def _upload_resumable_binary(
@@ -248,8 +463,7 @@ async def _get_status_payload(
 ) -> dict[str, Any]:
     field_candidates = (
         "status_code,status",
-        "status_code,status,video_status",
-        "status_code,status,error_message,video_status",
+        "status_code,status,error_message",
         "status_code",
     )
     last_error_detail = ""
@@ -296,7 +510,7 @@ def _next_retry_poll_interval(
     return max(0.0, min(target, remaining))
 
 
-async def publish_to_instagram(
+async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
     *,
     ig_user_id: str,
     ig_access_token: str,
@@ -305,48 +519,87 @@ async def publish_to_instagram(
     graph_api_version: str = "v25.0",
     poll_interval: float = _DEFAULT_POLL_INTERVAL_SECONDS,
     poll_timeout: float = _DEFAULT_POLL_TIMEOUT_SECONDS,
+    share_to_feed: bool = True,
+    thumb_offset: int | None = None,
 ) -> InstagramPublishResult:
     base = f"https://graph.facebook.com/{graph_api_version}"
     timeout = httpx.Timeout(30.0, read=None)
     video_path: Path | None = None
+    started = time.monotonic()
+
+    if detail := _validate_caption(caption):
+        return InstagramPublishResult(success=False, detail=_stage_detail("preflight", detail))
+
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        try:
+            await _preflight_instagram_account(
+                client,
+                base=base,
+                ig_user_id=ig_user_id,
+                ig_access_token=ig_access_token,
+            )
+        except httpx.HTTPStatusError as e:
+            return InstagramPublishResult(
+                success=False,
+                detail=_stage_detail("preflight", _response_detail(e.response)),
+            )
+        except (httpx.HTTPError, RuntimeError, ValueError) as e:
+            return InstagramPublishResult(
+                success=False, detail=_stage_detail("preflight", str(e))
+            )
+
         try:
             video_path = await _download_video(client, video_url)
         except httpx.HTTPStatusError as e:
             return InstagramPublishResult(
                 success=False,
-                detail=f"download video failed: {_response_detail(e.response)}",
+                detail=_stage_detail("download", _response_detail(e.response)),
             )
         except (httpx.HTTPError, RuntimeError) as e:
             return InstagramPublishResult(
-                success=False, detail=f"download video failed: {e}"
+                success=False, detail=_stage_detail("download", str(e))
+            )
+
+        if detail := await _validate_video(video_path):
+            video_path.unlink(missing_ok=True)
+            return InstagramPublishResult(
+                success=False, detail=_stage_detail("validate", detail)
             )
 
         try:
+            create_data = {
+                "media_type": "REELS",
+                "upload_type": "resumable",
+                "caption": caption,
+                "share_to_feed": "true" if share_to_feed else "false",
+                "access_token": ig_access_token,
+            }
+            if thumb_offset is not None:
+                create_data["thumb_offset"] = str(thumb_offset)
             create = await client.post(
                 f"{base}/{ig_user_id}/media",
-                data={
-                    "media_type": "REELS",
-                    "upload_type": "resumable",
-                    "caption": caption,
-                    "share_to_feed": "true",
-                    "access_token": ig_access_token,
-                },
+                data=create_data,
             )
             create.raise_for_status()
             create_payload = create.json()
             container_id = create_payload["id"]
             upload_uri = create_payload["uri"]
+            logger.info(
+                "Instagram container created ig_user_id=%s graph_api_version=%s container_id=%s",
+                ig_user_id,
+                graph_api_version,
+                container_id,
+            )
         except httpx.HTTPStatusError as e:
             video_path.unlink(missing_ok=True)
             return InstagramPublishResult(
                 success=False,
-                detail=f"create container failed: {_response_detail(e.response)}",
+                detail=_stage_detail("create_container", _response_detail(e.response)),
             )
         except (httpx.HTTPError, KeyError, ValueError) as e:
             video_path.unlink(missing_ok=True)
             return InstagramPublishResult(
-                success=False, detail=f"create container failed: {e}"
+                success=False, detail=_stage_detail("create_container", str(e))
             )
 
         try:
@@ -360,20 +613,24 @@ async def publish_to_instagram(
                     video_path.unlink(missing_ok=True)
                     return InstagramPublishResult(
                         success=False,
-                        detail=(
-                            "resumable upload failed: "
-                            f"{_upload_response_detail(upload)}"
-                        ),
+                        detail=_stage_detail("rupload", _upload_response_detail(upload)),
                     )
                 logger.info(
                     "Instagram resumable upload returned indeterminate processing "
                     "response for container %s; polling container status",
                     container_id,
                 )
+            else:
+                logger.info(
+                    "Instagram rupload succeeded ig_user_id=%s container_id=%s status_code=%s",
+                    ig_user_id,
+                    container_id,
+                    upload.status_code,
+                )
         except (OSError, TimeoutError) as e:
             video_path.unlink(missing_ok=True)
             return InstagramPublishResult(
-                success=False, detail=f"resumable upload failed: {e}"
+                success=False, detail=_stage_detail("rupload", str(e))
             )
         finally:
             if video_path is not None:
@@ -396,10 +653,15 @@ async def publish_to_instagram(
             except httpx.HTTPStatusError as e:
                 return InstagramPublishResult(
                     success=False,
-                    detail=f"status poll failed: {_response_detail(e.response)}",
+                    detail=_stage_detail("status_poll", _response_detail(e.response)),
                 )
             except _RetryableStatusPollError as e:
-                logger.info("Instagram status poll retryable error: %s", e)
+                logger.info(
+                    "Instagram status poll retryable error ig_user_id=%s container_id=%s: %s",
+                    ig_user_id,
+                    container_id,
+                    e,
+                )
                 next_poll_interval = _next_retry_poll_interval(
                     next_poll_interval,
                     elapsed=elapsed,
@@ -408,21 +670,37 @@ async def publish_to_instagram(
                 continue
             except httpx.HTTPError as e:
                 return InstagramPublishResult(
-                    success=False, detail=f"status poll failed: {e}"
+                    success=False, detail=_stage_detail("status_poll", str(e))
                 )
             except (RuntimeError, ValueError) as e:
                 return InstagramPublishResult(
-                    success=False, detail=f"status poll failed: {e}"
+                    success=False, detail=_stage_detail("status_poll", str(e))
                 )
             if code == "FINISHED":
+                logger.info(
+                    "Instagram container finished ig_user_id=%s container_id=%s elapsed=%.1fs",
+                    ig_user_id,
+                    container_id,
+                    time.monotonic() - started,
+                )
                 break
+            if code == "PUBLISHED":
+                logger.info(
+                    "Instagram container already published ig_user_id=%s container_id=%s",
+                    ig_user_id,
+                    container_id,
+                )
+                return InstagramPublishResult(success=True)
             if code in {"ERROR", "EXPIRED"}:
                 return InstagramPublishResult(
-                    success=False, detail=_status_detail(status_payload)
+                    success=False,
+                    detail=_stage_detail("status_poll", _status_detail(status_payload)),
                 )
             next_poll_interval = poll_interval
         else:
-            return InstagramPublishResult(success=False, detail="poll timeout")
+            return InstagramPublishResult(
+                success=False, detail=_stage_detail("status_poll", "poll timeout")
+            )
 
         try:
             pub = await client.post(
@@ -434,12 +712,22 @@ async def publish_to_instagram(
             )
             pub.raise_for_status()
             media_id = pub.json()["id"]
+            logger.info(
+                "Instagram publish succeeded ig_user_id=%s container_id=%s "
+                "media_id=%s elapsed=%.1fs",
+                ig_user_id,
+                container_id,
+                media_id,
+                time.monotonic() - started,
+            )
         except httpx.HTTPStatusError as e:
             return InstagramPublishResult(
-                success=False, detail=f"publish failed: {_response_detail(e.response)}"
+                success=False, detail=_stage_detail("publish", _response_detail(e.response))
             )
         except (httpx.HTTPError, KeyError, ValueError) as e:
-            return InstagramPublishResult(success=False, detail=f"publish failed: {e}")
+            return InstagramPublishResult(
+                success=False, detail=_stage_detail("publish", str(e))
+            )
 
         permalink: str | None = None
         try:
@@ -451,7 +739,8 @@ async def publish_to_instagram(
             permalink = perma.json().get("permalink")
         except httpx.HTTPError:
             logger.warning(
-                "permalink fetch failed for %s - publish still succeeded", media_id
+                "Instagram permalink fetch failed media_id=%s - publish still succeeded",
+                media_id,
             )
 
         return InstagramPublishResult(success=True, permalink=permalink)

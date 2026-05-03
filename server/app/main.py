@@ -23,7 +23,9 @@ logger = logging.getLogger(__name__)
 
 def _resolve_paths() -> tuple[Path, Path, Path]:
     base = Path(__file__).resolve().parent.parent
-    config_path = Path(os.environ.get("ATR_TIKTOK_SERVER_CONFIG_PATH", base / "config" / "config.yaml"))
+    config_path = Path(
+        os.environ.get("ATR_TIKTOK_SERVER_CONFIG_PATH", base / "config" / "config.yaml")
+    )
     avatars_dir = Path(os.environ.get("ATR_TIKTOK_SERVER_AVATARS_DIR", base / "avatars"))
     data_dir = Path(os.environ.get("ATR_TIKTOK_SERVER_DATA_DIR", base / "data"))
     return config_path, avatars_dir, data_dir
@@ -59,7 +61,7 @@ def create_app() -> FastAPI:
             stop_event.set()
             try:
                 await asyncio.wait_for(task, timeout=5.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task

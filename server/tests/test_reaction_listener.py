@@ -1,12 +1,11 @@
 """Tests for app.services.reaction_listener."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
-import pytest
 
 from app.config import Settings
 from app.models.job import Job, PlatformStatus
@@ -25,7 +24,7 @@ def _make_job_with_embed(
     reminder_message_id: str | None = None,
     reminder_forward_message_id: str | None = None,
 ) -> Job:
-    now = datetime(2026, 4, 27, 21, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 4, 27, 21, 0, tzinfo=UTC)
     return Job(
         project_id=project_id,
         job_id="j_x",

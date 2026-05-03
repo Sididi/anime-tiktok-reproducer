@@ -12,7 +12,7 @@ def test_healthz_returns_status_ok(
     monkeypatch.setenv("ATR_TIKTOK_SERVER_CONFIG_PATH", str(example_yaml))
     monkeypatch.setenv("ATR_TIKTOK_SERVER_AVATARS_DIR", str(tmp_server_dir / "avatars"))
     monkeypatch.setenv("ATR_TIKTOK_SERVER_DATA_DIR", str(tmp_server_dir / "data"))
-    from app.main import create_app
+    from app.main import create_app  # noqa: PLC0415
 
     app = create_app()
     with TestClient(app) as client:

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from app.config import Settings
 from app.models.job import Job, PlatformStatus
@@ -44,7 +44,7 @@ async def dispatch_due_actions(
     now: datetime | None = None,
 ) -> int:
     """Run per-platform actions for any due job. Returns count of actions taken."""
-    current = _normalize_utc(now or datetime.now(tz=timezone.utc))
+    current = _normalize_utc(now or datetime.now(tz=UTC))
     actions = 0
     for job in await store.list_all():
         for platform in job.platforms_requested:
@@ -53,9 +53,10 @@ async def dispatch_due_actions(
             if platform == "tiktok":
                 if await _dispatch_tiktok_reminder(job, store, settings, discord):
                     actions += 1
-            elif platform == "instagram":
-                if await _dispatch_instagram_publish(job, store, settings, discord):
-                    actions += 1
+            elif platform == "instagram" and await _dispatch_instagram_publish(
+                job, store, settings, discord
+            ):
+                actions += 1
             # youtube + facebook: nothing to do (main backend handles those)
     return actions
 
@@ -67,8 +68,8 @@ def _platform_due_time(job: Job, platform: str) -> datetime:
 
 def _normalize_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 async def _dispatch_tiktok_reminder(
@@ -156,9 +157,15 @@ async def _dispatch_instagram_publish(
         caption=payload["caption"],
         video_url=_instagram_video_url(job, settings),
         graph_api_version=payload.get("graph_api_version", "v25.0"),
+        poll_interval=float(payload.get("poll_interval_seconds") or 60.0),
+        poll_timeout=float(payload.get("poll_timeout_seconds") or 900.0),
+        share_to_feed=(
+            True if payload.get("share_to_feed") is None else bool(payload["share_to_feed"])
+        ),
+        thumb_offset=payload.get("thumb_offset"),
     )
 
-    now = datetime.now(tz=timezone.utc)
+    now = datetime.now(tz=UTC)
     if result.success:
         await store.merge_platform_status(
             job.project_id, "instagram",
@@ -280,6 +287,6 @@ async def run_scheduler_loop(
                 await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
                 logger.info("Scheduler stopping")
                 return
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
         await asyncio.sleep(interval_seconds)

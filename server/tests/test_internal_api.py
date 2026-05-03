@@ -1,17 +1,21 @@
 """Tests for /api/internal/* endpoints."""
 from __future__ import annotations
 
+import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient
+
+from app.models.job import Job, PlatformStatus
 
 
 def _make_app(monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path):
     monkeypatch.setenv("ATR_TIKTOK_SERVER_CONFIG_PATH", str(example_yaml))
     monkeypatch.setenv("ATR_TIKTOK_SERVER_AVATARS_DIR", str(tmp_server_dir / "avatars"))
     monkeypatch.setenv("ATR_TIKTOK_SERVER_DATA_DIR", str(tmp_server_dir / "data"))
-    from app.main import create_app
+    from app.main import create_app  # noqa: PLC0415
 
     app = create_app()
     discord = AsyncMock()
@@ -101,12 +105,9 @@ def test_delete_job_removes_reminder_and_forward_when_present(
 ):
     """If the scheduler has already fired the reminder + forward, delete_job
     must remove all three messages (embed, reminder, forward)."""
-    from app.models.job import PlatformStatus, Job
-    from datetime import datetime, timezone as _tz
-
     app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
     # Pre-populate the store with a job that already has all three msg ids.
-    now = datetime(2026, 4, 27, 21, 0, tzinfo=_tz.utc)
+    now = datetime(2026, 4, 27, 21, 0, tzinfo=UTC)
     job = Job(
         project_id="p1",
         job_id="j_x",
@@ -125,7 +126,6 @@ def test_delete_job_removes_reminder_and_forward_when_present(
         updated_at=now,
     )
 
-    import asyncio
     asyncio.run(app.state.job_store.create(job))
 
     with TestClient(app) as client:
@@ -229,7 +229,6 @@ def test_create_job_persists_instagram_payload(
     assert r.status_code == 200
 
     # Verify the IG payload is persisted on the job.
-    import asyncio
     job = asyncio.run(app.state.job_store.get("p1"))
     assert job is not None
     assert job.instagram_payload == {
@@ -263,7 +262,6 @@ def test_create_job_persists_platform_scheduled_at(
         r = client.post("/api/internal/jobs", json=payload, headers=INTERNAL_AUTH)
     assert r.status_code == 200
 
-    import asyncio
     job = asyncio.run(app.state.job_store.get("p1"))
     assert job is not None
     assert job.platform_scheduled_at["instagram"].isoformat() == "2026-04-26T06:01:00+00:00"
@@ -281,7 +279,6 @@ def test_create_job_without_instagram_field_persists_none(
         r = client.post("/api/internal/jobs", json=JOB_PAYLOAD, headers=INTERNAL_AUTH)
     assert r.status_code == 200
 
-    import asyncio
     job = asyncio.run(app.state.job_store.get("p1"))
     assert job is not None
     assert job.instagram_payload is None

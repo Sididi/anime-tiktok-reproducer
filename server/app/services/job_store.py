@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import tempfile
@@ -37,10 +38,8 @@ class JobStore:
                 json.dump({"jobs": jobs}, f, indent=2)
             os.replace(tmp, self._path)
         except Exception:
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(tmp)
-            except OSError:
-                pass
             raise
 
     async def create(self, job: Job) -> None:

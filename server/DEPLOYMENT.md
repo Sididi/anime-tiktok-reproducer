@@ -482,6 +482,17 @@ If the gateway fails to connect, check:
 
 5. **Cascade delete still works** — `DELETE /api/internal/jobs/<pid>` removes the embed + any reminder messages.
 
+### Instagram Meta prerequisites
+
+Instagram publishing uses the Meta Instagram Graph API Reels content publishing flow from the VPS: create container, upload the local video bytes through `rupload.facebook.com`, poll the container until `FINISHED`, then call `media_publish`.
+
+Before testing a real publish, confirm:
+- The Instagram account is a professional account.
+- For the Facebook Login flow, the Instagram account is connected to a Facebook Page.
+- The token can access the target IG user id and has `instagram_basic` and `instagram_content_publish`.
+- The Facebook user/system user behind the token has the required Page tasks, especially `CREATE_CONTENT` or `MANAGE`.
+- The video meets Meta Reels specs: MP4/MOV, H.264 or HEVC, AAC audio, 3 seconds to 15 minutes, max 300 MB, max width 1920px.
+
 ### Roll back
 
 If anything breaks:

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import discord
 
@@ -88,7 +88,7 @@ class ReactionListener:
             job.project_id,
         )
 
-        now = datetime.now(tz=timezone.utc)
+        now = datetime.now(tz=UTC)
         existing_tiktok = job.platform_statuses.get(
             "tiktok", PlatformStatus(status="pending")
         )
@@ -179,7 +179,7 @@ class ReactionListener:
         if self._task:
             try:
                 await asyncio.wait_for(self._task, timeout=5.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+            except (TimeoutError, asyncio.CancelledError):
                 pass
             except Exception:
                 # Connection errors during shutdown are expected (e.g. connector

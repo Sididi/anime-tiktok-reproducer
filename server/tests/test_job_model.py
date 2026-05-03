@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from app.models.job import PlatformStatus, Job
+from app.models.job import Job, PlatformStatus
 
 
 def _make_job(**overrides) -> Job:

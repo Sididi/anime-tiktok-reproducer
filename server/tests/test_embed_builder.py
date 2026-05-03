@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from app.config import AccountConfig
-from app.models.job import PlatformStatus, Job
+from app.models.job import Job, PlatformStatus
 from app.services.embed_builder import build_embed
 
 

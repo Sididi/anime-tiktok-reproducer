@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from app.models.job import PlatformStatus, Job
+from app.models.job import Job, PlatformStatus
 from app.services.job_store import JobStore
 
 
@@ -58,7 +58,6 @@ async def test_create_duplicate_is_noop(tmp_path: Path):
 
 
 async def test_update(tmp_path: Path):
-    from app.models.job import PlatformStatus
     store = JobStore(tmp_path / "jobs.json")
     job = _make_job()
     await store.create(job)

@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from app.config import Settings
-from app.models.job import PlatformStatus, Job
+from app.models.job import Job, PlatformStatus
 from app.services.job_store import JobStore
 from app.services.reminder_scheduler import (
     dispatch_due_actions,
@@ -27,7 +27,7 @@ def _make_job(
     platform_status: str = "pending",
     discord_message_id: str | None = "embed_id",
 ) -> Job:
-    now = datetime(2026, 4, 27, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
     return Job(
         project_id=project_id,
         job_id=f"j_{project_id}",
@@ -51,7 +51,7 @@ async def test_dispatch_skips_jobs_not_yet_due(
 ):
     settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
     store = JobStore(tmp_path / "jobs.json")
-    future = datetime.now(tz=timezone.utc) + timedelta(hours=1)
+    future = datetime.now(tz=UTC) + timedelta(hours=1)
     await store.create(_make_job(slot_time=future))
     discord = AsyncMock()
 
@@ -66,7 +66,7 @@ async def test_dispatch_fires_due_jobs_and_marks_them(
 ):
     settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
     store = JobStore(tmp_path / "jobs.json")
-    past = datetime.now(tz=timezone.utc) - timedelta(minutes=5)
+    past = datetime.now(tz=UTC) - timedelta(minutes=5)
     await store.create(_make_job(slot_time=past))
 
     discord = AsyncMock()
@@ -86,7 +86,7 @@ async def test_dispatch_skips_already_reminded_jobs(
 ):
     settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
     store = JobStore(tmp_path / "jobs.json")
-    past = datetime.now(tz=timezone.utc) - timedelta(hours=1)
+    past = datetime.now(tz=UTC) - timedelta(hours=1)
     await store.create(_make_job(slot_time=past, reminder_message_id="already_sent"))
 
     discord = AsyncMock()
@@ -103,7 +103,7 @@ async def test_dispatch_retries_on_next_tick_when_post_fails(
     and the next tick re-attempts."""
     settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
     store = JobStore(tmp_path / "jobs.json")
-    past = datetime.now(tz=timezone.utc) - timedelta(minutes=5)
+    past = datetime.now(tz=UTC) - timedelta(minutes=5)
     await store.create(_make_job(slot_time=past))
 
     discord = AsyncMock()
@@ -155,7 +155,7 @@ async def test_dispatch_instagram_happy_path(
 ):
     settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
     store = JobStore(tmp_path / "jobs.json")
-    past = datetime.now(tz=timezone.utc) - timedelta(minutes=5)
+    past = datetime.now(tz=UTC) - timedelta(minutes=5)
     job = _make_job(slot_time=past, project_id="ig-job")
     job.platforms_requested = ["instagram"]
     job.instagram_payload = {
@@ -163,6 +163,10 @@ async def test_dispatch_instagram_happy_path(
         "ig_access_token": "token",
         "caption": "Hello",
         "graph_api_version": "v25.0",
+        "poll_interval_seconds": 7,
+        "poll_timeout_seconds": 600,
+        "share_to_feed": False,
+        "thumb_offset": 250,
     }
     job.platform_statuses = {"instagram": PlatformStatus(status="pending")}
     await store.create(job)
@@ -187,6 +191,10 @@ async def test_dispatch_instagram_happy_path(
     assert ig.url == "https://instagram.com/reel/x"
     assert ig.attempts == 1
     assert publish_mock.await_args.kwargs["video_url"].endswith("/api/videos/ig-job")
+    assert publish_mock.await_args.kwargs["poll_interval"] == 7
+    assert publish_mock.await_args.kwargs["poll_timeout"] == 600
+    assert publish_mock.await_args.kwargs["share_to_feed"] is False
+    assert publish_mock.await_args.kwargs["thumb_offset"] == 250
     # Embed re-render attempted
     discord.edit_message.assert_called()
 
@@ -196,8 +204,8 @@ async def test_dispatch_instagram_uses_platform_scheduled_time(
 ):
     settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
     store = JobStore(tmp_path / "jobs.json")
-    instagram_due = datetime(2026, 4, 26, 6, 1, tzinfo=timezone.utc)
-    tiktok_due = datetime(2026, 4, 26, 21, 0, tzinfo=timezone.utc)
+    instagram_due = datetime(2026, 4, 26, 6, 1, tzinfo=UTC)
+    tiktok_due = datetime(2026, 4, 26, 21, 0, tzinfo=UTC)
     job = _make_job(slot_time=tiktok_due, project_id="ig-platform-time")
     job.platforms_requested = ["instagram", "tiktok"]
     job.platform_scheduled_at = {
@@ -226,7 +234,7 @@ async def test_dispatch_instagram_uses_platform_scheduled_time(
             store=store,
             settings=settings,
             discord=discord,
-            now=datetime(2026, 4, 26, 6, 2, tzinfo=timezone.utc),
+            now=datetime(2026, 4, 26, 6, 2, tzinfo=UTC),
         )
 
     assert actions == 1
@@ -242,7 +250,7 @@ async def test_dispatch_legacy_instagram_uses_slot_time(
 ):
     settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
     store = JobStore(tmp_path / "jobs.json")
-    slot_time = datetime(2026, 4, 26, 21, 0, tzinfo=timezone.utc)
+    slot_time = datetime(2026, 4, 26, 21, 0, tzinfo=UTC)
     job = _make_job(slot_time=slot_time, project_id="ig-legacy-time")
     job.platforms_requested = ["instagram"]
     job.instagram_payload = {"ig_user_id": "x", "ig_access_token": "x", "caption": "x"}
@@ -263,13 +271,13 @@ async def test_dispatch_legacy_instagram_uses_slot_time(
             store=store,
             settings=settings,
             discord=discord,
-            now=datetime(2026, 4, 26, 6, 2, tzinfo=timezone.utc),
+            now=datetime(2026, 4, 26, 6, 2, tzinfo=UTC),
         )
         due_actions = await dispatch_due_actions(
             store=store,
             settings=settings,
             discord=discord,
-            now=datetime(2026, 4, 26, 21, 1, tzinfo=timezone.utc),
+            now=datetime(2026, 4, 26, 21, 1, tzinfo=UTC),
         )
 
     assert early_actions == 0
@@ -283,7 +291,7 @@ async def test_dispatch_instagram_retries_until_max(
     """5 failed attempts -> mark failed + post failure ping."""
     settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
     store = JobStore(tmp_path / "jobs.json")
-    past = datetime.now(tz=timezone.utc) - timedelta(minutes=5)
+    past = datetime.now(tz=UTC) - timedelta(minutes=5)
     job = _make_job(slot_time=past, project_id="ig-fail")
     job.platforms_requested = ["instagram"]
     job.instagram_payload = {
@@ -295,7 +303,7 @@ async def test_dispatch_instagram_retries_until_max(
     discord = AsyncMock()
 
     fail = AsyncMock(return_value=type("R", (), {
-        "success": False, "permalink": None, "detail": "Meta 503",
+        "success": False, "permalink": None, "detail": "status_poll: Meta 503",
     })())
 
     with patch("app.services.reminder_scheduler.publish_to_instagram", new=fail):
@@ -308,7 +316,7 @@ async def test_dispatch_instagram_retries_until_max(
     ig = refreshed.platform_statuses["instagram"]
     assert ig.status == "failed"
     assert ig.attempts == 5
-    assert "Meta 503" in (ig.detail or "")
+    assert ig.detail == "status_poll: Meta 503"
     # Failure ping posted
     discord.post_message.assert_called()
 
@@ -318,7 +326,7 @@ async def test_dispatch_instagram_skips_already_uploaded(
 ):
     settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
     store = JobStore(tmp_path / "jobs.json")
-    past = datetime.now(tz=timezone.utc) - timedelta(minutes=5)
+    past = datetime.now(tz=UTC) - timedelta(minutes=5)
     job = _make_job(slot_time=past, project_id="ig-done")
     job.platforms_requested = ["instagram"]
     job.instagram_payload = {"ig_user_id": "x", "ig_access_token": "x", "caption": "x"}
@@ -342,7 +350,7 @@ async def test_dispatch_instagram_retries_legacy_container_error_once(
 ):
     settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
     store = JobStore(tmp_path / "jobs.json")
-    past = datetime.now(tz=timezone.utc) - timedelta(minutes=5)
+    past = datetime.now(tz=UTC) - timedelta(minutes=5)
     job = _make_job(slot_time=past, project_id="ig-legacy-error")
     job.platforms_requested = ["instagram"]
     job.instagram_payload = {"ig_user_id": "x", "ig_access_token": "x", "caption": "x"}
@@ -382,7 +390,7 @@ async def test_dispatch_instagram_retries_resumable_header_error_once(
 ):
     settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
     store = JobStore(tmp_path / "jobs.json")
-    past = datetime.now(tz=timezone.utc) - timedelta(minutes=5)
+    past = datetime.now(tz=UTC) - timedelta(minutes=5)
     job = _make_job(slot_time=past, project_id="ig-header-error")
     job.platforms_requested = ["instagram"]
     job.instagram_payload = {"ig_user_id": "x", "ig_access_token": "x", "caption": "x"}

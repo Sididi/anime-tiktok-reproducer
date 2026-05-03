@@ -1,13 +1,13 @@
 """Tests for app.services.reminder_service."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
 import httpx
 
 from app.config import AccountConfig
-from app.models.job import PlatformStatus, Job
+from app.models.job import Job, PlatformStatus
 from app.services.reminder_service import build_reminder_embed, post_reminder
 
 
@@ -22,7 +22,7 @@ def _account() -> AccountConfig:
 
 
 def _job(*, discord_message_id: str | None = "m_embed") -> Job:
-    now = datetime(2026, 4, 27, 21, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 4, 27, 21, 0, tzinfo=UTC)
     return Job(
         project_id="p1",
         job_id="j_x",
