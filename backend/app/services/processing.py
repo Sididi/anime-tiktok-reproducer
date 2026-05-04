@@ -2704,9 +2704,30 @@ class ProcessingService:
                 new_transcription,
                 playback_scene_sources,
             )
-            required_source_paths = cls._collect_required_source_paths(
-                playback_scene_sources,
-            )
+            try:
+                required_source_paths = cls._collect_required_source_paths(
+                    playback_scene_sources,
+                )
+            except RuntimeError:
+                # Manifest may be stale (e.g. episode just hydrated from
+                # Storage Box). Refresh once and re-resolve before giving up.
+                await AnimeLibraryService.ensure_episode_manifest(
+                    force_refresh=True,
+                    library_type=project.library_type,
+                )
+                playback_scene_sources = cls.resolve_scene_sources(
+                    matches,
+                    source_rate,
+                    library_type=project.library_type,
+                )
+                raw_scene_image_render_plan = await cls._build_raw_scene_image_render_plan(
+                    project,
+                    new_transcription,
+                    playback_scene_sources,
+                )
+                required_source_paths = cls._collect_required_source_paths(
+                    playback_scene_sources,
+                )
             total_source_paths = len(required_source_paths)
             source_audio_policies: dict[str, dict[str, Any]] = {}
             source_audio_policy_paths: dict[str, Path] = {}

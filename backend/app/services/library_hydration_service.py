@@ -823,6 +823,13 @@ class LibraryHydrationService:
                 finally:
                     if session is not None:
                         await StorageBoxTransferProgress.close_session(session)
+                    # Newly hydrated episode files must become visible to
+                    # AnimeLibraryService.resolve_episode_path consumers
+                    # (processing pipeline, gap resolution, playback).
+                    await AnimeLibraryService.ensure_episode_manifest(
+                        force_refresh=True,
+                        library_type=scoped_type,
+                    )
 
                 local_episode_count = await asyncio.to_thread(
                     cls._count_local_episodes_from_manifest,
