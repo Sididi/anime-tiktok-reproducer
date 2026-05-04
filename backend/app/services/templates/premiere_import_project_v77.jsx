@@ -2463,8 +2463,8 @@
 
       // 4. APPLY SCALE (Standard API)
       perfStart("scenes_scale");
-      if (!setScaleOnItem(v3Item, 75) && v3)
-        setScaleAndPosition(v3, startSec, 75); // Main Scaled Down
+      if (!setScaleOnItem(v3Item, 76) && v3)
+        setScaleAndPosition(v3, startSec, 76); // Main Scaled Down
       if (!setScaleOnItem(v1Item, 183) && v1)
         setScaleAndPosition(v1, startSec, 183); // Background Scaled Up
       perfEnd("scenes_scale");
@@ -6129,8 +6129,8 @@
       var newDurationSeconds = snapSecondsToFrame(s.target_duration);
       enforceTrackItemDuration(v3Item, newDurationSeconds);
       enforceTrackItemDuration(v1Item, newDurationSeconds);
-      if (!setScaleOnItem(v3Item, 75) && v3)
-        setScaleAndPosition(v3, startSec, 75);
+      if (!setScaleOnItem(v3Item, 76) && v3)
+        setScaleAndPosition(v3, startSec, 76);
       if (!setScaleOnItem(v1Item, 183) && v1)
         setScaleAndPosition(v1, startSec, 183);
 

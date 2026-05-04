@@ -981,7 +981,7 @@ class ProcessingService:
         - 60fps vertical sequence creation via .sqpreset
         - Speed adjustments via qeItem.setSpeed()
         - 4-Track Structure: V4(Subtitles), V3(Main), V2(Border), V1(Background)
-        - Scaling: V1 (183%), V3 (75% grand mode / 68% small mode)
+        - Scaling: V1 (183%), V3 (76% grand mode / 68% small mode)
 
         Frame-Perfect Timing:
         - All timeline positions are snapped to 60fps frame grid
@@ -1193,7 +1193,7 @@ class ProcessingService:
         content = template_path.read_text(encoding="utf-8")
 
         # Apply grand_mode / small-mode patches before dynamic substitutions.
-        # grand_mode=True  → keep template as-is (White border 10px, V3 scale 75%)
+        # grand_mode=True  → keep template as-is (White border 10px, V3 scale 76%)
         # grand_mode=False → ship White border 5px and use the older V3 scale of 68%
         if not settings.grand_mode_enabled:
             content = cls._replace_template_once(
@@ -1204,13 +1204,13 @@ class ProcessingService:
             )
             content = cls._replace_template_once(
                 content,
-                r"if \(!setScaleOnItem\(v3Item, 75\) && v3\)",
+                r"if \(!setScaleOnItem\(v3Item, 76\) && v3\)",
                 "if (!setScaleOnItem(v3Item, 68) && v3)",
                 label="V3_SCALE_setScaleOnItem",
             )
             content = cls._replace_template_once(
                 content,
-                r"setScaleAndPosition\(v3, startSec, 75\); // Main Scaled Down",
+                r"setScaleAndPosition\(v3, startSec, 76\); // Main Scaled Down",
                 "setScaleAndPosition(v3, startSec, 68); // Main Scaled Down",
                 label="V3_SCALE_setScaleAndPosition",
             )
@@ -2350,7 +2350,7 @@ class ProcessingService:
 
         Track layout (created by JSX script):
         - V4: Reserved for subtitles
-        - V3: Main video (Scale 75% grand mode / 68% small mode)
+        - V3: Main video (Scale 76% grand mode / 68% small mode)
         - V2: White border MOGRT (10px grand mode / 5px small mode)
         - V1: Background (Scale 183%)
         - A1: Original anime audio (MUTED)
