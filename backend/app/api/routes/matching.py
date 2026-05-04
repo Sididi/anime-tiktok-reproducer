@@ -415,6 +415,10 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
             chains = (
                 SceneMergerService.build_merge_chains(
                     pairs, scenes, first_pass_matches, index_fps=index_fps,
+                    video_path=video_path,
+                    library_path=source_path,
+                    library_type=project.library_type,
+                    anime_name=anime_name,
                 )
                 if pairs
                 else []

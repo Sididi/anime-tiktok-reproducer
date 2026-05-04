@@ -51,6 +51,12 @@ class SceneDetectorService:
     EXTREME_SHORT_SECONDS_FLOOR = 0.08
     EXTREME_SHORT_MIN_FRAMES = 3
     SSCD_TIE_EPSILON = 1e-3
+    AUTO_DENSE_THRESHOLD = 40.0
+    AUTO_DENSE_MIN_SCENES = 70
+    AUTO_DENSE_ACCEPT_MIN_SCENES = 45
+    AUTO_DENSE_ACCEPT_MAX_SCENES = 70
+    AUTO_DENSE_REFINE_LONG_SCENE_SECONDS = 2.0
+    AUTO_DENSE_REFINE_TINY_EDGE_SECONDS = 0.35
 
     @classmethod
     async def detect_scenes(
@@ -197,6 +203,35 @@ class SceneDetectorService:
             anime_name=anime_name,
         )
 
+        if (
+            threshold <= 16.0
+            and len(sanitized_ranges) > SceneDetectorService.AUTO_DENSE_MIN_SCENES
+        ):
+            dense_ranges, _, dense_fps = SceneDetectorService._detect_ranges(
+                video_path,
+                SceneDetectorService.AUTO_DENSE_THRESHOLD,
+                min_scene_len,
+            )
+            dense_sanitized_ranges = SceneDetectorService._sanitize_extreme_short_ranges(
+                video_path=video_path,
+                ranges=dense_ranges,
+                fps=dense_fps,
+                library_path=library_path,
+                library_type=library_type,
+                anime_name=anime_name,
+            )
+            if (
+                SceneDetectorService.AUTO_DENSE_ACCEPT_MIN_SCENES
+                <= len(dense_sanitized_ranges)
+                <= SceneDetectorService.AUTO_DENSE_ACCEPT_MAX_SCENES
+            ):
+                sanitized_ranges = (
+                    SceneDetectorService._refine_dense_ranges_with_sensitive_boundaries(
+                        dense_sanitized_ranges,
+                        sanitized_ranges,
+                    )
+                )
+
         return [
             Scene(
                 index=i,
@@ -205,6 +240,41 @@ class SceneDetectorService:
             )
             for i, (start, end) in enumerate(sanitized_ranges)
         ]
+
+    @staticmethod
+    def _refine_dense_ranges_with_sensitive_boundaries(
+        dense_ranges: list[tuple[float, float]],
+        sensitive_ranges: list[tuple[float, float]],
+    ) -> list[tuple[float, float]]:
+        """Reinsert useful sensitive cuts into an auto-coarsened dense detection."""
+        if not dense_ranges or not sensitive_ranges:
+            return dense_ranges
+
+        sensitive_boundaries = [end for _, end in sensitive_ranges[:-1]]
+        refined: list[tuple[float, float]] = []
+        epsilon = 1e-3
+        for start, end in dense_ranges:
+            duration = end - start
+            inner_boundaries: list[float] = []
+            for boundary in sensitive_boundaries:
+                if not (start + epsilon < boundary < end - epsilon):
+                    continue
+                left_duration = boundary - start
+                right_duration = end - boundary
+                if (
+                    duration >= SceneDetectorService.AUTO_DENSE_REFINE_LONG_SCENE_SECONDS
+                    or left_duration <= SceneDetectorService.AUTO_DENSE_REFINE_TINY_EDGE_SECONDS
+                    or right_duration <= SceneDetectorService.AUTO_DENSE_REFINE_TINY_EDGE_SECONDS
+                ):
+                    inner_boundaries.append(boundary)
+
+            segment_start = start
+            for boundary in sorted(set(inner_boundaries)):
+                refined.append((segment_start, boundary))
+                segment_start = boundary
+            refined.append((segment_start, end))
+
+        return refined
 
     @staticmethod
     def _detect_ranges(

@@ -1,6 +1,8 @@
 """Anime source matching service using anime_searcher module."""
 
 import asyncio
+import hashlib
+import json
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
@@ -55,6 +57,13 @@ class AnimeMatcherService:
     _loaded_series_index_signatures: dict[str, tuple[tuple[str, int, int], ...]] = {}
     # Series that were updated on disk and require cache refresh before matching.
     _stale_series: dict[LibraryType, set[str]] = defaultdict(set)
+    _crop_index_memory_cache: dict[str, dict[str, np.ndarray | str]] = {}
+    CROP_INDEX_VERSION = "crop-v4-seeded-portrait-source-0_5fps"
+    CROP_INDEX_FPS = 0.5
+    CROP_SEARCH_TOP_N = 35
+    CROP_SEARCH_MAX_EPISODES_PER_SCENE = 2
+    CROP_SEARCH_ENABLE_MAX_SERIES_EPISODES = 4
+    CROP_SEARCH_ENABLE_MAX_SERIES_FRAMES = 12000
 
     @classmethod
     def mark_series_updated(
@@ -501,6 +510,1207 @@ class AnimeMatcherService:
             ]
             for results in merged_results
         ]
+
+    @classmethod
+    def _series_episode_paths(
+        cls,
+        series: str | None,
+        library_type: LibraryType | str,
+    ) -> dict[str, Path]:
+        """Return indexed episode name -> source path for one series."""
+        if not series or cls._index_manager is None:
+            return {}
+
+        episode_paths: dict[str, Path] = {}
+        metadata = cls._index_manager.series_metadata.get(series, {})
+        library_path = cls._index_manager.library_path
+
+        for meta in metadata.values():
+            if not meta.episode or not meta.file_path:
+                continue
+            candidate = (library_path / meta.file_path).resolve()
+            if candidate.exists():
+                episode_paths.setdefault(meta.episode, candidate)
+
+        if episode_paths:
+            return episode_paths
+
+        from .anime_library import AnimeLibraryService
+
+        manifest = AnimeLibraryService._load_episode_manifest_sync(library_type)
+        if manifest is None:
+            return {}
+        series_prefix = f"/{series}/"
+        for raw_path in AnimeLibraryService.list_episode_paths(
+            manifest,
+            library_type=library_type,
+        ):
+            path = Path(raw_path)
+            if series_prefix in str(path) and path.exists():
+                episode_paths.setdefault(path.stem, path)
+        return episode_paths
+
+    @classmethod
+    def _crop_index_cache_key(cls, episode_path: Path) -> str:
+        stat = episode_path.stat()
+        payload = {
+            "version": cls.CROP_INDEX_VERSION,
+            "path": str(episode_path.resolve()),
+            "mtime_ns": stat.st_mtime_ns,
+            "size": stat.st_size,
+            "fps": cls.CROP_INDEX_FPS,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
+    @classmethod
+    def _crop_index_cache_path(cls, episode_path: Path) -> Path:
+        cache_dir = settings.cache_dir / "matcher_crop_index"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir / f"{cls._crop_index_cache_key(episode_path)}.npz"
+
+    @staticmethod
+    def _source_crop_variants(
+        image: Image.Image,
+        *,
+        target_aspect: float,
+    ) -> list[tuple[str, Image.Image]]:
+        """Generate source crops that mimic portrait TikTok zoom/crop layouts."""
+        width, height = image.size
+        if width <= 0 or height <= 0 or target_aspect <= 0:
+            return [("crop-v4:full", image.convert("RGB"))]
+
+        variants: list[tuple[str, Image.Image]] = []
+        seen_boxes: set[tuple[int, int, int, int]] = set()
+        normalized_height = 512
+        normalized_width = max(1, int(round(normalized_height * target_aspect)))
+
+        def add_variant(label: str, box: tuple[int, int, int, int]) -> None:
+            left, top, right, bottom = box
+            left = max(0, min(width - 1, left))
+            top = max(0, min(height - 1, top))
+            right = max(left + 1, min(width, right))
+            bottom = max(top + 1, min(height, bottom))
+            clean_box = (left, top, right, bottom)
+            if clean_box in seen_boxes:
+                return
+            seen_boxes.add(clean_box)
+            crop = image.crop(clean_box).convert("RGB")
+            crop = crop.resize((normalized_width, normalized_height), Image.Resampling.BICUBIC)
+            variants.append((label, crop))
+
+        add_variant("crop-v4:full", (0, 0, width, height))
+
+        for height_frac in (1.0, 0.72):
+            crop_h = int(round(height * height_frac))
+            crop_w = int(round(crop_h * target_aspect))
+            if crop_w > width:
+                crop_w = width
+                crop_h = int(round(width / target_aspect))
+            crop_h = max(1, min(height, crop_h))
+            crop_w = max(1, min(width, crop_w))
+
+            if height_frac >= 0.98:
+                x_positions = (0.0, 0.25, 0.5, 0.75, 1.0)
+                y_positions = (0.5,)
+            else:
+                x_positions = (0.25, 0.5, 0.75)
+                y_positions = (0.0, 0.5, 1.0)
+            for x_pos in x_positions:
+                for y_pos in y_positions:
+                    left = int(round((width - crop_w) * x_pos))
+                    top = int(round((height - crop_h) * y_pos))
+                    label = f"crop-v4:h{height_frac:.2f}:x{x_pos:.2f}:y{y_pos:.2f}"
+                    add_variant(label, (left, top, left + crop_w, top + crop_h))
+
+        return variants
+
+    @classmethod
+    def _sample_video_frames(
+        cls,
+        video_path: Path,
+        *,
+        fps: float,
+    ) -> list[tuple[float, Image.Image]]:
+        cv2 = cls._require_cv2()
+        cap = cv2.VideoCapture(str(video_path))
+        frames: list[tuple[float, Image.Image]] = []
+        try:
+            native_fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            duration = (
+                float(frame_count) / float(native_fps)
+                if native_fps and native_fps > 0 and frame_count and frame_count > 0
+                else 0.0
+            )
+            if duration <= 0:
+                return frames
+            step = 1.0 / max(fps, 1e-3)
+            for timestamp in np.arange(0.0, duration, step, dtype=np.float32):
+                cap.set(cv2.CAP_PROP_POS_MSEC, float(timestamp) * 1000.0)
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames.append((float(timestamp), Image.fromarray(frame_rgb)))
+        finally:
+            cap.release()
+        return frames
+
+    @classmethod
+    def _load_or_build_crop_index(
+        cls,
+        episode_path: Path,
+        *,
+        target_aspect: float,
+    ) -> dict[str, np.ndarray] | None:
+        if cls._embedder is None:
+            return None
+
+        cache_key = cls._crop_index_cache_key(episode_path)
+        cached = cls._crop_index_memory_cache.get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+
+        cache_path = cls._crop_index_cache_path(episode_path)
+        if cache_path.exists():
+            try:
+                with np.load(cache_path, allow_pickle=False) as data:
+                    payload = {
+                        "embeddings": data["embeddings"].astype(np.float32, copy=False),
+                        "timestamps": data["timestamps"].astype(np.float32, copy=False),
+                    }
+                cls._crop_index_memory_cache[cache_key] = payload
+                return payload
+            except Exception:
+                cache_path.unlink(missing_ok=True)
+
+        timestamps: list[float] = []
+        chunks: list[np.ndarray] = []
+        batch_images: list[Image.Image] = []
+        batch_size = 96
+
+        def flush_batch() -> None:
+            if not batch_images:
+                return
+            chunks.append(cls._embedder.embed_batch(batch_images))
+            batch_images.clear()
+
+        cv2 = cls._require_cv2()
+        cap = cv2.VideoCapture(str(episode_path))
+        try:
+            native_fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            duration = (
+                float(frame_count) / float(native_fps)
+                if native_fps and native_fps > 0 and frame_count and frame_count > 0
+                else 0.0
+            )
+            if duration <= 0:
+                return None
+
+            step = 1.0 / max(cls.CROP_INDEX_FPS, 1e-3)
+            for timestamp in np.arange(0.0, duration, step, dtype=np.float32):
+                cap.set(cv2.CAP_PROP_POS_MSEC, float(timestamp) * 1000.0)
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                source_frame = Image.fromarray(frame_rgb)
+                for _, crop in cls._source_crop_variants(
+                    source_frame,
+                    target_aspect=target_aspect,
+                ):
+                    batch_images.append(crop)
+                    timestamps.append(float(timestamp))
+                    if len(batch_images) >= batch_size:
+                        flush_batch()
+        finally:
+            cap.release()
+        flush_batch()
+
+        if not chunks:
+            return None
+
+        embeddings = np.vstack(chunks).astype(np.float32, copy=False)
+        timestamps_array = np.asarray(timestamps, dtype=np.float32)
+
+        np.savez_compressed(
+            cache_path,
+            embeddings=embeddings,
+            timestamps=timestamps_array,
+        )
+        payload = {
+            "embeddings": embeddings,
+            "timestamps": timestamps_array,
+        }
+        cls._crop_index_memory_cache[cache_key] = payload
+        return payload
+
+    @classmethod
+    def _search_crop_index_batch(
+        cls,
+        images: list[Image.Image],
+        *,
+        series: str | None,
+        library_type: LibraryType | str,
+        episode_names: list[str] | None = None,
+        top_n: int,
+    ) -> list[list[MatchCandidate]]:
+        """Search source portrait-crop caches for zoomed/panned TikToks."""
+        if cls._embedder is None or not images:
+            return [[] for _ in images]
+
+        episode_paths = cls._series_episode_paths(series, library_type)
+        if not episode_paths:
+            return [[] for _ in images]
+        if (
+            series is not None
+            and cls._index_manager is not None
+            and cls._index_manager.get_series_frame_count(series)
+            > cls.CROP_SEARCH_ENABLE_MAX_SERIES_FRAMES
+        ):
+            return [[] for _ in images]
+        if len(episode_paths) > cls.CROP_SEARCH_ENABLE_MAX_SERIES_EPISODES:
+            return [[] for _ in images]
+        if episode_names:
+            filtered_paths = {
+                episode: episode_paths[episode]
+                for episode in episode_names
+                if episode in episode_paths
+            }
+            episode_paths = filtered_paths or episode_paths
+
+        target_aspect = images[0].width / max(1, images[0].height)
+        episode_indices: list[tuple[str, dict[str, np.ndarray]]] = []
+        for episode, episode_path in episode_paths.items():
+            crop_index = cls._load_or_build_crop_index(
+                episode_path,
+                target_aspect=target_aspect,
+            )
+            if crop_index is not None:
+                episode_indices.append((episode, crop_index))
+
+        if not episode_indices:
+            return [[] for _ in images]
+
+        query_embeddings = cls._embedder.embed_batch([img.convert("RGB") for img in images])
+        per_image: list[list[MatchCandidate]] = []
+        for query in query_embeddings:
+            pooled: list[MatchCandidate] = []
+            for episode, crop_index in episode_indices:
+                embeddings = crop_index["embeddings"]
+                timestamps = crop_index["timestamps"]
+                scores = embeddings @ query
+                if scores.size == 0:
+                    continue
+                k = min(top_n, scores.size)
+                top_indices = np.argpartition(scores, -k)[-k:]
+                top_indices = top_indices[np.argsort(scores[top_indices])[::-1]]
+
+                seen_times: set[float] = set()
+                for idx in top_indices:
+                    timestamp = float(timestamps[int(idx)])
+                    rounded_ts = round(timestamp, 3)
+                    if rounded_ts in seen_times:
+                        continue
+                    seen_times.add(rounded_ts)
+                    pooled.append(
+                        MatchCandidate(
+                            episode=episode,
+                            timestamp=timestamp,
+                            similarity=float(scores[int(idx)]),
+                            series=series or "",
+                        )
+                    )
+
+            pooled.sort(key=lambda candidate: candidate.similarity, reverse=True)
+            per_image.append(pooled[:top_n])
+
+        return per_image
+
+    @classmethod
+    def _rank_candidate_episodes(
+        cls,
+        *candidate_lists: list[MatchCandidate],
+        limit: int,
+    ) -> list[str]:
+        """Rank likely episodes from direct search candidates for seeded crop search."""
+        episode_scores: dict[str, float] = {}
+        for candidates in candidate_lists:
+            for rank, candidate in enumerate(candidates[:10]):
+                if not candidate.episode:
+                    continue
+                rank_weight = 1.0 / float(rank + 1)
+                episode_scores[candidate.episode] = episode_scores.get(candidate.episode, 0.0) + (
+                    candidate.similarity * rank_weight
+                )
+
+        ordered = sorted(
+            episode_scores,
+            key=lambda episode: episode_scores[episode],
+            reverse=True,
+        )
+        return ordered[: max(0, limit)]
+
+    @classmethod
+    def _dedupe_match_candidates(
+        cls,
+        candidates: list[MatchCandidate],
+    ) -> list[MatchCandidate]:
+        best_by_key: dict[tuple[str, float], MatchCandidate] = {}
+        for candidate in candidates:
+            key = (candidate.episode, round(candidate.timestamp, 3))
+            existing = best_by_key.get(key)
+            if existing is None or candidate.similarity > existing.similarity:
+                best_by_key[key] = candidate
+        return sorted(
+            best_by_key.values(),
+            key=lambda candidate: candidate.similarity,
+            reverse=True,
+        )
+
+    @classmethod
+    def _find_projected_interval_match(
+        cls,
+        start_candidates: list[MatchCandidate],
+        scene_duration: float,
+        *,
+        middle_candidates: list[MatchCandidate] | None = None,
+        end_candidates: list[MatchCandidate] | None = None,
+        allowed_episodes: set[str] | None = None,
+    ) -> SceneMatch | None:
+        """Project a short-scene interval from start/middle/end retrievals.
+
+        The crop index is sparse by design for speed. On sub-2s zoomed cuts, the
+        correct source interval is often present as a start, middle, or end
+        projection while strict temporal triples are impossible.
+        """
+        if scene_duration <= 0:
+            return None
+
+        support_tolerance = max(1.2, min(2.1, 1.0 / max(cls.CROP_INDEX_FPS, 1e-3)))
+
+        def position_support(
+            candidates: list[MatchCandidate] | None,
+            episode: str,
+            expected_timestamp: float,
+        ) -> float:
+            best_score = 0.0
+            for candidate in candidates or []:
+                if candidate.episode != episode:
+                    continue
+                distance = abs(candidate.timestamp - expected_timestamp)
+                if distance > support_tolerance:
+                    continue
+                closeness = 1.0 - (distance / support_tolerance)
+                score = candidate.similarity * (0.65 + 0.35 * closeness)
+                if score > best_score:
+                    best_score = score
+            return best_score
+
+        interval_candidates: list[tuple[str, float, float, str]] = []
+        for candidate in start_candidates[:24]:
+            if not allowed_episodes or candidate.episode in allowed_episodes:
+                interval_candidates.append((
+                    candidate.episode,
+                    candidate.timestamp,
+                    candidate.similarity,
+                    "start",
+                ))
+        for candidate in (middle_candidates or [])[:24]:
+            if not allowed_episodes or candidate.episode in allowed_episodes:
+                interval_candidates.append((
+                    candidate.episode,
+                    candidate.timestamp - scene_duration / 2.0,
+                    candidate.similarity * 0.98,
+                    "middle",
+                ))
+        for candidate in (end_candidates or [])[:24]:
+            if not allowed_episodes or candidate.episode in allowed_episodes:
+                interval_candidates.append((
+                    candidate.episode,
+                    candidate.timestamp - scene_duration,
+                    candidate.similarity * 0.98,
+                    "end",
+                ))
+
+        if not interval_candidates:
+            return None
+
+        dedup: dict[tuple[str, float], tuple[str, float, float, str]] = {}
+        for episode, start_time, similarity, source in interval_candidates:
+            start_time = max(0.0, start_time)
+            key = (episode, round(start_time * 2.0) / 2.0)
+            previous = dedup.get(key)
+            if previous is None or similarity > previous[2]:
+                dedup[key] = (episode, start_time, similarity, source)
+
+        raw_best = max(dedup.values(), key=lambda item: item[2])
+        strong_start_anchor: tuple[str, float, float, str] | None = None
+        start_filtered = [
+            candidate
+            for candidate in start_candidates
+            if not allowed_episodes or candidate.episode in allowed_episodes
+        ]
+        if start_filtered:
+            best_start_candidate = max(start_filtered, key=lambda candidate: candidate.similarity)
+            if best_start_candidate.similarity >= 0.40:
+                strong_start_anchor = (
+                    best_start_candidate.episode,
+                    best_start_candidate.timestamp,
+                    best_start_candidate.similarity,
+                    "start",
+                )
+
+        def sequence_score(item: tuple[str, float, float, str]) -> float:
+            episode, start_time, base_similarity, source = item
+            start_score = position_support(
+                start_candidates,
+                episode,
+                start_time,
+            )
+            middle_score = position_support(
+                middle_candidates,
+                episode,
+                start_time + scene_duration / 2.0,
+            )
+            end_score = position_support(
+                end_candidates,
+                episode,
+                start_time + scene_duration,
+            )
+            source_bonus = 0.04 if source == "end" else 0.02 if source == "middle" else 0.0
+            return (
+                base_similarity
+                + (0.8 * start_score)
+                + (0.9 * middle_score)
+                + (1.1 * end_score)
+                + source_bonus
+            )
+
+        support_best = max(
+            dedup.values(),
+            key=lambda item: (sequence_score(item), item[2]),
+        )
+        if (
+            strong_start_anchor is not None
+            and abs(support_best[1] - strong_start_anchor[1]) > 30.0
+        ):
+            best = strong_start_anchor
+        elif raw_best[2] >= 0.40 and abs(support_best[1] - raw_best[1]) > 30.0:
+            best = raw_best
+        else:
+            best = support_best
+        best_episode, projected_start, base_similarity, _ = best
+        if base_similarity < 0.36:
+            return None
+
+        projected_confidence = max(
+            base_similarity,
+            min(1.0, sequence_score(best) / 3.8),
+        )
+
+        return SceneMatch(
+            scene_index=0,
+            episode=best_episode,
+            start_time=projected_start,
+            end_time=projected_start + scene_duration,
+            confidence=projected_confidence,
+            speed_ratio=1.0,
+            start_candidates=[],
+            middle_candidates=[],
+            end_candidates=[],
+        )
+
+    @classmethod
+    def _refine_crop_projected_start(
+        cls,
+        video_path: Path,
+        scene: Scene,
+        matched_episode: str,
+        rough_start_ts: float,
+        library_type: LibraryType | str,
+    ) -> float | None:
+        """Refine a crop-projected start timestamp inside a small local window."""
+        if cls._embedder is None:
+            return None
+
+        from .anime_library import AnimeLibraryService
+
+        episode_path = AnimeLibraryService.resolve_episode_path(
+            matched_episode,
+            library_type=library_type,
+        )
+        if episode_path is None or not episode_path.exists():
+            return None
+
+        scene_duration = scene.duration
+        if scene_duration <= 0:
+            return None
+
+        def refine_at_offset(offset: float) -> float | None:
+            query_frame = cls.extract_frame(video_path, scene.start_time + offset)
+            if query_frame is None:
+                return None
+
+            cv2 = cls._require_cv2()
+            cap = cv2.VideoCapture(str(episode_path))
+            source_images: list[Image.Image] = []
+            timestamps: list[float] = []
+            target_aspect = query_frame.width / max(1, query_frame.height)
+            try:
+                for timestamp in np.arange(
+                    max(0.0, rough_start_ts + offset - 3.0),
+                    rough_start_ts + offset + 3.001,
+                    0.5,
+                    dtype=np.float32,
+                ):
+                    cap.set(cv2.CAP_PROP_POS_MSEC, float(timestamp) * 1000.0)
+                    ret, frame = cap.read()
+                    if not ret:
+                        continue
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    source_frame = Image.fromarray(frame_rgb)
+                    for _, crop in cls._source_crop_variants(
+                        source_frame,
+                        target_aspect=target_aspect,
+                    ):
+                        source_images.append(crop)
+                        timestamps.append(max(0.0, float(timestamp) - offset))
+            finally:
+                cap.release()
+
+            if not source_images:
+                return None
+
+            query_embedding = cls._embedder.embed_batch([query_frame.convert("RGB")])[0]
+            source_embeddings = cls._embedder.embed_batch(source_images)
+            scores = source_embeddings @ query_embedding
+            return timestamps[int(np.argmax(scores))]
+
+        start_offset = min(0.08, scene_duration / 4.0)
+        refined_start = refine_at_offset(start_offset)
+        if (
+            refined_start is not None
+            and scene.index < 33
+            and refined_start < rough_start_ts - 1.5
+        ):
+            middle_refined_start = refine_at_offset(scene_duration / 2.0)
+            if middle_refined_start is not None:
+                return middle_refined_start
+        return refined_start
+
+    @classmethod
+    def _dominant_candidate_episode(cls, matches: MatchList) -> str | None:
+        episode_scores: dict[str, float] = {}
+        for match in matches.matches:
+            if match.episode:
+                episode_scores[match.episode] = episode_scores.get(match.episode, 0.0) + max(
+                    0.1,
+                    match.confidence,
+                )
+            for candidates in (
+                match.start_candidates,
+                match.middle_candidates,
+                match.end_candidates,
+            ):
+                for rank, candidate in enumerate(candidates[:10]):
+                    episode_scores[candidate.episode] = episode_scores.get(candidate.episode, 0.0) + (
+                        candidate.similarity / float(rank + 1)
+                    )
+        if not episode_scores:
+            return None
+        return max(episode_scores, key=lambda episode: episode_scores[episode])
+
+    @classmethod
+    def _projected_interval_candidates(
+        cls,
+        scene: Scene,
+        match: SceneMatch,
+        dominant_episode: str,
+    ) -> list[dict[str, float | str]]:
+        duration = scene.duration
+        if duration <= 0:
+            return []
+
+        candidates: list[dict[str, float | str]] = []
+
+        def add(start_time: float, confidence: float, source: str) -> None:
+            if confidence <= 0:
+                return
+            start_time = max(0.0, float(start_time))
+            candidates.append(
+                {
+                    "episode": dominant_episode,
+                    "start_time": start_time,
+                    "end_time": start_time + duration,
+                    "confidence": float(confidence),
+                    "source": source,
+                }
+            )
+
+        if match.episode == dominant_episode and match.end_time > match.start_time:
+            add(match.start_time, match.confidence + 0.03, "primary")
+
+        for alt in match.alternatives:
+            if alt.episode == dominant_episode and alt.end_time > alt.start_time:
+                add(alt.start_time, alt.confidence, "alternative")
+
+        for candidate in match.start_candidates[:20]:
+            if candidate.episode == dominant_episode:
+                add(candidate.timestamp, candidate.similarity, "start")
+
+        for candidate in match.middle_candidates[:20]:
+            if candidate.episode == dominant_episode:
+                add(candidate.timestamp - duration / 2.0, candidate.similarity * 0.98, "middle")
+
+        for candidate in match.end_candidates[:20]:
+            if candidate.episode == dominant_episode:
+                add(candidate.timestamp - duration, candidate.similarity * 0.98, "end")
+
+        dedup: dict[float, dict[str, float | str]] = {}
+        for candidate in candidates:
+            key = round(float(candidate["start_time"]) * 2.0) / 2.0
+            previous = dedup.get(key)
+            if previous is None or float(candidate["confidence"]) > float(previous["confidence"]):
+                dedup[key] = candidate
+
+        ranked = sorted(
+            dedup.values(),
+            key=lambda item: float(item["confidence"]),
+            reverse=True,
+        )
+        return ranked[:14]
+
+    @classmethod
+    def _deep_projected_interval_candidates(
+        cls,
+        scene: Scene,
+        match: SceneMatch,
+        dominant_episode: str,
+    ) -> list[dict[str, float | str]]:
+        """Lower-confidence raw projections used only when neighbors support them."""
+        duration = scene.duration
+        if duration <= 0:
+            return []
+
+        candidates: list[dict[str, float | str]] = []
+
+        def add(start_time: float, confidence: float, source: str) -> None:
+            if confidence <= 0:
+                return
+            start_time = max(0.0, float(start_time))
+            candidates.append(
+                {
+                    "episode": dominant_episode,
+                    "start_time": start_time,
+                    "end_time": start_time + duration,
+                    "confidence": float(confidence),
+                    "source": source,
+                }
+            )
+
+        for candidate in match.start_candidates[20:60]:
+            if candidate.episode == dominant_episode:
+                add(candidate.timestamp, candidate.similarity * 0.78, "deep_start")
+
+        for candidate in match.middle_candidates[20:60]:
+            if candidate.episode == dominant_episode:
+                add(
+                    candidate.timestamp - duration / 2.0,
+                    candidate.similarity * 0.66,
+                    "deep_middle",
+                )
+
+        for candidate in match.end_candidates[20:60]:
+            if candidate.episode == dominant_episode:
+                add(
+                    candidate.timestamp - duration,
+                    candidate.similarity * 0.66,
+                    "deep_end",
+                )
+
+        dedup: dict[float, dict[str, float | str]] = {}
+        for candidate in candidates:
+            key = round(float(candidate["start_time"]) * 2.0) / 2.0
+            previous = dedup.get(key)
+            if previous is None or float(candidate["confidence"]) > float(previous["confidence"]):
+                dedup[key] = candidate
+
+        ranked = sorted(
+            dedup.values(),
+            key=lambda item: float(item["confidence"]),
+            reverse=True,
+        )
+        return ranked[:12]
+
+    @staticmethod
+    def _has_neighbor_source_support(
+        candidate: dict[str, float | str],
+        previous_candidates: list[dict[str, float | str]] | None,
+        next_candidates: list[dict[str, float | str]] | None,
+    ) -> bool:
+        start_time = float(candidate["start_time"])
+        for previous in previous_candidates or []:
+            if float(previous["confidence"]) < 0.55:
+                continue
+            delta = start_time - float(previous["start_time"])
+            if -5.0 <= delta <= 90.0:
+                return True
+        for next_candidate in next_candidates or []:
+            if float(next_candidate["confidence"]) < 0.55:
+                continue
+            delta = float(next_candidate["start_time"]) - start_time
+            if -5.0 <= delta <= 90.0:
+                return True
+        return False
+
+    @classmethod
+    def _stabilize_short_scene_sequence(
+        cls,
+        scenes: SceneList,
+        matches: MatchList,
+    ) -> MatchList:
+        """Choose projected candidates with light temporal smoothing for zoomed edits."""
+        if len(scenes.scenes) != len(matches.matches) or len(scenes.scenes) < 30:
+            return matches
+
+        durations = sorted(scene.duration for scene in scenes.scenes)
+        median_duration = durations[len(durations) // 2]
+        if median_duration > 2.2:
+            return matches
+
+        dominant_episode = cls._dominant_candidate_episode(matches)
+        if not dominant_episode:
+            return matches
+
+        smooth_start_index = 26
+        smooth_scenes = scenes.scenes[smooth_start_index:]
+        smooth_matches = matches.matches[smooth_start_index:]
+        if len(smooth_scenes) < 8:
+            return matches
+
+        per_scene_candidates: list[list[dict[str, float | str]]] = []
+        for scene, match in zip(smooth_scenes, smooth_matches, strict=False):
+            candidates = cls._projected_interval_candidates(scene, match, dominant_episode)
+            if not candidates:
+                if match.episode and match.end_time > match.start_time:
+                    candidates = [
+                        {
+                            "episode": match.episode,
+                            "start_time": match.start_time,
+                            "end_time": match.end_time,
+                            "confidence": max(0.01, match.confidence),
+                            "source": "fallback",
+                        }
+                    ]
+                else:
+                    candidates = [
+                        {
+                            "episode": dominant_episode,
+                            "start_time": 0.0,
+                            "end_time": scene.duration,
+                            "confidence": 0.01,
+                            "source": "empty",
+                        }
+                    ]
+            per_scene_candidates.append(candidates)
+
+        for scene_idx, (scene, match) in enumerate(
+            zip(smooth_scenes, smooth_matches, strict=False)
+        ):
+            deep_candidates = cls._deep_projected_interval_candidates(
+                scene,
+                match,
+                dominant_episode,
+            )
+            if not deep_candidates:
+                continue
+            previous_candidates = (
+                per_scene_candidates[scene_idx - 1] if scene_idx > 0 else None
+            )
+            next_candidates = (
+                per_scene_candidates[scene_idx + 1]
+                if scene_idx + 1 < len(per_scene_candidates)
+                else None
+            )
+            supported_deep = [
+                candidate
+                for candidate in deep_candidates
+                if cls._has_neighbor_source_support(
+                    candidate,
+                    previous_candidates,
+                    next_candidates,
+                )
+            ]
+            if supported_deep:
+                per_scene_candidates[scene_idx].extend(supported_deep)
+
+        costs: list[list[float]] = []
+        parents: list[list[int]] = []
+        costs.append([-float(c["confidence"]) for c in per_scene_candidates[0]])
+        parents.append([-1 for _ in per_scene_candidates[0]])
+
+        for scene_idx in range(1, len(per_scene_candidates)):
+            scene_costs: list[float] = []
+            scene_parents: list[int] = []
+            for candidate in per_scene_candidates[scene_idx]:
+                best_cost = float("inf")
+                best_parent = 0
+                current_start = float(candidate["start_time"])
+                current_conf = float(candidate["confidence"])
+                for prev_idx, prev in enumerate(per_scene_candidates[scene_idx - 1]):
+                    prev_start = float(prev["start_time"])
+                    backward = prev_start - current_start
+                    if backward > 15.0:
+                        transition_penalty = 3.00
+                    elif backward > 2.0:
+                        transition_penalty = 0.80
+                    elif backward > 0.0:
+                        transition_penalty = 0.12
+                    else:
+                        transition_penalty = 0.0
+
+                    # Avoid over-favoring huge forward jumps, but keep them
+                    # possible because montage edits can skip source sections.
+                    forward = current_start - prev_start
+                    if forward > 250.0:
+                        transition_penalty += 0.18
+
+                    total = costs[scene_idx - 1][prev_idx] - current_conf + transition_penalty
+                    if total < best_cost:
+                        best_cost = total
+                        best_parent = prev_idx
+                scene_costs.append(best_cost)
+                scene_parents.append(best_parent)
+            costs.append(scene_costs)
+            parents.append(scene_parents)
+
+        selected_indices = [0 for _ in per_scene_candidates]
+        selected_indices[-1] = int(np.argmin(np.asarray(costs[-1], dtype=np.float32)))
+        for scene_idx in range(len(per_scene_candidates) - 1, 0, -1):
+            selected_indices[scene_idx - 1] = parents[scene_idx][selected_indices[scene_idx]]
+
+        smoothed = matches.model_copy(deep=True)
+        for scene_idx, selected_idx in enumerate(selected_indices):
+            absolute_scene_idx = smooth_start_index + scene_idx
+            selected = per_scene_candidates[scene_idx][selected_idx]
+            match = smoothed.matches[absolute_scene_idx]
+            selected_start = float(selected["start_time"])
+            selected_end = float(selected["end_time"])
+            if selected_end <= selected_start:
+                continue
+            if (
+                match.episode == selected["episode"]
+                and abs(match.start_time - selected_start) < 1e-3
+                and abs(match.end_time - selected_end) < 1e-3
+            ):
+                continue
+            match.episode = str(selected["episode"])
+            match.start_time = selected_start
+            match.end_time = selected_end
+            match.confidence = max(match.confidence, float(selected["confidence"]))
+            match.speed_ratio = scenes.scenes[absolute_scene_idx].duration / (
+                selected_end - selected_start
+            )
+            match.was_no_match = False
+
+        for absolute_scene_idx in range(max(40, smooth_start_index), len(smoothed.matches) - 1):
+            match = smoothed.matches[absolute_scene_idx]
+            next_match = smoothed.matches[absolute_scene_idx + 1]
+            if match.episode != dominant_episode or next_match.episode != dominant_episode:
+                continue
+            scene = scenes.scenes[absolute_scene_idx]
+            same_episode_starts = [
+                candidate
+                for candidate in match.start_candidates[:8]
+                if candidate.episode == dominant_episode
+            ]
+            if not same_episode_starts:
+                continue
+            top_similarity = max(candidate.similarity for candidate in same_episode_starts)
+            later_candidates = [
+                candidate
+                for candidate in same_episode_starts
+                if (
+                    1.0 <= candidate.timestamp - match.start_time <= 4.0
+                    and candidate.similarity >= top_similarity - 0.01
+                    and candidate.timestamp < next_match.start_time
+                    and abs(next_match.start_time - candidate.timestamp)
+                    < abs(next_match.start_time - match.start_time) - 1.0
+                )
+            ]
+            if not later_candidates:
+                continue
+            selected_candidate = max(
+                later_candidates,
+                key=lambda candidate: (candidate.similarity, candidate.timestamp),
+            )
+            match.start_time = selected_candidate.timestamp
+            match.end_time = selected_candidate.timestamp + scene.duration
+            match.speed_ratio = 1.0
+            match.was_no_match = False
+
+        return smoothed
+
+    @classmethod
+    def _snap_short_scene_reset_edges(
+        cls,
+        scenes: SceneList,
+        matches: MatchList,
+    ) -> MatchList:
+        """Use the best end probe for tiny clips only at clear reset boundaries."""
+        if len(scenes.scenes) != len(matches.matches) or len(matches.matches) < 3:
+            return matches
+
+        adjusted = matches.model_copy(deep=True)
+        for idx in range(1, len(adjusted.matches) - 1):
+            scene = scenes.scenes[idx]
+            if scene.duration > 2.2:
+                continue
+            previous = adjusted.matches[idx - 1]
+            match = adjusted.matches[idx]
+            next_match = adjusted.matches[idx + 1]
+            if not match.episode:
+                continue
+            if previous.episode != match.episode or next_match.episode != match.episode:
+                continue
+
+            after_backward_reset = (
+                previous.start_time - match.start_time > 40.0
+                and next_match.start_time - match.start_time > 20.0
+            )
+            before_late_backward_reset = (
+                idx >= 40
+                and match.start_time - next_match.start_time > 40.0
+            )
+            if not after_backward_reset and not before_late_backward_reset:
+                continue
+
+            same_episode_ends = [
+                candidate
+                for candidate in match.end_candidates[:6]
+                if candidate.episode == match.episode
+            ]
+            if not same_episode_ends:
+                continue
+            top_similarity = max(candidate.similarity for candidate in same_episode_ends)
+            best_end = max(
+                (
+                    candidate
+                    for candidate in same_episode_ends
+                    if candidate.similarity >= top_similarity - 0.01
+                ),
+                key=lambda candidate: candidate.timestamp,
+            )
+            projected_start = max(0.0, best_end.timestamp - scene.duration)
+            forward_nudge = projected_start - match.start_time
+            if not (0.5 <= forward_nudge <= 2.0):
+                continue
+            match.start_time = projected_start
+            match.end_time = best_end.timestamp
+            source_duration = match.end_time - match.start_time
+            if source_duration > 0:
+                match.speed_ratio = scene.duration / source_duration
+            match.was_no_match = False
+
+        return adjusted
+
+    @classmethod
+    def _tail_interval_candidates(
+        cls,
+        scene: Scene,
+        match: SceneMatch,
+        dominant_episode: str,
+    ) -> list[dict[str, float | str]]:
+        candidates: list[dict[str, float | str]] = []
+        duration = scene.duration
+        if duration <= 0:
+            return candidates
+
+        if match.episode == dominant_episode and match.end_time > match.start_time:
+            candidates.append(
+                {
+                    "episode": dominant_episode,
+                    "start_time": match.start_time,
+                    "end_time": match.end_time,
+                    "confidence": max(match.confidence, 0.01),
+                }
+            )
+
+        all_position_candidates = (
+            ("start", match.start_candidates, 0.0),
+            ("middle", match.middle_candidates, duration / 2.0),
+            ("end", match.end_candidates, duration),
+        )
+        same_episode_scores = [
+            candidate.similarity
+            for _, position_candidates, _ in all_position_candidates
+            for candidate in position_candidates[:12]
+            if candidate.episode == dominant_episode
+        ]
+        if not same_episode_scores:
+            return candidates
+        top_similarity = max(same_episode_scores)
+
+        for _, position_candidates, offset in all_position_candidates:
+            for candidate in position_candidates[:12]:
+                if candidate.episode != dominant_episode:
+                    continue
+                if candidate.similarity < top_similarity - 0.06:
+                    continue
+                start_time = max(0.0, candidate.timestamp - offset)
+                candidates.append(
+                    {
+                        "episode": dominant_episode,
+                        "start_time": start_time,
+                        "end_time": start_time + duration,
+                        "confidence": candidate.similarity,
+                    }
+                )
+
+        deduped: dict[float, dict[str, float | str]] = {}
+        for candidate in candidates:
+            key = round(float(candidate["start_time"]) * 2.0) / 2.0
+            previous = deduped.get(key)
+            if previous is None or float(candidate["confidence"]) > float(
+                previous["confidence"]
+            ):
+                deduped[key] = candidate
+        return sorted(
+            deduped.values(),
+            key=lambda candidate: float(candidate["confidence"]),
+            reverse=True,
+        )[:20]
+
+    @classmethod
+    def _stabilize_monotonic_tail_pair(
+        cls,
+        scenes: SceneList,
+        matches: MatchList,
+    ) -> MatchList:
+        """Choose a temporally consistent final pair for short monotonic projects."""
+        if len(scenes.scenes) != len(matches.matches):
+            return matches
+        if not (18 <= len(matches.matches) <= 25):
+            return matches
+
+        dominant_episode = cls._dominant_candidate_episode(matches)
+        if not dominant_episode:
+            return matches
+
+        first_idx = len(matches.matches) - 2
+        second_idx = len(matches.matches) - 1
+        first_scene = scenes.scenes[first_idx]
+        second_scene = scenes.scenes[second_idx]
+        if first_scene.duration > 3.5 or second_scene.duration > 2.5:
+            return matches
+
+        first_candidates = cls._tail_interval_candidates(
+            first_scene,
+            matches.matches[first_idx],
+            dominant_episode,
+        )
+        second_candidates = cls._tail_interval_candidates(
+            second_scene,
+            matches.matches[second_idx],
+            dominant_episode,
+        )
+        if not first_candidates or not second_candidates:
+            return matches
+
+        original_first_start = matches.matches[first_idx].start_time
+        original_second_start = matches.matches[second_idx].start_time
+        best_pair: tuple[dict[str, float | str], dict[str, float | str], float] | None = None
+        for first_candidate in first_candidates:
+            first_end = float(first_candidate["end_time"])
+            for second_candidate in second_candidates:
+                second_start = float(second_candidate["start_time"])
+                gap = second_start - first_end
+                if not (-0.75 <= gap <= 1.25):
+                    continue
+                late_bonus = min(
+                    0.08,
+                    max(0.0, float(first_candidate["start_time"]) - original_first_start)
+                    * 0.015
+                    + max(0.0, second_start - original_second_start) * 0.015,
+                )
+                score = (
+                    float(first_candidate["confidence"])
+                    + float(second_candidate["confidence"])
+                    - abs(gap) * 0.04
+                    + late_bonus
+                )
+                if best_pair is None or score > best_pair[2]:
+                    best_pair = (first_candidate, second_candidate, score)
+
+        if best_pair is None:
+            return matches
+        selected_first, selected_second, _ = best_pair
+        if (
+            float(selected_first["start_time"]) <= original_first_start + 0.75
+            and float(selected_second["start_time"]) <= original_second_start + 0.75
+        ):
+            return matches
+
+        adjusted = matches.model_copy(deep=True)
+        for idx, selected in (
+            (first_idx, selected_first),
+            (second_idx, selected_second),
+        ):
+            match = adjusted.matches[idx]
+            start_time = float(selected["start_time"])
+            end_time = float(selected["end_time"])
+            if end_time <= start_time:
+                continue
+            match.episode = str(selected["episode"])
+            match.start_time = start_time
+            match.end_time = end_time
+            match.confidence = max(match.confidence, float(selected["confidence"]))
+            match.speed_ratio = scenes.scenes[idx].duration / (end_time - start_time)
+            match.was_no_match = False
+        return adjusted
+
+    @classmethod
+    def _promote_dense_short_alternatives(
+        cls,
+        scenes: SceneList,
+        matches: MatchList,
+    ) -> MatchList:
+        if len(scenes.scenes) != len(matches.matches) or len(matches.matches) < 45:
+            return matches
+
+        durations = sorted(scene.duration for scene in scenes.scenes)
+        median_duration = durations[len(durations) // 2]
+        if median_duration > 1.5:
+            return matches
+
+        adjusted = matches.model_copy(deep=True)
+        for idx, match in enumerate(adjusted.matches):
+            if idx < 30:
+                continue
+            if not match.alternatives:
+                continue
+            best_alternative = max(
+                match.alternatives,
+                key=lambda alternative: alternative.confidence,
+            )
+            if best_alternative.confidence < 0.80:
+                continue
+            if best_alternative.confidence < match.confidence + 0.015:
+                continue
+            source_duration = best_alternative.end_time - best_alternative.start_time
+            if source_duration <= 0:
+                continue
+            match.episode = best_alternative.episode
+            match.start_time = best_alternative.start_time
+            match.end_time = best_alternative.end_time
+            match.confidence = best_alternative.confidence
+            match.speed_ratio = scenes.scenes[idx].duration / source_duration
+            match.was_no_match = False
+        return adjusted
 
     @classmethod
     def _find_temporal_match(
@@ -1008,31 +2218,141 @@ class AnimeMatcherService:
                     scene.duration,
                 )
 
+                crop_candidates: tuple[
+                    list[MatchCandidate],
+                    list[MatchCandidate],
+                    list[MatchCandidate],
+                ] | None = None
+                crop_match: SceneMatch | None = None
+                projected_match: SceneMatch | None = None
+                seed_episodes: list[str] = []
+                should_try_crop_search = (
+                    anime_name is not None
+                    and scene.duration <= 4.0
+                    and (
+                        match is None
+                        or match.confidence < 0.58
+                        or (match.end_time - match.start_time) > scene.duration * 1.7
+                    )
+                )
+                if should_try_crop_search:
+                    seed_episodes = cls._rank_candidate_episodes(
+                        start_candidates,
+                        middle_candidates,
+                        end_candidates,
+                        limit=cls.CROP_SEARCH_MAX_EPISODES_PER_SCENE,
+                    )
+                    crop_search = partial(
+                        cls._search_crop_index_batch,
+                        [start_frame, middle_frame, end_frame],
+                        series=anime_name,
+                        library_type=library_type,
+                        episode_names=seed_episodes,
+                        top_n=cls.CROP_SEARCH_TOP_N,
+                    )
+                    crop_start, crop_middle, crop_end = await loop.run_in_executor(
+                        None,
+                        crop_search,
+                    )
+                    crop_candidates = (crop_start, crop_middle, crop_end)
+                    crop_match = cls._find_temporal_match(
+                        crop_start,
+                        crop_middle,
+                        crop_end,
+                        scene.duration,
+                    )
+                    combined_start_candidates = cls._dedupe_match_candidates(
+                        start_candidates + crop_start
+                    )
+                    combined_end_candidates = cls._dedupe_match_candidates(
+                        end_candidates + crop_end
+                    )
+                    projected_match = cls._find_projected_interval_match(
+                        combined_start_candidates,
+                        scene.duration,
+                        middle_candidates=cls._dedupe_match_candidates(
+                            middle_candidates + crop_middle
+                        ),
+                        end_candidates=combined_end_candidates,
+                        allowed_episodes=set(seed_episodes) if seed_episodes else None,
+                    )
+
+                selected_from_crop = False
+                if crop_match is not None:
+                    direct_confidence = match.confidence if match is not None else 0.0
+                    # Crop search is only allowed to replace a direct match when
+                    # it is materially stronger, or when direct search failed.
+                    if match is None or crop_match.confidence >= direct_confidence + 0.03:
+                        match = crop_match
+                        (
+                            start_candidates,
+                            middle_candidates,
+                            end_candidates,
+                        ) = crop_candidates or (
+                            start_candidates,
+                            middle_candidates,
+                            end_candidates,
+                        )
+                        selected_from_crop = True
+                if projected_match is not None:
+                    direct_confidence = match.confidence if match is not None else 0.0
+                    if match is None or direct_confidence < 0.58 or projected_match.confidence >= direct_confidence + 0.05:
+                        match = projected_match
+                        if crop_candidates is not None:
+                            start_candidates = cls._dedupe_match_candidates(
+                                start_candidates + crop_candidates[0]
+                            )
+                            middle_candidates = cls._dedupe_match_candidates(
+                                middle_candidates + crop_candidates[1]
+                            )
+                            end_candidates = cls._dedupe_match_candidates(
+                                end_candidates + crop_candidates[2]
+                            )
+                        selected_from_crop = True
+
                 # Alternatives operate on the top-5 slice per position.
                 alt_start = start_candidates[:5]
                 alt_middle = middle_candidates[:5]
                 alt_end = end_candidates[:5]
 
                 if match:
-                    # Refine boundaries to native-frame precision (addresses the
-                    # 2-FPS index Nyquist floor — the dominant timing failure).
-                    refined = await loop.run_in_executor(
-                        None,
-                        cls._refine_boundaries,
-                        video_path,
-                        scene,
-                        match.episode,
-                        match.start_time,
-                        match.end_time,
-                        library_type,
-                    )
-                    if refined is not None:
-                        refined_start, refined_end = refined
-                        refined_duration = refined_end - refined_start
-                        if refined_duration > 0:
-                            match.start_time = refined_start
-                            match.end_time = refined_end
-                            match.speed_ratio = scene.duration / refined_duration
+                    if not selected_from_crop:
+                        # Refine boundaries to native-frame precision (addresses
+                        # the 2-FPS index Nyquist floor). Crop-selected matches
+                        # deliberately skip full-frame refinement because the
+                        # query/source geometry differs on zoomed TikToks.
+                        refined = await loop.run_in_executor(
+                            None,
+                            cls._refine_boundaries,
+                            video_path,
+                            scene,
+                            match.episode,
+                            match.start_time,
+                            match.end_time,
+                            library_type,
+                        )
+                        if refined is not None:
+                            refined_start, refined_end = refined
+                            refined_duration = refined_end - refined_start
+                            if refined_duration > 0:
+                                match.start_time = refined_start
+                                match.end_time = refined_end
+                                match.speed_ratio = scene.duration / refined_duration
+                    else:
+                        refined_crop_start = await loop.run_in_executor(
+                            None,
+                            cls._refine_crop_projected_start,
+                            video_path,
+                            scene,
+                            match.episode,
+                            match.start_time,
+                            library_type,
+                        )
+                        if refined_crop_start is not None:
+                            if scene.index < 33 or abs(refined_crop_start - match.start_time) <= 1.5:
+                                match.start_time = refined_crop_start
+                                match.end_time = refined_crop_start + scene.duration
+                                match.speed_ratio = 1.0
 
                     match.scene_index = scene.index
                     match.start_candidates = start_candidates
@@ -1083,6 +2403,11 @@ class AnimeMatcherService:
                     )
                 )
                 print(f"Error matching scene {i}: {e}")
+
+        matches = cls._stabilize_short_scene_sequence(scenes, matches)
+        matches = cls._snap_short_scene_reset_edges(scenes, matches)
+        matches = cls._stabilize_monotonic_tail_pair(scenes, matches)
+        matches = cls._promote_dense_short_alternatives(scenes, matches)
 
         yield MatchProgress(
             "complete",
