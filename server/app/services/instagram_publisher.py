@@ -63,6 +63,11 @@ _MAX_REEL_DURATION_SECONDS = 15 * 60.0
 _ALLOWED_VIDEO_CODECS = {"h264", "hevc"}
 _ALLOWED_AUDIO_CODECS = {"aac"}
 _ALLOWED_CONTAINERS = {"mov", "mp4", "m4v", "quicktime"}
+_TRANSCODE_TRIGGER_RATIO = 0.95
+_TRANSCODE_TARGET_RATIO = 0.92
+_TRANSCODE_AUDIO_BITRATE = 192_000
+_TRANSCODE_MIN_VIDEO_BITRATE = 500_000
+_TRANSCODE_TIMEOUT_SECONDS = 3600
 
 
 def _stage_detail(stage: str, detail: str) -> str:
@@ -360,6 +365,164 @@ def _parse_frame_rate(value: Any) -> float | None:
     return _float_or_none(text)
 
 
+async def _probe_duration_seconds(video_path: Path) -> float | None:
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        return None
+
+    def run() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(video_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    try:
+        result = await asyncio.to_thread(run)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return _float_or_none(result.stdout.strip())
+
+
+async def _maybe_transcode_for_size(video_path: Path) -> Path:  # noqa: PLR0911
+    """Re-encode the video below the Reels size cap when it's too large.
+
+    Returns the original path when no transcode is needed, ffmpeg/ffprobe is
+    unavailable, or the transcode fails — letting downstream validation surface
+    the size error as before.
+    """
+    file_size = video_path.stat().st_size
+    if file_size <= _MAX_REEL_BYTES * _TRANSCODE_TRIGGER_RATIO:
+        return video_path
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        logger.warning(
+            "Instagram video is %d bytes (>cap) but ffmpeg is unavailable; "
+            "skipping pre-upload transcode",
+            file_size,
+        )
+        return video_path
+
+    duration = await _probe_duration_seconds(video_path)
+    if duration is None or duration <= 0:
+        logger.warning(
+            "Instagram video is %d bytes (>cap) but duration probe failed; "
+            "skipping pre-upload transcode",
+            file_size,
+        )
+        return video_path
+
+    target_total_bits = int(_MAX_REEL_BYTES * _TRANSCODE_TARGET_RATIO * 8)
+    video_bitrate = max(
+        int(target_total_bits / duration) - _TRANSCODE_AUDIO_BITRATE,
+        _TRANSCODE_MIN_VIDEO_BITRATE,
+    )
+
+    fd, out_str = tempfile.mkstemp(prefix="ig-reel-tc-", suffix=".mp4")
+    os.close(fd)
+    out_path = Path(out_str)
+    pass_log_dir = Path(tempfile.mkdtemp(prefix="ig-reel-pass-"))
+    pass_log_prefix = pass_log_dir / "ffmpeg2pass"
+
+    def run_pass(pass_num: int) -> subprocess.CompletedProcess[str]:
+        common = [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(video_path),
+            "-c:v",
+            "libx264",
+            "-b:v",
+            str(video_bitrate),
+            "-preset",
+            "medium",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            "-passlogfile",
+            str(pass_log_prefix),
+            "-pass",
+            str(pass_num),
+        ]
+        if pass_num == 1:
+            cmd = [*common, "-an", "-f", "mp4", os.devnull]
+        else:
+            cmd = [
+                *common,
+                "-c:a",
+                "aac",
+                "-b:a",
+                str(_TRANSCODE_AUDIO_BITRATE),
+                str(out_path),
+            ]
+        return subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_TRANSCODE_TIMEOUT_SECONDS,
+        )
+
+    logger.info(
+        "Instagram pre-upload transcode start: %d bytes over %.2fs, "
+        "target video bitrate %d bps",
+        file_size,
+        duration,
+        video_bitrate,
+    )
+    try:
+        for pass_num in (1, 2):
+            try:
+                result = await asyncio.to_thread(run_pass, pass_num)
+            except (OSError, subprocess.SubprocessError) as e:
+                logger.warning(
+                    "Instagram pre-upload transcode pass %d errored: %s",
+                    pass_num,
+                    e,
+                )
+                out_path.unlink(missing_ok=True)
+                return video_path
+            if result.returncode != 0:
+                logger.warning(
+                    "Instagram pre-upload transcode pass %d failed: %s",
+                    pass_num,
+                    (result.stderr or "").strip()[:300],
+                )
+                out_path.unlink(missing_ok=True)
+                return video_path
+
+        new_size = out_path.stat().st_size if out_path.exists() else 0
+        if new_size <= 0:
+            logger.warning("Instagram pre-upload transcode produced empty file")
+            out_path.unlink(missing_ok=True)
+            return video_path
+
+        logger.info(
+            "Instagram pre-upload transcode complete: %d bytes -> %d bytes",
+            file_size,
+            new_size,
+        )
+        video_path.unlink(missing_ok=True)
+        return out_path
+    finally:
+        shutil.rmtree(pass_log_dir, ignore_errors=True)
+
+
 async def _validate_video(video_path: Path) -> str | None:  # noqa: PLR0911
     file_size = video_path.stat().st_size
     if file_size <= 0:
@@ -568,6 +731,8 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
             return InstagramPublishResult(
                 success=False, detail=_stage_detail("download", str(e))
             )
+
+        video_path = await _maybe_transcode_for_size(video_path)
 
         if detail := await _validate_video(video_path):
             video_path.unlink(missing_ok=True)
