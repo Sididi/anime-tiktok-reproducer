@@ -84,7 +84,7 @@ def build_embed(
         {"name": "Plateformes", "value": "\n".join(plat_lines), "inline": False},
         {
             "name": "Description TikTok",
-            "value": f"```\n{job.description.replace('```', 'ʼʼʼ')}\n```",
+            "value": f"`{job.description.replace('`', 'ʼ')}`",
             "inline": False,
         },
         {"name": "Lien vidéo", "value": job.drive_video_url, "inline": False},

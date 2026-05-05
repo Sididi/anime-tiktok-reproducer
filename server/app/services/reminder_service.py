@@ -38,7 +38,7 @@ def build_reminder_embed(
     """Pure function: build the reminder embed dict."""
     avatar_url = f"{public_base_url.rstrip('/')}/api/avatars/{account.avatar}"
     when = format_french_datetime(job.slot_time, tz=display_tz)
-    safe_desc = job.description.replace("```", "ʼʼʼ")
+    safe_desc = job.description.replace("`", "ʼ")
     return {
         "author": {"name": account.name, "icon_url": avatar_url},
         "title": job.anime_title,
@@ -48,7 +48,7 @@ def build_reminder_embed(
             {"name": "📺 Compte", "value": account.name, "inline": True},
             {
                 "name": "Description TikTok",
-                "value": f"```\n{safe_desc}\n```",
+                "value": f"`{safe_desc}`",
                 "inline": False,
             },
         ],
