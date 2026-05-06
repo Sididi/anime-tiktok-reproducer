@@ -1086,6 +1086,7 @@ class GapResolutionService:
         cls,
         matches: list[SceneMatch],
         scene_timings: list[dict],  # From transcription, each has words with start/end
+        min_speed_factor: float | None = None,
     ) -> list[GapInfo]:
         """Calculate which scenes have gaps due to the configured speed floor.
 
@@ -1097,16 +1098,24 @@ class GapResolutionService:
             scene_timings: Authoritative playback scene timings. When present,
                 start_time/end_time are preferred over word-derived timing,
                 including for raw scenes.
+            min_speed_factor: Override the global speed floor for this run
+                (e.g. project-level setting). Falls back to settings.
 
         Returns:
             List of GapInfo for scenes that have gaps
         """
         gaps = []
 
+        if min_speed_factor is not None:
+            min_speed_fraction = Fraction(str(min_speed_factor)).limit_denominator(100000)
+        else:
+            min_speed_fraction = settings.min_playback_speed_fraction
+
         # Create calculator for frame-perfect timing (same as processing.py)
         calculator = OTIOTimingCalculator(
             sequence_rate=cls.TIMELINE_RATE,
             source_rate=cls.SOURCE_RATE,
+            min_speed=min_speed_fraction,
         )
 
         # Older saved states may not have authoritative scene bounds yet.

@@ -1017,6 +1017,7 @@ class ProcessingService:
         calculator = OTIOTimingCalculator(
             sequence_rate=sequence_rate,
             source_rate=source_rate,
+            min_speed=Fraction(str(project.resolved_min_playback_speed())).limit_denominator(100000),
         )
 
         # Build scenes data with frame-perfect timing

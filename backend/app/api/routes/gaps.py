@@ -28,7 +28,7 @@ async def get_gaps_config(project_id: str) -> GapsConfigResponse:
 
     return GapsConfigResponse(
         full_auto_enabled=settings.gaps_full_auto_enabled,
-        min_speed_factor=settings.min_playback_speed_factor,
+        min_speed_factor=project.resolved_min_playback_speed(),
     )
 
 
@@ -93,7 +93,7 @@ async def get_gaps(project_id: str) -> GapsResponse:
             has_gaps=False,
             gaps=[],
             total_gap_duration=0.0,
-            min_speed_factor=settings.min_playback_speed_factor,
+            min_speed_factor=project.resolved_min_playback_speed(),
         )
 
     # Load transcription (from the gap detection step - should have been saved)
@@ -106,7 +106,7 @@ async def get_gaps(project_id: str) -> GapsResponse:
                 has_gaps=False,
                 gaps=[],
                 total_gap_duration=0.0,
-                min_speed_factor=settings.min_playback_speed_factor,
+                min_speed_factor=project.resolved_min_playback_speed(),
             )
 
     try:
@@ -117,11 +117,15 @@ async def get_gaps(project_id: str) -> GapsResponse:
             has_gaps=False,
             gaps=[],
             total_gap_duration=0.0,
-            min_speed_factor=settings.min_playback_speed_factor,
+            min_speed_factor=project.resolved_min_playback_speed(),
         )
 
     # Calculate gaps
-    gaps = GapResolutionService.calculate_gaps(matches.matches, scene_timings)
+    gaps = GapResolutionService.calculate_gaps(
+        matches.matches,
+        scene_timings,
+        min_speed_factor=project.resolved_min_playback_speed(),
+    )
 
     total_gap_duration = sum(g.gap_duration for g in gaps)
 
@@ -129,7 +133,7 @@ async def get_gaps(project_id: str) -> GapsResponse:
         has_gaps=len(gaps) > 0,
         gaps=[g.to_dict() for g in gaps],
         total_gap_duration=total_gap_duration,
-        min_speed_factor=settings.min_playback_speed_factor,
+        min_speed_factor=project.resolved_min_playback_speed(),
     )
 
 
