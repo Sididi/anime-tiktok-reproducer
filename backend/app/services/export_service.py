@@ -203,24 +203,32 @@ class ExportService:
     SUBTITLES_ARCHIVE_FILENAME = "atr_subtitles.zip"
 
     @classmethod
-    def get_required_import_assets(cls) -> tuple[str, ...]:
+    def get_required_import_assets(cls, project: Project) -> tuple[str, ...]:
         """Return the tuple of asset filenames to bundle in the export ZIP.
 
-        The border mogrt varies depending on ``grand_mode_enabled``:
-        - grand_mode=True  → White border 10px.mogrt
-        - grand_mode=False → White border 5px.mogrt
+        Asset names come from the project's resolved template:
+        - foreground/background prfpset
+        - white border mogrt (omitted when white_border.enabled is false)
+        - overlay prfpsets (each side may be null)
         """
-        border_mogrt = (
-            "White border 10px.mogrt" if settings.grand_mode_enabled else "White border 5px.mogrt"
-        )
-        return (
+        from .template_service import TemplateService
+
+        template = TemplateService.get(project.resolved_template_key())
+
+        assets: list[str] = [
             "TikTok60fps.sqpreset",
-            border_mogrt,
-            "SPM Anime Background.prfpset",
-            "SPM Anime Foreground.prfpset",
-            "SPM Anime Category Title.prfpset",
             "ATR Proxy H264.epr",
-        )
+            template.background.prfpset,
+            template.foreground.prfpset,
+        ]
+        if template.white_border.enabled and template.white_border.mogrt:
+            assets.append(template.white_border.mogrt)
+        if template.overlay.enabled:
+            if template.overlay.title.prfpset:
+                assets.append(template.overlay.title.prfpset)
+            if template.overlay.category.prfpset:
+                assets.append(template.overlay.category.prfpset)
+        return tuple(dict.fromkeys(assets))  # de-dupe while preserving order
     _LANG_TO_LOCALE = {
         "fr": "fr_FR",
         "en": "en_GB",
@@ -512,7 +520,7 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
             )
 
         assets_dir = cls.get_assets_dir()
-        for asset_name in cls.get_required_import_assets():
+        for asset_name in cls.get_required_import_assets(project):
             asset = assets_dir / asset_name
             if not asset.exists():
                 raise FileNotFoundError(f"Missing required asset file: {asset_name}")
