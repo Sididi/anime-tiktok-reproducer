@@ -47,6 +47,10 @@
   var PROJECT_PROXY_PLAN_CACHE = null;
   var PROJECT_PROXY_TARGETS_BY_PATH = {};
 
+  // --- TEMPLATE TOGGLES (overridden by Python at render time) ---
+  var WHITE_BORDER_ENABLED = true;
+  var OVERLAY_ENABLED = true;
+
   // --- SCENES DATA ---
   var scenes = [
     {
@@ -2513,7 +2517,7 @@
     var sequenceEndSec = ttsEndSec;
 
     // --- V2: BORDER MOGRT ---
-    if (v2 && new File(BORDER_MOGRT_PATH).exists) {
+    if (WHITE_BORDER_ENABLED && v2 && new File(BORDER_MOGRT_PATH).exists) {
       log("Adding Border Mogrt to V2...");
       try {
         if (sequenceEndSec > 0) {
@@ -2526,6 +2530,8 @@
       } catch (e) {
         log("Border Mogrt Error: " + e.message);
       }
+    } else if (!WHITE_BORDER_ENABLED) {
+      log("Skipping V2 border (template white_border.enabled=false).");
     }
 
     validateAndRepairRawSceneVideoPlacement(v1, v3, scenes);
@@ -2538,12 +2544,16 @@
       qeTrackCache,
     );
 
-    log("Adding overlays on V5 and V6...");
-    if (!placeOverlayOnTrack(v5, CATEGORY_OVERLAY_FILENAME, sequenceEndSec)) {
-      log("Warning: Failed to place " + CATEGORY_OVERLAY_FILENAME + " on V5.");
-    }
-    if (!placeOverlayOnTrack(v6, TITLE_OVERLAY_FILENAME, sequenceEndSec)) {
-      log("Warning: Failed to place " + TITLE_OVERLAY_FILENAME + " on V6.");
+    if (OVERLAY_ENABLED) {
+      log("Adding overlays on V5 and V6...");
+      if (!placeOverlayOnTrack(v5, CATEGORY_OVERLAY_FILENAME, sequenceEndSec)) {
+        log("Warning: Failed to place " + CATEGORY_OVERLAY_FILENAME + " on V5.");
+      }
+      if (!placeOverlayOnTrack(v6, TITLE_OVERLAY_FILENAME, sequenceEndSec)) {
+        log("Warning: Failed to place " + TITLE_OVERLAY_FILENAME + " on V6.");
+      }
+    } else {
+      log("Skipping V5/V6 overlays (template overlay.enabled=false).");
     }
 
     var musicFilenameTrimmed = trimSpaces(MUSIC_FILENAME);
@@ -2593,16 +2603,18 @@
       QE_TRACK_RESOLVE_CACHE,
     );
     perfEnd("presets_v3");
-    log("Applying Category Title preset on V5...");
-    perfStart("presets_v5");
-    applyVideoPresetToTrackItems(
-      4,
-      CATEGORY_TITLE_PRESET_NAME,
-      CATEGORY_TITLE_PRESET_FILE_PATH,
-      qeSeq,
-      QE_TRACK_RESOLVE_CACHE,
-    );
-    perfEnd("presets_v5");
+    if (OVERLAY_ENABLED) {
+      log("Applying Category Title preset on V5...");
+      perfStart("presets_v5");
+      applyVideoPresetToTrackItems(
+        4,
+        CATEGORY_TITLE_PRESET_NAME,
+        CATEGORY_TITLE_PRESET_FILE_PATH,
+        qeSeq,
+        QE_TRACK_RESOLVE_CACHE,
+      );
+      perfEnd("presets_v5");
+    }
     perfEnd("presets", "Presets");
 
     // --- V4: SUBTITLES (SRT timings + external MOGRT files) ---

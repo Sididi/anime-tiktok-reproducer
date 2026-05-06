@@ -1197,13 +1197,49 @@ class ProcessingService:
         content = template_path.read_text(encoding="utf-8")
 
         # Apply template-driven substitutions before dynamic ones.
-        # White border mogrt name (always present in classic; minimal can swap or disable).
+        # White border mogrt (only used when white_border.enabled is True).
         border_mogrt = template.white_border.mogrt or "White border 10px.mogrt"
         content = cls._replace_template_once(
             content,
             r'var BORDER_MOGRT_PATH = ASSETS_DIR \+ "/White border 10px\.mogrt";',
             f'var BORDER_MOGRT_PATH = ASSETS_DIR + "/{border_mogrt}";',
             label="BORDER_MOGRT_PATH",
+        )
+        # Background prfpset name.
+        content = cls._replace_template_once(
+            content,
+            r'var BACKGROUND_PRESET_NAME = "SPM Anime Background";',
+            f'var BACKGROUND_PRESET_NAME = "{cls._escape_js_string(template.background.prfpset.removesuffix(".prfpset"))}";',
+            label="BACKGROUND_PRESET_NAME",
+        )
+        # Foreground prfpset name.
+        content = cls._replace_template_once(
+            content,
+            r'var FOREGROUND_PRESET_NAME = "SPM Anime Foreground";',
+            f'var FOREGROUND_PRESET_NAME = "{cls._escape_js_string(template.foreground.prfpset.removesuffix(".prfpset"))}";',
+            label="FOREGROUND_PRESET_NAME",
+        )
+        # Overlay (category title) prfpset — best-effort; fallback to existing constant.
+        overlay_title_prfpset = template.overlay.title.prfpset or template.overlay.category.prfpset
+        if overlay_title_prfpset:
+            content = cls._replace_template_once(
+                content,
+                r'var CATEGORY_TITLE_PRESET_NAME = "SPM Anime Category Title";',
+                f'var CATEGORY_TITLE_PRESET_NAME = "{cls._escape_js_string(overlay_title_prfpset.removesuffix(".prfpset"))}";',
+                label="CATEGORY_TITLE_PRESET_NAME",
+            )
+        # White border / overlay enable toggles.
+        content = cls._replace_template_once(
+            content,
+            r"var WHITE_BORDER_ENABLED = true;",
+            f"var WHITE_BORDER_ENABLED = {'true' if template.white_border.enabled else 'false'};",
+            label="WHITE_BORDER_ENABLED",
+        )
+        content = cls._replace_template_once(
+            content,
+            r"var OVERLAY_ENABLED = true;",
+            f"var OVERLAY_ENABLED = {'true' if template.overlay.enabled else 'false'};",
+            label="OVERLAY_ENABLED",
         )
         # Foreground V3 zoom percentage (76 by default; templates can override).
         zoom_pct = int(round(template.foreground.zoom * 100))
@@ -2968,8 +3004,14 @@ class ProcessingService:
                 label="Raw-scene subtitle",
             )
 
-            # Step 5: Generate title overlay images (if video_overlay is set)
-            if project.video_overlay and project.video_overlay.get("title"):
+            # Step 5: Generate title overlay images (if video_overlay is set and template enables overlay)
+            from .template_service import TemplateService
+            active_template = TemplateService.get(project.resolved_template_key())
+            if (
+                active_template.overlay.enabled
+                and project.video_overlay
+                and project.video_overlay.get("title")
+            ):
                 yield ProcessingProgress(
                     "processing",
                     "overlay_image_generation",
@@ -2982,6 +3024,8 @@ class ProcessingService:
                     title=project.video_overlay["title"],
                     category=project.video_overlay.get("category", ""),
                     output_dir=output_dir,
+                    title_style=active_template.overlay.title.style,
+                    category_style=active_template.overlay.category.style,
                 )
                 logger.info(
                     "Generated title overlays: %s",
