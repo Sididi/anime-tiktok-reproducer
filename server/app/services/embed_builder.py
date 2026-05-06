@@ -30,6 +30,16 @@ _STATUS_EMOJI = {
     "failed": "❌",
 }
 
+# Discord markdown characters that need escaping when rendering user text as
+# plain content. Backslash must come first so we don't double-escape ourselves.
+_DISCORD_MD_CHARS = ("\\", "*", "_", "~", "`", "|", ">", "#")
+
+
+def _escape_discord_markdown(text: str) -> str:
+    for ch in _DISCORD_MD_CHARS:
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
 
 def format_french_datetime(dt: datetime, *, tz: str = "UTC") -> str:
     """Render `dt` in French. `tz` is the IANA timezone to display in."""
@@ -84,7 +94,7 @@ def build_embed(
         {"name": "Plateformes", "value": "\n".join(plat_lines), "inline": False},
         {
             "name": "Description TikTok",
-            "value": f"`{job.description.replace('`', 'ʼ')}`",
+            "value": _escape_discord_markdown(job.description),
             "inline": False,
         },
         {"name": "Lien vidéo", "value": job.drive_video_url, "inline": False},

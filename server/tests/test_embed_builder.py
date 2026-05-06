@@ -85,14 +85,17 @@ def test_embed_platforms_field_renders_all_statuses():
     assert "🎯" in plats and "TikTok" in plats and "Pending" in plats
 
 
-def test_embed_description_field_uses_code_block():
+def test_embed_description_field_is_plain_text():
+    """Description must be plain text (no code fences) so Discord mobile copy
+    yields just the text — long-pressing inline code or a code block on mobile
+    includes the surrounding backticks in the clipboard."""
     embed = build_embed(
         _job_fixture(), _accounts(), "https://tiktok.sididi.tv"
     )
     fields = {f["name"]: f["value"] for f in embed["fields"]}
-    assert fields["Description TikTok"].startswith("```")
-    assert "Posted today!" in fields["Description TikTok"]
-    assert fields["Description TikTok"].endswith("```")
+    value = fields["Description TikTok"]
+    assert value == "Posted today!"
+    assert "`" not in value
 
 
 def test_embed_includes_drive_link():
@@ -115,16 +118,25 @@ def test_embed_after_ack_marks_tiktok_uploaded():
     assert "✅ TikTok" in plats
 
 
-def test_embed_description_escapes_triple_backticks():
+def test_embed_description_escapes_discord_markdown():
+    """Markdown chars in user descriptions must be escaped so Discord renders
+    them literally instead of as bold/italic/code/quote/heading."""
     job = _job_fixture()
-    job.description = "Look at this code: ```python\nprint('hi')\n```"
+    job.description = "Check *this* _out_ ~now~ |spoiler| `code` > quote #tag"
     embed = build_embed(job, _accounts(), "https://tiktok.sididi.tv")
     fields = {f["name"]: f["value"] for f in embed["fields"]}
-    desc_field = fields["Description TikTok"]
-    # The outer fence intact:
-    assert desc_field.startswith("```\n")
-    assert desc_field.endswith("\n```")
-    # Inner triple-backticks replaced:
-    inner = desc_field[4:-4]  # strip outer fences
-    assert "```" not in inner
-    assert "ʼʼʼ" in inner
+    value = fields["Description TikTok"]
+    assert value == (
+        "Check \\*this\\* \\_out\\_ \\~now\\~ \\|spoiler\\| \\`code\\` "
+        "\\> quote \\#tag"
+    )
+
+
+def test_embed_description_escapes_backslashes_first():
+    """A literal backslash in the description must be escaped before other
+    characters, otherwise we'd double-escape the backslashes we just added."""
+    job = _job_fixture()
+    job.description = "path\\to\\file *bold*"
+    embed = build_embed(job, _accounts(), "https://tiktok.sididi.tv")
+    fields = {f["name"]: f["value"] for f in embed["fields"]}
+    assert fields["Description TikTok"] == "path\\\\to\\\\file \\*bold\\*"
