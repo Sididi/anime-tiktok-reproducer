@@ -325,7 +325,7 @@ async def get_script_automation_config(project_id: str):
         "script_title_selection_enabled": settings.script_title_selection_enabled,
         "static_overlay_title_enabled": settings.static_overlay_title_enabled,
         "static_overlay_title": static_overlay_title,
-        "llm": _llm_endpoint_payload(),
+        "llm": _llm_endpoint_payload(project),
         "elevenlabs": {
             "configured": ElevenLabsService.is_configured(),
             "model_id": settings.elevenlabs_model_id,
