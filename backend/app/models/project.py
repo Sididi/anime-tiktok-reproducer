@@ -1,9 +1,10 @@
 from enum import Enum
 from datetime import datetime
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Any
 import uuid
 
+from ..config import settings
 from ..library_types import DEFAULT_LIBRARY_TYPE, LibraryType
 
 
@@ -64,9 +65,36 @@ class Project(BaseModel):
     tts_speed: float | None = None
     video_overlay: dict[str, Any] | None = None
     voice_key: str | None = None
+    llm_preset: str | None = None
+    template: str | None = None
+    min_playback_speed: float | None = None
 
     # Scheduling
     scheduled_at: datetime | None = None  # derived aggregate: max of platform_schedules[*].scheduled_at
     scheduled_account_id: str | None = None
     scheduled_slot: str | None = None  # legacy; no longer written by new code
     platform_schedules: dict[str, PlatformSchedule] = Field(default_factory=dict)
+
+    @field_validator("min_playback_speed")
+    @classmethod
+    def _validate_min_playback_speed(cls, value: float | None) -> float | None:
+        if value is None:
+            return None
+        if value <= 0.10 or value > 1.0:
+            raise ValueError(
+                "min_playback_speed must be greater than 0.10 and at most 1.0"
+            )
+        return value
+
+    def resolved_min_playback_speed(self) -> float:
+        if self.min_playback_speed is not None:
+            return self.min_playback_speed
+        return settings.min_playback_speed_factor
+
+    def resolved_llm_preset_key(self) -> str:
+        from ..services.llm_config_service import LLMConfigService
+        return self.llm_preset or LLMConfigService.default_preset_key()
+
+    def resolved_template_key(self) -> str:
+        from ..services.template_service import TemplateService
+        return self.template or TemplateService.default_key()
