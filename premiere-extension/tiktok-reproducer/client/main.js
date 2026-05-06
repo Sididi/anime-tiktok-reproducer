@@ -381,8 +381,36 @@
     return message || code || "Unknown cleanup failure";
   }
 
+  function removePathWithWindowsFallback(targetPath) {
+    if (process.platform !== "win32" || !targetPath || !fs.existsSync(targetPath)) {
+      return {
+        attempted: false,
+        ok: false,
+      };
+    }
+    try {
+      var command = 'rmdir /s /q "' + targetPath.replace(/"/g, '\\"') + '"';
+      childProcess.execFileSync(
+        "cmd.exe",
+        ["/d", "/s", "/c", command],
+        { windowsHide: true },
+      );
+      return {
+        attempted: true,
+        ok: !fs.existsSync(targetPath),
+      };
+    } catch (e) {
+      return {
+        attempted: true,
+        ok: false,
+        error: e,
+      };
+    }
+  }
+
   function removePathOnce(targetPath) {
     var normalized = String(targetPath || "").trim();
+    var windowsFallbackUsed = false;
     if (!normalized) {
       return {
         ok: false,
@@ -409,22 +437,35 @@
         fs.rmdirSync(normalized, { recursive: true });
       }
     } catch (e) {
-      return {
-        ok: false,
-        error: e,
-      };
+      var fallbackAfterError = removePathWithWindowsFallback(normalized);
+      windowsFallbackUsed = !!fallbackAfterError.attempted;
+      if (!fallbackAfterError.ok) {
+        return {
+          ok: false,
+          error: fallbackAfterError.error || e,
+          windows_delete_fallback_used: windowsFallbackUsed,
+        };
+      }
     }
 
     if (fs.existsSync(normalized)) {
-      return {
-        ok: false,
-        error: new Error("Path still exists after cleanup: " + normalized),
-      };
+      var fallbackAfterExists = removePathWithWindowsFallback(normalized);
+      windowsFallbackUsed = !!fallbackAfterExists.attempted;
+      if (!fallbackAfterExists.ok) {
+        return {
+          ok: false,
+          error:
+            fallbackAfterExists.error ||
+            new Error("Path still exists after cleanup: " + normalized),
+          windows_delete_fallback_used: windowsFallbackUsed,
+        };
+      }
     }
 
     return {
       ok: true,
       removed: true,
+      windows_delete_fallback_used: windowsFallbackUsed,
     };
   }
 
@@ -1829,6 +1870,44 @@
     );
   }
 
+  function preflightManagedBatchExportInHost(batchIds) {
+    var entries = [];
+    (batchIds || []).forEach(function (projectId) {
+      var state = getProjectState(projectId);
+      if (!state || hasAllExpectedUploads(state)) {
+        return;
+      }
+      entries.push({
+        project_id: projectId,
+        sequence_name: String(
+          state.sequence_name || buildProjectSequenceName(projectId),
+        ),
+      });
+    });
+    if (entries.length === 0) {
+      return Promise.resolve({
+        ok: true,
+        checked: 0,
+        missing: [],
+      });
+    }
+    var hostCall =
+      'preflightManagedBatchExport("' +
+      escapeForEval(JSON.stringify(entries)) +
+      '")';
+    return evalHost(hostCall).then(function (result) {
+      var raw = String(result || "");
+      if (raw.indexOf("ERROR:") === 0) {
+        throw new Error(raw);
+      }
+      try {
+        return JSON.parse(raw || "{}");
+      } catch (parseErr) {
+        throw new Error("Invalid batch export preflight response: " + raw);
+      }
+    });
+  }
+
   function clearLocalProxyTrackingForExport() {
     var droppedJobs = cancelLocalProxyRenderProcessesForExport();
     Object.keys(encoderJobMap).forEach(function (jobId) {
@@ -2001,7 +2080,20 @@
     suppressLogs,
   ) {
     var quiet = !!suppressLogs;
-    var hostCall = "purgeActiveProject()";
+    var cleanupRoots = [];
+    if (Array.isArray(localRootPath)) {
+      cleanupRoots = localRootPath
+        .map(function (rootPath) {
+          return String(rootPath || "").trim();
+        })
+        .filter(Boolean);
+    } else if (String(localRootPath || "").trim()) {
+      cleanupRoots = [String(localRootPath || "").trim()];
+    }
+    var hostCall =
+      'cleanupImportedProjectsForLocalRoots("' +
+      escapeForEval(JSON.stringify(cleanupRoots)) +
+      '")';
 
     return evalHost(hostCall).then(function (result) {
       var raw = String(result || "").trim();
@@ -2028,6 +2120,7 @@
         var warningCount = Array.isArray(summary.warnings)
           ? summary.warnings.length
           : Number(summary.warning_count || 0);
+        var detachedProxyCount = Number(summary.detached_proxy_count || 0);
         log(
           "Premiere cleanup for " +
             projectId +
@@ -2039,6 +2132,8 @@
             remainingSequences +
             ", remainingRootItems=" +
             remainingRootItems +
+            ", detachedProxies=" +
+            detachedProxyCount +
             ", warnings=" +
             warningCount,
           "info",
@@ -2347,6 +2442,7 @@
     }
 
     disarmExportMonitor(id);
+    cancelLocalProxyRenderProcessesForExport();
     var isBatchProject = getBatchRuntimeHelper().isProjectInExportBatch(
       ensureBatchRuntime(),
       id,
@@ -4204,8 +4300,16 @@
         " project(s).",
       "info",
     );
+    cancelLocalProxyRenderProcessesForExport();
 
-    cleanupImportedProjectInHost("batch", "", false)
+    var batchCleanupRoots = batchIds
+      .map(function (projectId) {
+        var state = getProjectState(projectId);
+        return state && state.local_root ? String(state.local_root) : "";
+      })
+      .filter(Boolean);
+
+    cleanupImportedProjectInHost("batch", batchCleanupRoots, false)
       .then(function (hostSummary) {
         batchIds.forEach(function (projectId) {
           upsertProjectState(projectId, {
@@ -4788,9 +4892,13 @@
                 log(
                   "Proxy attach pending for " +
                     projectId +
-                    (pendingAttachErrors.length > 0
-                      ? ": " + pendingAttachErrors.join(" | ")
-                      : ""),
+                    ": " +
+                    completedTargets +
+                    "/" +
+                    totalTargets +
+                    " complete, " +
+                    attachPending +
+                    " waiting for Premiere attach verification",
                   "info",
                 );
               }
@@ -5180,7 +5288,7 @@
             : attachedOk
               ? "ready"
               : "warning",
-        proxy_pending_count: nextPending,
+        proxy_pending_count: Math.max(nextPending, attachPending ? 1 : 0),
         proxy_error: attachPending ? null : attachError || null,
         proxy_job_ids: remainingJobIds,
       });
@@ -5197,7 +5305,7 @@
         log(
           "Proxy encode completed for " +
             projectId +
-            " and is waiting for Premiere import before attach",
+            " and is waiting for Premiere proxy attach verification",
           "info",
         );
       } else {
@@ -5324,6 +5432,29 @@
             " proxy job(s)",
           "info",
         );
+
+        var preflightBatchIds = exportReadiness.current_batch_ids.slice(0);
+        return preflightManagedBatchExportInHost(preflightBatchIds);
+      })
+      .then(function (preflightResult) {
+        if (!preflightResult || preflightResult.ok === false) {
+          var missing = preflightResult && Array.isArray(preflightResult.missing)
+            ? preflightResult.missing
+            : [];
+          var missingText = missing
+            .map(function (entry) {
+              return (
+                String(entry.project_id || "unknown") +
+                "=" +
+                String(entry.sequence_name || "missing")
+              );
+            })
+            .join(", ");
+          throw new Error(
+            "Batch sequence preflight failed" +
+              (missingText ? ": " + missingText : ""),
+          );
+        }
 
         var batchIds = getBatchRuntimeHelper().beginExportPhase(runtime);
         syncTrackedBatchProjectMetadata();
@@ -5475,6 +5606,10 @@
         updateGlobalStatus();
       })
       .catch(function (err) {
+        if (getBatchPhase() !== getBatchRuntimeHelper().PHASES.blocked_error) {
+          getBatchRuntimeHelper().markBatchBlocked(ensureBatchRuntime());
+          syncTrackedBatchProjectMetadata();
+        }
         handleBatchFailure("batch", "Export start failed: " + err.message);
         log("Managed batch export failed to start: " + err.message, "error");
         updateGlobalStatus();

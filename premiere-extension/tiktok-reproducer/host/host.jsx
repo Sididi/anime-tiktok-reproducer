@@ -16,6 +16,7 @@ var __atrProxyRepairQueuedMap = {};
 var __atrProxyRepairJobKeyMap = {};
 var __atrPendingProxyKickoffs = {};
 var __atrProxyPresetPathCache = {};
+var __atrProxyAttachAttemptMap = {};
 var __atrEncoderCallbacksBound = false;
 var __atrCleanupMaxBinPasses = 5;
 var __atrTempAudioSequencePrefix = "ATR_AUDIO_NO_MUSIC_TMP__";
@@ -90,8 +91,16 @@ function __atrNormalizePath(value) {
 }
 
 function __atrNormalizeComparePath(value) {
-  var normalized = __atrNormalizePath(value).toLowerCase();
+  var normalized = __atrNormalizePath(value);
+  try {
+    normalized = decodeURI(normalized);
+  } catch (eDecode) {}
+  normalized = normalized.toLowerCase();
   normalized = normalized.replace(/\/+/g, "/");
+  normalized = normalized.replace(/^file:\/+/, "");
+  if (/^\/[a-z]:/.test(normalized)) {
+    normalized = normalized.substring(1);
+  }
   if (
     normalized.length > 1 &&
     normalized.charAt(normalized.length - 1) === "/"
@@ -102,13 +111,15 @@ function __atrNormalizeComparePath(value) {
 }
 
 function __atrPathStartsWith(pathValue, rootValue) {
-  if (!pathValue || !rootValue) {
+  var normalizedPath = __atrNormalizeComparePath(pathValue);
+  var normalizedRoot = __atrNormalizeComparePath(rootValue);
+  if (!normalizedPath || !normalizedRoot) {
     return false;
   }
-  if (pathValue === rootValue) {
+  if (normalizedPath === normalizedRoot) {
     return true;
   }
-  return pathValue.indexOf(rootValue + "/") === 0;
+  return normalizedPath.indexOf(normalizedRoot + "/") === 0;
 }
 
 function __atrGetExtensionRootPath() {
@@ -663,6 +674,48 @@ function __atrIsSuccessfulAttachResult(result) {
   return result === 0 || result === true || result === "0";
 }
 
+function __atrBuildProjectItemStableKey(projectItem) {
+  var key = "";
+  try {
+    key = __atrSafeString(projectItem && projectItem.nodeId);
+  } catch (eNode) {
+    key = "";
+  }
+  if (key) {
+    return key;
+  }
+  return (
+    __atrNormalizeComparePath(__atrGetProjectItemMediaPath(projectItem)) +
+    "::" +
+    __atrSafeString(__atrGetProjectItemName(projectItem))
+  );
+}
+
+function __atrBuildProxyAttachAttemptKey(projectItem, proxyPath) {
+  return (
+    __atrBuildProjectItemStableKey(projectItem) +
+    "::" +
+    __atrNormalizeComparePath(proxyPath)
+  );
+}
+
+function __atrRememberProxyAttachAttempt(projectItem, proxyPath) {
+  var key = __atrBuildProxyAttachAttemptKey(projectItem, proxyPath);
+  if (!key) {
+    return;
+  }
+  __atrProxyAttachAttemptMap[key] = new Date().getTime();
+}
+
+function __atrProxyAttachAttemptIsCoolingDown(projectItem, proxyPath) {
+  var key = __atrBuildProxyAttachAttemptKey(projectItem, proxyPath);
+  var attemptedAt = key ? Number(__atrProxyAttachAttemptMap[key] || 0) : 0;
+  if (!attemptedAt) {
+    return false;
+  }
+  return new Date().getTime() - attemptedAt < 30000;
+}
+
 function __atrProjectItemProxyMatchState(projectItem, proxyPath) {
   if (!projectItem || !proxyPath) {
     return 0;
@@ -674,7 +727,8 @@ function __atrProjectItemProxyMatchState(projectItem, proxyPath) {
     if (!projectItem.hasProxy()) {
       return 0;
     }
-    var currentProxyPath = __atrNormalizeComparePath(projectItem.getProxyPath());
+    var currentRawPath = projectItem.getProxyPath();
+    var currentProxyPath = __atrNormalizeComparePath(currentRawPath);
     var expectedProxyPath = __atrNormalizeComparePath(proxyPath);
     if (currentProxyPath && expectedProxyPath && currentProxyPath === expectedProxyPath) {
       return 1;
@@ -686,6 +740,13 @@ function __atrProjectItemProxyMatchState(projectItem, proxyPath) {
         return 1;
       }
     } catch (eFile) {}
+    try {
+      var currentFile = new File(currentRawPath);
+      var currentFsPath = __atrNormalizeComparePath(currentFile.fsName || "");
+      if (currentFsPath && expectedProxyPath && currentFsPath === expectedProxyPath) {
+        return 1;
+      }
+    } catch (eCurrentFile) {}
     return 0;
   } catch (eProxyPath) {
     return -1;
@@ -695,9 +756,11 @@ function __atrProjectItemProxyMatchState(projectItem, proxyPath) {
 function __atrTryAttachProxy(projectItem, proxyPath) {
   var response = {
     ok: false,
+    pending: false,
     error: "",
     attached_path: "",
     last_result: "",
+    attempted: false,
   };
   if (!projectItem || !proxyPath) {
     response.error = "Missing project item or proxy path";
@@ -730,6 +793,12 @@ function __atrTryAttachProxy(projectItem, proxyPath) {
       return response;
     }
 
+    if (__atrProxyAttachAttemptIsCoolingDown(projectItem, candidate)) {
+      response.pending = true;
+      response.error = "Proxy attach is settling in Premiere";
+      continue;
+    }
+
     try {
       if (projectItem.refreshMedia) {
         projectItem.refreshMedia();
@@ -737,6 +806,8 @@ function __atrTryAttachProxy(projectItem, proxyPath) {
     } catch (eRefresh) {}
 
     try {
+      response.attempted = true;
+      __atrRememberProxyAttachAttempt(projectItem, candidate);
       var attachResult = projectItem.attachProxy(candidate, 0);
       response.last_result = __atrSafeString(attachResult);
       for (var verifyAttempt = 0; verifyAttempt < 4; verifyAttempt += 1) {
@@ -761,6 +832,11 @@ function __atrTryAttachProxy(projectItem, proxyPath) {
         response.ok = true;
         response.attached_path = candidate;
         return response;
+      }
+      if (proxyFile.exists) {
+        response.pending = true;
+        response.error = "attachProxy did not verify yet";
+        continue;
       }
       response.error =
         "attachProxy returned " +
@@ -1104,6 +1180,99 @@ function __atrBuildImportedCleanupScan(normalizedRootPath) {
   return report;
 }
 
+function __atrDetachManagedProxiesForCleanupObject(localRootPath) {
+  var normalizedRootPath = __atrNormalizeComparePath(localRootPath);
+  var result = {
+    ok: true,
+    considered_proxy_items: 0,
+    detached_proxy_count: 0,
+    detach_proxy_unavailable_count: 0,
+    detach_proxy_failed_count: 0,
+    detach_proxy_warnings: [],
+  };
+
+  if (!normalizedRootPath || !app || !app.project || !app.project.rootItem) {
+    return result;
+  }
+
+  try {
+    if (app.setEnableProxies) {
+      app.setEnableProxies(0);
+    }
+  } catch (eDisableProxyView) {
+    result.detach_proxy_warnings.push(
+      "Could not disable proxy view: " +
+        __atrSafeString(eDisableProxyView.message || eDisableProxyView),
+    );
+  }
+
+  var scan = __atrBuildImportedCleanupScan(normalizedRootPath);
+  for (var i = 0; i < scan.imported_leaf_items.length; i += 1) {
+    var item = scan.imported_leaf_items[i];
+    if (!item || !item.hasProxy || !item.getProxyPath) {
+      continue;
+    }
+
+    var proxyPath = "";
+    try {
+      if (!item.hasProxy()) {
+        continue;
+      }
+      proxyPath = __atrSafeString(item.getProxyPath());
+    } catch (eProxyState) {
+      continue;
+    }
+
+    if (!__atrLooksLikeManagedProxyPath(proxyPath, normalizedRootPath)) {
+      continue;
+    }
+
+    result.considered_proxy_items += 1;
+    if (!item.detachProxy) {
+      result.detach_proxy_unavailable_count += 1;
+      continue;
+    }
+
+    try {
+      var detached = item.detachProxy();
+      if (detached === undefined || detached === 0 || detached === true || detached === "0") {
+        result.detached_proxy_count += 1;
+      } else {
+        result.detach_proxy_failed_count += 1;
+      }
+    } catch (eDetach) {
+      result.detach_proxy_failed_count += 1;
+      if (result.detach_proxy_warnings.length < 5) {
+        result.detach_proxy_warnings.push(
+          "Could not detach proxy from " +
+            __atrGetProjectItemName(item) +
+            ": " +
+            __atrSafeString(eDetach.message || eDetach),
+        );
+      }
+    }
+  }
+
+  if (result.detach_proxy_unavailable_count > 0) {
+    result.detach_proxy_warnings.push(
+      "projectItem.detachProxy is unavailable for " +
+        result.detach_proxy_unavailable_count +
+        " managed proxy item(s); project purge will release them.",
+    );
+  }
+
+  result.ok = result.detach_proxy_failed_count === 0;
+  return result;
+}
+
+function detachManagedProxiesForCleanup(localRootPath) {
+  try {
+    return JSON.stringify(__atrDetachManagedProxiesForCleanupObject(localRootPath));
+  } catch (e) {
+    return "ERROR: " + e.message + " (line " + e.line + ")";
+  }
+}
+
 function __atrDeleteBinItem(projectItem) {
   if (!projectItem || !projectItem.deleteBin) {
     return false;
@@ -1378,6 +1547,9 @@ function __atrAttachProxyToMatchingItems(projectId, mediaPath, proxyPath, localR
     attached_count: 0,
     already_compliant_count: 0,
     completed_count: 0,
+    attach_pending_count: 0,
+    unverified_attach_count: 0,
+    attach_pending_samples: [],
     errors: [],
   };
 
@@ -1435,6 +1607,16 @@ function __atrAttachProxyToMatchingItems(projectId, mediaPath, proxyPath, localR
       if (attachAttempt.ok) {
         response.attached_count += 1;
         response.completed_count += 1;
+      } else if (attachAttempt.pending) {
+        response.attach_pending_count += 1;
+        response.unverified_attach_count += 1;
+        if (response.attach_pending_samples.length < 4) {
+          response.attach_pending_samples.push(
+            (itemName || __atrGetBasename(mediaPath)) +
+              ": " +
+              __atrSafeString(attachAttempt.error || "attach pending"),
+          );
+        }
       } else {
         response.errors.push(
           "Failed to attach proxy" +
@@ -1458,7 +1640,10 @@ function __atrAttachProxyToMatchingItems(projectId, mediaPath, proxyPath, localR
     response.completed_count >= response.eligible_count;
   if (!response.proxy_attached) {
     response.proxy_attach_pending = true;
-    response.proxy_attach_error = response.errors.join(" | ");
+    response.proxy_attach_error =
+      response.errors.length > 0
+        ? response.errors.join(" | ")
+        : response.attach_pending_samples.join(" | ");
     if (!response.proxy_attach_error && response.eligible_count <= 0) {
       response.proxy_attach_error =
         "No proxy-capable video project item found yet for " +
@@ -1483,6 +1668,8 @@ function __atrAttachGeneratedProxyForJob(jobID, outputPath) {
     attached_count: 0,
     eligible_count: 0,
     already_compliant_count: 0,
+    attach_pending_count: 0,
+    unverified_attach_count: 0,
   };
   if (!job) {
     return response;
@@ -1510,6 +1697,10 @@ function __atrAttachGeneratedProxyForJob(jobID, outputPath) {
     response.ignored_count = Number(attachAttempt.ignored_count || 0);
     response.already_compliant_count = Number(
       attachAttempt.already_compliant_count || 0,
+    );
+    response.attach_pending_count = Number(attachAttempt.attach_pending_count || 0);
+    response.unverified_attach_count = Number(
+      attachAttempt.unverified_attach_count || 0,
     );
   } catch (eAttach) {
     response.proxy_attached = false;
@@ -1707,11 +1898,9 @@ function __atrQueueProjectItemProxyRepair(
 }
 
 function __atrForgetEncoderJob(jobID) {
-  var tempSequenceName = __atrSafeString(
-    __atrTempAudioSequenceByJob[jobID] || "",
-  );
-  if (tempSequenceName) {
-    __atrDeleteSequenceByName(tempSequenceName);
+  var tempSequenceRecord = __atrTempAudioSequenceByJob[jobID] || null;
+  if (tempSequenceRecord) {
+    __atrDeleteTempAudioSequenceRecord(tempSequenceRecord);
   }
   try {
     delete __atrTempAudioSequenceByJob[jobID];
@@ -1792,6 +1981,10 @@ function ATR_onEncoderJobComplete(jobID, outputPath) {
       proxyAttach.already_compliant_count || 0,
     );
     detail.ignored_count = Number(proxyAttach.ignored_count || 0);
+    detail.attach_pending_count = Number(proxyAttach.attach_pending_count || 0);
+    detail.unverified_attach_count = Number(
+      proxyAttach.unverified_attach_count || 0,
+    );
   }
   __atrPushEncoderEvent("complete", jobID, detail);
   __atrForgetEncoderJob(jobID);
@@ -1945,6 +2138,52 @@ function __atrFindSequenceByName(sequenceName) {
   return null;
 }
 
+function preflightManagedBatchExport(batchJson) {
+  try {
+    var entries = [];
+    try {
+      entries =
+        typeof batchJson === "string" ? JSON.parse(batchJson || "[]") : batchJson;
+    } catch (eParse) {
+      return "ERROR: Invalid batch preflight payload";
+    }
+    if (!entries || !entries.length) {
+      return JSON.stringify({
+        ok: false,
+        checked: 0,
+        found: 0,
+        missing: [],
+        error: "No batch sequences to preflight",
+      });
+    }
+
+    var missing = [];
+    var found = 0;
+    for (var i = 0; i < entries.length; i += 1) {
+      var entry = entries[i] || {};
+      var sequenceName = __atrSafeString(entry.sequence_name);
+      var projectId = __atrSafeString(entry.project_id);
+      if (!sequenceName || !__atrFindSequenceByName(sequenceName)) {
+        missing.push({
+          project_id: projectId,
+          sequence_name: sequenceName,
+        });
+      } else {
+        found += 1;
+      }
+    }
+
+    return JSON.stringify({
+      ok: missing.length === 0,
+      checked: entries.length,
+      found: found,
+      missing: missing,
+    });
+  } catch (e) {
+    return "ERROR: " + e.message + " (line " + e.line + ")";
+  }
+}
+
 function __atrCloneSequence(sourceSequence) {
   var sequences = app && app.project ? app.project.sequences : null;
   if (!sequences) {
@@ -1952,6 +2191,7 @@ function __atrCloneSequence(sourceSequence) {
   }
 
   var beforeCount = 0;
+  var beforeKeys = __atrCaptureSequenceKeys();
   try {
     beforeCount = Number(sequences.numSequences || 0);
   } catch (eBefore) {
@@ -1978,7 +2218,20 @@ function __atrCloneSequence(sourceSequence) {
     throw new Error("Clone did not create a new sequence");
   }
 
-  var cloneSequence = sequences[afterCount - 1];
+  var cloneSequence = null;
+  for (var i = 0; i < afterCount; i += 1) {
+    var candidate = sequences[i];
+    if (!candidate) {
+      continue;
+    }
+    if (!beforeKeys[__atrBuildSequenceObjectKey(candidate, i)]) {
+      cloneSequence = candidate;
+      break;
+    }
+  }
+  if (!cloneSequence) {
+    cloneSequence = sequences[afterCount - 1];
+  }
   if (!cloneSequence) {
     throw new Error("Unable to access cloned sequence");
   }
@@ -1997,9 +2250,103 @@ function __atrGetSequenceName(sequence) {
   }
 }
 
+function __atrGetSequenceId(sequence) {
+  if (!sequence) {
+    return "";
+  }
+  try {
+    return __atrSafeString(sequence.sequenceID || "");
+  } catch (e) {
+    return "";
+  }
+}
+
+function __atrSequenceNameHasTempAudioPrefix(sequenceName) {
+  return __atrSafeString(sequenceName).indexOf(__atrTempAudioSequencePrefix) === 0;
+}
+
+function __atrCaptureSequenceKeys() {
+  var out = {};
+  var sequences = app && app.project ? app.project.sequences : null;
+  var count = 0;
+  if (!sequences) {
+    return out;
+  }
+  try {
+    count = Number(sequences.numSequences || 0);
+  } catch (eCount) {
+    count = 0;
+  }
+  for (var i = 0; i < count; i += 1) {
+    var sequence = sequences[i];
+    if (!sequence) {
+      continue;
+    }
+    out[__atrBuildSequenceObjectKey(sequence, i)] = true;
+  }
+  return out;
+}
+
+function __atrBuildSequenceObjectKey(sequence, index) {
+  var sequenceId = __atrGetSequenceId(sequence);
+  if (sequenceId) {
+    return "id:" + sequenceId;
+  }
+  return "name:" + __atrGetSequenceName(sequence) + "::index:" + __atrSafeString(index);
+}
+
+function __atrFindSequenceByTempRecord(record) {
+  var sequenceName = "";
+  var sequenceId = "";
+  if (typeof record === "string") {
+    sequenceName = __atrSafeString(record);
+  } else if (record) {
+    sequenceName = __atrSafeString(record.name);
+    sequenceId = __atrSafeString(record.sequence_id);
+  }
+  if (!__atrSequenceNameHasTempAudioPrefix(sequenceName)) {
+    return null;
+  }
+
+  var sequences = app && app.project ? app.project.sequences : null;
+  var count = 0;
+  if (!sequences) {
+    return null;
+  }
+  try {
+    count = Number(sequences.numSequences || 0);
+  } catch (eCount) {
+    count = 0;
+  }
+  for (var i = 0; i < count; i += 1) {
+    var sequence = sequences[i];
+    if (!sequence) {
+      continue;
+    }
+    if (sequenceId && __atrGetSequenceId(sequence) === sequenceId) {
+      return sequence;
+    }
+    if (__atrGetSequenceName(sequence) === sequenceName) {
+      return sequence;
+    }
+  }
+  return null;
+}
+
+function __atrDeleteTempAudioSequenceRecord(record) {
+  var sequence = __atrFindSequenceByTempRecord(record);
+  if (!sequence) {
+    return false;
+  }
+  if (!__atrSequenceNameHasTempAudioPrefix(__atrGetSequenceName(sequence))) {
+    return false;
+  }
+  return __atrDeleteSequenceObject(sequence);
+}
+
 function __atrDeleteSequenceByName(sequenceName) {
   var targetName = __atrSafeString(sequenceName);
-  if (!targetName) {
+  if (!targetName || !__atrSequenceNameHasTempAudioPrefix(targetName)) {
     return false;
   }
 
@@ -2282,6 +2629,75 @@ function purgeActiveProject() {
   }
 }
 
+function cleanupImportedProjectsForLocalRoots(localRootsJson) {
+  try {
+    var roots = [];
+    try {
+      roots =
+        typeof localRootsJson === "string"
+          ? JSON.parse(localRootsJson || "[]")
+          : localRootsJson;
+    } catch (eParse) {
+      roots = [];
+    }
+    if (!roots || !roots.length) {
+      roots = [];
+    }
+
+    var detachSummaries = [];
+    var detachedProxyCount = 0;
+    var detachWarnings = [];
+    for (var i = 0; i < roots.length; i += 1) {
+      var rootPath = __atrSafeString(roots[i]);
+      if (!rootPath) {
+        continue;
+      }
+      var detachSummary = __atrDetachManagedProxiesForCleanupObject(rootPath);
+      detachSummary.local_root = rootPath;
+      detachSummaries.push(detachSummary);
+      detachedProxyCount += Number(detachSummary.detached_proxy_count || 0);
+      if (detachSummary.detach_proxy_warnings && detachSummary.detach_proxy_warnings.length) {
+        for (var w = 0; w < detachSummary.detach_proxy_warnings.length; w += 1) {
+          if (detachWarnings.length < 10) {
+            detachWarnings.push(detachSummary.detach_proxy_warnings[w]);
+          }
+        }
+      }
+    }
+
+    var purgeRaw = purgeActiveProject();
+    if (purgeRaw && String(purgeRaw).indexOf("ERROR:") === 0) {
+      return purgeRaw;
+    }
+    var purgeSummary = {};
+    try {
+      purgeSummary = JSON.parse(purgeRaw || "{}");
+    } catch (ePurgeParse) {
+      purgeSummary = {
+        ok: true,
+        raw: __atrSafeString(purgeRaw),
+      };
+    }
+
+    purgeSummary.detach_proxy_summaries = detachSummaries;
+    purgeSummary.detached_proxy_count = detachedProxyCount;
+    purgeSummary.detach_proxy_warnings = detachWarnings;
+    purgeSummary.warning_count =
+      Number(purgeSummary.warning_count || 0) + detachWarnings.length;
+    if (detachWarnings.length > 0) {
+      if (!purgeSummary.warnings) {
+        purgeSummary.warnings = [];
+      }
+      for (var j = 0; j < detachWarnings.length; j += 1) {
+        purgeSummary.warnings.push(detachWarnings[j]);
+      }
+    }
+    return JSON.stringify(purgeSummary);
+  } catch (e) {
+    return "ERROR: " + e.message + " (line " + e.line + ")";
+  }
+}
+
 /**
  * Execute a .jsx script file with error handling.
  * @param {string} scriptPath - Absolute path to the .jsx file (forward slashes)
@@ -2453,8 +2869,10 @@ function startManagedExport(projectId, sequenceName, outputPath, presetPath) {
         audioOutputFsPath,
         audioPresetFsPath,
       );
-      __atrTempAudioSequenceByJob[audioJobID] =
-        __atrSafeString(tempSequenceName);
+      __atrTempAudioSequenceByJob[audioJobID] = {
+        name: __atrSafeString(tempSequenceName),
+        sequence_id: __atrGetSequenceId(tempSequence),
+      };
       __atrPushEncoderEvent("queued", audioJobID, {
         output_path: audioOutputFsPath,
         preset_path: audioPresetFsPath,
@@ -3250,6 +3668,7 @@ function reconcileAtrProjectProxies(localRootPath, proxyPlanJson) {
       missing_items: 0,
       missing_outputs: 0,
       attach_pending: 0,
+      unverified_attach_count: 0,
       eligible_items: 0,
       ignored_items: 0,
       errors: [],
@@ -3344,7 +3763,13 @@ function reconcileAtrProjectProxies(localRootPath, proxyPlanJson) {
         }
         if (attachResult.proxy_attach_pending) {
           result.pending += 1;
-          result.attach_pending += 1;
+          result.attach_pending += Math.max(
+            1,
+            Number(attachResult.attach_pending_count || 0),
+          );
+          result.unverified_attach_count += Number(
+            attachResult.unverified_attach_count || 0,
+          );
           if (attachResult.proxy_attach_error) {
             result.attach_pending_errors.push(
               target.media_path +
@@ -3436,6 +3861,7 @@ function __atrClearTrackedProxyState() {
 
   __atrProxyRepairQueuedMap = {};
   __atrProxyRepairJobKeyMap = {};
+  __atrProxyAttachAttemptMap = {};
 
   var canceledKickoffs = 0;
   for (var kickoffId in __atrPendingProxyKickoffs) {
@@ -3470,15 +3896,57 @@ function __atrBuildAmeClearQueueScript() {
   ].join("");
 }
 
+function __atrResolveAmeBridgeTalkTarget() {
+  var candidates = ["ame"];
+  if (typeof BridgeTalk === "undefined") {
+    return candidates;
+  }
+  try {
+    if (BridgeTalk.getTargets) {
+      var targets = BridgeTalk.getTargets();
+      for (var i = 0; targets && i < targets.length; i += 1) {
+        var target = __atrSafeString(targets[i]).toLowerCase();
+        if (target.indexOf("ame") === 0 && candidates.join("|").indexOf(target) === -1) {
+          candidates.push(target);
+        }
+      }
+    }
+  } catch (eTargets) {}
+  try {
+    if (BridgeTalk.getSpecifier) {
+      var specifier = __atrSafeString(BridgeTalk.getSpecifier("ame"));
+      if (specifier && candidates.join("|").indexOf(specifier.toLowerCase()) === -1) {
+        candidates.push(specifier);
+      }
+    }
+  } catch (eSpecifier) {}
+  return candidates;
+}
+
+function __atrBridgeTalkTargetIsRunning(targets) {
+  if (typeof BridgeTalk === "undefined" || !BridgeTalk.isRunning) {
+    return false;
+  }
+  for (var i = 0; targets && i < targets.length; i += 1) {
+    try {
+      if (BridgeTalk.isRunning(targets[i])) {
+        return true;
+      }
+    } catch (eRunning) {}
+  }
+  return false;
+}
+
 function __atrEnsureAmeRunning(result) {
   if (typeof BridgeTalk === "undefined") {
     result.errors.push("BridgeTalk is unavailable");
     return false;
   }
 
+  var targets = __atrResolveAmeBridgeTalkTarget();
   var alreadyRunning = false;
   try {
-    alreadyRunning = !!(BridgeTalk.isRunning && BridgeTalk.isRunning("ame"));
+    alreadyRunning = __atrBridgeTalkTargetIsRunning(targets);
   } catch (eRunningCheck) {
     alreadyRunning = false;
   }
@@ -3513,13 +3981,7 @@ function __atrEnsureAmeRunning(result) {
 
   var deadline = new Date().getTime() + 90000;
   while (new Date().getTime() < deadline) {
-    var running = false;
-    try {
-      running = !!(BridgeTalk.isRunning && BridgeTalk.isRunning("ame"));
-    } catch (eRunningPoll) {
-      running = false;
-    }
-    if (running) {
+    if (__atrBridgeTalkTargetIsRunning(targets)) {
       return true;
     }
     try {
@@ -3556,23 +4018,56 @@ function __atrClearAmeQueueThroughBridgeTalk() {
 
   var done = false;
   var responseText = "";
+  var targets = __atrResolveAmeBridgeTalkTarget();
+  var sent = false;
+  var sendErrors = [];
   try {
-    var bt = new BridgeTalk();
-    bt.target = "ame";
-    bt.body = __atrBuildAmeClearQueueScript();
-    bt.onResult = function (response) {
-      responseText = __atrSafeString(response && response.body);
-      done = true;
-    };
-    bt.onError = function (error) {
+    var sendDeadline = new Date().getTime() + 30000;
+    while (!sent && new Date().getTime() < sendDeadline) {
+      for (var targetIndex = 0; targetIndex < targets.length && !sent; targetIndex += 1) {
+        var bt = new BridgeTalk();
+        bt.target = targets[targetIndex];
+        bt.body = __atrBuildAmeClearQueueScript();
+        bt.onResult = function (response) {
+          responseText = __atrSafeString(response && response.body);
+          done = true;
+        };
+        bt.onError = function (error) {
+          result.errors.push(
+            "BridgeTalk AME clear failed: " +
+              __atrSafeString(error && (error.body || error.message || error)),
+          );
+          done = true;
+        };
+        try {
+          sent = !!bt.send(60);
+          if (!sent) {
+            sendErrors.push("send returned false for " + targets[targetIndex]);
+          }
+        } catch (eSendAttempt) {
+          sendErrors.push(
+            targets[targetIndex] +
+              ": " +
+              __atrSafeString(eSendAttempt.message || eSendAttempt),
+          );
+        }
+      }
+      if (!sent) {
+        try {
+          if (BridgeTalk.pump) {
+            BridgeTalk.pump();
+          }
+        } catch (ePumpSend) {}
+        try {
+          $.sleep(500);
+        } catch (eSleepSend) {}
+      }
+    }
+    if (!sent) {
       result.errors.push(
-        "BridgeTalk AME clear failed: " +
-          __atrSafeString(error && (error.body || error.message || error)),
+        "BridgeTalk could not send AME clear request" +
+          (sendErrors.length > 0 ? ": " + sendErrors.slice(0, 4).join(" | ") : ""),
       );
-      done = true;
-    };
-    if (!bt.send(60)) {
-      result.errors.push("BridgeTalk could not send AME clear request");
       return result;
     }
   } catch (eSend) {
