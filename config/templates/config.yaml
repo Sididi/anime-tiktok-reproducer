@@ -1,0 +1,46 @@
+default: classic
+
+templates:
+  classic:
+    label: "Classic (white panel)"
+    foreground:
+      prfpset: "SPM Anime Foreground.prfpset"
+      zoom: 0.76
+    background:
+      prfpset: "SPM Anime Background.prfpset"
+    subtitles:
+      mogrt: "SPM_Anime_Subtitle.mogrt"
+      raw_mogrt: "SPM_Anime_Subtitle_Raw.mogrt"
+    white_border:
+      enabled: true
+      mogrt: "White border 10px.mogrt"
+    overlay:
+      enabled: true
+      title:
+        style: "classic"
+        prfpset: "SPM Anime Category Title.prfpset"
+      category:
+        style: "classic"
+        prfpset: null
+
+  minimal:
+    label: "Minimal (no panel)"
+    foreground:
+      prfpset: "SPM Anime Foreground.prfpset"
+      zoom: 0.76
+    background:
+      prfpset: "SPM Anime Background.prfpset"
+    subtitles:
+      mogrt: "SPM_Anime_Subtitle.mogrt"
+      raw_mogrt: "SPM_Anime_Subtitle_Raw.mogrt"
+    white_border:
+      enabled: true
+      mogrt: "White border 10px.mogrt"
+    overlay:
+      enabled: true
+      title:
+        style: "minimal"
+        prfpset: null
+      category:
+        style: "minimal"
+        prfpset: null
