@@ -28,6 +28,9 @@ const COLUMNS: { key: SortColumn | null; label: string; className: string }[] = 
   { key: null,              label: "Account",      className: "w-28" },
   { key: "language",        label: "Lang",         className: "w-12" },
   { key: "library_type",    label: "Type",         className: "w-28" },
+  { key: null,              label: "LLM",          className: "w-20" },
+  { key: null,              label: "Speed",        className: "w-16" },
+  { key: null,              label: "Template",     className: "w-24" },
   { key: "scheduled_at",    label: "Scheduled At", className: "w-32" },
   { key: "local_size_bytes",label: "Size",         className: "w-20" },
   { key: null,              label: "Actions",      className: "w-52" },
@@ -57,10 +60,13 @@ function SkeletonRows({ colCount }: { colCount: number }) {
           <td className="py-3 pr-3"><div className="h-5 w-16 rounded bg-[hsl(var(--muted))] animate-pulse" /></td>
           <td className="py-3 pr-3"><div className="h-3 w-6 rounded bg-[hsl(var(--muted))] animate-pulse" /></td>
           <td className="py-3 pr-3"><div className="h-3 w-20 rounded bg-[hsl(var(--muted))] animate-pulse" /></td>
+          <td className="py-3 pr-3"><div className="h-3 w-12 rounded bg-[hsl(var(--muted))] animate-pulse" /></td>
+          <td className="py-3 pr-3"><div className="h-3 w-8 rounded bg-[hsl(var(--muted))] animate-pulse" /></td>
+          <td className="py-3 pr-3"><div className="h-3 w-16 rounded bg-[hsl(var(--muted))] animate-pulse" /></td>
           <td className="py-3 pr-3"><div className="h-3 w-16 rounded bg-[hsl(var(--muted))] animate-pulse" /></td>
           <td className="py-3 pr-3"><div className="h-3 w-10 rounded bg-[hsl(var(--muted))] animate-pulse" /></td>
           <td className="py-3 pr-3"><div className="h-8 w-24 rounded bg-[hsl(var(--muted))] animate-pulse" /></td>
-          {colCount > 8 && <td className="py-3 pr-3"><div className="h-4 w-4 rounded bg-[hsl(var(--muted))] animate-pulse" /></td>}
+          {colCount > 11 && <td className="py-3 pr-3"><div className="h-4 w-4 rounded bg-[hsl(var(--muted))] animate-pulse" /></td>}
         </tr>
       ))}
     </>
