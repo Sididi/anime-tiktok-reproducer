@@ -35,6 +35,7 @@ from ...services import (
 )
 from ...services.forced_alignment import ForcedAlignmentService
 from ...services.llm_config_service import LLMConfigService
+from ...services.template_service import TemplateService
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["processing"])
 
@@ -320,6 +321,25 @@ async def get_script_automation_config(project_id: str):
         else None
     )
 
+    templates_payload = [
+        {"key": key, "label": tpl.label, "overlay_enabled": tpl.overlay.enabled}
+        for key, tpl in TemplateService.list_templates()
+    ]
+    presets_payload = [
+        {"key": key, "label": preset.label}
+        for key, preset in LLMConfigService.list_presets()
+    ]
+    current = {
+        "llm_preset": project.resolved_llm_preset_key(),
+        "template": project.resolved_template_key(),
+        "min_playback_speed": project.resolved_min_playback_speed(),
+    }
+    defaults = {
+        "llm_preset": LLMConfigService.default_preset_key(),
+        "template": TemplateService.default_key(),
+        "min_playback_speed": settings.min_playback_speed_factor,
+    }
+
     return {
         "enabled": settings.script_automate_enabled,
         "script_title_selection_enabled": settings.script_title_selection_enabled,
@@ -337,6 +357,10 @@ async def get_script_automation_config(project_id: str):
         "musics": musics,
         "default_music_key": default_music_key,
         "music_config_error": music_error,
+        "templates": templates_payload,
+        "llm_presets": presets_payload,
+        "current": current,
+        "defaults": defaults,
     }
 
 
@@ -734,6 +758,73 @@ async def get_script_settings(project_id: str):
         "video_overlay": project.video_overlay,
         "voice_key": project.voice_key,
     }
+
+
+class ScriptPhaseSettingsRequest(BaseModel):
+    llm_preset: str | None = None
+    template: str | None = None
+    min_playback_speed: float | None = None
+
+
+class ScriptPhaseSettingsResponse(BaseModel):
+    llm_preset: str
+    template: str
+    min_playback_speed: float
+    gaps_recomputing: bool
+
+
+@router.post("/script/phase-settings")
+async def update_script_phase_settings(
+    project_id: str, request: ScriptPhaseSettingsRequest
+) -> ScriptPhaseSettingsResponse:
+    """Update per-project /script knobs: LLM preset, template, min playback speed.
+
+    When min_playback_speed changes for a project past SCRIPT_RESTRUCTURE,
+    the response signals that gap state should be recomputed by the client.
+    """
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    speed_changed = False
+
+    if request.llm_preset is not None:
+        try:
+            LLMConfigService.get_preset(request.llm_preset)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        project.llm_preset = request.llm_preset
+
+    if request.template is not None:
+        try:
+            TemplateService.get(request.template)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        project.template = request.template
+
+    if request.min_playback_speed is not None:
+        prior = project.resolved_min_playback_speed()
+        try:
+            project.min_playback_speed = request.min_playback_speed
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if abs(prior - request.min_playback_speed) > 1e-9:
+            speed_changed = True
+
+    ProjectService.save(project)
+
+    gaps_recomputing = bool(
+        speed_changed
+        and project.phase
+        in (ProjectPhase.SCRIPT_RESTRUCTURE, ProjectPhase.PROCESSING, ProjectPhase.COMPLETE)
+    )
+
+    return ScriptPhaseSettingsResponse(
+        llm_preset=project.resolved_llm_preset_key(),
+        template=project.resolved_template_key(),
+        min_playback_speed=project.resolved_min_playback_speed(),
+        gaps_recomputing=gaps_recomputing,
+    )
 
 
 @router.post("/script/overlay/generate")
