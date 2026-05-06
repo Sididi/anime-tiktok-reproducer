@@ -86,3 +86,57 @@ body {
   font-style: italic;
   color: hsl(var(--muted-foreground));
 }
+
+/* Project settings panel (template / LLM / speed) */
+.project-settings-panel h3 {
+  font-weight: 600;
+  font-size: 0.95rem;
+  margin: 0 0 0.75rem 0;
+}
+.project-settings-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+}
+.project-settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+}
+.project-settings-field select {
+  padding: 0.5rem;
+  border-radius: 6px;
+  border: 1px solid hsl(var(--input));
+  background: hsl(var(--background));
+  font-size: 0.85rem;
+}
+.project-settings-default-marker {
+  font-style: italic;
+  color: hsl(var(--muted-foreground));
+  font-weight: normal;
+}
+.project-settings-slider-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.project-settings-slider-row input[type="range"] {
+  flex: 1;
+}
+.project-settings-reset {
+  padding: 0.25rem 0.6rem;
+  border-radius: 4px;
+  border: 1px solid hsl(var(--input));
+  background: hsl(var(--background));
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+.project-settings-reset:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.disabled-section {
+  opacity: 0.4;
+  pointer-events: none;
+}

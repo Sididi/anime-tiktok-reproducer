@@ -39,6 +39,7 @@ import {
   MetadataEditorModal,
   TitleSelectionModal,
 } from "@/components/script";
+import { ProjectSettingsPanel } from "@/components/script/ProjectSettingsPanel";
 import { readSSEStream } from "@/utils/sse";
 
 // Upload mode types
@@ -1997,7 +1998,7 @@ export function ScriptRestructurePage() {
           : !automationConfig.enabled
             ? "Automation disabled on backend"
             : !automationConfig.llm.configured
-              ? `${automationConfig.llm.provider === "claude" ? "Anthropic" : "Gemini"} API key missing on backend`
+              ? "OpenRouter API key missing on backend (ATR_OPENROUTER_API_KEY)"
               : !automationConfig.elevenlabs.configured
                 ? "ElevenLabs API key missing on backend"
                 : automationConfig.voice_config_error
@@ -2066,6 +2067,46 @@ export function ScriptRestructurePage() {
         {error && (
           <div className="p-3 bg-[hsl(var(--destructive))]/10 rounded-lg">
             <p className="text-sm text-[hsl(var(--destructive))]">{error}</p>
+          </div>
+        )}
+
+        {automationConfig && (
+          <div className="bg-[hsl(var(--card))] rounded-lg p-4">
+            <ProjectSettingsPanel
+              config={{
+                templates: automationConfig.templates,
+                llm_presets: automationConfig.llm_presets,
+                current: automationConfig.current,
+                defaults: automationConfig.defaults,
+              }}
+              onChange={async (payload) => {
+                if (!projectId) {
+                  throw new Error("Missing projectId");
+                }
+                const result = await api.updateScriptPhaseSettings(
+                  projectId,
+                  payload,
+                );
+                setAutomationConfig((prev) =>
+                  prev
+                    ? {
+                        ...prev,
+                        current: {
+                          llm_preset: result.llm_preset,
+                          template: result.template,
+                          min_playback_speed: result.min_playback_speed,
+                        },
+                      }
+                    : prev,
+                );
+                if (result.gaps_recomputing) {
+                  setError(
+                    "Min playback speed changed. Re-run gap resolution before regenerating.",
+                  );
+                }
+                return result;
+              }}
+            />
           </div>
         )}
 

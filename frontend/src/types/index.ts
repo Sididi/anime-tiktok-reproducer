@@ -99,14 +99,11 @@ export interface ScriptAutomationConfig {
   static_overlay_title_enabled: boolean;
   static_overlay_title: string | null;
   llm: {
-    provider: string;
     configured: boolean;
-    model: string;
-  };
-  llm_light?: {
-    provider: string;
-    configured: boolean;
-    model: string;
+    preset_key: string;
+    preset_label: string;
+    big_model: string;
+    light_model: string;
   };
   elevenlabs: {
     configured: boolean;
@@ -119,6 +116,18 @@ export interface ScriptAutomationConfig {
   musics: ScriptAutomationMusic[];
   default_music_key: string | null;
   music_config_error: string | null;
+  templates: Array<{ key: string; label: string; overlay_enabled: boolean }>;
+  llm_presets: Array<{ key: string; label: string }>;
+  current: {
+    llm_preset: string;
+    template: string;
+    min_playback_speed: number;
+  };
+  defaults: {
+    llm_preset: string;
+    template: string;
+    min_playback_speed: number;
+  };
 }
 
 export interface ScriptAutomationPart {
