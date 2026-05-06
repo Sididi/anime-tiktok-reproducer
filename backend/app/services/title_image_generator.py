@@ -88,7 +88,12 @@ def _split_emoji_segments(text: str) -> list[tuple[str, bool]]:
 
 
 class TitleImageGeneratorService:
-    """Generates transparent PNG overlays for title and category text."""
+    """Generates transparent PNG overlays for title and category text.
+
+    Renderer styles are looked up via TITLE_RENDERERS / CATEGORY_RENDERERS
+    (defined at the bottom of this module). Add a new style by registering
+    a function ``(text: str, output_path: Path) -> None``.
+    """
 
     @classmethod
     def generate(
@@ -96,19 +101,32 @@ class TitleImageGeneratorService:
         title: str,
         category: str,
         output_dir: Path,
+        *,
+        title_style: str = "classic",
+        category_style: str = "classic",
     ) -> dict[str, Path]:
         """Generate title and category overlay PNGs.
 
         Returns dict with keys 'title' and 'category' mapping to output paths.
         """
-        output_dir.mkdir(parents=True, exist_ok=True)
+        title_render = TITLE_RENDERERS.get(title_style)
+        category_render = CATEGORY_RENDERERS.get(category_style)
+        if title_render is None:
+            raise ValueError(
+                f"Unknown title style '{title_style}'. "
+                f"Available: {sorted(TITLE_RENDERERS.keys())}"
+            )
+        if category_render is None:
+            raise ValueError(
+                f"Unknown category style '{category_style}'. "
+                f"Available: {sorted(CATEGORY_RENDERERS.keys())}"
+            )
 
+        output_dir.mkdir(parents=True, exist_ok=True)
         title_path = output_dir / "title_overlay.png"
         category_path = output_dir / "category_overlay.png"
-
-        cls._render_title(title, title_path)
-        cls._render_category(category, category_path)
-
+        title_render(title, title_path)
+        category_render(category, category_path)
         return {"title": title_path, "category": category_path}
 
     @classmethod
@@ -329,6 +347,10 @@ class TitleImageGeneratorService:
 
         img.save(output_path, "PNG")
 
+    # The methods below are kept as classmethods so the existing classic
+    # renderer can call them. Module-level wrappers near the bottom of this
+    # file expose them via the renderer registry.
+
     @classmethod
     def _draw_outlined_text(
         cls,
@@ -429,3 +451,82 @@ class TitleImageGeneratorService:
             )
 
         img.save(output_path, "PNG")
+
+
+# --- Renderer registry ---
+#
+# A renderer takes (text, output_path) and writes a transparent PNG of size
+# WIDTH x HEIGHT (1080x1920) to the path. Templates pick a renderer by name
+# via overlay.title.style / overlay.category.style.
+
+# Minimal palette — refine constants once compared against reference screenshot.
+_MINIMAL_COLOR = (242, 213, 138, 255)  # cream gold
+_MINIMAL_SHADOW = (0, 0, 0, 180)
+_MINIMAL_CATEGORY_COLOR = (242, 213, 138, 200)  # cream gold ~78% opacity
+
+
+def _render_title_classic(text: str, output_path: Path) -> None:
+    """Classic title renderer (white rounded panel)."""
+    TitleImageGeneratorService._render_title(text, output_path)
+
+
+def _render_category_classic(text: str, output_path: Path) -> None:
+    """Classic category renderer (white text + black outline)."""
+    TitleImageGeneratorService._render_category(text, output_path)
+
+
+def _render_title_minimal(text: str, output_path: Path) -> None:
+    """Minimal title renderer — gold cream text, no panel, drop shadow.
+
+    Placeholder — refine constants once compared against reference screenshot.
+    """
+    img = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    font = (
+        ImageFont.truetype(str(TITLE_FONT_PATH), TITLE_FONT_SIZE)
+        if TITLE_FONT_PATH.exists()
+        else ImageFont.load_default()
+    )
+    rendered_text = text.upper()
+    bbox = draw.textbbox((0, 0), rendered_text, font=font)
+    w = bbox[2] - bbox[0]
+    h = bbox[3] - bbox[1]
+    x = (WIDTH - w) // 2
+    y = CENTER_FRAME_TOP - h - TITLE_GAP_ABOVE_CENTER
+    # Drop shadow
+    draw.text((x + 3, y + 3), rendered_text, fill=_MINIMAL_SHADOW, font=font)
+    # Main text
+    draw.text((x, y), rendered_text, fill=_MINIMAL_COLOR, font=font)
+    img.save(output_path, "PNG")
+
+
+def _render_category_minimal(text: str, output_path: Path) -> None:
+    """Minimal category renderer — semi-transparent gold cream text.
+
+    Placeholder — refine constants once compared against reference screenshot.
+    """
+    img = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    font = (
+        ImageFont.truetype(str(CAT_FONT_PATH), CAT_FONT_SIZE)
+        if CAT_FONT_PATH.exists()
+        else ImageFont.load_default()
+    )
+    rendered_text = text.upper()
+    bbox = draw.textbbox((0, 0), rendered_text, font=font)
+    w = bbox[2] - bbox[0]
+    x = (WIDTH - w) // 2
+    y = CENTER_FRAME_BOT + CAT_GAP_BELOW_CENTER
+    draw.text((x, y), rendered_text, fill=_MINIMAL_CATEGORY_COLOR, font=font)
+    img.save(output_path, "PNG")
+
+
+TITLE_RENDERERS: dict[str, "callable"] = {
+    "classic": _render_title_classic,
+    "minimal": _render_title_minimal,
+}
+
+CATEGORY_RENDERERS: dict[str, "callable"] = {
+    "classic": _render_category_classic,
+    "minimal": _render_category_minimal,
+}
