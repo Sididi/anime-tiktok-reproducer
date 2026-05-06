@@ -1134,12 +1134,15 @@ class ProcessingService:
                 f"{preview}"
             )
 
+        from .template_service import TemplateService
+        template = TemplateService.get(project.resolved_template_key())
         return cls._render_jsx_from_template(
             project_id=project.id,
             scenes=scenes,
             source_audio_policies=source_audio_policies or {},
             source_fps_num=source_rate.rate.numerator,
             source_fps_den=source_rate.rate.denominator,
+            template=template,
             subtitle_timing_relative_path=subtitle_timing_relative_path,
             raw_scene_subtitle_timing_relative_path=raw_scene_subtitle_timing_relative_path,
             raw_scene_subtitle_mogrt_relative_dir=raw_scene_subtitle_mogrt_relative_dir,
@@ -1185,6 +1188,7 @@ class ProcessingService:
         raw_scene_subtitle_mogrt_relative_dir: str,
         music_filename: str,
         music_gain_db: float,
+        template,  # type: ignore[no-untyped-def]
     ) -> str:
         template_path = cls.PREMIERE_JSX_TEMPLATE_PATH
         if not template_path.exists():
@@ -1192,26 +1196,28 @@ class ProcessingService:
 
         content = template_path.read_text(encoding="utf-8")
 
-        # Apply grand_mode / small-mode patches before dynamic substitutions.
-        # grand_mode=True  → keep template as-is (White border 10px, V3 scale 76%)
-        # grand_mode=False → ship White border 5px and use the older V3 scale of 68%
-        if not settings.grand_mode_enabled:
-            content = cls._replace_template_once(
-                content,
-                r'var BORDER_MOGRT_PATH = ASSETS_DIR \+ "/White border 10px\.mogrt";',
-                'var BORDER_MOGRT_PATH = ASSETS_DIR + "/White border 5px.mogrt";',
-                label="BORDER_MOGRT_PATH",
-            )
+        # Apply template-driven substitutions before dynamic ones.
+        # White border mogrt name (always present in classic; minimal can swap or disable).
+        border_mogrt = template.white_border.mogrt or "White border 10px.mogrt"
+        content = cls._replace_template_once(
+            content,
+            r'var BORDER_MOGRT_PATH = ASSETS_DIR \+ "/White border 10px\.mogrt";',
+            f'var BORDER_MOGRT_PATH = ASSETS_DIR + "/{border_mogrt}";',
+            label="BORDER_MOGRT_PATH",
+        )
+        # Foreground V3 zoom percentage (76 by default; templates can override).
+        zoom_pct = int(round(template.foreground.zoom * 100))
+        if zoom_pct != 76:
             content = cls._replace_template_once(
                 content,
                 r"if \(!setScaleOnItem\(v3Item, 76\) && v3\)",
-                "if (!setScaleOnItem(v3Item, 68) && v3)",
+                f"if (!setScaleOnItem(v3Item, {zoom_pct}) && v3)",
                 label="V3_SCALE_setScaleOnItem",
             )
             content = cls._replace_template_once(
                 content,
                 r"setScaleAndPosition\(v3, startSec, 76\); // Main Scaled Down",
-                "setScaleAndPosition(v3, startSec, 68); // Main Scaled Down",
+                f"setScaleAndPosition(v3, startSec, {zoom_pct}); // Main Scaled Down",
                 label="V3_SCALE_setScaleAndPosition",
             )
 
