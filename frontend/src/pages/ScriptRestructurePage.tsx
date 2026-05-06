@@ -2813,69 +2813,89 @@ export function ScriptRestructurePage() {
               </div>
 
               {/* Video Overlay */}
-              <div className="bg-[hsl(var(--card))] rounded-lg p-4 space-y-3">
-                <div className="flex items-center justify-between">
-                  <h3 className="font-medium text-sm flex items-center gap-2">
-                    <Sparkles className="h-4 w-4" />
-                    Video Overlay
-                  </h3>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={handleGenerateOverlay}
-                    disabled={
-                      !jsonValid ||
-                      overlayGenerating ||
-                      !!overlayTitle
-                    }
-                    className="h-7 text-xs"
+              {(() => {
+                const overlayDisabledByTemplate = !!automationConfig
+                  && !automationConfig.templates.find(
+                    (t) => t.key === automationConfig.current.template,
+                  )?.overlay_enabled;
+                return (
+                  <div
+                    className={`bg-[hsl(var(--card))] rounded-lg p-4 space-y-3 ${
+                      overlayDisabledByTemplate ? "disabled-section" : ""
+                    }`}
                   >
-                    {overlayGenerating ? (
-                      <Loader2 className="h-3 w-3 animate-spin mr-1" />
-                    ) : (
-                      <Sparkles className="h-3 w-3 mr-1" />
-                    )}
-                    Generate
-                  </Button>
-                </div>
-                <div className="space-y-2">
-                  <div>
-                    <div className="flex items-center justify-between mb-1">
-                      <label className="text-xs text-[hsl(var(--muted-foreground))]">
-                        Title
-                      </label>
-                      <span
-                        className={`text-xs font-mono ${
-                          overlayTitle.length > 45
-                            ? "text-[hsl(var(--destructive))]"
-                            : "text-[hsl(var(--muted-foreground))]"
-                        }`}
+                    <div className="flex items-center justify-between">
+                      <h3 className="font-medium text-sm flex items-center gap-2">
+                        <Sparkles className="h-4 w-4" />
+                        Video Overlay
+                        {overlayDisabledByTemplate && (
+                          <span className="text-xs italic text-[hsl(var(--muted-foreground))]">
+                            (disabled by template)
+                          </span>
+                        )}
+                      </h3>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleGenerateOverlay}
+                        disabled={
+                          overlayDisabledByTemplate ||
+                          !jsonValid ||
+                          overlayGenerating ||
+                          !!overlayTitle
+                        }
+                        className="h-7 text-xs"
                       >
-                        {overlayTitle.length}/45
-                      </span>
+                        {overlayGenerating ? (
+                          <Loader2 className="h-3 w-3 animate-spin mr-1" />
+                        ) : (
+                          <Sparkles className="h-3 w-3 mr-1" />
+                        )}
+                        Generate
+                      </Button>
                     </div>
-                    <input
-                      type="text"
-                      value={overlayTitle}
-                      onChange={(e) => setOverlayTitle(e.target.value)}
-                      placeholder="Clickbait title..."
-                      className="w-full px-2 py-1.5 text-sm rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--background))]"
-                    />
+                    <div className="space-y-2">
+                      <div>
+                        <div className="flex items-center justify-between mb-1">
+                          <label className="text-xs text-[hsl(var(--muted-foreground))]">
+                            Title
+                          </label>
+                          <span
+                            className={`text-xs font-mono ${
+                              overlayTitle.length > 45
+                                ? "text-[hsl(var(--destructive))]"
+                                : "text-[hsl(var(--muted-foreground))]"
+                            }`}
+                          >
+                            {overlayTitle.length}/45
+                          </span>
+                        </div>
+                        <input
+                          type="text"
+                          value={overlayTitle}
+                          onChange={(e) => setOverlayTitle(e.target.value)}
+                          placeholder="Clickbait title..."
+                          disabled={overlayDisabledByTemplate}
+                          className="w-full px-2 py-1.5 text-sm rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--background))]"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-xs text-[hsl(var(--muted-foreground))] mb-1 block">
+                          Category
+                        </label>
+                        <input
+                          type="text"
+                          value={overlayCategory}
+                          onChange={(e) => setOverlayCategory(e.target.value)}
+                          placeholder="Genre • Genre"
+                          disabled={overlayDisabledByTemplate}
+                          className="w-full px-2 py-1.5 text-sm rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--background))]"
+                        />
+                      </div>
+                    </div>
                   </div>
-                  <div>
-                    <label className="text-xs text-[hsl(var(--muted-foreground))] mb-1 block">
-                      Category
-                    </label>
-                    <input
-                      type="text"
-                      value={overlayCategory}
-                      onChange={(e) => setOverlayCategory(e.target.value)}
-                      placeholder="Genre • Genre"
-                      className="w-full px-2 py-1.5 text-sm rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--background))]"
-                    />
-                  </div>
-                </div>
-              </div>
+                );
+              })()}
 
               <div className="bg-[hsl(var(--muted))] rounded-lg p-4">
                 <h3 className="font-medium mb-2">Checklist</h3>
