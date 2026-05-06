@@ -1,4 +1,4 @@
-default_music_key: kentenshi_paranoia
+default_music_key: montagem_batchi_cut_start_15s
 
 music:
   credits_song_death:
@@ -52,6 +52,11 @@ music:
     display_name: "Montagem Batchi"
     file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/montagem batchi.wav"
     volume_db: -28
+
+  montagem_batchi_cut_start_15s:
+    display_name: "Montagem Batchi (Cut Start 15s)"
+    file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/montagem batchi (cut start 15s).wav"
+    volume_db: -25
 
   joyful_chess:
     display_name: "Joyful Chess"
