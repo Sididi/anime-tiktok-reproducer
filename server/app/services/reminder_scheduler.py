@@ -145,7 +145,7 @@ async def _dispatch_instagram_publish(
     # Bump status to uploading + attempts before the call.
     # Use merge_platform_status (atomic read-merge-write under the lock) so a
     # concurrent reaction-handler write to platform_statuses['tiktok'] isn't
-    # clobbered by a stale snapshot during the 5-minute IG poll window.
+    # clobbered by a stale snapshot during the multi-minute IG poll window.
     await store.merge_platform_status(
         job.project_id, "instagram",
         PlatformStatus(status="uploading", attempts=next_attempts),
@@ -158,7 +158,7 @@ async def _dispatch_instagram_publish(
         video_url=_instagram_video_url(job, settings),
         graph_api_version=payload.get("graph_api_version", "v25.0"),
         poll_interval=float(payload.get("poll_interval_seconds") or 60.0),
-        poll_timeout=float(payload.get("poll_timeout_seconds") or 900.0),
+        poll_timeout=float(payload.get("poll_timeout_seconds") or 1800.0),
         share_to_feed=(
             True if payload.get("share_to_feed") is None else bool(payload["share_to_feed"])
         ),
