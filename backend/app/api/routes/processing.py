@@ -34,8 +34,29 @@ from ...services import (
     AudioSpeedService,
 )
 from ...services.forced_alignment import ForcedAlignmentService
+from ...services.llm_config_service import LLMConfigService
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["processing"])
+
+
+def _llm_endpoint_payload(project=None) -> dict[str, Any]:
+    """Return the LLM info block for /script/automation/config.
+
+    Until per-project LLM presets land, this resolves the configured default.
+    """
+    preset_key = (
+        project.resolved_llm_preset_key()
+        if project is not None and hasattr(project, "resolved_llm_preset_key")
+        else LLMConfigService.default_preset_key()
+    )
+    preset = LLMConfigService.get_preset(preset_key)
+    return {
+        "configured": LLMService.is_configured(),
+        "preset_key": preset_key,
+        "preset_label": preset.label,
+        "big_model": preset.big.openrouter_id,
+        "light_model": preset.light.openrouter_id,
+    }
 
 
 UPLOAD_CHUNK_SIZE = 1024 * 1024
@@ -304,16 +325,7 @@ async def get_script_automation_config(project_id: str):
         "script_title_selection_enabled": settings.script_title_selection_enabled,
         "static_overlay_title_enabled": settings.static_overlay_title_enabled,
         "static_overlay_title": static_overlay_title,
-        "llm": {
-            "provider": LLMService.provider_name(),
-            "configured": LLMService.is_configured(),
-            "model": LLMService.active_model(),
-        },
-        "llm_light": {
-            "provider": LLMService.provider_name(),
-            "configured": LLMService.is_configured(),
-            "model": LLMService.active_light_model(),
-        },
+        "llm": _llm_endpoint_payload(),
         "elevenlabs": {
             "configured": ElevenLabsService.is_configured(),
             "model_id": settings.elevenlabs_model_id,

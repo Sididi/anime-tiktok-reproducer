@@ -779,8 +779,9 @@ class ScriptAutomationService:
         project: Project,
         script_payload: dict[str, Any],
         target_language: str,
+        preset_key: str | None = None,
     ) -> dict[str, Any]:
-        """Generate a video overlay (title hooks + category) via Gemini light model."""
+        """Generate a video overlay (title hooks + category) via the active LLM preset's light tier."""
         anime_name = project.anime_name or "Inconnu"
         script_summary = cls._script_text_from_payload(script_payload)[:500]
         prompt = ScriptPhasePromptService.build_overlay_prompt(
@@ -792,8 +793,8 @@ class ScriptAutomationService:
 
         result = LLMService.generate_json(
             prompt,
-            model=LLMService.active_light_model(),
-            response_json_schema=_OVERLAY_RESPONSE_SCHEMA,
+            preset_key=preset_key,
+            tier="light",
         )
         overlay = cls._normalize_overlay_payload(result)
 
@@ -878,7 +879,7 @@ class ScriptAutomationService:
 
             if existing_script_json is None and not LLMService.is_configured():
                 raise RuntimeError(
-                    f"LLM API key is missing (provider={LLMService.provider_name()})"
+                    "LLM API key is missing (ATR_OPENROUTER_API_KEY)"
                 )
             if not skip_tts and not ElevenLabsService.is_configured():
                 raise RuntimeError("ElevenLabs API key is missing (ATR_ELEVENLABS_API_KEY)")
@@ -903,7 +904,7 @@ class ScriptAutomationService:
                     target_language=target_language,
                 )
             else:
-                yield cls._event("llm_script", message=f"Generating script JSON with {LLMService.provider_name().title()}...")
+                yield cls._event("llm_script", message=f"Generating script JSON ({project.resolved_llm_preset_key()})...")
                 prompt = cls._build_script_prompt(
                     project=project,
                     transcription=transcription,
@@ -912,11 +913,8 @@ class ScriptAutomationService:
                 raw_script_payload = await asyncio.to_thread(
                     LLMService.generate_json_value,
                     prompt,
-                    response_json_schema=cls._script_response_schema(
-                        target_language=target_language,
-                        scene_count=len(transcription.scenes),
-                    ),
-                    enable_thinking=True,
+                    preset_key=project.resolved_llm_preset_key(),
+                    tier="big",
                 )
                 script_payload = cls._normalize_script_payload(
                     payload=cls._coerce_generated_script_payload(
@@ -1054,7 +1052,7 @@ class ScriptAutomationService:
             if skip_metadata or not settings.automate_metadata_overlay_enabled:
                 yield cls._event("llm_metadata", message="Metadata generation skipped")
             else:
-                yield cls._event("llm_metadata", message=f"Generating metadata JSON with {LLMService.provider_name().title()}...")
+                yield cls._event("llm_metadata", message=f"Generating metadata JSON ({project.resolved_llm_preset_key()})...")
                 try:
                     metadata_prompt = MetadataService.build_prompt_from_script_payload(
                         anime_name=project.anime_name or "Inconnu",
@@ -1065,7 +1063,8 @@ class ScriptAutomationService:
                     raw_metadata_payload = await asyncio.to_thread(
                         LLMService.generate_json,
                         metadata_prompt,
-                        response_json_schema=cls._metadata_response_schema(),
+                        preset_key=project.resolved_llm_preset_key(),
+                        tier="light",
                     )
                     validated_metadata = MetadataService.validate_candidate_payload(
                         raw_metadata_payload
@@ -1100,6 +1099,7 @@ class ScriptAutomationService:
                         project=project,
                         script_payload=script_payload,
                         target_language=target_language,
+                        preset_key=project.resolved_llm_preset_key(),
                     )
                     yield cls._event(
                         "overlay_ready",
