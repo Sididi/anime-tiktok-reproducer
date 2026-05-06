@@ -1091,7 +1091,14 @@ class ScriptAutomationService:
                     )
 
             # --- Video overlay generation ---
-            if not skip_overlay and settings.automate_metadata_overlay_enabled and LLMService.is_configured():
+            from .template_service import TemplateService
+            active_template = TemplateService.get(project.resolved_template_key())
+            if (
+                not skip_overlay
+                and active_template.overlay.enabled
+                and settings.automate_metadata_overlay_enabled
+                and LLMService.is_configured()
+            ):
                 yield cls._event("generating_overlay", message="Generating video overlay...")
                 try:
                     overlay_json = await asyncio.to_thread(
