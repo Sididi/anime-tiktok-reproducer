@@ -91,6 +91,15 @@ class Settings(BaseSettings):
     anthropic_light_model: str = "claude-haiku-4-5"
     anthropic_timeout: int = 300
 
+    # OpenRouter (replaces per-provider keys)
+    openrouter_api_key: str | None = None
+    openrouter_timeout: int = 600  # seconds; generous for thinking models
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+
+    # Config paths for new feature configs
+    llm_config_path: Path = PROJECT_ROOT / "config" / "llm" / "config.yaml"
+    templates_config_path: Path = PROJECT_ROOT / "config" / "templates" / "config.yaml"
+
     # Google OAuth shared credentials
     google_client_id: str | None = None
     google_client_secret: str | None = None
