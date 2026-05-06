@@ -17,6 +17,7 @@ class Settings(BaseSettings):
         env_prefix="ATR_",
         env_file=(PROJECT_ROOT / ".env", BACKEND_ROOT / ".env"),
         env_file_encoding="utf-8",
+        extra="ignore",
     )
 
     # Paths
@@ -64,9 +65,6 @@ class Settings(BaseSettings):
     # When True, /script title generation returns multiple choices and the UI asks
     # the user to pick one instead of auto-selecting the first suggestion.
     script_title_selection_enabled: bool = False
-    # When True, "grand" mode: uses White border 10px mogrt and V3 scale 75%.
-    # When False (default), uses White border 5px and V3 scale 68%.
-    grand_mode_enabled: bool = False
     # When True, /script video overlay "title" is pre-filled statically based on the
     # project library type (no LLM call, no 8-proposition modal).
     static_overlay_title_enabled: bool = False
@@ -75,21 +73,9 @@ class Settings(BaseSettings):
     gaps_full_auto_enabled: bool = False
     matches_full_auto_enabled: bool = False
     processing_gdrive_full_auto_enabled: bool = False
-    gemini_api_key: str | None = None
-    gemini_model: str = "gemini-3.1-pro-preview"
-    gemini_timeout: int = 300  # seconds (read timeout for Gemini API; connect=10)
     elevenlabs_api_key: str | None = None
     elevenlabs_model_id: str = "eleven_multilingual_v2"
     elevenlabs_output_format: str = "pcm_44100"
-    gemini_light_model: str = "gemini-2.5-flash"
-
-    # LLM provider switch ("gemini" | "claude")
-    llm_provider: str = "gemini"
-    # Anthropic (Claude)
-    anthropic_api_key: str | None = None
-    anthropic_model: str = "claude-sonnet-4-6"
-    anthropic_light_model: str = "claude-haiku-4-5"
-    anthropic_timeout: int = 300
 
     # OpenRouter (replaces per-provider keys)
     openrouter_api_key: str | None = None
@@ -220,14 +206,6 @@ class Settings(BaseSettings):
     def matcher_min_speed_factor(self) -> float:
         return float(self.matcher_min_speed_fraction)
 
-    @field_validator("llm_provider")
-    @classmethod
-    def _normalize_llm_provider(cls, value: str) -> str:
-        normalized = (value or "").strip().lower()
-        if normalized not in {"gemini", "claude"}:
-            raise ValueError("ATR_LLM_PROVIDER must be 'gemini' or 'claude'")
-        return normalized
-
     @field_validator("cep_trigger_url_template")
     @classmethod
     def _validate_cep_trigger_url_template(cls, value: str) -> str:
@@ -352,6 +330,32 @@ class Settings(BaseSettings):
         return max(1, min(4, value))
 
 settings = Settings()
+
+# Warn about legacy env vars that are now ignored.
+import logging as _logging
+
+_legacy_env_keys = (
+    "ATR_LLM_PROVIDER",
+    "ATR_GEMINI_API_KEY",
+    "ATR_GEMINI_MODEL",
+    "ATR_GEMINI_LIGHT_MODEL",
+    "ATR_GEMINI_TIMEOUT",
+    "ATR_ANTHROPIC_API_KEY",
+    "ATR_ANTHROPIC_MODEL",
+    "ATR_ANTHROPIC_LIGHT_MODEL",
+    "ATR_ANTHROPIC_TIMEOUT",
+    "ATR_GRAND_MODE_ENABLED",
+)
+_logger = _logging.getLogger("app.config")
+for _key in _legacy_env_keys:
+    if _key in os.environ:
+        _logger.warning(
+            "%s is set but ignored. Configure LLM models via "
+            "config/llm/config.yaml and templates via "
+            "config/templates/config.yaml. Use ATR_OPENROUTER_API_KEY for "
+            "the API key.",
+            _key,
+        )
 
 # Ensure directories exist
 settings.data_dir.mkdir(parents=True, exist_ok=True)
