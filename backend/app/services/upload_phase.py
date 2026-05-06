@@ -346,6 +346,12 @@ class UploadPhaseService:
                     }
                     for platform, ps in (project.platform_schedules or {}).items()
                 },
+                "llm_preset_resolved": project.resolved_llm_preset_key(),
+                "llm_preset_is_default": project.llm_preset is None,
+                "template_resolved": project.resolved_template_key(),
+                "template_is_default": project.template is None,
+                "min_playback_speed_resolved": project.resolved_min_playback_speed(),
+                "min_playback_speed_is_default": project.min_playback_speed is None,
             }
 
         if not projects:
