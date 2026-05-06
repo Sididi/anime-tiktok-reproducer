@@ -1012,6 +1012,18 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
+  updateScriptPhaseSettings: (
+    projectId: string,
+    payload: import("../types").ScriptPhaseSettingsRequest,
+  ) =>
+    request<import("../types").ScriptPhaseSettingsResponse>(
+      `/projects/${projectId}/script/phase-settings`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+    ),
+
   // Video overlay
   generateOverlay: (
     projectId: string,

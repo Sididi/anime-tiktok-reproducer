@@ -190,6 +190,25 @@ export interface ProjectManagerRow {
   created_at: string | null;
   scheduled_at: string | null;
   scheduled_account_id: string | null;
+  llm_preset_resolved: string;
+  llm_preset_is_default: boolean;
+  min_playback_speed_resolved: number;
+  min_playback_speed_is_default: boolean;
+  template_resolved: string;
+  template_is_default: boolean;
+}
+
+export interface ScriptPhaseSettingsRequest {
+  llm_preset?: string;
+  template?: string;
+  min_playback_speed?: number;
+}
+
+export interface ScriptPhaseSettingsResponse {
+  llm_preset: string;
+  template: string;
+  min_playback_speed: number;
+  gaps_recomputing: boolean;
 }
 
 export interface ProjectUploadJob {
