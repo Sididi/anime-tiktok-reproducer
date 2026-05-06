@@ -1,0 +1,22 @@
+default: claude
+
+presets:
+  claude:
+    label: "Claude (Opus 4.7 + Haiku 4.5)"
+    big:
+      openrouter_id: anthropic/claude-opus-4.7
+      thinking:
+        max_tokens: 6000
+    light:
+      openrouter_id: anthropic/claude-haiku-4.5
+      thinking: null
+
+  gemini:
+    label: "Gemini (3.1 Pro + 2.5 Flash)"
+    big:
+      openrouter_id: google/gemini-3-pro-preview
+      thinking:
+        effort: high
+    light:
+      openrouter_id: google/gemini-2.5-flash
+      thinking: null
