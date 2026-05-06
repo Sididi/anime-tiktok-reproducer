@@ -30,15 +30,6 @@ _STATUS_EMOJI = {
     "failed": "❌",
 }
 
-# Discord markdown characters that need escaping when rendering user text as
-# plain content. Backslash must come first so we don't double-escape ourselves.
-_DISCORD_MD_CHARS = ("\\", "*", "_", "~", "`", "|", ">", "#")
-
-
-def _escape_discord_markdown(text: str) -> str:
-    for ch in _DISCORD_MD_CHARS:
-        text = text.replace(ch, f"\\{ch}")
-    return text
 
 
 def format_french_datetime(dt: datetime, *, tz: str = "UTC") -> str:
@@ -94,7 +85,12 @@ def build_embed(
         {"name": "Plateformes", "value": "\n".join(plat_lines), "inline": False},
         {
             "name": "Description TikTok",
-            "value": _escape_discord_markdown(job.description),
+            # Plain text, no markdown escaping. Discord mobile's "copy" returns
+            # raw source — backticks (`x`) come through as backticks, escapes
+            # (\*) come through as backslashes. Both ruin a paste into TikTok.
+            # Anime TikTok descriptions don't use *, _, ~, |, >, so the
+            # markdown-collision case is acceptably rare.
+            "value": job.description,
             "inline": False,
         },
         {"name": "Lien vidéo", "value": job.drive_video_url, "inline": False},

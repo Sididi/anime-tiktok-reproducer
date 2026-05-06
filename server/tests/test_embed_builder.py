@@ -118,25 +118,15 @@ def test_embed_after_ack_marks_tiktok_uploaded():
     assert "✅ TikTok" in plats
 
 
-def test_embed_description_escapes_discord_markdown():
-    """Markdown chars in user descriptions must be escaped so Discord renders
-    them literally instead of as bold/italic/code/quote/heading."""
+def test_embed_description_is_passed_through_verbatim():
+    """Description must be passed through unchanged — no backticks, no
+    backslash escaping. Discord mobile's copy returns raw source, so any
+    wrapping or escaping ends up in the user's clipboard."""
     job = _job_fixture()
-    job.description = "Check *this* _out_ ~now~ |spoiler| `code` > quote #tag"
+    job.description = "Check *this* _out_ ~now~ #tag 🔥"
     embed = build_embed(job, _accounts(), "https://tiktok.sididi.tv")
     fields = {f["name"]: f["value"] for f in embed["fields"]}
     value = fields["Description TikTok"]
-    assert value == (
-        "Check \\*this\\* \\_out\\_ \\~now\\~ \\|spoiler\\| \\`code\\` "
-        "\\> quote \\#tag"
-    )
-
-
-def test_embed_description_escapes_backslashes_first():
-    """A literal backslash in the description must be escaped before other
-    characters, otherwise we'd double-escape the backslashes we just added."""
-    job = _job_fixture()
-    job.description = "path\\to\\file *bold*"
-    embed = build_embed(job, _accounts(), "https://tiktok.sididi.tv")
-    fields = {f["name"]: f["value"] for f in embed["fields"]}
-    assert fields["Description TikTok"] == "path\\\\to\\\\file \\*bold\\*"
+    assert value == "Check *this* _out_ ~now~ #tag 🔥"
+    assert "\\" not in value
+    assert "`" not in value
