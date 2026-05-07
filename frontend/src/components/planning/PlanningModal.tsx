@@ -10,6 +10,7 @@ import {
 import { PlanningHeader } from "./PlanningHeader";
 import { PlanningCalendar } from "./PlanningCalendar";
 import { EventPopover } from "./EventPopover";
+import { SlotPickerPopover } from "@/components/project-manager/SlotPickerPopover";
 
 const LS_ACCOUNT = "atr.planning.account_id";
 const LS_PLATFORMS = "atr.planning.platforms";
@@ -54,6 +55,10 @@ export function PlanningModal({ open, onClose }: PlanningModalProps) {
     event: PlanningEvent;
     anchor: { x: number; y: number };
   } | null>(null);
+  const [reslottingSingle, setReslottingSingle] = useState<PlanningEvent | null>(
+    null,
+  );
+  const [reAnchoring, setReAnchoring] = useState<PlanningEvent | null>(null);
 
   const selectedAccount = useMemo(
     () => accounts.find((a) => a.id === selectedAccountId) ?? null,
@@ -161,27 +166,8 @@ export function PlanningModal({ open, onClose }: PlanningModalProps) {
               event={eventForPopover}
               anchor={popover.anchor}
               onClose={() => setPopover(null)}
-              onRescheduleSlot={async () => {
-                const newSlotIso = window.prompt(
-                  `New slot for ${eventForPopover.platform} (ISO 8601, e.g. 2026-05-08T14:00:00Z):`,
-                );
-                if (!newSlotIso) return;
-                try {
-                  await api.reschedulePlatform(
-                    eventForPopover.project_id,
-                    eventForPopover.platform,
-                    newSlotIso,
-                  );
-                  setPopover(null);
-                  await reload();
-                } catch (err) {
-                  setError((err as Error).message);
-                }
-              }}
-              onRescheduleProject={() => {
-                // Phase 3 wires the TT-anchored picker; show a placeholder for now.
-                window.alert("Reschedule whole project: available in Phase 3.");
-              }}
+              onRescheduleSlot={() => setReslottingSingle(eventForPopover)}
+              onRescheduleProject={() => setReAnchoring(eventForPopover)}
               rescheduleProjectDisabled={!projectHasTikTok}
               rescheduleProjectDisabledReason={
                 projectHasTikTok
@@ -220,6 +206,64 @@ export function PlanningModal({ open, onClose }: PlanningModalProps) {
                 } catch (err) {
                   setError((err as Error).message);
                 }
+              }}
+            />
+          )}
+
+          {reslottingSingle && (
+            <SlotPickerPopover
+              open
+              mode="single-platform"
+              projectId={reslottingSingle.project_id}
+              accountId={reslottingSingle.account_id}
+              platform={reslottingSingle.platform}
+              platformsForAnchor={[reslottingSingle.platform]}
+              initialIso={reslottingSingle.slot}
+              onClose={() => setReslottingSingle(null)}
+              onConfirm={async (payload) => {
+                const single = payload as { slot: string };
+                await api.reschedulePlatform(
+                  reslottingSingle.project_id,
+                  reslottingSingle.platform,
+                  single.slot,
+                );
+                setReslottingSingle(null);
+                setPopover(null);
+                await reload();
+              }}
+            />
+          )}
+
+          {reAnchoring && (
+            <SlotPickerPopover
+              open
+              mode="anchor"
+              projectId={reAnchoring.project_id}
+              accountId={reAnchoring.account_id}
+              initialIso={
+                events.find(
+                  (e) =>
+                    e.project_id === reAnchoring.project_id &&
+                    e.platform === "tiktok",
+                )?.slot
+              }
+              platformsForAnchor={Array.from(
+                new Set(
+                  events
+                    .filter((e) => e.project_id === reAnchoring.project_id)
+                    .map((e) => e.platform),
+                ),
+              )}
+              onClose={() => setReAnchoring(null)}
+              onConfirm={async (payload) => {
+                const anchor = payload as {
+                  tiktok_slot: string;
+                  overrides?: Partial<Record<Platform, string>>;
+                };
+                await api.rescheduleAnchor(reAnchoring.project_id, anchor);
+                setReAnchoring(null);
+                setPopover(null);
+                await reload();
               }}
             />
           )}

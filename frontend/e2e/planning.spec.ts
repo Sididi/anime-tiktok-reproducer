@@ -126,7 +126,11 @@ test("Planning modal filters by platform", async ({ page }) => {
 });
 
 function installMocksWithMutations(events: unknown[], accounts: unknown[]) {
-  return ([eventsArg, accountsArg]: [unknown[], unknown[]]) => {
+  return ([eventsArg, accountsArg, freeSlotIso]: [
+    unknown[],
+    unknown[],
+    string,
+  ]) => {
     const orig = window.fetch.bind(window);
     const jsonResponse = (payload: unknown, status = 200) =>
       new Response(JSON.stringify(payload), {
@@ -160,6 +164,11 @@ function installMocksWithMutations(events: unknown[], accounts: unknown[]) {
       if (path === "/api/scheduling/events") {
         return jsonResponse({ events: eventsArg });
       }
+      if (path === "/api/scheduling/free-slots") {
+        return jsonResponse({
+          slots: [{ slot: freeSlotIso, available: true }],
+        });
+      }
       if (
         path.startsWith("/api/scheduling/projects/") &&
         path.endsWith("/platforms/youtube") &&
@@ -168,8 +177,8 @@ function installMocksWithMutations(events: unknown[], accounts: unknown[]) {
         // @ts-expect-error inject flag for assertions
         window.__patched = true;
         return jsonResponse({
-          slot: "2026-05-08T14:00:00Z",
-          scheduled_at: "2026-05-08T14:11:00Z",
+          slot: freeSlotIso,
+          scheduled_at: freeSlotIso,
           notification_status: "ok",
         });
       }
@@ -200,25 +209,34 @@ function installMocksWithMutations(events: unknown[], accounts: unknown[]) {
 }
 
 test("Reschedule slot triggers PATCH and reloads", async ({ page }) => {
+  // Pick a slot ISO inside the day of the existing YouTube event so the
+  // SlotPickerPopover surfaces it after fetching free-slots for that day.
+  const targetSlotIso = isoForOffset(1, 14, 0);
   await page.addInitScript(installMocksWithMutations(EVENTS, ACCOUNTS), [
     EVENTS,
     ACCOUNTS,
+    targetSlotIso,
   ]);
   await page.goto("/");
   await page.getByRole("button", { name: "Planning" }).click();
   await expect(page.getByRole("heading", { name: "Planning" })).toBeVisible();
   await expect(page.getByText("Show Alpha").first()).toBeVisible();
 
-  page.on("dialog", async (dlg) => {
-    if (dlg.type() === "prompt") {
-      await dlg.accept("2026-05-08T14:00:00Z");
-    } else {
-      await dlg.dismiss();
-    }
-  });
-
   await page.getByText("Show Alpha").first().click();
   await page.getByRole("button", { name: "Reschedule slot" }).click();
+
+  // SlotPickerPopover now drives the flow — pick the offered chip then Schedule.
+  const expectedLabel = new Intl.DateTimeFormat("fr-FR", {
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: "Europe/Paris",
+  }).format(new Date(targetSlotIso));
+  await page
+    .getByRole("button", { name: new RegExp(`^${expectedLabel}$`) })
+    .first()
+    .click();
+  await page.getByRole("button", { name: "Schedule", exact: true }).click();
+
   await page.waitForFunction(
     () => (window as unknown as { __patched?: boolean }).__patched === true,
   );
@@ -228,6 +246,7 @@ test("Cancel slot triggers DELETE", async ({ page }) => {
   await page.addInitScript(installMocksWithMutations(EVENTS, ACCOUNTS), [
     EVENTS,
     ACCOUNTS,
+    isoForOffset(2, 16, 0),
   ]);
   await page.goto("/");
   await page.getByRole("button", { name: "Planning" }).click();
