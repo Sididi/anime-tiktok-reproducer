@@ -517,6 +517,74 @@ class SchedulingService:
         )
 
     @classmethod
+    def reschedule_platform(
+        cls, project_id: str, platform: str, new_slot: datetime
+    ) -> PlatformSchedule:
+        """Replace a single platform's slot. Validates against the pool."""
+        with cls._reservation_lock:
+            project = ProjectService.load(project_id)
+            if project is None:
+                raise ValueError("Project not found")
+            account_id = project.scheduled_account_id
+            if not account_id:
+                raise ValueError("Project has no scheduled account")
+            slot = cls._normalize_utc_datetime(new_slot)
+            if not cls._is_slot_in_account_config(account_id, platform, slot):
+                raise ValueError(f"Slot {slot.isoformat()} not configured for {platform}")
+
+            # Free old slot before checking pool: must NOT see ourselves as taking it.
+            schedules = dict(project.platform_schedules or {})
+            old = schedules.pop(platform, None)
+            project.platform_schedules = schedules
+            ProjectService.save(project)
+
+            try:
+                pool_key = cls._resolve_pool_key(account_id, platform)
+                taken = cls._collect_reserved_slots_for_pool(pool_key, platform)
+                if slot.isoformat() in taken:
+                    raise ValueError(f"Slot {slot.isoformat()} already taken in {platform} pool")
+
+                now_utc = datetime.now(timezone.utc)
+                if slot < now_utc + timedelta(minutes=cls._MIN_LEAD_MINUTES):
+                    raise ValueError("slot_too_close")
+
+                new_sched = PlatformSchedule(
+                    slot=slot,
+                    scheduled_at=cls._randomize_slot(slot, now_utc),
+                )
+                schedules[platform] = new_sched
+                project.platform_schedules = schedules
+                cls._recompute_aggregates(project)
+                ProjectService.save(project)
+                return new_sched
+            except Exception:
+                # Restore the old reservation on failure.
+                if old is not None:
+                    schedules[platform] = old
+                    project.platform_schedules = schedules
+                    ProjectService.save(project)
+                raise
+
+    @classmethod
+    def cancel_platform_slot(cls, project_id: str, platform: str) -> None:
+        with cls._reservation_lock:
+            project = ProjectService.load(project_id)
+            if project is None:
+                return
+            schedules = dict(project.platform_schedules or {})
+            if platform in schedules:
+                del schedules[platform]
+                project.platform_schedules = schedules
+                cls._recompute_aggregates(project)
+                if not schedules:
+                    project.scheduled_account_id = None
+                ProjectService.save(project)
+
+    @classmethod
+    def cancel_all_slots(cls, project_id: str) -> None:
+        cls.clear_reserved_slots(project_id)
+
+    @classmethod
     def clear_reserved_slots(cls, project_id: str) -> None:
         with cls._reservation_lock:
             project = ProjectService.load(project_id)

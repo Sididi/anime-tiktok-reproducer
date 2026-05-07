@@ -229,3 +229,73 @@ def test_reschedule_anchor_swaps_existing_reservations(isolated_scheduler):
     )
     reloaded = ProjectService.load("proj")
     assert reloaded.platform_schedules["tiktok"].slot == new_anchor
+
+
+def test_reschedule_platform_replaces_single_platform_slot(isolated_scheduler):
+    project = Project(id="proj")
+    ProjectService.get_project_dir(project.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(project)
+    SchedulingService.reserve_anchor(
+        "proj", "acc_a", datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
+    )
+    new_yt = datetime(2026, 5, 8, 14, 0, tzinfo=timezone.utc)
+    sched = SchedulingService.reschedule_platform("proj", "youtube", new_yt)
+    assert sched.slot == new_yt
+
+    reloaded = ProjectService.load("proj")
+    assert reloaded.platform_schedules["youtube"].slot == new_yt
+    # tiktok unchanged
+    assert reloaded.platform_schedules["tiktok"].slot == datetime(
+        2026, 5, 7, 14, 0, tzinfo=timezone.utc
+    )
+
+
+def test_reschedule_platform_rejects_taken_slot(isolated_scheduler):
+    other = Project(
+        id="other",
+        scheduled_account_id="acc_a",
+        platform_schedules={
+            "youtube": __import__("app").models.PlatformSchedule(
+                slot=datetime(2026, 5, 8, 14, 0, tzinfo=timezone.utc),
+                scheduled_at=datetime(2026, 5, 8, 14, 5, tzinfo=timezone.utc),
+            )
+        },
+    )
+    ProjectService.get_project_dir(other.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(other)
+    project = Project(id="proj")
+    ProjectService.get_project_dir(project.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(project)
+    SchedulingService.reserve_anchor(
+        "proj", "acc_a", datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
+    )
+    with pytest.raises(ValueError):
+        SchedulingService.reschedule_platform(
+            "proj", "youtube", datetime(2026, 5, 8, 14, 0, tzinfo=timezone.utc)
+        )
+
+
+def test_cancel_platform_slot_removes_only_one_platform(isolated_scheduler):
+    project = Project(id="proj")
+    ProjectService.get_project_dir(project.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(project)
+    SchedulingService.reserve_anchor(
+        "proj", "acc_a", datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
+    )
+    SchedulingService.cancel_platform_slot("proj", "youtube")
+    reloaded = ProjectService.load("proj")
+    assert "youtube" not in reloaded.platform_schedules
+    assert "tiktok" in reloaded.platform_schedules
+
+
+def test_cancel_all_slots_clears_everything(isolated_scheduler):
+    project = Project(id="proj")
+    ProjectService.get_project_dir(project.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(project)
+    SchedulingService.reserve_anchor(
+        "proj", "acc_a", datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
+    )
+    SchedulingService.cancel_all_slots("proj")
+    reloaded = ProjectService.load("proj")
+    assert reloaded.platform_schedules == {}
+    assert reloaded.scheduled_account_id is None
