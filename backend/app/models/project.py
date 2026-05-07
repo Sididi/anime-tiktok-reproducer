@@ -75,6 +75,11 @@ class Project(BaseModel):
     scheduled_slot: str | None = None  # legacy; no longer written by new code
     platform_schedules: dict[str, PlatformSchedule] = Field(default_factory=dict)
 
+    # Per-platform pending platform-side notifications. Set when a reschedule
+    # could not be propagated to YT/FB/IG and is awaiting retry.
+    # key = platform; value = {target_scheduled_at, retries, last_error, last_attempt_at}.
+    reschedule_pending: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
     @field_validator("min_playback_speed")
     @classmethod
     def _validate_min_playback_speed(cls, value: float | None) -> float | None:
