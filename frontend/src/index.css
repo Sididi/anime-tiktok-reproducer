@@ -19,6 +19,10 @@
   --input: 0 0% 20%;
   --ring: 217 91% 60%;
   --radius: 0.5rem;
+  --platform-youtube: 268 76% 58%;
+  --platform-facebook: 220 76% 50%;
+  --platform-instagram: 35 91% 55%;
+  --platform-tiktok: 330 81% 60%;
 }
 
 * {
