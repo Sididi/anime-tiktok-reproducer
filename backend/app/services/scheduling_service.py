@@ -17,6 +17,25 @@ class FreeSlot:
     taken_by_project_id: str | None = None
 
 
+@dataclass
+class ResolvedSlot:
+    slot: datetime
+    scheduled_at: datetime
+    available: bool
+
+
+@dataclass
+class AnchorConflict:
+    platform: str
+    reason: str
+
+
+@dataclass
+class ResolveAnchorResult:
+    resolved: dict[str, ResolvedSlot]
+    conflicts: list[AnchorConflict]
+
+
 class SchedulingService:
     """Finds and reserves the next available upload slot per (account, platform)."""
 
@@ -221,6 +240,106 @@ class SchedulingService:
                     return results
             current_date += timedelta(days=1)
         return results
+
+    # ---------------------------------------------------------------- anchoring
+
+    _OTHER_PLATFORMS_FOR_ANCHOR: tuple[str, ...] = ("youtube", "facebook", "instagram")
+
+    @classmethod
+    def _is_slot_in_account_config(
+        cls, account_id: str, platform: str, slot: datetime
+    ) -> bool:
+        account = AccountService.get_account(account_id)
+        if not account:
+            return False
+        slot_strings = account.slots_for(platform)
+        wanted = (slot.hour, slot.minute)
+        for slot_str in slot_strings:
+            parts = slot_str.strip().split(":")
+            hour = int(parts[0])
+            minute = int(parts[1]) if len(parts) > 1 else 0
+            if (hour, minute) == wanted:
+                return True
+        return False
+
+    @classmethod
+    def resolve_anchor(
+        cls,
+        account_id: str,
+        tiktok_slot: datetime,
+        overrides: dict[str, datetime] | None = None,
+    ) -> "ResolveAnchorResult":
+        """Resolve which slot will be reserved per platform, given a TT anchor.
+
+        Pure read-only — does not write anything.
+        """
+        anchor = cls._normalize_utc_datetime(tiktok_slot)
+        overrides = overrides or {}
+        now_utc = datetime.now(timezone.utc)
+
+        resolved: dict[str, ResolvedSlot] = {}
+        conflicts: list[AnchorConflict] = []
+
+        # TikTok itself is the anchor: must match a configured slot, must be
+        # free in TT pool.
+        if not cls._is_slot_in_account_config(account_id, "tiktok", anchor):
+            conflicts.append(AnchorConflict("tiktok", "slot_not_configured"))
+        else:
+            tt_pool_key = cls._resolve_pool_key(account_id, "tiktok")
+            tt_taken = cls._collect_reserved_slots_for_pool(tt_pool_key, "tiktok")
+            if anchor.isoformat() in tt_taken:
+                conflicts.append(AnchorConflict("tiktok", "slot_taken"))
+            else:
+                resolved["tiktok"] = ResolvedSlot(
+                    slot=anchor,
+                    scheduled_at=cls._randomize_slot(anchor, now_utc),
+                    available=True,
+                )
+
+        # Other platforms: take override if provided, else first free slot ≥ anchor.
+        account = AccountService.get_account(account_id)
+        for platform in cls._OTHER_PLATFORMS_FOR_ANCHOR:
+            if account is None or not account.slots_for(platform):
+                continue
+            override = overrides.get(platform)
+            if override is not None:
+                slot = cls._normalize_utc_datetime(override)
+                if not cls._is_slot_in_account_config(account_id, platform, slot):
+                    conflicts.append(AnchorConflict(platform, "slot_not_configured"))
+                    continue
+                pool_key = cls._resolve_pool_key(account_id, platform)
+                taken = cls._collect_reserved_slots_for_pool(pool_key, platform)
+                if slot.isoformat() in taken:
+                    conflicts.append(AnchorConflict(platform, "slot_taken"))
+                    continue
+                resolved[platform] = ResolvedSlot(
+                    slot=slot,
+                    scheduled_at=cls._randomize_slot(slot, now_utc),
+                    available=True,
+                )
+                continue
+
+            # Use a tick before the anchor so the anchor slot itself is a
+            # valid candidate (find_free_slots_after is strictly > after).
+            # Request a generous batch so we can skip taken slots and find the
+            # first available one within the lookahead window.
+            free = cls.find_free_slots_after(
+                account_id=account_id,
+                platform=platform,
+                after=anchor - timedelta(microseconds=1),
+                limit=cls._MAX_LOOKAHEAD_DAYS * max(len(account.slots_for(platform)), 1),
+            )
+            free_avail = next((s for s in free if s.available), None)
+            if free_avail is None:
+                conflicts.append(AnchorConflict(platform, "pool_full"))
+                continue
+            resolved[platform] = ResolvedSlot(
+                slot=free_avail.slot,
+                scheduled_at=cls._randomize_slot(free_avail.slot, now_utc),
+                available=True,
+            )
+
+        return ResolveAnchorResult(resolved=resolved, conflicts=conflicts)
 
     # -------------------------------------------------------------- reservation
 

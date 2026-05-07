@@ -100,3 +100,55 @@ def test_find_free_slots_after_marks_taken_slots(isolated_scheduler):
     assert len(taken) == 1
     assert taken[0].slot == datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
     assert taken[0].taken_by_project_id == "p1"
+
+
+def test_resolve_anchor_resolves_each_platform_to_first_free_slot(isolated_scheduler):
+    result = SchedulingService.resolve_anchor(
+        account_id="acc_a",
+        tiktok_slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+        overrides=None,
+    )
+    yt = result.resolved["youtube"]
+    assert yt.slot == datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
+    assert yt.available is True
+    assert result.conflicts == []
+
+
+def test_resolve_anchor_falls_back_to_next_slot_when_taken(isolated_scheduler):
+    other = Project(id="other", scheduled_account_id="acc_a")
+    other.platform_schedules = {
+        "youtube": __import__("app").models.PlatformSchedule(
+            slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+            scheduled_at=datetime(2026, 5, 7, 14, 7, tzinfo=timezone.utc),
+        )
+    }
+    ProjectService.get_project_dir(other.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(other)
+
+    result = SchedulingService.resolve_anchor(
+        account_id="acc_a",
+        tiktok_slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+        overrides=None,
+    )
+    yt = result.resolved["youtube"]
+    assert yt.slot == datetime(2026, 5, 7, 18, 0, tzinfo=timezone.utc)
+    assert yt.available is True
+
+
+def test_resolve_anchor_uses_overrides(isolated_scheduler):
+    result = SchedulingService.resolve_anchor(
+        account_id="acc_a",
+        tiktok_slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+        overrides={"youtube": datetime(2026, 5, 8, 18, 0, tzinfo=timezone.utc)},
+    )
+    yt = result.resolved["youtube"]
+    assert yt.slot == datetime(2026, 5, 8, 18, 0, tzinfo=timezone.utc)
+
+
+def test_resolve_anchor_invalid_override_returns_conflict(isolated_scheduler):
+    result = SchedulingService.resolve_anchor(
+        account_id="acc_a",
+        tiktok_slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+        overrides={"youtube": datetime(2026, 5, 7, 9, 0, tzinfo=timezone.utc)},
+    )
+    assert any(c.platform == "youtube" for c in result.conflicts)
