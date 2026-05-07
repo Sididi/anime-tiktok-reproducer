@@ -1,4 +1,4 @@
-import { FolderKanban, Eraser } from "lucide-react";
+import { CalendarDays, FolderKanban, Eraser } from "lucide-react";
 import type { LibraryType } from "@/types";
 import { LIBRARY_TYPE_OPTIONS } from "@/utils/libraryTypes";
 
@@ -6,6 +6,7 @@ interface LibraryHeaderProps {
   selectedType: LibraryType;
   onTypeChange: (type: LibraryType) => void;
   onOpenProjectManager: () => void;
+  onOpenPlanning: () => void;
   onOpenPurge: () => void;
 }
 
@@ -13,6 +14,7 @@ export function LibraryHeader({
   selectedType,
   onTypeChange,
   onOpenProjectManager,
+  onOpenPlanning,
   onOpenPurge,
 }: LibraryHeaderProps) {
   return (
@@ -43,6 +45,14 @@ export function LibraryHeader({
       >
         <FolderKanban className="h-4 w-4" />
         <span>Projects</span>
+      </button>
+
+      <button
+        onClick={onOpenPlanning}
+        className="flex items-center gap-1.5 bg-[hsl(var(--secondary))] rounded px-3 py-1.5 text-sm hover:bg-[hsl(var(--secondary))]/80 transition-colors"
+      >
+        <CalendarDays className="h-4 w-4" />
+        <span>Planning</span>
       </button>
 
       <button

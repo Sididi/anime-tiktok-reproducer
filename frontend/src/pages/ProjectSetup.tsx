@@ -14,6 +14,7 @@ import {
 } from "@/components/library";
 import { FolderBrowserModal } from "@/components/FolderBrowserModal";
 import { ProjectManagerModal } from "@/components/project-manager";
+import { PlanningModal } from "@/components/planning";
 import { DuplicateTikTokWarning } from "@/components/DuplicateTikTokWarning";
 import { api, SeriesDeleteConflictError } from "@/api/client";
 import { readSSEStream } from "@/utils/sse";
@@ -45,6 +46,7 @@ export function ProjectSetup() {
 
   // Modals
   const [showProjectManager, setShowProjectManager] = useState(false);
+  const [showPlanning, setShowPlanning] = useState(false);
   const [showPurge, setShowPurge] = useState(false);
   const [showNewSource, setShowNewSource] = useState(false);
   const [showFolderBrowser, setShowFolderBrowser] = useState(false);
@@ -574,6 +576,7 @@ export function ProjectSetup() {
         selectedType={selectedLibraryType}
         onTypeChange={setSelectedLibraryType}
         onOpenProjectManager={() => setShowProjectManager(true)}
+        onOpenPlanning={() => setShowPlanning(true)}
         onOpenPurge={handleOpenPurge}
       />
 
@@ -625,6 +628,11 @@ export function ProjectSetup() {
       <ProjectManagerModal
         open={showProjectManager}
         onClose={() => setShowProjectManager(false)}
+      />
+
+      <PlanningModal
+        open={showPlanning}
+        onClose={() => setShowPlanning(false)}
       />
 
       <NewSourceModal
