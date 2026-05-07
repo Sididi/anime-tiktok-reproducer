@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import random
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from threading import Lock
 
 from ..models import PlatformSchedule, Project
 from .account_service import AccountService
 from .project_service import ProjectService
+
+
+@dataclass
+class FreeSlot:
+    slot: datetime
+    available: bool
+    taken_by_project_id: str | None = None
 
 
 class SchedulingService:
@@ -39,13 +47,17 @@ class SchedulingService:
         return key or f"account:{account_id}:{platform}"
 
     @classmethod
-    def _collect_reserved_slots_for_pool(cls, pool_key: str, platform: str) -> set[str]:
-        """Return ISO slot strings already reserved in the given (pool, platform)."""
+    def _collect_pool_reservations(
+        cls, pool_key: str, platform: str
+    ) -> dict[str, str]:
+        """Return {slot_iso: project_id} for the given pool/platform."""
         account_pool_keys: dict[str, str] = {}
         for acc_id, acc in AccountService.all_accounts().items():
-            account_pool_keys[acc_id] = acc.pool_key_for(platform) or f"account:{acc_id}:{platform}"
+            account_pool_keys[acc_id] = (
+                acc.pool_key_for(platform) or f"account:{acc_id}:{platform}"
+            )
 
-        reserved: set[str] = set()
+        reservations: dict[str, str] = {}
         for project in ProjectService.list_all():
             schedules = project.platform_schedules or {}
             sched = schedules.get(platform)
@@ -55,8 +67,13 @@ class SchedulingService:
             if not owner_id:
                 continue
             if account_pool_keys.get(owner_id) == pool_key:
-                reserved.add(cls._normalize_utc_datetime(sched.slot).isoformat())
-        return reserved
+                slot_iso = cls._normalize_utc_datetime(sched.slot).isoformat()
+                reservations[slot_iso] = project.id
+        return reservations
+
+    @classmethod
+    def _collect_reserved_slots_for_pool(cls, pool_key: str, platform: str) -> set[str]:
+        return set(cls._collect_pool_reservations(pool_key, platform).keys())
 
     @classmethod
     def _recompute_aggregates(cls, project: Project) -> None:
@@ -144,6 +161,66 @@ class SchedulingService:
             f"No available slot found for account {account_id} platform {platform} "
             f"within {cls._MAX_LOOKAHEAD_DAYS} days"
         )
+
+    @classmethod
+    def find_free_slots_after(
+        cls,
+        account_id: str,
+        platform: str,
+        after: datetime,
+        limit: int,
+    ) -> list[FreeSlot]:
+        """Return up to `limit` slots ≥ `after` for (account, platform).
+
+        Each FreeSlot tells whether the slot is currently free in the pool;
+        if not, includes the project_id occupying it.
+        """
+        if limit <= 0:
+            return []
+
+        account = AccountService.get_account(account_id)
+        if not account:
+            raise ValueError(f"Account {account_id} not found")
+
+        slot_strings = account.slots_for(platform)
+        if not slot_strings:
+            return []
+
+        slot_times: list[tuple[int, int]] = []
+        for slot_str in slot_strings:
+            parts = slot_str.strip().split(":")
+            slot_times.append((int(parts[0]), int(parts[1]) if len(parts) > 1 else 0))
+        slot_times.sort()
+
+        pool_key = cls._resolve_pool_key(account_id, platform)
+        reservations = cls._collect_pool_reservations(pool_key, platform)
+
+        after_utc = cls._normalize_utc_datetime(after)
+        results: list[FreeSlot] = []
+
+        current_date = after_utc.date()
+        for _ in range(cls._MAX_LOOKAHEAD_DAYS + 1):
+            for hour, minute in slot_times:
+                slot_dt = datetime(
+                    current_date.year, current_date.month, current_date.day,
+                    hour, minute, 0,
+                    tzinfo=timezone.utc,
+                )
+                if slot_dt <= after_utc:
+                    continue
+                slot_iso = slot_dt.isoformat()
+                taker = reservations.get(slot_iso)
+                results.append(
+                    FreeSlot(
+                        slot=slot_dt,
+                        available=taker is None,
+                        taken_by_project_id=taker,
+                    )
+                )
+                if len(results) >= limit:
+                    return results
+            current_date += timedelta(days=1)
+        return results
 
     # -------------------------------------------------------------- reservation
 
