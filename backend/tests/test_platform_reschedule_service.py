@@ -77,3 +77,68 @@ def test_cancel_youtube_clears_publish_at_and_sets_private():
     body = fake_youtube.videos.return_value.update.call_args.kwargs["body"]
     assert body["status"]["privacyStatus"] == "private"
     assert "publishAt" not in body["status"]
+
+
+def test_notify_facebook_posts_scheduled_publish_time(monkeypatch):
+    project = Project(
+        id="p1",
+        scheduled_account_id="acc_a",
+        upload_last_result={"platforms": {"facebook": {"url": "https://www.facebook.com/page/videos/9876543210/"}}},
+    )
+
+    posted: dict = {}
+    class FakeResp:
+        status_code = 200
+        def json(self) -> dict:
+            return {"success": True}
+        def raise_for_status(self) -> None:
+            return None
+
+    def fake_post(url, data=None, **kwargs):
+        posted["url"] = url
+        posted["data"] = data
+        return FakeResp()
+
+    monkeypatch.setattr(
+        "app.services.platform_reschedule_service.AccountService.get_meta_credentials",
+        lambda _id: type("C", (), {"facebook_page_access_token": "tok", "page_id": "p"})(),
+    )
+    monkeypatch.setattr(
+        "app.services.platform_reschedule_service.httpx.post", fake_post
+    )
+
+    result = PlatformRescheduleService.notify(
+        project, "facebook",
+        datetime(2026, 5, 8, 14, 0, tzinfo=timezone.utc),
+    )
+    assert result.status == "ok"
+    assert "9876543210" in posted["url"]
+    assert posted["data"]["scheduled_publish_time"] == int(
+        datetime(2026, 5, 8, 14, 0, tzinfo=timezone.utc).timestamp()
+    )
+
+
+def test_cancel_facebook_marks_unpublished(monkeypatch):
+    project = Project(
+        id="p1",
+        scheduled_account_id="acc_a",
+        upload_last_result={"platforms": {"facebook": {"url": "https://www.facebook.com/page/videos/9876543210/"}}},
+    )
+
+    posted: dict = {}
+    class FakeResp:
+        status_code = 200
+        def json(self): return {"success": True}
+        def raise_for_status(self): return None
+    def fake_post(url, data=None, **kwargs):
+        posted["data"] = data
+        return FakeResp()
+    monkeypatch.setattr(
+        "app.services.platform_reschedule_service.AccountService.get_meta_credentials",
+        lambda _id: type("C", (), {"facebook_page_access_token": "tok", "page_id": "p"})(),
+    )
+    monkeypatch.setattr("app.services.platform_reschedule_service.httpx.post", fake_post)
+
+    result = PlatformRescheduleService.cancel(project, "facebook")
+    assert result.status == "ok"
+    assert posted["data"]["published"] == "false"

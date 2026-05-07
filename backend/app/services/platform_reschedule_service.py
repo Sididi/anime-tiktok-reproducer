@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
+import httpx
 from googleapiclient.discovery import build
 
 from ..models import Project
@@ -110,6 +111,8 @@ class PlatformRescheduleService:
             return NotificationResult(status="pending_retry", error=str(exc))
         return NotificationResult(status="skipped")
 
+    _FB_GRAPH_VERSION = "v25.0"
+
     # Implementations live in tasks 10-12.
     @classmethod
     def _notify_youtube(cls, project: Project, url: str, new_scheduled_at: datetime) -> NotificationResult:
@@ -130,7 +133,23 @@ class PlatformRescheduleService:
 
     @classmethod
     def _notify_facebook(cls, project: Project, url: str, new_scheduled_at: datetime) -> NotificationResult:
-        raise NotImplementedError
+        video_id = cls._facebook_video_id(url)
+        if not video_id:
+            return NotificationResult(status="skipped")
+        creds = AccountService.get_meta_credentials(project.scheduled_account_id)
+        epoch = int(new_scheduled_at.timestamp())
+        api_url = f"https://graph.facebook.com/{cls._FB_GRAPH_VERSION}/{video_id}"
+        resp = httpx.post(
+            api_url,
+            data={
+                "scheduled_publish_time": epoch,
+                "published": "false",
+                "access_token": creds.facebook_page_access_token,
+            },
+            timeout=20.0,
+        )
+        resp.raise_for_status()
+        return NotificationResult(status="ok")
 
     @classmethod
     def _notify_instagram(cls, project: Project, new_scheduled_at: datetime) -> NotificationResult:
@@ -152,7 +171,21 @@ class PlatformRescheduleService:
 
     @classmethod
     def _cancel_facebook(cls, project: Project, url: str) -> NotificationResult:
-        raise NotImplementedError
+        video_id = cls._facebook_video_id(url)
+        if not video_id:
+            return NotificationResult(status="skipped")
+        creds = AccountService.get_meta_credentials(project.scheduled_account_id)
+        api_url = f"https://graph.facebook.com/{cls._FB_GRAPH_VERSION}/{video_id}"
+        resp = httpx.post(
+            api_url,
+            data={
+                "published": "false",
+                "access_token": creds.facebook_page_access_token,
+            },
+            timeout=20.0,
+        )
+        resp.raise_for_status()
+        return NotificationResult(status="ok")
 
     @classmethod
     def _cancel_instagram(cls, project: Project) -> NotificationResult:
