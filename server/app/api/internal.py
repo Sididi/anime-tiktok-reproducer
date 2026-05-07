@@ -68,6 +68,11 @@ class GenericMessageEditRequest(BaseModel):
     embed: dict | None = None
 
 
+class UpdateSlotRequest(BaseModel):
+    slot_time: datetime
+    platform_scheduled_at: dict[str, datetime] | None = None
+
+
 @router.post("/jobs", response_model=CreateJobResponse)
 async def create_job(req: CreateJobRequest, request: Request) -> CreateJobResponse:
     settings = request.app.state.settings
@@ -160,15 +165,37 @@ async def platform_status(
     return {"ok": True, "noop": False}
 
 
-@router.delete("/jobs/{project_id}")
-async def delete_job(project_id: str, request: Request) -> dict:
+@router.patch("/jobs/{project_id}/slot")
+async def update_job_slot(
+    project_id: str, req: UpdateSlotRequest, request: Request
+) -> dict:
+    store = request.app.state.job_store
+    job = await store.get(project_id)
+    if job is None:
+        raise HTTPException(404, f"Job for project {project_id!r} not found")
+
+    fields: dict[str, object] = {"slot_time": req.slot_time}
+    if req.platform_scheduled_at is not None:
+        fields["platform_scheduled_at"] = dict(req.platform_scheduled_at)
+    updated = await store.update(project_id, **fields)
+    return {
+        "project_id": updated.project_id,
+        "slot_time": updated.slot_time.isoformat(),
+        "platform_scheduled_at": {
+            p: dt.isoformat() for p, dt in updated.platform_scheduled_at.items()
+        },
+    }
+
+
+@router.delete("/jobs/{project_id}", status_code=204)
+async def delete_job(project_id: str, request: Request) -> None:
     settings = request.app.state.settings
     store = request.app.state.job_store
     discord = request.app.state.discord
 
     job = await store.get(project_id)
     if job is None:
-        return {"ok": True, "deleted": False}
+        raise HTTPException(404, f"Job for project {project_id!r} not found")
 
     if job.discord_message_id:
         try:
@@ -194,7 +221,7 @@ async def delete_job(project_id: str, request: Request) -> dict:
             logger.warning("Reminder forward delete failed for %s: %s", project_id, e)
 
     await store.delete(project_id)
-    return {"ok": True, "deleted": True}
+    return None
 
 
 @router.post("/discord/messages")

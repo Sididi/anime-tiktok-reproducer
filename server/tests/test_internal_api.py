@@ -95,7 +95,7 @@ def test_delete_job_removes_messages(
     with TestClient(app) as client:
         client.post("/api/internal/jobs", json=JOB_PAYLOAD, headers=INTERNAL_AUTH)
         r = client.delete("/api/internal/jobs/p1", headers=INTERNAL_AUTH)
-    assert r.status_code == 200
+    assert r.status_code == 204
     # Only the embed message exists pre-scheduler.
     assert discord.delete_message.call_count == 1
 
@@ -130,18 +130,18 @@ def test_delete_job_removes_reminder_and_forward_when_present(
 
     with TestClient(app) as client:
         r = client.delete("/api/internal/jobs/p1", headers=INTERNAL_AUTH)
-    assert r.status_code == 200
+    assert r.status_code == 204
     # embed + reminder + forward
     assert discord.delete_message.call_count == 3
 
 
-def test_delete_missing_returns_200(
+def test_delete_missing_returns_404(
     monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
 ):
     app, _ = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
     with TestClient(app) as client:
         r = client.delete("/api/internal/jobs/never", headers=INTERNAL_AUTH)
-    assert r.status_code == 200
+    assert r.status_code == 404
 
 
 def test_generic_message_post(
