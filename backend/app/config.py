@@ -59,6 +59,9 @@ class Settings(BaseSettings):
 
     cep_trigger_url_template: str = "http://localhost:48653/p/{project_id}"
 
+    # Scheduling v2 feature flag (Planning system Phase 1)
+    scheduling_v2_enabled: bool = True
+
     # HuggingFace (pyannote diarization for raw scene detection)
     hf_token: str | None = None
 

@@ -4,15 +4,26 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
+from ...config import settings as app_settings
 from ...models import Project
 from ...services.account_service import AccountService
 from ...services.project_service import ProjectService
 from ...services.scheduling_service import SchedulingService
 
-router = APIRouter(prefix="/scheduling", tags=["scheduling"])
+
+def _require_v2() -> None:
+    if not app_settings.scheduling_v2_enabled:
+        raise HTTPException(503, "scheduling_v2_disabled")
+
+
+router = APIRouter(
+    prefix="/scheduling",
+    tags=["scheduling"],
+    dependencies=[Depends(_require_v2)],
+)
 
 Platform = Literal["youtube", "facebook", "instagram", "tiktok"]
 

@@ -216,3 +216,11 @@ def test_reschedule_pending_endpoint(client):
     assert r.status_code == 200
     items = r.json()["items"]
     assert any(i["project_id"] == "p1" and i["platform"] == "youtube" for i in items)
+
+
+def test_router_disabled_when_flag_off(client, monkeypatch):
+    monkeypatch.setattr(
+        "app.api.routes.scheduling.app_settings.scheduling_v2_enabled", False
+    )
+    r = client.get("/api/scheduling/events")
+    assert r.status_code == 503
