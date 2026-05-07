@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, FileResponse
 from typing import Optional, Any
 import json
+import re
 import tempfile
 from pathlib import Path
 from threading import Lock
@@ -602,7 +603,11 @@ async def upload_restructured_script(
             tmp_path = Path(tmp_dir)
             stored_part_paths: list[Path] = []
 
-            for i, part in enumerate(audio_parts):
+            # Naturally sort uploaded parts by filename to ensure correct sequence regardless of client upload order
+            if audio_parts:
+                audio_parts.sort(key=lambda p: [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', p.filename or "")])
+
+            for i, part in enumerate(audio_parts or []):
                 uploaded_path = tmp_path / f"part_{i}{Path(part.filename or '.mp3').suffix}"
                 await _write_upload_to_path(part, uploaded_path)
                 normalized_part_path = parts_dir / f"part_{i + 1:04d}.wav"
