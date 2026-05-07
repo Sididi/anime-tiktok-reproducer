@@ -6,7 +6,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
+from googleapiclient.discovery import build
+
 from ..models import Project
+from .account_service import AccountService
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -110,7 +113,20 @@ class PlatformRescheduleService:
     # Implementations live in tasks 10-12.
     @classmethod
     def _notify_youtube(cls, project: Project, url: str, new_scheduled_at: datetime) -> NotificationResult:
-        raise NotImplementedError
+        video_id = cls._youtube_video_id(url)
+        if not video_id:
+            return NotificationResult(status="skipped")
+        creds = AccountService.get_youtube_credentials(project.scheduled_account_id)
+        youtube = build("youtube", "v3", credentials=creds, cache_discovery=False)
+        body = {
+            "id": video_id,
+            "status": {
+                "privacyStatus": "private",
+                "publishAt": new_scheduled_at.isoformat(),
+            },
+        }
+        youtube.videos().update(part="status", body=body).execute()
+        return NotificationResult(status="ok")
 
     @classmethod
     def _notify_facebook(cls, project: Project, url: str, new_scheduled_at: datetime) -> NotificationResult:
@@ -122,7 +138,17 @@ class PlatformRescheduleService:
 
     @classmethod
     def _cancel_youtube(cls, project: Project, url: str) -> NotificationResult:
-        raise NotImplementedError
+        video_id = cls._youtube_video_id(url)
+        if not video_id:
+            return NotificationResult(status="skipped")
+        creds = AccountService.get_youtube_credentials(project.scheduled_account_id)
+        youtube = build("youtube", "v3", credentials=creds, cache_discovery=False)
+        body = {
+            "id": video_id,
+            "status": {"privacyStatus": "private"},
+        }
+        youtube.videos().update(part="status", body=body).execute()
+        return NotificationResult(status="ok")
 
     @classmethod
     def _cancel_facebook(cls, project: Project, url: str) -> NotificationResult:
