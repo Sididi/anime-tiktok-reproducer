@@ -269,6 +269,7 @@ export interface Account {
   language: string;
   avatar_url: string;
   slots: string[];
+  slots_by_platform?: Partial<Record<Platform, string[]>>;
   supported_types: LibraryType[];
 }
 
