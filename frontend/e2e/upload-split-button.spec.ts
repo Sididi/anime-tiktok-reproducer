@@ -277,3 +277,86 @@ test("Schedule mode reserves anchor before upload", async ({ page }) => {
     () => (window as unknown as { __uploadCalled?: boolean }).__uploadCalled === true,
   );
 });
+
+function installCascadeMocks() {
+  const testWindow = window as Window &
+    typeof globalThis & {
+      __cascadeApplied?: boolean;
+    };
+  testWindow.__cascadeApplied = false;
+  const orig = window.fetch.bind(window);
+  window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const requestUrl =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url;
+    const url = new URL(requestUrl, window.location.origin);
+    const json = (body: unknown) =>
+      new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    if (url.pathname.endsWith("/cascade-preview")) {
+      return json({
+        per_platform: [
+          {
+            platform: "tiktok",
+            target_slot: "2026-05-07T14:00:00Z",
+            target_scheduled_at: "2026-05-07T14:09:00Z",
+            displaced: [
+              {
+                project_id: "x",
+                anime_title: "Bumped",
+                from_slot: "2026-05-07T14:00:00Z",
+                to_slot: "2026-05-07T18:00:00Z",
+                requires_platform_notification: true,
+              },
+            ],
+          },
+        ],
+        blockers: [],
+      });
+    }
+    if (url.pathname.endsWith("/cascade-apply") && init?.method === "POST") {
+      testWindow.__cascadeApplied = true;
+      return json({
+        per_platform: [],
+        blockers: [],
+        notification_status: {},
+      });
+    }
+    return orig(input, init);
+  };
+}
+
+test("Urgent mode previews and applies cascade", async ({ page }) => {
+  await page.addInitScript(installCascadeMocks);
+  await page.addInitScript(installMocks, { account: ACCOUNT, row: ROW });
+  await page.addInitScript(installCheckDelay);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Projects" }).click();
+
+  const projectRow = page.locator("tr").filter({ hasText: "Show Alpha" });
+  await expect(projectRow).toBeVisible();
+
+  await page.getByRole("button", { name: "All Projects" }).click();
+  await page.getByRole("button", { name: "Account A" }).click();
+
+  await projectRow.getByRole("button", { name: "Upload options" }).click();
+  await page.getByRole("button", { name: /Upload urgently/ }).click();
+
+  await expect(page.getByText(/will be shifted/i).first()).toBeVisible();
+
+  await page.getByRole("button", { name: /Confirm urgent upload/ }).click();
+
+  await page.waitForFunction(
+    () =>
+      (window as unknown as { __cascadeApplied?: boolean }).__cascadeApplied ===
+      true,
+  );
+  await page.waitForFunction(
+    () => (window as unknown as { __uploadCalled?: boolean }).__uploadCalled === true,
+  );
+});
