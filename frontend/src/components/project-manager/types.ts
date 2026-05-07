@@ -8,3 +8,10 @@ export type SortColumn =
   | "created_at";
 
 export type SortDirection = "asc" | "desc";
+
+export type UploadMode = "auto" | "scheduled" | "urgent";
+
+export interface AnchorPayload {
+  tiktok_slot: string;
+  overrides?: Partial<Record<import("@/types").Platform, string>>;
+}

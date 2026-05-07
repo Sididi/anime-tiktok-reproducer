@@ -51,9 +51,16 @@ class Settings(BaseSettings):
 
     # TikTok server (VPS) integration — replaces previous Discord webhook
     tiktok_server_base_url: str | None = None
+    # Internal API base for /api/internal/jobs/* (planning/reschedule path).
+    # May equal tiktok_server_base_url; kept distinct so deployments can route
+    # the planning endpoints separately (e.g. behind a different ingress).
+    tiktok_server_url: str | None = None
     tiktok_server_internal_token: str | None = None
 
     cep_trigger_url_template: str = "http://localhost:48653/p/{project_id}"
+
+    # Scheduling v2 feature flag (Planning system Phase 1)
+    scheduling_v2_enabled: bool = True
 
     # HuggingFace (pyannote diarization for raw scene detection)
     hf_token: str | None = None

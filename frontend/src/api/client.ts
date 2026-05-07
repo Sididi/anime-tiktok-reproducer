@@ -1126,4 +1126,139 @@ export const api = {
         }),
       },
     ),
+
+  // Scheduling
+  async listPlanningEvents(
+    params: {
+      account_id?: string | null;
+      platforms?: import("@/types").Platform[];
+      range_start?: string;
+      range_end?: string;
+    } = {},
+  ): Promise<{ events: import("@/types").PlanningEvent[] }> {
+    const usp = new URLSearchParams();
+    if (params.account_id) usp.set("account_id", params.account_id);
+    if (params.platforms?.length)
+      usp.set("platforms", params.platforms.join(","));
+    if (params.range_start) usp.set("range_start", params.range_start);
+    if (params.range_end) usp.set("range_end", params.range_end);
+    const qs = usp.toString();
+    return request(`/scheduling/events${qs ? `?${qs}` : ""}`);
+  },
+
+  async listFreeSlots(params: {
+    account_id: string;
+    platform: import("@/types").Platform;
+    after: string;
+    limit?: number;
+  }): Promise<{ slots: import("@/types").FreeSlot[] }> {
+    const usp = new URLSearchParams({
+      account_id: params.account_id,
+      platform: params.platform,
+      after: params.after,
+      limit: String(params.limit ?? 20),
+    });
+    return request(`/scheduling/free-slots?${usp.toString()}`);
+  },
+
+  async resolveAnchor(payload: {
+    project_id: string;
+    account_id: string;
+    tiktok_slot: string;
+    overrides?: Partial<Record<import("@/types").Platform, string>>;
+  }): Promise<import("@/types").ResolveAnchorResult> {
+    return request(`/scheduling/resolve-anchor`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async reserveAnchor(
+    project_id: string,
+    payload: {
+      account_id: string;
+      tiktok_slot: string;
+      overrides?: Partial<Record<import("@/types").Platform, string>>;
+    },
+  ): Promise<{
+    platform_schedules: Record<string, { slot: string; scheduled_at: string }>;
+  }> {
+    return request(`/scheduling/projects/${project_id}/reserve-anchor`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async reschedulePlatform(
+    project_id: string,
+    platform: import("@/types").Platform,
+    new_slot: string,
+  ): Promise<{
+    slot: string;
+    scheduled_at: string;
+    notification_status: string;
+  }> {
+    return request(`/scheduling/projects/${project_id}/platforms/${platform}`, {
+      method: "PATCH",
+      body: JSON.stringify({ new_slot }),
+    });
+  },
+
+  async rescheduleAnchor(
+    project_id: string,
+    payload: {
+      tiktok_slot: string;
+      overrides?: Partial<Record<import("@/types").Platform, string>>;
+    },
+  ): Promise<{
+    platform_schedules: Record<string, { slot: string; scheduled_at: string }>;
+    notification_status: Record<string, string>;
+  }> {
+    return request(`/scheduling/projects/${project_id}/anchor`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async cancelPlatformSlot(
+    project_id: string,
+    platform: import("@/types").Platform,
+  ): Promise<void> {
+    await fetch(
+      `${API_BASE}/scheduling/projects/${project_id}/platforms/${platform}`,
+      {
+        method: "DELETE",
+      },
+    );
+  },
+
+  async cancelAllSlots(project_id: string): Promise<void> {
+    await fetch(`${API_BASE}/scheduling/projects/${project_id}/all`, {
+      method: "DELETE",
+    });
+  },
+
+  async cascadePreview(
+    project_id: string,
+    account_id: string,
+  ): Promise<import("@/types").CascadePreview> {
+    return request(`/scheduling/projects/${project_id}/cascade-preview`, {
+      method: "POST",
+      body: JSON.stringify({ account_id }),
+    });
+  },
+
+  async cascadeApply(
+    project_id: string,
+    account_id: string,
+  ): Promise<
+    import("@/types").CascadePreview & {
+      notification_status: Record<string, Record<string, string>>;
+    }
+  > {
+    return request(`/scheduling/projects/${project_id}/cascade-apply`, {
+      method: "POST",
+      body: JSON.stringify({ account_id }),
+    });
+  },
 };

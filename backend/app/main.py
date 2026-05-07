@@ -22,6 +22,7 @@ from .services.library_hydration_service import LibraryHydrationService
 from .services.project_service import ProjectService
 from .services.project_startup_service import project_startup_queue
 from .services.project_upload_service import project_upload_queue
+from .services.reschedule_retry_service import RescheduleRetryService
 from .services.storage_box_sftp_client import StorageBoxSftpClient
 
 
@@ -125,6 +126,16 @@ async def lifespan(app: FastAPI):
     await project_startup_queue.startup_cleanup()
     await project_upload_queue.startup_cleanup()
 
+    reschedule_retry_stop = asyncio.Event()
+    app.state.reschedule_retry_stop = reschedule_retry_stop
+    _track_app_task(
+        app,
+        asyncio.create_task(
+            RescheduleRetryService.run_loop(reschedule_retry_stop),
+            name="reschedule-retry-loop",
+        ),
+    )
+
     app.state.integrations_health = IntegrationHealthService.initialize_startup_state(
         integration_enabled=settings.integration_startup_health_check_enabled,
         storage_box_enabled=settings.storage_box_enabled,
@@ -149,6 +160,7 @@ async def lifespan(app: FastAPI):
         )
 
     yield
+    reschedule_retry_stop.set()
     await _cancel_app_tasks(app)
     await StorageBoxSftpClient.close_pool()
 

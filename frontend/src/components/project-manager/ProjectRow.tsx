@@ -1,6 +1,6 @@
-import { Loader2, UploadCloud, Trash2, Eye } from "lucide-react";
+import { Loader2, Trash2, Eye } from "lucide-react";
 import { Button } from "@/components/ui";
-import { Tooltip } from "./Tooltip";
+import { UploadSplitButton } from "./UploadSplitButton";
 import {
   formatBytes,
   formatScheduledAt,
@@ -13,6 +13,7 @@ import type { ProjectManagerRow, Account } from "@/types";
 interface ProjectRowProps {
   row: ProjectManagerRow;
   accounts: Account[];
+  selectedAccount: Account | null;
   uploadState?: {
     active: boolean;
     label: string | null;
@@ -20,6 +21,8 @@ interface ProjectRowProps {
   activeDeleteId: string | null;
   holdingDeleteId: string | null;
   onUpload: (row: ProjectManagerRow) => void;
+  onUploadSchedule: (row: ProjectManagerRow) => void;
+  onUploadUrgent: (row: ProjectManagerRow) => void;
   onDeleteHoldStart: (row: ProjectManagerRow) => void;
   onDeleteHoldCancel: () => void;
   onPreview: (driveVideoId: string) => void;
@@ -31,10 +34,13 @@ interface ProjectRowProps {
 export function ProjectRow({
   row,
   accounts,
+  selectedAccount,
   uploadState,
   activeDeleteId,
   holdingDeleteId,
   onUpload,
+  onUploadSchedule,
+  onUploadUrgent,
   onDeleteHoldStart,
   onDeleteHoldCancel,
   onPreview,
@@ -72,24 +78,17 @@ export function ProjectRow({
     : null;
 
   const uploadButton = (
-    <Button
-      size="sm"
-      onClick={() => onUpload(row)}
-      disabled={!canUpload || !!uploadState?.active}
-      className="active:scale-95 transition-transform"
-    >
-      {uploadState?.active ? (
-        <>
-          <Loader2 className="h-4 w-4 animate-spin mr-1.5" />
-          {uploadState.label || "Uploading"}
-        </>
-      ) : (
-        <>
-          <UploadCloud className="h-4 w-4 mr-1.5" />
-          Upload
-        </>
-      )}
-    </Button>
+    <UploadSplitButton
+      row={row}
+      selectedAccount={selectedAccount ?? null}
+      uploadActive={!!uploadState?.active}
+      uploadLabel={uploadState?.label ?? null}
+      disabled={!canUpload}
+      disabledReason={uploadDisabledReason ?? undefined}
+      onAuto={() => onUpload(row)}
+      onSchedule={() => onUploadSchedule(row)}
+      onUrgent={() => onUploadUrgent(row)}
+    />
   );
 
   return (
@@ -232,13 +231,7 @@ export function ProjectRow({
           )}
 
           {/* Upload */}
-          {uploadDisabledReason ? (
-            <Tooltip text={uploadDisabledReason}>
-              <div>{uploadButton}</div>
-            </Tooltip>
-          ) : (
-            uploadButton
-          )}
+          {uploadButton}
 
           {/* Delete (hold 1s) */}
           <Button
