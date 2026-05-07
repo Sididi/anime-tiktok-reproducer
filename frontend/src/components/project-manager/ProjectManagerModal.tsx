@@ -13,6 +13,8 @@ import { ScheduledDeleteConfirm } from "./ScheduledDeleteConfirm";
 import { UploadJobsPanel } from "./UploadJobsPanel";
 import { VideoPreviewModal } from "./VideoPreviewModal";
 import { ProjectTable } from "./ProjectTable";
+import { SlotPickerPopover } from "./SlotPickerPopover";
+import { UrgentCascadeModal } from "./UrgentCascadeModal";
 import { YouTubeDurationModal } from "./YouTubeDurationModal";
 import type { SortColumn, SortDirection, UploadMode, AnchorPayload } from "./types";
 import {
@@ -23,6 +25,7 @@ import type {
   Account,
   CopyrightCheckResult,
   FacebookCheckResult,
+  Platform,
   ProjectManagerRow,
   ProjectUploadJob,
   UploadDurationStrategy,
@@ -730,6 +733,50 @@ export function ProjectManagerModal({
     [selectedAccountId, accounts, startUploadWithChecks],
   );
 
+  const [schedulingForProject, setSchedulingForProject] = useState<{
+    row: ProjectManagerRow;
+    accountId: string;
+  } | null>(null);
+  const [urgentForProject, setUrgentForProject] = useState<{
+    row: ProjectManagerRow;
+    accountId: string;
+  } | null>(null);
+
+  const resolveAccountIdForRow = useCallback(
+    (row: ProjectManagerRow): string | null => {
+      if (selectedAccountId) return selectedAccountId;
+      const compatible = accounts.find((a) =>
+        isAccountCompatibleWithProjectRow(a, row),
+      );
+      return compatible?.id ?? null;
+    },
+    [selectedAccountId, accounts],
+  );
+
+  const handleUploadSchedule = useCallback(
+    (row: ProjectManagerRow) => {
+      const accountId = resolveAccountIdForRow(row);
+      if (!accountId) {
+        setError("Pick an account before scheduling manually.");
+        return;
+      }
+      setSchedulingForProject({ row, accountId });
+    },
+    [resolveAccountIdForRow],
+  );
+
+  const handleUploadUrgent = useCallback(
+    (row: ProjectManagerRow) => {
+      const accountId = resolveAccountIdForRow(row);
+      if (!accountId) {
+        setError("Pick an account before urgent upload.");
+        return;
+      }
+      setUrgentForProject({ row, accountId });
+    },
+    [resolveAccountIdForRow],
+  );
+
   const compatibleAccounts = useMemo(() => {
     if (!accountPickerForProject) return [];
     const row = rows.find((r) => r.project_id === accountPickerForProject);
@@ -953,6 +1000,7 @@ export function ProjectManagerModal({
               <ProjectTable
                 rows={sortedRows}
                 accounts={accounts}
+                selectedAccount={selectedAccount}
                 loading={loading}
                 sortColumn={sortColumn}
                 sortDirection={sortDirection}
@@ -961,6 +1009,8 @@ export function ProjectManagerModal({
                 activeDeleteId={activeDeleteId}
                 holdingDeleteId={holdingDeleteId}
                 onUpload={handleUploadClick}
+                onUploadSchedule={handleUploadSchedule}
+                onUploadUrgent={handleUploadUrgent}
                 onDeleteHoldStart={startDeleteHold}
                 onDeleteHoldCancel={cancelDeleteHold}
                 onPreview={(id) => setPreviewVideoId(id)}
@@ -1185,6 +1235,55 @@ export function ProjectManagerModal({
             driveVideoId={previewVideoId}
             onClose={() => setPreviewVideoId(null)}
           />
+
+          {schedulingForProject && (
+            <SlotPickerPopover
+              open
+              mode="anchor"
+              projectId={schedulingForProject.row.project_id}
+              accountId={schedulingForProject.accountId}
+              platformsForAnchor={
+                ["tiktok", "youtube", "facebook", "instagram"] as Platform[]
+              }
+              onClose={() => setSchedulingForProject(null)}
+              onConfirm={async (payload) => {
+                const anchor = payload as {
+                  tiktok_slot: string;
+                  overrides?: Partial<Record<Platform, string>>;
+                };
+                const ctx = schedulingForProject;
+                setSchedulingForProject(null);
+                await startUploadWithChecks(
+                  ctx.row.project_id,
+                  ctx.accountId,
+                  "scheduled",
+                  anchor,
+                );
+              }}
+            />
+          )}
+
+          {urgentForProject && (
+            <UrgentCascadeModal
+              open
+              projectId={urgentForProject.row.project_id}
+              projectTitle={urgentForProject.row.anime_title || "Project"}
+              accountId={urgentForProject.accountId}
+              onClose={() => setUrgentForProject(null)}
+              onConfirmed={() => {
+                const ctx = urgentForProject;
+                setUrgentForProject(null);
+                // Cascade already applied — call upload flow with mode=auto
+                // so it consumes freshly-reserved slots via
+                // _try_reuse_platform_reservation.
+                void startUploadWithChecks(
+                  ctx.row.project_id,
+                  ctx.accountId,
+                  "auto",
+                );
+              }}
+            />
+          )}
         </motion.div>
       )}
     </AnimatePresence>

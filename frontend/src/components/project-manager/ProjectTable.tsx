@@ -6,6 +6,7 @@ import type { ProjectManagerRow, Account } from "@/types";
 interface ProjectTableProps {
   rows: ProjectManagerRow[];
   accounts: Account[];
+  selectedAccount: Account | null;
   loading: boolean;
   sortColumn: SortColumn;
   sortDirection: SortDirection;
@@ -14,6 +15,8 @@ interface ProjectTableProps {
   activeDeleteId: string | null;
   holdingDeleteId: string | null;
   onUpload: (row: ProjectManagerRow) => void;
+  onUploadSchedule: (row: ProjectManagerRow) => void;
+  onUploadUrgent: (row: ProjectManagerRow) => void;
   onDeleteHoldStart: (row: ProjectManagerRow) => void;
   onDeleteHoldCancel: () => void;
   onPreview: (driveVideoId: string) => void;
@@ -76,6 +79,7 @@ function SkeletonRows({ colCount }: { colCount: number }) {
 export function ProjectTable({
   rows,
   accounts,
+  selectedAccount,
   loading,
   sortColumn,
   sortDirection,
@@ -84,6 +88,8 @@ export function ProjectTable({
   activeDeleteId,
   holdingDeleteId,
   onUpload,
+  onUploadSchedule,
+  onUploadUrgent,
   onDeleteHoldStart,
   onDeleteHoldCancel,
   onPreview,
@@ -131,10 +137,13 @@ export function ProjectTable({
               key={row.project_id}
               row={row}
               accounts={accounts}
+              selectedAccount={selectedAccount}
               uploadState={uploadStateByProjectId[row.project_id]}
               activeDeleteId={activeDeleteId}
               holdingDeleteId={holdingDeleteId}
               onUpload={onUpload}
+              onUploadSchedule={onUploadSchedule}
+              onUploadUrgent={onUploadUrgent}
               onDeleteHoldStart={onDeleteHoldStart}
               onDeleteHoldCancel={onDeleteHoldCancel}
               onPreview={onPreview}

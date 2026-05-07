@@ -24,10 +24,7 @@ export function UploadSplitButton({
   const ref = useRef<HTMLDivElement | null>(null);
   void row;
 
-  const slotsByPlatform = (selectedAccount as
-    | (Account & { slots_by_platform?: Partial<Record<string, string[]>> })
-    | null)?.slots_by_platform;
-  const accountHasTikTok = !!slotsByPlatform?.tiktok?.length;
+  const accountHasTikTok = !!selectedAccount?.slots_by_platform?.tiktok?.length;
 
   useEffect(() => {
     if (!open) return;
