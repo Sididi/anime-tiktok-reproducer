@@ -291,3 +291,88 @@ async def delete_all(project_id: str):
     for platform in list(project.platform_schedules.keys()):
         await asyncio.to_thread(_notify_cancellation, project_id, platform)
     await asyncio.to_thread(SchedulingService.cancel_all_slots, project_id)
+
+
+class CascadeRequest(BaseModel):
+    account_id: str
+
+
+def _cascade_to_payload(result) -> dict:
+    return {
+        "per_platform": [
+            {
+                "platform": p.platform,
+                "target_slot": p.target_slot.isoformat(),
+                "target_scheduled_at": p.target_scheduled_at.isoformat(),
+                "displaced": [
+                    {
+                        "project_id": d.project_id,
+                        "anime_title": d.anime_title,
+                        "from_slot": d.from_slot.isoformat(),
+                        "to_slot": d.to_slot.isoformat(),
+                        "requires_platform_notification": d.requires_platform_notification,
+                    }
+                    for d in p.displaced
+                ],
+            }
+            for p in result.per_platform
+        ],
+        "blockers": [{"platform": b.platform, "reason": b.reason} for b in result.blockers],
+    }
+
+
+@router.post("/projects/{project_id}/cascade-preview")
+async def cascade_preview(project_id: str, req: CascadeRequest):
+    result = await asyncio.to_thread(
+        SchedulingService.compute_cascade, project_id, req.account_id
+    )
+    return _cascade_to_payload(result)
+
+
+@router.post("/projects/{project_id}/cascade-apply")
+async def cascade_apply(project_id: str, req: CascadeRequest):
+    try:
+        result = await asyncio.to_thread(
+            SchedulingService.apply_cascade, project_id, req.account_id
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        if "pool_busy" in msg:
+            raise HTTPException(409, msg)
+        if "facebook_horizon_exceeded" in msg or "pool_full" in msg:
+            raise HTTPException(422, msg)
+        raise HTTPException(422, msg)
+
+    notification_status: dict[str, dict[str, str]] = {}
+    for plat in result.per_platform:
+        notification_status[plat.platform] = {}
+        for displaced in plat.displaced:
+            ts = await asyncio.to_thread(
+                _notify_displaced,
+                displaced.project_id,
+                plat.platform,
+                # use the recomputed scheduled_at written by apply_cascade
+                ProjectService.load(displaced.project_id)
+                    .platform_schedules[plat.platform].scheduled_at,
+            )
+            notification_status[plat.platform][displaced.project_id] = ts
+
+    payload = _cascade_to_payload(result)
+    payload["notification_status"] = notification_status
+    return payload
+
+
+@router.get("/reschedule-pending")
+async def reschedule_pending():
+    items: list[dict] = []
+    for project in await asyncio.to_thread(ProjectService.list_all):
+        for platform, entry in (project.reschedule_pending or {}).items():
+            items.append({
+                "project_id": project.id,
+                "platform": platform,
+                "target_scheduled_at": entry.get("target_scheduled_at"),
+                "retries": entry.get("retries", 0),
+                "last_error": entry.get("last_error"),
+                "last_attempt_at": entry.get("last_attempt_at"),
+            })
+    return {"items": items}

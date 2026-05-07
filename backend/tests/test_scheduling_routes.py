@@ -149,3 +149,70 @@ def test_delete_all_endpoint(client):
     assert r.status_code == 204
     project = ProjectService.load("p1")
     assert project.platform_schedules == {}
+
+
+def test_cascade_preview_endpoint(client):
+    other = Project(id="other", scheduled_account_id="acc_a",
+        anime_name="Other",
+        platform_schedules={
+            "tiktok": PlatformSchedule(
+                slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+                scheduled_at=datetime(2026, 5, 7, 14, 6, tzinfo=timezone.utc),
+            )
+        }
+    )
+    ProjectService.get_project_dir(other.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(other)
+    urgent = Project(id="urgent", anime_name="Urgent")
+    ProjectService.get_project_dir(urgent.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(urgent)
+
+    r = client.post("/api/scheduling/projects/urgent/cascade-preview",
+                    json={"account_id": "acc_a"})
+    assert r.status_code == 200
+    body = r.json()
+    tt = next(p for p in body["per_platform"] if p["platform"] == "tiktok")
+    assert len(tt["displaced"]) == 1
+
+
+def test_cascade_apply_endpoint(client):
+    other = Project(id="other", scheduled_account_id="acc_a",
+        anime_name="Other",
+        platform_schedules={
+            "tiktok": PlatformSchedule(
+                slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+                scheduled_at=datetime(2026, 5, 7, 14, 6, tzinfo=timezone.utc),
+            )
+        }
+    )
+    ProjectService.get_project_dir(other.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(other)
+    urgent = Project(id="urgent", anime_name="Urgent")
+    ProjectService.get_project_dir(urgent.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(urgent)
+
+    r = client.post("/api/scheduling/projects/urgent/cascade-apply",
+                    json={"account_id": "acc_a"})
+    assert r.status_code == 200
+    other = ProjectService.load("other")
+    assert other.platform_schedules["tiktok"].slot == datetime(
+        2026, 5, 7, 18, 0, tzinfo=timezone.utc
+    )
+
+
+def test_reschedule_pending_endpoint(client):
+    project = Project(id="p1")
+    project.reschedule_pending = {
+        "youtube": {
+            "target_scheduled_at": datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+            "retries": 2,
+            "last_error": "503",
+            "last_attempt_at": datetime(2026, 5, 7, 14, 5, tzinfo=timezone.utc),
+        }
+    }
+    ProjectService.get_project_dir(project.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(project)
+    r = client.get("/api/scheduling/reschedule-pending")
+    assert r.status_code == 200
+    items = r.json()["items"]
+    assert any(i["project_id"] == "p1" and i["platform"] == "youtube" for i in items)
