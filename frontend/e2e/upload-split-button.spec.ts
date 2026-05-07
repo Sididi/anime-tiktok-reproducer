@@ -155,3 +155,125 @@ test("Auto upload (single click on Upload) still works as before", async ({
     () => (window as unknown as { __uploadCalled?: boolean }).__uploadCalled === true,
   );
 });
+
+function installSchedulingMocks() {
+  const testWindow = window as Window &
+    typeof globalThis & {
+      __anchored?: boolean;
+    };
+  testWindow.__anchored = false;
+  const orig = window.fetch.bind(window);
+  window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const requestUrl =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url;
+    const url = new URL(requestUrl, window.location.origin);
+    const json = (body: unknown) =>
+      new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    // Slots are sent as UTC ISO; SlotChips renders them via Europe/Paris.
+    // 12:00Z → 14:00 Paris (CEST in May), 16:00Z → 18:00 Paris.
+    if (url.pathname === "/api/scheduling/free-slots") {
+      return json({
+        slots: [
+          { slot: "2026-05-08T12:00:00Z", available: true },
+          { slot: "2026-05-08T16:00:00Z", available: true },
+        ],
+      });
+    }
+    if (url.pathname === "/api/scheduling/resolve-anchor") {
+      return json({
+        resolved: {
+          tiktok: {
+            slot: "2026-05-08T12:00:00Z",
+            scheduled_at: "2026-05-08T12:08:00Z",
+            available: true,
+          },
+          youtube: {
+            slot: "2026-05-08T12:00:00Z",
+            scheduled_at: "2026-05-08T12:09:00Z",
+            available: true,
+          },
+        },
+        conflicts: [],
+      });
+    }
+    if (url.pathname.includes("/reserve-anchor") && init?.method === "POST") {
+      testWindow.__anchored = true;
+      return json({
+        platform_schedules: {
+          tiktok: {
+            slot: "2026-05-08T12:00:00Z",
+            scheduled_at: "2026-05-08T12:08:00Z",
+          },
+        },
+      });
+    }
+    return orig(input, init);
+  };
+}
+
+// Wrap fetch one more time so that copyright/facebook/youtube check responses
+// resolve on a macrotask (setTimeout). Otherwise React 18 doesn't have time to
+// commit `setUploadSession` and update the session ref before the awaited check
+// resolves, which causes `isSessionCurrent` to return false and the upload flow
+// to halt at "checking_copyright". The auto path doesn't trip on this because
+// it has no preceding await before the first setUploadSession.
+function installCheckDelay() {
+  const orig = window.fetch.bind(window);
+  window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const requestUrl =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url;
+    const url = new URL(requestUrl, window.location.origin);
+    if (
+      url.pathname.endsWith("/copyright-check") ||
+      url.pathname.endsWith("/facebook-check") ||
+      url.pathname.endsWith("/youtube-check")
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    return orig(input, init);
+  };
+}
+
+test("Schedule mode reserves anchor before upload", async ({ page }) => {
+  await page.addInitScript(installSchedulingMocks);
+  await page.addInitScript(installMocks, { account: ACCOUNT, row: ROW });
+  await page.addInitScript(installCheckDelay);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Projects" }).click();
+
+  const projectRow = page.locator("tr").filter({ hasText: "Show Alpha" });
+  await expect(projectRow).toBeVisible();
+
+  await page.getByRole("button", { name: "All Projects" }).click();
+  await page.getByRole("button", { name: "Account A" }).click();
+
+  await projectRow.getByRole("button", { name: "Upload options" }).click();
+  await page.getByRole("button", { name: /Schedule for specific slot/ }).click();
+  // Slots are mocked for 2026-05-08; click that day in the calendar so the
+  // popover's same-day filter surfaces them.
+  await page
+    .getByRole("heading", { name: "Pick a slot" })
+    .locator("..")
+    .getByRole("button", { name: "8", exact: true })
+    .click();
+  await page.getByRole("button", { name: /^14:00$/ }).first().click();
+  await page.getByRole("button", { name: "Schedule", exact: true }).click();
+
+  await page.waitForFunction(
+    () => (window as unknown as { __anchored?: boolean }).__anchored === true,
+  );
+  await page.waitForFunction(
+    () => (window as unknown as { __uploadCalled?: boolean }).__uploadCalled === true,
+  );
+});
