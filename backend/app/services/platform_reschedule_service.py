@@ -9,6 +9,7 @@ from typing import Literal
 import httpx
 from googleapiclient.discovery import build
 
+from ..config import settings
 from ..models import Project
 from .account_service import AccountService
 
@@ -153,7 +154,20 @@ class PlatformRescheduleService:
 
     @classmethod
     def _notify_instagram(cls, project: Project, new_scheduled_at: datetime) -> NotificationResult:
-        raise NotImplementedError
+        url = settings.tiktok_server_url.rstrip("/") + f"/api/internal/jobs/{project.id}/slot"
+        resp = httpx.patch(
+            url,
+            json={
+                "slot_time": new_scheduled_at.isoformat(),
+                "platform_scheduled_at": {"instagram": new_scheduled_at.isoformat()},
+            },
+            headers={"Authorization": f"Bearer {settings.tiktok_server_internal_token}"},
+            timeout=20.0,
+        )
+        if resp.status_code == 404:
+            return NotificationResult(status="skipped")
+        resp.raise_for_status()
+        return NotificationResult(status="ok")
 
     @classmethod
     def _cancel_youtube(cls, project: Project, url: str) -> NotificationResult:
@@ -189,4 +203,13 @@ class PlatformRescheduleService:
 
     @classmethod
     def _cancel_instagram(cls, project: Project) -> NotificationResult:
-        raise NotImplementedError
+        url = settings.tiktok_server_url.rstrip("/") + f"/api/internal/jobs/{project.id}"
+        resp = httpx.delete(
+            url,
+            headers={"Authorization": f"Bearer {settings.tiktok_server_internal_token}"},
+            timeout=20.0,
+        )
+        if resp.status_code == 404:
+            return NotificationResult(status="skipped")
+        resp.raise_for_status()
+        return NotificationResult(status="ok")

@@ -142,3 +142,66 @@ def test_cancel_facebook_marks_unpublished(monkeypatch):
     result = PlatformRescheduleService.cancel(project, "facebook")
     assert result.status == "ok"
     assert posted["data"]["published"] == "false"
+
+
+def test_notify_instagram_patches_server_endpoint(monkeypatch):
+    project = Project(
+        id="p1",
+        scheduled_account_id="acc_a",
+        upload_last_result={"platforms": {"instagram": {"url": "https://instagram.com/p/abc"}}},
+    )
+
+    captured: dict = {}
+    class FakeResp:
+        status_code = 200
+        def raise_for_status(self): return None
+    def fake_patch(url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        captured["headers"] = headers
+        return FakeResp()
+
+    monkeypatch.setattr(
+        "app.services.platform_reschedule_service.settings.tiktok_server_url",
+        "https://server.example.com",
+    )
+    monkeypatch.setattr(
+        "app.services.platform_reschedule_service.settings.tiktok_server_internal_token",
+        "secret",
+    )
+    monkeypatch.setattr("app.services.platform_reschedule_service.httpx.patch", fake_patch)
+
+    result = PlatformRescheduleService.notify(
+        project, "instagram",
+        datetime(2026, 5, 8, 14, 0, tzinfo=timezone.utc),
+    )
+    assert result.status == "ok"
+    assert captured["url"] == "https://server.example.com/api/internal/jobs/p1/slot"
+    assert captured["headers"]["Authorization"] == "Bearer secret"
+    assert captured["json"]["slot_time"].startswith("2026-05-08T14:00:00")
+    assert "instagram" in captured["json"]["platform_scheduled_at"]
+
+
+def test_cancel_instagram_deletes_server_job(monkeypatch):
+    project = Project(id="p1", scheduled_account_id="acc_a")
+
+    captured: dict = {}
+    class FakeResp:
+        status_code = 204
+        def raise_for_status(self): return None
+    def fake_delete(url, headers=None, timeout=None):
+        captured["url"] = url
+        return FakeResp()
+    monkeypatch.setattr(
+        "app.services.platform_reschedule_service.settings.tiktok_server_url",
+        "https://server.example.com",
+    )
+    monkeypatch.setattr(
+        "app.services.platform_reschedule_service.settings.tiktok_server_internal_token",
+        "secret",
+    )
+    monkeypatch.setattr("app.services.platform_reschedule_service.httpx.delete", fake_delete)
+
+    result = PlatformRescheduleService.cancel(project, "instagram")
+    assert result.status == "ok"
+    assert captured["url"] == "https://server.example.com/api/internal/jobs/p1"
