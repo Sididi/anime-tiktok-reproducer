@@ -152,3 +152,80 @@ def test_resolve_anchor_invalid_override_returns_conflict(isolated_scheduler):
         overrides={"youtube": datetime(2026, 5, 7, 9, 0, tzinfo=timezone.utc)},
     )
     assert any(c.platform == "youtube" for c in result.conflicts)
+
+
+def test_reserve_anchor_persists_platform_schedules(isolated_scheduler):
+    project = Project(id="proj")
+    ProjectService.get_project_dir(project.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(project)
+    result = SchedulingService.reserve_anchor(
+        project_id="proj",
+        account_id="acc_a",
+        tiktok_slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+    )
+    assert "tiktok" in result
+    assert "youtube" in result
+    reloaded = ProjectService.load("proj")
+    assert reloaded.scheduled_account_id == "acc_a"
+    assert "tiktok" in reloaded.platform_schedules
+
+
+def test_reserve_anchor_idempotent_when_called_twice(isolated_scheduler):
+    project = Project(id="proj")
+    ProjectService.get_project_dir(project.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(project)
+    first = SchedulingService.reserve_anchor(
+        project_id="proj",
+        account_id="acc_a",
+        tiktok_slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+    )
+    second = SchedulingService.reserve_anchor(
+        project_id="proj",
+        account_id="acc_a",
+        tiktok_slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+    )
+    assert first["tiktok"].slot == second["tiktok"].slot
+    assert first["tiktok"].scheduled_at == second["tiktok"].scheduled_at
+
+
+def test_reserve_anchor_raises_on_conflict(isolated_scheduler):
+    other = Project(
+        id="other",
+        scheduled_account_id="acc_a",
+        platform_schedules={
+            "tiktok": __import__("app").models.PlatformSchedule(
+                slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+                scheduled_at=datetime(2026, 5, 7, 14, 8, tzinfo=timezone.utc),
+            )
+        },
+    )
+    ProjectService.get_project_dir(other.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(other)
+    project = Project(id="proj")
+    ProjectService.get_project_dir(project.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(project)
+    with pytest.raises(ValueError) as exc:
+        SchedulingService.reserve_anchor(
+            project_id="proj",
+            account_id="acc_a",
+            tiktok_slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+        )
+    assert "tiktok" in str(exc.value)
+
+
+def test_reschedule_anchor_swaps_existing_reservations(isolated_scheduler):
+    project = Project(id="proj")
+    ProjectService.get_project_dir(project.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(project)
+    SchedulingService.reserve_anchor(
+        project_id="proj",
+        account_id="acc_a",
+        tiktok_slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+    )
+    new_anchor = datetime(2026, 5, 8, 18, 0, tzinfo=timezone.utc)
+    SchedulingService.reschedule_anchor(
+        project_id="proj",
+        tiktok_slot=new_anchor,
+    )
+    reloaded = ProjectService.load("proj")
+    assert reloaded.platform_schedules["tiktok"].slot == new_anchor

@@ -439,6 +439,84 @@ class SchedulingService:
             return results
 
     @classmethod
+    def reserve_anchor(
+        cls,
+        project_id: str,
+        account_id: str,
+        tiktok_slot: datetime,
+        overrides: dict[str, datetime] | None = None,
+    ) -> dict[str, PlatformSchedule]:
+        """Reserve TT (anchor) + each other configured platform on `project`.
+
+        Idempotent: a second call with the same anchor reuses the existing
+        per-platform reservations.
+        Raises ValueError if any platform conflicts.
+        """
+        with cls._reservation_lock:
+            project = ProjectService.load(project_id)
+            if project is None:
+                raise ValueError("Project not found")
+
+            # Reuse path: same account, same anchor TT slot already stored.
+            existing_tt = (project.platform_schedules or {}).get("tiktok")
+            anchor = cls._normalize_utc_datetime(tiktok_slot)
+            if (
+                existing_tt is not None
+                and project.scheduled_account_id == account_id
+                and cls._normalize_utc_datetime(existing_tt.slot) == anchor
+            ):
+                return dict(project.platform_schedules)
+
+            # Drop reservations belonging to a different account before reserving.
+            if project.scheduled_account_id and project.scheduled_account_id != account_id:
+                project.platform_schedules = {}
+
+            resolution = cls.resolve_anchor(account_id, anchor, overrides)
+            if resolution.conflicts:
+                conflict_summary = ", ".join(
+                    f"{c.platform}:{c.reason}" for c in resolution.conflicts
+                )
+                raise ValueError(f"Anchor conflicts: {conflict_summary}")
+
+            schedules = dict(project.platform_schedules or {})
+            for platform, resolved in resolution.resolved.items():
+                schedules[platform] = PlatformSchedule(
+                    slot=resolved.slot, scheduled_at=resolved.scheduled_at
+                )
+            project.platform_schedules = schedules
+            project.scheduled_account_id = account_id
+            cls._recompute_aggregates(project)
+            ProjectService.save(project)
+            return dict(schedules)
+
+    @classmethod
+    def reschedule_anchor(
+        cls,
+        project_id: str,
+        tiktok_slot: datetime,
+        overrides: dict[str, datetime] | None = None,
+    ) -> dict[str, PlatformSchedule]:
+        """Re-anchor a project's reservations on a new TT slot."""
+        with cls._reservation_lock:
+            project = ProjectService.load(project_id)
+            if project is None:
+                raise ValueError("Project not found")
+            account_id = project.scheduled_account_id
+            if not account_id:
+                raise ValueError("Project has no scheduled account")
+            # Drop existing per-platform reservations so resolve_anchor sees
+            # the slots as free in this pool.
+            project.platform_schedules = {}
+            ProjectService.save(project)
+
+        return cls.reserve_anchor(
+            project_id=project_id,
+            account_id=account_id,
+            tiktok_slot=tiktok_slot,
+            overrides=overrides,
+        )
+
+    @classmethod
     def clear_reserved_slots(cls, project_id: str) -> None:
         with cls._reservation_lock:
             project = ProjectService.load(project_id)
