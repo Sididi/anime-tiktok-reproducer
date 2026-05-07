@@ -124,3 +124,121 @@ test("Planning modal filters by platform", async ({ page }) => {
   await youtubeChip.click();
   await expect(youtubeChip).toHaveAttribute("aria-pressed", "false");
 });
+
+function installMocksWithMutations(events: unknown[], accounts: unknown[]) {
+  return ([eventsArg, accountsArg]: [unknown[], unknown[]]) => {
+    const orig = window.fetch.bind(window);
+    const jsonResponse = (payload: unknown, status = 200) =>
+      new Response(JSON.stringify(payload), {
+        status,
+        headers: { "Content-Type": "application/json" },
+      });
+    const emptyEventStream = () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.close();
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "text/event-stream" } },
+      );
+
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const requestUrl =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+      const url = new URL(requestUrl, window.location.origin);
+      const path = url.pathname;
+      const method = (init?.method ?? "GET").toUpperCase();
+
+      if (path === "/api/accounts") {
+        return jsonResponse({ accounts: accountsArg });
+      }
+      if (path === "/api/scheduling/events") {
+        return jsonResponse({ events: eventsArg });
+      }
+      if (
+        path.startsWith("/api/scheduling/projects/") &&
+        path.endsWith("/platforms/youtube") &&
+        method === "PATCH"
+      ) {
+        // @ts-expect-error inject flag for assertions
+        window.__patched = true;
+        return jsonResponse({
+          slot: "2026-05-08T14:00:00Z",
+          scheduled_at: "2026-05-08T14:11:00Z",
+          notification_status: "ok",
+        });
+      }
+      if (
+        path.startsWith("/api/scheduling/projects/") &&
+        path.endsWith("/platforms/tiktok") &&
+        method === "DELETE"
+      ) {
+        // @ts-expect-error inject flag for assertions
+        window.__deleted = true;
+        return new Response(null, { status: 204 });
+      }
+      if (path === "/api/anime/source-details") {
+        return jsonResponse([]);
+      }
+      if (path === "/api/anime/jobs/stream") {
+        return emptyEventStream();
+      }
+      if (path === "/api/projects/startup/jobs") {
+        return jsonResponse({ jobs: [] });
+      }
+      if (path === "/api/projects/startup/jobs/stream") {
+        return emptyEventStream();
+      }
+      return orig(input, init);
+    };
+  };
+}
+
+test("Reschedule slot triggers PATCH and reloads", async ({ page }) => {
+  await page.addInitScript(installMocksWithMutations(EVENTS, ACCOUNTS), [
+    EVENTS,
+    ACCOUNTS,
+  ]);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Planning" }).click();
+  await expect(page.getByRole("heading", { name: "Planning" })).toBeVisible();
+  await expect(page.getByText("Show Alpha").first()).toBeVisible();
+
+  page.on("dialog", async (dlg) => {
+    if (dlg.type() === "prompt") {
+      await dlg.accept("2026-05-08T14:00:00Z");
+    } else {
+      await dlg.dismiss();
+    }
+  });
+
+  await page.getByText("Show Alpha").first().click();
+  await page.getByRole("button", { name: "Reschedule slot" }).click();
+  await page.waitForFunction(
+    () => (window as unknown as { __patched?: boolean }).__patched === true,
+  );
+});
+
+test("Cancel slot triggers DELETE", async ({ page }) => {
+  await page.addInitScript(installMocksWithMutations(EVENTS, ACCOUNTS), [
+    EVENTS,
+    ACCOUNTS,
+  ]);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Planning" }).click();
+  await expect(page.getByRole("heading", { name: "Planning" })).toBeVisible();
+  await expect(page.getByText("Show Beta").first()).toBeVisible();
+
+  page.on("dialog", (dlg) => dlg.accept());
+
+  await page.getByText("Show Beta").first().click();
+  await page.getByRole("button", { name: "Cancel slot" }).click();
+  await page.waitForFunction(
+    () => (window as unknown as { __deleted?: boolean }).__deleted === true,
+  );
+});
