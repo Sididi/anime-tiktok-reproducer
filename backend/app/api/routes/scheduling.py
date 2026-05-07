@@ -142,3 +142,128 @@ async def free_slots(
             for s in slots
         ]
     }
+
+
+class ResolveAnchorRequest(BaseModel):
+    project_id: str
+    account_id: str
+    tiktok_slot: datetime
+    overrides: dict[str, datetime] | None = None
+
+
+class ReserveAnchorRequest(BaseModel):
+    account_id: str
+    tiktok_slot: datetime
+    overrides: dict[str, datetime] | None = None
+
+
+class PatchPlatformRequest(BaseModel):
+    new_slot: datetime
+
+
+class PatchAnchorRequest(BaseModel):
+    tiktok_slot: datetime
+    overrides: dict[str, datetime] | None = None
+
+
+def _platform_schedules_to_dict(schedules):
+    return {
+        p: {"slot": s.slot.isoformat(), "scheduled_at": s.scheduled_at.isoformat()}
+        for p, s in schedules.items()
+    }
+
+
+def _notify_displaced(project_id: str, platform: str, new_scheduled_at: datetime) -> str:
+    """Trigger platform notification, return 'ok' / 'pending_retry' / 'skipped'.
+
+    Mutates project.reschedule_pending on pending_retry to feed the retry loop.
+    """
+    from ...services.platform_reschedule_service import PlatformRescheduleService  # noqa: PLC0415
+    project = ProjectService.load(project_id)
+    if project is None:
+        return "skipped"
+    result = PlatformRescheduleService.notify(project, platform, new_scheduled_at)
+    if result.status == "pending_retry":
+        pending = dict(project.reschedule_pending or {})
+        pending[platform] = {
+            "target_scheduled_at": new_scheduled_at,
+            "retries": 0,
+            "last_error": result.error,
+            "last_attempt_at": datetime.now(tz=new_scheduled_at.tzinfo),
+        }
+        project.reschedule_pending = pending
+        ProjectService.save(project)
+    return result.status
+
+
+@router.post("/resolve-anchor")
+async def resolve_anchor(req: ResolveAnchorRequest):
+    result = await asyncio.to_thread(
+        SchedulingService.resolve_anchor,
+        req.account_id, req.tiktok_slot, req.overrides,
+    )
+    return {
+        "resolved": {
+            p: {"slot": r.slot.isoformat(), "scheduled_at": r.scheduled_at.isoformat(),
+                "available": r.available}
+            for p, r in result.resolved.items()
+        },
+        "conflicts": [{"platform": c.platform, "reason": c.reason} for c in result.conflicts],
+    }
+
+
+@router.post("/projects/{project_id}/reserve-anchor")
+async def reserve_anchor(project_id: str, req: ReserveAnchorRequest):
+    try:
+        schedules = await asyncio.to_thread(
+            SchedulingService.reserve_anchor,
+            project_id, req.account_id, req.tiktok_slot, req.overrides,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        if "tiktok" in msg and "slot_taken" in msg:
+            raise HTTPException(409, "tiktok_slot_taken")
+        if "slot_not_configured" in msg:
+            raise HTTPException(422, "invalid_slot")
+        if "Project not found" in msg:
+            raise HTTPException(404, msg)
+        raise HTTPException(422, msg)
+    return {"platform_schedules": _platform_schedules_to_dict(schedules)}
+
+
+@router.patch("/projects/{project_id}/platforms/{platform}")
+async def patch_platform(project_id: str, platform: str, req: PatchPlatformRequest):
+    try:
+        sched = await asyncio.to_thread(
+            SchedulingService.reschedule_platform, project_id, platform, req.new_slot
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    notif_status = await asyncio.to_thread(
+        _notify_displaced, project_id, platform, sched.scheduled_at
+    )
+    return {
+        "slot": sched.slot.isoformat(),
+        "scheduled_at": sched.scheduled_at.isoformat(),
+        "notification_status": notif_status,
+    }
+
+
+@router.patch("/projects/{project_id}/anchor")
+async def patch_anchor(project_id: str, req: PatchAnchorRequest):
+    try:
+        schedules = await asyncio.to_thread(
+            SchedulingService.reschedule_anchor,
+            project_id, req.tiktok_slot, req.overrides,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    statuses: dict[str, str] = {}
+    for platform, sched in schedules.items():
+        statuses[platform] = await asyncio.to_thread(
+            _notify_displaced, project_id, platform, sched.scheduled_at
+        )
+    return {
+        "platform_schedules": _platform_schedules_to_dict(schedules),
+        "notification_status": statuses,
+    }

@@ -79,3 +79,47 @@ def test_free_slots_endpoint(client):
     slots = r.json()["slots"]
     assert len(slots) == 4
     assert all("slot" in s and "available" in s for s in slots)
+
+
+def test_resolve_anchor_endpoint(client):
+    p = Project(id="p1")
+    ProjectService.get_project_dir(p.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(p)
+    r = client.post("/api/scheduling/resolve-anchor", json={
+        "project_id": "p1",
+        "account_id": "acc_a",
+        "tiktok_slot": datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc).isoformat(),
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert "tiktok" in body["resolved"]
+    assert body["conflicts"] == []
+
+
+def test_reserve_anchor_endpoint(client):
+    p = Project(id="p1")
+    ProjectService.get_project_dir(p.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(p)
+    r = client.post("/api/scheduling/projects/p1/reserve-anchor", json={
+        "account_id": "acc_a",
+        "tiktok_slot": datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc).isoformat(),
+    })
+    assert r.status_code == 200
+    schedules = r.json()["platform_schedules"]
+    assert "tiktok" in schedules
+
+
+def test_patch_platform_endpoint(client):
+    p = Project(id="p1")
+    ProjectService.get_project_dir(p.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(p)
+    SchedulingService.reserve_anchor(
+        "p1", "acc_a", datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
+    )
+    r = client.patch(
+        "/api/scheduling/projects/p1/platforms/youtube",
+        json={"new_slot": datetime(2026, 5, 8, 14, 0, tzinfo=timezone.utc).isoformat()},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["slot"].startswith("2026-05-08T14:00:00")
