@@ -36,6 +36,35 @@ class ResolveAnchorResult:
     conflicts: list[AnchorConflict]
 
 
+@dataclass
+class DisplacedItem:
+    project_id: str
+    anime_title: str
+    from_slot: datetime
+    to_slot: datetime
+    requires_platform_notification: bool
+
+
+@dataclass
+class CascadePlatform:
+    platform: str
+    target_slot: datetime
+    target_scheduled_at: datetime
+    displaced: list[DisplacedItem]
+
+
+@dataclass
+class CascadeBlocker:
+    platform: str
+    reason: str
+
+
+@dataclass
+class CascadeResult:
+    per_platform: list[CascadePlatform]
+    blockers: list[CascadeBlocker]
+
+
 class SchedulingService:
     """Finds and reserves the next available upload slot per (account, platform)."""
 
@@ -594,3 +623,203 @@ class SchedulingService:
             project.scheduled_account_id = None
             cls._recompute_aggregates(project)
             ProjectService.save(project)
+
+    # ----------------------------------------------------------------- cascade
+
+    _CASCADE_PLATFORMS: tuple[str, ...] = ("tiktok", "youtube", "facebook", "instagram")
+
+    @classmethod
+    def _platforms_for_project(cls, project_id: str, account_id: str) -> list[str]:
+        """Return the cascade-relevant platforms for an urgent project upload."""
+        from .project_upload_service import _platforms_to_reserve  # noqa: PLC0415
+        account = AccountService.get_account(account_id)
+        if account is None:
+            return []
+        return _platforms_to_reserve(account, requested_platforms=None)
+
+    @classmethod
+    def _slot_times_sorted(
+        cls, account_id: str, platform: str
+    ) -> list[tuple[int, int]]:
+        account = AccountService.get_account(account_id)
+        if not account:
+            return []
+        out: list[tuple[int, int]] = []
+        for s in account.slots_for(platform):
+            parts = s.strip().split(":")
+            out.append((int(parts[0]), int(parts[1]) if len(parts) > 1 else 0))
+        return sorted(out)
+
+    @classmethod
+    def _next_slot_after(
+        cls,
+        account_id: str,
+        platform: str,
+        after_slot: datetime,
+    ) -> datetime | None:
+        slot_times = cls._slot_times_sorted(account_id, platform)
+        if not slot_times:
+            return None
+        cap = datetime.now(timezone.utc) + timedelta(days=cls._MAX_LOOKAHEAD_DAYS)
+        current_date = after_slot.date()
+        seen_after = False
+        for _ in range(cls._MAX_LOOKAHEAD_DAYS + 1):
+            for hour, minute in slot_times:
+                candidate = datetime(
+                    current_date.year, current_date.month, current_date.day,
+                    hour, minute, 0, tzinfo=timezone.utc,
+                )
+                if candidate <= after_slot:
+                    continue
+                if candidate > cap:
+                    return None
+                return candidate
+            current_date += timedelta(days=1)
+            del seen_after
+        return None
+
+    @classmethod
+    def _earliest_slot_at_or_after(
+        cls, account_id: str, platform: str, lower_bound: datetime
+    ) -> datetime | None:
+        slot_times = cls._slot_times_sorted(account_id, platform)
+        if not slot_times:
+            return None
+        cap = lower_bound + timedelta(days=cls._MAX_LOOKAHEAD_DAYS)
+        current_date = lower_bound.date()
+        for _ in range(cls._MAX_LOOKAHEAD_DAYS + 1):
+            for hour, minute in slot_times:
+                candidate = datetime(
+                    current_date.year, current_date.month, current_date.day,
+                    hour, minute, 0, tzinfo=timezone.utc,
+                )
+                if candidate < lower_bound:
+                    continue
+                if candidate > cap:
+                    return None
+                return candidate
+            current_date += timedelta(days=1)
+        return None
+
+    @classmethod
+    def _project_requires_platform_notification(
+        cls, project: Project, platform: str
+    ) -> bool:
+        result = project.upload_last_result or {}
+        platforms = result.get("platforms") if isinstance(result, dict) else None
+        if not isinstance(platforms, dict):
+            return False
+        entry = platforms.get(platform)
+        if not isinstance(entry, dict):
+            return False
+        return bool(entry.get("url"))
+
+    @classmethod
+    def _pool_is_busy_uploading(cls, account_id: str, platform: str) -> tuple[bool, str | None]:
+        from .project_upload_service import project_upload_queue  # noqa: PLC0415
+        pool_key = cls._resolve_pool_key(account_id, platform)
+        account_pool_keys: dict[str, str] = {}
+        for acc_id, acc in AccountService.all_accounts().items():
+            account_pool_keys[acc_id] = (
+                acc.pool_key_for(platform) or f"account:{acc_id}:{platform}"
+            )
+        in_pool_pids: set[str] = set()
+        for project in ProjectService.list_all():
+            if (project.scheduled_account_id
+                and account_pool_keys.get(project.scheduled_account_id) == pool_key):
+                in_pool_pids.add(project.id)
+
+        for job in project_upload_queue.list_jobs():
+            if job.project_id in in_pool_pids and job.status in ("running", "queued"):
+                return True, job.project_id
+        return False, None
+
+    @classmethod
+    def compute_cascade(cls, project_id: str, account_id: str) -> CascadeResult:
+        """Pure simulation: which projects move where if `project_id` jumps in.
+
+        Anchor per platform = first configured slot >= now+30min.
+        Cascade rule: occupant of anchor slot moves to next configured slot;
+        if that's also taken, occupant moves further; repeat until empty slot
+        or lookahead window exhausted.
+        """
+        platforms = cls._platforms_for_project(project_id, account_id)
+        per_platform: list[CascadePlatform] = []
+        blockers: list[CascadeBlocker] = []
+        now_utc = datetime.now(timezone.utc)
+        earliest_allowed = now_utc + timedelta(minutes=cls._MIN_LEAD_MINUTES)
+        fb_horizon = now_utc + timedelta(days=29)
+
+        for platform in platforms:
+            busy, _busy_pid = cls._pool_is_busy_uploading(account_id, platform)
+            if busy:
+                blockers.append(CascadeBlocker(platform, "pool_busy"))
+                continue
+
+            anchor = cls._earliest_slot_at_or_after(account_id, platform, earliest_allowed)
+            if anchor is None:
+                blockers.append(CascadeBlocker(platform, "pool_full"))
+                continue
+
+            pool_key = cls._resolve_pool_key(account_id, platform)
+            reservations = cls._collect_pool_reservations(pool_key, platform)
+
+            # Build map slot_iso -> project for efficient cascade walking.
+            # We need the actual Project entries to keep titles/upload_last_result.
+            account_pool_keys: dict[str, str] = {}
+            for acc_id, acc in AccountService.all_accounts().items():
+                account_pool_keys[acc_id] = (
+                    acc.pool_key_for(platform) or f"account:{acc_id}:{platform}"
+                )
+            slot_to_project: dict[str, Project] = {}
+            for project in ProjectService.list_all():
+                if (project.scheduled_account_id
+                    and account_pool_keys.get(project.scheduled_account_id) == pool_key):
+                    sched = (project.platform_schedules or {}).get(platform)
+                    if sched:
+                        slot_to_project[
+                            cls._normalize_utc_datetime(sched.slot).isoformat()
+                        ] = project
+
+            displaced: list[DisplacedItem] = []
+            current_slot = anchor
+            occupant = slot_to_project.get(current_slot.isoformat())
+            blocked_for_platform = False
+            while occupant is not None:
+                next_slot = cls._next_slot_after(account_id, platform, current_slot)
+                if next_slot is None:
+                    blockers.append(CascadeBlocker(platform, "pool_full"))
+                    blocked_for_platform = True
+                    break
+                if platform == "facebook" and next_slot > fb_horizon:
+                    blockers.append(CascadeBlocker(platform, "facebook_horizon_exceeded"))
+                    blocked_for_platform = True
+                    break
+                displaced.append(DisplacedItem(
+                    project_id=occupant.id,
+                    anime_title=occupant.anime_name or occupant.id,
+                    from_slot=current_slot,
+                    to_slot=next_slot,
+                    requires_platform_notification=cls._project_requires_platform_notification(
+                        occupant, platform
+                    ),
+                ))
+                # Walk to next slot; check if it's also occupied.
+                current_slot = next_slot
+                occupant = slot_to_project.get(current_slot.isoformat())
+
+            if blocked_for_platform:
+                # Don't add a cascade plan for a blocked platform - the apply
+                # path uses len(blockers) > 0 to abort entirely.
+                continue
+
+            target_slot = anchor
+            target_scheduled_at = cls._randomize_slot(target_slot, now_utc)
+            per_platform.append(CascadePlatform(
+                platform=platform,
+                target_slot=target_slot,
+                target_scheduled_at=target_scheduled_at,
+                displaced=displaced,
+            ))
+
+        return CascadeResult(per_platform=per_platform, blockers=blockers)

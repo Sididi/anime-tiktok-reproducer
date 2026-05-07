@@ -299,3 +299,84 @@ def test_cancel_all_slots_clears_everything(isolated_scheduler):
     reloaded = ProjectService.load("proj")
     assert reloaded.platform_schedules == {}
     assert reloaded.scheduled_account_id is None
+
+
+def test_compute_cascade_simple_one_displaced(isolated_scheduler):
+    other = Project(id="other", scheduled_account_id="acc_a",
+        platform_schedules={
+            "tiktok": __import__("app").models.PlatformSchedule(
+                slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+                scheduled_at=datetime(2026, 5, 7, 14, 5, tzinfo=timezone.utc),
+            )
+        }
+    )
+    ProjectService.get_project_dir(other.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(other)
+    urgent = Project(id="urgent", anime_name="Urgent")
+    ProjectService.get_project_dir(urgent.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(urgent)
+
+    result = SchedulingService.compute_cascade("urgent", "acc_a")
+    tt = next(p for p in result.per_platform if p.platform == "tiktok")
+    assert tt.target_slot == datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
+    assert len(tt.displaced) == 1
+    assert tt.displaced[0].project_id == "other"
+    assert tt.displaced[0].from_slot == datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
+    assert tt.displaced[0].to_slot == datetime(2026, 5, 7, 18, 0, tzinfo=timezone.utc)
+
+
+def test_compute_cascade_chain_three_displaced(isolated_scheduler):
+    for pid, hour in [("a", 14), ("b", 18), ("c", 21)]:
+        proj = Project(id=pid, scheduled_account_id="acc_a",
+            platform_schedules={
+                "tiktok": __import__("app").models.PlatformSchedule(
+                    slot=datetime(2026, 5, 7, hour, 0, tzinfo=timezone.utc),
+                    scheduled_at=datetime(2026, 5, 7, hour, 5, tzinfo=timezone.utc),
+                )
+            }
+        )
+        ProjectService.get_project_dir(proj.id).mkdir(parents=True, exist_ok=True)
+        ProjectService.save(proj)
+    urgent = Project(id="urgent")
+    ProjectService.get_project_dir(urgent.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(urgent)
+
+    result = SchedulingService.compute_cascade("urgent", "acc_a")
+    tt = next(p for p in result.per_platform if p.platform == "tiktok")
+    assert len(tt.displaced) == 3
+    # cascade order: a -> 18, b -> 21, c -> next day 12
+    assert tt.displaced[0].project_id == "a"
+    assert tt.displaced[0].to_slot == datetime(2026, 5, 7, 18, 0, tzinfo=timezone.utc)
+    assert tt.displaced[1].project_id == "b"
+    assert tt.displaced[1].to_slot == datetime(2026, 5, 7, 21, 0, tzinfo=timezone.utc)
+    assert tt.displaced[2].project_id == "c"
+    assert tt.displaced[2].to_slot == datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc)
+
+
+def test_compute_cascade_blocks_when_pool_busy(isolated_scheduler, monkeypatch):
+    """A project in the pool with an active upload job blocks cascade."""
+    active = Project(id="active", scheduled_account_id="acc_a",
+        platform_schedules={
+            "tiktok": __import__("app").models.PlatformSchedule(
+                slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+                scheduled_at=datetime(2026, 5, 7, 14, 3, tzinfo=timezone.utc),
+            )
+        }
+    )
+    ProjectService.get_project_dir(active.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(active)
+    urgent = Project(id="urgent")
+    ProjectService.get_project_dir(urgent.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(urgent)
+
+    # Monkey-patch the queue check to simulate a running job for "active".
+    from app.services import project_upload_service as pus
+    class FakeJob:
+        status = "running"
+        project_id = "active"
+    monkeypatch.setattr(
+        pus.project_upload_queue, "list_jobs", lambda: [FakeJob()]
+    )
+
+    result = SchedulingService.compute_cascade("urgent", "acc_a")
+    assert any(b.platform == "tiktok" and b.reason == "pool_busy" for b in result.blockers)
