@@ -400,6 +400,61 @@ export interface Transcription {
   scenes: SceneTranscription[];
 }
 
+export type Platform = "youtube" | "facebook" | "instagram" | "tiktok";
+
+export const ALL_PLATFORMS: readonly Platform[] = [
+  "youtube",
+  "facebook",
+  "instagram",
+  "tiktok",
+] as const;
+
+export interface PlanningEvent {
+  project_id: string;
+  anime_title: string;
+  account_id: string;
+  account_avatar_url: string;
+  account_name: string;
+  platform: Platform;
+  slot: string;            // ISO; clean time (no jitter), shown to user
+  scheduled_at: string;    // ISO with jitter; hidden from UI
+  drive_folder_url: string | null;
+  status: "scheduled" | "running" | "complete";
+}
+
+export interface FreeSlot {
+  slot: string;
+  available: boolean;
+  taken_by_project_id?: string;
+}
+
+export interface ResolveAnchorResolvedSlot {
+  slot: string;
+  scheduled_at: string;
+  available: boolean;
+}
+
+export interface ResolveAnchorResult {
+  resolved: Partial<Record<Platform, ResolveAnchorResolvedSlot>>;
+  conflicts: Array<{ platform: Platform; reason: string }>;
+}
+
+export interface CascadePreview {
+  per_platform: Array<{
+    platform: Platform;
+    target_slot: string;
+    target_scheduled_at: string;
+    displaced: Array<{
+      project_id: string;
+      anime_title: string;
+      from_slot: string;
+      to_slot: string;
+      requires_platform_notification: boolean;
+    }>;
+  }>;
+  blockers: Array<{ platform: Platform; reason: string }>;
+}
+
 export type {
   SourceDetails,
   BrowseEntry,
