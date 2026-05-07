@@ -380,3 +380,63 @@ def test_compute_cascade_blocks_when_pool_busy(isolated_scheduler, monkeypatch):
 
     result = SchedulingService.compute_cascade("urgent", "acc_a")
     assert any(b.platform == "tiktok" and b.reason == "pool_busy" for b in result.blockers)
+
+
+def test_apply_cascade_persists_displacements_and_reserves_urgent(isolated_scheduler):
+    other = Project(id="other", scheduled_account_id="acc_a",
+        anime_name="Other Anime",
+        platform_schedules={
+            "tiktok": __import__("app").models.PlatformSchedule(
+                slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+                scheduled_at=datetime(2026, 5, 7, 14, 4, tzinfo=timezone.utc),
+            )
+        }
+    )
+    ProjectService.get_project_dir(other.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(other)
+    urgent = Project(id="urgent", anime_name="Urgent")
+    ProjectService.get_project_dir(urgent.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(urgent)
+
+    result = SchedulingService.apply_cascade("urgent", "acc_a")
+    assert any(p.platform == "tiktok" for p in result.per_platform)
+
+    other = ProjectService.load("other")
+    urgent = ProjectService.load("urgent")
+    assert other.platform_schedules["tiktok"].slot == datetime(
+        2026, 5, 7, 18, 0, tzinfo=timezone.utc
+    )
+    assert urgent.platform_schedules["tiktok"].slot == datetime(
+        2026, 5, 7, 14, 0, tzinfo=timezone.utc
+    )
+    assert urgent.scheduled_account_id == "acc_a"
+
+
+def test_apply_cascade_aborts_with_blockers(isolated_scheduler, monkeypatch):
+    from app.services import project_upload_service as pus
+    class FakeJob:
+        status = "running"
+        project_id = "blocker"
+    blocker = Project(id="blocker", scheduled_account_id="acc_a",
+        platform_schedules={
+            "tiktok": __import__("app").models.PlatformSchedule(
+                slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+                scheduled_at=datetime(2026, 5, 7, 14, 5, tzinfo=timezone.utc),
+            )
+        }
+    )
+    ProjectService.get_project_dir(blocker.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(blocker)
+    urgent = Project(id="urgent")
+    ProjectService.get_project_dir(urgent.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(urgent)
+    monkeypatch.setattr(pus.project_upload_queue, "list_jobs", lambda: [FakeJob()])
+
+    with pytest.raises(ValueError):
+        SchedulingService.apply_cascade("urgent", "acc_a")
+
+    # Ensure no partial state was persisted.
+    blocker = ProjectService.load("blocker")
+    assert blocker.platform_schedules["tiktok"].slot == datetime(
+        2026, 5, 7, 14, 0, tzinfo=timezone.utc
+    )

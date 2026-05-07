@@ -823,3 +823,49 @@ class SchedulingService:
             ))
 
         return CascadeResult(per_platform=per_platform, blockers=blockers)
+
+    @classmethod
+    def apply_cascade(cls, project_id: str, account_id: str) -> CascadeResult:
+        """Compute and persist a cascade. Reserves the urgent project's slots."""
+        with cls._reservation_lock:
+            result = cls.compute_cascade(project_id, account_id)
+            if result.blockers:
+                summary = ", ".join(f"{b.platform}:{b.reason}" for b in result.blockers)
+                raise ValueError(f"Cascade blocked: {summary}")
+
+            urgent = ProjectService.load(project_id)
+            if urgent is None:
+                raise ValueError("Urgent project not found")
+
+            now_utc = datetime.now(timezone.utc)
+
+            # 1. Move displaced projects in REVERSE order of their cascade chain.
+            #    Walking from the farthest-pushed back to the closest avoids
+            #    momentary "two projects on same slot" states inside the lock.
+            for plat in result.per_platform:
+                for item in reversed(plat.displaced):
+                    project = ProjectService.load(item.project_id)
+                    if project is None:
+                        continue
+                    schedules = dict(project.platform_schedules or {})
+                    schedules[plat.platform] = PlatformSchedule(
+                        slot=item.to_slot,
+                        scheduled_at=cls._randomize_slot(item.to_slot, now_utc),
+                    )
+                    project.platform_schedules = schedules
+                    cls._recompute_aggregates(project)
+                    ProjectService.save(project)
+
+            # 2. Reserve the urgent project's slots on the freed targets.
+            schedules = dict(urgent.platform_schedules or {})
+            for plat in result.per_platform:
+                schedules[plat.platform] = PlatformSchedule(
+                    slot=plat.target_slot,
+                    scheduled_at=plat.target_scheduled_at,
+                )
+            urgent.platform_schedules = schedules
+            urgent.scheduled_account_id = account_id
+            cls._recompute_aggregates(urgent)
+            ProjectService.save(urgent)
+
+            return result
