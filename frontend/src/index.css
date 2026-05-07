@@ -145,7 +145,7 @@ body {
   pointer-events: none;
 }
 
-/* Planning calendar (ScheduleX) — dark theme overrides to match the app */
+/* Planning calendar (ScheduleX) — dark theme overrides + layout fixes */
 .planning-calendar {
   --sx-color-background: hsl(var(--card));
   --sx-color-on-background: hsl(var(--foreground));
@@ -153,4 +153,45 @@ body {
   --sx-color-on-surface: hsl(var(--foreground));
   --sx-internal-color-text: hsl(var(--foreground));
   --sx-color-outline: hsl(var(--border));
+
+  /* The whole stack must be allowed to shrink so the grid can scroll. */
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+}
+.planning-calendar .sx-react-calendar-wrapper,
+.planning-calendar .sx__calendar-wrapper,
+.planning-calendar .sx__calendar {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1 1 0;
+  height: auto !important;
+}
+.planning-calendar .sx__week-grid,
+.planning-calendar .sx__time-grid-wrapper,
+.planning-calendar .sx__time-grid-content,
+.planning-calendar .sx__view-container,
+.planning-calendar [class*="time-grid-scroll"] {
+  min-height: 0;
+}
+
+/* Background "available slot" events: hollow ghost rectangles. */
+.planning-calendar .sx__time-grid-event.atr-bg-slot {
+  background: transparent !important;
+  border: 1px dashed hsl(var(--border)) !important;
+  color: hsl(var(--muted-foreground)) !important;
+  pointer-events: none;
+  font-size: 10px;
+  opacity: 0.55;
+}
+.planning-calendar .sx__time-grid-event.atr-bg-slot .sx__time-grid-event-title,
+.planning-calendar .sx__time-grid-event.atr-bg-slot .sx__time-grid-event-time {
+  display: none;
+}
+
+/* Multi-platform grouped event: keep platform pills readable. */
+.planning-calendar .sx__time-grid-event.atr-group .sx__time-grid-event-inner {
+  padding: 4px 6px;
 }

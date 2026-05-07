@@ -131,7 +131,7 @@ export function PlanningModal({ open, onClose }: PlanningModalProps) {
           }}
         >
           <motion.div
-            className="w-full max-w-7xl h-[88vh] bg-[hsl(var(--card))] border border-[hsl(var(--border))] rounded-xl flex flex-col overflow-hidden"
+            className="w-[96vw] max-w-[1700px] h-[92vh] bg-[hsl(var(--card))] border border-[hsl(var(--border))] rounded-xl flex flex-col overflow-hidden"
             initial={{ scale: 0.95, opacity: 0 }}
             animate={{ scale: 1, opacity: 1 }}
             exit={{ scale: 0.95, opacity: 0 }}
@@ -153,9 +153,12 @@ export function PlanningModal({ open, onClose }: PlanningModalProps) {
                 {error}
               </div>
             )}
-            <div className="flex-1 overflow-hidden p-4">
+            <div className="flex-1 min-h-0 overflow-hidden p-4">
               <PlanningCalendar
                 events={events}
+                accounts={accounts}
+                selectedAccountId={selectedAccountId}
+                selectedPlatforms={selectedPlatforms}
                 onEventClick={(event, anchor) => setPopover({ event, anchor })}
               />
             </div>

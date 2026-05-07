@@ -27,9 +27,10 @@ export function PlatformCheckboxes({ selected, onChange }: PlatformCheckboxesPro
             ? "bg-[hsl(var(--secondary))] border-[hsl(var(--border))]"
             : "border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))]"
         }`}
-        aria-label="Toggle all platforms"
+        aria-label={allSelected ? "Deselect all platforms" : "Select all platforms"}
+        title={allSelected ? "Deselect all" : "Select all"}
       >
-        {allSelected ? "All" : "None"}
+        All
       </button>
       {ALL_PLATFORMS.map((p) => {
         const active = selected.includes(p);

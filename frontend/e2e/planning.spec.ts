@@ -119,7 +119,7 @@ test("Planning modal filters by platform", async ({ page }) => {
   await expect(page.getByText("Show Alpha").first()).toBeVisible();
 
   // Click the YouTube chip — its accessible name resolves to the title attribute.
-  const youtubeChip = page.getByRole("button", { name: "YT" });
+  const youtubeChip = page.getByRole("button", { name: "YT", exact: true });
   await expect(youtubeChip).toHaveAttribute("aria-pressed", "true");
   await youtubeChip.click();
   await expect(youtubeChip).toHaveAttribute("aria-pressed", "false");
