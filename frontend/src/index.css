@@ -144,3 +144,13 @@ body {
   opacity: 0.4;
   pointer-events: none;
 }
+
+/* Planning calendar (ScheduleX) — dark theme overrides to match the app */
+.planning-calendar {
+  --sx-color-background: hsl(var(--card));
+  --sx-color-on-background: hsl(var(--foreground));
+  --sx-color-surface: hsl(var(--card));
+  --sx-color-on-surface: hsl(var(--foreground));
+  --sx-internal-color-text: hsl(var(--foreground));
+  --sx-color-outline: hsl(var(--border));
+}
