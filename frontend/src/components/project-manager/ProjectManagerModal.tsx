@@ -14,7 +14,7 @@ import { UploadJobsPanel } from "./UploadJobsPanel";
 import { VideoPreviewModal } from "./VideoPreviewModal";
 import { ProjectTable } from "./ProjectTable";
 import { YouTubeDurationModal } from "./YouTubeDurationModal";
-import type { SortColumn, SortDirection } from "./types";
+import type { SortColumn, SortDirection, UploadMode, AnchorPayload } from "./types";
 import {
   getLibraryTypeLabel,
   isAccountCompatibleWithProjectRow,
@@ -539,7 +539,39 @@ export function ProjectManagerModal({
   );
 
   const startUploadWithChecks = useCallback(
-    async (projectId: string, accountId?: string) => {
+    async (
+      projectId: string,
+      accountId?: string,
+      mode: UploadMode = "auto",
+      anchorPayload?: AnchorPayload,
+    ) => {
+      if (mode !== "auto" && !accountId) {
+        setError("Manual scheduling requires an account selection");
+        return;
+      }
+
+      if (mode === "scheduled" && anchorPayload) {
+        try {
+          await api.reserveAnchor(projectId, {
+            account_id: accountId!,
+            tiktok_slot: anchorPayload.tiktok_slot,
+            overrides: anchorPayload.overrides,
+          });
+        } catch (err) {
+          setError((err as Error).message);
+          return;
+        }
+      }
+
+      if (mode === "urgent") {
+        try {
+          await api.cascadeApply(projectId, accountId!);
+        } catch (err) {
+          setError((err as Error).message);
+          return;
+        }
+      }
+
       const token = createUploadToken();
       const context: PendingUploadContext = { projectId, accountId };
       setUploadSession({
