@@ -267,3 +267,27 @@ async def patch_anchor(project_id: str, req: PatchAnchorRequest):
         "platform_schedules": _platform_schedules_to_dict(schedules),
         "notification_status": statuses,
     }
+
+
+def _notify_cancellation(project_id: str, platform: str) -> str:
+    from ...services.platform_reschedule_service import PlatformRescheduleService  # noqa: PLC0415
+    project = ProjectService.load(project_id)
+    if project is None:
+        return "skipped"
+    return PlatformRescheduleService.cancel(project, platform).status
+
+
+@router.delete("/projects/{project_id}/platforms/{platform}", status_code=204)
+async def delete_platform(project_id: str, platform: str):
+    await asyncio.to_thread(_notify_cancellation, project_id, platform)
+    await asyncio.to_thread(SchedulingService.cancel_platform_slot, project_id, platform)
+
+
+@router.delete("/projects/{project_id}/all", status_code=204)
+async def delete_all(project_id: str):
+    project = await asyncio.to_thread(ProjectService.load, project_id)
+    if project is None:
+        raise HTTPException(404, "Project not found")
+    for platform in list(project.platform_schedules.keys()):
+        await asyncio.to_thread(_notify_cancellation, project_id, platform)
+    await asyncio.to_thread(SchedulingService.cancel_all_slots, project_id)

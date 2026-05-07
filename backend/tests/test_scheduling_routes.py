@@ -123,3 +123,29 @@ def test_patch_platform_endpoint(client):
     assert r.status_code == 200
     body = r.json()
     assert body["slot"].startswith("2026-05-08T14:00:00")
+
+
+def test_delete_platform_endpoint(client):
+    p = Project(id="p1")
+    ProjectService.get_project_dir(p.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(p)
+    SchedulingService.reserve_anchor(
+        "p1", "acc_a", datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
+    )
+    r = client.delete("/api/scheduling/projects/p1/platforms/youtube")
+    assert r.status_code == 204
+    project = ProjectService.load("p1")
+    assert "youtube" not in project.platform_schedules
+
+
+def test_delete_all_endpoint(client):
+    p = Project(id="p1")
+    ProjectService.get_project_dir(p.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(p)
+    SchedulingService.reserve_anchor(
+        "p1", "acc_a", datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
+    )
+    r = client.delete("/api/scheduling/projects/p1/all")
+    assert r.status_code == 204
+    project = ProjectService.load("p1")
+    assert project.platform_schedules == {}
