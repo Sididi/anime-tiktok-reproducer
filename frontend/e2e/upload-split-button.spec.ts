@@ -157,6 +157,20 @@ test("Auto upload (single click on Upload) still works as before", async ({
 });
 
 function installSchedulingMocks() {
+  // Anchor mock dates to "tomorrow" so the picker never marks them as past
+  // (`isPast` disables past days in the calendar). Helpers live inside the
+  // function so `addInitScript` serializes them with the page.
+  const tomorrowUtc = (() => {
+    const d = new Date();
+    d.setUTCHours(0, 0, 0, 0);
+    d.setUTCDate(d.getUTCDate() + 1);
+    return d;
+  })();
+  const tomorrowAt = (hour: number, minute = 0): string => {
+    const d = new Date(tomorrowUtc);
+    d.setUTCHours(hour, minute, 0, 0);
+    return d.toISOString();
+  };
   const testWindow = window as Window &
     typeof globalThis & {
       __anchored?: boolean;
@@ -181,8 +195,8 @@ function installSchedulingMocks() {
     if (url.pathname === "/api/scheduling/free-slots") {
       return json({
         slots: [
-          { slot: "2026-05-08T12:00:00Z", available: true },
-          { slot: "2026-05-08T16:00:00Z", available: true },
+          { slot: tomorrowAt(12, 0), available: true },
+          { slot: tomorrowAt(16, 0), available: true },
         ],
       });
     }
@@ -190,13 +204,13 @@ function installSchedulingMocks() {
       return json({
         resolved: {
           tiktok: {
-            slot: "2026-05-08T12:00:00Z",
-            scheduled_at: "2026-05-08T12:08:00Z",
+            slot: tomorrowAt(12, 0),
+            scheduled_at: tomorrowAt(12, 8),
             available: true,
           },
           youtube: {
-            slot: "2026-05-08T12:00:00Z",
-            scheduled_at: "2026-05-08T12:09:00Z",
+            slot: tomorrowAt(12, 0),
+            scheduled_at: tomorrowAt(12, 9),
             available: true,
           },
         },
@@ -260,12 +274,18 @@ test("Schedule mode reserves anchor before upload", async ({ page }) => {
 
   await projectRow.getByRole("button", { name: "Upload options" }).click();
   await page.getByRole("button", { name: /Schedule for specific slot/ }).click();
-  // Slots are mocked for 2026-05-08; click that day in the calendar so the
-  // popover's same-day filter surfaces them.
+  // Mocked slots are seeded for tomorrow so the calendar's `isPast` rule
+  // never disables them.
+  const dayLabel = await page.evaluate(() => {
+    const d = new Date();
+    d.setUTCHours(0, 0, 0, 0);
+    d.setUTCDate(d.getUTCDate() + 1);
+    return String(d.getUTCDate());
+  });
   await page
     .getByRole("heading", { name: "Pick a slot" })
     .locator("..")
-    .getByRole("button", { name: "8", exact: true })
+    .getByRole("button", { name: dayLabel, exact: true })
     .click();
   await page.getByRole("button", { name: /^14:00$/ }).first().click();
   await page.getByRole("button", { name: "Schedule", exact: true }).click();

@@ -58,10 +58,15 @@ export function SlotPickerCalendar({
   const isSelected = (d: Date) =>
     !!selectedDate && ymd(d) === ymd(selectedDate);
   const isPast = (d: Date) => startOfDay(d).getTime() < today.getTime();
-  const isUnconfigured = (d: Date) =>
-    daysWithSlots ? !daysWithSlots.has(ymd(d)) : false;
-  const isFull = (d: Date) =>
-    daysWithFreeSlots ? !daysWithFreeSlots.has(ymd(d)) : false;
+  // A day is "full" only when slots ARE configured for it AND every one is
+  // already taken. Days where the account has no slot configured are NOT
+  // crossed — clicking them just shows an empty slot list. This matches the
+  // user-facing rule: cross past days + days with zero free slots.
+  const isFull = (d: Date) => {
+    if (!daysWithSlots || !daysWithFreeSlots) return false;
+    const key = ymd(d);
+    return daysWithSlots.has(key) && !daysWithFreeSlots.has(key);
+  };
 
   return (
     <div className="text-xs">
@@ -88,18 +93,15 @@ export function SlotPickerCalendar({
       <div className="grid grid-cols-7 gap-px">
         {grid.map((d, i) => {
           const past = isPast(d);
-          const unconfigured = isUnconfigured(d);
           const full = isFull(d);
-          const blocked = past || unconfigured || full;
+          const blocked = past || full;
           const offMonth = !inMonth(d);
           const sel = isSelected(d);
           const title = past
             ? "Date passée"
-            : unconfigured
-              ? "Aucun slot configuré ce jour"
-              : full
-                ? "Tous les slots sont déjà pris"
-                : undefined;
+            : full
+              ? "Tous les slots sont déjà pris"
+              : undefined;
           return (
             <button
               key={i}

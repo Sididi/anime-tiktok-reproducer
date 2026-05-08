@@ -82,12 +82,13 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
     monthStart.setHours(0, 0, 0, 0);
     (async () => {
       try {
+        // Backend caps `limit` at 200. Even a 1-slot/day platform (YT) gets
+        // ~6 months of coverage with 200, well past the visible month.
         const r = await api.listFreeSlots({
           account_id: accountId,
           platform: platformForFetch,
           after: monthStart.toISOString(),
-          // 50 days * ~6 slots = 300; covers the whole displayed month + buffer.
-          limit: 400,
+          limit: 200,
         });
         if (cancelled) return;
         setMonthSlots(r.slots);
