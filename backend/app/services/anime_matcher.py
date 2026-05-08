@@ -57,9 +57,11 @@ class AnimeMatcherService:
     _loaded_series_index_signatures: dict[str, tuple[tuple[str, int, int], ...]] = {}
     # Series that were updated on disk and require cache refresh before matching.
     _stale_series: dict[LibraryType, set[str]] = defaultdict(set)
+    _cv2 = None
     _crop_index_memory_cache: dict[str, dict[str, np.ndarray | str]] = {}
     CROP_INDEX_VERSION = "crop-v4-seeded-portrait-source-0_5fps"
     CROP_INDEX_FPS = 0.5
+    CROP_INDEX_BATCH_SIZE = 24
     CROP_SEARCH_TOP_N = 35
     CROP_SEARCH_MAX_EPISODES_PER_SCENE = 2
     CROP_SEARCH_ENABLE_MAX_SERIES_EPISODES = 4
@@ -133,8 +135,11 @@ class AnimeMatcherService:
 
     @staticmethod
     def _require_cv2():
+        if AnimeMatcherService._cv2 is not None:
+            return AnimeMatcherService._cv2
         import cv2
 
+        AnimeMatcherService._cv2 = cv2
         return cv2
 
     @classmethod
@@ -211,6 +216,12 @@ class AnimeMatcherService:
             return True
 
         try:
+            # Import OpenCV before anime_searcher pulls in torchvision. In the
+            # pixi environment, importing torchvision first can make a later
+            # cv2 import fail with a libtiff/libjpeg symbol conflict, which then
+            # turns matching into empty candidate lists.
+            cls._require_cv2()
+
             from anime_searcher.indexer.embedder import SSCDEmbedder
             from anime_searcher.indexer.index_manager import IndexManager
             from anime_searcher.searcher.query import QueryProcessor
@@ -689,7 +700,7 @@ class AnimeMatcherService:
         timestamps: list[float] = []
         chunks: list[np.ndarray] = []
         batch_images: list[Image.Image] = []
-        batch_size = 96
+        batch_size = cls.CROP_INDEX_BATCH_SIZE
 
         def flush_batch() -> None:
             if not batch_images:
@@ -765,30 +776,43 @@ class AnimeMatcherService:
         episode_paths = cls._series_episode_paths(series, library_type)
         if not episode_paths:
             return [[] for _ in images]
-        if (
+
+        seeded_search = bool(episode_names)
+        if episode_names:
+            seed_limit = max(1, cls.CROP_SEARCH_MAX_EPISODES_PER_SCENE)
+            filtered_paths = {
+                episode: episode_paths[episode]
+                for episode in episode_names[:seed_limit]
+                if episode in episode_paths
+            }
+            if not filtered_paths:
+                return [[] for _ in images]
+            episode_paths = filtered_paths
+        elif (
             series is not None
             and cls._index_manager is not None
             and cls._index_manager.get_series_frame_count(series)
             > cls.CROP_SEARCH_ENABLE_MAX_SERIES_FRAMES
         ):
             return [[] for _ in images]
-        if len(episode_paths) > cls.CROP_SEARCH_ENABLE_MAX_SERIES_EPISODES:
+        elif len(episode_paths) > cls.CROP_SEARCH_ENABLE_MAX_SERIES_EPISODES:
             return [[] for _ in images]
-        if episode_names:
-            filtered_paths = {
-                episode: episode_paths[episode]
-                for episode in episode_names
-                if episode in episode_paths
-            }
-            episode_paths = filtered_paths or episode_paths
 
         target_aspect = images[0].width / max(1, images[0].height)
         episode_indices: list[tuple[str, dict[str, np.ndarray]]] = []
         for episode, episode_path in episode_paths.items():
-            crop_index = cls._load_or_build_crop_index(
-                episode_path,
-                target_aspect=target_aspect,
-            )
+            try:
+                crop_index = cls._load_or_build_crop_index(
+                    episode_path,
+                    target_aspect=target_aspect,
+                )
+            except Exception as exc:
+                search_scope = "seeded" if seeded_search else "unseeded"
+                print(
+                    "Skipping "
+                    f"{search_scope} crop index for {episode}: {exc}"
+                )
+                continue
             if crop_index is not None:
                 episode_indices.append((episode, crop_index))
 
@@ -1397,6 +1421,8 @@ class AnimeMatcherService:
         for scene_idx, selected_idx in enumerate(selected_indices):
             absolute_scene_idx = smooth_start_index + scene_idx
             selected = per_scene_candidates[scene_idx][selected_idx]
+            if selected.get("source") == "empty":
+                continue
             match = smoothed.matches[absolute_scene_idx]
             selected_start = float(selected["start_time"])
             selected_end = float(selected["end_time"])
