@@ -70,10 +70,10 @@ class _FakeEmbedder:
         return np.ones((len(images), 2), dtype=np.float32)
 
 
-def test_seeded_crop_search_filters_before_large_series_limits(monkeypatch) -> None:
+def test_seeded_large_series_crop_search_uses_local_windows(monkeypatch) -> None:
     images = [Image.new("RGB", (9, 16), "black")]
     episode_paths = {f"ep{i}": Path(f"/tmp/ep{i}.mp4") for i in range(8)}
-    built: list[str] = []
+    local_calls: list[dict[str, object]] = []
 
     monkeypatch.setattr(AnimeMatcherService, "_embedder", _FakeEmbedder())
     monkeypatch.setattr(AnimeMatcherService, "_index_manager", _FakeIndexManager(50000))
@@ -82,18 +82,33 @@ def test_seeded_crop_search_filters_before_large_series_limits(monkeypatch) -> N
         "_series_episode_paths",
         classmethod(lambda cls, series, library_type: episode_paths),
     )
-
-    def fake_load(cls, episode_path: Path, *, target_aspect: float):
-        built.append(episode_path.stem)
-        return {
-            "embeddings": np.ones((1, 2), dtype=np.float32),
-            "timestamps": np.asarray([12.0], dtype=np.float32),
-        }
-
     monkeypatch.setattr(
         AnimeMatcherService,
         "_load_or_build_crop_index",
-        classmethod(fake_load),
+        classmethod(
+            lambda cls, episode_path, *, target_aspect: (_ for _ in ()).throw(
+                AssertionError("full-episode crop index should not be built")
+            )
+        ),
+    )
+
+    def fake_local(cls, images, **kwargs):
+        local_calls.append(kwargs)
+        return [
+            [
+                MatchCandidate(
+                    episode="ep7",
+                    timestamp=12.0,
+                    similarity=0.9,
+                    series="large-series",
+                )
+            ]
+        ]
+
+    monkeypatch.setattr(
+        AnimeMatcherService,
+        "_search_local_crop_windows_batch",
+        classmethod(fake_local),
     )
 
     results = AnimeMatcherService._search_crop_index_batch(
@@ -101,11 +116,17 @@ def test_seeded_crop_search_filters_before_large_series_limits(monkeypatch) -> N
         series="large-series",
         library_type="anime",
         episode_names=["ep7", "ep2"],
+        anchor_candidates=(
+            [MatchCandidate(episode="ep7", timestamp=12.0, similarity=0.8, series="s")],
+            [],
+            [],
+        ),
         top_n=3,
     )
 
-    assert built == ["ep7", "ep2"]
-    assert [candidate.episode for candidate in results[0]] == ["ep7", "ep2"]
+    assert [candidate.episode for candidate in results[0]] == ["ep7"]
+    assert len(local_calls) == 1
+    assert local_calls[0]["episode_names"] == ["ep7", "ep2"]
 
 
 def test_unseeded_crop_search_keeps_large_series_conservative(monkeypatch) -> None:
@@ -148,7 +169,7 @@ def test_crop_search_skips_failed_episode_index(monkeypatch) -> None:
     images = [Image.new("RGB", (9, 16), "black")]
 
     monkeypatch.setattr(AnimeMatcherService, "_embedder", _FakeEmbedder())
-    monkeypatch.setattr(AnimeMatcherService, "_index_manager", _FakeIndexManager(50000))
+    monkeypatch.setattr(AnimeMatcherService, "_index_manager", _FakeIndexManager(100))
     monkeypatch.setattr(
         AnimeMatcherService,
         "_series_episode_paths",
@@ -183,6 +204,88 @@ def test_crop_search_skips_failed_episode_index(monkeypatch) -> None:
     )
 
     assert [candidate.episode for candidate in results[0]] == ["good"]
+
+
+def test_local_crop_search_respects_source_crop_cap(monkeypatch) -> None:
+    images = [Image.new("RGB", (9, 16), "black")]
+    embed_batch_sizes: list[int] = []
+
+    class CountingEmbedder:
+        def embed_batch(self, batch_images: list[Image.Image]) -> np.ndarray:
+            embed_batch_sizes.append(len(batch_images))
+            return np.ones((len(batch_images), 2), dtype=np.float32)
+
+    monkeypatch.setattr(AnimeMatcherService, "_embedder", CountingEmbedder())
+    monkeypatch.setattr(AnimeMatcherService, "LOCAL_CROP_MAX_SOURCE_CROPS_PER_SCENE", 5)
+    monkeypatch.setattr(AnimeMatcherService, "CROP_INDEX_BATCH_SIZE", 3)
+    monkeypatch.setattr(
+        AnimeMatcherService,
+        "_series_episode_paths",
+        classmethod(
+            lambda cls, series, library_type: {
+                "ep1": Path("/tmp/ep1.mp4"),
+                "ep2": Path("/tmp/ep2.mp4"),
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        AnimeMatcherService,
+        "_local_crop_sample_times",
+        classmethod(lambda cls, anchors: [1.0, 1.5, 2.0]),
+    )
+
+    def fake_collect(
+        cls,
+        episode_path: Path,
+        sample_times: list[float],
+        *,
+        target_aspect: float,
+        remaining_crop_budget: int,
+    ):
+        return (
+            [Image.new("RGB", (9, 16), "white") for _ in range(remaining_crop_budget)],
+            [float(index) for index in range(remaining_crop_budget)],
+        )
+
+    monkeypatch.setattr(
+        AnimeMatcherService,
+        "_collect_local_crop_variants",
+        classmethod(fake_collect),
+    )
+
+    results = AnimeMatcherService._search_local_crop_windows_batch(
+        images,
+        series="large-series",
+        library_type="anime",
+        episode_names=["ep1", "ep2"],
+        anchor_candidates=(
+            [
+                MatchCandidate(episode="ep1", timestamp=10.0, similarity=0.9, series="s"),
+                MatchCandidate(episode="ep2", timestamp=20.0, similarity=0.8, series="s"),
+            ],
+            [],
+            [],
+        ),
+        top_n=3,
+    )
+
+    assert results[0]
+    # Source crops embed in batches [3, 2], then the single query frame embeds.
+    assert embed_batch_sizes == [3, 2, 1]
+
+
+def test_crop_search_trigger_skips_high_confidence_direct_match() -> None:
+    match = SceneMatch(
+        scene_index=0,
+        episode="E1",
+        start_time=10.0,
+        end_time=12.0,
+        confidence=0.7,
+        speed_ratio=1.0,
+    )
+
+    assert AnimeMatcherService._should_try_crop_search("Series", 2.0, match) is False
+    assert AnimeMatcherService._should_try_crop_search("Series", 2.0, None) is True
 
 
 def _short_scenes(count: int) -> SceneList:

@@ -66,6 +66,11 @@ class AnimeMatcherService:
     CROP_SEARCH_MAX_EPISODES_PER_SCENE = 2
     CROP_SEARCH_ENABLE_MAX_SERIES_EPISODES = 4
     CROP_SEARCH_ENABLE_MAX_SERIES_FRAMES = 12000
+    LOCAL_CROP_WINDOW_SECONDS = 3.0
+    LOCAL_CROP_FPS = 2.0
+    LOCAL_CROP_MAX_ANCHORS_PER_EPISODE = 3
+    LOCAL_CROP_MIN_ANCHOR_SEPARATION = 2.0
+    LOCAL_CROP_MAX_SOURCE_CROPS_PER_SCENE = 192
 
     @classmethod
     def mark_series_updated(
@@ -760,6 +765,223 @@ class AnimeMatcherService:
         return payload
 
     @classmethod
+    def _local_crop_anchors(
+        cls,
+        candidate_lists: tuple[
+            list[MatchCandidate],
+            list[MatchCandidate],
+            list[MatchCandidate],
+        ] | None,
+        episode_names: list[str],
+    ) -> dict[str, list[float]]:
+        if not candidate_lists or not episode_names:
+            return {}
+
+        allowed_episodes = set(episode_names[: cls.CROP_SEARCH_MAX_EPISODES_PER_SCENE])
+        raw_anchors: dict[str, list[tuple[float, float]]] = {
+            episode: [] for episode in allowed_episodes
+        }
+        for candidates in candidate_lists:
+            for candidate in candidates:
+                if candidate.episode not in allowed_episodes:
+                    continue
+                raw_anchors[candidate.episode].append(
+                    (candidate.timestamp, candidate.similarity)
+                )
+
+        anchors: dict[str, list[float]] = {}
+        min_separation = cls.LOCAL_CROP_MIN_ANCHOR_SEPARATION
+        max_anchors = cls.LOCAL_CROP_MAX_ANCHORS_PER_EPISODE
+        for episode, episode_anchors in raw_anchors.items():
+            selected: list[float] = []
+            ranked = sorted(
+                episode_anchors,
+                key=lambda item: (item[1], -abs(item[0])),
+                reverse=True,
+            )
+            for timestamp, _ in ranked:
+                if any(abs(timestamp - existing) < min_separation for existing in selected):
+                    continue
+                selected.append(timestamp)
+                if len(selected) >= max_anchors:
+                    break
+            if selected:
+                anchors[episode] = selected
+
+        return anchors
+
+    @classmethod
+    def _local_crop_sample_times(cls, anchors: list[float]) -> list[float]:
+        sample_times: list[float] = []
+        seen: set[float] = set()
+        window = cls.LOCAL_CROP_WINDOW_SECONDS
+        step = 1.0 / max(cls.LOCAL_CROP_FPS, 1e-3)
+
+        for anchor in anchors:
+            for timestamp in np.arange(
+                max(0.0, anchor - window),
+                anchor + window + (step / 2.0),
+                step,
+                dtype=np.float32,
+            ):
+                rounded = round(float(timestamp), 3)
+                if rounded in seen:
+                    continue
+                seen.add(rounded)
+                sample_times.append(float(timestamp))
+
+        return sample_times
+
+    @classmethod
+    def _collect_local_crop_variants(
+        cls,
+        episode_path: Path,
+        sample_times: list[float],
+        *,
+        target_aspect: float,
+        remaining_crop_budget: int,
+    ) -> tuple[list[Image.Image], list[float]]:
+        if remaining_crop_budget <= 0 or not sample_times:
+            return [], []
+
+        cv2 = cls._require_cv2()
+        cap = cv2.VideoCapture(str(episode_path))
+        crops: list[Image.Image] = []
+        timestamps: list[float] = []
+        try:
+            for timestamp in sample_times:
+                if len(crops) >= remaining_crop_budget:
+                    break
+                cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, timestamp) * 1000.0)
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                source_frame = Image.fromarray(frame_rgb)
+                for _, crop in cls._source_crop_variants(
+                    source_frame,
+                    target_aspect=target_aspect,
+                ):
+                    if len(crops) >= remaining_crop_budget:
+                        break
+                    crops.append(crop)
+                    timestamps.append(float(timestamp))
+        finally:
+            cap.release()
+
+        return crops, timestamps
+
+    @classmethod
+    def _search_local_crop_windows_batch(
+        cls,
+        images: list[Image.Image],
+        *,
+        series: str | None,
+        library_type: LibraryType | str,
+        episode_names: list[str],
+        anchor_candidates: tuple[
+            list[MatchCandidate],
+            list[MatchCandidate],
+            list[MatchCandidate],
+        ] | None,
+        top_n: int,
+    ) -> list[list[MatchCandidate]]:
+        """Search bounded local crop windows around direct SSCD anchors."""
+        if cls._embedder is None or not images:
+            return [[] for _ in images]
+
+        anchors = cls._local_crop_anchors(anchor_candidates, episode_names)
+        if not anchors:
+            return [[] for _ in images]
+
+        episode_paths = cls._series_episode_paths(series, library_type)
+        if not episode_paths:
+            return [[] for _ in images]
+
+        target_aspect = images[0].width / max(1, images[0].height)
+        source_images: list[Image.Image] = []
+        source_timestamps: list[float] = []
+        source_episodes: list[str] = []
+        max_source_crops = cls.LOCAL_CROP_MAX_SOURCE_CROPS_PER_SCENE
+
+        scoped_episode_names = episode_names[: cls.CROP_SEARCH_MAX_EPISODES_PER_SCENE]
+        for episode_index, episode in enumerate(scoped_episode_names):
+            episode_path = episode_paths.get(episode)
+            if episode_path is None:
+                continue
+            sample_times = cls._local_crop_sample_times(anchors.get(episode, []))
+            remaining = max_source_crops - len(source_images)
+            if remaining <= 0:
+                break
+            if episode_index == 0:
+                episode_budget = max(1, int(max_source_crops * 0.75))
+            else:
+                remaining_episodes = max(1, len(scoped_episode_names) - episode_index)
+                episode_budget = max(1, remaining // remaining_episodes)
+            try:
+                crops, timestamps = cls._collect_local_crop_variants(
+                    episode_path,
+                    sample_times,
+                    target_aspect=target_aspect,
+                    remaining_crop_budget=episode_budget,
+                )
+            except Exception as exc:
+                print(f"Skipping local crop windows for {episode}: {exc}")
+                continue
+            source_images.extend(crops)
+            source_timestamps.extend(timestamps)
+            source_episodes.extend([episode] * len(crops))
+            if len(source_images) >= max_source_crops:
+                break
+
+        if not source_images:
+            return [[] for _ in images]
+
+        source_embeddings: list[np.ndarray] = []
+        for start in range(0, len(source_images), cls.CROP_INDEX_BATCH_SIZE):
+            source_embeddings.append(
+                cls._embedder.embed_batch(
+                    source_images[start : start + cls.CROP_INDEX_BATCH_SIZE]
+                )
+            )
+        source_matrix = np.vstack(source_embeddings).astype(np.float32, copy=False)
+        timestamp_array = np.asarray(source_timestamps, dtype=np.float32)
+        query_embeddings = cls._embedder.embed_batch([img.convert("RGB") for img in images])
+
+        per_image: list[list[MatchCandidate]] = []
+        for query in query_embeddings:
+            scores = source_matrix @ query
+            if scores.size == 0:
+                per_image.append([])
+                continue
+            k = min(top_n * 4, scores.size)
+            top_indices = np.argpartition(scores, -k)[-k:]
+            top_indices = top_indices[np.argsort(scores[top_indices])[::-1]]
+
+            pooled: list[MatchCandidate] = []
+            seen_keys: set[tuple[str, float]] = set()
+            for idx in top_indices:
+                episode = source_episodes[int(idx)]
+                timestamp = float(timestamp_array[int(idx)])
+                key = (episode, round(timestamp, 3))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                pooled.append(
+                    MatchCandidate(
+                        episode=episode,
+                        timestamp=timestamp,
+                        similarity=float(scores[int(idx)]),
+                        series=series or "",
+                    )
+                )
+                if len(pooled) >= top_n:
+                    break
+            per_image.append(pooled)
+
+        return per_image
+
+    @classmethod
     def _search_crop_index_batch(
         cls,
         images: list[Image.Image],
@@ -767,6 +989,11 @@ class AnimeMatcherService:
         series: str | None,
         library_type: LibraryType | str,
         episode_names: list[str] | None = None,
+        anchor_candidates: tuple[
+            list[MatchCandidate],
+            list[MatchCandidate],
+            list[MatchCandidate],
+        ] | None = None,
         top_n: int,
     ) -> list[list[MatchCandidate]]:
         """Search source portrait-crop caches for zoomed/panned TikToks."""
@@ -776,8 +1003,14 @@ class AnimeMatcherService:
         episode_paths = cls._series_episode_paths(series, library_type)
         if not episode_paths:
             return [[] for _ in images]
+        total_episode_count = len(episode_paths)
 
         seeded_search = bool(episode_names)
+        series_frame_count = (
+            cls._index_manager.get_series_frame_count(series)
+            if series is not None and cls._index_manager is not None
+            else 0
+        )
         if episode_names:
             seed_limit = max(1, cls.CROP_SEARCH_MAX_EPISODES_PER_SCENE)
             filtered_paths = {
@@ -788,11 +1021,22 @@ class AnimeMatcherService:
             if not filtered_paths:
                 return [[] for _ in images]
             episode_paths = filtered_paths
+            if (
+                series_frame_count > cls.CROP_SEARCH_ENABLE_MAX_SERIES_FRAMES
+                or total_episode_count > cls.CROP_SEARCH_ENABLE_MAX_SERIES_EPISODES
+            ):
+                return cls._search_local_crop_windows_batch(
+                    images,
+                    series=series,
+                    library_type=library_type,
+                    episode_names=list(episode_paths.keys()),
+                    anchor_candidates=anchor_candidates,
+                    top_n=top_n,
+                )
         elif (
             series is not None
             and cls._index_manager is not None
-            and cls._index_manager.get_series_frame_count(series)
-            > cls.CROP_SEARCH_ENABLE_MAX_SERIES_FRAMES
+            and series_frame_count > cls.CROP_SEARCH_ENABLE_MAX_SERIES_FRAMES
         ):
             return [[] for _ in images]
         elif len(episode_paths) > cls.CROP_SEARCH_ENABLE_MAX_SERIES_EPISODES:
@@ -877,6 +1121,22 @@ class AnimeMatcherService:
             reverse=True,
         )
         return ordered[: max(0, limit)]
+
+    @staticmethod
+    def _should_try_crop_search(
+        anime_name: str | None,
+        scene_duration: float,
+        match: SceneMatch | None,
+    ) -> bool:
+        return (
+            anime_name is not None
+            and scene_duration <= 4.0
+            and (
+                match is None
+                or match.confidence < 0.58
+                or (match.end_time - match.start_time) > scene_duration * 1.7
+            )
+        )
 
     @classmethod
     def _dedupe_match_candidates(
@@ -2252,14 +2512,10 @@ class AnimeMatcherService:
                 crop_match: SceneMatch | None = None
                 projected_match: SceneMatch | None = None
                 seed_episodes: list[str] = []
-                should_try_crop_search = (
-                    anime_name is not None
-                    and scene.duration <= 4.0
-                    and (
-                        match is None
-                        or match.confidence < 0.58
-                        or (match.end_time - match.start_time) > scene.duration * 1.7
-                    )
+                should_try_crop_search = cls._should_try_crop_search(
+                    anime_name,
+                    scene.duration,
+                    match,
                 )
                 if should_try_crop_search:
                     seed_episodes = cls._rank_candidate_episodes(
@@ -2274,6 +2530,11 @@ class AnimeMatcherService:
                         series=anime_name,
                         library_type=library_type,
                         episode_names=seed_episodes,
+                        anchor_candidates=(
+                            start_candidates,
+                            middle_candidates,
+                            end_candidates,
+                        ),
                         top_n=cls.CROP_SEARCH_TOP_N,
                     )
                     crop_start, crop_middle, crop_end = await loop.run_in_executor(
