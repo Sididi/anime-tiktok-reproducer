@@ -186,3 +186,40 @@ body {
 .planning-calendar .sx__time-grid-event-inner {
   padding: 0 !important;
 }
+
+/* Compact the day-header strip so the time grid gets more vertical room. */
+.planning-calendar .sx__week-header {
+  min-height: 0 !important;
+}
+.planning-calendar .sx__week-grid__date {
+  padding-top: 4px !important;
+  padding-bottom: 4px !important;
+  min-height: 0 !important;
+}
+.planning-calendar .sx__week-grid__day-name {
+  font-size: 10px !important;
+  line-height: 1.1 !important;
+  margin: 0 !important;
+}
+.planning-calendar .sx__week-grid__date-number {
+  font-size: 13px !important;
+  line-height: 1.1 !important;
+  width: 22px !important;
+  height: 22px !important;
+  margin: 2px auto 0 !important;
+}
+/* Compact the calendar app header (today / nav arrows / month label). */
+.planning-calendar .sx__calendar-header {
+  padding: 4px 6px !important;
+  min-height: 0 !important;
+}
+.planning-calendar .sx__calendar-header-content {
+  gap: 6px !important;
+}
+.planning-calendar .sx__today-button {
+  padding: 2px 8px !important;
+  height: auto !important;
+}
+.planning-calendar .sx__forward-backward-navigation button {
+  padding: 2px !important;
+}

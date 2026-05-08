@@ -222,19 +222,11 @@ test("Reschedule slot triggers PATCH and reloads", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Planning" })).toBeVisible();
   await expect(page.getByText("Show Alpha").first()).toBeVisible();
 
-  // ScheduleX's onEventClick fires from a real DOM click — synthesize one
-  // via dispatchEvent so framework click hooks see it.
-  await page.locator(".sx__time-grid-event").first().evaluate((el) => {
-    const r = (el as HTMLElement).getBoundingClientRect();
-    el.dispatchEvent(
-      new MouseEvent("click", {
-        bubbles: true,
-        cancelable: true,
-        clientX: r.x + r.width / 2,
-        clientY: r.y + r.height / 2,
-      }),
-    );
-  });
+  // The React custom component now binds onClick directly on its inner div.
+  await page
+    .locator(".sx__time-grid-event-inner > div")
+    .first()
+    .click();
   await expect(page.getByRole("dialog", { name: "Event details" })).toBeVisible();
   // Click "Move" on the first (YouTube) row.
   await page.getByRole("dialog").getByRole("button", { name: /Move/i }).first().click();
@@ -270,17 +262,10 @@ test("Cancel slot triggers DELETE", async ({ page }) => {
   page.on("dialog", (dlg) => dlg.accept());
 
   // The second event card is Show Beta (TT-only).
-  await page.locator(".sx__time-grid-event").nth(1).evaluate((el) => {
-    const r = (el as HTMLElement).getBoundingClientRect();
-    el.dispatchEvent(
-      new MouseEvent("click", {
-        bubbles: true,
-        cancelable: true,
-        clientX: r.x + r.width / 2,
-        clientY: r.y + r.height / 2,
-      }),
-    );
-  });
+  await page
+    .locator(".sx__time-grid-event-inner > div")
+    .nth(1)
+    .click();
   await expect(page.getByRole("dialog", { name: "Event details" })).toBeVisible();
   // Per-platform popover: the only platform row is TT — click its "Cancel".
   await page.getByRole("dialog").getByRole("button", { name: /Cancel/i }).first().click();

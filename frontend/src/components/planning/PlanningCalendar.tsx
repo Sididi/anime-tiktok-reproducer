@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef } from "react";
 import "temporal-polyfill/global";
 import { ScheduleXCalendar, useNextCalendarApp } from "@schedule-x/react";
 import { createViewWeek } from "@schedule-x/calendar";
@@ -80,7 +80,19 @@ function fmtSlotTime(iso: string): string {
   }).format(new Date(iso));
 }
 
+/** ScheduleX's onEventClick delegation can be flaky once we render a React
+ *  custom component into the slot — bind onClick directly to our card and
+ *  read the handler from this context. */
+const EventClickContext = createContext<
+  | ((
+      g: { project_id: string; slot: string; members: PlanningEvent[] },
+      anchor: { x: number; y: number },
+    ) => void)
+  | null
+>(null);
+
 function GroupEventCard({ calendarEvent }: TimeGridEventProps) {
+  const onClick = useContext(EventClickContext);
   const members = calendarEvent._members ?? [];
   if (!members.length) return null;
   const first = members[0];
@@ -104,6 +116,17 @@ function GroupEventCard({ calendarEvent }: TimeGridEventProps) {
         cursor: "pointer",
       }}
       title={`${first.anime_title} — ${first.account_name}`}
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick?.(
+          {
+            project_id: first.project_id,
+            slot: first.slot,
+            members,
+          },
+          { x: e.clientX, y: e.clientY },
+        );
+      }}
     >
       <div
         style={{
@@ -151,9 +174,15 @@ function GroupEventCard({ calendarEvent }: TimeGridEventProps) {
           fontSize: 11,
           lineHeight: "1.15",
           color: "hsl(var(--foreground))",
-          whiteSpace: "nowrap",
+          // Allow up to two lines so longer titles aren't cut on a single
+          // line. Falls back to ellipsis only when even two lines overflow.
+          display: "-webkit-box",
+          WebkitLineClamp: 2,
+          WebkitBoxOrient: "vertical",
           overflow: "hidden",
-          textOverflow: "ellipsis",
+          wordBreak: "break-word",
+          flex: "1 1 auto",
+          minHeight: 0,
         }}
       >
         {first.anime_title}
@@ -202,8 +231,15 @@ export function PlanningCalendar({
 
   const onEventClickRef = useRef(onEventClick);
   onEventClickRef.current = onEventClick;
-  const sxEventsRef = useRef(sxEvents);
-  sxEventsRef.current = sxEvents;
+  // Stable callback for the context — always reads the latest prop via ref.
+  const stableOnClick = useMemo(
+    () =>
+      (
+        g: { project_id: string; slot: string; members: PlanningEvent[] },
+        anchor: { x: number; y: number },
+      ) => onEventClickRef.current(g, anchor),
+    [],
+  );
 
   const calendar = useNextCalendarApp({
     views: [createViewWeek()],
@@ -215,28 +251,11 @@ export function PlanningCalendar({
     events: sxEvents,
     calendars: PLATFORM_CALENDARS,
     weekOptions: {
-      // Compact: 24px/hour → 576px for 24h. Combined with ScheduleX's
-      // header strip (~80px) the whole calendar fits ~656px which sits
-      // inside the 92vh modal body (~700px) without needing a scroll.
-      // Empty hours are sparse on purpose; events still read at this size.
-      gridHeight: 576,
-    },
-    callbacks: {
-      onEventClick(sxEvent, uiEvent) {
-        const id = String(sxEvent.id);
-        const match = sxEventsRef.current.find((e) => e.id === id);
-        if (!match) return;
-        const mouse = uiEvent as MouseEvent;
-        const first = match._members[0];
-        onEventClickRef.current(
-          {
-            project_id: first.project_id,
-            slot: first.slot,
-            members: match._members,
-          },
-          { x: mouse?.clientX ?? 0, y: mouse?.clientY ?? 0 },
-        );
-      },
+      // Compact: ~30px/hour → 720px for 24h. With the trimmed header strip
+      // the whole grid fits inside the 92vh modal body without scroll, and
+      // a 90-min event card is tall enough for avatar + pills + 2-line
+      // title + slot time.
+      gridHeight: 720,
     },
   });
 
@@ -245,13 +264,24 @@ export function PlanningCalendar({
     calendar.events.set(sxEvents);
   }, [calendar, sxEvents]);
 
+  // ScheduleX's React wrapper destroys + re-renders the whole calendar
+  // whenever `customComponents` is a new reference. Memoize so that doesn't
+  // happen on every parent render (which would cause the visible flash and
+  // wipe the click handlers between renders).
+  const customComponents = useMemo(
+    () => ({ timeGridEvent: GroupEventCard }),
+    [],
+  );
+
   return (
-    <div className="planning-calendar h-full">
-      <ScheduleXCalendar
-        calendarApp={calendar}
-        customComponents={{ timeGridEvent: GroupEventCard }}
-      />
-    </div>
+    <EventClickContext.Provider value={stableOnClick}>
+      <div className="planning-calendar h-full">
+        <ScheduleXCalendar
+          calendarApp={calendar}
+          customComponents={customComponents}
+        />
+      </div>
+    </EventClickContext.Provider>
   );
 }
 
