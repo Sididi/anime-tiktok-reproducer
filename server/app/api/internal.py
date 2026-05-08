@@ -69,8 +69,16 @@ class GenericMessageEditRequest(BaseModel):
 
 
 class UpdateSlotRequest(BaseModel):
-    slot_time: datetime
+    """Partial update to a job's scheduling state.
+
+    All fields are optional so callers can move a single platform without
+    touching the others. `platform_scheduled_at` is merged into the existing
+    map (keys present in the request override; keys absent are preserved).
+    """
+
+    slot_time: datetime | None = None
     platform_scheduled_at: dict[str, datetime] | None = None
+    reminder_cancelled: bool | None = None
 
 
 @router.post("/jobs", response_model=CreateJobResponse)
@@ -174,9 +182,27 @@ async def update_job_slot(
     if job is None:
         raise HTTPException(404, f"Job for project {project_id!r} not found")
 
-    fields: dict[str, object] = {"slot_time": req.slot_time}
+    fields: dict[str, object] = {}
+    if req.slot_time is not None:
+        fields["slot_time"] = req.slot_time
     if req.platform_scheduled_at is not None:
-        fields["platform_scheduled_at"] = dict(req.platform_scheduled_at)
+        # Merge into the existing per-platform map so partial updates (e.g.
+        # moving only the TikTok slot) don't wipe other platforms' entries.
+        merged = dict(job.platform_scheduled_at or {})
+        merged.update(dict(req.platform_scheduled_at))
+        fields["platform_scheduled_at"] = merged
+    if req.reminder_cancelled is not None:
+        fields["reminder_cancelled"] = req.reminder_cancelled
+    if not fields:
+        # Nothing to change.
+        return {
+            "project_id": job.project_id,
+            "slot_time": job.slot_time.isoformat(),
+            "platform_scheduled_at": {
+                p: dt.isoformat() for p, dt in job.platform_scheduled_at.items()
+            },
+            "reminder_cancelled": job.reminder_cancelled,
+        }
     updated = await store.update(project_id, **fields)
     return {
         "project_id": updated.project_id,
@@ -184,6 +210,7 @@ async def update_job_slot(
         "platform_scheduled_at": {
             p: dt.isoformat() for p, dt in updated.platform_scheduled_at.items()
         },
+        "reminder_cancelled": updated.reminder_cancelled,
     }
 
 

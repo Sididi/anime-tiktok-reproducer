@@ -14,10 +14,10 @@ from app.services.platform_reschedule_service import (
 )
 
 
-def test_notify_returns_skipped_for_unsupported_platform():
+def test_notify_returns_skipped_for_unknown_platform():
     project = Project(id="p1")
     result = PlatformRescheduleService.notify(
-        project, "tiktok", datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
+        project, "myspace", datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
     )
     assert result.status == "skipped"
 
@@ -178,8 +178,80 @@ def test_notify_instagram_patches_server_endpoint(monkeypatch):
     assert result.status == "ok"
     assert captured["url"] == "https://server.example.com/api/internal/jobs/p1/slot"
     assert captured["headers"]["Authorization"] == "Bearer secret"
-    assert captured["json"]["slot_time"].startswith("2026-05-08T14:00:00")
-    assert "instagram" in captured["json"]["platform_scheduled_at"]
+    # Per-platform reschedule must NOT clobber the canonical slot_time on
+    # the server — it only updates the per-platform map entry.
+    assert "slot_time" not in captured["json"]
+    assert captured["json"]["platform_scheduled_at"] == {
+        "instagram": "2026-05-08T14:00:00+00:00",
+    }
+
+
+def test_notify_tiktok_patches_server_endpoint(monkeypatch):
+    """TT reschedule must reach the server so the reminder fires at the new
+    time — TT is manually posted but the /server/ pings the operator."""
+    project = Project(id="p1", scheduled_account_id="acc_a")
+
+    captured: dict = {}
+    class FakeResp:
+        status_code = 200
+        def raise_for_status(self): return None
+    def fake_patch(url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        captured["headers"] = headers
+        return FakeResp()
+
+    monkeypatch.setattr(
+        "app.services.platform_reschedule_service.settings.tiktok_server_url",
+        "https://server.example.com",
+    )
+    monkeypatch.setattr(
+        "app.services.platform_reschedule_service.settings.tiktok_server_internal_token",
+        "secret",
+    )
+    monkeypatch.setattr("app.services.platform_reschedule_service.httpx.patch", fake_patch)
+
+    result = PlatformRescheduleService.notify(
+        project, "tiktok",
+        datetime(2026, 5, 8, 14, 0, tzinfo=timezone.utc),
+    )
+    assert result.status == "ok"
+    assert captured["url"] == "https://server.example.com/api/internal/jobs/p1/slot"
+    assert captured["headers"]["Authorization"] == "Bearer secret"
+    assert "slot_time" not in captured["json"]
+    assert captured["json"]["platform_scheduled_at"] == {
+        "tiktok": "2026-05-08T14:00:00+00:00",
+    }
+
+
+def test_cancel_tiktok_marks_reminder_cancelled(monkeypatch):
+    """TT cancel keeps the job on the server (so other platforms' reminders
+    survive) but flips reminder_cancelled so the TT ping is skipped."""
+    project = Project(id="p1", scheduled_account_id="acc_a")
+
+    captured: dict = {}
+    class FakeResp:
+        status_code = 200
+        def raise_for_status(self): return None
+    def fake_patch(url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        return FakeResp()
+
+    monkeypatch.setattr(
+        "app.services.platform_reschedule_service.settings.tiktok_server_url",
+        "https://server.example.com",
+    )
+    monkeypatch.setattr(
+        "app.services.platform_reschedule_service.settings.tiktok_server_internal_token",
+        "secret",
+    )
+    monkeypatch.setattr("app.services.platform_reschedule_service.httpx.patch", fake_patch)
+
+    result = PlatformRescheduleService.cancel(project, "tiktok")
+    assert result.status == "ok"
+    assert captured["url"] == "https://server.example.com/api/internal/jobs/p1/slot"
+    assert captured["json"] == {"reminder_cancelled": True}
 
 
 def test_cancel_instagram_deletes_server_job(monkeypatch):

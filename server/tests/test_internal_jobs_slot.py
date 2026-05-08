@@ -14,7 +14,7 @@ JOB_PAYLOAD = {
     "anime_title": "Test",
     "description": "d",
     "drive_video_url": "https://drive.google.com/uc?id=x",
-    "platforms_requested": ["instagram"],
+    "platforms_requested": ["tiktok", "instagram"],
     "instagram": {
         "ig_user_id": "ig",
         "ig_access_token": "tok",
@@ -65,6 +65,54 @@ def test_patch_job_slot_404_for_missing(monkeypatch, example_yaml, example_env, 
             headers=INTERNAL_AUTH,
         )
         assert r.status_code == 404
+
+
+def test_patch_merges_platform_scheduled_at(monkeypatch, example_yaml, example_env, tmp_server_dir):
+    """Updating one platform's slot must NOT wipe other platforms' entries."""
+    app = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    with TestClient(app) as client:
+        client.post("/api/internal/jobs", json=JOB_PAYLOAD, headers=INTERNAL_AUTH)
+
+        # First, set IG entry only.
+        client.patch(
+            "/api/internal/jobs/p1/slot",
+            json={"platform_scheduled_at": {"instagram": "2026-05-08T18:00:00+00:00"}},
+            headers=INTERNAL_AUTH,
+        )
+        # Now move only TT — IG entry must survive.
+        r = client.patch(
+            "/api/internal/jobs/p1/slot",
+            json={"platform_scheduled_at": {"tiktok": "2026-05-09T14:00:00+00:00"}},
+            headers=INTERNAL_AUTH,
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["platform_scheduled_at"]["instagram"].startswith(
+            "2026-05-08T18:00:00"
+        )
+        assert body["platform_scheduled_at"]["tiktok"].startswith(
+            "2026-05-09T14:00:00"
+        )
+        # Top-level slot_time was never sent so it stays at the original.
+        assert body["slot_time"].startswith("2026-05-07T14:00:00")
+
+
+def test_patch_sets_reminder_cancelled(monkeypatch, example_yaml, example_env, tmp_server_dir):
+    """Cancelling the TT reminder is a one-field PATCH that doesn't touch
+    slot_time or platform_scheduled_at."""
+    app = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    with TestClient(app) as client:
+        client.post("/api/internal/jobs", json=JOB_PAYLOAD, headers=INTERNAL_AUTH)
+        r = client.patch(
+            "/api/internal/jobs/p1/slot",
+            json={"reminder_cancelled": True},
+            headers=INTERNAL_AUTH,
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["reminder_cancelled"] is True
+        # Original slot_time preserved.
+        assert body["slot_time"].startswith("2026-05-07T14:00:00")
 
 
 def test_delete_job_removes_it(monkeypatch, example_yaml, example_env, tmp_server_dir):

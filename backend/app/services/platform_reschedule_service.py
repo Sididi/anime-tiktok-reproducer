@@ -66,8 +66,19 @@ class PlatformRescheduleService:
     def notify(
         cls, project: Project, platform: str, new_scheduled_at: datetime
     ) -> NotificationResult:
+        # TikTok is posted manually, but our /server/ holds the reminder
+        # scheduler that pings the operator at slot time, so a reschedule
+        # still needs to flow there. There's no "video URL" for TT — the
+        # server identifies the job by project_id.
         if platform == "tiktok":
-            return NotificationResult(status="skipped")
+            try:
+                return cls._notify_tiktok(project, new_scheduled_at)
+            except Exception as exc:
+                logger.warning(
+                    "platform reschedule failed: project=%s platform=tiktok error=%s",
+                    project.id, exc,
+                )
+                return NotificationResult(status="pending_retry", error=str(exc))
 
         url = cls._platform_video_url(project, platform)
         if not url:
@@ -90,8 +101,18 @@ class PlatformRescheduleService:
 
     @classmethod
     def cancel(cls, project: Project, platform: str) -> NotificationResult:
+        # TikTok cancel: tell the server to skip the reminder. We don't
+        # delete the whole job (other platforms may still want their
+        # publish/reminder logic).
         if platform == "tiktok":
-            return NotificationResult(status="skipped")
+            try:
+                return cls._cancel_tiktok(project)
+            except Exception as exc:
+                logger.warning(
+                    "platform cancel failed: project=%s platform=tiktok error=%s",
+                    project.id, exc,
+                )
+                return NotificationResult(status="pending_retry", error=str(exc))
 
         url = cls._platform_video_url(project, platform)
         if not url and platform != "instagram":
@@ -154,12 +175,25 @@ class PlatformRescheduleService:
 
     @classmethod
     def _notify_instagram(cls, project: Project, new_scheduled_at: datetime) -> NotificationResult:
+        return cls._patch_server_slot(project, "instagram", new_scheduled_at)
+
+    @classmethod
+    def _notify_tiktok(
+        cls, project: Project, new_scheduled_at: datetime
+    ) -> NotificationResult:
+        # Same server endpoint as IG; the server's reminder scheduler reads
+        # `platform_scheduled_at["tiktok"]` to know when to ping the operator.
+        return cls._patch_server_slot(project, "tiktok", new_scheduled_at)
+
+    @classmethod
+    def _patch_server_slot(
+        cls, project: Project, platform: str, new_scheduled_at: datetime
+    ) -> NotificationResult:
         url = settings.tiktok_server_url.rstrip("/") + f"/api/internal/jobs/{project.id}/slot"
         resp = httpx.patch(
             url,
             json={
-                "slot_time": new_scheduled_at.isoformat(),
-                "platform_scheduled_at": {"instagram": new_scheduled_at.isoformat()},
+                "platform_scheduled_at": {platform: new_scheduled_at.isoformat()},
             },
             headers={"Authorization": f"Bearer {settings.tiktok_server_internal_token}"},
             timeout=20.0,
@@ -206,6 +240,23 @@ class PlatformRescheduleService:
         url = settings.tiktok_server_url.rstrip("/") + f"/api/internal/jobs/{project.id}"
         resp = httpx.delete(
             url,
+            headers={"Authorization": f"Bearer {settings.tiktok_server_internal_token}"},
+            timeout=20.0,
+        )
+        if resp.status_code == 404:
+            return NotificationResult(status="skipped")
+        resp.raise_for_status()
+        return NotificationResult(status="ok")
+
+    @classmethod
+    def _cancel_tiktok(cls, project: Project) -> NotificationResult:
+        # Tell the server's reminder scheduler to skip the TT ping. We don't
+        # delete the job — IG/YT/FB reminders or status tracking on the same
+        # job stay intact.
+        url = settings.tiktok_server_url.rstrip("/") + f"/api/internal/jobs/{project.id}/slot"
+        resp = httpx.patch(
+            url,
+            json={"reminder_cancelled": True},
             headers={"Authorization": f"Bearer {settings.tiktok_server_internal_token}"},
             timeout=20.0,
         )

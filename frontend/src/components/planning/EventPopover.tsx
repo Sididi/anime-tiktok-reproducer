@@ -46,8 +46,20 @@ export function EventPopover({
   const POPOVER_W = 360;
   // Approx height: 96 (header+slot+drive) + 38 per platform row + 84 (global actions).
   const POPOVER_H = 96 + members.length * 38 + 84;
-  const left = Math.min(window.innerWidth - POPOVER_W - 8, Math.max(8, anchor.x + 8));
-  const top = Math.min(window.innerHeight - POPOVER_H - 8, Math.max(8, anchor.y + 8));
+
+  // Place to the right of the click; flip to the left if it would overflow.
+  let left = anchor.x + 12;
+  if (left + POPOVER_W > window.innerWidth - 8) {
+    left = anchor.x - POPOVER_W - 12;
+  }
+  left = Math.max(8, Math.min(window.innerWidth - POPOVER_W - 8, left));
+
+  // Prefer below the click; flip above if it would clip the viewport bottom.
+  let top = anchor.y + 12;
+  if (top + POPOVER_H > window.innerHeight - 8) {
+    top = anchor.y - POPOVER_H - 12;
+  }
+  top = Math.max(8, Math.min(window.innerHeight - POPOVER_H - 8, top));
 
   return (
     <div
