@@ -30,6 +30,62 @@ def test_notify_skips_when_video_id_missing():
     assert result.status == "skipped"
 
 
+def test_tiktok_paths_skip_cleanly_when_server_url_unset(monkeypatch):
+    """When neither tiktok_server_url nor tiktok_server_base_url is set,
+    TT/IG server-bound calls return skipped instead of crashing on None."""
+    project = Project(id="p1", scheduled_account_id="acc_a")
+    monkeypatch.setattr(
+        "app.services.platform_reschedule_service.settings.tiktok_server_url",
+        None,
+    )
+    monkeypatch.setattr(
+        "app.services.platform_reschedule_service.settings.tiktok_server_base_url",
+        None,
+    )
+    monkeypatch.setattr(
+        "app.services.platform_reschedule_service.settings.tiktok_server_internal_token",
+        None,
+    )
+    assert (
+        PlatformRescheduleService.notify(
+            project, "tiktok", datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
+        ).status
+        == "skipped"
+    )
+    assert PlatformRescheduleService.cancel(project, "tiktok").status == "skipped"
+    assert PlatformRescheduleService.cancel(project, "instagram").status == "skipped"
+
+
+def test_tiktok_falls_back_to_tiktok_server_base_url(monkeypatch):
+    """When only the legacy tiktok_server_base_url is set, the reschedule
+    path should use it for the /api/internal/* calls."""
+    project = Project(id="p1", scheduled_account_id="acc_a")
+    captured: dict = {}
+    class FakeResp:
+        status_code = 200
+        def raise_for_status(self): return None
+    def fake_patch(url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        return FakeResp()
+    monkeypatch.setattr(
+        "app.services.platform_reschedule_service.settings.tiktok_server_url",
+        None,
+    )
+    monkeypatch.setattr(
+        "app.services.platform_reschedule_service.settings.tiktok_server_base_url",
+        "https://legacy.example.com",
+    )
+    monkeypatch.setattr(
+        "app.services.platform_reschedule_service.settings.tiktok_server_internal_token",
+        "tok",
+    )
+    monkeypatch.setattr("app.services.platform_reschedule_service.httpx.patch", fake_patch)
+
+    result = PlatformRescheduleService.cancel(project, "tiktok")
+    assert result.status == "ok"
+    assert captured["url"].startswith("https://legacy.example.com/")
+
+
 def test_notify_youtube_calls_videos_update_with_publish_at():
     project = Project(
         id="p1",

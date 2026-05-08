@@ -52,10 +52,17 @@ class Settings(BaseSettings):
     # TikTok server (VPS) integration — replaces previous Discord webhook
     tiktok_server_base_url: str | None = None
     # Internal API base for /api/internal/jobs/* (planning/reschedule path).
-    # May equal tiktok_server_base_url; kept distinct so deployments can route
-    # the planning endpoints separately (e.g. behind a different ingress).
+    # Optional — when unset, falls back to `tiktok_server_base_url` so a
+    # single env var (`ATR_TIKTOK_SERVER_BASE_URL`) covers both routes for
+    # most deployments. Set this only if planning endpoints live behind a
+    # different ingress than upload/discord webhooks.
     tiktok_server_url: str | None = None
     tiktok_server_internal_token: str | None = None
+
+    @property
+    def tiktok_server_internal_url(self) -> str | None:
+        """Effective base URL for /api/internal/* calls."""
+        return self.tiktok_server_url or self.tiktok_server_base_url
 
     cep_trigger_url_template: str = "http://localhost:48653/p/{project_id}"
 

@@ -186,10 +186,21 @@ class PlatformRescheduleService:
         return cls._patch_server_slot(project, "tiktok", new_scheduled_at)
 
     @classmethod
+    def _server_base_url(cls) -> str | None:
+        base = settings.tiktok_server_internal_url
+        return base.rstrip("/") if base else None
+
+    @classmethod
     def _patch_server_slot(
         cls, project: Project, platform: str, new_scheduled_at: datetime
     ) -> NotificationResult:
-        url = settings.tiktok_server_url.rstrip("/") + f"/api/internal/jobs/{project.id}/slot"
+        base = cls._server_base_url()
+        if not base or not settings.tiktok_server_internal_token:
+            # No /server/ deployed — silently skip the platforms that depend
+            # on it (TT reminder, IG publish). The local platform_schedules
+            # change is still persisted; nothing to propagate.
+            return NotificationResult(status="skipped")
+        url = f"{base}/api/internal/jobs/{project.id}/slot"
         resp = httpx.patch(
             url,
             json={
@@ -237,7 +248,10 @@ class PlatformRescheduleService:
 
     @classmethod
     def _cancel_instagram(cls, project: Project) -> NotificationResult:
-        url = settings.tiktok_server_url.rstrip("/") + f"/api/internal/jobs/{project.id}"
+        base = cls._server_base_url()
+        if not base or not settings.tiktok_server_internal_token:
+            return NotificationResult(status="skipped")
+        url = f"{base}/api/internal/jobs/{project.id}"
         resp = httpx.delete(
             url,
             headers={"Authorization": f"Bearer {settings.tiktok_server_internal_token}"},
@@ -253,7 +267,10 @@ class PlatformRescheduleService:
         # Tell the server's reminder scheduler to skip the TT ping. We don't
         # delete the job — IG/YT/FB reminders or status tracking on the same
         # job stay intact.
-        url = settings.tiktok_server_url.rstrip("/") + f"/api/internal/jobs/{project.id}/slot"
+        base = cls._server_base_url()
+        if not base or not settings.tiktok_server_internal_token:
+            return NotificationResult(status="skipped")
+        url = f"{base}/api/internal/jobs/{project.id}/slot"
         resp = httpx.patch(
             url,
             json={"reminder_cancelled": True},
