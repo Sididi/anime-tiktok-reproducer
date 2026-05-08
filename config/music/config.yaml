@@ -25,7 +25,7 @@ music:
   girl_a_full_small_loop:
     display_name: "Girl A Full - Small Loop"
     file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/girl a full small loop.wav"
-    volume_db: -30
+    volume_db: -20
 
   girl_a_cut_super_slowed:
     display_name: "Girl A Cut - Super Slowed"

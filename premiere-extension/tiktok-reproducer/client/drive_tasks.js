@@ -24,6 +24,8 @@ var SMALL_FILE_BYTES = 12 * 1024 * 1024;
 var SMALL_FILE_HIGH_COUNT = 120;
 var SMALL_FILE_MEDIUM_COUNT = 40;
 var TREE_LIST_CONCURRENCY = 6;
+var WINDOWS_RENAME_RETRY_ATTEMPTS = 12;
+var WINDOWS_RENAME_RETRY_DELAY_MS = 250;
 var SHARED_HTTPS_AGENT = new https.Agent({
   keepAlive: true,
   maxSockets: 32,
@@ -119,6 +121,67 @@ function extractSubtitlesArchive(localRootPath, projectId, emitProgress) {
 function sleep(ms) {
   return new Promise(function (resolve) {
     setTimeout(resolve, ms);
+  });
+}
+
+function isRetryableRenameError(err) {
+  var code = String(err && err.code ? err.code : "").toUpperCase();
+  return (
+    code === "EPERM" ||
+    code === "EBUSY" ||
+    code === "EACCES" ||
+    code === "ENOTEMPTY"
+  );
+}
+
+function renamePathWithRetry(sourcePath, destinationPath, options) {
+  var opts = options || {};
+  var maxAttempts = Math.max(
+    1,
+    Number(opts.maxAttempts || WINDOWS_RENAME_RETRY_ATTEMPTS),
+  );
+  var delayMs = Math.max(
+    25,
+    Number(opts.delayMs || WINDOWS_RENAME_RETRY_DELAY_MS),
+  );
+  var label = String(opts.label || "rename");
+  var attempt = 0;
+
+  function tryRename() {
+    attempt += 1;
+    try {
+      fs.renameSync(sourcePath, destinationPath);
+      return Promise.resolve({
+        ok: true,
+        attempts: attempt,
+      });
+    } catch (err) {
+      if (attempt < maxAttempts && isRetryableRenameError(err)) {
+        return sleep(delayMs * attempt).then(tryRename);
+      }
+      var detail = new Error(
+        label +
+          " failed after " +
+          attempt +
+          " attempt(s): " +
+          sourcePath +
+          " -> " +
+          destinationPath +
+          ": " +
+          (err && err.message ? err.message : String(err)),
+      );
+      detail.code = err && err.code ? err.code : "RENAME_FAILED";
+      detail.cause = err;
+      throw detail;
+    }
+  }
+
+  return tryRename();
+}
+
+function finalizeDownloadedFolderWithRetry(partialRoot, targetRoot) {
+  return renamePathWithRetry(partialRoot, targetRoot, {
+    label: "Downloaded project folder finalize",
   });
 }
 
@@ -719,7 +782,7 @@ function downloadFileWithResume(
               stream.destroy(err);
             });
 
-            stream.on("finish", function () {
+            stream.on("close", function () {
               if (streamErrored) {
                 return;
               }
@@ -727,13 +790,13 @@ function downloadFileWithResume(
                 resolve(attemptDownload(wrote, attempt + 1));
                 return;
               }
-              try {
-                fs.renameSync(partPath, destinationPath);
-              } catch (e) {
-                reject(e);
-                return;
-              }
-              resolve({ bytes: wrote, reused: false });
+              renamePathWithRetry(partPath, destinationPath, {
+                label: "Downloaded file finalize",
+              })
+                .then(function () {
+                  resolve({ bytes: wrote, reused: false });
+                })
+                .catch(reject);
             });
 
             res.pipe(stream);
@@ -957,7 +1020,12 @@ function performDownloadProject(payload, emitProgress) {
           },
         ).then(function () {
           var downloadElapsedMs = Math.max(1, Date.now() - downloadStartedAt);
-          fs.renameSync(partialRoot, targetRoot);
+          return finalizeDownloadedFolderWithRetry(partialRoot, targetRoot).then(
+            function () {
+              return downloadElapsedMs;
+            },
+          );
+        }).then(function (downloadElapsedMs) {
 
           var extractStartedAt = Date.now();
           var extraction = extractSubtitlesArchive(

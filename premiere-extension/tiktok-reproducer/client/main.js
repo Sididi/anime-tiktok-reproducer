@@ -37,6 +37,8 @@
   var PANEL_BUILD_ID = "2026-04-29-async-proxy-v8";
   var PROJECT_CONTEXT_FILENAME = ".atr_project_context.json";
   var PROXY_OUTPUT_SUFFIX = "__atr_proxy.mp4";
+  var PROXY_MARKER_SUFFIX = ".atr_proxy.json";
+  var PROXY_MARKER_VERSION = 1;
   var ATR_OUTPUT_PATTERN = /^ATR_.*\.mp4$/i;
   var KNOWN_VIDEO_EXTENSIONS = {
     ".avi": true,
@@ -381,6 +383,41 @@
     return message || code || "Unknown cleanup failure";
   }
 
+  function isRetryableRenameError(err) {
+    var code = String(err && err.code ? err.code : "").toUpperCase();
+    return (
+      code === "EPERM" ||
+      code === "EBUSY" ||
+      code === "EACCES" ||
+      code === "ENOTEMPTY"
+    );
+  }
+
+  function renamePathWithRetry(sourcePath, destinationPath, options) {
+    var opts = options || {};
+    var maxAttempts = Math.max(1, Number(opts.maxAttempts || 10));
+    var delayMs = Math.max(25, Number(opts.delayMs || 200));
+    var attempt = 0;
+
+    function tryRename() {
+      attempt += 1;
+      try {
+        fs.renameSync(sourcePath, destinationPath);
+        return Promise.resolve({
+          ok: true,
+          attempts: attempt,
+        });
+      } catch (err) {
+        if (attempt < maxAttempts && isRetryableRenameError(err)) {
+          return sleep(delayMs * attempt).then(tryRename);
+        }
+        throw err;
+      }
+    }
+
+    return tryRename();
+  }
+
   function removePathWithWindowsFallback(targetPath) {
     if (process.platform !== "win32" || !targetPath || !fs.existsSync(targetPath)) {
       return {
@@ -389,10 +426,9 @@
       };
     }
     try {
-      var command = 'rmdir /s /q "' + targetPath.replace(/"/g, '\\"') + '"';
       childProcess.execFileSync(
         "cmd.exe",
-        ["/d", "/s", "/c", command],
+        ["/d", "/c", "rmdir", "/s", "/q", targetPath],
         { windowsHide: true },
       );
       return {
@@ -1271,6 +1307,77 @@
     return path.join(rootPath, relativeProxyDir, baseName + PROXY_OUTPUT_SUFFIX);
   }
 
+  function getProxyMarkerPath(outputPath) {
+    return String(outputPath || "") + PROXY_MARKER_SUFFIX;
+  }
+
+  function readProxyMarker(outputPath) {
+    return readJson(getProxyMarkerPath(outputPath), null);
+  }
+
+  function isCleanProxyOutput(outputPath) {
+    var normalizedOutputPath = String(outputPath || "").trim();
+    if (!normalizedOutputPath || !fs.existsSync(normalizedOutputPath)) {
+      return false;
+    }
+    var marker = readProxyMarker(normalizedOutputPath);
+    return !!(
+      marker &&
+      Number(marker.marker_version || 0) === PROXY_MARKER_VERSION &&
+      marker.panel_build_id
+    );
+  }
+
+  function writeCleanProxyMarker(outputPath, target) {
+    writeJsonAtomic(getProxyMarkerPath(outputPath), {
+      marker_version: PROXY_MARKER_VERSION,
+      panel_build_id: PANEL_BUILD_ID,
+      created_at: nowIso(),
+      output_path: String(outputPath || ""),
+      media_path: String((target && target.media_path) || ""),
+      source_codec: String((target && target.source_codec) || ""),
+      expected_proxy_width: Number((target && target.expected_proxy_width) || 0),
+      expected_proxy_height: Number((target && target.expected_proxy_height) || 0),
+    });
+  }
+
+  function removeProxyOutputAndMarker(outputPath) {
+    var normalizedOutputPath = String(outputPath || "").trim();
+    if (!normalizedOutputPath) {
+      return;
+    }
+    try {
+      if (fs.existsSync(normalizedOutputPath)) {
+        fs.unlinkSync(normalizedOutputPath);
+      }
+    } catch (eOutput) {}
+    try {
+      var markerPath = getProxyMarkerPath(normalizedOutputPath);
+      if (fs.existsSync(markerPath)) {
+        fs.unlinkSync(markerPath);
+      }
+    } catch (eMarker) {}
+  }
+
+  function getProxyRenderTempPath(outputPath, jobId) {
+    var parsed = path.parse(String(outputPath || ""));
+    return path.join(
+      parsed.dir,
+      "." + parsed.name + "." + String(jobId || Date.now()) + ".rendering.mp4",
+    );
+  }
+
+  function hasActiveProxyRenderForOutput(outputPath) {
+    var normalizedOutputPath = path.normalize(String(outputPath || ""));
+    return Object.keys(proxyRenderProcessMap).some(function (jobId) {
+      var entry = proxyRenderProcessMap[jobId];
+      return (
+        entry &&
+        path.normalize(String(entry.output_path || "")) === normalizedOutputPath
+      );
+    });
+  }
+
   function buildFfmpegProxyArgs(target, outputPath, audioMode) {
     var width = ensureEvenPositive(
       Number(target && target.expected_proxy_width) || 480,
@@ -1321,7 +1428,7 @@
         args.push("-c:a", "copy");
       }
     }
-    args.push("-map_metadata", "0", "-map_chapters", "-1", "-movflags", "+faststart");
+    args.push("-map_metadata", "-1", "-map_chapters", "-1", "-movflags", "+faststart");
     args.push(String(outputPath || ""));
     return args;
   }
@@ -1381,7 +1488,9 @@
       Date.now() +
       "_" +
       Math.random().toString(16).slice(2);
-    var args = buildFfmpegProxyArgs(target, outputPath, audioMode || "copy");
+    var tempOutputPath = getProxyRenderTempPath(outputPath, jobId);
+    removeProxyOutputAndMarker(tempOutputPath);
+    var args = buildFfmpegProxyArgs(target, tempOutputPath, audioMode || "copy");
     var child = childProcess.spawn("ffmpeg", args, {
       stdio: ["ignore", "ignore", "pipe"],
       windowsHide: true,
@@ -1390,6 +1499,7 @@
       project_id: projectId,
       process: child,
       output_path: outputPath,
+      temp_output_path: tempOutputPath,
       media_path: target.media_path,
       lease: lease || null,
       audio_mode: audioMode || "copy",
@@ -1418,18 +1528,16 @@
       delete proxyRenderProcessMap[jobId];
       delete encoderJobMap[jobId];
       if (latestEntry.canceled) {
+        removeProxyOutputAndMarker(tempOutputPath);
         return;
       }
       if (!isAutomationProjectActive(projectId)) {
+        removeProxyOutputAndMarker(tempOutputPath);
         return;
       }
       if (code !== 0) {
         if ((latestEntry.audio_mode || "copy") === "copy") {
-          try {
-            if (fs.existsSync(outputPath)) {
-              fs.unlinkSync(outputPath);
-            }
-          } catch (unlinkCopyErr) {}
+          removeProxyOutputAndMarker(tempOutputPath);
           log(
             "Proxy audio copy failed for " +
               projectId +
@@ -1465,11 +1573,7 @@
           });
           return;
         }
-        try {
-          if (fs.existsSync(outputPath)) {
-            fs.unlinkSync(outputPath);
-          }
-        } catch (unlinkErr) {}
+        removeProxyOutputAndMarker(tempOutputPath);
         updateProxyJobCompletion(
           projectId,
           jobId,
@@ -1480,15 +1584,34 @@
         );
         return;
       }
-      updateProxyJobCompletion(projectId, jobId, null);
-      log(
-        "Proxy render completed for " +
-          projectId +
-          " (" +
-          path.basename(outputPath) +
-          ")",
-        "info",
-      );
+      removeProxyOutputAndMarker(outputPath);
+      renamePathWithRetry(tempOutputPath, outputPath, {
+        maxAttempts: 10,
+        delayMs: 200,
+      })
+        .then(function () {
+          writeCleanProxyMarker(outputPath, target);
+          updateProxyJobCompletion(projectId, jobId, null);
+          log(
+            "Proxy render completed for " +
+              projectId +
+              " (" +
+              path.basename(outputPath) +
+              ")",
+            "info",
+          );
+        })
+        .catch(function (renameErr) {
+          removeProxyOutputAndMarker(tempOutputPath);
+          updateProxyJobCompletion(
+            projectId,
+            jobId,
+            "Proxy finalize failed for " +
+              path.basename(outputPath) +
+              ": " +
+              (renameErr && renameErr.message ? renameErr.message : renameErr),
+          );
+        });
     });
     return jobId;
   }
@@ -1517,8 +1640,14 @@
         return;
       }
       var outputPath = computeManagedProxyOutputPath(localRootPath, target);
-      if (fs.existsSync(outputPath)) {
+      if (isCleanProxyOutput(outputPath)) {
         existingOutputs += 1;
+        return;
+      }
+      if (fs.existsSync(outputPath)) {
+        removeProxyOutputAndMarker(outputPath);
+      }
+      if (hasActiveProxyRenderForOutput(outputPath)) {
         return;
       }
       jobIds.push(spawnFfmpegProxyJob(projectId, localRootPath, target, lease, "copy"));
@@ -1550,6 +1679,24 @@
       job_ids: jobIds,
       existing_outputs: existingOutputs,
     });
+  }
+
+  function removeDirtyProxyOutputs(localRootPath, proxyPlan) {
+    var targets = proxyPlan && Array.isArray(proxyPlan.targets)
+      ? proxyPlan.targets
+      : [];
+    var removed = 0;
+    targets.forEach(function (target) {
+      if (!target || !target.needs_proxy) {
+        return;
+      }
+      var outputPath = computeManagedProxyOutputPath(localRootPath, target);
+      if (fs.existsSync(outputPath) && !isCleanProxyOutput(outputPath)) {
+        removeProxyOutputAndMarker(outputPath);
+        removed += 1;
+      }
+    });
+    return removed;
   }
 
   function patchImportProjectForAsyncProxies(importPath) {
@@ -4810,6 +4957,55 @@
       if (!proxyPlan || !proxyPlan.enabled) {
         runtime.in_flight = false;
         proxyReconcileState[projectId] = runtime;
+        return;
+      }
+
+      var dirtyProxyOutputs = removeDirtyProxyOutputs(state.local_root, proxyPlan);
+      if (dirtyProxyOutputs > 0) {
+        scheduleProxyRenderingSidecar(
+          projectId,
+          state.local_root,
+          proxyPlan,
+          proxyLeaseMap[projectId] || null,
+        )
+          .then(function (scheduleResult) {
+            runtime.in_flight = false;
+            proxyReconcileState[projectId] = runtime;
+            var jobIds =
+              scheduleResult && Array.isArray(scheduleResult.job_ids)
+                ? scheduleResult.job_ids
+                : [];
+            if (jobIds.length > 0) {
+              registerProxyEncoderJobs(
+                projectId,
+                jobIds,
+                proxyLeaseMap[projectId] || null,
+              );
+            }
+            upsertProjectState(projectId, {
+              proxy_status: "proxying",
+              proxy_error: null,
+              proxy_pending_count: Math.max(1, jobIds.length),
+              proxy_job_ids: jobIds,
+              proxy_last_run_at: nowIso(),
+            });
+            log(
+              "Regenerating " +
+                dirtyProxyOutputs +
+                " legacy proxy output(s) for " +
+                projectId,
+              "info",
+            );
+          })
+          .catch(function (err) {
+            runtime.in_flight = false;
+            proxyReconcileState[projectId] = runtime;
+            upsertProjectState(projectId, {
+              proxy_status: "warning",
+              proxy_error: err.message,
+              proxy_last_run_at: nowIso(),
+            });
+          });
         return;
       }
 
