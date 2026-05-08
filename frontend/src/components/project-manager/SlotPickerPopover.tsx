@@ -68,6 +68,48 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
     return () => { cancelled = true; };
   }, [open, selectedDate, accountId, platformForFetch]);
 
+  // Fetch a wide window of slots for the displayed month so the calendar can
+  // strike days that have no configured slot or no free slot.
+  const [monthSlots, setMonthSlots] = useState<FreeSlot[]>([]);
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    const monthStart = new Date(
+      monthAnchor.getFullYear(),
+      monthAnchor.getMonth(),
+      1,
+    );
+    monthStart.setHours(0, 0, 0, 0);
+    (async () => {
+      try {
+        const r = await api.listFreeSlots({
+          account_id: accountId,
+          platform: platformForFetch,
+          after: monthStart.toISOString(),
+          // 50 days * ~6 slots = 300; covers the whole displayed month + buffer.
+          limit: 400,
+        });
+        if (cancelled) return;
+        setMonthSlots(r.slots);
+      } catch {
+        if (!cancelled) setMonthSlots([]);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [open, monthAnchor, accountId, platformForFetch]);
+
+  const { daysWithSlots, daysWithFreeSlots } = useMemo(() => {
+    const all = new Set<string>();
+    const free = new Set<string>();
+    for (const s of monthSlots) {
+      const d = new Date(s.slot);
+      const ymd = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+      all.add(ymd);
+      if (s.available) free.add(ymd);
+    }
+    return { daysWithSlots: all, daysWithFreeSlots: free };
+  }, [monthSlots]);
+
   // Live resolve preview in anchor mode.
   useEffect(() => {
     if (!open || mode !== "anchor" || !selectedSlotIso) {
@@ -143,6 +185,8 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
             setSelectedDate(d);
             setSelectedSlotIso(null);
           }}
+          daysWithSlots={daysWithSlots}
+          daysWithFreeSlots={daysWithFreeSlots}
         />
         <div className="border-t border-[hsl(var(--border))] mt-3 pt-2">
           <div className="text-[11px] text-[hsl(var(--muted-foreground))] mb-1.5">

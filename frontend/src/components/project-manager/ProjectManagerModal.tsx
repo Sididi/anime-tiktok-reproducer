@@ -169,6 +169,12 @@ export function ProjectManagerModal({
   const [accountPickerForProject, setAccountPickerForProject] = useState<
     string | null
   >(null);
+  // When the user picked Schedule/Urgent in "All Projects" mode, we open
+  // the same account picker as the auto flow but remember which mode to
+  // resume into once an account is chosen.
+  const [accountPickerMode, setAccountPickerMode] = useState<
+    "auto" | "scheduled" | "urgent"
+  >("auto");
   const [deleteConfirmRow, setDeleteConfirmRow] =
     useState<ProjectManagerRow | null>(null);
   const [previewVideoId, setPreviewVideoId] = useState<string | null>(null);
@@ -725,6 +731,7 @@ export function ProjectManagerModal({
       if (selectedAccountId) {
         void startUploadWithChecks(row.project_id, selectedAccountId);
       } else if (accounts.length > 0) {
+        setAccountPickerMode("auto");
         setAccountPickerForProject(row.project_id);
       } else {
         void startUploadWithChecks(row.project_id);
@@ -742,39 +749,29 @@ export function ProjectManagerModal({
     accountId: string;
   } | null>(null);
 
-  const resolveAccountIdForRow = useCallback(
-    (row: ProjectManagerRow): string | null => {
-      if (selectedAccountId) return selectedAccountId;
-      const compatible = accounts.find((a) =>
-        isAccountCompatibleWithProjectRow(a, row),
-      );
-      return compatible?.id ?? null;
-    },
-    [selectedAccountId, accounts],
-  );
-
   const handleUploadSchedule = useCallback(
     (row: ProjectManagerRow) => {
-      const accountId = resolveAccountIdForRow(row);
-      if (!accountId) {
-        setError("Pick an account before scheduling manually.");
+      if (selectedAccountId) {
+        setSchedulingForProject({ row, accountId: selectedAccountId });
         return;
       }
-      setSchedulingForProject({ row, accountId });
+      // "All Projects" — defer to the same account picker the auto flow uses.
+      setAccountPickerMode("scheduled");
+      setAccountPickerForProject(row.project_id);
     },
-    [resolveAccountIdForRow],
+    [selectedAccountId],
   );
 
   const handleUploadUrgent = useCallback(
     (row: ProjectManagerRow) => {
-      const accountId = resolveAccountIdForRow(row);
-      if (!accountId) {
-        setError("Pick an account before urgent upload.");
+      if (selectedAccountId) {
+        setUrgentForProject({ row, accountId: selectedAccountId });
         return;
       }
-      setUrgentForProject({ row, accountId });
+      setAccountPickerMode("urgent");
+      setAccountPickerForProject(row.project_id);
     },
-    [resolveAccountIdForRow],
+    [selectedAccountId],
   );
 
   const compatibleAccounts = useMemo(() => {
@@ -1026,10 +1023,21 @@ export function ProjectManagerModal({
             accounts={compatibleAccounts}
             onPick={(accountId) => {
               const projectId = accountPickerForProject!;
+              const row = rows.find((r) => r.project_id === projectId);
               setAccountPickerForProject(null);
-              void startUploadWithChecks(projectId, accountId);
+              if (accountPickerMode === "scheduled" && row) {
+                setSchedulingForProject({ row, accountId });
+              } else if (accountPickerMode === "urgent" && row) {
+                setUrgentForProject({ row, accountId });
+              } else {
+                void startUploadWithChecks(projectId, accountId);
+              }
+              setAccountPickerMode("auto");
             }}
-            onClose={() => setAccountPickerForProject(null)}
+            onClose={() => {
+              setAccountPickerForProject(null);
+              setAccountPickerMode("auto");
+            }}
           />
 
           <AnimatePresence>

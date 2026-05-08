@@ -48,7 +48,10 @@ export function AccountSelectorDropdown({
         />
       </button>
       {isOpen && (
-        <div className="absolute top-full left-0 mt-1 z-10 bg-[hsl(var(--card))] border border-[hsl(var(--border))] rounded-lg shadow-lg min-w-[200px] py-1">
+        <div
+          className="absolute top-full left-0 mt-1 bg-[hsl(var(--card))] border border-[hsl(var(--border))] rounded-lg shadow-lg min-w-[200px] py-1 max-h-[60vh] overflow-y-auto"
+          style={{ zIndex: 200 }}
+        >
           <button
             type="button"
             className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-[hsl(var(--muted))] text-left transition-colors"

@@ -1,37 +1,53 @@
 import { motion } from "framer-motion";
 import { ExternalLink, X, Trash2, RotateCcw, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui";
-import type { PlanningEvent } from "@/types";
+import type { Platform, PlanningEvent } from "@/types";
 import { PLATFORM_LABELS, platformBgHsl } from "./platformColors";
 
 interface EventPopoverProps {
-  event: PlanningEvent;
+  /**
+   * All members of the grouped event (same project + same slot).
+   * Always at least one element.
+   */
+  members: PlanningEvent[];
   anchor: { x: number; y: number };
   onClose: () => void;
-  onRescheduleSlot: () => void;
+  onReschedulePlatform: (platform: Platform) => void;
+  onCancelPlatform: (platform: Platform) => void;
   onRescheduleProject: () => void;
   rescheduleProjectDisabled?: boolean;
   rescheduleProjectDisabledReason?: string;
-  onCancelSlot: () => void;
   onCancelAll: () => void;
 }
 
 function formatSlot(iso: string): string {
   return new Intl.DateTimeFormat("fr-FR", {
-    weekday: "short", day: "2-digit", month: "short",
-    hour: "2-digit", minute: "2-digit",
+    weekday: "short",
+    day: "2-digit",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
     timeZone: "Europe/Paris",
   }).format(new Date(iso));
 }
 
 export function EventPopover({
-  event, anchor, onClose,
-  onRescheduleSlot, onRescheduleProject, rescheduleProjectDisabled,
+  members,
+  anchor,
+  onClose,
+  onReschedulePlatform,
+  onCancelPlatform,
+  onRescheduleProject,
+  rescheduleProjectDisabled,
   rescheduleProjectDisabledReason,
-  onCancelSlot, onCancelAll,
+  onCancelAll,
 }: EventPopoverProps) {
-  const left = Math.min(window.innerWidth - 320, Math.max(8, anchor.x + 8));
-  const top = Math.min(window.innerHeight - 280, Math.max(8, anchor.y + 8));
+  const first = members[0];
+  const POPOVER_W = 360;
+  // Approx height: 96 (header+slot+drive) + 38 per platform row + 84 (global actions).
+  const POPOVER_H = 96 + members.length * 38 + 84;
+  const left = Math.min(window.innerWidth - POPOVER_W - 8, Math.max(8, anchor.x + 8));
+  const top = Math.min(window.innerHeight - POPOVER_H - 8, Math.max(8, anchor.y + 8));
 
   return (
     <div
@@ -45,48 +61,42 @@ export function EventPopover({
         animate={{ opacity: 1, scale: 1 }}
         exit={{ opacity: 0, scale: 0.96 }}
         transition={{ duration: 0.12 }}
-        className="absolute w-80 rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--card))] shadow-xl p-4"
-        style={{ left, top }}
+        className="absolute rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--card))] shadow-xl p-4"
+        style={{ left, top, width: POPOVER_W }}
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-start justify-between mb-2">
+        <div className="flex items-start justify-between mb-2 gap-2">
           <div className="min-w-0">
-            <div className="font-semibold truncate">{event.anime_title}</div>
+            <div className="font-semibold truncate">{first.anime_title}</div>
             <div className="text-[11px] font-mono text-[hsl(var(--muted-foreground))] truncate">
-              {event.project_id}
+              {first.project_id}
             </div>
           </div>
           <button
             onClick={onClose}
-            className="p-1 rounded hover:bg-[hsl(var(--muted))]"
+            className="p-1 rounded hover:bg-[hsl(var(--muted))] flex-shrink-0"
             aria-label="Close"
           >
             <X className="h-4 w-4" />
           </button>
         </div>
 
-        <div className="flex items-center gap-2 mb-3">
+        <div className="flex items-center gap-2 mb-2">
           <img
-            src={event.account_avatar_url}
+            src={first.account_avatar_url}
             alt=""
-            className="h-6 w-6 rounded-full bg-[hsl(var(--muted))]"
+            className="h-6 w-6 rounded-full bg-[hsl(var(--muted))] flex-shrink-0"
           />
-          <span className="text-sm">{event.account_name}</span>
-          <span
-            className="ml-auto text-[10px] font-bold px-2 py-0.5 rounded text-white"
-            style={{ backgroundColor: platformBgHsl(event.platform) }}
-          >
-            {PLATFORM_LABELS[event.platform]}
-          </span>
+          <span className="text-sm truncate">{first.account_name}</span>
         </div>
 
-        <div className="text-sm text-[hsl(var(--muted-foreground))] mb-3">
-          {formatSlot(event.slot)}
+        <div className="text-sm text-[hsl(var(--muted-foreground))] mb-2">
+          {formatSlot(first.slot)}
         </div>
 
-        {event.drive_folder_url && (
+        {first.drive_folder_url && (
           <a
-            href={event.drive_folder_url}
+            href={first.drive_folder_url}
             target="_blank"
             rel="noreferrer"
             className="inline-flex items-center gap-1 text-xs text-[hsl(var(--primary))] hover:underline mb-3"
@@ -95,24 +105,63 @@ export function EventPopover({
           </a>
         )}
 
-        <div className="grid grid-cols-2 gap-2">
-          <Button size="sm" variant="outline" onClick={onRescheduleSlot}>
-            <RefreshCw className="h-3.5 w-3.5 mr-1.5" /> Reschedule slot
-          </Button>
+        {/* Per-platform actions */}
+        <div className="space-y-1.5 mb-3 border-t border-[hsl(var(--border))] pt-2">
+          {members.map((m) => (
+            <div key={m.platform} className="flex items-center gap-2">
+              <span
+                className="text-[10px] font-bold px-1.5 py-0.5 rounded text-white flex-shrink-0"
+                style={{
+                  backgroundColor: platformBgHsl(m.platform),
+                  minWidth: 30,
+                  textAlign: "center",
+                }}
+              >
+                {PLATFORM_LABELS[m.platform]}
+              </span>
+              <div className="flex-1" />
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-7 px-2 text-xs"
+                onClick={() => onReschedulePlatform(m.platform)}
+                title={`Reschedule ${PLATFORM_LABELS[m.platform]} slot`}
+              >
+                <RefreshCw className="h-3 w-3 mr-1" /> Move
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-7 px-2 text-xs text-[hsl(var(--destructive))] hover:text-[hsl(var(--destructive))]"
+                onClick={() => onCancelPlatform(m.platform)}
+                title={`Cancel ${PLATFORM_LABELS[m.platform]} slot`}
+              >
+                <Trash2 className="h-3 w-3 mr-1" /> Cancel
+              </Button>
+            </div>
+          ))}
+        </div>
+
+        {/* Global actions */}
+        <div className="grid grid-cols-2 gap-2 border-t border-[hsl(var(--border))] pt-2">
           <Button
             size="sm"
             variant="outline"
+            className="h-8 px-2 text-xs whitespace-nowrap"
             onClick={onRescheduleProject}
             disabled={rescheduleProjectDisabled}
-            title={rescheduleProjectDisabledReason}
+            title={rescheduleProjectDisabledReason ?? "Re-anchor whole project"}
           >
-            <RotateCcw className="h-3.5 w-3.5 mr-1.5" /> Reschedule project
+            <RotateCcw className="h-3.5 w-3.5 mr-1" /> Re-anchor project
           </Button>
-          <Button size="sm" variant="ghost" onClick={onCancelSlot} className="text-[hsl(var(--destructive))]">
-            <Trash2 className="h-3.5 w-3.5 mr-1.5" /> Cancel slot
-          </Button>
-          <Button size="sm" variant="ghost" onClick={onCancelAll} className="text-[hsl(var(--destructive))]">
-            <Trash2 className="h-3.5 w-3.5 mr-1.5" /> Cancel all
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-8 px-2 text-xs text-[hsl(var(--destructive))] whitespace-nowrap"
+            onClick={onCancelAll}
+            title="Cancel all platforms"
+          >
+            <Trash2 className="h-3.5 w-3.5 mr-1" /> Cancel all
           </Button>
         </div>
       </motion.div>

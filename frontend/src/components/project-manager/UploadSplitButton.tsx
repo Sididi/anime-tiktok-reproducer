@@ -24,7 +24,10 @@ export function UploadSplitButton({
   const ref = useRef<HTMLDivElement | null>(null);
   void row;
 
-  const accountHasTikTok = !!selectedAccount?.slots_by_platform?.tiktok?.length;
+  // When an account is selected, it must have TT slots to manually schedule.
+  // When no account is selected ("All Projects"), the row's account picker
+  // will be opened first — assume some compatible account has TT.
+  const scheduleDisabled = !!selectedAccount && !selectedAccount.slots_by_platform?.tiktok?.length;
 
   useEffect(() => {
     if (!open) return;
@@ -86,9 +89,9 @@ export function UploadSplitButton({
             </button>
             <button
               type="button"
-              disabled={!accountHasTikTok}
+              disabled={scheduleDisabled}
               onClick={() => { setOpen(false); onSchedule(); }}
-              title={accountHasTikTok ? undefined : "Manual scheduling requires a TikTok-enabled account"}
+              title={scheduleDisabled ? "This account has no TikTok configured" : undefined}
               className="w-full text-left flex items-start gap-2.5 px-2.5 py-2 rounded hover:bg-[hsl(var(--muted))] disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <Calendar className="h-4 w-4 mt-0.5 text-blue-500" />

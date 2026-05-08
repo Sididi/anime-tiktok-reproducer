@@ -35,6 +35,12 @@ function readPersistedAccount(): string | null {
   }
 }
 
+interface GroupedEventClick {
+  project_id: string;
+  slot: string;
+  members: PlanningEvent[];
+}
+
 interface PlanningModalProps {
   open: boolean;
   onClose: () => void;
@@ -52,7 +58,7 @@ export function PlanningModal({ open, onClose }: PlanningModalProps) {
     readPersistedPlatforms(),
   );
   const [popover, setPopover] = useState<{
-    event: PlanningEvent;
+    grouped: GroupedEventClick;
     anchor: { x: number; y: number };
   } | null>(null);
   const [reslottingSingle, setReslottingSingle] = useState<PlanningEvent | null>(
@@ -111,11 +117,13 @@ export function PlanningModal({ open, onClose }: PlanningModalProps) {
 
   if (!open) return null;
 
-  const eventForPopover = popover?.event;
-  const projectHasTikTok = !!events.find(
-    (e) =>
-      e.project_id === eventForPopover?.project_id && e.platform === "tiktok",
+  const groupedForPopover = popover?.grouped;
+  const projectHasTikTok = !!groupedForPopover?.members.some(
+    (m) => m.platform === "tiktok",
   );
+
+  const memberFor = (platform: Platform): PlanningEvent | undefined =>
+    groupedForPopover?.members.find((m) => m.platform === platform);
 
   return (
     <AnimatePresence>
@@ -156,54 +164,57 @@ export function PlanningModal({ open, onClose }: PlanningModalProps) {
             <div className="flex-1 min-h-0 overflow-hidden p-4">
               <PlanningCalendar
                 events={events}
-                accounts={accounts}
-                selectedAccountId={selectedAccountId}
-                selectedPlatforms={selectedPlatforms}
-                onEventClick={(event, anchor) => setPopover({ event, anchor })}
+                onEventClick={(grouped, anchor) =>
+                  setPopover({ grouped, anchor })
+                }
               />
             </div>
           </motion.div>
 
-          {popover && eventForPopover && (
+          {popover && groupedForPopover && (
             <EventPopover
-              event={eventForPopover}
+              members={groupedForPopover.members}
               anchor={popover.anchor}
               onClose={() => setPopover(null)}
-              onRescheduleSlot={() => setReslottingSingle(eventForPopover)}
-              onRescheduleProject={() => setReAnchoring(eventForPopover)}
-              rescheduleProjectDisabled={!projectHasTikTok}
-              rescheduleProjectDisabledReason={
-                projectHasTikTok
-                  ? undefined
-                  : "This project has no TikTok reservation"
-              }
-              onCancelSlot={async () => {
+              onReschedulePlatform={(platform) => {
+                const m = memberFor(platform);
+                if (m) setReslottingSingle(m);
+              }}
+              onCancelPlatform={async (platform) => {
+                const m = memberFor(platform);
+                if (!m) return;
                 if (
                   !confirm(
-                    `Cancel ${eventForPopover.platform} slot for ${eventForPopover.anime_title}?`,
+                    `Cancel ${platform.toUpperCase()} slot for ${m.anime_title}?`,
                   )
                 )
                   return;
                 try {
-                  await api.cancelPlatformSlot(
-                    eventForPopover.project_id,
-                    eventForPopover.platform,
-                  );
+                  await api.cancelPlatformSlot(m.project_id, m.platform);
                   setPopover(null);
                   await reload();
                 } catch (err) {
                   setError((err as Error).message);
                 }
               }}
+              onRescheduleProject={() => {
+                const tt = memberFor("tiktok");
+                if (tt) setReAnchoring(tt);
+              }}
+              rescheduleProjectDisabled={!projectHasTikTok}
+              rescheduleProjectDisabledReason={
+                projectHasTikTok
+                  ? undefined
+                  : "This project has no TikTok reservation"
+              }
               onCancelAll={async () => {
+                const m = groupedForPopover.members[0];
                 if (
-                  !confirm(
-                    `Cancel ALL slots for ${eventForPopover.anime_title}?`,
-                  )
+                  !confirm(`Cancel ALL platforms for ${m.anime_title}?`)
                 )
                   return;
                 try {
-                  await api.cancelAllSlots(eventForPopover.project_id);
+                  await api.cancelAllSlots(m.project_id);
                   setPopover(null);
                   await reload();
                 } catch (err) {

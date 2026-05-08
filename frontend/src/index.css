@@ -177,21 +177,12 @@ body {
   min-height: 0;
 }
 
-/* Background "available slot" events: hollow ghost rectangles. */
-.planning-calendar .sx__time-grid-event.atr-bg-slot {
+/* Hide ScheduleX's default event chrome — our custom React component owns it. */
+.planning-calendar .sx__time-grid-event {
   background: transparent !important;
-  border: 1px dashed hsl(var(--border)) !important;
-  color: hsl(var(--muted-foreground)) !important;
-  pointer-events: none;
-  font-size: 10px;
-  opacity: 0.55;
+  border: none !important;
+  padding: 0 !important;
 }
-.planning-calendar .sx__time-grid-event.atr-bg-slot .sx__time-grid-event-title,
-.planning-calendar .sx__time-grid-event.atr-bg-slot .sx__time-grid-event-time {
-  display: none;
-}
-
-/* Multi-platform grouped event: keep platform pills readable. */
-.planning-calendar .sx__time-grid-event.atr-group .sx__time-grid-event-inner {
-  padding: 4px 6px;
+.planning-calendar .sx__time-grid-event-inner {
+  padding: 0 !important;
 }

@@ -222,8 +222,22 @@ test("Reschedule slot triggers PATCH and reloads", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Planning" })).toBeVisible();
   await expect(page.getByText("Show Alpha").first()).toBeVisible();
 
-  await page.getByText("Show Alpha").first().click();
-  await page.getByRole("button", { name: "Reschedule slot" }).click();
+  // ScheduleX's onEventClick fires from a real DOM click — synthesize one
+  // via dispatchEvent so framework click hooks see it.
+  await page.locator(".sx__time-grid-event").first().evaluate((el) => {
+    const r = (el as HTMLElement).getBoundingClientRect();
+    el.dispatchEvent(
+      new MouseEvent("click", {
+        bubbles: true,
+        cancelable: true,
+        clientX: r.x + r.width / 2,
+        clientY: r.y + r.height / 2,
+      }),
+    );
+  });
+  await expect(page.getByRole("dialog", { name: "Event details" })).toBeVisible();
+  // Click "Move" on the first (YouTube) row.
+  await page.getByRole("dialog").getByRole("button", { name: /Move/i }).first().click();
 
   // SlotPickerPopover now drives the flow — pick the offered chip then Schedule.
   const expectedLabel = new Intl.DateTimeFormat("fr-FR", {
@@ -255,8 +269,21 @@ test("Cancel slot triggers DELETE", async ({ page }) => {
 
   page.on("dialog", (dlg) => dlg.accept());
 
-  await page.getByText("Show Beta").first().click();
-  await page.getByRole("button", { name: "Cancel slot" }).click();
+  // The second event card is Show Beta (TT-only).
+  await page.locator(".sx__time-grid-event").nth(1).evaluate((el) => {
+    const r = (el as HTMLElement).getBoundingClientRect();
+    el.dispatchEvent(
+      new MouseEvent("click", {
+        bubbles: true,
+        cancelable: true,
+        clientX: r.x + r.width / 2,
+        clientY: r.y + r.height / 2,
+      }),
+    );
+  });
+  await expect(page.getByRole("dialog", { name: "Event details" })).toBeVisible();
+  // Per-platform popover: the only platform row is TT — click its "Cancel".
+  await page.getByRole("dialog").getByRole("button", { name: /Cancel/i }).first().click();
   await page.waitForFunction(
     () => (window as unknown as { __deleted?: boolean }).__deleted === true,
   );
