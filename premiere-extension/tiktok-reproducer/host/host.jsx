@@ -1180,6 +1180,46 @@ function __atrBuildImportedCleanupScan(normalizedRootPath) {
   return report;
 }
 
+function __atrCloseSourceMonitorForCleanup(result) {
+  if (!app || !app.sourceMonitor) {
+    return;
+  }
+  try {
+    if (app.sourceMonitor.closeAllClips) {
+      app.sourceMonitor.closeAllClips();
+      if (result) {
+        result.source_monitor_close_attempted = true;
+      }
+      return;
+    }
+  } catch (eCloseAll) {
+    if (result && result.detach_proxy_warnings) {
+      result.detach_proxy_warnings.push(
+        "Could not close all Source Monitor clips: " +
+          __atrSafeString(eCloseAll.message || eCloseAll),
+      );
+    }
+  }
+
+  try {
+    if (app.sourceMonitor.closeClip) {
+      for (var i = 0; i < 25; i += 1) {
+        app.sourceMonitor.closeClip();
+      }
+      if (result) {
+        result.source_monitor_close_attempted = true;
+      }
+    }
+  } catch (eCloseClip) {
+    if (result && result.detach_proxy_warnings) {
+      result.detach_proxy_warnings.push(
+        "Could not close Source Monitor clips: " +
+          __atrSafeString(eCloseClip.message || eCloseClip),
+      );
+    }
+  }
+}
+
 function __atrDetachManagedProxiesForCleanupObject(localRootPath) {
   var normalizedRootPath = __atrNormalizeComparePath(localRootPath);
   var result = {
@@ -1194,6 +1234,8 @@ function __atrDetachManagedProxiesForCleanupObject(localRootPath) {
   if (!normalizedRootPath || !app || !app.project || !app.project.rootItem) {
     return result;
   }
+
+  __atrCloseSourceMonitorForCleanup(result);
 
   try {
     if (app.setEnableProxies) {
@@ -1262,6 +1304,79 @@ function __atrDetachManagedProxiesForCleanupObject(localRootPath) {
   }
 
   result.ok = result.detach_proxy_failed_count === 0;
+  return result;
+}
+
+function __atrSetImportedMediaOfflineForCleanupObject(localRootPath) {
+  var normalizedRootPath = __atrNormalizeComparePath(localRootPath);
+  var result = {
+    ok: true,
+    considered_media_items: 0,
+    media_offline_count: 0,
+    media_offline_unavailable_count: 0,
+    media_offline_failed_count: 0,
+    media_release_warnings: [],
+  };
+
+  if (!normalizedRootPath || !app || !app.project || !app.project.rootItem) {
+    return result;
+  }
+
+  __atrCloseSourceMonitorForCleanup(result);
+
+  var scan = __atrBuildImportedCleanupScan(normalizedRootPath);
+  for (var i = 0; i < scan.imported_leaf_items.length; i += 1) {
+    var item = scan.imported_leaf_items[i];
+    if (!item) {
+      continue;
+    }
+    result.considered_media_items += 1;
+    if (!item.setOffline) {
+      result.media_offline_unavailable_count += 1;
+      continue;
+    }
+
+    try {
+      if (item.isOffline && item.isOffline()) {
+        result.media_offline_count += 1;
+        continue;
+      }
+    } catch (eOfflineState) {}
+
+    try {
+      var offlineResult = item.setOffline();
+      if (
+        offlineResult === undefined ||
+        offlineResult === 0 ||
+        offlineResult === true ||
+        offlineResult === "0"
+      ) {
+        result.media_offline_count += 1;
+      } else {
+        result.media_offline_failed_count += 1;
+      }
+    } catch (eSetOffline) {
+      result.media_offline_failed_count += 1;
+      if (result.media_release_warnings.length < 5) {
+        result.media_release_warnings.push(
+          "Could not make media offline for " +
+            __atrGetProjectItemName(item) +
+            ": " +
+            __atrSafeString(eSetOffline.message || eSetOffline),
+        );
+      }
+    }
+  }
+
+  if (result.media_offline_unavailable_count > 0) {
+    result.media_release_warnings.push(
+      "projectItem.setOffline is unavailable for " +
+        result.media_offline_unavailable_count +
+        " imported item(s); project purge will be used instead.",
+    );
+  }
+
+  result.ok = result.media_offline_failed_count === 0;
   return result;
 }
 
@@ -2645,8 +2760,11 @@ function cleanupImportedProjectsForLocalRoots(localRootsJson) {
     }
 
     var detachSummaries = [];
+    var mediaReleaseSummaries = [];
     var detachedProxyCount = 0;
+    var mediaOfflineCount = 0;
     var detachWarnings = [];
+    var mediaReleaseWarnings = [];
     for (var i = 0; i < roots.length; i += 1) {
       var rootPath = __atrSafeString(roots[i]);
       if (!rootPath) {
@@ -2663,7 +2781,38 @@ function cleanupImportedProjectsForLocalRoots(localRootsJson) {
           }
         }
       }
+
+      var mediaReleaseSummary =
+        __atrSetImportedMediaOfflineForCleanupObject(rootPath);
+      mediaReleaseSummary.local_root = rootPath;
+      mediaReleaseSummaries.push(mediaReleaseSummary);
+      mediaOfflineCount += Number(mediaReleaseSummary.media_offline_count || 0);
+      if (
+        mediaReleaseSummary.media_release_warnings &&
+        mediaReleaseSummary.media_release_warnings.length
+      ) {
+        for (
+          var mw = 0;
+          mw < mediaReleaseSummary.media_release_warnings.length;
+          mw += 1
+        ) {
+          if (mediaReleaseWarnings.length < 10) {
+            mediaReleaseWarnings.push(
+              mediaReleaseSummary.media_release_warnings[mw],
+            );
+          }
+        }
+      }
     }
+
+    try {
+      __atrCloseSourceMonitorForCleanup(null);
+    } catch (eCloseBeforePurge) {}
+    try {
+      if ($ && $.sleep) {
+        $.sleep(300);
+      }
+    } catch (eSleepBeforePurge) {}
 
     var purgeRaw = purgeActiveProject();
     if (purgeRaw && String(purgeRaw).indexOf("ERROR:") === 0) {
@@ -2679,17 +2828,34 @@ function cleanupImportedProjectsForLocalRoots(localRootsJson) {
       };
     }
 
+    try {
+      __atrCloseSourceMonitorForCleanup(null);
+    } catch (eCloseAfterPurge) {}
+    try {
+      if ($ && $.sleep) {
+        $.sleep(300);
+      }
+    } catch (eSleepAfterPurge) {}
+
     purgeSummary.detach_proxy_summaries = detachSummaries;
+    purgeSummary.media_release_summaries = mediaReleaseSummaries;
     purgeSummary.detached_proxy_count = detachedProxyCount;
+    purgeSummary.media_offline_count = mediaOfflineCount;
     purgeSummary.detach_proxy_warnings = detachWarnings;
+    purgeSummary.media_release_warnings = mediaReleaseWarnings;
     purgeSummary.warning_count =
-      Number(purgeSummary.warning_count || 0) + detachWarnings.length;
-    if (detachWarnings.length > 0) {
+      Number(purgeSummary.warning_count || 0) +
+      detachWarnings.length +
+      mediaReleaseWarnings.length;
+    if (detachWarnings.length > 0 || mediaReleaseWarnings.length > 0) {
       if (!purgeSummary.warnings) {
         purgeSummary.warnings = [];
       }
       for (var j = 0; j < detachWarnings.length; j += 1) {
         purgeSummary.warnings.push(detachWarnings[j]);
+      }
+      for (var k = 0; k < mediaReleaseWarnings.length; k += 1) {
+        purgeSummary.warnings.push(mediaReleaseWarnings[k]);
       }
     }
     return JSON.stringify(purgeSummary);

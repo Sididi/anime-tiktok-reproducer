@@ -58,6 +58,8 @@
   var CLEANUP_RETRY_DELAY_MS = 15000;
   var CLEANUP_BACKOFF_BASE_MS = 250;
   var CLEANUP_BACKOFF_MAX_MS = 4000;
+  var CLEANUP_NODE_RM_MAX_RETRIES = 18;
+  var CLEANUP_NODE_RM_RETRY_DELAY_MS = 250;
   var CLEANUP_REMAINING_PREVIEW_LIMIT = 6;
   var PROXY_RECONCILE_MAX_ATTACH_ATTEMPTS = 120;
   var MAX_LOG_ENTRIES = 200;
@@ -425,6 +427,7 @@
         ok: false,
       };
     }
+    var errors = [];
     try {
       childProcess.execFileSync(
         "cmd.exe",
@@ -434,14 +437,88 @@
       return {
         attempted: true,
         ok: !fs.existsSync(targetPath),
+        method: "cmd_rmdir",
       };
     } catch (e) {
+      errors.push(e);
+    }
+    if (!fs.existsSync(targetPath)) {
       return {
         attempted: true,
-        ok: false,
-        error: e,
+        ok: true,
+        method: "cmd_rmdir",
       };
     }
+    try {
+      childProcess.execFileSync(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          "Remove-Item -LiteralPath $args[0] -Recurse -Force -ErrorAction Stop",
+          targetPath,
+        ],
+        { windowsHide: true },
+      );
+      return {
+        attempted: true,
+        ok: !fs.existsSync(targetPath),
+        method: "powershell_remove_item",
+      };
+    } catch (psErr) {
+      errors.push(psErr);
+    }
+    return {
+      attempted: true,
+      ok: false,
+      error: errors[errors.length - 1],
+      errors: errors,
+      method: "windows_fallbacks",
+    };
+  }
+
+  function makePathWritableRecursive(targetPath) {
+    var normalized = String(targetPath || "").trim();
+    if (!normalized || !fs.existsSync(normalized)) {
+      return;
+    }
+
+    function chmodPath(itemPath, isDirectory) {
+      try {
+        fs.chmodSync(itemPath, isDirectory ? 0o777 : 0o666);
+      } catch (eFile) {
+        // Best effort only; locked media will still be reported by deletion.
+      }
+    }
+
+    function walk(dirPath) {
+      var entries = [];
+      try {
+        entries = fs.readdirSync(dirPath);
+      } catch (eRead) {
+        chmodPath(dirPath, true);
+        return;
+      }
+      for (var i = 0; i < entries.length; i += 1) {
+        var entryPath = path.join(dirPath, entries[i]);
+        var stat = null;
+        try {
+          stat = fs.lstatSync(entryPath);
+        } catch (eStat) {
+          chmodPath(entryPath, false);
+          continue;
+        }
+        if (stat && stat.isDirectory()) {
+          walk(entryPath);
+        }
+        chmodPath(entryPath, !!(stat && stat.isDirectory()));
+      }
+    }
+    walk(normalized);
+    chmodPath(normalized, true);
   }
 
   function removePathOnce(targetPath) {
@@ -462,12 +539,13 @@
     }
 
     try {
+      makePathWritableRecursive(normalized);
       if (fs.rmSync) {
         fs.rmSync(normalized, {
           recursive: true,
           force: true,
-          maxRetries: 0,
-          retryDelay: 0,
+          maxRetries: CLEANUP_NODE_RM_MAX_RETRIES,
+          retryDelay: CLEANUP_NODE_RM_RETRY_DELAY_MS,
         });
       } else {
         fs.rmdirSync(normalized, { recursive: true });
@@ -2268,6 +2346,7 @@
           ? summary.warnings.length
           : Number(summary.warning_count || 0);
         var detachedProxyCount = Number(summary.detached_proxy_count || 0);
+        var mediaOfflineCount = Number(summary.media_offline_count || 0);
         log(
           "Premiere cleanup for " +
             projectId +
@@ -2281,6 +2360,8 @@
             remainingRootItems +
             ", detachedProxies=" +
             detachedProxyCount +
+            ", mediaOffline=" +
+            mediaOfflineCount +
             ", warnings=" +
             warningCount,
           "info",
