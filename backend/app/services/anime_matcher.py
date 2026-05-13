@@ -1364,20 +1364,32 @@ class AnimeMatcherService:
         )
 
     @staticmethod
+    def _source_duration_within_speed_bounds(
+        scene_duration: float,
+        start_time: float,
+        end_time: float,
+    ) -> bool:
+        source_duration = end_time - start_time
+        if scene_duration <= 0 or source_duration <= 0:
+            return False
+        speed_ratio = scene_duration / source_duration
+        return settings.matcher_min_speed_factor <= speed_ratio <= 1.60
+
+    @staticmethod
     def _proposal_source_priority(proposal: MatchProposal) -> int:
         if proposal.source == "refined":
             return 2
-        if proposal.source in {"crop", "crop_projected", "cropped"}:
+        if proposal.source in {"crop", "crop_projected", "cropped", "projected"}:
             return 1
         return 0
 
     @classmethod
     def _proposal_rank_key(cls, proposal: MatchProposal) -> tuple[float, int, float, int]:
         return (
-            proposal.confidence,
-            cls._proposal_source_priority(proposal),
             proposal.selection_score,
             proposal.vote_count,
+            cls._proposal_source_priority(proposal),
+            proposal.confidence,
         )
 
     @classmethod
@@ -1702,6 +1714,8 @@ class AnimeMatcherService:
         middle_candidates: list[MatchCandidate] | None = None,
         end_candidates: list[MatchCandidate] | None = None,
         allowed_episodes: set[str] | None = None,
+        source: str = "projected",
+        selection_bonus: float = 0.25,
     ) -> MatchProposal | None:
         """Project a short-scene interval from start/middle/end retrievals.
 
@@ -1839,8 +1853,8 @@ class AnimeMatcherService:
             start_time=projected_start,
             end_time=projected_start + scene_duration,
             confidence=projected_confidence,
-            selection_score=projected_confidence + 0.015,
-            source="crop_projected",
+            selection_score=projected_confidence + selection_bonus,
+            source=source,
             vote_count=1,
             debug={"base_similarity": base_similarity},
         )
@@ -2323,6 +2337,400 @@ class AnimeMatcherService:
         return smoothed
 
     @classmethod
+    def _monotonic_sequence_candidate_options(
+        cls,
+        scene: Scene,
+        match: SceneMatch,
+        dominant_episode: str,
+    ) -> list[dict[str, float | str | int]]:
+        duration = scene.duration
+        if duration <= 0:
+            return []
+
+        options: dict[tuple[float, float], dict[str, float | str | int]] = {}
+
+        def add(
+            start_time: float,
+            end_time: float,
+            confidence: float,
+            source: str,
+            vote_count: int = 1,
+        ) -> None:
+            if confidence <= 0 or end_time <= start_time:
+                return
+            start_time = max(0.0, float(start_time))
+            if not cls._source_duration_within_speed_bounds(
+                duration,
+                start_time,
+                end_time,
+            ):
+                return
+
+            speed_ratio = duration / (end_time - start_time)
+            source_bonus = {
+                "direct": 0.06,
+                "crop": 0.04,
+                "weighted_avg": 0.025,
+                "start_mid_end": 0.045,
+                "start_end": 0.025,
+                "refined": -0.015,
+            }.get(source, 0.0)
+            speed_penalty = 0.0
+            if speed_ratio > 1.25:
+                speed_penalty = 0.025 * ((speed_ratio - 1.25) / 0.35)
+            selection_score = float(confidence) + source_bonus - speed_penalty
+
+            key = (round(start_time, 2), round(end_time, 2))
+            previous = options.get(key)
+            if previous is None or selection_score > float(previous["selection_score"]):
+                options[key] = {
+                    "episode": dominant_episode,
+                    "start_time": start_time,
+                    "end_time": float(end_time),
+                    "confidence": float(confidence),
+                    "selection_score": selection_score,
+                    "source": source,
+                    "vote_count": vote_count,
+                }
+
+        if match.episode == dominant_episode and match.end_time > match.start_time:
+            add(
+                match.start_time,
+                match.end_time,
+                match.confidence,
+                "primary",
+            )
+
+        for alternative in match.alternatives:
+            if alternative.episode != dominant_episode:
+                continue
+            add(
+                alternative.start_time,
+                alternative.end_time,
+                alternative.confidence,
+                alternative.algorithm or "alternative",
+                alternative.vote_count,
+            )
+
+        for candidate in match.start_candidates[:20]:
+            if candidate.episode == dominant_episode:
+                add(
+                    candidate.timestamp,
+                    candidate.timestamp + duration,
+                    candidate.similarity,
+                    "start",
+                )
+        for candidate in match.middle_candidates[:20]:
+            if candidate.episode == dominant_episode:
+                add(
+                    candidate.timestamp - duration / 2.0,
+                    candidate.timestamp + duration / 2.0,
+                    candidate.similarity * 0.98,
+                    "middle",
+                )
+        for candidate in match.end_candidates[:20]:
+            if candidate.episode == dominant_episode:
+                add(
+                    candidate.timestamp - duration,
+                    candidate.timestamp,
+                    candidate.similarity * 0.98,
+                    "end",
+                )
+
+        for start_candidate in match.start_candidates[:14]:
+            if start_candidate.episode != dominant_episode:
+                continue
+            for end_candidate in match.end_candidates[:14]:
+                if end_candidate.episode != dominant_episode:
+                    continue
+                if end_candidate.timestamp <= start_candidate.timestamp:
+                    continue
+                if not cls._source_duration_within_speed_bounds(
+                    duration,
+                    start_candidate.timestamp,
+                    end_candidate.timestamp,
+                ):
+                    continue
+
+                source_duration = end_candidate.timestamp - start_candidate.timestamp
+                expected_middle = start_candidate.timestamp + source_duration / 2.0
+                middle_support = [
+                    middle_candidate
+                    for middle_candidate in match.middle_candidates[:14]
+                    if (
+                        middle_candidate.episode == dominant_episode
+                        and abs(middle_candidate.timestamp - expected_middle)
+                        <= max(0.7, source_duration * 0.4)
+                    )
+                ]
+                confidence = (
+                    start_candidate.similarity + end_candidate.similarity
+                ) / 2.0
+                source = "start_end"
+                vote_count = 2
+                if middle_support:
+                    confidence = (
+                        start_candidate.similarity
+                        + end_candidate.similarity
+                        + max(candidate.similarity for candidate in middle_support)
+                    ) / 3.0
+                    source = "start_mid_end"
+                    vote_count = 3
+
+                add(
+                    start_candidate.timestamp,
+                    end_candidate.timestamp,
+                    confidence,
+                    source,
+                    vote_count,
+                )
+
+        return sorted(
+            options.values(),
+            key=lambda item: float(item["selection_score"]),
+            reverse=True,
+        )[:24]
+
+    @classmethod
+    def _stabilize_monotonic_source_sequence(
+        cls,
+        scenes: SceneList,
+        matches: MatchList,
+    ) -> MatchList:
+        """Select a consistent source path for short same-episode projects."""
+        if len(scenes.scenes) != len(matches.matches):
+            return matches
+        if not (12 <= len(matches.matches) <= 30):
+            return matches
+
+        dominant_episode = cls._dominant_candidate_episode(matches)
+        if not dominant_episode:
+            return matches
+
+        primary_matches = [
+            match
+            for match in matches.matches
+            if match.episode and match.end_time > match.start_time
+        ]
+        if len(primary_matches) < max(8, int(len(matches.matches) * 0.65)):
+            return matches
+        dominant_count = sum(
+            1 for match in primary_matches if match.episode == dominant_episode
+        )
+        if dominant_count / len(primary_matches) < 0.75:
+            return matches
+
+        adjacent_pairs = [
+            (left, right)
+            for left, right in zip(primary_matches, primary_matches[1:], strict=False)
+            if left.episode == dominant_episode and right.episode == dominant_episode
+        ]
+        if adjacent_pairs:
+            monotonic_fraction = sum(
+                1
+                for left, right in adjacent_pairs
+                if right.start_time >= left.start_time - 0.5
+            ) / len(adjacent_pairs)
+            if monotonic_fraction < 0.60:
+                return matches
+
+        per_scene_options = [
+            cls._monotonic_sequence_candidate_options(
+                scene,
+                match,
+                dominant_episode,
+            )
+            for scene, match in zip(scenes.scenes, matches.matches, strict=False)
+        ]
+        if any(not options for options in per_scene_options):
+            return matches
+
+        costs: list[list[float]] = []
+        parents: list[list[int]] = []
+        costs.append(
+            [-float(option["selection_score"]) for option in per_scene_options[0]]
+        )
+        parents.append([-1 for _ in per_scene_options[0]])
+
+        for scene_idx in range(1, len(per_scene_options)):
+            scene_costs: list[float] = []
+            scene_parents: list[int] = []
+            for option in per_scene_options[scene_idx]:
+                best_cost = float("inf")
+                best_parent = 0
+                current_start = float(option["start_time"])
+                current_score = float(option["selection_score"])
+
+                for prev_idx, previous in enumerate(per_scene_options[scene_idx - 1]):
+                    previous_start = float(previous["start_time"])
+                    previous_end = float(previous["end_time"])
+                    source_gap = current_start - previous_end
+                    start_delta = current_start - previous_start
+                    transition_penalty = 0.0
+
+                    if start_delta < -1.0:
+                        transition_penalty += 4.0
+                    elif start_delta < -0.2:
+                        transition_penalty += 0.8
+
+                    if source_gap < -1.0:
+                        transition_penalty += 1.5 + abs(source_gap) * 0.08
+                    elif source_gap < -0.15:
+                        transition_penalty += 0.25
+                    elif source_gap <= 12.0:
+                        transition_penalty += source_gap * 0.003
+                    elif source_gap <= 30.0:
+                        transition_penalty += 0.036 + (source_gap - 12.0) * 0.006
+                    elif source_gap <= 45.0:
+                        transition_penalty += 0.144 + (source_gap - 30.0) * 0.003
+                    else:
+                        transition_penalty += 0.2 + (source_gap - 45.0) * 0.012
+
+                    total = (
+                        costs[scene_idx - 1][prev_idx]
+                        - current_score
+                        + transition_penalty
+                    )
+                    if total < best_cost:
+                        best_cost = total
+                        best_parent = prev_idx
+
+                scene_costs.append(best_cost)
+                scene_parents.append(best_parent)
+            costs.append(scene_costs)
+            parents.append(scene_parents)
+
+        selected_indices = [0 for _ in per_scene_options]
+        selected_indices[-1] = int(np.argmin(np.asarray(costs[-1], dtype=np.float32)))
+        for scene_idx in range(len(per_scene_options) - 1, 0, -1):
+            selected_indices[scene_idx - 1] = parents[scene_idx][
+                selected_indices[scene_idx]
+            ]
+
+        adjusted = matches.model_copy(deep=True)
+        changed = False
+        for scene_idx, selected_idx in enumerate(selected_indices):
+            selected = per_scene_options[scene_idx][selected_idx]
+            match = adjusted.matches[scene_idx]
+            selected_start = float(selected["start_time"])
+            selected_end = float(selected["end_time"])
+            if (
+                match.episode == selected["episode"]
+                and abs(match.start_time - selected_start) < 1e-3
+                and abs(match.end_time - selected_end) < 1e-3
+            ):
+                continue
+            cls._apply_proposal_to_match(
+                scenes.scenes[scene_idx],
+                match,
+                MatchProposal(
+                    episode=str(selected["episode"]),
+                    start_time=selected_start,
+                    end_time=selected_end,
+                    confidence=float(selected["confidence"]),
+                    selection_score=float(selected["selection_score"]),
+                    source="continuity",
+                    vote_count=int(selected["vote_count"]),
+                ),
+            )
+            changed = True
+
+        recovered = cls._recover_monotonic_boundary_alternatives(scenes, adjusted)
+        if recovered is not adjusted:
+            adjusted = recovered
+            changed = True
+        return adjusted if changed else matches
+
+    @classmethod
+    def _recover_monotonic_boundary_alternatives(
+        cls,
+        scenes: SceneList,
+        matches: MatchList,
+    ) -> MatchList:
+        """Prefer boundary-anchored probes when monotonic continuity drifts."""
+        if len(scenes.scenes) != len(matches.matches):
+            return matches
+
+        adjusted = matches.model_copy(deep=True)
+        changed = False
+        continuity_sources = {"continuity", "best_frame", "refined"}
+        for idx, match in enumerate(adjusted.matches):
+            if not match.episode or match.was_no_match or not match.alternatives:
+                continue
+            primary_source = match.alternatives[0].algorithm or ""
+            if primary_source not in continuity_sources:
+                continue
+
+            scene = scenes.scenes[idx]
+            selected_alternative = None
+            direct_alternatives = [
+                alternative
+                for alternative in match.alternatives
+                if (
+                    alternative.algorithm == "direct"
+                    and alternative.episode == match.episode
+                    and alternative.vote_count >= 3
+                    and alternative.confidence >= 0.49
+                    and alternative.confidence >= match.confidence - 0.40
+                    and alternative.end_time > alternative.start_time
+                    and abs(alternative.start_time - match.start_time) <= 1.0
+                    and abs(alternative.end_time - match.end_time) <= 1.0
+                    and cls._source_duration_within_speed_bounds(
+                        scene.duration,
+                        alternative.start_time,
+                        alternative.end_time,
+                    )
+                )
+            ]
+            if direct_alternatives:
+                selected_alternative = max(
+                    direct_alternatives,
+                    key=lambda alternative: alternative.confidence,
+                )
+            else:
+                weighted_alternatives = [
+                    alternative
+                    for alternative in match.alternatives
+                    if (
+                        alternative.algorithm == "weighted_avg"
+                        and alternative.episode == match.episode
+                        and alternative.vote_count >= 12
+                        and alternative.confidence >= 0.65
+                        and alternative.confidence >= match.confidence - 0.12
+                        and alternative.end_time > alternative.start_time
+                        and abs(alternative.start_time - match.start_time) <= 0.60
+                        and abs(alternative.end_time - match.end_time) <= 0.60
+                        and cls._source_duration_within_speed_bounds(
+                            scene.duration,
+                            alternative.start_time,
+                            alternative.end_time,
+                        )
+                    )
+                ]
+                if weighted_alternatives:
+                    selected_alternative = max(
+                        weighted_alternatives,
+                        key=lambda alternative: (
+                            alternative.vote_count,
+                            alternative.confidence,
+                        ),
+                    )
+
+            if selected_alternative is None:
+                continue
+            proposal = cls._proposal_from_alternative(
+                selected_alternative,
+                source=f"monotonic_{selected_alternative.algorithm}",
+                selection_bonus=0.0,
+            )
+            if proposal is None:
+                continue
+            cls._apply_proposal_to_match(scene, match, proposal)
+            changed = True
+
+        return adjusted if changed else matches
+
+    @classmethod
     def _snap_short_scene_reset_edges(
         cls,
         scenes: SceneList,
@@ -2574,6 +2982,39 @@ class AnimeMatcherService:
                 continue
             if not match.alternatives:
                 continue
+            continuity_alternatives = [
+                alternative
+                for alternative in match.alternatives
+                if (
+                    alternative.algorithm == "continuity"
+                    and alternative.episode == match.episode
+                    and alternative.end_time > alternative.start_time
+                    and (
+                        abs(alternative.start_time - match.start_time) > 1e-3
+                        or abs(alternative.end_time - match.end_time) > 1e-3
+                    )
+                    and abs(alternative.start_time - match.start_time) <= 2.0
+                    and abs(alternative.end_time - match.end_time) <= 2.0
+                    and alternative.confidence >= match.confidence - 1e-6
+                )
+            ]
+            if continuity_alternatives:
+                continuity_alternative = max(
+                    continuity_alternatives,
+                    key=lambda alternative: alternative.confidence,
+                )
+                proposal = cls._proposal_from_alternative(
+                    continuity_alternative,
+                    source="continuity",
+                    selection_bonus=0.0,
+                )
+                if proposal is not None:
+                    cls._apply_proposal_to_match(
+                        scenes.scenes[idx],
+                        match,
+                        proposal,
+                    )
+                    continue
             best_alternative = max(
                 match.alternatives,
                 key=lambda alternative: alternative.confidence,
@@ -2593,6 +3034,478 @@ class AnimeMatcherService:
             if proposal is not None:
                 cls._apply_proposal_to_match(scenes.scenes[idx], match, proposal)
         return adjusted
+
+    @classmethod
+    def _promote_dense_local_source_alternatives(
+        cls,
+        scenes: SceneList,
+        matches: MatchList,
+    ) -> MatchList:
+        if len(scenes.scenes) != len(matches.matches) or len(matches.matches) < 45:
+            return matches
+
+        durations = sorted(scene.duration for scene in scenes.scenes if scene.duration > 0)
+        if not durations or durations[len(durations) // 2] > 1.5:
+            return matches
+
+        adjusted = matches.model_copy(deep=True)
+        for idx in range(1, len(adjusted.matches) - 1):
+            previous_match = adjusted.matches[idx - 1]
+            match = adjusted.matches[idx]
+            next_match = adjusted.matches[idx + 1]
+            if (
+                match.was_no_match
+                or not match.episode
+                or not match.alternatives
+                or not previous_match.episode
+                or previous_match.episode != match.episode
+                or next_match.episode != match.episode
+                or previous_match.end_time >= next_match.start_time
+            ):
+                continue
+
+            source_span = next_match.start_time - previous_match.end_time
+            scene_duration = scenes.scenes[idx].duration
+
+            def inside_local_bracket(alternative: AlternativeMatch) -> bool:
+                return (
+                    alternative.episode == match.episode
+                    and alternative.end_time > alternative.start_time
+                    and alternative.start_time >= previous_match.end_time - 1.0
+                    and alternative.end_time <= next_match.start_time + 1.0
+                    and cls._source_duration_within_speed_bounds(
+                        scene_duration,
+                        alternative.start_time,
+                        alternative.end_time,
+                    )
+                )
+
+            primary_inside = (
+                match.start_time >= previous_match.end_time - 1.0
+                and match.end_time <= next_match.start_time + 1.0
+            )
+            if source_span <= 12.0 and not primary_inside:
+                bracket_alternatives = [
+                    alternative
+                    for alternative in match.alternatives
+                    if inside_local_bracket(alternative)
+                    and alternative.confidence >= 0.40
+                ]
+                if bracket_alternatives:
+                    selected = max(
+                        bracket_alternatives,
+                        key=lambda alternative: (
+                            alternative.confidence,
+                            alternative.vote_count,
+                        ),
+                    )
+                    proposal = cls._proposal_from_alternative(
+                        selected,
+                        source="local_bracket",
+                        selection_bonus=0.0,
+                    )
+                    if proposal is not None:
+                        cls._apply_proposal_to_match(
+                            scenes.scenes[idx],
+                            match,
+                            proposal,
+                        )
+                    continue
+
+            primary_source = match.alternatives[0].algorithm or ""
+            if primary_source != "continuity" or scene_duration > 0.95:
+                continue
+            if not (
+                previous_match.end_time
+                < match.start_time
+                < match.end_time
+                < next_match.start_time
+            ):
+                continue
+
+            previous_gap = match.start_time - previous_match.end_time
+            next_gap = next_match.start_time - match.end_time
+            if previous_gap < 1.8 or previous_gap > 5.0 or next_gap > 4.0:
+                continue
+
+            earlier_alternatives = [
+                alternative
+                for alternative in match.alternatives[1:]
+                if (
+                    inside_local_bracket(alternative)
+                    and alternative.start_time >= match.start_time - 1.2
+                    and alternative.start_time < match.start_time - 0.35
+                    and alternative.end_time <= next_match.start_time + 0.8
+                    and alternative.confidence >= 0.45
+                    and (
+                        alternative.vote_count >= 8
+                        or alternative.confidence >= match.confidence - 0.10
+                    )
+                )
+            ]
+            if not earlier_alternatives:
+                continue
+
+            selected = max(
+                earlier_alternatives,
+                key=lambda alternative: (
+                    alternative.vote_count,
+                    alternative.confidence,
+                ),
+            )
+            proposal = cls._proposal_from_alternative(
+                selected,
+                source="local_gap",
+                selection_bonus=0.0,
+            )
+            if proposal is not None:
+                cls._apply_proposal_to_match(
+                    scenes.scenes[idx],
+                    match,
+                    proposal,
+                )
+        return adjusted
+
+    @classmethod
+    def _promote_duration_consistent_weighted_alternatives(
+        cls,
+        scenes: SceneList,
+        matches: MatchList,
+    ) -> MatchList:
+        if len(scenes.scenes) != len(matches.matches):
+            return matches
+
+        adjusted = matches.model_copy(deep=True)
+        for idx, match in enumerate(adjusted.matches):
+            if not match.episode or match.end_time <= match.start_time:
+                continue
+            scene_duration = scenes.scenes[idx].duration
+            if scene_duration <= 0:
+                continue
+
+            current_duration_error = abs(
+                (match.end_time - match.start_time) - scene_duration
+            )
+            weighted_alternatives = [
+                alternative
+                for alternative in match.alternatives
+                if (
+                    alternative.algorithm == "weighted_avg"
+                    and alternative.episode == match.episode
+                    and alternative.vote_count >= 6
+                    and alternative.confidence >= 0.75
+                    and alternative.confidence >= match.confidence - 0.10
+                    and alternative.end_time > alternative.start_time
+                    and abs(alternative.start_time - match.start_time) <= 0.30
+                    and abs(alternative.end_time - match.end_time) <= 0.30
+                )
+            ]
+            if not weighted_alternatives:
+                continue
+
+            best_alternative = min(
+                weighted_alternatives,
+                key=lambda alternative: abs(
+                    (alternative.end_time - alternative.start_time) - scene_duration
+                ),
+            )
+            best_duration_error = abs(
+                (best_alternative.end_time - best_alternative.start_time)
+                - scene_duration
+            )
+            if best_duration_error + 0.10 >= current_duration_error:
+                continue
+
+            proposal = cls._proposal_from_alternative(
+                best_alternative,
+                source="weighted_avg",
+                selection_bonus=0.0,
+            )
+            if proposal is not None:
+                cls._apply_proposal_to_match(
+                    scenes.scenes[idx],
+                    match,
+                    proposal,
+                )
+        return adjusted
+
+    @classmethod
+    def _extend_underfilled_source_end_candidates(
+        cls,
+        scenes: SceneList,
+        matches: MatchList,
+    ) -> MatchList:
+        if len(scenes.scenes) != len(matches.matches):
+            return matches
+
+        adjusted = matches.model_copy(deep=True)
+        changed = False
+        for idx, match in enumerate(adjusted.matches):
+            if not match.episode or match.was_no_match or match.end_time <= match.start_time:
+                continue
+
+            scene = scenes.scenes[idx]
+            scene_duration = scene.duration
+            if scene_duration < 2.5:
+                continue
+
+            current_source_duration = match.end_time - match.start_time
+            current_duration_error = abs(current_source_duration - scene_duration)
+            if current_source_duration >= scene_duration - 0.50:
+                continue
+
+            start_support = max(
+                (
+                    candidate.similarity
+                    for candidate in match.start_candidates[:12]
+                    if (
+                        candidate.episode == match.episode
+                        and abs(candidate.timestamp - match.start_time) <= 0.60
+                    )
+                ),
+                default=0.0,
+            )
+            if start_support < 0.45:
+                continue
+
+            viable_end_candidates: list[tuple[float, MatchCandidate]] = []
+            for candidate in match.end_candidates[:12]:
+                if candidate.episode != match.episode:
+                    continue
+                if candidate.timestamp <= match.start_time:
+                    continue
+                if candidate.similarity < 0.40:
+                    continue
+                if abs(candidate.timestamp - match.end_time) > 1.25:
+                    continue
+                if not cls._source_duration_within_speed_bounds(
+                    scene_duration,
+                    match.start_time,
+                    candidate.timestamp,
+                ):
+                    continue
+
+                duration_error = abs(
+                    (candidate.timestamp - match.start_time) - scene_duration
+                )
+                if duration_error + 0.30 >= current_duration_error:
+                    continue
+                viable_end_candidates.append((duration_error, candidate))
+
+            if not viable_end_candidates:
+                continue
+
+            _, best_end = min(
+                viable_end_candidates,
+                key=lambda item: (item[0], -item[1].similarity),
+            )
+            confidence = max(
+                match.confidence,
+                (start_support + best_end.similarity) / 2.0,
+            )
+            proposal = MatchProposal(
+                episode=match.episode,
+                start_time=match.start_time,
+                end_time=best_end.timestamp,
+                confidence=confidence,
+                selection_score=confidence + 0.01,
+                source="duration_end",
+                vote_count=2,
+            )
+            cls._apply_proposal_to_match(scene, match, proposal)
+            changed = True
+
+        return adjusted if changed else matches
+
+    @classmethod
+    def _extend_monotonic_speed_floor_alternatives(
+        cls,
+        scenes: SceneList,
+        matches: MatchList,
+    ) -> MatchList:
+        if len(scenes.scenes) != len(matches.matches):
+            return matches
+        if not (12 <= len(matches.matches) <= 30):
+            return matches
+
+        dominant_episode = cls._dominant_candidate_episode(matches)
+        if not dominant_episode:
+            return matches
+
+        primary_matches = [
+            match
+            for match in matches.matches
+            if match.episode and match.end_time > match.start_time
+        ]
+        if len(primary_matches) < max(8, int(len(matches.matches) * 0.65)):
+            return matches
+        dominant_count = sum(
+            1 for match in primary_matches if match.episode == dominant_episode
+        )
+        if dominant_count / len(primary_matches) < 0.75:
+            return matches
+
+        adjusted = matches.model_copy(deep=True)
+        changed = False
+        for idx, match in enumerate(adjusted.matches):
+            if (
+                match.episode != dominant_episode
+                or match.was_no_match
+                or match.end_time <= match.start_time
+            ):
+                continue
+
+            scene_duration = scenes.scenes[idx].duration
+            if not (0.75 <= scene_duration <= 1.50):
+                continue
+
+            max_source_duration = scene_duration / max(
+                settings.matcher_min_speed_factor,
+                1e-6,
+            )
+            selected_alternative = None
+            selected_end_support = 0.0
+            for alternative in match.alternatives:
+                if alternative.episode != dominant_episode:
+                    continue
+                if alternative.algorithm not in {"direct", "weighted_avg"}:
+                    continue
+                if alternative.algorithm == "direct" and (
+                    alternative.vote_count < 3 or alternative.confidence < 0.50
+                ):
+                    continue
+                if alternative.algorithm == "weighted_avg" and (
+                    alternative.vote_count < 10 or alternative.confidence < 0.55
+                ):
+                    continue
+                if not (0.50 <= alternative.start_time - match.start_time <= 3.0):
+                    continue
+
+                projected_end = alternative.start_time + max_source_duration
+                end_support = max(
+                    (
+                        candidate.similarity
+                        for candidate in match.end_candidates
+                        if (
+                            candidate.episode == dominant_episode
+                            and abs(candidate.timestamp - projected_end) <= 0.60
+                        )
+                    ),
+                    default=0.0,
+                )
+                if (
+                    end_support < 0.45
+                    and abs(alternative.end_time - projected_end) > 0.60
+                ):
+                    continue
+                if selected_alternative is None or (
+                    alternative.confidence + end_support
+                    > selected_alternative.confidence + selected_end_support
+                ):
+                    selected_alternative = alternative
+                    selected_end_support = end_support
+
+            if selected_alternative is None:
+                continue
+
+            projected_end = selected_alternative.start_time + max_source_duration
+            confidence = max(
+                match.confidence,
+                selected_alternative.confidence,
+                selected_end_support,
+            )
+            cls._apply_proposal_to_match(
+                scenes.scenes[idx],
+                match,
+                MatchProposal(
+                    episode=dominant_episode,
+                    start_time=selected_alternative.start_time,
+                    end_time=projected_end,
+                    confidence=confidence,
+                    selection_score=confidence + 0.01,
+                    source="monotonic_speed_floor",
+                    vote_count=selected_alternative.vote_count,
+                ),
+            )
+            changed = True
+
+        return adjusted if changed else matches
+
+    @classmethod
+    def _promote_short_end_projection_start_anchors(
+        cls,
+        scenes: SceneList,
+        matches: MatchList,
+    ) -> MatchList:
+        if len(scenes.scenes) != len(matches.matches):
+            return matches
+
+        adjusted = matches.model_copy(deep=True)
+        changed = False
+        for idx, match in enumerate(adjusted.matches):
+            if (
+                not match.episode
+                or match.was_no_match
+                or match.end_time <= match.start_time
+                or not match.alternatives
+            ):
+                continue
+            if match.alternatives[0].algorithm != "end":
+                continue
+
+            scene = scenes.scenes[idx]
+            scene_duration = scene.duration
+            if scene_duration <= 0 or scene_duration > 1.0:
+                continue
+
+            same_episode_starts = [
+                candidate
+                for candidate in match.start_candidates[:5]
+                if candidate.episode == match.episode
+            ]
+            if not same_episode_starts:
+                continue
+            best_start = max(
+                same_episode_starts,
+                key=lambda candidate: candidate.similarity,
+            )
+            if best_start.similarity < 0.82:
+                continue
+            if not (2.0 <= match.start_time - best_start.timestamp <= 5.0):
+                continue
+
+            projected_middle = best_start.timestamp + scene_duration / 2.0
+            middle_support = max(
+                (
+                    candidate.similarity
+                    for candidate in match.middle_candidates[:8]
+                    if (
+                        candidate.episode == match.episode
+                        and abs(candidate.timestamp - projected_middle) <= 1.0
+                    )
+                ),
+                default=0.0,
+            )
+            if middle_support < 0.80:
+                continue
+
+            confidence = max(
+                match.confidence,
+                (best_start.similarity + middle_support) / 2.0,
+            )
+            proposal = MatchProposal(
+                episode=match.episode,
+                start_time=best_start.timestamp,
+                end_time=best_start.timestamp + scene_duration,
+                confidence=confidence,
+                selection_score=confidence + 0.01,
+                source="start_anchor",
+                vote_count=2,
+            )
+            cls._apply_proposal_to_match(scene, match, proposal)
+            changed = True
+
+        return adjusted if changed else matches
 
     @classmethod
     def _find_temporal_proposal(
@@ -2739,11 +3652,18 @@ class AnimeMatcherService:
         ):
             proposal = cls._proposal_from_alternative(alternative)
             if proposal is not None:
-                algorithm_bonus = {
-                    "weighted_avg": 0.010,
-                    "best_frame": 0.0,
-                    "union_topk": -0.005,
-                }.get(alternative.algorithm or "", 0.0)
+                if alternative.algorithm == "weighted_avg":
+                    if alternative.vote_count < 2:
+                        algorithm_bonus = -0.20
+                    elif alternative.vote_count < 4:
+                        algorithm_bonus = -0.05
+                    else:
+                        algorithm_bonus = 0.02
+                else:
+                    algorithm_bonus = {
+                        "best_frame": -0.25,
+                        "union_topk": -0.25,
+                    }.get(alternative.algorithm or "", 0.0)
                 proposals.append(
                     MatchProposal(
                         episode=proposal.episode,
@@ -3155,6 +4075,17 @@ class AnimeMatcherService:
                     direct_candidates.get(i, ([], [], []))
                 )
 
+                if existing_matches and i < len(existing_matches.matches):
+                    existing_match = existing_matches.matches[i]
+                    if existing_match.merged_from is not None:
+                        merged_seed = cls._proposal_from_match(
+                            existing_match,
+                            source="merged_seed",
+                            selection_bonus=0.10,
+                        )
+                        if merged_seed is not None:
+                            proposals.append(merged_seed)
+
                 # Find temporal match across the deep candidate pool.
                 direct_proposal = cls._find_temporal_proposal(
                     start_candidates,
@@ -3166,6 +4097,25 @@ class AnimeMatcherService:
                 )
                 if direct_proposal is not None:
                     proposals.append(direct_proposal)
+
+                direct_projected_proposal = cls._find_projected_interval_proposal(
+                    start_candidates,
+                    scene.duration,
+                    middle_candidates=middle_candidates,
+                    end_candidates=end_candidates,
+                    allowed_episodes=set(
+                        cls._rank_candidate_episodes(
+                            start_candidates,
+                            middle_candidates,
+                            end_candidates,
+                            limit=cls.CROP_SEARCH_MAX_EPISODES_PER_SCENE,
+                        )
+                    ),
+                    source="projected",
+                    selection_bonus=0.25,
+                )
+                if direct_projected_proposal is not None:
+                    proposals.append(direct_projected_proposal)
 
                 crop_candidates: tuple[
                     list[MatchCandidate],
@@ -3233,6 +4183,8 @@ class AnimeMatcherService:
                         middle_candidates=combined_middle_candidates,
                         end_candidates=combined_end_candidates,
                         allowed_episodes=set(seed_episodes) if seed_episodes else None,
+                        source="crop_projected",
+                        selection_bonus=0.25,
                     )
                     start_candidates = combined_start_candidates
                     middle_candidates = combined_middle_candidates
@@ -3254,12 +4206,14 @@ class AnimeMatcherService:
                         scene.duration,
                     )
                 )
-
                 selected_before_refine = (
                     cls._dedupe_proposals(proposals)[0] if proposals else None
                 )
                 if selected_before_refine is not None:
-                    if selected_before_refine.source in {"crop", "crop_projected"}:
+                    if selected_before_refine.source in {
+                        "crop",
+                        "crop_projected",
+                    }:
                         refined_crop_start = await loop.run_in_executor(
                             None,
                             cls._refine_crop_projected_start,
@@ -3284,7 +4238,7 @@ class AnimeMatcherService:
                                     vote_count=selected_before_refine.vote_count,
                                 )
                             )
-                    else:
+                    elif selected_before_refine.source != "merged_seed":
                         refined = await loop.run_in_executor(
                             None,
                             cls._refine_boundaries,
@@ -3297,7 +4251,11 @@ class AnimeMatcherService:
                         )
                         if refined is not None:
                             refined_start, refined_end = refined
-                            if refined_end > refined_start:
+                            if cls._source_duration_within_speed_bounds(
+                                scene.duration,
+                                refined_start,
+                                refined_end,
+                            ):
                                 proposals.append(
                                     MatchProposal(
                                         episode=selected_before_refine.episode,
@@ -3354,9 +4312,18 @@ class AnimeMatcherService:
                 print(f"Error matching scene {i}: {e}")
 
         matches = cls._stabilize_short_scene_sequence(scenes, matches)
+        matches = cls._stabilize_monotonic_source_sequence(scenes, matches)
         matches = cls._snap_short_scene_reset_edges(scenes, matches)
         matches = cls._stabilize_monotonic_tail_pair(scenes, matches)
         matches = cls._promote_dense_short_alternatives(scenes, matches)
+        matches = cls._promote_dense_local_source_alternatives(scenes, matches)
+        matches = cls._promote_duration_consistent_weighted_alternatives(
+            scenes,
+            matches,
+        )
+        matches = cls._extend_underfilled_source_end_candidates(scenes, matches)
+        matches = cls._extend_monotonic_speed_floor_alternatives(scenes, matches)
+        matches = cls._promote_short_end_projection_start_anchors(scenes, matches)
         matches = cls._validate_and_repair_matches(scenes, matches)
 
         yield MatchProgress(

@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.models import MatchCandidate, MatchList, Scene, SceneList, SceneMatch
 from app.services import anime_matcher as matcher_module
 from app.services.anime_matcher import AnimeMatcherService, MatchProposal
+from app.services.scene_merger import SceneMergerService
 
 
 def _write_index_fixture(library_path: Path, frame_count: int) -> None:
@@ -371,7 +372,7 @@ def test_batched_probe_search_skips_incomplete_frame_triples(monkeypatch) -> Non
     assert results[1] == ([], [], [])
 
 
-def test_proposal_ranking_uses_confidence_before_selection_bonus() -> None:
+def test_proposal_ranking_uses_reliability_adjusted_selection_score() -> None:
     high_similarity = MatchProposal(
         episode="E1",
         start_time=10.0,
@@ -393,17 +394,18 @@ def test_proposal_ranking_uses_confidence_before_selection_bonus() -> None:
         [lower_similarity_with_bonus, high_similarity]
     )
 
-    assert ranked[0] is high_similarity
+    assert ranked[0] is lower_similarity_with_bonus
 
 
-def test_proposal_ranking_ties_prefer_refined_then_crop() -> None:
+def test_proposal_ranking_ties_prefer_votes_then_refined_then_crop() -> None:
     direct = MatchProposal(
         episode="E1",
         start_time=10.0,
         end_time=11.0,
         confidence=0.80,
-        selection_score=0.95,
+        selection_score=0.80,
         source="direct",
+        vote_count=1,
     )
     crop = MatchProposal(
         episode="E2",
@@ -412,6 +414,7 @@ def test_proposal_ranking_ties_prefer_refined_then_crop() -> None:
         confidence=0.80,
         selection_score=0.80,
         source="crop",
+        vote_count=1,
     )
     refined = MatchProposal(
         episode="E3",
@@ -420,11 +423,21 @@ def test_proposal_ranking_ties_prefer_refined_then_crop() -> None:
         confidence=0.80,
         selection_score=0.80,
         source="refined",
+        vote_count=1,
+    )
+    voted = MatchProposal(
+        episode="E4",
+        start_time=40.0,
+        end_time=41.0,
+        confidence=0.80,
+        selection_score=0.80,
+        source="direct",
+        vote_count=3,
     )
 
-    ranked = AnimeMatcherService._dedupe_proposals([direct, crop, refined])
+    ranked = AnimeMatcherService._dedupe_proposals([direct, crop, refined, voted])
 
-    assert [proposal.source for proposal in ranked] == ["refined", "crop", "direct"]
+    assert [proposal.episode for proposal in ranked] == ["E4", "E3", "E2", "E1"]
 
 
 def _short_scenes(count: int) -> SceneList:
@@ -502,6 +515,690 @@ def test_stabilizer_can_apply_real_projected_candidates() -> None:
         and alt.algorithm == "continuity"
         for alt in result.matches[26].alternatives
     )
+
+
+def test_monotonic_source_stabilizer_prefers_consistent_alternative() -> None:
+    scenes = _short_scenes(12)
+    matches = MatchList()
+    for index in range(12):
+        start_time = 10.0 + index
+        matches.matches.append(
+            SceneMatch(
+                scene_index=index,
+                episode="E1",
+                start_time=start_time,
+                end_time=start_time + 1.0,
+                confidence=0.75,
+                speed_ratio=1.0,
+            )
+        )
+
+    matches.matches[5].start_time = 80.0
+    matches.matches[5].end_time = 81.0
+    matches.matches[5].confidence = 0.82
+    matches.matches[5].alternatives = [
+        matcher_module.AlternativeMatch(
+            episode="E1",
+            start_time=15.0,
+            end_time=16.0,
+            confidence=0.74,
+            speed_ratio=1.0,
+            vote_count=3,
+            algorithm="direct",
+        )
+    ]
+
+    result = AnimeMatcherService._stabilize_monotonic_source_sequence(scenes, matches)
+
+    assert result.matches[5].start_time == 15.0
+    assert result.matches[5].end_time == 16.0
+    assert result.matches[5].alternatives[0].algorithm == "continuity"
+
+
+def test_monotonic_boundary_recovery_prefers_direct_then_weighted() -> None:
+    scenes = _short_scenes(2)
+    matches = MatchList(
+        matches=[
+            SceneMatch(
+                scene_index=0,
+                episode="E1",
+                start_time=20.5,
+                end_time=21.5,
+                confidence=0.82,
+                speed_ratio=1.0,
+                alternatives=[
+                    matcher_module.AlternativeMatch(
+                        episode="E1",
+                        start_time=20.5,
+                        end_time=21.5,
+                        confidence=0.82,
+                        speed_ratio=1.0,
+                        vote_count=3,
+                        algorithm="continuity",
+                    ),
+                    matcher_module.AlternativeMatch(
+                        episode="E1",
+                        start_time=20.0,
+                        end_time=21.0,
+                        confidence=0.50,
+                        speed_ratio=1.0,
+                        vote_count=3,
+                        algorithm="direct",
+                    ),
+                ],
+            ),
+            SceneMatch(
+                scene_index=1,
+                episode="E1",
+                start_time=30.5,
+                end_time=31.5,
+                confidence=0.74,
+                speed_ratio=1.0,
+                alternatives=[
+                    matcher_module.AlternativeMatch(
+                        episode="E1",
+                        start_time=30.5,
+                        end_time=31.5,
+                        confidence=0.74,
+                        speed_ratio=1.0,
+                        vote_count=3,
+                        algorithm="continuity",
+                    ),
+                    matcher_module.AlternativeMatch(
+                        episode="E1",
+                        start_time=30.0,
+                        end_time=31.0,
+                        confidence=0.66,
+                        speed_ratio=1.0,
+                        vote_count=12,
+                        algorithm="weighted_avg",
+                    ),
+                ],
+            ),
+        ]
+    )
+
+    result = AnimeMatcherService._recover_monotonic_boundary_alternatives(
+        scenes,
+        matches,
+    )
+
+    assert result.matches[0].start_time == 20.0
+    assert result.matches[0].end_time == 21.0
+    assert result.matches[0].alternatives[0].algorithm == "monotonic_direct"
+    assert result.matches[1].start_time == 30.0
+    assert result.matches[1].end_time == 31.0
+    assert result.matches[1].alternatives[0].algorithm == "monotonic_weighted_avg"
+
+
+def test_dense_non_monotonic_merge_requires_visual_support() -> None:
+    scenes = SceneList(
+        scenes=[
+            Scene(index=0, start_time=0.0, end_time=0.6),
+            Scene(index=1, start_time=0.6, end_time=1.45),
+            Scene(index=2, start_time=1.45, end_time=2.8),
+        ]
+    )
+    matches = MatchList(
+        matches=[
+            SceneMatch(
+                scene_index=0,
+                episode="E1",
+                start_time=20.0,
+                end_time=20.6,
+                confidence=0.8,
+                speed_ratio=1.0,
+            ),
+            SceneMatch(
+                scene_index=1,
+                episode="E1",
+                start_time=300.0,
+                end_time=300.85,
+                confidence=0.8,
+                speed_ratio=1.0,
+            ),
+            SceneMatch(
+                scene_index=2,
+                episode="E1",
+                start_time=500.0,
+                end_time=501.35,
+                confidence=0.8,
+                speed_ratio=1.0,
+            ),
+        ]
+    )
+
+    assert SceneMergerService._build_non_monotonic_dense_chains(
+        scenes,
+        matches,
+        {0: 0.41},
+    ) == []
+    assert SceneMergerService._build_non_monotonic_dense_chains(
+        scenes,
+        matches,
+        {0: 0.85},
+    ) == [[0, 1]]
+
+
+def test_dense_non_monotonic_merge_absorbs_short_backward_jump() -> None:
+    scenes = SceneList(
+        scenes=[
+            Scene(index=0, start_time=0.0, end_time=1.35),
+            Scene(index=1, start_time=1.35, end_time=2.25),
+            Scene(index=2, start_time=2.25, end_time=3.5),
+        ]
+    )
+    matches = MatchList(
+        matches=[
+            SceneMatch(
+                scene_index=0,
+                episode="E1",
+                start_time=680.0,
+                end_time=681.4,
+                confidence=0.8,
+                speed_ratio=1.0,
+            ),
+            SceneMatch(
+                scene_index=1,
+                episode="E1",
+                start_time=640.0,
+                end_time=640.9,
+                confidence=0.8,
+                speed_ratio=1.0,
+            ),
+            SceneMatch(
+                scene_index=2,
+                episode="E1",
+                start_time=700.0,
+                end_time=701.2,
+                confidence=0.8,
+                speed_ratio=1.0,
+            ),
+        ]
+    )
+
+    assert SceneMergerService._build_non_monotonic_dense_chains(
+        scenes,
+        matches,
+        {},
+    ) == [[0, 1]]
+
+
+def test_dense_non_monotonic_merge_absorbs_visual_short_medium_fragment() -> None:
+    scenes = SceneList(
+        scenes=[
+            Scene(index=0, start_time=0.0, end_time=0.95),
+            Scene(index=1, start_time=0.95, end_time=2.35),
+            Scene(index=2, start_time=2.35, end_time=3.6),
+            Scene(index=3, start_time=3.6, end_time=4.9),
+        ]
+    )
+    matches = MatchList(
+        matches=[
+            SceneMatch(
+                scene_index=0,
+                episode="E1",
+                start_time=953.70,
+                end_time=954.65,
+                confidence=0.8,
+                speed_ratio=1.0,
+            ),
+            SceneMatch(
+                scene_index=1,
+                episode="E1",
+                start_time=955.20,
+                end_time=956.60,
+                confidence=0.8,
+                speed_ratio=1.0,
+            ),
+            SceneMatch(
+                scene_index=2,
+                episode="E1",
+                start_time=962.0,
+                end_time=963.2,
+                confidence=0.8,
+                speed_ratio=1.0,
+            ),
+            SceneMatch(
+                scene_index=3,
+                episode="E1",
+                start_time=1100.0,
+                end_time=1101.3,
+                confidence=0.8,
+                speed_ratio=1.0,
+            ),
+        ]
+    )
+
+    assert SceneMergerService._build_non_monotonic_dense_chains(
+        scenes,
+        matches,
+        {0: 0.29},
+    ) == []
+    assert SceneMergerService._build_non_monotonic_dense_chains(
+        scenes,
+        matches,
+        {0: 0.33},
+    ) == [[0, 1]]
+
+
+def test_dense_visual_boundary_snap_selects_strong_local_cut() -> None:
+    scenes = _short_scenes(45)
+    moves = SceneMergerService._dense_visual_boundary_snap_candidates(
+        scenes,
+        [0.70, 1.00, 1.35],
+        [20.0, 30.0, 82.0],
+    )
+
+    assert moves == {0: 1.35}
+
+
+def test_dense_visual_boundary_snap_ignores_sparse_projects() -> None:
+    scenes = _short_scenes(20)
+    moves = SceneMergerService._dense_visual_boundary_snap_candidates(
+        scenes,
+        [0.70, 1.00, 1.35],
+        [20.0, 30.0, 82.0],
+    )
+
+    assert moves == {}
+
+
+def test_snap_dense_visual_boundaries_updates_adjacent_scene_edges(
+    monkeypatch,
+) -> None:
+    scenes = _short_scenes(45)
+    monkeypatch.setattr(
+        SceneMergerService,
+        "_video_frame_diffs",
+        classmethod(lambda cls, video_path: ([0.70, 1.00, 1.35], [20.0, 30.0, 82.0])),
+    )
+
+    snapped = SceneMergerService.snap_dense_visual_boundaries(
+        Path("/tmp/source.mp4"),
+        scenes,
+    )
+
+    assert snapped.scenes[0].end_time == 1.35
+    assert snapped.scenes[1].start_time == 1.35
+    assert scenes.scenes[0].end_time == 1.0
+    assert snapped.validate_continuity()
+
+
+def test_merge_scenes_preserves_same_episode_source_seed() -> None:
+    scenes = SceneList(
+        scenes=[
+            Scene(index=0, start_time=10.0, end_time=11.0),
+            Scene(index=1, start_time=11.0, end_time=12.4),
+        ]
+    )
+    matches = MatchList(
+        matches=[
+            SceneMatch(
+                scene_index=0,
+                episode="E1",
+                start_time=953.70,
+                end_time=954.65,
+                confidence=0.79,
+                speed_ratio=1.0,
+            ),
+            SceneMatch(
+                scene_index=1,
+                episode="E1",
+                start_time=955.20,
+                end_time=956.62,
+                confidence=0.84,
+                speed_ratio=1.0,
+            ),
+        ]
+    )
+
+    merged_scenes, merged_matches, _ = SceneMergerService.merge_scenes_and_matches(
+        scenes,
+        matches,
+        [[0, 1]],
+    )
+
+    assert [(scene.start_time, scene.end_time) for scene in merged_scenes.scenes] == [
+        (10.0, 12.4)
+    ]
+    assert merged_matches.matches[0].episode == "E1"
+    assert merged_matches.matches[0].start_time == 953.70
+    assert merged_matches.matches[0].end_time == 956.62
+    assert merged_matches.matches[0].was_no_match is False
+    assert merged_matches.matches[0].merged_from == [0, 1]
+
+
+def test_dense_promotion_prefers_tied_continuity_alternative() -> None:
+    scenes = _short_scenes(45)
+    matches = MatchList()
+    for index in range(45):
+        matches.matches.append(
+            SceneMatch(
+                scene_index=index,
+                episode="E1",
+                start_time=100.0 + index,
+                end_time=101.0 + index,
+                confidence=0.6,
+                speed_ratio=1.0,
+            )
+        )
+
+    target = matches.matches[40]
+    target.start_time = 908.0
+    target.end_time = 908.8
+    target.confidence = 0.77
+    target.alternatives = [
+        matcher_module.AlternativeMatch(
+            episode="E1",
+            start_time=906.65,
+            end_time=907.47,
+            confidence=0.77,
+            speed_ratio=1.0,
+            vote_count=1,
+            algorithm="continuity",
+        )
+    ]
+
+    result = AnimeMatcherService._promote_dense_short_alternatives(scenes, matches)
+
+    assert result.matches[40].start_time == 906.65
+    assert result.matches[40].end_time == 907.47
+
+
+def test_duration_consistent_weighted_alternative_can_adjust_nearby_bounds() -> None:
+    scenes = SceneList(
+        scenes=[Scene(index=0, start_time=0.0, end_time=0.62)]
+    )
+    matches = MatchList(
+        matches=[
+            SceneMatch(
+                scene_index=0,
+                episode="E1",
+                start_time=937.56,
+                end_time=938.02,
+                confidence=0.86,
+                speed_ratio=1.0,
+                alternatives=[
+                    matcher_module.AlternativeMatch(
+                        episode="E1",
+                        start_time=937.69,
+                        end_time=938.31,
+                        confidence=0.79,
+                        speed_ratio=1.0,
+                        vote_count=6,
+                        algorithm="weighted_avg",
+                    )
+                ],
+            )
+        ]
+    )
+
+    result = AnimeMatcherService._promote_duration_consistent_weighted_alternatives(
+        scenes,
+        matches,
+    )
+
+    assert result.matches[0].start_time == 937.69
+    assert result.matches[0].end_time == 938.31
+
+
+def test_underfilled_source_interval_can_extend_to_supported_end() -> None:
+    scenes = SceneList(
+        scenes=[Scene(index=0, start_time=0.0, end_time=5.16)]
+    )
+    matches = MatchList(
+        matches=[
+            SceneMatch(
+                scene_index=0,
+                episode="E1",
+                start_time=653.0,
+                end_time=657.0,
+                confidence=0.50,
+                speed_ratio=1.29,
+                start_candidates=[
+                    MatchCandidate(
+                        episode="E1",
+                        timestamp=653.0,
+                        similarity=0.46,
+                        series="Series",
+                    )
+                ],
+                end_candidates=[
+                    MatchCandidate(
+                        episode="E1",
+                        timestamp=658.0,
+                        similarity=0.44,
+                        series="Series",
+                    )
+                ],
+            )
+        ]
+    )
+
+    result = AnimeMatcherService._extend_underfilled_source_end_candidates(
+        scenes,
+        matches,
+    )
+
+    assert result.matches[0].start_time == 653.0
+    assert result.matches[0].end_time == 658.0
+    assert result.matches[0].alternatives[0].algorithm == "duration_end"
+
+
+def test_monotonic_speed_floor_can_extend_short_alternative() -> None:
+    scenes = _short_scenes(12)
+    scenes.scenes[5].start_time = 5.0
+    scenes.scenes[5].end_time = 6.3
+    matches = MatchList()
+    for index in range(12):
+        start_time = 10.0 + index * 3.0
+        matches.matches.append(
+            SceneMatch(
+                scene_index=index,
+                episode="E1",
+                start_time=start_time,
+                end_time=start_time + 1.3,
+                confidence=0.70,
+                speed_ratio=1.0,
+            )
+        )
+
+    target = matches.matches[5]
+    target.start_time = 696.5
+    target.end_time = 697.8
+    target.alternatives = [
+        matcher_module.AlternativeMatch(
+            episode="E1",
+            start_time=698.5,
+            end_time=700.0,
+            confidence=0.56,
+            speed_ratio=0.87,
+            vote_count=12,
+            algorithm="weighted_avg",
+        )
+    ]
+    target.end_candidates = [
+        MatchCandidate(
+            episode="E1",
+            timestamp=700.0,
+            similarity=0.48,
+            series="Series",
+        )
+    ]
+
+    result = AnimeMatcherService._extend_monotonic_speed_floor_alternatives(
+        scenes,
+        matches,
+    )
+
+    assert result.matches[5].start_time == 698.5
+    assert result.matches[5].end_time == 700.5
+    assert result.matches[5].alternatives[0].algorithm == "monotonic_speed_floor"
+
+
+def test_short_end_projection_can_use_strong_start_anchor() -> None:
+    scenes = SceneList(
+        scenes=[Scene(index=0, start_time=0.0, end_time=0.88)]
+    )
+    matches = MatchList(
+        matches=[
+            SceneMatch(
+                scene_index=0,
+                episode="E1",
+                start_time=739.56,
+                end_time=740.44,
+                confidence=0.85,
+                speed_ratio=1.0,
+                alternatives=[
+                    matcher_module.AlternativeMatch(
+                        episode="E1",
+                        start_time=739.56,
+                        end_time=740.44,
+                        confidence=0.85,
+                        speed_ratio=1.0,
+                        vote_count=1,
+                        algorithm="end",
+                    )
+                ],
+                start_candidates=[
+                    MatchCandidate(
+                        episode="E1",
+                        timestamp=736.0,
+                        similarity=0.83,
+                        series="Series",
+                    )
+                ],
+                middle_candidates=[
+                    MatchCandidate(
+                        episode="E1",
+                        timestamp=736.5,
+                        similarity=0.84,
+                        series="Series",
+                    )
+                ],
+            )
+        ]
+    )
+
+    result = AnimeMatcherService._promote_short_end_projection_start_anchors(
+        scenes,
+        matches,
+    )
+
+    assert result.matches[0].start_time == 736.0
+    assert result.matches[0].end_time == 736.88
+    assert result.matches[0].alternatives[0].algorithm == "start_anchor"
+
+
+def test_dense_local_source_outlier_promotes_bracketed_alternative() -> None:
+    scenes = _short_scenes(45)
+    matches = MatchList()
+    for index in range(45):
+        start_time = 900.0 + index * 3.0
+        matches.matches.append(
+            SceneMatch(
+                scene_index=index,
+                episode="E1",
+                start_time=start_time,
+                end_time=start_time + 1.0,
+                confidence=0.70,
+                speed_ratio=1.0,
+            )
+        )
+
+    matches.matches[19].start_time = 705.45
+    matches.matches[19].end_time = 706.55
+    matches.matches[20].start_time = 628.5
+    matches.matches[20].end_time = 630.0
+    matches.matches[20].confidence = 0.68
+    matches.matches[20].alternatives = [
+        matcher_module.AlternativeMatch(
+            episode="E1",
+            start_time=628.5,
+            end_time=630.0,
+            confidence=0.68,
+            speed_ratio=1.0,
+            vote_count=1,
+            algorithm="end",
+        ),
+        matcher_module.AlternativeMatch(
+            episode="E1",
+            start_time=716.0,
+            end_time=717.5,
+            confidence=0.42,
+            speed_ratio=1.0,
+            vote_count=1,
+            algorithm="end",
+        ),
+    ]
+    matches.matches[21].start_time = 718.22
+    matches.matches[21].end_time = 718.80
+
+    result = AnimeMatcherService._promote_dense_local_source_alternatives(
+        scenes,
+        matches,
+    )
+
+    assert result.matches[20].start_time == 716.0
+    assert result.matches[20].end_time == 717.5
+    assert result.matches[20].alternatives[0].algorithm == "local_bracket"
+
+
+def test_dense_local_source_gap_prefers_high_vote_earlier_alternative() -> None:
+    scenes = _short_scenes(45)
+    scenes.scenes[30].start_time = 30.0
+    scenes.scenes[30].end_time = 30.85
+    matches = MatchList()
+    for index in range(45):
+        start_time = 900.0 + index * 3.0
+        matches.matches.append(
+            SceneMatch(
+                scene_index=index,
+                episode="E1",
+                start_time=start_time,
+                end_time=start_time + 1.0,
+                confidence=0.70,
+                speed_ratio=1.0,
+            )
+        )
+
+    matches.matches[29].start_time = 747.58
+    matches.matches[29].end_time = 748.46
+    matches.matches[30].start_time = 750.50
+    matches.matches[30].end_time = 751.35
+    matches.matches[30].confidence = 0.97
+    matches.matches[30].alternatives = [
+        matcher_module.AlternativeMatch(
+            episode="E1",
+            start_time=750.50,
+            end_time=751.35,
+            confidence=0.97,
+            speed_ratio=1.0,
+            vote_count=1,
+            algorithm="continuity",
+        ),
+        matcher_module.AlternativeMatch(
+            episode="E1",
+            start_time=749.58,
+            end_time=750.43,
+            confidence=0.57,
+            speed_ratio=1.0,
+            vote_count=14,
+            algorithm="weighted_avg",
+        ),
+    ]
+    matches.matches[31].start_time = 752.65
+    matches.matches[31].end_time = 754.0
+
+    result = AnimeMatcherService._promote_dense_local_source_alternatives(
+        scenes,
+        matches,
+    )
+
+    assert result.matches[30].start_time == 749.58
+    assert result.matches[30].end_time == 750.43
+    assert result.matches[30].alternatives[0].algorithm == "local_gap"
 
 
 def test_finalized_primary_is_visible_as_candidate() -> None:

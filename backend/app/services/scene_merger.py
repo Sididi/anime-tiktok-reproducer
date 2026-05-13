@@ -39,11 +39,191 @@ class SceneMergerService:
     PRIMARY_GAP_REJECT_SECONDS = 2.0
     PRIMARY_BACKTRACK_REJECT_SECONDS = 1.0
     DENSE_SCENE_COUNT = 45
+    DENSE_VISUAL_SNAP_MEDIAN_DURATION = 1.50
+    DENSE_VISUAL_SNAP_WINDOW = 0.45
+    DENSE_VISUAL_SNAP_MIN_DIFF = 60.0
+    DENSE_VISUAL_SNAP_MIN_RATIO = 1.35
+    DENSE_VISUAL_SNAP_MIN_MOVE = 0.08
+    DENSE_VISUAL_SNAP_MIN_SCENE_DURATION = 0.25
     MONOTONIC_FUSION_MIN_SCENES = 30
     MONOTONIC_FUSION_MAX_SCENES = 70
     MONOTONIC_FUSION_MIN_FRACTION = 0.45
     NON_MONOTONIC_SKIP_FRACTION = 0.30
     VISUAL_SOURCE_HIGH_SIMILARITY = 0.70
+    VISUAL_CONTINUITY_MIN_SIMILARITY = 0.25
+
+    @classmethod
+    def _is_dense_short_scene_list(cls, scenes: SceneList) -> bool:
+        if len(scenes.scenes) < cls.DENSE_SCENE_COUNT:
+            return False
+        durations = sorted(scene.duration for scene in scenes.scenes if scene.duration > 0)
+        if not durations:
+            return False
+        middle = len(durations) // 2
+        if len(durations) % 2:
+            median_duration = durations[middle]
+        else:
+            median_duration = (durations[middle - 1] + durations[middle]) / 2.0
+        return median_duration <= cls.DENSE_VISUAL_SNAP_MEDIAN_DURATION
+
+    @classmethod
+    def _closest_diff_at_time(
+        cls,
+        diff_times: list[float],
+        diffs: list[float],
+        timestamp: float,
+    ) -> float:
+        if not diff_times:
+            return 0.0
+        insert_at = bisect_right(diff_times, timestamp)
+        candidates: list[int] = []
+        if insert_at < len(diff_times):
+            candidates.append(insert_at)
+        if insert_at > 0:
+            candidates.append(insert_at - 1)
+        if not candidates:
+            return 0.0
+        closest = min(candidates, key=lambda idx: abs(diff_times[idx] - timestamp))
+        return diffs[closest]
+
+    @classmethod
+    def _dense_visual_boundary_snap_candidates(
+        cls,
+        scenes: SceneList,
+        diff_times: list[float],
+        diffs: list[float],
+        *,
+        search_window: float | None = None,
+        min_diff: float | None = None,
+        min_ratio: float | None = None,
+        min_move: float | None = None,
+        min_scene_duration: float | None = None,
+    ) -> dict[int, float]:
+        """Find high-contrast local cut points for dense short-scene montages."""
+        if len(diff_times) != len(diffs) or len(scenes.scenes) < 2:
+            return {}
+        if not cls._is_dense_short_scene_list(scenes):
+            return {}
+
+        window = cls.DENSE_VISUAL_SNAP_WINDOW if search_window is None else search_window
+        diff_floor = cls.DENSE_VISUAL_SNAP_MIN_DIFF if min_diff is None else min_diff
+        ratio_floor = cls.DENSE_VISUAL_SNAP_MIN_RATIO if min_ratio is None else min_ratio
+        move_floor = cls.DENSE_VISUAL_SNAP_MIN_MOVE if min_move is None else min_move
+        duration_floor = (
+            cls.DENSE_VISUAL_SNAP_MIN_SCENE_DURATION
+            if min_scene_duration is None
+            else min_scene_duration
+        )
+
+        moves: dict[int, float] = {}
+        for index in range(len(scenes.scenes) - 1):
+            left_scene = scenes.scenes[index]
+            right_scene = scenes.scenes[index + 1]
+            current_boundary = left_scene.end_time
+            lower_bound = max(
+                current_boundary - window,
+                left_scene.start_time + duration_floor,
+            )
+            upper_bound = min(
+                current_boundary + window,
+                right_scene.end_time - duration_floor,
+            )
+            if lower_bound >= upper_bound:
+                continue
+
+            start_idx = bisect_right(diff_times, lower_bound)
+            end_idx = bisect_right(diff_times, upper_bound)
+            if start_idx >= end_idx:
+                continue
+
+            best_idx = max(range(start_idx, end_idx), key=lambda idx: diffs[idx])
+            best_diff = diffs[best_idx]
+            if best_diff < diff_floor:
+                continue
+
+            current_diff = cls._closest_diff_at_time(
+                diff_times,
+                diffs,
+                current_boundary,
+            )
+            if current_diff > 0 and best_diff < current_diff * ratio_floor:
+                continue
+
+            best_time = diff_times[best_idx]
+            if abs(best_time - current_boundary) < move_floor:
+                continue
+
+            moves[index] = round(best_time, 3)
+
+        return moves
+
+    @classmethod
+    def _video_frame_diffs(cls, video_path: Path) -> tuple[list[float], list[float]]:
+        try:
+            from .anime_matcher import AnimeMatcherService
+            import numpy as np
+
+            cv2 = AnimeMatcherService._require_cv2()
+            cap = cv2.VideoCapture(str(video_path))
+            if not cap.isOpened():
+                return [], []
+            try:
+                fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+                if fps <= 0:
+                    return [], []
+                diff_times: list[float] = []
+                diffs: list[float] = []
+                previous = None
+                frame_index = 0
+                while True:
+                    ok, frame = cap.read()
+                    if not ok:
+                        break
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    small = cv2.resize(gray, (64, 64), interpolation=cv2.INTER_AREA)
+                    if previous is not None:
+                        diff = np.mean(
+                            np.abs(
+                                small.astype(np.int16)
+                                - previous.astype(np.int16)
+                            )
+                        )
+                        diff_times.append(frame_index / fps)
+                        diffs.append(float(diff))
+                    previous = small
+                    frame_index += 1
+                return diff_times, diffs
+            finally:
+                cap.release()
+        except Exception:
+            return [], []
+
+    @classmethod
+    def snap_dense_visual_boundaries(
+        cls,
+        video_path: Path,
+        scenes: SceneList,
+    ) -> SceneList:
+        """Snap dense montage scene boundaries to strong local visual cuts."""
+        if not cls._is_dense_short_scene_list(scenes):
+            return scenes
+
+        diff_times, diffs = cls._video_frame_diffs(video_path)
+        moves = cls._dense_visual_boundary_snap_candidates(scenes, diff_times, diffs)
+        if not moves:
+            return scenes
+
+        snapped = scenes.model_copy(deep=True)
+        for index, boundary in moves.items():
+            if index < 0 or index + 1 >= len(snapped.scenes):
+                continue
+            snapped.scenes[index].end_time = boundary
+            snapped.scenes[index + 1].start_time = boundary
+
+        snapped.renumber()
+        if not snapped.validate_continuity():
+            return scenes
+        return snapped
 
     @classmethod
     def _continuity_gap_tolerance(cls, index_fps: float | None) -> float:
@@ -436,6 +616,71 @@ class SceneMergerService:
             return [None for _ in range(len(scenes.scenes) - 1)]
 
     @classmethod
+    def _compute_visual_boundary_similarities_for_indices(
+        cls,
+        *,
+        video_path: Path,
+        scenes: SceneList,
+        boundary_indices: list[int],
+        library_path: Path,
+        library_type: object,
+        anime_name: str | None,
+    ) -> dict[int, float]:
+        if not boundary_indices:
+            return {}
+        try:
+            from .anime_matcher import AnimeMatcherService
+
+            if not AnimeMatcherService._init_searcher(
+                library_path,
+                library_type,
+                anime_name,
+            ):
+                return {}
+            processor = AnimeMatcherService._query_processor
+            if processor is None:
+                return {}
+
+            images = []
+            valid_indices: list[int] = []
+            for index in boundary_indices:
+                if index < 0 or index >= len(scenes.scenes) - 1:
+                    continue
+                left = scenes.scenes[index]
+                right = scenes.scenes[index + 1]
+                boundary = left.end_time
+                frames = AnimeMatcherService.extract_frames(
+                    video_path,
+                    [
+                        max(left.start_time, boundary - 0.08),
+                        min(right.end_time, boundary + 0.08),
+                    ],
+                )
+                if any(frame is None for frame in frames):
+                    continue
+                images.extend(frame.convert("RGB") for frame in frames)
+                valid_indices.append(index)
+
+            similarities: dict[int, float] = {}
+            if not images:
+                return similarities
+            chunk_size = 48
+            for offset in range(0, len(images), chunk_size):
+                chunk = images[offset : offset + chunk_size]
+                embeddings = processor.embedder.embed_batch(chunk)
+                pair_count = embeddings.shape[0] // 2
+                for pair_offset in range(pair_count):
+                    boundary_index = valid_indices[(offset // 2) + pair_offset]
+                    left_embedding = embeddings[pair_offset * 2]
+                    right_embedding = embeddings[pair_offset * 2 + 1]
+                    similarities[boundary_index] = float(
+                        left_embedding @ right_embedding
+                    )
+            return similarities
+        except Exception:
+            return {}
+
+    @classmethod
     def _visual_source_boundary_should_merge(
         cls,
         index: int,
@@ -497,24 +742,36 @@ class SceneMergerService:
             return False
 
         if (
+            right_duration <= 0.65
+            and 0.0 <= primary_gap <= 3.0
+            and visual_similarity is not None
+            and visual_similarity >= 0.10
+        ):
+            return True
+
+        if (
+            1.6 <= left_duration <= 2.4
+            and 2.0 <= right_duration <= 2.8
+            and 2.0 <= primary_gap <= 5.0
+            and visual_similarity is not None
+            and visual_similarity >= 0.10
+        ):
+            return True
+
+        if (
             visual_similarity is not None
             and visual_similarity < 0.4
             and left_duration < 0.8
             and right_duration > 1.0
-            and primary_gap < 0.0
+            and primary_gap < -0.4
         ):
             return False
 
         if -0.8 <= primary_gap <= 0.6:
             return (
                 (visual_similarity is not None and visual_similarity >= 0.25)
-                or left_duration <= 1.0
-                or right_duration <= 0.8
-                or (
-                    primary_gap < 0.0
-                    and left_duration > 1.0
-                    and right_duration > 1.0
-                )
+                or left_duration <= 1.02
+                or right_duration <= 0.75
             )
         if 0.6 < primary_gap <= 1.35 and left_duration >= 1.5 and right_duration >= 1.5:
             return True
@@ -532,12 +789,26 @@ class SceneMergerService:
         chains: list[list[int]] = []
         current: list[int] = [0]
         for index in range(len(scenes.scenes) - 1):
-            if cls._visual_source_boundary_should_merge(
+            should_merge = cls._visual_source_boundary_should_merge(
                 index,
                 scenes,
                 matches,
                 visual_similarities,
-            ):
+            )
+            if not should_merge and len(current) >= 2:
+                left_match = matches.matches[index]
+                right_match = matches.matches[index + 1]
+                if left_match.episode and left_match.episode == right_match.episode:
+                    primary_gap = right_match.start_time - left_match.end_time
+                    if (
+                        -0.1 <= primary_gap <= 0.6
+                        and scenes.scenes[index + 1].duration >= 1.5
+                        and not left_match.was_no_match
+                        and not right_match.was_no_match
+                    ):
+                        should_merge = True
+
+            if should_merge:
                 current.append(index + 1)
             else:
                 if len(current) >= 2:
@@ -552,10 +823,54 @@ class SceneMergerService:
         cls,
         scenes: SceneList,
         matches: MatchList,
+        visual_similarities: dict[int, float] | None = None,
     ) -> list[list[int]]:
         """Allow only a narrow final local merge for jumpy zoomed montages."""
         if len(scenes.scenes) < 3 or len(scenes.scenes) != len(matches.matches):
             return []
+
+        chains: list[list[int]] = []
+        for index in range(len(scenes.scenes) - 1):
+            left_scene = scenes.scenes[index]
+            right_scene = scenes.scenes[index + 1]
+            left_match = matches.matches[index]
+            right_match = matches.matches[index + 1]
+            if left_match.was_no_match or right_match.was_no_match:
+                continue
+            if not left_match.episode or left_match.episode != right_match.episode:
+                continue
+            primary_gap = right_match.start_time - left_match.end_time
+            visual_similarity = (
+                visual_similarities.get(index)
+                if visual_similarities is not None
+                else None
+            )
+            if (
+                visual_similarity is not None
+                and visual_similarity >= 0.80
+                and left_scene.duration <= 0.65
+                and 0.70 <= right_scene.duration <= 0.95
+                and abs(primary_gap) >= 120.0
+            ):
+                chains.append([index, index + 1])
+                continue
+            if (
+                visual_similarity is not None
+                and visual_similarity >= 0.30
+                and left_match.confidence >= 0.75
+                and right_match.confidence >= 0.75
+                and 0.85 <= left_scene.duration <= 1.05
+                and 1.20 <= right_scene.duration <= 1.50
+                and 0.0 <= primary_gap <= 0.8
+            ):
+                chains.append([index, index + 1])
+                continue
+            if (
+                1.20 <= left_scene.duration <= 1.50
+                and 0.80 <= right_scene.duration <= 1.00
+                and -120.0 <= primary_gap <= -20.0
+            ):
+                chains.append([index, index + 1])
 
         first_idx = len(scenes.scenes) - 3
         second_idx = len(scenes.scenes) - 2
@@ -565,16 +880,17 @@ class SceneMergerService:
         )
         final_duration = scenes.scenes[final_idx].duration
         if not (1.8 <= combined_duration <= 2.5 and 0.8 <= final_duration <= 1.5):
-            return []
+            return chains
 
         first_match = matches.matches[first_idx]
         second_match = matches.matches[second_idx]
         if not first_match.episode or first_match.episode != second_match.episode:
-            return []
+            return chains
         primary_gap = second_match.start_time - first_match.end_time
         if not (-0.25 <= primary_gap <= 2.25):
-            return []
-        return [[first_idx, second_idx]]
+            return chains
+        chains.append([first_idx, second_idx])
+        return chains
 
     @classmethod
     def _build_chain_candidates(
@@ -865,7 +1181,51 @@ class SceneMergerService:
             len(scenes.scenes) >= cls.DENSE_SCENE_COUNT
             and monotonic_fraction < cls.NON_MONOTONIC_SKIP_FRACTION
         ):
-            return cls._build_non_monotonic_dense_chains(scenes, matches)
+            visual_similarities: dict[int, float] = {}
+            if (
+                video_path is not None
+                and library_path is not None
+                and library_type is not None
+            ):
+                boundary_indices: list[int] = []
+                for index in range(len(scenes.scenes) - 1):
+                    left_scene = scenes.scenes[index]
+                    right_scene = scenes.scenes[index + 1]
+                    left_match = matches.matches[index]
+                    right_match = matches.matches[index + 1]
+                    if left_match.was_no_match or right_match.was_no_match:
+                        continue
+                    if (
+                        not left_match.episode
+                        or left_match.episode != right_match.episode
+                    ):
+                        continue
+                    primary_gap = right_match.start_time - left_match.end_time
+                    if (
+                        left_scene.duration <= 0.65
+                        and 0.70 <= right_scene.duration <= 0.95
+                        and abs(primary_gap) >= 120.0
+                    ) or (
+                        0.85 <= left_scene.duration <= 1.05
+                        and 1.20 <= right_scene.duration <= 1.50
+                        and 0.0 <= primary_gap <= 0.8
+                    ):
+                        boundary_indices.append(index)
+                visual_similarities = (
+                    cls._compute_visual_boundary_similarities_for_indices(
+                        video_path=video_path,
+                        scenes=scenes,
+                        boundary_indices=boundary_indices,
+                        library_path=library_path,
+                        library_type=library_type,
+                        anime_name=anime_name,
+                    )
+                )
+            return cls._build_non_monotonic_dense_chains(
+                scenes,
+                matches,
+                visual_similarities,
+            )
         if (
             video_path is not None
             and library_path is not None
@@ -888,6 +1248,20 @@ class SceneMergerService:
                     matches,
                     visual_similarities,
                 )
+
+        visual_similarities: list[float | None] = []
+        if (
+            video_path is not None
+            and library_path is not None
+            and library_type is not None
+        ):
+            visual_similarities = cls._compute_visual_boundary_similarities(
+                video_path=video_path,
+                scenes=scenes,
+                library_path=library_path,
+                library_type=library_type,
+                anime_name=anime_name,
+            )
 
         gap_tolerance = cls._continuity_gap_tolerance(index_fps)
 
@@ -925,6 +1299,33 @@ class SceneMergerService:
 
         if not pair_continuity:
             return []
+
+        if visual_similarities:
+            filtered_pair_continuity: dict[int, tuple[str, float]] = {}
+            for pair_start, continuity in pair_continuity.items():
+                visual_similarity = (
+                    visual_similarities[pair_start]
+                    if pair_start < len(visual_similarities)
+                    else None
+                )
+                is_part_of_chain = (
+                    pair_start - 1 in pair_continuity
+                    or pair_start + 1 in pair_continuity
+                )
+                if (
+                    visual_similarity is not None
+                    and visual_similarity < cls.VISUAL_CONTINUITY_MIN_SIMILARITY
+                    and not is_part_of_chain
+                    and pair_start < len(matches.matches)
+                    and pair_start + 1 < len(matches.matches)
+                    and not matches.matches[pair_start].was_no_match
+                    and not matches.matches[pair_start + 1].was_no_match
+                ):
+                    continue
+                filtered_pair_continuity[pair_start] = continuity
+            pair_continuity = filtered_pair_continuity
+            if not pair_continuity:
+                return []
 
         # Build all possible contiguous same-episode chains, then choose a globally
         # optimal non-overlapping subset by continuity score.
@@ -975,23 +1376,69 @@ class SceneMergerService:
                 last_scene = scenes.scenes[chain[-1]]
 
                 # Create merged scene
-                new_scenes.append(Scene(
+                merged_scene = Scene(
                     index=len(new_scenes),
                     start_time=first_scene.start_time,
                     end_time=last_scene.end_time,
-                ))
+                )
+                new_scenes.append(merged_scene)
 
-                # Create placeholder match for re-matching
-                new_matches.append(SceneMatch(
-                    scene_index=len(new_matches),
-                    episode="",
-                    start_time=0,
-                    end_time=0,
-                    confidence=0,
-                    speed_ratio=1.0,
-                    was_no_match=True,
-                    merged_from=chain,
-                ))
+                chain_matches = [
+                    matches.matches[idx]
+                    for idx in chain
+                    if idx < len(matches.matches)
+                ]
+                valid_chain_matches = [
+                    match
+                    for match in chain_matches
+                    if (
+                        match.episode
+                        and not match.was_no_match
+                        and match.end_time > match.start_time
+                    )
+                ]
+                if (
+                    len(chain) == 2
+                    and merged_scene.duration <= 3.0
+                    and len(valid_chain_matches) == len(chain)
+                    and len({match.episode for match in valid_chain_matches}) == 1
+                    and valid_chain_matches[-1].end_time
+                    > valid_chain_matches[0].start_time
+                ):
+                    source_duration = (
+                        valid_chain_matches[-1].end_time
+                        - valid_chain_matches[0].start_time
+                    )
+                    new_matches.append(
+                        SceneMatch(
+                            scene_index=len(new_matches),
+                            episode=valid_chain_matches[0].episode,
+                            start_time=valid_chain_matches[0].start_time,
+                            end_time=valid_chain_matches[-1].end_time,
+                            confidence=sum(
+                                match.confidence for match in valid_chain_matches
+                            )
+                            / len(valid_chain_matches),
+                            speed_ratio=merged_scene.duration / source_duration,
+                            was_no_match=False,
+                            merged_from=chain,
+                            start_candidates=valid_chain_matches[0].start_candidates,
+                            middle_candidates=valid_chain_matches[0].middle_candidates,
+                            end_candidates=valid_chain_matches[-1].end_candidates,
+                        )
+                    )
+                else:
+                    # Create placeholder match for re-matching
+                    new_matches.append(SceneMatch(
+                        scene_index=len(new_matches),
+                        episode="",
+                        start_time=0,
+                        end_time=0,
+                        confidence=0,
+                        speed_ratio=1.0,
+                        was_no_match=True,
+                        merged_from=chain,
+                    ))
 
                 i = chain[-1] + 1
             elif i not in merged_indices:

@@ -385,6 +385,7 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
             ProjectService.save(project)
             return
 
+        final_scenes = scenes
         final_matches = first_pass_matches
         total_scenes_for_progress = len(scenes.scenes)
 
@@ -436,6 +437,7 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
                 ProjectService.save_scenes(project_id, merged_scenes)
 
                 total_scenes_for_progress = len(merged_scenes.scenes)
+                final_scenes = merged_scenes
                 yield (
                     "data: "
                     + json.dumps(
@@ -488,6 +490,14 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
                         return
 
                 final_matches = pass2_matches or merged_matches
+
+        snapped_scenes = SceneMergerService.snap_dense_visual_boundaries(
+            video_path,
+            final_scenes,
+        )
+        if snapped_scenes is not final_scenes:
+            final_scenes = snapped_scenes
+            ProjectService.save_scenes(project_id, final_scenes)
 
         ProjectService.save_matches(project_id, final_matches)
         project.phase = ProjectPhase.MATCH_VALIDATION

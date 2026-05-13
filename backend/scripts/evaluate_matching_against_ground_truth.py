@@ -160,6 +160,11 @@ async def _generate(
                 pass2.matches[i].merged_from = merged_matches.matches[i].merged_from
             final_matches = pass2
 
+    final_scenes = SceneMergerService.snap_dense_visual_boundaries(
+        video_path,
+        final_scenes,
+    )
+
     elapsed = time.perf_counter() - start_clock
     return GeneratedResult(final_scenes, final_matches, elapsed)
 
