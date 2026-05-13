@@ -77,6 +77,10 @@ class AnimeMatcherService:
         dict[str, Path],
     ] = {}
     _crop_index_memory_cache: dict[str, dict[str, np.ndarray | str]] = {}
+    # Per-(video signature, native frame index) cache of SSCD embeddings for
+    # TikTok frames. Reused across passes when scene re-matching lands on a
+    # frame index that was already embedded in an earlier pass.
+    _video_frame_embedding_cache: dict[tuple[str, int, int, int], np.ndarray] = {}
     CROP_INDEX_VERSION = "crop-v4-seeded-portrait-source-0_5fps"
     CROP_INDEX_FPS = 0.5
     CROP_INDEX_BATCH_SIZE = 24
@@ -323,19 +327,78 @@ class AnimeMatcherService:
         """
         cv2 = cls._require_cv2()
         cap = cv2.VideoCapture(str(video_path))
-        frames: list[Image.Image | None] = []
         try:
-            for timestamp in timestamps:
-                cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, timestamp) * 1000)
-                ret, frame = cap.read()
-                if not ret:
-                    frames.append(None)
-                    continue
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frames.append(Image.fromarray(frame_rgb))
-            return frames
+            return cls._extract_frames_from_capture(cap, timestamps)
         finally:
             cap.release()
+
+    @classmethod
+    def _extract_frames_from_capture(
+        cls,
+        cap,
+        timestamps: list[float],
+    ) -> list[Image.Image | None]:
+        """Decode frames at the given timestamps using one ordered seek+grab pass.
+
+        Replaces the naive ``cap.set(POS_MSEC) + cap.read()`` per-timestamp pattern,
+        which forces a full keyframe seek per sample. We sort the targets, seek
+        once to the first frame, then ``cap.grab()`` forward to subsequent
+        targets. Identical pixels, far fewer container/codec restarts.
+        """
+        cv2 = cls._require_cv2()
+        frames: list[Image.Image | None] = [None] * len(timestamps)
+        if not timestamps:
+            return frames
+
+        native_fps = cap.get(cv2.CAP_PROP_FPS)
+        if not native_fps or native_fps <= 0:
+            for index, timestamp in enumerate(timestamps):
+                cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, float(timestamp)) * 1000.0)
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames[index] = Image.fromarray(frame_rgb)
+            return frames
+
+        ordered_targets = sorted(
+            enumerate(timestamps),
+            key=lambda item: max(0.0, float(item[1])),
+        )
+
+        next_frame_index = 0
+        last_frame_index = -1
+        last_image: Image.Image | None = None
+        for original_index, raw_timestamp in ordered_targets:
+            timestamp = max(0.0, float(raw_timestamp))
+            target_frame_index = max(0, int(round(timestamp * float(native_fps))))
+            if target_frame_index == last_frame_index:
+                frames[original_index] = (
+                    last_image.copy() if last_image is not None else None
+                )
+                continue
+
+            if target_frame_index < next_frame_index:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame_index)
+                next_frame_index = target_frame_index
+
+            while next_frame_index < target_frame_index:
+                if not cap.grab():
+                    break
+                next_frame_index += 1
+            ret, frame = cap.read()
+            if ret:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                image = Image.fromarray(frame_rgb)
+            else:
+                image = None
+
+            last_frame_index = target_frame_index
+            last_image = image
+            next_frame_index = target_frame_index + 1
+            frames[original_index] = image
+
+        return frames
 
     @staticmethod
     def _scene_probe_times(scene: Scene) -> tuple[float, float, float]:
@@ -356,21 +419,62 @@ class AnimeMatcherService:
         scene_items: list[tuple[int, Scene]],
     ) -> dict[int, tuple[Image.Image | None, Image.Image | None, Image.Image | None]]:
         """Extract all start/middle/end probe frames using one ordered capture pass."""
+        frames, _ = cls._extract_scene_probe_frames_with_indices(video_path, scene_items)
+        return frames
+
+    @classmethod
+    def _extract_scene_probe_frames_with_indices(
+        cls,
+        video_path: Path,
+        scene_items: list[tuple[int, Scene]],
+    ) -> tuple[
+        dict[int, tuple[Image.Image | None, Image.Image | None, Image.Image | None]],
+        dict[int, tuple[int | None, int | None, int | None]],
+    ]:
+        """Same as :meth:`_extract_scene_probe_frames` but also reports the native
+        source frame index decoded for each (scene, position).
+
+        The frame indices are used as keys for the cross-pass probe-embedding
+        cache so that re-matching a scene whose probes land on the same source
+        frame skips both decode and embedding.
+        """
         cv2 = cls._require_cv2()
         cap = cv2.VideoCapture(str(video_path))
         frames_by_scene: dict[
             int,
             tuple[Image.Image | None, Image.Image | None, Image.Image | None],
         ] = {}
+        indices_by_scene: dict[
+            int,
+            tuple[int | None, int | None, int | None],
+        ] = {}
         try:
             targets: list[tuple[float, int, int]] = []
             for scene_index, scene in scene_items:
                 frames_by_scene[scene_index] = (None, None, None)
+                indices_by_scene[scene_index] = (None, None, None)
                 for position, timestamp in enumerate(cls._scene_probe_times(scene)):
                     targets.append((max(0.0, timestamp), scene_index, position))
             targets.sort(key=lambda item: item[0])
 
             native_fps = cap.get(cv2.CAP_PROP_FPS)
+
+            def assign(scene_index: int, position: int, image, frame_idx) -> None:
+                scene_frames = list(frames_by_scene[scene_index])
+                scene_frames[position] = image
+                frames_by_scene[scene_index] = (
+                    scene_frames[0],
+                    scene_frames[1],
+                    scene_frames[2],
+                )
+                scene_indices = list(indices_by_scene[scene_index])
+                scene_indices[position] = frame_idx
+                indices_by_scene[scene_index] = (
+                    scene_indices[0],
+                    scene_indices[1],
+                    scene_indices[2],
+                )
+
             if not native_fps or native_fps <= 0:
                 for timestamp, scene_index, position in targets:
                     cap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
@@ -380,14 +484,8 @@ class AnimeMatcherService:
                         if ret
                         else None
                     )
-                    scene_frames = list(frames_by_scene[scene_index])
-                    scene_frames[position] = image
-                    frames_by_scene[scene_index] = (
-                        scene_frames[0],
-                        scene_frames[1],
-                        scene_frames[2],
-                    )
-                return frames_by_scene
+                    assign(scene_index, position, image, None)
+                return frames_by_scene, indices_by_scene
 
             next_frame_index = 0
             last_frame_index = -1
@@ -414,16 +512,10 @@ class AnimeMatcherService:
                     last_image = image
                     next_frame_index = target_frame_index + 1
 
-                scene_frames = list(frames_by_scene[scene_index])
-                scene_frames[position] = image
-                frames_by_scene[scene_index] = (
-                    scene_frames[0],
-                    scene_frames[1],
-                    scene_frames[2],
-                )
+                assign(scene_index, position, image, target_frame_index)
         finally:
             cap.release()
-        return frames_by_scene
+        return frames_by_scene, indices_by_scene
 
     @staticmethod
     def _search_result_to_candidates(results) -> list[MatchCandidate]:
@@ -450,11 +542,22 @@ class AnimeMatcherService:
         flip: bool,
         series: str | None,
         batch_size: int = 48,
+        video_path: Path | None = None,
+        probe_frame_indices: dict[
+            int,
+            tuple[int | None, int | None, int | None],
+        ] | None = None,
     ) -> dict[
         int,
         tuple[list[MatchCandidate], list[MatchCandidate], list[MatchCandidate]],
     ]:
-        """Search direct SSCD candidates for all scene probe frames in chunks."""
+        """Search direct SSCD candidates for all scene probe frames in chunks.
+
+        When ``video_path`` and ``probe_frame_indices`` are provided, embeddings
+        are cached at (video signature, native frame index) granularity and
+        reused across passes — useful when scene re-matching after a merge
+        lands on a probe frame that was already embedded in pass 1.
+        """
         flat_images: list[Image.Image] = []
         flat_keys: list[tuple[int, int]] = []
         for scene_index, frames in probe_frames.items():
@@ -475,18 +578,98 @@ class AnimeMatcherService:
             return candidates_by_scene
 
         candidate_lists: dict[tuple[int, int], list[MatchCandidate]] = {}
-        for start in range(0, len(flat_images), batch_size):
-            batch_images = flat_images[start : start + batch_size]
-            batch_keys = flat_keys[start : start + batch_size]
-            batch_results = cls._search_image_batch(
-                batch_images,
-                top_n=top_n,
-                threshold=threshold,
-                flip=flip,
-                series=series,
-            )
-            for key, results in zip(batch_keys, batch_results, strict=False):
-                candidate_lists[key] = cls._search_result_to_candidates(results)
+        use_cache_path = (
+            video_path is not None
+            and probe_frame_indices is not None
+            and not flip
+            and cls._query_processor is not None
+        )
+
+        if use_cache_path:
+            video_signature = cls._video_signature(video_path)
+            cache = cls._video_frame_embedding_cache
+            sig_path, sig_mtime, sig_size = video_signature
+            cached_embeddings: dict[tuple[int, int], np.ndarray] = {}
+            missing_keys: list[tuple[int, int]] = []
+            missing_images: list[Image.Image] = []
+            missing_cache_keys: list[
+                tuple[str, int, int, int] | None
+            ] = []
+            for key, image in zip(flat_keys, flat_images, strict=False):
+                scene_index, position = key
+                indices = probe_frame_indices.get(scene_index)
+                frame_idx = (
+                    indices[position]
+                    if indices is not None and position < len(indices)
+                    else None
+                )
+                if frame_idx is None:
+                    missing_keys.append(key)
+                    missing_images.append(image)
+                    missing_cache_keys.append(None)
+                    continue
+                cache_key = (sig_path, sig_mtime, sig_size, int(frame_idx))
+                cached = cache.get(cache_key)
+                if cached is not None:
+                    cached_embeddings[key] = cached
+                else:
+                    missing_keys.append(key)
+                    missing_images.append(image)
+                    missing_cache_keys.append(cache_key)
+
+            embedded_lookup: dict[tuple[int, int], np.ndarray] = dict(cached_embeddings)
+            for start in range(0, len(missing_images), batch_size):
+                batch_images = [
+                    image.convert("RGB")
+                    for image in missing_images[start : start + batch_size]
+                ]
+                batch_keys = missing_keys[start : start + batch_size]
+                batch_cache_keys = missing_cache_keys[start : start + batch_size]
+                batch_embeddings = cls._embed_pil_batch(batch_images)
+                for key, cache_key, embedding in zip(
+                    batch_keys,
+                    batch_cache_keys,
+                    batch_embeddings,
+                    strict=False,
+                ):
+                    embedded_lookup[key] = embedding
+                    if cache_key is not None:
+                        cache[cache_key] = embedding
+
+            if embedded_lookup:
+                stacked = np.stack(
+                    [embedded_lookup[key] for key in flat_keys],
+                    axis=0,
+                ).astype(np.float32, copy=False)
+                raw_results = cls._query_processor.index_manager.search_batch(
+                    stacked,
+                    top_n,
+                    threshold,
+                    series=series,
+                )
+                for key, results in zip(flat_keys, raw_results, strict=False):
+                    candidate_lists[key] = [
+                        MatchCandidate(
+                            episode=meta.episode,
+                            timestamp=meta.timestamp,
+                            similarity=float(sim),
+                            series=meta.series,
+                        )
+                        for sim, meta in results
+                    ]
+        else:
+            for start in range(0, len(flat_images), batch_size):
+                batch_images = flat_images[start : start + batch_size]
+                batch_keys = flat_keys[start : start + batch_size]
+                batch_results = cls._search_image_batch(
+                    batch_images,
+                    top_n=top_n,
+                    threshold=threshold,
+                    flip=flip,
+                    series=series,
+                )
+                for key, results in zip(batch_keys, batch_results, strict=False):
+                    candidate_lists[key] = cls._search_result_to_candidates(results)
 
         for scene_index, frames in probe_frames.items():
             if not all(frames):
@@ -497,6 +680,32 @@ class AnimeMatcherService:
                 candidate_lists.get((scene_index, 2), []),
             )
         return candidates_by_scene
+
+    @classmethod
+    def _embed_pil_batch(cls, images: list[Image.Image]) -> np.ndarray:
+        """Embed a batch of PIL images, preferring the GPU-resident preprocessing
+        path on the SSCD embedder when available.
+
+        Falls back to ``embed_batch`` for test fakes and non-CUDA builds.
+        """
+        embedder = cls._embedder
+        if embedder is None:
+            return np.empty((0, 512), dtype=np.float32)
+        if not images:
+            return np.empty((0, 512), dtype=np.float32)
+        gpu_embed = getattr(embedder, "embed_pil_batch_gpu", None)
+        if callable(gpu_embed):
+            return gpu_embed(images)
+        return embedder.embed_batch(images)
+
+    @classmethod
+    def _video_signature(cls, video_path: Path) -> tuple[str, int, int]:
+        """Return a (path, mtime_ns, size) signature used to invalidate cached frame embeddings."""
+        try:
+            stat = video_path.stat()
+            return (str(video_path.resolve()), stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            return (str(video_path), -1, -1)
 
     @classmethod
     def get_index_fps(cls) -> float:
@@ -540,25 +749,48 @@ class AnimeMatcherService:
         CAP_PROP_POS_MSEC read before the decode advances the position).
         """
         cv2 = cls._require_cv2()
-        start_ts = max(0.0, start_ts)
         cap = cv2.VideoCapture(str(video_path))
-        frames: list[tuple[float, Image.Image]] = []
         try:
-            cap.set(cv2.CAP_PROP_POS_MSEC, start_ts * 1000.0)
-            while len(frames) < max_frames:
-                pos_ts = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-                if pos_ts > end_ts:
-                    break
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                if pos_ts < start_ts:
-                    # Seek landed on an earlier keyframe; skip until we enter the window.
-                    continue
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frames.append((pos_ts, Image.fromarray(frame_rgb)))
+            return cls._collect_frames_in_window_from_capture(
+                cap,
+                start_ts,
+                end_ts,
+                max_frames=max_frames,
+                sample_frames=sample_frames,
+            )
         finally:
             cap.release()
+
+    @classmethod
+    def _collect_frames_in_window_from_capture(
+        cls,
+        cap,
+        start_ts: float,
+        end_ts: float,
+        max_frames: int = 48,
+        sample_frames: int | None = None,
+    ) -> list[tuple[float, Image.Image]]:
+        """Window decode using an externally-managed VideoCapture.
+
+        Lets ``_refine_boundaries`` share one capture across the start- and
+        end-boundary windows instead of opening the source episode twice.
+        """
+        cv2 = cls._require_cv2()
+        start_ts = max(0.0, start_ts)
+        frames: list[tuple[float, Image.Image]] = []
+        cap.set(cv2.CAP_PROP_POS_MSEC, start_ts * 1000.0)
+        while len(frames) < max_frames:
+            pos_ts = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            if pos_ts > end_ts:
+                break
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if pos_ts < start_ts:
+                # Seek landed on an earlier keyframe; skip until we enter the window.
+                continue
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append((pos_ts, Image.fromarray(frame_rgb)))
         if sample_frames is not None and len(frames) > sample_frames:
             indices = np.linspace(0, len(frames) - 1, sample_frames, dtype=np.int32)
             return [frames[int(index)] for index in indices]
@@ -618,31 +850,39 @@ class AnimeMatcherService:
         index_step = 1.0 / max(cls.get_index_fps(), 1e-3)
         window = max(0.5, index_step + 0.15)
 
-        start_frames = cls._collect_frames_in_window(
-            episode_path,
-            matched_start_ts - window,
-            matched_start_ts + window,
-            sample_frames=cls.REFINE_MAX_FRAMES_PER_BOUNDARY,
-        )
-        end_frames = cls._collect_frames_in_window(
-            episode_path,
-            matched_end_ts - window,
-            matched_end_ts + window,
-            sample_frames=cls.REFINE_MAX_FRAMES_PER_BOUNDARY,
-        )
+        # Share one VideoCapture across both boundary windows. Walking forward
+        # from the start window into the end window avoids a second container
+        # open + codec reinit and lets the decoder grab through without a
+        # second keyframe seek when the windows are close together.
+        cv2 = cls._require_cv2()
+        cap = cv2.VideoCapture(str(episode_path))
+        try:
+            start_frames = cls._collect_frames_in_window_from_capture(
+                cap,
+                matched_start_ts - window,
+                matched_start_ts + window,
+                sample_frames=cls.REFINE_MAX_FRAMES_PER_BOUNDARY,
+            )
+            end_frames = cls._collect_frames_in_window_from_capture(
+                cap,
+                matched_end_ts - window,
+                matched_end_ts + window,
+                sample_frames=cls.REFINE_MAX_FRAMES_PER_BOUNDARY,
+            )
+        finally:
+            cap.release()
         if not start_frames or not end_frames:
             return None
 
-        embedder = cls._embedder
-        query_embeddings = embedder.embed_batch([tiktok_start_frame, tiktok_end_frame])
+        query_embeddings = cls._embed_pil_batch([tiktok_start_frame, tiktok_end_frame])
         if query_embeddings.shape[0] < 2:
             return None
         q_start, q_end = query_embeddings[0], query_embeddings[1]
 
         start_imgs = [f[1] for f in start_frames]
         end_imgs = [f[1] for f in end_frames]
-        start_embs = embedder.embed_batch(start_imgs)
-        end_embs = embedder.embed_batch(end_imgs)
+        start_embs = cls._embed_pil_batch(start_imgs)
+        end_embs = cls._embed_pil_batch(end_imgs)
 
         # SSCD embeddings are L2-normalized — inner product == cosine.
         start_scores = start_embs @ q_start
@@ -675,30 +915,26 @@ class AnimeMatcherService:
         """
         processor = cls._query_processor
         prepared = [img.convert("RGB") for img in images]
+        if not prepared:
+            return []
 
-        embeddings = processor.embedder.embed_batch(prepared)
-        per_image_results = [
-            processor.index_manager.search(
-                embeddings[i],
+        embeddings = cls._embed_pil_batch(prepared)
+        per_image_results = processor.index_manager.search_batch(
+            embeddings,
+            top_n,
+            threshold,
+            series=series,
+        )
+
+        if flip:
+            flipped = [ImageOps.mirror(img) for img in prepared]
+            flip_embeddings = cls._embed_pil_batch(flipped)
+            per_image_flip_results = processor.index_manager.search_batch(
+                flip_embeddings,
                 top_n,
                 threshold,
                 series=series,
             )
-            for i in range(len(prepared))
-        ]
-
-        if flip:
-            flipped = [ImageOps.mirror(img) for img in prepared]
-            flip_embeddings = processor.embedder.embed_batch(flipped)
-            per_image_flip_results = [
-                processor.index_manager.search(
-                    flip_embeddings[i],
-                    top_n,
-                    threshold,
-                    series=series,
-                )
-                for i in range(len(prepared))
-            ]
             merged_results = [
                 processor._merge_results(per_image_results[i], per_image_flip_results[i], top_n)
                 for i in range(len(prepared))
@@ -781,10 +1017,23 @@ class AnimeMatcherService:
         ).hexdigest()
 
     @classmethod
-    def _crop_index_cache_path(cls, episode_path: Path) -> Path:
+    def _crop_index_cache_paths(cls, episode_path: Path) -> tuple[Path, Path, Path]:
+        """Return (embeddings.npy, timestamps.npy, legacy.npz) paths for the cache key.
+
+        We persist float32 embeddings and float32 timestamps to two separate
+        ``.npy`` files so the loader can ``mmap`` them directly — zlib was
+        chewing CPU for ~5% compression on essentially-incompressible
+        embeddings. The legacy ``.npz`` path is kept so existing caches stay
+        readable until they get superseded.
+        """
         cache_dir = settings.cache_dir / "matcher_crop_index"
         cache_dir.mkdir(parents=True, exist_ok=True)
-        return cache_dir / f"{cls._crop_index_cache_key(episode_path)}.npz"
+        key = cls._crop_index_cache_key(episode_path)
+        return (
+            cache_dir / f"{key}.emb.npy",
+            cache_dir / f"{key}.ts.npy",
+            cache_dir / f"{key}.npz",
+        )
 
     @staticmethod
     def _source_crop_variants(
@@ -863,13 +1112,14 @@ class AnimeMatcherService:
             if duration <= 0:
                 return frames
             step = 1.0 / max(fps, 1e-3)
-            for timestamp in np.arange(0.0, duration, step, dtype=np.float32):
-                cap.set(cv2.CAP_PROP_POS_MSEC, float(timestamp) * 1000.0)
-                ret, frame = cap.read()
-                if not ret:
-                    continue
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frames.append((float(timestamp), Image.fromarray(frame_rgb)))
+            timestamps = [
+                float(timestamp)
+                for timestamp in np.arange(0.0, duration, step, dtype=np.float32)
+            ]
+            decoded = cls._extract_frames_from_capture(cap, timestamps)
+            for timestamp, image in zip(timestamps, decoded):
+                if image is not None:
+                    frames.append((timestamp, image))
         finally:
             cap.release()
         return frames
@@ -889,18 +1139,51 @@ class AnimeMatcherService:
         if cached is not None:
             return cached  # type: ignore[return-value]
 
-        cache_path = cls._crop_index_cache_path(episode_path)
-        if cache_path.exists():
+        embeddings_path, timestamps_path, legacy_path = cls._crop_index_cache_paths(
+            episode_path,
+        )
+        if embeddings_path.exists() and timestamps_path.exists():
             try:
-                with np.load(cache_path, allow_pickle=False) as data:
-                    payload = {
-                        "embeddings": data["embeddings"].astype(np.float32, copy=False),
-                        "timestamps": data["timestamps"].astype(np.float32, copy=False),
-                    }
+                embeddings_arr = np.load(
+                    embeddings_path, mmap_mode="r", allow_pickle=False,
+                )
+                timestamps_arr = np.load(
+                    timestamps_path, mmap_mode="r", allow_pickle=False,
+                )
+                if embeddings_arr.dtype != np.float32:
+                    embeddings_arr = np.asarray(embeddings_arr, dtype=np.float32)
+                if timestamps_arr.dtype != np.float32:
+                    timestamps_arr = np.asarray(timestamps_arr, dtype=np.float32)
+                payload = {
+                    "embeddings": embeddings_arr,
+                    "timestamps": timestamps_arr,
+                }
                 cls._crop_index_memory_cache[cache_key] = payload
                 return payload
             except Exception:
-                cache_path.unlink(missing_ok=True)
+                embeddings_path.unlink(missing_ok=True)
+                timestamps_path.unlink(missing_ok=True)
+
+        if legacy_path.exists():
+            try:
+                with np.load(legacy_path, allow_pickle=False) as data:
+                    embeddings_arr = data["embeddings"].astype(np.float32, copy=False)
+                    timestamps_arr = data["timestamps"].astype(np.float32, copy=False)
+                np.save(embeddings_path, embeddings_arr)
+                np.save(timestamps_path, timestamps_arr)
+                legacy_path.unlink(missing_ok=True)
+                payload = {
+                    "embeddings": np.load(
+                        embeddings_path, mmap_mode="r", allow_pickle=False,
+                    ),
+                    "timestamps": np.load(
+                        timestamps_path, mmap_mode="r", allow_pickle=False,
+                    ),
+                }
+                cls._crop_index_memory_cache[cache_key] = payload
+                return payload
+            except Exception:
+                legacy_path.unlink(missing_ok=True)
 
         timestamps: list[float] = []
         chunks: list[np.ndarray] = []
@@ -910,7 +1193,7 @@ class AnimeMatcherService:
         def flush_batch() -> None:
             if not batch_images:
                 return
-            chunks.append(cls._embedder.embed_batch(batch_images))
+            chunks.append(cls._embed_pil_batch(batch_images))
             batch_images.clear()
 
         cv2 = cls._require_cv2()
@@ -927,19 +1210,20 @@ class AnimeMatcherService:
                 return None
 
             step = 1.0 / max(cls.CROP_INDEX_FPS, 1e-3)
-            for timestamp in np.arange(0.0, duration, step, dtype=np.float32):
-                cap.set(cv2.CAP_PROP_POS_MSEC, float(timestamp) * 1000.0)
-                ret, frame = cap.read()
-                if not ret:
+            sample_times = [
+                float(timestamp)
+                for timestamp in np.arange(0.0, duration, step, dtype=np.float32)
+            ]
+            decoded = cls._extract_frames_from_capture(cap, sample_times)
+            for timestamp, source_frame in zip(sample_times, decoded):
+                if source_frame is None:
                     continue
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                source_frame = Image.fromarray(frame_rgb)
                 for _, crop in cls._source_crop_variants(
                     source_frame,
                     target_aspect=target_aspect,
                 ):
                     batch_images.append(crop)
-                    timestamps.append(float(timestamp))
+                    timestamps.append(timestamp)
                     if len(batch_images) >= batch_size:
                         flush_batch()
         finally:
@@ -952,14 +1236,15 @@ class AnimeMatcherService:
         embeddings = np.vstack(chunks).astype(np.float32, copy=False)
         timestamps_array = np.asarray(timestamps, dtype=np.float32)
 
-        np.savez_compressed(
-            cache_path,
-            embeddings=embeddings,
-            timestamps=timestamps_array,
-        )
+        np.save(embeddings_path, embeddings)
+        np.save(timestamps_path, timestamps_array)
         payload = {
-            "embeddings": embeddings,
-            "timestamps": timestamps_array,
+            "embeddings": np.load(
+                embeddings_path, mmap_mode="r", allow_pickle=False,
+            ),
+            "timestamps": np.load(
+                timestamps_path, mmap_mode="r", allow_pickle=False,
+            ),
         }
         cls._crop_index_memory_cache[cache_key] = payload
         return payload
@@ -1049,15 +1334,12 @@ class AnimeMatcherService:
         crops: list[Image.Image] = []
         timestamps: list[float] = []
         try:
-            for timestamp in sample_times:
+            decoded = cls._extract_frames_from_capture(cap, list(sample_times))
+            for timestamp, source_frame in zip(sample_times, decoded):
                 if len(crops) >= remaining_crop_budget:
                     break
-                cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, timestamp) * 1000.0)
-                ret, frame = cap.read()
-                if not ret:
+                if source_frame is None:
                     continue
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                source_frame = Image.fromarray(frame_rgb)
                 for _, crop in cls._source_crop_variants(
                     source_frame,
                     target_aspect=target_aspect,
@@ -1140,13 +1422,13 @@ class AnimeMatcherService:
         source_embeddings: list[np.ndarray] = []
         for start in range(0, len(source_images), cls.CROP_INDEX_BATCH_SIZE):
             source_embeddings.append(
-                cls._embedder.embed_batch(
+                cls._embed_pil_batch(
                     source_images[start : start + cls.CROP_INDEX_BATCH_SIZE]
                 )
             )
         source_matrix = np.vstack(source_embeddings).astype(np.float32, copy=False)
         timestamp_array = np.asarray(source_timestamps, dtype=np.float32)
-        query_embeddings = cls._embedder.embed_batch([img.convert("RGB") for img in images])
+        query_embeddings = cls._embed_pil_batch([img.convert("RGB") for img in images])
 
         per_image: list[list[MatchCandidate]] = []
         for query in query_embeddings:
@@ -1243,27 +1525,16 @@ class AnimeMatcherService:
             return [[] for _ in images]
 
         target_aspect = images[0].width / max(1, images[0].height)
-        episode_indices: list[tuple[str, dict[str, np.ndarray]]] = []
-        for episode, episode_path in episode_paths.items():
-            try:
-                crop_index = cls._load_or_build_crop_index(
-                    episode_path,
-                    target_aspect=target_aspect,
-                )
-            except Exception as exc:
-                search_scope = "seeded" if seeded_search else "unseeded"
-                print(
-                    "Skipping "
-                    f"{search_scope} crop index for {episode}: {exc}"
-                )
-                continue
-            if crop_index is not None:
-                episode_indices.append((episode, crop_index))
+        episode_indices = cls._load_episode_crop_indices(
+            episode_paths,
+            target_aspect=target_aspect,
+            seeded_search=seeded_search,
+        )
 
         if not episode_indices:
             return [[] for _ in images]
 
-        query_embeddings = cls._embedder.embed_batch([img.convert("RGB") for img in images])
+        query_embeddings = cls._embed_pil_batch([img.convert("RGB") for img in images])
         per_image: list[list[MatchCandidate]] = []
         for query in query_embeddings:
             pooled: list[MatchCandidate] = []
@@ -1297,6 +1568,53 @@ class AnimeMatcherService:
             per_image.append(pooled[:top_n])
 
         return per_image
+
+    @classmethod
+    def _load_episode_crop_indices(
+        cls,
+        episode_paths: dict[str, Path],
+        *,
+        target_aspect: float,
+        seeded_search: bool,
+    ) -> list[tuple[str, dict[str, np.ndarray]]]:
+        """Resolve crop indices for one or more episodes.
+
+        Single episode is built inline; multi-episode runs the builds in a small
+        thread pool so cv2 decode (releases the GIL) on one episode can overlap
+        the GPU embed of another. Embedder calls are still serialised at the
+        CUDA stream level — the win here is decode/H2D overlap, not concurrent
+        GPU kernels.
+        """
+        items = list(episode_paths.items())
+        if not items:
+            return []
+
+        def build_one(item: tuple[str, Path]) -> tuple[str, dict[str, np.ndarray] | None]:
+            episode, episode_path = item
+            try:
+                crop_index = cls._load_or_build_crop_index(
+                    episode_path,
+                    target_aspect=target_aspect,
+                )
+            except Exception as exc:
+                search_scope = "seeded" if seeded_search else "unseeded"
+                print(f"Skipping {search_scope} crop index for {episode}: {exc}")
+                return episode, None
+            return episode, crop_index
+
+        if len(items) == 1:
+            results = [build_one(items[0])]
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=min(len(items), 2)) as pool:
+                results = list(pool.map(build_one, items))
+
+        return [
+            (episode, crop_index)
+            for episode, crop_index in results
+            if crop_index is not None
+        ]
 
     @classmethod
     def _rank_candidate_episodes(
@@ -1925,32 +2243,33 @@ class AnimeMatcherService:
             timestamps: list[float] = []
             target_aspect = query_frame.width / max(1, query_frame.height)
             try:
-                for timestamp in np.arange(
-                    max(0.0, rough_start_ts + offset - 3.0),
-                    rough_start_ts + offset + 3.001,
-                    0.5,
-                    dtype=np.float32,
-                ):
-                    cap.set(cv2.CAP_PROP_POS_MSEC, float(timestamp) * 1000.0)
-                    ret, frame = cap.read()
-                    if not ret:
+                sample_times = [
+                    float(timestamp)
+                    for timestamp in np.arange(
+                        max(0.0, rough_start_ts + offset - 3.0),
+                        rough_start_ts + offset + 3.001,
+                        0.5,
+                        dtype=np.float32,
+                    )
+                ]
+                decoded = cls._extract_frames_from_capture(cap, sample_times)
+                for timestamp, source_frame in zip(sample_times, decoded):
+                    if source_frame is None:
                         continue
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    source_frame = Image.fromarray(frame_rgb)
                     for _, crop in cls._source_crop_variants(
                         source_frame,
                         target_aspect=target_aspect,
                     ):
                         source_images.append(crop)
-                        timestamps.append(max(0.0, float(timestamp) - offset))
+                        timestamps.append(max(0.0, timestamp - offset))
             finally:
                 cap.release()
 
             if not source_images:
                 return None
 
-            query_embedding = cls._embedder.embed_batch([query_frame.convert("RGB")])[0]
-            source_embeddings = cls._embedder.embed_batch(source_images)
+            query_embedding = cls._embed_pil_batch([query_frame.convert("RGB")])[0]
+            source_embeddings = cls._embed_pil_batch(source_images)
             scores = source_embeddings @ query_embedding
             return timestamps[int(np.argmax(scores))]
 
@@ -3996,9 +4315,9 @@ class AnimeMatcherService:
             0,
             total_scenes,
         )
-        probe_frames = await loop.run_in_executor(
+        probe_frames, probe_frame_indices = await loop.run_in_executor(
             None,
-            cls._extract_scene_probe_frames,
+            cls._extract_scene_probe_frames_with_indices,
             video_path,
             target_scene_items,
         )
@@ -4011,6 +4330,8 @@ class AnimeMatcherService:
                 threshold=None,
                 flip=False,
                 series=anime_name,
+                video_path=video_path,
+                probe_frame_indices=probe_frame_indices,
             ),
         )
 
