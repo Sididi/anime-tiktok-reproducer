@@ -72,6 +72,10 @@ class AnimeMatcherService:
     # Series that were updated on disk and require cache refresh before matching.
     _stale_series: dict[LibraryType, set[str]] = defaultdict(set)
     _cv2 = None
+    _episode_paths_cache: dict[
+        tuple[str, str, str, tuple[tuple[str, int, int], ...] | None],
+        dict[str, Path],
+    ] = {}
     _crop_index_memory_cache: dict[str, dict[str, np.ndarray | str]] = {}
     CROP_INDEX_VERSION = "crop-v4-seeded-portrait-source-0_5fps"
     CROP_INDEX_FPS = 0.5
@@ -85,6 +89,7 @@ class AnimeMatcherService:
     LOCAL_CROP_MAX_ANCHORS_PER_EPISODE = 3
     LOCAL_CROP_MIN_ANCHOR_SEPARATION = 2.0
     LOCAL_CROP_MAX_SOURCE_CROPS_PER_SCENE = 192
+    REFINE_MAX_FRAMES_PER_BOUNDARY = 12
 
     @classmethod
     def mark_series_updated(
@@ -262,6 +267,7 @@ class AnimeMatcherService:
             cls._loaded_library_type = scoped_type
             cls._loaded_index_signature = cls._index_signature(library_path, None)
             cls._loaded_series_index_signatures = {}
+            cls._episode_paths_cache = {}
             for series_name in cls._index_manager.get_series_list():
                 cls._loaded_series_index_signatures[series_name] = cls._index_signature(
                     library_path,
@@ -331,6 +337,167 @@ class AnimeMatcherService:
         finally:
             cap.release()
 
+    @staticmethod
+    def _scene_probe_times(scene: Scene) -> tuple[float, float, float]:
+        """Return start/middle/end probe timestamps for a scene."""
+        frame_offset = 0.125
+        scene_duration = scene.end_time - scene.start_time
+        safe_offset = min(frame_offset, scene_duration / 4)
+        return (
+            scene.start_time + safe_offset,
+            (scene.start_time + scene.end_time) / 2,
+            scene.end_time - safe_offset,
+        )
+
+    @classmethod
+    def _extract_scene_probe_frames(
+        cls,
+        video_path: Path,
+        scene_items: list[tuple[int, Scene]],
+    ) -> dict[int, tuple[Image.Image | None, Image.Image | None, Image.Image | None]]:
+        """Extract all start/middle/end probe frames using one ordered capture pass."""
+        cv2 = cls._require_cv2()
+        cap = cv2.VideoCapture(str(video_path))
+        frames_by_scene: dict[
+            int,
+            tuple[Image.Image | None, Image.Image | None, Image.Image | None],
+        ] = {}
+        try:
+            targets: list[tuple[float, int, int]] = []
+            for scene_index, scene in scene_items:
+                frames_by_scene[scene_index] = (None, None, None)
+                for position, timestamp in enumerate(cls._scene_probe_times(scene)):
+                    targets.append((max(0.0, timestamp), scene_index, position))
+            targets.sort(key=lambda item: item[0])
+
+            native_fps = cap.get(cv2.CAP_PROP_FPS)
+            if not native_fps or native_fps <= 0:
+                for timestamp, scene_index, position in targets:
+                    cap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
+                    ret, frame = cap.read()
+                    image = (
+                        Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                        if ret
+                        else None
+                    )
+                    scene_frames = list(frames_by_scene[scene_index])
+                    scene_frames[position] = image
+                    frames_by_scene[scene_index] = (
+                        scene_frames[0],
+                        scene_frames[1],
+                        scene_frames[2],
+                    )
+                return frames_by_scene
+
+            next_frame_index = 0
+            last_frame_index = -1
+            last_image: Image.Image | None = None
+            for timestamp, scene_index, position in targets:
+                target_frame_index = max(0, int(round(timestamp * float(native_fps))))
+                if target_frame_index == last_frame_index:
+                    image = last_image.copy() if last_image is not None else None
+                else:
+                    if target_frame_index < next_frame_index:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame_index)
+                        next_frame_index = target_frame_index
+                    while next_frame_index < target_frame_index:
+                        if not cap.grab():
+                            break
+                        next_frame_index += 1
+                    ret, frame = cap.read()
+                    if ret:
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        image = Image.fromarray(frame_rgb)
+                    else:
+                        image = None
+                    last_frame_index = target_frame_index
+                    last_image = image
+                    next_frame_index = target_frame_index + 1
+
+                scene_frames = list(frames_by_scene[scene_index])
+                scene_frames[position] = image
+                frames_by_scene[scene_index] = (
+                    scene_frames[0],
+                    scene_frames[1],
+                    scene_frames[2],
+                )
+        finally:
+            cap.release()
+        return frames_by_scene
+
+    @staticmethod
+    def _search_result_to_candidates(results) -> list[MatchCandidate]:
+        return [
+            MatchCandidate(
+                episode=r.episode,
+                timestamp=r.timestamp,
+                similarity=r.similarity,
+                series=r.series,
+            )
+            for r in results
+        ]
+
+    @classmethod
+    def _search_scene_probe_candidates_batch(
+        cls,
+        probe_frames: dict[
+            int,
+            tuple[Image.Image | None, Image.Image | None, Image.Image | None],
+        ],
+        *,
+        top_n: int,
+        threshold: float | None,
+        flip: bool,
+        series: str | None,
+        batch_size: int = 48,
+    ) -> dict[
+        int,
+        tuple[list[MatchCandidate], list[MatchCandidate], list[MatchCandidate]],
+    ]:
+        """Search direct SSCD candidates for all scene probe frames in chunks."""
+        flat_images: list[Image.Image] = []
+        flat_keys: list[tuple[int, int]] = []
+        for scene_index, frames in probe_frames.items():
+            if not all(frames):
+                continue
+            for position, frame in enumerate(frames):
+                if frame is None:
+                    continue
+                flat_keys.append((scene_index, position))
+                flat_images.append(frame)
+
+        empty = ([], [], [])
+        candidates_by_scene: dict[
+            int,
+            tuple[list[MatchCandidate], list[MatchCandidate], list[MatchCandidate]],
+        ] = {scene_index: empty for scene_index in probe_frames}
+        if not flat_images:
+            return candidates_by_scene
+
+        candidate_lists: dict[tuple[int, int], list[MatchCandidate]] = {}
+        for start in range(0, len(flat_images), batch_size):
+            batch_images = flat_images[start : start + batch_size]
+            batch_keys = flat_keys[start : start + batch_size]
+            batch_results = cls._search_image_batch(
+                batch_images,
+                top_n=top_n,
+                threshold=threshold,
+                flip=flip,
+                series=series,
+            )
+            for key, results in zip(batch_keys, batch_results, strict=False):
+                candidate_lists[key] = cls._search_result_to_candidates(results)
+
+        for scene_index, frames in probe_frames.items():
+            if not all(frames):
+                continue
+            candidates_by_scene[scene_index] = (
+                candidate_lists.get((scene_index, 0), []),
+                candidate_lists.get((scene_index, 1), []),
+                candidate_lists.get((scene_index, 2), []),
+            )
+        return candidates_by_scene
+
     @classmethod
     def get_index_fps(cls) -> float:
         """Return the FPS the loaded library was indexed at.
@@ -364,6 +531,7 @@ class AnimeMatcherService:
         start_ts: float,
         end_ts: float,
         max_frames: int = 48,
+        sample_frames: int | None = None,
     ) -> list[tuple[float, Image.Image]]:
         """Decode frames whose timestamps fall in [start_ts, end_ts].
 
@@ -391,6 +559,9 @@ class AnimeMatcherService:
                 frames.append((pos_ts, Image.fromarray(frame_rgb)))
         finally:
             cap.release()
+        if sample_frames is not None and len(frames) > sample_frames:
+            indices = np.linspace(0, len(frames) - 1, sample_frames, dtype=np.int32)
+            return [frames[int(index)] for index in indices]
         return frames
 
     @classmethod
@@ -451,11 +622,13 @@ class AnimeMatcherService:
             episode_path,
             matched_start_ts - window,
             matched_start_ts + window,
+            sample_frames=cls.REFINE_MAX_FRAMES_PER_BOUNDARY,
         )
         end_frames = cls._collect_frames_in_window(
             episode_path,
             matched_end_ts - window,
             matched_end_ts + window,
+            sample_frames=cls.REFINE_MAX_FRAMES_PER_BOUNDARY,
         )
         if not start_frames or not end_frames:
             return None
@@ -551,6 +724,17 @@ class AnimeMatcherService:
         if not series or cls._index_manager is None:
             return {}
 
+        scoped_type = coerce_library_type(library_type)
+        cache_key = (
+            str(cls._index_manager.library_path),
+            scoped_type.value,
+            series,
+            cls._loaded_series_index_signatures.get(series),
+        )
+        cached = cls._episode_paths_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         episode_paths: dict[str, Path] = {}
         metadata = cls._index_manager.series_metadata.get(series, {})
         library_path = cls._index_manager.library_path
@@ -563,6 +747,7 @@ class AnimeMatcherService:
                 episode_paths.setdefault(meta.episode, candidate)
 
         if episode_paths:
+            cls._episode_paths_cache[cache_key] = episode_paths
             return episode_paths
 
         from .anime_library import AnimeLibraryService
@@ -578,6 +763,7 @@ class AnimeMatcherService:
             path = Path(raw_path)
             if series_prefix in str(path) and path.exists():
                 episode_paths.setdefault(path.stem, path)
+        cls._episode_paths_cache[cache_key] = episode_paths
         return episode_paths
 
     @classmethod
@@ -1177,6 +1363,23 @@ class AnimeMatcherService:
             round(proposal.end_time, 3),
         )
 
+    @staticmethod
+    def _proposal_source_priority(proposal: MatchProposal) -> int:
+        if proposal.source == "refined":
+            return 2
+        if proposal.source in {"crop", "crop_projected", "cropped"}:
+            return 1
+        return 0
+
+    @classmethod
+    def _proposal_rank_key(cls, proposal: MatchProposal) -> tuple[float, int, float, int]:
+        return (
+            proposal.confidence,
+            cls._proposal_source_priority(proposal),
+            proposal.selection_score,
+            proposal.vote_count,
+        )
+
     @classmethod
     def _dedupe_proposals(cls, proposals: list[MatchProposal]) -> list[MatchProposal]:
         best_by_key: dict[tuple[str, float, float], MatchProposal] = {}
@@ -1187,15 +1390,11 @@ class AnimeMatcherService:
                 continue
             key = cls._proposal_key(proposal)
             existing = best_by_key.get(key)
-            if existing is None or proposal.selection_score > existing.selection_score:
+            if existing is None or cls._proposal_rank_key(proposal) > cls._proposal_rank_key(existing):
                 best_by_key[key] = proposal
         return sorted(
             best_by_key.values(),
-            key=lambda proposal: (
-                proposal.selection_score,
-                proposal.confidence,
-                proposal.vote_count,
-            ),
+            key=cls._proposal_rank_key,
             reverse=True,
         )
 
@@ -2859,12 +3058,48 @@ class AnimeMatcherService:
             )
             return
 
+        target_indices = (
+            set(scene_indices_to_match)
+            if scene_indices_to_match is not None
+            else set(range(total_scenes))
+        )
+        target_scene_items = [
+            (i, scene)
+            for i, scene in enumerate(scenes.scenes)
+            if i in target_indices
+        ]
+
+        yield MatchProgress(
+            "matching",
+            0,
+            f"{prefix}Preparing direct frame search...",
+            0,
+            total_scenes,
+        )
+        probe_frames = await loop.run_in_executor(
+            None,
+            cls._extract_scene_probe_frames,
+            video_path,
+            target_scene_items,
+        )
+        direct_candidates = await loop.run_in_executor(
+            None,
+            partial(
+                cls._search_scene_probe_candidates_batch,
+                probe_frames,
+                top_n=25,
+                threshold=None,
+                flip=False,
+                series=anime_name,
+            ),
+        )
+
         matches = MatchList()
         processed_count = 0
 
         for i, scene in enumerate(scenes.scenes):
             # Skip scenes not in the target list
-            if scene_indices_to_match is not None and i not in scene_indices_to_match:
+            if i not in target_indices:
                 # Copy existing match
                 if existing_matches and i < len(existing_matches.matches):
                     match_copy = existing_matches.matches[i].model_copy()
@@ -2896,24 +3131,9 @@ class AnimeMatcherService:
             end_candidates: list[MatchCandidate] = []
             proposals: list[MatchProposal] = []
             try:
-                # Extract frames at start, middle, end of scene
-                # Add 125ms offset from boundaries to avoid transition artifacts
-                FRAME_OFFSET = 0.125  # 125ms offset from scene boundaries
-
-                scene_duration = scene.end_time - scene.start_time
-                # Ensure we have enough duration for offset
-                safe_offset = min(FRAME_OFFSET, scene_duration / 4)
-
-                start_time = scene.start_time + safe_offset
-                middle_time = (scene.start_time + scene.end_time) / 2
-                end_time = scene.end_time - safe_offset
-
-                # Run frame extraction in one capture pass.
-                start_frame, middle_frame, end_frame = await loop.run_in_executor(
-                    None,
-                    cls.extract_frames,
-                    video_path,
-                    [start_time, middle_time, end_time],
+                start_frame, middle_frame, end_frame = probe_frames.get(
+                    i,
+                    (None, None, None),
                 )
 
                 if not all([start_frame, middle_frame, end_frame]):
@@ -2931,40 +3151,9 @@ class AnimeMatcherService:
                     )
                     continue
 
-                # Retrieve deep top-K for the triple search so recycled animation
-                # doesn't silently bury the correct reference frame below rank 5.
-                # Alternatives are computed from the top-5 slice to keep their
-                # noise profile stable.
-                # Flip augmentation is off: anime isn't broadcast mirrored, so
-                # mirroring only adds symmetry-coincidence false positives.
-                search_batch = partial(
-                    cls._search_image_batch,
-                    [start_frame, middle_frame, end_frame],
-                    top_n=25,
-                    threshold=None,
-                    flip=False,
-                    series=anime_name,
+                start_candidates, middle_candidates, end_candidates = (
+                    direct_candidates.get(i, ([], [], []))
                 )
-                start_results, middle_results, end_results = await loop.run_in_executor(
-                    None,
-                    search_batch,
-                )
-
-                # Convert to MatchCandidate objects
-                def to_candidates(results) -> list[MatchCandidate]:
-                    return [
-                        MatchCandidate(
-                            episode=r.episode,
-                            timestamp=r.timestamp,
-                            similarity=r.similarity,
-                            series=r.series,
-                        )
-                        for r in results
-                    ]
-
-                start_candidates = to_candidates(start_results)
-                middle_candidates = to_candidates(middle_results)
-                end_candidates = to_candidates(end_results)
 
                 # Find temporal match across the deep candidate pool.
                 direct_proposal = cls._find_temporal_proposal(

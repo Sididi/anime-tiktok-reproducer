@@ -288,6 +288,145 @@ def test_crop_search_trigger_skips_high_confidence_direct_match() -> None:
     assert AnimeMatcherService._should_try_crop_search("Series", 2.0, None) is True
 
 
+def test_batched_probe_search_preserves_scene_positions(monkeypatch) -> None:
+    probe_frames = {
+        4: (
+            Image.new("RGB", (8, 8), "red"),
+            Image.new("RGB", (8, 8), "green"),
+            Image.new("RGB", (8, 8), "blue"),
+        ),
+        9: (
+            Image.new("RGB", (8, 8), "white"),
+            Image.new("RGB", (8, 8), "gray"),
+            Image.new("RGB", (8, 8), "black"),
+        ),
+    }
+    calls: list[int] = []
+
+    class Result:
+        def __init__(self, episode: str, timestamp: float) -> None:
+            self.episode = episode
+            self.timestamp = timestamp
+            self.similarity = 0.9
+            self.series = "Series"
+
+    def fake_search(cls, images, **kwargs):
+        calls.append(len(images))
+        return [
+            [Result(f"ep-{len(calls)}-{index}", float(index))]
+            for index, _ in enumerate(images)
+        ]
+
+    monkeypatch.setattr(
+        AnimeMatcherService,
+        "_search_image_batch",
+        classmethod(fake_search),
+    )
+
+    results = AnimeMatcherService._search_scene_probe_candidates_batch(
+        probe_frames,
+        top_n=25,
+        threshold=None,
+        flip=False,
+        series="Series",
+        batch_size=4,
+    )
+
+    assert calls == [4, 2]
+    assert results[4][0][0].episode == "ep-1-0"
+    assert results[4][1][0].episode == "ep-1-1"
+    assert results[4][2][0].episode == "ep-1-2"
+    assert results[9][0][0].episode == "ep-1-3"
+    assert results[9][1][0].episode == "ep-2-0"
+    assert results[9][2][0].episode == "ep-2-1"
+
+
+def test_batched_probe_search_skips_incomplete_frame_triples(monkeypatch) -> None:
+    probe_frames = {
+        1: (
+            Image.new("RGB", (8, 8), "red"),
+            None,
+            Image.new("RGB", (8, 8), "blue"),
+        )
+    }
+
+    monkeypatch.setattr(
+        AnimeMatcherService,
+        "_search_image_batch",
+        classmethod(
+            lambda cls, images, **kwargs: (_ for _ in ()).throw(
+                AssertionError("incomplete triples should not be searched")
+            )
+        ),
+    )
+
+    results = AnimeMatcherService._search_scene_probe_candidates_batch(
+        probe_frames,
+        top_n=25,
+        threshold=None,
+        flip=False,
+        series="Series",
+    )
+
+    assert results[1] == ([], [], [])
+
+
+def test_proposal_ranking_uses_confidence_before_selection_bonus() -> None:
+    high_similarity = MatchProposal(
+        episode="E1",
+        start_time=10.0,
+        end_time=11.0,
+        confidence=0.80,
+        selection_score=0.80,
+        source="direct",
+    )
+    lower_similarity_with_bonus = MatchProposal(
+        episode="E2",
+        start_time=20.0,
+        end_time=21.0,
+        confidence=0.79,
+        selection_score=0.95,
+        source="refined",
+    )
+
+    ranked = AnimeMatcherService._dedupe_proposals(
+        [lower_similarity_with_bonus, high_similarity]
+    )
+
+    assert ranked[0] is high_similarity
+
+
+def test_proposal_ranking_ties_prefer_refined_then_crop() -> None:
+    direct = MatchProposal(
+        episode="E1",
+        start_time=10.0,
+        end_time=11.0,
+        confidence=0.80,
+        selection_score=0.95,
+        source="direct",
+    )
+    crop = MatchProposal(
+        episode="E2",
+        start_time=20.0,
+        end_time=21.0,
+        confidence=0.80,
+        selection_score=0.80,
+        source="crop",
+    )
+    refined = MatchProposal(
+        episode="E3",
+        start_time=30.0,
+        end_time=31.0,
+        confidence=0.80,
+        selection_score=0.80,
+        source="refined",
+    )
+
+    ranked = AnimeMatcherService._dedupe_proposals([direct, crop, refined])
+
+    assert [proposal.source for proposal in ranked] == ["refined", "crop", "direct"]
+
+
 def _short_scenes(count: int) -> SceneList:
     return SceneList(
         scenes=[
