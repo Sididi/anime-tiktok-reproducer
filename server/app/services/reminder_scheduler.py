@@ -31,6 +31,8 @@ from app.services.reminder_service import post_reminder
 logger = logging.getLogger(__name__)
 
 _IG_MAX_ATTEMPTS = 5
+_IG_DEFAULT_POLL_INTERVAL_SECONDS = 60.0
+_IG_DEFAULT_POLL_TIMEOUT_SECONDS = 4 * 60 * 60.0
 _LEGACY_IG_CONTAINER_ERROR = "container status_code = ERROR"
 _URL_INGEST_IG_CONTAINER_ERROR = "error code 2207077"
 _RESUMABLE_HEADER_ERROR = "Invalid Header format"
@@ -157,8 +159,12 @@ async def _dispatch_instagram_publish(
         caption=payload["caption"],
         video_url=_instagram_video_url(job, settings),
         graph_api_version=payload.get("graph_api_version", "v25.0"),
-        poll_interval=float(payload.get("poll_interval_seconds") or 60.0),
-        poll_timeout=float(payload.get("poll_timeout_seconds") or 1800.0),
+        poll_interval=float(
+            payload.get("poll_interval_seconds") or _IG_DEFAULT_POLL_INTERVAL_SECONDS
+        ),
+        poll_timeout=float(
+            payload.get("poll_timeout_seconds") or _IG_DEFAULT_POLL_TIMEOUT_SECONDS
+        ),
         share_to_feed=(
             True if payload.get("share_to_feed") is None else bool(payload["share_to_feed"])
         ),

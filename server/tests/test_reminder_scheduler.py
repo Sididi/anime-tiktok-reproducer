@@ -239,6 +239,8 @@ async def test_dispatch_instagram_uses_platform_scheduled_time(
 
     assert actions == 1
     assert publish_mock.await_count == 1
+    assert publish_mock.await_args.kwargs["poll_interval"] == 60.0
+    assert publish_mock.await_args.kwargs["poll_timeout"] == 4 * 60 * 60.0
     refreshed = await store.get("ig-platform-time")
     assert refreshed.platform_statuses["instagram"].status == "uploaded"
     assert refreshed.reminder_message_id is None

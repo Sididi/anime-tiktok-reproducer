@@ -27,8 +27,11 @@ def test_create_app_cleans_orphan_instagram_temp_downloads(
     monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path, tmp_path: Path
 ):
     orphan = tmp_path / "ig-reel-orphan.mp4"
+    pass_dir = tmp_path / "ig-reel-pass-orphan"
     unrelated = tmp_path / "other.mp4"
     orphan.write_bytes(b"orphan")
+    pass_dir.mkdir()
+    (pass_dir / "ffmpeg2pass-0.log").write_text("pass")
     unrelated.write_bytes(b"keep")
 
     monkeypatch.setenv("ATR_TIKTOK_SERVER_CONFIG_PATH", str(example_yaml))
@@ -40,4 +43,5 @@ def test_create_app_cleans_orphan_instagram_temp_downloads(
     create_app()
 
     assert not orphan.exists()
+    assert not pass_dir.exists()
     assert unrelated.exists()

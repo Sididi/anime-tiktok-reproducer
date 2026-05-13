@@ -8,7 +8,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 import numpy as np
 from PIL import Image, ImageOps
@@ -42,6 +42,20 @@ class MatchProgress:
         if self.matches is not None:
             result["matches"] = self.matches.model_dump()
         return result
+
+
+@dataclass(frozen=True)
+class MatchProposal:
+    """Internal normalized proposal used to select and expose scene matches."""
+
+    episode: str
+    start_time: float
+    end_time: float
+    confidence: float
+    selection_score: float
+    source: str
+    vote_count: int = 1
+    debug: dict[str, Any] | None = None
 
 
 class AnimeMatcherService:
@@ -1155,8 +1169,333 @@ class AnimeMatcherService:
             reverse=True,
         )
 
+    @staticmethod
+    def _proposal_key(proposal: MatchProposal) -> tuple[str, float, float]:
+        return (
+            proposal.episode,
+            round(proposal.start_time, 3),
+            round(proposal.end_time, 3),
+        )
+
     @classmethod
-    def _find_projected_interval_match(
+    def _dedupe_proposals(cls, proposals: list[MatchProposal]) -> list[MatchProposal]:
+        best_by_key: dict[tuple[str, float, float], MatchProposal] = {}
+        for proposal in proposals:
+            if not proposal.episode:
+                continue
+            if proposal.end_time <= proposal.start_time:
+                continue
+            key = cls._proposal_key(proposal)
+            existing = best_by_key.get(key)
+            if existing is None or proposal.selection_score > existing.selection_score:
+                best_by_key[key] = proposal
+        return sorted(
+            best_by_key.values(),
+            key=lambda proposal: (
+                proposal.selection_score,
+                proposal.confidence,
+                proposal.vote_count,
+            ),
+            reverse=True,
+        )
+
+    @staticmethod
+    def _proposal_to_alternative(
+        proposal: MatchProposal,
+        scene_duration: float,
+    ) -> AlternativeMatch:
+        source_duration = max(1e-3, proposal.end_time - proposal.start_time)
+        return AlternativeMatch(
+            episode=proposal.episode,
+            start_time=proposal.start_time,
+            end_time=proposal.end_time,
+            confidence=proposal.confidence,
+            speed_ratio=scene_duration / source_duration,
+            vote_count=proposal.vote_count,
+            algorithm=proposal.source,
+        )
+
+    @classmethod
+    def _proposal_from_alternative(
+        cls,
+        alternative: AlternativeMatch,
+        *,
+        source: str | None = None,
+        selection_bonus: float = 0.0,
+    ) -> MatchProposal | None:
+        if not alternative.episode or alternative.end_time <= alternative.start_time:
+            return None
+        algorithm = source or alternative.algorithm or "alternative"
+        return MatchProposal(
+            episode=alternative.episode,
+            start_time=alternative.start_time,
+            end_time=alternative.end_time,
+            confidence=alternative.confidence,
+            selection_score=alternative.confidence + selection_bonus,
+            source=algorithm,
+            vote_count=alternative.vote_count,
+        )
+
+    @classmethod
+    def _proposal_from_match(
+        cls,
+        match: SceneMatch,
+        *,
+        source: str,
+        selection_bonus: float = 0.0,
+    ) -> MatchProposal | None:
+        if not match.episode or match.end_time <= match.start_time:
+            return None
+        return MatchProposal(
+            episode=match.episode,
+            start_time=match.start_time,
+            end_time=match.end_time,
+            confidence=match.confidence,
+            selection_score=match.confidence + selection_bonus,
+            source=source,
+            vote_count=1,
+        )
+
+    @classmethod
+    def _alternatives_from_proposals(
+        cls,
+        proposals: list[MatchProposal],
+        scene_duration: float,
+        *,
+        selected: MatchProposal | None = None,
+        limit: int = 7,
+    ) -> list[AlternativeMatch]:
+        ranked = cls._dedupe_proposals(proposals)
+        if selected is not None:
+            selected_key = cls._proposal_key(selected)
+            if not any(cls._proposal_key(proposal) == selected_key for proposal in ranked):
+                ranked.insert(0, selected)
+
+        selected_alt: AlternativeMatch | None = None
+        if selected is not None:
+            selected_alt = cls._proposal_to_alternative(selected, scene_duration)
+
+        alternatives: list[AlternativeMatch] = []
+        seen_keys: set[tuple[str, float, float]] = set()
+        if selected_alt is not None:
+            alternatives.append(selected_alt)
+            seen_keys.add(
+                (
+                    selected_alt.episode,
+                    round(selected_alt.start_time, 3),
+                    round(selected_alt.end_time, 3),
+                )
+            )
+
+        for proposal in ranked:
+            key = cls._proposal_key(proposal)
+            if key in seen_keys:
+                continue
+            alternatives.append(cls._proposal_to_alternative(proposal, scene_duration))
+            seen_keys.add(key)
+            if len(alternatives) >= limit:
+                break
+
+        return alternatives
+
+    @staticmethod
+    def _alternative_matches_primary(
+        match: SceneMatch,
+        alternative: AlternativeMatch,
+        *,
+        tolerance: float = 0.06,
+    ) -> bool:
+        return (
+            alternative.episode == match.episode
+            and abs(alternative.start_time - match.start_time) <= tolerance
+            and abs(alternative.end_time - match.end_time) <= tolerance
+        )
+
+    @classmethod
+    def _ensure_primary_in_alternatives(
+        cls,
+        scene: Scene,
+        match: SceneMatch,
+        *,
+        source: str = "primary",
+    ) -> SceneMatch:
+        if not match.episode or match.end_time <= match.start_time:
+            return match
+        if any(cls._alternative_matches_primary(match, alt) for alt in match.alternatives):
+            return match
+        proposal = cls._proposal_from_match(match, source=source)
+        if proposal is None:
+            return match
+        selected_alt = cls._proposal_to_alternative(proposal, scene.duration)
+        match.alternatives = [selected_alt, *match.alternatives[:6]]
+        return match
+
+    @classmethod
+    def _build_match_from_proposals(
+        cls,
+        scene: Scene,
+        proposals: list[MatchProposal],
+        *,
+        start_candidates: list[MatchCandidate] | None = None,
+        middle_candidates: list[MatchCandidate] | None = None,
+        end_candidates: list[MatchCandidate] | None = None,
+        was_no_match: bool = False,
+        merged_from: list[int] | None = None,
+    ) -> SceneMatch:
+        ranked = cls._dedupe_proposals(proposals)
+        selected = ranked[0] if ranked else None
+        start_candidates = start_candidates or []
+        middle_candidates = middle_candidates or []
+        end_candidates = end_candidates or []
+
+        if selected is None:
+            return SceneMatch(
+                scene_index=scene.index,
+                episode="",
+                start_time=0,
+                end_time=0,
+                confidence=0,
+                speed_ratio=1.0,
+                was_no_match=was_no_match,
+                merged_from=merged_from,
+                alternatives=cls._alternatives_from_proposals(
+                    ranked,
+                    scene.duration,
+                    selected=None,
+                ),
+                start_candidates=start_candidates,
+                middle_candidates=middle_candidates,
+                end_candidates=end_candidates,
+            )
+
+        source_duration = max(1e-3, selected.end_time - selected.start_time)
+        return SceneMatch(
+            scene_index=scene.index,
+            episode=selected.episode,
+            start_time=selected.start_time,
+            end_time=selected.end_time,
+            confidence=selected.confidence,
+            speed_ratio=scene.duration / source_duration,
+            was_no_match=False,
+            merged_from=merged_from,
+            alternatives=cls._alternatives_from_proposals(
+                ranked,
+                scene.duration,
+                selected=selected,
+            ),
+            start_candidates=start_candidates,
+            middle_candidates=middle_candidates,
+            end_candidates=end_candidates,
+        )
+
+    @classmethod
+    def _apply_proposal_to_match(
+        cls,
+        scene: Scene,
+        match: SceneMatch,
+        proposal: MatchProposal,
+    ) -> None:
+        if not proposal.episode or proposal.end_time <= proposal.start_time:
+            return
+        match.episode = proposal.episode
+        match.start_time = proposal.start_time
+        match.end_time = proposal.end_time
+        match.confidence = max(match.confidence, proposal.confidence)
+        source_duration = proposal.end_time - proposal.start_time
+        match.speed_ratio = scene.duration / source_duration if source_duration > 0 else 1.0
+        match.was_no_match = False
+        existing_proposals = [
+            existing
+            for alt in match.alternatives
+            if (existing := cls._proposal_from_alternative(alt)) is not None
+        ]
+        match.alternatives = cls._alternatives_from_proposals(
+            [*existing_proposals, proposal],
+            scene.duration,
+            selected=proposal,
+        )
+
+    @classmethod
+    def _validate_and_repair_match(cls, scene: Scene, match: SceneMatch) -> SceneMatch:
+        has_frame_candidates = bool(
+            match.start_candidates or match.middle_candidates or match.end_candidates
+        )
+        if match.episode and match.end_time > match.start_time:
+            if any(cls._alternative_matches_primary(match, alt) for alt in match.alternatives):
+                return match
+
+            same_episode = [
+                alt for alt in match.alternatives if alt.episode == match.episode
+            ]
+            fallback = max(
+                same_episode or match.alternatives,
+                key=lambda alt: alt.confidence,
+                default=None,
+            )
+            if fallback is not None:
+                repaired = match.model_copy(deep=True)
+                repaired.episode = fallback.episode
+                repaired.start_time = fallback.start_time
+                repaired.end_time = fallback.end_time
+                repaired.confidence = fallback.confidence
+                source_duration = fallback.end_time - fallback.start_time
+                repaired.speed_ratio = (
+                    scene.duration / source_duration
+                    if source_duration > 0
+                    else 1.0
+                )
+                repaired.was_no_match = False
+                return cls._ensure_primary_in_alternatives(
+                    scene,
+                    repaired,
+                    source=fallback.algorithm or "repaired",
+                )
+            return cls._ensure_primary_in_alternatives(scene, match, source="primary")
+
+        if has_frame_candidates and not match.alternatives:
+            proposals = cls._compute_alternative_proposals(
+                match.start_candidates[:5],
+                match.middle_candidates[:5],
+                match.end_candidates[:5],
+                scene.duration,
+            )
+            if proposals:
+                repaired = cls._build_match_from_proposals(
+                    scene,
+                    proposals,
+                    start_candidates=match.start_candidates,
+                    middle_candidates=match.middle_candidates,
+                    end_candidates=match.end_candidates,
+                    was_no_match=True,
+                    merged_from=match.merged_from,
+                )
+                repaired.episode = ""
+                repaired.start_time = 0.0
+                repaired.end_time = 0.0
+                repaired.confidence = 0.0
+                repaired.speed_ratio = 1.0
+                repaired.was_no_match = True
+                return repaired
+        return match
+
+    @classmethod
+    def _validate_and_repair_matches(
+        cls,
+        scenes: SceneList,
+        matches: MatchList,
+    ) -> MatchList:
+        if len(scenes.scenes) != len(matches.matches):
+            return matches
+        repaired = matches.model_copy(deep=True)
+        for idx, scene in enumerate(scenes.scenes):
+            repaired.matches[idx] = cls._validate_and_repair_match(
+                scene,
+                repaired.matches[idx],
+            )
+        return repaired
+
+    @classmethod
+    def _find_projected_interval_proposal(
         cls,
         start_candidates: list[MatchCandidate],
         scene_duration: float,
@@ -1164,7 +1503,7 @@ class AnimeMatcherService:
         middle_candidates: list[MatchCandidate] | None = None,
         end_candidates: list[MatchCandidate] | None = None,
         allowed_episodes: set[str] | None = None,
-    ) -> SceneMatch | None:
+    ) -> MatchProposal | None:
         """Project a short-scene interval from start/middle/end retrievals.
 
         The crop index is sparse by design for speed. On sub-2s zoomed cuts, the
@@ -1296,16 +1635,44 @@ class AnimeMatcherService:
             min(1.0, sequence_score(best) / 3.8),
         )
 
-        return SceneMatch(
-            scene_index=0,
+        return MatchProposal(
             episode=best_episode,
             start_time=projected_start,
             end_time=projected_start + scene_duration,
             confidence=projected_confidence,
+            selection_score=projected_confidence + 0.015,
+            source="crop_projected",
+            vote_count=1,
+            debug={"base_similarity": base_similarity},
+        )
+
+    @classmethod
+    def _find_projected_interval_match(
+        cls,
+        start_candidates: list[MatchCandidate],
+        scene_duration: float,
+        *,
+        middle_candidates: list[MatchCandidate] | None = None,
+        end_candidates: list[MatchCandidate] | None = None,
+        allowed_episodes: set[str] | None = None,
+    ) -> MatchProposal | None:
+        """Backward-compatible wrapper for tests/callers still expecting SceneMatch."""
+        proposal = cls._find_projected_interval_proposal(
+            start_candidates,
+            scene_duration,
+            middle_candidates=middle_candidates,
+            end_candidates=end_candidates,
+            allowed_episodes=allowed_episodes,
+        )
+        if proposal is None:
+            return None
+        return SceneMatch(
+            scene_index=0,
+            episode=proposal.episode,
+            start_time=proposal.start_time,
+            end_time=proposal.end_time,
+            confidence=proposal.confidence,
             speed_ratio=1.0,
-            start_candidates=[],
-            middle_candidates=[],
-            end_candidates=[],
         )
 
     @classmethod
@@ -1694,14 +2061,20 @@ class AnimeMatcherService:
                 and abs(match.end_time - selected_end) < 1e-3
             ):
                 continue
-            match.episode = str(selected["episode"])
-            match.start_time = selected_start
-            match.end_time = selected_end
-            match.confidence = max(match.confidence, float(selected["confidence"]))
-            match.speed_ratio = scenes.scenes[absolute_scene_idx].duration / (
-                selected_end - selected_start
+            proposal = MatchProposal(
+                episode=str(selected["episode"]),
+                start_time=selected_start,
+                end_time=selected_end,
+                confidence=float(selected["confidence"]),
+                selection_score=float(selected["confidence"]) + 0.02,
+                source="continuity",
+                vote_count=1,
             )
-            match.was_no_match = False
+            cls._apply_proposal_to_match(
+                scenes.scenes[absolute_scene_idx],
+                match,
+                proposal,
+            )
 
         for absolute_scene_idx in range(max(40, smooth_start_index), len(smoothed.matches) - 1):
             match = smoothed.matches[absolute_scene_idx]
@@ -1734,10 +2107,19 @@ class AnimeMatcherService:
                 later_candidates,
                 key=lambda candidate: (candidate.similarity, candidate.timestamp),
             )
-            match.start_time = selected_candidate.timestamp
-            match.end_time = selected_candidate.timestamp + scene.duration
-            match.speed_ratio = 1.0
-            match.was_no_match = False
+            cls._apply_proposal_to_match(
+                scene,
+                match,
+                MatchProposal(
+                    episode=selected_candidate.episode,
+                    start_time=selected_candidate.timestamp,
+                    end_time=selected_candidate.timestamp + scene.duration,
+                    confidence=selected_candidate.similarity,
+                    selection_score=selected_candidate.similarity + 0.02,
+                    source="continuity",
+                    vote_count=1,
+                ),
+            )
 
         return smoothed
 
@@ -1795,12 +2177,19 @@ class AnimeMatcherService:
             forward_nudge = projected_start - match.start_time
             if not (0.5 <= forward_nudge <= 2.0):
                 continue
-            match.start_time = projected_start
-            match.end_time = best_end.timestamp
-            source_duration = match.end_time - match.start_time
-            if source_duration > 0:
-                match.speed_ratio = scene.duration / source_duration
-            match.was_no_match = False
+            cls._apply_proposal_to_match(
+                scene,
+                match,
+                MatchProposal(
+                    episode=match.episode,
+                    start_time=projected_start,
+                    end_time=best_end.timestamp,
+                    confidence=best_end.similarity,
+                    selection_score=best_end.similarity + 0.015,
+                    source="reset_edge",
+                    vote_count=1,
+                ),
+            )
 
         return adjusted
 
@@ -1951,12 +2340,19 @@ class AnimeMatcherService:
             end_time = float(selected["end_time"])
             if end_time <= start_time:
                 continue
-            match.episode = str(selected["episode"])
-            match.start_time = start_time
-            match.end_time = end_time
-            match.confidence = max(match.confidence, float(selected["confidence"]))
-            match.speed_ratio = scenes.scenes[idx].duration / (end_time - start_time)
-            match.was_no_match = False
+            cls._apply_proposal_to_match(
+                scenes.scenes[idx],
+                match,
+                MatchProposal(
+                    episode=str(selected["episode"]),
+                    start_time=start_time,
+                    end_time=end_time,
+                    confidence=float(selected["confidence"]),
+                    selection_score=float(selected["confidence"]) + 0.02,
+                    source="continuity",
+                    vote_count=1,
+                ),
+            )
         return adjusted
 
     @classmethod
@@ -1990,21 +2386,25 @@ class AnimeMatcherService:
             source_duration = best_alternative.end_time - best_alternative.start_time
             if source_duration <= 0:
                 continue
-            match.episode = best_alternative.episode
-            match.start_time = best_alternative.start_time
-            match.end_time = best_alternative.end_time
-            match.confidence = best_alternative.confidence
-            match.speed_ratio = scenes.scenes[idx].duration / source_duration
-            match.was_no_match = False
+            proposal = cls._proposal_from_alternative(
+                best_alternative,
+                source=best_alternative.algorithm or "promoted_alternative",
+                selection_bonus=0.015,
+            )
+            if proposal is not None:
+                cls._apply_proposal_to_match(scenes.scenes[idx], match, proposal)
         return adjusted
 
     @classmethod
-    def _find_temporal_match(
+    def _find_temporal_proposal(
         cls,
         start_candidates: list[MatchCandidate],
         middle_candidates: list[MatchCandidate],
         end_candidates: list[MatchCandidate],
         scene_duration: float,
+        *,
+        source: str = "direct",
+        selection_bonus: float = 0.0,
     ) -> SceneMatch | None:
         """
         Find a temporally consistent match across start/middle/end candidates.
@@ -2020,12 +2420,12 @@ class AnimeMatcherService:
             scene_duration: Duration of the scene in the TikTok
 
         Returns:
-            SceneMatch if a consistent match is found, None otherwise
+            MatchProposal if a consistent match is found, None otherwise
         """
         MIN_SPEED = settings.matcher_min_speed_factor
         MAX_SPEED = 1.60  # 160% - sped up
 
-        best_match: SceneMatch | None = None
+        best_match: MatchProposal | None = None
         best_confidence = 0.0
 
         for start in start_candidates:
@@ -2078,19 +2478,85 @@ class AnimeMatcherService:
 
                     if confidence > best_confidence:
                         best_confidence = confidence
-                        best_match = SceneMatch(
-                            scene_index=0,  # Will be set later
+                        best_match = MatchProposal(
                             episode=start.episode,
                             start_time=start.timestamp,
                             end_time=end.timestamp,
                             confidence=confidence,
-                            speed_ratio=speed_ratio,
-                            start_candidates=[start],
-                            middle_candidates=[middle],
-                            end_candidates=[end],
+                            selection_score=confidence + selection_bonus,
+                            source=source,
+                            vote_count=3,
+                            debug={
+                                "speed_ratio": speed_ratio,
+                                "start_similarity": start.similarity,
+                                "middle_similarity": middle.similarity,
+                                "end_similarity": end.similarity,
+                            },
                         )
 
         return best_match
+
+    @classmethod
+    def _find_temporal_match(
+        cls,
+        start_candidates: list[MatchCandidate],
+        middle_candidates: list[MatchCandidate],
+        end_candidates: list[MatchCandidate],
+        scene_duration: float,
+    ) -> SceneMatch | None:
+        """Backward-compatible wrapper for callers/tests expecting SceneMatch."""
+        proposal = cls._find_temporal_proposal(
+            start_candidates,
+            middle_candidates,
+            end_candidates,
+            scene_duration,
+        )
+        if proposal is None:
+            return None
+        source_duration = proposal.end_time - proposal.start_time
+        return SceneMatch(
+            scene_index=0,
+            episode=proposal.episode,
+            start_time=proposal.start_time,
+            end_time=proposal.end_time,
+            confidence=proposal.confidence,
+            speed_ratio=scene_duration / source_duration if source_duration > 0 else 1.0,
+        )
+
+    @classmethod
+    def _compute_alternative_proposals(
+        cls,
+        start_candidates: list[MatchCandidate],
+        middle_candidates: list[MatchCandidate],
+        end_candidates: list[MatchCandidate],
+        scene_duration: float,
+    ) -> list[MatchProposal]:
+        proposals: list[MatchProposal] = []
+        for alternative in cls._compute_alternatives(
+            start_candidates,
+            middle_candidates,
+            end_candidates,
+            scene_duration,
+        ):
+            proposal = cls._proposal_from_alternative(alternative)
+            if proposal is not None:
+                algorithm_bonus = {
+                    "weighted_avg": 0.010,
+                    "best_frame": 0.0,
+                    "union_topk": -0.005,
+                }.get(alternative.algorithm or "", 0.0)
+                proposals.append(
+                    MatchProposal(
+                        episode=proposal.episode,
+                        start_time=proposal.start_time,
+                        end_time=proposal.end_time,
+                        confidence=proposal.confidence,
+                        selection_score=proposal.confidence + algorithm_bonus,
+                        source=proposal.source,
+                        vote_count=proposal.vote_count,
+                    )
+                )
+        return proposals
 
     @classmethod
     def _compute_alternatives(
@@ -2425,6 +2891,10 @@ class AnimeMatcherService:
                 total_scenes,
             )
 
+            start_candidates: list[MatchCandidate] = []
+            middle_candidates: list[MatchCandidate] = []
+            end_candidates: list[MatchCandidate] = []
+            proposals: list[MatchProposal] = []
             try:
                 # Extract frames at start, middle, end of scene
                 # Add 125ms offset from boundaries to avoid transition artifacts
@@ -2497,25 +2967,34 @@ class AnimeMatcherService:
                 end_candidates = to_candidates(end_results)
 
                 # Find temporal match across the deep candidate pool.
-                match = cls._find_temporal_match(
+                direct_proposal = cls._find_temporal_proposal(
                     start_candidates,
                     middle_candidates,
                     end_candidates,
                     scene.duration,
+                    source="direct",
+                    selection_bonus=0.02,
                 )
+                if direct_proposal is not None:
+                    proposals.append(direct_proposal)
 
                 crop_candidates: tuple[
                     list[MatchCandidate],
                     list[MatchCandidate],
                     list[MatchCandidate],
                 ] | None = None
-                crop_match: SceneMatch | None = None
-                projected_match: SceneMatch | None = None
+                crop_proposal: MatchProposal | None = None
+                projected_proposal: MatchProposal | None = None
                 seed_episodes: list[str] = []
+                match_for_crop = (
+                    cls._build_match_from_proposals(scene, [direct_proposal])
+                    if direct_proposal is not None
+                    else None
+                )
                 should_try_crop_search = cls._should_try_crop_search(
                     anime_name,
                     scene.duration,
-                    match,
+                    match_for_crop,
                 )
                 if should_try_crop_search:
                     seed_episodes = cls._rank_candidate_episodes(
@@ -2542,159 +3021,154 @@ class AnimeMatcherService:
                         crop_search,
                     )
                     crop_candidates = (crop_start, crop_middle, crop_end)
-                    crop_match = cls._find_temporal_match(
+                    crop_proposal = cls._find_temporal_proposal(
                         crop_start,
                         crop_middle,
                         crop_end,
                         scene.duration,
+                        source="crop",
+                        selection_bonus=0.025,
                     )
                     combined_start_candidates = cls._dedupe_match_candidates(
                         start_candidates + crop_start
                     )
+                    combined_middle_candidates = cls._dedupe_match_candidates(
+                        middle_candidates + crop_middle
+                    )
                     combined_end_candidates = cls._dedupe_match_candidates(
                         end_candidates + crop_end
                     )
-                    projected_match = cls._find_projected_interval_match(
+                    projected_proposal = cls._find_projected_interval_proposal(
                         combined_start_candidates,
                         scene.duration,
-                        middle_candidates=cls._dedupe_match_candidates(
-                            middle_candidates + crop_middle
-                        ),
+                        middle_candidates=combined_middle_candidates,
                         end_candidates=combined_end_candidates,
                         allowed_episodes=set(seed_episodes) if seed_episodes else None,
                     )
-
-                selected_from_crop = False
-                if crop_match is not None:
-                    direct_confidence = match.confidence if match is not None else 0.0
-                    # Crop search is only allowed to replace a direct match when
-                    # it is materially stronger, or when direct search failed.
-                    if match is None or crop_match.confidence >= direct_confidence + 0.03:
-                        match = crop_match
-                        (
-                            start_candidates,
-                            middle_candidates,
-                            end_candidates,
-                        ) = crop_candidates or (
-                            start_candidates,
-                            middle_candidates,
-                            end_candidates,
-                        )
-                        selected_from_crop = True
-                if projected_match is not None:
-                    direct_confidence = match.confidence if match is not None else 0.0
-                    if match is None or direct_confidence < 0.58 or projected_match.confidence >= direct_confidence + 0.05:
-                        match = projected_match
-                        if crop_candidates is not None:
-                            start_candidates = cls._dedupe_match_candidates(
-                                start_candidates + crop_candidates[0]
-                            )
-                            middle_candidates = cls._dedupe_match_candidates(
-                                middle_candidates + crop_candidates[1]
-                            )
-                            end_candidates = cls._dedupe_match_candidates(
-                                end_candidates + crop_candidates[2]
-                            )
-                        selected_from_crop = True
+                    start_candidates = combined_start_candidates
+                    middle_candidates = combined_middle_candidates
+                    end_candidates = combined_end_candidates
+                    if crop_proposal is not None:
+                        proposals.append(crop_proposal)
+                    if projected_proposal is not None:
+                        proposals.append(projected_proposal)
 
                 # Alternatives operate on the top-5 slice per position.
                 alt_start = start_candidates[:5]
                 alt_middle = middle_candidates[:5]
                 alt_end = end_candidates[:5]
+                proposals.extend(
+                    cls._compute_alternative_proposals(
+                        alt_start,
+                        alt_middle,
+                        alt_end,
+                        scene.duration,
+                    )
+                )
 
-                if match:
-                    if not selected_from_crop:
-                        # Refine boundaries to native-frame precision (addresses
-                        # the 2-FPS index Nyquist floor). Crop-selected matches
-                        # deliberately skip full-frame refinement because the
-                        # query/source geometry differs on zoomed TikToks.
-                        refined = await loop.run_in_executor(
-                            None,
-                            cls._refine_boundaries,
-                            video_path,
-                            scene,
-                            match.episode,
-                            match.start_time,
-                            match.end_time,
-                            library_type,
-                        )
-                        if refined is not None:
-                            refined_start, refined_end = refined
-                            refined_duration = refined_end - refined_start
-                            if refined_duration > 0:
-                                match.start_time = refined_start
-                                match.end_time = refined_end
-                                match.speed_ratio = scene.duration / refined_duration
-                    else:
+                selected_before_refine = (
+                    cls._dedupe_proposals(proposals)[0] if proposals else None
+                )
+                if selected_before_refine is not None:
+                    if selected_before_refine.source in {"crop", "crop_projected"}:
                         refined_crop_start = await loop.run_in_executor(
                             None,
                             cls._refine_crop_projected_start,
                             video_path,
                             scene,
-                            match.episode,
-                            match.start_time,
+                            selected_before_refine.episode,
+                            selected_before_refine.start_time,
                             library_type,
                         )
-                        if refined_crop_start is not None:
-                            if scene.index < 33 or abs(refined_crop_start - match.start_time) <= 1.5:
-                                match.start_time = refined_crop_start
-                                match.end_time = refined_crop_start + scene.duration
-                                match.speed_ratio = 1.0
-
-                    match.scene_index = scene.index
-                    match.start_candidates = start_candidates
-                    match.middle_candidates = middle_candidates
-                    match.end_candidates = end_candidates
-                    match.alternatives = cls._compute_alternatives(
-                        alt_start,
-                        alt_middle,
-                        alt_end,
-                        scene.duration,
-                    )
-                    matches.matches.append(match)
-                else:
-                    # No match found - compute alternatives for manual selection
-                    alternatives = cls._compute_alternatives(
-                        alt_start,
-                        alt_middle,
-                        alt_end,
-                        scene.duration,
-                    )
-                    matches.matches.append(
-                        SceneMatch(
-                            scene_index=scene.index,
-                            episode="",
-                            start_time=0,
-                            end_time=0,
-                            confidence=0,
-                            speed_ratio=1.0,
-                            was_no_match=True,
-                            alternatives=alternatives,
-                            start_candidates=start_candidates,
-                            middle_candidates=middle_candidates,
-                            end_candidates=end_candidates,
+                        if refined_crop_start is not None and (
+                            scene.index < 33
+                            or abs(refined_crop_start - selected_before_refine.start_time) <= 1.5
+                        ):
+                            proposals.append(
+                                MatchProposal(
+                                    episode=selected_before_refine.episode,
+                                    start_time=refined_crop_start,
+                                    end_time=refined_crop_start + scene.duration,
+                                    confidence=selected_before_refine.confidence,
+                                    selection_score=selected_before_refine.selection_score + 0.02,
+                                    source="refined",
+                                    vote_count=selected_before_refine.vote_count,
+                                )
+                            )
+                    else:
+                        refined = await loop.run_in_executor(
+                            None,
+                            cls._refine_boundaries,
+                            video_path,
+                            scene,
+                            selected_before_refine.episode,
+                            selected_before_refine.start_time,
+                            selected_before_refine.end_time,
+                            library_type,
                         )
+                        if refined is not None:
+                            refined_start, refined_end = refined
+                            if refined_end > refined_start:
+                                proposals.append(
+                                    MatchProposal(
+                                        episode=selected_before_refine.episode,
+                                        start_time=refined_start,
+                                        end_time=refined_end,
+                                        confidence=selected_before_refine.confidence,
+                                        selection_score=selected_before_refine.selection_score + 0.02,
+                                        source="refined",
+                                        vote_count=selected_before_refine.vote_count,
+                                    )
+                                )
+
+                matches.matches.append(
+                    cls._build_match_from_proposals(
+                        scene,
+                        proposals,
+                        start_candidates=start_candidates,
+                        middle_candidates=middle_candidates,
+                        end_candidates=end_candidates,
+                        was_no_match=not proposals,
                     )
+                )
 
             except Exception as e:
-                # Store error match but continue processing
+                # Store whatever evidence was collected before the failure so
+                # the UI still has reviewable candidates instead of a blank row.
+                if not proposals and (
+                    start_candidates or middle_candidates or end_candidates
+                ):
+                    proposals = cls._compute_alternative_proposals(
+                        start_candidates[:5],
+                        middle_candidates[:5],
+                        end_candidates[:5],
+                        scene.duration,
+                    )
                 matches.matches.append(
-                    SceneMatch(
-                        scene_index=scene.index,
-                        episode="",
-                        start_time=0,
-                        end_time=0,
-                        confidence=0,
-                        speed_ratio=1.0,
+                    cls._build_match_from_proposals(
+                        scene,
+                        proposals,
+                        start_candidates=start_candidates,
+                        middle_candidates=middle_candidates,
+                        end_candidates=end_candidates,
                         was_no_match=True,
                     )
                 )
+                match = matches.matches[-1]
+                if proposals:
+                    match.episode = ""
+                    match.start_time = 0.0
+                    match.end_time = 0.0
+                    match.confidence = 0.0
+                    match.speed_ratio = 1.0
+                    match.was_no_match = True
                 print(f"Error matching scene {i}: {e}")
 
         matches = cls._stabilize_short_scene_sequence(scenes, matches)
         matches = cls._snap_short_scene_reset_edges(scenes, matches)
         matches = cls._stabilize_monotonic_tail_pair(scenes, matches)
         matches = cls._promote_dense_short_alternatives(scenes, matches)
+        matches = cls._validate_and_repair_matches(scenes, matches)
 
         yield MatchProgress(
             "complete",

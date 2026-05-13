@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from app.services.reminder_scheduler import run_scheduler_loop
 
 logger = logging.getLogger(__name__)
 _INSTAGRAM_TEMP_DOWNLOAD_GLOB = "ig-reel-*.mp4"
+_INSTAGRAM_TEMP_PASS_DIR_GLOB = "ig-reel-pass-*"
 
 
 def _resolve_paths() -> tuple[Path, Path, Path]:
@@ -45,8 +47,16 @@ def _cleanup_instagram_temp_downloads(temp_dir: Path | None = None) -> int:
             removed += 1
         except OSError:
             logger.warning("Failed to remove orphan Instagram temp download %s", path)
+    for path in root.glob(_INSTAGRAM_TEMP_PASS_DIR_GLOB):
+        if not path.is_dir():
+            continue
+        try:
+            shutil.rmtree(path)
+            removed += 1
+        except OSError:
+            logger.warning("Failed to remove orphan Instagram temp pass directory %s", path)
     if removed:
-        logger.info("Removed %d orphan Instagram temp download(s)", removed)
+        logger.info("Removed %d orphan Instagram temp artifact(s)", removed)
     return removed
 
 

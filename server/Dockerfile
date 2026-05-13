@@ -9,6 +9,13 @@ WORKDIR /app
 # Install uv (fast Python package manager).
 RUN pip install --no-cache-dir uv==0.5.14
 
+# Instagram Reels can reject videos over 300 MiB. The publisher has a
+# pre-upload transcode path for oversized files, so the runtime image must
+# include ffmpeg/ffprobe.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install dependencies first for better cache reuse.
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev

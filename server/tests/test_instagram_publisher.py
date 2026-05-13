@@ -24,6 +24,7 @@ MEDIA_ID = "media_99"
 PERMALINK_URL = "https://www.instagram.com/reel/Cxxx/"
 UPLOAD_URI = "https://rupload.facebook.com/ig-api-upload/v25.0/container_42"
 ORIGINAL_VALIDATE_VIDEO = instagram_publisher._validate_video
+ORIGINAL_PREPARE_VIDEO = instagram_publisher._prepare_video_for_instagram_upload
 
 # Common kwargs shared by all tests
 _COMMON = dict(
@@ -58,10 +59,14 @@ def mock_meta_side_effects(monkeypatch):
     async def validate(path):
         return None
 
+    async def prepare(path):
+        return path
+
     async def upload(**kwargs):
         return _UploadResponse(status_code=200, body='{"success": true}')
 
     monkeypatch.setattr(instagram_publisher, "_preflight_instagram_account", preflight)
+    monkeypatch.setattr(instagram_publisher, "_prepare_video_for_instagram_upload", prepare)
     monkeypatch.setattr(instagram_publisher, "_validate_video", validate)
     monkeypatch.setattr(instagram_publisher, "_upload_resumable_binary", upload)
 
@@ -457,6 +462,28 @@ async def test_validation_failure_is_stage_prefixed(monkeypatch):
     assert result.detail == "validate: duration 1.00s outside 3-900s"
 
 
+async def test_prepare_failure_deletes_downloaded_video(tmp_path, monkeypatch):
+    video = tmp_path / "downloaded.mp4"
+    video.write_bytes(b"fake mp4 bytes")
+
+    async def download(client, video_url):
+        return video
+
+    async def prepare(path):
+        raise RuntimeError("encoder exploded")
+
+    monkeypatch.setattr(instagram_publisher, "_download_video", download)
+    monkeypatch.setattr(instagram_publisher, "_prepare_video_for_instagram_upload", prepare)
+
+    result = await publish_to_instagram(
+        **_COMMON, poll_interval=0.01, poll_timeout=1.0
+    )
+
+    assert result.success is False
+    assert result.detail == "prepare_video: encoder exploded"
+    assert not video.exists()
+
+
 async def test_ffprobe_unavailable_validation_falls_back(tmp_path, monkeypatch):
     monkeypatch.setattr(instagram_publisher.shutil, "which", lambda name: None)
     video = tmp_path / "video.mp4"
@@ -516,28 +543,58 @@ def test_upload_streams_file_without_read_bytes(tmp_path, monkeypatch):
     assert captured["content_has_read"] is True
 
 
-async def test_maybe_transcode_skips_when_under_threshold(tmp_path):
+async def test_prepare_video_transcodes_even_when_under_size_threshold(tmp_path, monkeypatch):
     video = tmp_path / "video.mp4"
     video.write_bytes(b"x" * 1024)
+    pass_calls: list[int] = []
 
-    result = await instagram_publisher._maybe_transcode_for_size(video)
+    monkeypatch.setattr(
+        instagram_publisher.shutil, "which", lambda name: f"/usr/bin/{name}"
+    )
 
-    assert result == video
-    assert video.exists()
+    async def fake_duration(path):
+        return 60.0
+
+    monkeypatch.setattr(
+        instagram_publisher, "_probe_duration_seconds", fake_duration
+    )
+
+    class Completed:
+        returncode = 0
+        stderr = ""
+        stdout = ""
+
+    def fake_run(cmd, **kwargs):
+        pass_idx = cmd.index("-pass") + 1
+        pass_num = int(cmd[pass_idx])
+        pass_calls.append(pass_num)
+        if pass_num == 2:
+            Path(cmd[-1]).write_bytes(b"prepared mp4 payload")
+        return Completed()
+
+    monkeypatch.setattr(instagram_publisher.subprocess, "run", fake_run)
+
+    result = await ORIGINAL_PREPARE_VIDEO(video)
+
+    assert pass_calls == [1, 2]
+    assert result != video
+    assert result.exists()
+    assert not video.exists()
+    result.unlink(missing_ok=True)
 
 
-async def test_maybe_transcode_skips_when_ffmpeg_unavailable(tmp_path, monkeypatch):
+async def test_prepare_video_fails_when_ffmpeg_unavailable(tmp_path, monkeypatch):
     video = tmp_path / "video.mp4"
     video.write_bytes(b"x" * (instagram_publisher._MAX_REEL_BYTES + 1))
     monkeypatch.setattr(instagram_publisher.shutil, "which", lambda name: None)
 
-    result = await instagram_publisher._maybe_transcode_for_size(video)
+    with pytest.raises(RuntimeError, match="ffmpeg is unavailable"):
+        await ORIGINAL_PREPARE_VIDEO(video)
 
-    assert result == video
     assert video.exists()
 
 
-async def test_maybe_transcode_runs_two_passes_and_replaces_file(tmp_path, monkeypatch):
+async def test_prepare_video_runs_two_passes_and_replaces_file(tmp_path, monkeypatch):
     video = tmp_path / "video.mp4"
     video.write_bytes(b"x" * (instagram_publisher._MAX_REEL_BYTES + 1))
     output_holder: dict[str, Path] = {}
@@ -572,7 +629,7 @@ async def test_maybe_transcode_runs_two_passes_and_replaces_file(tmp_path, monke
 
     monkeypatch.setattr(instagram_publisher.subprocess, "run", fake_run)
 
-    result = await instagram_publisher._maybe_transcode_for_size(video)
+    result = await ORIGINAL_PREPARE_VIDEO(video)
 
     assert pass_calls == [1, 2]
     assert result != video
@@ -582,7 +639,57 @@ async def test_maybe_transcode_runs_two_passes_and_replaces_file(tmp_path, monke
     result.unlink(missing_ok=True)
 
 
-async def test_maybe_transcode_falls_back_when_pass_fails(tmp_path, monkeypatch):
+async def test_prepare_video_retries_when_output_still_too_large(tmp_path, monkeypatch):
+    monkeypatch.setattr(instagram_publisher, "_MAX_REEL_BYTES", 1024)
+    monkeypatch.setattr(instagram_publisher, "_TARGET_REEL_BYTES", 1024)
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"x" * (instagram_publisher._MAX_REEL_BYTES + 1))
+    pass_calls: list[int] = []
+    second_pass_outputs = 0
+
+    monkeypatch.setattr(
+        instagram_publisher.shutil, "which", lambda name: f"/usr/bin/{name}"
+    )
+
+    async def fake_duration(path):
+        return 600.0
+
+    monkeypatch.setattr(
+        instagram_publisher, "_probe_duration_seconds", fake_duration
+    )
+
+    class Completed:
+        returncode = 0
+        stderr = ""
+        stdout = ""
+
+    def fake_run(cmd, **kwargs):
+        nonlocal second_pass_outputs
+        pass_idx = cmd.index("-pass") + 1
+        pass_num = int(cmd[pass_idx])
+        pass_calls.append(pass_num)
+        if pass_num == 2:
+            out = Path(cmd[-1])
+            second_pass_outputs += 1
+            if second_pass_outputs == 1:
+                out.write_bytes(b"x" * (instagram_publisher._MAX_REEL_BYTES + 1))
+            else:
+                out.write_bytes(b"transcoded mp4 payload")
+        return Completed()
+
+    monkeypatch.setattr(instagram_publisher.subprocess, "run", fake_run)
+
+    result = await ORIGINAL_PREPARE_VIDEO(video)
+
+    assert pass_calls == [1, 2, 1, 2]
+    assert result != video
+    assert result.exists()
+    assert result.stat().st_size < instagram_publisher._MAX_REEL_BYTES
+    assert not video.exists()
+    result.unlink(missing_ok=True)
+
+
+async def test_prepare_video_fails_when_pass_fails(tmp_path, monkeypatch):
     video = tmp_path / "video.mp4"
     original_size = instagram_publisher._MAX_REEL_BYTES + 1
     video.write_bytes(b"x" * original_size)
@@ -607,9 +714,9 @@ async def test_maybe_transcode_falls_back_when_pass_fails(tmp_path, monkeypatch)
         instagram_publisher.subprocess, "run", lambda *a, **k: Completed()
     )
 
-    result = await instagram_publisher._maybe_transcode_for_size(video)
+    with pytest.raises(RuntimeError, match="video preparation pass 1 failed"):
+        await ORIGINAL_PREPARE_VIDEO(video)
 
-    assert result == video
     assert video.exists()
     assert video.stat().st_size == original_size
 

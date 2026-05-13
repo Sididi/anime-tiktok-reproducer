@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.models import MatchCandidate, MatchList, Scene, SceneList, SceneMatch
 from app.services import anime_matcher as matcher_module
-from app.services.anime_matcher import AnimeMatcherService
+from app.services.anime_matcher import AnimeMatcherService, MatchProposal
 
 
 def _write_index_fixture(library_path: Path, frame_count: int) -> None:
@@ -356,6 +356,116 @@ def test_stabilizer_can_apply_real_projected_candidates() -> None:
     assert result.matches[26].start_time == 20.0
     assert result.matches[26].end_time == 21.0
     assert result.matches[26].was_no_match is False
+    assert any(
+        alt.episode == "E1"
+        and alt.start_time == 20.0
+        and alt.end_time == 21.0
+        and alt.algorithm == "continuity"
+        for alt in result.matches[26].alternatives
+    )
+
+
+def test_finalized_primary_is_visible_as_candidate() -> None:
+    scene = Scene(index=0, start_time=0.0, end_time=1.0)
+
+    match = AnimeMatcherService._build_match_from_proposals(
+        scene,
+        [
+            MatchProposal(
+                episode="E1",
+                start_time=10.0,
+                end_time=11.0,
+                confidence=0.9,
+                selection_score=0.95,
+                source="refined",
+                vote_count=1,
+            ),
+            MatchProposal(
+                episode="E1",
+                start_time=9.5,
+                end_time=10.5,
+                confidence=0.88,
+                selection_score=0.88,
+                source="best_frame",
+                vote_count=1,
+            ),
+        ],
+    )
+
+    assert match.episode == "E1"
+    assert match.start_time == 10.0
+    assert match.end_time == 11.0
+    assert match.alternatives[0].algorithm == "refined"
+    assert any(
+        alt.episode == match.episode
+        and alt.start_time == match.start_time
+        and alt.end_time == match.end_time
+        for alt in match.alternatives
+    )
+
+
+def test_validation_repairs_primary_absent_from_alternatives() -> None:
+    scene = Scene(index=0, start_time=0.0, end_time=1.0)
+    match = SceneMatch(
+        scene_index=0,
+        episode="wrong",
+        start_time=100.0,
+        end_time=101.0,
+        confidence=0.7,
+        speed_ratio=1.0,
+        alternatives=[
+            matcher_module.AlternativeMatch(
+                episode="right",
+                start_time=10.0,
+                end_time=11.0,
+                confidence=0.8,
+                speed_ratio=1.0,
+                vote_count=1,
+                algorithm="best_frame",
+            )
+        ],
+    )
+
+    repaired = AnimeMatcherService._validate_and_repair_match(scene, match)
+
+    assert repaired.episode == "right"
+    assert repaired.start_time == 10.0
+    assert repaired.end_time == 11.0
+    assert any(
+        alt.episode == repaired.episode
+        and alt.start_time == repaired.start_time
+        and alt.end_time == repaired.end_time
+        for alt in repaired.alternatives
+    )
+
+
+def test_no_match_with_frame_candidates_gets_alternatives() -> None:
+    scene = Scene(index=0, start_time=0.0, end_time=1.0)
+    match = SceneMatch(
+        scene_index=0,
+        episode="",
+        start_time=0.0,
+        end_time=0.0,
+        confidence=0.0,
+        speed_ratio=1.0,
+        was_no_match=True,
+        start_candidates=[
+            MatchCandidate(episode="E1", timestamp=10.0, similarity=0.7, series="S")
+        ],
+        middle_candidates=[
+            MatchCandidate(episode="E1", timestamp=10.5, similarity=0.7, series="S")
+        ],
+        end_candidates=[
+            MatchCandidate(episode="E1", timestamp=11.0, similarity=0.7, series="S")
+        ],
+    )
+
+    repaired = AnimeMatcherService._validate_and_repair_match(scene, match)
+
+    assert repaired.episode == ""
+    assert repaired.was_no_match is True
+    assert repaired.alternatives
+    assert repaired.start_candidates
 
 
 def test_init_searcher_preloads_cv2_before_searcher_import(

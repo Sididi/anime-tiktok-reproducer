@@ -308,7 +308,9 @@ export interface AlternativeMatch {
   confidence: number;
   speed_ratio: number;
   vote_count: number;
-  algorithm?: string; // 'weighted_avg' | 'best_frame' | 'union_topk'
+  // Includes retrieval and post-processing sources such as weighted_avg,
+  // best_frame, union_topk, direct, crop, crop_projected, refined, continuity.
+  algorithm?: string;
 }
 
 export interface SceneMatch {
