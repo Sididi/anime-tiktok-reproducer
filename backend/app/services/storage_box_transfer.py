@@ -113,6 +113,10 @@ class StorageBoxTransferService:
             "BatchMode=yes",
             "-o",
             "StrictHostKeyChecking=yes",
+            "-o",
+            "ServerAliveInterval=30",
+            "-o",
+            "ServerAliveCountMax=3",
         ]
         if settings.storage_box_known_hosts_path:
             command.extend(

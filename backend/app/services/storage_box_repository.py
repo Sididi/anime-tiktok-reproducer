@@ -706,20 +706,39 @@ class StorageBoxRepository:
         artifacts: list[LocalArtifact],
     ) -> None:
         async def _verify(artifact: LocalArtifact) -> None:
-            remote_path = staging_root / artifact.remote_relative_path
-            stat_result = await StorageBoxSftpClient.stat(remote_path)
-            remote_size = int(getattr(stat_result, "size", 0))
-            if remote_size != artifact.size_bytes:
-                raise RuntimeError(
-                    f"Remote size mismatch for {artifact.remote_relative_path.as_posix()}: "
-                    f"expected {artifact.size_bytes}, got {remote_size}"
-                )
+            await cls._verify_remote_artifact(staging_root=staging_root, artifact=artifact)
 
         await _run_bounded(
             artifacts,
             settings.storage_box_upload_max_parallel,
             _verify,
         )
+
+    @classmethod
+    async def _verify_remote_artifact(
+        cls,
+        *,
+        staging_root: PurePosixPath,
+        artifact: LocalArtifact,
+    ) -> None:
+        remote_path = staging_root / artifact.remote_relative_path
+        stat_result = await StorageBoxSftpClient.stat(remote_path)
+        remote_size = int(getattr(stat_result, "size", 0))
+        if remote_size != artifact.size_bytes:
+            raise RuntimeError(
+                f"Remote size mismatch for {artifact.remote_relative_path.as_posix()}: "
+                f"expected {artifact.size_bytes}, got {remote_size}"
+            )
+
+    @classmethod
+    async def _remove_staged_artifact(
+        cls,
+        *,
+        staging_root: PurePosixPath,
+        artifact: LocalArtifact,
+    ) -> None:
+        with suppress(Exception):
+            await StorageBoxSftpClient.remove_file(staging_root / artifact.remote_relative_path)
 
     @classmethod
     async def _resolve_or_create_series_id(
@@ -1480,11 +1499,36 @@ class StorageBoxRepository:
             ) if progress_callback is not None else None
 
             async def _upload_artifact(artifact: LocalArtifact) -> None:
-                await StorageBoxTransferService.upload_file(
-                    artifact.local_path,
-                    staging_root / artifact.remote_relative_path,
-                    session=session,
-                )
+                max_attempts = max(1, settings.storage_box_retry_max_attempts)
+                for attempt in range(1, max_attempts + 1):
+                    if attempt > 1:
+                        await cls._remove_staged_artifact(
+                            staging_root=staging_root,
+                            artifact=artifact,
+                        )
+                    await StorageBoxTransferService.upload_file(
+                        artifact.local_path,
+                        staging_root / artifact.remote_relative_path,
+                        session=session,
+                    )
+                    try:
+                        await cls._verify_remote_artifact(
+                            staging_root=staging_root,
+                            artifact=artifact,
+                        )
+                        return
+                    except RuntimeError:
+                        if attempt >= max_attempts:
+                            raise
+                        logger.warning(
+                            "Publish %s: uploaded artifact failed remote size "
+                            "verification; retrying (%d/%d): %s",
+                            display_name,
+                            attempt,
+                            max_attempts,
+                            artifact.remote_relative_path.as_posix(),
+                            exc_info=True,
+                        )
 
             try:
                 await _run_bounded(

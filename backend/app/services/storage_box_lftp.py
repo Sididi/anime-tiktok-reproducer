@@ -98,6 +98,10 @@ class StorageBoxLftpService:
             "BatchMode=yes",
             "-o",
             "IdentitiesOnly=yes",
+            "-o",
+            "ServerAliveInterval=30",
+            "-o",
+            "ServerAliveCountMax=3",
         ]
         if settings.storage_box_known_hosts_path:
             known_hosts = settings.storage_box_known_hosts_path.expanduser()

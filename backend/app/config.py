@@ -164,7 +164,7 @@ class Settings(BaseSettings):
     storage_box_download_max_parallel: int = 6
     storage_box_transfer_mode: str = "auto"
     storage_box_rsync_min_file_size_mb: int = 4
-    storage_box_rsync_timeout_seconds: int = 7200
+    storage_box_rsync_timeout_seconds: int = 1800
     # Retry settings for transient SFTP/network errors (VPN flaps, NAT timeouts,
     # brief Hetzner reachability dips). Per-operation retry — the retried
     # operation re-acquires a fresh SSH session, so a half-dead pooled
