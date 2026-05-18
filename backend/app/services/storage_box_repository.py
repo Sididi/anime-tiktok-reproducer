@@ -118,6 +118,16 @@ class LocalArtifact:
     local_relative_path: str | None = None
 
 
+@dataclass(frozen=True)
+class RemoteArtifact:
+    remote_relative_path: PurePosixPath
+    previous_remote_path: PurePosixPath
+    size_bytes: int
+    sha256: str
+    artifact_type: str
+    local_relative_path: str | None = None
+
+
 class StorageBoxRepository:
     """Owns release publication and remote catalog/current/manifest reads."""
 
@@ -703,9 +713,9 @@ class StorageBoxRepository:
         cls,
         *,
         staging_root: PurePosixPath,
-        artifacts: list[LocalArtifact],
+        artifacts: list[LocalArtifact | RemoteArtifact],
     ) -> None:
-        async def _verify(artifact: LocalArtifact) -> None:
+        async def _verify(artifact: LocalArtifact | RemoteArtifact) -> None:
             await cls._verify_remote_artifact(staging_root=staging_root, artifact=artifact)
 
         await _run_bounded(
@@ -719,7 +729,7 @@ class StorageBoxRepository:
         cls,
         *,
         staging_root: PurePosixPath,
-        artifact: LocalArtifact,
+        artifact: LocalArtifact | RemoteArtifact,
     ) -> None:
         remote_path = staging_root / artifact.remote_relative_path
         stat_result = await StorageBoxSftpClient.stat(remote_path)
@@ -1351,6 +1361,7 @@ class StorageBoxRepository:
         display_name: str,
         series_id: str | None = None,
         expected_min_episodes: int | None = None,
+        merge_existing_release: bool = False,
         progress_callback: ProgressCallback | None = None,
     ) -> dict[str, Any]:
         scoped_type = coerce_library_type(library_type)
@@ -1378,22 +1389,24 @@ class StorageBoxRepository:
         # whether we wipe just the staging dir or the entire series root —
         # see the except branch at the end of the publish.
         previous_sha_to_remote: dict[str, PurePosixPath] = {}
+        previous_manifest: dict[str, Any] | None = None
+        previous_release_root: PurePosixPath | None = None
         is_brand_new_series = True
         try:
             prev_current = await cls.get_current_release(scoped_type, effective_series_id)
             is_brand_new_series = False
             prev_release_id = str(prev_current["release_id"])
-            prev_release_root = cls._release_root(
+            previous_release_root = cls._release_root(
                 scoped_type, effective_series_id, prev_release_id,
             )
-            prev_manifest = await cls.get_series_manifest(
+            previous_manifest = await cls.get_series_manifest(
                 scoped_type, effective_series_id, prev_release_id,
             )
-            for art in prev_manifest.get("artifacts", []):
+            for art in previous_manifest.get("artifacts", []):
                 sha = art.get("sha256")
                 rel = art.get("relative_path")
                 if sha and rel:
-                    previous_sha_to_remote[sha] = prev_release_root / PurePosixPath(rel)
+                    previous_sha_to_remote[sha] = previous_release_root / PurePosixPath(rel)
         except Exception:
             logger.debug(
                 "No previous release found for %s; will do full upload",
@@ -1430,6 +1443,98 @@ class StorageBoxRepository:
                         torrent_count = 0
                     break
 
+            preserved_artifacts: list[RemoteArtifact] = []
+            if merge_existing_release and previous_manifest and previous_release_root is not None:
+                local_episode_keys = {
+                    str(item.get("episode_key"))
+                    for item in episodes
+                    if isinstance(item, dict) and item.get("episode_key")
+                }
+                previous_episodes = [
+                    item
+                    for item in previous_manifest.get("episodes", [])
+                    if isinstance(item, dict)
+                    and str(item.get("episode_key") or "") not in local_episode_keys
+                ]
+                if previous_episodes:
+                    episodes = [*previous_episodes, *episodes]
+                    preserved_relative_paths: set[str] = set()
+                    for episode in previous_episodes:
+                        media = episode.get("media")
+                        if isinstance(media, dict) and media.get("relative_path"):
+                            preserved_relative_paths.add(str(media["relative_path"]))
+                        sidecars = episode.get("sidecars")
+                        if isinstance(sidecars, list):
+                            for sidecar in sidecars:
+                                if isinstance(sidecar, dict) and sidecar.get("relative_path"):
+                                    preserved_relative_paths.add(str(sidecar["relative_path"]))
+
+                    local_relative_paths = {
+                        artifact.remote_relative_path.as_posix()
+                        for artifact in artifacts
+                    }
+                    previous_artifacts = {
+                        str(item.get("relative_path")): item
+                        for item in previous_manifest.get("artifacts", [])
+                        if isinstance(item, dict) and item.get("relative_path")
+                    }
+                    for relative_path in sorted(preserved_relative_paths):
+                        if relative_path in local_relative_paths:
+                            continue
+                        previous_artifact = previous_artifacts.get(relative_path)
+                        if not previous_artifact:
+                            raise RuntimeError(
+                                "Previous release manifest is missing an artifact for "
+                                f"preserved episode path: {relative_path}"
+                            )
+                        preserved_artifacts.append(
+                            RemoteArtifact(
+                                remote_relative_path=PurePosixPath(relative_path),
+                                previous_remote_path=(
+                                    previous_release_root / PurePosixPath(relative_path)
+                                ),
+                                size_bytes=int(previous_artifact.get("size_bytes") or 0),
+                                sha256=str(previous_artifact.get("sha256") or ""),
+                                artifact_type=str(
+                                    previous_artifact.get("artifact_type") or "library"
+                                ),
+                                local_relative_path=(
+                                    str(previous_artifact.get("local_relative_path"))
+                                    if previous_artifact.get("local_relative_path")
+                                    else None
+                                ),
+                            )
+                        )
+
+                    logger.info(
+                        "Publish %s: preserving %d episode(s) and %d artifact(s) "
+                        "from previous release during incremental update",
+                        display_name,
+                        len(previous_episodes),
+                        len(preserved_artifacts),
+                    )
+
+            manifest_artifacts = [
+                {
+                    "relative_path": artifact.remote_relative_path.as_posix(),
+                    "local_relative_path": artifact.local_relative_path,
+                    "size_bytes": artifact.size_bytes,
+                    "sha256": artifact.sha256,
+                    "artifact_type": artifact.artifact_type,
+                }
+                for artifact in artifacts
+            ]
+            manifest_artifacts.extend(
+                {
+                    "relative_path": artifact.remote_relative_path.as_posix(),
+                    "local_relative_path": artifact.local_relative_path,
+                    "size_bytes": artifact.size_bytes,
+                    "sha256": artifact.sha256,
+                    "artifact_type": artifact.artifact_type,
+                }
+                for artifact in preserved_artifacts
+            )
+
             manifest_payload = {
                 "schema_version": SCHEMA_VERSION,
                 "library_type": scoped_type.value,
@@ -1454,16 +1559,7 @@ class StorageBoxRepository:
                 "torrent_count": torrent_count,
                 "torrent_metadata_relative_path": torrent_metadata_relative_path,
                 "episodes": episodes,
-                "artifacts": [
-                    {
-                        "relative_path": artifact.remote_relative_path.as_posix(),
-                        "local_relative_path": artifact.local_relative_path,
-                        "size_bytes": artifact.size_bytes,
-                        "sha256": artifact.sha256,
-                        "artifact_type": artifact.artifact_type,
-                    }
-                    for artifact in artifacts
-                ],
+                "artifacts": manifest_artifacts,
             }
             manifest_text = _json_dumps(manifest_payload)
 
@@ -1579,7 +1675,36 @@ class StorageBoxRepository:
                         _upload_artifact,
                     )
 
-            await cls._verify_remote_artifacts(staging_root=staging_root, artifacts=artifacts)
+            if preserved_artifacts:
+                hardlink_probe = preserved_artifacts[0]
+                hardlink_ok = await cls._try_hardlink_first(
+                    hardlink_probe.previous_remote_path,
+                    staging_root / hardlink_probe.remote_relative_path,
+                )
+                if not hardlink_ok:
+                    raise RuntimeError(
+                        "Storage Box hardlink support is required to publish an "
+                        "incremental update while preserving non-hydrated episodes."
+                    )
+
+                remaining_preserved = preserved_artifacts[1:]
+                if remaining_preserved:
+                    async def _hardlink_preserved(artifact: RemoteArtifact) -> None:
+                        await StorageBoxSftpClient.hardlink(
+                            artifact.previous_remote_path,
+                            staging_root / artifact.remote_relative_path,
+                        )
+
+                    await _run_bounded(
+                        remaining_preserved,
+                        settings.storage_box_upload_max_parallel,
+                        _hardlink_preserved,
+                    )
+
+            await cls._verify_remote_artifacts(
+                staging_root=staging_root,
+                artifacts=[*artifacts, *preserved_artifacts],
+            )
             await StorageBoxSftpClient.write_text(
                 staging_root / "series_manifest.json",
                 manifest_text,

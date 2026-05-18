@@ -1369,6 +1369,7 @@ class LibraryHydrationService:
         series_id: str | None = None,
         already_locked: bool = False,
         expected_min_episodes: int | None = None,
+        merge_existing_release: bool = False,
         progress_callback: ProgressCallback | None = None,
     ) -> dict[str, Any]:
         scoped_type = coerce_library_type(library_type)
@@ -1379,6 +1380,7 @@ class LibraryHydrationService:
                 display_name=display_name,
                 series_id=series_id,
                 expected_min_episodes=expected_min_episodes,
+                merge_existing_release=merge_existing_release,
                 progress_callback=progress_callback,
             )
             await cls.sync_local_series_state(

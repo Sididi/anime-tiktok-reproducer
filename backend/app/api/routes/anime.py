@@ -544,6 +544,7 @@ async def update_anime(request: UpdateAnimeRequest):
                     series_id=series_id,
                     already_locked=bool(series_id),
                     expected_min_episodes=expected_min_episodes,
+                    merge_existing_release=bool(series_id),
                 )
             except Exception as exc:
                 yield f"data: {json.dumps({'status': 'error', 'progress': 0.0, 'message': str(exc), 'error': str(exc), 'anime_name': request.anime_name})}\n\n"
