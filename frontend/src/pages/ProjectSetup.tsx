@@ -26,6 +26,8 @@ import type {
   SeriesDeleteReferencingProject,
 } from "@/types";
 
+const SOURCE_REFRESH_INTERVAL_MS = 60_000;
+
 export function ProjectSetup() {
   // Library state
   const [selectedLibraryType, setSelectedLibraryType] = useState<LibraryType>(
@@ -43,6 +45,7 @@ export function ProjectSetup() {
   const [startupJobs, setStartupJobs] = useState<ProjectStartupJob[]>([]);
   const startupAbortRef = useRef<AbortController | null>(null);
   const startupTabsRef = useRef<Map<string, Window | null>>(new Map());
+  const sourceLoadSeqRef = useRef(0);
 
   // Modals
   const [showProjectManager, setShowProjectManager] = useState(false);
@@ -76,18 +79,46 @@ export function ProjectSetup() {
   // ---------------------------------------------------------------------------
   // Load sources
   // ---------------------------------------------------------------------------
-  const loadSources = useCallback(async () => {
+  const loadSources = useCallback(async (options?: { clearOnError?: boolean }) => {
+    const requestSeq = sourceLoadSeqRef.current + 1;
+    sourceLoadSeqRef.current = requestSeq;
     try {
       const details = await api.getSourceDetails(selectedLibraryType);
+      if (requestSeq !== sourceLoadSeqRef.current) {
+        return;
+      }
       setSources(details);
     } catch (err) {
       console.error("Failed to load sources:", err);
-      setSources([]);
+      if (options?.clearOnError !== false && requestSeq === sourceLoadSeqRef.current) {
+        setSources([]);
+      }
     }
   }, [selectedLibraryType]);
 
   useEffect(() => {
     void loadSources();
+  }, [loadSources]);
+
+  useEffect(() => {
+    const refreshSources = () => {
+      void loadSources({ clearOnError: false });
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        refreshSources();
+      }
+    };
+
+    const intervalId = window.setInterval(refreshSources, SOURCE_REFRESH_INTERVAL_MS);
+    window.addEventListener("focus", refreshSources);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      window.clearInterval(intervalId);
+      window.removeEventListener("focus", refreshSources);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
   }, [loadSources]);
 
   const handleJobComplete = useCallback(
