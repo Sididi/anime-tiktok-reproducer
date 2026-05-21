@@ -343,6 +343,7 @@ class LibraryHydrationService:
             return False
         if state.hydration_status not in {
             HYDRATION_STATUS_INDEX_READY,
+            HYDRATION_STATUS_HYDRATING_EPISODES,
             HYDRATION_STATUS_FULLY_LOCAL,
         }:
             return False
