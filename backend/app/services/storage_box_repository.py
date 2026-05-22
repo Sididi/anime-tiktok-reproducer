@@ -22,7 +22,7 @@ from .storage_box_progress import (
     ProgressCallback,
     StorageBoxTransferProgress,
 )
-from .storage_box_sftp_client import StorageBoxSftpClient
+from .storage_box_sftp_client import StorageBoxSftpClient, _is_transient_error
 from .storage_box_transfer import StorageBoxTransferService
 
 
@@ -318,7 +318,9 @@ class StorageBoxRepository:
                 cls._catalog_path(scoped_type),
                 context=f"{scoped_type} catalog",
             )
-        except Exception:
+        except Exception as exc:
+            if _is_transient_error(exc):
+                raise
             payload = await cls.rebuild_catalog(scoped_type)
 
         items = payload.get("items", [])
@@ -465,8 +467,10 @@ class StorageBoxRepository:
 
         try:
             series_ids = await StorageBoxSftpClient.listdir(series_root)
-        except Exception:
-            series_ids = []
+        except Exception as exc:
+            raise RuntimeError(
+                f"Cannot rebuild {scoped_type.value} catalog: failed to list remote series root"
+            ) from exc
 
         for series_id in sorted(series_ids):
             try:
