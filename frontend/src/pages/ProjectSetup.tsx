@@ -26,8 +26,6 @@ import type {
   SeriesDeleteReferencingProject,
 } from "@/types";
 
-const SOURCE_REFRESH_INTERVAL_MS = 60_000;
-
 export function ProjectSetup() {
   // Library state
   const [selectedLibraryType, setSelectedLibraryType] = useState<LibraryType>(
@@ -85,14 +83,16 @@ export function ProjectSetup() {
     try {
       const details = await api.getSourceDetails(selectedLibraryType);
       if (requestSeq !== sourceLoadSeqRef.current) {
-        return;
+        return null;
       }
       setSources(details);
+      return details;
     } catch (err) {
       console.error("Failed to load sources:", err);
       if (options?.clearOnError !== false && requestSeq === sourceLoadSeqRef.current) {
         setSources([]);
       }
+      return null;
     }
   }, [selectedLibraryType]);
 
@@ -100,25 +100,8 @@ export function ProjectSetup() {
     void loadSources();
   }, [loadSources]);
 
-  useEffect(() => {
-    const refreshSources = () => {
-      void loadSources({ clearOnError: false });
-    };
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === "visible") {
-        refreshSources();
-      }
-    };
-
-    const intervalId = window.setInterval(refreshSources, SOURCE_REFRESH_INTERVAL_MS);
-    window.addEventListener("focus", refreshSources);
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-
-    return () => {
-      window.clearInterval(intervalId);
-      window.removeEventListener("focus", refreshSources);
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-    };
+  const reloadSources = useCallback(async () => {
+    await loadSources();
   }, [loadSources]);
 
   const handleJobComplete = useCallback(
@@ -314,7 +297,9 @@ export function ProjectSetup() {
     setStatusText("Launching...");
 
     try {
-      const selectedSourceDetails = sources.find(
+      const latestSources = await loadSources({ clearOnError: false });
+      const availableSources = latestSources ?? sources;
+      const selectedSourceDetails = availableSources.find(
         (source) => source.series_id === selectedSource,
       );
       if (!selectedSourceDetails) {
@@ -341,7 +326,14 @@ export function ProjectSetup() {
       setProcessing(false);
       setStatusText("");
     }
-  }, [tiktokUrl, selectedSource, selectedLibraryType, sources, upsertStartupJob]);
+  }, [
+    tiktokUrl,
+    selectedSource,
+    selectedLibraryType,
+    sources,
+    loadSources,
+    upsertStartupJob,
+  ]);
 
   const handleOpenStartupJob = useCallback((job: ProjectStartupJob) => {
     if (!job.ready_url) {
@@ -739,8 +731,8 @@ export function ProjectSetup() {
           sourceName={episodeSource.name}
           seriesId={episodeSource.series_id}
           libraryType={selectedLibraryType}
-          onComplete={loadSources}
-          onSourcesChanged={loadSources}
+          onComplete={reloadSources}
+          onSourcesChanged={reloadSources}
         />
       )}
     </div>
