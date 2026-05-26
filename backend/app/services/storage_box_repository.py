@@ -133,6 +133,7 @@ class StorageBoxRepository:
 
     _catalog_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
     _catalog_cache_ttl_seconds = 30.0
+    _background_tasks: set[asyncio.Task[Any]] = set()
 
     @classmethod
     def is_enabled(cls) -> bool:
@@ -190,6 +191,19 @@ class StorageBoxRepository:
         return cls._type_root(library_type) / "series" / series_id
 
     @classmethod
+    def _deleted_series_root(
+        cls,
+        library_type: LibraryType | str,
+        series_id: str,
+    ) -> PurePosixPath:
+        return (
+            cls._type_root(library_type)
+            / ".trash"
+            / "deleted-series"
+            / f"{series_id}-{uuid.uuid4().hex[:12]}"
+        )
+
+    @classmethod
     def _current_path(
         cls,
         library_type: LibraryType | str,
@@ -244,6 +258,18 @@ class StorageBoxRepository:
             return
         scoped_type = coerce_library_type(library_type).value
         cls._catalog_cache.pop(scoped_type, None)
+
+    @classmethod
+    def _spawn_background_task(
+        cls,
+        coroutine,
+        *,
+        description: str,
+    ) -> asyncio.Task[Any]:
+        task = asyncio.create_task(coroutine, name=description)
+        cls._background_tasks.add(task)
+        task.add_done_callback(cls._background_tasks.discard)
+        return task
 
     @staticmethod
     def _normalized_catalog_name(value: Any) -> str:
@@ -343,6 +369,19 @@ class StorageBoxRepository:
         normalized = display_name.strip().casefold()
         for entry in entries:
             if str(entry.get("name", "")).strip().casefold() == normalized:
+                return entry
+        return None
+
+    @classmethod
+    async def find_catalog_entry_by_series_id(
+        cls,
+        library_type: LibraryType | str,
+        series_id: str,
+    ) -> dict[str, Any] | None:
+        entries = await cls.list_catalog(library_type)
+        normalized = series_id.strip()
+        for entry in entries:
+            if str(entry.get("series_id", "")).strip() == normalized:
                 return entry
         return None
 
@@ -509,6 +548,47 @@ class StorageBoxRepository:
         await StorageBoxSftpClient.replace_file(tmp_path, catalog_path)
         cls._invalidate_catalog_cache(scoped_type)
         return payload
+
+    @classmethod
+    async def remove_catalog_entry(
+        cls,
+        library_type: LibraryType | str,
+        series_id: str,
+    ) -> None:
+        scoped_type = coerce_library_type(library_type)
+        catalog_path = cls._catalog_path(scoped_type)
+        try:
+            payload = await cls._read_remote_json(
+                catalog_path,
+                context=f"{scoped_type.value} catalog",
+            )
+        except Exception as exc:
+            if _is_transient_error(exc):
+                raise
+            cls._invalidate_catalog_cache(scoped_type)
+            return
+
+        items = payload.get("items", [])
+        if not isinstance(items, list):
+            items = []
+        filtered_items = [
+            item
+            for item in items
+            if not (
+                isinstance(item, dict)
+                and str(item.get("series_id") or "").strip() == series_id
+            )
+        ]
+        if len(filtered_items) == len(items):
+            cls._invalidate_catalog_cache(scoped_type)
+            return
+
+        payload["items"] = filtered_items
+        payload["updated_at"] = _utc_now_iso()
+        tmp_path = catalog_path.with_name(f"catalog.{uuid.uuid4().hex[:8]}.tmp")
+        await cls._write_remote_json(tmp_path, payload)
+        await StorageBoxSftpClient.replace_file(tmp_path, catalog_path)
+        cls._invalidate_catalog_cache(scoped_type)
 
     @classmethod
     def _read_local_index_series_payload(
@@ -1775,6 +1855,28 @@ class StorageBoxRepository:
             raise RuntimeError("Storage Box is not configured.")
 
         series_root = cls._series_root(scoped_type, series_id)
+        deleted_root: PurePosixPath | None = None
         if await StorageBoxSftpClient.exists(series_root):
-            await StorageBoxSftpClient.remove_tree(series_root)
-        await cls.rebuild_catalog(scoped_type)
+            deleted_root = cls._deleted_series_root(scoped_type, series_id)
+            await StorageBoxSftpClient.rename(series_root, deleted_root)
+
+        await cls.remove_catalog_entry(scoped_type, series_id)
+
+        if deleted_root is None:
+            return
+
+        async def _cleanup_remote_tree() -> None:
+            try:
+                await StorageBoxSftpClient.remove_tree(deleted_root)
+            except Exception:
+                logger.exception(
+                    "Background Storage Box delete failed for %s/%s at %s",
+                    scoped_type.value,
+                    series_id,
+                    deleted_root,
+                )
+
+        cls._spawn_background_task(
+            _cleanup_remote_tree(),
+            description=f"storage-box-delete:{scoped_type.value}:{series_id}",
+        )

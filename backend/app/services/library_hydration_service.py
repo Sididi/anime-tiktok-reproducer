@@ -1437,19 +1437,38 @@ class LibraryHydrationService:
                 scoped_type,
                 series_id,
             )
-            manifest = None
+            catalog_entry = None
             with suppress(Exception):
-                manifest = await cls._load_or_fetch_manifest(scoped_type, series_id)
+                catalog_entry = await StorageBoxRepository.find_catalog_entry_by_series_id(
+                    scoped_type,
+                    series_id,
+                )
+            manifest = None
+            if isinstance(catalog_entry, dict):
+                display_name = str(catalog_entry.get("name") or "").strip()
+                storage_release_id = str(catalog_entry.get("storage_release_id") or "").strip()
+                if display_name:
+                    manifest = {
+                        "series_id": series_id,
+                        "display_name": display_name,
+                        "release_id": storage_release_id,
+                        "episode_count": int(catalog_entry.get("episode_count", 0) or 0),
+                        "episodes": [],
+                    }
+            if manifest is None:
+                with suppress(Exception):
+                    manifest = await cls._load_or_fetch_manifest(scoped_type, series_id)
 
-            display_name = (
-                str(manifest["display_name"])
-                if manifest
-                else await asyncio.to_thread(
+            if manifest is None and isinstance(catalog_entry, dict):
+                display_name = str(catalog_entry.get("name") or "").strip()
+            elif manifest is not None:
+                display_name = str(manifest["display_name"])
+            else:
+                display_name = await asyncio.to_thread(
                     cls._resolve_local_display_name_sync,
                     scoped_type,
                     series_id,
                 )
-            )
 
             async with cls._library_lock(scoped_type):
                 await asyncio.to_thread(

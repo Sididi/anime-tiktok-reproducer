@@ -59,7 +59,7 @@ class ScriptAutomationService:
     TTS_MIN = 500
     TTS_SOFT_MAX = 750
     TTS_HARD_MAX = 800
-    V3_CONTROL_PREFIX = "[TikTok narrator, energetic, rapid]"
+    V3_CONTROL_PREFIX = "[speedy]"
 
     @classmethod
     def _event(
