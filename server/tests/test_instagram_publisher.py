@@ -1,12 +1,14 @@
 """Tests for app.services.instagram_publisher using respx-mocked Graph API."""
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
 import pytest
 import respx
 
+from app.models.job import InstagramPublishState
 from app.services import instagram_publisher
 from app.services.instagram_publisher import (
     _preflight_instagram_account,
@@ -307,7 +309,194 @@ async def test_polling_timeout():
     )
 
     assert result.success is False
-    assert result.detail == "status_poll: poll timeout"
+    assert result.detail is not None
+    assert result.detail.startswith("status_poll: poll timeout after ")
+    assert f"container={CONTAINER_ID}" in result.detail
+    assert "last_status=IN_PROGRESS" in result.detail
+    assert "resumable=true" in result.detail
+    assert result.publish_state is not None
+    assert result.publish_state.container_id == CONTAINER_ID
+    assert result.publish_state.last_status_code == "IN_PROGRESS"
+
+
+@respx.mock
+async def test_timeout_retry_reuses_uploaded_container_without_new_create():
+    state = InstagramPublishState(
+        container_id=CONTAINER_ID,
+        upload_uri=UPLOAD_URI,
+        stage="uploaded",
+        created_at=datetime.now(tz=UTC) - timedelta(minutes=5),
+        expires_at=datetime.now(tz=UTC) + timedelta(hours=23),
+        upload_completed_at=datetime.now(tz=UTC) - timedelta(minutes=4),
+        last_status_code="IN_PROGRESS",
+    )
+    status_route = respx.get(f"{BASE}/{CONTAINER_ID}").mock(
+        return_value=httpx.Response(200, json={"status_code": "FINISHED", "id": CONTAINER_ID})
+    )
+    publish_route = respx.post(f"{BASE}/{IG_USER_ID}/media_publish").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID})
+    )
+    respx.get(f"{BASE}/{MEDIA_ID}").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID, "permalink": PERMALINK_URL})
+    )
+
+    result = await publish_to_instagram(
+        **_COMMON,
+        poll_interval=0.01,
+        poll_timeout=1.0,
+        publish_state=state,
+    )
+
+    assert result.success is True
+    assert result.permalink == PERMALINK_URL
+    assert status_route.called
+    assert publish_route.called
+    assert result.publish_state is not None
+    assert result.publish_state.container_id == CONTAINER_ID
+    assert result.publish_state.media_id == MEDIA_ID
+
+
+@respx.mock
+async def test_resumed_published_container_returns_success_without_publish():
+    state = InstagramPublishState(
+        container_id=CONTAINER_ID,
+        upload_uri=UPLOAD_URI,
+        stage="uploaded",
+        created_at=datetime.now(tz=UTC) - timedelta(minutes=5),
+        expires_at=datetime.now(tz=UTC) + timedelta(hours=23),
+        upload_completed_at=datetime.now(tz=UTC) - timedelta(minutes=4),
+        last_status_code="IN_PROGRESS",
+    )
+    respx.get(f"{BASE}/{CONTAINER_ID}").mock(
+        return_value=httpx.Response(200, json={"status_code": "PUBLISHED", "id": CONTAINER_ID})
+    )
+    publish_route = respx.post(f"{BASE}/{IG_USER_ID}/media_publish").mock(
+        return_value=httpx.Response(500, text="should not publish again")
+    )
+
+    result = await publish_to_instagram(
+        **_COMMON,
+        poll_interval=0.01,
+        poll_timeout=1.0,
+        publish_state=state,
+    )
+
+    assert result.success is True
+    assert publish_route.called is False
+    assert result.publish_state is not None
+    assert result.publish_state.stage == "published"
+
+
+@respx.mock
+async def test_expired_state_creates_fresh_container():
+    expired_state = InstagramPublishState(
+        container_id="old_container",
+        upload_uri="https://rupload.facebook.com/old",
+        stage="uploaded",
+        created_at=datetime.now(tz=UTC) - timedelta(days=2),
+        expires_at=datetime.now(tz=UTC) - timedelta(days=1),
+        upload_completed_at=datetime.now(tz=UTC) - timedelta(days=2),
+        last_status_code="IN_PROGRESS",
+    )
+    _mock_video_download()
+    create_route = _mock_resumable_create()
+    respx.get(f"{BASE}/{CONTAINER_ID}").mock(
+        return_value=httpx.Response(200, json={"status_code": "FINISHED", "id": CONTAINER_ID})
+    )
+    respx.post(f"{BASE}/{IG_USER_ID}/media_publish").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID})
+    )
+    respx.get(f"{BASE}/{MEDIA_ID}").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID, "permalink": PERMALINK_URL})
+    )
+
+    result = await publish_to_instagram(
+        **_COMMON,
+        poll_interval=0.01,
+        poll_timeout=1.0,
+        publish_state=expired_state,
+    )
+
+    assert result.success is True
+    assert create_route.called
+    assert result.publish_state is not None
+    assert result.publish_state.container_id == CONTAINER_ID
+
+
+@respx.mock
+async def test_error_state_creates_fresh_container():
+    error_state = InstagramPublishState(
+        container_id="old_container",
+        upload_uri="https://rupload.facebook.com/old",
+        stage="polling",
+        created_at=datetime.now(tz=UTC) - timedelta(minutes=5),
+        expires_at=datetime.now(tz=UTC) + timedelta(hours=23),
+        upload_completed_at=datetime.now(tz=UTC) - timedelta(minutes=4),
+        last_status_code="ERROR",
+    )
+    _mock_video_download()
+    create_route = _mock_resumable_create()
+    respx.get(f"{BASE}/{CONTAINER_ID}").mock(
+        return_value=httpx.Response(200, json={"status_code": "FINISHED", "id": CONTAINER_ID})
+    )
+    respx.post(f"{BASE}/{IG_USER_ID}/media_publish").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID})
+    )
+    respx.get(f"{BASE}/{MEDIA_ID}").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID, "permalink": PERMALINK_URL})
+    )
+
+    result = await publish_to_instagram(
+        **_COMMON,
+        poll_interval=0.01,
+        poll_timeout=1.0,
+        publish_state=error_state,
+    )
+
+    assert result.success is True
+    assert create_route.called
+    assert result.publish_state is not None
+    assert result.publish_state.container_id == CONTAINER_ID
+
+
+@respx.mock
+async def test_created_state_reuploads_without_new_create(monkeypatch):
+    state = InstagramPublishState(
+        container_id=CONTAINER_ID,
+        upload_uri=UPLOAD_URI,
+        stage="created",
+        created_at=datetime.now(tz=UTC) - timedelta(minutes=5),
+        expires_at=datetime.now(tz=UTC) + timedelta(hours=23),
+    )
+    uploaded = {}
+
+    async def upload(**kwargs):
+        uploaded.update(kwargs)
+        return _UploadResponse(status_code=200, body='{"success": true}')
+
+    monkeypatch.setattr(instagram_publisher, "_upload_resumable_binary", upload)
+    _mock_video_download()
+    respx.get(f"{BASE}/{CONTAINER_ID}").mock(
+        return_value=httpx.Response(200, json={"status_code": "FINISHED", "id": CONTAINER_ID})
+    )
+    respx.post(f"{BASE}/{IG_USER_ID}/media_publish").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID})
+    )
+    respx.get(f"{BASE}/{MEDIA_ID}").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID, "permalink": PERMALINK_URL})
+    )
+
+    result = await publish_to_instagram(
+        **_COMMON,
+        poll_interval=0.01,
+        poll_timeout=1.0,
+        publish_state=state,
+    )
+
+    assert result.success is True
+    assert uploaded["upload_uri"] == UPLOAD_URI
+    assert result.publish_state is not None
+    assert result.publish_state.upload_completed_at is not None
 
 
 @respx.mock

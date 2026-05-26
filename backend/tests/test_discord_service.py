@@ -146,12 +146,16 @@ def test_create_job_with_instagram_payload():
             "ig_access_token": "ig_token",
             "caption": "hi",
             "graph_api_version": "v25.0",
+            "poll_interval_seconds": 60,
+            "poll_timeout_seconds": 14400,
         },
     )
     assert route.called
     sent = route.calls.last.request.content
     assert b'"instagram":{' in sent or b'"instagram": {' in sent
     assert b'"ig_user_id":"ig_42"' in sent or b'"ig_user_id": "ig_42"' in sent
+    assert b'"poll_interval_seconds":60' in sent or b'"poll_interval_seconds": 60' in sent
+    assert b'"poll_timeout_seconds":14400' in sent or b'"poll_timeout_seconds": 14400' in sent
 
 
 @respx.mock

@@ -141,8 +141,8 @@ class Settings(BaseSettings):
     facebook_page_access_token: str | None = None
     instagram_business_account_id: str | None = None
     instagram_access_token: str | None = None
-    instagram_publish_poll_interval_seconds: int = 5
-    instagram_publish_timeout_seconds: int = 15 * 60
+    instagram_publish_poll_interval_seconds: int = 60
+    instagram_publish_timeout_seconds: int = 4 * 60 * 60
 
     # qBittorrent
     qbittorrent_url: str = "http://localhost:8080"

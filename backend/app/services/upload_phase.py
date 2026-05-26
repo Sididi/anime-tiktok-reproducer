@@ -603,6 +603,8 @@ class UploadPhaseService:
                     "ig_access_token": ig_token,
                     "caption": metadata.instagram.caption,
                     "graph_api_version": settings.meta_graph_api_version,
+                    "poll_interval_seconds": settings.instagram_publish_poll_interval_seconds,
+                    "poll_timeout_seconds": settings.instagram_publish_timeout_seconds,
                 }
 
         discord_message_id = None

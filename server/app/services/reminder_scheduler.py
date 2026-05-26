@@ -22,7 +22,7 @@ import logging
 from datetime import UTC, datetime
 
 from app.config import Settings
-from app.models.job import Job, PlatformStatus
+from app.models.job import InstagramPublishState, Job, PlatformStatus
 from app.services.embed_builder import build_embed
 from app.services.instagram_publisher import publish_to_instagram
 from app.services.job_store import JobStore
@@ -153,6 +153,9 @@ async def _dispatch_instagram_publish(
         PlatformStatus(status="uploading", attempts=next_attempts),
     )
 
+    async def persist_instagram_state(state: InstagramPublishState) -> None:
+        await store.set_instagram_publish_state(job.project_id, state)
+
     result = await publish_to_instagram(
         ig_user_id=payload["ig_user_id"],
         ig_access_token=payload["ig_access_token"],
@@ -169,7 +172,11 @@ async def _dispatch_instagram_publish(
             True if payload.get("share_to_feed") is None else bool(payload["share_to_feed"])
         ),
         thumb_offset=payload.get("thumb_offset"),
+        publish_state=job.instagram_publish_state,
+        progress_callback=persist_instagram_state,
     )
+    if (result_state := getattr(result, "publish_state", None)) is not None:
+        await store.set_instagram_publish_state(job.project_id, result_state)
 
     now = datetime.now(tz=UTC)
     if result.success:

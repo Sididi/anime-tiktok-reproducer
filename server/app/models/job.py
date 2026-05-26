@@ -37,6 +37,73 @@ class PlatformStatus:
         )
 
 
+@dataclass(frozen=True)
+class InstagramPublishState:
+    """Sanitized resumable Instagram publish state.
+
+    This intentionally excludes access tokens and upload headers. The upload URI
+    is persisted so a container created before a crash can be retried.
+    """
+
+    container_id: str | None = None
+    upload_uri: str | None = None
+    stage: str | None = None
+    created_at: datetime | None = None
+    expires_at: datetime | None = None
+    upload_completed_at: datetime | None = None
+    last_polled_at: datetime | None = None
+    last_status_code: str | None = None
+    last_status_detail: str | None = None
+    last_status_payload_summary: dict[str, Any] | None = None
+    media_id: str | None = None
+    permalink: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "container_id": self.container_id,
+            "upload_uri": self.upload_uri,
+            "stage": self.stage,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "upload_completed_at": (
+                self.upload_completed_at.isoformat() if self.upload_completed_at else None
+            ),
+            "last_polled_at": self.last_polled_at.isoformat() if self.last_polled_at else None,
+            "last_status_code": self.last_status_code,
+            "last_status_detail": self.last_status_detail,
+            "last_status_payload_summary": self.last_status_payload_summary,
+            "media_id": self.media_id,
+            "permalink": self.permalink,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any] | None) -> InstagramPublishState | None:
+        if not isinstance(d, dict):
+            return None
+
+        def _dt(key: str) -> datetime | None:
+            value = d.get(key)
+            if not value:
+                return None
+            return datetime.fromisoformat(str(value))
+
+        summary = d.get("last_status_payload_summary")
+        return cls(
+            container_id=d.get("container_id"),
+            upload_uri=d.get("upload_uri"),
+            stage=d.get("stage"),
+            created_at=_dt("created_at"),
+            expires_at=_dt("expires_at"),
+            upload_completed_at=_dt("upload_completed_at"),
+            last_polled_at=_dt("last_polled_at"),
+            last_status_code=d.get("last_status_code"),
+            last_status_detail=d.get("last_status_detail"),
+            last_status_payload_summary=summary if isinstance(summary, dict) else None,
+            media_id=d.get("media_id"),
+            permalink=d.get("permalink"),
+        )
+
+
 @dataclass
 class Job:
     project_id: str
@@ -54,6 +121,7 @@ class Job:
     reminder_forward_message_id: str | None = None
     reminder_cancelled: bool = False
     instagram_payload: dict | None = None
+    instagram_publish_state: InstagramPublishState | None = None
     platform_scheduled_at: dict[str, datetime] = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
     updated_at: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
@@ -81,6 +149,11 @@ class Job:
             "reminder_forward_message_id": self.reminder_forward_message_id,
             "reminder_cancelled": self.reminder_cancelled,
             "instagram_payload": self.instagram_payload,
+            "instagram_publish_state": (
+                self.instagram_publish_state.to_dict()
+                if self.instagram_publish_state
+                else None
+            ),
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
         }
@@ -109,6 +182,9 @@ class Job:
             reminder_forward_message_id=d.get("reminder_forward_message_id"),
             reminder_cancelled=bool(d.get("reminder_cancelled", False)),
             instagram_payload=d.get("instagram_payload"),
+            instagram_publish_state=InstagramPublishState.from_dict(
+                d.get("instagram_publish_state")
+            ),
             created_at=datetime.fromisoformat(d["created_at"]),
             updated_at=datetime.fromisoformat(d["updated_at"]),
         )

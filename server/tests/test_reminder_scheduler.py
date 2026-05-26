@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from app.config import Settings
-from app.models.job import Job, PlatformStatus
+from app.models.job import InstagramPublishState, Job, PlatformStatus
 from app.services.job_store import JobStore
 from app.services.reminder_scheduler import (
     dispatch_due_actions,
@@ -197,6 +197,67 @@ async def test_dispatch_instagram_happy_path(
     assert publish_mock.await_args.kwargs["thumb_offset"] == 250
     # Embed re-render attempted
     discord.edit_message.assert_called()
+
+
+async def test_dispatch_instagram_passes_and_persists_publish_state(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
+    store = JobStore(tmp_path / "jobs.json")
+    past = datetime.now(tz=UTC) - timedelta(minutes=5)
+    existing_state = InstagramPublishState(
+        container_id="container_existing",
+        upload_uri="https://rupload.facebook.com/existing",
+        stage="uploaded",
+        created_at=datetime.now(tz=UTC) - timedelta(minutes=10),
+        expires_at=datetime.now(tz=UTC) + timedelta(hours=23),
+        upload_completed_at=datetime.now(tz=UTC) - timedelta(minutes=9),
+        last_status_code="IN_PROGRESS",
+    )
+    persisted_state = InstagramPublishState(
+        container_id="container_existing",
+        upload_uri="https://rupload.facebook.com/existing",
+        stage="polling",
+        created_at=existing_state.created_at,
+        expires_at=existing_state.expires_at,
+        upload_completed_at=existing_state.upload_completed_at,
+        last_polled_at=datetime.now(tz=UTC),
+        last_status_code="IN_PROGRESS",
+    )
+    job = _make_job(slot_time=past, project_id="ig-resume")
+    job.platforms_requested = ["instagram"]
+    job.instagram_payload = {"ig_user_id": "x", "ig_access_token": "x", "caption": "x"}
+    job.instagram_publish_state = existing_state
+    job.platform_statuses = {
+        "instagram": PlatformStatus(status="pending"),
+        "tiktok": PlatformStatus(status="pending"),
+    }
+    await store.create(job)
+    discord = AsyncMock()
+
+    async def fake_publish(**kwargs):
+        assert kwargs["publish_state"] == existing_state
+        await kwargs["progress_callback"](persisted_state)
+        return type("R", (), {
+            "success": False,
+            "permalink": None,
+            "detail": "status_poll: poll timeout after 600s; container=container_existing",
+            "publish_state": persisted_state,
+        })()
+
+    with patch("app.services.reminder_scheduler.publish_to_instagram", new=fake_publish):
+        actions = await dispatch_due_actions(
+            store=store, settings=settings, discord=discord
+        )
+
+    assert actions == 0
+    refreshed = await store.get("ig-resume")
+    assert refreshed is not None
+    assert refreshed.instagram_publish_state == persisted_state
+    assert refreshed.platform_statuses["tiktok"].status == "pending"
+    assert refreshed.platform_statuses["instagram"].status == "pending"
+    assert refreshed.platform_statuses["instagram"].detail is not None
+    assert "container=container_existing" in refreshed.platform_statuses["instagram"].detail
 
 
 async def test_dispatch_instagram_uses_platform_scheduled_time(

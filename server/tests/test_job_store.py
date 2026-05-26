@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from app.models.job import Job, PlatformStatus
+from app.models.job import InstagramPublishState, Job, PlatformStatus
 from app.services.job_store import JobStore
 
 
@@ -37,6 +38,46 @@ async def test_create_and_get(tmp_path: Path):
     await store.create(job)
     fetched = await store.get(job.project_id)
     assert fetched == job
+
+
+async def test_old_job_without_instagram_state_deserializes(tmp_path: Path):
+    store = JobStore(tmp_path / "jobs.json")
+    job = _make_job()
+    payload = job.to_dict()
+    payload.pop("instagram_publish_state")
+    (tmp_path / "jobs.json").write_text(
+        json.dumps({"jobs": {job.project_id: payload}})
+    )
+
+    fetched = await store.get(job.project_id)
+
+    assert fetched is not None
+    assert fetched.instagram_publish_state is None
+
+
+async def test_set_instagram_publish_state_preserves_platform_statuses(tmp_path: Path):
+    store = JobStore(tmp_path / "jobs.json")
+    job = _make_job()
+    job.platforms_requested = ["instagram", "tiktok"]
+    job.platform_statuses = {
+        "instagram": PlatformStatus(status="uploading", attempts=1),
+        "tiktok": PlatformStatus(status="uploaded", url="https://x"),
+    }
+    await store.create(job)
+    state = InstagramPublishState(
+        container_id="container_1",
+        upload_uri="https://rupload.facebook.com/container_1",
+        stage="uploaded",
+        created_at=datetime(2026, 4, 26, 21, 1, tzinfo=UTC),
+        expires_at=datetime(2026, 4, 27, 21, 1, tzinfo=UTC),
+    )
+
+    await store.set_instagram_publish_state(job.project_id, state)
+
+    fetched = await store.get(job.project_id)
+    assert fetched is not None
+    assert fetched.instagram_publish_state == state
+    assert fetched.platform_statuses["tiktok"].status == "uploaded"
 
 
 async def test_get_missing_returns_none(tmp_path: Path):
