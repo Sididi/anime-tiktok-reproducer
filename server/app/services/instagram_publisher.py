@@ -77,6 +77,7 @@ _PREPARED_REEL_MIN_VIDEO_BITRATE = 1_500_000
 _TRANSCODE_TIMEOUT_SECONDS = 3600
 _INSTAGRAM_CONTAINER_TTL_SECONDS = 24 * 60 * 60
 _RECREATE_CONTAINER_STATUSES = {"ERROR", "EXPIRED"}
+_ERROR_PHASE_STATUSES = {"error", "failed"}
 
 InstagramProgressCallback = Callable[[InstagramPublishState], Awaitable[None] | None]
 
@@ -241,6 +242,30 @@ def _status_payload_summary(payload: dict[str, Any]) -> dict[str, Any]:
         if compact_video_status:
             summary["video_status"] = compact_video_status
     return summary
+
+
+def _status_payload_has_error_phase(payload: dict[str, Any]) -> bool:
+    video_status = payload.get("video_status")
+    if not isinstance(video_status, dict):
+        return False
+    for phase_name in ("uploading_phase", "processing_phase"):
+        phase = video_status.get(phase_name)
+        if not isinstance(phase, dict):
+            continue
+        phase_status = str(phase.get("status") or "").strip().lower()
+        if phase_status in _ERROR_PHASE_STATUSES:
+            return True
+        if isinstance(phase.get("error"), dict):
+            return True
+    return False
+
+
+def _state_has_error_phase(state: InstagramPublishState) -> bool:
+    summary = state.last_status_payload_summary
+    if isinstance(summary, dict) and _status_payload_has_error_phase(summary):
+        return True
+    detail = str(state.last_status_detail or "").lower()
+    return "uploading_phase=error" in detail or "processing_phase=error" in detail
 
 
 def _timeout_detail(
@@ -878,16 +903,18 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
             state is not None
             and bool(state.container_id)
             and not _state_is_expired(state)
+            and not _state_has_error_phase(state)
             and str(state.last_status_code or "").upper() not in _RECREATE_CONTAINER_STATUSES
         )
         if state and state.container_id and not valid_existing_container:
             logger.info(
                 "Instagram container state cannot be resumed; creating a new container "
-                "ig_user_id=%s old_container_id=%s last_status=%s expired=%s",
+                "ig_user_id=%s old_container_id=%s last_status=%s expired=%s phase_error=%s",
                 ig_user_id,
                 state.container_id,
                 state.last_status_code,
                 _state_is_expired(state),
+                _state_has_error_phase(state),
             )
             state = None
             valid_existing_container = False
@@ -1160,7 +1187,9 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                     container_id,
                 )
                 return InstagramPublishResult(success=True, publish_state=state)
-            if code in _RECREATE_CONTAINER_STATUSES:
+            if code in _RECREATE_CONTAINER_STATUSES or _status_payload_has_error_phase(
+                status_payload
+            ):
                 return InstagramPublishResult(
                     success=False,
                     detail=_stage_detail("status_poll", _status_detail(status_payload)),
