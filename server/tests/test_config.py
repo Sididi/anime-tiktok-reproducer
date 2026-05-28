@@ -16,6 +16,7 @@ def test_load_minimal_valid_config(example_yaml: Path, example_env, tmp_server_d
     assert "anime_fr" in s.accounts
     assert s.accounts["anime_fr"].device == "iphone_13_pro"
     assert s.accounts["anime_fr"].avatar == "anime_fr.jpg"
+    assert s.data_dir == example_yaml.parent / "data"
 
 
 def test_account_avatar_must_exist_on_disk(tmp_server_dir: Path, example_env):

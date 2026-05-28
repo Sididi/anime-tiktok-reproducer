@@ -32,6 +32,11 @@ from typing import Any
 import httpx
 
 from app.models.job import InstagramPublishState
+from app.services.instagram_prepared_media import (
+    new_prepared_media_token,
+    prepared_media_filename,
+    prepared_media_public_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +75,8 @@ _ALLOWED_VIDEO_CODECS = {"h264", "hevc"}
 _ALLOWED_AUDIO_CODECS = {"aac"}
 _ALLOWED_CONTAINERS = {"mov", "mp4", "m4v", "quicktime"}
 _PREPARED_REEL_FPS = 30
+_PREPARED_REEL_WIDTH = 1080
+_PREPARED_REEL_HEIGHT = 1920
 _PREPARED_REEL_TARGET_VIDEO_BITRATE = 8_000_000
 _PREPARED_REEL_AUDIO_BITRATE = 128_000
 _PREPARED_REEL_TARGET_RATIOS = (0.92, 0.82, 0.72)
@@ -595,7 +602,7 @@ async def _probe_duration_seconds(video_path: Path) -> float | None:
     return _float_or_none(result.stdout.strip())
 
 
-async def _prepare_video_for_instagram_upload(video_path: Path) -> Path:  # noqa: PLR0911
+async def _prepare_video_for_instagram_upload(video_path: Path) -> Path:  # noqa: PLR0911, PLR0915
     """Normalize every Reel before upload so Meta gets a predictable file.
 
     The VPS downloads the shared Drive export, prepares a 30fps H.264/AAC MP4
@@ -635,13 +642,26 @@ async def _prepare_video_for_instagram_upload(video_path: Path) -> Path:  # noqa
             pass_log_prefix: Path = pass_log_prefix,
             out_path: Path = out_path,
         ) -> subprocess.CompletedProcess[str]:
+            video_filter = (
+                "[0:v:0]split=2[bgsrc][fgsrc];"
+                f"[bgsrc]scale={_PREPARED_REEL_WIDTH}:{_PREPARED_REEL_HEIGHT}:"
+                "force_original_aspect_ratio=increase,"
+                f"crop={_PREPARED_REEL_WIDTH}:{_PREPARED_REEL_HEIGHT},"
+                "gblur=sigma=24[bg];"
+                f"[fgsrc]scale={_PREPARED_REEL_WIDTH}:{_PREPARED_REEL_HEIGHT}:"
+                "force_original_aspect_ratio=decrease,setsar=1[fg];"
+                "[bg][fg]overlay=(W-w)/2:(H-h)/2,"
+                "setsar=1,format=yuv420p[v]"
+            )
             common = [
                 ffmpeg,
                 "-y",
                 "-i",
                 str(video_path),
+                "-filter_complex",
+                video_filter,
                 "-map",
-                "0:v:0",
+                "[v]",
                 "-map",
                 "0:a:0?",
                 "-c:v",
@@ -898,6 +918,77 @@ async def _download_video(client: httpx.AsyncClient, video_url: str) -> Path:
         raise
 
 
+def _state_prepared_media_path(
+    state: InstagramPublishState | None,
+    prepared_media_dir: Path | None,
+) -> Path | None:
+    if (
+        state is None
+        or prepared_media_dir is None
+        or not state.prepared_media_token
+        or not state.prepared_media_filename
+    ):
+        return None
+    if Path(state.prepared_media_filename).name != state.prepared_media_filename:
+        return None
+    path = prepared_media_dir / state.prepared_media_filename
+    return path if path.is_file() else None
+
+
+def _delete_prepared_media(
+    state: InstagramPublishState | None,
+    prepared_media_dir: Path | None,
+) -> None:
+    path = _state_prepared_media_path(state, prepared_media_dir)
+    if path is not None:
+        path.unlink(missing_ok=True)
+
+
+def _clear_prepared_media_state(
+    state: InstagramPublishState | None,
+) -> InstagramPublishState | None:
+    if state is None:
+        return None
+    return replace(
+        state,
+        prepared_media_filename=None,
+        prepared_media_token=None,
+        prepared_media_size=None,
+        prepared_media_expires_at=None,
+        prepared_media_url=None,
+    )
+
+
+def _cache_prepared_media(
+    *,
+    video_path: Path,
+    project_id: str | None,
+    prepared_media_dir: Path | None,
+    public_base_url: str | None,
+    expires_at: datetime,
+) -> tuple[Path, dict[str, Any]]:
+    if not project_id or prepared_media_dir is None or not public_base_url:
+        return video_path, {}
+
+    token = new_prepared_media_token()
+    filename = prepared_media_filename(project_id, token)
+    prepared_media_dir.mkdir(parents=True, exist_ok=True)
+    cached_path = prepared_media_dir / filename
+    os.replace(video_path, cached_path)
+    size = cached_path.stat().st_size
+    return cached_path, {
+        "prepared_media_filename": filename,
+        "prepared_media_token": token,
+        "prepared_media_size": size,
+        "prepared_media_expires_at": expires_at,
+        "prepared_media_url": prepared_media_public_url(
+            public_base_url=public_base_url,
+            project_id=project_id,
+            token=token,
+        ),
+    }
+
+
 async def _get_status_payload(
     client: httpx.AsyncClient,
     *,
@@ -969,6 +1060,9 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
     thumb_offset: int | None = None,
     publish_state: InstagramPublishState | dict[str, Any] | None = None,
     progress_callback: InstagramProgressCallback | None = None,
+    project_id: str | None = None,
+    prepared_media_dir: Path | None = None,
+    public_base_url: str | None = None,
 ) -> InstagramPublishResult:
     base = f"https://graph.facebook.com/{graph_api_version}"
     timeout = httpx.Timeout(30.0, read=None)
@@ -976,8 +1070,11 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
     started = time.monotonic()
     state = _coerce_publish_state(publish_state)
     force_video_url_reason: str | None = None
+    invalid_state: InstagramPublishState | None = None
 
     if state and state.stage == "published":
+        _delete_prepared_media(state, prepared_media_dir)
+        state = _clear_prepared_media_state(state)
         return InstagramPublishResult(
             success=True,
             permalink=state.permalink,
@@ -1015,6 +1112,7 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
         if state and state.container_id and (
             _state_has_error_phase(state) or _state_has_zero_byte_upload(state)
         ):
+            invalid_state = state
             force_video_url_reason = (
                 state.last_status_detail
                 or f"previous {state.upload_method or 'unknown'} container had ingest failure"
@@ -1040,6 +1138,7 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                 _state_has_error_phase(state),
                 _state_has_zero_byte_upload(state),
             )
+            invalid_state = invalid_state or state
             state = None
             valid_existing_container = False
 
@@ -1070,7 +1169,28 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
 
         if not valid_existing_container:
             upload_method = "video_url" if force_video_url_reason else "rupload"
-            if upload_method == "rupload":
+            prepared_metadata: dict[str, Any] = {}
+            prepared_video_url = video_url
+            cached_prepared_path = _state_prepared_media_path(
+                invalid_state,
+                prepared_media_dir,
+            )
+            if (
+                upload_method == "video_url"
+                and cached_prepared_path is not None
+                and invalid_state is not None
+                and invalid_state.prepared_media_url
+            ):
+                video_path = cached_prepared_path
+                prepared_video_url = invalid_state.prepared_media_url
+                prepared_metadata = {
+                    "prepared_media_filename": invalid_state.prepared_media_filename,
+                    "prepared_media_token": invalid_state.prepared_media_token,
+                    "prepared_media_size": invalid_state.prepared_media_size,
+                    "prepared_media_expires_at": invalid_state.prepared_media_expires_at,
+                    "prepared_media_url": invalid_state.prepared_media_url,
+                }
+            else:
                 try:
                     video_path = await _download_video(client, video_url)
                 except httpx.HTTPStatusError as e:
@@ -1103,6 +1223,17 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                         detail=_stage_detail("validate", detail),
                         publish_state=state,
                     )
+                expires_at = _utc_now() + timedelta(
+                    seconds=_INSTAGRAM_CONTAINER_TTL_SECONDS
+                )
+                video_path, prepared_metadata = _cache_prepared_media(
+                    video_path=video_path,
+                    project_id=project_id,
+                    prepared_media_dir=prepared_media_dir,
+                    public_base_url=public_base_url,
+                    expires_at=expires_at,
+                )
+                prepared_video_url = prepared_metadata.get("prepared_media_url") or video_url
 
             try:
                 container_id, upload_uri = await _create_instagram_container(
@@ -1114,19 +1245,22 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                     share_to_feed=share_to_feed,
                     thumb_offset=thumb_offset,
                     upload_method=upload_method,
-                    video_url=video_url if upload_method == "video_url" else None,
+                    video_url=prepared_video_url if upload_method == "video_url" else None,
                 )
                 created_at = _utc_now()
+                expires_at = created_at + timedelta(
+                    seconds=_INSTAGRAM_CONTAINER_TTL_SECONDS
+                )
                 state = InstagramPublishState(
                     container_id=container_id,
                     upload_uri=upload_uri,
                     stage="uploaded" if upload_method == "video_url" else "created",
                     created_at=created_at,
-                    expires_at=created_at
-                    + timedelta(seconds=_INSTAGRAM_CONTAINER_TTL_SECONDS),
+                    expires_at=expires_at,
                     upload_completed_at=created_at if upload_method == "video_url" else None,
                     upload_method=upload_method,
                     fallback_reason=force_video_url_reason,
+                    **prepared_metadata,
                 )
                 await _emit_progress(progress_callback, state)
                 logger.info(
@@ -1139,6 +1273,13 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                     bool(force_video_url_reason),
                 )
                 needs_upload = upload_method == "rupload"
+                if (
+                    upload_method == "video_url"
+                    and video_path is not None
+                    and not prepared_metadata
+                ):
+                    video_path.unlink(missing_ok=True)
+                    video_path = None
             except httpx.HTTPStatusError as e:
                 if video_path is not None:
                     video_path.unlink(missing_ok=True)
@@ -1156,38 +1297,53 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                     publish_state=state,
                 )
         elif needs_upload:
-            try:
-                video_path = await _download_video(client, video_url)
-            except httpx.HTTPStatusError as e:
-                return InstagramPublishResult(
-                    success=False,
-                    detail=_stage_detail("download", _response_detail(e.response)),
-                    publish_state=state,
-                )
-            except (httpx.HTTPError, RuntimeError) as e:
-                return InstagramPublishResult(
-                    success=False,
-                    detail=_stage_detail("download", str(e)),
-                    publish_state=state,
-                )
+            video_path = _state_prepared_media_path(state, prepared_media_dir)
+            if video_path is None:
+                try:
+                    video_path = await _download_video(client, video_url)
+                except httpx.HTTPStatusError as e:
+                    return InstagramPublishResult(
+                        success=False,
+                        detail=_stage_detail("download", _response_detail(e.response)),
+                        publish_state=state,
+                    )
+                except (httpx.HTTPError, RuntimeError) as e:
+                    return InstagramPublishResult(
+                        success=False,
+                        detail=_stage_detail("download", str(e)),
+                        publish_state=state,
+                    )
 
-            try:
-                video_path = await _prepare_video_for_instagram_upload(video_path)
-            except RuntimeError as e:
-                video_path.unlink(missing_ok=True)
-                return InstagramPublishResult(
-                    success=False,
-                    detail=_stage_detail("prepare_video", str(e)),
-                    publish_state=state,
-                )
+                try:
+                    video_path = await _prepare_video_for_instagram_upload(video_path)
+                except RuntimeError as e:
+                    video_path.unlink(missing_ok=True)
+                    return InstagramPublishResult(
+                        success=False,
+                        detail=_stage_detail("prepare_video", str(e)),
+                        publish_state=state,
+                    )
 
-            if detail := await _validate_video(video_path):
-                video_path.unlink(missing_ok=True)
-                return InstagramPublishResult(
-                    success=False,
-                    detail=_stage_detail("validate", detail),
-                    publish_state=state,
+                if detail := await _validate_video(video_path):
+                    video_path.unlink(missing_ok=True)
+                    return InstagramPublishResult(
+                        success=False,
+                        detail=_stage_detail("validate", detail),
+                        publish_state=state,
+                    )
+                expires_at = state.expires_at or (
+                    _utc_now() + timedelta(seconds=_INSTAGRAM_CONTAINER_TTL_SECONDS)
                 )
+                video_path, prepared_metadata = _cache_prepared_media(
+                    video_path=video_path,
+                    project_id=project_id,
+                    prepared_media_dir=prepared_media_dir,
+                    public_base_url=public_base_url,
+                    expires_at=expires_at,
+                )
+                if prepared_metadata:
+                    state = replace(state, **prepared_metadata)
+                    await _emit_progress(progress_callback, state)
         else:
             container_id = str(state.container_id)
             upload_uri = state.upload_uri
@@ -1271,7 +1427,9 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                 )
             finally:
                 if video_path is not None:
-                    video_path.unlink(missing_ok=True)
+                    cached_path = _state_prepared_media_path(state, prepared_media_dir)
+                    if cached_path is None or video_path != cached_path:
+                        video_path.unlink(missing_ok=True)
                     video_path = None
 
         elapsed = 0.0
@@ -1343,6 +1501,8 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
             if code == "PUBLISHED":
                 if state is not None:
                     state = replace(state, stage="published")
+                    _delete_prepared_media(state, prepared_media_dir)
+                    state = _clear_prepared_media_state(state)
                     await _emit_progress(progress_callback, state)
                 logger.info(
                     "Instagram container already published ig_user_id=%s container_id=%s",
@@ -1382,16 +1542,23 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                     thumb_offset=thumb_offset,
                     publish_state=state,
                     progress_callback=progress_callback,
+                    project_id=project_id,
+                    prepared_media_dir=prepared_media_dir,
+                    public_base_url=public_base_url,
                 )
                 if fallback.success:
                     return fallback
                 fallback_detail = fallback.detail or "publish failed"
+                _delete_prepared_media(fallback.publish_state, prepared_media_dir)
+                fallback_state = _clear_prepared_media_state(fallback.publish_state)
                 return InstagramPublishResult(
                     success=False,
                     detail=f"{rupload_detail}; fallback_video_url: {fallback_detail}",
-                    publish_state=fallback.publish_state,
+                    publish_state=fallback_state,
                 )
             if code in _RECREATE_CONTAINER_STATUSES or phase_error:
+                _delete_prepared_media(state, prepared_media_dir)
+                state = _clear_prepared_media_state(state)
                 return InstagramPublishResult(
                     success=False,
                     detail=_stage_detail("status_poll", _status_detail(status_payload)),
@@ -1431,12 +1598,16 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                 time.monotonic() - started,
             )
         except httpx.HTTPStatusError as e:
+            _delete_prepared_media(state, prepared_media_dir)
+            state = _clear_prepared_media_state(state)
             return InstagramPublishResult(
                 success=False,
                 detail=_stage_detail("publish", _response_detail(e.response)),
                 publish_state=state,
             )
         except (httpx.HTTPError, KeyError, ValueError) as e:
+            _delete_prepared_media(state, prepared_media_dir)
+            state = _clear_prepared_media_state(state)
             return InstagramPublishResult(
                 success=False,
                 detail=_stage_detail("publish", str(e)),
@@ -1464,6 +1635,8 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                 media_id=str(media_id),
                 permalink=permalink,
             )
+            _delete_prepared_media(state, prepared_media_dir)
+            state = _clear_prepared_media_state(state)
             await _emit_progress(progress_callback, state)
 
         return InstagramPublishResult(

@@ -69,6 +69,11 @@ def test_instagram_publish_state_round_trip_with_fallback_fields():
         upload_completed_at=datetime(2026, 4, 26, 21, 1, tzinfo=UTC),
         upload_method="video_url",
         fallback_reason="rupload zero-byte ingest",
+        prepared_media_filename="proj-token.mp4",
+        prepared_media_token="token",
+        prepared_media_size=12345,
+        prepared_media_expires_at=datetime(2026, 4, 27, 21, 0, tzinfo=UTC),
+        prepared_media_url="https://tiktok.sididi.tv/api/instagram/prepared/proj/token.mp4",
     )
 
     restored = InstagramPublishState.from_dict(state.to_dict())

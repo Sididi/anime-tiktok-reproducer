@@ -195,6 +195,11 @@ async def test_dispatch_instagram_happy_path(
     assert publish_mock.await_args.kwargs["poll_timeout"] == 600
     assert publish_mock.await_args.kwargs["share_to_feed"] is False
     assert publish_mock.await_args.kwargs["thumb_offset"] == 250
+    assert publish_mock.await_args.kwargs["project_id"] == "ig-job"
+    assert publish_mock.await_args.kwargs["prepared_media_dir"] == (
+        settings.data_dir / "instagram-prepared"
+    )
+    assert publish_mock.await_args.kwargs["public_base_url"] == settings.public_base_url
     # Embed re-render attempted
     discord.edit_message.assert_called()
 

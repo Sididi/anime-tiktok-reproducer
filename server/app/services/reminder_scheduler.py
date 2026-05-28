@@ -174,6 +174,9 @@ async def _dispatch_instagram_publish(
         thumb_offset=payload.get("thumb_offset"),
         publish_state=job.instagram_publish_state,
         progress_callback=persist_instagram_state,
+        project_id=job.project_id,
+        prepared_media_dir=settings.data_dir / "instagram-prepared",
+        public_base_url=settings.public_base_url,
     )
     if (result_state := getattr(result, "publish_state", None)) is not None:
         await store.set_instagram_publish_state(job.project_id, result_state)

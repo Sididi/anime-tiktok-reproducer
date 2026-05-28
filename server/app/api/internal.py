@@ -248,7 +248,6 @@ async def delete_job(project_id: str, request: Request) -> None:
             logger.warning("Reminder forward delete failed for %s: %s", project_id, e)
 
     await store.delete(project_id)
-    return None
 
 
 @router.post("/discord/messages")

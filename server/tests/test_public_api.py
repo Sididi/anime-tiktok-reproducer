@@ -49,6 +49,40 @@ def test_path_traversal_rejected(
     assert r.status_code in (400, 404)
 
 
+def test_prepared_instagram_video_served_by_token(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    app = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    prepared_dir = tmp_server_dir / "data" / "instagram-prepared"
+    prepared_dir.mkdir(parents=True)
+    video = prepared_dir / "ig-job-token_123.mp4"
+    video.write_bytes(b"prepared mp4 bytes")
+
+    with TestClient(app) as client:
+        r = client.get("/api/instagram/prepared/ig-job/token_123.mp4")
+        head = client.head("/api/instagram/prepared/ig-job/token_123.mp4")
+
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("video/mp4")
+    assert r.content == b"prepared mp4 bytes"
+    assert head.status_code == 200
+    assert head.headers["content-length"] == str(len(b"prepared mp4 bytes"))
+
+
+def test_prepared_instagram_video_rejects_bad_token(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    app = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    prepared_dir = tmp_server_dir / "data" / "instagram-prepared"
+    prepared_dir.mkdir(parents=True)
+    (prepared_dir / "ig-job-token_123.mp4").write_bytes(b"prepared mp4 bytes")
+
+    with TestClient(app) as client:
+        r = client.get("/api/instagram/prepared/ig-job/..%2Ftoken_123.mp4")
+
+    assert r.status_code == 404
+
+
 @respx.mock
 def test_video_proxy_streams_job_video(
     monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path

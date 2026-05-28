@@ -59,6 +59,11 @@ class InstagramPublishState:
     permalink: str | None = None
     upload_method: str | None = None
     fallback_reason: str | None = None
+    prepared_media_filename: str | None = None
+    prepared_media_token: str | None = None
+    prepared_media_size: int | None = None
+    prepared_media_expires_at: datetime | None = None
+    prepared_media_url: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -78,6 +83,15 @@ class InstagramPublishState:
             "permalink": self.permalink,
             "upload_method": self.upload_method,
             "fallback_reason": self.fallback_reason,
+            "prepared_media_filename": self.prepared_media_filename,
+            "prepared_media_token": self.prepared_media_token,
+            "prepared_media_size": self.prepared_media_size,
+            "prepared_media_expires_at": (
+                self.prepared_media_expires_at.isoformat()
+                if self.prepared_media_expires_at
+                else None
+            ),
+            "prepared_media_url": self.prepared_media_url,
         }
 
     @classmethod
@@ -107,6 +121,15 @@ class InstagramPublishState:
             permalink=d.get("permalink"),
             upload_method=d.get("upload_method"),
             fallback_reason=d.get("fallback_reason"),
+            prepared_media_filename=d.get("prepared_media_filename"),
+            prepared_media_token=d.get("prepared_media_token"),
+            prepared_media_size=(
+                int(d["prepared_media_size"])
+                if d.get("prepared_media_size") is not None
+                else None
+            ),
+            prepared_media_expires_at=_dt("prepared_media_expires_at"),
+            prepared_media_url=d.get("prepared_media_url"),
         )
 
 

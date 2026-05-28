@@ -16,6 +16,7 @@ from app.api.internal import router as internal_router
 from app.api.public import router as public_router
 from app.config import Settings
 from app.services.discord_client import DiscordClient
+from app.services.instagram_prepared_media import cleanup_expired_prepared_media
 from app.services.job_store import JobStore
 from app.services.reaction_listener import ReactionListener
 from app.services.reminder_scheduler import run_scheduler_loop
@@ -60,14 +61,21 @@ def _cleanup_instagram_temp_downloads(temp_dir: Path | None = None) -> int:
     return removed
 
 
-def create_app() -> FastAPI:
+def create_app() -> FastAPI:  # noqa: PLR0915
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
     config_path, avatars_dir, data_dir = _resolve_paths()
-    settings = Settings.load(config_path=config_path, avatars_dir=avatars_dir)
+    settings = Settings.load(
+        config_path=config_path,
+        avatars_dir=avatars_dir,
+        data_dir=data_dir,
+    )
     data_dir.mkdir(parents=True, exist_ok=True)
     job_store = JobStore(data_dir / "jobs.json")
     _cleanup_instagram_temp_downloads()
+    expired_prepared = cleanup_expired_prepared_media(data_dir / "instagram-prepared")
+    if expired_prepared:
+        logger.info("Removed %d expired Instagram prepared media file(s)", expired_prepared)
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):

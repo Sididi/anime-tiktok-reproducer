@@ -37,9 +37,16 @@ class Settings:
     accounts: dict[str, AccountConfig]
     discord: DiscordConfig
     avatars_dir: Path
+    data_dir: Path
 
     @classmethod
-    def load(cls, *, config_path: Path, avatars_dir: Path) -> Settings:
+    def load(
+        cls,
+        *,
+        config_path: Path,
+        avatars_dir: Path,
+        data_dir: Path | None = None,
+    ) -> Settings:
         if not config_path.is_file():
             raise ConfigError(f"Config file not found: {config_path}")
 
@@ -79,4 +86,5 @@ class Settings:
                 reminder_role_id=_required_env("ATR_DISCORD_REMINDER_ROLE_ID"),
             ),
             avatars_dir=avatars_dir,
+            data_dir=data_dir or config_path.parent / "data",
         )

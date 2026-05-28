@@ -8,6 +8,12 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
 
+from app.services.instagram_prepared_media import (
+    prepared_media_path,
+    validate_prepared_media_id,
+    validate_prepared_media_token,
+)
+
 router = APIRouter(prefix="/api")
 
 
@@ -29,6 +35,38 @@ async def get_avatar(filename: str, request: Request) -> FileResponse:
     return FileResponse(
         resolved,
         media_type=mime or "image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@router.api_route(
+    "/instagram/prepared/{project_id}/{token}.mp4",
+    methods=["GET", "HEAD"],
+)
+async def get_prepared_instagram_video(
+    project_id: str,
+    token: str,
+    request: Request,
+) -> FileResponse:
+    try:
+        validate_prepared_media_id(project_id, label="project_id")
+        validate_prepared_media_token(token)
+    except ValueError:
+        raise HTTPException(404, "Prepared media not found") from None
+
+    root = request.app.state.settings.data_dir / "instagram-prepared"
+    path = prepared_media_path(root, project_id, token)
+    try:
+        resolved = path.resolve()
+        root_resolved = root.resolve()
+    except (OSError, ValueError):
+        raise HTTPException(404, "Prepared media not found") from None
+    if root_resolved not in resolved.parents or not resolved.is_file():
+        raise HTTPException(404, "Prepared media not found")
+
+    return FileResponse(
+        resolved,
+        media_type="video/mp4",
         headers={"Cache-Control": "public, max-age=86400"},
     )
 

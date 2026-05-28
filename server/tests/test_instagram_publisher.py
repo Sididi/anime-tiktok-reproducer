@@ -1,10 +1,13 @@
 """Tests for app.services.instagram_publisher using respx-mocked Graph API."""
 from __future__ import annotations
 
+import json
+import subprocess
 import threading
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
@@ -54,6 +57,11 @@ def _mock_resumable_create():
     return respx.post(f"{BASE}/{IG_USER_ID}/media").mock(
         return_value=httpx.Response(200, json={"id": CONTAINER_ID, "uri": UPLOAD_URI})
     )
+
+
+def _form_call(route, index: int = -1) -> dict[str, list[str]]:
+    content = route.calls[index].request.content.decode()
+    return parse_qs(content)
 
 
 @pytest.fixture(autouse=True)
@@ -366,7 +374,8 @@ async def test_polling_timeout():
 
 
 @respx.mock
-async def test_in_progress_with_phase_error_falls_back_to_video_url():
+async def test_in_progress_with_phase_error_falls_back_to_video_url(tmp_path):
+    prepared_dir = tmp_path / "prepared"
     _mock_video_download()
     create_route = respx.post(f"{BASE}/{IG_USER_ID}/media").mock(
         side_effect=[
@@ -404,11 +413,21 @@ async def test_in_progress_with_phase_error_falls_back_to_video_url():
     )
 
     result = await publish_to_instagram(
-        **_COMMON, poll_interval=0.01, poll_timeout=60
+        **_COMMON,
+        poll_interval=0.01,
+        poll_timeout=60,
+        project_id="ig-job",
+        prepared_media_dir=prepared_dir,
+        public_base_url="https://tiktok.sididi.tv",
     )
 
     assert result.success is True
     assert create_route.call_count == 2
+    fallback_form = _form_call(create_route, 1)
+    assert fallback_form["video_url"][0].startswith(
+        "https://tiktok.sididi.tv/api/instagram/prepared/ig-job/"
+    )
+    assert fallback_form["video_url"][0].endswith(".mp4")
     assert rupload_status.called
     assert video_url_status.called
     assert publish_route.called
@@ -417,12 +436,15 @@ async def test_in_progress_with_phase_error_falls_back_to_video_url():
     assert result.publish_state.upload_method == "video_url"
     assert result.publish_state.fallback_reason is not None
     assert "uploading_phase=error" in result.publish_state.fallback_reason
+    assert result.publish_state.prepared_media_filename is None
+    assert not prepared_dir.exists() or not list(prepared_dir.glob("*.mp4"))
 
 
 @respx.mock
-async def test_rupload_phase_error_and_video_url_fallback_failure_reports_both():
+async def test_rupload_phase_error_and_video_url_fallback_failure_reports_both(tmp_path):
+    prepared_dir = tmp_path / "prepared"
     _mock_video_download()
-    respx.post(f"{BASE}/{IG_USER_ID}/media").mock(
+    create_route = respx.post(f"{BASE}/{IG_USER_ID}/media").mock(
         side_effect=[
             httpx.Response(200, json={"id": CONTAINER_ID, "uri": UPLOAD_URI}),
             httpx.Response(200, json={"id": VIDEO_URL_CONTAINER_ID}),
@@ -455,16 +477,26 @@ async def test_rupload_phase_error_and_video_url_fallback_failure_reports_both()
     )
 
     result = await publish_to_instagram(
-        **_COMMON, poll_interval=0.01, poll_timeout=1.0
+        **_COMMON,
+        poll_interval=0.01,
+        poll_timeout=1.0,
+        project_id="ig-job",
+        prepared_media_dir=prepared_dir,
+        public_base_url="https://tiktok.sididi.tv",
     )
 
     assert result.success is False
     assert result.detail is not None
     assert result.detail.startswith("status_poll: container status_code = IN_PROGRESS")
     assert "fallback_video_url: status_poll: container status_code = ERROR" in result.detail
+    assert _form_call(create_route, 1)["video_url"][0].startswith(
+        "https://tiktok.sididi.tv/api/instagram/prepared/ig-job/"
+    )
     assert result.publish_state is not None
     assert result.publish_state.container_id == VIDEO_URL_CONTAINER_ID
     assert result.publish_state.upload_method == "video_url"
+    assert result.publish_state.prepared_media_filename is None
+    assert not list(prepared_dir.glob("*.mp4"))
 
 
 @respx.mock
@@ -1015,6 +1047,72 @@ async def test_prepare_video_transcodes_even_when_under_size_threshold(tmp_path,
     assert result.exists()
     assert not video.exists()
     result.unlink(missing_ok=True)
+
+
+async def test_prepare_video_outputs_vertical_reels_safe_file(tmp_path):
+    ffmpeg = instagram_publisher.shutil.which("ffmpeg")
+    ffprobe = instagram_publisher.shutil.which("ffprobe")
+    if ffmpeg is None or ffprobe is None:
+        pytest.skip("ffmpeg/ffprobe unavailable")
+
+    source = tmp_path / "landscape.mp4"
+    create = subprocess.run(
+        [
+            ffmpeg,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=150x108:rate=30:duration=3",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=channel_layout=stereo:sample_rate=44100",
+            "-shortest",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            str(source),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert create.returncode == 0, create.stderr
+
+    prepared = await ORIGINAL_PREPARE_VIDEO(source)
+    try:
+        probe = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_streams",
+                str(prepared),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert probe.returncode == 0, probe.stderr
+        payload = json.loads(probe.stdout)
+        video = next(s for s in payload["streams"] if s["codec_type"] == "video")
+        audio = next(s for s in payload["streams"] if s["codec_type"] == "audio")
+        assert video["codec_name"] == "h264"
+        assert video["width"] == 1080
+        assert video["height"] == 1920
+        assert video["pix_fmt"] == "yuv420p"
+        assert audio["codec_name"] == "aac"
+        assert audio["sample_rate"] == "48000"
+    finally:
+        prepared.unlink(missing_ok=True)
 
 
 async def test_prepare_video_fails_when_ffmpeg_unavailable(tmp_path, monkeypatch):
