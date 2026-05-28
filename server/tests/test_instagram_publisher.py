@@ -1,7 +1,9 @@
 """Tests for app.services.instagram_publisher using respx-mocked Graph API."""
 from __future__ import annotations
 
+import threading
 from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import httpx
@@ -22,6 +24,7 @@ BASE = "https://graph.facebook.com/v25.0"
 IG_USER_ID = "ig_user_123"
 ACCESS_TOKEN = "access_token_abc"
 CONTAINER_ID = "container_42"
+VIDEO_URL_CONTAINER_ID = "container_video_url"
 MEDIA_ID = "media_99"
 PERMALINK_URL = "https://www.instagram.com/reel/Cxxx/"
 UPLOAD_URI = "https://rupload.facebook.com/ig-api-upload/v25.0/container_42"
@@ -363,13 +366,15 @@ async def test_polling_timeout():
 
 
 @respx.mock
-async def test_in_progress_with_phase_error_fails_without_timeout():
+async def test_in_progress_with_phase_error_falls_back_to_video_url():
     _mock_video_download()
-    _mock_resumable_create()
-    publish_route = respx.post(f"{BASE}/{IG_USER_ID}/media_publish").mock(
-        return_value=httpx.Response(500, text="should not publish")
+    create_route = respx.post(f"{BASE}/{IG_USER_ID}/media").mock(
+        side_effect=[
+            httpx.Response(200, json={"id": CONTAINER_ID, "uri": UPLOAD_URI}),
+            httpx.Response(200, json={"id": VIDEO_URL_CONTAINER_ID}),
+        ]
     )
-    respx.get(f"{BASE}/{CONTAINER_ID}").mock(
+    rupload_status = respx.get(f"{BASE}/{CONTAINER_ID}").mock(
         return_value=httpx.Response(
             200,
             json={
@@ -386,24 +391,80 @@ async def test_in_progress_with_phase_error_fails_without_timeout():
             },
         )
     )
+    video_url_status = respx.get(f"{BASE}/{VIDEO_URL_CONTAINER_ID}").mock(
+        return_value=httpx.Response(
+            200, json={"status_code": "FINISHED", "id": VIDEO_URL_CONTAINER_ID}
+        )
+    )
+    publish_route = respx.post(f"{BASE}/{IG_USER_ID}/media_publish").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID})
+    )
+    respx.get(f"{BASE}/{MEDIA_ID}").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID, "permalink": PERMALINK_URL})
+    )
 
     result = await publish_to_instagram(
         **_COMMON, poll_interval=0.01, poll_timeout=60
     )
 
-    assert result.success is False
-    assert result.detail == (
-        "status_poll: container status_code = IN_PROGRESS; "
-        "status = In Progress: Media is still being processed. "
-        "(uploading_phase=error, bytes_transferred=0, processing_phase=error)"
-    )
-    assert publish_route.called is False
+    assert result.success is True
+    assert create_route.call_count == 2
+    assert rupload_status.called
+    assert video_url_status.called
+    assert publish_route.called
     assert result.publish_state is not None
-    assert result.publish_state.last_status_code == "IN_PROGRESS"
-    assert result.publish_state.last_status_payload_summary is not None
-    assert result.publish_state.last_status_payload_summary["video_status"][
-        "uploading_phase"
-    ]["status"] == "error"
+    assert result.publish_state.container_id == VIDEO_URL_CONTAINER_ID
+    assert result.publish_state.upload_method == "video_url"
+    assert result.publish_state.fallback_reason is not None
+    assert "uploading_phase=error" in result.publish_state.fallback_reason
+
+
+@respx.mock
+async def test_rupload_phase_error_and_video_url_fallback_failure_reports_both():
+    _mock_video_download()
+    respx.post(f"{BASE}/{IG_USER_ID}/media").mock(
+        side_effect=[
+            httpx.Response(200, json={"id": CONTAINER_ID, "uri": UPLOAD_URI}),
+            httpx.Response(200, json={"id": VIDEO_URL_CONTAINER_ID}),
+        ]
+    )
+    respx.get(f"{BASE}/{CONTAINER_ID}").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status_code": "IN_PROGRESS",
+                "status": "In Progress: Media is still being processed.",
+                "video_status": {
+                    "uploading_phase": {
+                        "status": "error",
+                        "bytes_transferred": 0,
+                    },
+                    "processing_phase": {"status": "error"},
+                },
+            },
+        )
+    )
+    respx.get(f"{BASE}/{VIDEO_URL_CONTAINER_ID}").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status_code": "ERROR",
+                "status": "The video URL is not reachable.",
+            },
+        )
+    )
+
+    result = await publish_to_instagram(
+        **_COMMON, poll_interval=0.01, poll_timeout=1.0
+    )
+
+    assert result.success is False
+    assert result.detail is not None
+    assert result.detail.startswith("status_poll: container status_code = IN_PROGRESS")
+    assert "fallback_video_url: status_poll: container status_code = ERROR" in result.detail
+    assert result.publish_state is not None
+    assert result.publish_state.container_id == VIDEO_URL_CONTAINER_ID
+    assert result.publish_state.upload_method == "video_url"
 
 
 @respx.mock
@@ -634,6 +695,7 @@ async def test_created_state_reuploads_without_new_create(monkeypatch):
     assert uploaded["upload_uri"] == UPLOAD_URI
     assert result.publish_state is not None
     assert result.publish_state.upload_completed_at is not None
+    assert result.publish_state.upload_method == "rupload"
 
 
 @respx.mock
@@ -867,6 +929,52 @@ def test_upload_streams_file_without_read_bytes(tmp_path, monkeypatch):
     assert captured["url"] == UPLOAD_URI
     assert captured["headers"]["file_size"] == str(len(b"fake mp4 bytes"))
     assert captured["content_has_read"] is True
+
+
+def test_upload_transport_sends_exact_body_length_without_chunking(tmp_path):
+    video = tmp_path / "video.mp4"
+    payload = b"0123456789abcdef" * 1024
+    video.write_bytes(payload)
+    captured = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):  # noqa: N802
+            content_length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(content_length)
+            captured["headers"] = dict(self.headers)
+            captured["body"] = body
+            response_body = b'{"success": true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response_body)))
+            self.end_headers()
+            self.wfile.write(response_body)
+
+        def log_message(self, *args):
+            return None
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.handle_request)
+    thread.start()
+    try:
+        result = _upload_resumable_binary_sync(
+            upload_uri=f"http://127.0.0.1:{server.server_port}/upload",
+            ig_access_token=ACCESS_TOKEN,
+            video_path=video,
+            timeout_seconds=30,
+        )
+    finally:
+        thread.join(timeout=5)
+        server.server_close()
+
+    assert result.status_code == 200
+    assert captured["headers"]["Content-Length"] == str(len(payload))
+    assert captured["headers"]["file_size"] == str(len(payload))
+    assert captured["headers"]["offset"] == "0"
+    assert "Transfer-Encoding" not in captured["headers"]
+    assert captured["body"] == payload
 
 
 async def test_prepare_video_transcodes_even_when_under_size_threshold(tmp_path, monkeypatch):

@@ -57,6 +57,8 @@ class InstagramPublishState:
     last_status_payload_summary: dict[str, Any] | None = None
     media_id: str | None = None
     permalink: str | None = None
+    upload_method: str | None = None
+    fallback_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -74,6 +76,8 @@ class InstagramPublishState:
             "last_status_payload_summary": self.last_status_payload_summary,
             "media_id": self.media_id,
             "permalink": self.permalink,
+            "upload_method": self.upload_method,
+            "fallback_reason": self.fallback_reason,
         }
 
     @classmethod
@@ -101,6 +105,8 @@ class InstagramPublishState:
             last_status_payload_summary=summary if isinstance(summary, dict) else None,
             media_id=d.get("media_id"),
             permalink=d.get("permalink"),
+            upload_method=d.get("upload_method"),
+            fallback_reason=d.get("fallback_reason"),
         )
 
 

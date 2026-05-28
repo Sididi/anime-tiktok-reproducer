@@ -277,12 +277,34 @@ def _status_payload_has_error_phase(payload: dict[str, Any]) -> bool:
     return False
 
 
+def _status_payload_has_zero_byte_upload(payload: dict[str, Any]) -> bool:
+    video_status = payload.get("video_status")
+    if not isinstance(video_status, dict):
+        return False
+    uploading_phase = video_status.get("uploading_phase")
+    if not isinstance(uploading_phase, dict):
+        return False
+    for key in ("bytes_transferred", "bytes_transfered"):
+        if key in uploading_phase:
+            with contextlib.suppress(TypeError, ValueError):
+                return int(uploading_phase[key]) == 0
+    return False
+
+
 def _state_has_error_phase(state: InstagramPublishState) -> bool:
     summary = state.last_status_payload_summary
     if isinstance(summary, dict) and _status_payload_has_error_phase(summary):
         return True
     detail = str(state.last_status_detail or "").lower()
     return "uploading_phase=error" in detail or "processing_phase=error" in detail
+
+
+def _state_has_zero_byte_upload(state: InstagramPublishState) -> bool:
+    summary = state.last_status_payload_summary
+    if isinstance(summary, dict) and _status_payload_has_zero_byte_upload(summary):
+        return True
+    detail = str(state.last_status_detail or "").lower()
+    return "bytes_transferred=0" in detail or "bytes_transfered=0" in detail
 
 
 def _timeout_detail(
@@ -367,6 +389,45 @@ def _upload_headers(ig_access_token: str, file_size: int) -> dict[str, str]:
         "file_size": str(file_size),
         "Content-Length": str(file_size),
     }
+
+
+async def _create_instagram_container(
+    client: httpx.AsyncClient,
+    *,
+    base: str,
+    ig_user_id: str,
+    ig_access_token: str,
+    caption: str,
+    share_to_feed: bool,
+    thumb_offset: int | None,
+    upload_method: str,
+    video_url: str | None = None,
+) -> tuple[str, str | None]:
+    create_data = {
+        "media_type": "REELS",
+        "caption": caption,
+        "share_to_feed": "true" if share_to_feed else "false",
+        "access_token": ig_access_token,
+    }
+    if thumb_offset is not None:
+        create_data["thumb_offset"] = str(thumb_offset)
+    if upload_method == "rupload":
+        create_data["upload_type"] = "resumable"
+    elif upload_method == "video_url":
+        if not video_url:
+            raise ValueError("video_url is required for video_url upload")
+        create_data["video_url"] = video_url
+    else:
+        raise ValueError(f"unsupported Instagram upload method {upload_method!r}")
+
+    create = await client.post(f"{base}/{ig_user_id}/media", data=create_data)
+    create.raise_for_status()
+    create_payload = create.json()
+    container_id = str(create_payload["id"])
+    upload_uri = create_payload.get("uri")
+    if upload_method == "rupload" and not upload_uri:
+        raise KeyError("uri")
+    return container_id, str(upload_uri) if upload_uri else None
 
 
 def _validate_caption(caption: str) -> str | None:
@@ -595,6 +656,14 @@ async def _prepare_video_for_instagram_upload(video_path: Path) -> Path:  # noqa
                 "yuv420p",
                 "-profile:v",
                 "high",
+                "-g",
+                str(_PREPARED_REEL_FPS * 2),
+                "-keyint_min",
+                str(_PREPARED_REEL_FPS * 2),
+                "-sc_threshold",
+                "0",
+                "-flags",
+                "+cgop",
                 "-movflags",
                 "+faststart",
                 "-passlogfile",
@@ -609,6 +678,8 @@ async def _prepare_video_for_instagram_upload(video_path: Path) -> Path:  # noqa
                     *common,
                     "-c:a",
                     "aac",
+                    "-profile:a",
+                    "aac_low",
                     "-b:a",
                     str(_PREPARED_REEL_AUDIO_BITRATE),
                     "-ar",
@@ -742,6 +813,32 @@ async def _validate_video(video_path: Path) -> str | None:  # noqa: PLR0911
         return f"ffprobe returned invalid JSON: {e}"
     if not isinstance(payload, dict):
         return "ffprobe response was not an object"
+    probe_summary = {
+        "format": payload.get("format", {}),
+        "streams": [
+            {
+                key: stream.get(key)
+                for key in (
+                    "codec_type",
+                    "codec_name",
+                    "profile",
+                    "width",
+                    "height",
+                    "pix_fmt",
+                    "avg_frame_rate",
+                    "sample_rate",
+                    "channels",
+                )
+                if key in stream
+            }
+            for stream in payload.get("streams", [])
+            if isinstance(stream, dict)
+        ],
+    }
+    logger.info(
+        "Instagram prepared video probe: %s",
+        probe_summary,
+    )
     return _validate_video_streams(payload)
 
 
@@ -878,6 +975,7 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
     video_path: Path | None = None
     started = time.monotonic()
     state = _coerce_publish_state(publish_state)
+    force_video_url_reason: str | None = None
 
     if state and state.stage == "published":
         return InstagramPublishResult(
@@ -914,22 +1012,33 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                 publish_state=state,
             )
 
+        if state and state.container_id and (
+            _state_has_error_phase(state) or _state_has_zero_byte_upload(state)
+        ):
+            force_video_url_reason = (
+                state.last_status_detail
+                or f"previous {state.upload_method or 'unknown'} container had ingest failure"
+            )
+
         valid_existing_container = (
             state is not None
             and bool(state.container_id)
             and not _state_is_expired(state)
             and not _state_has_error_phase(state)
+            and not _state_has_zero_byte_upload(state)
             and str(state.last_status_code or "").upper() not in _RECREATE_CONTAINER_STATUSES
         )
         if state and state.container_id and not valid_existing_container:
             logger.info(
                 "Instagram container state cannot be resumed; creating a new container "
-                "ig_user_id=%s old_container_id=%s last_status=%s expired=%s phase_error=%s",
+                "ig_user_id=%s old_container_id=%s last_status=%s expired=%s "
+                "phase_error=%s zero_byte_upload=%s",
                 ig_user_id,
                 state.container_id,
                 state.last_status_code,
                 _state_is_expired(state),
                 _state_has_error_phase(state),
+                _state_has_zero_byte_upload(state),
             )
             state = None
             valid_existing_container = False
@@ -960,83 +1069,87 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                 )
 
         if not valid_existing_container:
-            try:
-                video_path = await _download_video(client, video_url)
-            except httpx.HTTPStatusError as e:
-                return InstagramPublishResult(
-                    success=False,
-                    detail=_stage_detail("download", _response_detail(e.response)),
-                    publish_state=state,
-                )
-            except (httpx.HTTPError, RuntimeError) as e:
-                return InstagramPublishResult(
-                    success=False,
-                    detail=_stage_detail("download", str(e)),
-                    publish_state=state,
-                )
+            upload_method = "video_url" if force_video_url_reason else "rupload"
+            if upload_method == "rupload":
+                try:
+                    video_path = await _download_video(client, video_url)
+                except httpx.HTTPStatusError as e:
+                    return InstagramPublishResult(
+                        success=False,
+                        detail=_stage_detail("download", _response_detail(e.response)),
+                        publish_state=state,
+                    )
+                except (httpx.HTTPError, RuntimeError) as e:
+                    return InstagramPublishResult(
+                        success=False,
+                        detail=_stage_detail("download", str(e)),
+                        publish_state=state,
+                    )
+
+                try:
+                    video_path = await _prepare_video_for_instagram_upload(video_path)
+                except RuntimeError as e:
+                    video_path.unlink(missing_ok=True)
+                    return InstagramPublishResult(
+                        success=False,
+                        detail=_stage_detail("prepare_video", str(e)),
+                        publish_state=state,
+                    )
+
+                if detail := await _validate_video(video_path):
+                    video_path.unlink(missing_ok=True)
+                    return InstagramPublishResult(
+                        success=False,
+                        detail=_stage_detail("validate", detail),
+                        publish_state=state,
+                    )
 
             try:
-                video_path = await _prepare_video_for_instagram_upload(video_path)
-            except RuntimeError as e:
-                video_path.unlink(missing_ok=True)
-                return InstagramPublishResult(
-                    success=False,
-                    detail=_stage_detail("prepare_video", str(e)),
-                    publish_state=state,
+                container_id, upload_uri = await _create_instagram_container(
+                    client,
+                    base=base,
+                    ig_user_id=ig_user_id,
+                    ig_access_token=ig_access_token,
+                    caption=caption,
+                    share_to_feed=share_to_feed,
+                    thumb_offset=thumb_offset,
+                    upload_method=upload_method,
+                    video_url=video_url if upload_method == "video_url" else None,
                 )
-
-            if detail := await _validate_video(video_path):
-                video_path.unlink(missing_ok=True)
-                return InstagramPublishResult(
-                    success=False,
-                    detail=_stage_detail("validate", detail),
-                    publish_state=state,
-                )
-
-            try:
-                create_data = {
-                    "media_type": "REELS",
-                    "upload_type": "resumable",
-                    "caption": caption,
-                    "share_to_feed": "true" if share_to_feed else "false",
-                    "access_token": ig_access_token,
-                }
-                if thumb_offset is not None:
-                    create_data["thumb_offset"] = str(thumb_offset)
-                create = await client.post(
-                    f"{base}/{ig_user_id}/media",
-                    data=create_data,
-                )
-                create.raise_for_status()
-                create_payload = create.json()
-                container_id = str(create_payload["id"])
-                upload_uri = str(create_payload["uri"])
                 created_at = _utc_now()
                 state = InstagramPublishState(
                     container_id=container_id,
                     upload_uri=upload_uri,
-                    stage="created",
+                    stage="uploaded" if upload_method == "video_url" else "created",
                     created_at=created_at,
                     expires_at=created_at
                     + timedelta(seconds=_INSTAGRAM_CONTAINER_TTL_SECONDS),
+                    upload_completed_at=created_at if upload_method == "video_url" else None,
+                    upload_method=upload_method,
+                    fallback_reason=force_video_url_reason,
                 )
                 await _emit_progress(progress_callback, state)
                 logger.info(
                     "Instagram container created ig_user_id=%s graph_api_version=%s "
-                    "container_id=%s",
+                    "container_id=%s upload_method=%s fallback=%s",
                     ig_user_id,
                     graph_api_version,
                     container_id,
+                    upload_method,
+                    bool(force_video_url_reason),
                 )
+                needs_upload = upload_method == "rupload"
             except httpx.HTTPStatusError as e:
-                video_path.unlink(missing_ok=True)
+                if video_path is not None:
+                    video_path.unlink(missing_ok=True)
                 return InstagramPublishResult(
                     success=False,
                     detail=_stage_detail("create_container", _response_detail(e.response)),
                     publish_state=state,
                 )
             except (httpx.HTTPError, KeyError, ValueError) as e:
-                video_path.unlink(missing_ok=True)
+                if video_path is not None:
+                    video_path.unlink(missing_ok=True)
                 return InstagramPublishResult(
                     success=False,
                     detail=_stage_detail("create_container", str(e)),
@@ -1081,26 +1194,51 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
 
         if needs_upload:
             try:
+                upload_file_size = video_path.stat().st_size if video_path else 0
                 upload = await _upload_resumable_binary(
                     upload_uri=str(upload_uri),
                     ig_access_token=ig_access_token,
                     video_path=video_path,
                 )
+                upload_detail = _upload_response_detail(upload)
                 if upload.status_code >= 400:
                     if not _is_resumable_upload_indeterminate_body(upload.body):
+                        logger.warning(
+                            "Instagram rupload failed ig_user_id=%s container_id=%s "
+                            "status_code=%s file_size=%d detail=%s",
+                            ig_user_id,
+                            container_id,
+                            upload.status_code,
+                            upload_file_size,
+                            upload_detail,
+                        )
                         video_path.unlink(missing_ok=True)
                         return InstagramPublishResult(
                             success=False,
-                            detail=_stage_detail("rupload", _upload_response_detail(upload)),
+                            detail=_stage_detail("rupload", upload_detail),
                             publish_state=state,
                         )
                     logger.info(
                         "Instagram resumable upload returned indeterminate processing "
-                        "response for container %s; polling container status",
+                        "response for container %s; polling container status "
+                        "status_code=%s file_size=%d detail=%s",
                         container_id,
+                        upload.status_code,
+                        upload_file_size,
+                        upload_detail,
                     )
                 else:
                     if problem := _upload_response_success_problem(upload):
+                        logger.warning(
+                            "Instagram rupload response was not successful "
+                            "ig_user_id=%s container_id=%s status_code=%s "
+                            "file_size=%d detail=%s",
+                            ig_user_id,
+                            container_id,
+                            upload.status_code,
+                            upload_file_size,
+                            problem,
+                        )
                         video_path.unlink(missing_ok=True)
                         return InstagramPublishResult(
                             success=False,
@@ -1109,16 +1247,19 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                         )
                     logger.info(
                         "Instagram rupload succeeded ig_user_id=%s container_id=%s "
-                        "status_code=%s",
+                        "status_code=%s file_size=%d detail=%s",
                         ig_user_id,
                         container_id,
                         upload.status_code,
+                        upload_file_size,
+                        upload_detail,
                     )
                 if state is not None:
                     state = replace(
                         state,
                         stage="uploaded",
                         upload_completed_at=_utc_now(),
+                        upload_method=state.upload_method or "rupload",
                     )
                     await _emit_progress(progress_callback, state)
             except (OSError, TimeoutError) as e:
@@ -1209,9 +1350,48 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                     container_id,
                 )
                 return InstagramPublishResult(success=True, publish_state=state)
-            if code in _RECREATE_CONTAINER_STATUSES or _status_payload_has_error_phase(
-                status_payload
+            phase_error = _status_payload_has_error_phase(status_payload)
+            zero_byte_upload = _status_payload_has_zero_byte_upload(status_payload)
+            if (
+                (phase_error or zero_byte_upload)
+                and state is not None
+                and state.upload_method != "video_url"
+                and not state.fallback_reason
             ):
+                rupload_detail = _stage_detail(
+                    "status_poll", _status_detail(status_payload)
+                )
+                logger.info(
+                    "Instagram rupload container failed ingest; falling back to "
+                    "video_url ig_user_id=%s container_id=%s phase_error=%s "
+                    "zero_byte_upload=%s",
+                    ig_user_id,
+                    container_id,
+                    phase_error,
+                    zero_byte_upload,
+                )
+                fallback = await publish_to_instagram(
+                    ig_user_id=ig_user_id,
+                    ig_access_token=ig_access_token,
+                    caption=caption,
+                    video_url=video_url,
+                    graph_api_version=graph_api_version,
+                    poll_interval=poll_interval,
+                    poll_timeout=poll_timeout,
+                    share_to_feed=share_to_feed,
+                    thumb_offset=thumb_offset,
+                    publish_state=state,
+                    progress_callback=progress_callback,
+                )
+                if fallback.success:
+                    return fallback
+                fallback_detail = fallback.detail or "publish failed"
+                return InstagramPublishResult(
+                    success=False,
+                    detail=f"{rupload_detail}; fallback_video_url: {fallback_detail}",
+                    publish_state=fallback.publish_state,
+                )
+            if code in _RECREATE_CONTAINER_STATUSES or phase_error:
                 return InstagramPublishResult(
                     success=False,
                     detail=_stage_detail("status_poll", _status_detail(status_payload)),

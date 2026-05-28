@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from app.models.job import Job, PlatformStatus
+from app.models.job import InstagramPublishState, Job, PlatformStatus
 
 
 def _make_job(**overrides) -> Job:
@@ -59,6 +59,21 @@ def test_job_round_trip_without_platform_scheduled_at():
 def test_platform_status_round_trip():
     ps = PlatformStatus(status="uploaded", url="https://youtu.be/abc", detail=None)
     assert PlatformStatus.from_dict(ps.to_dict()) == ps
+
+
+def test_instagram_publish_state_round_trip_with_fallback_fields():
+    state = InstagramPublishState(
+        container_id="container_video_url",
+        stage="uploaded",
+        created_at=datetime(2026, 4, 26, 21, 0, tzinfo=UTC),
+        upload_completed_at=datetime(2026, 4, 26, 21, 1, tzinfo=UTC),
+        upload_method="video_url",
+        fallback_reason="rupload zero-byte ingest",
+    )
+
+    restored = InstagramPublishState.from_dict(state.to_dict())
+
+    assert restored == state
 
 
 def test_job_with_uploaded_platform_status():

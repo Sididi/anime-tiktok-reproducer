@@ -484,7 +484,7 @@ If the gateway fails to connect, check:
 
 ### Instagram Meta prerequisites
 
-Instagram publishing uses the Meta Instagram Graph API Reels content publishing flow from the VPS: create container, upload the local video bytes through `rupload.facebook.com`, poll the container until `FINISHED`, then call `media_publish`. The VPS persists the current container id, upload URI, last status, and publish stage in `jobs.json`; if a polling attempt times out, the next scheduler tick resumes that same unexpired container instead of creating a fresh opaque upload.
+Instagram publishing uses the Meta Instagram Graph API Reels content publishing flow from the VPS: create container, upload the local video bytes through `rupload.facebook.com`, poll the container until `FINISHED`, then call `media_publish`. If Meta reports a zero-byte/phase-error rupload ingest (`uploading_phase=error`, `bytes_transferred=0`), the publisher creates a fresh `video_url` container using the VPS `/api/videos/{project_id}` URL and polls that fallback container instead. The VPS persists the current container id, upload URI, upload method, last status, and publish stage in `jobs.json`; if a polling attempt times out, the next scheduler tick resumes that same unexpired healthy container instead of creating a fresh opaque upload.
 
 Backend upload jobs pass `ATR_INSTAGRAM_PUBLISH_POLL_INTERVAL_SECONDS` and `ATR_INSTAGRAM_PUBLISH_TIMEOUT_SECONDS` into the VPS job payload. Defaults are 60 seconds between polls and a 4 hour per-attempt polling window.
 
