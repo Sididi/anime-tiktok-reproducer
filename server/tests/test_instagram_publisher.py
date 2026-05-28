@@ -202,11 +202,54 @@ async def test_resumable_upload_processing_failed_error_polls_container(monkeypa
     assert status_route.called
 
 
-def test_upload_headers_include_entity_length_without_transfer_encoding():
+@respx.mock
+async def test_resumable_upload_2xx_without_success_true_fails(monkeypatch):
+    async def upload(**kwargs):
+        return _UploadResponse(status_code=200, body='{"success": false, "message": "nope"}')
+
+    monkeypatch.setattr(instagram_publisher, "_upload_resumable_binary", upload)
+    _mock_video_download()
+    _mock_resumable_create()
+    status_route = respx.get(f"{BASE}/{CONTAINER_ID}").mock(
+        return_value=httpx.Response(200, json={"status_code": "FINISHED"})
+    )
+
+    result = await publish_to_instagram(
+        **_COMMON, poll_interval=0.01, poll_timeout=1.0
+    )
+
+    assert result.success is False
+    assert result.detail is not None
+    assert result.detail.startswith("rupload:")
+    assert status_route.called is False
+
+
+@respx.mock
+async def test_resumable_upload_2xx_non_json_body_fails(monkeypatch):
+    async def upload(**kwargs):
+        return _UploadResponse(status_code=200, body="OK")
+
+    monkeypatch.setattr(instagram_publisher, "_upload_resumable_binary", upload)
+    _mock_video_download()
+    _mock_resumable_create()
+
+    result = await publish_to_instagram(
+        **_COMMON, poll_interval=0.01, poll_timeout=1.0
+    )
+
+    assert result.success is False
+    assert result.detail == "rupload: rupload returned non-JSON success body: OK"
+
+
+def test_upload_headers_match_instagram_rupload_contract():
     headers = _upload_headers(ACCESS_TOKEN, len(b"fake mp4 bytes"))
 
     assert headers["Content-Length"] == str(len(b"fake mp4 bytes"))
-    assert headers["X-Entity-Length"] == str(len(b"fake mp4 bytes"))
+    assert headers["file_size"] == str(len(b"fake mp4 bytes"))
+    assert headers["offset"] == "0"
+    assert headers["Authorization"] == f"OAuth {ACCESS_TOKEN}"
+    assert "X-Entity-Length" not in headers
+    assert "Content-Type" not in headers
     assert "Transfer-Encoding" not in headers
 
 

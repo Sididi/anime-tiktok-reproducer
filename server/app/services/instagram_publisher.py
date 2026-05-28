@@ -145,6 +145,23 @@ def _upload_response_detail(response: _UploadResponse) -> str:
     return str(payload)[:500]
 
 
+def _upload_response_success_problem(response: _UploadResponse) -> str | None:
+    try:
+        payload = json.loads(response.body)
+    except ValueError:
+        body = response.body.strip()
+        if body:
+            return f"rupload returned non-JSON success body: {body[:300]}"
+        return "rupload returned an empty success body"
+    if not isinstance(payload, dict):
+        return f"rupload returned unexpected success body: {payload!r}"[:300]
+    if payload.get("success") is True:
+        return None
+    if payload.get("success") is False:
+        return _upload_response_detail(response)
+    return f"rupload response missing success=true: {str(payload)[:300]}"
+
+
 def _status_detail(payload: dict[str, Any]) -> str:
     code = payload.get("status_code")
     error_message = str(
@@ -349,8 +366,6 @@ def _upload_headers(ig_access_token: str, file_size: int) -> dict[str, str]:
         "offset": "0",
         "file_size": str(file_size),
         "Content-Length": str(file_size),
-        "X-Entity-Length": str(file_size),
-        "Content-Type": "application/octet-stream",
     }
 
 
@@ -1085,6 +1100,13 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                         container_id,
                     )
                 else:
+                    if problem := _upload_response_success_problem(upload):
+                        video_path.unlink(missing_ok=True)
+                        return InstagramPublishResult(
+                            success=False,
+                            detail=_stage_detail("rupload", problem),
+                            publish_state=state,
+                        )
                     logger.info(
                         "Instagram rupload succeeded ig_user_id=%s container_id=%s "
                         "status_code=%s",
