@@ -214,14 +214,26 @@ class SceneMergerService:
             return scenes
 
         snapped = scenes.model_copy(deep=True)
-        for index, boundary in moves.items():
+        for index, boundary in sorted(moves.items()):
             if index < 0 or index + 1 >= len(snapped.scenes):
                 continue
-            snapped.scenes[index].end_time = boundary
-            snapped.scenes[index + 1].start_time = boundary
+            left_scene = snapped.scenes[index]
+            right_scene = snapped.scenes[index + 1]
+            if (
+                boundary - left_scene.start_time < cls.DENSE_VISUAL_SNAP_MIN_SCENE_DURATION
+                or right_scene.end_time - boundary < cls.DENSE_VISUAL_SNAP_MIN_SCENE_DURATION
+            ):
+                continue
+            left_scene.end_time = boundary
+            right_scene.start_time = boundary
 
         snapped.renumber()
         if not snapped.validate_continuity():
+            return scenes
+        if any(
+            scene.duration < cls.DENSE_VISUAL_SNAP_MIN_SCENE_DURATION
+            for scene in snapped.scenes
+        ):
             return scenes
         return snapped
 

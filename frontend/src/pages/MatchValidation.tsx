@@ -1729,6 +1729,19 @@ export function MatchValidation() {
           ...prev,
           [sceneIndex]: {
             phase: "preparing",
+            message: "Hydrating source episode...",
+          },
+        }));
+
+        const downloadOk = await handleDeferredDownload();
+        if (!downloadOk) {
+          throw new Error("Source episode hydration failed");
+        }
+
+        setPendingSceneUpdates((prev) => ({
+          ...prev,
+          [sceneIndex]: {
+            phase: "preparing",
             message: "Preparing source clip...",
           },
         }));
@@ -1822,6 +1835,7 @@ export function MatchValidation() {
       sceneWarnings,
       scenes,
       stopFastWatch,
+      handleDeferredDownload,
       patchPlaybackSceneAsset,
       showToast,
     ],

@@ -208,7 +208,13 @@ async def get_sources(project_id: str):
 
 @router.get("/sources/episodes")
 async def list_episodes(project_id: str):
-    """List all video files in the source paths or anime library."""
+    """List episodes available for manual matching.
+
+    Local files are returned as paths so the modal can preview them directly.
+    When the project is backed by a Storage Box series, include all release
+    episode keys as selectable values even if the episode is not hydrated yet;
+    saving that match can hydrate the selected episode before clip prep.
+    """
     project = ProjectService.load(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -276,6 +282,30 @@ async def list_episodes(project_id: str):
 
     # Remove duplicates and sort
     episodes = sorted(set(episodes))
+
+    if project.series_id:
+        try:
+            episode_sources = await LibraryHydrationService.get_episode_sources(
+                library_type=project.library_type,
+                series_id=project.series_id,
+            )
+            storage_episodes = (
+                episode_sources.get("storage_box", {}).get("episodes", [])
+                if isinstance(episode_sources, dict)
+                else []
+            )
+            remote_episode_keys = [
+                str(item.get("episode_key") or "").strip()
+                for item in storage_episodes
+                if isinstance(item, dict) and str(item.get("episode_key") or "").strip()
+            ]
+            episodes = sorted(set([*episodes, *remote_episode_keys]))
+        except Exception as exc:
+            logger.warning(
+                "Unable to load Storage Box episode list for project %s: %s",
+                project_id,
+                exc,
+            )
 
     return {"episodes": episodes}
 

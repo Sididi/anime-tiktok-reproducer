@@ -825,6 +825,47 @@ def test_snap_dense_visual_boundaries_updates_adjacent_scene_edges(
     assert snapped.validate_continuity()
 
 
+def test_snap_dense_visual_boundaries_skips_adjacent_collapse(
+    monkeypatch,
+) -> None:
+    scenes = SceneList(
+        scenes=[
+            Scene(index=0, start_time=6.0, end_time=6.9),
+            Scene(index=1, start_time=6.9, end_time=7.566),
+            Scene(index=2, start_time=7.566, end_time=8.133),
+            *[
+                Scene(
+                    index=index,
+                    start_time=8.133 + (index - 2),
+                    end_time=9.133 + (index - 2),
+                )
+                for index in range(3, 45)
+            ],
+        ]
+    )
+    monkeypatch.setattr(
+        SceneMergerService,
+        "_video_frame_diffs",
+        classmethod(lambda cls, video_path: ([], [])),
+    )
+    monkeypatch.setattr(
+        SceneMergerService,
+        "_dense_visual_boundary_snap_candidates",
+        classmethod(lambda cls, scenes, diff_times, diffs: {0: 7.3, 1: 7.3}),
+    )
+
+    snapped = SceneMergerService.snap_dense_visual_boundaries(
+        Path("/tmp/source.mp4"),
+        scenes,
+    )
+
+    assert snapped.scenes[0].end_time == 7.3
+    assert snapped.scenes[1].start_time == 7.3
+    assert snapped.scenes[1].end_time == 7.566
+    assert snapped.validate_continuity()
+    assert all(scene.duration > 0 for scene in snapped.scenes)
+
+
 def test_merge_scenes_preserves_same_episode_source_seed() -> None:
     scenes = SceneList(
         scenes=[
