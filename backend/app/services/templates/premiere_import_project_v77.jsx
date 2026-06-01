@@ -50,6 +50,10 @@
   // --- TEMPLATE TOGGLES (overridden by Python at render time) ---
   var WHITE_BORDER_ENABLED = true;
   var OVERLAY_ENABLED = true;
+  var CATEGORY_OVERLAY_ENABLED = true;
+  var TITLE_OVERLAY_ENABLED = true;
+  var OVERLAY_END_SEC = 2.5;
+  var OVERLAY_FADE_DURATION_SEC = 0.5;
 
   // --- SCENES DATA ---
   var scenes = [
@@ -702,6 +706,7 @@
   var LUMETRI_PRESET_ARB_STRINGS_CACHE = {};
   var LUMETRI_LOOK_PATH_CACHE = {};
   var VIDEO_EFFECT_RESOLVE_CACHE = {};
+  var VIDEO_TRANSITION_RESOLVE_CACHE = {};
   var KNOWN_MEDIA_EXTENSIONS = {
     ".mkv": true,
     ".mp4": true,
@@ -2143,6 +2148,7 @@
     PERF_COUNTERS = {};
     PRESET_PARSED_DATA_CACHE = {};
     VIDEO_EFFECT_RESOLVE_CACHE = {};
+    VIDEO_TRANSITION_RESOLVE_CACHE = {};
     QE_TRACK_RESOLVE_CACHE = {};
     QE_TRACK_ITEM_HINTS = {};
     PROJECT_ITEM_AUDIO_POLICY_CACHE = {};
@@ -2250,8 +2256,12 @@
       preloadNames[scenes[i].clipName] = true;
     }
     preloadNames[AUDIO_FILENAME] = true;
-    preloadNames[CATEGORY_OVERLAY_FILENAME] = true;
-    preloadNames[TITLE_OVERLAY_FILENAME] = true;
+    if (OVERLAY_ENABLED && CATEGORY_OVERLAY_ENABLED) {
+      preloadNames[CATEGORY_OVERLAY_FILENAME] = true;
+    }
+    if (OVERLAY_ENABLED && TITLE_OVERLAY_ENABLED) {
+      preloadNames[TITLE_OVERLAY_FILENAME] = true;
+    }
     if (trimSpaces(MUSIC_FILENAME) !== "") {
       preloadNames[MUSIC_FILENAME] = true;
     }
@@ -2545,15 +2555,45 @@
     );
 
     if (OVERLAY_ENABLED) {
-      log("Adding overlays on V5 and V6...");
-      if (!placeOverlayOnTrack(v5, CATEGORY_OVERLAY_FILENAME, sequenceEndSec)) {
-        log("Warning: Failed to place " + CATEGORY_OVERLAY_FILENAME + " on V5.");
+      log("Adding overlays on V5/V6 until " + OVERLAY_END_SEC + "s...");
+      var overlayFadeTrackIndexes = [];
+      if (CATEGORY_OVERLAY_ENABLED) {
+        var categoryOverlayItem = placeOverlayOnTrack(
+          v5,
+          CATEGORY_OVERLAY_FILENAME,
+          OVERLAY_END_SEC,
+        );
+        if (!categoryOverlayItem) {
+          log("Warning: Failed to place " + CATEGORY_OVERLAY_FILENAME + " on V5.");
+        } else {
+          overlayFadeTrackIndexes.push(4);
+        }
       }
-      if (!placeOverlayOnTrack(v6, TITLE_OVERLAY_FILENAME, sequenceEndSec)) {
-        log("Warning: Failed to place " + TITLE_OVERLAY_FILENAME + " on V6.");
+      if (TITLE_OVERLAY_ENABLED) {
+        var titleOverlayItem = placeOverlayOnTrack(
+          v6,
+          TITLE_OVERLAY_FILENAME,
+          OVERLAY_END_SEC,
+        );
+        if (!titleOverlayItem) {
+          log("Warning: Failed to place " + TITLE_OVERLAY_FILENAME + " on V6.");
+        } else {
+          overlayFadeTrackIndexes.push(5);
+        }
+      }
+      for (
+        var overlayFadeIdx = 0;
+        overlayFadeIdx < overlayFadeTrackIndexes.length;
+        overlayFadeIdx++
+      ) {
+        applyOverlayFadeOut(
+          overlayFadeTrackIndexes[overlayFadeIdx],
+          OVERLAY_FADE_DURATION_SEC,
+          qeSeq,
+        );
       }
     } else {
-      log("Skipping V5/V6 overlays (template overlay.enabled=false).");
+      log("Skipping V5/V6 overlays (disabled or empty title/category).");
     }
 
     var musicFilenameTrimmed = trimSpaces(MUSIC_FILENAME);
@@ -2603,7 +2643,7 @@
       QE_TRACK_RESOLVE_CACHE,
     );
     perfEnd("presets_v3");
-    if (OVERLAY_ENABLED) {
+    if (OVERLAY_ENABLED && CATEGORY_OVERLAY_ENABLED) {
       log("Applying Category Title preset on V5...");
       perfStart("presets_v5");
       applyVideoPresetToTrackItems(
@@ -2614,6 +2654,18 @@
         QE_TRACK_RESOLVE_CACHE,
       );
       perfEnd("presets_v5");
+    }
+    if (OVERLAY_ENABLED && TITLE_OVERLAY_ENABLED) {
+      log("Applying Category Title preset on V6...");
+      perfStart("presets_v6");
+      applyVideoPresetToTrackItems(
+        5,
+        CATEGORY_TITLE_PRESET_NAME,
+        CATEGORY_TITLE_PRESET_FILE_PATH,
+        qeSeq,
+        QE_TRACK_RESOLVE_CACHE,
+      );
+      perfEnd("presets_v6");
     }
     perfEnd("presets", "Presets");
 
@@ -3668,6 +3720,92 @@
     } catch (e) {}
     VIDEO_EFFECT_RESOLVE_CACHE[name] = resolved;
     return resolved;
+  }
+
+  function getVideoTransitionListItem(transitions, idx) {
+    if (!transitions || typeof idx !== "number" || idx < 0) return null;
+    try {
+      if (transitions[idx]) return transitions[idx];
+    } catch (e0) {}
+    try {
+      if (transitions.getItemAt) return transitions.getItemAt(idx);
+    } catch (e1) {}
+    return null;
+  }
+
+  function resolveVideoTransitionByName(transitionName) {
+    if (!transitionName) return null;
+    var name = transitionName.toString().replace(/^\s+|\s+$/g, "");
+    if (!name) return null;
+    if (VIDEO_TRANSITION_RESOLVE_CACHE[name] !== undefined) {
+      return VIDEO_TRANSITION_RESOLVE_CACHE[name];
+    }
+    var resolved = null;
+    try {
+      var transitions = qe.project.getVideoTransitionList();
+      var count = 0;
+      try {
+        if (transitions && transitions.numItems !== undefined) {
+          count = transitions.numItems;
+        } else if (transitions && transitions.length !== undefined) {
+          count = transitions.length;
+        }
+      } catch (eCount) {}
+      for (var i = 0; i < count; i++) {
+        var candidate = getVideoTransitionListItem(transitions, i);
+        var candidateName =
+          candidate && candidate.name ? candidate.name.toString() : "";
+        if (candidateName === name) {
+          resolved = candidate;
+          break;
+        }
+      }
+    } catch (eList) {}
+    if (!resolved) {
+      try {
+        resolved = qe.project.getVideoTransitionByName(name);
+      } catch (eDirect) {}
+    }
+    VIDEO_TRANSITION_RESOLVE_CACHE[name] = resolved;
+    return resolved;
+  }
+
+  function resolveAdditiveDissolveTransition() {
+    return (
+      resolveVideoTransitionByName("Fondu additif") ||
+      resolveVideoTransitionByName("Additive Dissolve")
+    );
+  }
+
+  function formatTransitionDurationString(durationSec) {
+    var frames = Math.max(1, Math.round(durationSec * SEQ_FPS));
+    var ff = frames < 10 ? "0" + frames : frames.toString();
+    return "00:00:00:" + ff;
+  }
+
+  function getQEItemEndTicks(qeItem) {
+    if (!qeItem || !qeItem.end) return null;
+    var endTicks = null;
+    try {
+      if (qeItem.end.ticks !== undefined) {
+        endTicks = parseInt(qeItem.end.ticks, 10);
+      }
+    } catch (e0) {}
+
+    if (typeof endTicks === "number" && !isNaN(endTicks)) {
+      return endTicks;
+    }
+
+    try {
+      if (typeof qeItem.end.seconds === "number") {
+        return secondsToTicks(qeItem.end.seconds);
+      }
+      if (typeof qeItem.end.secs === "number") {
+        return secondsToTicks(qeItem.end.secs);
+      }
+    } catch (e1) {}
+
+    return null;
   }
 
   function pushUnique(arr, value) {
@@ -5217,14 +5355,246 @@
     }
   }
 
+  function applyOverlayFadeOut(trackIndex, durationSec, qeSeq) {
+    if (applyOverlayNativeAdditiveDissolve(trackIndex, durationSec, qeSeq)) {
+      return true;
+    }
+    log(
+      "Overlay fade: native Fondu additif unavailable or failed; falling back to Opacity keyframes.",
+    );
+    return applyOverlayOpacityFadeOut(trackIndex, durationSec);
+  }
+
+  function applyOverlayNativeAdditiveDissolve(trackIndex, durationSec, qeSeq) {
+    if (typeof trackIndex !== "number" || trackIndex < 0 || !(durationSec > 0)) {
+      return false;
+    }
+
+    try {
+      if (!qeSeq) qeSeq = qe.project.getActiveSequence();
+    } catch (eSeq) {}
+    if (!qeSeq) {
+      log("Warning: Overlay fade: QE sequence unavailable for native transition.");
+      return false;
+    }
+
+    var transition = resolveAdditiveDissolveTransition();
+    if (!transition) {
+      log(
+        "Warning: Overlay fade: native transition 'Fondu additif' not found.",
+      );
+      return false;
+    }
+
+    var qeTrack = null;
+    try {
+      qeTrack = qeSeq.getVideoTrackAt(trackIndex);
+    } catch (eTrack) {}
+    if (!qeTrack) {
+      log(
+        "Warning: Overlay fade: QE video track V" +
+          (trackIndex + 1) +
+          " unavailable.",
+      );
+      return false;
+    }
+
+    var qeItem = findQETrackItemAtStartInTrack(qeTrack, 0, null);
+    if (!qeItem) {
+      log(
+        "Warning: Overlay fade: QE clip not found on V" +
+          (trackIndex + 1) +
+          " at 0s.",
+      );
+      return false;
+    }
+
+    var durationString = formatTransitionDurationString(durationSec);
+    try {
+      qeItem.addTransition(transition, false, durationString, "0", 1);
+      log(
+        "Applied native Fondu additif fade-out (" +
+          durationSec.toFixed(2) +
+          "s) to V" +
+          (trackIndex + 1) +
+          ".",
+      );
+      return true;
+    } catch (eClip) {
+      log(
+        "Warning: Overlay fade: clip-level native transition failed: " +
+          (eClip && eClip.message ? eClip.message : String(eClip)),
+      );
+    }
+
+    try {
+      if (!qeTrack.addTransition) return false;
+      var endTicks = getQEItemEndTicks(qeItem);
+      if (endTicks === null) return false;
+      var durationTicks =
+        Math.max(1, Math.round(durationSec * SEQ_FPS)) * TICKS_PER_FRAME;
+      qeTrack.addTransition(
+        transition,
+        true,
+        endTicks.toString(),
+        durationTicks.toString(),
+        "0",
+        false,
+      );
+      log(
+        "Applied native Fondu additif fade-out via QE track (" +
+          durationSec.toFixed(2) +
+          "s) to V" +
+          (trackIndex + 1) +
+          ".",
+      );
+      return true;
+    } catch (eTrackAdd) {
+      log(
+        "Warning: Overlay fade: track-level native transition failed: " +
+          (eTrackAdd && eTrackAdd.message
+            ? eTrackAdd.message
+            : String(eTrackAdd)),
+      );
+    }
+
+    return false;
+  }
+
+  function applyOverlayOpacityFadeOut(trackIndex, durationSec) {
+    if (typeof trackIndex !== "number" || trackIndex < 0 || !(durationSec > 0)) {
+      return false;
+    }
+
+    var sequence = app.project.activeSequence;
+    if (!sequence) return false;
+
+    var stdTrack = sequence.videoTracks[trackIndex];
+    if (!stdTrack || !stdTrack.clips || stdTrack.clips.numItems <= 0) {
+      log("Warning: Overlay fade: no clips on V" + (trackIndex + 1) + ".");
+      return false;
+    }
+    var stdItem = stdTrack.clips[0];
+
+    // Find the intrinsic Opacity component (always present, no addVideoEffect needed).
+    var opComp = null;
+    for (var c = 0; c < stdItem.components.numItems; c++) {
+      var comp = stdItem.components[c];
+      var nm = comp && comp.displayName ? comp.displayName.toString() : "";
+      if (nm === "Opacité" || nm === "Opacity") {
+        opComp = comp;
+        break;
+      }
+    }
+    if (!opComp) {
+      log(
+        "Warning: Overlay fade: Opacity component not found on V" +
+          (trackIndex + 1) +
+          " clip (components=" +
+          stdItem.components.numItems +
+          ").",
+      );
+      return false;
+    }
+
+    // Find the opacity value property by name, falling back to index 0.
+    var opProp = null;
+    for (var p = 0; p < opComp.properties.numItems; p++) {
+      var prop = opComp.properties[p];
+      var pnm = prop && prop.displayName ? prop.displayName.toString() : "";
+      if (pnm === "Opacité" || pnm === "Opacity") {
+        opProp = prop;
+        break;
+      }
+    }
+    if (!opProp && opComp.properties.numItems > 0) {
+      opProp = opComp.properties[0];
+    }
+    if (!opProp) {
+      log("Warning: Overlay fade: no properties on Opacity component.");
+      return false;
+    }
+
+    // Compute keyframe times from ticks to avoid float-seconds precision drift.
+    var clipStartTicks = null;
+    try {
+      if (stdItem.start && stdItem.start.ticks !== undefined) {
+        clipStartTicks = parseInt(stdItem.start.ticks, 10);
+      }
+    } catch (eStartTicks) {}
+    if (typeof clipStartTicks !== "number" || isNaN(clipStartTicks)) {
+      var clipStartFallback = getTrackItemStartSeconds(stdItem);
+      if (typeof clipStartFallback === "number") {
+        clipStartTicks = Math.round(clipStartFallback * TICKS_PER_SECOND);
+      }
+    }
+
+    var clipEndTicks = null;
+    try {
+      if (stdItem.end && stdItem.end.ticks !== undefined) {
+        clipEndTicks = parseInt(stdItem.end.ticks, 10);
+      }
+    } catch (eTicks) {}
+    if (typeof clipEndTicks !== "number" || isNaN(clipEndTicks)) {
+      var clipEndFallback = getTrackItemEndSeconds(stdItem);
+      if (typeof clipEndFallback !== "number") {
+        log("Warning: Overlay fade: cannot determine clip end time.");
+        return false;
+      }
+      clipEndTicks = Math.round(clipEndFallback * TICKS_PER_SECOND);
+    }
+
+    // Snap fade duration to a frame boundary.
+    var durationFrames = Math.max(1, Math.round(durationSec * SEQ_FPS));
+    var fadeStartTicks = clipEndTicks - durationFrames * TICKS_PER_FRAME;
+    if (
+      typeof clipStartTicks === "number" &&
+      !isNaN(clipStartTicks) &&
+      fadeStartTicks < clipStartTicks
+    ) {
+      fadeStartTicks = clipStartTicks;
+    }
+    var fadeStartSec = fadeStartTicks / TICKS_PER_SECOND;
+    var clipEndSec = clipEndTicks / TICKS_PER_SECOND;
+
+    try {
+      // setTimeVarying(true) MUST be called before addKey — without it addKey is a silent no-op.
+      var fadeStartTime = buildSequenceTimeFromSeconds(fadeStartSec);
+      var clipEndTime = buildSequenceTimeFromSeconds(clipEndSec);
+      opProp.setTimeVarying(true);
+      opProp.addKey(fadeStartTime);
+      opProp.setValueAtKey(fadeStartTime, 100);
+      opProp.addKey(clipEndTime);
+      opProp.setValueAtKey(clipEndTime, 0);
+      log(
+        "Applied opacity fade-out (" +
+          durationSec.toFixed(2) +
+          "s) to V" +
+          (trackIndex + 1) +
+          " [" +
+          fadeStartSec.toFixed(3) +
+          "s -> " +
+          clipEndSec.toFixed(3) +
+          "s].",
+      );
+      return true;
+    } catch (e0) {
+      log(
+        "Warning: Overlay fade: keyframes failed: " +
+          (e0 && e0.message ? e0.message : String(e0)),
+      );
+      return false;
+    }
+  }
+
   function placeOverlayOnTrack(track, filename, endSec) {
     if (!track || !filename || typeof endSec !== "number" || !(endSec > 0))
-      return false;
+      return null;
 
     var overlayItem = getOrImportClip(filename);
     if (!overlayItem) {
       log("Warning: Overlay not found: " + filename);
-      return false;
+      return null;
     }
 
     try {
@@ -5236,7 +5606,7 @@
           "': " +
           (e0 && e0.message ? e0.message : e0),
       );
-      return false;
+      return null;
     }
 
     var filenameNoExt = stripKnownExtension(filename);
@@ -5251,7 +5621,7 @@
           filename +
           "'.",
       );
-      return false;
+      return null;
     }
 
     if (!setTrackItemEndSeconds(item, endSec)) {
@@ -5262,9 +5632,9 @@
           endSec +
           "s.",
       );
-      return false;
+      return null;
     }
-    return true;
+    return item;
   }
 
   function getTrackCollectionIndex(trackCollection, targetTrack) {

@@ -715,7 +715,8 @@ export function ScriptRestructurePage() {
           const overlay = settingsResult.video_overlay;
           let savedTitle = "";
           let savedCategory = "";
-          if (overlay) {
+          const hasSavedOverlay = overlay !== null && typeof overlay === "object";
+          if (hasSavedOverlay) {
             if (typeof overlay.title === "string") {
               savedTitle = overlay.title;
               setOverlayTitle(overlay.title);
@@ -729,6 +730,7 @@ export function ScriptRestructurePage() {
           if (
             loadedAutomation?.static_overlay_title_enabled &&
             loadedAutomation.static_overlay_title &&
+            !hasSavedOverlay &&
             !savedTitle.trim()
           ) {
             const staticTitle = loadedAutomation.static_overlay_title;
@@ -1873,14 +1875,10 @@ export function ScriptRestructurePage() {
           tts_speed: ttsSpeed,
           music_key: automationMusicKey,
           voice_key: automationVoiceKey || null,
-          ...(overlayTitle || overlayCategory
-            ? {
-                video_overlay: {
-                  title: overlayTitle,
-                  category: overlayCategory,
-                },
-              }
-            : {}),
+          video_overlay: {
+            title: overlayTitle,
+            category: overlayCategory,
+          },
         })
         .catch(() => {});
 

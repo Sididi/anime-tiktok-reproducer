@@ -1137,6 +1137,9 @@ class ProcessingService:
 
         from .template_service import TemplateService
         template = TemplateService.get(project.resolved_template_key())
+        overlay = project.video_overlay if isinstance(project.video_overlay, dict) else {}
+        overlay_title_enabled = bool(str(overlay.get("title", "")).strip())
+        overlay_category_enabled = bool(str(overlay.get("category", "")).strip())
         return cls._render_jsx_from_template(
             project_id=project.id,
             scenes=scenes,
@@ -1144,6 +1147,8 @@ class ProcessingService:
             source_fps_num=source_rate.rate.numerator,
             source_fps_den=source_rate.rate.denominator,
             template=template,
+            overlay_title_enabled=overlay_title_enabled,
+            overlay_category_enabled=overlay_category_enabled,
             subtitle_timing_relative_path=subtitle_timing_relative_path,
             raw_scene_subtitle_timing_relative_path=raw_scene_subtitle_timing_relative_path,
             raw_scene_subtitle_mogrt_relative_dir=raw_scene_subtitle_mogrt_relative_dir,
@@ -1190,6 +1195,8 @@ class ProcessingService:
         music_filename: str,
         music_gain_db: float,
         template,  # type: ignore[no-untyped-def]
+        overlay_title_enabled: bool,
+        overlay_category_enabled: bool,
     ) -> str:
         template_path = cls.PREMIERE_JSX_TEMPLATE_PATH
         if not template_path.exists():
@@ -1230,6 +1237,9 @@ class ProcessingService:
                 label="CATEGORY_TITLE_PRESET_NAME",
             )
         # White border / overlay enable toggles.
+        effective_title_overlay_enabled = template.overlay.enabled and overlay_title_enabled
+        effective_category_overlay_enabled = template.overlay.enabled and overlay_category_enabled
+        effective_overlay_enabled = effective_title_overlay_enabled or effective_category_overlay_enabled
         content = cls._replace_template_once(
             content,
             r"var WHITE_BORDER_ENABLED = true;",
@@ -1239,8 +1249,20 @@ class ProcessingService:
         content = cls._replace_template_once(
             content,
             r"var OVERLAY_ENABLED = true;",
-            f"var OVERLAY_ENABLED = {'true' if template.overlay.enabled else 'false'};",
+            f"var OVERLAY_ENABLED = {'true' if effective_overlay_enabled else 'false'};",
             label="OVERLAY_ENABLED",
+        )
+        content = cls._replace_template_once(
+            content,
+            r"var CATEGORY_OVERLAY_ENABLED = true;",
+            f"var CATEGORY_OVERLAY_ENABLED = {'true' if effective_category_overlay_enabled else 'false'};",
+            label="CATEGORY_OVERLAY_ENABLED",
+        )
+        content = cls._replace_template_once(
+            content,
+            r"var TITLE_OVERLAY_ENABLED = true;",
+            f"var TITLE_OVERLAY_ENABLED = {'true' if effective_title_overlay_enabled else 'false'};",
+            label="TITLE_OVERLAY_ENABLED",
         )
         # Foreground V3 zoom percentage (76 by default; templates can override).
         zoom_pct = int(round(template.foreground.zoom * 100))
@@ -3008,11 +3030,15 @@ class ProcessingService:
             # Step 5: Generate title overlay images (if video_overlay is set and template enables overlay)
             from .template_service import TemplateService
             active_template = TemplateService.get(project.resolved_template_key())
-            if (
+            overlay = project.video_overlay if isinstance(project.video_overlay, dict) else None
+            overlay_title = str(overlay.get("title", "")).strip() if overlay else ""
+            overlay_category = str(overlay.get("category", "")).strip() if overlay else ""
+            should_generate_overlay = bool(
                 active_template.overlay.enabled
-                and project.video_overlay
-                and project.video_overlay.get("title")
-            ):
+                and overlay
+                and (overlay_title or overlay_category)
+            )
+            if should_generate_overlay:
                 yield ProcessingProgress(
                     "processing",
                     "overlay_image_generation",
@@ -3022,8 +3048,8 @@ class ProcessingService:
                 from .title_image_generator import TitleImageGeneratorService
 
                 overlay_paths = TitleImageGeneratorService.generate(
-                    title=project.video_overlay["title"],
-                    category=project.video_overlay.get("category", ""),
+                    title=overlay_title,
+                    category=overlay_category,
                     output_dir=output_dir,
                     title_style=active_template.overlay.title.style,
                     category_style=active_template.overlay.category.style,
@@ -3034,10 +3060,27 @@ class ProcessingService:
                 )
 
                 # Store overlay image paths in project
-                project.video_overlay["title_image"] = str(overlay_paths["title"])
-                project.video_overlay["category_image"] = str(overlay_paths["category"])
+                if overlay is not None:
+                    if "title" in overlay_paths:
+                        overlay["title_image"] = str(overlay_paths["title"])
+                    else:
+                        overlay.pop("title_image", None)
+                    if "category" in overlay_paths:
+                        overlay["category_image"] = str(overlay_paths["category"])
+                    else:
+                        overlay.pop("category_image", None)
+                    project.video_overlay = overlay
                 ProjectService.save(project)
             else:
+                for stale_overlay_name in ("title_overlay.png", "category_overlay.png"):
+                    stale_overlay_path = output_dir / stale_overlay_name
+                    if stale_overlay_path.exists():
+                        stale_overlay_path.unlink()
+                if overlay is not None:
+                    overlay.pop("title_image", None)
+                    overlay.pop("category_image", None)
+                    project.video_overlay = overlay
+                    ProjectService.save(project)
                 yield ProcessingProgress(
                     "processing",
                     "overlay_image_generation",

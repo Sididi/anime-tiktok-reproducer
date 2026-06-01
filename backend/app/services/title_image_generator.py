@@ -105,9 +105,9 @@ class TitleImageGeneratorService:
         title_style: str = "classic",
         category_style: str = "classic",
     ) -> dict[str, Path]:
-        """Generate title and category overlay PNGs.
+        """Generate non-empty title and category overlay PNGs.
 
-        Returns dict with keys 'title' and 'category' mapping to output paths.
+        Returns dict with keys for the generated sides.
         """
         title_render = TITLE_RENDERERS.get(title_style)
         category_render = CATEGORY_RENDERERS.get(category_style)
@@ -123,11 +123,20 @@ class TitleImageGeneratorService:
             )
 
         output_dir.mkdir(parents=True, exist_ok=True)
+        generated: dict[str, Path] = {}
         title_path = output_dir / "title_overlay.png"
         category_path = output_dir / "category_overlay.png"
-        title_render(title, title_path)
-        category_render(category, category_path)
-        return {"title": title_path, "category": category_path}
+        if title.strip():
+            title_render(title, title_path)
+            generated["title"] = title_path
+        elif title_path.exists():
+            title_path.unlink()
+        if category.strip():
+            category_render(category, category_path)
+            generated["category"] = category_path
+        elif category_path.exists():
+            category_path.unlink()
+        return generated
 
     @classmethod
     def _load_font(cls, size: int, path: Path | None = None) -> ImageFont.FreeTypeFont:
