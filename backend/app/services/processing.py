@@ -42,6 +42,7 @@ from .auto_editor_profiles import AutoEditorProfile, PRODUCTION_AUTO_EDITOR_PROF
 from .forced_alignment import ForcedAlignmentService, PreparedAlignmentAudio
 from .script_automation_service import ScriptAutomationService
 from .voice_config_service import VoiceConfigService
+from .voice_defingerprint import VoiceDefingerprintService
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -3086,6 +3087,32 @@ class ProcessingService:
                     "overlay_image_generation",
                     0.82,
                     "Skipping title overlay image generation (no overlay configured)",
+                )
+
+            # Step 7: De-fingerprint the published TTS voiceover to avoid TikTok
+            # false-positive strikes. Fail-open: never blocks completion.
+            tts_final_path = output_dir / "tts_edited.wav"
+            if tts_final_path.exists() and settings.voice_defingerprint_level != "off":
+                yield ProcessingProgress(
+                    "processing",
+                    "voice_defingerprint",
+                    0.95,
+                    "Applying voice de-fingerprinting...",
+                )
+                raw_backup = output_dir / "tts_edited.raw.wav"
+                shutil.copyfile(tts_final_path, raw_backup)
+                defingerprint_meta = await asyncio.to_thread(
+                    VoiceDefingerprintService.apply,
+                    raw_backup,
+                    tts_final_path,
+                    level=settings.voice_defingerprint_level,
+                )
+                logger.info(
+                    "Voice de-fingerprint result: %s",
+                    {
+                        key: defingerprint_meta.get(key)
+                        for key in ("applied", "level", "seed")
+                    },
                 )
 
             # Clear processing state now that we're done

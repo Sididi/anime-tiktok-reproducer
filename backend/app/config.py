@@ -1,3 +1,4 @@
+import logging
 import os
 from fractions import Fraction
 from pydantic import field_validator
@@ -90,6 +91,9 @@ class Settings(BaseSettings):
     elevenlabs_api_key: str | None = None
     elevenlabs_model_id: str = "eleven_multilingual_v2"
     elevenlabs_output_format: str = "pcm_44100"
+    # Post-process the published TTS voiceover to reduce ElevenLabs/AI fingerprints.
+    # Env: ATR_VOICE_DEFINGERPRINT_LEVEL. One of: off, default, light, moderate, aggressive.
+    voice_defingerprint_level: str = "default"
 
     # OpenRouter (replaces per-provider keys)
     openrouter_api_key: str | None = None
@@ -243,6 +247,18 @@ class Settings(BaseSettings):
             return None
         stripped = value.strip()
         return stripped or None
+
+    @field_validator("voice_defingerprint_level")
+    @classmethod
+    def _normalize_voice_defingerprint_level(cls, value: str | None) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized in {"off", "default", "light", "moderate", "aggressive"}:
+            return normalized
+        logging.warning(
+            "Unknown ATR_VOICE_DEFINGERPRINT_LEVEL=%r; falling back to 'default'",
+            value,
+        )
+        return "default"
 
     @field_validator("storage_box_host", "storage_box_username", "storage_box_root")
     @classmethod

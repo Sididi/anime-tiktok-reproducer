@@ -36,8 +36,10 @@ ce que les strikes cessent.
 
 ## Décisions de design (validées)
 
-- **Niveau de départ** : `moderate` (différence audible mais subtile, sonne
-  « plus naturel/enregistré », bon compromis efficacité/qualité).
+- **Niveau de départ** : `default` (profil haute qualité en deux étapes :
+  première passe inspirée de `geeknik/ai-audio-fingerprint-remover`, puis passe
+  ffmpeg locale très légère ; `moderate` reste disponible comme option plus
+  forte si les strikes persistent).
 - **Contrôle** : config globale uniquement (pas d'UI, pas d'override par run).
 - **Approche technique** : chaîne de filtres **ffmpeg** (déjà présent via pydub ;
   ffmpeg n8.1 dispose de `rubberband`, `afftdn`, `anlmdn`, `aecho`, `asetrate`,
@@ -58,7 +60,7 @@ VoiceDefingerprintService.apply(
     input_path: Path,
     output_path: Path,
     *,
-    level: str,            # "off" | "light" | "moderate" | "aggressive"
+    level: str,            # "off" | "default" | "light" | "moderate" | "aggressive"
     seed: int | None = None,
 ) -> dict                  # métadonnées : {level, seed, params, applied: bool}
 ```
@@ -90,29 +92,39 @@ version traitée.
 
 ## Chaîne de traitement
 
-Tout en ffmpeg, **durée préservée** (sortie trimmée/paddée à la durée exacte de
+La sortie est **durée préservée** (sortie trimmée/paddée à la durée exacte de
 l'entrée). Paramètres randomisés par run dans les bornes du niveau (RNG seedé).
+Le niveau `default` exécute d'abord une première passe locale inspirée de
+`geeknik/ai-audio-fingerprint-remover` : réécriture WAV sans métadonnées,
+atténuation ciblée de bandes hautes typiques de watermark, dither HF masqué,
+micro-dynamiques et imperfection harmonique minuscule. Cette première passe est
+implémentée avec `numpy`/`scipy`/`soundfile` déjà présents, sans dépendre du
+projet archivé ni ajouter `librosa`/`mutagen`.
 
 > Note : aucun changement de tempo (`atempo`) — il modifierait la durée et
 > désynchroniserait les sous-titres. Pitch via `rubberband` (durée préservée).
 > La queue de réverb (`aecho`) est trimmée à la durée d'origine.
 
-| Brique | Rôle anti-fingerprint | `light` | `moderate` | `aggressive` |
-|---|---|---|---|---|
-| Détour rééchantillonnage (`aresample` soxr 44.1k→48k→44.1k) | casse empreintes niveau échantillon, ~transparent | ✓ | ✓ | ✓ |
-| Bruit de fond (mix `anoisesrc` brown/pink) | supprime le « trop propre », brouille watermark HF | -58 dBFS | -46 dBFS | -38 dBFS |
-| Pitch/formant micro-shift (`rubberband`, durée préservée) | altère la signature du vocodeur | ±5 cents, formants préservés | ±15–30 cents, formants préservés | ±50 cents, formants déplacés |
-| EQ haute fréquence (`lowpass`/`highshelf`) | détruit le watermark logé >14 kHz | rolloff ~18 kHz | ~16 kHz + shelf | ~14 kHz + shelf marqué |
-| Réverb de pièce courte (`aecho`, queue trimmée) | « sonne enregistré dans une vraie pièce » | — | très légère | légère |
-| Saturation douce (`asoftclip` tanh) | harmoniques non-neuronales | — | — | ✓ |
-| Round-trip lossy (encode→décode AAC/Opus) | écrase détail spectral fin + watermarks fragiles | 192k | 128k | 96k (×2) |
-| Loudnorm final (`loudnorm` EBU R128) | loudness cohérent | ✓ | ✓ | ✓ |
+| Brique | Rôle anti-fingerprint | `light` | `default` | `moderate` | `aggressive` |
+|---|---|---|---|---|---|
+| Passe geeknik locale | métadonnées, bandes watermark hautes, micro-imperfections quasi inaudibles | — | ✓ | — | — |
+| Détour rééchantillonnage (`aresample` soxr 44.1k→48k→44.1k) | casse empreintes niveau échantillon, ~transparent | ✓ | ✓ | ✓ | ✓ |
+| Bruit de fond (mix `anoisesrc` brown/pink) | supprime le « trop propre », brouille watermark HF | -58 dBFS | -60 dBFS | -46 dBFS | -38 dBFS |
+| Pitch/formant micro-shift (`rubberband`, durée préservée) | altère la signature du vocodeur | ±5 cents, formants préservés | ±4 cents, formants préservés | ±15–30 cents, formants préservés | ±50 cents, formants déplacés |
+| EQ haute fréquence (`lowpass`/`highshelf`) | détruit le watermark logé >14 kHz | rolloff ~18 kHz | ~18.5–19.5 kHz | ~16 kHz + shelf | ~14 kHz + shelf marqué |
+| Réverb de pièce courte (`aecho`, queue trimmée) | « sonne enregistré dans une vraie pièce » | — | — | très légère | légère |
+| Saturation douce (`asoftclip` tanh) | harmoniques non-neuronales | — | — | — | ✓ |
+| Round-trip lossy (encode→décode AAC/Opus) | écrase détail spectral fin + watermarks fragiles | 192k | 224k | 128k | 96k (×2) |
+| Loudnorm final (`loudnorm` EBU R128) | loudness cohérent | ✓ | ✓ | ✓ | ✓ |
 
-### Implémentation (2 passes ffmpeg)
+### Implémentation
 
-1. **Passe DSP** : `filter_complex` avec entrée bruit (`anoisesrc`) + briques DSP,
-   sortie WAV trimmée à la durée d'origine.
-2. **Passe round-trip lossy** : encode vers AAC/Opus au bitrate du niveau puis
+1. **Passe geeknik locale (`default` uniquement)** : lecture/écriture WAV propre,
+   suppression ciblée de bandes hautes, dither HF masqué, micro-dynamiques et
+   imperfection harmonique très faible.
+2. **Passe DSP ffmpeg** : `filter_complex` avec entrée bruit (`anoisesrc`) +
+   briques DSP, sortie WAV trimmée à la durée d'origine.
+3. **Passe round-trip lossy** : encode vers AAC/Opus au bitrate du niveau puis
    re-décode en WAV (×2 en `aggressive`).
 
 Le constructeur de filtergraph est une **fonction pure**
@@ -124,10 +136,10 @@ une table de presets (`_PRESETS`).
 
 Dans `backend/app/config.py` (pattern `ATR_` existant) :
 
-- `voice_defingerprint_level: str = "moderate"` → env `ATR_VOICE_DEFINGERPRINT_LEVEL`
-- Valeurs : `off` | `light` | `moderate` | `aggressive`.
+- `voice_defingerprint_level: str = "default"` → env `ATR_VOICE_DEFINGERPRINT_LEVEL`
+- Valeurs : `off` | `default` | `light` | `moderate` | `aggressive`.
 - `off` = no-op total (aucun backup, aucune passe ffmpeg).
-- Validation : valeur inconnue → fallback `moderate` + warning loggé.
+- Validation : valeur inconnue → fallback `default` + warning loggé.
 
 ## Préservation de la durée
 
@@ -171,7 +183,7 @@ Le dé-fingerprinting ne doit **jamais** casser un run :
 
 ## Validation empirique (post-implémentation)
 
-Workflow attendu de l'utilisateur : démarrer en `moderate`, publier, observer.
-Si des strikes persistent → passer en `aggressive` via
+Workflow attendu de l'utilisateur : démarrer en `default`, publier, observer.
+Si des strikes persistent → passer en `moderate`, puis `aggressive` via
 `ATR_VOICE_DEFINGERPRINT_LEVEL` (aucun changement de code). Si la qualité est
 prioritaire et les strikes cessent → tester `light`.
