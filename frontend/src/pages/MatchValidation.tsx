@@ -852,6 +852,7 @@ export function MatchValidation() {
   const skipUiEnabledRef = useRef(false);
   const [matchesAutoEnabled, setMatchesAutoEnabled] = useState(false);
   const matchesAutoFillTriggeredRef = useRef(false);
+  const matchesAutoFillAllowedRef = useRef(false);
   const [activeSceneIndex, setActiveSceneIndex] = useState(-1);
   const [autoScroll, setAutoScroll] = useState(true);
   const [fastWatchPlaying, setFastWatchPlaying] = useState(false);
@@ -1343,6 +1344,8 @@ export function MatchValidation() {
           ...m,
           was_no_match: m.was_no_match ?? (m.confidence === 0 && !m.episode),
         }));
+        matchesAutoFillTriggeredRef.current = true;
+        matchesAutoFillAllowedRef.current = false;
         setMatches(matchesWithTracking);
         if (matchesWithTracking.length > 0) {
           try {
@@ -1544,6 +1547,7 @@ export function MatchValidation() {
     setSceneWarnings({});
     setToast(null);
     matchesAutoFillTriggeredRef.current = false;
+    matchesAutoFillAllowedRef.current = true;
     setMatching(true);
     setPlaybackManifest(null);
     setPlaybackProgress(null);
@@ -1947,11 +1951,13 @@ export function MatchValidation() {
       !matchesAutoEnabled ||
       !mergeContinuous ||
       matches.length === 0 ||
+      !matchesAutoFillAllowedRef.current ||
       matchesAutoFillTriggeredRef.current
     ) {
       return;
     }
     matchesAutoFillTriggeredRef.current = true;
+    matchesAutoFillAllowedRef.current = false;
     handleAutoFillBestCandidates();
   }, [
     projectId,

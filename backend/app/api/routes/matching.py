@@ -108,6 +108,11 @@ def _dedupe_episode_options(episodes: list[str]) -> list[str]:
     return sorted(options)
 
 
+def _is_confirmed_match(match: SceneMatch) -> bool:
+    """Return True when a match already has a deliberate persisted choice."""
+    return bool(match.confirmed and match.episode and match.confidence > 0)
+
+
 def _serialize_scenes(scenes: SceneList) -> list[dict[str, float | int]]:
     """Serialize scenes with derived duration for frontend consumers."""
     return [
@@ -1024,6 +1029,14 @@ async def update_matches_batch(project_id: str, request: BatchUpdateMatchesReque
                 status_code=404,
                 detail=f"Match not found for scene {update.scene_index}",
             )
+
+        if _is_confirmed_match(match):
+            logger.info(
+                "Skipping stale batch auto-fill for already confirmed scene %s in project %s",
+                update.scene_index,
+                project_id,
+            )
+            continue
 
         match.episode = _canonical_episode_ref(
             update.episode,

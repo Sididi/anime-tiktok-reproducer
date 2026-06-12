@@ -107,6 +107,7 @@ function ManualMatchModalContent({
   const sourcePlayerRef = useRef<ManagedVideoPlayerHandle>(null);
   const pendingSeekTimeRef = useRef<number | null>(null);
   const resumePlaybackAfterLoadRef = useRef(false);
+  const lastTimingResetKeyRef = useRef<string | null>(null);
   const [fallbackEpisodes, setFallbackEpisodes] = useState<string[]>([]);
 
   const availableEpisodes = episodes.length > 0 ? episodes : fallbackEpisodes;
@@ -249,21 +250,42 @@ function ManualMatchModalContent({
   const matchEndTime = match?.end_time;
 
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen) {
+      lastTimingResetKeyRef.current = null;
+      return;
+    }
 
     const hasConfidentMatch =
       matchConfidence !== undefined && matchConfidence > 0;
+    const timingResetKey = [
+      scene.index,
+      scene.start_time,
+      scene.end_time,
+      matchEpisode ?? "",
+      matchConfidence ?? "",
+      matchStartTime ?? "",
+      matchEndTime ?? "",
+    ].join("|");
 
     const nextEpisode = resolveEpisode(
       availableEpisodes,
       hasConfidentMatch ? matchEpisode ?? null : null,
     );
 
+    setSelectedEpisode((currentEpisode) => currentEpisode || nextEpisode);
+    if (lastTimingResetKeyRef.current === timingResetKey) {
+      return;
+    }
+
+    lastTimingResetKeyRef.current = timingResetKey;
     resetSourcePlaybackState();
     setSelectedEpisode(nextEpisode);
     setSourcePhase(nextEpisode ? "leasing" : "poster");
-
-    if (hasConfidentMatch && matchStartTime !== undefined && matchEndTime !== undefined) {
+    if (
+      hasConfidentMatch &&
+      matchStartTime !== undefined &&
+      matchEndTime !== undefined
+    ) {
       setStartTime(formatTime(matchStartTime));
       setEndTime(formatTime(matchEndTime));
       pendingSeekTimeRef.current = matchStartTime;
@@ -281,6 +303,9 @@ function ManualMatchModalContent({
     matchStartTime,
     resetSourcePlaybackState,
     sceneDuration,
+    scene.end_time,
+    scene.index,
+    scene.start_time,
   ]);
   /* eslint-enable react-hooks/set-state-in-effect */
 

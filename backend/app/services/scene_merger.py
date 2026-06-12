@@ -1,5 +1,6 @@
 """Service for detecting and merging continuous anime scenes."""
 
+import copy
 import json
 from bisect import bisect_right
 from pathlib import Path
@@ -1643,6 +1644,77 @@ class SceneMergerService:
             backup_matches[original_index] = match_dump.model_dump()
 
     @classmethod
+    def _rebuild_backup_for_current_timeline(
+        cls,
+        backup: dict,
+        scenes: SceneList,
+        ordered_matches: list[SceneMatch],
+    ) -> tuple[dict, list[list[int]], list[SceneMatch]]:
+        """
+        Re-anchor a stale merge backup to the current scene list.
+
+        Manual splits can happen after a pre-merge backup has been created. In
+        that case current individual scenes may outnumber the backup range.
+        Rebuild the backup around the current timeline, while preserving old
+        backup entries for already-merged scenes so undo-merge still restores
+        their original participants.
+        """
+        backup_scenes = backup.get("scenes")
+        backup_matches = backup.get("matches")
+        if not isinstance(backup_scenes, list) or not isinstance(backup_matches, list):
+            raise ValueError("Merge backup is missing original matches")
+
+        rebuilt_scenes: list[dict] = []
+        rebuilt_matches: list[dict] = []
+        original_groups: list[list[int]] = []
+        updated_matches: list[SceneMatch] = []
+
+        def append_backup_entry(scene_dump: dict, match_dump: dict) -> int:
+            original_index = len(rebuilt_scenes)
+            clean_scene = copy.deepcopy(scene_dump)
+            clean_scene["index"] = original_index
+            rebuilt_scenes.append(clean_scene)
+
+            clean_match = copy.deepcopy(match_dump)
+            clean_match["scene_index"] = original_index
+            clean_match["merged_from"] = None
+            rebuilt_matches.append(clean_match)
+            return original_index
+
+        for scene, match in zip(scenes.scenes, ordered_matches, strict=False):
+            match_copy = match.model_copy(deep=True)
+            merged_group = cls._normalize_original_indices(match.merged_from)
+
+            if merged_group:
+                new_group: list[int] = []
+                for old_index in merged_group:
+                    if old_index >= len(backup_scenes) or old_index >= len(backup_matches):
+                        raise ValueError("Merge backup does not cover current merged scene")
+                    new_group.append(
+                        append_backup_entry(
+                            backup_scenes[old_index],
+                            backup_matches[old_index],
+                        )
+                    )
+                match_copy.merged_from = new_group
+                original_groups.append(new_group)
+                updated_matches.append(match_copy)
+                continue
+
+            match_copy.merged_from = None
+            original_index = append_backup_entry(
+                scene.model_dump(),
+                match_copy.model_dump(),
+            )
+            original_groups.append([original_index])
+            updated_matches.append(match_copy)
+
+        backup["scenes"] = rebuilt_scenes
+        backup["matches"] = rebuilt_matches
+        backup["chains"] = []
+        return backup, original_groups, updated_matches
+
+    @classmethod
     def prepare_manual_merge_with_previous(
         cls,
         project_id: str,
@@ -1669,7 +1741,16 @@ class SceneMergerService:
         if not backup:
             backup = cls._build_backup_payload(scenes, ordered_matches)
 
-        original_groups = cls._resolve_original_groups(ordered_matches, backup)
+        try:
+            original_groups = cls._resolve_original_groups(ordered_matches, backup)
+        except ValueError:
+            backup, original_groups, ordered_matches = (
+                cls._rebuild_backup_for_current_timeline(
+                    backup,
+                    scenes,
+                    ordered_matches,
+                )
+            )
         cls._refresh_backup_for_individual_participants(
             backup,
             scenes,
