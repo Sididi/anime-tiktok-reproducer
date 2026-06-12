@@ -1723,11 +1723,37 @@ class SceneMergerService:
 
         merged_scenes = SceneList(scenes=new_scenes)
         merged_scenes.renumber()
-        if not merged_scenes.validate_continuity():
+        if not cls._manual_merge_preserves_local_continuity(
+            merged_scenes,
+            merged_scene_index,
+        ):
             raise ValueError("Manual merge broke scene continuity")
 
         merged_matches = MatchList(matches=new_matches)
         return merged_scenes, merged_matches, backup, merged_scene_index
+
+    @classmethod
+    def _manual_merge_preserves_local_continuity(
+        cls,
+        scenes: SceneList,
+        merged_scene_index: int,
+    ) -> bool:
+        """Validate only boundaries that a manual merge can actually affect."""
+        if merged_scene_index < 0 or merged_scene_index >= len(scenes.scenes):
+            return False
+
+        merged_scene = scenes.scenes[merged_scene_index]
+        if merged_scene_index > 0:
+            previous_scene = scenes.scenes[merged_scene_index - 1]
+            if abs(merged_scene.start_time - previous_scene.end_time) > 0.001:
+                return False
+
+        if merged_scene_index + 1 < len(scenes.scenes):
+            next_scene = scenes.scenes[merged_scene_index + 1]
+            if abs(next_scene.start_time - merged_scene.end_time) > 0.001:
+                return False
+
+        return True
 
     @classmethod
     def save_pre_merge_backup(cls, project_id: str, backup: dict) -> None:

@@ -1506,14 +1506,6 @@ class StorageBoxRepository:
         )
 
         try:
-            if expected_min_episodes is not None and len(episodes) < expected_min_episodes:
-                raise RuntimeError(
-                    f"Publish aborted for '{display_name}': collected "
-                    f"{len(episodes)} episode(s) but caller expected at least "
-                    f"{expected_min_episodes}. The series directory may have "
-                    f"been mutated (evicted, deleted, or concurrently modified) "
-                    f"during the update."
-                )
             torrent_metadata_relative_path: str | None = None
             torrent_count = 0
             for artifact in artifacts:
@@ -1597,6 +1589,15 @@ class StorageBoxRepository:
                         len(previous_episodes),
                         len(preserved_artifacts),
                     )
+
+            if expected_min_episodes is not None and len(episodes) < expected_min_episodes:
+                raise RuntimeError(
+                    f"Publish aborted for '{display_name}': collected "
+                    f"{len(episodes)} episode(s) but caller expected at least "
+                    f"{expected_min_episodes}. The series directory may have "
+                    f"been mutated (evicted, deleted, or concurrently modified) "
+                    f"during the update."
+                )
 
             manifest_artifacts = [
                 {

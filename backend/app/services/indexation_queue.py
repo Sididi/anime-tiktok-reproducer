@@ -122,6 +122,7 @@ class IndexationQueueService:
                 job.status = "indexing"
                 job.phase = "starting"
                 self._broadcast(job)
+                current_update_manifest: dict | None = None
                 if job.job_type == "update":
                     job.phase = "hydrate_index"
                     job.message = "Hydrating matcher cache from Storage Box..."
@@ -145,10 +146,12 @@ class IndexationQueueService:
                             job.library_type, job.series_id
                         )
                     )
-                    await LibraryHydrationService.ensure_series_index_hydrated(
-                        library_type=job.library_type,
-                        series_id=job.series_id,
-                        already_locked=True,
+                    current_update_manifest = (
+                        await LibraryHydrationService.ensure_series_index_hydrated(
+                            library_type=job.library_type,
+                            series_id=job.series_id,
+                            already_locked=True,
+                        )
                     )
                     source_files = self._collect_direct_video_files(Path(job.source_path))
                     if not source_files:
@@ -204,11 +207,24 @@ class IndexationQueueService:
                         self._reset_network_progress_fields(job)
                         self._broadcast(job)
                         prepared = progress.prepared_library_paths or []
-                        expected_min_episodes = (
-                            len(prepared)
-                            if prepared and job.job_type == "update"
-                            else None
-                        )
+                        expected_min_episodes = None
+                        merge_existing_release = False
+                        if job.job_type == "update" and current_update_manifest:
+                            merge_existing_release = True
+                            remote_episode_keys = {
+                                str(item.get("episode_key") or "").strip()
+                                for item in current_update_manifest.get("episodes", [])
+                                if isinstance(item, dict)
+                                and str(item.get("episode_key") or "").strip()
+                            }
+                            prepared_episode_keys = {
+                                Path(path).stem
+                                for path in prepared
+                                if str(path).strip()
+                            }
+                            expected_min_episodes = len(
+                                remote_episode_keys | prepared_episode_keys
+                            )
                         publish_result = await LibraryHydrationService.publish_series_release(
                             library_type=job.library_type,
                             display_name=job.source_name,
@@ -217,6 +233,7 @@ class IndexationQueueService:
                                 job.job_type == "update" and bool(job.series_id)
                             ),
                             expected_min_episodes=expected_min_episodes,
+                            merge_existing_release=merge_existing_release,
                             progress_callback=self._make_network_progress_callback(job),
                         )
                         job.series_id = str(publish_result["series_id"])

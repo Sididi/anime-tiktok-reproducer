@@ -85,6 +85,29 @@ def _canonical_episode_ref(episode: str, *, library_type: str | None = None) -> 
     return _strip_known_media_extension(clean_episode)
 
 
+def _canonical_episode_option(episode: str) -> str:
+    """Return the manual-selection value shown for a source episode option."""
+    clean_episode = str(episode or "").strip()
+    if not clean_episode:
+        return ""
+
+    candidate = Path(clean_episode)
+    if candidate.is_absolute() or candidate.suffix or "/" in clean_episode or "\\" in clean_episode:
+        return _strip_known_media_extension(candidate.name or clean_episode)
+
+    return _strip_known_media_extension(clean_episode)
+
+
+def _dedupe_episode_options(episodes: list[str]) -> list[str]:
+    """Collapse path/filename variants to one extensionless manual-selection value."""
+    options = {
+        canonical
+        for episode in episodes
+        if (canonical := _canonical_episode_option(episode))
+    }
+    return sorted(options)
+
+
 def _serialize_scenes(scenes: SceneList) -> list[dict[str, float | int]]:
     """Serialize scenes with derived duration for frontend consumers."""
     return [
@@ -210,7 +233,8 @@ async def get_sources(project_id: str):
 async def list_episodes(project_id: str):
     """List episodes available for manual matching.
 
-    Local files are returned as paths so the modal can preview them directly.
+    Episodes are returned as canonical extensionless values. The source-video
+    routes resolve these values back to local paths when previewing.
     When the project is backed by a Storage Box series, include all release
     episode keys as selectable values even if the episode is not hydrated yet;
     saving that match can hydrate the selected episode before clip prep.
@@ -280,8 +304,7 @@ async def list_episodes(project_id: str):
         if len(episodes) == manifest_hits_before:
             episodes.extend(await asyncio.to_thread(_scan_source_dir_sync, src_path))
 
-    # Remove duplicates and sort
-    episodes = sorted(set(episodes))
+    episodes = _dedupe_episode_options(episodes)
 
     if project.series_id:
         try:
@@ -299,7 +322,7 @@ async def list_episodes(project_id: str):
                 for item in storage_episodes
                 if isinstance(item, dict) and str(item.get("episode_key") or "").strip()
             ]
-            episodes = sorted(set([*episodes, *remote_episode_keys]))
+            episodes = _dedupe_episode_options([*episodes, *remote_episode_keys])
         except Exception as exc:
             logger.warning(
                 "Unable to load Storage Box episode list for project %s: %s",

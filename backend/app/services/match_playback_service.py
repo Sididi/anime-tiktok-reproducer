@@ -852,7 +852,8 @@ class MatchPlaybackService:
         if not encoded:
             vf = (
                 f"scale=w={profile.width}:h={profile.height}:"
-                f"force_original_aspect_ratio=decrease,fps={profile.fps}"
+                f"force_original_aspect_ratio=decrease:force_divisible_by=2,"
+                f"fps={profile.fps}"
             )
 
             if cls._is_nvenc_available_sync():
