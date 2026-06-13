@@ -108,9 +108,9 @@ def _dedupe_episode_options(episodes: list[str]) -> list[str]:
     return sorted(options)
 
 
-def _is_confirmed_match(match: SceneMatch) -> bool:
-    """Return True when a match already has a deliberate persisted choice."""
-    return bool(match.confirmed and match.episode and match.confidence > 0)
+def _has_persisted_match_choice(match: SceneMatch) -> bool:
+    """Return True when a match already has a usable persisted source choice."""
+    return bool(match.episode and match.confidence > 0)
 
 
 def _serialize_scenes(scenes: SceneList) -> list[dict[str, float | int]]:
@@ -776,7 +776,7 @@ async def get_matches_playback_manifest(project_id: str):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    return MatchPlaybackService.get_manifest(project_id)
+    return await MatchPlaybackService.get_manifest(project_id)
 
 
 @router.get("/matches/playback/clip/{scene_index}/{track}")
@@ -1030,9 +1030,9 @@ async def update_matches_batch(project_id: str, request: BatchUpdateMatchesReque
                 detail=f"Match not found for scene {update.scene_index}",
             )
 
-        if _is_confirmed_match(match):
+        if _has_persisted_match_choice(match):
             logger.info(
-                "Skipping stale batch auto-fill for already confirmed scene %s in project %s",
+                "Skipping stale batch auto-fill for already matched scene %s in project %s",
                 update.scene_index,
                 project_id,
             )

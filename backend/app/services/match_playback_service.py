@@ -1821,13 +1821,38 @@ class MatchPlaybackService:
         )
 
     @classmethod
-    def get_manifest(cls, project_id: str) -> dict:
+    async def get_manifest(cls, project_id: str) -> dict:
         fingerprint = cls._load_active_fingerprint(project_id)
         if not fingerprint:
             return cls._default_manifest()
 
         manifest = cls._load_manifest_sync(project_id, fingerprint)
         if not cls._validate_manifest_sync(project_id, manifest):
+            return cls._default_manifest()
+
+        project = ProjectService.load(project_id)
+        scenes = ProjectService.load_scenes(project_id)
+        matches = ProjectService.load_matches(project_id)
+        if not project or not scenes or not scenes.scenes or not matches:
+            return cls._default_manifest()
+
+        valid_matches = [
+            match for match in matches.matches if match.confidence > 0 and bool(match.episode)
+        ]
+        source_by_episode: dict[str, Path] = {}
+        try:
+            for episode in sorted({match.episode for match in valid_matches}):
+                source_by_episode[episode] = await cls._resolve_episode_path(project, episode)
+            current_fingerprint = cls._build_fingerprint(
+                project,
+                scenes,
+                matches,
+                source_by_episode,
+            )
+        except Exception:
+            return cls._default_manifest()
+
+        if current_fingerprint != fingerprint:
             return cls._default_manifest()
 
         assert manifest is not None

@@ -133,6 +133,7 @@ function ManualMatchModalContent({
   const [isPlaying, setIsPlaying] = useState(false);
   const [sourcePhase, setSourcePhase] =
     useState<ManagedVideoPhase>("poster");
+  const [saving, setSaving] = useState(false);
 
   const sceneDuration = scene.end_time - scene.start_time;
   const sourceStrategy = useSourcePlaybackStrategy({
@@ -422,7 +423,11 @@ function ManualMatchModalContent({
     seekSourceGlobal(start, true);
   }, [seekSourceGlobal, startTime]);
 
-  const handleSave = useCallback(() => {
+  const handleSave = useCallback(async () => {
+    if (saving) {
+      return;
+    }
+
     const start = parseTime(startTime);
     const end = parseTime(endTime);
     if (start === null || end === null || !selectedEpisode) {
@@ -430,9 +435,24 @@ function ManualMatchModalContent({
     }
 
     const meta = evaluateSelection(sceneDuration, start, end);
-    void onSave(selectedEpisode, start, end, meta);
-    onClose();
-  }, [endTime, onClose, onSave, sceneDuration, selectedEpisode, startTime]);
+    setSaving(true);
+    try {
+      await onSave(selectedEpisode, start, end, meta);
+      onClose();
+    } catch {
+      // The parent displays the specific save error and keeps the modal open.
+    } finally {
+      setSaving(false);
+    }
+  }, [
+    endTime,
+    onClose,
+    onSave,
+    saving,
+    sceneDuration,
+    selectedEpisode,
+    startTime,
+  ]);
 
   const handleSelectCandidate = useCallback(
     (candidate: AlternativeMatch) => {
@@ -507,8 +527,9 @@ function ManualMatchModalContent({
             Manual Match Selection - Scene {scene.index + 1}
           </h2>
           <button
-            onClick={onClose}
-            className="rounded p-1 hover:bg-[hsl(var(--muted))]"
+            onClick={saving ? undefined : onClose}
+            disabled={saving}
+            className="rounded p-1 hover:bg-[hsl(var(--muted))] disabled:cursor-not-allowed disabled:opacity-50"
           >
             <X className="h-5 w-5" />
           </button>
@@ -704,12 +725,12 @@ function ManualMatchModalContent({
         </div>
 
         <div className="flex justify-end gap-2 border-t border-[hsl(var(--border))] p-4">
-          <Button variant="outline" onClick={onClose}>
+          <Button variant="outline" onClick={onClose} disabled={saving}>
             Cancel
           </Button>
-          <Button onClick={handleSave}>
+          <Button onClick={handleSave} disabled={saving}>
             <Check className="mr-2 h-4 w-4" />
-            Save Match
+            {saving ? "Saving..." : "Save Match"}
           </Button>
         </div>
       </div>

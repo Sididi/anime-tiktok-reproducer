@@ -1703,6 +1703,8 @@ export function MatchValidation() {
         return next;
       });
 
+      let persisted = false;
+
       try {
         stopFastWatch();
         const { match: updatedMatch } = await api.updateMatch(
@@ -1715,6 +1717,7 @@ export function MatchValidation() {
             confirmed: true,
           },
         );
+        persisted = true;
 
         setMatches((prev) =>
           prev.map((m) => {
@@ -1800,12 +1803,22 @@ export function MatchValidation() {
           delete next[sceneIndex];
           return next;
         });
-      } catch {
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "Manual match update failed";
         setPendingSceneUpdates((prev) => {
           const next = { ...prev };
           delete next[sceneIndex];
           return next;
         });
+        if (persisted) {
+          setPlaybackError(message);
+          showToast(
+            "error",
+            `Manual save succeeded for scene ${sceneIndex + 1}, but playback refresh failed.`,
+          );
+          return;
+        }
         setMatches((prev) =>
           prev.map((match) =>
             match.scene_index === sceneIndex && previousMatch
@@ -1829,7 +1842,7 @@ export function MatchValidation() {
           "error",
           `Manual save failed for scene ${sceneIndex + 1}. Previous match restored.`,
         );
-        return;
+        throw err;
       }
     },
     [
