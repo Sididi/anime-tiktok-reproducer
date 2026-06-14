@@ -104,5 +104,5 @@ voices:
       speed: 1.0
       use_speaker_boost: true
     auto_editor_overrides:
-      threshold: "0.055"
+      threshold: "0.052"
       margin: "0.05sec,0.18sec"
