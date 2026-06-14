@@ -6,6 +6,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from app.config import Settings
 from app.models.job import InstagramPublishState, Job, PlatformStatus
 from app.services.job_store import JobStore
@@ -191,6 +193,7 @@ async def test_dispatch_instagram_happy_path(
     assert ig.url == "https://instagram.com/reel/x"
     assert ig.attempts == 1
     assert publish_mock.await_args.kwargs["video_url"].endswith("/api/videos/ig-job")
+    assert publish_mock.await_args.kwargs["download_url"] == job.drive_video_url
     assert publish_mock.await_args.kwargs["poll_interval"] == 7
     assert publish_mock.await_args.kwargs["poll_timeout"] == 600
     assert publish_mock.await_args.kwargs["share_to_feed"] is False
@@ -490,4 +493,57 @@ async def test_dispatch_instagram_retries_resumable_header_error_once(
     assert actions == 1
     assert ig.status == "uploaded"
     assert ig.attempts == 7
+    assert publish_mock.await_count == 1
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "prepare_video: video preparation pass 2 failed: ffmpeg version 7.1.4",
+        "download:",
+    ],
+)
+async def test_dispatch_instagram_retries_old_prepare_and_download_failures_once(
+    tmp_path: Path,
+    example_yaml: Path,
+    example_env,
+    tmp_server_dir: Path,
+    detail: str,
+):
+    settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
+    store = JobStore(tmp_path / "jobs.json")
+    past = datetime.now(tz=UTC) - timedelta(minutes=5)
+    job = _make_job(slot_time=past, project_id="ig-old-failure")
+    job.platforms_requested = ["instagram"]
+    job.instagram_payload = {"ig_user_id": "x", "ig_access_token": "x", "caption": "x"}
+    job.platform_statuses = {
+        "instagram": PlatformStatus(
+            status="failed",
+            detail=detail,
+            attempts=5,
+        )
+    }
+    await store.create(job)
+
+    discord = AsyncMock()
+    publish_mock = AsyncMock(return_value=type("R", (), {
+        "success": False,
+        "permalink": None,
+        "detail": detail,
+    })())
+
+    with patch("app.services.reminder_scheduler.publish_to_instagram", new=publish_mock):
+        first_actions = await dispatch_due_actions(
+            store=store, settings=settings, discord=discord
+        )
+        second_actions = await dispatch_due_actions(
+            store=store, settings=settings, discord=discord
+        )
+
+    refreshed = await store.get("ig-old-failure")
+    ig = refreshed.platform_statuses["instagram"]
+    assert first_actions == 0
+    assert second_actions == 0
+    assert ig.status == "failed"
+    assert ig.attempts == 6
     assert publish_mock.await_count == 1

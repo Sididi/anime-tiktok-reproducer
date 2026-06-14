@@ -374,8 +374,92 @@ async def test_polling_timeout():
 
 
 @respx.mock
-async def test_in_progress_with_phase_error_falls_back_to_video_url(tmp_path):
+async def test_prepared_media_video_url_is_primary(tmp_path):
     prepared_dir = tmp_path / "prepared"
+    _mock_video_download()
+    create_route = respx.post(f"{BASE}/{IG_USER_ID}/media").mock(
+        return_value=httpx.Response(200, json={"id": VIDEO_URL_CONTAINER_ID})
+    )
+    video_url_status = respx.get(f"{BASE}/{VIDEO_URL_CONTAINER_ID}").mock(
+        return_value=httpx.Response(
+            200, json={"status_code": "FINISHED", "id": VIDEO_URL_CONTAINER_ID}
+        )
+    )
+    publish_route = respx.post(f"{BASE}/{IG_USER_ID}/media_publish").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID})
+    )
+    respx.get(f"{BASE}/{MEDIA_ID}").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID, "permalink": PERMALINK_URL})
+    )
+
+    result = await publish_to_instagram(
+        **_COMMON,
+        poll_interval=0.01,
+        poll_timeout=60,
+        project_id="ig-job",
+        prepared_media_dir=prepared_dir,
+        public_base_url="https://tiktok.sididi.tv",
+    )
+
+    assert result.success is True
+    assert create_route.call_count == 1
+    create_form = _form_call(create_route)
+    assert create_form["video_url"][0].startswith(
+        "https://tiktok.sididi.tv/api/instagram/prepared/ig-job/"
+    )
+    assert create_form["video_url"][0].endswith(".mp4")
+    assert video_url_status.called
+    assert publish_route.called
+    assert result.publish_state is not None
+    assert result.publish_state.container_id == VIDEO_URL_CONTAINER_ID
+    assert result.publish_state.upload_method == "video_url"
+    assert result.publish_state.prepared_media_filename is None
+    assert not prepared_dir.exists() or not list(prepared_dir.glob("*.mp4"))
+
+
+@respx.mock
+async def test_prepared_media_video_url_create_failure_falls_back_to_rupload(tmp_path):
+    prepared_dir = tmp_path / "prepared"
+    _mock_video_download()
+    create_route = respx.post(f"{BASE}/{IG_USER_ID}/media").mock(
+        side_effect=[
+            httpx.Response(400, json={"error": {"message": "URL fetch failed"}}),
+            httpx.Response(200, json={"id": CONTAINER_ID, "uri": UPLOAD_URI}),
+        ]
+    )
+    respx.get(f"{BASE}/{CONTAINER_ID}").mock(
+        return_value=httpx.Response(200, json={"status_code": "FINISHED", "id": CONTAINER_ID})
+    )
+    respx.post(f"{BASE}/{IG_USER_ID}/media_publish").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID})
+    )
+    respx.get(f"{BASE}/{MEDIA_ID}").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID, "permalink": PERMALINK_URL})
+    )
+
+    result = await publish_to_instagram(
+        **_COMMON,
+        poll_interval=0.01,
+        poll_timeout=1.0,
+        project_id="ig-job",
+        prepared_media_dir=prepared_dir,
+        public_base_url="https://tiktok.sididi.tv",
+    )
+
+    assert result.success is True
+    assert create_route.call_count == 2
+    assert _form_call(create_route, 0)["video_url"][0].startswith(
+        "https://tiktok.sididi.tv/api/instagram/prepared/ig-job/"
+    )
+    assert _form_call(create_route, 1)["upload_type"][0] == "resumable"
+    assert result.publish_state is not None
+    assert result.publish_state.upload_method == "rupload"
+    assert result.publish_state.fallback_reason is not None
+    assert "URL fetch failed" in result.publish_state.fallback_reason
+
+
+@respx.mock
+async def test_in_progress_with_phase_error_falls_back_to_video_url():
     _mock_video_download()
     create_route = respx.post(f"{BASE}/{IG_USER_ID}/media").mock(
         side_effect=[
@@ -416,18 +500,11 @@ async def test_in_progress_with_phase_error_falls_back_to_video_url(tmp_path):
         **_COMMON,
         poll_interval=0.01,
         poll_timeout=60,
-        project_id="ig-job",
-        prepared_media_dir=prepared_dir,
-        public_base_url="https://tiktok.sididi.tv",
     )
 
     assert result.success is True
     assert create_route.call_count == 2
-    fallback_form = _form_call(create_route, 1)
-    assert fallback_form["video_url"][0].startswith(
-        "https://tiktok.sididi.tv/api/instagram/prepared/ig-job/"
-    )
-    assert fallback_form["video_url"][0].endswith(".mp4")
+    assert _form_call(create_route, 1)["video_url"][0] == _COMMON["video_url"]
     assert rupload_status.called
     assert video_url_status.called
     assert publish_route.called
@@ -436,13 +513,10 @@ async def test_in_progress_with_phase_error_falls_back_to_video_url(tmp_path):
     assert result.publish_state.upload_method == "video_url"
     assert result.publish_state.fallback_reason is not None
     assert "uploading_phase=error" in result.publish_state.fallback_reason
-    assert result.publish_state.prepared_media_filename is None
-    assert not prepared_dir.exists() or not list(prepared_dir.glob("*.mp4"))
 
 
 @respx.mock
-async def test_rupload_phase_error_and_video_url_fallback_failure_reports_both(tmp_path):
-    prepared_dir = tmp_path / "prepared"
+async def test_rupload_phase_error_and_video_url_fallback_failure_reports_both():
     _mock_video_download()
     create_route = respx.post(f"{BASE}/{IG_USER_ID}/media").mock(
         side_effect=[
@@ -480,23 +554,17 @@ async def test_rupload_phase_error_and_video_url_fallback_failure_reports_both(t
         **_COMMON,
         poll_interval=0.01,
         poll_timeout=1.0,
-        project_id="ig-job",
-        prepared_media_dir=prepared_dir,
-        public_base_url="https://tiktok.sididi.tv",
     )
 
     assert result.success is False
     assert result.detail is not None
     assert result.detail.startswith("status_poll: container status_code = IN_PROGRESS")
     assert "fallback_video_url: status_poll: container status_code = ERROR" in result.detail
-    assert _form_call(create_route, 1)["video_url"][0].startswith(
-        "https://tiktok.sididi.tv/api/instagram/prepared/ig-job/"
-    )
+    assert _form_call(create_route, 1)["video_url"][0] == _COMMON["video_url"]
     assert result.publish_state is not None
     assert result.publish_state.container_id == VIDEO_URL_CONTAINER_ID
     assert result.publish_state.upload_method == "video_url"
     assert result.publish_state.prepared_media_filename is None
-    assert not list(prepared_dir.glob("*.mp4"))
 
 
 @respx.mock
@@ -904,6 +972,22 @@ async def test_prepare_failure_deletes_downloaded_video(tmp_path, monkeypatch):
     assert not video.exists()
 
 
+@respx.mock
+async def test_download_failure_detail_includes_host_status_and_body():
+    respx.get(_COMMON["video_url"]).mock(
+        return_value=httpx.Response(403, text="forbidden by upstream")
+    )
+
+    result = await publish_to_instagram(
+        **_COMMON, poll_interval=0.01, poll_timeout=1.0
+    )
+
+    assert result.success is False
+    assert result.detail is not None
+    assert result.detail.startswith("download: GET cdn.example.com failed HTTP 403")
+    assert "forbidden by upstream" in result.detail
+
+
 async def test_ffprobe_unavailable_validation_falls_back(tmp_path, monkeypatch):
     monkeypatch.setattr(instagram_publisher.shutil, "which", lambda name: None)
     video = tmp_path / "video.mp4"
@@ -1009,47 +1093,22 @@ def test_upload_transport_sends_exact_body_length_without_chunking(tmp_path):
     assert captured["body"] == payload
 
 
-async def test_prepare_video_transcodes_even_when_under_size_threshold(tmp_path, monkeypatch):
+async def test_prepare_video_uses_valid_original_when_under_target(tmp_path, monkeypatch):
     video = tmp_path / "video.mp4"
     video.write_bytes(b"x" * 1024)
-    pass_calls: list[int] = []
 
-    monkeypatch.setattr(
-        instagram_publisher.shutil, "which", lambda name: f"/usr/bin/{name}"
-    )
+    def fail_run(*args, **kwargs):
+        raise AssertionError("valid small video should not invoke ffmpeg")
 
-    async def fake_duration(path):
-        return 60.0
-
-    monkeypatch.setattr(
-        instagram_publisher, "_probe_duration_seconds", fake_duration
-    )
-
-    class Completed:
-        returncode = 0
-        stderr = ""
-        stdout = ""
-
-    def fake_run(cmd, **kwargs):
-        pass_idx = cmd.index("-pass") + 1
-        pass_num = int(cmd[pass_idx])
-        pass_calls.append(pass_num)
-        if pass_num == 2:
-            Path(cmd[-1]).write_bytes(b"prepared mp4 payload")
-        return Completed()
-
-    monkeypatch.setattr(instagram_publisher.subprocess, "run", fake_run)
+    monkeypatch.setattr(instagram_publisher.subprocess, "run", fail_run)
 
     result = await ORIGINAL_PREPARE_VIDEO(video)
 
-    assert pass_calls == [1, 2]
-    assert result != video
+    assert result == video
     assert result.exists()
-    assert not video.exists()
-    result.unlink(missing_ok=True)
 
 
-async def test_prepare_video_outputs_vertical_reels_safe_file(tmp_path):
+async def test_prepare_video_outputs_vertical_reels_safe_file(tmp_path, monkeypatch):
     ffmpeg = instagram_publisher.shutil.which("ffmpeg")
     ffprobe = instagram_publisher.shutil.which("ffprobe")
     if ffmpeg is None or ffprobe is None:
@@ -1084,6 +1143,12 @@ async def test_prepare_video_outputs_vertical_reels_safe_file(tmp_path):
     )
     assert create.returncode == 0, create.stderr
 
+    async def validate(path):
+        if path == source:
+            return "source requires normalization"
+        return await ORIGINAL_VALIDATE_VIDEO(path)
+
+    monkeypatch.setattr(instagram_publisher, "_validate_video", validate)
     prepared = await ORIGINAL_PREPARE_VIDEO(source)
     try:
         probe = subprocess.run(
@@ -1116,6 +1181,8 @@ async def test_prepare_video_outputs_vertical_reels_safe_file(tmp_path):
 
 
 async def test_prepare_video_fails_when_ffmpeg_unavailable(tmp_path, monkeypatch):
+    monkeypatch.setattr(instagram_publisher, "_MAX_REEL_BYTES", 1024)
+    monkeypatch.setattr(instagram_publisher, "_TARGET_REEL_BYTES", 900)
     video = tmp_path / "video.mp4"
     video.write_bytes(b"x" * (instagram_publisher._MAX_REEL_BYTES + 1))
     monkeypatch.setattr(instagram_publisher.shutil, "which", lambda name: None)
@@ -1126,11 +1193,13 @@ async def test_prepare_video_fails_when_ffmpeg_unavailable(tmp_path, monkeypatch
     assert video.exists()
 
 
-async def test_prepare_video_runs_two_passes_and_replaces_file(tmp_path, monkeypatch):
+async def test_prepare_video_runs_one_pass_and_replaces_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(instagram_publisher, "_MAX_REEL_BYTES", 1024)
+    monkeypatch.setattr(instagram_publisher, "_TARGET_REEL_BYTES", 900)
     video = tmp_path / "video.mp4"
     video.write_bytes(b"x" * (instagram_publisher._MAX_REEL_BYTES + 1))
     output_holder: dict[str, Path] = {}
-    pass_calls: list[int] = []
+    commands: list[list[str]] = []
 
     monkeypatch.setattr(
         instagram_publisher.shutil, "which", lambda name: f"/usr/bin/{name}"
@@ -1150,20 +1219,19 @@ async def test_prepare_video_runs_two_passes_and_replaces_file(tmp_path, monkeyp
             self.stdout = ""
 
     def fake_run(cmd, **kwargs):
-        pass_idx = cmd.index("-pass") + 1
-        pass_num = int(cmd[pass_idx])
-        pass_calls.append(pass_num)
-        if pass_num == 2:
-            out = Path(cmd[-1])
-            out.write_bytes(b"transcoded mp4 payload")
-            output_holder["out"] = out
+        commands.append(cmd)
+        out = Path(cmd[-1])
+        out.write_bytes(b"transcoded")
+        output_holder["out"] = out
         return Completed()
 
     monkeypatch.setattr(instagram_publisher.subprocess, "run", fake_run)
 
     result = await ORIGINAL_PREPARE_VIDEO(video)
 
-    assert pass_calls == [1, 2]
+    assert len(commands) == 1
+    assert "-pass" not in commands[0]
+    assert "-hide_banner" in commands[0]
     assert result != video
     assert result.exists()
     assert result == output_holder["out"]
@@ -1173,11 +1241,11 @@ async def test_prepare_video_runs_two_passes_and_replaces_file(tmp_path, monkeyp
 
 async def test_prepare_video_retries_when_output_still_too_large(tmp_path, monkeypatch):
     monkeypatch.setattr(instagram_publisher, "_MAX_REEL_BYTES", 1024)
-    monkeypatch.setattr(instagram_publisher, "_TARGET_REEL_BYTES", 1024)
+    monkeypatch.setattr(instagram_publisher, "_TARGET_REEL_BYTES", 20)
     video = tmp_path / "video.mp4"
     video.write_bytes(b"x" * (instagram_publisher._MAX_REEL_BYTES + 1))
-    pass_calls: list[int] = []
-    second_pass_outputs = 0
+    commands: list[list[str]] = []
+    outputs = 0
 
     monkeypatch.setattr(
         instagram_publisher.shutil, "which", lambda name: f"/usr/bin/{name}"
@@ -1196,35 +1264,35 @@ async def test_prepare_video_retries_when_output_still_too_large(tmp_path, monke
         stdout = ""
 
     def fake_run(cmd, **kwargs):
-        nonlocal second_pass_outputs
-        pass_idx = cmd.index("-pass") + 1
-        pass_num = int(cmd[pass_idx])
-        pass_calls.append(pass_num)
-        if pass_num == 2:
-            out = Path(cmd[-1])
-            second_pass_outputs += 1
-            if second_pass_outputs == 1:
-                out.write_bytes(b"x" * (instagram_publisher._MAX_REEL_BYTES + 1))
-            else:
-                out.write_bytes(b"transcoded mp4 payload")
+        nonlocal outputs
+        commands.append(cmd)
+        out = Path(cmd[-1])
+        outputs += 1
+        if outputs == 1:
+            out.write_bytes(b"x" * 25)
+        else:
+            out.write_bytes(b"transcoded")
         return Completed()
 
     monkeypatch.setattr(instagram_publisher.subprocess, "run", fake_run)
 
     result = await ORIGINAL_PREPARE_VIDEO(video)
 
-    assert pass_calls == [1, 2, 1, 2]
+    assert len(commands) == 2
     assert result != video
     assert result.exists()
-    assert result.stat().st_size < instagram_publisher._MAX_REEL_BYTES
+    assert result.stat().st_size <= instagram_publisher._TARGET_REEL_BYTES
     assert not video.exists()
     result.unlink(missing_ok=True)
 
 
-async def test_prepare_video_fails_when_pass_fails(tmp_path, monkeypatch):
+async def test_prepare_video_falls_back_to_valid_original_when_normalization_fails(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(instagram_publisher, "_MAX_REEL_BYTES", 100)
+    monkeypatch.setattr(instagram_publisher, "_TARGET_REEL_BYTES", 50)
     video = tmp_path / "video.mp4"
-    original_size = instagram_publisher._MAX_REEL_BYTES + 1
-    video.write_bytes(b"x" * original_size)
+    video.write_bytes(b"x" * 80)
 
     monkeypatch.setattr(
         instagram_publisher.shutil, "which", lambda name: f"/usr/bin/{name}"
@@ -1246,9 +1314,55 @@ async def test_prepare_video_fails_when_pass_fails(tmp_path, monkeypatch):
         instagram_publisher.subprocess, "run", lambda *a, **k: Completed()
     )
 
-    with pytest.raises(RuntimeError, match="video preparation pass 1 failed"):
+    result = await ORIGINAL_PREPARE_VIDEO(video)
+
+    assert result == video
+    assert video.exists()
+
+
+async def test_prepare_video_fails_when_ffmpeg_fails_for_invalid_source(
+    tmp_path, monkeypatch
+):
+    video = tmp_path / "video.mp4"
+    original_size = 80
+    video.write_bytes(b"x" * original_size)
+
+    async def invalid_source(path):
+        return "video codec 'vp9' is not H.264/HEVC"
+
+    monkeypatch.setattr(instagram_publisher, "_validate_video", invalid_source)
+    monkeypatch.setattr(
+        instagram_publisher.shutil, "which", lambda name: f"/usr/bin/{name}"
+    )
+
+    async def fake_duration(path):
+        return 600.0
+
+    monkeypatch.setattr(
+        instagram_publisher, "_probe_duration_seconds", fake_duration
+    )
+
+    class Completed:
+        returncode = 1
+        stderr = (
+            "ffmpeg version 7.1.4\n"
+            "configuration: --lots-of-noise\n"
+            "Input #0, mov,mp4,m4a,3gp,3g2,mj2\n"
+            "encoder exploded"
+        )
+        stdout = ""
+
+    monkeypatch.setattr(
+        instagram_publisher.subprocess, "run", lambda *a, **k: Completed()
+    )
+
+    with pytest.raises(RuntimeError) as exc:
         await ORIGINAL_PREPARE_VIDEO(video)
 
+    assert "original invalid" in str(exc.value)
+    assert "ffmpeg failed" in str(exc.value)
+    assert "encoder exploded" in str(exc.value)
+    assert "configuration:" not in str(exc.value)
     assert video.exists()
     assert video.stat().st_size == original_size
 

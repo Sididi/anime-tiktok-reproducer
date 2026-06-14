@@ -28,6 +28,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -437,6 +438,56 @@ async def _create_instagram_container(
     return container_id, str(upload_uri) if upload_uri else None
 
 
+async def _create_rupload_fallback_container(
+    client: httpx.AsyncClient,
+    *,
+    base: str,
+    ig_user_id: str,
+    ig_access_token: str,
+    caption: str,
+    share_to_feed: bool,
+    thumb_offset: int | None,
+    graph_api_version: str,
+    first_detail: str,
+    force_video_url_reason: str | None,
+    prepared_metadata: dict[str, Any],
+    progress_callback: InstagramProgressCallback | None,
+) -> tuple[str, str | None, InstagramPublishState]:
+    container_id, upload_uri = await _create_instagram_container(
+        client,
+        base=base,
+        ig_user_id=ig_user_id,
+        ig_access_token=ig_access_token,
+        caption=caption,
+        share_to_feed=share_to_feed,
+        thumb_offset=thumb_offset,
+        upload_method="rupload",
+    )
+    created_at = _utc_now()
+    expires_at = created_at + timedelta(seconds=_INSTAGRAM_CONTAINER_TTL_SECONDS)
+    state = InstagramPublishState(
+        container_id=container_id,
+        upload_uri=upload_uri,
+        stage="created",
+        created_at=created_at,
+        expires_at=expires_at,
+        upload_method="rupload",
+        fallback_reason=(
+            force_video_url_reason or f"video_url container failed: {first_detail}"
+        ),
+        **prepared_metadata,
+    )
+    await _emit_progress(progress_callback, state)
+    logger.info(
+        "Instagram rupload fallback container created "
+        "ig_user_id=%s graph_api_version=%s container_id=%s",
+        ig_user_id,
+        graph_api_version,
+        container_id,
+    )
+    return container_id, upload_uri, state
+
+
 def _validate_caption(caption: str) -> str | None:
     if len(caption) > _MAX_CAPTION_CHARS:
         return f"caption is {len(caption)} chars; max is {_MAX_CAPTION_CHARS}"
@@ -602,21 +653,50 @@ async def _probe_duration_seconds(video_path: Path) -> float | None:
     return _float_or_none(result.stdout.strip())
 
 
-async def _prepare_video_for_instagram_upload(video_path: Path) -> Path:  # noqa: PLR0911, PLR0915
-    """Normalize every Reel before upload so Meta gets a predictable file.
+def _ffmpeg_failure_detail(result: subprocess.CompletedProcess[str]) -> str:
+    text = "\n".join(part for part in (result.stderr, result.stdout) if part)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    skipped_prefixes = (
+        "ffmpeg version ",
+        "built with ",
+        "configuration:",
+        "libav",
+        "libsw",
+        "libpostproc",
+    )
+    useful = [
+        line
+        for line in lines
+        if not line.startswith(skipped_prefixes)
+        and not line.startswith("  configuration:")
+    ]
+    tail = useful[-8:] if useful else lines[-8:]
+    return "\n".join(tail)[:1000] or f"ffmpeg exited with {result.returncode}"
 
-    The VPS downloads the shared Drive export, prepares a 30fps H.264/AAC MP4
-    with a conservative bitrate/size target, then uploads only that prepared
-    file to Instagram. The caller owns cleanup of the returned path.
-    """
+
+def _video_filter() -> str:
+    return (
+        "[0:v:0]split=2[bgsrc][fgsrc];"
+        f"[bgsrc]scale={_PREPARED_REEL_WIDTH}:{_PREPARED_REEL_HEIGHT}:"
+        "force_original_aspect_ratio=increase,"
+        f"crop={_PREPARED_REEL_WIDTH}:{_PREPARED_REEL_HEIGHT},"
+        "gblur=sigma=24[bg];"
+        f"[fgsrc]scale={_PREPARED_REEL_WIDTH}:{_PREPARED_REEL_HEIGHT}:"
+        "force_original_aspect_ratio=decrease,setsar=1[fg];"
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2,"
+        "setsar=1,format=yuv420p[v]"
+    )
+
+
+async def _normalize_video_for_instagram_upload(video_path: Path) -> Path:  # noqa: PLR0915
     file_size = video_path.stat().st_size
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
-        raise RuntimeError("ffmpeg is unavailable; cannot prepare Instagram video")
+        raise RuntimeError("ffmpeg is unavailable; cannot normalize Instagram video")
 
     duration = await _probe_duration_seconds(video_path)
     if duration is None or duration <= 0:
-        raise RuntimeError("duration probe failed; cannot prepare Instagram video")
+        raise RuntimeError("duration probe failed; cannot normalize Instagram video")
 
     for target_ratio in _PREPARED_REEL_TARGET_RATIOS:
         target_total_bits = int(_TARGET_REEL_BYTES * target_ratio * 8)
@@ -632,34 +712,20 @@ async def _prepare_video_for_instagram_upload(video_path: Path) -> Path:  # noqa
         fd, out_str = tempfile.mkstemp(prefix="ig-reel-prepared-", suffix=".mp4")
         os.close(fd)
         out_path = Path(out_str)
-        pass_log_dir = Path(tempfile.mkdtemp(prefix="ig-reel-pass-"))
-        pass_log_prefix = pass_log_dir / "ffmpeg2pass"
 
-        def run_pass(
-            pass_num: int,
+        def run_normalize(
             *,
             video_bitrate: int = video_bitrate,
-            pass_log_prefix: Path = pass_log_prefix,
             out_path: Path = out_path,
         ) -> subprocess.CompletedProcess[str]:
-            video_filter = (
-                "[0:v:0]split=2[bgsrc][fgsrc];"
-                f"[bgsrc]scale={_PREPARED_REEL_WIDTH}:{_PREPARED_REEL_HEIGHT}:"
-                "force_original_aspect_ratio=increase,"
-                f"crop={_PREPARED_REEL_WIDTH}:{_PREPARED_REEL_HEIGHT},"
-                "gblur=sigma=24[bg];"
-                f"[fgsrc]scale={_PREPARED_REEL_WIDTH}:{_PREPARED_REEL_HEIGHT}:"
-                "force_original_aspect_ratio=decrease,setsar=1[fg];"
-                "[bg][fg]overlay=(W-w)/2:(H-h)/2,"
-                "setsar=1,format=yuv420p[v]"
-            )
-            common = [
+            cmd = [
                 ffmpeg,
+                "-hide_banner",
                 "-y",
                 "-i",
                 str(video_path),
                 "-filter_complex",
-                video_filter,
+                _video_filter(),
                 "-map",
                 "[v]",
                 "-map",
@@ -684,30 +750,20 @@ async def _prepare_video_for_instagram_upload(video_path: Path) -> Path:  # noqa
                 "0",
                 "-flags",
                 "+cgop",
+                "-c:a",
+                "aac",
+                "-profile:a",
+                "aac_low",
+                "-b:a",
+                str(_PREPARED_REEL_AUDIO_BITRATE),
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
                 "-movflags",
                 "+faststart",
-                "-passlogfile",
-                str(pass_log_prefix),
-                "-pass",
-                str(pass_num),
+                str(out_path),
             ]
-            if pass_num == 1:
-                cmd = [*common, "-an", "-f", "mp4", os.devnull]
-            else:
-                cmd = [
-                    *common,
-                    "-c:a",
-                    "aac",
-                    "-profile:a",
-                    "aac_low",
-                    "-b:a",
-                    str(_PREPARED_REEL_AUDIO_BITRATE),
-                    "-ar",
-                    "48000",
-                    "-ac",
-                    "2",
-                    str(out_path),
-                ]
             return subprocess.run(
                 cmd,
                 check=False,
@@ -717,7 +773,7 @@ async def _prepare_video_for_instagram_upload(video_path: Path) -> Path:  # noqa
             )
 
         logger.info(
-            "Instagram video preparation start: %d bytes over %.2fs, "
+            "Instagram video normalization start: %d bytes over %.2fs, "
             "target ratio %.2f, fps=%d, target video bitrate %d bps",
             file_size,
             duration,
@@ -725,66 +781,95 @@ async def _prepare_video_for_instagram_upload(video_path: Path) -> Path:  # noqa
             _PREPARED_REEL_FPS,
             video_bitrate,
         )
+        keep_output = False
         try:
-            for pass_num in (1, 2):
-                try:
-                    result = await asyncio.to_thread(run_pass, pass_num)
-                except (OSError, subprocess.SubprocessError) as e:
-                    logger.warning(
-                        "Instagram video preparation pass %d errored: %s",
-                        pass_num,
-                        e,
-                    )
-                    out_path.unlink(missing_ok=True)
-                    raise RuntimeError(f"video preparation pass {pass_num} errored: {e}") from e
-                if result.returncode != 0:
-                    detail = (result.stderr or "").strip()[:300]
-                    logger.warning(
-                        "Instagram video preparation pass %d failed: %s",
-                        pass_num,
-                        detail,
-                    )
-                    out_path.unlink(missing_ok=True)
-                    raise RuntimeError(
-                        f"video preparation pass {pass_num} failed: {detail or result.returncode}"
-                    )
+            try:
+                result = await asyncio.to_thread(run_normalize)
+            except (OSError, subprocess.SubprocessError) as e:
+                logger.warning("Instagram video normalization errored: %s", e)
+                raise RuntimeError(f"ffmpeg errored: {type(e).__name__}: {e}") from e
+            if result.returncode != 0:
+                detail = _ffmpeg_failure_detail(result)
+                logger.warning("Instagram video normalization failed: %s", detail)
+                raise RuntimeError(f"ffmpeg failed: {detail}")
 
             new_size = out_path.stat().st_size if out_path.exists() else 0
             if new_size <= 0:
-                logger.warning("Instagram video preparation produced empty file")
-                out_path.unlink(missing_ok=True)
-                raise RuntimeError("video preparation produced an empty output file")
+                logger.warning("Instagram video normalization produced empty file")
+                raise RuntimeError("ffmpeg produced an empty output file")
             if new_size > _TARGET_REEL_BYTES:
                 logger.warning(
-                    "Instagram video preparation remained too large at ratio %.2f: "
+                    "Instagram video normalization remained too large at ratio %.2f: "
                     "%d bytes > target %d bytes; retrying lower target",
                     target_ratio,
                     new_size,
                     _TARGET_REEL_BYTES,
                 )
-                out_path.unlink(missing_ok=True)
                 continue
 
+            if detail := await _validate_video(out_path):
+                logger.warning(
+                    "Instagram video normalization produced invalid file: %s",
+                    detail,
+                )
+                raise RuntimeError(f"ffmpeg output invalid: {detail}")
+
             logger.info(
-                "Instagram video preparation complete: %d bytes -> %d bytes",
+                "Instagram video normalization complete: %d bytes -> %d bytes",
                 file_size,
                 new_size,
             )
+            keep_output = True
             video_path.unlink(missing_ok=True)
             return out_path
         finally:
-            shutil.rmtree(pass_log_dir, ignore_errors=True)
+            if not keep_output and out_path.exists():
+                out_path.unlink(missing_ok=True)
 
     raise RuntimeError(
-        "video preparation could not get "
+        "ffmpeg could not get "
         f"{file_size} byte file under target {_TARGET_REEL_BYTES} bytes"
     )
+
+
+async def _prepare_video_for_instagram_upload(video_path: Path) -> Path:
+    """Stage a Reel for Instagram while avoiding unnecessary transcoding.
+
+    Existing generated videos are usually already compliant. Keep those files
+    unchanged; only normalize when the original is invalid or too close to the
+    size limits. The caller owns cleanup of the returned path.
+    """
+    file_size = video_path.stat().st_size
+    original_detail = await _validate_video(video_path)
+    if original_detail is None and file_size <= _TARGET_REEL_BYTES:
+        logger.info(
+            "Instagram video preparation using original compliant file: %d bytes",
+            file_size,
+        )
+        return video_path
+
+    original_can_fallback = original_detail is None and file_size <= _MAX_REEL_BYTES
+    try:
+        return await _normalize_video_for_instagram_upload(video_path)
+    except RuntimeError as e:
+        if original_can_fallback:
+            logger.warning(
+                "Instagram video normalization failed; using original compliant "
+                "file under hard cap: %s",
+                e,
+            )
+            return video_path
+        if original_detail is not None:
+            raise RuntimeError(
+                f"original invalid ({original_detail}); normalization failed ({e})"
+            ) from e
+        raise
 
 
 async def _maybe_transcode_for_size(video_path: Path) -> Path:
     """Compatibility wrapper for older tests/imports."""
     logger.warning(
-        "_maybe_transcode_for_size is deprecated; preparing Instagram video unconditionally"
+        "_maybe_transcode_for_size is deprecated; preparing Instagram video conditionally"
     )
     return await _prepare_video_for_instagram_upload(video_path)
 
@@ -900,12 +985,32 @@ async def _upload_resumable_binary(
     )
 
 
+def _url_host_label(url: str) -> str:
+    parsed = urlparse(url)
+    return parsed.netloc or parsed.path or "unknown-host"
+
+
+def _download_failure_detail(video_url: str, exc: BaseException) -> str:
+    host = _url_host_label(video_url)
+    if isinstance(exc, httpx.HTTPStatusError):
+        response = exc.response
+        return (
+            f"GET {host} failed HTTP {response.status_code}: "
+            f"{_response_detail(response)}"
+        )
+    text = str(exc).strip()
+    suffix = f": {text}" if text else ""
+    return f"GET {host} failed {type(exc).__name__}{suffix}"
+
+
 async def _download_video(client: httpx.AsyncClient, video_url: str) -> Path:
     fd, tmp = tempfile.mkstemp(prefix="ig-reel-", suffix=".mp4")
     os.close(fd)
     path = Path(tmp)
     try:
         async with client.stream("GET", video_url) as response:
+            if response.status_code >= 400:
+                await response.aread()
             response.raise_for_status()
             with path.open("wb") as f:
                 async for chunk in response.aiter_bytes():
@@ -1053,6 +1158,7 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
     ig_access_token: str,
     caption: str,
     video_url: str,
+    download_url: str | None = None,
     graph_api_version: str = "v25.0",
     poll_interval: float = _DEFAULT_POLL_INTERVAL_SECONDS,
     poll_timeout: float = _DEFAULT_POLL_TIMEOUT_SECONDS,
@@ -1066,6 +1172,7 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
 ) -> InstagramPublishResult:
     base = f"https://graph.facebook.com/{graph_api_version}"
     timeout = httpx.Timeout(30.0, read=None)
+    source_video_url = download_url or video_url
     video_path: Path | None = None
     started = time.monotonic()
     state = _coerce_publish_state(publish_state)
@@ -1168,7 +1275,6 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                 )
 
         if not valid_existing_container:
-            upload_method = "video_url" if force_video_url_reason else "rupload"
             prepared_metadata: dict[str, Any] = {}
             prepared_video_url = video_url
             cached_prepared_path = _state_prepared_media_path(
@@ -1176,7 +1282,7 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                 prepared_media_dir,
             )
             if (
-                upload_method == "video_url"
+                force_video_url_reason
                 and cached_prepared_path is not None
                 and invalid_state is not None
                 and invalid_state.prepared_media_url
@@ -1192,17 +1298,23 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                 }
             else:
                 try:
-                    video_path = await _download_video(client, video_url)
+                    video_path = await _download_video(client, source_video_url)
                 except httpx.HTTPStatusError as e:
                     return InstagramPublishResult(
                         success=False,
-                        detail=_stage_detail("download", _response_detail(e.response)),
+                        detail=_stage_detail(
+                            "download",
+                            _download_failure_detail(source_video_url, e),
+                        ),
                         publish_state=state,
                     )
                 except (httpx.HTTPError, RuntimeError) as e:
                     return InstagramPublishResult(
                         success=False,
-                        detail=_stage_detail("download", str(e)),
+                        detail=_stage_detail(
+                            "download",
+                            _download_failure_detail(source_video_url, e),
+                        ),
                         publish_state=state,
                     )
 
@@ -1234,6 +1346,14 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                     expires_at=expires_at,
                 )
                 prepared_video_url = prepared_metadata.get("prepared_media_url") or video_url
+
+            if prepared_metadata.get("prepared_media_url"):
+                upload_method = "video_url"
+                prepared_video_url = str(prepared_metadata["prepared_media_url"])
+            elif force_video_url_reason:
+                upload_method = "video_url"
+            else:
+                upload_method = "rupload"
 
             try:
                 container_id, upload_uri = await _create_instagram_container(
@@ -1280,37 +1400,94 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                 ):
                     video_path.unlink(missing_ok=True)
                     video_path = None
-            except httpx.HTTPStatusError as e:
-                if video_path is not None:
-                    video_path.unlink(missing_ok=True)
-                return InstagramPublishResult(
-                    success=False,
-                    detail=_stage_detail("create_container", _response_detail(e.response)),
-                    publish_state=state,
+            except (httpx.HTTPStatusError, httpx.HTTPError, KeyError, ValueError) as e:
+                first_detail = (
+                    _response_detail(e.response)
+                    if isinstance(e, httpx.HTTPStatusError)
+                    else f"{type(e).__name__}: {e}"
                 )
-            except (httpx.HTTPError, KeyError, ValueError) as e:
-                if video_path is not None:
-                    video_path.unlink(missing_ok=True)
-                return InstagramPublishResult(
-                    success=False,
-                    detail=_stage_detail("create_container", str(e)),
-                    publish_state=state,
-                )
+                if upload_method == "video_url" and video_path is not None:
+                    logger.warning(
+                        "Instagram video_url container creation failed; falling back "
+                        "to rupload ig_user_id=%s detail=%s",
+                        ig_user_id,
+                        first_detail,
+                    )
+                    try:
+                        container_id, upload_uri, state = (
+                            await _create_rupload_fallback_container(
+                                client,
+                                base=base,
+                                ig_user_id=ig_user_id,
+                                ig_access_token=ig_access_token,
+                                caption=caption,
+                                share_to_feed=share_to_feed,
+                                thumb_offset=thumb_offset,
+                                graph_api_version=graph_api_version,
+                                first_detail=first_detail,
+                                force_video_url_reason=force_video_url_reason,
+                                prepared_metadata=prepared_metadata,
+                                progress_callback=progress_callback,
+                            )
+                        )
+                        needs_upload = True
+                    except httpx.HTTPStatusError as fallback_e:
+                        if video_path is not None:
+                            video_path.unlink(missing_ok=True)
+                        return InstagramPublishResult(
+                            success=False,
+                            detail=(
+                                f"create_container: {first_detail}; "
+                                "fallback_rupload: "
+                                f"{_response_detail(fallback_e.response)}"
+                            ),
+                            publish_state=state,
+                        )
+                    except (httpx.HTTPError, KeyError, ValueError) as fallback_e:
+                        if video_path is not None:
+                            video_path.unlink(missing_ok=True)
+                        fallback_detail = (
+                            _response_detail(fallback_e.response)
+                            if isinstance(fallback_e, httpx.HTTPStatusError)
+                            else f"{type(fallback_e).__name__}: {fallback_e}"
+                        )
+                        return InstagramPublishResult(
+                            success=False,
+                            detail=(
+                                f"create_container: {first_detail}; "
+                                f"fallback_rupload: {fallback_detail}"
+                            ),
+                            publish_state=state,
+                        )
+                else:
+                    if video_path is not None:
+                        video_path.unlink(missing_ok=True)
+                    return InstagramPublishResult(
+                        success=False,
+                        detail=_stage_detail("create_container", first_detail),
+                        publish_state=state,
+                    )
         elif needs_upload:
             video_path = _state_prepared_media_path(state, prepared_media_dir)
             if video_path is None:
                 try:
-                    video_path = await _download_video(client, video_url)
+                    video_path = await _download_video(client, source_video_url)
                 except httpx.HTTPStatusError as e:
                     return InstagramPublishResult(
                         success=False,
-                        detail=_stage_detail("download", _response_detail(e.response)),
+                        detail=_stage_detail(
+                            "download",
+                            _download_failure_detail(source_video_url, e),
+                        ),
                         publish_state=state,
                     )
                 except (httpx.HTTPError, RuntimeError) as e:
                     return InstagramPublishResult(
                         success=False,
-                        detail=_stage_detail("download", str(e)),
+                        detail=_stage_detail(
+                            "download",
+                            _download_failure_detail(source_video_url, e),
+                        ),
                         publish_state=state,
                     )
 
@@ -1535,6 +1712,7 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                     ig_access_token=ig_access_token,
                     caption=caption,
                     video_url=video_url,
+                    download_url=download_url,
                     graph_api_version=graph_api_version,
                     poll_interval=poll_interval,
                     poll_timeout=poll_timeout,

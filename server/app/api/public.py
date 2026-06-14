@@ -1,8 +1,10 @@
 """Public asset serving. No auth."""
 from __future__ import annotations
 
+import contextlib
 import mimetypes
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
@@ -97,6 +99,20 @@ async def get_job_video(project_id: str, request: Request) -> Response:
     except httpx.HTTPError as exc:
         await client.aclose()
         raise HTTPException(502, f"Video upstream fetch failed: {exc}") from exc
+
+    if upstream.status_code >= 400:
+        body = ""
+        if request.method != "HEAD":
+            with contextlib.suppress(httpx.HTTPError):
+                body = (await upstream.aread()).decode("utf-8", errors="replace").strip()
+        host = urlparse(job.drive_video_url).netloc or "upstream"
+        await upstream.aclose()
+        await client.aclose()
+        suffix = f": {body[:300]}" if body else ""
+        raise HTTPException(
+            502,
+            f"Video upstream {host} returned HTTP {upstream.status_code}{suffix}",
+        )
 
     response_headers = {
         key: value

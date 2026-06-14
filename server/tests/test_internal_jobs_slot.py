@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient
-
 
 JOB_PAYLOAD = {
     "project_id": "p1",

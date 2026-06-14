@@ -36,6 +36,10 @@ _IG_DEFAULT_POLL_TIMEOUT_SECONDS = 4 * 60 * 60.0
 _LEGACY_IG_CONTAINER_ERROR = "container status_code = ERROR"
 _URL_INGEST_IG_CONTAINER_ERROR = "error code 2207077"
 _RESUMABLE_HEADER_ERROR = "Invalid Header format"
+_PREPARE_VIDEO_PASS_ERROR = "prepare_video: video preparation pass"
+_PREPARE_VIDEO_FFMPEG_ERROR = "prepare_video: ffmpeg failed"
+_PREPARE_VIDEO_FFMPEG_ERRORED = "prepare_video: ffmpeg errored"
+_DOWNLOAD_STAGE_ERROR = "download:"
 
 
 async def dispatch_due_actions(
@@ -132,9 +136,9 @@ async def _dispatch_instagram_publish(
     current = job.platform_statuses.get("instagram", PlatformStatus(status="pending"))
     # Already terminal — nothing to do
     if current.status in ("uploaded", "failed", "skipped"):
-        if _should_retry_legacy_instagram_failure(current):
+        if _should_retry_recoverable_instagram_failure(current):
             logger.info(
-                "Retrying legacy Instagram container failure for %s via public proxy",
+                "Retrying recoverable Instagram failure for %s",
                 job.project_id,
             )
         else:
@@ -161,6 +165,7 @@ async def _dispatch_instagram_publish(
         ig_access_token=payload["ig_access_token"],
         caption=payload["caption"],
         video_url=_instagram_video_url(job, settings),
+        download_url=job.drive_video_url,
         graph_api_version=payload.get("graph_api_version", "v25.0"),
         poll_interval=float(
             payload.get("poll_interval_seconds") or _IG_DEFAULT_POLL_INTERVAL_SECONDS
@@ -252,12 +257,16 @@ def _instagram_video_url(job: Job, settings: Settings) -> str:
     return f"{settings.public_base_url.rstrip('/')}/api/videos/{job.project_id}"
 
 
-def _should_retry_legacy_instagram_failure(status: PlatformStatus) -> bool:
+def _should_retry_recoverable_instagram_failure(status: PlatformStatus) -> bool:
     detail = status.detail or ""
     retryable_attempts = {
         _LEGACY_IG_CONTAINER_ERROR: _IG_MAX_ATTEMPTS,
         _URL_INGEST_IG_CONTAINER_ERROR: _IG_MAX_ATTEMPTS,
         _RESUMABLE_HEADER_ERROR: _IG_MAX_ATTEMPTS + 1,
+        _PREPARE_VIDEO_PASS_ERROR: _IG_MAX_ATTEMPTS,
+        _PREPARE_VIDEO_FFMPEG_ERROR: _IG_MAX_ATTEMPTS,
+        _PREPARE_VIDEO_FFMPEG_ERRORED: _IG_MAX_ATTEMPTS,
+        _DOWNLOAD_STAGE_ERROR: _IG_MAX_ATTEMPTS,
     }
     return (
         status.status == "failed"

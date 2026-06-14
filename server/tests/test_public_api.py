@@ -126,3 +126,43 @@ def test_video_proxy_streams_job_video(
     assert r.headers["content-type"].startswith("video/mp4")
     assert r.content == b"video bytes"
     assert upstream.called
+
+
+@respx.mock
+def test_video_proxy_reports_upstream_http_errors(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    from app.models.job import Job, PlatformStatus  # noqa: PLC0415
+
+    app = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    source_url = "https://drive.usercontent.google.com/download?id=file_403"
+    project_id = "video-proxy-error"
+    asyncio.run(
+        app.state.job_store.create(
+            Job(
+                project_id=project_id,
+                job_id="j_video_error",
+                account_id="anime_fr",
+                device_id="iphone",
+                anime_title="Video Proxy Error",
+                description="desc",
+                drive_video_url=source_url,
+                slot_time=datetime.now(tz=UTC),
+                platforms_requested=["instagram"],
+                platform_statuses={"instagram": PlatformStatus(status="pending")},
+                discord_message_id=None,
+                reminder_message_id=None,
+            )
+        )
+    )
+
+    with TestClient(app) as client:
+        upstream = respx.get(source_url).mock(
+            return_value=httpx.Response(403, text="forbidden")
+        )
+        r = client.get(f"/api/videos/{project_id}")
+
+    assert r.status_code == 502
+    assert "returned HTTP 403" in r.text
+    assert "forbidden" in r.text
+    assert upstream.called
