@@ -164,6 +164,7 @@ async def test_dispatch_instagram_happy_path(
         "ig_user_id": "ig_user_42",
         "ig_access_token": "token",
         "caption": "Hello",
+        "prepared_video_url": "https://drive.usercontent.google.com/download?id=ig_prepared",
         "graph_api_version": "v25.0",
         "poll_interval_seconds": 7,
         "poll_timeout_seconds": 600,
@@ -192,17 +193,24 @@ async def test_dispatch_instagram_happy_path(
     assert ig.status == "uploaded"
     assert ig.url == "https://instagram.com/reel/x"
     assert ig.attempts == 1
-    assert publish_mock.await_args.kwargs["video_url"].endswith("/api/videos/ig-job")
-    assert publish_mock.await_args.kwargs["download_url"] == job.drive_video_url
+    assert (
+        publish_mock.await_args.kwargs["video_url"]
+        == "https://drive.usercontent.google.com/download?id=ig_prepared"
+    )
+    assert (
+        publish_mock.await_args.kwargs["download_url"]
+        == "https://drive.usercontent.google.com/download?id=ig_prepared"
+    )
     assert publish_mock.await_args.kwargs["poll_interval"] == 7
     assert publish_mock.await_args.kwargs["poll_timeout"] == 600
     assert publish_mock.await_args.kwargs["share_to_feed"] is False
     assert publish_mock.await_args.kwargs["thumb_offset"] == 250
     assert publish_mock.await_args.kwargs["project_id"] == "ig-job"
-    assert publish_mock.await_args.kwargs["prepared_media_dir"] == (
-        settings.data_dir / "instagram-prepared"
+    assert "prepared_media_dir" not in publish_mock.await_args.kwargs
+    assert "public_base_url" not in publish_mock.await_args.kwargs
+    assert publish_mock.await_args.kwargs["temp_dir"] == (
+        settings.data_dir / "tmp" / "instagram"
     )
-    assert publish_mock.await_args.kwargs["public_base_url"] == settings.public_base_url
     # Embed re-render attempted
     discord.edit_message.assert_called()
 

@@ -160,12 +160,16 @@ async def _dispatch_instagram_publish(
     async def persist_instagram_state(state: InstagramPublishState) -> None:
         await store.set_instagram_publish_state(job.project_id, state)
 
+    prepared_video_url = payload.get("prepared_video_url") or ""
+    instagram_video_url = str(prepared_video_url).strip() or _instagram_video_url(job, settings)
+    instagram_download_url = str(prepared_video_url).strip() or job.drive_video_url
+
     result = await publish_to_instagram(
         ig_user_id=payload["ig_user_id"],
         ig_access_token=payload["ig_access_token"],
         caption=payload["caption"],
-        video_url=_instagram_video_url(job, settings),
-        download_url=job.drive_video_url,
+        video_url=instagram_video_url,
+        download_url=instagram_download_url,
         graph_api_version=payload.get("graph_api_version", "v25.0"),
         poll_interval=float(
             payload.get("poll_interval_seconds") or _IG_DEFAULT_POLL_INTERVAL_SECONDS
@@ -180,8 +184,7 @@ async def _dispatch_instagram_publish(
         publish_state=job.instagram_publish_state,
         progress_callback=persist_instagram_state,
         project_id=job.project_id,
-        prepared_media_dir=settings.data_dir / "instagram-prepared",
-        public_base_url=settings.public_base_url,
+        temp_dir=settings.data_dir / "tmp" / "instagram",
     )
     if (result_state := getattr(result, "publish_state", None)) is not None:
         await store.set_instagram_publish_state(job.project_id, result_state)

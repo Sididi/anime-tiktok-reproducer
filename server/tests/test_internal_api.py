@@ -221,7 +221,14 @@ def test_create_job_persists_instagram_payload(
             "ig_user_id": "ig_user_42",
             "ig_access_token": "ig_token_secret",
             "caption": "Hello from IG",
+            "prepared_video_url": "https://drive.usercontent.google.com/download?id=ig_prepared",
             "graph_api_version": "v25.0",
+        },
+        "platform_statuses": {
+            "instagram": {
+                "status": "failed",
+                "detail": "Instagram video preparation failed",
+            }
         },
     }
     with TestClient(app) as client:
@@ -235,8 +242,59 @@ def test_create_job_persists_instagram_payload(
         "ig_user_id": "ig_user_42",
         "ig_access_token": "ig_token_secret",
         "caption": "Hello from IG",
+        "prepared_video_url": "https://drive.usercontent.google.com/download?id=ig_prepared",
         "graph_api_version": "v25.0",
     }
+    assert job.platform_statuses["instagram"].status == "failed"
+    assert job.platform_statuses["instagram"].detail == "Instagram video preparation failed"
+
+
+def test_create_existing_job_updates_changed_payload_and_clears_instagram_state(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    from app.models.job import InstagramPublishState  # noqa: PLC0415
+
+    app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    discord.post_message.return_value = "msg_embed"
+
+    payload = {
+        **JOB_PAYLOAD,
+        "platforms_requested": ["instagram"],
+        "instagram": {
+            "ig_user_id": "ig_user_42",
+            "ig_access_token": "ig_token_secret",
+            "caption": "Hello from IG",
+            "prepared_video_url": "https://drive.usercontent.google.com/download?id=old",
+        },
+    }
+    with TestClient(app) as client:
+        first = client.post("/api/internal/jobs", json=payload, headers=INTERNAL_AUTH)
+        assert first.status_code == 200
+
+        asyncio.run(
+            app.state.job_store.set_instagram_publish_state(
+                "p1",
+                InstagramPublishState(container_id="stale", stage="uploaded"),
+            )
+        )
+
+        changed = {
+            **payload,
+            "instagram": {
+                **payload["instagram"],
+                "prepared_video_url": "https://drive.usercontent.google.com/download?id=new",
+            },
+        }
+        second = client.post("/api/internal/jobs", json=changed, headers=INTERNAL_AUTH)
+    assert second.status_code == 200
+    assert second.json()["job_id"] == first.json()["job_id"]
+
+    job = asyncio.run(app.state.job_store.get("p1"))
+    assert job is not None
+    assert job.instagram_payload["prepared_video_url"].endswith("id=new")
+    assert job.instagram_publish_state is None
+    assert job.platform_statuses["instagram"].status == "pending"
+    discord.edit_message.assert_called()
 
 
 def test_create_job_persists_platform_scheduled_at(

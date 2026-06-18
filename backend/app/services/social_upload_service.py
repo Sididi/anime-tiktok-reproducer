@@ -1224,6 +1224,52 @@ class SocialUploadService:
         )
 
     @classmethod
+    def _remux_video_faststart(
+        cls,
+        *,
+        input_path: Path,
+        output_path: Path,
+    ) -> str | None:
+        if input_path == output_path:
+            return None
+        cmd = rewrite_media_command(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(input_path),
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0?",
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ]
+        )
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=get_media_subprocess_env(cmd),
+            )
+        except FileNotFoundError:
+            return "ffmpeg is not available on the server."
+        except Exception as exc:
+            return f"ffmpeg remux failed: {exc}"
+
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "unknown ffmpeg error").strip()
+            return f"ffmpeg remux failed: {detail[:300]}"
+        if not output_path.exists() or output_path.stat().st_size <= 0:
+            return "ffmpeg remux produced an empty output file."
+        return None
+
+    @classmethod
     def _prepare_video_for_limited_duration_upload(
         cls,
         *,
@@ -1327,6 +1373,122 @@ class SocialUploadService:
             video_path=output_path,
             transcoded=True,
             original_duration_seconds=duration_seconds,
+            speed_factor=speed_factor,
+        )
+
+    @classmethod
+    def prepare_instagram_video_for_drive(
+        cls,
+        *,
+        source_video_path: Path,
+        output_path: Path,
+        facebook_strategy: str | None = None,
+        facebook_prep_dir: Path | None = None,
+    ) -> LimitedDurationVideoPreparation:
+        """Prepare the retained Google Drive artifact used by the VPS IG scheduler."""
+        strategy = (facebook_strategy or "auto").strip().lower()
+        if strategy == "skip":
+            return LimitedDurationVideoPreparation(
+                status="skip",
+                detail="Refus volontaire par l'utilisateur: vidéo trop longue pour Instagram.",
+            )
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        candidate: Path
+        original_duration_seconds: float | None = None
+        speed_factor: float | None = None
+        transcoded = False
+
+        if strategy == "cut":
+            cut_error = cls._cut_facebook_video(
+                input_path=source_video_path,
+                output_path=output_path,
+            )
+            if cut_error:
+                return LimitedDurationVideoPreparation(
+                    status="error",
+                    detail=f"Instagram cut failed: {cut_error}",
+                )
+            candidate = output_path
+        elif strategy == "sped_up":
+            cached = (
+                facebook_prep_dir / "sped_up.mp4"
+                if facebook_prep_dir and (facebook_prep_dir / "sped_up.mp4").exists()
+                else None
+            )
+            if cached:
+                candidate = cached
+            else:
+                prep = cls._prepare_facebook_video_for_upload(
+                    source_video_path=source_video_path,
+                    work_dir=output_path.parent,
+                )
+                if prep.status != "ready" or prep.video_path is None:
+                    return LimitedDurationVideoPreparation(
+                        status="error",
+                        detail=prep.detail or "Instagram sped-up transcoding failed.",
+                        original_duration_seconds=prep.original_duration_seconds,
+                        speed_factor=prep.speed_factor,
+                    )
+                candidate = prep.video_path
+                original_duration_seconds = prep.original_duration_seconds
+                speed_factor = prep.speed_factor
+                transcoded = prep.transcoded
+        else:
+            prep = cls._prepare_facebook_video_for_upload(
+                source_video_path=source_video_path,
+                work_dir=output_path.parent,
+            )
+            if prep.status == "skip":
+                return LimitedDurationVideoPreparation(
+                    status="skip",
+                    detail=prep.detail,
+                    original_duration_seconds=prep.original_duration_seconds,
+                    speed_factor=prep.speed_factor,
+                )
+            if prep.status == "error" or prep.video_path is None:
+                return LimitedDurationVideoPreparation(
+                    status="error",
+                    detail=prep.detail or "Instagram video preparation failed.",
+                    original_duration_seconds=prep.original_duration_seconds,
+                    speed_factor=prep.speed_factor,
+                )
+            candidate = prep.video_path
+            original_duration_seconds = prep.original_duration_seconds
+            speed_factor = prep.speed_factor
+            transcoded = prep.transcoded
+
+        remux_error = cls._remux_video_faststart(
+            input_path=candidate,
+            output_path=output_path,
+        )
+        if remux_error:
+            return LimitedDurationVideoPreparation(
+                status="error",
+                detail=f"Instagram video preparation failed: {remux_error}",
+                original_duration_seconds=original_duration_seconds,
+                speed_factor=speed_factor,
+            )
+
+        media_validation_error = cls._validate_facebook_reel_media(video_path=output_path)
+        if media_validation_error:
+            return LimitedDurationVideoPreparation(
+                status="error",
+                detail=media_validation_error.replace(
+                    "Facebook reel media validation failed",
+                    "Instagram prepared media validation failed",
+                    1,
+                ),
+                original_duration_seconds=original_duration_seconds,
+                speed_factor=speed_factor,
+            )
+
+        return LimitedDurationVideoPreparation(
+            status="ready",
+            video_path=output_path,
+            detail=None,
+            transcoded=transcoded or candidate != source_video_path,
+            original_duration_seconds=original_duration_seconds,
             speed_factor=speed_factor,
         )
 

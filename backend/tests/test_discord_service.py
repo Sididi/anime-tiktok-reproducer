@@ -145,17 +145,27 @@ def test_create_job_with_instagram_payload():
             "ig_user_id": "ig_42",
             "ig_access_token": "ig_token",
             "caption": "hi",
+            "prepared_video_url": "https://drive.usercontent.google.com/download?id=ig",
             "graph_api_version": "v25.0",
             "poll_interval_seconds": 60,
             "poll_timeout_seconds": 14400,
+        },
+        platform_statuses={
+            "instagram": {
+                "status": "failed",
+                "detail": "Instagram video preparation failed",
+            }
         },
     )
     assert route.called
     sent = route.calls.last.request.content
     assert b'"instagram":{' in sent or b'"instagram": {' in sent
     assert b'"ig_user_id":"ig_42"' in sent or b'"ig_user_id": "ig_42"' in sent
+    assert b'"prepared_video_url":"https://drive.usercontent.google.com/download?id=ig"' in sent
     assert b'"poll_interval_seconds":60' in sent or b'"poll_interval_seconds": 60' in sent
     assert b'"poll_timeout_seconds":14400' in sent or b'"poll_timeout_seconds": 14400' in sent
+    assert b'"platform_statuses":{' in sent or b'"platform_statuses": {' in sent
+    assert b'"status":"failed"' in sent or b'"status": "failed"' in sent
 
 
 @respx.mock

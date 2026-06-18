@@ -118,6 +118,8 @@ class SceneMergerService:
 
         moves: dict[int, float] = {}
         for index in range(len(scenes.scenes) - 1):
+            if index >= len(scenes.scenes) - 2:
+                continue
             left_scene = scenes.scenes[index]
             right_scene = scenes.scenes[index + 1]
             current_boundary = left_scene.end_time
@@ -217,6 +219,8 @@ class SceneMergerService:
         snapped = scenes.model_copy(deep=True)
         for index, boundary in sorted(moves.items()):
             if index < 0 or index + 1 >= len(snapped.scenes):
+                continue
+            if index >= len(snapped.scenes) - 2:
                 continue
             left_scene = snapped.scenes[index]
             right_scene = snapped.scenes[index + 1]
@@ -591,23 +595,30 @@ class SceneMergerService:
             if processor is None:
                 return [None for _ in range(len(scenes.scenes) - 1)]
 
-            images = []
-            boundary_indices: list[int] = []
+            timestamps: list[float] = []
+            candidate_indices: list[int] = []
             for index in range(len(scenes.scenes) - 1):
                 left = scenes.scenes[index]
                 right = scenes.scenes[index + 1]
                 boundary = left.end_time
-                frames = AnimeMatcherService.extract_frames(
-                    video_path,
+                timestamps.extend(
                     [
                         max(left.start_time, boundary - 0.08),
                         min(right.end_time, boundary + 0.08),
-                    ],
+                    ]
                 )
-                if any(frame is None for frame in frames):
+                candidate_indices.append(index)
+
+            decoded_frames = AnimeMatcherService.extract_frames(video_path, timestamps)
+            images = []
+            boundary_indices: list[int] = []
+            for pair_offset, boundary_index in enumerate(candidate_indices):
+                frame_offset = pair_offset * 2
+                frames = decoded_frames[frame_offset : frame_offset + 2]
+                if len(frames) < 2 or any(frame is None for frame in frames):
                     continue
                 images.extend(frame.convert("RGB") for frame in frames)
-                boundary_indices.append(index)
+                boundary_indices.append(boundary_index)
 
             similarities: list[float | None] = [
                 None for _ in range(len(scenes.scenes) - 1)
@@ -654,25 +665,32 @@ class SceneMergerService:
             if processor is None:
                 return {}
 
-            images = []
-            valid_indices: list[int] = []
+            timestamps: list[float] = []
+            candidate_indices: list[int] = []
             for index in boundary_indices:
                 if index < 0 or index >= len(scenes.scenes) - 1:
                     continue
                 left = scenes.scenes[index]
                 right = scenes.scenes[index + 1]
                 boundary = left.end_time
-                frames = AnimeMatcherService.extract_frames(
-                    video_path,
+                timestamps.extend(
                     [
                         max(left.start_time, boundary - 0.08),
                         min(right.end_time, boundary + 0.08),
-                    ],
+                    ]
                 )
-                if any(frame is None for frame in frames):
+                candidate_indices.append(index)
+
+            decoded_frames = AnimeMatcherService.extract_frames(video_path, timestamps)
+            images = []
+            valid_indices: list[int] = []
+            for pair_offset, boundary_index in enumerate(candidate_indices):
+                frame_offset = pair_offset * 2
+                frames = decoded_frames[frame_offset : frame_offset + 2]
+                if len(frames) < 2 or any(frame is None for frame in frames):
                     continue
                 images.extend(frame.convert("RGB") for frame in frames)
-                valid_indices.append(index)
+                valid_indices.append(boundary_index)
 
             similarities: dict[int, float] = {}
             if not images:
@@ -1167,6 +1185,36 @@ class SceneMergerService:
         return [chain for chain in stitched if len(chain) >= 2]
 
     @classmethod
+    def _append_terminal_tiny_chain(
+        cls,
+        scenes: SceneList,
+        chains: list[list[int]],
+    ) -> list[list[int]]:
+        """Absorb a final transition sliver in dense detector output."""
+        if len(scenes.scenes) < cls.DENSE_SCENE_COUNT:
+            return chains
+        if len(scenes.scenes) < 2:
+            return chains
+        final_index = len(scenes.scenes) - 1
+        previous_index = final_index - 1
+        if scenes.scenes[final_index].duration > 0.50:
+            return chains
+
+        adjusted = [list(chain) for chain in chains if chain]
+        for chain in adjusted:
+            if final_index in chain:
+                return chains
+            if chain and chain[-1] == previous_index:
+                chain.append(final_index)
+                return adjusted
+
+        covered = {idx for chain in adjusted for idx in chain}
+        if previous_index in covered:
+            return chains
+        adjusted.append([previous_index, final_index])
+        return adjusted
+
+    @classmethod
     def build_merge_chains(
         cls,
         pairs: list[tuple[int, int]],
@@ -1234,10 +1282,13 @@ class SceneMergerService:
                         anime_name=anime_name,
                     )
                 )
-            return cls._build_non_monotonic_dense_chains(
+            return cls._append_terminal_tiny_chain(
                 scenes,
-                matches,
-                visual_similarities,
+                cls._build_non_monotonic_dense_chains(
+                    scenes,
+                    matches,
+                    visual_similarities,
+                ),
             )
         if (
             video_path is not None
@@ -1256,10 +1307,13 @@ class SceneMergerService:
                 anime_name=anime_name,
             )
             if any(similarity is not None for similarity in visual_similarities):
-                return cls._build_visual_source_chains(
+                return cls._append_terminal_tiny_chain(
                     scenes,
-                    matches,
-                    visual_similarities,
+                    cls._build_visual_source_chains(
+                        scenes,
+                        matches,
+                        visual_similarities,
+                    ),
                 )
 
         visual_similarities: list[float | None] = []
@@ -1344,7 +1398,10 @@ class SceneMergerService:
         # optimal non-overlapping subset by continuity score.
         chain_candidates = cls._build_chain_candidates(pair_continuity)
         selected_chains = cls._select_non_overlapping_chains(chain_candidates)
-        return cls._stitch_adjacent_chains(selected_chains, matches, scenes)
+        return cls._append_terminal_tiny_chain(
+            scenes,
+            cls._stitch_adjacent_chains(selected_chains, matches, scenes),
+        )
 
     @classmethod
     def merge_scenes_and_matches(

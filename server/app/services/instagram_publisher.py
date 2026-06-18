@@ -1003,8 +1003,19 @@ def _download_failure_detail(video_url: str, exc: BaseException) -> str:
     return f"GET {host} failed {type(exc).__name__}{suffix}"
 
 
-async def _download_video(client: httpx.AsyncClient, video_url: str) -> Path:
-    fd, tmp = tempfile.mkstemp(prefix="ig-reel-", suffix=".mp4")
+async def _download_video(
+    client: httpx.AsyncClient,
+    video_url: str,
+    *,
+    temp_dir: Path | None = None,
+) -> Path:
+    if temp_dir is not None:
+        temp_dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        prefix="ig-reel-",
+        suffix=".mp4",
+        dir=str(temp_dir) if temp_dir is not None else None,
+    )
     os.close(fd)
     path = Path(tmp)
     try:
@@ -1169,6 +1180,7 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
     project_id: str | None = None,
     prepared_media_dir: Path | None = None,
     public_base_url: str | None = None,
+    temp_dir: Path | None = None,
 ) -> InstagramPublishResult:
     base = f"https://graph.facebook.com/{graph_api_version}"
     timeout = httpx.Timeout(30.0, read=None)
@@ -1296,9 +1308,15 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                     "prepared_media_expires_at": invalid_state.prepared_media_expires_at,
                     "prepared_media_url": invalid_state.prepared_media_url,
                 }
+            elif force_video_url_reason:
+                prepared_video_url = video_url
             else:
                 try:
-                    video_path = await _download_video(client, source_video_url)
+                    video_path = await _download_video(
+                        client,
+                        source_video_url,
+                        temp_dir=temp_dir,
+                    )
                 except httpx.HTTPStatusError as e:
                     return InstagramPublishResult(
                         success=False,
@@ -1315,16 +1333,6 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                             "download",
                             _download_failure_detail(source_video_url, e),
                         ),
-                        publish_state=state,
-                    )
-
-                try:
-                    video_path = await _prepare_video_for_instagram_upload(video_path)
-                except RuntimeError as e:
-                    video_path.unlink(missing_ok=True)
-                    return InstagramPublishResult(
-                        success=False,
-                        detail=_stage_detail("prepare_video", str(e)),
                         publish_state=state,
                     )
 
@@ -1471,7 +1479,11 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
             video_path = _state_prepared_media_path(state, prepared_media_dir)
             if video_path is None:
                 try:
-                    video_path = await _download_video(client, source_video_url)
+                    video_path = await _download_video(
+                        client,
+                        source_video_url,
+                        temp_dir=temp_dir,
+                    )
                 except httpx.HTTPStatusError as e:
                     return InstagramPublishResult(
                         success=False,
@@ -1488,16 +1500,6 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                             "download",
                             _download_failure_detail(source_video_url, e),
                         ),
-                        publish_state=state,
-                    )
-
-                try:
-                    video_path = await _prepare_video_for_instagram_upload(video_path)
-                except RuntimeError as e:
-                    video_path.unlink(missing_ok=True)
-                    return InstagramPublishResult(
-                        success=False,
-                        detail=_stage_detail("prepare_video", str(e)),
                         publish_state=state,
                     )
 
@@ -1723,6 +1725,7 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                     project_id=project_id,
                     prepared_media_dir=prepared_media_dir,
                     public_base_url=public_base_url,
+                    temp_dir=temp_dir,
                 )
                 if fallback.success:
                     return fallback

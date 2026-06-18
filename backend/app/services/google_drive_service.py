@@ -324,6 +324,30 @@ class GoogleDriveService:
         return cls._query_files(q, drive=drive)
 
     @classmethod
+    def list_children_named(
+        cls,
+        folder_id: str,
+        filename: str,
+        *,
+        drive=None,
+    ) -> list[dict[str, Any]]:
+        q = (
+            "trashed=false and "
+            f"name='{_escape_query_value(filename)}' and "
+            f"'{_escape_query_value(folder_id)}' in parents"
+        )
+        return cls._query_files(q, drive=drive)
+
+    @classmethod
+    def delete_file(cls, file_id: str, *, drive=None) -> None:
+        drive = drive or cls._client()
+
+        def _delete() -> None:
+            drive.files().delete(fileId=file_id, supportsAllDrives=True).execute()
+
+        cls._execute_with_retries(_delete, operation=f"drive_delete:{file_id}")
+
+    @classmethod
     def clear_folder(
         cls,
         folder_id: str,
@@ -567,6 +591,31 @@ class GoogleDriveService:
         )
 
     @classmethod
+    def upsert_local_file(
+        cls,
+        *,
+        parent_id: str,
+        filename: str,
+        local_path: Path,
+        chunksize: int | None = None,
+        drive=None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        drive = drive or cls._client()
+        for existing in cls.list_children_named(parent_id, filename, drive=drive):
+            file_id = existing.get("id")
+            if file_id:
+                cls.delete_file(str(file_id), drive=drive)
+        return cls.upload_local_file(
+            parent_id=parent_id,
+            filename=filename,
+            local_path=local_path,
+            chunksize=chunksize,
+            drive=drive,
+            progress_callback=progress_callback,
+        )
+
+    @classmethod
     def upload_bytes(
         cls,
         *,
@@ -662,8 +711,8 @@ class GoogleDriveService:
         return result
 
     @classmethod
-    def set_public_read(cls, file_id: str) -> None:
-        drive = cls._client()
+    def set_public_read(cls, file_id: str, *, drive=None) -> None:
+        drive = drive or cls._client()
         drive.permissions().create(
             fileId=file_id,
             body={"type": "anyone", "role": "reader"},

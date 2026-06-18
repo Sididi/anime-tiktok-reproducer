@@ -73,6 +73,7 @@ def create_app() -> FastAPI:  # noqa: PLR0915
     data_dir.mkdir(parents=True, exist_ok=True)
     job_store = JobStore(data_dir / "jobs.json")
     _cleanup_instagram_temp_downloads()
+    _cleanup_instagram_temp_downloads(data_dir / "tmp" / "instagram")
     expired_prepared = cleanup_expired_prepared_media(data_dir / "instagram-prepared")
     if expired_prepared:
         logger.info("Removed %d expired Instagram prepared media file(s)", expired_prepared)

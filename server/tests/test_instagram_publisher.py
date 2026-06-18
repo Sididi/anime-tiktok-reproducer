@@ -950,25 +950,130 @@ async def test_validation_failure_is_stage_prefixed(monkeypatch):
     assert result.detail == "validate: duration 1.00s outside 3-900s"
 
 
-async def test_prepare_failure_deletes_downloaded_video(tmp_path, monkeypatch):
+async def test_validation_failure_deletes_downloaded_video(tmp_path, monkeypatch):
     video = tmp_path / "downloaded.mp4"
     video.write_bytes(b"fake mp4 bytes")
 
-    async def download(client, video_url):
+    async def download(client, video_url, *, temp_dir=None):
         return video
 
-    async def prepare(path):
-        raise RuntimeError("encoder exploded")
+    async def validate(path):
+        return "duration 1.00s outside 3-900s"
 
     monkeypatch.setattr(instagram_publisher, "_download_video", download)
-    monkeypatch.setattr(instagram_publisher, "_prepare_video_for_instagram_upload", prepare)
+    monkeypatch.setattr(instagram_publisher, "_validate_video", validate)
 
     result = await publish_to_instagram(
         **_COMMON, poll_interval=0.01, poll_timeout=1.0
     )
 
     assert result.success is False
-    assert result.detail == "prepare_video: encoder exploded"
+    assert result.detail == "validate: duration 1.00s outside 3-900s"
+    assert not video.exists()
+
+
+def _patch_downloaded_video(monkeypatch, tmp_path: Path):
+    video = tmp_path / "downloaded.mp4"
+    video.write_bytes(b"fake mp4 bytes")
+    seen: dict[str, Path | str | None] = {}
+
+    async def download(client, video_url, *, temp_dir=None):
+        seen["video_url"] = video_url
+        seen["temp_dir"] = temp_dir
+        return video
+
+    monkeypatch.setattr(instagram_publisher, "_download_video", download)
+    return video, seen
+
+
+@respx.mock
+async def test_success_deletes_downloaded_video_and_uses_temp_dir(tmp_path, monkeypatch):
+    video, seen = _patch_downloaded_video(monkeypatch, tmp_path)
+    _mock_resumable_create()
+    respx.get(f"{BASE}/{CONTAINER_ID}").mock(
+        return_value=httpx.Response(200, json={"status_code": "FINISHED"})
+    )
+    respx.post(f"{BASE}/{IG_USER_ID}/media_publish").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID})
+    )
+    respx.get(f"{BASE}/{MEDIA_ID}").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID, "permalink": PERMALINK_URL})
+    )
+    temp_dir = tmp_path / "ig-tmp"
+
+    result = await publish_to_instagram(
+        **_COMMON,
+        poll_interval=0.01,
+        poll_timeout=1.0,
+        temp_dir=temp_dir,
+    )
+
+    assert result.success is True
+    assert seen["temp_dir"] == temp_dir
+    assert not video.exists()
+
+
+@respx.mock
+async def test_upload_failure_deletes_downloaded_video(tmp_path, monkeypatch):
+    video, _seen = _patch_downloaded_video(monkeypatch, tmp_path)
+
+    async def upload(**kwargs):
+        return _UploadResponse(status_code=500, body="upload failed")
+
+    monkeypatch.setattr(instagram_publisher, "_upload_resumable_binary", upload)
+    _mock_resumable_create()
+
+    result = await publish_to_instagram(
+        **_COMMON,
+        poll_interval=0.01,
+        poll_timeout=1.0,
+    )
+
+    assert result.success is False
+    assert result.detail == "rupload: upload failed"
+    assert not video.exists()
+
+
+@respx.mock
+async def test_poll_failure_deletes_downloaded_video(tmp_path, monkeypatch):
+    video, _seen = _patch_downloaded_video(monkeypatch, tmp_path)
+    _mock_resumable_create()
+    respx.get(f"{BASE}/{CONTAINER_ID}").mock(
+        return_value=httpx.Response(200, json={"status_code": "ERROR"})
+    )
+
+    result = await publish_to_instagram(
+        **_COMMON,
+        poll_interval=0.01,
+        poll_timeout=1.0,
+    )
+
+    assert result.success is False
+    assert result.detail == (
+        "status_poll: container status_code = ERROR; no status detail returned"
+    )
+    assert not video.exists()
+
+
+@respx.mock
+async def test_publish_failure_deletes_downloaded_video(tmp_path, monkeypatch):
+    video, _seen = _patch_downloaded_video(monkeypatch, tmp_path)
+    _mock_resumable_create()
+    respx.get(f"{BASE}/{CONTAINER_ID}").mock(
+        return_value=httpx.Response(200, json={"status_code": "FINISHED"})
+    )
+    respx.post(f"{BASE}/{IG_USER_ID}/media_publish").mock(
+        return_value=httpx.Response(500, text="publish failed")
+    )
+
+    result = await publish_to_instagram(
+        **_COMMON,
+        poll_interval=0.01,
+        poll_timeout=1.0,
+    )
+
+    assert result.success is False
+    assert result.detail == "publish: publish failed"
     assert not video.exists()
 
 

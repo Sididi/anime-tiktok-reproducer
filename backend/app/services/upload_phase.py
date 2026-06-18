@@ -78,6 +78,7 @@ def _dir_size(path: Path) -> int:
 class UploadPhaseService:
     """Project manager view, upload execution, and managed delete flow."""
     _SUPPORTED_PLATFORMS = ("youtube", "facebook", "instagram")
+    _INSTAGRAM_DRIVE_FILENAME = "output_instagram.mp4"
     _FRENCH_TZ = ZoneInfo("Europe/Paris")
     _drive_video_cache: dict[str, dict[str, Any]] = {}
     _DRIVE_BATCH_LOOKUP_MAX_ATTEMPTS = 3
@@ -273,6 +274,10 @@ class UploadPhaseService:
                         ExportService.VIDEO_EXTENSIONS,
                         drive=drive,
                     )
+                    drive_root_videos = {
+                        folder_id: ExportService.filter_upload_video_candidates(files)
+                        for folder_id, files in drive_root_videos.items()
+                    }
                     drive_batch_lookup_failed = False
                     break
                 except Exception as exc:
@@ -444,6 +449,86 @@ class UploadPhaseService:
             raise ValueError("At least one platform is required when 'platforms' is provided.")
         return tuple(normalized)
 
+    @staticmethod
+    def _platform_status_payload(
+        results_by_platform: dict[str, PlatformUploadResult],
+    ) -> dict[str, dict[str, Any]]:
+        return {
+            platform: {
+                "status": result.status,
+                "url": result.url,
+                "detail": result.detail,
+            }
+            for platform, result in results_by_platform.items()
+        }
+
+    @classmethod
+    def _prepare_instagram_drive_video(
+        cls,
+        *,
+        project_id: str,
+        source_video_path: Path,
+        drive_folder_id: str,
+        facebook_strategy: str | None,
+        work_dir: Path,
+    ) -> tuple[PlatformUploadResult | None, dict[str, str]]:
+        output_path = work_dir / cls._INSTAGRAM_DRIVE_FILENAME
+        prep = SocialUploadService.prepare_instagram_video_for_drive(
+            source_video_path=source_video_path,
+            output_path=output_path,
+            facebook_strategy=facebook_strategy,
+            facebook_prep_dir=cls._facebook_prep_dir(project_id),
+        )
+        if prep.status == "skip":
+            return (
+                PlatformUploadResult(
+                    platform="instagram",
+                    status="skipped",
+                    detail=prep.detail,
+                ),
+                {},
+            )
+        if prep.status != "ready" or prep.video_path is None:
+            return (
+                PlatformUploadResult(
+                    platform="instagram",
+                    status="failed",
+                    detail=prep.detail or "Instagram video preparation failed.",
+                ),
+                {},
+            )
+
+        drive = GoogleDriveService.client()
+        uploaded = GoogleDriveService.upsert_local_file(
+            parent_id=drive_folder_id,
+            filename=cls._INSTAGRAM_DRIVE_FILENAME,
+            local_path=prep.video_path,
+            chunksize=settings.drive_upload_chunk_mb * 1024 * 1024,
+            drive=drive,
+        )
+        file_id = str(uploaded.get("id") or "").strip()
+        if not file_id:
+            return (
+                PlatformUploadResult(
+                    platform="instagram",
+                    status="failed",
+                    detail=f"Drive upload returned no file id for {cls._INSTAGRAM_DRIVE_FILENAME}",
+                ),
+                {},
+            )
+        GoogleDriveService.set_public_read(file_id, drive=drive)
+        direct_url = GoogleDriveService.get_direct_download_url(file_id)
+        web_url = str(uploaded.get("webViewLink") or "") or GoogleDriveService.get_web_view_url(file_id)
+        return (
+            None,
+            {
+                "instagram_drive_file_id": file_id,
+                "instagram_drive_video_url": direct_url,
+                "instagram_drive_web_url": web_url,
+                "instagram_drive_filename": cls._INSTAGRAM_DRIVE_FILENAME,
+            },
+        )
+
     @classmethod
     def execute_upload(
         cls,
@@ -535,8 +620,13 @@ class UploadPhaseService:
             cls._compute_upfront_skips(requested_platforms, account)
         )
         discord_message_id: str | None = None
+        instagram_drive_metadata: dict[str, str] = {}
 
-        def emit_platform_result(result: PlatformUploadResult) -> None:
+        def emit_platform_result(
+            result: PlatformUploadResult,
+            *,
+            update_discord: bool = True,
+        ) -> None:
             if platform_result_callback is not None:
                 try:
                     platform_result_callback(asdict(result))
@@ -547,24 +637,25 @@ class UploadPhaseService:
                         result.platform,
                         exc_info=True,
                     )
-            try:
-                DiscordService.update_job_platform(
-                    project_id,
-                    result.platform,
-                    status=result.status,
-                    url=result.url,
-                    detail=result.detail,
-                )
-            except Exception:
-                logger.warning(
-                    "Discord platform update failed for %s/%s",
-                    project_id,
-                    result.platform,
-                    exc_info=True,
-                )
+            if update_discord:
+                try:
+                    DiscordService.update_job_platform(
+                        project_id,
+                        result.platform,
+                        status=result.status,
+                        url=result.url,
+                        detail=result.detail,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Discord platform update failed for %s/%s",
+                        project_id,
+                        result.platform,
+                        exc_info=True,
+                    )
 
         for skip_result in results_by_platform.values():
-            emit_platform_result(skip_result)
+            emit_platform_result(skip_result, update_discord=False)
 
         # Clean up any stale Discord messages from prior runs before posting a fresh
         # "upload in progress" message.  We used to delete these at finalize-time,
@@ -591,14 +682,14 @@ class UploadPhaseService:
             project.final_upload_discord_message_id = None
 
         # Build Instagram payload for the VPS scheduler (deferred publish at slot_time).
-        ig_payload: dict | None = None
+        ig_payload_base: dict | None = None
         if account and account.meta and account.meta.instagram_business_account_id:
             ig_token = (
                 account.meta.instagram_access_token
                 or account.meta.facebook_page_access_token
             )
             if ig_token:
-                ig_payload = {
+                ig_payload_base = {
                     "ig_user_id": account.meta.instagram_business_account_id,
                     "ig_access_token": ig_token,
                     "caption": metadata.instagram.caption,
@@ -606,48 +697,6 @@ class UploadPhaseService:
                     "poll_interval_seconds": settings.instagram_publish_poll_interval_seconds,
                     "poll_timeout_seconds": settings.instagram_publish_timeout_seconds,
                 }
-
-        discord_message_id = None
-        try:
-            discord_slot_time = (
-                platform_scheduled_at.get("tiktok")
-                or project.scheduled_at
-                or datetime.now(timezone.utc)
-            )
-            job_response = DiscordService.create_job(
-                project_id=project_id,
-                # Use the live account_id arg (validated above), not
-                # project.scheduled_account_id which is only persisted at the
-                # END of execute_upload — None on first upload.
-                account_id=account_id or project.scheduled_account_id or "",
-                slot_time=discord_slot_time,
-                anime_title=project.anime_name or "Unknown",
-                description=metadata.tiktok.description,
-                drive_video_url=direct_drive_download or drive_video_url,
-                platforms_requested=list(requested_platforms),
-                instagram=ig_payload,
-                platform_scheduled_at=platform_scheduled_at,
-            )
-        except Exception:
-            logger.warning(
-                "Discord create_job failed for project %s",
-                project_id,
-                exc_info=True,
-            )
-            job_response = None
-
-        if job_response is not None:
-            discord_message_id = job_response.get("discord_message_id")
-            if discord_message_id:
-                project.final_upload_discord_message_id = discord_message_id
-                try:
-                    ProjectService.save(project)
-                except Exception:
-                    logger.warning(
-                        "Failed to persist Discord message id for project %s",
-                        project_id,
-                        exc_info=True,
-                    )
 
         with tempfile.TemporaryDirectory(prefix=f"atr-upload-{project_id}-") as tmp_dir:
             local_video_path = Path(tmp_dir) / (readiness.drive_video_name or "final_video.mp4")
@@ -667,6 +716,86 @@ class UploadPhaseService:
                 cls._replace_video_audio(local_video_path, audio_path, replaced_video)
                 local_video_path = replaced_video
                 force_local_upload = True
+
+            ig_payload = dict(ig_payload_base) if ig_payload_base is not None else None
+            if (
+                "instagram" in requested_platforms
+                and "instagram" not in results_by_platform
+            ):
+                if ig_payload is None:
+                    results_by_platform["instagram"] = PlatformUploadResult(
+                        platform="instagram",
+                        status="skipped",
+                        detail="No Instagram credentials configured for this account",
+                    )
+                    emit_platform_result(
+                        results_by_platform["instagram"],
+                        update_discord=False,
+                    )
+                else:
+                    emit_progress(
+                        0.40,
+                        "prepare_instagram",
+                        "Preparing Instagram video artifact...",
+                    )
+                    ig_result, instagram_drive_metadata = cls._prepare_instagram_drive_video(
+                        project_id=project_id,
+                        source_video_path=local_video_path,
+                        drive_folder_id=readiness.drive_folder_id,
+                        facebook_strategy=facebook_strategy,
+                        work_dir=Path(tmp_dir),
+                    )
+                    if ig_result is not None:
+                        results_by_platform["instagram"] = ig_result
+                        ig_payload = None
+                        emit_platform_result(ig_result, update_discord=False)
+                    else:
+                        ig_payload["prepared_video_url"] = instagram_drive_metadata[
+                            "instagram_drive_video_url"
+                        ]
+
+            discord_message_id = None
+            try:
+                discord_slot_time = (
+                    platform_scheduled_at.get("tiktok")
+                    or project.scheduled_at
+                    or datetime.now(timezone.utc)
+                )
+                job_response = DiscordService.create_job(
+                    project_id=project_id,
+                    # Use the live account_id arg (validated above), not
+                    # project.scheduled_account_id which is only persisted at the
+                    # END of execute_upload — None on first upload.
+                    account_id=account_id or project.scheduled_account_id or "",
+                    slot_time=discord_slot_time,
+                    anime_title=project.anime_name or "Unknown",
+                    description=metadata.tiktok.description,
+                    drive_video_url=direct_drive_download or drive_video_url,
+                    platforms_requested=list(requested_platforms),
+                    instagram=ig_payload,
+                    platform_scheduled_at=platform_scheduled_at,
+                    platform_statuses=cls._platform_status_payload(results_by_platform),
+                )
+            except Exception:
+                logger.warning(
+                    "Discord create_job failed for project %s",
+                    project_id,
+                    exc_info=True,
+                )
+                job_response = None
+
+            if job_response is not None:
+                discord_message_id = job_response.get("discord_message_id")
+                if discord_message_id:
+                    project.final_upload_discord_message_id = discord_message_id
+                    try:
+                        ProjectService.save(project)
+                    except Exception:
+                        logger.warning(
+                            "Failed to persist Discord message id for project %s",
+                            project_id,
+                            exc_info=True,
+                        )
 
             jobs: dict[str, Any] = {}
 
@@ -708,42 +837,26 @@ class UploadPhaseService:
                     youtube_prep_dir=_yt_prep_dir_global,
                 )
 
-            # Facebook + Instagram jobs
-            if account and account.meta and account_id and (
-                "facebook" in requested_platforms or "instagram" in requested_platforms
-            ):
+            # Facebook job. Instagram is deferred to the VPS scheduler via create_job above.
+            if account and account.meta and account_id and "facebook" in requested_platforms:
                 meta_creds = AccountService.get_meta_credentials(account_id)
 
-                if "facebook" in requested_platforms:
-                    _fb_strategy = facebook_strategy  # capture for lambda
-                    _fb_prep_dir = cls._facebook_prep_dir(project_id)
-                    _fb_video_url = None if force_local_upload else direct_drive_download
-                    _fb_scheduled_at = platform_scheduled_at.get("facebook")
-                    jobs["facebook"] = lambda: SocialUploadService.upload_facebook(
-                        video_path=local_video_path,
-                        subtitle_path=subtitle_path,
-                        subtitle_locale=subtitle_locale,
-                        metadata=metadata,
-                        video_url=_fb_video_url,
-                        page_id=meta_creds.page_id,
-                        page_access_token=meta_creds.facebook_page_access_token,
-                        scheduled_at=_fb_scheduled_at,
-                        facebook_strategy=_fb_strategy,
-                        facebook_prep_dir=_fb_prep_dir,
-                    )
-
-                # Instagram: deferred to the VPS scheduler via create_job above.
-                # The ig_payload (built earlier) carries the credentials; the VPS
-                # publishes at slot_time. If no IG creds were available, record a
-                # skipped result so the embed is accurate.
-                if "instagram" in requested_platforms and "instagram" not in results_by_platform:
-                    if ig_payload is None:
-                        results_by_platform["instagram"] = PlatformUploadResult(
-                            platform="instagram",
-                            status="skipped",
-                            detail="No Instagram credentials configured for this account",
-                        )
-                        emit_platform_result(results_by_platform["instagram"])
+                _fb_strategy = facebook_strategy  # capture for lambda
+                _fb_prep_dir = cls._facebook_prep_dir(project_id)
+                _fb_video_url = None if force_local_upload else direct_drive_download
+                _fb_scheduled_at = platform_scheduled_at.get("facebook")
+                jobs["facebook"] = lambda: SocialUploadService.upload_facebook(
+                    video_path=local_video_path,
+                    subtitle_path=subtitle_path,
+                    subtitle_locale=subtitle_locale,
+                    metadata=metadata,
+                    video_url=_fb_video_url,
+                    page_id=meta_creds.page_id,
+                    page_access_token=meta_creds.facebook_page_access_token,
+                    scheduled_at=_fb_scheduled_at,
+                    facebook_strategy=_fb_strategy,
+                    facebook_prep_dir=_fb_prep_dir,
+                )
             elif not account:
                 # Global (backwards compat)
                 if "facebook" in requested_platforms:
@@ -759,14 +872,6 @@ class UploadPhaseService:
                         facebook_strategy=_fb_strategy_global,
                         facebook_prep_dir=_fb_prep_dir_global,
                     )
-                # Instagram deferred to VPS scheduler (no account = no IG creds).
-                if "instagram" in requested_platforms and "instagram" not in results_by_platform:
-                    results_by_platform["instagram"] = PlatformUploadResult(
-                        platform="instagram",
-                        status="skipped",
-                        detail="No Instagram credentials configured for this account",
-                    )
-                    emit_platform_result(results_by_platform["instagram"])
 
             selected_jobs = {platform: jobs[platform] for platform in requested_platforms if platform in jobs}
 
@@ -876,6 +981,7 @@ class UploadPhaseService:
             "requested_platforms": list(requested_platforms),
             "drive_video_url": drive_video_url,
             "direct_drive_download": direct_drive_download,
+            **instagram_drive_metadata,
         }
 
         # Save scheduling info. Per-platform reservations are already persisted
@@ -895,6 +1001,7 @@ class UploadPhaseService:
             "requested_platforms": list(requested_platforms),
             "drive_video_url": drive_video_url,
             "direct_drive_download": direct_drive_download,
+            **instagram_drive_metadata,
             "discord_message_id": project.final_upload_discord_message_id,
             "platform_scheduled_at": {
                 platform: dt.isoformat() for platform, dt in platform_scheduled_at.items()

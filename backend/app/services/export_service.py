@@ -198,6 +198,17 @@ class _DriveUploadProgressTracker:
 
 
 class ExportService:
+    IGNORED_UPLOAD_VIDEO_FILENAMES = {"output_instagram.mp4"}
+
+    @classmethod
+    def filter_upload_video_candidates(cls, files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        ignored = {name.casefold() for name in cls.IGNORED_UPLOAD_VIDEO_FILENAMES}
+        return [
+            file_data
+            for file_data in files
+            if str(file_data.get("name") or "").casefold() not in ignored
+        ]
+
     VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
     BAKED_SUBTITLE_RE = re.compile(r"^subtitle_(\d+)\.mogrt$", re.IGNORECASE)
     SUBTITLES_ARCHIVE_FILENAME = "atr_subtitles.zip"
@@ -823,4 +834,6 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
 
     @classmethod
     def detect_upload_video_in_drive_root(cls, folder_id: str) -> list[dict[str, Any]]:
-        return GoogleDriveService.list_root_video_files(folder_id, cls.VIDEO_EXTENSIONS)
+        return cls.filter_upload_video_candidates(
+            GoogleDriveService.list_root_video_files(folder_id, cls.VIDEO_EXTENSIONS)
+        )

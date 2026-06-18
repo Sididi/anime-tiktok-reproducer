@@ -111,6 +111,7 @@ class DiscordService:
         platforms_requested: list[str],
         instagram: dict | None = None,
         platform_scheduled_at: dict[str, datetime] | None = None,
+        platform_statuses: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
         body = {
             "project_id": project_id,
@@ -128,6 +129,8 @@ class DiscordService:
                 platform: scheduled_at.isoformat()
                 for platform, scheduled_at in platform_scheduled_at.items()
             }
+        if platform_statuses is not None:
+            body["platform_statuses"] = dict(platform_statuses)
         with _client() as c:
             r = c.post("/api/internal/jobs", json=body)
             r.raise_for_status()

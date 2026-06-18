@@ -11,7 +11,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.models import MatchCandidate, MatchList, Scene, SceneList, SceneMatch
+from app.models import AlternativeMatch, MatchCandidate, MatchList, Scene, SceneList, SceneMatch
 from app.services import anime_matcher as matcher_module
 from app.services.anime_matcher import AnimeMatcherService, MatchProposal
 from app.services.scene_merger import SceneMergerService
@@ -69,6 +69,54 @@ class _FakeIndexManager:
 class _FakeEmbedder:
     def embed_batch(self, images: list[Image.Image]) -> np.ndarray:
         return np.ones((len(images), 2), dtype=np.float32)
+
+
+class _BatchLimitedGpuEmbedder:
+    def __init__(self, max_batch: int) -> None:
+        self.max_batch = max_batch
+        self.gpu_calls: list[int] = []
+        self.cpu_calls: list[int] = []
+
+    def embed_pil_batch_gpu(self, images: list[Image.Image]) -> np.ndarray:
+        self.gpu_calls.append(len(images))
+        if len(images) > self.max_batch:
+            raise RuntimeError("CUDA out of memory while allocating tensor")
+        return np.full((len(images), 2), len(images), dtype=np.float32)
+
+    def embed_batch(self, images: list[Image.Image]) -> np.ndarray:
+        self.cpu_calls.append(len(images))
+        return np.full((len(images), 2), -1.0, dtype=np.float32)
+
+
+def test_embed_pil_batch_splits_gpu_batch_after_cuda_oom(monkeypatch) -> None:
+    fake = _BatchLimitedGpuEmbedder(max_batch=2)
+    monkeypatch.setattr(AnimeMatcherService, "_embedder", fake)
+    AnimeMatcherService.reset_runtime_stats()
+
+    images = [Image.new("RGB", (16, 16), "black") for _ in range(5)]
+    embeddings = AnimeMatcherService._embed_pil_batch(images)
+
+    assert embeddings.shape == (5, 2)
+    assert fake.gpu_calls == [5, 2, 3, 1, 2]
+    assert fake.cpu_calls == []
+    assert AnimeMatcherService.get_runtime_stats()["sscd_embedding_oom_retries"] == 2
+
+
+def test_embed_pil_batch_falls_back_to_cpu_path_for_single_image_oom(
+    monkeypatch,
+) -> None:
+    fake = _BatchLimitedGpuEmbedder(max_batch=0)
+    monkeypatch.setattr(AnimeMatcherService, "_embedder", fake)
+    AnimeMatcherService.reset_runtime_stats()
+
+    embeddings = AnimeMatcherService._embed_pil_batch(
+        [Image.new("RGB", (4096, 4096), "black")]
+    )
+
+    assert embeddings.tolist() == [[-1.0, -1.0]]
+    assert fake.gpu_calls == [1]
+    assert fake.cpu_calls == [1]
+    assert AnimeMatcherService.get_runtime_stats()["sscd_embedding_oom_retries"] == 1
 
 
 def test_seeded_large_series_crop_search_uses_local_windows(monkeypatch) -> None:
@@ -275,6 +323,54 @@ def test_local_crop_search_respects_source_crop_cap(monkeypatch) -> None:
     assert embed_batch_sizes == [3, 2, 1]
 
 
+def test_extract_frames_seeks_across_large_frame_gaps(monkeypatch) -> None:
+    class FakeCV2:
+        CAP_PROP_FPS = 1
+        CAP_PROP_POS_FRAMES = 2
+        COLOR_BGR2RGB = 3
+
+        @staticmethod
+        def cvtColor(frame, code):
+            return frame
+
+    class FakeCapture:
+        def __init__(self) -> None:
+            self.position = 0
+            self.set_calls: list[tuple[int, int]] = []
+            self.grab_calls = 0
+
+        def get(self, prop: int) -> float:
+            if prop == FakeCV2.CAP_PROP_FPS:
+                return 30.0
+            return 0.0
+
+        def set(self, prop: int, value: int) -> None:
+            self.set_calls.append((prop, int(value)))
+            self.position = int(value)
+
+        def grab(self) -> bool:
+            self.grab_calls += 1
+            self.position += 1
+            return True
+
+        def read(self):
+            self.position += 1
+            return True, np.zeros((2, 2, 3), dtype=np.uint8)
+
+    cap = FakeCapture()
+    monkeypatch.setattr(
+        AnimeMatcherService,
+        "_require_cv2",
+        classmethod(lambda cls: FakeCV2),
+    )
+
+    frames = AnimeMatcherService._extract_frames_from_capture(cap, [0.0, 100.0])
+
+    assert all(frame is not None for frame in frames)
+    assert (FakeCV2.CAP_PROP_POS_FRAMES, 3000) in cap.set_calls
+    assert cap.grab_calls < AnimeMatcherService.MAX_SEQUENTIAL_GRAB_FRAMES
+
+
 def test_crop_search_trigger_skips_high_confidence_direct_match() -> None:
     match = SceneMatch(
         scene_index=0,
@@ -287,6 +383,227 @@ def test_crop_search_trigger_skips_high_confidence_direct_match() -> None:
 
     assert AnimeMatcherService._should_try_crop_search("Series", 2.0, match) is False
     assert AnimeMatcherService._should_try_crop_search("Series", 2.0, None) is True
+
+
+def test_tail_interval_candidates_include_exposed_alternatives() -> None:
+    scene = Scene(index=0, start_time=0.0, end_time=2.0)
+    match = SceneMatch(
+        scene_index=0,
+        episode="E1",
+        start_time=10.0,
+        end_time=12.0,
+        confidence=0.8,
+        speed_ratio=1.0,
+        alternatives=[
+            AlternativeMatch(
+                episode="E1",
+                start_time=20.0,
+                end_time=22.0,
+                confidence=0.7,
+                speed_ratio=1.0,
+                algorithm="weighted_avg",
+            )
+        ],
+    )
+
+    candidates = AnimeMatcherService._tail_interval_candidates(scene, match, "E1")
+
+    assert any(
+        candidate["start_time"] == 20.0 and candidate["end_time"] == 22.0
+        for candidate in candidates
+    )
+
+
+def test_extend_end_to_next_start_uses_nearby_end_candidate() -> None:
+    scenes = SceneList(
+        scenes=[
+            Scene(index=0, start_time=0.0, end_time=1.4),
+            Scene(index=1, start_time=1.4, end_time=2.4),
+        ]
+    )
+    matches = MatchList(
+        matches=[
+            SceneMatch(
+                scene_index=0,
+                episode="E1",
+                start_time=100.0,
+                end_time=101.0,
+                confidence=0.6,
+                speed_ratio=1.4,
+                end_candidates=[
+                    MatchCandidate(
+                        episode="E1",
+                        timestamp=102.0,
+                        similarity=0.7,
+                        series="Series",
+                    )
+                ],
+            ),
+            SceneMatch(
+                scene_index=1,
+                episode="E1",
+                start_time=102.1,
+                end_time=103.1,
+                confidence=0.6,
+                speed_ratio=1.0,
+            ),
+        ]
+    )
+
+    adjusted = AnimeMatcherService._extend_end_to_next_start_candidates(
+        scenes,
+        matches,
+    )
+
+    assert adjusted.matches[0].end_time == 102.0
+    assert adjusted.matches[0].alternatives[0].algorithm == "next_start_end"
+
+
+def test_dense_boundary_supported_promotes_close_weighted_end_projection() -> None:
+    scenes = _short_scenes(45)
+    matches = MatchList(
+        matches=[
+            SceneMatch(
+                scene_index=index,
+                episode="E1",
+                start_time=100.0 + index,
+                end_time=101.0 + index,
+                confidence=0.8,
+                speed_ratio=1.0,
+            )
+            for index in range(45)
+        ]
+    )
+    target = matches.matches[10]
+    target.start_time = 200.0
+    target.end_time = 200.8
+    target.confidence = 0.86
+    target.alternatives = [
+        AlternativeMatch(
+            episode="E1",
+            start_time=200.0,
+            end_time=200.8,
+            confidence=0.86,
+            speed_ratio=1.0,
+            vote_count=1,
+            algorithm="end",
+        ),
+        AlternativeMatch(
+            episode="E1",
+            start_time=200.3,
+            end_time=201.1,
+            confidence=0.79,
+            speed_ratio=1.0,
+            vote_count=6,
+            algorithm="weighted_avg",
+        ),
+    ]
+
+    adjusted = AnimeMatcherService._promote_dense_boundary_supported_alternatives(
+        scenes,
+        matches,
+    )
+
+    assert adjusted.matches[10].start_time == 200.3
+    assert adjusted.matches[10].alternatives[0].algorithm == "weighted_avg"
+
+
+def test_dense_boundary_supported_promotes_close_direct_refinement() -> None:
+    scenes = _short_scenes(45)
+    matches = MatchList(
+        matches=[
+            SceneMatch(
+                scene_index=index,
+                episode="E1",
+                start_time=100.0 + index,
+                end_time=101.0 + index,
+                confidence=0.8,
+                speed_ratio=1.0,
+            )
+            for index in range(45)
+        ]
+    )
+    target = matches.matches[12]
+    target.start_time = 300.0
+    target.end_time = 301.2
+    target.confidence = 0.75
+    target.alternatives = [
+        AlternativeMatch(
+            episode="E1",
+            start_time=300.0,
+            end_time=301.2,
+            confidence=0.75,
+            speed_ratio=1.0,
+            vote_count=1,
+            algorithm="refined",
+        ),
+        AlternativeMatch(
+            episode="E1",
+            start_time=300.2,
+            end_time=301.0,
+            confidence=0.42,
+            speed_ratio=1.0,
+            vote_count=3,
+            algorithm="direct",
+        ),
+    ]
+
+    adjusted = AnimeMatcherService._promote_dense_boundary_supported_alternatives(
+        scenes,
+        matches,
+    )
+
+    assert adjusted.matches[12].start_time == 300.2
+    assert adjusted.matches[12].alternatives[0].algorithm == "direct"
+
+
+def test_dense_boundary_supported_promotes_local_continuity_alternative() -> None:
+    scenes = _short_scenes(45)
+    matches = MatchList(
+        matches=[
+            SceneMatch(
+                scene_index=index,
+                episode="E1",
+                start_time=100.0 + index,
+                end_time=101.0 + index,
+                confidence=0.8,
+                speed_ratio=1.0,
+            )
+            for index in range(45)
+        ]
+    )
+    target = matches.matches[30]
+    target.start_time = 500.0
+    target.end_time = 501.0
+    target.confidence = 0.90
+    target.alternatives = [
+        AlternativeMatch(
+            episode="E1",
+            start_time=500.0,
+            end_time=501.0,
+            confidence=0.90,
+            speed_ratio=1.0,
+            vote_count=1,
+            algorithm="continuity",
+        ),
+        AlternativeMatch(
+            episode="E1",
+            start_time=498.6,
+            end_time=499.6,
+            confidence=0.89,
+            speed_ratio=1.0,
+            vote_count=1,
+            algorithm="best_frame",
+        ),
+    ]
+
+    adjusted = AnimeMatcherService._promote_dense_boundary_supported_alternatives(
+        scenes,
+        matches,
+    )
+
+    assert adjusted.matches[30].start_time == 498.6
+    assert adjusted.matches[30].alternatives[0].algorithm == "best_frame"
 
 
 def test_batched_probe_search_preserves_scene_positions(monkeypatch) -> None:
@@ -793,6 +1110,18 @@ def test_dense_visual_boundary_snap_selects_strong_local_cut() -> None:
     assert moves == {0: 1.35}
 
 
+def test_dense_visual_boundary_snap_skips_terminal_boundary() -> None:
+    scenes = _short_scenes(45)
+    terminal_boundary = scenes.scenes[-2].end_time
+    moves = SceneMergerService._dense_visual_boundary_snap_candidates(
+        scenes,
+        [terminal_boundary + 0.25],
+        [90.0],
+    )
+
+    assert moves == {}
+
+
 def test_dense_visual_boundary_snap_ignores_sparse_projects() -> None:
     scenes = _short_scenes(20)
     moves = SceneMergerService._dense_visual_boundary_snap_candidates(
@@ -836,8 +1165,8 @@ def test_snap_dense_visual_boundaries_skips_adjacent_collapse(
             *[
                 Scene(
                     index=index,
-                    start_time=8.133 + (index - 2),
-                    end_time=9.133 + (index - 2),
+                    start_time=8.133 + (index - 3),
+                    end_time=9.133 + (index - 3),
                 )
                 for index in range(3, 45)
             ],
@@ -851,7 +1180,7 @@ def test_snap_dense_visual_boundaries_skips_adjacent_collapse(
     monkeypatch.setattr(
         SceneMergerService,
         "_dense_visual_boundary_snap_candidates",
-        classmethod(lambda cls, scenes, diff_times, diffs: {0: 7.3, 1: 7.3}),
+        classmethod(lambda cls, scenes, diff_times, diffs: {0: 7.15, 1: 7.15}),
     )
 
     snapped = SceneMergerService.snap_dense_visual_boundaries(
@@ -859,11 +1188,171 @@ def test_snap_dense_visual_boundaries_skips_adjacent_collapse(
         scenes,
     )
 
-    assert snapped.scenes[0].end_time == 7.3
-    assert snapped.scenes[1].start_time == 7.3
+    assert snapped.scenes[0].end_time == 7.15
+    assert snapped.scenes[1].start_time == 7.15
     assert snapped.scenes[1].end_time == 7.566
     assert snapped.validate_continuity()
     assert all(scene.duration > 0 for scene in snapped.scenes)
+
+
+def test_snap_dense_visual_boundaries_ignores_terminal_boundary_move(
+    monkeypatch,
+) -> None:
+    scenes = _short_scenes(45)
+    terminal_index = len(scenes.scenes) - 2
+    terminal_boundary = scenes.scenes[terminal_index].end_time
+    monkeypatch.setattr(
+        SceneMergerService,
+        "_video_frame_diffs",
+        classmethod(lambda cls, video_path: ([], [])),
+    )
+    monkeypatch.setattr(
+        SceneMergerService,
+        "_dense_visual_boundary_snap_candidates",
+        classmethod(
+            lambda cls, scenes, diff_times, diffs: {
+                terminal_index: terminal_boundary + 0.25
+            }
+        ),
+    )
+
+    snapped = SceneMergerService.snap_dense_visual_boundaries(
+        Path("/tmp/source.mp4"),
+        scenes,
+    )
+
+    assert snapped.scenes[terminal_index].end_time == terminal_boundary
+    assert snapped.scenes[terminal_index + 1].start_time == terminal_boundary
+
+
+def test_append_terminal_tiny_chain_adds_final_transition() -> None:
+    scenes = _short_scenes(45)
+    scenes.scenes[-2].end_time = 44.6
+    scenes.scenes[-1].start_time = 44.6
+    scenes.scenes[-1].end_time = 45.0
+
+    chains = SceneMergerService._append_terminal_tiny_chain(scenes, [[2, 3]])
+
+    assert chains == [[2, 3], [43, 44]]
+
+
+def test_append_terminal_tiny_chain_extends_existing_penultimate_chain() -> None:
+    scenes = _short_scenes(45)
+    scenes.scenes[-2].end_time = 44.6
+    scenes.scenes[-1].start_time = 44.6
+    scenes.scenes[-1].end_time = 45.0
+
+    chains = SceneMergerService._append_terminal_tiny_chain(scenes, [[41, 42, 43]])
+
+    assert chains == [[41, 42, 43, 44]]
+
+
+def test_visual_boundary_similarities_batch_frame_extraction(monkeypatch) -> None:
+    scenes = SceneList(
+        scenes=[
+            Scene(index=0, start_time=0.0, end_time=1.0),
+            Scene(index=1, start_time=1.0, end_time=2.0),
+            Scene(index=2, start_time=2.0, end_time=3.0),
+        ]
+    )
+    calls: list[list[float]] = []
+
+    class FakeEmbedder:
+        def embed_batch(self, images):
+            assert len(images) == 4
+            return np.array(
+                [
+                    [1.0, 0.0],
+                    [0.0, 1.0],
+                    [1.0, 0.0],
+                    [1.0, 0.0],
+                ],
+                dtype=np.float32,
+            )
+
+    monkeypatch.setattr(
+        AnimeMatcherService,
+        "_init_searcher",
+        classmethod(lambda cls, library_path, library_type, anime_name: True),
+    )
+    monkeypatch.setattr(
+        AnimeMatcherService,
+        "_query_processor",
+        types.SimpleNamespace(embedder=FakeEmbedder()),
+    )
+
+    def fake_extract_frames(video_path, timestamps):
+        calls.append(list(timestamps))
+        return [Image.new("RGB", (4, 4), "black") for _ in timestamps]
+
+    monkeypatch.setattr(AnimeMatcherService, "extract_frames", fake_extract_frames)
+
+    similarities = SceneMergerService._compute_visual_boundary_similarities(
+        video_path=Path("/tmp/video.mp4"),
+        scenes=scenes,
+        library_path=Path("/tmp/library"),
+        library_type="local",
+        anime_name="Series",
+    )
+
+    assert calls == [[0.92, 1.08, 1.92, 2.08]]
+    assert similarities == [0.0, 1.0]
+
+
+def test_visual_boundary_similarities_for_indices_batch_frame_extraction(
+    monkeypatch,
+) -> None:
+    scenes = SceneList(
+        scenes=[
+            Scene(index=0, start_time=0.0, end_time=1.0),
+            Scene(index=1, start_time=1.0, end_time=2.0),
+            Scene(index=2, start_time=2.0, end_time=3.0),
+            Scene(index=3, start_time=3.0, end_time=4.0),
+        ]
+    )
+    calls: list[list[float]] = []
+
+    class FakeEmbedder:
+        def embed_batch(self, images):
+            assert len(images) == 4
+            return np.array(
+                [
+                    [1.0, 0.0],
+                    [1.0, 0.0],
+                    [1.0, 0.0],
+                    [0.0, 1.0],
+                ],
+                dtype=np.float32,
+            )
+
+    monkeypatch.setattr(
+        AnimeMatcherService,
+        "_init_searcher",
+        classmethod(lambda cls, library_path, library_type, anime_name: True),
+    )
+    monkeypatch.setattr(
+        AnimeMatcherService,
+        "_query_processor",
+        types.SimpleNamespace(embedder=FakeEmbedder()),
+    )
+
+    def fake_extract_frames(video_path, timestamps):
+        calls.append(list(timestamps))
+        return [Image.new("RGB", (4, 4), "black") for _ in timestamps]
+
+    monkeypatch.setattr(AnimeMatcherService, "extract_frames", fake_extract_frames)
+
+    similarities = SceneMergerService._compute_visual_boundary_similarities_for_indices(
+        video_path=Path("/tmp/video.mp4"),
+        scenes=scenes,
+        boundary_indices=[0, 2],
+        library_path=Path("/tmp/library"),
+        library_type="local",
+        anime_name="Series",
+    )
+
+    assert calls == [[0.92, 1.08, 2.92, 3.08]]
+    assert similarities == {0: 1.0, 2: 0.0}
 
 
 def test_merge_scenes_preserves_same_episode_source_seed() -> None:
@@ -1314,6 +1803,206 @@ def test_validation_repairs_primary_absent_from_alternatives() -> None:
         and alt.end_time == repaired.end_time
         for alt in repaired.alternatives
     )
+
+
+def test_dense_source_exposure_preserves_existing_primary() -> None:
+    scenes = _short_scenes(45)
+    matches = _empty_matches(45)
+    matches.matches[0] = SceneMatch(
+        scene_index=0,
+        episode="E1",
+        start_time=100.0,
+        end_time=101.0,
+        confidence=0.70,
+        speed_ratio=1.0,
+        alternatives=[
+            AlternativeMatch(
+                episode="E1",
+                start_time=100.0,
+                end_time=101.0,
+                confidence=0.70,
+                speed_ratio=1.0,
+                vote_count=1,
+                algorithm="continuity",
+            )
+        ],
+        start_candidates=[
+            MatchCandidate(episode="E1", timestamp=10.0, similarity=0.95, series="S")
+        ],
+        middle_candidates=[
+            MatchCandidate(episode="E1", timestamp=10.5, similarity=0.95, series="S")
+        ],
+        end_candidates=[
+            MatchCandidate(episode="E1", timestamp=11.0, similarity=0.95, series="S")
+        ],
+    )
+
+    result = AnimeMatcherService._promote_dense_source_cut_aligned_alternatives(
+        scenes,
+        matches,
+        {"E1": [10.0, 11.0]},
+    )
+
+    match = result.matches[0]
+    assert match.start_time == 100.0
+    assert match.end_time == 101.0
+    assert match.alternatives[0].algorithm == "continuity"
+    assert any(
+        alt.algorithm in {
+            "start_probe",
+            "source_cut_aligned",
+            "source_cut_duration",
+            "source_cut_pair",
+        }
+        and alt.start_time == 10.0
+        and alt.end_time == 11.0
+        for alt in match.alternatives
+    )
+
+
+def test_dense_source_exposure_keeps_supported_raw_probe_projection() -> None:
+    scenes = _short_scenes(45)
+    matches = _empty_matches(45)
+    matches.matches[0] = SceneMatch(
+        scene_index=0,
+        episode="E1",
+        start_time=100.0,
+        end_time=101.0,
+        confidence=0.72,
+        speed_ratio=1.0,
+        alternatives=[
+            AlternativeMatch(
+                episode="E1",
+                start_time=100.0,
+                end_time=101.0,
+                confidence=0.72,
+                speed_ratio=1.0,
+                vote_count=1,
+                algorithm="refined",
+            )
+        ],
+        start_candidates=[
+            MatchCandidate(episode="E1", timestamp=20.0, similarity=0.41, series="S")
+        ],
+        middle_candidates=[
+            MatchCandidate(episode="E1", timestamp=20.5, similarity=0.41, series="S")
+        ],
+        end_candidates=[
+            MatchCandidate(episode="E1", timestamp=21.0, similarity=0.41, series="S")
+        ],
+    )
+    noisy_cuts = [100.0 + offset / 10.0 for offset in range(-12, 13)]
+
+    result = AnimeMatcherService._promote_dense_source_cut_aligned_alternatives(
+        scenes,
+        matches,
+        {"E1": noisy_cuts},
+    )
+
+    assert any(
+        alt.algorithm in {"start_probe", "probe_pair"}
+        and alt.start_time == 20.0
+        and alt.end_time == 21.0
+        for alt in result.matches[0].alternatives
+    )
+
+
+def test_supported_local_bracket_refinement_promotes_stronger_refined_probe() -> None:
+    scenes = _short_scenes(45)
+    matches = _empty_matches(45)
+    matches.matches[8] = SceneMatch(
+        scene_index=8,
+        episode="E1",
+        start_time=250.0,
+        end_time=251.0,
+        confidence=0.80,
+        speed_ratio=1.0,
+        was_no_match=False,
+        alternatives=[
+            AlternativeMatch(
+                episode="E1",
+                start_time=250.0,
+                end_time=251.0,
+                confidence=0.80,
+                speed_ratio=1.0,
+                vote_count=1,
+                algorithm="local_bracket",
+            ),
+            AlternativeMatch(
+                episode="E1",
+                start_time=198.9,
+                end_time=199.9,
+                confidence=0.80,
+                speed_ratio=1.0,
+                vote_count=1,
+                algorithm="refined",
+            ),
+        ],
+        middle_candidates=[
+            MatchCandidate(episode="E1", timestamp=199.4, similarity=0.83, series="S")
+        ],
+        end_candidates=[
+            MatchCandidate(episode="E1", timestamp=199.9, similarity=0.82, series="S")
+        ],
+    )
+
+    result = AnimeMatcherService._promote_supported_local_bracket_refinements(
+        scenes,
+        matches,
+    )
+
+    assert result.matches[8].start_time == 198.9
+    assert result.matches[8].end_time == 199.9
+    assert result.matches[8].alternatives[0].algorithm == "refined"
+
+
+def test_supported_local_bracket_refinement_requires_stronger_probe() -> None:
+    scenes = _short_scenes(45)
+    matches = _empty_matches(45)
+    matches.matches[8] = SceneMatch(
+        scene_index=8,
+        episode="E1",
+        start_time=250.0,
+        end_time=251.0,
+        confidence=0.80,
+        speed_ratio=1.0,
+        was_no_match=False,
+        alternatives=[
+            AlternativeMatch(
+                episode="E1",
+                start_time=250.0,
+                end_time=251.0,
+                confidence=0.80,
+                speed_ratio=1.0,
+                vote_count=1,
+                algorithm="local_bracket",
+            ),
+            AlternativeMatch(
+                episode="E1",
+                start_time=198.9,
+                end_time=199.9,
+                confidence=0.80,
+                speed_ratio=1.0,
+                vote_count=1,
+                algorithm="refined",
+            ),
+        ],
+        middle_candidates=[
+            MatchCandidate(episode="E1", timestamp=199.4, similarity=0.80, series="S")
+        ],
+        end_candidates=[
+            MatchCandidate(episode="E1", timestamp=199.9, similarity=0.80, series="S")
+        ],
+    )
+
+    result = AnimeMatcherService._promote_supported_local_bracket_refinements(
+        scenes,
+        matches,
+    )
+
+    assert result.matches[8].start_time == 250.0
+    assert result.matches[8].end_time == 251.0
+    assert result.matches[8].alternatives[0].algorithm == "local_bracket"
 
 
 def test_no_match_with_frame_candidates_gets_alternatives() -> None:

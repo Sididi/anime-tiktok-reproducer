@@ -25,11 +25,18 @@ class InstagramPayload(BaseModel):
     ig_user_id: str
     ig_access_token: str
     caption: str
+    prepared_video_url: str | None = None
     graph_api_version: str = "v25.0"
     poll_interval_seconds: float | None = None
     poll_timeout_seconds: float | None = None
     share_to_feed: bool | None = None
     thumb_offset: int | None = None
+
+
+class InitialPlatformStatus(BaseModel):
+    status: Literal["pending", "uploading", "uploaded", "skipped", "failed"]
+    url: str | None = None
+    detail: str | None = None
 
 
 class CreateJobRequest(BaseModel):
@@ -41,6 +48,7 @@ class CreateJobRequest(BaseModel):
     description: str
     drive_video_url: str
     platforms_requested: list[str]
+    platform_statuses: dict[str, InitialPlatformStatus] | None = None
     instagram: InstagramPayload | None = None
 
 
@@ -81,6 +89,36 @@ class UpdateSlotRequest(BaseModel):
     reminder_cancelled: bool | None = None
 
 
+def _initial_platform_statuses(req: CreateJobRequest) -> dict[str, PlatformStatus]:
+    statuses = {p: PlatformStatus(status="pending") for p in req.platforms_requested}
+    for platform, status in (req.platform_statuses or {}).items():
+        if platform not in statuses:
+            continue
+        statuses[platform] = PlatformStatus(
+            status=status.status,
+            url=status.url,
+            detail=status.detail,
+        )
+    return statuses
+
+
+def _instagram_payload(req: CreateJobRequest) -> dict | None:
+    return req.instagram.model_dump(exclude_none=True) if req.instagram else None
+
+
+def _job_payload_changed(job: Job, req: CreateJobRequest, instagram_payload: dict | None) -> bool:
+    return (
+        job.account_id != req.account_id
+        or job.slot_time != req.slot_time
+        or job.platform_scheduled_at != dict(req.platform_scheduled_at or {})
+        or job.anime_title != req.anime_title
+        or job.description != req.description
+        or job.drive_video_url != req.drive_video_url
+        or job.platforms_requested != list(req.platforms_requested)
+        or job.instagram_payload != instagram_payload
+    )
+
+
 @router.post("/jobs", response_model=CreateJobResponse)
 async def create_job(req: CreateJobRequest, request: Request) -> CreateJobResponse:
     settings = request.app.state.settings
@@ -92,15 +130,43 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
     account = settings.accounts[req.account_id]
 
     existing = await store.get(req.project_id)
+    instagram_payload = _instagram_payload(req)
+    platform_statuses = _initial_platform_statuses(req)
     if existing is not None:
+        if not _job_payload_changed(existing, req, instagram_payload):
+            return CreateJobResponse(
+                job_id=existing.job_id, discord_message_id=existing.discord_message_id
+            )
+
+        updated = await store.update(
+            req.project_id,
+            account_id=req.account_id,
+            device_id=account.device,
+            anime_title=req.anime_title,
+            description=req.description,
+            drive_video_url=req.drive_video_url,
+            slot_time=req.slot_time,
+            platform_scheduled_at=dict(req.platform_scheduled_at or {}),
+            platforms_requested=list(req.platforms_requested),
+            platform_statuses=platform_statuses,
+            instagram_payload=instagram_payload,
+            instagram_publish_state=None,
+        )
+        if updated.discord_message_id:
+            try:
+                embed = build_embed(updated, settings.accounts, settings.public_base_url)
+                await discord.edit_message(
+                    settings.discord.upload_channel_id,
+                    updated.discord_message_id,
+                    embed=embed,
+                )
+            except Exception as e:
+                logger.warning("Embed edit failed for %s: %s", req.project_id, e)
         return CreateJobResponse(
-            job_id=existing.job_id, discord_message_id=existing.discord_message_id
+            job_id=updated.job_id, discord_message_id=updated.discord_message_id
         )
 
     now = datetime.now(tz=UTC)
-    platform_statuses = {
-        p: PlatformStatus(status="pending") for p in req.platforms_requested
-    }
     job = Job(
         project_id=req.project_id,
         job_id=f"j_{secrets.token_hex(4)}",
@@ -116,7 +182,7 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
         discord_message_id=None,
         reminder_message_id=None,
         reminder_forward_message_id=None,
-        instagram_payload=req.instagram.model_dump(exclude_none=True) if req.instagram else None,
+        instagram_payload=instagram_payload,
         created_at=now,
         updated_at=now,
     )
