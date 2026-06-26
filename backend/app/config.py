@@ -92,7 +92,8 @@ class Settings(BaseSettings):
     elevenlabs_model_id: str = "eleven_multilingual_v2"
     elevenlabs_output_format: str = "pcm_44100"
     # Post-process the published TTS voiceover to reduce ElevenLabs/AI fingerprints.
-    # Env: ATR_VOICE_DEFINGERPRINT_LEVEL. One of: off, default, light, moderate, aggressive.
+    # Env: ATR_VOICE_DEFINGERPRINT_LEVEL.
+    # One of: off, default, light, moderate, aggressive, nvidia, nvidia_strong_hq.
     voice_defingerprint_level: str = "default"
 
     # OpenRouter (replaces per-provider keys)
@@ -252,7 +253,15 @@ class Settings(BaseSettings):
     @classmethod
     def _normalize_voice_defingerprint_level(cls, value: str | None) -> str:
         normalized = str(value or "").strip().lower()
-        if normalized in {"off", "default", "light", "moderate", "aggressive"}:
+        if normalized in {
+            "off",
+            "default",
+            "light",
+            "moderate",
+            "aggressive",
+            "nvidia",
+            "nvidia_strong_hq",
+        }:
             return normalized
         logging.warning(
             "Unknown ATR_VOICE_DEFINGERPRINT_LEVEL=%r; falling back to 'default'",

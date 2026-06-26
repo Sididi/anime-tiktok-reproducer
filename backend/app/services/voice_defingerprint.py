@@ -17,8 +17,18 @@ from ..utils.media_binaries import get_media_subprocess_env, rewrite_media_comma
 
 logger = logging.getLogger("uvicorn.error")
 
-VALID_LEVELS: tuple[str, ...] = ("off", "default", "light", "moderate", "aggressive")
+VALID_LEVELS: tuple[str, ...] = (
+    "off",
+    "default",
+    "light",
+    "moderate",
+    "aggressive",
+    "nvidia",
+    "nvidia_strong_hq",
+)
 _DURATION_TOLERANCE_S = 0.001
+_NVIDIA_SAMPLE_RATE = 44100
+_NVIDIA_MU_LAW_CHANNELS = 256
 
 _GEEKNIK_QUALITY_BANDS: tuple[tuple[float, float, float], ...] = (
     (15000.0, 17000.0, 0.28),  # ElevenLabs-like upper spectral watermark region.
@@ -101,6 +111,11 @@ def normalize_level(level: str | None) -> str:
 
 
 def _sample_params(level: str, rng: random.Random) -> dict[str, Any]:
+    if level == "nvidia":
+        return _sample_nvidia_params(rng)
+    if level == "nvidia_strong_hq":
+        return _sample_nvidia_strong_hq_params(rng)
+
     bounds = _PRESETS[level]
     reverb = bounds.reverb_delay_ms is not None and bounds.reverb_decay is not None
     return {
@@ -115,6 +130,72 @@ def _sample_params(level: str, rng: random.Random) -> dict[str, Any]:
         "lossy_bitrate_k": bounds.lossy_bitrate_k,
         "lossy_passes": bounds.lossy_passes,
         "geeknik_first_pass": level == "default",
+    }
+
+
+def _sample_nvidia_params(rng: random.Random) -> dict[str, Any]:
+    base_coat = rng.choices(
+        ("noise", "phase", "mulaw", "median", "pitch"),
+        weights=(0.50, 0.25, 0.18, 0.05, 0.02),
+        k=1,
+    )[0]
+    return {
+        "pipeline": "nvidia_hq_af_v2",
+        "base_coat": base_coat,
+        "pitch_semitones": round(rng.uniform(-0.45, 0.45), 4),
+        "median_kernel": 3,
+        "median_mix": round(rng.uniform(0.12, 0.24), 4),
+        "gaussian_sigma": round(rng.uniform(0.00035, 0.0012), 6),
+        "mu_law_channels": _NVIDIA_MU_LAW_CHANNELS,
+        "mu_law_mix": round(rng.uniform(0.08, 0.18), 4),
+        "phase_jitter_std": round(rng.uniform(0.002, 0.006), 6),
+        "phase_blend": round(rng.uniform(0.03, 0.08), 4),
+        "spectral_noise_floor": round(rng.uniform(0.00004, 0.00016), 6),
+        "prosody_gain_depth": round(rng.uniform(0.001, 0.0035), 6),
+        "prosody_rate_hz": round(rng.uniform(0.35, 1.1), 4),
+        "start_jitter_ms": rng.randint(0, 8),
+        "end_jitter_ms": rng.randint(0, 8),
+        "precision_enabled": False,
+        "precision_l2_per_sample_eps": 0.002,
+        "precision_l2_per_sample_alpha": 0.00035,
+        "precision_steps": 6,
+        "nmr_weight": 0.9,
+        "codec_chain": rng.choice(("aac", "opus")),
+        "aac_bitrate_k": 192,
+        "opus_bitrate_k": 192,
+    }
+
+
+def _sample_nvidia_strong_hq_params(rng: random.Random) -> dict[str, Any]:
+    return {
+        "pipeline": "nvidia_strong_hq_v06",
+        "base_coat": "phase",
+        "pitch_enabled": True,
+        "pitch_semitones": round(rng.uniform(0.10, 0.18), 4),
+        "median_kernel": 3,
+        "median_mix": round(rng.uniform(0.18, 0.22), 4),
+        "gaussian_sigma": round(rng.uniform(0.0014, 0.0021), 6),
+        "continuous_noise_dbfs": round(rng.uniform(-60.9, -59.8), 2),
+        "mu_law_channels": _NVIDIA_MU_LAW_CHANNELS,
+        "mu_law_mix": round(rng.uniform(0.20, 0.24), 4),
+        "phase_jitter_std": round(rng.uniform(0.008, 0.011), 6),
+        "phase_blend": round(rng.uniform(0.078, 0.095), 4),
+        "spectral_noise_floor": round(rng.uniform(0.00034, 0.00046), 6),
+        "prosody_gain_depth": round(rng.uniform(0.0052, 0.0068), 6),
+        "prosody_rate_hz": round(rng.uniform(0.72, 0.90), 4),
+        "start_jitter_ms": rng.randint(22, 28),
+        "end_jitter_ms": rng.randint(24, 31),
+        "lowpass_hz": rng.randint(14540, 14680),
+        "saturation": True,
+        "saturation_threshold": round(rng.uniform(0.970, 0.978), 4),
+        "precision_enabled": False,
+        "precision_l2_per_sample_eps": 0.002,
+        "precision_l2_per_sample_alpha": 0.00035,
+        "precision_steps": 6,
+        "nmr_weight": 0.9,
+        "codec_chain": "opus",
+        "aac_bitrate_k": 160,
+        "opus_bitrate_k": 144,
     }
 
 
@@ -388,6 +469,509 @@ def _run_lossy_roundtrip(
     )
 
 
+def _nvidia_pitch_ratio(semitones: float) -> float:
+    return 2.0 ** (semitones / 12.0)
+
+
+def _build_nvidia_pitch_filter(params: dict[str, Any], duration_s: float) -> str:
+    chain = ["aresample=48000:resampler=soxr"]
+    if params.get("pitch_enabled") or params.get("base_coat") == "pitch":
+        ratio = _nvidia_pitch_ratio(float(params["pitch_semitones"]))
+        chain.append(f"rubberband=pitch={ratio:.6f}:formant=preserved")
+    lowpass_hz = params.get("lowpass_hz")
+    if lowpass_hz is not None:
+        chain.append(f"lowpass=f={int(lowpass_hz)}")
+    if params.get("saturation"):
+        threshold = float(params.get("saturation_threshold", 0.97))
+        chain.append(f"asoftclip=type=tanh:threshold={threshold:.4f}")
+    chain.extend(
+        [
+            f"apad",
+            f"atrim=0:{duration_s:.6f}",
+        ]
+    )
+    return f"[0:a]{','.join(chain)}[out]"
+
+
+def _run_nvidia_pitch_stage(
+    input_path: Path,
+    output_path: Path,
+    params: dict[str, Any],
+    duration_s: float,
+) -> None:
+    _run_ffmpeg(
+        [
+            "-i",
+            str(input_path),
+            "-filter_complex",
+            _build_nvidia_pitch_filter(params, duration_s),
+            "-map",
+            "[out]",
+            "-ac",
+            "1",
+            "-ar",
+            str(_NVIDIA_SAMPLE_RATE),
+            "-c:a",
+            "pcm_s16le",
+            str(output_path),
+        ]
+    )
+
+
+def _nvidia_fit_samples(audio: Any, target_samples: int) -> Any:
+    import numpy as np
+
+    if audio.ndim > 1:
+        audio = np.mean(audio, axis=1)
+    audio = np.asarray(audio, dtype=np.float64)
+    if audio.shape[0] > target_samples:
+        return audio[:target_samples]
+    if audio.shape[0] < target_samples:
+        return np.pad(audio, (0, target_samples - audio.shape[0]), mode="constant")
+    return audio
+
+
+def _nvidia_mu_law_roundtrip(audio: Any, channels: int) -> Any:
+    import numpy as np
+
+    mu = float(max(2, channels - 1))
+    clipped = np.clip(audio, -1.0, 1.0)
+    encoded = np.sign(clipped) * np.log1p(mu * np.abs(clipped)) / np.log1p(mu)
+    quantized = np.round((encoded + 1.0) * 0.5 * mu)
+    expanded = (quantized / mu) * 2.0 - 1.0
+    decoded = np.sign(expanded) * (np.expm1(np.abs(expanded) * np.log1p(mu)) / mu)
+    return np.asarray(decoded, dtype=np.float64)
+
+
+def _nvidia_phase_flatness_stage(
+    audio: Any,
+    sr: int,
+    params: dict[str, Any],
+    rng: Any,
+) -> Any:
+    import numpy as np
+    from scipy import signal
+
+    if audio.shape[0] < 512:
+        return audio
+
+    nperseg = min(2048, max(512, 2 ** int(np.floor(np.log2(audio.shape[0])))))
+    noverlap = min(nperseg - 1, int(nperseg * 0.75))
+    freqs, _, spectrum = signal.stft(
+        audio,
+        fs=sr,
+        nperseg=nperseg,
+        noverlap=noverlap,
+        boundary="zeros",
+    )
+    mask = (freqs >= 2000.0) & (freqs <= min(8000.0, sr * 0.48))
+    if not np.any(mask):
+        return audio
+
+    band = spectrum[mask]
+    phase_noise = rng.normal(0.0, params["phase_jitter_std"], size=band.shape)
+    band = band * np.exp(1j * phase_noise)
+
+    median_mag = float(np.median(np.abs(band))) if band.size else 0.0
+    noise_floor = max(params["spectral_noise_floor"], median_mag * 0.06)
+    random_phase = rng.uniform(-np.pi, np.pi, size=band.shape)
+    frame_shape = rng.uniform(0.55, 1.45, size=band.shape)
+    band = band + noise_floor * frame_shape * np.exp(1j * random_phase)
+    spectrum[mask] = band
+
+    _, restored = signal.istft(
+        spectrum,
+        fs=sr,
+        nperseg=nperseg,
+        noverlap=noverlap,
+        input_onesided=True,
+    )
+    restored = _nvidia_fit_samples(restored, audio.shape[0])
+    blend = float(params.get("phase_blend", 0.05))
+    return (1.0 - blend) * audio + blend * restored
+
+
+def _nvidia_prosody_stage(audio: Any, sr: int, params: dict[str, Any], rng: Any) -> Any:
+    import numpy as np
+
+    if audio.shape[0] == 0:
+        return audio
+
+    t = np.arange(audio.shape[0], dtype=np.float64) / float(sr)
+    depth = float(params["prosody_gain_depth"])
+    phase = rng.uniform(0.0, 2.0 * np.pi)
+    gain = 1.0 + depth * np.sin(2.0 * np.pi * params["prosody_rate_hz"] * t + phase)
+
+    control_hop = max(1, int(sr * 0.09))
+    control_count = int(np.ceil(audio.shape[0] / control_hop)) + 1
+    control = rng.normal(0.0, depth * 0.45, control_count)
+    control_x = np.arange(control_count) * control_hop
+    gain += np.interp(np.arange(audio.shape[0]), control_x, control)
+
+    return audio * np.clip(gain, 0.94, 1.06)
+
+
+def _nvidia_edge_jitter(audio: Any, sr: int, params: dict[str, Any], rng: Any) -> Any:
+    import numpy as np
+
+    result = audio.copy()
+    for edge, ms in (("start", params["start_jitter_ms"]), ("end", params["end_jitter_ms"])):
+        samples = min(result.shape[0], int(round(sr * float(ms) / 1000.0)))
+        if samples <= 0:
+            continue
+        if edge == "start":
+            fade = np.linspace(0.0, 1.0, samples, dtype=np.float64)
+            shaped = result[:samples] * fade
+            shaped += rng.normal(0.0, 1.0e-5, samples) * (1.0 - fade)
+            result[:samples] = shaped
+        else:
+            fade = np.linspace(1.0, 0.0, samples, dtype=np.float64)
+            shaped = result[-samples:] * fade
+            shaped += rng.normal(0.0, 1.0e-5, samples) * (1.0 - fade)
+            result[-samples:] = shaped
+    return result
+
+
+def _nvidia_rms(audio: Any) -> float:
+    import numpy as np
+
+    return float(np.sqrt(np.mean(np.square(audio)))) if audio.shape[0] else 0.0
+
+
+def _nvidia_match_rms(processed: Any, original: Any) -> Any:
+    import numpy as np
+
+    original_rms = _nvidia_rms(original)
+    processed_rms = _nvidia_rms(processed)
+    if original_rms > 1e-9 and processed_rms > 1e-9:
+        processed = processed * np.clip(original_rms / processed_rms, 0.35, 2.85)
+    return np.clip(processed, -0.98, 0.98)
+
+
+def _run_nvidia_waveform_stage(
+    input_path: Path,
+    output_path: Path,
+    params: dict[str, Any],
+    duration_s: float,
+    *,
+    seed: int,
+) -> None:
+    import numpy as np
+    import soundfile as sf
+    from scipy import signal
+
+    audio, sr = sf.read(str(input_path), always_2d=True, dtype="float64")
+    target_samples = int(round(duration_s * sr))
+    audio = _nvidia_fit_samples(audio, target_samples)
+    original = audio.copy()
+
+    rng = np.random.default_rng(seed ^ 0x5EEDC0DE)
+    base_coat = params.get("base_coat")
+    if base_coat == "median":
+        kernel = int(params["median_kernel"])
+        if kernel > 1 and audio.shape[0] >= kernel:
+            filtered = signal.medfilt(audio, kernel_size=kernel)
+            mix = float(params["median_mix"])
+            audio = (1.0 - mix) * audio + mix * filtered
+    elif base_coat == "noise":
+        audio = audio + rng.normal(0.0, params["gaussian_sigma"], audio.shape[0])
+    elif base_coat == "mulaw":
+        encoded = _nvidia_mu_law_roundtrip(audio, int(params["mu_law_channels"]))
+        mix = float(params["mu_law_mix"])
+        audio = (1.0 - mix) * audio + mix * encoded
+    elif base_coat == "phase":
+        audio = _nvidia_phase_flatness_stage(audio, sr, params, rng)
+
+    continuous_noise_dbfs = params.get("continuous_noise_dbfs")
+    if continuous_noise_dbfs is not None:
+        audio = audio + rng.normal(
+            0.0,
+            _dbfs_to_amplitude(float(continuous_noise_dbfs)),
+            audio.shape[0],
+        )
+
+    audio = _nvidia_prosody_stage(audio, sr, params, rng)
+    audio = _nvidia_edge_jitter(audio, sr, params, rng)
+    audio = _nvidia_fit_samples(audio, target_samples)
+    audio = _nvidia_match_rms(audio, original)
+
+    sf.write(str(output_path), audio, sr, subtype="PCM_16")
+
+
+def _run_nvidia_precision_coat(
+    input_path: Path,
+    output_path: Path,
+    params: dict[str, Any],
+    duration_s: float,
+) -> None:
+    try:
+        import numpy as np
+        import soundfile as sf
+        import torch
+    except Exception as exc:
+        logger.warning("Nvidia precision coat skipped; dependencies unavailable: %s", exc)
+        params["precision_status"] = "skipped_missing_dependency"
+        shutil.copyfile(input_path, output_path)
+        return
+
+    try:
+        audio, sr = sf.read(str(input_path), always_2d=True, dtype="float64")
+        target_samples = int(round(duration_s * sr))
+        audio = _nvidia_fit_samples(audio, target_samples)
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        params["precision_device"] = device.type
+        x = torch.as_tensor(audio, dtype=torch.float32, device=device)
+        delta = torch.zeros_like(x)
+
+        n_fft = min(2048, max(512, 2 ** int(np.floor(np.log2(max(512, audio.shape[0]))))))
+        hop = max(128, n_fft // 4)
+        window = torch.hann_window(n_fft, device=device)
+        freqs = torch.fft.rfftfreq(n_fft, d=1.0 / float(sr)).to(device)
+        mask = (freqs >= 2000.0) & (freqs <= min(8000.0, sr * 0.48))
+        if int(mask.sum().item()) == 0:
+            params["precision_status"] = "skipped_empty_band"
+            shutil.copyfile(input_path, output_path)
+            return
+
+        eps = float(params["precision_l2_per_sample_eps"]) * float(x.numel() ** 0.5)
+        alpha = float(params["precision_l2_per_sample_alpha"]) * float(x.numel() ** 0.5)
+        nmr_weight = float(params["nmr_weight"])
+        source_rms = torch.sqrt(torch.mean(torch.square(x))).detach().clamp_min(1.0e-8)
+
+        for _ in range(int(params["precision_steps"])):
+            x_adv = torch.clamp(x + delta, -0.98, 0.98).detach().requires_grad_(True)
+            spectrum = torch.stft(
+                x_adv,
+                n_fft=n_fft,
+                hop_length=hop,
+                win_length=n_fft,
+                window=window,
+                return_complex=True,
+                center=True,
+            )
+            band = spectrum[mask]
+            magnitude = torch.abs(band).clamp_min(1.0e-7)
+            flatness = torch.exp(torch.mean(torch.log(magnitude), dim=0))
+            flatness = flatness / torch.mean(magnitude, dim=0).clamp_min(1.0e-7)
+            loss_flatness = -torch.mean(flatness)
+
+            if band.shape[1] > 1:
+                phase = torch.angle(band)
+                loss_phase = torch.mean(torch.cos(phase[:, 1:] - phase[:, :-1]))
+            else:
+                loss_phase = torch.zeros((), dtype=torch.float32, device=device)
+
+            candidate_delta = x_adv - x
+            perturb_rms = torch.sqrt(torch.mean(torch.square(candidate_delta)))
+            loss_nmr = torch.relu((perturb_rms / source_rms) - 0.08) ** 2
+            adv_rms = torch.sqrt(torch.mean(torch.square(x_adv))).clamp_min(1.0e-8)
+            loss_loudness = torch.square((adv_rms - source_rms) / source_rms)
+
+            total = (
+                loss_flatness
+                + 0.35 * loss_phase
+                + nmr_weight * loss_nmr
+                + 0.25 * loss_loudness
+            )
+            grad = torch.autograd.grad(total, x_adv)[0]
+            grad_norm = torch.linalg.vector_norm(grad).clamp_min(1.0e-8)
+            delta = (x_adv.detach() - alpha * grad / grad_norm) - x
+            delta_norm = torch.linalg.vector_norm(delta)
+            if float(delta_norm.detach().cpu()) > eps:
+                delta = delta * (eps / delta_norm)
+
+        processed = torch.clamp(x + delta, -0.98, 0.98).detach().cpu().numpy()
+        processed = _nvidia_fit_samples(processed, target_samples)
+        processed = _nvidia_match_rms(processed, audio)
+        processed = np.nan_to_num(processed, nan=0.0, posinf=0.98, neginf=-0.98)
+
+        source_p95 = float(np.percentile(np.abs(audio), 95)) if audio.size else 0.0
+        processed_p95 = (
+            float(np.percentile(np.abs(processed), 95)) if processed.size else 0.0
+        )
+        source_rms_np = _nvidia_rms(audio)
+        processed_rms_np = _nvidia_rms(processed)
+        p95_ratio = processed_p95 / max(source_p95, 1.0e-8)
+        rms_ratio = processed_rms_np / max(source_rms_np, 1.0e-8)
+        if not (
+            np.isfinite(p95_ratio)
+            and np.isfinite(rms_ratio)
+            and 0.35 <= p95_ratio <= 2.85
+            and 0.5 <= rms_ratio <= 2.0
+        ):
+            logger.warning(
+                "Nvidia precision coat skipped by quality guard: "
+                "p95_ratio=%.3f rms_ratio=%.3f",
+                p95_ratio,
+                rms_ratio,
+            )
+            params["precision_status"] = "skipped_quality_guard"
+            shutil.copyfile(input_path, output_path)
+            return
+
+        sf.write(str(output_path), processed, sr, subtype="PCM_16")
+        params["precision_status"] = "applied"
+    except Exception as exc:
+        logger.warning("Nvidia precision coat skipped after failure: %s", exc)
+        params["precision_status"] = "skipped_error"
+        shutil.copyfile(input_path, output_path)
+
+
+def _run_nvidia_platform_roundtrip(
+    input_path: Path,
+    output_path: Path,
+    params: dict[str, Any],
+    duration_s: float,
+    *,
+    workdir: Path,
+) -> None:
+    codec_chain = params.get("codec_chain", "aac")
+    encoded = workdir / f"nvidia_codec.{ 'opus' if codec_chain == 'opus' else 'm4a' }"
+    if codec_chain == "opus":
+        encode_args = [
+            "-i",
+            str(input_path),
+            "-c:a",
+            "libopus",
+            "-b:a",
+            f"{params['opus_bitrate_k']}k",
+            "-application",
+            "audio",
+            str(encoded),
+        ]
+    else:
+        encode_args = [
+            "-i",
+            str(input_path),
+            "-ar",
+            "44100",
+            "-c:a",
+            "aac",
+            "-b:a",
+            f"{params['aac_bitrate_k']}k",
+            str(encoded),
+        ]
+    _run_ffmpeg(encode_args)
+    _run_ffmpeg(
+        [
+            "-i",
+            str(encoded),
+            "-af",
+            f"apad,atrim=0:{duration_s:.6f}",
+            "-ac",
+            "1",
+            "-ar",
+            str(_NVIDIA_SAMPLE_RATE),
+            "-c:a",
+            "pcm_s16le",
+            str(output_path),
+        ]
+    )
+
+
+def _nvidia_resample_like(audio: Any, source_sr: int, target_sr: int) -> Any:
+    if source_sr == target_sr:
+        return audio
+
+    from math import gcd
+
+    from scipy import signal
+
+    factor = gcd(source_sr, target_sr)
+    return signal.resample_poly(audio, target_sr // factor, source_sr // factor)
+
+
+def _run_nvidia_final_quality_pass(
+    original_path: Path,
+    input_path: Path,
+    output_path: Path,
+    duration_s: float,
+) -> None:
+    import numpy as np
+    import soundfile as sf
+
+    original, original_sr = sf.read(str(original_path), always_2d=True, dtype="float64")
+    processed, processed_sr = sf.read(str(input_path), always_2d=True, dtype="float64")
+
+    original = _nvidia_fit_samples(original, int(round(duration_s * original_sr)))
+    processed = _nvidia_fit_samples(processed, int(round(duration_s * processed_sr)))
+    original = _nvidia_resample_like(original, original_sr, processed_sr)
+    original = _nvidia_fit_samples(original, processed.shape[0])
+
+    source_p95 = float(np.percentile(np.abs(original), 95)) if original.size else 0.0
+    processed_p95 = (
+        float(np.percentile(np.abs(processed), 95)) if processed.size else 0.0
+    )
+    if source_p95 > 1.0e-8 and processed_p95 > 1.0e-8:
+        processed = processed * np.clip(source_p95 / processed_p95, 0.5, 2.0)
+
+    source_rms = _nvidia_rms(original)
+    processed_rms = _nvidia_rms(processed)
+    if source_rms > 1.0e-8 and processed_rms > 1.0e-8:
+        processed = processed * np.clip(source_rms / processed_rms, 0.65, 1.55)
+
+    processed = np.nan_to_num(processed, nan=0.0, posinf=0.98, neginf=-0.98)
+    processed = np.clip(processed, -0.98, 0.98)
+
+    final_p95 = float(np.percentile(np.abs(processed), 95)) if processed.size else 0.0
+    final_rms = _nvidia_rms(processed)
+    p95_ratio = final_p95 / max(source_p95, 1.0e-8)
+    rms_ratio = final_rms / max(source_rms, 1.0e-8)
+    if not (
+        np.isfinite(p95_ratio)
+        and np.isfinite(rms_ratio)
+        and 0.45 <= p95_ratio <= 2.2
+        and 0.55 <= rms_ratio <= 1.9
+    ):
+        raise RuntimeError(
+            "nvidia final quality guard failed: "
+            f"p95_ratio={p95_ratio:.3f} rms_ratio={rms_ratio:.3f}"
+        )
+
+    sf.write(str(output_path), processed, processed_sr, subtype="PCM_16")
+
+
+def _run_nvidia_pipeline(
+    input_path: Path,
+    output_path: Path,
+    params: dict[str, Any],
+    duration_s: float,
+    *,
+    seed: int,
+    workdir: Path,
+) -> None:
+    pitched = workdir / "nvidia_pitch.wav"
+    statistical = workdir / "nvidia_statistical.wav"
+    precision = workdir / "nvidia_precision.wav"
+    transcoded = workdir / "nvidia_transcoded.wav"
+    restored = workdir / "nvidia_restored.wav"
+
+    _run_nvidia_pitch_stage(input_path, pitched, params, duration_s)
+    _run_nvidia_waveform_stage(pitched, statistical, params, duration_s, seed=seed)
+    if params.get("precision_enabled"):
+        _run_nvidia_precision_coat(statistical, precision, params, duration_s)
+        codec_input = precision
+    else:
+        params["precision_status"] = "disabled_quality"
+        codec_input = statistical
+    _run_nvidia_platform_roundtrip(
+        codec_input,
+        transcoded,
+        params,
+        duration_s,
+        workdir=workdir,
+    )
+    _run_nvidia_final_quality_pass(input_path, transcoded, restored, duration_s)
+
+    out_duration = _wav_duration(restored)
+    if abs(out_duration - duration_s) > _DURATION_TOLERANCE_S:
+        raise RuntimeError(
+            f"duration drift: {out_duration:.6f}s vs {duration_s:.6f}s"
+        )
+    shutil.copyfile(restored, output_path)
+
+
 class VoiceDefingerprintService:
     """Applies a duration-preserving ffmpeg chain to TTS WAV audio."""
 
@@ -417,6 +1001,28 @@ class VoiceDefingerprintService:
             src_duration = _wav_duration(input_path)
             with tempfile.TemporaryDirectory() as temp_dir:
                 workdir = Path(temp_dir)
+                if level in {"nvidia", "nvidia_strong_hq"}:
+                    _run_nvidia_pipeline(
+                        input_path,
+                        output_path,
+                        params,
+                        src_duration,
+                        seed=seed,
+                        workdir=workdir,
+                    )
+                    logger.info(
+                        "Voice de-fingerprint applied: level=%s seed=%s params=%s",
+                        level,
+                        seed,
+                        params,
+                    )
+                    return {
+                        "applied": True,
+                        "level": level,
+                        "seed": seed,
+                        "params": params,
+                    }
+
                 dsp_input = input_path
                 if level == "default":
                     geeknik_out = workdir / "geeknik_quality.wav"
