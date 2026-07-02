@@ -17,6 +17,7 @@ _EXPORTS = {
     "DownloaderService": (".downloader", "DownloaderService"),
     "SceneDetectorService": (".scene_detector", "SceneDetectorService"),
     "AnimeMatcherService": (".anime_matcher", "AnimeMatcherService"),
+    "SceneAlignerService": (".scene_aligner", "SceneAlignerService"),
     "AnimeLibraryService": (".anime_library", "AnimeLibraryService"),
     "TranscriberService": (".transcriber", "TranscriberService"),
     "ProcessingService": (".processing", "ProcessingService"),

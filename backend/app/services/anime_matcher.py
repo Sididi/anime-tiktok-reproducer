@@ -935,6 +935,7 @@ class AnimeMatcherService:
         matched_start_ts: float,
         matched_end_ts: float,
         library_type: LibraryType | str,
+        sample_frames_per_boundary: int | None = None,
     ) -> tuple[float, float] | None:
         """Refine (start_ts, end_ts) to native source FPS using argmax cosine.
 
@@ -989,18 +990,19 @@ class AnimeMatcherService:
             # second keyframe seek when the windows are close together.
             cv2 = cls._require_cv2()
             cap = cv2.VideoCapture(str(episode_path))
+            sample_frames = sample_frames_per_boundary or cls.REFINE_MAX_FRAMES_PER_BOUNDARY
             try:
                 start_frames = cls._collect_frames_in_window_from_capture(
                     cap,
                     matched_start_ts - window,
                     matched_start_ts + window,
-                    sample_frames=cls.REFINE_MAX_FRAMES_PER_BOUNDARY,
+                    sample_frames=sample_frames,
                 )
                 end_frames = cls._collect_frames_in_window_from_capture(
                     cap,
                     matched_end_ts - window,
                     matched_end_ts + window,
-                    sample_frames=cls.REFINE_MAX_FRAMES_PER_BOUNDARY,
+                    sample_frames=sample_frames,
                 )
             finally:
                 cap.release()

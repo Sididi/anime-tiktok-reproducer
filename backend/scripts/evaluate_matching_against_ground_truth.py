@@ -21,7 +21,12 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from app.models import MatchList, Scene, SceneList
-from app.services import AnimeLibraryService, AnimeMatcherService, SceneMergerService
+from app.services import (
+    AnimeLibraryService,
+    AnimeMatcherService,
+    SceneAlignerService,
+    SceneMergerService,
+)
 from app.services.project_service import ProjectService
 from app.services.scene_detector import SceneDetectorService
 
@@ -130,6 +135,7 @@ async def _generate(
     min_scene_len: int,
     max_scenes: int | None = None,
     visual_merge_threshold: float | None = None,
+    matcher: str = "legacy",
     verbose: bool = False,
 ) -> GeneratedResult:
     project, gt_scenes, _ = _load_required(project_id)
@@ -202,6 +208,47 @@ async def _generate(
 
     library_path = AnimeLibraryService.get_library_path(project.library_type)
     phase_start = time.perf_counter()
+    if matcher == "aligner":
+        align_diagnostics = None
+        async for progress in SceneAlignerService.align_scenes_progress(
+            video_path,
+            scenes,
+            library_path,
+            project.library_type,
+            anime_name=project.anime_name,
+        ):
+            if verbose and progress.status == "matching":
+                print(f"[{project_id}] aligner: {progress.message}", flush=True)
+            if progress.status == "error":
+                raise RuntimeError(progress.error or "aligner failed")
+            if progress.status == "complete":
+                align_diagnostics = SceneAlignerService.get_last_diagnostics()
+        align_result = SceneAlignerService.get_last_result()
+        if align_result is None:
+            raise RuntimeError("aligner completed without results")
+        final_scenes = align_result.scenes
+        final_matches = align_result.matches
+        _record_phase(
+            phase_timings,
+            "aligner",
+            phase_start,
+            verbose=verbose,
+            project_id=project_id,
+        )
+        matcher_stats = AnimeMatcherService.get_runtime_stats()
+        matcher_stats.update(align_diagnostics.stats() if align_diagnostics else {})
+        recalled, recall_total = _stage3_evidence_recall(project_id)
+        matcher_stats["aligner_stage3_evidence_recall"] = float(recalled)
+        matcher_stats["aligner_stage3_evidence_total"] = float(recall_total)
+        elapsed = time.perf_counter() - start_clock
+        return GeneratedResult(
+            final_scenes,
+            final_matches,
+            elapsed,
+            phase_timings=phase_timings,
+            matcher_stats=matcher_stats,
+        )
+
     first_pass = await _collect_match_result(
         video_path,
         scenes,
@@ -428,6 +475,32 @@ def _candidate_contains(match, gt_match, tolerance: float) -> bool:
             ):
                 return True
     return False
+
+
+def _stage3_evidence_recall(project_id: str, tolerance: float = 0.5) -> tuple[int, int]:
+    """Count GT scenes whose source interval is present in aligner hypotheses."""
+    _, gt_scenes, gt_matches = _load_required(project_id)
+    segments = SceneAlignerService.get_last_diagnostics().segments
+    if not segments:
+        return 0, len(gt_scenes.scenes)
+
+    recalled = 0
+    for gt_scene, gt_match in zip(gt_scenes.scenes, gt_matches.matches, strict=False):
+        center = (gt_scene.start_time + gt_scene.end_time) / 2.0
+        for segment in segments:
+            if segment.episode != gt_match.episode:
+                continue
+            if not (segment.tiktok_start - tolerance <= center <= segment.tiktok_end + tolerance):
+                continue
+            start = segment.source_at(gt_scene.start_time)
+            end = segment.source_at(gt_scene.end_time)
+            if (
+                abs(start - gt_match.start_time) <= tolerance
+                and abs(end - gt_match.end_time) <= tolerance
+            ):
+                recalled += 1
+                break
+    return recalled, len(gt_scenes.scenes)
 
 
 def _validate_strict(
@@ -665,6 +738,7 @@ async def _main() -> int:
     parser.add_argument("--max-wrong-primary", type=int, default=2)
     parser.add_argument("--max-scenes", type=int, default=None)
     parser.add_argument("--visual-merge-threshold", type=float, default=None)
+    parser.add_argument("--matcher", choices=("legacy", "aligner"), default="legacy")
     parser.add_argument("--load-generated-json", type=Path, default=None)
     parser.add_argument("--save-generated-json", type=Path, default=None)
     parser.add_argument("--quiet-profile", action="store_true")
@@ -684,6 +758,7 @@ async def _main() -> int:
                 min_scene_len=args.min_scene_len,
                 max_scenes=args.max_scenes,
                 visual_merge_threshold=args.visual_merge_threshold,
+                matcher=args.matcher,
                 verbose=not args.quiet_profile,
             )
             if args.save_generated_json is not None:
