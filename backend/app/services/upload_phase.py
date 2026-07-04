@@ -455,6 +455,25 @@ class UploadPhaseService:
         }
 
     @classmethod
+    def _vps_platforms(
+        cls,
+        requested_platforms: tuple[str, ...],
+        account: AccountConfig | None,
+        tiktok_payload: dict[str, Any] | None,
+    ) -> list[str]:
+        """Platforms recorded on the VPS job. TikTok is server-published, so it
+        joins the job whenever the account schedules it (slots) or a payload
+        exists — it is never part of the locally-uploaded platforms."""
+        platforms = list(requested_platforms)
+        if "tiktok" in platforms:
+            return platforms
+        if tiktok_payload is not None or (
+            account is not None and account.slots_for("tiktok")
+        ):
+            platforms.append("tiktok")
+        return platforms
+
+    @classmethod
     def _normalize_platforms(cls, platforms: list[str] | None) -> tuple[str, ...]:
         if platforms is None:
             return cls._SUPPORTED_PLATFORMS
@@ -635,15 +654,29 @@ class UploadPhaseService:
                     _, _sched = SchedulingService.find_next_slot_for_platform(account_id, _platform)
                 platform_scheduled_at[_platform] = _sched
 
+        # Build the TikTok payload for the VPS scheduler (server-side publish
+        # via Post for Me at slot_time).
+        tiktok_payload = cls._build_tiktok_payload(account, metadata.tiktok.description)
+
         # Public share the drive video before upload phase.
         emit_progress(0.15, "prepare", "Preparing Drive upload assets...")
         GoogleDriveService.set_public_read(readiness.drive_video_id)
         drive_video_url = readiness.drive_video_web_url or GoogleDriveService.get_web_view_url(readiness.drive_video_id)
         direct_drive_download = GoogleDriveService.get_direct_download_url(readiness.drive_video_id)
 
+        vps_platforms = cls._vps_platforms(requested_platforms, account, tiktok_payload)
         results_by_platform: dict[str, PlatformUploadResult] = dict(
             cls._compute_upfront_skips(requested_platforms, account)
         )
+        if "tiktok" in vps_platforms and tiktok_payload is None:
+            results_by_platform.setdefault(
+                "tiktok",
+                PlatformUploadResult(
+                    platform="tiktok",
+                    status="skipped",
+                    detail="No Post for Me account configured for this account",
+                ),
+            )
         discord_message_id: str | None = None
         instagram_drive_metadata: dict[str, str] = {}
 
@@ -723,8 +756,6 @@ class UploadPhaseService:
                     "poll_timeout_seconds": settings.instagram_publish_timeout_seconds,
                 }
 
-        tiktok_payload = cls._build_tiktok_payload(account, metadata.tiktok.description)
-
         with tempfile.TemporaryDirectory(prefix=f"atr-upload-{project_id}-") as tmp_dir:
             local_video_path = Path(tmp_dir) / (readiness.drive_video_name or "final_video.mp4")
             emit_progress(0.30, "download", "Downloading final video from Drive...")
@@ -798,7 +829,7 @@ class UploadPhaseService:
                     anime_title=project.anime_name or "Unknown",
                     description=metadata.tiktok.description,
                     drive_video_url=direct_drive_download or drive_video_url,
-                    platforms_requested=list(requested_platforms),
+                    platforms_requested=vps_platforms,
                     instagram=ig_payload,
                     tiktok=tiktok_payload,
                     platform_scheduled_at=platform_scheduled_at,

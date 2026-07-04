@@ -59,3 +59,35 @@ def test_no_upfront_skip_with_pfm_id():
         ("tiktok",), _account(AccountTikTokConfig(post_for_me_account_id="spc_1"))
     )
     assert "tiktok" not in skips
+
+
+def test_vps_platforms_appends_tiktok_when_payload_exists():
+    account = _account(AccountTikTokConfig(post_for_me_account_id="spc_1"))
+    payload = {"social_account_id": "spc_1", "caption": "c"}
+    platforms = UploadPhaseService._vps_platforms(
+        ("youtube", "facebook", "instagram"), account, payload
+    )
+    assert platforms == ["youtube", "facebook", "instagram", "tiktok"]
+    assert platforms.count("tiktok") == 1
+
+
+def test_vps_platforms_appends_tiktok_when_account_has_tiktok_slots():
+    account = _account(AccountTikTokConfig(slots=["lundi 18:00"]))
+    platforms = UploadPhaseService._vps_platforms(
+        ("youtube", "facebook", "instagram"), account, None
+    )
+    assert "tiktok" in platforms
+
+
+def test_vps_platforms_no_tiktok_without_block():
+    platforms = UploadPhaseService._vps_platforms(
+        ("youtube", "facebook", "instagram"), _account(None), None
+    )
+    assert "tiktok" not in platforms
+
+
+def test_vps_platforms_no_duplicate_tiktok():
+    account = _account(AccountTikTokConfig(post_for_me_account_id="spc_1"))
+    payload = {"social_account_id": "spc_1", "caption": "c"}
+    platforms = UploadPhaseService._vps_platforms(("tiktok",), account, payload)
+    assert platforms == ["tiktok"]
