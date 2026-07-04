@@ -248,6 +248,39 @@ async def test_dispatch_tiktok_terminal_statuses_are_not_retried(
     assert called is False
 
 
+async def test_dispatch_tiktok_resumes_uploading_after_crash(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
+):
+    """A job left in 'uploading' (process crashed mid-publish) is re-dispatched;
+    the persisted publish_state (post_id set) is the double-post protection."""
+    settings = replace(
+        _settings_for(example_yaml, tmp_server_dir / "avatars"), pfm_api_key="key"
+    )
+    store = JobStore(tmp_path / "jobs.json")
+    discord = AsyncMock()
+    seen = {}
+
+    async def fake_publish(**kwargs):
+        seen.update(kwargs)
+        return TikTokPublishResult(success=True)
+
+    monkeypatch.setattr(
+        "app.services.reminder_scheduler.publish_to_tiktok", fake_publish
+    )
+    job = _tiktok_job()
+    job.tiktok_publish_state = TikTokPublishState(
+        post_id="post_7", stage="post_created"
+    )
+    await store.create(job)
+    await store.merge_platform_status(
+        "p1", "tiktok", PlatformStatus(status="uploading", attempts=1)
+    )
+    await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    assert seen["publish_state"].post_id == "post_7"
+    updated = await store.get("p1")
+    assert updated.platform_statuses["tiktok"].attempts == 2
+
+
 async def test_dispatch_tiktok_passes_publish_state_for_resume(
     tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
 ):

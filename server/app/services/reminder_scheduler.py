@@ -94,7 +94,11 @@ async def _dispatch_tiktok_publish(
         )
         return False
     current = job.platform_statuses.get("tiktok", PlatformStatus(status="pending"))
-    if current.status in ("uploaded", "failed", "skipped", "uploading"):
+    # 'uploading' is NOT terminal: the scheduler loop is sequential, so seeing it
+    # at tick start means the process crashed mid-publish. Re-dispatch; the
+    # persisted tiktok_publish_state (post_id → poll instead of create) is the
+    # double-post protection.
+    if current.status in ("uploaded", "failed", "skipped"):
         return False
 
     next_attempts = current.attempts + 1
