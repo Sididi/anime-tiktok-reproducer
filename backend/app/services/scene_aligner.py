@@ -138,6 +138,15 @@ class _DecodedState:
     emission: float
 
 
+@dataclass(frozen=True)
+class _GroupFit:
+    segment: SegmentHypothesis
+    inlier_count: int
+    residual_sse: float
+    mean_abs_residual: float
+    covered_fragments: frozenset[int]
+
+
 class SceneAlignerService:
     """Dense correspondence, robust segment extraction, and global timeline decode."""
 
@@ -287,7 +296,12 @@ class SceneAlignerService:
         diagnostics.phase_timings["decode"] = time.perf_counter() - started
 
         started = time.perf_counter()
-        final_scenes, remapped = cls._remap_decoded_without_merge(scenes, decoded)
+        final_scenes, remapped = cls._segment_decoded_continuities(
+            video_path,
+            scenes,
+            decoded,
+            correspondences,
+        )
         diagnostics.phase_timings["merge"] = time.perf_counter() - started
 
         started = time.perf_counter()
@@ -1182,26 +1196,410 @@ class SceneAlignerService:
             score -= EPISODE_SWITCH_PENALTY
             return score
         gap = right.source_at(right_scene.start_time) - left.source_at(left_scene.end_time)
-        if gap < 0:
+        index_step = 1.0 / max(AnimeMatcherService.get_index_fps(), 1e-3)
+        if abs(gap) <= CONTINUITY_GRID_STEPS * index_step:
+            score += EPISODE_SWITCH_PENALTY
+        elif gap < 0:
             score -= BACKWARD_JUMP_PENALTY
         return score
 
     @classmethod
-    def _remap_decoded_without_merge(
+    def _segment_decoded_continuities(
+        cls,
+        video_path: Path,
+        scenes: SceneList,
+        decoded: list[SegmentHypothesis | None],
+        correspondences: list[Correspondence],
+    ) -> tuple[SceneList, list[tuple[list[int], SegmentHypothesis | None]]]:
+        by_fragment = cls._correspondences_by_fragment(scenes, correspondences)
+        groups = cls._decoded_fragment_groups(scenes, decoded, by_fragment)
+        final_scenes = SceneList(
+            scenes=[
+                Scene(
+                    index=group_index,
+                    start_time=scenes.scenes[indices[0]].start_time,
+                    end_time=scenes.scenes[indices[-1]].end_time,
+                )
+                for group_index, (indices, _) in enumerate(groups)
+            ]
+        )
+
+        snapped = cls._snap_final_boundaries(video_path, final_scenes)
+        remapped: list[tuple[list[int], SegmentHypothesis | None]] = []
+        for group_index, (indices, fit) in enumerate(groups):
+            scene = snapped.scenes[group_index]
+            if fit is None:
+                remapped.append((indices, None))
+                continue
+            remapped.append(
+                (
+                    indices,
+                    SegmentHypothesis(
+                        id=fit.segment.id,
+                        episode=fit.segment.episode,
+                        tiktok_start=scene.start_time,
+                        tiktok_end=scene.end_time,
+                        a=fit.segment.a,
+                        b=fit.segment.b,
+                        inlier_count=fit.segment.inlier_count,
+                        mean_similarity=fit.segment.mean_similarity,
+                        score=fit.segment.score,
+                        scene_index=scene.index,
+                    ),
+                )
+            )
+        return snapped, remapped
+
+    @classmethod
+    def _correspondences_by_fragment(
+        cls,
+        scenes: SceneList,
+        correspondences: list[Correspondence],
+    ) -> dict[int, list[Correspondence]]:
+        by_fragment: dict[int, list[Correspondence]] = {
+            index: [] for index in range(len(scenes.scenes))
+        }
+        scene_index = 0
+        for corr in sorted(correspondences, key=lambda item: item.t_tiktok):
+            while (
+                scene_index < len(scenes.scenes)
+                and corr.t_tiktok >= scenes.scenes[scene_index].end_time
+            ):
+                scene_index += 1
+            if scene_index >= len(scenes.scenes):
+                break
+            scene = scenes.scenes[scene_index]
+            if scene.start_time <= corr.t_tiktok < scene.end_time:
+                by_fragment[scene_index].append(corr)
+        return by_fragment
+
+    @classmethod
+    def _decoded_fragment_groups(
         cls,
         scenes: SceneList,
         decoded: list[SegmentHypothesis | None],
-    ) -> tuple[SceneList, list[tuple[list[int], SegmentHypothesis | None]]]:
-        copied = SceneList(
-            scenes=[
-                Scene(index=index, start_time=scene.start_time, end_time=scene.end_time)
-                for index, scene in enumerate(scenes.scenes)
-            ]
-        )
-        return copied, [
-            ([index], decoded[index] if index < len(decoded) else None)
-            for index in range(len(copied.scenes))
+        by_fragment: dict[int, list[Correspondence]],
+    ) -> list[tuple[list[int], _GroupFit | None]]:
+        groups: list[tuple[list[int], _GroupFit | None]] = []
+        index = 0
+        while index < len(scenes.scenes):
+            segment = decoded[index] if index < len(decoded) else None
+            if segment is None:
+                groups.append(([index], None))
+                index += 1
+                continue
+
+            current_indices = [index]
+            current_fit = cls._fit_decoded_group(
+                scenes,
+                current_indices,
+                decoded,
+                by_fragment,
+            )
+            cursor = index + 1
+            while cursor < len(scenes.scenes):
+                candidate_indices = [*current_indices, cursor]
+                candidate_fit = cls._fit_decoded_group(
+                    scenes,
+                    candidate_indices,
+                    decoded,
+                    by_fragment,
+                    episode=segment.episode,
+                )
+                if candidate_fit is None:
+                    break
+                if cls._group_has_clear_changepoint(
+                    scenes,
+                    candidate_indices,
+                    decoded,
+                    by_fragment,
+                    candidate_fit,
+                ):
+                    break
+                current_indices = candidate_indices
+                current_fit = candidate_fit
+                cursor += 1
+
+            groups.append((current_indices, current_fit))
+            index = current_indices[-1] + 1
+        return groups
+
+    @classmethod
+    def _fit_decoded_group(
+        cls,
+        scenes: SceneList,
+        indices: list[int],
+        decoded: list[SegmentHypothesis | None],
+        by_fragment: dict[int, list[Correspondence]],
+        episode: str | None = None,
+    ) -> _GroupFit | None:
+        decoded_segments = [
+            decoded[index]
+            for index in indices
+            if index < len(decoded) and decoded[index] is not None
         ]
+        if episode is None and not decoded_segments:
+            return None
+        if episode is None:
+            episode = decoded_segments[0].episode
+        if episode is None:
+            return None
+        decoded_segments = [
+            segment for segment in decoded_segments if segment.episode == episode
+        ]
+
+        group_scene = Scene(
+            index=indices[0],
+            start_time=scenes.scenes[indices[0]].start_time,
+            end_time=scenes.scenes[indices[-1]].end_time,
+        )
+        group_corrs = [
+            corr
+            for index in indices
+            for corr in by_fragment.get(index, [])
+            if corr.episode == episode
+        ]
+        if not group_corrs:
+            return None
+
+        seeds = {(segment.a, segment.b) for segment in decoded_segments}
+        if decoded_segments:
+            first = decoded_segments[0]
+            last = decoded_segments[-1]
+            dt = scenes.scenes[indices[-1]].end_time - scenes.scenes[indices[0]].start_time
+            if dt > 1e-6:
+                source_start = first.source_at(scenes.scenes[indices[0]].start_time)
+                source_end = last.source_at(scenes.scenes[indices[-1]].end_time)
+                speed = (source_end - source_start) / dt
+                if MIN_EVIDENCE_SPEED <= speed <= MAX_EVIDENCE_SPEED:
+                    seeds.add((speed, source_start - speed * scenes.scenes[indices[0]].start_time))
+        if not seeds:
+            best_by_time: dict[float, Correspondence] = {}
+            for corr in group_corrs:
+                key = round(corr.t_tiktok, 3)
+                previous = best_by_time.get(key)
+                if previous is None or corr.similarity > previous.similarity:
+                    best_by_time[key] = corr
+            for corr in best_by_time.values():
+                seeds.add((1.0, corr.t_source - corr.t_tiktok))
+        best_fit: _GroupFit | None = None
+        for speed, offset in cls._dedupe_line_seeds(list(seeds)):
+            segment = cls._refit_line_from_inliers(
+                group_scene,
+                episode,
+                group_corrs,
+                speed,
+                offset,
+            )
+            if segment is None:
+                continue
+            fit = cls._measure_group_fit(segment, scenes, indices, group_corrs)
+            if fit is None:
+                continue
+            if best_fit is None or cls._group_fit_score(fit, len(indices)) > cls._group_fit_score(
+                best_fit,
+                len(indices),
+            ):
+                best_fit = fit
+        return best_fit
+
+    @classmethod
+    def _measure_group_fit(
+        cls,
+        segment: SegmentHypothesis,
+        scenes: SceneList,
+        indices: list[int],
+        correspondences: list[Correspondence],
+    ) -> _GroupFit | None:
+        best_by_time: dict[float, tuple[Correspondence, int]] = {}
+        fragment_by_time: dict[float, int] = {}
+        for fragment_index in indices:
+            scene = scenes.scenes[fragment_index]
+            for corr in correspondences:
+                if not (scene.start_time <= corr.t_tiktok < scene.end_time):
+                    continue
+                residual = abs(corr.t_source - segment.source_at(corr.t_tiktok))
+                if residual > SEGMENT_RESIDUAL_SECONDS:
+                    continue
+                key = round(corr.t_tiktok, 3)
+                previous = best_by_time.get(key)
+                if previous is None or corr.similarity > previous[0].similarity:
+                    best_by_time[key] = (corr, fragment_index)
+                    fragment_by_time[key] = fragment_index
+
+        if len(best_by_time) < MIN_SEGMENT_INLIER_TIMES:
+            return None
+        residuals = np.array(
+            [
+                corr.t_source - segment.source_at(corr.t_tiktok)
+                for corr, _ in best_by_time.values()
+            ],
+            dtype=np.float64,
+        )
+        covered = frozenset(fragment_by_time.values())
+        measured_segment = SegmentHypothesis(
+            id=segment.id,
+            episode=segment.episode,
+            tiktok_start=scenes.scenes[indices[0]].start_time,
+            tiktok_end=scenes.scenes[indices[-1]].end_time,
+            a=segment.a,
+            b=segment.b,
+            inlier_count=len(best_by_time),
+            mean_similarity=segment.mean_similarity,
+            score=segment.score,
+            scene_index=indices[0],
+        )
+        return _GroupFit(
+            segment=measured_segment,
+            inlier_count=len(best_by_time),
+            residual_sse=float(np.sum(residuals * residuals)),
+            mean_abs_residual=float(np.mean(np.abs(residuals))),
+            covered_fragments=covered,
+        )
+
+    @staticmethod
+    def _group_fit_score(fit: _GroupFit, fragment_count: int) -> float:
+        coverage = len(fit.covered_fragments) / max(1, fragment_count)
+        return fit.segment.score + coverage - fit.mean_abs_residual
+
+    @classmethod
+    def _group_has_clear_changepoint(
+        cls,
+        scenes: SceneList,
+        indices: list[int],
+        decoded: list[SegmentHypothesis | None],
+        by_fragment: dict[int, list[Correspondence]],
+        one_fit: _GroupFit,
+    ) -> bool:
+        if len(indices) < 2:
+            return False
+        if len(one_fit.covered_fragments) < max(1, len(indices) - 1):
+            return True
+
+        best_two_bic = math.inf
+        for split_offset in range(1, len(indices)):
+            left_indices = indices[:split_offset]
+            right_indices = indices[split_offset:]
+            left_fit = cls._fit_decoded_group(
+                scenes,
+                left_indices,
+                decoded,
+                by_fragment,
+                episode=one_fit.segment.episode,
+            )
+            right_fit = cls._fit_decoded_group(
+                scenes,
+                right_indices,
+                decoded,
+                by_fragment,
+                episode=one_fit.segment.episode,
+            )
+            if left_fit is None or right_fit is None:
+                continue
+            n = left_fit.inlier_count + right_fit.inlier_count
+            if n < 4:
+                continue
+            sse = left_fit.residual_sse + right_fit.residual_sse
+            best_two_bic = min(best_two_bic, cls._bic(sse, n, parameter_count=4))
+        if not math.isfinite(best_two_bic):
+            return False
+        one_bic = cls._bic(one_fit.residual_sse, one_fit.inlier_count, parameter_count=2)
+        return best_two_bic < one_bic
+
+    @staticmethod
+    def _bic(sse: float, sample_count: int, *, parameter_count: int) -> float:
+        n = max(1, sample_count)
+        variance = max(sse / n, 1e-6)
+        return n * math.log(variance) + parameter_count * math.log(n)
+
+    @classmethod
+    def _snap_final_boundaries(cls, video_path: Path, scenes: SceneList) -> SceneList:
+        try:
+            from .scene_merger import SceneMergerService
+
+            diff_times, diffs = SceneMergerService._video_frame_diffs(video_path)
+            moves = cls._visual_boundary_snap_candidates(
+                scenes,
+                diff_times,
+                diffs,
+            )
+        except Exception:
+            return scenes
+        if not moves:
+            return scenes
+
+        snapped = scenes.model_copy(deep=True)
+        duration_floor = SceneMergerService.DENSE_VISUAL_SNAP_MIN_SCENE_DURATION
+        for index, boundary in sorted(moves.items()):
+            if index < 0 or index + 1 >= len(snapped.scenes):
+                continue
+            left_scene = snapped.scenes[index]
+            right_scene = snapped.scenes[index + 1]
+            if (
+                boundary - left_scene.start_time < duration_floor
+                or right_scene.end_time - boundary < duration_floor
+            ):
+                continue
+            left_scene.end_time = boundary
+            right_scene.start_time = boundary
+        snapped.renumber()
+        if not snapped.validate_continuity():
+            return scenes
+        return snapped
+
+    @staticmethod
+    def _visual_boundary_snap_candidates(
+        scenes: SceneList,
+        diff_times: list[float],
+        diffs: list[float],
+    ) -> dict[int, float]:
+        from bisect import bisect_right
+
+        from .scene_merger import SceneMergerService
+
+        if len(diff_times) != len(diffs) or len(scenes.scenes) < 2:
+            return {}
+
+        moves: dict[int, float] = {}
+        window = SceneMergerService.DENSE_VISUAL_SNAP_WINDOW
+        diff_floor = SceneMergerService.DENSE_VISUAL_SNAP_MIN_DIFF
+        ratio_floor = SceneMergerService.DENSE_VISUAL_SNAP_MIN_RATIO
+        move_floor = SceneMergerService.DENSE_VISUAL_SNAP_MIN_MOVE
+        duration_floor = SceneMergerService.DENSE_VISUAL_SNAP_MIN_SCENE_DURATION
+
+        for index in range(len(scenes.scenes) - 1):
+            left_scene = scenes.scenes[index]
+            right_scene = scenes.scenes[index + 1]
+            current_boundary = left_scene.end_time
+            lower_bound = max(current_boundary - window, left_scene.start_time + duration_floor)
+            upper_bound = min(current_boundary + window, right_scene.end_time - duration_floor)
+            if lower_bound >= upper_bound:
+                continue
+
+            start_idx = bisect_right(diff_times, lower_bound)
+            end_idx = bisect_right(diff_times, upper_bound)
+            if start_idx >= end_idx:
+                continue
+
+            best_idx = max(range(start_idx, end_idx), key=lambda idx: diffs[idx])
+            best_diff = diffs[best_idx]
+            if best_diff < diff_floor:
+                continue
+
+            current_diff = SceneMergerService._closest_diff_at_time(
+                diff_times,
+                diffs,
+                current_boundary,
+            )
+            if current_diff > 0 and best_diff < current_diff * ratio_floor:
+                continue
+
+            best_time = diff_times[best_idx]
+            if abs(best_time - current_boundary) < move_floor:
+                continue
+            moves[index] = round(best_time, 3)
+
+        return moves
 
     @classmethod
     def _merge_decoded_continuities(
