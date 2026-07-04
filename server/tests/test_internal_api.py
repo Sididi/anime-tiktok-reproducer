@@ -340,3 +340,77 @@ def test_create_job_without_instagram_field_persists_none(
     job = asyncio.run(app.state.job_store.get("p1"))
     assert job is not None
     assert job.instagram_payload is None
+
+
+def test_create_job_stores_tiktok_payload(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    discord.post_message.return_value = "msg_embed"
+
+    tiktok = {
+        "social_account_id": "spc_1",
+        "caption": "cap",
+        "privacy_status": "public",
+        "allow_comment": True,
+        "allow_duet": True,
+        "allow_stitch": False,
+    }
+    payload = {**JOB_PAYLOAD, "tiktok": tiktok}
+    with TestClient(app) as client:
+        r = client.post("/api/internal/jobs", json=payload, headers=INTERNAL_AUTH)
+    assert r.status_code == 200
+
+    job = asyncio.run(app.state.job_store.get("p1"))
+    assert job is not None
+    assert job.tiktok_payload == tiktok
+
+
+def test_update_job_replaces_tiktok_payload_and_resets_state(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    from app.models.job import TikTokPublishState  # noqa: PLC0415
+
+    app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    discord.post_message.return_value = "msg_embed"
+
+    payload = {
+        **JOB_PAYLOAD,
+        "tiktok": {"social_account_id": "spc_1", "caption": "a"},
+    }
+    with TestClient(app) as client:
+        first = client.post("/api/internal/jobs", json=payload, headers=INTERNAL_AUTH)
+        assert first.status_code == 200
+
+        asyncio.run(
+            app.state.job_store.set_tiktok_publish_state(
+                "p1", TikTokPublishState(post_id="stale", stage="published")
+            )
+        )
+
+        changed = {
+            **payload,
+            "tiktok": {"social_account_id": "spc_1", "caption": "b"},
+        }
+        second = client.post("/api/internal/jobs", json=changed, headers=INTERNAL_AUTH)
+    assert second.status_code == 200
+
+    job = asyncio.run(app.state.job_store.get("p1"))
+    assert job is not None
+    assert job.tiktok_payload["caption"] == "b"
+    assert job.tiktok_publish_state is None
+
+
+def test_create_job_without_tiktok_payload_is_allowed(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    discord.post_message.return_value = "msg_embed"
+
+    with TestClient(app) as client:
+        r = client.post("/api/internal/jobs", json=JOB_PAYLOAD, headers=INTERNAL_AUTH)
+    assert r.status_code == 200
+
+    job = asyncio.run(app.state.job_store.get("p1"))
+    assert job is not None
+    assert job.tiktok_payload is None

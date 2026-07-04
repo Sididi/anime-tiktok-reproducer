@@ -33,6 +33,15 @@ class InstagramPayload(BaseModel):
     thumb_offset: int | None = None
 
 
+class TikTokPayload(BaseModel):
+    social_account_id: str
+    caption: str
+    privacy_status: str = "public"
+    allow_comment: bool = True
+    allow_duet: bool = True
+    allow_stitch: bool = True
+
+
 class InitialPlatformStatus(BaseModel):
     status: Literal["pending", "uploading", "uploaded", "skipped", "failed"]
     url: str | None = None
@@ -50,6 +59,7 @@ class CreateJobRequest(BaseModel):
     platforms_requested: list[str]
     platform_statuses: dict[str, InitialPlatformStatus] | None = None
     instagram: InstagramPayload | None = None
+    tiktok: TikTokPayload | None = None
 
 
 class CreateJobResponse(BaseModel):
@@ -106,7 +116,16 @@ def _instagram_payload(req: CreateJobRequest) -> dict | None:
     return req.instagram.model_dump(exclude_none=True) if req.instagram else None
 
 
-def _job_payload_changed(job: Job, req: CreateJobRequest, instagram_payload: dict | None) -> bool:
+def _tiktok_payload(req: CreateJobRequest) -> dict | None:
+    return req.tiktok.model_dump() if req.tiktok else None
+
+
+def _job_payload_changed(
+    job: Job,
+    req: CreateJobRequest,
+    instagram_payload: dict | None,
+    tiktok_payload: dict | None,
+) -> bool:
     return (
         job.account_id != req.account_id
         or job.slot_time != req.slot_time
@@ -116,6 +135,7 @@ def _job_payload_changed(job: Job, req: CreateJobRequest, instagram_payload: dic
         or job.drive_video_url != req.drive_video_url
         or job.platforms_requested != list(req.platforms_requested)
         or job.instagram_payload != instagram_payload
+        or job.tiktok_payload != tiktok_payload
     )
 
 
@@ -131,9 +151,10 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
 
     existing = await store.get(req.project_id)
     instagram_payload = _instagram_payload(req)
+    tiktok_payload = _tiktok_payload(req)
     platform_statuses = _initial_platform_statuses(req)
     if existing is not None:
-        if not _job_payload_changed(existing, req, instagram_payload):
+        if not _job_payload_changed(existing, req, instagram_payload, tiktok_payload):
             return CreateJobResponse(
                 job_id=existing.job_id, discord_message_id=existing.discord_message_id
             )
@@ -151,6 +172,8 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
             platform_statuses=platform_statuses,
             instagram_payload=instagram_payload,
             instagram_publish_state=None,
+            tiktok_payload=tiktok_payload,
+            tiktok_publish_state=None,
         )
         if updated.discord_message_id:
             try:
@@ -183,6 +206,7 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
         reminder_message_id=None,
         reminder_forward_message_id=None,
         instagram_payload=instagram_payload,
+        tiktok_payload=tiktok_payload,
         created_at=now,
         updated_at=now,
     )
