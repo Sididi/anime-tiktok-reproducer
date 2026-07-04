@@ -38,6 +38,8 @@ class Settings:
     discord: DiscordConfig
     avatars_dir: Path
     data_dir: Path
+    pfm_api_key: str | None = None
+    pfm_base_url: str = "https://api.postforme.dev/v1"
 
     @classmethod
     def load(
@@ -59,7 +61,7 @@ class Settings:
                 id=aid,
                 name=str(a["name"]),
                 language=str(a["language"]),
-                device=str(a["device"]),
+                device=str(a.get("device") or ""),
                 avatar=str(a["avatar"]),
             )
             if not (avatars_dir / account.avatar).is_file():
@@ -87,4 +89,8 @@ class Settings:
             ),
             avatars_dir=avatars_dir,
             data_dir=data_dir or config_path.parent / "data",
+            pfm_api_key=os.environ.get("ATR_PFM_API_KEY") or None,
+            pfm_base_url=os.environ.get(
+                "ATR_PFM_BASE_URL", "https://api.postforme.dev/v1"
+            ),
         )

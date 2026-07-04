@@ -39,3 +39,47 @@ def test_missing_config_file_raises(tmp_server_dir: Path, example_env):
     missing = tmp_server_dir / "does-not-exist.yaml"
     with pytest.raises(ConfigError, match="not found"):
         Settings.load(config_path=missing, avatars_dir=tmp_server_dir / "avatars")
+
+
+def test_pfm_settings_default_and_env(
+    tmp_server_dir: Path, example_avatar: Path, example_env, monkeypatch: pytest.MonkeyPatch
+):
+    config = tmp_server_dir / "config.yaml"
+    config.write_text(
+        "accounts:\n"
+        "  anime_fr:\n"
+        "    name: Anime FR\n"
+        "    language: fr\n"
+        "    device: iphone_16\n"
+        "    avatar: anime_fr.jpg\n"
+    )
+    settings = Settings.load(
+        config_path=config, avatars_dir=tmp_server_dir / "avatars"
+    )
+    assert settings.pfm_api_key is None
+    assert settings.pfm_base_url == "https://api.postforme.dev/v1"
+
+    monkeypatch.setenv("ATR_PFM_API_KEY", "pfm_test_key")
+    monkeypatch.setenv("ATR_PFM_BASE_URL", "http://localhost:9999/v1")
+    settings = Settings.load(
+        config_path=config, avatars_dir=tmp_server_dir / "avatars"
+    )
+    assert settings.pfm_api_key == "pfm_test_key"
+    assert settings.pfm_base_url == "http://localhost:9999/v1"
+
+
+def test_account_device_is_optional(
+    tmp_server_dir: Path, example_avatar: Path, example_env
+):
+    config = tmp_server_dir / "config.yaml"
+    config.write_text(
+        "accounts:\n"
+        "  anime_fr:\n"
+        "    name: Anime FR\n"
+        "    language: fr\n"
+        "    avatar: anime_fr.jpg\n"
+    )
+    settings = Settings.load(
+        config_path=config, avatars_dir=tmp_server_dir / "avatars"
+    )
+    assert settings.accounts["anime_fr"].device == ""
