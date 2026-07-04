@@ -59,7 +59,6 @@ class ScriptAutomationService:
     TTS_MIN = 500
     TTS_SOFT_MAX = 750
     TTS_HARD_MAX = 800
-    V3_CONTROL_PREFIX = "[speedy]"
 
     @classmethod
     def _event(
@@ -1005,7 +1004,6 @@ class ScriptAutomationService:
                         if v3_seed is None:
                             v3_seed = secrets.randbits(32)
                         seed = v3_seed
-                        outgoing_text = f"{cls.V3_CONTROL_PREFIX} {chunk}"
                     elif previous_request_id:
                         previous_request_ids = [previous_request_id]
 
