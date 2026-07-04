@@ -3,9 +3,8 @@
 Polls every `interval` seconds; for each job, iterates `platforms_requested`
 and runs due per-platform actions:
 
-- tiktok    → post reminder (rich embed + forward) in the reminder channel.
-              Skipped if `reminder_message_id` is already set or
-              `reminder_cancelled` is True (operator reacted before slot).
+- tiktok    → publish the video via Post for Me (managed TikTok API).
+              Retries like Instagram; after 5 attempts give up + ping.
 - instagram → call Instagram Graph API to publish the Reel. On success,
               update the embed. On failure, increment attempts; after
               5 attempts give up + ping the reminder channel.
@@ -22,15 +21,21 @@ import logging
 from datetime import UTC, datetime
 
 from app.config import Settings
-from app.models.job import InstagramPublishState, Job, PlatformStatus
+from app.models.job import (
+    InstagramPublishState,
+    Job,
+    PlatformStatus,
+    TikTokPublishState,
+)
 from app.services.embed_builder import build_embed
 from app.services.instagram_publisher import publish_to_instagram
 from app.services.job_store import JobStore
-from app.services.reminder_service import post_reminder
+from app.services.post_for_me_publisher import TikTokPublishResult, publish_to_tiktok
 
 logger = logging.getLogger(__name__)
 
 _IG_MAX_ATTEMPTS = 5
+_TT_MAX_ATTEMPTS = 5
 _IG_DEFAULT_POLL_INTERVAL_SECONDS = 60.0
 _IG_DEFAULT_POLL_TIMEOUT_SECONDS = 4 * 60 * 60.0
 _LEGACY_IG_CONTAINER_ERROR = "container status_code = ERROR"
@@ -57,7 +62,7 @@ async def dispatch_due_actions(
             if _platform_due_time(job, platform) > current:
                 continue
             if platform == "tiktok":
-                if await _dispatch_tiktok_reminder(job, store, settings, discord):
+                if await _dispatch_tiktok_publish(job, store, settings, discord):
                     actions += 1
             elif platform == "instagram" and await _dispatch_instagram_publish(
                 job, store, settings, discord
@@ -78,49 +83,103 @@ def _normalize_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
-async def _dispatch_tiktok_reminder(
+async def _dispatch_tiktok_publish(
     job: Job, store: JobStore, settings: Settings, discord
 ) -> bool:
-    if job.reminder_cancelled:
-        return False
-    if job.reminder_message_id is not None:
-        return False
-    # Don't post if tiktok platform is already uploaded (e.g. operator reacted)
-    tt = job.platform_statuses.get("tiktok", PlatformStatus(status="pending"))
-    if tt.status != "pending":
-        return False
-    account = settings.accounts.get(job.account_id)
-    if account is None:
+    payload = job.tiktok_payload
+    if not payload:
         logger.warning(
-            "Job %s references unknown account %s; skipping TikTok reminder",
+            "Job %s has 'tiktok' in platforms_requested but no tiktok_payload",
             job.project_id,
-            job.account_id,
         )
         return False
-    rich_id, forward_id = await post_reminder(
-        discord,
-        job=job,
-        account=account,
-        public_base_url=settings.public_base_url,
-        upload_channel_id=settings.discord.upload_channel_id,
-        reminder_channel_id=settings.discord.reminder_channel_id,
-        role_id=settings.discord.reminder_role_id,
-        guild_id=settings.discord.guild_id,
-    )
-    if rich_id is None:
+    current = job.platform_statuses.get("tiktok", PlatformStatus(status="pending"))
+    if current.status in ("uploaded", "failed", "skipped", "uploading"):
         return False
-    await store.update(
-        job.project_id,
-        reminder_message_id=rich_id,
-        reminder_forward_message_id=forward_id,
+
+    next_attempts = current.attempts + 1
+    # merge_platform_status is atomic under the store lock (see the Instagram
+    # dispatcher for the rationale).
+    await store.merge_platform_status(
+        job.project_id, "tiktok",
+        PlatformStatus(status="uploading", attempts=next_attempts),
     )
-    logger.info(
-        "TikTok reminder dispatched for %s (rich=%s forward=%s)",
-        job.project_id,
-        rich_id,
-        forward_id,
-    )
-    return True
+
+    async def persist_tiktok_state(state: TikTokPublishState) -> None:
+        await store.set_tiktok_publish_state(job.project_id, state)
+
+    if not settings.pfm_api_key:
+        result = TikTokPublishResult(
+            success=False, detail="ATR_PFM_API_KEY is not configured"
+        )
+    else:
+        result = await publish_to_tiktok(
+            api_key=settings.pfm_api_key,
+            base_url=settings.pfm_base_url,
+            social_account_id=payload["social_account_id"],
+            caption=payload["caption"],
+            download_url=job.drive_video_url,
+            privacy_status=payload.get("privacy_status", "public"),
+            allow_comment=bool(payload.get("allow_comment", True)),
+            allow_duet=bool(payload.get("allow_duet", True)),
+            allow_stitch=bool(payload.get("allow_stitch", True)),
+            publish_state=job.tiktok_publish_state,
+            progress_callback=persist_tiktok_state,
+            temp_dir=settings.data_dir / "tmp" / "tiktok",
+        )
+    if result.publish_state is not None:
+        await store.set_tiktok_publish_state(job.project_id, result.publish_state)
+
+    now = datetime.now(tz=UTC)
+    if result.success:
+        await store.merge_platform_status(
+            job.project_id, "tiktok",
+            PlatformStatus(
+                status="uploaded",
+                url=result.url,
+                attempts=next_attempts,
+                completed_at=now,
+            ),
+        )
+        await _rerender_embed(job.project_id, store, settings, discord)
+        logger.info(
+            "TikTok publish succeeded for %s (url=%s)", job.project_id, result.url
+        )
+        return True
+
+    if next_attempts >= _TT_MAX_ATTEMPTS:
+        await store.merge_platform_status(
+            job.project_id, "tiktok",
+            PlatformStatus(
+                status="failed",
+                detail=result.detail,
+                attempts=next_attempts,
+                completed_at=now,
+            ),
+        )
+        await _rerender_embed(job.project_id, store, settings, discord)
+        await _post_failure_ping(
+            job, settings, discord, result.detail or "publish failed",
+            platform_label="TikTok",
+        )
+        logger.warning(
+            "TikTok publish failed for %s after %d attempts: %s",
+            job.project_id, next_attempts, result.detail,
+        )
+    else:
+        await store.merge_platform_status(
+            job.project_id, "tiktok",
+            PlatformStatus(
+                status="pending",
+                detail=result.detail,
+                attempts=next_attempts,
+            ),
+        )
+        logger.info(
+            "TikTok publish attempt %d/%d failed for %s: %s — will retry next tick",
+            next_attempts, _TT_MAX_ATTEMPTS, job.project_id, result.detail,
+        )
+    return False
 
 
 async def _dispatch_instagram_publish(
@@ -220,7 +279,10 @@ async def _dispatch_instagram_publish(
             ),
         )
         await _rerender_embed(job.project_id, store, settings, discord)
-        await _post_failure_ping(job, settings, discord, result.detail or "publish failed")
+        await _post_failure_ping(
+            job, settings, discord, result.detail or "publish failed",
+            platform_label="Instagram",
+        )
         logger.warning(
             "Instagram publish failed for %s after %d attempts: %s",
             job.project_id, next_attempts, result.detail,
@@ -243,17 +305,17 @@ async def _dispatch_instagram_publish(
 
 
 async def _post_failure_ping(
-    job: Job, settings: Settings, discord, detail: str
+    job: Job, settings: Settings, discord, detail: str, *, platform_label: str
 ) -> None:
     role = settings.discord.reminder_role_id
     msg = (
-        f"<@&{role}> Instagram publish failed for **{job.anime_title}** "
+        f"<@&{role}> {platform_label} publish failed for **{job.anime_title}** "
         f"({job.account_id}): {detail}"
     )
     try:
         await discord.post_message(settings.discord.reminder_channel_id, content=msg)
     except Exception:
-        logger.exception("Failed to post Instagram failure ping")
+        logger.exception("Failed to post %s failure ping", platform_label)
 
 
 def _instagram_video_url(job: Job, settings: Settings) -> str:

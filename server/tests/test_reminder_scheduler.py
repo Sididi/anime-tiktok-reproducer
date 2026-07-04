@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -9,8 +10,14 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from app.config import Settings
-from app.models.job import InstagramPublishState, Job, PlatformStatus
+from app.models.job import (
+    InstagramPublishState,
+    Job,
+    PlatformStatus,
+    TikTokPublishState,
+)
 from app.services.job_store import JobStore
+from app.services.post_for_me_publisher import TikTokPublishResult
 from app.services.reminder_scheduler import (
     dispatch_due_actions,
     run_scheduler_loop,
@@ -63,67 +70,6 @@ async def test_dispatch_skips_jobs_not_yet_due(
     discord.post_message.assert_not_called()
 
 
-async def test_dispatch_fires_due_jobs_and_marks_them(
-    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path
-):
-    settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
-    store = JobStore(tmp_path / "jobs.json")
-    past = datetime.now(tz=UTC) - timedelta(minutes=5)
-    await store.create(_make_job(slot_time=past))
-
-    discord = AsyncMock()
-    discord.post_message.side_effect = ["m_rich", "m_forward"]
-
-    posted = await dispatch_due_actions(store=store, settings=settings, discord=discord)
-
-    assert posted == 1
-    refreshed = await store.get("p1")
-    assert refreshed is not None
-    assert refreshed.reminder_message_id == "m_rich"
-    assert refreshed.reminder_forward_message_id == "m_forward"
-
-
-async def test_dispatch_skips_already_reminded_jobs(
-    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path
-):
-    settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
-    store = JobStore(tmp_path / "jobs.json")
-    past = datetime.now(tz=UTC) - timedelta(hours=1)
-    await store.create(_make_job(slot_time=past, reminder_message_id="already_sent"))
-
-    discord = AsyncMock()
-    posted = await dispatch_due_actions(store=store, settings=settings, discord=discord)
-
-    assert posted == 0
-    discord.post_message.assert_not_called()
-
-
-async def test_dispatch_retries_on_next_tick_when_post_fails(
-    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path
-):
-    """If the rich message post returns None, reminder_message_id stays None
-    and the next tick re-attempts."""
-    settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
-    store = JobStore(tmp_path / "jobs.json")
-    past = datetime.now(tz=UTC) - timedelta(minutes=5)
-    await store.create(_make_job(slot_time=past))
-
-    discord = AsyncMock()
-    # First tick: rich-post raises, reminder_service swallows -> rich_id is None
-    # so the scheduler doesn't update the store.
-    discord.post_message.side_effect = Exception("Discord 5xx")
-
-    posted = await dispatch_due_actions(store=store, settings=settings, discord=discord)
-    assert posted == 0
-    assert (await store.get("p1")).reminder_message_id is None
-
-    # Second tick: success.
-    discord.post_message.side_effect = ["m_rich", "m_forward"]
-    posted2 = await dispatch_due_actions(store=store, settings=settings, discord=discord)
-    assert posted2 == 1
-    assert (await store.get("p1")).reminder_message_id == "m_rich"
-
-
 async def test_run_scheduler_loop_stops_on_event(
     tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path
 ):
@@ -146,6 +92,186 @@ async def test_run_scheduler_loop_stops_on_event(
     await asyncio.wait_for(task, timeout=1.0)
     # Loop exited cleanly via stop_event.
     assert task.done()
+
+
+# ---------------------------------------------------------------------------
+# TikTok publish dispatch tests
+# ---------------------------------------------------------------------------
+
+def _tiktok_job(project_id="p1", *, slot_offset_minutes=-1, payload=True, **overrides):
+    """Build a due-by-default TikTok job."""
+    job = _make_job(
+        project_id=project_id,
+        slot_time=datetime.now(tz=UTC) + timedelta(minutes=slot_offset_minutes),
+    )
+    if payload:
+        job.tiktok_payload = {
+            "social_account_id": "spc_1",
+            "caption": "cap",
+            "privacy_status": "public",
+            "allow_comment": True,
+            "allow_duet": True,
+            "allow_stitch": True,
+        }
+    for key, value in overrides.items():
+        setattr(job, key, value)
+    return job
+
+
+async def test_dispatch_tiktok_happy_path(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
+):
+    settings = replace(
+        _settings_for(example_yaml, tmp_server_dir / "avatars"), pfm_api_key="key"
+    )
+    store = JobStore(tmp_path / "jobs.json")
+    discord = AsyncMock()
+    calls = {}
+
+    async def fake_publish(**kwargs):
+        calls.update(kwargs)
+        return TikTokPublishResult(
+            success=True,
+            url="https://tiktok.com/@a/video/1",
+            publish_state=TikTokPublishState(post_id="post_1", stage="published"),
+        )
+
+    monkeypatch.setattr(
+        "app.services.reminder_scheduler.publish_to_tiktok", fake_publish
+    )
+    await store.create(_tiktok_job())
+    actions = await dispatch_due_actions(
+        store=store, settings=settings, discord=discord
+    )
+    assert actions == 1
+    job = await store.get("p1")
+    assert job.platform_statuses["tiktok"].status == "uploaded"
+    assert job.platform_statuses["tiktok"].url == "https://tiktok.com/@a/video/1"
+    assert job.tiktok_publish_state.stage == "published"
+    assert calls["social_account_id"] == "spc_1"
+    assert calls["caption"] == "cap"
+    assert calls["download_url"] == job.drive_video_url
+
+
+async def test_dispatch_tiktok_missing_payload_skips(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
+    store = JobStore(tmp_path / "jobs.json")
+    discord = AsyncMock()
+    await store.create(_tiktok_job(payload=False))
+    actions = await dispatch_due_actions(
+        store=store, settings=settings, discord=discord
+    )
+    assert actions == 0
+    job = await store.get("p1")
+    assert (
+        job.platform_statuses.get("tiktok", PlatformStatus(status="pending")).status
+        == "pending"
+    )
+
+
+async def test_dispatch_tiktok_missing_api_key_counts_attempt(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    settings = replace(
+        _settings_for(example_yaml, tmp_server_dir / "avatars"), pfm_api_key=None
+    )
+    store = JobStore(tmp_path / "jobs.json")
+    discord = AsyncMock()
+    await store.create(_tiktok_job())
+    await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    job = await store.get("p1")
+    tt = job.platform_statuses["tiktok"]
+    assert tt.status == "pending"          # retried next tick
+    assert tt.attempts == 1
+    assert "ATR_PFM_API_KEY" in tt.detail
+
+
+async def test_dispatch_tiktok_fails_after_max_attempts_and_pings(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
+):
+    settings = replace(
+        _settings_for(example_yaml, tmp_server_dir / "avatars"), pfm_api_key="key"
+    )
+    store = JobStore(tmp_path / "jobs.json")
+    discord = AsyncMock()
+
+    async def fake_publish(**kwargs):
+        return TikTokPublishResult(success=False, detail="result: tiktok rejected")
+
+    monkeypatch.setattr(
+        "app.services.reminder_scheduler.publish_to_tiktok", fake_publish
+    )
+    await store.create(_tiktok_job())
+    await store.merge_platform_status(
+        "p1", "tiktok", PlatformStatus(status="pending", attempts=4)
+    )
+    await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    updated = await store.get("p1")
+    assert updated.platform_statuses["tiktok"].status == "failed"
+    assert updated.platform_statuses["tiktok"].attempts == 5
+    # a failure ping mentioning TikTok was posted to the alerts channel
+    contents = [
+        str(kwargs.get("content") or (args[1] if len(args) > 1 else ""))
+        for args, kwargs in discord.post_message.call_args_list
+    ]
+    assert any("TikTok" in c for c in contents)
+
+
+async def test_dispatch_tiktok_terminal_statuses_are_not_retried(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
+):
+    settings = replace(
+        _settings_for(example_yaml, tmp_server_dir / "avatars"), pfm_api_key="key"
+    )
+    store = JobStore(tmp_path / "jobs.json")
+    discord = AsyncMock()
+    called = False
+
+    async def fake_publish(**kwargs):
+        nonlocal called
+        called = True
+        return TikTokPublishResult(success=True)
+
+    monkeypatch.setattr(
+        "app.services.reminder_scheduler.publish_to_tiktok", fake_publish
+    )
+    await store.create(_tiktok_job())
+    await store.merge_platform_status(
+        "p1", "tiktok", PlatformStatus(status="uploaded")
+    )
+    actions = await dispatch_due_actions(
+        store=store, settings=settings, discord=discord
+    )
+    assert actions == 0
+    assert called is False
+
+
+async def test_dispatch_tiktok_passes_publish_state_for_resume(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
+):
+    settings = replace(
+        _settings_for(example_yaml, tmp_server_dir / "avatars"), pfm_api_key="key"
+    )
+    store = JobStore(tmp_path / "jobs.json")
+    discord = AsyncMock()
+    seen = {}
+
+    async def fake_publish(**kwargs):
+        seen.update(kwargs)
+        return TikTokPublishResult(success=True)
+
+    monkeypatch.setattr(
+        "app.services.reminder_scheduler.publish_to_tiktok", fake_publish
+    )
+    job = _tiktok_job()
+    job.tiktok_publish_state = TikTokPublishState(
+        post_id="post_7", stage="post_created"
+    )
+    await store.create(job)
+    await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    assert seen["publish_state"].post_id == "post_7"
 
 
 # ---------------------------------------------------------------------------
