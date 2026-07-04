@@ -110,6 +110,7 @@ class DiscordService:
         drive_video_url: str,
         platforms_requested: list[str],
         instagram: dict | None = None,
+        tiktok: dict | None = None,
         platform_scheduled_at: dict[str, datetime] | None = None,
         platform_statuses: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
@@ -124,6 +125,8 @@ class DiscordService:
         }
         if instagram is not None:
             body["instagram"] = instagram
+        if tiktok is not None:
+            body["tiktok"] = tiktok
         if platform_scheduled_at is not None:
             body["platform_scheduled_at"] = {
                 platform: scheduled_at.isoformat()

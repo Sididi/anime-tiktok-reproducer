@@ -169,6 +169,50 @@ def test_create_job_with_instagram_payload():
 
 
 @respx.mock
+def test_create_job_forwards_tiktok_payload():
+    route = respx.post("https://tiktok.sididi.tv/api/internal/jobs").mock(
+        return_value=httpx.Response(200, json={"job_id": "j_x", "discord_message_id": "m_1"})
+    )
+    DiscordService.create_job(
+        project_id="p1",
+        account_id="anime_fr",
+        slot_time=datetime(2026, 4, 27, 21, 0, tzinfo=timezone.utc),
+        anime_title="Title",
+        description="Desc",
+        drive_video_url="https://drive/x",
+        platforms_requested=["tiktok"],
+        tiktok={"social_account_id": "spc_1", "caption": "c"},
+    )
+    assert route.called
+    import json
+
+    sent_body = json.loads(route.calls.last.request.content)
+    assert sent_body["tiktok"] == {"social_account_id": "spc_1", "caption": "c"}
+
+
+@respx.mock
+def test_create_job_omits_tiktok_key_when_none():
+    route = respx.post("https://tiktok.sididi.tv/api/internal/jobs").mock(
+        return_value=httpx.Response(200, json={"job_id": "j_x", "discord_message_id": "m_1"})
+    )
+    DiscordService.create_job(
+        project_id="p1",
+        account_id="anime_fr",
+        slot_time=datetime(2026, 4, 27, 21, 0, tzinfo=timezone.utc),
+        anime_title="Title",
+        description="Desc",
+        drive_video_url="https://drive/x",
+        platforms_requested=["youtube"],
+        tiktok=None,
+    )
+    assert route.called
+    import json
+
+    sent_body = json.loads(route.calls.last.request.content)
+    assert "tiktok" not in sent_body
+
+
+@respx.mock
 def test_create_job_sends_platform_scheduled_at():
     route = respx.post("https://tiktok.sididi.tv/api/internal/jobs").mock(
         return_value=httpx.Response(200, json={"job_id": "j_x", "discord_message_id": "m_1"})

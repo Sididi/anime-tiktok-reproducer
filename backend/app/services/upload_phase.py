@@ -421,6 +421,12 @@ class UploadPhaseService:
             elif platform == "instagram":
                 if account is not None and account.meta is None:
                     reason = default_detail
+            elif platform == "tiktok":
+                if account is not None and (
+                    account.tiktok is None
+                    or not account.tiktok.post_for_me_account_id
+                ):
+                    reason = "No Post for Me account configured for this account"
             if reason is not None:
                 skips[platform] = PlatformUploadResult(
                     platform=platform,
@@ -428,6 +434,25 @@ class UploadPhaseService:
                     detail=reason,
                 )
         return skips
+
+    @classmethod
+    def _build_tiktok_payload(
+        cls, account: AccountConfig | None, tiktok_description: str
+    ) -> dict[str, Any] | None:
+        """Payload for the VPS server's Post for Me publish (see server TikTokPayload)."""
+        if account is None or account.tiktok is None:
+            return None
+        tiktok = account.tiktok
+        if not tiktok.post_for_me_account_id:
+            return None
+        return {
+            "social_account_id": tiktok.post_for_me_account_id,
+            "caption": tiktok_description,
+            "privacy_status": tiktok.privacy_status,
+            "allow_comment": tiktok.allow_comment,
+            "allow_duet": tiktok.allow_duet,
+            "allow_stitch": tiktok.allow_stitch,
+        }
 
     @classmethod
     def _normalize_platforms(cls, platforms: list[str] | None) -> tuple[str, ...]:
@@ -698,6 +723,8 @@ class UploadPhaseService:
                     "poll_timeout_seconds": settings.instagram_publish_timeout_seconds,
                 }
 
+        tiktok_payload = cls._build_tiktok_payload(account, metadata.tiktok.description)
+
         with tempfile.TemporaryDirectory(prefix=f"atr-upload-{project_id}-") as tmp_dir:
             local_video_path = Path(tmp_dir) / (readiness.drive_video_name or "final_video.mp4")
             emit_progress(0.30, "download", "Downloading final video from Drive...")
@@ -773,6 +800,7 @@ class UploadPhaseService:
                     drive_video_url=direct_drive_download or drive_video_url,
                     platforms_requested=list(requested_platforms),
                     instagram=ig_payload,
+                    tiktok=tiktok_payload,
                     platform_scheduled_at=platform_scheduled_at,
                     platform_statuses=cls._platform_status_payload(results_by_platform),
                 )
