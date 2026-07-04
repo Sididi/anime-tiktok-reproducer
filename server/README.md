@@ -33,7 +33,9 @@ docker compose up -d --build
 
 ## Smoke test (post-deploy)
 
-Replace `INTERNAL` and channel/role IDs with real values.
+Replace `INTERNAL` and channel/role IDs with real values. TikTok publishing goes through
+Post for Me — see [docs/POST_FOR_ME_SETUP.md](../docs/POST_FOR_ME_SETUP.md) for account
+setup and `ATR_PFM_API_KEY`.
 
 ```bash
 INTERNAL="<ATR_TIKTOK_SERVER_INTERNAL_TOKEN>"
@@ -64,7 +66,7 @@ curl -s -o /dev/null -w "%{http_code}\n" -X POST "$BASE/api/internal/jobs" \
 # Expected: 401
 ```
 
-### 4. Create a fake job → verify Discord embed (no reminder yet)
+### 4. Create a fake job → verify Discord embed
 
 ```bash
 SLOT=$(date -u -d '+2 minutes' +%Y-%m-%dT%H:%M:%S+00:00)
@@ -84,7 +86,7 @@ curl -s -X POST "$BASE/api/internal/jobs" \
 
 In Discord:
 - The upload channel should show a rich embed with avatar + device + project + platforms grid + description + drive URL.
-- **No reminder yet** — the scheduler fires it at slot_time (~2 minutes later).
+- At `slot_time` (~2 minutes later) the scheduler publishes TikTok via Post for Me — see step 6.
 
 ### 5. Update a platform status → verify embed edits
 
@@ -97,12 +99,13 @@ curl -s -X POST "$BASE/api/internal/jobs/smoke-1/platform-status" \
 
 In Discord: the embed's YouTube line should change to `✅ YouTube — https://youtu.be/SMOKE`.
 
-### 6. Wait for slot_time → verify reminder + forward appear
+### 6. Wait for slot_time → verify TikTok publish
 
-After ~2 minutes (the SLOT you set), check the reminder channel. You should see:
-- A rich embed with account/avatar + Paris-time slot + device + description code-block.
-- A native forward of the original upload-channel embed.
-- A `@Tiktok Reproducer` role ping in the rich message.
+After ~2 minutes (the SLOT you set), check the upload-channel embed. The TikTok line
+should flip to `✅ TikTok — <published URL>` (requires `ATR_PFM_API_KEY` to be set and a
+valid `tiktok.post_for_me_account_id` on the account). Without a working Post for Me
+config, the line instead shows the retry detail (`⏳ TikTok — Uploading (...)`), and a
+`@Tiktok Reproducer` role ping is sent to the alerts channel after 5 failed attempts.
 
 ### 7. Cascade delete
 
@@ -111,4 +114,5 @@ curl -s -X DELETE "$BASE/api/internal/jobs/smoke-1" -H "Authorization: Bearer $I
 # Expected: {"ok":true, "deleted":true}
 ```
 
-In Discord: the embed AND both reminder messages disappear.
+In Discord: the upload-channel embed disappears (reminders are no longer created, so there
+are no reminder messages left to clean up).

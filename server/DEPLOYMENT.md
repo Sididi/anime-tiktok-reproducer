@@ -167,6 +167,7 @@ ls server/avatars/
 - `ATR_MOBILE_TOKEN_<DEVICE>` — one per device id, also random. You'll paste these into each phone's mobile-app settings later.
 - `ATR_DISCORD_BOT_TOKEN` — from your Discord developer portal application's Bot tab.
 - `ATR_DISCORD_GUILD_ID`, `ATR_DISCORD_UPLOAD_CHANNEL_ID`, `ATR_DISCORD_REMINDER_CHANNEL_ID`, `ATR_DISCORD_REMINDER_ROLE_ID` — right-click each in Discord (developer mode on) → Copy ID.
+- `ATR_PFM_API_KEY` — Post for Me API key — TikTok auto-publish (docs/POST_FOR_ME_SETUP.md).
 - `ATR_PUBLIC_BASE_URL=https://tiktok.sididi.tv`
 
 **Key checklist for `config/config.yaml`:**
@@ -263,10 +264,10 @@ Run the full curl checklist from `README.md` § "Smoke test (post-deploy)". Set 
 1. `/healthz` → `{"status":"ok",…}`
 2. Avatar serves with `image/jpeg` content-type
 3. Mobile auth gate rejects unauthenticated, accepts the right token
-4. Creating a fake job posts a Discord embed + reminder
+4. Creating a fake job posts a Discord embed
 5. Updating a platform status edits the embed in place
 6. Mobile API lists the job, returns video URL, accepts ack (Discord reaction added)
-7. Cascade delete removes the embed + reminder
+7. Cascade delete removes the embed
 8. Mobile job list is empty again
 
 If any step fails, the most common causes are:
@@ -471,14 +472,16 @@ If the gateway fails to connect, check:
    - **No** request is sent to n8n (you can verify by checking your n8n logs are silent).
 
 3. **At slot_time** (verify in container logs `docker compose logs -f`):
-   - For TikTok: the rich reminder + forward appear in the reminder channel.
    - For Instagram: `Instagram publish succeeded for <project_id>` log line. The embed's IG line transitions to `✅ Instagram — https://instagram.com/reel/...`.
+   - For TikTok: see step 4 below.
 
-4. **React with ✅ on the upload-channel embed** (yourself, from any phone). The bot:
-   - Edits the embed: TikTok line becomes `✅ TikTok — Posté`.
-   - Adds its own ✅ reaction (visual confirmation).
-   - If reminder was already in the channel: deletes it.
-   - If reminder hadn't fired yet: scheduler skips it on the next tick.
+4. **TikTok now publishes automatically at slot_time** — the Discord reaction listener
+   described above is disabled (the code is kept in `main.py`, commented out, as a manual
+   fallback). Instead, the scheduler publishes to TikTok via Post for Me, the same as
+   Instagram: `TikTok publish succeeded for <project_id>` appears in the logs, and the
+   embed's TikTok line transitions to `✅ TikTok — <published URL>`. On failure it retries
+   up to 5 times, showing the retry detail on the embed line; after the 5th failed
+   attempt, a `@Tiktok Reproducer` role ping is sent to the former reminder channel.
 
 5. **Cascade delete still works** — `DELETE /api/internal/jobs/<pid>` removes the embed + any reminder messages.
 

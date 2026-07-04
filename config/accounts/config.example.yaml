@@ -11,7 +11,7 @@ accounts:
     supported_types:
       - "anime"
     avatar: "anime_fr.jpg"       # filename in <repo>/server/avatars/ (served by VPS)
-    device: "iphone_13_pro"     # must match a device id in the VPS server's config
+    device: "iphone_13_pro"     # optional: label shown in the Discord embed (legacy manual-post field)
     # Upload slots in UTC (HH:MM). Shared by every platform on this account.
     slots:
       - "14:00"
@@ -27,6 +27,15 @@ accounts:
       facebook_page_access_token: "EAA..."
       instagram_business_account_id: "456..."
       instagram_access_token: "IGA..."  # optional: defaults to facebook_page_access_token
+    tiktok:
+      # Post for Me social-account id (spc_...) — enables automatic TikTok
+      # publishing via the VPS server. See docs/POST_FOR_ME_SETUP.md.
+      post_for_me_account_id: "spc_..."
+      # Optional post options (defaults shown):
+      # privacy_status: "public"
+      # allow_comment: true
+      # allow_duet: true
+      # allow_stitch: true
 
   # Optional example: per-platform slot overrides.
   #
@@ -39,7 +48,7 @@ accounts:
   #   - YouTube   pooled by `youtube.channel_id`
   #   - Facebook  pooled by `meta.facebook_page_id`
   #   - Instagram pooled by `meta.instagram_business_account_id`
-  #   - TikTok    never pooled (manual post; slot is a Discord reminder)
+  #   - TikTok    pooled by tiktok.post_for_me_account_id
   #
   # anime_en:
   #   name: "Anime EN"
@@ -47,7 +56,7 @@ accounts:
   #   supported_types:
   #     - "anime"
   #   avatar: "anime_en.png"
-  #   device: "pixel_8_pro"       # must match a device id in the VPS server's config
+  #   device: "pixel_8_pro"       # optional: label shown in the Discord embed (legacy manual-post field)
   #   slots:
   #     - "15:00"
   #     - "20:00"

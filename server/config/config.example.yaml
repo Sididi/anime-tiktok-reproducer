@@ -3,9 +3,10 @@
 # Validation at startup:
 #   - every account.avatar must be a filename present in ../avatars/
 #
-# `device` is a free-form label shown in the Discord embed's "📱 Device"
-# field. It's not validated; pick whatever name helps you remember which
-# phone the operator uses for that account.
+# `device` is an optional free-form label shown in the Discord embed's
+# "📱 Device" field (legacy manual-post metadata). It's not validated; pick
+# whatever name helps you remember which phone the operator uses for that
+# account, or omit it entirely.
 accounts:
   anime_fr:
     name: "Anime FR"

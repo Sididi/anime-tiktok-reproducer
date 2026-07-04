@@ -8,10 +8,12 @@
 # mobile job list, video URL, ack, cascade delete.
 #
 # After it runs, manually verify in Discord:
-#   - Step 3 posted an embed in the upload channel + a reminder in the reminder channel
+#   - Step 3 posted an embed in the upload channel
 #   - Step 4 edited the embed (YouTube line ✅ with link)
-#   - Step 7 marked TikTok ✅ Posté and added a ✅ reaction
-#   - Step 8 removed both Discord messages
+#   - At slot_time, the scheduler publishes TikTok via Post for Me: the TikTok
+#     line flips to ✅ with the published URL (requires ATR_PFM_API_KEY; without
+#     it, the line shows the retry detail instead)
+#   - Step 8 removed the Discord embed
 
 set -euo pipefail
 
@@ -96,7 +98,9 @@ curl -sS "$BASE/api/mobile/jobs" -H "Authorization: Bearer $MOBILE"; echo
 
 echo
 echo "✓ HTTP surface OK. Now eyeball Discord:"
-echo "  3. Embed appeared in upload channel + reminder forwarded with @Tiktok Reproducer ping"
+echo "  3. Embed appeared in upload channel"
 echo "  4. Embed's YouTube line changed to ✅ with the youtu.be/SMOKE link"
-echo "  7. Embed's TikTok line changed to ✅ Posté + bot added a ✅ reaction"
-echo "  8. Both embed and reminder messages disappeared"
+echo "  At slot_time: TikTok line changes to ✅ with the published URL (needs"
+echo "  ATR_PFM_API_KEY; otherwise it shows the retry detail. After 5 failed"
+echo "  attempts, a role ping is sent to the alerts channel.)"
+echo "  8. Embed disappeared"
