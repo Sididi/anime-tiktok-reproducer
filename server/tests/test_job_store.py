@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from app.models.job import InstagramPublishState, Job, PlatformStatus
+from app.models.job import InstagramPublishState, Job, PlatformStatus, TikTokPublishState
 from app.services.job_store import JobStore
 
 
@@ -210,3 +210,14 @@ async def test_merge_platform_status_missing_job_raises(tmp_path: Path):
         await store.merge_platform_status(
             "missing", "instagram", PlatformStatus(status="pending")
         )
+
+
+async def test_set_tiktok_publish_state(tmp_path: Path):
+    store = JobStore(tmp_path / "jobs.json")
+    job = _make_job("p1")
+    await store.create(job)
+    state = TikTokPublishState(post_id="post_9", stage="post_created")
+    updated = await store.set_tiktok_publish_state("p1", state)
+    assert updated.tiktok_publish_state == state
+    reloaded = await store.get("p1")
+    assert reloaded.tiktok_publish_state.post_id == "post_9"

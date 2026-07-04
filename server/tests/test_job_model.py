@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from app.models.job import InstagramPublishState, Job, PlatformStatus
+from app.models.job import InstagramPublishState, Job, PlatformStatus, TikTokPublishState
 
 
 def _make_job(**overrides) -> Job:
@@ -95,3 +95,58 @@ def test_job_with_uploaded_platform_status():
     restored = Job.from_dict(d)
     assert restored == job
     assert restored.platform_statuses["tiktok"].completed_at == completed
+
+
+def _job_dict_minimal() -> dict:
+    return {
+        "project_id": "p1",
+        "job_id": "j_1",
+        "account_id": "anime_fr",
+        "device_id": "iphone_16",
+        "anime_title": "Title",
+        "description": "desc",
+        "drive_video_url": "https://drive/x",
+        "slot_time": "2026-07-04T12:00:00+00:00",
+        "platforms_requested": ["tiktok"],
+        "platform_statuses": {},
+        "discord_message_id": None,
+        "reminder_message_id": None,
+        "created_at": "2026-07-04T10:00:00+00:00",
+        "updated_at": "2026-07-04T10:00:00+00:00",
+    }
+
+
+def test_tiktok_publish_state_round_trip():
+    state = TikTokPublishState(
+        post_id="post_123",
+        media_url="https://media.postforme.dev/abc.mp4",
+        stage="post_created",
+        created_at=datetime(2026, 7, 4, 12, 0, tzinfo=UTC),
+        last_polled_at=datetime(2026, 7, 4, 12, 5, tzinfo=UTC),
+        last_error=None,
+        url=None,
+    )
+    restored = TikTokPublishState.from_dict(state.to_dict())
+    assert restored == state
+
+
+def test_tiktok_publish_state_from_dict_none():
+    assert TikTokPublishState.from_dict(None) is None
+
+
+def test_job_round_trips_tiktok_fields():
+    d = _job_dict_minimal()
+    d["tiktok_payload"] = {"social_account_id": "spc_1", "caption": "hi"}
+    d["tiktok_publish_state"] = {"post_id": "post_1", "stage": "published"}
+    job = Job.from_dict(d)
+    assert job.tiktok_payload == {"social_account_id": "spc_1", "caption": "hi"}
+    assert job.tiktok_publish_state.post_id == "post_1"
+    out = job.to_dict()
+    assert out["tiktok_payload"] == d["tiktok_payload"]
+    assert out["tiktok_publish_state"]["post_id"] == "post_1"
+
+
+def test_job_defaults_tiktok_fields_absent():
+    job = Job.from_dict(_job_dict_minimal())
+    assert job.tiktok_payload is None
+    assert job.tiktok_publish_state is None

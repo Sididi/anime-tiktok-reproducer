@@ -133,6 +133,57 @@ class InstagramPublishState:
         )
 
 
+@dataclass(frozen=True)
+class TikTokPublishState:
+    """Resumable Post for Me publish state (no secrets: the API key stays in env).
+
+    Once `post_id` is set, retries poll that post's results instead of creating
+    a new post — this is the double-post guard.
+    """
+
+    post_id: str | None = None
+    media_url: str | None = None
+    stage: str | None = None  # media_uploaded | post_created | published | failed
+    created_at: datetime | None = None
+    last_polled_at: datetime | None = None
+    last_error: str | None = None
+    url: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "post_id": self.post_id,
+            "media_url": self.media_url,
+            "stage": self.stage,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "last_polled_at": (
+                self.last_polled_at.isoformat() if self.last_polled_at else None
+            ),
+            "last_error": self.last_error,
+            "url": self.url,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any] | None) -> TikTokPublishState | None:
+        if not isinstance(d, dict):
+            return None
+
+        def _dt(key: str) -> datetime | None:
+            value = d.get(key)
+            if not value:
+                return None
+            return datetime.fromisoformat(str(value))
+
+        return cls(
+            post_id=d.get("post_id"),
+            media_url=d.get("media_url"),
+            stage=d.get("stage"),
+            created_at=_dt("created_at"),
+            last_polled_at=_dt("last_polled_at"),
+            last_error=d.get("last_error"),
+            url=d.get("url"),
+        )
+
+
 @dataclass
 class Job:
     project_id: str
@@ -151,6 +202,8 @@ class Job:
     reminder_cancelled: bool = False
     instagram_payload: dict | None = None
     instagram_publish_state: InstagramPublishState | None = None
+    tiktok_payload: dict | None = None
+    tiktok_publish_state: TikTokPublishState | None = None
     platform_scheduled_at: dict[str, datetime] = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
     updated_at: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
@@ -183,6 +236,12 @@ class Job:
                 if self.instagram_publish_state
                 else None
             ),
+            "tiktok_payload": self.tiktok_payload,
+            "tiktok_publish_state": (
+                self.tiktok_publish_state.to_dict()
+                if self.tiktok_publish_state
+                else None
+            ),
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
         }
@@ -213,6 +272,10 @@ class Job:
             instagram_payload=d.get("instagram_payload"),
             instagram_publish_state=InstagramPublishState.from_dict(
                 d.get("instagram_publish_state")
+            ),
+            tiktok_payload=d.get("tiktok_payload"),
+            tiktok_publish_state=TikTokPublishState.from_dict(
+                d.get("tiktok_publish_state")
             ),
             created_at=datetime.fromisoformat(d["created_at"]),
             updated_at=datetime.fromisoformat(d["updated_at"]),
