@@ -255,8 +255,6 @@ class AccountService:
                 continue
             try:
                 result[str(account_id)] = cls._parse_account(str(account_id), account_raw)
-            except ValueError:
-                raise
             except Exception:
                 logger.exception("Failed to parse account %s", account_id)
         logger.info("Loaded %d account(s) from %s", len(result), path)

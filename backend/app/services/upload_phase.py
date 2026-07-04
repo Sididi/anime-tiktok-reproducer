@@ -80,6 +80,7 @@ class UploadPhaseService:
     _SUPPORTED_PLATFORMS = ("youtube", "facebook", "instagram")
     _INSTAGRAM_DRIVE_FILENAME = "output_instagram.mp4"
     _FRENCH_TZ = ZoneInfo("Europe/Paris")
+    _TIKTOK_NOT_CONFIGURED_DETAIL = "No Post for Me account configured for this account"
     _drive_video_cache: dict[str, dict[str, Any]] = {}
     _DRIVE_BATCH_LOOKUP_MAX_ATTEMPTS = 3
 
@@ -426,7 +427,7 @@ class UploadPhaseService:
                     account.tiktok is None
                     or not account.tiktok.post_for_me_account_id
                 ):
-                    reason = "No Post for Me account configured for this account"
+                    reason = cls._TIKTOK_NOT_CONFIGURED_DETAIL
             if reason is not None:
                 skips[platform] = PlatformUploadResult(
                     platform=platform,
@@ -462,13 +463,18 @@ class UploadPhaseService:
         tiktok_payload: dict[str, Any] | None,
     ) -> list[str]:
         """Platforms recorded on the VPS job. TikTok is server-published, so it
-        joins the job whenever the account schedules it (slots) or a payload
-        exists — it is never part of the locally-uploaded platforms."""
+        joins the job whenever a payload exists or the account has an explicit
+        `tiktok:` block that schedules it (slots) — it is never part of the
+        locally-uploaded platforms. Without a payload, top-level `slots:` alone
+        (no `tiktok:` block) does not count, since `slots_for` falls back to
+        the top-level list for every platform."""
         platforms = list(requested_platforms)
         if "tiktok" in platforms:
             return platforms
         if tiktok_payload is not None or (
-            account is not None and account.slots_for("tiktok")
+            account is not None
+            and account.tiktok is not None
+            and account.slots_for("tiktok")
         ):
             platforms.append("tiktok")
         return platforms
@@ -674,7 +680,7 @@ class UploadPhaseService:
                 PlatformUploadResult(
                     platform="tiktok",
                     status="skipped",
-                    detail="No Post for Me account configured for this account",
+                    detail=cls._TIKTOK_NOT_CONFIGURED_DETAIL,
                 ),
             )
         discord_message_id: str | None = None

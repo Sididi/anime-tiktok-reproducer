@@ -86,19 +86,20 @@ def _normalize_utc(value: datetime) -> datetime:
 async def _dispatch_tiktok_publish(
     job: Job, store: JobStore, settings: Settings, discord
 ) -> bool:
-    payload = job.tiktok_payload
-    if not payload:
-        logger.warning(
-            "Job %s has 'tiktok' in platforms_requested but no tiktok_payload",
-            job.project_id,
-        )
-        return False
     current = job.platform_statuses.get("tiktok", PlatformStatus(status="pending"))
     # 'uploading' is NOT terminal: the scheduler loop is sequential, so seeing it
     # at tick start means the process crashed mid-publish. Re-dispatch; the
     # persisted tiktok_publish_state (post_id → poll instead of create) is the
     # double-post protection.
     if current.status in ("uploaded", "failed", "skipped"):
+        return False
+
+    payload = job.tiktok_payload
+    if not payload:
+        logger.warning(
+            "Job %s has 'tiktok' in platforms_requested but no tiktok_payload",
+            job.project_id,
+        )
         return False
 
     next_attempts = current.attempts + 1

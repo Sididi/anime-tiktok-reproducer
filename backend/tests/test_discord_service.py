@@ -1,6 +1,7 @@
 """Tests for the rewritten DiscordService (HTTP client to the VPS server)."""
 from __future__ import annotations
 
+import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -184,8 +185,6 @@ def test_create_job_forwards_tiktok_payload():
         tiktok={"social_account_id": "spc_1", "caption": "c"},
     )
     assert route.called
-    import json
-
     sent_body = json.loads(route.calls.last.request.content)
     assert sent_body["tiktok"] == {"social_account_id": "spc_1", "caption": "c"}
 
@@ -206,8 +205,6 @@ def test_create_job_omits_tiktok_key_when_none():
         tiktok=None,
     )
     assert route.called
-    import json
-
     sent_body = json.loads(route.calls.last.request.content)
     assert "tiktok" not in sent_body
 

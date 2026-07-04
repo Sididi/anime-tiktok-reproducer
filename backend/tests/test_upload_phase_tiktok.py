@@ -86,6 +86,19 @@ def test_vps_platforms_no_tiktok_without_block():
     assert "tiktok" not in platforms
 
 
+def test_vps_platforms_no_tiktok_with_only_top_level_slots():
+    """Top-level `slots:` alone (no explicit `tiktok:` block) must not enroll the
+    account in TikTok VPS dispatch — that requires an explicit tiktok block."""
+    account = AccountConfig(
+        id="anime_fr", name="Anime FR", language="fr", device="",
+        slots=["06:00"], tiktok=None,
+    )
+    platforms = UploadPhaseService._vps_platforms(
+        ("youtube", "facebook", "instagram"), account, None
+    )
+    assert "tiktok" not in platforms
+
+
 def test_vps_platforms_no_duplicate_tiktok():
     account = _account(AccountTikTokConfig(post_for_me_account_id="spc_1"))
     payload = {"social_account_id": "spc_1", "caption": "c"}

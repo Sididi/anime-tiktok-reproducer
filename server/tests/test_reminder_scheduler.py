@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -154,21 +155,45 @@ async def test_dispatch_tiktok_happy_path(
 
 
 async def test_dispatch_tiktok_missing_payload_skips(
-    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, caplog
 ):
     settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
     store = JobStore(tmp_path / "jobs.json")
     discord = AsyncMock()
     await store.create(_tiktok_job(payload=False))
-    actions = await dispatch_due_actions(
-        store=store, settings=settings, discord=discord
-    )
+    with caplog.at_level(logging.WARNING):
+        actions = await dispatch_due_actions(
+            store=store, settings=settings, discord=discord
+        )
     assert actions == 0
     job = await store.get("p1")
     assert (
         job.platform_statuses.get("tiktok", PlatformStatus(status="pending")).status
         == "pending"
     )
+    assert any("no tiktok_payload" in record.message for record in caplog.records)
+
+
+async def test_dispatch_tiktok_skipped_status_missing_payload_no_warning(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, caplog
+):
+    """A job seeded with 'skipped' (no PFM account configured) has no
+    tiktok_payload by design, and must not warn on every scheduler tick forever."""
+    settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
+    store = JobStore(tmp_path / "jobs.json")
+    discord = AsyncMock()
+    await store.create(
+        _tiktok_job(
+            payload=False,
+            platform_statuses={"tiktok": PlatformStatus(status="skipped")},
+        )
+    )
+    with caplog.at_level(logging.WARNING):
+        actions = await dispatch_due_actions(
+            store=store, settings=settings, discord=discord
+        )
+    assert actions == 0
+    assert not any("no tiktok_payload" in record.message for record in caplog.records)
 
 
 async def test_dispatch_tiktok_missing_api_key_counts_attempt(

@@ -53,6 +53,8 @@ def test_pfm_settings_default_and_env(
         "    device: iphone_16\n"
         "    avatar: anime_fr.jpg\n"
     )
+    monkeypatch.delenv("ATR_PFM_API_KEY", raising=False)
+    monkeypatch.delenv("ATR_PFM_BASE_URL", raising=False)
     settings = Settings.load(
         config_path=config, avatars_dir=tmp_server_dir / "avatars"
     )
