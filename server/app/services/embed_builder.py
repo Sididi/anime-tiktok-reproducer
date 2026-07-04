@@ -49,20 +49,13 @@ _format_french_datetime = format_french_datetime
 
 def _format_platform_line(platform: str, ps: PlatformStatus) -> str:
     label = _PLATFORM_DISPLAY.get(platform, platform.title())
-    if platform == "tiktok" and ps.status == "uploaded":
-        emoji = "✅"
-        suffix = " — Posté"
-    elif platform == "tiktok" and ps.status == "pending":
-        emoji = "🎯"
-        suffix = " — Pending handoff"
+    emoji = _STATUS_EMOJI.get(ps.status, "·")
+    if ps.url:
+        suffix = f" — {ps.url}"
+    elif ps.detail:
+        suffix = f" — {ps.status.title()} ({ps.detail})"
     else:
-        emoji = _STATUS_EMOJI.get(ps.status, "·")
-        if ps.url:
-            suffix = f" — {ps.url}"
-        elif ps.detail:
-            suffix = f" — {ps.status.title()} ({ps.detail})"
-        else:
-            suffix = f" — {ps.status.title()}"
+        suffix = f" — {ps.status.title()}"
     return f"{emoji} {label}{suffix}"
 
 
@@ -79,8 +72,10 @@ def build_embed(
         for p in job.platforms_requested
     ]
 
-    fields = [
-        {"name": "📱 Device", "value": job.device_id, "inline": True},
+    fields: list[dict[str, Any]] = []
+    if job.device_id:
+        fields.append({"name": "📱 Device", "value": job.device_id, "inline": True})
+    fields.extend([
         {"name": "🆔 Project", "value": job.project_id, "inline": True},
         {"name": "Plateformes", "value": "\n".join(plat_lines), "inline": False},
         {
@@ -94,14 +89,17 @@ def build_embed(
             "inline": False,
         },
         {"name": "Lien vidéo", "value": job.drive_video_url, "inline": False},
-    ]
+    ])
+
+    footer_bits = [account.name]
+    if job.device_id:
+        footer_bits.append(job.device_id)
+    footer_bits.append(f"{job.slot_time.strftime('%H:%M')} UTC")
 
     return {
         "author": {"name": account.name, "icon_url": avatar_url},
         "title": job.anime_title,
         "description": f"Programmé le **{_format_french_datetime(job.slot_time)}**",
         "fields": fields,
-        "footer": {
-            "text": f"{account.name} · {job.device_id} · {job.slot_time.strftime('%H:%M')} UTC"
-        },
+        "footer": {"text": " · ".join(footer_bits)},
     }

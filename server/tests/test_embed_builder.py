@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 
 from app.config import AccountConfig
 from app.models.job import Job, PlatformStatus
-from app.services.embed_builder import build_embed
+from app.services.embed_builder import _format_platform_line, build_embed
 
 
 def _job_fixture() -> Job:
@@ -82,7 +82,7 @@ def test_embed_platforms_field_renders_all_statuses():
     assert "✅" in plats and "YouTube" in plats and "youtu.be/abc" in plats
     assert "⚠️" in plats and "Facebook" in plats and "Not configured" in plats
     assert "⏳" in plats and "Instagram" in plats
-    assert "🎯" in plats and "TikTok" in plats and "Pending" in plats
+    assert "⏳" in plats and "TikTok" in plats and "Pending" in plats
 
 
 def test_embed_description_field_is_plain_text():
@@ -130,3 +130,23 @@ def test_embed_description_is_passed_through_verbatim():
     assert value == "Check *this* _out_ ~now~ #tag 🔥"
     assert "\\" not in value
     assert "`" not in value
+
+
+def test_tiktok_line_is_generic_with_url():
+    ps = PlatformStatus(status="uploaded", url="https://tiktok.com/@a/video/1")
+    line = _format_platform_line("tiktok", ps)
+    assert line == "✅ TikTok — https://tiktok.com/@a/video/1"
+
+
+def test_tiktok_line_pending_is_generic():
+    line = _format_platform_line("tiktok", PlatformStatus(status="pending"))
+    assert line == "⏳ TikTok — Pending"
+
+
+def test_embed_omits_device_when_empty():
+    job = _job_fixture()
+    job.device_id = ""
+    embed = build_embed(job, _accounts(), "https://tiktok.sididi.tv")
+    names = [f["name"] for f in embed["fields"]]
+    assert "📱 Device" not in names
+    assert " ·  · " not in embed["footer"]["text"]

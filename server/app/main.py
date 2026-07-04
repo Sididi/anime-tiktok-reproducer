@@ -18,7 +18,9 @@ from app.config import Settings
 from app.services.discord_client import DiscordClient
 from app.services.instagram_prepared_media import cleanup_expired_prepared_media
 from app.services.job_store import JobStore
-from app.services.reaction_listener import ReactionListener
+# DISABLED 2026-07: TikTok posting is now automated via Post for Me. The
+# ✅-reaction manual-ack listener is kept, commented out, as a manual fallback.
+# from app.services.reaction_listener import ReactionListener
 from app.services.reminder_scheduler import run_scheduler_loop
 
 logger = logging.getLogger(__name__)
@@ -110,19 +112,20 @@ def create_app() -> FastAPI:  # noqa: PLR0915
                 app.state.settings = settings
                 app.state.job_store = job_store
                 app.state.discord = discord
-                listener = ReactionListener(
-                    bot_token=settings.discord.bot_token,
-                    store=job_store,
-                    settings=settings,
-                    rest_discord_client=discord,
-                )
-                await listener.start()
+                # DISABLED 2026-07: manual-ack reaction listener kept as fallback.
+                # listener = ReactionListener(
+                #     bot_token=settings.discord.bot_token,
+                #     store=job_store,
+                #     settings=settings,
+                #     rest_discord_client=discord,
+                # )
+                # await listener.start()
                 sched_task, stop_event = await _start_scheduler(discord)
                 try:
                     yield
                 finally:
                     await _stop_scheduler(sched_task, stop_event)
-                    await listener.stop()
+                    # await listener.stop()
                     app.state.discord = None
         else:
             app.state.settings = settings
