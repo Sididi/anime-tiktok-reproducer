@@ -55,6 +55,11 @@ class AccountInstagramConfig:
 @dataclass
 class AccountTikTokConfig:
     slots: list[str] | None = None
+    post_for_me_account_id: str | None = None
+    privacy_status: str = "public"
+    allow_comment: bool = True
+    allow_duet: bool = True
+    allow_stitch: bool = True
 
 
 @dataclass
@@ -71,7 +76,7 @@ class AccountConfig:
     id: str
     name: str
     language: str
-    device: str
+    device: str = ""
     supported_types: list[LibraryType] = field(default_factory=lambda: [DEFAULT_LIBRARY_TYPE])
     avatar: str | None = None
     slots: list[str] = field(default_factory=list)
@@ -116,7 +121,8 @@ class AccountConfig:
             igid = self.meta.instagram_business_account_id if self.meta else None
             return f"instagram:{igid}" if igid else None
         if platform == "tiktok":
-            return None
+            pfm_id = self.tiktok.post_for_me_account_id if self.tiktok else None
+            return f"tiktok:{pfm_id}" if pfm_id else None
         return None
 
 
@@ -178,18 +184,22 @@ class AccountService:
         )
 
         tiktok_raw = raw.get("tiktok")
-        tiktok = (
-            AccountTikTokConfig(slots=_normalize_slots(tiktok_raw.get("slots")))
-            if isinstance(tiktok_raw, dict)
-            else None
-        )
-
-        device = raw.get("device")
-        if not device or not isinstance(device, str):
-            raise ValueError(
-                f"Account {account_id!r}: missing required field 'device'. "
-                f"Set device: \"<device_id>\" matching a device in the VPS server's config."
+        tiktok = None
+        if isinstance(tiktok_raw, dict):
+            tiktok = AccountTikTokConfig(
+                slots=_normalize_slots(tiktok_raw.get("slots")),
+                post_for_me_account_id=(
+                    str(tiktok_raw["post_for_me_account_id"])
+                    if tiktok_raw.get("post_for_me_account_id")
+                    else None
+                ),
+                privacy_status=str(tiktok_raw.get("privacy_status") or "public"),
+                allow_comment=bool(tiktok_raw.get("allow_comment", True)),
+                allow_duet=bool(tiktok_raw.get("allow_duet", True)),
+                allow_stitch=bool(tiktok_raw.get("allow_stitch", True)),
             )
+
+        device = str(raw.get("device") or "")
 
         slots_raw = raw.get("slots", [])
         slots = [str(s) for s in slots_raw] if isinstance(slots_raw, list) else []
