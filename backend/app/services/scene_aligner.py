@@ -112,6 +112,10 @@ class AlignmentDiagnostics:
     weak_variant_sample_count: int = 0
     phase_timings: dict[str, float] = field(default_factory=dict)
     segments: list[SegmentHypothesis] = field(default_factory=list)
+    stage4_groups: list[dict[str, object]] = field(default_factory=list)
+    decoded_fragments: list[dict[str, object]] = field(default_factory=list)
+    decoded_candidates: list[dict[str, object]] = field(default_factory=list)
+    stage4_attempts: list[dict[str, object]] = field(default_factory=list)
 
     def stats(self) -> dict[str, float]:
         result = {
@@ -119,7 +123,19 @@ class AlignmentDiagnostics:
             "aligner_correspondence_count": float(self.correspondence_count),
             "aligner_segment_count": float(self.segment_count),
             "aligner_weak_variant_sample_count": float(self.weak_variant_sample_count),
+            "aligner_stage4_group_count": float(len(self.stage4_groups)),
         }
+        if self.stage4_groups:
+            fragment_counts = [
+                float(group.get("fragment_count", 0.0))
+                for group in self.stage4_groups
+            ]
+            result["aligner_stage4_mean_fragments_per_group"] = float(
+                np.mean(fragment_counts)
+            )
+            result["aligner_stage4_max_fragments_per_group"] = float(
+                max(fragment_counts)
+            )
         for name, seconds in self.phase_timings.items():
             result[f"aligner_{name}_seconds"] = seconds
         return result
@@ -232,23 +248,11 @@ class SceneAlignerService:
             correspondences,
             include_low_rank_common_seeds=True,
         )
-        cls._add_global_path_segments(
-            scenes,
-            correspondences,
-            scene_segments,
-            max_segments=MAX_SEGMENTS_PER_SCENE,
-        )
         decode_segments = cls.extract_scene_segments(
             scenes,
             decode_correspondences,
             max_segments=DECODE_SEGMENTS_PER_SCENE,
             line_limit=DECODE_RETRIEVAL_TOP_K,
-        )
-        cls._add_global_path_segments(
-            scenes,
-            decode_correspondences,
-            decode_segments,
-            max_segments=DECODE_SEGMENTS_PER_SCENE,
         )
         cls._trim_scene_segments(decode_segments, DECODE_SEGMENTS_PER_SCENE)
         diagnostics.phase_timings["segment"] = time.perf_counter() - started
@@ -265,23 +269,11 @@ class SceneAlignerService:
                 correspondences,
                 include_low_rank_common_seeds=True,
             )
-            cls._add_global_path_segments(
-                scenes,
-                correspondences,
-                scene_segments,
-                max_segments=MAX_SEGMENTS_PER_SCENE,
-            )
             decode_segments = cls.extract_scene_segments(
                 scenes,
                 decode_correspondences,
                 max_segments=DECODE_SEGMENTS_PER_SCENE,
                 line_limit=DECODE_RETRIEVAL_TOP_K,
-            )
-            cls._add_global_path_segments(
-                scenes,
-                decode_correspondences,
-                decode_segments,
-                max_segments=DECODE_SEGMENTS_PER_SCENE,
             )
             cls._trim_scene_segments(decode_segments, DECODE_SEGMENTS_PER_SCENE)
             diagnostics.phase_timings["variant_retrieve"] = time.perf_counter() - started
@@ -290,18 +282,31 @@ class SceneAlignerService:
         diagnostics.correspondence_count = len(correspondences)
         diagnostics.segments = [segment for values in scene_segments.values() for segment in values]
         diagnostics.segment_count = len(diagnostics.segments)
+        diagnostics.decoded_candidates = cls._decode_candidate_records(
+            scenes,
+            decode_segments,
+        )
 
         started = time.perf_counter()
         decoded = cls.decode_scene_sequence(scenes, decode_segments)
+        diagnostics.decoded_fragments = cls._decoded_fragment_records(scenes, decoded)
         diagnostics.phase_timings["decode"] = time.perf_counter() - started
 
         started = time.perf_counter()
-        final_scenes, remapped = cls._segment_decoded_continuities(
+        (
+            final_scenes,
+            remapped,
+            stage4_groups,
+            stage4_attempts,
+        ) = cls._segment_decoded_continuities(
             video_path,
             scenes,
             decoded,
+            decode_segments,
             correspondences,
         )
+        diagnostics.stage4_groups = stage4_groups
+        diagnostics.stage4_attempts = stage4_attempts
         diagnostics.phase_timings["merge"] = time.perf_counter() - started
 
         started = time.perf_counter()
@@ -1209,10 +1214,23 @@ class SceneAlignerService:
         video_path: Path,
         scenes: SceneList,
         decoded: list[SegmentHypothesis | None],
+        decode_segments: dict[int, list[SegmentHypothesis]],
         correspondences: list[Correspondence],
-    ) -> tuple[SceneList, list[tuple[list[int], SegmentHypothesis | None]]]:
+    ) -> tuple[
+        SceneList,
+        list[tuple[list[int], SegmentHypothesis | None]],
+        list[dict[str, object]],
+        list[dict[str, object]],
+    ]:
         by_fragment = cls._correspondences_by_fragment(scenes, correspondences)
-        groups = cls._decoded_fragment_groups(scenes, decoded, by_fragment)
+        attempt_records: list[dict[str, object]] = []
+        groups = cls._decoded_fragment_groups(
+            scenes,
+            decoded,
+            decode_segments,
+            by_fragment,
+            attempt_records,
+        )
         final_scenes = SceneList(
             scenes=[
                 Scene(
@@ -1226,11 +1244,48 @@ class SceneAlignerService:
 
         snapped = cls._snap_final_boundaries(video_path, final_scenes)
         remapped: list[tuple[list[int], SegmentHypothesis | None]] = []
+        group_records: list[dict[str, object]] = []
         for group_index, (indices, fit) in enumerate(groups):
             scene = snapped.scenes[group_index]
             if fit is None:
                 remapped.append((indices, None))
+                group_records.append(
+                    {
+                        "scene_index": group_index,
+                        "fragment_indices": list(indices),
+                        "fragment_count": len(indices),
+                        "tiktok_start": scene.start_time,
+                        "tiktok_end": scene.end_time,
+                        "episode": None,
+                    }
+                )
                 continue
+            source_start = fit.segment.source_at(scene.start_time)
+            source_end = fit.segment.source_at(scene.end_time)
+            group_records.append(
+                {
+                    "scene_index": group_index,
+                    "fragment_indices": list(indices),
+                    "fragment_count": len(indices),
+                    "tiktok_start": scene.start_time,
+                    "tiktok_end": scene.end_time,
+                    "episode": fit.segment.episode,
+                    "source_start": source_start,
+                    "source_end": source_end,
+                    "source_rate": fit.segment.a,
+                    "inlier_count": fit.inlier_count,
+                    "mean_abs_residual": fit.mean_abs_residual,
+                    "covered_fragments": sorted(fit.covered_fragments),
+                    "changepoint": cls._group_changepoint_summary(
+                        scenes,
+                        indices,
+                        decoded,
+                        decode_segments,
+                        by_fragment,
+                        fit,
+                    ),
+                }
+            )
             remapped.append(
                 (
                     indices,
@@ -1248,7 +1303,65 @@ class SceneAlignerService:
                     ),
                 )
             )
-        return snapped, remapped
+        return snapped, remapped, group_records, attempt_records
+
+    @staticmethod
+    def _decoded_fragment_records(
+        scenes: SceneList,
+        decoded: list[SegmentHypothesis | None],
+    ) -> list[dict[str, object]]:
+        records: list[dict[str, object]] = []
+        for index, scene in enumerate(scenes.scenes):
+            segment = decoded[index] if index < len(decoded) else None
+            record: dict[str, object] = {
+                "fragment_index": index,
+                "tiktok_start": scene.start_time,
+                "tiktok_end": scene.end_time,
+            }
+            if segment is not None:
+                record.update(
+                    {
+                        "episode": segment.episode,
+                        "source_start": segment.source_at(scene.start_time),
+                        "source_end": segment.source_at(scene.end_time),
+                        "source_rate": segment.a,
+                        "inlier_count": segment.inlier_count,
+                        "mean_similarity": segment.mean_similarity,
+                        "score": segment.score,
+                    }
+                )
+            records.append(record)
+        return records
+
+    @staticmethod
+    def _decode_candidate_records(
+        scenes: SceneList,
+        decode_segments: dict[int, list[SegmentHypothesis]],
+    ) -> list[dict[str, object]]:
+        records: list[dict[str, object]] = []
+        for index, scene in enumerate(scenes.scenes):
+            candidates: list[dict[str, object]] = []
+            for segment in decode_segments.get(index, [])[:ALTERNATIVES_PER_SCENE]:
+                candidates.append(
+                    {
+                        "episode": segment.episode,
+                        "source_start": segment.source_at(scene.start_time),
+                        "source_end": segment.source_at(scene.end_time),
+                        "source_rate": segment.a,
+                        "inlier_count": segment.inlier_count,
+                        "mean_similarity": segment.mean_similarity,
+                        "score": segment.score,
+                    }
+                )
+            records.append(
+                {
+                    "fragment_index": index,
+                    "tiktok_start": scene.start_time,
+                    "tiktok_end": scene.end_time,
+                    "candidates": candidates,
+                }
+            )
+        return records
 
     @classmethod
     def _correspondences_by_fragment(
@@ -1278,7 +1391,9 @@ class SceneAlignerService:
         cls,
         scenes: SceneList,
         decoded: list[SegmentHypothesis | None],
+        decode_segments: dict[int, list[SegmentHypothesis]],
         by_fragment: dict[int, list[Correspondence]],
+        attempt_records: list[dict[str, object]] | None = None,
     ) -> list[tuple[list[int], _GroupFit | None]]:
         groups: list[tuple[list[int], _GroupFit | None]] = []
         index = 0
@@ -1294,6 +1409,7 @@ class SceneAlignerService:
                 scenes,
                 current_indices,
                 decoded,
+                decode_segments,
                 by_fragment,
             )
             cursor = index + 1
@@ -1303,18 +1419,66 @@ class SceneAlignerService:
                     scenes,
                     candidate_indices,
                     decoded,
+                    decode_segments,
                     by_fragment,
                     episode=segment.episode,
                 )
                 if candidate_fit is None:
+                    if attempt_records is not None:
+                        attempt_records.append(
+                            {
+                                "start_fragment": index,
+                                "candidate_indices": candidate_indices,
+                                "accepted": False,
+                                "stop_reason": "no_fit",
+                            }
+                        )
                     break
-                if cls._group_has_clear_changepoint(
+                changepoint = cls._group_changepoint_summary(
                     scenes,
                     candidate_indices,
                     decoded,
+                    decode_segments,
                     by_fragment,
                     candidate_fit,
-                ):
+                )
+                has_changepoint = cls._group_has_clear_changepoint_for_candidate(
+                    scenes,
+                    candidate_indices,
+                    decoded,
+                    candidate_fit,
+                    changepoint,
+                )
+                decoded_gap = cls._decoded_boundary_gap(
+                    scenes,
+                    candidate_indices,
+                    decoded,
+                )
+                if attempt_records is not None:
+                    attempt_records.append(
+                        {
+                            "start_fragment": index,
+                            "candidate_indices": candidate_indices,
+                            "accepted": not has_changepoint,
+                            "stop_reason": "changepoint"
+                            if has_changepoint
+                            else None,
+                            "episode": candidate_fit.segment.episode,
+                            "source_start": candidate_fit.segment.source_at(
+                                scenes.scenes[candidate_indices[0]].start_time
+                            ),
+                            "source_end": candidate_fit.segment.source_at(
+                                scenes.scenes[candidate_indices[-1]].end_time
+                            ),
+                            "source_rate": candidate_fit.segment.a,
+                            "inlier_count": candidate_fit.inlier_count,
+                            "mean_abs_residual": candidate_fit.mean_abs_residual,
+                            "covered_fragments": sorted(candidate_fit.covered_fragments),
+                            "decoded_boundary_gap": decoded_gap,
+                            "changepoint": changepoint,
+                        }
+                    )
+                if has_changepoint:
                     break
                 current_indices = candidate_indices
                 current_fit = candidate_fit
@@ -1330,6 +1494,7 @@ class SceneAlignerService:
         scenes: SceneList,
         indices: list[int],
         decoded: list[SegmentHypothesis | None],
+        decode_segments: dict[int, list[SegmentHypothesis]],
         by_fragment: dict[int, list[Correspondence]],
         episode: str | None = None,
     ) -> _GroupFit | None:
@@ -1347,7 +1512,6 @@ class SceneAlignerService:
         decoded_segments = [
             segment for segment in decoded_segments if segment.episode == episode
         ]
-
         group_scene = Scene(
             index=indices[0],
             start_time=scenes.scenes[indices[0]].start_time,
@@ -1468,15 +1632,102 @@ class SceneAlignerService:
         scenes: SceneList,
         indices: list[int],
         decoded: list[SegmentHypothesis | None],
+        decode_segments: dict[int, list[SegmentHypothesis]],
         by_fragment: dict[int, list[Correspondence]],
         one_fit: _GroupFit,
     ) -> bool:
         if len(indices) < 2:
             return False
+        if cls._group_has_uncovered_source_gap(scenes, indices, decoded, one_fit):
+            return True
         if len(one_fit.covered_fragments) < max(1, len(indices) - 1):
             return True
+        summary = cls._group_changepoint_summary(
+            scenes,
+            indices,
+            decoded,
+            decode_segments,
+            by_fragment,
+            one_fit,
+        )
+        return cls._group_has_clear_changepoint_for_candidate(
+            scenes,
+            indices,
+            decoded,
+            one_fit,
+            summary,
+        )
 
-        best_two_bic = math.inf
+    @classmethod
+    def _group_has_clear_changepoint_for_candidate(
+        cls,
+        scenes: SceneList,
+        indices: list[int],
+        decoded: list[SegmentHypothesis | None],
+        one_fit: _GroupFit,
+        summary: dict[str, object] | None,
+    ) -> bool:
+        if len(indices) < 2:
+            return False
+        if cls._group_has_uncovered_source_gap(scenes, indices, decoded, one_fit):
+            return True
+        if len(one_fit.covered_fragments) < max(1, len(indices) - 1):
+            return True
+        if summary is None:
+            return False
+        return bool(summary["selected_as_clear"])
+
+    @classmethod
+    def _group_has_uncovered_source_gap(
+        cls,
+        scenes: SceneList,
+        indices: list[int],
+        decoded: list[SegmentHypothesis | None],
+        one_fit: _GroupFit,
+    ) -> bool:
+        if len(one_fit.covered_fragments) >= len(indices):
+            return False
+        if len(one_fit.covered_fragments) < max(1, len(indices) - 1):
+            return False
+        gap = cls._decoded_boundary_gap(scenes, indices, decoded)
+        if gap is None:
+            return False
+        index_step = 1.0 / max(AnimeMatcherService.get_index_fps(), 1e-3)
+        return abs(gap) > CONTINUITY_GRID_STEPS * index_step
+
+    @staticmethod
+    def _decoded_boundary_gap(
+        scenes: SceneList,
+        indices: list[int],
+        decoded: list[SegmentHypothesis | None],
+    ) -> float | None:
+        if len(indices) < 2:
+            return None
+        left_index = indices[-2]
+        right_index = indices[-1]
+        if left_index >= len(decoded) or right_index >= len(decoded):
+            return None
+        left = decoded[left_index]
+        right = decoded[right_index]
+        if left is None or right is None or left.episode != right.episode:
+            return None
+        boundary = scenes.scenes[left_index].end_time
+        return right.source_at(boundary) - left.source_at(boundary)
+
+    @classmethod
+    def _group_changepoint_summary(
+        cls,
+        scenes: SceneList,
+        indices: list[int],
+        decoded: list[SegmentHypothesis | None],
+        decode_segments: dict[int, list[SegmentHypothesis]],
+        by_fragment: dict[int, list[Correspondence]],
+        one_fit: _GroupFit,
+    ) -> dict[str, object] | None:
+        if len(indices) < 2:
+            return None
+
+        best: dict[str, object] | None = None
         for split_offset in range(1, len(indices)):
             left_indices = indices[:split_offset]
             right_indices = indices[split_offset:]
@@ -1484,6 +1735,7 @@ class SceneAlignerService:
                 scenes,
                 left_indices,
                 decoded,
+                decode_segments,
                 by_fragment,
                 episode=one_fit.segment.episode,
             )
@@ -1491,6 +1743,7 @@ class SceneAlignerService:
                 scenes,
                 right_indices,
                 decoded,
+                decode_segments,
                 by_fragment,
                 episode=one_fit.segment.episode,
             )
@@ -1499,12 +1752,39 @@ class SceneAlignerService:
             n = left_fit.inlier_count + right_fit.inlier_count
             if n < 4:
                 continue
-            sse = left_fit.residual_sse + right_fit.residual_sse
-            best_two_bic = min(best_two_bic, cls._bic(sse, n, parameter_count=4))
-        if not math.isfinite(best_two_bic):
-            return False
-        one_bic = cls._bic(one_fit.residual_sse, one_fit.inlier_count, parameter_count=2)
-        return best_two_bic < one_bic
+            boundary = scenes.scenes[left_indices[-1]].end_time
+            two_bic = cls._bic(
+                left_fit.residual_sse + right_fit.residual_sse,
+                n,
+                parameter_count=4,
+            )
+            record: dict[str, object] = {
+                "split_after_fragment": left_indices[-1],
+                "boundary": boundary,
+                "two_bic": two_bic,
+                "source_gap": right_fit.segment.source_at(boundary)
+                - left_fit.segment.source_at(boundary),
+                "left_rate": left_fit.segment.a,
+                "right_rate": right_fit.segment.a,
+                "left_inliers": left_fit.inlier_count,
+                "right_inliers": right_fit.inlier_count,
+            }
+            if best is None or two_bic < float(best["two_bic"]):
+                best = record
+
+        if best is None:
+            return None
+        best["one_bic"] = cls._bic(
+            one_fit.residual_sse,
+            one_fit.inlier_count,
+            parameter_count=2,
+        )
+        bic_margin = float(best["one_bic"]) - float(best["two_bic"])
+        clear_margin = 0.5 * math.log(max(one_fit.inlier_count, 2))
+        best["bic_margin"] = bic_margin
+        best["clear_margin"] = clear_margin
+        best["selected_as_clear"] = float(best["two_bic"]) < float(best["one_bic"])
+        return best
 
     @staticmethod
     def _bic(sse: float, sample_count: int, *, parameter_count: int) -> float:

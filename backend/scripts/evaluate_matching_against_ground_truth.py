@@ -38,6 +38,7 @@ class GeneratedResult:
     elapsed_seconds: float
     phase_timings: dict[str, float] = field(default_factory=dict)
     matcher_stats: dict[str, float] = field(default_factory=dict)
+    aligner_debug: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -240,6 +241,16 @@ async def _generate(
         recalled, recall_total = _stage3_evidence_recall(project_id)
         matcher_stats["aligner_stage3_evidence_recall"] = float(recalled)
         matcher_stats["aligner_stage3_evidence_total"] = float(recall_total)
+        aligner_debug = (
+            {
+                "decoded_candidates": align_diagnostics.decoded_candidates,
+                "decoded_fragments": align_diagnostics.decoded_fragments,
+                "stage4_attempts": align_diagnostics.stage4_attempts,
+                "stage4_groups": align_diagnostics.stage4_groups,
+            }
+            if align_diagnostics
+            else {}
+        )
         elapsed = time.perf_counter() - start_clock
         return GeneratedResult(
             final_scenes,
@@ -247,6 +258,7 @@ async def _generate(
             elapsed,
             phase_timings=phase_timings,
             matcher_stats=matcher_stats,
+            aligner_debug=aligner_debug,
         )
 
     first_pass = await _collect_match_result(
@@ -380,6 +392,7 @@ def _load_generated(path: Path) -> GeneratedResult:
         elapsed_seconds=float(payload.get("elapsed_seconds", 0.0)),
         phase_timings=dict(payload.get("phase_timings", {})),
         matcher_stats=dict(payload.get("matcher_stats", {})),
+        aligner_debug=dict(payload.get("aligner_debug", {})),
     )
 
 
@@ -393,6 +406,7 @@ def _save_generated(path: Path, generated: GeneratedResult) -> None:
                 "elapsed_seconds": generated.elapsed_seconds,
                 "phase_timings": generated.phase_timings,
                 "matcher_stats": generated.matcher_stats,
+                "aligner_debug": generated.aligner_debug,
             },
             indent=2,
         )
