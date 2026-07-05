@@ -3330,14 +3330,52 @@
     });
   }
 
+  var lanTasks = null;
+
+  function runTransferTask(taskName, payload, onProgress, options) {
+    var lanBaseUrl =
+      payload && payload.settings
+        ? String(payload.settings.lan_base_url || "")
+        : "";
+    if (!lanBaseUrl) {
+      return runDriveTask(taskName, payload, onProgress, options);
+    }
+    if (!lanTasks) {
+      lanTasks = require(getClientFilePath("lan_tasks.js"));
+    }
+    return lanTasks.probe(payload.settings).then(
+      function () {
+        log("LAN mode selected for " + taskName, "info");
+        return lanTasks.runTask(taskName, payload, onProgress).catch(function (
+          err,
+        ) {
+          log("LAN task failed: " + err.message, "error");
+          throw err; // clean failure — re-run re-probes (spec: no silent mid-job engine switch)
+        });
+      },
+      function (probeErr) {
+        log(
+          "LAN probe failed (" +
+            probeErr.message +
+            "), falling back to Drive for " +
+            taskName,
+          "warn",
+        );
+        return runDriveTask(taskName, payload, onProgress, options);
+      },
+    );
+  }
+
   // --- Drive automation jobs ---
 
   function executeDownloadImport(projectId, controller) {
     if (!validateProjectId(projectId)) {
       return Promise.reject(new Error("Invalid project ID: " + projectId));
     }
-    if (!isDriveConfigured()) {
-      return Promise.reject(new Error("Drive settings are incomplete"));
+    if (!isDriveConfigured() && !String((settings && settings.lan_base_url) || "")) {
+      return Promise.reject(
+        new Error("Neither Drive nor LAN transfer is configured"),
+      );
     }
 
     var lease = captureAutomationLease(projectId);
@@ -3365,7 +3403,7 @@
     var downloadPayload = buildDrivePayloadBase();
     downloadPayload.project_id = projectId;
 
-    return runDriveTask(
+    return runTransferTask(
       "downloadProject",
       downloadPayload,
       function (progress) {
@@ -3706,8 +3744,10 @@
         ),
       );
     }
-    if (!isDriveConfigured()) {
-      return Promise.reject(new Error("Drive settings are incomplete"));
+    if (!isDriveConfigured() && !String((settings && settings.lan_base_url) || "")) {
+      return Promise.reject(
+        new Error("Neither Drive nor LAN transfer is configured"),
+      );
     }
 
     var lease = captureAutomationLease(projectId);
@@ -3747,7 +3787,7 @@
 
     var lastProgressPct = -1;
 
-    return runDriveTask(
+    return runTransferTask(
       "uploadOutput",
       uploadPayload,
       function (progress) {
