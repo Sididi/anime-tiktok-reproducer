@@ -11,7 +11,7 @@ from ...config import settings as app_settings
 from ...models import Project
 from ...services.account_service import AccountService
 from ...services.project_service import ProjectService
-from ...services.scheduling_service import SchedulingService
+from ...services.scheduling_service import SchedulingService, StealSpec
 
 
 def _require_v2() -> None:
@@ -166,10 +166,16 @@ class ResolveAnchorRequest(BaseModel):
     overrides: dict[str, datetime] | None = None
 
 
+class StealSpecModel(BaseModel):
+    mode: Literal["cascade", "next_free"]
+    expected_occupant_id: str | None = None
+
+
 class ReserveAnchorRequest(BaseModel):
     account_id: str
     tiktok_slot: datetime
     overrides: dict[str, datetime] | None = None
+    steals: dict[str, StealSpecModel] | None = None
 
 
 class PatchPlatformRequest(BaseModel):
@@ -179,6 +185,7 @@ class PatchPlatformRequest(BaseModel):
 class PatchAnchorRequest(BaseModel):
     tiktok_slot: datetime
     overrides: dict[str, datetime] | None = None
+    steals: dict[str, StealSpecModel] | None = None
 
 
 def _platform_schedules_to_dict(schedules):
@@ -231,15 +238,43 @@ async def resolve_anchor(req: ResolveAnchorRequest):
     }
 
 
+def _steals_to_specs(steals):
+    return (
+        {p: StealSpec(mode=s.mode, expected_occupant_id=s.expected_occupant_id)
+         for p, s in steals.items()}
+        if steals else None
+    )
+
+
+async def _notify_switch_displacements(switches, steals) -> dict[str, dict[str, str]]:
+    notification_status: dict[str, dict[str, str]] = {}
+    for platform, result in switches.items():
+        spec = steals[platform]
+        plan = result.cascade if spec.mode == "cascade" else result.next_free
+        notification_status[platform] = {}
+        for displaced in plan.displaced:
+            moved = ProjectService.load(displaced.project_id)
+            sched = (moved.platform_schedules or {}).get(platform) if moved else None
+            if sched is None:
+                continue
+            notification_status[platform][displaced.project_id] = await asyncio.to_thread(
+                _notify_displaced, displaced.project_id, platform, sched.scheduled_at
+            )
+    return notification_status
+
+
 @router.post("/projects/{project_id}/reserve-anchor")
 async def reserve_anchor(project_id: str, req: ReserveAnchorRequest):
+    steals = _steals_to_specs(req.steals)
     try:
-        schedules = await asyncio.to_thread(
+        schedules, switches = await asyncio.to_thread(
             SchedulingService.reserve_anchor,
-            project_id, req.account_id, req.tiktok_slot, req.overrides,
+            project_id, req.account_id, req.tiktok_slot, req.overrides, steals,
         )
     except ValueError as exc:
         msg = str(exc)
+        if "slot_state_changed" in msg or "pool_busy" in msg:
+            raise HTTPException(409, msg)
         if "tiktok" in msg and "slot_taken" in msg:
             raise HTTPException(409, "tiktok_slot_taken")
         if "slot_not_configured" in msg:
@@ -247,7 +282,12 @@ async def reserve_anchor(project_id: str, req: ReserveAnchorRequest):
         if "Project not found" in msg:
             raise HTTPException(404, msg)
         raise HTTPException(422, msg)
-    return {"platform_schedules": _platform_schedules_to_dict(schedules)}
+
+    notification_status = await _notify_switch_displacements(switches, req.steals or {})
+    return {
+        "platform_schedules": _platform_schedules_to_dict(schedules),
+        "notification_status": notification_status,
+    }
 
 
 class ReserveManualRequest(BaseModel):
@@ -312,21 +352,30 @@ async def patch_platform(project_id: str, platform: str, req: PatchPlatformReque
 
 @router.patch("/projects/{project_id}/anchor")
 async def patch_anchor(project_id: str, req: PatchAnchorRequest):
+    steals = _steals_to_specs(req.steals)
     try:
-        schedules = await asyncio.to_thread(
+        schedules, switches = await asyncio.to_thread(
             SchedulingService.reschedule_anchor,
-            project_id, req.tiktok_slot, req.overrides,
+            project_id, req.tiktok_slot, req.overrides, steals,
         )
     except ValueError as exc:
-        raise HTTPException(422, str(exc))
+        msg = str(exc)
+        if "slot_state_changed" in msg or "pool_busy" in msg:
+            raise HTTPException(409, msg)
+        raise HTTPException(422, msg)
+
+    # Notify the rescheduled project's own platforms (its slots moved).
     statuses: dict[str, str] = {}
     for platform, sched in schedules.items():
         statuses[platform] = await asyncio.to_thread(
             _notify_displaced, project_id, platform, sched.scheduled_at
         )
+    # Notify projects displaced by any steal.
+    displaced_status = await _notify_switch_displacements(switches, req.steals or {})
     return {
         "platform_schedules": _platform_schedules_to_dict(schedules),
         "notification_status": statuses,
+        "displaced_notification_status": displaced_status,
     }
 
 

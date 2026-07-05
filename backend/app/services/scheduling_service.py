@@ -84,6 +84,12 @@ class SwitchResult:
     uploaded_count: int
 
 
+@dataclass
+class StealSpec:
+    mode: str
+    expected_occupant_id: str | None
+
+
 class SchedulingService:
     """Finds and reserves the next available upload slot per (account, platform)."""
 
@@ -498,12 +504,16 @@ class SchedulingService:
         account_id: str,
         tiktok_slot: datetime,
         overrides: dict[str, datetime] | None = None,
-    ) -> dict[str, PlatformSchedule]:
+        steals: dict[str, StealSpec] | None = None,
+    ) -> tuple[dict[str, PlatformSchedule], dict[str, SwitchResult]]:
         """Reserve TT (anchor) + each other configured platform on `project`.
 
         Idempotent: a second call with the same anchor reuses the existing
         per-platform reservations.
-        Raises ValueError if any platform conflicts.
+        Optionally steals occupied slots (displacing occupants) BEFORE
+        resolving the anchor, all under one lock, all-or-nothing.
+        Returns (schedules, applied_switches).
+        Raises ValueError if any platform conflicts or a steal is stale/blocked.
         """
         with cls._reservation_lock:
             project = ProjectService.load(project_id)
@@ -518,11 +528,33 @@ class SchedulingService:
                 and project.scheduled_account_id == account_id
                 and cls._normalize_utc_datetime(existing_tt.slot) == anchor
             ):
-                return dict(project.platform_schedules)
+                return dict(project.platform_schedules), {}
 
             # Drop reservations belonging to a different account before reserving.
             if project.scheduled_account_id and project.scheduled_account_id != account_id:
                 project.platform_schedules = {}
+
+            # Steal phase: validate EVERY steal before writing ANY move, so a
+            # stale occupant or blocker aborts with zero side effects.
+            applied_switches: dict[str, SwitchResult] = {}
+            steal_plans: list[tuple[str, SwitchPlan]] = []
+            for platform, spec in (steals or {}).items():
+                steal_slot = anchor if platform == "tiktok" else (overrides or {}).get(platform)
+                if steal_slot is None:
+                    raise ValueError(f"steal for {platform} requires an override slot")
+                result = cls.compute_switch(project_id, account_id, platform, steal_slot)
+                if (result.occupant_project_id or None) != (spec.expected_occupant_id or None):
+                    raise ValueError("slot_state_changed")
+                plan = result.cascade if spec.mode == "cascade" else result.next_free
+                if plan.blockers:
+                    summary = ", ".join(f"{b.platform}:{b.reason}" for b in plan.blockers)
+                    raise ValueError(f"Switch blocked: {summary}")
+                steal_plans.append((platform, plan))
+                applied_switches[platform] = result
+
+            now_utc = datetime.now(timezone.utc)
+            for platform, plan in steal_plans:
+                cls._apply_displacements(platform, plan.displaced, now_utc)
 
             resolution = cls.resolve_anchor(account_id, anchor, overrides)
             if resolution.conflicts:
@@ -540,7 +572,7 @@ class SchedulingService:
             project.scheduled_account_id = account_id
             cls._recompute_aggregates(project)
             ProjectService.save(project)
-            return dict(schedules)
+            return dict(schedules), applied_switches
 
     @classmethod
     def reserve_manual(
@@ -581,7 +613,8 @@ class SchedulingService:
         project_id: str,
         tiktok_slot: datetime,
         overrides: dict[str, datetime] | None = None,
-    ) -> dict[str, PlatformSchedule]:
+        steals: dict[str, StealSpec] | None = None,
+    ) -> tuple[dict[str, PlatformSchedule], dict[str, SwitchResult]]:
         """Re-anchor a project's reservations on a new TT slot."""
         with cls._reservation_lock:
             project = ProjectService.load(project_id)
@@ -600,6 +633,7 @@ class SchedulingService:
             account_id=account_id,
             tiktok_slot=tiktok_slot,
             overrides=overrides,
+            steals=steals,
         )
 
     @classmethod

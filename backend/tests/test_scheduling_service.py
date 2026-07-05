@@ -341,3 +341,42 @@ def test_apply_switch_stale_occupant_raises(tmp_path, monkeypatch):
     ProjectService.save(Project(id="me"))
     with pytest.raises(ValueError, match="slot_state_changed"):
         SchedulingService.apply_switch("me", acc, "tiktok", s10, "cascade", "someoneelse")
+
+
+def test_reserve_anchor_with_steal_is_atomic(tmp_path, monkeypatch):
+    from app.services.scheduling_service import StealSpec
+    acc = _setup_single_account(tmp_path, monkeypatch)
+    _patch_pool_not_busy(monkeypatch)
+    s10, s14 = _future_slot(1, 10), _future_slot(1, 14)
+    _save_scheduled_project("projB", acc, "tiktok", s10)
+    ProjectService.get_project_dir("me").mkdir(parents=True, exist_ok=True)
+    ProjectService.save(Project(id="me"))
+
+    schedules, switches = SchedulingService.reserve_anchor(
+        "me", acc, s10,
+        steals={"tiktok": StealSpec(mode="cascade", expected_occupant_id="projB")},
+    )
+
+    assert schedules["tiktok"].slot == s10
+    assert ProjectService.load("projB").platform_schedules["tiktok"].slot == s14
+    assert switches["tiktok"].occupant_project_id == "projB"
+
+
+def test_reserve_anchor_steal_stale_occupant_writes_nothing(tmp_path, monkeypatch):
+    import pytest
+    from app.services.scheduling_service import StealSpec
+    acc = _setup_single_account(tmp_path, monkeypatch)
+    _patch_pool_not_busy(monkeypatch)
+    s10 = _future_slot(1, 10)
+    _save_scheduled_project("projB", acc, "tiktok", s10)
+    ProjectService.get_project_dir("me").mkdir(parents=True, exist_ok=True)
+    ProjectService.save(Project(id="me"))
+
+    with pytest.raises(ValueError, match="slot_state_changed"):
+        SchedulingService.reserve_anchor(
+            "me", acc, s10,
+            steals={"tiktok": StealSpec(mode="cascade", expected_occupant_id="wrong")},
+        )
+    # nothing moved, nothing reserved
+    assert ProjectService.load("projB").platform_schedules["tiktok"].slot == s10
+    assert not (ProjectService.load("me").platform_schedules or {})

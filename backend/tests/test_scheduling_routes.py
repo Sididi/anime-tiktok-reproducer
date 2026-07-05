@@ -313,3 +313,31 @@ def test_switch_apply_stale_occupant_409(client):
         },
     )
     assert resp.status_code == 409
+
+
+def test_reserve_anchor_with_steals_route(client):
+    slot1 = _seed_pool_b_c()
+    resp = client.post(
+        "/api/scheduling/projects/me/reserve-anchor",
+        json={
+            "account_id": "acc_a",
+            "tiktok_slot": slot1.isoformat(),
+            "steals": {
+                "tiktok": {"mode": "cascade", "expected_occupant_id": "projB"}
+            },
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["platform_schedules"]["tiktok"]["slot"] == slot1.isoformat()
+    assert "projB" in body["notification_status"]["tiktok"]
+    # stale occupant -> 409, nothing moved
+    resp = client.post(
+        "/api/scheduling/projects/projC/reserve-anchor",
+        json={
+            "account_id": "acc_a",
+            "tiktok_slot": slot1.isoformat(),
+            "steals": {"tiktok": {"mode": "cascade", "expected_occupant_id": "wrong"}},
+        },
+    )
+    assert resp.status_code == 409
