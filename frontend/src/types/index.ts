@@ -423,12 +423,14 @@ export interface PlanningEvent {
   scheduled_at: string;    // ISO with jitter; hidden from UI
   drive_folder_url: string | null;
   status: "scheduled" | "running" | "complete";
+  manual: boolean;
 }
 
 export interface FreeSlot {
   slot: string;
   available: boolean;
   taken_by_project_id?: string;
+  taken_by_title?: string;
 }
 
 export interface ResolveAnchorResolvedSlot {
@@ -440,6 +442,25 @@ export interface ResolveAnchorResolvedSlot {
 export interface ResolveAnchorResult {
   resolved: Partial<Record<Platform, ResolveAnchorResolvedSlot>>;
   conflicts: Array<{ platform: Platform; reason: string }>;
+}
+
+export type SwitchMode = "cascade" | "next_free";
+export interface StealSpec { mode: SwitchMode; expected_occupant_id: string | null; }
+export interface SwitchPlanDto {
+  displaced: Array<{
+    project_id: string; anime_title: string;
+    from_slot: string; to_slot: string;
+    requires_platform_notification: boolean;
+  }>;
+  blockers: Array<{ platform: Platform; reason: string }>;
+}
+export interface SwitchPreview {
+  platform: Platform; slot: string;
+  occupant_project_id: string | null;
+  occupant_title: string | null;
+  uploaded_count: number;
+  cascade: SwitchPlanDto;
+  next_free: SwitchPlanDto;
 }
 
 export interface CascadePreview {
