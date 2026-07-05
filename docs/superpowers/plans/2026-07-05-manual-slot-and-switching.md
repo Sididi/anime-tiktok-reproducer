@@ -6,7 +6,7 @@
 
 **Architecture:** `PlatformSchedule` gains a `manual` flag excluded from pool counting at a single point (`_collect_pool_reservations`). Switching reuses the urgent-cascade walk generalized to an arbitrary start slot (`compute_switch`/`apply_switch` + `steals` param on `reserve_anchor` for atomicity with the anchor flow). Displaced projects are notified through the existing `PlatformRescheduleService` (YT/FB/IG/TT all covered) with the existing `reschedule_pending` retry queue as fallback.
 
-**Tech Stack:** FastAPI + Pydantic (backend), React + TypeScript + framer-motion (frontend), pytest (via `pixi run test`), Playwright e2e.
+**Tech Stack:** FastAPI + Pydantic (backend), React + TypeScript + framer-motion (frontend), pytest (via `pixi run -e dev test`), Playwright e2e.
 
 **Spec:** `docs/superpowers/specs/2026-07-05-manual-slot-and-switching-design.md`
 
@@ -19,7 +19,7 @@
 - Displacement writes happen farthest-first (reverse order) under `_reservation_lock`.
 - `apply_switch` re-verifies the occupant vs `expected_occupant_id` → `slot_state_changed` (HTTP 409) on mismatch.
 - French UI copy in frontend (match existing style: "Heure personnalisée", "Programmer (manuel)", "Cascader", "Slot libre suivant", "Annuler", "Programmation manuelle").
-- Backend tests: `pixi run test tests/<file>.py -v` (task cwd is `backend/`). Frontend type check: `cd frontend && npx tsc -b --noEmit` (or `npm run build`).
+- Backend tests: `pixi run -e dev test tests/<file>.py -v` (task cwd is `backend/`). Frontend type check: `cd frontend && npx tsc -b --noEmit` (or `npm run build`).
 - Commit after every task (conventional commits, `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`).
 
 ## Delegation Map (orchestrator: Fable — do not implement tasks inline)
@@ -148,7 +148,7 @@ def test_cascade_skips_manual_entries(tmp_path, monkeypatch):
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `pixi run test tests/test_scheduling_service.py -v -k "manual or taken_slot_reports"`
+Run: `pixi run -e dev test tests/test_scheduling_service.py -v -k "manual or taken_slot_reports"`
 Expected: FAIL — `PlatformSchedule.__init__() got an unexpected keyword argument 'manual'` / `taken_by_title` attribute error.
 
 - [ ] **Step 3: Implement**
@@ -234,7 +234,7 @@ In `compute_cascade`, delete the inline `account_pool_keys`/`slot_to_project` bl
 
 - [ ] **Step 4: Run the full scheduling test files**
 
-Run: `pixi run test tests/test_scheduling_service.py tests/test_scheduling_v2_service.py tests/test_scheduling_routes.py -v`
+Run: `pixi run -e dev test tests/test_scheduling_service.py tests/test_scheduling_v2_service.py tests/test_scheduling_routes.py -v`
 Expected: ALL PASS (new tests + no regression from the return-type change).
 
 - [ ] **Step 5: Commit**
@@ -300,7 +300,7 @@ def test_reserve_manual_overwrites_previous_manual(tmp_path, monkeypatch):
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `pixi run test tests/test_scheduling_service.py -v -k reserve_manual`
+Run: `pixi run -e dev test tests/test_scheduling_service.py -v -k reserve_manual`
 Expected: FAIL — `AttributeError: ... has no attribute 'reserve_manual'`.
 
 - [ ] **Step 3: Implement** (in `scheduling_service.py`, after `reserve_anchor`)
@@ -342,7 +342,7 @@ Expected: FAIL — `AttributeError: ... has no attribute 'reserve_manual'`.
 
 - [ ] **Step 4: Run tests**
 
-Run: `pixi run test tests/test_scheduling_service.py -v -k reserve_manual`
+Run: `pixi run -e dev test tests/test_scheduling_service.py -v -k reserve_manual`
 Expected: 3 PASS.
 
 - [ ] **Step 5: Commit**
@@ -412,7 +412,7 @@ def test_reserve_manual_route_rejects_too_close(client):
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `pixi run test tests/test_scheduling_routes.py -v -k reserve_manual`
+Run: `pixi run -e dev test tests/test_scheduling_routes.py -v -k reserve_manual`
 Expected: FAIL with 404 (route doesn't exist).
 
 - [ ] **Step 3: Implement** in `backend/app/api/routes/scheduling.py`:
@@ -484,7 +484,7 @@ async def reserve_manual(project_id: str, req: ReserveManualRequest):
 
 - [ ] **Step 4: Run tests**
 
-Run: `pixi run test tests/test_scheduling_routes.py -v`
+Run: `pixi run -e dev test tests/test_scheduling_routes.py -v`
 Expected: ALL PASS (new + existing).
 
 - [ ] **Step 5: Commit**
@@ -606,7 +606,7 @@ def test_compute_switch_pool_busy_blocks_both_plans(tmp_path, monkeypatch):
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `pixi run test tests/test_scheduling_service.py -v -k compute_switch`
+Run: `pixi run -e dev test tests/test_scheduling_service.py -v -k compute_switch`
 Expected: FAIL — no attribute `compute_switch`.
 
 - [ ] **Step 3: Implement.** Dataclasses after `CascadeResult` (~line 66):
@@ -729,7 +729,7 @@ Method (in the cascade section, after `compute_cascade`):
 
 - [ ] **Step 4: Run tests**
 
-Run: `pixi run test tests/test_scheduling_service.py -v -k compute_switch`
+Run: `pixi run -e dev test tests/test_scheduling_service.py -v -k compute_switch`
 Expected: 4 PASS.
 
 - [ ] **Step 5: Commit**
@@ -798,7 +798,7 @@ def test_apply_switch_stale_occupant_raises(tmp_path, monkeypatch):
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `pixi run test tests/test_scheduling_service.py -v -k apply_switch`
+Run: `pixi run -e dev test tests/test_scheduling_service.py -v -k apply_switch`
 Expected: FAIL — no attribute `apply_switch`.
 
 - [ ] **Step 3: Implement** (after `compute_switch`):
@@ -864,7 +864,7 @@ Expected: FAIL — no attribute `apply_switch`.
 
 - [ ] **Step 4: Run tests**
 
-Run: `pixi run test tests/test_scheduling_service.py -v`
+Run: `pixi run -e dev test tests/test_scheduling_service.py -v`
 Expected: ALL PASS.
 
 - [ ] **Step 5: Commit**
@@ -954,7 +954,7 @@ def test_switch_apply_stale_occupant_409(client):
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `pixi run test tests/test_scheduling_routes.py -v -k switch`
+Run: `pixi run -e dev test tests/test_scheduling_routes.py -v -k switch`
 Expected: FAIL with 404.
 
 - [ ] **Step 3: Implement:**
@@ -1041,7 +1041,7 @@ async def switch_apply(project_id: str, req: SwitchApplyRequest):
 
 - [ ] **Step 4: Run tests**
 
-Run: `pixi run test tests/test_scheduling_routes.py -v`
+Run: `pixi run -e dev test tests/test_scheduling_routes.py -v`
 Expected: ALL PASS.
 
 - [ ] **Step 5: Commit**
@@ -1147,7 +1147,7 @@ def test_reserve_anchor_with_steals_route(client):
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `pixi run test tests/test_scheduling_service.py -v -k steal`
+Run: `pixi run -e dev test tests/test_scheduling_service.py -v -k steal`
 Expected: FAIL — `ImportError: cannot import name 'StealSpec'`.
 
 - [ ] **Step 3: Implement.** Dataclass after `SwitchResult`:
@@ -1274,7 +1274,7 @@ Both endpoints convert models to specs and notify displaced projects after succe
 
 - [ ] **Step 4: Run the whole backend suite**
 
-Run: `pixi run test -v`
+Run: `pixi run -e dev test -v`
 Expected: ALL PASS (tuple-return callers all updated).
 
 - [ ] **Step 5: Commit**
@@ -2112,7 +2112,7 @@ Expected: new tests PASS, no existing test broken.
 - [ ] **Step 4: Full verification sweep**
 
 ```bash
-pixi run test -v                      # entire backend suite
+pixi run -e dev test -v                      # entire backend suite
 cd frontend && npx tsc -b --noEmit && npm run build && npm run test
 ```
 Expected: everything green.
