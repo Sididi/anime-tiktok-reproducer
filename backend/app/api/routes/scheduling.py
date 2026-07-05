@@ -39,12 +39,14 @@ class PlanningEvent(BaseModel):
     scheduled_at: datetime
     drive_folder_url: str | None
     status: Literal["scheduled", "running", "complete"]
+    manual: bool = False
 
 
 class FreeSlotResponse(BaseModel):
     slot: datetime
     available: bool
     taken_by_project_id: str | None = None
+    taken_by_title: str | None = None
 
 
 def _project_event_status(project: Project, platform: str) -> str:
@@ -78,6 +80,7 @@ def _build_planning_event(
         scheduled_at=sched.scheduled_at,
         drive_folder_url=project.drive_folder_url,
         status=_project_event_status(project, platform),  # type: ignore[arg-type]
+        manual=sched.manual,
     )
 
 
@@ -149,6 +152,7 @@ async def free_slots(
                 slot=s.slot,
                 available=s.available,
                 taken_by_project_id=s.taken_by_project_id,
+                taken_by_title=s.taken_by_title,
             ).model_dump(mode="json")
             for s in slots
         ]
@@ -179,7 +183,11 @@ class PatchAnchorRequest(BaseModel):
 
 def _platform_schedules_to_dict(schedules):
     return {
-        p: {"slot": s.slot.isoformat(), "scheduled_at": s.scheduled_at.isoformat()}
+        p: {
+            "slot": s.slot.isoformat(),
+            "scheduled_at": s.scheduled_at.isoformat(),
+            "manual": s.manual,
+        }
         for p, s in schedules.items()
     }
 
@@ -240,6 +248,48 @@ async def reserve_anchor(project_id: str, req: ReserveAnchorRequest):
             raise HTTPException(404, msg)
         raise HTTPException(422, msg)
     return {"platform_schedules": _platform_schedules_to_dict(schedules)}
+
+
+class ReserveManualRequest(BaseModel):
+    account_id: str
+    at: datetime
+    platforms: list[Platform] | None = None
+
+
+@router.post("/projects/{project_id}/reserve-manual")
+async def reserve_manual(project_id: str, req: ReserveManualRequest):
+    platforms = list(req.platforms) if req.platforms else None
+    if not platforms:
+        from ...services.project_upload_service import _platforms_to_reserve  # noqa: PLC0415
+        account = AccountService.get_account(req.account_id)
+        if account is None:
+            raise HTTPException(404, "Account not found")
+        platforms = _platforms_to_reserve(account, requested_platforms=None)
+    try:
+        schedules = await asyncio.to_thread(
+            SchedulingService.reserve_manual,
+            project_id, req.account_id, req.at, platforms,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        if "slot_too_close" in msg:
+            raise HTTPException(422, "slot_too_close")
+        if "Project not found" in msg:
+            raise HTTPException(404, msg)
+        raise HTTPException(422, msg)
+
+    # Editing an already-uploaded manual schedule must reach the platforms
+    # (YT publishAt, FB scheduled_publish_time, VPS reminder). For not-yet
+    # uploaded projects every notify is a cheap skip.
+    statuses: dict[str, str] = {}
+    for platform, sched in schedules.items():
+        statuses[platform] = await asyncio.to_thread(
+            _notify_displaced, project_id, platform, sched.scheduled_at
+        )
+    return {
+        "platform_schedules": _platform_schedules_to_dict(schedules),
+        "notification_status": statuses,
+    }
 
 
 @router.patch("/projects/{project_id}/platforms/{platform}")

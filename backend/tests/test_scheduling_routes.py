@@ -224,3 +224,44 @@ def test_router_disabled_when_flag_off(client, monkeypatch):
     )
     r = client.get("/api/scheduling/events")
     assert r.status_code == 503
+
+
+from datetime import timedelta
+
+
+def _mk_project(pid: str, **kwargs) -> Project:
+    p = Project(id=pid, **kwargs)
+    ProjectService.get_project_dir(p.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(p)
+    return p
+
+
+def test_reserve_manual_route_and_planning_flag(client):
+    _mk_project("p1", anime_name="Show")
+    at = _NOW + timedelta(hours=3)
+    resp = client.post(
+        "/api/scheduling/projects/p1/reserve-manual",
+        json={"account_id": "acc_a", "at": at.isoformat(), "platforms": ["tiktok"]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["platform_schedules"]["tiktok"]["manual"] is True
+    assert body["platform_schedules"]["tiktok"]["slot"] == at.isoformat()
+    assert "notification_status" in body
+
+    events = client.get(
+        "/api/scheduling/events", params={"range_start": _NOW.isoformat()}
+    ).json()["events"]
+    ev = next(e for e in events if e["project_id"] == "p1")
+    assert ev["manual"] is True
+
+
+def test_reserve_manual_route_rejects_too_close(client):
+    _mk_project("p1")
+    at = _NOW + timedelta(minutes=5)
+    resp = client.post(
+        "/api/scheduling/projects/p1/reserve-manual",
+        json={"account_id": "acc_a", "at": at.isoformat(), "platforms": ["tiktok"]},
+    )
+    assert resp.status_code == 422
+    assert "slot_too_close" in resp.text
