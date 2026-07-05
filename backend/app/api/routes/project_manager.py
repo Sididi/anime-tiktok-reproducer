@@ -11,6 +11,7 @@ from ...services import UploadPhaseService
 from ...services.google_drive_service import GoogleDriveService
 from ...services.project_upload_service import project_upload_queue
 from ...services.project_service import ProjectService
+from ...services.upload_phase import PendingProjectDeletionRequiresConfirmation
 
 
 router = APIRouter(prefix="/project-manager", tags=["project-manager"])
@@ -98,10 +99,24 @@ async def stream_project_upload_jobs():
 
 
 @router.delete("/projects/{project_id}")
-async def delete_managed_project(project_id: str):
-    """Delete local project + linked Drive folder + webhook message cleanup."""
+async def delete_managed_project(project_id: str, confirmed: bool = False):
+    """Archive and delete a project, requiring confirmation while scheduled."""
     try:
-        return await asyncio.to_thread(UploadPhaseService.managed_delete, project_id)
+        return await asyncio.to_thread(
+            UploadPhaseService.managed_delete,
+            project_id,
+            confirmed=confirmed,
+        )
+    except PendingProjectDeletionRequiresConfirmation as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "scheduled_project_confirmation_required",
+                "message": str(exc),
+                "project_id": exc.project_id,
+                "platforms": exc.platforms,
+            },
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except Exception as exc:

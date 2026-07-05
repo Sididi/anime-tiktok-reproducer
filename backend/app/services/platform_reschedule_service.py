@@ -26,18 +26,24 @@ class NotificationResult:
 
 
 class PlatformRescheduleService:
-    """Propagates slot changes to YouTube/Facebook/Instagram-server.
-
-    TikTok is manual and never notified.
-    """
+    """Propagates schedule changes to platform APIs and the VPS scheduler."""
 
     @classmethod
     def _platform_video_url(cls, project: Project, platform: str) -> str | None:
         result = project.upload_last_result or {}
         platforms = result.get("platforms") if isinstance(result, dict) else None
-        if not isinstance(platforms, dict):
-            return None
-        entry = platforms.get(platform)
+        entry = None
+        if isinstance(platforms, dict):
+            entry = platforms.get(platform)
+        elif isinstance(platforms, list):
+            entry = next(
+                (
+                    item
+                    for item in platforms
+                    if isinstance(item, dict) and item.get("platform") == platform
+                ),
+                None,
+            )
         if not isinstance(entry, dict):
             return None
         url = entry.get("url")
@@ -59,7 +65,10 @@ class PlatformRescheduleService:
 
     @classmethod
     def _facebook_video_id(cls, url: str) -> str | None:
-        m = re.search(r"/videos?/(\d+)", url) or re.search(r"v=(\d+)", url)
+        m = (
+            re.search(r"/(?:videos?|reel)/(\d+)", url)
+            or re.search(r"v=(\d+)", url)
+        )
         return m.group(1) if m else None
 
     @classmethod
@@ -248,6 +257,11 @@ class PlatformRescheduleService:
 
     @classmethod
     def _cancel_instagram(cls, project: Project) -> NotificationResult:
+        return cls.delete_server_job(project)
+
+    @classmethod
+    def delete_server_job(cls, project: Project) -> NotificationResult:
+        """Delete the VPS job, cancelling pending Instagram and TikTok work."""
         base = cls._server_base_url()
         if not base or not settings.tiktok_server_internal_token:
             return NotificationResult(status="skipped")

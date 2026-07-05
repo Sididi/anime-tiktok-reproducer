@@ -22,11 +22,19 @@ from .google_drive_service import GoogleDriveService
 from .metadata import MetadataService
 from .meta_token_service import MetaTokenService
 from .music_config_service import MusicConfigService
+from .platform_reschedule_service import PlatformRescheduleService
 from .project_service import ProjectService
 from .scheduling_service import SchedulingService
 from .social_upload_service import PlatformUploadResult, SocialUploadService
 
 logger = logging.getLogger("uvicorn.error")
+
+
+class PendingProjectDeletionRequiresConfirmation(ValueError):
+    def __init__(self, project_id: str, platforms: list[str]):
+        super().__init__("Scheduled project deletion requires explicit confirmation")
+        self.project_id = project_id
+        self.platforms = platforms
 
 
 @dataclass
@@ -1335,51 +1343,134 @@ class UploadPhaseService:
         )
 
     @classmethod
-    def managed_delete(cls, project_id: str) -> dict[str, Any]:
+    def managed_delete(
+        cls, project_id: str, *, confirmed: bool = False
+    ) -> dict[str, Any]:
         project = ProjectService.load(project_id)
         if not project:
             raise ValueError("Project not found")
 
+        now = datetime.now(timezone.utc)
+        pending_platform_set = {
+            platform
+            for platform, schedule in (project.platform_schedules or {}).items()
+            if (
+                schedule.scheduled_at.replace(tzinfo=timezone.utc)
+                if schedule.scheduled_at.tzinfo is None
+                else schedule.scheduled_at.astimezone(timezone.utc)
+            ) > now
+        }
+        aggregate_scheduled_at = project.scheduled_at
+        aggregate_is_future = bool(
+            aggregate_scheduled_at
+            and (
+                aggregate_scheduled_at.replace(tzinfo=timezone.utc)
+                if aggregate_scheduled_at.tzinfo is None
+                else aggregate_scheduled_at.astimezone(timezone.utc)
+            )
+            > now
+        )
+        # Older persisted projects may only have the aggregate scheduled_at.
+        # Derive their remote platforms from the saved upload result so they
+        # receive the same confirmation and cancellation protection.
+        if aggregate_is_future and not pending_platform_set:
+            upload_result = project.upload_last_result or {}
+            stored_platforms = (
+                upload_result.get("platforms")
+                if isinstance(upload_result, dict)
+                else None
+            )
+            if isinstance(stored_platforms, list):
+                pending_platform_set.update(
+                    str(item["platform"])
+                    for item in stored_platforms
+                    if isinstance(item, dict) and item.get("platform")
+                )
+            elif isinstance(stored_platforms, dict):
+                pending_platform_set.update(str(item) for item in stored_platforms)
+            requested = (
+                upload_result.get("requested_platforms")
+                if isinstance(upload_result, dict)
+                else None
+            )
+            if isinstance(requested, list):
+                pending_platform_set.update(str(item) for item in requested)
+            if not pending_platform_set:
+                pending_platform_set.update(
+                    ("youtube", "facebook", "instagram", "tiktok")
+                )
+        pending_platforms = sorted(pending_platform_set)
+        if pending_platforms and not confirmed:
+            raise PendingProjectDeletionRequiresConfirmation(
+                project.id, pending_platforms
+            )
+
         cleanup_warnings: list[str] = []
+        drive_deleted = False
+        archive_result: dict[str, Any] | None = None
+        drive_folder_id = project.drive_folder_id
+        should_resolve_by_name = bool(
+            not drive_folder_id
+            and (
+                project.upload_completed_at
+                or project.upload_last_result
+                or project.drive_folder_url
+            )
+        )
+        if should_resolve_by_name and GoogleDriveService.is_configured():
+            found = GoogleDriveService.find_project_folder_by_name(
+                ExportService.output_folder_name(project)
+            )
+            drive_folder_id = found["id"] if found else None
+
+        # Archive must finish before any destructive Drive or local operation.
+        if drive_folder_id and GoogleDriveService.is_configured():
+            archive_result = GoogleDriveService.archive_project_folder(drive_folder_id)
+
+        cancellation_status: dict[str, str] = {}
+        server_platforms = {"instagram", "tiktok"}.intersection(pending_platforms)
+        if server_platforms or (
+            pending_platforms and project.final_upload_discord_message_id
+        ):
+            server_result = PlatformRescheduleService.delete_server_job(project)
+            for platform in sorted(server_platforms):
+                cancellation_status[platform] = server_result.status
+            if server_result.status == "pending_retry":
+                raise RuntimeError(
+                    "Could not remove the pending Instagram/TikTok server job: "
+                    f"{server_result.error or 'unknown error'}"
+                )
+
+        for platform in (
+            item for item in pending_platforms if item not in server_platforms
+        ):
+            result = PlatformRescheduleService.cancel(project, platform)
+            cancellation_status[platform] = result.status
+            if result.status == "pending_retry":
+                raise RuntimeError(
+                    f"Could not unschedule {platform}: {result.error or 'unknown error'}"
+                )
+
         try:
             if project.final_upload_discord_message_id:
-                # delete_job cascades: removes both the embed and the reminder
-                # message on the VPS in one call.
+                # Removes the VPS job and all associated Discord messages.
                 DiscordService.delete_job(project_id)
             elif project.generation_discord_message_id:
                 DiscordService.delete_message(project.generation_discord_message_id)
         except Exception as exc:
             cleanup_warnings.append(f"discord cleanup failed: {exc}")
 
-        drive_deleted = False
-        try:
-            drive_folder_id = project.drive_folder_id
-            should_resolve_by_name = bool(
-                not drive_folder_id
-                and (
-                    project.upload_completed_at
-                    or project.upload_last_result
-                    or project.drive_folder_url
-                )
-            )
-            if should_resolve_by_name and GoogleDriveService.is_configured():
-                found = GoogleDriveService.find_project_folder_by_name(
-                    ExportService.output_folder_name(project)
-                )
-                drive_folder_id = found["id"] if found else None
-
-            if drive_folder_id and GoogleDriveService.is_configured():
-                GoogleDriveService.delete_folder(drive_folder_id)
-                drive_deleted = True
-        except Exception as exc:
-            cleanup_warnings.append(f"drive cleanup failed: {exc}")
-            drive_deleted = False
+        if drive_folder_id and GoogleDriveService.is_configured():
+            GoogleDriveService.delete_folder(drive_folder_id)
+            drive_deleted = True
 
         local_deleted = ProjectService.delete(project.id)
         result = {
             "status": "deleted" if local_deleted else "not_found",
             "local_deleted": local_deleted,
             "drive_deleted": drive_deleted,
+            "archive": archive_result,
+            "unscheduled": cancellation_status,
         }
         if cleanup_warnings:
             result["cleanup_warnings"] = cleanup_warnings

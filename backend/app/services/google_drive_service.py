@@ -40,6 +40,10 @@ def _escape_query_value(s: str) -> str:
 
 class GoogleDriveService:
     """Google Drive utilities for project-level folder and file management."""
+    ARCHIVE_FOLDER_NAME = "Archive Projets"
+    ARCHIVE_ROOT_FILES = {"import_project.jsx", "tts_edited.wav"}
+    ARCHIVE_FULL_FOLDERS = {"subtitles", "raw_scene_subtitles", "assets"}
+    ARCHIVE_SOURCE_FILES = {"title_overlay.png", "category_overlay.png"}
     _lock = Lock()
     _credentials_cache: Credentials | None = None
     _client_local = local()
@@ -317,6 +321,140 @@ class GoogleDriveService:
             supportsAllDrives=True,
         ).execute()
         return created["id"], created.get("webViewLink", "")
+
+    @classmethod
+    def _ensure_child_folder(
+        cls,
+        folder_name: str,
+        parent_id: str,
+        *,
+        drive=None,
+    ) -> dict[str, Any]:
+        drive = drive or cls._client()
+        q = (
+            f"mimeType='{FOLDER_MIME}' and trashed=false and "
+            f"name='{_escape_query_value(folder_name)}' and "
+            f"'{_escape_query_value(parent_id)}' in parents"
+        )
+        existing = cls._query_files(q, drive=drive)
+        if existing:
+            return existing[0]
+        return drive.files().create(
+            body={"name": folder_name, "mimeType": FOLDER_MIME, "parents": [parent_id]},
+            fields="id,name,mimeType,webViewLink",
+            supportsAllDrives=True,
+        ).execute()
+
+    @classmethod
+    def _copy_archive_tree(
+        cls,
+        source_folder_id: str,
+        destination_folder_id: str,
+        *,
+        drive,
+        allowed_names: set[str] | None = None,
+    ) -> int:
+        copied = 0
+        for item in cls.list_children(source_folder_id, drive=drive):
+            name = str(item.get("name") or "")
+            if allowed_names is not None and name not in allowed_names:
+                continue
+            item_id = str(item.get("id") or "")
+            if not item_id:
+                continue
+            if item.get("mimeType") == FOLDER_MIME:
+                destination = cls._ensure_child_folder(
+                    name, destination_folder_id, drive=drive
+                )
+                copied += cls._copy_archive_tree(
+                    item_id, destination["id"], drive=drive
+                )
+                continue
+
+            def _copy() -> dict[str, Any]:
+                return drive.files().copy(
+                    fileId=item_id,
+                    body={"name": name, "parents": [destination_folder_id]},
+                    fields="id",
+                    supportsAllDrives=True,
+                ).execute()
+
+            cls._execute_with_retries(
+                _copy, operation=f"drive_archive_copy:{item_id}"
+            )
+            copied += 1
+        return copied
+
+    @classmethod
+    def archive_project_folder(cls, source_folder_id: str) -> dict[str, Any]:
+        """Copy the reconstructable subset of a project into Archive Projets."""
+        drive = cls._client()
+        source = drive.files().get(
+            fileId=source_folder_id,
+            fields="id,name",
+            supportsAllDrives=True,
+        ).execute()
+        project_name = str(source.get("name") or "")
+        if not project_name:
+            raise RuntimeError("Drive project folder has no name")
+        parent_id = settings.google_drive_parent_folder_id
+        if not parent_id:
+            raise RuntimeError("Google Drive parent folder not configured")
+
+        archive_root = cls._ensure_child_folder(
+            cls.ARCHIVE_FOLDER_NAME, parent_id, drive=drive
+        )
+        archive_project = cls._ensure_child_folder(
+            project_name, archive_root["id"], drive=drive
+        )
+        children = cls.list_children(source_folder_id, drive=drive)
+        available_root_files = {
+            str(item.get("name") or "")
+            for item in children
+            if item.get("mimeType") != FOLDER_MIME
+        }
+        missing_required = cls.ARCHIVE_ROOT_FILES - available_root_files
+        if missing_required:
+            raise RuntimeError(
+                "Cannot archive project; required Drive files are missing: "
+                + ", ".join(sorted(missing_required))
+            )
+        # A previous interrupted attempt may have left a partial archive.
+        cls.clear_folder(archive_project["id"], drive=drive)
+
+        copied = 0
+        for item in children:
+            name = str(item.get("name") or "")
+            item_id = str(item.get("id") or "")
+            if not item_id:
+                continue
+            if item.get("mimeType") != FOLDER_MIME:
+                if name not in cls.ARCHIVE_ROOT_FILES:
+                    continue
+                copied += cls._copy_archive_tree(
+                    source_folder_id,
+                    archive_project["id"],
+                    drive=drive,
+                    allowed_names={name},
+                )
+                continue
+            if name not in cls.ARCHIVE_FULL_FOLDERS and name != "sources":
+                continue
+            destination = cls._ensure_child_folder(
+                name, archive_project["id"], drive=drive
+            )
+            copied += cls._copy_archive_tree(
+                item_id,
+                destination["id"],
+                drive=drive,
+                allowed_names=cls.ARCHIVE_SOURCE_FILES if name == "sources" else None,
+            )
+
+        return {
+            "folder_id": archive_project["id"],
+            "folder_url": archive_project.get("webViewLink", ""),
+            "files_copied": copied,
+        }
 
     @classmethod
     def list_children(cls, folder_id: str, *, drive=None) -> list[dict[str, Any]]:

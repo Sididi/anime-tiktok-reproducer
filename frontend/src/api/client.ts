@@ -281,9 +281,15 @@ export const api = {
   getCopyrightVideoUrl: (projectId: string) =>
     `${API_BASE}/project-manager/projects/${projectId}/copyright-video`,
 
-  deleteManagedProject: (projectId: string) =>
-    request<{ status: string; local_deleted: boolean; drive_deleted: boolean }>(
-      `/project-manager/projects/${projectId}`,
+  deleteManagedProject: (projectId: string, confirmed = false) =>
+    request<{
+      status: string;
+      local_deleted: boolean;
+      drive_deleted: boolean;
+      archive: { folder_id: string; folder_url: string; files_copied: number } | null;
+      unscheduled: Record<string, string>;
+    }>(
+      `/project-manager/projects/${projectId}?confirmed=${confirmed}`,
       { method: "DELETE" },
     ),
 

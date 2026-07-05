@@ -16,6 +16,7 @@ import { ProjectTable } from "./ProjectTable";
 import { SlotPickerPopover } from "./SlotPickerPopover";
 import { UrgentCascadeModal } from "./UrgentCascadeModal";
 import { YouTubeDurationModal } from "./YouTubeDurationModal";
+import { formatScheduledAt } from "./utils";
 import type { SortColumn, SortDirection, UploadMode, AnchorPayload } from "./types";
 import {
   getLibraryTypeLabel,
@@ -162,8 +163,6 @@ export function ProjectManagerModal({
   const uploadSessionsRef = useRef<Record<string, UploadSession>>({});
 
   const [activeDeleteId, setActiveDeleteId] = useState<string | null>(null);
-  const [holdingDeleteId, setHoldingDeleteId] = useState<string | null>(null);
-  const holdTimerRef = useRef<number | null>(null);
   const reloadRowsTimerRef = useRef<number | null>(null);
 
   const [accountPickerForProject, setAccountPickerForProject] = useState<
@@ -381,7 +380,6 @@ export function ProjectManagerModal({
 
   useEffect(
     () => () => {
-      if (holdTimerRef.current) window.clearTimeout(holdTimerRef.current);
       if (reloadRowsTimerRef.current) {
         window.clearTimeout(reloadRowsTimerRef.current);
       }
@@ -394,7 +392,6 @@ export function ProjectManagerModal({
       setUploadSessions({});
       setAccountPickerForProject(null);
       setAccountDropdownOpen(false);
-      setHoldingDeleteId(null);
       setPreviewVideoId(null);
     }
   }, [open]);
@@ -650,7 +647,7 @@ export function ProjectManagerModal({
     try {
       for (const id of ids) {
         try {
-          await api.deleteManagedProject(id);
+          await api.deleteManagedProject(id, true);
         } catch {
           failedIds.push(id);
         }
@@ -717,6 +714,17 @@ export function ProjectManagerModal({
       return 0;
     });
   }, [filteredRows, sortColumn, sortDirection]);
+
+  const selectedPendingRows = useMemo(
+    () =>
+      rows.filter(
+        (row) =>
+          selectedProjectIds.has(row.project_id) &&
+          !!row.scheduled_at &&
+          new Date(row.scheduled_at) > new Date(),
+      ),
+    [rows, selectedProjectIds],
+  );
 
   const toggleSort = (column: SortColumn) => {
     if (sortColumn === column) {
@@ -787,7 +795,7 @@ export function ProjectManagerModal({
       setActiveDeleteId(projectId);
       setError(null);
       try {
-        await api.deleteManagedProject(projectId);
+        await api.deleteManagedProject(projectId, true);
         await loadData();
       } catch (err) {
         setError((err as Error).message);
@@ -798,30 +806,7 @@ export function ProjectManagerModal({
     [loadData],
   );
 
-  const startDeleteHold = (row: ProjectManagerRow) => {
-    if (row.scheduled_at) {
-      const scheduledDate = new Date(row.scheduled_at);
-      if (scheduledDate > new Date()) {
-        setDeleteConfirmRow(row);
-        return;
-      }
-    }
-    if (holdTimerRef.current) window.clearTimeout(holdTimerRef.current);
-    setHoldingDeleteId(row.project_id);
-    holdTimerRef.current = window.setTimeout(() => {
-      setHoldingDeleteId(null);
-      void runDelete(row.project_id);
-      holdTimerRef.current = null;
-    }, 1000);
-  };
-
-  const cancelDeleteHold = () => {
-    if (holdTimerRef.current) {
-      window.clearTimeout(holdTimerRef.current);
-      holdTimerRef.current = null;
-    }
-    setHoldingDeleteId(null);
-  };
+  const requestDelete = (row: ProjectManagerRow) => setDeleteConfirmRow(row);
 
   const promptSessions = useMemo(
     () =>
@@ -1005,12 +990,10 @@ export function ProjectManagerModal({
                 onToggleSort={toggleSort}
                 uploadStateByProjectId={uploadStateByProjectId}
                 activeDeleteId={activeDeleteId}
-                holdingDeleteId={holdingDeleteId}
                 onUpload={handleUploadClick}
                 onUploadSchedule={handleUploadSchedule}
                 onUploadUrgent={handleUploadUrgent}
-                onDeleteHoldStart={startDeleteHold}
-                onDeleteHoldCancel={cancelDeleteHold}
+                onDelete={requestDelete}
                 onPreview={(id) => setPreviewVideoId(id)}
                 multiDeleteMode={multiDeleteMode}
                 selectedProjectIds={selectedProjectIds}
@@ -1184,8 +1167,9 @@ export function ProjectManagerModal({
           </AnimatePresence>
 
           <ScheduledDeleteConfirm
-            open={!!deleteConfirmRow?.scheduled_at}
-            scheduledAt={deleteConfirmRow?.scheduled_at || ""}
+            open={!!deleteConfirmRow}
+            projectTitle={deleteConfirmRow?.anime_title || deleteConfirmRow?.project_id || ""}
+            scheduledAt={deleteConfirmRow?.scheduled_at || null}
             onConfirm={() => {
               const projectId = deleteConfirmRow!.project_id;
               setDeleteConfirmRow(null);
@@ -1216,9 +1200,25 @@ export function ProjectManagerModal({
                     {selectedProjectIds.size !== 1 ? "s" : ""}?
                   </h3>
                   <p className="text-sm text-[hsl(var(--muted-foreground))] mb-4">
-                    This will permanently delete all selected projects. This
-                    action cannot be undone.
+                    Reconstructable Drive files, when present, will be copied to
+                    Archive Projets before the selected projects are deleted.
                   </p>
+                  {selectedPendingRows.length > 0 && (
+                    <div className="mb-4 rounded-md border border-[hsl(var(--destructive))]/50 bg-[hsl(var(--destructive))]/10 p-3">
+                      <p className="text-sm font-medium mb-2">
+                        Confirm that these still-scheduled projects must be
+                        unscheduled from every platform:
+                      </p>
+                      <ul className="text-xs space-y-1">
+                        {selectedPendingRows.map((row) => (
+                          <li key={row.project_id}>
+                            {row.anime_title || row.project_id} —{" "}
+                            {formatScheduledAt(row.scheduled_at)}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
                   <div className="flex justify-end gap-2">
                     <Button
                       variant="ghost"

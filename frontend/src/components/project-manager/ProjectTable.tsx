@@ -13,12 +13,10 @@ interface ProjectTableProps {
   onToggleSort: (column: SortColumn) => void;
   uploadStateByProjectId: Record<string, { active: boolean; label: string | null }>;
   activeDeleteId: string | null;
-  holdingDeleteId: string | null;
   onUpload: (row: ProjectManagerRow) => void;
   onUploadSchedule: (row: ProjectManagerRow) => void;
   onUploadUrgent: (row: ProjectManagerRow) => void;
-  onDeleteHoldStart: (row: ProjectManagerRow) => void;
-  onDeleteHoldCancel: () => void;
+  onDelete: (row: ProjectManagerRow) => void;
   onPreview: (driveVideoId: string) => void;
   multiDeleteMode: boolean;
   selectedProjectIds: Set<string>;
@@ -86,12 +84,10 @@ export function ProjectTable({
   onToggleSort,
   uploadStateByProjectId,
   activeDeleteId,
-  holdingDeleteId,
   onUpload,
   onUploadSchedule,
   onUploadUrgent,
-  onDeleteHoldStart,
-  onDeleteHoldCancel,
+  onDelete,
   onPreview,
   multiDeleteMode,
   selectedProjectIds,
@@ -140,12 +136,10 @@ export function ProjectTable({
               selectedAccount={selectedAccount}
               uploadState={uploadStateByProjectId[row.project_id]}
               activeDeleteId={activeDeleteId}
-              holdingDeleteId={holdingDeleteId}
               onUpload={onUpload}
               onUploadSchedule={onUploadSchedule}
               onUploadUrgent={onUploadUrgent}
-              onDeleteHoldStart={onDeleteHoldStart}
-              onDeleteHoldCancel={onDeleteHoldCancel}
+              onDelete={onDelete}
               onPreview={onPreview}
               multiDeleteMode={multiDeleteMode}
               isSelected={selectedProjectIds.has(row.project_id)}

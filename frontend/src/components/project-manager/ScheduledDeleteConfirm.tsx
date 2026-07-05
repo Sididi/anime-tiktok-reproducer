@@ -4,12 +4,14 @@ import { formatScheduledAt } from "./utils";
 
 interface ScheduledDeleteConfirmProps {
   open: boolean;
-  scheduledAt: string;
+  projectTitle: string;
+  scheduledAt: string | null;
   onConfirm: () => void;
   onCancel: () => void;
 }
 
-export function ScheduledDeleteConfirm({ open, scheduledAt, onConfirm, onCancel }: ScheduledDeleteConfirmProps) {
+export function ScheduledDeleteConfirm({ open, projectTitle, scheduledAt, onConfirm, onCancel }: ScheduledDeleteConfirmProps) {
+  const isPending = !!scheduledAt && new Date(scheduledAt) > new Date();
   return (
     <AnimatePresence>
       {open && (
@@ -28,16 +30,30 @@ export function ScheduledDeleteConfirm({ open, scheduledAt, onConfirm, onCancel 
             transition={{ duration: 0.15 }}
             onClick={(e) => e.stopPropagation()}
           >
-            <h3 className="font-semibold mb-2">Delete Scheduled Project?</h3>
+            <h3 className="font-semibold mb-2">
+              {isPending ? "Delete scheduled project?" : "Delete project?"}
+            </h3>
             <p className="text-sm text-[hsl(var(--muted-foreground))] mb-4">
-              This project has a scheduled upload at <strong>{formatScheduledAt(scheduledAt)}</strong>. Delete anyway?
+              {isPending ? (
+                <>
+                  <strong>{projectTitle}</strong> is still scheduled for{" "}
+                  <strong>{formatScheduledAt(scheduledAt)}</strong>. Confirming will
+                  unschedule every platform before deletion.
+                </>
+              ) : (
+                <>
+                  Delete <strong>{projectTitle}</strong>?
+                </>
+              )}
+              {" "}The reconstructable Drive files, when present, will first be
+              copied to Archive Projets.
             </p>
             <div className="flex justify-end gap-2">
               <Button variant="ghost" size="sm" onClick={onCancel}>
                 Cancel
               </Button>
               <Button variant="destructive" size="sm" onClick={onConfirm}>
-                Delete
+                Confirm delete
               </Button>
             </div>
           </motion.div>

@@ -19,12 +19,10 @@ interface ProjectRowProps {
     label: string | null;
   };
   activeDeleteId: string | null;
-  holdingDeleteId: string | null;
   onUpload: (row: ProjectManagerRow) => void;
   onUploadSchedule: (row: ProjectManagerRow) => void;
   onUploadUrgent: (row: ProjectManagerRow) => void;
-  onDeleteHoldStart: (row: ProjectManagerRow) => void;
-  onDeleteHoldCancel: () => void;
+  onDelete: (row: ProjectManagerRow) => void;
   onPreview: (driveVideoId: string) => void;
   multiDeleteMode: boolean;
   isSelected: boolean;
@@ -37,12 +35,10 @@ export function ProjectRow({
   selectedAccount,
   uploadState,
   activeDeleteId,
-  holdingDeleteId,
   onUpload,
   onUploadSchedule,
   onUploadUrgent,
-  onDeleteHoldStart,
-  onDeleteHoldCancel,
+  onDelete,
   onPreview,
   multiDeleteMode,
   isSelected,
@@ -233,28 +229,15 @@ export function ProjectRow({
           {/* Upload */}
           {uploadButton}
 
-          {/* Delete (hold 1s) */}
+          {/* Delete */}
           <Button
             size="icon"
             variant="destructive"
             className="relative overflow-hidden h-9 w-9 active:scale-95 transition-transform shrink-0"
             disabled={activeDeleteId !== null}
-            onMouseDown={() => onDeleteHoldStart(row)}
-            onMouseUp={onDeleteHoldCancel}
-            onMouseLeave={onDeleteHoldCancel}
-            onTouchStart={() => onDeleteHoldStart(row)}
-            onTouchEnd={onDeleteHoldCancel}
-            onTouchCancel={onDeleteHoldCancel}
-            title="Hold to delete"
+            onClick={() => onDelete(row)}
+            title="Delete project"
           >
-            <span
-              className="absolute inset-0 bg-white/20 origin-left transition-transform"
-              style={{
-                transform: holdingDeleteId === row.project_id ? "scaleX(1)" : "scaleX(0)",
-                transitionDuration: holdingDeleteId === row.project_id ? "1s" : "0s",
-                transitionTimingFunction: "linear",
-              }}
-            />
             {activeDeleteId === row.project_id ? (
               <Loader2 className="h-4 w-4 animate-spin" />
             ) : (
