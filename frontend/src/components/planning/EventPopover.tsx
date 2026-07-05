@@ -1,7 +1,9 @@
+import { useState } from "react";
 import { motion } from "framer-motion";
 import { ExternalLink, X, Trash2, RotateCcw, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui";
 import type { Platform, PlanningEvent } from "@/types";
+import { ALL_PLATFORMS } from "@/types";
 import { PLATFORM_LABELS, platformBgHsl } from "./platformColors";
 
 interface EventPopoverProps {
@@ -31,6 +33,23 @@ function formatSlot(iso: string): string {
   }).format(new Date(iso));
 }
 
+const STATUS_UI: Record<
+  PlanningEvent["status"],
+  { label: string; className: string } | null
+> = {
+  scheduled: null,
+  running: {
+    label: "En cours",
+    className: "text-green-500 border-green-500/40",
+  },
+  complete: {
+    label: "Publié",
+    className: "text-green-500/80 border-green-500/30",
+  },
+};
+
+type ConfirmTarget = { kind: "platform"; platform: Platform } | { kind: "all" };
+
 export function EventPopover({
   members,
   anchor,
@@ -43,6 +62,14 @@ export function EventPopover({
   onCancelAll,
 }: EventPopoverProps) {
   const first = members[0];
+  const ordered = [...members].sort(
+    (a, b) =>
+      ALL_PLATFORMS.indexOf(a.platform) - ALL_PLATFORMS.indexOf(b.platform),
+  );
+  // Two-step destructive actions: first click arms ("Confirmer ?"),
+  // second click executes. Any other interaction disarms.
+  const [confirming, setConfirming] = useState<ConfirmTarget | null>(null);
+
   const POPOVER_W = 360;
   // Approx height: 96 (header+slot+drive) + 38 per platform row + 84 (global actions).
   const POPOVER_H = 96 + members.length * 38 + 84;
@@ -60,6 +87,10 @@ export function EventPopover({
     top = anchor.y - POPOVER_H - 12;
   }
   top = Math.max(8, Math.min(window.innerHeight - POPOVER_H - 8, top));
+
+  const isConfirmingPlatform = (p: Platform) =>
+    confirming?.kind === "platform" && confirming.platform === p;
+  const isConfirmingAll = confirming?.kind === "all";
 
   return (
     <div
@@ -87,7 +118,7 @@ export function EventPopover({
           <button
             onClick={onClose}
             className="p-1 rounded hover:bg-[hsl(var(--muted))] flex-shrink-0"
-            aria-label="Close"
+            aria-label="Fermer"
           >
             <X className="h-4 w-4" />
           </button>
@@ -119,67 +150,126 @@ export function EventPopover({
             rel="noreferrer"
             className="inline-flex items-center gap-1 text-xs text-[hsl(var(--primary))] hover:underline mb-3"
           >
-            Drive folder <ExternalLink className="h-3 w-3" />
+            Dossier Drive <ExternalLink className="h-3 w-3" />
           </a>
         )}
 
         {/* Per-platform actions */}
         <div className="space-y-1.5 mb-3 border-t border-[hsl(var(--border))] pt-2">
-          {members.map((m) => (
-            <div key={m.platform} className="flex items-center gap-2">
-              <span
-                className="text-[10px] font-bold px-1.5 py-0.5 rounded text-white flex-shrink-0"
-                style={{
-                  backgroundColor: platformBgHsl(m.platform),
-                  minWidth: 30,
-                  textAlign: "center",
-                }}
-              >
-                {PLATFORM_LABELS[m.platform]}
-              </span>
-              <div className="flex-1" />
-              <Button
-                size="sm"
-                variant="ghost"
-                className="h-7 px-2 text-xs"
-                onClick={() => onReschedulePlatform(m.platform)}
-                title={`Reschedule ${PLATFORM_LABELS[m.platform]} slot`}
-              >
-                <RefreshCw className="h-3 w-3 mr-1" /> Move
-              </Button>
-              <Button
-                size="sm"
-                variant="ghost"
-                className="h-7 px-2 text-xs text-[hsl(var(--destructive))] hover:text-[hsl(var(--destructive))]"
-                onClick={() => onCancelPlatform(m.platform)}
-                title={`Cancel ${PLATFORM_LABELS[m.platform]} slot`}
-              >
-                <Trash2 className="h-3 w-3 mr-1" /> Cancel
-              </Button>
-            </div>
-          ))}
+          {ordered.map((m) => {
+            const statusUi = STATUS_UI[m.status];
+            const locked = m.status !== "scheduled";
+            const lockedReason =
+              m.status === "running"
+                ? "Upload en cours — action impossible"
+                : "Déjà publié — action impossible";
+            return (
+              <div key={m.platform} className="flex items-center gap-2">
+                <span
+                  className="text-[10px] font-bold px-1.5 py-0.5 rounded text-white flex-shrink-0"
+                  style={{
+                    backgroundColor: platformBgHsl(m.platform),
+                    minWidth: 30,
+                    textAlign: "center",
+                  }}
+                >
+                  {PLATFORM_LABELS[m.platform]}
+                </span>
+                {statusUi && (
+                  <span
+                    className={`text-[10px] px-1.5 py-0.5 rounded border ${statusUi.className} ${
+                      m.status === "running" ? "planning-status-pulse" : ""
+                    }`}
+                  >
+                    {statusUi.label}
+                  </span>
+                )}
+                <div className="flex-1" />
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 px-2 text-xs"
+                  disabled={locked}
+                  onClick={() => {
+                    setConfirming(null);
+                    onReschedulePlatform(m.platform);
+                  }}
+                  title={
+                    locked
+                      ? lockedReason
+                      : `Déplacer le créneau ${PLATFORM_LABELS[m.platform]}`
+                  }
+                >
+                  <RefreshCw className="h-3 w-3 mr-1" /> Déplacer
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className={`h-7 px-2 text-xs text-[hsl(var(--destructive))] hover:text-[hsl(var(--destructive))] ${
+                    isConfirmingPlatform(m.platform)
+                      ? "bg-[hsl(var(--destructive))]/15"
+                      : ""
+                  }`}
+                  disabled={locked}
+                  onClick={() => {
+                    if (isConfirmingPlatform(m.platform)) {
+                      setConfirming(null);
+                      onCancelPlatform(m.platform);
+                    } else {
+                      setConfirming({ kind: "platform", platform: m.platform });
+                    }
+                  }}
+                  title={
+                    locked
+                      ? lockedReason
+                      : `Annuler le créneau ${PLATFORM_LABELS[m.platform]}`
+                  }
+                >
+                  <Trash2 className="h-3 w-3 mr-1" />
+                  {isConfirmingPlatform(m.platform) ? "Confirmer ?" : "Annuler"}
+                </Button>
+              </div>
+            );
+          })}
         </div>
 
-        {/* Global actions */}
+        {/* Global actions — affect the whole project (all platforms, even on
+            other calendar cards). */}
         <div className="grid grid-cols-2 gap-2 border-t border-[hsl(var(--border))] pt-2">
           <Button
             size="sm"
             variant="outline"
             className="h-8 px-2 text-xs whitespace-nowrap"
-            onClick={onRescheduleProject}
+            onClick={() => {
+              setConfirming(null);
+              onRescheduleProject();
+            }}
             disabled={rescheduleProjectDisabled}
-            title={rescheduleProjectDisabledReason ?? "Re-anchor whole project"}
+            title={
+              rescheduleProjectDisabledReason ??
+              "Replanifier le projet entier (toutes plateformes)"
+            }
           >
-            <RotateCcw className="h-3.5 w-3.5 mr-1" /> Re-anchor project
+            <RotateCcw className="h-3.5 w-3.5 mr-1" /> Replanifier projet
           </Button>
           <Button
             size="sm"
             variant="ghost"
-            className="h-8 px-2 text-xs text-[hsl(var(--destructive))] whitespace-nowrap"
-            onClick={onCancelAll}
-            title="Cancel all platforms"
+            className={`h-8 px-2 text-xs text-[hsl(var(--destructive))] whitespace-nowrap ${
+              isConfirmingAll ? "bg-[hsl(var(--destructive))]/15" : ""
+            }`}
+            onClick={() => {
+              if (isConfirmingAll) {
+                setConfirming(null);
+                onCancelAll();
+              } else {
+                setConfirming({ kind: "all" });
+              }
+            }}
+            title="Annuler toutes les plateformes du projet"
           >
-            <Trash2 className="h-3.5 w-3.5 mr-1" /> Cancel all
+            <Trash2 className="h-3.5 w-3.5 mr-1" />
+            {isConfirmingAll ? "Confirmer ?" : "Tout annuler"}
           </Button>
         </div>
       </motion.div>

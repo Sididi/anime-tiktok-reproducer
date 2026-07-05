@@ -14,12 +14,13 @@ interface PlanningHeaderProps {
   loading: boolean;
   onRefresh: () => void;
   onClose: () => void;
+  upcomingCount: number;
 }
 
 export function PlanningHeader({
   accounts, selectedAccount, onSelectAccount,
   selectedPlatforms, onChangePlatforms,
-  loading, onRefresh, onClose,
+  loading, onRefresh, onClose, upcomingCount,
 }: PlanningHeaderProps) {
   const [accountDropdownOpen, setAccountDropdownOpen] = useState(false);
 
@@ -39,7 +40,12 @@ export function PlanningHeader({
         <div className="min-w-0">
           <h2 className="text-xl font-semibold">Planning</h2>
           <p className="text-sm text-[hsl(var(--muted-foreground))]">
-            Forward upload schedule (Europe/Paris)
+            Uploads planifiés (Europe/Paris)
+            {upcomingCount > 0 && (
+              <span className="ml-2 text-xs px-1.5 py-0.5 rounded bg-[hsl(var(--secondary))] text-[hsl(var(--foreground))]">
+                {upcomingCount} à venir
+              </span>
+            )}
           </p>
         </div>
       </div>
@@ -48,10 +54,17 @@ export function PlanningHeader({
           selected={selectedPlatforms}
           onChange={onChangePlatforms}
         />
-        <Button variant="outline" size="sm" onClick={onRefresh} disabled={loading}>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={onRefresh}
+          disabled={loading}
+          title="Rafraîchir"
+          aria-label="Rafraîchir"
+        >
           {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
         </Button>
-        <Button variant="ghost" size="sm" onClick={onClose}>
+        <Button variant="ghost" size="sm" onClick={onClose} title="Fermer" aria-label="Fermer">
           <X className="h-4 w-4" />
         </Button>
       </div>

@@ -20,6 +20,9 @@ function isoForOffset(dayOffset: number, hour: number, minute = 0): string {
   return d.toISOString();
 }
 
+// All shared events sit at offset 0 (today): ScheduleX only renders the
+// current Mon–Sun week, so any positive offset falls off the grid when the
+// suite runs on a Sunday.
 const EVENTS = [
   {
     project_id: "p1",
@@ -28,8 +31,8 @@ const EVENTS = [
     account_avatar_url: "/api/accounts/acc_a/avatar",
     account_name: "Account A",
     platform: "youtube",
-    slot: isoForOffset(1, 12, 0),
-    scheduled_at: isoForOffset(1, 12, 8),
+    slot: isoForOffset(0, 6, 0),
+    scheduled_at: isoForOffset(0, 6, 8),
     drive_folder_url: "https://drive.example/p1",
     status: "scheduled",
   },
@@ -40,8 +43,8 @@ const EVENTS = [
     account_avatar_url: "/api/accounts/acc_a/avatar",
     account_name: "Account A",
     platform: "tiktok",
-    slot: isoForOffset(2, 16, 0),
-    scheduled_at: isoForOffset(2, 16, 14),
+    slot: isoForOffset(0, 9, 0),
+    scheduled_at: isoForOffset(0, 9, 14),
     drive_folder_url: null,
     status: "scheduled",
   },
@@ -209,8 +212,8 @@ function installMocksWithMutations(events: unknown[], accounts: unknown[]) {
 }
 
 test("Reschedule slot triggers PATCH and reloads", async ({ page }) => {
-  // Pick a slot ISO inside the day of the existing YouTube event so the
-  // SlotPickerPopover surfaces it after fetching free-slots for that day.
+  // Free chips must be > now+30min, so anchor the target slot tomorrow and
+  // drive the picker calendar there (same pattern as the steal test).
   const targetSlotIso = isoForOffset(1, 14, 0);
   await page.addInitScript(installMocksWithMutations(EVENTS, ACCOUNTS), [
     EVENTS,
@@ -228,8 +231,21 @@ test("Reschedule slot triggers PATCH and reloads", async ({ page }) => {
     .first()
     .click();
   await expect(page.getByRole("dialog", { name: "Event details" })).toBeVisible();
-  // Click "Move" on the first (YouTube) row.
-  await page.getByRole("dialog").getByRole("button", { name: /Move/i }).first().click();
+  // Click "Déplacer" on the first (YouTube) row.
+  await page.getByRole("dialog").getByRole("button", { name: /Déplacer/i }).first().click();
+
+  // Navigate the picker calendar to tomorrow so the future slot surfaces.
+  const dayLabel = await page.evaluate(() => {
+    const d = new Date();
+    d.setDate(d.getDate() + 1);
+    return String(d.getDate());
+  });
+  await page
+    .getByRole("heading", { name: "Pick YT slot" })
+    .locator("..")
+    .getByRole("button", { name: dayLabel, exact: true })
+    .first()
+    .click();
 
   // SlotPickerPopover now drives the flow — pick the offered chip then Schedule.
   const expectedLabel = new Intl.DateTimeFormat("fr-FR", {
@@ -259,16 +275,23 @@ test("Cancel slot triggers DELETE", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Planning" })).toBeVisible();
   await expect(page.getByText("Show Beta").first()).toBeVisible();
 
-  page.on("dialog", (dlg) => dlg.accept());
-
   // The second event card is Show Beta (TT-only).
   await page
     .locator(".sx__time-grid-event-inner > div")
     .nth(1)
     .click();
   await expect(page.getByRole("dialog", { name: "Event details" })).toBeVisible();
-  // Per-platform popover: the only platform row is TT — click its "Cancel".
-  await page.getByRole("dialog").getByRole("button", { name: /Cancel/i }).first().click();
+  // Per-platform popover: the only platform row is TT — two-step inline
+  // confirmation: "Annuler" arms the button, "Confirmer ?" executes.
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: "Annuler", exact: true })
+    .first()
+    .click();
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: /Confirmer \?/ })
+    .click();
   await page.waitForFunction(
     () => (window as unknown as { __deleted?: boolean }).__deleted === true,
   );
@@ -469,10 +492,10 @@ test("Single-platform steal applies a cascade switch", async ({ page }) => {
 
   await page.locator(".sx__time-grid-event-inner > div").first().click();
   await expect(page.getByRole("dialog", { name: "Event details" })).toBeVisible();
-  // Move on the YouTube row → single-platform slot picker.
+  // Déplacer on the YouTube row → single-platform slot picker.
   await page
     .getByRole("dialog")
-    .getByRole("button", { name: /Move/i })
+    .getByRole("button", { name: /Déplacer/i })
     .first()
     .click();
 

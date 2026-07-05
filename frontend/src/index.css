@@ -187,6 +187,22 @@ body {
   padding: 0 !important;
 }
 
+/* Hide ScheduleX's default month-grid event chrome too. */
+.planning-calendar .sx__month-grid-event {
+  background: transparent !important;
+  border: none !important;
+  padding: 0 !important;
+}
+
+/* Pulsing dot for uploads currently running. */
+@keyframes planning-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+.planning-status-pulse {
+  animation: planning-pulse 1.2s ease-in-out infinite;
+}
+
 /* Compact the day-header strip so the time grid gets more vertical room. */
 .planning-calendar .sx__week-header {
   min-height: 0 !important;

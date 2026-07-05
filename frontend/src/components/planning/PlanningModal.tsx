@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
+import { X } from "lucide-react";
 import { api } from "@/api/client";
 import {
   ALL_PLATFORMS,
@@ -14,6 +15,12 @@ import { SlotPickerPopover } from "@/components/project-manager/SlotPickerPopove
 
 const LS_ACCOUNT = "atr.planning.account_id";
 const LS_PLATFORMS = "atr.planning.platforms";
+
+/** How far back to fetch events so recently published uploads stay visible. */
+const HISTORY_DAYS = 30;
+
+/** Background refresh cadence while the modal is open. */
+const POLL_MS = 60_000;
 
 function readPersistedPlatforms(): Platform[] {
   try {
@@ -33,6 +40,13 @@ function readPersistedAccount(): string | null {
   } catch {
     return null;
   }
+}
+
+function historyStartIso(): string {
+  const d = new Date();
+  d.setDate(d.getDate() - HISTORY_DAYS);
+  d.setHours(0, 0, 0, 0);
+  return d.toISOString();
 }
 
 interface GroupedEventClick {
@@ -71,28 +85,61 @@ export function PlanningModal({ open, onClose }: PlanningModalProps) {
     [accounts, selectedAccountId],
   );
 
-  const reload = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const [accountsRes, eventsRes] = await Promise.all([
-        api.listAccounts(),
-        api.listPlanningEvents({
-          account_id: selectedAccountId,
-          platforms: selectedPlatforms,
-        }),
-      ]);
-      setAccounts(accountsRes.accounts);
-      setEvents(eventsRes.events);
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setLoading(false);
-    }
-  }, [selectedAccountId, selectedPlatforms]);
+  const noPlatformSelected = selectedPlatforms.length === 0;
+
+  const reload = useCallback(
+    async (opts?: { silent?: boolean }) => {
+      if (!opts?.silent) {
+        setLoading(true);
+        setError(null);
+      }
+      try {
+        const [accountsRes, eventsRes] = await Promise.all([
+          api.listAccounts(),
+          // Empty platform selection means "show nothing" — the backend
+          // treats a missing `platforms` param as "all", so skip the call.
+          selectedPlatforms.length
+            ? api.listPlanningEvents({
+                account_id: selectedAccountId,
+                platforms: selectedPlatforms,
+                range_start: historyStartIso(),
+              })
+            : Promise.resolve({ events: [] as PlanningEvent[] }),
+        ]);
+        setAccounts(accountsRes.accounts);
+        setEvents(eventsRes.events);
+        // Drop a persisted account filter that no longer exists — otherwise
+        // it silently hides everything with no visible cause.
+        if (
+          selectedAccountId &&
+          !accountsRes.accounts.some((a) => a.id === selectedAccountId)
+        ) {
+          setSelectedAccountId(null);
+        }
+      } catch (err) {
+        if (!opts?.silent) setError((err as Error).message);
+      } finally {
+        if (!opts?.silent) setLoading(false);
+      }
+    },
+    [selectedAccountId, selectedPlatforms],
+  );
 
   useEffect(() => {
     if (open) void reload();
+  }, [open, reload]);
+
+  // Keep the calendar fresh while it's open: poll in the background and
+  // refetch when the window regains focus.
+  useEffect(() => {
+    if (!open) return;
+    const interval = setInterval(() => void reload({ silent: true }), POLL_MS);
+    const onFocus = () => void reload({ silent: true });
+    window.addEventListener("focus", onFocus);
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener("focus", onFocus);
+    };
   }, [open, reload]);
 
   useEffect(() => {
@@ -155,10 +202,27 @@ export function PlanningModal({ open, onClose }: PlanningModalProps) {
               loading={loading}
               onRefresh={() => void reload()}
               onClose={onClose}
+              upcomingCount={
+                events.filter((e) => new Date(e.slot).getTime() >= Date.now())
+                  .length
+              }
             />
             {error && (
-              <div className="mx-6 mt-4 p-3 rounded-md bg-[hsl(var(--destructive))]/10 text-sm text-[hsl(var(--destructive))]">
-                {error}
+              <div className="mx-6 mt-4 p-3 rounded-md bg-[hsl(var(--destructive))]/10 text-sm text-[hsl(var(--destructive))] flex items-start justify-between gap-3">
+                <span>{error}</span>
+                <button
+                  onClick={() => setError(null)}
+                  className="p-0.5 rounded hover:bg-[hsl(var(--destructive))]/20 flex-shrink-0"
+                  aria-label="Fermer l'erreur"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            )}
+            {noPlatformSelected && (
+              <div className="mx-6 mt-4 p-3 rounded-md bg-[hsl(var(--muted))]/50 text-sm text-[hsl(var(--muted-foreground))]">
+                Aucune plateforme sélectionnée — activez au moins une
+                plateforme pour afficher le planning.
               </div>
             )}
             <div className="flex-1 min-h-0 overflow-hidden">
@@ -183,12 +247,6 @@ export function PlanningModal({ open, onClose }: PlanningModalProps) {
               onCancelPlatform={async (platform) => {
                 const m = memberFor(platform);
                 if (!m) return;
-                if (
-                  !confirm(
-                    `Cancel ${platform.toUpperCase()} slot for ${m.anime_title}?`,
-                  )
-                )
-                  return;
                 try {
                   await api.cancelPlatformSlot(m.project_id, m.platform);
                   setPopover(null);
@@ -205,14 +263,10 @@ export function PlanningModal({ open, onClose }: PlanningModalProps) {
               rescheduleProjectDisabledReason={
                 projectHasTikTok
                   ? undefined
-                  : "This project has no TikTok reservation"
+                  : "Ce projet n'a pas de réservation TikTok"
               }
               onCancelAll={async () => {
                 const m = groupedForPopover.members[0];
-                if (
-                  !confirm(`Cancel ALL platforms for ${m.anime_title}?`)
-                )
-                  return;
                 try {
                   await api.cancelAllSlots(m.project_id);
                   setPopover(null);

@@ -1,8 +1,10 @@
 import { createContext, useContext, useEffect, useMemo, useRef } from "react";
 import "temporal-polyfill/global";
 import { ScheduleXCalendar, useNextCalendarApp } from "@schedule-x/react";
-import { createViewWeek } from "@schedule-x/calendar";
+import { createViewMonthGrid, createViewWeek } from "@schedule-x/calendar";
+import { createCurrentTimePlugin } from "@schedule-x/current-time";
 import "@schedule-x/theme-default/dist/index.css";
+import { CalendarX2 } from "lucide-react";
 import type { Platform, PlanningEvent } from "@/types";
 import { ALL_PLATFORMS } from "@/types";
 import { platformBgHsl, PLATFORM_SHORT } from "./platformColors";
@@ -43,6 +45,15 @@ function groupEvents(events: PlanningEvent[]): Map<string, PlanningEvent[]> {
     else map.set(key, [ev]);
   }
   return map;
+}
+
+type GroupStatus = "scheduled" | "running" | "complete" | "overdue";
+
+function groupStatus(members: PlanningEvent[]): GroupStatus {
+  if (members.some((m) => m.status === "running")) return "running";
+  if (members.every((m) => m.status === "complete")) return "complete";
+  const isPast = new Date(members[0].slot).getTime() < Date.now();
+  return isPast ? "overdue" : "scheduled";
 }
 
 const PLATFORM_CALENDARS = Object.fromEntries(
@@ -91,17 +102,70 @@ const EventClickContext = createContext<
   | null
 >(null);
 
-function GroupEventCard({ calendarEvent }: TimeGridEventProps) {
+function StatusDot({ status }: { status: GroupStatus }) {
+  if (status === "running") {
+    return (
+      <span
+        title="Upload en cours"
+        className="planning-status-pulse"
+        style={{
+          width: 6,
+          height: 6,
+          borderRadius: "50%",
+          background: "hsl(142 71% 45%)",
+          flex: "0 0 6px",
+        }}
+      />
+    );
+  }
+  if (status === "complete") {
+    return (
+      <span
+        title="Publié"
+        style={{ fontSize: 9, lineHeight: 1, color: "hsl(142 71% 45%)" }}
+      >
+        ✓
+      </span>
+    );
+  }
+  if (status === "overdue") {
+    return (
+      <span
+        title="Créneau passé — upload non confirmé"
+        style={{ fontSize: 9, lineHeight: 1, color: "hsl(38 92% 50%)", fontWeight: 700 }}
+      >
+        !
+      </span>
+    );
+  }
+  return null;
+}
+
+function useGroupCardData(calendarEvent: SxGroupEvent) {
   const onClick = useContext(EventClickContext);
   const members = calendarEvent._members ?? [];
-  if (!members.length) return null;
   const first = members[0];
-  const isManual = members.some((m) => m.manual);
-  // Sort members in canonical platform order so colours line up consistently.
   const ordered = [...members].sort(
     (a, b) =>
       ALL_PLATFORMS.indexOf(a.platform) - ALL_PLATFORMS.indexOf(b.platform),
   );
+  const handleClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!first) return;
+    onClick?.(
+      { project_id: first.project_id, slot: first.slot, members },
+      { x: e.clientX, y: e.clientY },
+    );
+  };
+  return { members, first, ordered, handleClick };
+}
+
+function GroupEventCard({ calendarEvent }: TimeGridEventProps) {
+  const { members, first, ordered, handleClick } =
+    useGroupCardData(calendarEvent);
+  if (!members.length) return null;
+  const isManual = members.some((m) => m.manual);
+  const status = groupStatus(members);
   return (
     <div
       style={{
@@ -117,19 +181,10 @@ function GroupEventCard({ calendarEvent }: TimeGridEventProps) {
         gap: 1,
         overflow: "hidden",
         cursor: "pointer",
+        opacity: status === "complete" ? 0.55 : 1,
       }}
       title={`${first.anime_title} — ${first.account_name}`}
-      onClick={(e) => {
-        e.stopPropagation();
-        onClick?.(
-          {
-            project_id: first.project_id,
-            slot: first.slot,
-            members,
-          },
-          { x: e.clientX, y: e.clientY },
-        );
-      }}
+      onClick={handleClick}
     >
       <div
         style={{
@@ -207,10 +262,79 @@ function GroupEventCard({ calendarEvent }: TimeGridEventProps) {
           fontSize: 9,
           color: "hsl(var(--muted-foreground))",
           lineHeight: "1",
+          display: "flex",
+          alignItems: "center",
+          gap: 3,
         }}
       >
         {fmtSlotTime(first.slot)}
+        <StatusDot status={status} />
       </div>
+    </div>
+  );
+}
+
+/** Compact single-line chip for the month grid. */
+function MonthGridEventCard({ calendarEvent }: TimeGridEventProps) {
+  const { members, first, ordered, handleClick } =
+    useGroupCardData(calendarEvent);
+  if (!members.length) return null;
+  const status = groupStatus(members);
+  const isManual = members.some((m) => m.manual);
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 3,
+        padding: "1px 4px",
+        borderRadius: 3,
+        background: "hsl(var(--card))",
+        border: isManual
+          ? "1px dashed hsl(45 90% 55%)"
+          : "1px solid hsl(var(--border))",
+        cursor: "pointer",
+        overflow: "hidden",
+        opacity: status === "complete" ? 0.55 : 1,
+      }}
+      title={`${first.anime_title} — ${first.account_name} · ${fmtSlotTime(first.slot)}`}
+      onClick={handleClick}
+    >
+      <span
+        style={{
+          fontSize: 9,
+          color: "hsl(var(--muted-foreground))",
+          flex: "0 0 auto",
+        }}
+      >
+        {fmtSlotTime(first.slot)}
+      </span>
+      {ordered.map((m) => (
+        <span
+          key={m.platform}
+          style={{
+            width: 6,
+            height: 6,
+            borderRadius: "50%",
+            background: platformBgHsl(m.platform),
+            flex: "0 0 6px",
+          }}
+          title={m.platform}
+        />
+      ))}
+      <span
+        style={{
+          fontSize: 10,
+          color: "hsl(var(--foreground))",
+          whiteSpace: "nowrap",
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          minWidth: 0,
+        }}
+      >
+        {first.anime_title}
+      </span>
+      <StatusDot status={status} />
     </div>
   );
 }
@@ -257,7 +381,7 @@ export function PlanningCalendar({
   );
 
   const calendar = useNextCalendarApp({
-    views: [createViewWeek()],
+    views: [createViewWeek(), createViewMonthGrid()],
     defaultView: "week",
     locale: "fr-FR",
     firstDayOfWeek: 1,
@@ -265,6 +389,7 @@ export function PlanningCalendar({
     isDark: true,
     events: sxEvents,
     calendars: PLATFORM_CALENDARS,
+    plugins: [createCurrentTimePlugin()],
     weekOptions: {
       // Compact: ~30px/hour → 720px for 24h. With the trimmed header strip
       // the whole grid fits inside the 92vh modal body without scroll, and
@@ -284,19 +409,29 @@ export function PlanningCalendar({
   // happen on every parent render (which would cause the visible flash and
   // wipe the click handlers between renders).
   const customComponents = useMemo(
-    () => ({ timeGridEvent: GroupEventCard }),
+    () => ({
+      timeGridEvent: GroupEventCard,
+      monthGridEvent: MonthGridEventCard,
+    }),
     [],
   );
 
   return (
     <EventClickContext.Provider value={stableOnClick}>
-      <div className="planning-calendar h-full">
+      <div className="planning-calendar h-full relative">
         <ScheduleXCalendar
           calendarApp={calendar}
           customComponents={customComponents}
         />
+        {events.length === 0 && (
+          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <div className="flex flex-col items-center gap-2 text-[hsl(var(--muted-foreground))] bg-[hsl(var(--card))]/80 rounded-lg px-6 py-4">
+              <CalendarX2 className="h-8 w-8 opacity-50" />
+              <span className="text-sm">Aucun upload planifié</span>
+            </div>
+          </div>
+        )}
       </div>
     </EventClickContext.Provider>
   );
 }
-
