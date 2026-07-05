@@ -69,7 +69,7 @@ Deployment on PC1:
 
 A new `lan_tasks.js` implements the **same task interface** as `drive_tasks.js` (`downloadImport`, `uploadOutput`, same progress callbacks); `main.js`'s job runner just picks an engine. `drive_tasks.js` is not modified — it remains the fallback engine.
 
-1. **Settings**: `lan_base_url` (e.g. `http://192.168.1.76:8000`), `lan_token`, `lan_probe_timeout_ms` (default 2500). Empty `lan_base_url` = feature fully off, no probe, behavior byte-identical to today.
+1. **Settings**: `lan_base_url` (default `http://arch-sid.local:8000`; mDNS-based, IP-independent), `lan_token`, `lan_probe_timeout_ms` (default 2500). Empty `lan_base_url` = feature fully off, no probe, behavior byte-identical to today.
 2. **Per-job detection**: at the start of each download/upload job, probe `GET /api/lan/ping`. Success → LAN engine for that job; failure/timeout → Drive engine. Fresh probe every job; a log line records the chosen mode and why.
 3. **Download job (LAN)**: manifest fetch, sequential per-file download with byte-size verification and 3 retries with backoff; same subtitle-archive extraction and progress reporting as today. If LAN dies mid-job after retries, the job fails cleanly; a re-run re-probes (and may choose Drive — assets are always there).
 4. **Upload job (LAN)**: POST `output.mp4` + `output_no_music.wav` to PC1. If LAN is unreachable at upload time, fall back to the existing direct Drive upload — the pipeline converges either way.
@@ -111,7 +111,7 @@ Unifying pattern on PC1: one helper — *"resolve source video: local path if pr
 
 ## Testing & rollout
 
-- **Milestone 0 (gate, before feature code)**: reachability from PC2 (`ping 192.168.1.76`, then a throwaway HTTP fetch once ufw is opened) — validates the PLC repeater bridges without AP isolation/NAT; `iperf3` run to measure the real PLC+WiFi ceiling; enable ProtonVPN "allow LAN connections" on PC1.
+- **Milestone 0 — PASSED 2026-07-05**: from PC2, ping/TCP/HTTP to PC1 all succeed; PLC repeater bridges cleanly (no AP isolation). mDNS works (`arch-sid.local` resolves from Windows; avahi active on PC1) → **`lan_base_url` uses `http://arch-sid.local:8000`**, with a static DHCP lease for `192.168.1.76` as backup. ProtonVPN on/off makes no difference — no kill-switch changes needed. Measured PC1→PC2 throughput: **~10.8 MB/s (~87 Mbps)**, the PLC+WiFi ceiling for asset downloads.
 - **Backend (pytest)**: token auth, manifest correctness, path-traversal rejection, filename whitelist, atomic upload, relay trigger (Drive mocked), local-first resolution helper (local present / absent / Drive fallback).
 - **CEP (manual E2E)**: one small real project run three ways — LAN mode; `lan_base_url` emptied (must match today's behavior exactly); ufw closed mid-run to watch the fallback engage.
 - **Rollout**: ships dormant. Backend endpoints harmless if unused; CEP only probes when `lan_base_url` is set. Enable = fill two settings fields on PC2; disable = empty one.
