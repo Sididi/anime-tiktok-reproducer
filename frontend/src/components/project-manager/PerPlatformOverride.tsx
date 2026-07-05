@@ -11,12 +11,13 @@ interface PerPlatformOverrideProps {
   overrides: Partial<Record<Platform, string>>;
   onChangeOverride: (platform: Platform, slotIso: string | null) => void;
   platforms: Platform[]; // platforms the project will reserve
+  onStealRequest?: (platform: Platform, slotIso: string) => void;
 }
 
 const NON_TT_PLATFORMS: Platform[] = ["youtube", "facebook", "instagram"];
 
 export function PerPlatformOverride({
-  accountId, anchorIso, resolved, overrides, onChangeOverride, platforms,
+  accountId, anchorIso, resolved, overrides, onChangeOverride, platforms, onStealRequest,
 }: PerPlatformOverrideProps) {
   const [open, setOpen] = useState(false);
   const [slotsByPlatform, setSlotsByPlatform] = useState<Record<Platform, FreeSlot[]>>(
@@ -64,15 +65,24 @@ export function PerPlatformOverride({
                 <select
                   className="flex-1 rounded border border-[hsl(var(--border))] bg-[hsl(var(--card))] px-2 py-1 text-xs"
                   value={current}
-                  onChange={(e) => onChangeOverride(p, e.target.value || null)}
+                  onChange={(e) => {
+                    const value = e.target.value;
+                    const chosen = slots.find((s) => s.slot === value);
+                    if (chosen && chosen.available === false && onStealRequest) {
+                      onStealRequest(p, value);
+                      return;
+                    }
+                    onChangeOverride(p, value || null);
+                  }}
                 >
-                  {slots.filter((s) => s.available || s.slot === current).map((s) => (
-                    <option key={s.slot} value={s.slot}>
-                      {new Intl.DateTimeFormat("fr-FR", {
-                        weekday: "short", day: "2-digit", month: "short",
-                        hour: "2-digit", minute: "2-digit", timeZone: "Europe/Paris",
-                      }).format(new Date(s.slot))}
-                    </option>
+                  {slots.map((s) => (
+                      <option key={s.slot} value={s.slot}>
+                        {new Intl.DateTimeFormat("fr-FR", {
+                          weekday: "short", day: "2-digit", month: "short",
+                          hour: "2-digit", minute: "2-digit", timeZone: "Europe/Paris",
+                        }).format(new Date(s.slot))}
+                        {!s.available ? " — occupé (échanger)" : ""}
+                      </option>
                   ))}
                 </select>
               </div>

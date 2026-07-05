@@ -106,6 +106,12 @@ export function EventPopover({
           {formatSlot(first.slot)}
         </div>
 
+        {first.manual && (
+          <div className="text-[11px] text-amber-500 mb-2">
+            Programmation manuelle — hors système de slots
+          </div>
+        )}
+
         {first.drive_folder_url && (
           <a
             href={first.drive_folder_url}

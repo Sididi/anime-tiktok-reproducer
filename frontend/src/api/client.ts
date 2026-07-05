@@ -1179,6 +1179,7 @@ export const api = {
       account_id: string;
       tiktok_slot: string;
       overrides?: Partial<Record<import("@/types").Platform, string>>;
+      steals?: Partial<Record<import("@/types").Platform, import("@/types").StealSpec>>;
     },
   ): Promise<{
     platform_schedules: Record<string, { slot: string; scheduled_at: string }>;
@@ -1209,6 +1210,7 @@ export const api = {
     payload: {
       tiktok_slot: string;
       overrides?: Partial<Record<import("@/types").Platform, string>>;
+      steals?: Partial<Record<import("@/types").Platform, import("@/types").StealSpec>>;
     },
   ): Promise<{
     platform_schedules: Record<string, { slot: string; scheduled_at: string }>;
@@ -1259,6 +1261,60 @@ export const api = {
     return request(`/scheduling/projects/${project_id}/cascade-apply`, {
       method: "POST",
       body: JSON.stringify({ account_id }),
+    });
+  },
+
+  async reserveManual(
+    project_id: string,
+    payload: {
+      account_id: string;
+      at: string;
+      platforms?: import("@/types").Platform[];
+    },
+  ): Promise<{
+    platform_schedules: Record<
+      string,
+      { slot: string; scheduled_at: string; manual: boolean }
+    >;
+    notification_status: Record<string, string>;
+  }> {
+    return request(`/scheduling/projects/${project_id}/reserve-manual`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async switchPreview(
+    project_id: string,
+    payload: {
+      account_id: string;
+      platform: import("@/types").Platform;
+      slot: string;
+    },
+  ): Promise<import("@/types").SwitchPreview> {
+    return request(`/scheduling/projects/${project_id}/switch-preview`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async switchApply(
+    project_id: string,
+    payload: {
+      account_id: string;
+      platform: import("@/types").Platform;
+      slot: string;
+      mode: import("@/types").SwitchMode;
+      expected_occupant_id: string | null;
+    },
+  ): Promise<
+    import("@/types").SwitchPreview & {
+      notification_status: Record<string, string>;
+    }
+  > {
+    return request(`/scheduling/projects/${project_id}/switch-apply`, {
+      method: "POST",
+      body: JSON.stringify(payload),
     });
   },
 };

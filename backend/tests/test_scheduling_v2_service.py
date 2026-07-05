@@ -158,7 +158,7 @@ def test_reserve_anchor_persists_platform_schedules(isolated_scheduler):
     project = Project(id="proj")
     ProjectService.get_project_dir(project.id).mkdir(parents=True, exist_ok=True)
     ProjectService.save(project)
-    result = SchedulingService.reserve_anchor(
+    result, _ = SchedulingService.reserve_anchor(
         project_id="proj",
         account_id="acc_a",
         tiktok_slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
@@ -174,12 +174,12 @@ def test_reserve_anchor_idempotent_when_called_twice(isolated_scheduler):
     project = Project(id="proj")
     ProjectService.get_project_dir(project.id).mkdir(parents=True, exist_ok=True)
     ProjectService.save(project)
-    first = SchedulingService.reserve_anchor(
+    first, _ = SchedulingService.reserve_anchor(
         project_id="proj",
         account_id="acc_a",
         tiktok_slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
     )
-    second = SchedulingService.reserve_anchor(
+    second, _ = SchedulingService.reserve_anchor(
         project_id="proj",
         account_id="acc_a",
         tiktok_slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),

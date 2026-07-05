@@ -11,7 +11,7 @@ from ...config import settings as app_settings
 from ...models import Project
 from ...services.account_service import AccountService
 from ...services.project_service import ProjectService
-from ...services.scheduling_service import SchedulingService
+from ...services.scheduling_service import SchedulingService, StealSpec
 
 
 def _require_v2() -> None:
@@ -39,12 +39,14 @@ class PlanningEvent(BaseModel):
     scheduled_at: datetime
     drive_folder_url: str | None
     status: Literal["scheduled", "running", "complete"]
+    manual: bool = False
 
 
 class FreeSlotResponse(BaseModel):
     slot: datetime
     available: bool
     taken_by_project_id: str | None = None
+    taken_by_title: str | None = None
 
 
 def _project_event_status(project: Project, platform: str) -> str:
@@ -78,6 +80,7 @@ def _build_planning_event(
         scheduled_at=sched.scheduled_at,
         drive_folder_url=project.drive_folder_url,
         status=_project_event_status(project, platform),  # type: ignore[arg-type]
+        manual=sched.manual,
     )
 
 
@@ -149,6 +152,7 @@ async def free_slots(
                 slot=s.slot,
                 available=s.available,
                 taken_by_project_id=s.taken_by_project_id,
+                taken_by_title=s.taken_by_title,
             ).model_dump(mode="json")
             for s in slots
         ]
@@ -162,10 +166,16 @@ class ResolveAnchorRequest(BaseModel):
     overrides: dict[str, datetime] | None = None
 
 
+class StealSpecModel(BaseModel):
+    mode: Literal["cascade", "next_free"]
+    expected_occupant_id: str | None = None
+
+
 class ReserveAnchorRequest(BaseModel):
     account_id: str
     tiktok_slot: datetime
     overrides: dict[str, datetime] | None = None
+    steals: dict[str, StealSpecModel] | None = None
 
 
 class PatchPlatformRequest(BaseModel):
@@ -175,11 +185,16 @@ class PatchPlatformRequest(BaseModel):
 class PatchAnchorRequest(BaseModel):
     tiktok_slot: datetime
     overrides: dict[str, datetime] | None = None
+    steals: dict[str, StealSpecModel] | None = None
 
 
 def _platform_schedules_to_dict(schedules):
     return {
-        p: {"slot": s.slot.isoformat(), "scheduled_at": s.scheduled_at.isoformat()}
+        p: {
+            "slot": s.slot.isoformat(),
+            "scheduled_at": s.scheduled_at.isoformat(),
+            "manual": s.manual,
+        }
         for p, s in schedules.items()
     }
 
@@ -223,15 +238,43 @@ async def resolve_anchor(req: ResolveAnchorRequest):
     }
 
 
+def _steals_to_specs(steals):
+    return (
+        {p: StealSpec(mode=s.mode, expected_occupant_id=s.expected_occupant_id)
+         for p, s in steals.items()}
+        if steals else None
+    )
+
+
+async def _notify_switch_displacements(switches, steals) -> dict[str, dict[str, str]]:
+    notification_status: dict[str, dict[str, str]] = {}
+    for platform, result in switches.items():
+        spec = steals[platform]
+        plan = result.cascade if spec.mode == "cascade" else result.next_free
+        notification_status[platform] = {}
+        for displaced in plan.displaced:
+            moved = ProjectService.load(displaced.project_id)
+            sched = (moved.platform_schedules or {}).get(platform) if moved else None
+            if sched is None:
+                continue
+            notification_status[platform][displaced.project_id] = await asyncio.to_thread(
+                _notify_displaced, displaced.project_id, platform, sched.scheduled_at
+            )
+    return notification_status
+
+
 @router.post("/projects/{project_id}/reserve-anchor")
 async def reserve_anchor(project_id: str, req: ReserveAnchorRequest):
+    steals = _steals_to_specs(req.steals)
     try:
-        schedules = await asyncio.to_thread(
+        schedules, switches = await asyncio.to_thread(
             SchedulingService.reserve_anchor,
-            project_id, req.account_id, req.tiktok_slot, req.overrides,
+            project_id, req.account_id, req.tiktok_slot, req.overrides, steals,
         )
     except ValueError as exc:
         msg = str(exc)
+        if "slot_state_changed" in msg or "pool_busy" in msg:
+            raise HTTPException(409, msg)
         if "tiktok" in msg and "slot_taken" in msg:
             raise HTTPException(409, "tiktok_slot_taken")
         if "slot_not_configured" in msg:
@@ -239,7 +282,54 @@ async def reserve_anchor(project_id: str, req: ReserveAnchorRequest):
         if "Project not found" in msg:
             raise HTTPException(404, msg)
         raise HTTPException(422, msg)
-    return {"platform_schedules": _platform_schedules_to_dict(schedules)}
+
+    notification_status = await _notify_switch_displacements(switches, req.steals or {})
+    return {
+        "platform_schedules": _platform_schedules_to_dict(schedules),
+        "notification_status": notification_status,
+    }
+
+
+class ReserveManualRequest(BaseModel):
+    account_id: str
+    at: datetime
+    platforms: list[Platform] | None = None
+
+
+@router.post("/projects/{project_id}/reserve-manual")
+async def reserve_manual(project_id: str, req: ReserveManualRequest):
+    platforms = list(req.platforms) if req.platforms else None
+    if not platforms:
+        from ...services.project_upload_service import _platforms_to_reserve  # noqa: PLC0415
+        account = AccountService.get_account(req.account_id)
+        if account is None:
+            raise HTTPException(404, "Account not found")
+        platforms = _platforms_to_reserve(account, requested_platforms=None)
+    try:
+        schedules = await asyncio.to_thread(
+            SchedulingService.reserve_manual,
+            project_id, req.account_id, req.at, platforms,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        if "slot_too_close" in msg:
+            raise HTTPException(422, "slot_too_close")
+        if "Project not found" in msg:
+            raise HTTPException(404, msg)
+        raise HTTPException(422, msg)
+
+    # Editing an already-uploaded manual schedule must reach the platforms
+    # (YT publishAt, FB scheduled_publish_time, VPS reminder). For not-yet
+    # uploaded projects every notify is a cheap skip.
+    statuses: dict[str, str] = {}
+    for platform, sched in schedules.items():
+        statuses[platform] = await asyncio.to_thread(
+            _notify_displaced, project_id, platform, sched.scheduled_at
+        )
+    return {
+        "platform_schedules": _platform_schedules_to_dict(schedules),
+        "notification_status": statuses,
+    }
 
 
 @router.patch("/projects/{project_id}/platforms/{platform}")
@@ -262,21 +352,30 @@ async def patch_platform(project_id: str, platform: str, req: PatchPlatformReque
 
 @router.patch("/projects/{project_id}/anchor")
 async def patch_anchor(project_id: str, req: PatchAnchorRequest):
+    steals = _steals_to_specs(req.steals)
     try:
-        schedules = await asyncio.to_thread(
+        schedules, switches = await asyncio.to_thread(
             SchedulingService.reschedule_anchor,
-            project_id, req.tiktok_slot, req.overrides,
+            project_id, req.tiktok_slot, req.overrides, steals,
         )
     except ValueError as exc:
-        raise HTTPException(422, str(exc))
+        msg = str(exc)
+        if "slot_state_changed" in msg or "pool_busy" in msg:
+            raise HTTPException(409, msg)
+        raise HTTPException(422, msg)
+
+    # Notify the rescheduled project's own platforms (its slots moved).
     statuses: dict[str, str] = {}
     for platform, sched in schedules.items():
         statuses[platform] = await asyncio.to_thread(
             _notify_displaced, project_id, platform, sched.scheduled_at
         )
+    # Notify projects displaced by any steal.
+    displaced_status = await _notify_switch_displacements(switches, req.steals or {})
     return {
         "platform_schedules": _platform_schedules_to_dict(schedules),
         "notification_status": statuses,
+        "displaced_notification_status": displaced_status,
     }
 
 
@@ -369,6 +468,85 @@ async def cascade_apply(project_id: str, req: CascadeRequest):
             notification_status[plat.platform][displaced.project_id] = ts
 
     payload = _cascade_to_payload(result)
+    payload["notification_status"] = notification_status
+    return payload
+
+
+class SwitchPreviewRequest(BaseModel):
+    account_id: str
+    platform: Platform
+    slot: datetime
+
+
+class SwitchApplyRequest(SwitchPreviewRequest):
+    mode: Literal["cascade", "next_free"]
+    expected_occupant_id: str | None = None
+
+
+def _switch_plan_payload(plan) -> dict:
+    return {
+        "displaced": [
+            {
+                "project_id": d.project_id,
+                "anime_title": d.anime_title,
+                "from_slot": d.from_slot.isoformat(),
+                "to_slot": d.to_slot.isoformat(),
+                "requires_platform_notification": d.requires_platform_notification,
+            }
+            for d in plan.displaced
+        ],
+        "blockers": [{"platform": b.platform, "reason": b.reason} for b in plan.blockers],
+    }
+
+
+def _switch_to_payload(result) -> dict:
+    return {
+        "platform": result.platform,
+        "slot": result.slot.isoformat(),
+        "occupant_project_id": result.occupant_project_id,
+        "occupant_title": result.occupant_title,
+        "uploaded_count": result.uploaded_count,
+        "cascade": _switch_plan_payload(result.cascade),
+        "next_free": _switch_plan_payload(result.next_free),
+    }
+
+
+@router.post("/projects/{project_id}/switch-preview")
+async def switch_preview(project_id: str, req: SwitchPreviewRequest):
+    result = await asyncio.to_thread(
+        SchedulingService.compute_switch,
+        project_id, req.account_id, req.platform, req.slot,
+    )
+    return _switch_to_payload(result)
+
+
+@router.post("/projects/{project_id}/switch-apply")
+async def switch_apply(project_id: str, req: SwitchApplyRequest):
+    try:
+        result = await asyncio.to_thread(
+            SchedulingService.apply_switch,
+            project_id, req.account_id, req.platform, req.slot,
+            req.mode, req.expected_occupant_id,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        if "slot_state_changed" in msg or "pool_busy" in msg:
+            raise HTTPException(409, msg)
+        raise HTTPException(422, msg)
+
+    plan = result.cascade if req.mode == "cascade" else result.next_free
+    notification_status: dict[str, str] = {}
+    for displaced in plan.displaced:
+        moved = ProjectService.load(displaced.project_id)
+        if moved is None:
+            continue
+        sched = (moved.platform_schedules or {}).get(req.platform)
+        if sched is None:
+            continue
+        notification_status[displaced.project_id] = await asyncio.to_thread(
+            _notify_displaced, displaced.project_id, req.platform, sched.scheduled_at
+        )
+    payload = _switch_to_payload(result)
     payload["notification_status"] = notification_status
     return payload
 

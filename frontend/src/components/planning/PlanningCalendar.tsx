@@ -96,6 +96,7 @@ function GroupEventCard({ calendarEvent }: TimeGridEventProps) {
   const members = calendarEvent._members ?? [];
   if (!members.length) return null;
   const first = members[0];
+  const isManual = members.some((m) => m.manual);
   // Sort members in canonical platform order so colours line up consistently.
   const ordered = [...members].sort(
     (a, b) =>
@@ -106,7 +107,9 @@ function GroupEventCard({ calendarEvent }: TimeGridEventProps) {
       style={{
         height: "100%",
         background: "hsl(var(--card))",
-        border: "1px solid hsl(var(--border))",
+        border: isManual
+          ? "1px dashed hsl(45 90% 55%)"
+          : "1px solid hsl(var(--border))",
         borderRadius: 4,
         padding: "2px 4px 2px 4px",
         display: "flex",
@@ -168,6 +171,18 @@ function GroupEventCard({ calendarEvent }: TimeGridEventProps) {
             {PLATFORM_SHORT[m.platform]}
           </span>
         ))}
+        {isManual && (
+          <span
+            title="Programmation manuelle"
+            style={{
+              fontSize: 9, fontWeight: 700, padding: "1px 4px",
+              borderRadius: 3, color: "hsl(45 90% 55%)",
+              border: "1px dashed hsl(45 90% 55%)", lineHeight: "1",
+            }}
+          >
+            M
+          </span>
+        )}
       </div>
       <div
         style={{

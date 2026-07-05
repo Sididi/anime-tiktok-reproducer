@@ -15,6 +15,7 @@ class FreeSlot:
     slot: datetime
     available: bool
     taken_by_project_id: str | None = None
+    taken_by_title: str | None = None
 
 
 @dataclass
@@ -65,6 +66,30 @@ class CascadeResult:
     blockers: list[CascadeBlocker]
 
 
+@dataclass
+class SwitchPlan:
+    mode: str
+    displaced: list[DisplacedItem]
+    blockers: list[CascadeBlocker]
+
+
+@dataclass
+class SwitchResult:
+    platform: str
+    slot: datetime
+    occupant_project_id: str | None
+    occupant_title: str | None
+    cascade: SwitchPlan
+    next_free: SwitchPlan
+    uploaded_count: int
+
+
+@dataclass
+class StealSpec:
+    mode: str
+    expected_occupant_id: str | None
+
+
 class SchedulingService:
     """Finds and reserves the next available upload slot per (account, platform)."""
 
@@ -97,26 +122,30 @@ class SchedulingService:
     @classmethod
     def _collect_pool_reservations(
         cls, pool_key: str, platform: str
-    ) -> dict[str, str]:
-        """Return {slot_iso: project_id} for the given pool/platform."""
+    ) -> dict[str, "Project"]:
+        """Return {slot_iso: Project} for the given pool/platform.
+
+        Manual reservations are invisible to the pool: they neither block
+        slots nor get displaced. This is the single exclusion point.
+        """
         account_pool_keys: dict[str, str] = {}
         for acc_id, acc in AccountService.all_accounts().items():
             account_pool_keys[acc_id] = (
                 acc.pool_key_for(platform) or f"account:{acc_id}:{platform}"
             )
 
-        reservations: dict[str, str] = {}
+        reservations: dict[str, Project] = {}
         for project in ProjectService.list_all():
             schedules = project.platform_schedules or {}
             sched = schedules.get(platform)
-            if sched is None:
+            if sched is None or sched.manual:
                 continue
             owner_id = project.scheduled_account_id
             if not owner_id:
                 continue
             if account_pool_keys.get(owner_id) == pool_key:
                 slot_iso = cls._normalize_utc_datetime(sched.slot).isoformat()
-                reservations[slot_iso] = project.id
+                reservations[slot_iso] = project
         return reservations
 
     @classmethod
@@ -262,7 +291,8 @@ class SchedulingService:
                     FreeSlot(
                         slot=slot_dt,
                         available=taker is None,
-                        taken_by_project_id=taker,
+                        taken_by_project_id=taker.id if taker else None,
+                        taken_by_title=(taker.anime_name or taker.id) if taker else None,
                     )
                 )
                 if len(results) >= limit:
@@ -474,12 +504,16 @@ class SchedulingService:
         account_id: str,
         tiktok_slot: datetime,
         overrides: dict[str, datetime] | None = None,
-    ) -> dict[str, PlatformSchedule]:
+        steals: dict[str, StealSpec] | None = None,
+    ) -> tuple[dict[str, PlatformSchedule], dict[str, SwitchResult]]:
         """Reserve TT (anchor) + each other configured platform on `project`.
 
         Idempotent: a second call with the same anchor reuses the existing
         per-platform reservations.
-        Raises ValueError if any platform conflicts.
+        Optionally steals occupied slots (displacing occupants) BEFORE
+        resolving the anchor, all under one lock, all-or-nothing.
+        Returns (schedules, applied_switches).
+        Raises ValueError if any platform conflicts or a steal is stale/blocked.
         """
         with cls._reservation_lock:
             project = ProjectService.load(project_id)
@@ -494,23 +528,115 @@ class SchedulingService:
                 and project.scheduled_account_id == account_id
                 and cls._normalize_utc_datetime(existing_tt.slot) == anchor
             ):
-                return dict(project.platform_schedules)
+                return dict(project.platform_schedules), {}
 
             # Drop reservations belonging to a different account before reserving.
             if project.scheduled_account_id and project.scheduled_account_id != account_id:
                 project.platform_schedules = {}
 
-            resolution = cls.resolve_anchor(account_id, anchor, overrides)
-            if resolution.conflicts:
-                conflict_summary = ", ".join(
-                    f"{c.platform}:{c.reason}" for c in resolution.conflicts
-                )
-                raise ValueError(f"Anchor conflicts: {conflict_summary}")
+            # Steal phase: validate EVERY steal before writing ANY move, so a
+            # stale occupant or blocker aborts with zero side effects.
+            applied_switches: dict[str, SwitchResult] = {}
+            steal_plans: list[tuple[str, SwitchPlan]] = []
+            for platform, spec in (steals or {}).items():
+                steal_slot = anchor if platform == "tiktok" else (overrides or {}).get(platform)
+                if steal_slot is None:
+                    raise ValueError(f"steal for {platform} requires an override slot")
+                result = cls.compute_switch(project_id, account_id, platform, steal_slot)
+                if (result.occupant_project_id or None) != (spec.expected_occupant_id or None):
+                    raise ValueError("slot_state_changed")
+                plan = result.cascade if spec.mode == "cascade" else result.next_free
+                if plan.blockers:
+                    summary = ", ".join(f"{b.platform}:{b.reason}" for b in plan.blockers)
+                    raise ValueError(f"Switch blocked: {summary}")
+                steal_plans.append((platform, plan))
+                applied_switches[platform] = result
+
+            now_utc = datetime.now(timezone.utc)
+
+            # Snapshot every to-be-displaced project's current per-platform
+            # schedule BEFORE moving anything, so a downstream anchor conflict
+            # (e.g. a non-tiktok override collides with a non-stolen project)
+            # can roll the moves back to zero net changes on disk.
+            displacement_snapshots: dict[
+                tuple[str, str], PlatformSchedule | None
+            ] = {}
+            for platform, plan in steal_plans:
+                for item in plan.displaced:
+                    key = (item.project_id, platform)
+                    if key in displacement_snapshots:
+                        continue
+                    moved = ProjectService.load(item.project_id)
+                    if moved is None:
+                        continue
+                    displacement_snapshots[key] = (moved.platform_schedules or {}).get(
+                        platform
+                    )
+
+            for platform, plan in steal_plans:
+                cls._apply_displacements(platform, plan.displaced, now_utc)
+
+            try:
+                resolution = cls.resolve_anchor(account_id, anchor, overrides)
+                if resolution.conflicts:
+                    conflict_summary = ", ".join(
+                        f"{c.platform}:{c.reason}" for c in resolution.conflicts
+                    )
+                    raise ValueError(f"Anchor conflicts: {conflict_summary}")
+            except Exception:
+                # Roll back every displaced move so the conflict leaves no
+                # partial write on disk.
+                for (proj_id, platform), original in displacement_snapshots.items():
+                    moved = ProjectService.load(proj_id)
+                    if moved is None:
+                        continue
+                    schedules = dict(moved.platform_schedules or {})
+                    if original is None:
+                        schedules.pop(platform, None)
+                    else:
+                        schedules[platform] = original
+                    moved.platform_schedules = schedules
+                    cls._recompute_aggregates(moved)
+                    ProjectService.save(moved)
+                raise
 
             schedules = dict(project.platform_schedules or {})
             for platform, resolved in resolution.resolved.items():
                 schedules[platform] = PlatformSchedule(
                     slot=resolved.slot, scheduled_at=resolved.scheduled_at
+                )
+            project.platform_schedules = schedules
+            project.scheduled_account_id = account_id
+            cls._recompute_aggregates(project)
+            ProjectService.save(project)
+            return dict(schedules), applied_switches
+
+    @classmethod
+    def reserve_manual(
+        cls,
+        project_id: str,
+        account_id: str,
+        at: datetime,
+        platforms: list[str],
+    ) -> dict[str, PlatformSchedule]:
+        """Reserve an exact user-chosen time OUTSIDE the slot system.
+
+        No slot-config check, no pool check, no jitter. Overwrites any
+        existing entries for the given platforms (that's also the edit path).
+        """
+        with cls._reservation_lock:
+            project = ProjectService.load(project_id)
+            if project is None:
+                raise ValueError("Project not found")
+            at_utc = cls._normalize_utc_datetime(at)
+            if at_utc < cls._earliest_allowed_publish_time():
+                raise ValueError("slot_too_close")
+            if project.scheduled_account_id and project.scheduled_account_id != account_id:
+                project.platform_schedules = {}
+            schedules = dict(project.platform_schedules or {})
+            for platform in platforms:
+                schedules[platform] = PlatformSchedule(
+                    slot=at_utc, scheduled_at=at_utc, manual=True
                 )
             project.platform_schedules = schedules
             project.scheduled_account_id = account_id
@@ -524,7 +650,8 @@ class SchedulingService:
         project_id: str,
         tiktok_slot: datetime,
         overrides: dict[str, datetime] | None = None,
-    ) -> dict[str, PlatformSchedule]:
+        steals: dict[str, StealSpec] | None = None,
+    ) -> tuple[dict[str, PlatformSchedule], dict[str, SwitchResult]]:
         """Re-anchor a project's reservations on a new TT slot."""
         with cls._reservation_lock:
             project = ProjectService.load(project_id)
@@ -543,6 +670,7 @@ class SchedulingService:
             account_id=account_id,
             tiktok_slot=tiktok_slot,
             overrides=overrides,
+            steals=steals,
         )
 
     @classmethod
@@ -762,24 +890,10 @@ class SchedulingService:
                 continue
 
             pool_key = cls._resolve_pool_key(account_id, platform)
-            reservations = cls._collect_pool_reservations(pool_key, platform)
 
             # Build map slot_iso -> project for efficient cascade walking.
             # We need the actual Project entries to keep titles/upload_last_result.
-            account_pool_keys: dict[str, str] = {}
-            for acc_id, acc in AccountService.all_accounts().items():
-                account_pool_keys[acc_id] = (
-                    acc.pool_key_for(platform) or f"account:{acc_id}:{platform}"
-                )
-            slot_to_project: dict[str, Project] = {}
-            for project in ProjectService.list_all():
-                if (project.scheduled_account_id
-                    and account_pool_keys.get(project.scheduled_account_id) == pool_key):
-                    sched = (project.platform_schedules or {}).get(platform)
-                    if sched:
-                        slot_to_project[
-                            cls._normalize_utc_datetime(sched.slot).isoformat()
-                        ] = project
+            slot_to_project = cls._collect_pool_reservations(pool_key, platform)
 
             displaced: list[DisplacedItem] = []
             current_slot = anchor
@@ -823,6 +937,156 @@ class SchedulingService:
             ))
 
         return CascadeResult(per_platform=per_platform, blockers=blockers)
+
+    @classmethod
+    def compute_switch(
+        cls, project_id: str, account_id: str, platform: str, slot: datetime,
+    ) -> SwitchResult:
+        """Pure simulation of stealing `slot` on `platform` for `project_id`.
+
+        Returns BOTH displacement plans (chain cascade / next-free-slot);
+        the user picks one at apply time.
+        """
+        slot_utc = cls._normalize_utc_datetime(slot)
+        now_utc = datetime.now(timezone.utc)
+        earliest_allowed = cls._earliest_allowed_publish_time()
+        fb_horizon = now_utc + timedelta(days=29)
+
+        pool_key = cls._resolve_pool_key(account_id, platform)
+        occupancy = {
+            iso: proj
+            for iso, proj in cls._collect_pool_reservations(pool_key, platform).items()
+            if proj.id != project_id  # our own old slot frees up as part of the switch
+        }
+        occupant = occupancy.get(slot_utc.isoformat())
+
+        shared: list[CascadeBlocker] = []
+        if not cls._is_slot_in_account_config(account_id, platform, slot_utc):
+            shared.append(CascadeBlocker(platform, "slot_not_configured"))
+        if slot_utc < earliest_allowed:
+            shared.append(CascadeBlocker(platform, "slot_too_close"))
+        busy, _busy_pid = cls._pool_is_busy_uploading(account_id, platform)
+        if busy:
+            shared.append(CascadeBlocker(platform, "pool_busy"))
+
+        cascade = SwitchPlan(mode="cascade", displaced=[], blockers=list(shared))
+        next_free = SwitchPlan(mode="next_free", displaced=[], blockers=list(shared))
+
+        if occupant is not None and not shared:
+            # Chain: each occupant pushes into the next configured slot.
+            current_slot, current_occ = slot_utc, occupant
+            while current_occ is not None:
+                nxt = cls._next_slot_after(account_id, platform, current_slot)
+                if nxt is None:
+                    cascade.blockers.append(CascadeBlocker(platform, "pool_full"))
+                    break
+                if platform == "facebook" and nxt > fb_horizon:
+                    cascade.blockers.append(
+                        CascadeBlocker(platform, "facebook_horizon_exceeded")
+                    )
+                    break
+                cascade.displaced.append(DisplacedItem(
+                    project_id=current_occ.id,
+                    anime_title=current_occ.anime_name or current_occ.id,
+                    from_slot=current_slot,
+                    to_slot=nxt,
+                    requires_platform_notification=(
+                        cls._project_requires_platform_notification(current_occ, platform)
+                    ),
+                ))
+                current_slot = nxt
+                current_occ = occupancy.get(nxt.isoformat())
+
+            # Next-free: the occupant alone jumps over taken slots.
+            landing = cls._next_slot_after(account_id, platform, slot_utc)
+            while landing is not None and landing.isoformat() in occupancy:
+                landing = cls._next_slot_after(account_id, platform, landing)
+            if landing is None:
+                next_free.blockers.append(CascadeBlocker(platform, "pool_full"))
+            elif platform == "facebook" and landing > fb_horizon:
+                next_free.blockers.append(
+                    CascadeBlocker(platform, "facebook_horizon_exceeded")
+                )
+            else:
+                next_free.displaced.append(DisplacedItem(
+                    project_id=occupant.id,
+                    anime_title=occupant.anime_name or occupant.id,
+                    from_slot=slot_utc,
+                    to_slot=landing,
+                    requires_platform_notification=(
+                        cls._project_requires_platform_notification(occupant, platform)
+                    ),
+                ))
+
+        uploaded_count = sum(
+            1 for d in cascade.displaced if d.requires_platform_notification
+        )
+        return SwitchResult(
+            platform=platform,
+            slot=slot_utc,
+            occupant_project_id=occupant.id if occupant else None,
+            occupant_title=(occupant.anime_name or occupant.id) if occupant else None,
+            cascade=cascade,
+            next_free=next_free,
+            uploaded_count=uploaded_count,
+        )
+
+    @classmethod
+    def _apply_displacements(
+        cls, platform: str, displaced: list[DisplacedItem], now_utc: datetime
+    ) -> None:
+        """Persist displacement moves farthest-first. Caller holds the lock."""
+        for item in reversed(displaced):
+            project = ProjectService.load(item.project_id)
+            if project is None:
+                continue
+            schedules = dict(project.platform_schedules or {})
+            schedules[platform] = PlatformSchedule(
+                slot=item.to_slot,
+                scheduled_at=cls._randomize_slot(item.to_slot, now_utc),
+            )
+            project.platform_schedules = schedules
+            cls._recompute_aggregates(project)
+            ProjectService.save(project)
+
+    @classmethod
+    def apply_switch(
+        cls,
+        project_id: str,
+        account_id: str,
+        platform: str,
+        slot: datetime,
+        mode: str,
+        expected_occupant_id: str | None,
+    ) -> SwitchResult:
+        """Steal `slot` on `platform`: displace the occupant per `mode`."""
+        with cls._reservation_lock:
+            result = cls.compute_switch(project_id, account_id, platform, slot)
+            if (result.occupant_project_id or None) != (expected_occupant_id or None):
+                raise ValueError("slot_state_changed")
+            plan = result.cascade if mode == "cascade" else result.next_free
+            if plan.blockers:
+                summary = ", ".join(f"{b.platform}:{b.reason}" for b in plan.blockers)
+                raise ValueError(f"Switch blocked: {summary}")
+
+            now_utc = datetime.now(timezone.utc)
+            cls._apply_displacements(platform, plan.displaced, now_utc)
+
+            switcher = ProjectService.load(project_id)
+            if switcher is None:
+                raise ValueError("Project not found")
+            if switcher.scheduled_account_id and switcher.scheduled_account_id != account_id:
+                switcher.platform_schedules = {}
+            schedules = dict(switcher.platform_schedules or {})
+            slot_utc = cls._normalize_utc_datetime(slot)
+            schedules[platform] = PlatformSchedule(
+                slot=slot_utc, scheduled_at=cls._randomize_slot(slot_utc, now_utc)
+            )
+            switcher.platform_schedules = schedules
+            switcher.scheduled_account_id = account_id
+            cls._recompute_aggregates(switcher)
+            ProjectService.save(switcher)
+            return result
 
     @classmethod
     def apply_cascade(cls, project_id: str, account_id: str) -> CascadeResult:
