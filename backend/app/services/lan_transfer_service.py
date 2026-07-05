@@ -8,8 +8,10 @@ filesystem path join), which removes path-traversal risk by construction.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,9 @@ class LanTransferService:
     _ALLOWED_OUTPUT_EXACT = {"output.mp4", "output_no_music.wav"}
     _ATR_OUTPUT_RE = re.compile(r"^atr_.*\.mp4\Z", re.IGNORECASE)
     _PROXY_SUFFIX = "__atr_proxy.mp4"
+    RELAY_STATUS_FILENAME = ".lan_relay_status.json"
+    _RELAY_MAX_ATTEMPTS = 3
+    _RELAY_RETRY_DELAY_S = 5.0
 
     @classmethod
     def _build_entries(cls, project) -> tuple[str, list[ManifestEntry]]:
@@ -119,3 +124,65 @@ class LanTransferService:
         if removed:
             logger.info("Swept %d stale LAN temp file(s)", removed)
         return removed
+
+    @classmethod
+    def _write_relay_status(cls, project_id: str, entry: dict) -> None:
+        status_path = ExportService.get_output_dir(project_id) / cls.RELAY_STATUS_FILENAME
+        data: dict = {}
+        if status_path.exists():
+            try:
+                data = json.loads(status_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = {}
+        data[entry["filename"]] = entry
+        tmp = status_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp.replace(status_path)
+
+    @classmethod
+    def relay_output_to_drive(cls, project_id: str, local_path: Path) -> dict:
+        # Local imports avoid a module-level circular import (upload_phase is heavy
+        # and this service is imported by upload_phase / lan routes elsewhere).
+        from .google_drive_service import GoogleDriveService
+        from .upload_phase import UploadPhaseService
+
+        entry = {"filename": local_path.name, "status": "pending", "attempts": 0, "file_id": None, "error": None}
+        if not GoogleDriveService.is_configured():
+            entry.update(status="skipped", error="Drive not configured")
+            cls._write_relay_status(project_id, entry)
+            return entry
+
+        project = ProjectService.load(project_id)
+        if not project:
+            entry.update(status="failed", error="project not found")
+            cls._write_relay_status(project_id, entry)
+            return entry
+
+        for attempt in range(1, cls._RELAY_MAX_ATTEMPTS + 1):
+            entry["attempts"] = attempt
+            try:
+                folder_id, _ = UploadPhaseService._resolve_drive_folder(project)
+                if not folder_id:
+                    folder_id, _ = GoogleDriveService.ensure_project_folder(ExportService.output_folder_name(project))
+                uploaded = GoogleDriveService.upsert_local_file(
+                    parent_id=folder_id,
+                    filename=local_path.name,
+                    local_path=local_path,
+                    chunksize=settings.drive_upload_chunk_mb * 1024 * 1024,
+                )
+                entry.update(status="uploaded", file_id=str(uploaded.get("id") or ""), error=None)
+                cls._write_relay_status(project_id, entry)
+                # Drop the readiness Drive-video cache so the next readiness poll re-reads.
+                UploadPhaseService._drive_video_cache.pop(project_id, None)
+                logger.info("LAN relay uploaded %s to Drive (project=%s)", local_path.name, project_id)
+                return entry
+            except Exception as exc:
+                entry.update(status="failed", error=str(exc))
+                cls._write_relay_status(project_id, entry)
+                logger.warning(
+                    "LAN relay attempt %d/%d failed for %s: %s",
+                    attempt, cls._RELAY_MAX_ATTEMPTS, local_path.name, exc,
+                )
+                if attempt < cls._RELAY_MAX_ATTEMPTS:
+                    time.sleep(cls._RELAY_RETRY_DELAY_S)
+        return entry

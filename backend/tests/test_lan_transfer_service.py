@@ -103,3 +103,53 @@ def test_sweep_stale_tmp_files(tmp_path, monkeypatch):
     assert LanTransferService.sweep_stale_tmp_files() == 1
     assert (out / "output.mp4").exists()
     assert not list(out.glob("*.lan_tmp"))
+
+
+def test_relay_output_uploads_and_writes_status(tmp_path, monkeypatch):
+    out = tmp_path / "output"
+    out.mkdir(parents=True)
+    video = out / "output.mp4"
+    video.write_bytes(b"v")
+    monkeypatch.setattr(
+        "app.services.lan_transfer_service.ExportService.get_output_dir",
+        classmethod(lambda cls, pid: out),
+    )
+
+    class _P:
+        id = "p1"
+        drive_folder_id = "folder-1"
+
+    monkeypatch.setattr("app.services.lan_transfer_service.ProjectService.load", classmethod(lambda cls, pid: _P()))
+
+    import app.services.google_drive_service as gds
+    monkeypatch.setattr(gds.GoogleDriveService, "is_configured", classmethod(lambda cls: True))
+    calls = []
+    monkeypatch.setattr(
+        gds.GoogleDriveService, "upsert_local_file",
+        classmethod(lambda cls, **kw: calls.append(kw) or {"id": "file-9"}),
+    )
+    import app.services.upload_phase as up
+    monkeypatch.setattr(up.UploadPhaseService, "_resolve_drive_folder", classmethod(lambda cls, p, **kw: ("folder-1", None)))
+
+    status = LanTransferService.relay_output_to_drive("p1", video)
+    assert status["status"] == "uploaded" and status["file_id"] == "file-9"
+    assert calls[0]["parent_id"] == "folder-1" and calls[0]["filename"] == "output.mp4"
+
+    import json
+    saved = json.loads((out / ".lan_relay_status.json").read_text())
+    assert saved["output.mp4"]["status"] == "uploaded"
+
+
+def test_relay_skips_when_drive_unconfigured(tmp_path, monkeypatch):
+    out = tmp_path / "output"
+    out.mkdir(parents=True)
+    video = out / "output.mp4"
+    video.write_bytes(b"v")
+    monkeypatch.setattr(
+        "app.services.lan_transfer_service.ExportService.get_output_dir",
+        classmethod(lambda cls, pid: out),
+    )
+    import app.services.google_drive_service as gds
+    monkeypatch.setattr(gds.GoogleDriveService, "is_configured", classmethod(lambda cls: False))
+    status = LanTransferService.relay_output_to_drive("p1", video)
+    assert status["status"] == "skipped"

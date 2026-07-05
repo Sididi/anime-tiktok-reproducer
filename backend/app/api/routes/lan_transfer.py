@@ -7,7 +7,7 @@ import asyncio
 import hmac
 import logging
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
 from fastapi.responses import FileResponse, Response
 
 from ...config import settings
@@ -63,11 +63,12 @@ async def download_manifest_file(project_id: str, relative_path: str):
 
 
 @router.post("/projects/{project_id}/outputs/{filename}")
-async def upload_output(project_id: str, filename: str, request: Request):
+async def upload_output(project_id: str, filename: str, request: Request, background_tasks: BackgroundTasks):
     await asyncio.to_thread(_load_project_or_404, project_id)
     if not LanTransferService.is_allowed_output_filename(filename):
         raise HTTPException(status_code=422, detail="Filename not allowed")
     destination = await LanTransferService.receive_output_stream(project_id, filename, request.stream())
     size = destination.stat().st_size
     logger.info("LAN output received: project=%s file=%s bytes=%d", project_id, filename, size)
+    background_tasks.add_task(LanTransferService.relay_output_to_drive, project_id, destination)
     return {"ok": True, "filename": filename, "size": size}

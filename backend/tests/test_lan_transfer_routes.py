@@ -105,6 +105,10 @@ def test_upload_output_writes_file(client, monkeypatch, tmp_path):
         "app.services.lan_transfer_service.ExportService.get_output_dir",
         classmethod(lambda cls, pid: tmp_path / "output"),
     )
+    monkeypatch.setattr(
+        "app.api.routes.lan_transfer.LanTransferService.relay_output_to_drive",
+        classmethod(lambda cls, pid, path: {"status": "skipped"}),
+    )
     resp = client.post("/api/lan/projects/p1/outputs/output.mp4", headers=AUTH, content=b"videobytes")
     assert resp.status_code == 200
     assert resp.json()["size"] == 10
