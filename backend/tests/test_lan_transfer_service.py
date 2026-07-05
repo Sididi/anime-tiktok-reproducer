@@ -52,3 +52,51 @@ def test_resolve_entry_by_stripped_path(fake_manifest):
     assert entry is not None and entry.inline_content == b"hello readme"
     assert LanTransferService.resolve_entry(_FakeProject(), "../../etc/passwd") is None
     assert LanTransferService.resolve_entry(_FakeProject(), "nope.bin") is None
+
+
+@pytest.mark.parametrize(
+    ("name", "allowed"),
+    [
+        ("output.mp4", True),
+        ("OUTPUT.MP4", True),
+        ("output_no_music.wav", True),
+        ("ATR_final_v2.mp4", True),
+        ("atr_final.mp4", True),           # ATR pattern is case-insensitive
+        ("ATR_final__atr_proxy.mp4", False),
+        ("output_instagram.mp4", False),
+        ("evil/../output.mp4", False),
+        ("..\\output.mp4", False),
+        (".hidden.mp4", False),
+        ("random.mp4", False),
+    ],
+)
+def test_output_filename_whitelist(name, allowed):
+    assert LanTransferService.is_allowed_output_filename(name) is allowed
+
+
+@pytest.mark.asyncio
+async def test_receive_output_stream_atomic(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "app.services.lan_transfer_service.ExportService.get_output_dir",
+        classmethod(lambda cls, pid: tmp_path / pid / "output"),
+    )
+
+    async def _chunks():
+        yield b"abc"
+        yield b"def"
+
+    dest = await LanTransferService.receive_output_stream("p1", "output.mp4", _chunks())
+    assert dest == tmp_path / "p1" / "output" / "output.mp4"
+    assert dest.read_bytes() == b"abcdef"
+    assert not list(dest.parent.glob("*.lan_tmp"))
+
+
+def test_sweep_stale_tmp_files(tmp_path, monkeypatch):
+    monkeypatch.setattr("app.services.lan_transfer_service.settings.projects_dir", tmp_path)
+    out = tmp_path / "p1" / "output"
+    out.mkdir(parents=True)
+    (out / "output.mp4.deadbeef.lan_tmp").write_bytes(b"partial")
+    (out / "output.mp4").write_bytes(b"keep")
+    assert LanTransferService.sweep_stale_tmp_files() == 1
+    assert (out / "output.mp4").exists()
+    assert not list(out.glob("*.lan_tmp"))

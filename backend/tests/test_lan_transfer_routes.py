@@ -84,3 +84,28 @@ def test_manifest_returns_409_when_no_matches(client, monkeypatch):
 
     resp = client.get("/api/lan/projects/p1/manifest", headers=AUTH)
     assert resp.status_code == 409
+
+
+def _patch_project(monkeypatch):
+    class _P:
+        id = "p1"
+        drive_folder_id = None
+    monkeypatch.setattr("app.api.routes.lan_transfer._load_project_or_404", lambda pid: _P())
+
+
+def test_upload_output_rejects_bad_filename(client, monkeypatch):
+    _patch_project(monkeypatch)
+    resp = client.post("/api/lan/projects/p1/outputs/output_instagram.mp4", headers=AUTH, content=b"x")
+    assert resp.status_code == 422
+
+
+def test_upload_output_writes_file(client, monkeypatch, tmp_path):
+    _patch_project(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.lan_transfer_service.ExportService.get_output_dir",
+        classmethod(lambda cls, pid: tmp_path / "output"),
+    )
+    resp = client.post("/api/lan/projects/p1/outputs/output.mp4", headers=AUTH, content=b"videobytes")
+    assert resp.status_code == 200
+    assert resp.json()["size"] == 10
+    assert (tmp_path / "output" / "output.mp4").read_bytes() == b"videobytes"
