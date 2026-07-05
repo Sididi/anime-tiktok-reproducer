@@ -219,3 +219,82 @@ def test_reserve_manual_overwrites_previous_manual(tmp_path, monkeypatch):
     SchedulingService.reserve_manual("p1", acc, at1, ["tiktok"])
     SchedulingService.reserve_manual("p1", acc, at2, ["tiktok"])
     assert ProjectService.load("p1").platform_schedules["tiktok"].slot == at2
+
+
+# --------------------------------------------------------------- compute_switch
+
+
+def _future_slot(days, hour):
+    from datetime import timedelta
+    return (datetime.now(timezone.utc) + timedelta(days=days)).replace(
+        hour=hour, minute=0, second=0, microsecond=0
+    )
+
+
+def _patch_pool_not_busy(monkeypatch):
+    monkeypatch.setattr(
+        SchedulingService,
+        "_pool_is_busy_uploading",
+        classmethod(lambda cls, a, p: (False, None)),
+    )
+
+
+def test_compute_switch_chain_and_next_free(tmp_path, monkeypatch):
+    acc = _setup_single_account(tmp_path, monkeypatch)   # slots 10/14/18
+    _patch_pool_not_busy(monkeypatch)
+    s10, s14, s18 = _future_slot(1, 10), _future_slot(1, 14), _future_slot(1, 18)
+    _save_scheduled_project("projB", acc, "tiktok", s10, title="B")
+    _save_scheduled_project("projC", acc, "tiktok", s14, title="C")
+    # 18:00 free
+
+    result = SchedulingService.compute_switch("newproj", acc, "tiktok", s10)
+
+    assert result.occupant_project_id == "projB"
+    assert result.occupant_title == "B"
+    # cascade: B -> 14 pushes C -> 18
+    assert [(d.project_id, d.from_slot, d.to_slot) for d in result.cascade.displaced] == [
+        ("projB", s10, s14),
+        ("projC", s14, s18),
+    ]
+    assert result.cascade.blockers == []
+    # next_free: B jumps over taken 14 straight to 18
+    assert [(d.project_id, d.to_slot) for d in result.next_free.displaced] == [
+        ("projB", s18)
+    ]
+    assert result.next_free.blockers == []
+    assert result.uploaded_count == 0
+
+
+def test_compute_switch_skips_own_reservation_and_manual(tmp_path, monkeypatch):
+    acc = _setup_single_account(tmp_path, monkeypatch)
+    _patch_pool_not_busy(monkeypatch)
+    s10, s14 = _future_slot(1, 10), _future_slot(1, 14)
+    _save_scheduled_project("projB", acc, "tiktok", s10, title="B")
+    _save_scheduled_project("me", acc, "tiktok", s14, title="Me")          # my own old slot
+    _save_scheduled_project("manualp", acc, "tiktok", _future_slot(1, 18), manual=True)
+
+    result = SchedulingService.compute_switch("me", acc, "tiktok", s10)
+    # my own 14:00 counts as free (it's released by the switch), so B lands there
+    assert [(d.project_id, d.to_slot) for d in result.cascade.displaced] == [("projB", s14)]
+    assert result.next_free.displaced[0].to_slot == s14
+
+
+def test_compute_switch_free_slot_has_no_occupant(tmp_path, monkeypatch):
+    acc = _setup_single_account(tmp_path, monkeypatch)
+    _patch_pool_not_busy(monkeypatch)
+    result = SchedulingService.compute_switch("newproj", acc, "tiktok", _future_slot(1, 10))
+    assert result.occupant_project_id is None
+    assert result.cascade.displaced == [] and result.next_free.displaced == []
+
+
+def test_compute_switch_pool_busy_blocks_both_plans(tmp_path, monkeypatch):
+    acc = _setup_single_account(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        SchedulingService,
+        "_pool_is_busy_uploading",
+        classmethod(lambda cls, a, p: (True, "busyproj")),
+    )
+    _save_scheduled_project("projB", acc, "tiktok", _future_slot(1, 10))
+    result = SchedulingService.compute_switch("newproj", acc, "tiktok", _future_slot(1, 10))
+    assert any(b.reason == "pool_busy" for b in result.cascade.blockers)
+    assert any(b.reason == "pool_busy" for b in result.next_free.blockers)

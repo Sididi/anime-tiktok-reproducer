@@ -66,6 +66,24 @@ class CascadeResult:
     blockers: list[CascadeBlocker]
 
 
+@dataclass
+class SwitchPlan:
+    mode: str
+    displaced: list[DisplacedItem]
+    blockers: list[CascadeBlocker]
+
+
+@dataclass
+class SwitchResult:
+    platform: str
+    slot: datetime
+    occupant_project_id: str | None
+    occupant_title: str | None
+    cascade: SwitchPlan
+    next_free: SwitchPlan
+    uploaded_count: int
+
+
 class SchedulingService:
     """Finds and reserves the next available upload slot per (account, platform)."""
 
@@ -848,6 +866,99 @@ class SchedulingService:
             ))
 
         return CascadeResult(per_platform=per_platform, blockers=blockers)
+
+    @classmethod
+    def compute_switch(
+        cls, project_id: str, account_id: str, platform: str, slot: datetime,
+    ) -> SwitchResult:
+        """Pure simulation of stealing `slot` on `platform` for `project_id`.
+
+        Returns BOTH displacement plans (chain cascade / next-free-slot);
+        the user picks one at apply time.
+        """
+        slot_utc = cls._normalize_utc_datetime(slot)
+        now_utc = datetime.now(timezone.utc)
+        earliest_allowed = cls._earliest_allowed_publish_time()
+        fb_horizon = now_utc + timedelta(days=29)
+
+        pool_key = cls._resolve_pool_key(account_id, platform)
+        occupancy = {
+            iso: proj
+            for iso, proj in cls._collect_pool_reservations(pool_key, platform).items()
+            if proj.id != project_id  # our own old slot frees up as part of the switch
+        }
+        occupant = occupancy.get(slot_utc.isoformat())
+
+        shared: list[CascadeBlocker] = []
+        if not cls._is_slot_in_account_config(account_id, platform, slot_utc):
+            shared.append(CascadeBlocker(platform, "slot_not_configured"))
+        if slot_utc < earliest_allowed:
+            shared.append(CascadeBlocker(platform, "slot_too_close"))
+        busy, _busy_pid = cls._pool_is_busy_uploading(account_id, platform)
+        if busy:
+            shared.append(CascadeBlocker(platform, "pool_busy"))
+
+        cascade = SwitchPlan(mode="cascade", displaced=[], blockers=list(shared))
+        next_free = SwitchPlan(mode="next_free", displaced=[], blockers=list(shared))
+
+        if occupant is not None and not shared:
+            # Chain: each occupant pushes into the next configured slot.
+            current_slot, current_occ = slot_utc, occupant
+            while current_occ is not None:
+                nxt = cls._next_slot_after(account_id, platform, current_slot)
+                if nxt is None:
+                    cascade.blockers.append(CascadeBlocker(platform, "pool_full"))
+                    break
+                if platform == "facebook" and nxt > fb_horizon:
+                    cascade.blockers.append(
+                        CascadeBlocker(platform, "facebook_horizon_exceeded")
+                    )
+                    break
+                cascade.displaced.append(DisplacedItem(
+                    project_id=current_occ.id,
+                    anime_title=current_occ.anime_name or current_occ.id,
+                    from_slot=current_slot,
+                    to_slot=nxt,
+                    requires_platform_notification=(
+                        cls._project_requires_platform_notification(current_occ, platform)
+                    ),
+                ))
+                current_slot = nxt
+                current_occ = occupancy.get(nxt.isoformat())
+
+            # Next-free: the occupant alone jumps over taken slots.
+            landing = cls._next_slot_after(account_id, platform, slot_utc)
+            while landing is not None and landing.isoformat() in occupancy:
+                landing = cls._next_slot_after(account_id, platform, landing)
+            if landing is None:
+                next_free.blockers.append(CascadeBlocker(platform, "pool_full"))
+            elif platform == "facebook" and landing > fb_horizon:
+                next_free.blockers.append(
+                    CascadeBlocker(platform, "facebook_horizon_exceeded")
+                )
+            else:
+                next_free.displaced.append(DisplacedItem(
+                    project_id=occupant.id,
+                    anime_title=occupant.anime_name or occupant.id,
+                    from_slot=slot_utc,
+                    to_slot=landing,
+                    requires_platform_notification=(
+                        cls._project_requires_platform_notification(occupant, platform)
+                    ),
+                ))
+
+        uploaded_count = sum(
+            1 for d in cascade.displaced if d.requires_platform_notification
+        )
+        return SwitchResult(
+            platform=platform,
+            slot=slot_utc,
+            occupant_project_id=occupant.id if occupant else None,
+            occupant_title=(occupant.anime_name or occupant.id) if occupant else None,
+            cascade=cascade,
+            next_free=next_free,
+            uploaded_count=uploaded_count,
+        )
 
     @classmethod
     def apply_cascade(cls, project_id: str, account_id: str) -> CascadeResult:
