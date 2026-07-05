@@ -126,7 +126,8 @@ async def lifespan(app: FastAPI):
     await LibraryHydrationService.startup_cleanup()
     await project_startup_queue.startup_cleanup()
     await project_upload_queue.startup_cleanup()
-    LanTransferService.sweep_stale_tmp_files()
+    if settings.lan_transfer_enabled:
+        LanTransferService.sweep_stale_tmp_files()
 
     reschedule_retry_stop = asyncio.Event()
     app.state.reschedule_retry_stop = reschedule_retry_stop

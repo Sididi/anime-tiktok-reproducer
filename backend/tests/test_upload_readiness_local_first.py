@@ -29,6 +29,14 @@ def test_find_local_video_prefers_output_mp4(output_dir):
     assert found is not None and found.name == "output.mp4"
 
 
+def test_find_local_video_none_when_feature_disabled(output_dir, monkeypatch):
+    (output_dir / "output.mp4").write_bytes(b"v")
+    monkeypatch.setattr(
+        "app.services.lan_transfer_service.settings.lan_transfer_enabled", False
+    )
+    assert LanTransferService.find_local_upload_video("p1") is None
+
+
 def test_find_local_video_single_atr(output_dir):
     (output_dir / "ATR_final.mp4").write_bytes(b"v")
     found = LanTransferService.find_local_upload_video("p1")

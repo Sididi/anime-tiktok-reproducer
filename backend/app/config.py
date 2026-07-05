@@ -69,6 +69,10 @@ class Settings(BaseSettings):
 
     # LAN transfer (Premiere Pro PC pulls assets / pushes outputs over the LAN)
     lan_transfer_token: str | None = None
+    # Master switch (ATR_LAN_TRANSFER_ENABLED=false in .env to kill the feature):
+    # when False, /api/lan/* returns 503 and local-first reads are bypassed, so
+    # the backend behaves exactly as before the LAN feature (pure Drive).
+    lan_transfer_enabled: bool = True
 
     # Scheduling v2 feature flag (Planning system Phase 1)
     scheduling_v2_enabled: bool = True

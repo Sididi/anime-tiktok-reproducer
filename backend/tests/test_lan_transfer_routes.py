@@ -45,6 +45,13 @@ def test_ping_503_when_unconfigured(client, monkeypatch):
     assert resp.status_code == 503
 
 
+def test_ping_503_when_disabled(client, monkeypatch):
+    monkeypatch.setattr("app.config.settings.lan_transfer_enabled", False)
+    resp = client.get("/api/lan/ping", headers=AUTH)
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == "LAN transfer disabled"
+
+
 def test_manifest_and_file_download(client, monkeypatch, tmp_path):
     from app.services.export_service import ManifestEntry
 

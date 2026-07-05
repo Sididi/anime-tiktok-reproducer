@@ -51,7 +51,12 @@ network hiccup never poisons later jobs.
 
 **Backend side:** run the backend bound to `0.0.0.0` (the `backend` pixi task
 already does this), set `ATR_LAN_TRANSFER_TOKEN` in the backend `.env`, and
-firewall port `8000` to the local subnet. Only `/api/lan/*` is token-guarded;
+firewall port `8000` to the local subnet.
+
+**Backend kill switch:** set `ATR_LAN_TRANSFER_ENABLED=false` in the backend
+`.env` to disable the feature entirely server-side — `/api/lan/*` returns 503
+(so the panel's probe fails and it falls back to Drive automatically) and the
+backend's local-first reads are bypassed, reverting behavior to pure Drive. Only `/api/lan/*` is token-guarded;
 binding `0.0.0.0` exposes the rest of the API to the LAN, which is why the
 firewall rule is required.
 

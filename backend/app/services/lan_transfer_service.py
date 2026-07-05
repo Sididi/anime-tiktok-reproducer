@@ -96,6 +96,8 @@ class LanTransferService:
 
     @classmethod
     def find_local_upload_video(cls, project_id: str) -> Path | None:
+        if not settings.lan_transfer_enabled:
+            return None
         output_dir = ExportService.get_output_dir(project_id)
         if not output_dir.exists():
             return None

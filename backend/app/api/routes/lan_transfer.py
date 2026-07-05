@@ -20,6 +20,8 @@ API_VERSION = LanTransferService.API_VERSION
 
 
 def require_lan_token(x_atr_lan_token: str | None = Header(default=None)) -> None:
+    if not settings.lan_transfer_enabled:
+        raise HTTPException(status_code=503, detail="LAN transfer disabled")
     expected = settings.lan_transfer_token
     if not expected:
         raise HTTPException(status_code=503, detail="LAN transfer not configured")
