@@ -177,3 +177,45 @@ def test_cascade_skips_manual_entries(tmp_path, monkeypatch):
     assert tt.target_slot == anchor
     # the manual project is NOT displaced even though it sits on the anchor slot
     assert tt.displaced == []
+
+
+def test_reserve_manual_writes_exact_time_no_jitter(tmp_path, monkeypatch):
+    from datetime import timedelta
+    acc = _setup_single_account(tmp_path, monkeypatch)
+    ProjectService.get_project_dir("p1").mkdir(parents=True, exist_ok=True)
+    ProjectService.save(Project(id="p1", anime_name="Bleach"))
+    at = (datetime.now(timezone.utc) + timedelta(hours=2)).replace(second=0, microsecond=0)
+
+    schedules = SchedulingService.reserve_manual("p1", acc, at, ["tiktok", "youtube"])
+
+    assert set(schedules) == {"tiktok", "youtube"}
+    for sched in schedules.values():
+        assert sched.manual is True
+        assert sched.slot == at
+        assert sched.scheduled_at == at          # exact, no jitter
+    saved = ProjectService.load("p1")
+    assert saved.scheduled_account_id == acc
+    assert saved.platform_schedules["tiktok"].manual is True
+
+
+def test_reserve_manual_rejects_too_close(tmp_path, monkeypatch):
+    from datetime import timedelta
+    import pytest
+    acc = _setup_single_account(tmp_path, monkeypatch)
+    ProjectService.get_project_dir("p1").mkdir(parents=True, exist_ok=True)
+    ProjectService.save(Project(id="p1"))
+    at = datetime.now(timezone.utc) + timedelta(minutes=5)
+    with pytest.raises(ValueError, match="slot_too_close"):
+        SchedulingService.reserve_manual("p1", acc, at, ["tiktok"])
+
+
+def test_reserve_manual_overwrites_previous_manual(tmp_path, monkeypatch):
+    from datetime import timedelta
+    acc = _setup_single_account(tmp_path, monkeypatch)
+    ProjectService.get_project_dir("p1").mkdir(parents=True, exist_ok=True)
+    ProjectService.save(Project(id="p1"))
+    at1 = (datetime.now(timezone.utc) + timedelta(hours=2)).replace(second=0, microsecond=0)
+    at2 = at1 + timedelta(hours=3)
+    SchedulingService.reserve_manual("p1", acc, at1, ["tiktok"])
+    SchedulingService.reserve_manual("p1", acc, at2, ["tiktok"])
+    assert ProjectService.load("p1").platform_schedules["tiktok"].slot == at2

@@ -525,6 +525,39 @@ class SchedulingService:
             return dict(schedules)
 
     @classmethod
+    def reserve_manual(
+        cls,
+        project_id: str,
+        account_id: str,
+        at: datetime,
+        platforms: list[str],
+    ) -> dict[str, PlatformSchedule]:
+        """Reserve an exact user-chosen time OUTSIDE the slot system.
+
+        No slot-config check, no pool check, no jitter. Overwrites any
+        existing entries for the given platforms (that's also the edit path).
+        """
+        with cls._reservation_lock:
+            project = ProjectService.load(project_id)
+            if project is None:
+                raise ValueError("Project not found")
+            at_utc = cls._normalize_utc_datetime(at)
+            if at_utc < cls._earliest_allowed_publish_time():
+                raise ValueError("slot_too_close")
+            if project.scheduled_account_id and project.scheduled_account_id != account_id:
+                project.platform_schedules = {}
+            schedules = dict(project.platform_schedules or {})
+            for platform in platforms:
+                schedules[platform] = PlatformSchedule(
+                    slot=at_utc, scheduled_at=at_utc, manual=True
+                )
+            project.platform_schedules = schedules
+            project.scheduled_account_id = account_id
+            cls._recompute_aggregates(project)
+            ProjectService.save(project)
+            return dict(schedules)
+
+    @classmethod
     def reschedule_anchor(
         cls,
         project_id: str,
