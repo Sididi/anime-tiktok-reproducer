@@ -235,12 +235,33 @@ export function PlanningModal({ open, onClose }: PlanningModalProps) {
               initialIso={reslottingSingle.slot}
               onClose={() => setReslottingSingle(null)}
               onConfirm={async (payload) => {
-                const single = payload as { slot: string };
-                await api.reschedulePlatform(
-                  reslottingSingle.project_id,
-                  reslottingSingle.platform,
-                  single.slot,
-                );
+                if ("slot" in payload && payload.steal) {
+                  const res = await api.switchApply(
+                    reslottingSingle.project_id,
+                    {
+                      account_id: reslottingSingle.account_id,
+                      platform: reslottingSingle.platform,
+                      slot: payload.slot,
+                      mode: payload.steal.mode,
+                      expected_occupant_id: payload.steal.expected_occupant_id,
+                    },
+                  );
+                  if (
+                    Object.values(res.notification_status).includes(
+                      "pending_retry",
+                    )
+                  ) {
+                    setError(
+                      "Certaines replanifications plateforme seront resynchronisées automatiquement.",
+                    );
+                  }
+                } else if ("slot" in payload) {
+                  await api.reschedulePlatform(
+                    reslottingSingle.project_id,
+                    reslottingSingle.platform,
+                    payload.slot,
+                  );
+                }
                 setReslottingSingle(null);
                 setPopover(null);
                 await reload();
@@ -268,13 +289,27 @@ export function PlanningModal({ open, onClose }: PlanningModalProps) {
                     .map((e) => e.platform),
                 ),
               )}
+              initialManual={events.some(
+                (e) => e.project_id === reAnchoring.project_id && e.manual,
+              )}
               onClose={() => setReAnchoring(null)}
               onConfirm={async (payload) => {
-                const anchor = payload as {
-                  tiktok_slot: string;
-                  overrides?: Partial<Record<Platform, string>>;
-                };
-                await api.rescheduleAnchor(reAnchoring.project_id, anchor);
+                if ("manual_at" in payload) {
+                  const platforms = Array.from(
+                    new Set(
+                      events
+                        .filter((e) => e.project_id === reAnchoring.project_id)
+                        .map((e) => e.platform),
+                    ),
+                  );
+                  await api.reserveManual(reAnchoring.project_id, {
+                    account_id: reAnchoring.account_id,
+                    at: payload.manual_at,
+                    platforms,
+                  });
+                } else if ("tiktok_slot" in payload) {
+                  await api.rescheduleAnchor(reAnchoring.project_id, payload);
+                }
                 setReAnchoring(null);
                 setPopover(null);
                 await reload();

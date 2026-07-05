@@ -565,6 +565,7 @@ export function ProjectManagerModal({
             account_id: accountId!,
             tiktok_slot: anchorPayload.tiktok_slot,
             overrides: anchorPayload.overrides,
+            steals: anchorPayload.steals,
           });
         } catch (err) {
           setError((err as Error).message);
@@ -1255,17 +1256,26 @@ export function ProjectManagerModal({
               }
               onClose={() => setSchedulingForProject(null)}
               onConfirm={async (payload) => {
-                const anchor = payload as {
-                  tiktok_slot: string;
-                  overrides?: Partial<Record<Platform, string>>;
-                };
                 const ctx = schedulingForProject;
                 setSchedulingForProject(null);
+                if ("manual_at" in payload) {
+                  await api.reserveManual(ctx.row.project_id, {
+                    account_id: ctx.accountId,
+                    at: payload.manual_at,
+                  });
+                  // reservations exist now; "auto" upload path reuses them
+                  await startUploadWithChecks(
+                    ctx.row.project_id,
+                    ctx.accountId,
+                    "auto",
+                  );
+                  return;
+                }
                 await startUploadWithChecks(
                   ctx.row.project_id,
                   ctx.accountId,
                   "scheduled",
-                  anchor,
+                  payload as AnchorPayload,
                 );
               }}
             />
