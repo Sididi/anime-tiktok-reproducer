@@ -67,6 +67,9 @@ class Settings(BaseSettings):
 
     cep_trigger_url_template: str = "http://localhost:48653/p/{project_id}"
 
+    # LAN transfer (Premiere Pro PC pulls assets / pushes outputs over the LAN)
+    lan_transfer_token: str | None = None
+
     # Scheduling v2 feature flag (Planning system Phase 1)
     scheduling_v2_enabled: bool = True
 
