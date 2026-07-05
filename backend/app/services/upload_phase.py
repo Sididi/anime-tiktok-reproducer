@@ -185,7 +185,14 @@ class UploadPhaseService:
             return None, None
         folder_id = readiness.drive_folder_id
         if not folder_id:
-            folder_id, _ = GoogleDriveService.ensure_project_folder(ExportService.output_folder_name(project))
+            folder_id, folder_url = GoogleDriveService.ensure_project_folder(
+                ExportService.output_folder_name(project)
+            )
+            readiness.drive_folder_id = folder_id
+            if not readiness.drive_folder_url:
+                readiness.drive_folder_url = folder_url
+        else:
+            readiness.drive_folder_id = folder_id
         uploaded = GoogleDriveService.upsert_local_file(
             parent_id=folder_id,
             filename=local.name,
@@ -1361,8 +1368,12 @@ class UploadPhaseService:
         if not original_path.exists():
             if readiness.local_video_path and Path(readiness.local_video_path).exists():
                 shutil.copy2(readiness.local_video_path, original_path)
-            else:
+            elif readiness.drive_video_id:
                 GoogleDriveService.download_file(readiness.drive_video_id, original_path)
+            else:
+                raise ValueError(
+                    "Final video unavailable: not present locally and no Drive copy"
+                )
 
         probe, probe_error = probe_media(video_path=original_path)
         if probe_error or probe is None or probe.duration_seconds is None:
