@@ -95,6 +95,25 @@ class LanTransferService:
         return bool(cls._ATR_OUTPUT_RE.match(lowered))
 
     @classmethod
+    def find_local_upload_video(cls, project_id: str) -> Path | None:
+        output_dir = ExportService.get_output_dir(project_id)
+        if not output_dir.exists():
+            return None
+        candidates = [
+            p for p in output_dir.iterdir()
+            if p.is_file()
+            and p.suffix.lower() in ExportService.VIDEO_EXTENSIONS
+            and cls.is_allowed_output_filename(p.name)
+            and p.name.casefold() != "output_no_music.wav"
+        ]
+        for candidate in candidates:
+            if candidate.name.casefold() == "output.mp4":
+                return candidate
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
+    @classmethod
     async def receive_output_stream(cls, project_id: str, filename: str, stream) -> Path:
         output_dir = ExportService.get_output_dir(project_id)
         output_dir.mkdir(parents=True, exist_ok=True)

@@ -48,6 +48,8 @@ class UploadReadiness:
     reasons: list[str]
     drive_folder_id: str | None
     drive_folder_url: str | None
+    local_video_path: str | None = None
+    local_video_name: str | None = None
 
 
 def _uploaded_fields(project: "Project") -> dict[str, Any]:
@@ -180,9 +182,10 @@ class UploadPhaseService:
         folder_url: str | None,
         video_files: list[dict[str, Any]],
         video_lookup_failed: bool = False,
+        local_video: Path | None = None,
     ) -> UploadReadiness:
         reasons: list[str] = []
-        if not folder_id:
+        if not folder_id and local_video is None:
             reasons.append("no output video found")
 
         video_count = len(video_files)
@@ -190,15 +193,18 @@ class UploadPhaseService:
 
         if not metadata_exists:
             reasons.append("no metadata found")
-        if video_count == 0:
-            if video_lookup_failed and folder_id:
-                reasons.append("unable to verify output video in Drive")
-            else:
-                reasons.append("no output video found")
-        elif video_count > 1:
-            reasons.append("more than one output video found (conflicting)")
+        if local_video is None:
+            if video_count == 0:
+                if video_lookup_failed and folder_id:
+                    reasons.append("unable to verify output video in Drive")
+                else:
+                    reasons.append("no output video found")
+            elif video_count > 1:
+                reasons.append("more than one output video found (conflicting)")
 
-        if metadata_exists and video_count == 1:
+        if local_video is not None:
+            status = "green" if metadata_exists else "orange"
+        elif metadata_exists and video_count == 1:
             status = "green"
         elif metadata_exists or video_count == 1:
             status = "orange"
@@ -215,11 +221,31 @@ class UploadPhaseService:
             reasons=sorted(set(reasons)),
             drive_folder_id=folder_id,
             drive_folder_url=folder_url,
+            local_video_path=str(local_video) if local_video else None,
+            local_video_name=local_video.name if local_video else None,
         )
 
     @classmethod
     def compute_readiness(cls, project: Project) -> UploadReadiness:
         metadata_exists = ProjectService.get_metadata_file(project.id).exists()
+
+        from .lan_transfer_service import LanTransferService
+
+        local_video = LanTransferService.find_local_upload_video(project.id)
+        if local_video is not None:
+            # Use whatever folder info is already cached on the project; never
+            # query Drive (no folder-by-name search, no video lookup) when a
+            # local video already answers the readiness question.
+            folder_id = project.drive_folder_id
+            folder_url = project.drive_folder_url
+            return cls._build_readiness(
+                metadata_exists=metadata_exists,
+                folder_id=folder_id,
+                folder_url=folder_url,
+                video_files=[],
+                local_video=local_video,
+            )
+
         folder_id, folder_url = cls._resolve_drive_folder(project)
 
         video_files: list[dict[str, Any]] = []
@@ -260,7 +286,12 @@ class UploadPhaseService:
 
     @classmethod
     def list_manager_rows(cls) -> list[dict[str, Any]]:
+        from .lan_transfer_service import LanTransferService
+
         projects = ProjectService.list_all()
+        local_videos: dict[str, Path | None] = {
+            project.id: LanTransferService.find_local_upload_video(project.id) for project in projects
+        }
         folder_candidates_by_name: dict[str, dict[str, Any]] = {}
         drive_root_videos: dict[str, list[dict[str, Any]]] = {}
         drive_batch_lookup_failed = False
@@ -271,6 +302,8 @@ class UploadPhaseService:
                     folder_candidates_by_name = GoogleDriveService.list_project_folders_under_parent(drive=drive)
                     folder_ids: list[str] = []
                     for project in projects:
+                        if local_videos[project.id] is not None:
+                            continue
                         folder_id, _ = cls._resolve_drive_folder(
                             project,
                             folder_candidates_by_name=folder_candidates_by_name,
@@ -307,33 +340,45 @@ class UploadPhaseService:
         def _build_row(project: Project) -> dict[str, Any]:
             project_dir = ProjectService.get_project_dir(project.id)
             metadata_exists = ProjectService.get_metadata_file(project.id).exists()
-            folder_id, folder_url = cls._resolve_drive_folder(
-                project,
-                folder_candidates_by_name=folder_candidates_by_name if folder_candidates_by_name else None,
-                resolve_remote_url=False,
-            )
-            video_files = drive_root_videos.get(folder_id or "", [])
-            if drive_batch_lookup_failed and folder_id and not video_files:
-                cached_video = cls._cached_drive_video(
-                    project_id=project.id,
-                    folder_id=folder_id,
+            local_video = local_videos.get(project.id)
+            if local_video is not None:
+                # Local-first: a video already exists on disk (delivered over LAN),
+                # so skip any Drive folder/video lookup entirely.
+                readiness = cls._build_readiness(
+                    metadata_exists=metadata_exists,
+                    folder_id=project.drive_folder_id,
+                    folder_url=project.drive_folder_url,
+                    video_files=[],
+                    local_video=local_video,
                 )
-                if cached_video is not None:
-                    video_files = [cached_video]
-            if video_files or not drive_batch_lookup_failed:
-                cls._cache_drive_video(
-                    project_id=project.id,
+            else:
+                folder_id, folder_url = cls._resolve_drive_folder(
+                    project,
+                    folder_candidates_by_name=folder_candidates_by_name if folder_candidates_by_name else None,
+                    resolve_remote_url=False,
+                )
+                video_files = drive_root_videos.get(folder_id or "", [])
+                if drive_batch_lookup_failed and folder_id and not video_files:
+                    cached_video = cls._cached_drive_video(
+                        project_id=project.id,
+                        folder_id=folder_id,
+                    )
+                    if cached_video is not None:
+                        video_files = [cached_video]
+                if video_files or not drive_batch_lookup_failed:
+                    cls._cache_drive_video(
+                        project_id=project.id,
+                        folder_id=folder_id,
+                        folder_url=folder_url,
+                        video_files=video_files,
+                    )
+                readiness = cls._build_readiness(
+                    metadata_exists=metadata_exists,
                     folder_id=folder_id,
                     folder_url=folder_url,
                     video_files=video_files,
+                    video_lookup_failed=drive_batch_lookup_failed,
                 )
-            readiness = cls._build_readiness(
-                metadata_exists=metadata_exists,
-                folder_id=folder_id,
-                folder_url=folder_url,
-                video_files=video_files,
-                video_lookup_failed=drive_batch_lookup_failed,
-            )
             return {
                 "project_id": project.id,
                 "anime_title": project.anime_name,
@@ -350,6 +395,7 @@ class UploadPhaseService:
                 "drive_folder_id": readiness.drive_folder_id,
                 "drive_folder_url": readiness.drive_folder_url,
                 "drive_video_id": readiness.drive_video_id,
+                "local_video_available": local_video is not None,
                 "created_at": project.created_at.isoformat() if project.created_at else None,
                 "scheduled_at": project.scheduled_at.isoformat() if project.scheduled_at else None,
                 "scheduled_account_id": project.scheduled_account_id,
