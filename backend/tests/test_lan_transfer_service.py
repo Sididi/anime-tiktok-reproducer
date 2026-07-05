@@ -68,6 +68,9 @@ def test_resolve_entry_by_stripped_path(fake_manifest):
         ("..\\output.mp4", False),
         (".hidden.mp4", False),
         ("random.mp4", False),
+        ("atr_evil.mp4\n", False),          # trailing newline must not slip past `$` anchor
+        ("output.mp4\n", False),            # trailing newline on an exact-match name
+        ("atr_x\t.mp4", False),             # embedded control character (tab)
     ],
 )
 def test_output_filename_whitelist(name, allowed):

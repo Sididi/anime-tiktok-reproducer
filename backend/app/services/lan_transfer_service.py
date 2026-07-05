@@ -25,7 +25,7 @@ class LanTransferService:
     API_VERSION = 1
     TMP_SUFFIX = ".lan_tmp"
     _ALLOWED_OUTPUT_EXACT = {"output.mp4", "output_no_music.wav"}
-    _ATR_OUTPUT_RE = re.compile(r"^atr_.*\.mp4$", re.IGNORECASE)
+    _ATR_OUTPUT_RE = re.compile(r"^atr_.*\.mp4\Z", re.IGNORECASE)
     _PROXY_SUFFIX = "__atr_proxy.mp4"
 
     @classmethod
@@ -77,6 +77,8 @@ class LanTransferService:
     @classmethod
     def is_allowed_output_filename(cls, name: str) -> bool:
         if not name or "/" in name or "\\" in name or name.startswith("."):
+            return False
+        if any(ord(ch) < 0x20 for ch in name):
             return False
         lowered = name.casefold()
         if lowered in cls._ALLOWED_OUTPUT_EXACT:
