@@ -106,6 +106,8 @@ Unifying pattern on PC1: one helper — *"resolve source video: local path if pr
 - **Path traversal / rogue LAN client**: `relpath` confined to the project export dir; upload filenames whitelisted; token on every `/api/lan/*` call.
 - **uvicorn `--reload`**: watches `.py` files only, so `.mp4` uploads landing in `backend/data` do not restart the server (assumption re-verified during testing).
 - **Concurrent projects**: endpoints stateless and per-project; jobs on different projects cannot collide.
+- **ProtonVPN toggled without warning on PC1** (observed in practice): if the kill-switch filters LAN while connected, the per-job probe fails and that job transparently uses Drive; a toggle mid-transfer exhausts retries, fails the job cleanly, and the re-run re-probes. VPN state affects speed, never correctness. Milestone 0 Stage C determines whether kill-switch settings (Standard vs Advanced, LAN-allow) can make LAN work with VPN on.
+- **PC1 has two LAN interfaces** (ethernet `192.168.1.76` + WiFi `192.168.1.57` on the devolo repeater): the CEP `lan_base_url` and ufw rule target the ethernet IP only; a static DHCP lease for it should be set in the box admin.
 
 ## Testing & rollout
 
