@@ -69,6 +69,9 @@
     client_secret: "",
     refresh_token: "",
     parent_folder_id: "",
+    lan_base_url: "",
+    lan_token: "",
+    lan_probe_timeout_ms: 2500,
     port: DEFAULT_PORT,
     preset_epr_path: "",
     audio_preset_epr_path: "",
@@ -99,6 +102,8 @@
   var settingParentFolderId = document.getElementById(
     "setting-parent-folder-id",
   );
+  var settingLanBaseUrl = document.getElementById("setting-lan-base-url");
+  var settingLanToken = document.getElementById("setting-lan-token");
   var settingPort = document.getElementById("setting-port");
   var settingPresetEpr = document.getElementById("setting-preset-epr");
   var settingAudioPresetEpr = document.getElementById(
@@ -1001,6 +1006,8 @@
     settingClientSecret.value = settings.client_secret || "";
     settingRefreshToken.value = settings.refresh_token || "";
     settingParentFolderId.value = settings.parent_folder_id || "";
+    settingLanBaseUrl.value = settings.lan_base_url || "";
+    settingLanToken.value = settings.lan_token || "";
     settingPort.value = String(settings.port || DEFAULT_PORT);
     settingPresetEpr.value = settings.preset_epr_path || "";
     settingAudioPresetEpr.value = settings.audio_preset_epr_path || "";
@@ -1023,6 +1030,11 @@
       client_secret: String(settingClientSecret.value || "").trim(),
       refresh_token: String(settingRefreshToken.value || "").trim(),
       parent_folder_id: String(settingParentFolderId.value || "").trim(),
+      lan_base_url: String(settingLanBaseUrl.value || "")
+        .trim()
+        .replace(/\/+$/, ""),
+      lan_token: String(settingLanToken.value || "").trim(),
+      lan_probe_timeout_ms: Number(settings.lan_probe_timeout_ms || 2500),
       port: Math.floor(parsedPort),
       preset_epr_path: String(settingPresetEpr.value || "").trim(),
       audio_preset_epr_path: String(settingAudioPresetEpr.value || "").trim(),
@@ -2230,6 +2242,9 @@
         client_secret: settings.client_secret,
         refresh_token: settings.refresh_token,
         parent_folder_id: settings.parent_folder_id,
+        lan_base_url: settings.lan_base_url || "",
+        lan_token: settings.lan_token || "",
+        lan_probe_timeout_ms: Number(settings.lan_probe_timeout_ms || 2500),
       },
       app_data_path: APPDATA,
     };
