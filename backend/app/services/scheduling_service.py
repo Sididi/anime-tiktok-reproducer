@@ -15,6 +15,7 @@ class FreeSlot:
     slot: datetime
     available: bool
     taken_by_project_id: str | None = None
+    taken_by_title: str | None = None
 
 
 @dataclass
@@ -97,26 +98,30 @@ class SchedulingService:
     @classmethod
     def _collect_pool_reservations(
         cls, pool_key: str, platform: str
-    ) -> dict[str, str]:
-        """Return {slot_iso: project_id} for the given pool/platform."""
+    ) -> dict[str, "Project"]:
+        """Return {slot_iso: Project} for the given pool/platform.
+
+        Manual reservations are invisible to the pool: they neither block
+        slots nor get displaced. This is the single exclusion point.
+        """
         account_pool_keys: dict[str, str] = {}
         for acc_id, acc in AccountService.all_accounts().items():
             account_pool_keys[acc_id] = (
                 acc.pool_key_for(platform) or f"account:{acc_id}:{platform}"
             )
 
-        reservations: dict[str, str] = {}
+        reservations: dict[str, Project] = {}
         for project in ProjectService.list_all():
             schedules = project.platform_schedules or {}
             sched = schedules.get(platform)
-            if sched is None:
+            if sched is None or sched.manual:
                 continue
             owner_id = project.scheduled_account_id
             if not owner_id:
                 continue
             if account_pool_keys.get(owner_id) == pool_key:
                 slot_iso = cls._normalize_utc_datetime(sched.slot).isoformat()
-                reservations[slot_iso] = project.id
+                reservations[slot_iso] = project
         return reservations
 
     @classmethod
@@ -262,7 +267,8 @@ class SchedulingService:
                     FreeSlot(
                         slot=slot_dt,
                         available=taker is None,
-                        taken_by_project_id=taker,
+                        taken_by_project_id=taker.id if taker else None,
+                        taken_by_title=(taker.anime_name or taker.id) if taker else None,
                     )
                 )
                 if len(results) >= limit:
@@ -762,24 +768,10 @@ class SchedulingService:
                 continue
 
             pool_key = cls._resolve_pool_key(account_id, platform)
-            reservations = cls._collect_pool_reservations(pool_key, platform)
 
             # Build map slot_iso -> project for efficient cascade walking.
             # We need the actual Project entries to keep titles/upload_last_result.
-            account_pool_keys: dict[str, str] = {}
-            for acc_id, acc in AccountService.all_accounts().items():
-                account_pool_keys[acc_id] = (
-                    acc.pool_key_for(platform) or f"account:{acc_id}:{platform}"
-                )
-            slot_to_project: dict[str, Project] = {}
-            for project in ProjectService.list_all():
-                if (project.scheduled_account_id
-                    and account_pool_keys.get(project.scheduled_account_id) == pool_key):
-                    sched = (project.platform_schedules or {}).get(platform)
-                    if sched:
-                        slot_to_project[
-                            cls._normalize_utc_datetime(sched.slot).isoformat()
-                        ] = project
+            slot_to_project = cls._collect_pool_reservations(pool_key, platform)
 
             displaced: list[DisplacedItem] = []
             current_slot = anchor

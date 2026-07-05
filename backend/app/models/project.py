@@ -29,6 +29,7 @@ class PlatformSchedule(BaseModel):
 
     slot: datetime
     scheduled_at: datetime
+    manual: bool = False
 
 
 class Project(BaseModel):
