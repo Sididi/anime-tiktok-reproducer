@@ -961,6 +961,63 @@ class SchedulingService:
         )
 
     @classmethod
+    def _apply_displacements(
+        cls, platform: str, displaced: list[DisplacedItem], now_utc: datetime
+    ) -> None:
+        """Persist displacement moves farthest-first. Caller holds the lock."""
+        for item in reversed(displaced):
+            project = ProjectService.load(item.project_id)
+            if project is None:
+                continue
+            schedules = dict(project.platform_schedules or {})
+            schedules[platform] = PlatformSchedule(
+                slot=item.to_slot,
+                scheduled_at=cls._randomize_slot(item.to_slot, now_utc),
+            )
+            project.platform_schedules = schedules
+            cls._recompute_aggregates(project)
+            ProjectService.save(project)
+
+    @classmethod
+    def apply_switch(
+        cls,
+        project_id: str,
+        account_id: str,
+        platform: str,
+        slot: datetime,
+        mode: str,
+        expected_occupant_id: str | None,
+    ) -> SwitchResult:
+        """Steal `slot` on `platform`: displace the occupant per `mode`."""
+        with cls._reservation_lock:
+            result = cls.compute_switch(project_id, account_id, platform, slot)
+            if (result.occupant_project_id or None) != (expected_occupant_id or None):
+                raise ValueError("slot_state_changed")
+            plan = result.cascade if mode == "cascade" else result.next_free
+            if plan.blockers:
+                summary = ", ".join(f"{b.platform}:{b.reason}" for b in plan.blockers)
+                raise ValueError(f"Switch blocked: {summary}")
+
+            now_utc = datetime.now(timezone.utc)
+            cls._apply_displacements(platform, plan.displaced, now_utc)
+
+            switcher = ProjectService.load(project_id)
+            if switcher is None:
+                raise ValueError("Project not found")
+            if switcher.scheduled_account_id and switcher.scheduled_account_id != account_id:
+                switcher.platform_schedules = {}
+            schedules = dict(switcher.platform_schedules or {})
+            slot_utc = cls._normalize_utc_datetime(slot)
+            schedules[platform] = PlatformSchedule(
+                slot=slot_utc, scheduled_at=cls._randomize_slot(slot_utc, now_utc)
+            )
+            switcher.platform_schedules = schedules
+            switcher.scheduled_account_id = account_id
+            cls._recompute_aggregates(switcher)
+            ProjectService.save(switcher)
+            return result
+
+    @classmethod
     def apply_cascade(cls, project_id: str, account_id: str) -> CascadeResult:
         """Compute and persist a cascade. Reserves the urgent project's slots."""
         with cls._reservation_lock:

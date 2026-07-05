@@ -298,3 +298,46 @@ def test_compute_switch_pool_busy_blocks_both_plans(tmp_path, monkeypatch):
     result = SchedulingService.compute_switch("newproj", acc, "tiktok", _future_slot(1, 10))
     assert any(b.reason == "pool_busy" for b in result.cascade.blockers)
     assert any(b.reason == "pool_busy" for b in result.next_free.blockers)
+
+
+def test_apply_switch_cascade_moves_chain_and_reserves(tmp_path, monkeypatch):
+    acc = _setup_single_account(tmp_path, monkeypatch)
+    _patch_pool_not_busy(monkeypatch)
+    s10, s14, s18 = _future_slot(1, 10), _future_slot(1, 14), _future_slot(1, 18)
+    _save_scheduled_project("projB", acc, "tiktok", s10)
+    _save_scheduled_project("projC", acc, "tiktok", s14)
+    ProjectService.get_project_dir("me").mkdir(parents=True, exist_ok=True)
+    ProjectService.save(Project(id="me"))
+
+    SchedulingService.apply_switch("me", acc, "tiktok", s10, "cascade", "projB")
+
+    assert ProjectService.load("me").platform_schedules["tiktok"].slot == s10
+    assert ProjectService.load("projB").platform_schedules["tiktok"].slot == s14
+    assert ProjectService.load("projC").platform_schedules["tiktok"].slot == s18
+
+
+def test_apply_switch_next_free_moves_only_occupant(tmp_path, monkeypatch):
+    acc = _setup_single_account(tmp_path, monkeypatch)
+    _patch_pool_not_busy(monkeypatch)
+    s10, s14, s18 = _future_slot(1, 10), _future_slot(1, 14), _future_slot(1, 18)
+    _save_scheduled_project("projB", acc, "tiktok", s10)
+    _save_scheduled_project("projC", acc, "tiktok", s14)
+    ProjectService.get_project_dir("me").mkdir(parents=True, exist_ok=True)
+    ProjectService.save(Project(id="me"))
+
+    SchedulingService.apply_switch("me", acc, "tiktok", s10, "next_free", "projB")
+
+    assert ProjectService.load("projB").platform_schedules["tiktok"].slot == s18
+    assert ProjectService.load("projC").platform_schedules["tiktok"].slot == s14  # untouched
+
+
+def test_apply_switch_stale_occupant_raises(tmp_path, monkeypatch):
+    import pytest
+    acc = _setup_single_account(tmp_path, monkeypatch)
+    _patch_pool_not_busy(monkeypatch)
+    s10 = _future_slot(1, 10)
+    _save_scheduled_project("projB", acc, "tiktok", s10)
+    ProjectService.get_project_dir("me").mkdir(parents=True, exist_ok=True)
+    ProjectService.save(Project(id="me"))
+    with pytest.raises(ValueError, match="slot_state_changed"):
+        SchedulingService.apply_switch("me", acc, "tiktok", s10, "cascade", "someoneelse")
