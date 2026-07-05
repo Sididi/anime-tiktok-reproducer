@@ -69,3 +69,18 @@ def test_manifest_and_file_download(client, monkeypatch, tmp_path):
     assert resp.status_code == 200 and resp.content == b"RIFFxxxx"
 
     assert client.get("/api/lan/projects/p1/files/missing.bin", headers=AUTH).status_code == 404
+
+
+def test_manifest_returns_409_when_no_matches(client, monkeypatch):
+    class _P:
+        id = "p1"
+        drive_folder_id = None
+
+    monkeypatch.setattr("app.api.routes.lan_transfer._load_project_or_404", lambda pid: _P())
+    monkeypatch.setattr(
+        "app.services.lan_transfer_service.ProjectService.load_matches",
+        lambda project_id: None,
+    )
+
+    resp = client.get("/api/lan/projects/p1/manifest", headers=AUTH)
+    assert resp.status_code == 409
