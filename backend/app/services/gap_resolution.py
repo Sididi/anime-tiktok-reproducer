@@ -263,7 +263,11 @@ class GapResolutionService:
     _scene_cut_inflight: dict[str, asyncio.Task[list[float]]] = {}
     _scene_cut_inflight_lock = asyncio.Lock()
     _scene_cut_semaphore = asyncio.Semaphore(6)
-    _scene_cut_cache: dict[str, list[float]] = {}
+    # In-memory hot layer over the on-disk scene-cut JSON cache. Bounded LRU so
+    # it does not accumulate a scene-cut list for every episode ever touched
+    # over the server's lifetime; a miss simply re-reads the JSON from disk.
+    _scene_cut_cache: OrderedDict[str, list[float]] = OrderedDict()
+    SCENE_CUT_CACHE_MAX_ENTRIES = 256
     _candidate_batch_inflight: dict[str, asyncio.Task[dict[int, list["GapCandidate"]]]] = {}
     _candidate_batch_lock = asyncio.Lock()
     _candidate_batch_result_cache: OrderedDict[
@@ -510,6 +514,23 @@ class GapResolutionService:
         )
 
     @classmethod
+    def _get_cached_scene_cuts(cls, cache_key: str) -> list[float] | None:
+        """Read the in-memory scene-cut cache, refreshing LRU recency on hit."""
+        cuts = cls._scene_cut_cache.get(cache_key)
+        if cuts is not None:
+            cls._scene_cut_cache.move_to_end(cache_key)
+        return cuts
+
+    @classmethod
+    def _remember_scene_cuts(cls, cache_key: str, cuts: list[float]) -> None:
+        """Store scene cuts in the bounded LRU, evicting the oldest past the cap."""
+        cache = cls._scene_cut_cache
+        cache[cache_key] = cuts
+        cache.move_to_end(cache_key)
+        while len(cache) > cls.SCENE_CUT_CACHE_MAX_ENTRIES:
+            cache.popitem(last=False)
+
+    @classmethod
     def load_cached_scene_cuts(
         cls,
         episode_path: str,
@@ -533,7 +554,7 @@ class GapResolutionService:
             min_scene_len_val,
             frame_skip_val,
         )
-        in_memory = cls._scene_cut_cache.get(cache_key)
+        in_memory = cls._get_cached_scene_cuts(cache_key)
         if in_memory is not None:
             return in_memory
 
@@ -557,7 +578,7 @@ class GapResolutionService:
             try:
                 data = json.loads(cache_candidate.read_text())
                 cuts = data.get("cuts", [])
-                cls._scene_cut_cache[cache_key] = cuts
+                cls._remember_scene_cuts(cache_key, cuts)
                 return cuts
             except (json.JSONDecodeError, KeyError):
                 continue
@@ -584,7 +605,7 @@ class GapResolutionService:
             min_scene_len_val,
             frame_skip_val,
         )
-        cls._scene_cut_cache[cache_key] = cuts
+        cls._remember_scene_cuts(cache_key, cuts)
         cache_path = cls.get_scene_cache_path(
             episode_path,
             threshold=threshold_val,

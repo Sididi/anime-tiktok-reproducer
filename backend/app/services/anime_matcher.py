@@ -6,7 +6,7 @@ import json
 import sys
 import time
 from bisect import bisect_left, bisect_right
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -92,11 +92,22 @@ class AnimeMatcherService:
         tuple[str, str, str, tuple[tuple[str, int, int], ...] | None],
         dict[str, Path],
     ] = {}
-    _crop_index_memory_cache: dict[str, dict[str, np.ndarray | str]] = {}
-    # Per-(video signature, native frame index) cache of SSCD embeddings for
+    # LRU cache of per-episode crop indices. Each payload holds two
+    # ``np.load(mmap_mode="r")`` arrays, so every retained entry keeps two open
+    # file descriptors alive. Bounded so a long-running server does not leak fds
+    # (and, for build/legacy fallbacks, RAM) across every episode ever matched.
+    _crop_index_memory_cache: "OrderedDict[str, dict[str, np.ndarray | str]]" = (
+        OrderedDict()
+    )
+    CROP_INDEX_MEMORY_CACHE_MAX = 64
+    # Per-(video signature, native frame index) LRU cache of SSCD embeddings for
     # TikTok frames. Reused across passes when scene re-matching lands on a
-    # frame index that was already embedded in an earlier pass.
-    _video_frame_embedding_cache: dict[tuple[str, int, int, int], np.ndarray] = {}
+    # frame index that was already embedded in an earlier pass. Bounded so the
+    # in-RAM embedding vectors do not accumulate unbounded across projects.
+    _video_frame_embedding_cache: "OrderedDict[tuple[str, int, int, int], np.ndarray]" = (
+        OrderedDict()
+    )
+    VIDEO_FRAME_EMBEDDING_CACHE_MAX = 8192
     _runtime_stats: dict[str, float] = defaultdict(float)
     CROP_INDEX_VERSION = "crop-v4-seeded-portrait-source-0_5fps"
     CROP_INDEX_FPS = 0.5
@@ -120,6 +131,55 @@ class AnimeMatcherService:
     DENSE_VISUAL_RERANK_MAX_SCENES = 10
     DENSE_VISUAL_RERANK_MAX_CANDIDATES = 6
     DENSE_VISUAL_RERANK_MARGIN = 0.012
+
+    @classmethod
+    def _get_cached_video_frame_embedding(
+        cls, key: tuple[str, int, int, int],
+    ) -> np.ndarray | None:
+        """Fetch a cached probe embedding, refreshing its LRU recency on hit."""
+        cache = cls._video_frame_embedding_cache
+        value = cache.get(key)
+        if value is not None:
+            cache.move_to_end(key)
+        return value
+
+    @classmethod
+    def _store_video_frame_embedding(
+        cls, key: tuple[str, int, int, int], embedding: np.ndarray,
+    ) -> None:
+        """Insert a probe embedding and evict the oldest entries past the bound."""
+        cache = cls._video_frame_embedding_cache
+        cache[key] = embedding
+        cache.move_to_end(key)
+        while len(cache) > cls.VIDEO_FRAME_EMBEDDING_CACHE_MAX:
+            cache.popitem(last=False)
+
+    @classmethod
+    def _get_cached_crop_index(
+        cls, key: str,
+    ) -> dict[str, np.ndarray | str] | None:
+        """Fetch a cached crop-index payload, refreshing its LRU recency on hit."""
+        cache = cls._crop_index_memory_cache
+        value = cache.get(key)
+        if value is not None:
+            cache.move_to_end(key)
+        return value
+
+    @classmethod
+    def _store_crop_index(
+        cls, key: str, payload: dict[str, np.ndarray | str],
+    ) -> None:
+        """Cache a crop-index payload and evict the oldest entries past the bound.
+
+        Evicting drops the last reference to the payload's memory-mapped arrays;
+        CPython then collects them and closes the backing file descriptors, so
+        the number of live mmap handles stays bounded by the cache size.
+        """
+        cache = cls._crop_index_memory_cache
+        cache[key] = payload
+        cache.move_to_end(key)
+        while len(cache) > cls.CROP_INDEX_MEMORY_CACHE_MAX:
+            cache.popitem(last=False)
 
     @classmethod
     def reset_runtime_stats(cls) -> None:
@@ -657,7 +717,6 @@ class AnimeMatcherService:
 
         if use_cache_path:
             video_signature = cls._video_signature(video_path)
-            cache = cls._video_frame_embedding_cache
             sig_path, sig_mtime, sig_size = video_signature
             cached_embeddings: dict[tuple[int, int], np.ndarray] = {}
             missing_keys: list[tuple[int, int]] = []
@@ -679,7 +738,7 @@ class AnimeMatcherService:
                     missing_cache_keys.append(None)
                     continue
                 cache_key = (sig_path, sig_mtime, sig_size, int(frame_idx))
-                cached = cache.get(cache_key)
+                cached = cls._get_cached_video_frame_embedding(cache_key)
                 if cached is not None:
                     cached_embeddings[key] = cached
                     cls._record_runtime_stat("probe_embedding_cache_hits")
@@ -706,7 +765,7 @@ class AnimeMatcherService:
                 ):
                     embedded_lookup[key] = embedding
                     if cache_key is not None:
-                        cache[cache_key] = embedding
+                        cls._store_video_frame_embedding(cache_key, embedding)
 
             if embedded_lookup:
                 stacked = np.stack(
@@ -1355,7 +1414,7 @@ class AnimeMatcherService:
 
         started_at = time.perf_counter()
         cache_key = cls._crop_index_cache_key(episode_path)
-        cached = cls._crop_index_memory_cache.get(cache_key)
+        cached = cls._get_cached_crop_index(cache_key)
         if cached is not None:
             cls._record_runtime_stat("crop_index_memory_cache_hits")
             return cached  # type: ignore[return-value]
@@ -1380,7 +1439,7 @@ class AnimeMatcherService:
                     "embeddings": embeddings_arr,
                     "timestamps": timestamps_arr,
                 }
-                cls._crop_index_memory_cache[cache_key] = payload
+                cls._store_crop_index(cache_key, payload)
                 cls._record_runtime_stat("crop_index_disk_cache_hits")
                 cls._record_runtime_stat(
                     "crop_index_load_seconds",
@@ -1408,7 +1467,7 @@ class AnimeMatcherService:
                         timestamps_path, mmap_mode="r", allow_pickle=False,
                     ),
                 }
-                cls._crop_index_memory_cache[cache_key] = payload
+                cls._store_crop_index(cache_key, payload)
                 cls._record_runtime_stat("crop_index_legacy_cache_hits")
                 cls._record_runtime_stat(
                     "crop_index_load_seconds",
@@ -1480,7 +1539,7 @@ class AnimeMatcherService:
                 timestamps_path, mmap_mode="r", allow_pickle=False,
             ),
         }
-        cls._crop_index_memory_cache[cache_key] = payload
+        cls._store_crop_index(cache_key, payload)
         cls._record_runtime_stat(
             "crop_index_build_seconds",
             time.perf_counter() - started_at,

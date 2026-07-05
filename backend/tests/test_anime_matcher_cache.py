@@ -47,6 +47,85 @@ def _write_index_fixture(library_path: Path, frame_count: int) -> None:
     )
 
 
+def test_video_frame_embedding_cache_is_bounded_lru(monkeypatch) -> None:
+    monkeypatch.setattr(
+        AnimeMatcherService,
+        "_video_frame_embedding_cache",
+        type(AnimeMatcherService._video_frame_embedding_cache)(),
+    )
+    monkeypatch.setattr(
+        AnimeMatcherService, "VIDEO_FRAME_EMBEDDING_CACHE_MAX", 4,
+    )
+
+    for idx in range(10):
+        key = ("video", 0, 0, idx)
+        AnimeMatcherService._store_video_frame_embedding(
+            key, np.full((2,), idx, dtype=np.float32)
+        )
+
+    cache = AnimeMatcherService._video_frame_embedding_cache
+    assert len(cache) == 4
+    # Only the four most-recent inserts survive (LRU eviction of oldest).
+    assert [k[3] for k in cache] == [6, 7, 8, 9]
+    # A hit refreshes recency so the entry is not the next victim.
+    assert AnimeMatcherService._get_cached_video_frame_embedding(
+        ("video", 0, 0, 6)
+    ) is not None
+    AnimeMatcherService._store_video_frame_embedding(
+        ("video", 0, 0, 10), np.zeros((2,), dtype=np.float32)
+    )
+    assert ("video", 0, 0, 6) in cache
+    assert ("video", 0, 0, 7) not in cache
+
+
+def test_crop_index_memory_cache_is_bounded_lru(monkeypatch) -> None:
+    monkeypatch.setattr(
+        AnimeMatcherService,
+        "_crop_index_memory_cache",
+        type(AnimeMatcherService._crop_index_memory_cache)(),
+    )
+    monkeypatch.setattr(AnimeMatcherService, "CROP_INDEX_MEMORY_CACHE_MAX", 3)
+
+    for idx in range(10):
+        AnimeMatcherService._store_crop_index(
+            f"ep{idx}",
+            {
+                "embeddings": np.ones((1, 2), dtype=np.float32),
+                "timestamps": np.asarray([float(idx)], dtype=np.float32),
+            },
+        )
+
+    cache = AnimeMatcherService._crop_index_memory_cache
+    assert len(cache) == 3
+    assert list(cache) == ["ep7", "ep8", "ep9"]
+    assert AnimeMatcherService._get_cached_crop_index("ep99") is None
+
+
+def test_crop_index_eviction_releases_mmap_file_descriptors(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """Evicting a payload must drop its mmap so the backing fd is closed."""
+    monkeypatch.setattr(
+        AnimeMatcherService,
+        "_crop_index_memory_cache",
+        type(AnimeMatcherService._crop_index_memory_cache)(),
+    )
+    monkeypatch.setattr(AnimeMatcherService, "CROP_INDEX_MEMORY_CACHE_MAX", 2)
+
+    def make_mmap_payload(idx: int) -> dict[str, np.ndarray]:
+        path = tmp_path / f"emb{idx}.npy"
+        np.save(path, np.ones((4, 2), dtype=np.float32))
+        return {"embeddings": np.load(path, mmap_mode="r", allow_pickle=False)}
+
+    # Insert far more mmap-backed payloads than the bound. Without eviction each
+    # np.load(mmap_mode="r") keeps a file descriptor open; the cache must cap
+    # the number of live payloads so descriptors do not accumulate.
+    for idx in range(200):
+        AnimeMatcherService._store_crop_index(f"ep{idx}", make_mmap_payload(idx))
+
+    assert len(AnimeMatcherService._crop_index_memory_cache) == 2
+
+
 def test_index_signature_tracks_requested_series_shard_changes(tmp_path: Path) -> None:
     library_path = tmp_path / "anime"
     _write_index_fixture(library_path, 2)

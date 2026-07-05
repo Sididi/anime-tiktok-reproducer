@@ -168,9 +168,9 @@ class SceneMergerService:
 
             cv2 = AnimeMatcherService._require_cv2()
             cap = cv2.VideoCapture(str(video_path))
-            if not cap.isOpened():
-                return [], []
             try:
+                if not cap.isOpened():
+                    return [], []
                 fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
                 if fps <= 0:
                     return [], []
