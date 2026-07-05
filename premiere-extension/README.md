@@ -22,8 +22,42 @@ Fill and save in **Automation Settings**:
 - `Drive Parent Folder ID`
 - `Local Server Port` (default: `48653`)
 - `AME Preset (.epr)` path (required for **Export via CEP**)
+- `LAN base URL (empty = Drive only)` — optional; see **LAN Transfer** below
+- `LAN token` — optional; must match the backend's `ATR_LAN_TRANSFER_TOKEN`
 
 Then click **Test Drive**.
+
+## LAN Transfer (optional, faster on a local network)
+
+When the backend PC and this Premiere PC are on the same LAN, the panel can
+download project assets from — and upload render outputs to — the backend
+directly over HTTP, skipping the Google Drive round-trip. Drive stays the
+automatic fallback and is still used by the distant VPS for scheduled
+publishing, so end state on Drive is unchanged.
+
+**How selection works:** before each download/upload job the panel probes
+`GET {LAN base URL}/api/lan/ping`. On success it uses the LAN engine for that
+job; on any failure (unreachable, wrong token, version mismatch) it silently
+falls back to the Drive engine. A fresh probe runs per job, so a transient
+network hiccup never poisons later jobs.
+
+**Enable (on this PC):** in Automation Settings set
+- `LAN base URL` = `http://<backend-host>:8000` (mDNS name recommended, e.g.
+  `http://arch-sid.local:8000`, so it survives IP changes)
+- `LAN token` = the same value as the backend's `ATR_LAN_TRANSFER_TOKEN`
+
+**Disable:** clear `LAN base URL`. The panel then behaves exactly as before
+(Drive only) with no probe.
+
+**Backend side:** run the backend bound to `0.0.0.0` (the `backend` pixi task
+already does this), set `ATR_LAN_TRANSFER_TOKEN` in the backend `.env`, and
+firewall port `8000` to the local subnet. Only `/api/lan/*` is token-guarded;
+binding `0.0.0.0` exposes the rest of the API to the LAN, which is why the
+firewall rule is required.
+
+**Scope:** only `output.mp4` and `output_no_music.wav` are uploaded over the
+LAN; `ATR_*` proxy files stay local to this PC. On receipt the backend relays
+the outputs to Drive automatically.
 
 ## Trigger Contract (Discord -> CEP)
 
