@@ -90,7 +90,11 @@ dev = { features = ["dev"], solve-group = "default" }
 
 [tasks]
 # Backend tasks
-backend = { cmd = "uvicorn app.main:app --reload --host 127.0.0.1 --port 8000", cwd = "backend" }
+# Binds 0.0.0.0 so the Premiere Pro PC can reach the LAN transfer endpoints
+# (/api/lan/*). Port 8000 must be firewalled to the local subnet (e.g.
+# `ufw allow from 192.168.1.0/24 to any port 8000 proto tcp`); the LAN routes
+# are additionally guarded by ATR_LAN_TRANSFER_TOKEN. See premiere-extension/README.md.
+backend = { cmd = "uvicorn app.main:app --reload --host 0.0.0.0 --port 8000", cwd = "backend" }
 
 # Frontend tasks (assumes fnm/npm available in PATH)
 frontend = { cmd = "npm run dev", cwd = "frontend" }

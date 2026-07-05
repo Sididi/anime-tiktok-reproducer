@@ -69,6 +69,9 @@
     client_secret: "",
     refresh_token: "",
     parent_folder_id: "",
+    lan_base_url: "",
+    lan_token: "",
+    lan_probe_timeout_ms: 2500,
     port: DEFAULT_PORT,
     preset_epr_path: "",
     audio_preset_epr_path: "",
@@ -99,6 +102,8 @@
   var settingParentFolderId = document.getElementById(
     "setting-parent-folder-id",
   );
+  var settingLanBaseUrl = document.getElementById("setting-lan-base-url");
+  var settingLanToken = document.getElementById("setting-lan-token");
   var settingPort = document.getElementById("setting-port");
   var settingPresetEpr = document.getElementById("setting-preset-epr");
   var settingAudioPresetEpr = document.getElementById(
@@ -1001,6 +1006,8 @@
     settingClientSecret.value = settings.client_secret || "";
     settingRefreshToken.value = settings.refresh_token || "";
     settingParentFolderId.value = settings.parent_folder_id || "";
+    settingLanBaseUrl.value = settings.lan_base_url || "";
+    settingLanToken.value = settings.lan_token || "";
     settingPort.value = String(settings.port || DEFAULT_PORT);
     settingPresetEpr.value = settings.preset_epr_path || "";
     settingAudioPresetEpr.value = settings.audio_preset_epr_path || "";
@@ -1023,6 +1030,11 @@
       client_secret: String(settingClientSecret.value || "").trim(),
       refresh_token: String(settingRefreshToken.value || "").trim(),
       parent_folder_id: String(settingParentFolderId.value || "").trim(),
+      lan_base_url: String(settingLanBaseUrl.value || "")
+        .trim()
+        .replace(/\/+$/, ""),
+      lan_token: String(settingLanToken.value || "").trim(),
+      lan_probe_timeout_ms: Number(settings.lan_probe_timeout_ms || 2500),
       port: Math.floor(parsedPort),
       preset_epr_path: String(settingPresetEpr.value || "").trim(),
       audio_preset_epr_path: String(settingAudioPresetEpr.value || "").trim(),
@@ -2230,6 +2242,9 @@
         client_secret: settings.client_secret,
         refresh_token: settings.refresh_token,
         parent_folder_id: settings.parent_folder_id,
+        lan_base_url: settings.lan_base_url || "",
+        lan_token: settings.lan_token || "",
+        lan_probe_timeout_ms: Number(settings.lan_probe_timeout_ms || 2500),
       },
       app_data_path: APPDATA,
     };
@@ -3315,14 +3330,52 @@
     });
   }
 
+  var lanTasks = null;
+
+  function runTransferTask(taskName, payload, onProgress, options) {
+    var lanBaseUrl =
+      payload && payload.settings
+        ? String(payload.settings.lan_base_url || "")
+        : "";
+    if (!lanBaseUrl) {
+      return runDriveTask(taskName, payload, onProgress, options);
+    }
+    if (!lanTasks) {
+      lanTasks = require(getClientFilePath("lan_tasks.js"));
+    }
+    return lanTasks.probe(payload.settings).then(
+      function () {
+        log("LAN mode selected for " + taskName, "info");
+        return lanTasks.runTask(taskName, payload, onProgress).catch(function (
+          err,
+        ) {
+          log("LAN task failed: " + err.message, "error");
+          throw err; // clean failure — re-run re-probes (spec: no silent mid-job engine switch)
+        });
+      },
+      function (probeErr) {
+        log(
+          "LAN probe failed (" +
+            probeErr.message +
+            "), falling back to Drive for " +
+            taskName,
+          "warn",
+        );
+        return runDriveTask(taskName, payload, onProgress, options);
+      },
+    );
+  }
+
   // --- Drive automation jobs ---
 
   function executeDownloadImport(projectId, controller) {
     if (!validateProjectId(projectId)) {
       return Promise.reject(new Error("Invalid project ID: " + projectId));
     }
-    if (!isDriveConfigured()) {
-      return Promise.reject(new Error("Drive settings are incomplete"));
+    if (!isDriveConfigured() && !String((settings && settings.lan_base_url) || "")) {
+      return Promise.reject(
+        new Error("Neither Drive nor LAN transfer is configured"),
+      );
     }
 
     var lease = captureAutomationLease(projectId);
@@ -3350,7 +3403,7 @@
     var downloadPayload = buildDrivePayloadBase();
     downloadPayload.project_id = projectId;
 
-    return runDriveTask(
+    return runTransferTask(
       "downloadProject",
       downloadPayload,
       function (progress) {
@@ -3691,8 +3744,10 @@
         ),
       );
     }
-    if (!isDriveConfigured()) {
-      return Promise.reject(new Error("Drive settings are incomplete"));
+    if (!isDriveConfigured() && !String((settings && settings.lan_base_url) || "")) {
+      return Promise.reject(
+        new Error("Neither Drive nor LAN transfer is configured"),
+      );
     }
 
     var lease = captureAutomationLease(projectId);
@@ -3732,7 +3787,7 @@
 
     var lastProgressPct = -1;
 
-    return runDriveTask(
+    return runTransferTask(
       "uploadOutput",
       uploadPayload,
       function (progress) {

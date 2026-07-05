@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from ...services import UploadPhaseService
 from ...services.google_drive_service import GoogleDriveService
+from ...services.lan_transfer_service import LanTransferService
 from ...services.project_upload_service import project_upload_queue
 from ...services.project_service import ProjectService
 from ...services.upload_phase import PendingProjectDeletionRequiresConfirmation
@@ -39,7 +40,7 @@ class CopyrightCheckRequest(BaseModel):
 
 class CopyrightBuildAudioRequest(BaseModel):
     music_key: str | None = None
-    no_music_file_id: str
+    no_music_file_id: str | None = None
 
 
 @router.get("/projects")
@@ -281,7 +282,12 @@ async def copyright_audio(project_id: str):
 
 @router.get("/projects/{project_id}/copyright-video")
 async def copyright_video(project_id: str):
-    """Download and cache the GDrive video for copyright preview."""
+    """Serve the final video for copyright preview: local (LAN transfer) first,
+    then the cached Drive download, then a fresh Drive download."""
+    local_video = await asyncio.to_thread(LanTransferService.find_local_upload_video, project_id)
+    if local_video is not None:
+        return FileResponse(path=local_video, media_type="video/mp4")
+
     prep_dir = UploadPhaseService._copyright_audio_dir(project_id)
     cached_videos = list(prep_dir.glob("*.mp4")) if prep_dir.exists() else []
     if cached_videos:
@@ -304,3 +310,12 @@ async def copyright_video(project_id: str):
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/projects/{project_id}/local-video")
+async def local_video(project_id: str):
+    """Serve the locally stored final video (LAN transfer), if present."""
+    video = await asyncio.to_thread(LanTransferService.find_local_upload_video, project_id)
+    if video is None:
+        raise HTTPException(status_code=404, detail="No local video for this project")
+    return FileResponse(path=video, media_type="video/mp4", filename=video.name)

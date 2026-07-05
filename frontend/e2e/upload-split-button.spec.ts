@@ -32,6 +32,7 @@ const ROW = {
   drive_folder_id: "folder",
   drive_folder_url: "https://drive.example/folder",
   drive_video_id: "drive-1",
+  local_video_available: false,
   created_at: "2026-04-12T09:00:00Z",
   scheduled_at: null,
   scheduled_account_id: null,

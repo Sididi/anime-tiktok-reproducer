@@ -17,7 +17,7 @@ interface ProjectTableProps {
   onUploadSchedule: (row: ProjectManagerRow) => void;
   onUploadUrgent: (row: ProjectManagerRow) => void;
   onDelete: (row: ProjectManagerRow) => void;
-  onPreview: (driveVideoId: string) => void;
+  onPreview: (target: { driveVideoId: string | null; projectId: string; localVideoAvailable: boolean }) => void;
   multiDeleteMode: boolean;
   selectedProjectIds: Set<string>;
   onToggleSelect: (id: string) => void;

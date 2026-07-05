@@ -18,6 +18,7 @@ from .api import api_router
 from .library_types import LibraryType
 from .services.account_service import AccountService
 from .services.integration_health_service import IntegrationHealthService
+from .services.lan_transfer_service import LanTransferService
 from .services.library_hydration_service import LibraryHydrationService
 from .services.project_service import ProjectService
 from .services.project_startup_service import project_startup_queue
@@ -125,6 +126,7 @@ async def lifespan(app: FastAPI):
     await LibraryHydrationService.startup_cleanup()
     await project_startup_queue.startup_cleanup()
     await project_upload_queue.startup_cleanup()
+    LanTransferService.sweep_stale_tmp_files()
 
     reschedule_retry_stop = asyncio.Event()
     app.state.reschedule_retry_stop = reschedule_retry_stop
