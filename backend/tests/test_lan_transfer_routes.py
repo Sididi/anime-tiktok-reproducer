@@ -43,3 +43,29 @@ def test_ping_503_when_unconfigured(client, monkeypatch):
     monkeypatch.setattr("app.config.settings.lan_transfer_token", None)
     resp = client.get("/api/lan/ping", headers=AUTH)
     assert resp.status_code == 503
+
+
+def test_manifest_and_file_download(client, monkeypatch, tmp_path):
+    from app.services.export_service import ManifestEntry
+
+    src = tmp_path / "tts_edited.wav"
+    src.write_bytes(b"RIFFxxxx")
+    entries = [ManifestEntry(relative_path="SPM_x_p1/tts_edited.wav", source_path=src)]
+
+    class _P:
+        id = "p1"
+        drive_folder_id = None
+
+    monkeypatch.setattr("app.api.routes.lan_transfer._load_project_or_404", lambda pid: _P())
+    monkeypatch.setattr(
+        "app.services.lan_transfer_service.LanTransferService._build_entries",
+        classmethod(lambda cls, project: ("SPM_x_p1", entries)),
+    )
+
+    manifest = client.get("/api/lan/projects/p1/manifest", headers=AUTH).json()
+    assert manifest["files"] == [{"relative_path": "tts_edited.wav", "size": 8}]
+
+    resp = client.get("/api/lan/projects/p1/files/tts_edited.wav", headers=AUTH)
+    assert resp.status_code == 200 and resp.content == b"RIFFxxxx"
+
+    assert client.get("/api/lan/projects/p1/files/missing.bin", headers=AUTH).status_code == 404
