@@ -5,12 +5,21 @@ import { Button } from "@/components/ui";
 
 interface VideoPreviewModalProps {
   driveVideoId: string | null;
+  projectId: string | null;
+  localVideoAvailable: boolean;
   onClose: () => void;
 }
 
-export function VideoPreviewModal({ driveVideoId, onClose }: VideoPreviewModalProps) {
+export function VideoPreviewModal({
+  driveVideoId,
+  projectId,
+  localVideoAvailable,
+  onClose,
+}: VideoPreviewModalProps) {
+  const isOpen = Boolean(driveVideoId) || Boolean(projectId && localVideoAvailable);
+
   useEffect(() => {
-    if (!driveVideoId) return;
+    if (!isOpen) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.stopPropagation();
@@ -19,11 +28,11 @@ export function VideoPreviewModal({ driveVideoId, onClose }: VideoPreviewModalPr
     };
     document.addEventListener("keydown", handleKeyDown, true);
     return () => document.removeEventListener("keydown", handleKeyDown, true);
-  }, [driveVideoId, onClose]);
+  }, [isOpen, onClose]);
 
   return (
     <AnimatePresence>
-      {driveVideoId && (
+      {isOpen && (
         <motion.div
           className="fixed inset-0 z-[60] bg-black/70 flex items-center justify-center p-8"
           initial={{ opacity: 0 }}
@@ -50,12 +59,21 @@ export function VideoPreviewModal({ driveVideoId, onClose }: VideoPreviewModalPr
                 <X className="h-5 w-5" />
               </Button>
             </div>
-            <iframe
-              src={`https://drive.google.com/file/d/${driveVideoId}/preview`}
-              className="w-full h-full"
-              allow="autoplay"
-              allowFullScreen
-            />
+            {localVideoAvailable && projectId ? (
+              <video
+                controls
+                autoPlay
+                className="w-full h-full"
+                src={`/api/project-manager/projects/${projectId}/local-video`}
+              />
+            ) : (
+              <iframe
+                src={`https://drive.google.com/file/d/${driveVideoId}/preview`}
+                className="w-full h-full"
+                allow="autoplay"
+                allowFullScreen
+              />
+            )}
           </motion.div>
         </motion.div>
       )}

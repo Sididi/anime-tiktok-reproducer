@@ -176,7 +176,11 @@ export function ProjectManagerModal({
   >("auto");
   const [deleteConfirmRow, setDeleteConfirmRow] =
     useState<ProjectManagerRow | null>(null);
-  const [previewVideoId, setPreviewVideoId] = useState<string | null>(null);
+  const [previewTarget, setPreviewTarget] = useState<{
+    driveVideoId: string | null;
+    projectId: string;
+    localVideoAvailable: boolean;
+  } | null>(null);
   const loadRequestIdRef = useRef(0);
 
   const [multiDeleteMode, setMultiDeleteMode] = useState(false);
@@ -363,7 +367,7 @@ export function ProjectManagerModal({
     if (!open) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
-      if (previewVideoId) return;
+      if (previewTarget) return;
       if (Object.values(uploadSessionsRef.current).some((session) => isPromptSessionStatus(session.status))) {
         return;
       }
@@ -376,7 +380,7 @@ export function ProjectManagerModal({
     };
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [open, onClose, previewVideoId, multiDeleteMode]);
+  }, [open, onClose, previewTarget, multiDeleteMode]);
 
   useEffect(
     () => () => {
@@ -392,7 +396,7 @@ export function ProjectManagerModal({
       setUploadSessions({});
       setAccountPickerForProject(null);
       setAccountDropdownOpen(false);
-      setPreviewVideoId(null);
+      setPreviewTarget(null);
     }
   }, [open]);
 
@@ -994,7 +998,7 @@ export function ProjectManagerModal({
                 onUploadSchedule={handleUploadSchedule}
                 onUploadUrgent={handleUploadUrgent}
                 onDelete={requestDelete}
-                onPreview={(id) => setPreviewVideoId(id)}
+                onPreview={(target) => setPreviewTarget(target)}
                 multiDeleteMode={multiDeleteMode}
                 selectedProjectIds={selectedProjectIds}
                 onToggleSelect={toggleSelectProject}
@@ -1241,8 +1245,10 @@ export function ProjectManagerModal({
           </AnimatePresence>
 
           <VideoPreviewModal
-            driveVideoId={previewVideoId}
-            onClose={() => setPreviewVideoId(null)}
+            driveVideoId={previewTarget?.driveVideoId ?? null}
+            projectId={previewTarget?.projectId ?? null}
+            localVideoAvailable={previewTarget?.localVideoAvailable ?? false}
+            onClose={() => setPreviewTarget(null)}
           />
 
           {schedulingForProject && (
