@@ -553,15 +553,52 @@ class SchedulingService:
                 applied_switches[platform] = result
 
             now_utc = datetime.now(timezone.utc)
+
+            # Snapshot every to-be-displaced project's current per-platform
+            # schedule BEFORE moving anything, so a downstream anchor conflict
+            # (e.g. a non-tiktok override collides with a non-stolen project)
+            # can roll the moves back to zero net changes on disk.
+            displacement_snapshots: dict[
+                tuple[str, str], PlatformSchedule | None
+            ] = {}
+            for platform, plan in steal_plans:
+                for item in plan.displaced:
+                    key = (item.project_id, platform)
+                    if key in displacement_snapshots:
+                        continue
+                    moved = ProjectService.load(item.project_id)
+                    if moved is None:
+                        continue
+                    displacement_snapshots[key] = (moved.platform_schedules or {}).get(
+                        platform
+                    )
+
             for platform, plan in steal_plans:
                 cls._apply_displacements(platform, plan.displaced, now_utc)
 
-            resolution = cls.resolve_anchor(account_id, anchor, overrides)
-            if resolution.conflicts:
-                conflict_summary = ", ".join(
-                    f"{c.platform}:{c.reason}" for c in resolution.conflicts
-                )
-                raise ValueError(f"Anchor conflicts: {conflict_summary}")
+            try:
+                resolution = cls.resolve_anchor(account_id, anchor, overrides)
+                if resolution.conflicts:
+                    conflict_summary = ", ".join(
+                        f"{c.platform}:{c.reason}" for c in resolution.conflicts
+                    )
+                    raise ValueError(f"Anchor conflicts: {conflict_summary}")
+            except Exception:
+                # Roll back every displaced move so the conflict leaves no
+                # partial write on disk.
+                for (proj_id, platform), original in displacement_snapshots.items():
+                    moved = ProjectService.load(proj_id)
+                    if moved is None:
+                        continue
+                    schedules = dict(moved.platform_schedules or {})
+                    if original is None:
+                        schedules.pop(platform, None)
+                    else:
+                        schedules[platform] = original
+                    moved.platform_schedules = schedules
+                    cls._recompute_aggregates(moved)
+                    ProjectService.save(moved)
+                raise
 
             schedules = dict(project.platform_schedules or {})
             for platform, resolved in resolution.resolved.items():

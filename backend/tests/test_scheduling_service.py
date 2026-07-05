@@ -380,3 +380,33 @@ def test_reserve_anchor_steal_stale_occupant_writes_nothing(tmp_path, monkeypatc
     # nothing moved, nothing reserved
     assert ProjectService.load("projB").platform_schedules["tiktok"].slot == s10
     assert not (ProjectService.load("me").platform_schedules or {})
+
+
+def test_reserve_anchor_rolls_back_steal_on_anchor_conflict(tmp_path, monkeypatch):
+    import pytest
+    from app.services.scheduling_service import StealSpec
+    acc = _setup_single_account(tmp_path, monkeypatch)  # slots 10/14/18 all platforms
+    _patch_pool_not_busy(monkeypatch)
+    s10, s14 = _future_slot(1, 10), _future_slot(1, 14)
+
+    # A valid tiktok steal: projB occupies the anchor slot, cascade moves it to 14.
+    _save_scheduled_project("projB", acc, "tiktok", s10, title="B")
+    # A different, NON-stolen project already holds the youtube slot we override to,
+    # so resolve_anchor raises "Anchor conflicts" AFTER the tiktok steal was applied.
+    _save_scheduled_project("projY", acc, "youtube", s14, title="Y")
+    ProjectService.get_project_dir("me").mkdir(parents=True, exist_ok=True)
+    ProjectService.save(Project(id="me"))
+
+    with pytest.raises(ValueError, match="Anchor conflicts"):
+        SchedulingService.reserve_anchor(
+            "me", acc, s10,
+            overrides={"youtube": s14},
+            steals={"tiktok": StealSpec(mode="cascade", expected_occupant_id="projB")},
+        )
+
+    # Rollback: the tiktok occupant is back on its ORIGINAL slot...
+    assert ProjectService.load("projB").platform_schedules["tiktok"].slot == s10
+    # ...the colliding youtube project is untouched...
+    assert ProjectService.load("projY").platform_schedules["youtube"].slot == s14
+    # ...and "me" reserved nothing.
+    assert not (ProjectService.load("me").platform_schedules or {})
