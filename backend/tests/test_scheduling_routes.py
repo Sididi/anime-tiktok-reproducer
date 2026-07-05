@@ -265,3 +265,51 @@ def test_reserve_manual_route_rejects_too_close(client):
     )
     assert resp.status_code == 422
     assert "slot_too_close" in resp.text
+
+
+def _seed_pool_b_c():
+    """projB @ 2026-05-08 12:00, projC @ 14:00, 18:00 free, plus 'me'."""
+    slot1 = datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc)
+    slot2 = datetime(2026, 5, 8, 14, 0, tzinfo=timezone.utc)
+    _mk_project("projB", anime_name="B", scheduled_account_id="acc_a",
+        platform_schedules={"tiktok": PlatformSchedule(slot=slot1, scheduled_at=slot1)})
+    _mk_project("projC", anime_name="C", scheduled_account_id="acc_a",
+        platform_schedules={"tiktok": PlatformSchedule(slot=slot2, scheduled_at=slot2)})
+    _mk_project("me")
+    return slot1
+
+
+def test_switch_preview_and_apply(client):
+    slot1 = _seed_pool_b_c()
+    resp = client.post(
+        "/api/scheduling/projects/me/switch-preview",
+        json={"account_id": "acc_a", "platform": "tiktok", "slot": slot1.isoformat()},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["occupant_project_id"] == "projB"
+    assert len(body["cascade"]["displaced"]) == 2      # B->14 pushes C->18
+    assert len(body["next_free"]["displaced"]) == 1    # B jumps to 18
+
+    resp = client.post(
+        "/api/scheduling/projects/me/switch-apply",
+        json={
+            "account_id": "acc_a", "platform": "tiktok", "slot": slot1.isoformat(),
+            "mode": "next_free", "expected_occupant_id": "projB",
+        },
+    )
+    assert resp.status_code == 200
+    assert "projB" in resp.json()["notification_status"]
+    assert ProjectService.load("me").platform_schedules["tiktok"].slot == slot1
+
+
+def test_switch_apply_stale_occupant_409(client):
+    slot1 = _seed_pool_b_c()
+    resp = client.post(
+        "/api/scheduling/projects/me/switch-apply",
+        json={
+            "account_id": "acc_a", "platform": "tiktok", "slot": slot1.isoformat(),
+            "mode": "cascade", "expected_occupant_id": "wrong",
+        },
+    )
+    assert resp.status_code == 409

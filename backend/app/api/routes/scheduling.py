@@ -423,6 +423,85 @@ async def cascade_apply(project_id: str, req: CascadeRequest):
     return payload
 
 
+class SwitchPreviewRequest(BaseModel):
+    account_id: str
+    platform: Platform
+    slot: datetime
+
+
+class SwitchApplyRequest(SwitchPreviewRequest):
+    mode: Literal["cascade", "next_free"]
+    expected_occupant_id: str | None = None
+
+
+def _switch_plan_payload(plan) -> dict:
+    return {
+        "displaced": [
+            {
+                "project_id": d.project_id,
+                "anime_title": d.anime_title,
+                "from_slot": d.from_slot.isoformat(),
+                "to_slot": d.to_slot.isoformat(),
+                "requires_platform_notification": d.requires_platform_notification,
+            }
+            for d in plan.displaced
+        ],
+        "blockers": [{"platform": b.platform, "reason": b.reason} for b in plan.blockers],
+    }
+
+
+def _switch_to_payload(result) -> dict:
+    return {
+        "platform": result.platform,
+        "slot": result.slot.isoformat(),
+        "occupant_project_id": result.occupant_project_id,
+        "occupant_title": result.occupant_title,
+        "uploaded_count": result.uploaded_count,
+        "cascade": _switch_plan_payload(result.cascade),
+        "next_free": _switch_plan_payload(result.next_free),
+    }
+
+
+@router.post("/projects/{project_id}/switch-preview")
+async def switch_preview(project_id: str, req: SwitchPreviewRequest):
+    result = await asyncio.to_thread(
+        SchedulingService.compute_switch,
+        project_id, req.account_id, req.platform, req.slot,
+    )
+    return _switch_to_payload(result)
+
+
+@router.post("/projects/{project_id}/switch-apply")
+async def switch_apply(project_id: str, req: SwitchApplyRequest):
+    try:
+        result = await asyncio.to_thread(
+            SchedulingService.apply_switch,
+            project_id, req.account_id, req.platform, req.slot,
+            req.mode, req.expected_occupant_id,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        if "slot_state_changed" in msg or "pool_busy" in msg:
+            raise HTTPException(409, msg)
+        raise HTTPException(422, msg)
+
+    plan = result.cascade if req.mode == "cascade" else result.next_free
+    notification_status: dict[str, str] = {}
+    for displaced in plan.displaced:
+        moved = ProjectService.load(displaced.project_id)
+        if moved is None:
+            continue
+        sched = (moved.platform_schedules or {}).get(req.platform)
+        if sched is None:
+            continue
+        notification_status[displaced.project_id] = await asyncio.to_thread(
+            _notify_displaced, displaced.project_id, req.platform, sched.scheduled_at
+        )
+    payload = _switch_to_payload(result)
+    payload["notification_status"] = notification_status
+    return payload
+
+
 @router.get("/reschedule-pending")
 async def reschedule_pending():
     items: list[dict] = []
