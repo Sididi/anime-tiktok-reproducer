@@ -54,7 +54,7 @@ New router `/api/lan/*` on the existing FastAPI app, guarded by a shared token (
 | `GET /api/lan/ping` | `{ok, api_version}` — CEP LAN detection probe (2.5s client timeout) |
 | `GET /api/lan/projects/{id}/manifest` | File list of the local export folder (relative path, size, mtime) — same tree uploaded to Drive |
 | `GET /api/lan/projects/{id}/files/{relpath}` | Streamed download; `relpath` resolved and confined to the project export dir (traversal rejected) |
-| `POST /api/lan/projects/{id}/outputs/{filename}` | Streamed upload into the project output dir; temp file + atomic rename; filename whitelist: `output.mp4`, `output_no_music.wav` only (ATR proxies stay on PC2 — user decision) |
+| `POST /api/lan/projects/{id}/outputs/{filename}` | Streamed upload into the project output dir; temp file + atomic rename; filename whitelist: `output.mp4`, `output_no_music.wav`, and final renders matching `ATR_*.mp4` — but never `*__atr_proxy.mp4` (proxies stay on PC2 — user decision) |
 
 On receipt of an output file, a background task **relays it to the project's Drive folder** (reuses `GoogleDriveService.upsert_local_file`) and invalidates the readiness cache. Relay failures retry with backoff; `execute_upload` performs a final ensure-upsert regardless.
 
