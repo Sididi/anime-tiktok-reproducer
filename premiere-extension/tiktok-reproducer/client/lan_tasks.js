@@ -109,6 +109,25 @@ function delay(ms) {
   });
 }
 
+// The download manifest is untrusted over the wire: it travels as plain HTTP
+// on the LAN (no TLS), so a spoofed server or a MITM could inject
+// relative_path values containing "../" segments. Even though the backend
+// is trusted and strips path prefixes server-side, this client-side check
+// is defense-in-depth against a tampered manifest writing files outside the
+// intended download folder (e.g. overwriting arbitrary files under APPDATA).
+function assertInsideDir(baseDir, candidatePath) {
+  var resolvedBase = path.resolve(baseDir);
+  var resolvedCandidate = path.resolve(candidatePath);
+  // Contained if equal to base or under base + separator. path.sep handles Windows.
+  if (
+    resolvedCandidate !== resolvedBase &&
+    resolvedCandidate.indexOf(resolvedBase + path.sep) !== 0
+  ) {
+    throw new Error("Refusing path outside download root: " + candidatePath);
+  }
+  return resolvedCandidate;
+}
+
 function downloadOneFile(settings, projectId, file, destination, onBytes) {
   ensureDir(path.dirname(destination));
   var apiPath =
@@ -303,8 +322,15 @@ function performDownloadProject(payload, emitProgress) {
     }
 
     return runWithConcurrency(files, DOWNLOAD_CONCURRENCY, function (file) {
-      var destination = path.join(partialRoot, file.relative_path);
-      return downloadFileWithRetries(settings, projectId, file, destination, onBytes);
+      // Wrap in Promise.resolve().then so a synchronous throw from
+      // assertInsideDir becomes a rejected promise: runWithConcurrency calls
+      // workerFn(item).then(...) directly, and a bare synchronous throw here
+      // would escape that .then attachment instead of failing the job.
+      return Promise.resolve().then(function () {
+        var destination = path.join(partialRoot, file.relative_path);
+        assertInsideDir(partialRoot, destination);
+        return downloadFileWithRetries(settings, projectId, file, destination, onBytes);
+      });
     })
       .then(function () {
         return renameWithRetry(partialRoot, targetRoot);
