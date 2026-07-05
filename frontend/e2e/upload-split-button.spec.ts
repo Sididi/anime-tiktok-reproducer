@@ -285,7 +285,10 @@ test("Schedule mode reserves anchor before upload", async ({ page }) => {
   await page
     .getByRole("heading", { name: "Pick a slot" })
     .locator("..")
+    // A trailing off-month cell can share the same day number, so scope to the
+    // first (in-month) match.
     .getByRole("button", { name: dayLabel, exact: true })
+    .first()
     .click();
   await page.getByRole("button", { name: /^14:00$/ }).first().click();
   await page.getByRole("button", { name: "Schedule", exact: true }).click();
@@ -379,4 +382,272 @@ test("Urgent mode previews and applies cascade", async ({ page }) => {
   await page.waitForFunction(
     () => (window as unknown as { __uploadCalled?: boolean }).__uploadCalled === true,
   );
+});
+
+// Helper: the day-cell label the calendar renders for "tomorrow". The calendar
+// prints `date.getDate()`; we anchor mocked slots to tomorrow so `isPast` never
+// disables them.
+async function clickTomorrow(page: import("@playwright/test").Page) {
+  const dayLabel = await page.evaluate(() => {
+    const d = new Date();
+    d.setDate(d.getDate() + 1);
+    return String(d.getDate());
+  });
+  await page
+    .getByRole("heading", { name: "Pick a slot" })
+    .locator("..")
+    .getByRole("button", { name: dayLabel, exact: true })
+    .first()
+    .click();
+}
+
+// Mocks for the manual custom-time flow. Captures the `at` sent to
+// reserve-manual so the test can assert the exact instant. free-slots returns
+// no chips (custom time doesn't need any) — the day is still selectable because
+// `isFull` only strikes days that HAVE configured-but-taken slots.
+function installManualMocks() {
+  const testWindow = window as Window &
+    typeof globalThis & { __manualAt?: string };
+  const orig = window.fetch.bind(window);
+  window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const requestUrl =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url;
+    const url = new URL(requestUrl, window.location.origin);
+    const json = (body: unknown) =>
+      new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    if (url.pathname === "/api/scheduling/free-slots") {
+      return json({ slots: [] });
+    }
+    if (url.pathname.includes("/reserve-manual") && init?.method === "POST") {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { at?: string };
+      testWindow.__manualAt = body.at;
+      return json({
+        platform_schedules: {
+          tiktok: {
+            slot: body.at,
+            scheduled_at: body.at,
+            manual: true,
+          },
+        },
+        notification_status: {},
+      });
+    }
+    return orig(input, init);
+  };
+}
+
+// Mocks for the amber-chip → switch modal → reserve-anchor steal flow. Anchors a
+// taken slot (occupied by projB / "Naruto") plus a decoy free slot to tomorrow.
+function installStealAnchorMocks() {
+  const tomorrowAt = (hourUtc: number): string => {
+    const d = new Date();
+    d.setUTCHours(hourUtc, 0, 0, 0);
+    d.setUTCDate(d.getUTCDate() + 1);
+    return d.toISOString();
+  };
+  const takenIso = tomorrowAt(12); // 14:00 Paris
+  const freeIso = tomorrowAt(16); // 18:00 Paris
+  const testWindow = window as Window &
+    typeof globalThis & {
+      __anchorBody?: unknown;
+      __anchored?: boolean;
+    };
+  testWindow.__anchored = false;
+  const orig = window.fetch.bind(window);
+  window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const requestUrl =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url;
+    const url = new URL(requestUrl, window.location.origin);
+    const json = (body: unknown) =>
+      new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    if (url.pathname === "/api/scheduling/free-slots") {
+      return json({
+        slots: [
+          {
+            slot: takenIso,
+            available: false,
+            taken_by_project_id: "projB",
+            taken_by_title: "Naruto",
+          },
+          { slot: freeIso, available: true },
+        ],
+      });
+    }
+    if (url.pathname.endsWith("/switch-preview") && init?.method === "POST") {
+      return json({
+        platform: "tiktok",
+        slot: takenIso,
+        occupant_project_id: "projB",
+        occupant_title: "Naruto",
+        uploaded_count: 0,
+        cascade: {
+          displaced: [
+            {
+              project_id: "projB",
+              anime_title: "Naruto",
+              from_slot: takenIso,
+              to_slot: freeIso,
+              requires_platform_notification: true,
+            },
+            {
+              project_id: "projC",
+              anime_title: "Bleach",
+              from_slot: freeIso,
+              to_slot: tomorrowAt(20),
+              requires_platform_notification: false,
+            },
+          ],
+          blockers: [],
+        },
+        next_free: {
+          displaced: [
+            {
+              project_id: "projB",
+              anime_title: "Naruto",
+              from_slot: takenIso,
+              to_slot: freeIso,
+              requires_platform_notification: true,
+            },
+          ],
+          blockers: [],
+        },
+      });
+    }
+    if (url.pathname === "/api/scheduling/resolve-anchor") {
+      return json({
+        resolved: {
+          tiktok: { slot: takenIso, scheduled_at: takenIso, available: true },
+        },
+        conflicts: [],
+      });
+    }
+    if (url.pathname.includes("/reserve-anchor") && init?.method === "POST") {
+      testWindow.__anchorBody = JSON.parse(String(init?.body ?? "{}"));
+      testWindow.__anchored = true;
+      return json({
+        platform_schedules: {
+          tiktok: { slot: takenIso, scheduled_at: takenIso },
+        },
+      });
+    }
+    return orig(input, init);
+  };
+}
+
+test.describe("manual custom-time + slot switching", () => {
+  // Pin the browser timezone so `17:23` maps to a fixed UTC instant regardless
+  // of the CI host clock. Europe/Paris in July (CEST) = UTC+2 → 15:23Z.
+  test.use({ timezoneId: "Europe/Paris" });
+
+  test("Custom time schedules a manual reservation", async ({ page }) => {
+    await page.addInitScript(installManualMocks);
+    await page.addInitScript(installMocks, { account: ACCOUNT, row: ROW });
+    await page.addInitScript(installCheckDelay);
+    await page.goto("/");
+    await page.getByRole("button", { name: "Projects" }).click();
+
+    const projectRow = page.locator("tr").filter({ hasText: "Show Alpha" });
+    await expect(projectRow).toBeVisible();
+
+    await page.getByRole("button", { name: "All Projects" }).click();
+    await page.getByRole("button", { name: "Account A" }).click();
+
+    await projectRow.getByRole("button", { name: "Upload options" }).click();
+    await page
+      .getByRole("button", { name: /Schedule for specific slot/ })
+      .click();
+
+    await clickTomorrow(page);
+
+    // Tick "Heure personnalisée" → the auto-resolve / override sections vanish
+    // and the submit button flips to the manual label.
+    await page.getByRole("checkbox").check();
+    await expect(page.getByText("Other platforms (auto)")).toHaveCount(0);
+    await expect(
+      page.getByRole("button", { name: "Programmer (manuel)" }),
+    ).toBeVisible();
+
+    await page.locator('input[type="time"]').fill("17:23");
+    await page.getByRole("button", { name: "Programmer (manuel)" }).click();
+
+    await page.waitForFunction(() =>
+      typeof (window as unknown as { __manualAt?: string }).__manualAt ===
+      "string",
+    );
+    const at = await page.evaluate(
+      () => (window as unknown as { __manualAt?: string }).__manualAt,
+    );
+    expect(at).toMatch(/T15:23:00\.000Z$/);
+  });
+
+  test("Amber chip opens switch modal and reserves with a next-free steal", async ({
+    page,
+  }) => {
+    await page.addInitScript(installStealAnchorMocks);
+    await page.addInitScript(installMocks, { account: ACCOUNT, row: ROW });
+    await page.addInitScript(installCheckDelay);
+    await page.goto("/");
+    await page.getByRole("button", { name: "Projects" }).click();
+
+    const projectRow = page.locator("tr").filter({ hasText: "Show Alpha" });
+    await expect(projectRow).toBeVisible();
+
+    await page.getByRole("button", { name: "All Projects" }).click();
+    await page.getByRole("button", { name: "Account A" }).click();
+
+    await projectRow.getByRole("button", { name: "Upload options" }).click();
+    await page
+      .getByRole("button", { name: /Schedule for specific slot/ })
+      .click();
+
+    await clickTomorrow(page);
+
+    // The occupied slot renders as an amber, still-clickable chip.
+    const amberChip = page.locator('button[title*="Occupé par"]');
+    await expect(amberChip).toBeVisible();
+    await expect(amberChip).toHaveClass(/border-amber-500\/60/);
+    await expect(amberChip).toBeEnabled();
+    await amberChip.click();
+
+    // Switch modal: both displacement plans render.
+    await expect(
+      page.getByText(/Cascade en chaîne — 2 vidéos déplacées/),
+    ).toBeVisible();
+    await expect(
+      page.getByText(/Prochain slot libre — 1 vidéo déplacée/),
+    ).toBeVisible();
+
+    await page
+      .getByRole("button", { name: /Slot libre suivant \(1 vidéo\)/ })
+      .click();
+
+    // Completing the schedule reserves the anchor with the encoded steal.
+    await page.getByRole("button", { name: "Schedule", exact: true }).click();
+
+    await page.waitForFunction(
+      () => (window as unknown as { __anchored?: boolean }).__anchored === true,
+    );
+    const body = await page.evaluate(
+      () => (window as unknown as { __anchorBody?: unknown }).__anchorBody,
+    );
+    expect(body).toMatchObject({
+      steals: {
+        tiktok: { mode: "next_free", expected_occupant_id: "projB" },
+      },
+    });
+  });
 });
