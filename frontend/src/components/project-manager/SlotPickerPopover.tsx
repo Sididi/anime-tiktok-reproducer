@@ -2,13 +2,23 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import { Button } from "@/components/ui";
 import { api } from "@/api/client";
-import type { FreeSlot, Platform, ResolveAnchorResult } from "@/types";
+import type { FreeSlot, Platform, ResolveAnchorResult, StealSpec, SwitchMode, SwitchPreview } from "@/types";
 import { PLATFORM_SHORT } from "@/components/planning/platformColors";
 import { SlotPickerCalendar } from "./SlotPickerCalendar";
 import { SlotChips } from "./SlotChips";
 import { PerPlatformOverride } from "./PerPlatformOverride";
+import { SwitchSlotConfirmModal } from "./SwitchSlotConfirmModal";
 
 export type SlotPickerMode = "anchor" | "single-platform";
+
+export type SlotPickerConfirmPayload =
+  | {
+      tiktok_slot: string;
+      overrides?: Partial<Record<Platform, string>>;
+      steals?: Partial<Record<Platform, StealSpec>>;
+    } // anchor
+  | { slot: string; steal?: StealSpec } // single-platform
+  | { manual_at: string }; // manual custom time
 
 interface SlotPickerPopoverProps {
   open: boolean;
@@ -19,9 +29,9 @@ interface SlotPickerPopoverProps {
   platform?: Platform;            // required when mode = single-platform
   initialIso?: string;             // pre-fill (current slot when rescheduling)
   platformsForAnchor: Platform[]; // anchor mode: which platforms are in scope
-  onConfirm: (
-    payload: { tiktok_slot: string; overrides?: Partial<Record<Platform, string>> } | { slot: string },
-  ) => Promise<void>;
+  allowManual?: boolean;           // default true in anchor mode
+  initialManual?: boolean;         // open with custom time active
+  onConfirm: (payload: SlotPickerConfirmPayload) => Promise<void>;
 }
 
 export function SlotPickerPopover(props: SlotPickerPopoverProps) {
@@ -39,6 +49,10 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
   const [overrides, setOverrides] = useState<Partial<Record<Platform, string>>>({});
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [customTime, setCustomTime] = useState<string>("");       // "HH:MM"
+  const [customActive, setCustomActive] = useState(!!props.initialManual);
+  const [steals, setSteals] = useState<Partial<Record<Platform, StealSpec>>>({});
+  const [switchTarget, setSwitchTarget] = useState<{ platform: Platform; slotIso: string } | null>(null);
 
   const platformForFetch: Platform = mode === "anchor" ? "tiktok" : platform!;
 
@@ -134,20 +148,58 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
     return () => { cancelled = true; };
   }, [open, mode, projectId, accountId, selectedSlotIso, overrides]);
 
+  const customIso = useMemo(() => {
+    if (!customActive || !selectedDate || !/^\d{2}:\d{2}$/.test(customTime)) return null;
+    const [h, m] = customTime.split(":").map(Number);
+    const d = new Date(selectedDate);
+    d.setHours(h, m, 0, 0);
+    return d.toISOString();
+  }, [customActive, selectedDate, customTime]);
+
+  const customTooClose =
+    customIso !== null && new Date(customIso).getTime() < Date.now() + 30 * 60 * 1000;
+
+  const proximityWarning = useMemo(() => {
+    if (!customIso) return null;
+    const t = new Date(customIso).getTime();
+    const near = slotsForDay.find(
+      (s) => !s.available && Math.abs(new Date(s.slot).getTime() - t) <= 60 * 60 * 1000,
+    );
+    return near
+      ? `Un upload (« ${near.taken_by_title ?? "?"} ») est déjà programmé vers ${new Intl.DateTimeFormat("fr-FR", { hour: "2-digit", minute: "2-digit", timeZone: "Europe/Paris" }).format(new Date(near.slot))} ce jour-là.`
+      : null;
+  }, [customIso, slotsForDay]);
+
+  const effectiveConflicts = useMemo(
+    () =>
+      (resolveResult?.conflicts ?? []).filter(
+        (c) => !(c.reason === "slot_taken" && steals[c.platform]),
+      ),
+    [resolveResult, steals],
+  );
+
   const canSubmit = useMemo(() => {
+    if (customActive) return !!customIso && !customTooClose;
     if (!selectedSlotIso) return false;
-    if (mode === "anchor" && resolveResult?.conflicts.length) return false;
+    if (mode === "anchor" && effectiveConflicts.length) return false;
     return true;
-  }, [selectedSlotIso, mode, resolveResult]);
+  }, [customActive, customIso, customTooClose, selectedSlotIso, mode, effectiveConflicts]);
 
   const handleSubmit = useCallback(async () => {
-    if (!selectedSlotIso) return;
     setSubmitting(true); setError(null);
     try {
-      if (mode === "anchor") {
-        await onConfirm({ tiktok_slot: selectedSlotIso, overrides });
+      if (customActive && customIso) {
+        await onConfirm({ manual_at: customIso });
+      } else if (mode === "anchor" && selectedSlotIso) {
+        await onConfirm({
+          tiktok_slot: selectedSlotIso,
+          overrides,
+          steals: Object.keys(steals).length ? steals : undefined,
+        });
+      } else if (selectedSlotIso) {
+        await onConfirm({ slot: selectedSlotIso, steal: steals[platform!] });
       } else {
-        await onConfirm({ slot: selectedSlotIso });
+        return;
       }
       onClose();
     } catch (err) {
@@ -155,7 +207,7 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
     } finally {
       setSubmitting(false);
     }
-  }, [selectedSlotIso, mode, overrides, onConfirm, onClose]);
+  }, [customActive, customIso, selectedSlotIso, mode, overrides, steals, platform, onConfirm, onClose]);
 
   if (!open) return null;
   return (
@@ -196,12 +248,63 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
           </div>
           <SlotChips
             slots={slotsForDay}
-            selectedIso={selectedSlotIso}
-            onSelect={setSelectedSlotIso}
+            selectedIso={customActive ? null : selectedSlotIso}
+            onSelect={(iso) => {
+              setCustomActive(false);
+              setSelectedSlotIso(iso);
+              setSteals((prev) => {
+                const next = { ...prev };
+                delete next[platformForFetch];
+                return next;
+              });
+            }}
+            onSelectTaken={(s) =>
+              setSwitchTarget({ platform: platformForFetch, slotIso: s.slot })
+            }
+            stolenIsos={
+              new Set(
+                steals[platformForFetch] && selectedSlotIso ? [selectedSlotIso] : [],
+              )
+            }
+            ownProjectId={projectId}
           />
         </div>
 
-        {mode === "anchor" && resolveResult && (
+        {mode === "anchor" && props.allowManual !== false && (
+          <div className="border-t border-[hsl(var(--border))] mt-3 pt-2">
+            <label className="flex items-center gap-2 text-[11px] text-[hsl(var(--muted-foreground))]">
+              <input
+                type="checkbox"
+                checked={customActive}
+                onChange={(e) => {
+                  setCustomActive(e.target.checked);
+                  if (e.target.checked) { setSelectedSlotIso(null); setSteals({}); }
+                }}
+              />
+              Heure personnalisée (hors slots, toutes plateformes)
+            </label>
+            {customActive && (
+              <div className="mt-1.5">
+                <input
+                  type="time"
+                  value={customTime}
+                  onChange={(e) => setCustomTime(e.target.value)}
+                  className="text-xs bg-transparent border border-[hsl(var(--border))] rounded px-2 py-1"
+                />
+                {customTooClose && (
+                  <div className="text-[11px] text-[hsl(var(--destructive))] mt-1">
+                    Minimum 30 minutes dans le futur.
+                  </div>
+                )}
+                {proximityWarning && (
+                  <div className="text-[11px] text-amber-500 mt-1">⚠ {proximityWarning}</div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {!customActive && mode === "anchor" && resolveResult && (
           <>
             <div className="border-t border-[hsl(var(--border))] mt-3 pt-2 text-[11px]">
               <div className="text-[hsl(var(--muted-foreground))] mb-1">Other platforms (auto)</div>
@@ -217,9 +320,9 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
                     </div>
                   ))}
               </div>
-              {resolveResult.conflicts.length > 0 && (
+              {effectiveConflicts.length > 0 && (
                 <div className="mt-1 text-[hsl(var(--destructive))]">
-                  Conflict: {resolveResult.conflicts.map((c) => `${c.platform}:${c.reason}`).join(", ")}
+                  Conflict: {effectiveConflicts.map((c) => `${c.platform}:${c.reason}`).join(", ")}
                 </div>
               )}
             </div>
@@ -237,6 +340,7 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
                 })
               }
               platforms={platformsForAnchor}
+              onStealRequest={(p, iso) => setSwitchTarget({ platform: p, slotIso: iso })}
             />
           </>
         )}
@@ -248,9 +352,37 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
         <div className="flex justify-end gap-2 mt-3">
           <Button size="sm" variant="ghost" onClick={onClose}>Cancel</Button>
           <Button size="sm" disabled={!canSubmit || submitting} onClick={handleSubmit}>
-            {submitting ? "Saving…" : "Schedule"}
+            {submitting ? "Saving…" : customActive ? "Programmer (manuel)" : "Schedule"}
           </Button>
         </div>
+
+        {switchTarget && (
+          <SwitchSlotConfirmModal
+            open
+            projectId={projectId}
+            accountId={accountId}
+            platform={switchTarget.platform}
+            slotIso={switchTarget.slotIso}
+            onClose={() => setSwitchTarget(null)}
+            onChoose={(chosenMode: SwitchMode, preview: SwitchPreview) => {
+              if (!switchTarget) return;
+              const tgt = switchTarget;
+              setSteals((prev) => ({
+                ...prev,
+                [tgt.platform]: {
+                  mode: chosenMode,
+                  expected_occupant_id: preview.occupant_project_id,
+                },
+              }));
+              if (tgt.platform === platformForFetch) {
+                setSelectedSlotIso(tgt.slotIso);
+                setCustomActive(false);
+              } else {
+                setOverrides((prev) => ({ ...prev, [tgt.platform]: tgt.slotIso }));
+              }
+            }}
+          />
+        )}
       </motion.div>
     </div>
   );
