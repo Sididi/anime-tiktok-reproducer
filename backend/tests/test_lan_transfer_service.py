@@ -153,3 +153,40 @@ def test_relay_skips_when_drive_unconfigured(tmp_path, monkeypatch):
     monkeypatch.setattr(gds.GoogleDriveService, "is_configured", classmethod(lambda cls: False))
     status = LanTransferService.relay_output_to_drive("p1", video)
     assert status["status"] == "skipped"
+
+
+def test_write_relay_status_concurrent_writes_are_not_lost(tmp_path, monkeypatch):
+    import json
+    import threading
+
+    out = tmp_path / "output"
+    out.mkdir(parents=True)
+    monkeypatch.setattr(
+        "app.services.lan_transfer_service.ExportService.get_output_dir",
+        classmethod(lambda cls, pid: out),
+    )
+
+    n = 20
+    threads = [
+        threading.Thread(
+            target=LanTransferService._write_relay_status,
+            args=(
+                "p1",
+                {
+                    "filename": f"file_{i}.mp4",
+                    "status": "uploaded",
+                    "attempts": 1,
+                    "file_id": f"id{i}",
+                    "error": None,
+                },
+            ),
+        )
+        for i in range(n)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    saved = json.loads((out / ".lan_relay_status.json").read_text())
+    assert set(saved.keys()) == {f"file_{i}.mp4" for i in range(n)}

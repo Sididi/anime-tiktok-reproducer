@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -32,6 +33,7 @@ class LanTransferService:
     RELAY_STATUS_FILENAME = ".lan_relay_status.json"
     _RELAY_MAX_ATTEMPTS = 3
     _RELAY_RETRY_DELAY_S = 5.0
+    _relay_status_lock = threading.Lock()
 
     @classmethod
     def _build_entries(cls, project) -> tuple[str, list[ManifestEntry]]:
@@ -128,16 +130,17 @@ class LanTransferService:
     @classmethod
     def _write_relay_status(cls, project_id: str, entry: dict) -> None:
         status_path = ExportService.get_output_dir(project_id) / cls.RELAY_STATUS_FILENAME
-        data: dict = {}
-        if status_path.exists():
-            try:
-                data = json.loads(status_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                data = {}
-        data[entry["filename"]] = entry
-        tmp = status_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        tmp.replace(status_path)
+        with cls._relay_status_lock:
+            data: dict = {}
+            if status_path.exists():
+                try:
+                    data = json.loads(status_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    data = {}
+            data[entry["filename"]] = entry
+            tmp = status_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            tmp.replace(status_path)
 
     @classmethod
     def relay_output_to_drive(cls, project_id: str, local_path: Path) -> dict:
