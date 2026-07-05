@@ -1265,7 +1265,15 @@ function __atrDetachManagedProxiesForCleanupObject(localRootPath) {
       continue;
     }
 
-    if (!__atrLooksLikeManagedProxyPath(proxyPath, normalizedRootPath)) {
+    // The entire local root is about to be deleted from disk, so any proxy
+    // whose file lives under it will disappear. Detach every such proxy - not
+    // only the ones matching the managed-name heuristic - because if the
+    // attachment survives, Premiere keeps the proxy registered and raises a
+    // blocking "link missing proxies" modal the moment the file is removed.
+    if (
+      !__atrPathStartsWith(proxyPath, normalizedRootPath) &&
+      !__atrLooksLikeManagedProxyPath(proxyPath, normalizedRootPath)
+    ) {
       continue;
     }
 
@@ -1275,21 +1283,54 @@ function __atrDetachManagedProxiesForCleanupObject(localRootPath) {
       continue;
     }
 
-    try {
-      var detached = item.detachProxy();
-      if (detached === undefined || detached === 0 || detached === true || detached === "0") {
-        result.detached_proxy_count += 1;
-      } else {
-        result.detach_proxy_failed_count += 1;
+    // detachProxy() returns before Premiere commits the change on Windows, so
+    // trusting its return value reports a false success: purge then deletes the
+    // item and the folder delete removes the proxy file while Premiere still
+    // has it attached, which queues the "link missing proxies" modal and holds
+    // the media file handles (leaving sources/proxies on disk). Confirm the
+    // proxy is actually gone via hasProxy(), mirroring the verified attach path.
+    var detachCommitted = false;
+    var lastDetachError = null;
+    for (
+      var detachAttempt = 0;
+      detachAttempt < 4 && !detachCommitted;
+      detachAttempt += 1
+    ) {
+      try {
+        item.detachProxy();
+      } catch (eDetach) {
+        lastDetachError = eDetach;
       }
-    } catch (eDetach) {
+      try {
+        if (item.refreshMedia) {
+          item.refreshMedia();
+        }
+      } catch (eRefreshDetach) {}
+      if (detachAttempt > 0) {
+        try {
+          $.sleep(200);
+        } catch (eSleepDetach) {}
+      }
+      try {
+        detachCommitted = !item.hasProxy();
+      } catch (eHasProxyAfter) {
+        // Item can no longer be queried for proxy state; treat as detached.
+        detachCommitted = true;
+      }
+    }
+
+    if (detachCommitted) {
+      result.detached_proxy_count += 1;
+    } else {
       result.detach_proxy_failed_count += 1;
       if (result.detach_proxy_warnings.length < 5) {
         result.detach_proxy_warnings.push(
-          "Could not detach proxy from " +
+          "Proxy still attached after detach for " +
             __atrGetProjectItemName(item) +
-            ": " +
-            __atrSafeString(eDetach.message || eDetach),
+            (lastDetachError
+              ? ": " +
+                __atrSafeString(lastDetachError.message || lastDetachError)
+              : ""),
         );
       }
     }
@@ -2762,6 +2803,7 @@ function cleanupImportedProjectsForLocalRoots(localRootsJson) {
     var detachSummaries = [];
     var mediaReleaseSummaries = [];
     var detachedProxyCount = 0;
+    var detachFailedCount = 0;
     var mediaOfflineCount = 0;
     var detachWarnings = [];
     var mediaReleaseWarnings = [];
@@ -2774,6 +2816,7 @@ function cleanupImportedProjectsForLocalRoots(localRootsJson) {
       detachSummary.local_root = rootPath;
       detachSummaries.push(detachSummary);
       detachedProxyCount += Number(detachSummary.detached_proxy_count || 0);
+      detachFailedCount += Number(detachSummary.detach_proxy_failed_count || 0);
       if (detachSummary.detach_proxy_warnings && detachSummary.detach_proxy_warnings.length) {
         for (var w = 0; w < detachSummary.detach_proxy_warnings.length; w += 1) {
           if (detachWarnings.length < 10) {
@@ -2840,6 +2883,7 @@ function cleanupImportedProjectsForLocalRoots(localRootsJson) {
     purgeSummary.detach_proxy_summaries = detachSummaries;
     purgeSummary.media_release_summaries = mediaReleaseSummaries;
     purgeSummary.detached_proxy_count = detachedProxyCount;
+    purgeSummary.detach_failed_count = detachFailedCount;
     purgeSummary.media_offline_count = mediaOfflineCount;
     purgeSummary.detach_proxy_warnings = detachWarnings;
     purgeSummary.media_release_warnings = mediaReleaseWarnings;

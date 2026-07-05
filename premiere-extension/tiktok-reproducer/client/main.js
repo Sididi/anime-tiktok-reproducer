@@ -2361,6 +2361,7 @@
           ? summary.warnings.length
           : Number(summary.warning_count || 0);
         var detachedProxyCount = Number(summary.detached_proxy_count || 0);
+        var detachFailedCount = Number(summary.detach_failed_count || 0);
         var mediaOfflineCount = Number(summary.media_offline_count || 0);
         log(
           "Premiere cleanup for " +
@@ -2375,11 +2376,13 @@
             remainingRootItems +
             ", detachedProxies=" +
             detachedProxyCount +
+            ", detachFailed=" +
+            detachFailedCount +
             ", mediaOffline=" +
             mediaOfflineCount +
             ", warnings=" +
             warningCount,
-          "info",
+          detachFailedCount > 0 ? "warn" : "info",
         );
       }
       return summary;
