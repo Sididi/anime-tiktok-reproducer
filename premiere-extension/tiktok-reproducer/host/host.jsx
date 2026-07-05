@@ -2876,6 +2876,12 @@ function runScript(scriptPath) {
       return "ERROR: File not found: " + scriptPath;
     }
     $.evalFile(file);
+    // The panel shares one persistent ExtendScript engine across every run.
+    // import_project.jsx is a large (~200 KB) script, so reclaim its transient
+    // memory after each run to curb the slowdown seen over successive imports.
+    try {
+      $.gc();
+    } catch (eGc) {}
     return "OK";
   } catch (e) {
     return "ERROR: " + e.message + " (line " + e.line + ")";

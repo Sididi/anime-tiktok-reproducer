@@ -699,6 +699,13 @@
     "__ATR_RAW_AUDIO__" + PROJECT_ID + "__" + PROJECT_EXECUTION_ID + "__";
   var PROJECT_ITEM_CACHE = {};
   var PROJECT_ITEM_CACHE_WARMED = false;
+  // Whole-project media/name index. When true, a PROJECT_ITEM_CACHE miss by
+  // media path provably means "not in this project", so the expensive
+  // full-root walk in findProjectItemByMediaPath can be skipped. This turns
+  // preload from O(scenes * total_project_items) into O(total_project_items)
+  // once + O(1) per clip -- the key win when one Premiere project is reused
+  // across many imports and its item tree keeps growing.
+  var FULL_MEDIA_INDEX_WARMED = false;
   var PRESET_FILE_TEXT_CACHE = {};
   var PRESET_PARSED_DATA_CACHE = {};
   var PRESET_EFFECT_VALUE_ENTRIES_CACHE = {};
@@ -1253,6 +1260,22 @@
     PROJECT_ITEM_CACHE_WARMED = true;
   }
 
+  // Index the ENTIRE project once (media path + name), not just the current
+  // project bin. Visiting every item is a strict superset of what each
+  // per-clip searchEverywhere walk would find, so once this runs a cache miss
+  // by media path is authoritative and the full-root walk can be skipped.
+  function warmFullProjectMediaIndex() {
+    if (FULL_MEDIA_INDEX_WARMED) return;
+    var root = getProjectRootItem();
+    if (!root) return;
+    walkProjectItems(root, function (item) {
+      if (!isBinItem(item)) {
+        cacheProjectItem(item);
+      }
+    });
+    FULL_MEDIA_INDEX_WARMED = true;
+  }
+
   function isItemNameMatch(itemName, nameRef) {
     if (!nameRef) return true;
     var itemNameNorm = itemName ? itemName.toString() : "";
@@ -1657,7 +1680,9 @@
     var found = findProjectItemByMediaPathInContainer(searchRoot, normalizedPath);
     if (found) return found;
 
-    if (searchEverywhere) {
+    // Skip the whole-project walk once the full media index is warmed: the
+    // cache miss above already proves the item is not in the project.
+    if (searchEverywhere && !FULL_MEDIA_INDEX_WARMED) {
       found = findProjectItemByMediaPathInContainer(getProjectRootItem(), normalizedPath);
       if (found) {
         moveItemToProjectBin(found);
@@ -2250,6 +2275,9 @@
 
     // Warm cache once, then preload only the source clips we will use.
     perfStart("preload");
+    // Index the whole project once so per-clip dedup lookups are O(1) instead
+    // of re-walking a project that grows with every reused-project import.
+    warmFullProjectMediaIndex();
     warmProjectItemCache();
     var preloadNames = {};
     for (var i = 0; i < scenes.length; i++) {
@@ -6924,6 +6952,7 @@
 
     PROJECT_ITEM_CACHE = {};
     PROJECT_ITEM_CACHE_WARMED = false;
+    FULL_MEDIA_INDEX_WARMED = false;
 
     var remainingSequences = 0;
     try {
