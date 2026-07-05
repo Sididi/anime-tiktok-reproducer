@@ -1031,7 +1031,7 @@ class SocialUploadService:
                 "-c:v",
                 "libx264",
                 "-preset",
-                "slow",
+                settings.social_transcode_preset,
                 "-crf",
                 "18",
                 "-pix_fmt",

@@ -782,6 +782,7 @@ class UploadPhaseService:
                 force_local_upload = True
 
             ig_payload = dict(ig_payload_base) if ig_payload_base is not None else None
+            ig_prep_needed = False
             if (
                 "instagram" in requested_platforms
                 and "instagram" not in results_by_platform
@@ -797,70 +798,7 @@ class UploadPhaseService:
                         update_discord=False,
                     )
                 else:
-                    emit_progress(
-                        0.40,
-                        "prepare_instagram",
-                        "Preparing Instagram video artifact...",
-                    )
-                    ig_result, instagram_drive_metadata = cls._prepare_instagram_drive_video(
-                        project_id=project_id,
-                        source_video_path=local_video_path,
-                        drive_folder_id=readiness.drive_folder_id,
-                        facebook_strategy=facebook_strategy,
-                        work_dir=Path(tmp_dir),
-                    )
-                    if ig_result is not None:
-                        results_by_platform["instagram"] = ig_result
-                        ig_payload = None
-                        emit_platform_result(ig_result, update_discord=False)
-                    else:
-                        ig_payload["prepared_video_url"] = instagram_drive_metadata[
-                            "instagram_drive_video_url"
-                        ]
-
-            discord_message_id = None
-            try:
-                discord_slot_time = (
-                    platform_scheduled_at.get("tiktok")
-                    or project.scheduled_at
-                    or datetime.now(timezone.utc)
-                )
-                job_response = DiscordService.create_job(
-                    project_id=project_id,
-                    # Use the live account_id arg (validated above), not
-                    # project.scheduled_account_id which is only persisted at the
-                    # END of execute_upload — None on first upload.
-                    account_id=account_id or project.scheduled_account_id or "",
-                    slot_time=discord_slot_time,
-                    anime_title=project.anime_name or "Unknown",
-                    description=metadata.tiktok.description,
-                    drive_video_url=direct_drive_download or drive_video_url,
-                    platforms_requested=vps_platforms,
-                    instagram=ig_payload,
-                    tiktok=tiktok_payload,
-                    platform_scheduled_at=platform_scheduled_at,
-                    platform_statuses=cls._platform_status_payload(results_by_platform),
-                )
-            except Exception:
-                logger.warning(
-                    "Discord create_job failed for project %s",
-                    project_id,
-                    exc_info=True,
-                )
-                job_response = None
-
-            if job_response is not None:
-                discord_message_id = job_response.get("discord_message_id")
-                if discord_message_id:
-                    project.final_upload_discord_message_id = discord_message_id
-                    try:
-                        ProjectService.save(project)
-                    except Exception:
-                        logger.warning(
-                            "Failed to persist Discord message id for project %s",
-                            project_id,
-                            exc_info=True,
-                        )
+                    ig_prep_needed = True
 
             jobs: dict[str, Any] = {}
 
@@ -941,14 +879,87 @@ class UploadPhaseService:
             selected_jobs = {platform: jobs[platform] for platform in requested_platforms if platform in jobs}
 
             emit_progress(0.55, "platform_upload", "Uploading to social platforms...")
-            max_parallel = max(1, min(settings.social_upload_max_parallel, len(selected_jobs))) if selected_jobs else 1
+            worker_count = len(selected_jobs) + (1 if ig_prep_needed else 0)
+            max_parallel = max(1, min(settings.social_upload_max_parallel, worker_count)) if worker_count else 1
             executor = ThreadPoolExecutor(max_workers=max_parallel)
             timed_out_platforms = False
+            abort_platform_jobs = False
             try:
                 future_to_platform = {
                     executor.submit(job): platform
                     for platform, job in selected_jobs.items()
                 }
+
+                # Instagram Drive prep (transcode + Drive re-upload) runs alongside
+                # the YouTube/Facebook uploads; only the Discord/VPS job created
+                # below needs its prepared URL.
+                if ig_prep_needed:
+                    ig_prep_future = executor.submit(
+                        cls._prepare_instagram_drive_video,
+                        project_id=project_id,
+                        source_video_path=local_video_path,
+                        drive_folder_id=readiness.drive_folder_id,
+                        facebook_strategy=facebook_strategy,
+                        work_dir=Path(tmp_dir),
+                    )
+                    try:
+                        ig_result, instagram_drive_metadata = ig_prep_future.result()
+                    except Exception:
+                        abort_platform_jobs = True
+                        raise
+                    if ig_result is not None:
+                        results_by_platform["instagram"] = ig_result
+                        ig_payload = None
+                        emit_platform_result(ig_result, update_discord=False)
+                    else:
+                        ig_payload["prepared_video_url"] = instagram_drive_metadata[
+                            "instagram_drive_video_url"
+                        ]
+
+                discord_message_id = None
+                try:
+                    discord_slot_time = (
+                        platform_scheduled_at.get("tiktok")
+                        or project.scheduled_at
+                        or datetime.now(timezone.utc)
+                    )
+                    job_response = DiscordService.create_job(
+                        project_id=project_id,
+                        # Use the live account_id arg (validated above), not
+                        # project.scheduled_account_id which is only persisted at the
+                        # END of execute_upload — None on first upload.
+                        account_id=account_id or project.scheduled_account_id or "",
+                        slot_time=discord_slot_time,
+                        anime_title=project.anime_name or "Unknown",
+                        description=metadata.tiktok.description,
+                        drive_video_url=direct_drive_download or drive_video_url,
+                        platforms_requested=vps_platforms,
+                        instagram=ig_payload,
+                        tiktok=tiktok_payload,
+                        platform_scheduled_at=platform_scheduled_at,
+                        platform_statuses=cls._platform_status_payload(results_by_platform),
+                    )
+                except Exception:
+                    logger.warning(
+                        "Discord create_job failed for project %s",
+                        project_id,
+                        exc_info=True,
+                    )
+                    job_response = None
+
+                if job_response is not None:
+                    discord_message_id = job_response.get("discord_message_id")
+                    if discord_message_id:
+                        project.final_upload_discord_message_id = discord_message_id
+                        try:
+                            ProjectService.save(project)
+                        except Exception:
+                            logger.warning(
+                                "Failed to persist Discord message id for project %s",
+                                project_id,
+                                exc_info=True,
+                            )
+
                 pending = set(future_to_platform)
                 deadline = time.monotonic() + max(
                     float(settings.project_manager_platform_phase_timeout_seconds),
@@ -1001,9 +1012,10 @@ class UploadPhaseService:
                         )
                         emit_platform_result(results_by_platform[platform])
             finally:
+                abandon_jobs = timed_out_platforms or abort_platform_jobs
                 executor.shutdown(
-                    wait=not timed_out_platforms,
-                    cancel_futures=timed_out_platforms,
+                    wait=not abandon_jobs,
+                    cancel_futures=abandon_jobs,
                 )
 
             # Keep deterministic ordering in reports/messages.

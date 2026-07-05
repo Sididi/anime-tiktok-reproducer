@@ -125,6 +125,9 @@ class Settings(BaseSettings):
     youtube_category_id: str = "22"
     youtube_channel_id: str | None = None
     social_upload_max_parallel: int = 3
+    # x264 preset for platform duration-limit transcodes (sped-up variants).
+    # Platforms re-encode on ingest, so a fast preset costs little quality.
+    social_transcode_preset: str = "veryfast"
     social_upload_http_timeout_seconds: int = 120
     social_upload_binary_timeout_seconds: int = 900
     social_upload_platform_timeout_seconds: int = 1200
