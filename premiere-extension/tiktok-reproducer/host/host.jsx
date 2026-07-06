@@ -6,26 +6,18 @@
  */
 
 var ATR_EXTENSION_ID = "com.animetiktok.tiktokreproducer.panel";
-var ATR_HOST_BUILD_ID = "2026-04-29-async-proxy-v8";
+// Must stay in sync with ATR_BUILD_ID in client/constants.js.
+var ATR_HOST_BUILD_ID = "2026-07-06-panel-cleanup-v9";
 var __atrEncoderEvents = [];
 var __atrEncoderJobProjectMap = {};
 var __atrEncoderJobMetaMap = {};
 var __atrTempAudioSequenceByJob = {};
-var __atrProxyJobMap = {};
-var __atrProxyRepairQueuedMap = {};
-var __atrProxyRepairJobKeyMap = {};
-var __atrPendingProxyKickoffs = {};
-var __atrProxyPresetPathCache = {};
 var __atrProxyAttachAttemptMap = {};
 var __atrEncoderCallbacksBound = false;
-var __atrCleanupMaxBinPasses = 5;
 var __atrTempAudioSequencePrefix = "ATR_AUDIO_NO_MUSIC_TMP__";
 var __atrProjectPurgeBinName = "__ATR_PURGE__";
-var __atrProxyPresetTemplateName = "ATR Proxy H264.epr";
 var __atrProxyOutputSuffix = "__atr_proxy.mp4";
 var __atrProxyRepairOutputSuffix = "__atr_proxy_projectitem.mp4";
-var __atrTicksPerSecond = 254016000000;
-var __atrProxyKickoffSeq = 0;
 
 /**
  * JSON.stringify polyfill for ExtendScript (ES3).
@@ -122,14 +114,6 @@ function __atrPathStartsWith(pathValue, rootValue) {
   return normalizedPath.indexOf(normalizedRoot + "/") === 0;
 }
 
-function __atrGetExtensionRootPath() {
-  try {
-    return __atrNormalizePath(new File($.fileName).parent.parent.fsName);
-  } catch (e) {
-    return "";
-  }
-}
-
 function __atrTrimTrailingSlash(pathValue) {
   var normalized = __atrNormalizePath(pathValue);
   if (
@@ -178,64 +162,6 @@ function __atrStripExtension(fileName) {
     return value;
   }
   return value.substring(0, dot);
-}
-
-function __atrEnsureFolder(folderPath) {
-  if (!folderPath) {
-    return false;
-  }
-  var folder = new Folder(folderPath);
-  if (folder.exists) {
-    return true;
-  }
-  var parent = folder.parent;
-  if (parent && !parent.exists && !__atrEnsureFolder(parent.fsName)) {
-    return false;
-  }
-  return !!folder.create();
-}
-
-function __atrReadTextFile(filePath) {
-  if (!filePath) {
-    return "";
-  }
-  var file = new File(filePath);
-  if (!file.exists || !file.open("r")) {
-    return "";
-  }
-  var content = "";
-  try {
-    content = file.read();
-  } catch (e) {
-    content = "";
-  }
-  file.close();
-  return content;
-}
-
-function __atrWriteTextFile(filePath, content) {
-  if (!filePath) {
-    return false;
-  }
-  var parentPath = __atrGetParentPath(filePath);
-  if (parentPath && !__atrEnsureFolder(parentPath)) {
-    return false;
-  }
-  var file = new File(filePath);
-  if (!file.open("w")) {
-    return false;
-  }
-  try {
-    file.encoding = "UTF8";
-    file.write(content || "");
-  } catch (e) {
-    try {
-      file.close();
-    } catch (eClose0) {}
-    return false;
-  }
-  file.close();
-  return true;
 }
 
 function __atrWalkProjectItems(containerItem, visitor) {
@@ -297,6 +223,9 @@ function __atrProjectItemCanAcceptProxy(projectItem) {
 }
 
 function __atrNameMatchesMediaPath(nameValue, mediaPath) {
+  // Exact (optionally extension-stripped) basename equality only. The old
+  // substring match could attach a proxy to the wrong item whenever one
+  // source's basename was contained in another item's name.
   var itemName = __atrSafeString(nameValue).toLowerCase();
   var baseName = __atrGetBasename(mediaPath).toLowerCase();
   var strippedBaseName = __atrStripExtension(baseName).toLowerCase();
@@ -304,23 +233,8 @@ function __atrNameMatchesMediaPath(nameValue, mediaPath) {
   return !!(
     itemName &&
     baseName &&
-    (itemName === baseName ||
-      strippedItemName === strippedBaseName ||
-      itemName.indexOf(baseName) !== -1 ||
-      itemName.indexOf(strippedBaseName) !== -1)
+    (itemName === baseName || strippedItemName === strippedBaseName)
   );
-}
-
-function __atrProjectItemNameMatchesMediaPath(projectItem, mediaPath) {
-  return __atrNameMatchesMediaPath(__atrGetProjectItemName(projectItem), mediaPath);
-}
-
-function __atrGetSequenceCount() {
-  try {
-    return Number(app && app.project && app.project.sequences ? app.project.sequences.numSequences || app.project.sequences.length || 0 : 0);
-  } catch (eSeqCount) {
-    return 0;
-  }
 }
 
 function __atrGetTrackCollectionCount(trackCollection) {
@@ -348,8 +262,29 @@ function __atrGetTrackItemProjectItem(trackItem) {
   return null;
 }
 
-function __atrFindTimelineVideoProjectItemsByMediaPath(mediaPath, items, seen) {
-  var wanted = __atrNormalizeComparePath(mediaPath);
+// One walk of the project tree plus one pass over the timelines, reusable
+// across every media-path lookup in a reconcile invocation. Previously each
+// lookup re-walked the whole project (O(targets x project size)).
+function __atrBuildMediaPathLeafIndex() {
+  var index = {
+    leaves: [], // { item, name, media_path } for leaf project items
+    timeline: [], // { item, name, clip_name, media_path } from video tracks
+  };
+
+  var root = app && app.project ? app.project.rootItem : null;
+  if (root) {
+    __atrWalkProjectItems(root, function (item) {
+      if (__atrGetProjectItemChildCount(item) > 0) {
+        return;
+      }
+      index.leaves.push({
+        item: item,
+        name: __atrGetProjectItemName(item),
+        media_path: __atrGetProjectItemMediaPath(item),
+      });
+    });
+  }
+
   var sequenceCount = __atrGetSequenceCount();
   for (var s = 0; s < sequenceCount; s += 1) {
     var sequence = null;
@@ -384,23 +319,23 @@ function __atrFindTimelineVideoProjectItemsByMediaPath(mediaPath, items, seen) {
         if (!projectItem) {
           continue;
         }
-        var itemMediaPath = __atrGetProjectItemMediaPath(projectItem);
         var clipName = "";
         try {
           clipName = __atrSafeString(clip && clip.name ? clip.name : "");
         } catch (eClipName) {
           clipName = "";
         }
-        if (
-          itemMediaPath === wanted ||
-          __atrProjectItemNameMatchesMediaPath(projectItem, mediaPath) ||
-          __atrNameMatchesMediaPath(clipName, mediaPath)
-        ) {
-          __atrPushUniqueProjectItem(items, seen, projectItem);
-        }
+        index.timeline.push({
+          item: projectItem,
+          name: __atrGetProjectItemName(projectItem),
+          clip_name: clipName,
+          media_path: __atrGetProjectItemMediaPath(projectItem),
+        });
       }
     }
   }
+
+  return index;
 }
 
 function __atrCollectProjectItemCandidateNames(items, limit) {
@@ -415,7 +350,7 @@ function __atrCollectProjectItemCandidateNames(items, limit) {
   return names.join(", ");
 }
 
-function __atrFindProjectItemsByMediaPath(mediaPath) {
+function __atrFindProjectItemsByMediaPath(mediaPath, existingIndex) {
   var root = app && app.project ? app.project.rootItem : null;
   var normalizedMediaPath = __atrNormalizePath(mediaPath);
   var wanted = __atrNormalizeComparePath(normalizedMediaPath);
@@ -424,6 +359,8 @@ function __atrFindProjectItemsByMediaPath(mediaPath) {
   if (!root || !wanted) {
     return found;
   }
+
+  var index = existingIndex || __atrBuildMediaPathLeafIndex();
 
   var candidatePaths = [];
   candidatePaths.push(normalizedMediaPath);
@@ -458,32 +395,43 @@ function __atrFindProjectItemsByMediaPath(mediaPath) {
     }
   }
 
-  __atrWalkProjectItems(root, function (item) {
-    if (__atrGetProjectItemChildCount(item) > 0) {
-      return;
+  var e;
+  for (e = 0; e < index.leaves.length; e += 1) {
+    if (index.leaves[e].media_path === wanted) {
+      __atrPushUniqueProjectItem(found, seen, index.leaves[e].item);
     }
-    if (__atrGetProjectItemMediaPath(item) === wanted) {
-      __atrPushUniqueProjectItem(found, seen, item);
+  }
+  for (e = 0; e < index.timeline.length; e += 1) {
+    if (index.timeline[e].media_path === wanted) {
+      __atrPushUniqueProjectItem(found, seen, index.timeline[e].item);
     }
-  });
+  }
 
-  __atrFindTimelineVideoProjectItemsByMediaPath(normalizedMediaPath, found, seen);
+  // Exact media-path matches win outright; name-based matching is only a
+  // last resort for items whose media path is unavailable (offline media),
+  // and now requires exact basename equality.
+  if (found.length > 0) {
+    return found;
+  }
 
-  __atrWalkProjectItems(root, function (itemByName) {
-    if (__atrGetProjectItemChildCount(itemByName) > 0) {
-      return;
+  for (e = 0; e < index.leaves.length; e += 1) {
+    if (__atrNameMatchesMediaPath(index.leaves[e].name, normalizedMediaPath)) {
+      __atrPushUniqueProjectItem(found, seen, index.leaves[e].item);
     }
-    if (__atrProjectItemNameMatchesMediaPath(itemByName, normalizedMediaPath)) {
-      __atrPushUniqueProjectItem(found, seen, itemByName);
+  }
+  for (e = 0; e < index.timeline.length; e += 1) {
+    if (
+      __atrNameMatchesMediaPath(index.timeline[e].name, normalizedMediaPath) ||
+      __atrNameMatchesMediaPath(
+        index.timeline[e].clip_name,
+        normalizedMediaPath,
+      )
+    ) {
+      __atrPushUniqueProjectItem(found, seen, index.timeline[e].item);
     }
-  });
+  }
 
   return found;
-}
-
-function __atrFindProjectItemByMediaPath(mediaPath) {
-  var items = __atrFindProjectItemsByMediaPath(mediaPath);
-  return items.length > 0 ? items[0] : null;
 }
 
 function __atrNormalizeProxyTarget(rawTarget) {
@@ -617,57 +565,6 @@ function __atrComputeManagedProxyRepairOutputPath(localRootPath, target) {
     rootPath,
     __atrJoinPath(relativeProxyDir, baseName + __atrProxyRepairOutputSuffix),
   );
-}
-
-function __atrEscapeRegex(value) {
-  return __atrSafeString(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function __atrReplaceExporterParamValue(xmlText, paramId, nextValue) {
-  var blockPattern = /<ExporterParam\b[\s\S]*?<\/ExporterParam>/g;
-  var identifierPattern = new RegExp(
-    "<ParamIdentifier>" + __atrEscapeRegex(paramId) + "</ParamIdentifier>",
-  );
-  var replaced = false;
-
-  return __atrSafeString(xmlText).replace(blockPattern, function (blockText) {
-    if (replaced || !identifierPattern.test(blockText)) {
-      return blockText;
-    }
-    replaced = true;
-    return blockText.replace(
-      /<ParamValue>[^<]*<\/ParamValue>/,
-      "<ParamValue>" + __atrSafeString(nextValue) + "</ParamValue>",
-    );
-  });
-}
-
-function __atrReplaceExporterParamTag(xmlText, paramId, tagName, nextValue) {
-  var blockPattern = /<ExporterParam\b[\s\S]*?<\/ExporterParam>/g;
-  var identifierPattern = new RegExp(
-    "<ParamIdentifier>" + __atrEscapeRegex(paramId) + "</ParamIdentifier>",
-  );
-  var tagPattern = new RegExp(
-    "<" + __atrEscapeRegex(tagName) + ">[^<]*</" + __atrEscapeRegex(tagName) + ">",
-  );
-  var replaced = false;
-
-  return __atrSafeString(xmlText).replace(blockPattern, function (blockText) {
-    if (replaced || !identifierPattern.test(blockText)) {
-      return blockText;
-    }
-    replaced = true;
-    return blockText.replace(
-      tagPattern,
-      "<" +
-        __atrSafeString(tagName) +
-        ">" +
-        __atrSafeString(nextValue) +
-        "</" +
-        __atrSafeString(tagName) +
-        ">",
-    );
-  });
 }
 
 function __atrIsSuccessfulAttachResult(result) {
@@ -853,234 +750,6 @@ function __atrTryAttachProxy(projectItem, proxyPath) {
     response.error = "attachProxy returned false";
   }
   return response;
-}
-
-function __atrResolveProxyPresetTemplatePath(localRootPath, explicitTemplatePath) {
-  var candidates = [
-    __atrNormalizePath(explicitTemplatePath),
-    __atrJoinPath(localRootPath, "assets/" + __atrProxyPresetTemplateName),
-    __atrJoinPath(
-      __atrGetExtensionRootPath(),
-      "assets/" + __atrProxyPresetTemplateName,
-    ),
-    __atrJoinPath(
-      __atrNormalizePath(new File($.fileName).parent.fsName),
-      "../assets/" + __atrProxyPresetTemplateName,
-    ),
-  ];
-
-  for (var i = 0; i < candidates.length; i += 1) {
-    var candidatePath = __atrNormalizePath(candidates[i]);
-    if (!candidatePath) {
-      continue;
-    }
-    var candidateFile = new File(candidatePath);
-    if (candidateFile.exists) {
-      return {
-        path: candidatePath,
-        error: "",
-      };
-    }
-  }
-
-  var checkedCandidates = [];
-  for (var j = 0; j < candidates.length; j += 1) {
-    if (candidates[j]) {
-      checkedCandidates.push(__atrNormalizePath(candidates[j]));
-    }
-  }
-
-  return {
-    path: "",
-    error:
-      "Proxy preset template not found in bundle or extension assets (" +
-      __atrProxyPresetTemplateName +
-      "). Checked: " +
-      checkedCandidates.join(" | "),
-  };
-}
-
-function __atrBuildProxyPresetPath(localRootPath, target, explicitTemplatePath) {
-  var width = Math.max(
-    2,
-    Number(target && target.expected_proxy_width || 0) || 480,
-  );
-  var height = Math.max(
-    2,
-    Number(target && target.expected_proxy_height || 0) || 270,
-  );
-  var fps = Number(target && target.source_fps || 0);
-  if (!fps || fps <= 0) {
-    fps = 23.976;
-  }
-  var fpsTicks = Math.max(1, Math.round(__atrTicksPerSecond / fps));
-  var audioChannels = Math.max(
-    0,
-    Number(target && target.source_audio_channels || 0),
-  );
-  var audioSampleRate = Math.max(
-    0,
-    Number(target && target.source_audio_sample_rate || 0),
-  );
-  var audioStreamCount = Math.max(
-    0,
-    Number(target && target.source_audio_stream_count || 0),
-  );
-  var hasAudio = audioStreamCount > 0 && audioChannels > 0;
-  var audioBitrate = audioChannels >= 6 ? "256" : audioChannels > 2 ? "192" : "96";
-  var audioKey = hasAudio
-    ? "a" + audioChannels + "_" + (audioSampleRate || 0)
-    : "noaudio";
-  var cacheKey = [
-    __atrNormalizeComparePath(localRootPath),
-    width,
-    height,
-    fpsTicks,
-    audioStreamCount,
-    audioChannels,
-    audioSampleRate,
-  ].join("x");
-  if (__atrProxyPresetPathCache[cacheKey]) {
-    return {
-      path: __atrProxyPresetPathCache[cacheKey],
-      error: "",
-    };
-  }
-
-  var templateResult = __atrResolveProxyPresetTemplatePath(
-    localRootPath,
-    explicitTemplatePath,
-  );
-  if (!templateResult.path) {
-    return {
-      path: "",
-      error: templateResult.error,
-    };
-  }
-
-  var templateXml = __atrReadTextFile(templateResult.path);
-  if (!templateXml) {
-    return {
-      path: "",
-      error: "Proxy preset template is unreadable: " + templateResult.path,
-    };
-  }
-
-  var presetXml = templateXml;
-  presetXml = presetXml.replace(
-    /<PresetName>[^<]*<\/PresetName>/,
-    "<PresetName>ATR Proxy H264 " +
-      width +
-      "x" +
-      height +
-      " " +
-      audioKey +
-      "</PresetName>",
-  );
-  presetXml = presetXml.replace(
-    /<DoAudio>[^<]*<\/DoAudio>/,
-    "<DoAudio>" + (hasAudio ? "true" : "false") + "</DoAudio>",
-  );
-  presetXml = presetXml.replace(
-    /<UseMaximumRenderQuality>[^<]*<\/UseMaximumRenderQuality>/,
-    "<UseMaximumRenderQuality>false</UseMaximumRenderQuality>",
-  );
-  presetXml = __atrReplaceExporterParamValue(
-    presetXml,
-    "ADBEVideoWidth",
-    width,
-  );
-  presetXml = __atrReplaceExporterParamValue(
-    presetXml,
-    "ADBEVideoHeight",
-    height,
-  );
-  presetXml = __atrReplaceExporterParamValue(
-    presetXml,
-    "ADBEVideoFPS",
-    fpsTicks,
-  );
-  presetXml = __atrReplaceExporterParamTag(
-    presetXml,
-    "ADBEVideoWidth",
-    "ParamIsDisabled",
-    "false",
-  );
-  presetXml = __atrReplaceExporterParamTag(
-    presetXml,
-    "ADBEVideoHeight",
-    "ParamIsDisabled",
-    "false",
-  );
-  presetXml = __atrReplaceExporterParamTag(
-    presetXml,
-    "ADBEVideoFPS",
-    "ParamIsDisabled",
-    "false",
-  );
-  presetXml = __atrReplaceExporterParamValue(
-    presetXml,
-    "ADBEVideoMinBitrate",
-    "0.4",
-  );
-  presetXml = __atrReplaceExporterParamValue(
-    presetXml,
-    "ADBEVideoTargetBitrate",
-    "1.2",
-  );
-  presetXml = __atrReplaceExporterParamValue(
-    presetXml,
-    "ADBEVideoMaxBitrate",
-    "2.0",
-  );
-  presetXml = __atrReplaceExporterParamValue(
-    presetXml,
-    "ADBEAudioBitrate",
-    audioBitrate,
-  );
-  if (audioChannels > 0) {
-    presetXml = __atrReplaceExporterParamValue(
-      presetXml,
-      "ADBEAudioNumChannels",
-      String(audioChannels),
-    );
-  }
-  if (audioSampleRate > 0) {
-    presetXml = __atrReplaceExporterParamValue(
-      presetXml,
-      "ADBEAudioRatePerSecond",
-      String(audioSampleRate),
-    );
-  }
-  presetXml = __atrReplaceExporterParamValue(
-    presetXml,
-    "ADBEMPEGKeyframeRate",
-    "30",
-  );
-
-  var presetPath = __atrJoinPath(
-    localRootPath,
-    "proxies/__atr_proxy_presets/atr_proxy_" +
-      width +
-      "x" +
-      height +
-      "_" +
-      fpsTicks +
-      "_" +
-      audioKey +
-      ".epr",
-  );
-  if (!__atrWriteTextFile(presetPath, presetXml)) {
-    return {
-      path: "",
-      error: "Failed to write generated proxy preset: " + presetPath,
-    };
-  }
-  __atrProxyPresetPathCache[cacheKey] = presetPath;
-  return {
-    path: presetPath,
-    error: "",
-  };
 }
 
 function __atrGetProjectItemMediaPath(projectItem) {
@@ -1421,205 +1090,6 @@ function __atrSetImportedMediaOfflineForCleanupObject(localRootPath) {
   return result;
 }
 
-function detachManagedProxiesForCleanup(localRootPath) {
-  try {
-    return JSON.stringify(__atrDetachManagedProxiesForCleanupObject(localRootPath));
-  } catch (e) {
-    return "ERROR: " + e.message + " (line " + e.line + ")";
-  }
-}
-
-function __atrDeleteBinItem(projectItem) {
-  if (!projectItem || !projectItem.deleteBin) {
-    return false;
-  }
-
-  try {
-    return !!projectItem.deleteBin();
-  } catch (e) {
-    return false;
-  }
-}
-
-function __atrDeleteLeafProjectItem(projectItem) {
-  if (
-    !projectItem ||
-    !projectItem.select ||
-    !app ||
-    !app.project ||
-    !app.project.deleteSelection
-  ) {
-    return false;
-  }
-
-  try {
-    projectItem.select();
-    return !!app.project.deleteSelection();
-  } catch (e) {
-    return false;
-  }
-}
-
-function __atrDeleteImportedProjectItems(normalizedRootPath) {
-  var binsDeleted = 0;
-  var leafDeleted = 0;
-  var failed = 0;
-  var passesExecuted = 0;
-  var fallbackBins = [];
-  var scan = __atrBuildImportedCleanupScan(normalizedRootPath);
-
-  while (
-    passesExecuted < __atrCleanupMaxBinPasses &&
-    scan.deletable_bins.length > 0
-  ) {
-    passesExecuted += 1;
-    var passDeleted = 0;
-    fallbackBins = scan.deletable_bins.slice(0);
-
-    for (var i = 0; i < scan.deletable_bins.length; i += 1) {
-      var binRecord = scan.deletable_bins[i];
-      if (__atrDeleteBinItem(binRecord.item)) {
-        binsDeleted += 1;
-        passDeleted += 1;
-      } else {
-        failed += 1;
-      }
-    }
-
-    if (passDeleted <= 0) {
-      break;
-    }
-
-    scan = __atrBuildImportedCleanupScan(normalizedRootPath);
-  }
-
-  if (scan.imported_leaf_items.length > 0) {
-    for (
-      var leafIndex = scan.imported_leaf_items.length - 1;
-      leafIndex >= 0;
-      leafIndex -= 1
-    ) {
-      var leafItem = scan.imported_leaf_items[leafIndex];
-      if (__atrDeleteLeafProjectItem(leafItem)) {
-        leafDeleted += 1;
-      } else {
-        failed += 1;
-      }
-    }
-
-    if (fallbackBins.length > 0) {
-      for (
-        var retryIndex = 0;
-        retryIndex < fallbackBins.length;
-        retryIndex += 1
-      ) {
-        if (__atrDeleteBinItem(fallbackBins[retryIndex].item)) {
-          binsDeleted += 1;
-        }
-      }
-    }
-  }
-
-  scan = __atrBuildImportedCleanupScan(normalizedRootPath);
-
-  return {
-    ok: scan.imported_leaf_items.length === 0,
-    bins_deleted: binsDeleted,
-    leaf_items_deleted: leafDeleted,
-    project_items_failed: failed,
-    project_items_remaining: Number(scan.imported_leaf_items.length || 0),
-    project_items_considered:
-      Number(scan.imported_leaf_items.length || 0) + leafDeleted,
-    passes_executed: passesExecuted,
-  };
-}
-
-function __atrRemoveImportedTimelineClips(normalizedRootPath) {
-  var removed = 0;
-  var failed = 0;
-  var sequenceCount = 0;
-  var sequences = app && app.project ? app.project.sequences : null;
-
-  if (!sequences) {
-    return {
-      removed: 0,
-      failed: 0,
-      sequences: 0,
-    };
-  }
-
-  try {
-    sequenceCount = Number(sequences.numSequences || 0);
-  } catch (eSeq) {
-    sequenceCount = 0;
-  }
-
-  for (var s = 0; s < sequenceCount; s += 1) {
-    var sequence = sequences[s];
-    if (!sequence) {
-      continue;
-    }
-
-    var trackGroups = [sequence.videoTracks, sequence.audioTracks];
-
-    for (var tg = 0; tg < trackGroups.length; tg += 1) {
-      var tracks = trackGroups[tg];
-      if (!tracks) {
-        continue;
-      }
-
-      var trackCount = 0;
-      try {
-        trackCount = Number(tracks.numTracks || 0);
-      } catch (eTrackCount) {
-        trackCount = 0;
-      }
-
-      for (var t = 0; t < trackCount; t += 1) {
-        var track = tracks[t];
-        if (!track || !track.clips) {
-          continue;
-        }
-
-        var clipCount = 0;
-        try {
-          clipCount = Number(track.clips.numItems || 0);
-        } catch (eClipCount) {
-          clipCount = 0;
-        }
-
-        for (var c = clipCount - 1; c >= 0; c -= 1) {
-          var clip = track.clips[c];
-          if (!clip) {
-            continue;
-          }
-
-          var clipMediaPath = __atrGetProjectItemMediaPath(clip.projectItem);
-          if (
-            !clipMediaPath ||
-            !__atrPathStartsWith(clipMediaPath, normalizedRootPath)
-          ) {
-            continue;
-          }
-
-          try {
-            clip.remove(0, 1);
-            removed += 1;
-          } catch (eRemove) {
-            failed += 1;
-          }
-        }
-      }
-    }
-  }
-
-  return {
-    removed: removed,
-    failed: failed,
-    sequences: sequenceCount,
-  };
-}
-
 function __atrPushEncoderEvent(type, jobID, detail) {
   var meta = __atrEncoderJobMetaMap[jobID] || null;
   var event = {
@@ -1649,21 +1119,6 @@ function __atrPushHostTrace(projectId, message, level, detail) {
   __atrPushEncoderEvent("trace", "", payload);
 }
 
-function __atrPushProxySummary(projectId, summary) {
-  var payload = summary || {};
-  payload.project_id = __atrSafeString(projectId);
-  payload.host_build_id = ATR_HOST_BUILD_ID;
-  __atrPushEncoderEvent("proxy_summary", "", payload);
-}
-
-function __atrEscapeForCodeString(value) {
-  return __atrSafeString(value)
-    .replace(/\\/g, "\\\\")
-    .replace(/"/g, '\\"')
-    .replace(/\r/g, "\\r")
-    .replace(/\n/g, "\\n");
-}
-
 function __atrRememberEncoderJob(
   jobID,
   projectId,
@@ -1680,17 +1135,13 @@ function __atrRememberEncoderJob(
   };
 }
 
-function __atrRememberProxyJob(jobID, projectId, mediaPath, proxyPath, localRootPath, autoEnableProxyView) {
-  __atrProxyJobMap[jobID] = {
-    project_id: __atrSafeString(projectId),
-    media_path: __atrNormalizePath(mediaPath),
-    proxy_path: __atrNormalizePath(proxyPath),
-    local_root_path: __atrNormalizePath(localRootPath),
-    auto_enable_proxy_view: !!autoEnableProxyView,
-  };
-}
-
-function __atrAttachProxyToMatchingItems(projectId, mediaPath, proxyPath, localRootPath) {
+function __atrAttachProxyToMatchingItems(
+  projectId,
+  mediaPath,
+  proxyPath,
+  localRootPath,
+  existingIndex,
+) {
   var response = {
     proxy_attached: false,
     proxy_attach_pending: false,
@@ -1711,7 +1162,7 @@ function __atrAttachProxyToMatchingItems(projectId, mediaPath, proxyPath, localR
 
   var proxyFile = new File(__atrNormalizePath(proxyPath));
   var proxyFsPath = __atrSafeString(proxyFile.fsName || proxyPath);
-  var items = __atrFindProjectItemsByMediaPath(mediaPath);
+  var items = __atrFindProjectItemsByMediaPath(mediaPath, existingIndex);
   response.item_count = items.length;
   if (!items.length) {
     response.proxy_attach_pending = true;
@@ -1813,246 +1264,6 @@ function __atrAttachProxyToMatchingItems(projectId, mediaPath, proxyPath, localR
   return response;
 }
 
-function __atrAttachGeneratedProxyForJob(jobID, outputPath) {
-  var job = __atrProxyJobMap[jobID] || null;
-  var response = {
-    proxy_attached: false,
-    proxy_attach_pending: false,
-    proxy_attach_error: "",
-    media_path: "",
-    output_path: __atrSafeString(outputPath),
-    attached_count: 0,
-    eligible_count: 0,
-    already_compliant_count: 0,
-    attach_pending_count: 0,
-    unverified_attach_count: 0,
-  };
-  if (!job) {
-    return response;
-  }
-
-  response.media_path = __atrSafeString(job.media_path);
-  var proxyPath = __atrNormalizePath(outputPath || job.proxy_path);
-  var proxyFile = new File(proxyPath);
-  var proxyFsPath = __atrSafeString(proxyFile.fsName || proxyPath);
-
-  try {
-    var attachAttempt = __atrAttachProxyToMatchingItems(
-      job.project_id,
-      job.media_path,
-      proxyFsPath,
-      job.local_root_path,
-    );
-    response.proxy_attached = !!attachAttempt.proxy_attached;
-    response.proxy_attach_pending = !!attachAttempt.proxy_attach_pending;
-    response.proxy_attach_error = __atrSafeString(
-      attachAttempt.proxy_attach_error,
-    );
-    response.attached_count = Number(attachAttempt.attached_count || 0);
-    response.eligible_count = Number(attachAttempt.eligible_count || 0);
-    response.ignored_count = Number(attachAttempt.ignored_count || 0);
-    response.already_compliant_count = Number(
-      attachAttempt.already_compliant_count || 0,
-    );
-    response.attach_pending_count = Number(attachAttempt.attach_pending_count || 0);
-    response.unverified_attach_count = Number(
-      attachAttempt.unverified_attach_count || 0,
-    );
-  } catch (eAttach) {
-    response.proxy_attached = false;
-    response.proxy_attach_pending = true;
-    response.proxy_attach_error = __atrSafeString(eAttach.message || eAttach);
-  }
-
-  __atrPushHostTrace(
-    job.project_id,
-    response.proxy_attached
-      ? "Proxy attached for " + __atrGetBasename(proxyFsPath)
-      : "Proxy attach failed for " +
-          __atrGetBasename(proxyFsPath) +
-          (response.proxy_attach_error
-            ? ": " + response.proxy_attach_error
-            : ""),
-    response.proxy_attached
-      ? "info"
-      : response.proxy_attach_pending
-        ? "info"
-        : "warn",
-  );
-
-  if (
-    response.proxy_attached &&
-    job.auto_enable_proxy_view &&
-    app &&
-    app.setEnableProxies
-  ) {
-    try {
-      app.setEnableProxies(1);
-    } catch (eEnableProxyView) {}
-  }
-
-  if (!response.proxy_attached && !response.proxy_attach_error) {
-    response.proxy_attach_error = "attachProxy returned false";
-  }
-  return response;
-}
-
-function __atrBuildProxyRepairKey(projectId, mediaPath) {
-  return (
-    __atrSafeString(projectId) +
-    "::" +
-    __atrNormalizeComparePath(mediaPath)
-  );
-}
-
-function __atrFindProxyCapableProjectItemByMediaPath(mediaPath) {
-  var items = __atrFindProjectItemsByMediaPath(mediaPath);
-  for (var i = 0; i < items.length; i += 1) {
-    var item = items[i];
-    if (
-      item &&
-      !__atrIsAtrRawAudioProjectItem(item) &&
-      __atrProjectItemCanAcceptProxy(item)
-    ) {
-      return item;
-    }
-  }
-  return null;
-}
-
-function __atrResolveRepairOutputPath(baseRepairPath) {
-  var normalizedRepairPath = __atrNormalizePath(baseRepairPath);
-  var repairFile = new File(normalizedRepairPath);
-  if (!repairFile.exists) {
-    return normalizedRepairPath;
-  }
-  try {
-    if (repairFile.remove()) {
-      return normalizedRepairPath;
-    }
-  } catch (eRemoveRepair) {}
-
-  var parentPath = __atrGetParentPath(normalizedRepairPath);
-  var baseName = __atrStripExtension(__atrGetBasename(normalizedRepairPath));
-  return __atrJoinPath(
-    parentPath,
-    baseName + "_" + new Date().getTime() + ".mp4",
-  );
-}
-
-function __atrQueueProjectItemProxyRepair(
-  projectId,
-  target,
-  normalizedRootPath,
-  proxyPresetTemplatePath,
-  autoEnableProxyView,
-) {
-  var response = {
-    ok: false,
-    queued: false,
-    job_id: "",
-    output_path: "",
-    error: "",
-  };
-  var repairKey = __atrBuildProxyRepairKey(projectId, target && target.media_path);
-  if (__atrProxyRepairQueuedMap[repairKey]) {
-    response.ok = true;
-    return response;
-  }
-
-  if (!app || !app.encoder) {
-    response.error = "app.encoder is unavailable for proxy repair";
-    return response;
-  }
-
-  var projectItem = __atrFindProxyCapableProjectItemByMediaPath(target.media_path);
-  if (!projectItem) {
-    response.error =
-      "No proxy-capable imported project item found for " + target.media_path;
-    return response;
-  }
-
-  var presetResult = __atrBuildProxyPresetPath(
-    normalizedRootPath,
-    target,
-    proxyPresetTemplatePath,
-  );
-  var presetPath = presetResult && presetResult.path ? presetResult.path : "";
-  if (!presetPath) {
-    response.error =
-      "Failed to build proxy repair preset for " +
-      target.media_path +
-      (presetResult && presetResult.error ? " (" + presetResult.error + ")" : "");
-    return response;
-  }
-
-  var repairPath = __atrResolveRepairOutputPath(
-    __atrComputeManagedProxyRepairOutputPath(normalizedRootPath, target),
-  );
-  var repairFolderPath = __atrGetParentPath(repairPath);
-  if (repairFolderPath && !__atrEnsureFolder(repairFolderPath)) {
-    response.error = "Failed to create proxy repair folder for " + repairPath;
-    return response;
-  }
-
-  __atrPushHostTrace(
-    projectId,
-    "Queueing ProjectItem proxy repair for " + __atrGetBasename(target.media_path),
-    "info",
-  );
-
-  try {
-    app.encoder.launchEncoder();
-    if (!__atrBindEncoderCallbacks()) {
-      response.error = "Unable to bind AME encoder callbacks for proxy repair";
-      return response;
-    }
-
-    var repairFile = new File(repairPath);
-    var repairFsPath = __atrSafeString(repairFile.fsName || repairPath);
-    var presetFile = new File(presetPath);
-    var presetFsPath = __atrSafeString(presetFile.fsName || presetPath);
-    var jobID = __atrEncodeProjectItem(projectItem, repairFsPath, presetFsPath);
-    __atrRememberEncoderJob(
-      jobID,
-      projectId || __atrSafeString(app.project ? app.project.name || "" : ""),
-      "proxy",
-      repairFsPath,
-      presetFsPath,
-    );
-    __atrRememberProxyJob(
-      jobID,
-      projectId || __atrSafeString(app.project ? app.project.name || "" : ""),
-      target.media_path,
-      repairPath,
-      normalizedRootPath,
-      autoEnableProxyView,
-    );
-    __atrProxyJobMap[jobID].proxy_repair = true;
-    __atrProxyJobMap[jobID].repair_key = repairKey;
-    __atrProxyRepairQueuedMap[repairKey] = true;
-    __atrProxyRepairJobKeyMap[jobID] = repairKey;
-
-    if (app.encoder.startBatch) {
-      app.encoder.startBatch();
-    }
-
-    response.ok = true;
-    response.queued = true;
-    response.job_id = __atrSafeString(jobID);
-    response.output_path = repairFsPath;
-    __atrPushHostTrace(
-      projectId,
-      "Queued ProjectItem proxy repair job " + response.job_id,
-      "info",
-    );
-  } catch (eRepair) {
-    response.error = __atrSafeString(eRepair.message || eRepair);
-  }
-
-  return response;
-}
-
 function __atrForgetEncoderJob(jobID) {
   var tempSequenceRecord = __atrTempAudioSequenceByJob[jobID] || null;
   if (tempSequenceRecord) {
@@ -2067,12 +1278,6 @@ function __atrForgetEncoderJob(jobID) {
   try {
     delete __atrEncoderJobMetaMap[jobID];
   } catch (e2) {}
-  try {
-    delete __atrProxyJobMap[jobID];
-  } catch (e3) {}
-  try {
-    delete __atrProxyRepairJobKeyMap[jobID];
-  } catch (e4) {}
 }
 
 function __atrBindEncoderCallbacks() {
@@ -2124,24 +1329,6 @@ function ATR_onEncoderJobComplete(jobID, outputPath) {
   var detail = {
     output_path: __atrSafeString(outputPath),
   };
-  var meta = __atrEncoderJobMetaMap[jobID] || null;
-  if (meta && meta.render_kind === "proxy") {
-    var proxyAttach = __atrAttachGeneratedProxyForJob(jobID, outputPath);
-    detail.proxy_attached = !!proxyAttach.proxy_attached;
-    detail.proxy_attach_pending = !!proxyAttach.proxy_attach_pending;
-    detail.proxy_attach_error = __atrSafeString(proxyAttach.proxy_attach_error);
-    detail.media_path = __atrSafeString(proxyAttach.media_path);
-    detail.attached_count = Number(proxyAttach.attached_count || 0);
-    detail.eligible_count = Number(proxyAttach.eligible_count || 0);
-    detail.already_compliant_count = Number(
-      proxyAttach.already_compliant_count || 0,
-    );
-    detail.ignored_count = Number(proxyAttach.ignored_count || 0);
-    detail.attach_pending_count = Number(proxyAttach.attach_pending_count || 0);
-    detail.unverified_attach_count = Number(
-      proxyAttach.unverified_attach_count || 0,
-    );
-  }
   __atrPushEncoderEvent("complete", jobID, detail);
   __atrForgetEncoderJob(jobID);
 }
@@ -3117,27 +2304,6 @@ function startManagedExport(projectId, sequenceName, outputPath, presetPath) {
   }
 }
 
-function __atrEncodeFile(filePath, outputFsPath, presetFsPath) {
-  var normalizedFilePath = __atrNormalizePath(filePath);
-  var sourceFile = new File(normalizedFilePath);
-  var sourceFsPath = __atrSafeString(sourceFile.fsName || normalizedFilePath);
-  var jobID = null;
-  try {
-    jobID = app.encoder.encodeFile(sourceFsPath, outputFsPath, presetFsPath, 0, 0);
-  } catch (eFive) {
-    try {
-      jobID = app.encoder.encodeFile(sourceFsPath, outputFsPath, presetFsPath, 0);
-    } catch (eFour) {
-      jobID = app.encoder.encodeFile(sourceFsPath, outputFsPath, presetFsPath);
-    }
-  }
-
-  if (!jobID && jobID !== 0) {
-    throw new Error("encodeFile returned an empty job ID");
-  }
-  return jobID;
-}
-
 function __atrEncodeProjectItem(projectItem, outputFsPath, presetFsPath) {
   var jobID = null;
   try {
@@ -3169,699 +2335,6 @@ function __atrEncodeProjectItem(projectItem, outputFsPath, presetFsPath) {
     throw new Error("encodeProjectItem returned an empty job ID");
   }
   return jobID;
-}
-
-function __atrRunScheduledProxyKickoff(kickoffId) {
-  var normalizedKickoffId = __atrSafeString(kickoffId);
-  var payload = __atrPendingProxyKickoffs[normalizedKickoffId] || null;
-  if (!payload) {
-    return;
-  }
-
-  try {
-    delete __atrPendingProxyKickoffs[normalizedKickoffId];
-  } catch (eDeleteKickoff) {}
-
-  var plan = __atrParseProxyPlan(payload.proxyPlanJson);
-  var projectId =
-    plan.project_id || __atrSafeString(app && app.project ? app.project.name : "");
-  __atrPushHostTrace(
-    projectId,
-    "Proxy kickoff started (" + normalizedKickoffId + ")",
-    "info",
-  );
-
-  var result = ensureAtrProjectProxies(
-    payload.localRootPath,
-    payload.proxyPlanJson,
-    payload.proxyPresetTemplatePath,
-  );
-
-  if (result && String(result).indexOf("ERROR:") === 0) {
-    __atrPushHostTrace(projectId, "Proxy kickoff failed: " + result, "error");
-    __atrPushProxySummary(projectId, {
-      ok: false,
-      queued: 0,
-      attached: 0,
-      skipped_h264: 0,
-      already_compliant: 0,
-      replaced_noncompliant: 0,
-      errors: [String(result)],
-      job_ids: [],
-    });
-    return;
-  }
-
-  var parsed = {};
-  try {
-    parsed = JSON.parse(result || "{}");
-  } catch (eParse) {
-    parsed = {
-      ok: false,
-      queued: 0,
-      attached: 0,
-      skipped_h264: 0,
-      already_compliant: 0,
-      replaced_noncompliant: 0,
-      errors: ["Invalid proxy kickoff result: " + __atrSafeString(result)],
-      job_ids: [],
-    };
-  }
-
-  __atrPushProxySummary(projectId, parsed);
-  __atrPushHostTrace(
-    projectId,
-    "Proxy kickoff finished: queued=" +
-      Number(parsed.queued || 0) +
-      ", attached=" +
-      Number(parsed.attached || 0) +
-      ", errors=" +
-      (parsed.errors && parsed.errors.length ? parsed.errors.length : 0),
-    parsed.ok === false ? "warn" : "info",
-  );
-}
-
-function __atrRunScheduledProxyEncoding(kickoffId) {
-  var normalizedKickoffId = __atrSafeString(kickoffId);
-  var payload = __atrPendingProxyKickoffs[normalizedKickoffId] || null;
-  if (!payload) {
-    return;
-  }
-
-  try {
-    delete __atrPendingProxyKickoffs[normalizedKickoffId];
-  } catch (eDeleteKickoff) {}
-
-  var plan = __atrParseProxyPlan(payload.proxyPlanJson);
-  var projectId =
-    plan.project_id || __atrSafeString(app && app.project ? app.project.name : "");
-  __atrPushHostTrace(
-    projectId,
-    "Pre-import proxy encoding kickoff started (" + normalizedKickoffId + ")",
-    "info",
-  );
-
-  var result = queueAtrProjectProxyEncoding(
-    payload.localRootPath,
-    payload.proxyPlanJson,
-    payload.proxyPresetTemplatePath,
-  );
-
-  if (result && String(result).indexOf("ERROR:") === 0) {
-    __atrPushHostTrace(projectId, "Proxy encoding kickoff failed: " + result, "error");
-    __atrPushProxySummary(projectId, {
-      ok: false,
-      queued: 0,
-      skipped_h264: 0,
-      existing_outputs: 0,
-      errors: [String(result)],
-      job_ids: [],
-    });
-    return;
-  }
-
-  var parsed = {};
-  try {
-    parsed = JSON.parse(result || "{}");
-  } catch (eParse) {
-    parsed = {
-      ok: false,
-      queued: 0,
-      skipped_h264: 0,
-      existing_outputs: 0,
-      errors: ["Invalid proxy encoding kickoff result: " + __atrSafeString(result)],
-      job_ids: [],
-    };
-  }
-
-  __atrPushProxySummary(projectId, parsed);
-  __atrPushHostTrace(
-    projectId,
-    "Pre-import proxy encoding kickoff finished: queued=" +
-      Number(parsed.queued || 0) +
-      ", existing=" +
-      Number(parsed.existing_outputs || 0) +
-      ", errors=" +
-      (parsed.errors && parsed.errors.length ? parsed.errors.length : 0),
-    parsed.ok === false ? "warn" : "info",
-  );
-}
-
-function scheduleAtrProjectProxyEncoding(localRootPath, proxyPlanJson, proxyPresetTemplatePath) {
-  try {
-    var plan = __atrParseProxyPlan(proxyPlanJson);
-    var projectId =
-      plan.project_id || __atrSafeString(app && app.project ? app.project.name : "");
-    var targetCount = plan.targets ? plan.targets.length : 0;
-
-    if (!plan.enabled || !targetCount) {
-      return JSON.stringify({
-        ok: true,
-        scheduled: false,
-        project_id: projectId,
-        target_count: targetCount,
-      });
-    }
-
-    __atrPushHostTrace(
-      projectId,
-      "Scheduling pre-import proxy encoding for " + targetCount + " target(s)",
-      "info",
-    );
-
-    if (app && app.scheduleTask) {
-      __atrProxyKickoffSeq += 1;
-      var kickoffId =
-        "atr_proxy_encode_" + new Date().getTime() + "_" + __atrProxyKickoffSeq;
-      __atrPendingProxyKickoffs[kickoffId] = {
-        localRootPath: __atrSafeString(localRootPath),
-        proxyPlanJson: proxyPlanJson,
-        proxyPresetTemplatePath: __atrSafeString(proxyPresetTemplatePath),
-      };
-      app.scheduleTask(
-        '__atrRunScheduledProxyEncoding("' +
-          __atrEscapeForCodeString(kickoffId) +
-          '")',
-        50,
-        false,
-      );
-      __atrPushHostTrace(
-        projectId,
-        "Pre-import proxy encoding scheduled (" + kickoffId + ")",
-        "info",
-      );
-      return JSON.stringify({
-        ok: true,
-        scheduled: true,
-        project_id: projectId,
-        kickoff_id: kickoffId,
-        target_count: targetCount,
-      });
-    }
-
-    __atrPushHostTrace(
-      projectId,
-      "app.scheduleTask unavailable; running pre-import proxy encoding inline",
-      "warn",
-    );
-    var inlineResult = queueAtrProjectProxyEncoding(
-      localRootPath,
-      proxyPlanJson,
-      proxyPresetTemplatePath,
-    );
-    if (inlineResult && String(inlineResult).indexOf("ERROR:") === 0) {
-      return inlineResult;
-    }
-    try {
-      __atrPushProxySummary(projectId, JSON.parse(inlineResult || "{}"));
-    } catch (eInlineParse) {}
-    return inlineResult;
-  } catch (e) {
-    return "ERROR: " + e.message + " (line " + e.line + ")";
-  }
-}
-
-function queueAtrProjectProxyEncoding(localRootPath, proxyPlanJson, proxyPresetTemplatePath) {
-  try {
-    var normalizedRootPath = __atrNormalizePath(localRootPath);
-    if (!normalizedRootPath) {
-      return "ERROR: Missing local project root";
-    }
-
-    var plan = __atrParseProxyPlan(proxyPlanJson);
-    var result = {
-      ok: true,
-      queued: 0,
-      skipped_h264: 0,
-      existing_outputs: 0,
-      errors: [],
-      job_ids: [],
-    };
-    if (plan.ffprobe_warning) {
-      result.ffprobe_warning = plan.ffprobe_warning;
-    }
-    if (!plan.enabled || !plan.targets.length) {
-      return JSON.stringify(result);
-    }
-
-    __atrPushHostTrace(
-      plan.project_id,
-      "Proxy pre-import queue entered for " + plan.targets.length + " target(s)",
-      "info",
-    );
-
-    if (!app || !app.encoder) {
-      return "ERROR: app.encoder is unavailable";
-    }
-
-    __atrPushHostTrace(plan.project_id, "Launching Adobe Media Encoder", "info");
-    app.encoder.launchEncoder();
-    __atrPushHostTrace(plan.project_id, "Binding AME encoder callbacks", "info");
-    if (!__atrBindEncoderCallbacks()) {
-      return "ERROR: Unable to bind AME encoder callbacks";
-    }
-
-    for (var i = 0; i < plan.targets.length; i += 1) {
-      var target = plan.targets[i];
-      if (!target) {
-        continue;
-      }
-
-      if (!target.needs_proxy) {
-        result.skipped_h264 += 1;
-        continue;
-      }
-
-      __atrPushHostTrace(
-        plan.project_id,
-        "Proxy queue target " +
-          (i + 1) +
-          "/" +
-          plan.targets.length +
-          ": " +
-          __atrGetBasename(target.media_path),
-        "info",
-      );
-
-      var desiredProxyPath = __atrComputeManagedProxyOutputPath(
-        normalizedRootPath,
-        target,
-      );
-      var desiredProxyFile = new File(desiredProxyPath);
-      if (desiredProxyFile.exists) {
-        result.existing_outputs += 1;
-        continue;
-      }
-
-      var presetResult = __atrBuildProxyPresetPath(
-        normalizedRootPath,
-        target,
-        proxyPresetTemplatePath,
-      );
-      var presetPath = presetResult && presetResult.path ? presetResult.path : "";
-      if (!presetPath) {
-        result.errors.push(
-          "Failed to build proxy preset for " +
-            target.media_path +
-            (presetResult && presetResult.error
-              ? " (" + presetResult.error + ")"
-              : ""),
-        );
-        result.ok = false;
-        continue;
-      }
-
-      var proxyFolderPath = __atrGetParentPath(desiredProxyPath);
-      if (proxyFolderPath && !__atrEnsureFolder(proxyFolderPath)) {
-        result.errors.push(
-          "Failed to create proxy folder for " + desiredProxyPath,
-        );
-        result.ok = false;
-        continue;
-      }
-
-      __atrPushHostTrace(
-        plan.project_id,
-        "Queueing proxy encode for " + __atrGetBasename(target.media_path),
-        "info",
-      );
-      var desiredProxyOutputFile = new File(desiredProxyPath);
-      var desiredProxyOutputFsPath = __atrSafeString(
-        desiredProxyOutputFile.fsName || desiredProxyPath,
-      );
-      var presetFile = new File(presetPath);
-      var presetFsPath = __atrSafeString(presetFile.fsName || presetPath);
-      var jobID = __atrEncodeFile(
-        target.media_path,
-        desiredProxyOutputFsPath,
-        presetFsPath,
-      );
-      __atrRememberEncoderJob(
-        jobID,
-        plan.project_id || __atrSafeString(app.project ? app.project.name : ""),
-        "proxy",
-        desiredProxyOutputFsPath,
-        presetFsPath,
-      );
-      __atrRememberProxyJob(
-        jobID,
-        plan.project_id || __atrSafeString(app.project ? app.project.name : ""),
-        target.media_path,
-        desiredProxyPath,
-        normalizedRootPath,
-        plan.auto_enable_proxy_view,
-      );
-      __atrPushHostTrace(
-        plan.project_id,
-        "Queued proxy encode job " + __atrSafeString(jobID),
-        "info",
-      );
-      result.queued += 1;
-      result.job_ids.push(__atrSafeString(jobID));
-    }
-
-    if (result.queued > 0 && app.encoder && app.encoder.startBatch) {
-      __atrPushHostTrace(
-        plan.project_id,
-        "Starting AME batch for " + result.queued + " proxy job(s)",
-        "info",
-      );
-      try {
-        app.encoder.startBatch();
-      } catch (eStartBatchQueued) {
-        result.ok = false;
-        result.errors.push(
-          "Failed to start AME batch: " +
-            __atrSafeString(eStartBatchQueued.message || eStartBatchQueued),
-        );
-        __atrPushHostTrace(
-          plan.project_id,
-          "Failed to start AME batch: " +
-            __atrSafeString(eStartBatchQueued.message || eStartBatchQueued),
-          "error",
-        );
-      }
-    }
-
-    return JSON.stringify(result);
-  } catch (e) {
-    return "ERROR: " + e.message + " (line " + e.line + ")";
-  }
-}
-
-function scheduleAtrProjectProxies(localRootPath, proxyPlanJson, proxyPresetTemplatePath) {
-  try {
-    var plan = __atrParseProxyPlan(proxyPlanJson);
-    var projectId =
-      plan.project_id || __atrSafeString(app && app.project ? app.project.name : "");
-    var targetCount = plan.targets ? plan.targets.length : 0;
-
-    if (!plan.enabled || !targetCount) {
-      return JSON.stringify({
-        ok: true,
-        scheduled: false,
-        project_id: projectId,
-        target_count: targetCount,
-      });
-    }
-
-    __atrPushHostTrace(
-      projectId,
-      "Scheduling proxy kickoff for " + targetCount + " target(s)",
-      "info",
-    );
-
-    if (app && app.scheduleTask) {
-      __atrProxyKickoffSeq += 1;
-      var kickoffId =
-        "atr_proxy_" + new Date().getTime() + "_" + __atrProxyKickoffSeq;
-      __atrPendingProxyKickoffs[kickoffId] = {
-        localRootPath: __atrSafeString(localRootPath),
-        proxyPlanJson: proxyPlanJson,
-        proxyPresetTemplatePath: __atrSafeString(proxyPresetTemplatePath),
-      };
-      app.scheduleTask(
-        '__atrRunScheduledProxyKickoff("' +
-          __atrEscapeForCodeString(kickoffId) +
-          '")',
-        50,
-        false,
-      );
-      __atrPushHostTrace(
-        projectId,
-        "Proxy kickoff scheduled (" + kickoffId + ")",
-        "info",
-      );
-      return JSON.stringify({
-        ok: true,
-        scheduled: true,
-        project_id: projectId,
-        kickoff_id: kickoffId,
-        target_count: targetCount,
-      });
-    }
-
-    __atrPushHostTrace(
-      projectId,
-      "app.scheduleTask unavailable; running proxy kickoff inline",
-      "warn",
-    );
-    return ensureAtrProjectProxies(
-      localRootPath,
-      proxyPlanJson,
-      proxyPresetTemplatePath,
-    );
-  } catch (e) {
-    return "ERROR: " + e.message + " (line " + e.line + ")";
-  }
-}
-
-function ensureAtrProjectProxies(localRootPath, proxyPlanJson, proxyPresetTemplatePath) {
-  try {
-    if (!app || !app.project) {
-      return "ERROR: No active Premiere project";
-    }
-
-    var normalizedRootPath = __atrNormalizePath(localRootPath);
-    if (!normalizedRootPath) {
-      return "ERROR: Missing local project root";
-    }
-
-    var plan = __atrParseProxyPlan(proxyPlanJson);
-    var result = {
-      ok: true,
-      queued: 0,
-      attached: 0,
-      skipped_h264: 0,
-      already_compliant: 0,
-      replaced_noncompliant: 0,
-      errors: [],
-      job_ids: [],
-    };
-    if (plan.ffprobe_warning) {
-      result.ffprobe_warning = plan.ffprobe_warning;
-    }
-    if (!plan.enabled || !plan.targets.length) {
-      return JSON.stringify(result);
-    }
-
-    __atrPushHostTrace(
-      plan.project_id,
-      "Proxy audit entered for " + plan.targets.length + " target(s)",
-      "info",
-    );
-
-    if (!app.encoder) {
-      return "ERROR: app.encoder is unavailable";
-    }
-
-    __atrPushHostTrace(plan.project_id, "Launching Adobe Media Encoder", "info");
-    app.encoder.launchEncoder();
-    __atrPushHostTrace(plan.project_id, "Binding AME encoder callbacks", "info");
-    if (!__atrBindEncoderCallbacks()) {
-      return "ERROR: Unable to bind AME encoder callbacks";
-    }
-
-    for (var i = 0; i < plan.targets.length; i += 1) {
-      var target = plan.targets[i];
-      if (!target) {
-        continue;
-      }
-
-      if (!target.needs_proxy) {
-        result.skipped_h264 += 1;
-        continue;
-      }
-
-      __atrPushHostTrace(
-        plan.project_id,
-        "Proxy audit target " +
-          (i + 1) +
-          "/" +
-          plan.targets.length +
-          ": " +
-          __atrGetBasename(target.media_path),
-        "info",
-      );
-
-      var projectItem = __atrFindProjectItemByMediaPath(target.media_path);
-      if (!projectItem) {
-        result.errors.push(
-          "Imported project item not found for " + target.media_path,
-        );
-        result.ok = false;
-        continue;
-      }
-
-      if (!projectItem.canProxy || !projectItem.canProxy()) {
-        result.errors.push(
-          "Project item cannot accept a proxy: " +
-            __atrSafeString(projectItem.name),
-        );
-        result.ok = false;
-        continue;
-      }
-
-      var desiredProxyPath = __atrComputeManagedProxyOutputPath(
-        normalizedRootPath,
-        target,
-      );
-      var currentProxyPath = "";
-      try {
-        if (projectItem.hasProxy && projectItem.hasProxy()) {
-          currentProxyPath = __atrNormalizePath(projectItem.getProxyPath());
-        }
-      } catch (eCurrentProxy) {
-        currentProxyPath = "";
-      }
-
-      var desiredProxyFile = new File(desiredProxyPath);
-      var desiredExists = !!desiredProxyFile.exists;
-      var desiredMatchesCurrent =
-        __atrNormalizeComparePath(currentProxyPath) ===
-        __atrNormalizeComparePath(desiredProxyPath);
-
-      if (desiredMatchesCurrent && desiredExists) {
-        result.already_compliant += 1;
-        continue;
-      }
-
-      if (desiredExists) {
-        try {
-          var desiredProxyFsPath = __atrSafeString(
-            desiredProxyFile.fsName || desiredProxyPath,
-          );
-          var attachExisting = __atrTryAttachProxy(
-            projectItem,
-            desiredProxyFsPath,
-          );
-          if (!attachExisting.ok) {
-            throw new Error(attachExisting.error || "attachProxy returned false");
-          }
-          result.attached += 1;
-          if (currentProxyPath) {
-            result.replaced_noncompliant += 1;
-          }
-          continue;
-        } catch (eAttachExisting) {
-          result.errors.push(
-            "Failed to attach existing proxy for " +
-              target.media_path +
-              ": " +
-              __atrSafeString(eAttachExisting.message || eAttachExisting),
-          );
-          result.ok = false;
-          continue;
-        }
-      }
-
-      var presetResult = __atrBuildProxyPresetPath(
-        normalizedRootPath,
-        target,
-        proxyPresetTemplatePath,
-      );
-      var presetPath = presetResult && presetResult.path ? presetResult.path : "";
-      if (!presetPath) {
-        result.errors.push(
-          "Failed to build proxy preset for " +
-            target.media_path +
-            (presetResult && presetResult.error
-              ? " (" + presetResult.error + ")"
-              : ""),
-        );
-        result.ok = false;
-        continue;
-      }
-
-      var proxyFolderPath = __atrGetParentPath(desiredProxyPath);
-      if (proxyFolderPath && !__atrEnsureFolder(proxyFolderPath)) {
-        result.errors.push(
-          "Failed to create proxy folder for " + desiredProxyPath,
-        );
-        result.ok = false;
-        continue;
-      }
-
-      __atrPushHostTrace(
-        plan.project_id,
-        "Queueing proxy encode for " + __atrGetBasename(target.media_path),
-        "info",
-      );
-      var desiredProxyOutputFile = new File(desiredProxyPath);
-      var desiredProxyOutputFsPath = __atrSafeString(
-        desiredProxyOutputFile.fsName || desiredProxyPath,
-      );
-      var presetFile = new File(presetPath);
-      var presetFsPath = __atrSafeString(presetFile.fsName || presetPath);
-      var jobID = __atrEncodeProjectItem(
-        projectItem,
-        desiredProxyOutputFsPath,
-        presetFsPath,
-      );
-      __atrRememberEncoderJob(
-        jobID,
-        plan.project_id || __atrSafeString(app.project.name || ""),
-        "proxy",
-        desiredProxyOutputFsPath,
-        presetFsPath,
-      );
-      __atrRememberProxyJob(
-        jobID,
-        plan.project_id || __atrSafeString(app.project.name || ""),
-        target.media_path,
-        desiredProxyPath,
-        normalizedRootPath,
-        plan.auto_enable_proxy_view,
-      );
-      __atrPushHostTrace(
-        plan.project_id,
-        "Queued proxy encode job " + __atrSafeString(jobID),
-        "info",
-      );
-      result.queued += 1;
-      result.job_ids.push(__atrSafeString(jobID));
-      if (currentProxyPath && !__atrLooksLikeManagedProxyPath(currentProxyPath, normalizedRootPath)) {
-        result.replaced_noncompliant += 1;
-      }
-    }
-
-    if (
-      plan.auto_enable_proxy_view &&
-      (result.attached > 0 || result.already_compliant > 0) &&
-      app.setEnableProxies
-    ) {
-      try {
-        app.setEnableProxies(1);
-      } catch (eEnableProxyView) {}
-    }
-
-    if (result.queued > 0 && app.encoder && app.encoder.startBatch) {
-      __atrPushHostTrace(
-        plan.project_id,
-        "Starting AME batch for " + result.queued + " proxy job(s)",
-        "info",
-      );
-      try {
-        app.encoder.startBatch();
-      } catch (eStartBatchQueued) {
-        result.ok = false;
-        result.errors.push(
-          "Failed to start AME batch: " +
-            __atrSafeString(eStartBatchQueued.message || eStartBatchQueued),
-        );
-        __atrPushHostTrace(
-          plan.project_id,
-          "Failed to start AME batch: " +
-            __atrSafeString(eStartBatchQueued.message || eStartBatchQueued),
-          "error",
-        );
-      }
-    }
-
-    return JSON.stringify(result);
-  } catch (e) {
-    return "ERROR: " + e.message + " (line " + e.line + ")";
-  }
 }
 
 function reconcileAtrProjectProxies(localRootPath, proxyPlanJson) {
@@ -3898,6 +2371,15 @@ function reconcileAtrProjectProxies(localRootPath, proxyPlanJson) {
       return JSON.stringify(result);
     }
 
+    // One project/timeline scan shared by every target in this invocation.
+    var mediaIndex = null;
+    function getMediaIndex() {
+      if (!mediaIndex) {
+        mediaIndex = __atrBuildMediaPathLeafIndex();
+      }
+      return mediaIndex;
+    }
+
     for (var i = 0; i < plan.targets.length; i += 1) {
       var target = plan.targets[i];
       if (!target || !target.needs_proxy) {
@@ -3920,15 +2402,6 @@ function reconcileAtrProjectProxies(localRootPath, proxyPlanJson) {
         result.missing_outputs += 1;
         continue;
       }
-      var repairKey = __atrBuildProxyRepairKey(plan.project_id, target.media_path);
-      if (__atrProxyRepairQueuedMap[repairKey] && !repairProxyFile.exists) {
-        result.pending += 1;
-        result.attach_pending += 1;
-        result.attach_pending_errors.push(
-          target.media_path + ": ProjectItem proxy repair is still rendering",
-        );
-        continue;
-      }
 
       try {
         var attachResult = null;
@@ -3941,6 +2414,7 @@ function reconcileAtrProjectProxies(localRootPath, proxyPlanJson) {
             target.media_path,
             repairProxyFsPath,
             normalizedRootPath,
+            getMediaIndex(),
           );
         }
 
@@ -3956,6 +2430,7 @@ function reconcileAtrProjectProxies(localRootPath, proxyPlanJson) {
             target.media_path,
             desiredProxyFsPath,
             normalizedRootPath,
+            getMediaIndex(),
           );
         }
 
@@ -4033,39 +2508,15 @@ function reconcileAtrProjectProxies(localRootPath, proxyPlanJson) {
   }
 }
 
-function __atrCountTrackedProxyJobs() {
-  var count = 0;
-  for (var jobID in __atrProxyJobMap) {
-    if (__atrProxyJobMap.hasOwnProperty(jobID)) {
-      count += 1;
-    }
-  }
-  return count;
-}
-
 function __atrClearTrackedProxyState() {
   var canceledJobs = 0;
-  for (var proxyJobID in __atrProxyJobMap) {
-    if (__atrProxyJobMap.hasOwnProperty(proxyJobID)) {
-      canceledJobs += 1;
-      try {
-        delete __atrProxyJobMap[proxyJobID];
-      } catch (eDeleteProxy) {}
-      try {
-        delete __atrEncoderJobProjectMap[proxyJobID];
-      } catch (eDeleteProject) {}
-      try {
-        delete __atrEncoderJobMetaMap[proxyJobID];
-      } catch (eDeleteMeta) {}
-    }
-  }
-
   for (var metaJobID in __atrEncoderJobMetaMap) {
     if (
       __atrEncoderJobMetaMap.hasOwnProperty(metaJobID) &&
       __atrEncoderJobMetaMap[metaJobID] &&
       __atrEncoderJobMetaMap[metaJobID].render_kind === "proxy"
     ) {
+      canceledJobs += 1;
       try {
         delete __atrEncoderJobProjectMap[metaJobID];
       } catch (eDeleteProject2) {}
@@ -4075,23 +2526,11 @@ function __atrClearTrackedProxyState() {
     }
   }
 
-  __atrProxyRepairQueuedMap = {};
-  __atrProxyRepairJobKeyMap = {};
   __atrProxyAttachAttemptMap = {};
-
-  var canceledKickoffs = 0;
-  for (var kickoffId in __atrPendingProxyKickoffs) {
-    if (__atrPendingProxyKickoffs.hasOwnProperty(kickoffId)) {
-      canceledKickoffs += 1;
-      try {
-        delete __atrPendingProxyKickoffs[kickoffId];
-      } catch (eDeleteKickoff) {}
-    }
-  }
 
   return {
     canceled_proxy_jobs: canceledJobs,
-    canceled_scheduled_kickoffs: canceledKickoffs,
+    canceled_scheduled_kickoffs: 0,
   };
 }
 
@@ -4195,7 +2634,9 @@ function __atrEnsureAmeRunning(result) {
     }
   }
 
-  var deadline = new Date().getTime() + 90000;
+  // Each pass blocks Premiere's ExtendScript engine (and UI); keep it short
+  // and let the panel retry the whole clear instead of one 90s host wait.
+  var deadline = new Date().getTime() + 20000;
   while (new Date().getTime() < deadline) {
     if (__atrBridgeTalkTargetIsRunning(targets)) {
       return true;
@@ -4210,7 +2651,7 @@ function __atrEnsureAmeRunning(result) {
     } catch (eSleepLaunch) {}
   }
 
-  result.errors.push("Adobe Media Encoder did not start within 90 seconds");
+  result.errors.push("Adobe Media Encoder did not start within 20 seconds");
   return false;
 }
 
@@ -4238,7 +2679,7 @@ function __atrClearAmeQueueThroughBridgeTalk() {
   var sent = false;
   var sendErrors = [];
   try {
-    var sendDeadline = new Date().getTime() + 30000;
+    var sendDeadline = new Date().getTime() + 10000;
     while (!sent && new Date().getTime() < sendDeadline) {
       for (var targetIndex = 0; targetIndex < targets.length && !sent; targetIndex += 1) {
         var bt = new BridgeTalk();
@@ -4336,7 +2777,7 @@ function __atrClearAmeQueueThroughBridgeTalk() {
 function cancelAtrProxyRenderingAndClearMediaEncoder() {
   var response = {
     ok: true,
-    canceled_proxy_jobs: __atrCountTrackedProxyJobs(),
+    canceled_proxy_jobs: 0,
     canceled_scheduled_kickoffs: 0,
     cleared_queue: false,
     errors: [],
@@ -4385,44 +2826,3 @@ function pullEncoderEvents() {
   }
 }
 
-/**
- * Remove imported assets (project panel + timeline fallback) tied to a local project root.
- *
- * @param {string} localRootPath
- * @returns {string} JSON result or ERROR
- */
-function cleanupImportedProjectMedia(localRootPath) {
-  try {
-    var normalizedRootPath = __atrNormalizeComparePath(localRootPath);
-    if (!normalizedRootPath) {
-      return "ERROR: Missing local root path";
-    }
-
-    var projectItems = __atrDeleteImportedProjectItems(normalizedRootPath);
-    var timeline = __atrRemoveImportedTimelineClips(normalizedRootPath);
-    var result = {
-      ok: !!projectItems.ok,
-      local_root: normalizedRootPath,
-      bins_deleted: Number(projectItems.bins_deleted || 0),
-      leaf_items_deleted: Number(projectItems.leaf_items_deleted || 0),
-      project_items_failed: Number(projectItems.project_items_failed || 0),
-      project_items_remaining: Number(
-        projectItems.project_items_remaining || 0,
-      ),
-      project_items_considered: Number(
-        projectItems.project_items_considered || 0,
-      ),
-      cleanup_passes_executed: Number(projectItems.passes_executed || 0),
-      timeline_removed: Number(timeline.removed || 0),
-      timeline_failed: Number(timeline.failed || 0),
-    };
-
-    if (!result.ok) {
-      result.error = "Imported Premiere project items remain after cleanup";
-    }
-
-    return JSON.stringify(result);
-  } catch (e) {
-    return "ERROR: " + e.message + " (line " + e.line + ")";
-  }
-}

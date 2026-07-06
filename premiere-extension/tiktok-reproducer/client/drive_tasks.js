@@ -7,15 +7,17 @@ var https = require("https");
 var zlib = require("zlib");
 var querystring = require("querystring");
 var crypto = require("crypto");
+var childProcess = require("child_process");
+var constants = require("./constants");
 var subtitleArchive = require("./subtitle_archive");
 var downloadProgress = require("./download_progress");
 
 var DRIVE_API_HOST = "www.googleapis.com";
 var OAUTH_HOST = "oauth2.googleapis.com";
 var FOLDER_MIME = "application/vnd.google-apps.folder";
-var OUTPUT_FILENAME = "output.mp4";
-var SUBTITLES_DIRNAME = "subtitles";
-var SUBTITLES_ARCHIVE_FILENAME = "atr_subtitles.zip";
+var OUTPUT_FILENAME = constants.OUTPUT_FILENAME;
+var SUBTITLES_DIRNAME = constants.SUBTITLES_DIRNAME;
+var SUBTITLES_ARCHIVE_FILENAME = constants.SUBTITLES_ARCHIVE_FILENAME;
 var RESUMABLE_CHUNK_SIZE = 8 * 1024 * 1024;
 var MAX_RETRIES = 6;
 var DOWNLOAD_CONCURRENCY_DEFAULT = 4;
@@ -1668,6 +1670,294 @@ function testDriveConnection(payload) {
   });
 }
 
+// --- Local path removal (runs in the worker so the panel thread never
+// blocks on chmod walks, rmSync retries, or Windows shell fallbacks) ---
+
+var CLEANUP_BACKOFF_BASE_MS = 250;
+var CLEANUP_BACKOFF_MAX_MS = 4000;
+var CLEANUP_NODE_RM_MAX_RETRIES = 18;
+var CLEANUP_NODE_RM_RETRY_DELAY_MS = 250;
+var CLEANUP_REMAINING_PREVIEW_LIMIT = 6;
+
+function isCleanupRetryableError(err) {
+  var code = String(err && err.code ? err.code : "").toUpperCase();
+  return (
+    code === "EBUSY" ||
+    code === "EPERM" ||
+    code === "EACCES" ||
+    code === "ENOTEMPTY"
+  );
+}
+
+function formatCleanupError(err) {
+  if (!err) {
+    return "Unknown cleanup failure";
+  }
+  var code = String(err.code || "").trim();
+  var message = String(err.message || err).trim();
+  if (code && message.indexOf(code + ":") !== 0) {
+    return code + ": " + message;
+  }
+  return message || code || "Unknown cleanup failure";
+}
+
+function collectCleanupRemainingEntries(rootPath, limit) {
+  var normalizedRoot = String(rootPath || "").trim();
+  var maxCount = Math.max(1, Number(limit || CLEANUP_REMAINING_PREVIEW_LIMIT));
+  var out = [];
+
+  if (!normalizedRoot || !fs.existsSync(normalizedRoot)) {
+    return out;
+  }
+
+  function walk(dirPath, relPrefix) {
+    if (out.length >= maxCount) {
+      return;
+    }
+    var entries = [];
+    try {
+      entries = fs.readdirSync(dirPath);
+    } catch (e) {
+      if (relPrefix) {
+        out.push(relPrefix);
+      }
+      return;
+    }
+
+    entries.sort();
+    for (var i = 0; i < entries.length; i += 1) {
+      if (out.length >= maxCount) {
+        break;
+      }
+      var name = entries[i];
+      var absPath = path.join(dirPath, name);
+      var relPath = relPrefix ? path.join(relPrefix, name) : name;
+      out.push(relPath);
+      try {
+        var st = fs.statSync(absPath);
+        if (st.isDirectory()) {
+          walk(absPath, relPath);
+        }
+      } catch (statErr) {
+        // ignore inaccessible entry
+      }
+    }
+  }
+
+  walk(normalizedRoot, "");
+  return out.slice(0, maxCount);
+}
+
+function removePathWithWindowsFallback(targetPath) {
+  if (
+    process.platform !== "win32" ||
+    !targetPath ||
+    !fs.existsSync(targetPath)
+  ) {
+    return {
+      attempted: false,
+      ok: false,
+    };
+  }
+  var errors = [];
+  try {
+    childProcess.execFileSync(
+      "cmd.exe",
+      ["/d", "/c", "rmdir", "/s", "/q", targetPath],
+      { windowsHide: true },
+    );
+    return {
+      attempted: true,
+      ok: !fs.existsSync(targetPath),
+      method: "cmd_rmdir",
+    };
+  } catch (e) {
+    errors.push(e);
+  }
+  if (!fs.existsSync(targetPath)) {
+    return {
+      attempted: true,
+      ok: true,
+      method: "cmd_rmdir",
+    };
+  }
+  try {
+    childProcess.execFileSync(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "Remove-Item -LiteralPath $args[0] -Recurse -Force -ErrorAction Stop",
+        targetPath,
+      ],
+      { windowsHide: true },
+    );
+    return {
+      attempted: true,
+      ok: !fs.existsSync(targetPath),
+      method: "powershell_remove_item",
+    };
+  } catch (psErr) {
+    errors.push(psErr);
+  }
+  return {
+    attempted: true,
+    ok: false,
+    error: errors[errors.length - 1],
+    method: "windows_fallbacks",
+  };
+}
+
+function makePathWritableRecursive(targetPath) {
+  var normalized = String(targetPath || "").trim();
+  if (!normalized || !fs.existsSync(normalized)) {
+    return;
+  }
+
+  function chmodPath(itemPath, isDirectory) {
+    try {
+      fs.chmodSync(itemPath, isDirectory ? 0o777 : 0o666);
+    } catch (eFile) {
+      // Best effort only; locked media will still be reported by deletion.
+    }
+  }
+
+  function walk(dirPath) {
+    var entries = [];
+    try {
+      entries = fs.readdirSync(dirPath);
+    } catch (eRead) {
+      chmodPath(dirPath, true);
+      return;
+    }
+    for (var i = 0; i < entries.length; i += 1) {
+      var entryPath = path.join(dirPath, entries[i]);
+      var stat = null;
+      try {
+        stat = fs.lstatSync(entryPath);
+      } catch (eStat) {
+        chmodPath(entryPath, false);
+        continue;
+      }
+      if (stat && stat.isDirectory()) {
+        walk(entryPath);
+      }
+      chmodPath(entryPath, !!(stat && stat.isDirectory()));
+    }
+  }
+  walk(normalized);
+  chmodPath(normalized, true);
+}
+
+function removePathOnce(targetPath) {
+  var normalized = String(targetPath || "").trim();
+  var windowsFallbackUsed = false;
+  if (!normalized) {
+    return {
+      ok: false,
+      error: new Error("Cleanup path is empty"),
+    };
+  }
+
+  if (!fs.existsSync(normalized)) {
+    return {
+      ok: true,
+      removed: false,
+    };
+  }
+
+  try {
+    makePathWritableRecursive(normalized);
+    if (fs.rmSync) {
+      fs.rmSync(normalized, {
+        recursive: true,
+        force: true,
+        maxRetries: CLEANUP_NODE_RM_MAX_RETRIES,
+        retryDelay: CLEANUP_NODE_RM_RETRY_DELAY_MS,
+      });
+    } else {
+      fs.rmdirSync(normalized, { recursive: true });
+    }
+  } catch (e) {
+    var fallbackAfterError = removePathWithWindowsFallback(normalized);
+    windowsFallbackUsed = !!fallbackAfterError.attempted;
+    if (!fallbackAfterError.ok) {
+      return {
+        ok: false,
+        error: fallbackAfterError.error || e,
+        windows_delete_fallback_used: windowsFallbackUsed,
+      };
+    }
+  }
+
+  if (fs.existsSync(normalized)) {
+    var fallbackAfterExists = removePathWithWindowsFallback(normalized);
+    windowsFallbackUsed = !!fallbackAfterExists.attempted;
+    if (!fallbackAfterExists.ok) {
+      return {
+        ok: false,
+        error:
+          fallbackAfterExists.error ||
+          new Error("Path still exists after cleanup: " + normalized),
+        windows_delete_fallback_used: windowsFallbackUsed,
+      };
+    }
+  }
+
+  return {
+    ok: true,
+    removed: true,
+    windows_delete_fallback_used: windowsFallbackUsed,
+  };
+}
+
+function performRemoveLocalPath(payload) {
+  var normalized = String((payload && payload.target_path) || "").trim();
+  var maxAttempts = Math.max(1, Number((payload && payload.max_attempts) || 1));
+  var attempt = 0;
+
+  function tryRemove() {
+    attempt += 1;
+    var result = removePathOnce(normalized);
+    if (result.ok) {
+      return Promise.resolve({
+        ok: true,
+        removed: !!result.removed,
+        attempts: attempt,
+        windows_delete_fallback_used: !!result.windows_delete_fallback_used,
+      });
+    }
+
+    var retryable = isCleanupRetryableError(result.error);
+    if (retryable && attempt < maxAttempts) {
+      var waitMs = Math.min(
+        CLEANUP_BACKOFF_MAX_MS,
+        CLEANUP_BACKOFF_BASE_MS * Math.pow(2, attempt - 1),
+      );
+      return sleep(waitMs).then(tryRemove);
+    }
+
+    return Promise.resolve({
+      ok: false,
+      removed: false,
+      attempts: attempt,
+      retryable_lock: retryable,
+      windows_delete_fallback_used: !!result.windows_delete_fallback_used,
+      error_message: formatCleanupError(result.error),
+      error_code: String((result.error && result.error.code) || ""),
+      remaining_entries: collectCleanupRemainingEntries(
+        normalized,
+        CLEANUP_REMAINING_PREVIEW_LIMIT,
+      ),
+    });
+  }
+
+  return tryRemove();
+}
+
 function validateSettings(settings) {
   var missing = [];
   if (!settings) {
@@ -1708,6 +1998,10 @@ function runTask(task, payload, emitProgress) {
   if (task === "uploadOutput") {
     validateSettings((safePayload || {}).settings || {});
     return performResumableUpload(safePayload, reporter);
+  }
+
+  if (task === "removeLocalPath") {
+    return performRemoveLocalPath(safePayload);
   }
 
   return Promise.reject(new Error("Unknown task: " + task));

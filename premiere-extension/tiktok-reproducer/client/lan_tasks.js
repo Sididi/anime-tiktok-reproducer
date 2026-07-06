@@ -9,6 +9,7 @@ var http = require("http");
 var https = require("https");
 var urlModule = require("url");
 
+var constants = require("./constants");
 var driveTasks = require("./drive_tasks.js");
 var subtitleArchive = require("./subtitle_archive");
 var downloadProgress = require("./download_progress");
@@ -17,10 +18,11 @@ var LAN_API_VERSION = 1;
 var FILE_MAX_ATTEMPTS = 3;
 var FILE_RETRY_DELAY_MS = 2000;
 var DOWNLOAD_CONCURRENCY = 2;
-var SUBTITLES_DIRNAME = "subtitles";
-var SUBTITLES_ARCHIVE_FILENAME = "atr_subtitles.zip";
-var PROJECT_CONTEXT_FILENAME = ".atr_project_context.json";
-var OUTPUT_FILENAME = "output.mp4";
+var UPLOAD_PROGRESS_BUCKET_PCT = 5;
+var SUBTITLES_DIRNAME = constants.SUBTITLES_DIRNAME;
+var SUBTITLES_ARCHIVE_FILENAME = constants.SUBTITLES_ARCHIVE_FILENAME;
+var PROJECT_CONTEXT_FILENAME = constants.PROJECT_CONTEXT_FILENAME;
+var OUTPUT_FILENAME = constants.OUTPUT_FILENAME;
 var FINALIZE_RENAME_MAX_ATTEMPTS = 3;
 var FINALIZE_RENAME_DELAY_MS = 150;
 
@@ -428,9 +430,20 @@ function performUploadOutput(payload, emitProgress) {
       });
       req.on("error", reject);
       var uploaded = 0;
+      var lastEmittedBucket = -1;
       var source = fs.createReadStream(outputPath);
+      // Emit at most one progress event per 5% bucket: through the worker
+      // every emit is an IPC message, and per-chunk emission floods the
+      // channel with thousands of messages on large outputs.
       source.on("data", function (chunk) {
         uploaded += chunk.length;
+        var pct =
+          totalBytes > 0 ? Math.floor((uploaded / totalBytes) * 100) : 0;
+        var bucket = Math.floor(pct / UPLOAD_PROGRESS_BUCKET_PCT);
+        if (bucket === lastEmittedBucket && uploaded < totalBytes) {
+          return;
+        }
+        lastEmittedBucket = bucket;
         emitProgress({ stage: "upload_progress", uploaded_bytes: uploaded, total_bytes: totalBytes });
       });
       source.on("error", reject);

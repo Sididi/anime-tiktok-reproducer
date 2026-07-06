@@ -4,10 +4,11 @@ var fs = require("fs");
 var path = require("path");
 var childProcess = require("child_process");
 var crypto = require("crypto");
+var constants = require("./constants");
 
-var SUBTITLES_DIRNAME = "subtitles";
-var SUBTITLES_ARCHIVE_FILENAME = "atr_subtitles.zip";
-var SUBTITLE_TIMING_FILENAME = "subtitle_timings.srt";
+var SUBTITLES_DIRNAME = constants.SUBTITLES_DIRNAME;
+var SUBTITLES_ARCHIVE_FILENAME = constants.SUBTITLES_ARCHIVE_FILENAME;
+var SUBTITLE_TIMING_FILENAME = constants.SUBTITLE_TIMING_FILENAME;
 var POWERSHELL_TIMEOUT_MS = 300000;
 var TEMP_DIR_PREFIX = "__atr_subtitles_extract__";
 
