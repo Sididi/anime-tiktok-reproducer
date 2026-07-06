@@ -1256,17 +1256,25 @@
     PROJECT_ITEM_CACHE_WARMED = true;
   }
 
-  // Index the ENTIRE project once (media path + name), not just the current
-  // project bin. Visiting every item is a strict superset of what each
-  // per-clip searchEverywhere walk would find, so once this runs a cache miss
-  // by media path is authoritative and the full-root walk can be skipped.
+  // Index the ENTIRE project once BY MEDIA PATH ONLY (ATR_BATCH_SAFE_MEDIA_INDEX),
+  // not just the current project bin. Visiting every item is a strict superset
+  // of what each per-clip searchEverywhere walk would find, so once this runs
+  // a cache miss by media path is authoritative and the full-root walk can be
+  // skipped. Never cache foreign bins' items by NAME here: during batch intake
+  // several __ATR_PROJECT__* bins coexist and every project ships identically
+  // named assets (tts_edited.wav, music, overlays); a name-keyed whole-project
+  // index makes the next project resolve the PREVIOUS project's audio instead
+  // of importing its own file. Media paths are unique per project, names are not.
   function warmFullProjectMediaIndex() {
     if (FULL_MEDIA_INDEX_WARMED) return;
     var root = getProjectRootItem();
     if (!root) return;
     walkProjectItems(root, function (item) {
       if (!isBinItem(item)) {
-        cacheProjectItem(item);
+        var itemMediaPath = getProjectItemMediaPath(item);
+        if (itemMediaPath) {
+          cacheProjectItemByMediaPath(itemMediaPath, item);
+        }
       }
     });
     FULL_MEDIA_INDEX_WARMED = true;
@@ -1702,6 +1710,15 @@
       findProjectItem(nameNoExt) ||
       findProjectItemLoose(cleanName) ||
       findProjectItemLoose(nameNoExt);
+    // Guard: when we know which file on disk we want, a name-matched item
+    // pointing at a DIFFERENT file is another project's asset with the same
+    // filename — treat it as a miss so the real file gets imported.
+    if (item && mediaPath) {
+      var itemMediaPath = getProjectItemMediaPath(item);
+      if (itemMediaPath && itemMediaPath !== normalizeComparePath(mediaPath)) {
+        return null;
+      }
+    }
     if (item) {
       moveItemToProjectBin(item);
       cacheProjectItem(item);

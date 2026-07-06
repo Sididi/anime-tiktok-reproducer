@@ -91,7 +91,7 @@ def test_strict_validator_rejects_scene_count_mismatch(monkeypatch) -> None:
     )
 
     assert not result.passed
-    assert "scene count mismatch" in result.rows[0]
+    assert "scene count differs" in result.rows[0]
 
 
 def test_strict_validator_allows_at_most_three_loose_scene_timings(monkeypatch) -> None:

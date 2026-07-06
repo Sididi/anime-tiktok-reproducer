@@ -1590,6 +1590,89 @@
     };
   }
 
+  // Retrofit for import_project.jsx generated between 2026-07-05 and
+  // 2026-07-06: their warmFullProjectMediaIndex caches every item in the
+  // whole Premiere project BY NAME, so during batch intake project N+1
+  // resolves project N's identically named assets (tts_edited.wav, music,
+  // overlays) instead of importing its own files. New scripts carry the
+  // ATR_BATCH_SAFE_MEDIA_INDEX marker (path-only index) from the template.
+  function patchImportProjectForBatchSafeMediaIndex(importPath) {
+    var normalizedImportPath = String(importPath || "").trim();
+    if (!normalizedImportPath || !fs.existsSync(normalizedImportPath)) {
+      return {
+        patched: false,
+        reason: "missing_import_project",
+      };
+    }
+
+    var source = fs.readFileSync(normalizedImportPath, "utf8");
+    if (source.indexOf("ATR_BATCH_SAFE_MEDIA_INDEX") !== -1) {
+      return {
+        patched: false,
+        reason: "already_patched",
+      };
+    }
+    if (source.indexOf("warmFullProjectMediaIndex") === -1) {
+      // Pre-index script: name lookups never left the project bin.
+      return {
+        patched: false,
+        reason: "index_not_present",
+      };
+    }
+
+    var legacyFunction = [
+      "  function warmFullProjectMediaIndex() {",
+      "    if (FULL_MEDIA_INDEX_WARMED) return;",
+      "    var root = getProjectRootItem();",
+      "    if (!root) return;",
+      "    walkProjectItems(root, function (item) {",
+      "      if (!isBinItem(item)) {",
+      "        cacheProjectItem(item);",
+      "      }",
+      "    });",
+      "    FULL_MEDIA_INDEX_WARMED = true;",
+      "  }",
+    ].join("\n");
+
+    var functionStart = source.indexOf(legacyFunction);
+    if (functionStart < 0) {
+      return {
+        patched: false,
+        reason: "index_function_shape_unknown",
+      };
+    }
+
+    var replacement = [
+      "  function warmFullProjectMediaIndex() {",
+      "    // ATR_BATCH_SAFE_MEDIA_INDEX: cache by media path only. Caching",
+      "    // foreign bins' items by NAME made later batch projects reuse the",
+      "    // previous project's identically named assets (tts_edited.wav...).",
+      "    if (FULL_MEDIA_INDEX_WARMED) return;",
+      "    var root = getProjectRootItem();",
+      "    if (!root) return;",
+      "    walkProjectItems(root, function (item) {",
+      "      if (!isBinItem(item)) {",
+      "        var itemMediaPath = getProjectItemMediaPath(item);",
+      "        if (itemMediaPath) {",
+      "          cacheProjectItemByMediaPath(itemMediaPath, item);",
+      "        }",
+      "      }",
+      "    });",
+      "    FULL_MEDIA_INDEX_WARMED = true;",
+      "  }",
+    ].join("\n");
+
+    var nextSource =
+      source.substring(0, functionStart) +
+      replacement +
+      source.substring(functionStart + legacyFunction.length);
+    fs.writeFileSync(normalizedImportPath, nextSource, "utf8");
+    return {
+      patched: true,
+      reason: "patched",
+    };
+  }
+
   function registerProxyEncoderJobs(projectId, jobIds) {
     var ids = Array.isArray(jobIds) ? jobIds : [];
     ids.forEach(function (jobId) {
@@ -3022,6 +3105,23 @@
             "Could not patch import_project.jsx proxy routing: " +
               importPatchErr.message,
             "warn",
+          );
+        }
+
+        var mediaIndexPatch =
+          patchImportProjectForBatchSafeMediaIndex(importPath);
+        if (mediaIndexPatch.patched) {
+          log(
+            "Patched import_project.jsx media index for batch-safe lookups",
+            "info",
+          );
+        } else if (mediaIndexPatch.reason === "index_function_shape_unknown") {
+          // Running this script could silently place the previous batch
+          // project's audio; failing the import is the safer outcome.
+          throw new Error(
+            "import_project.jsx has an unrecognized whole-project media " +
+              "index (not batch-safe). Regenerate the project JSX " +
+              "(backend/scripts/regenerate_import_project_jsx.py) and retry.",
           );
         }
 

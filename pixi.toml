@@ -49,8 +49,11 @@ openai = ">=1.50.0"
 yt-dlp = ">=2026.3.17"
 # Held <0.7: scenedetect 0.7 changes the detection API
 scenedetect = ">=0.6.5,<0.7"
-# 28.x was deleted from PyPI; 29.x is the Nim rewrite (same CLI flags we use)
-auto-editor = ">=29.0.0,<30"
+# 28.x was deleted from PyPI, and the only PyPI release (29.3.1, Nim rewrite)
+# has a broken audio renderer: every clip renders at 2x speed padded with
+# silence (verified 2026-07-06 on synthetic + real TTS wavs). Install the
+# last known-good Python version from the upstream git tag instead.
+auto-editor = { git = "https://github.com/WyattBlue/auto-editor", tag = "28.1.0" }
 opentimelineio = ">=0.18.1"
 pillow = ">=10.0"
 scipy = ">=1.10.0"
