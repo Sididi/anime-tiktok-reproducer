@@ -38,6 +38,8 @@ Tu reçois un JSON contenant des scènes. Chaque scène possède :
 - **Expressions Datées/Ringardes :** BANNIS les idiomes vieillots.
   - _Remplace par du concret/visuel :_ Utilise le langage courant et moderne parlé actuellement par les jeunes adultes natifs en [TARGET].
 - **Les Transitions (Crucial) :** Remplace les connecteurs écrits par des connecteurs oraux fluides typiques de [TARGET] (équivalents de "Du coup", "Alors", "Bref", "Au final").
+- **Enchaînements Causaux :** Quand le lien entre deux idées du script source est une opposition ou une conséquence, rends-le explicite (équivalents en [TARGET] de "Mais", "Sauf que", "Du coup") plutôt qu'une simple succession ("Et", "Puis", "Ensuite"). Un enchaînement causal retient mieux l'attention. **ATTENTION :** tu reformules un lien déjà présent dans le script source, tu n'inventes JAMAIS un lien de cause à effet qui n'y est pas.
+- **Concret > Intensité :** Si le script source contient un détail concret (un chiffre, un objet, un geste, une durée), conserve-le tel quel — ne le remplace jamais par un adjectif vague. Limite les intensificateurs creux (équivalents de "incroyable", "de fou") : maximum un par macro-séquence, c'est le détail concret qui crée l'impact. N'invente aucun détail absent du script source.
 - **Structure :** Fais des phrases courtes et directes.
 - **Interdit :** Pas de temps verbaux purement littéraires (comme le Passé Simple en français), sauf effet dramatique. Ça doit sonner parlé.
 
@@ -90,6 +92,7 @@ Ton input JSON découpe la vidéo en "plans de coupe" (cuts) très courts. Ne tr
 3. **L'Ancrage Visuel (IMPÉRATIF) :** C'est ta seule contrainte rigide lors de la redistribution.
    - Si la scène X montre une action spécifique (ex: un coup de poing), le mot correspondant en [TARGET] DOIT être dans l'objet JSON de la scène X.
    - *Méthode :* Écris l'histoire fluide, puis "épingle" les mots-clés sur les bons index temporels.
+4. **Interdiction de Spoiler :** Lors du regroupement, ne révèle JAMAIS une information avant le moment où le script source la révèle (ou avant la scène qui la montre à l'écran). Si le script source garde un suspense, ton texte le garde exactement au même endroit.
 
 ### 8. FORMATTAGE AUDIO
 
@@ -100,7 +103,8 @@ Ton input JSON découpe la vidéo en "plans de coupe" (cuts) très courts. Ne tr
 # FORMAT DE SORTIE
 
 - Retourne **UNIQUEMENT** un JSON valide.
-- Garde **STRICTEMENT** la même structure (mêmes clés, même nombre d'objets).
+- Commence l'objet JSON par une clé optionnelle `"_plan"` (une seule string, 3 à 5 lignes max) : notes-y ton découpage en macro-séquences et les mots d'ancrage visuel AVANT d'écrire les scènes. Cette clé est ignorée par le système — elle sert uniquement à structurer ta réflexion. Reste bref.
+- À part `"_plan"`, garde **STRICTEMENT** la même structure (mêmes clés, même nombre d'objets).
 - Change la valeur de la clé `"language"` pour le code ISO de [TARGET] (ex: "fr", "es", "de").
 - Si une scène d'entrée a un `text` vide (`""`), conserve-la vide en sortie. Ne génère aucun texte pour ces scènes. Cela veut dire que ce sont des scènes purement visuelles (raw scenes) où on laisse le son originel de l'œuvre.
 - Ne mets aucun markdown (pas de ```json), pas d'intro, pas de conclusion. Juste le raw JSON string.

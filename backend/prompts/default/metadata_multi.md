@@ -24,14 +24,11 @@ The final title will be chosen later inside the app and injected automatically i
 # Block 1: 8 unified metadata titles
 
 - Return EXACTLY 8 options in `title_candidates`.
-- Each title must be 62 characters maximum (strict).
-- Before finalizing each title, count its characters (including spaces)
-- If a title exceeds 62 characters, shorten it before including it
-- Valid examples:
-  - "This anime will make you cry" (28 chars) ✓
-  - "The most intense scene you'll watch today" (42 chars) ✓
-- Invalid example:
-  - "This anime scene will completely change your perspective on everything" (71 chars) ✗
+- Aim for 55 characters maximum per title (the system truncates at 62, so stay short).
+- **Front-loading:** the strongest word of the title must appear within the first 3 words. Feeds truncate, eyes scan the beginning.
+- **Specificity:** at least 4 out of 8 titles must reference a concrete element of the script (an action, a stake, a twist) without spoiling the resolution. A specific title beats a generic one.
+  - _Good:_ "He sacrifices his arm to save her"
+  - _Weak:_ "This anime will make you cry" (generic, seen everywhere)
 - The 8 titles must cover genuinely different angles, including:
   - shock
   - mystery
@@ -49,19 +46,20 @@ The final title will be chosen later inside the app and injected automatically i
 ## YouTube
 
 - `description`: ultra-condensed summary, 2 sentences maximum.
-- `tags`: include [OEUVRE] plus useful tags such as anime / manga / recommendation / recap.
+- The FIRST sentence is the only one visible before the click ("...more") and the only one search engines weight: it must contain a searchable genre keyword (e.g. "action anime", "revenge anime" in [TARGET]) AND leave a question open. Under 100 characters.
+- `tags`: include [OEUVRE] plus useful tags such as anime / manga / recommendation / recap (written in [TARGET]).
 
 ## Facebook
 
 - `description`: slightly more narrative, 3 to 4 short sentences, preserve mystery.
-- End with exactly: "Abonne toi pour plus de présentations d'anime"
+- End with a short subscribe CTA written in [TARGET] that promises the viewer a benefit — the [TARGET] equivalent of: "Subscribe to find your next anime gem". Never write this CTA in another language than [TARGET].
 - You may keep hashtags at the end if they feel natural.
-- `tags`: include [OEUVRE], Anime, Manga, Otaku, Recommandation Anime, Scène Culte, Meilleur Anime.
+- `tags`: include [OEUVRE] plus the [TARGET] equivalents of: Anime, Manga, Otaku, Anime Recommendation, Iconic Scene, Best Anime.
 
 ## Instagram
 
 - Return only `hashtags`.
-- Generate 3 to 5 relevant hashtags based on genre / tone / anime type.
+- Generate 4 to 5 hashtags mixing reach tiers: 1-2 very broad (#anime, #manga), 2-3 niche ones tied to the genre / tone and the [TARGET] audience (#animeaction, #sadanime...). The broad + niche mix maximizes discoverability.
 - Each entry must already start with `#`.
 - Do not return a full caption sentence.
 

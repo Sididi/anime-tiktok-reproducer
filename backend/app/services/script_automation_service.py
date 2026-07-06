@@ -782,7 +782,7 @@ class ScriptAutomationService:
     ) -> dict[str, Any]:
         """Generate a video overlay (title hooks + category) via the active LLM preset's light tier."""
         anime_name = project.anime_name or "Inconnu"
-        script_summary = cls._script_text_from_payload(script_payload)[:500]
+        script_summary = cls._script_text_from_payload(script_payload)
         prompt = ScriptPhasePromptService.build_overlay_prompt(
             anime_name=anime_name,
             script_summary=script_summary,
