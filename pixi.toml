@@ -28,7 +28,8 @@ torchvision = { version = ">=0.23.0", index = "https://download.pytorch.org/whl/
 torchcodec = ">=0.7.0,<0.8.0"
 
 # WhisperX (requires torch 2.8.x) - GPU accelerated transcription
-whisperx = ">=3.7.6"
+# Held <3.8: whisperx 3.8+ requires pyannote-audio>=4 (breaking major)
+whisperx = ">=3.7.6,<3.8"
 
 # FAISS for similarity search (CPU is fast enough for our use case)
 faiss-cpu = ">=1.7.4"
@@ -46,8 +47,10 @@ openai = ">=1.50.0"
 
 # Video/Audio processing
 yt-dlp = ">=2026.3.17"
-scenedetect = ">=0.6.5"
-auto-editor = ">=28.0.0,<29.0.0"
+# Held <0.7: scenedetect 0.7 changes the detection API
+scenedetect = ">=0.6.5,<0.7"
+# 28.x was deleted from PyPI; 29.x is the Nim rewrite (same CLI flags we use)
+auto-editor = ">=29.0.0,<30"
 opentimelineio = ">=0.18.1"
 pillow = ">=10.0"
 scipy = ">=1.10.0"
@@ -64,7 +67,8 @@ en-core-web-sm = { url = "https://github.com/explosion/spacy-models/releases/dow
 es-core-news-sm = { url = "https://github.com/explosion/spacy-models/releases/download/es_core_news_sm-3.8.0/es_core_news_sm-3.8.0-py3-none-any.whl" }
 
 # Speaker diarization for raw scene detection
-pyannote-audio = ">=3.3.0"
+# Held <4: pyannote 4.x is a breaking major (new pipeline API)
+pyannote-audio = ">=3.3.0,<4"
 
 # YAML config parsing
 pyyaml = ">=6.0"

@@ -64,7 +64,7 @@ def test_list_events_returns_filtered_events(client):
     )
     ProjectService.get_project_dir(project.id).mkdir(parents=True, exist_ok=True)
     ProjectService.save(project)
-    r = client.get("/api/scheduling/events")
+    r = client.get("/api/scheduling/events", params={"range_start": _NOW.isoformat()})
     assert r.status_code == 200
     events = r.json()["events"]
     assert any(e["project_id"] == "p1" and e["platform"] == "tiktok" for e in events)
