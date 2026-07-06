@@ -2568,21 +2568,59 @@
     var sequenceEndSec = ttsEndSec;
 
     // --- V2: BORDER MOGRT ---
-    if (WHITE_BORDER_ENABLED && v2 && new File(BORDER_MOGRT_PATH).exists) {
-      log("Adding Border Mogrt to V2...");
-      try {
-        if (sequenceEndSec > 0) {
-          var mgt = sequence.importMGT(BORDER_MOGRT_PATH, 0, 1, 0);
-          if (mgt) {
-            setTrackItemEndSeconds(mgt, sequenceEndSec);
-            log("Border Mogrt inserted. Duration: " + sequenceEndSec);
-          }
-        }
-      } catch (e) {
-        log("Border Mogrt Error: " + e.message);
-      }
-    } else if (!WHITE_BORDER_ENABLED) {
+    if (!WHITE_BORDER_ENABLED) {
       log("Skipping V2 border (template white_border.enabled=false).");
+    } else if (!v2) {
+      log("Warning: V2 track unavailable; Border Mogrt not inserted.");
+    } else if (!new File(BORDER_MOGRT_PATH).exists) {
+      log(
+        "Warning: Border Mogrt file missing at " +
+          BORDER_MOGRT_PATH +
+          "; border not inserted.",
+      );
+    } else {
+      log("Adding Border Mogrt to V2...");
+      var borderItem = null;
+      for (
+        var borderAttempt = 1;
+        borderAttempt <= 3 && !borderItem;
+        borderAttempt++
+      ) {
+        try {
+          borderItem = sequence.importMGT(BORDER_MOGRT_PATH, 0, 1, 0);
+        } catch (eBorder) {
+          log(
+            "Border Mogrt attempt " +
+              borderAttempt +
+              " error: " +
+              eBorder.message,
+          );
+        }
+        if (!borderItem && borderAttempt < 3) {
+          log(
+            "Border Mogrt attempt " +
+              borderAttempt +
+              " returned no item; retrying...",
+          );
+          $.sleep(250);
+        }
+      }
+      if (borderItem) {
+        if (!setTrackItemEndSeconds(borderItem, sequenceEndSec)) {
+          log(
+            "Warning: Border Mogrt inserted but end time could not be set to " +
+              sequenceEndSec +
+              "s.",
+          );
+        } else {
+          log("Border Mogrt inserted. Duration: " + sequenceEndSec);
+        }
+      } else {
+        log(
+          "Warning: Border Mogrt could not be inserted after 3 attempts " +
+            "(importMGT returned no item); V2 border is missing.",
+        );
+      }
     }
 
     validateAndRepairRawSceneVideoPlacement(v1, v3, scenes);
