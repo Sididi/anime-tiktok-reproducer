@@ -114,7 +114,7 @@ export function ProjectSettingsPanel({ config, onChange, disabled }: Props) {
               type="range"
               min={0.2}
               max={1.0}
-              step={0.05}
+              step={0.01}
               value={speed}
               disabled={inputDisabled}
               onChange={(e) => setSpeed(parseFloat(e.target.value))}
