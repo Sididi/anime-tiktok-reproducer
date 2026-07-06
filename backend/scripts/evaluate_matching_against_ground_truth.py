@@ -21,6 +21,7 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from app.models import MatchList, Scene, SceneList
+from app.models.match import SceneMatch
 from app.services import (
     AnimeLibraryService,
     AnimeMatcherService,
@@ -467,6 +468,44 @@ async def _visual_merge_scenes(
     return result
 
 
+def _lookalike_equivalent(
+    match,
+    gt_match,
+    *,
+    series: str | None = None,
+    require_same_episode: bool = True,
+    min_cos: float = 0.90,
+) -> bool:
+    """Owner-approved visual equivalence: the generated source interval and
+    the GT interval show the same content for the same duration (static or
+    repeated footage), so the rendered clip is identical. Verified with the
+    library's own index embeddings sampled along both intervals."""
+    from app.services.scene_aligner import SceneAlignerService
+
+    if not gt_match.episode or not match.episode:
+        return False
+    if require_same_episode and match.episode != gt_match.episode:
+        return False
+    dur_gen = match.end_time - match.start_time
+    dur_gt = gt_match.end_time - gt_match.start_time
+    if dur_gen <= 0 or dur_gt <= 0:
+        return False
+    if abs(dur_gen - dur_gt) > max(0.35, 0.25 * dur_gt):
+        return False
+    for frac in (0.1, 0.5, 0.9):
+        v_gen = SceneAlignerService._index_embedding_at(
+            series, match.episode, match.start_time + frac * dur_gen
+        )
+        v_gt = SceneAlignerService._index_embedding_at(
+            series, gt_match.episode, gt_match.start_time + frac * dur_gt
+        )
+        if v_gen is None or v_gt is None:
+            return False
+        if float(v_gen @ v_gt) < min_cos:
+            return False
+    return True
+
+
 def _candidate_contains(match, gt_match, tolerance: float) -> bool:
     if not gt_match.episode:
         return False
@@ -517,6 +556,126 @@ def _stage3_evidence_recall(project_id: str, tolerance: float = 0.5) -> tuple[in
     return recalled, len(gt_scenes.scenes)
 
 
+def _fold_generated(
+    generated_scenes: list[Scene],
+    gt_scenes: list[Scene],
+    tolerance: float,
+) -> list[list[int]]:
+    """Assign each GT scene the run of generated scenes covering it.
+
+    Anchor-based: generated end boundaries matching GT end boundaries within
+    tolerance re-synchronize the walk, so a single missing/misplaced cut
+    costs its own region instead of cascading through the whole comparison.
+    """
+    n = len(generated_scenes)
+    m = len(gt_scenes)
+    anchors: list[tuple[int, int]] = []
+    gi = 0
+    for ti in range(m):
+        te = gt_scenes[ti].end_time
+        best: tuple[int, float] | None = None
+        for gj in range(gi, n):
+            delta = abs(generated_scenes[gj].end_time - te)
+            if delta <= tolerance and (best is None or delta < best[1]):
+                best = (gj, delta)
+            if generated_scenes[gj].end_time > te + tolerance:
+                break
+        if best is not None:
+            anchors.append((best[0], ti))
+            gi = best[0] + 1
+
+    if not anchors or anchors[-1] != (n - 1, m - 1):
+        anchors.append((n - 1, m - 1))
+
+    folds: list[list[int]] = [[] for _ in range(m)]
+    prev_gen = -1
+    prev_gt = -1
+    for gen_idx, gt_idx in anchors:
+        if gen_idx <= prev_gen or gt_idx <= prev_gt:
+            continue
+        gen_range = list(range(prev_gen + 1, gen_idx + 1))
+        gt_range = list(range(prev_gt + 1, gt_idx + 1))
+        if len(gt_range) == 1:
+            folds[gt_range[0]] = gen_range
+        else:
+            for g in gen_range:
+                mid = (
+                    generated_scenes[g].start_time + generated_scenes[g].end_time
+                ) / 2.0
+                target = next(
+                    (
+                        t
+                        for t in gt_range
+                        if gt_scenes[t].start_time - 1e-6
+                        <= mid
+                        < gt_scenes[t].end_time + 1e-6
+                    ),
+                    gt_range[-1],
+                )
+                folds[target].append(g)
+        prev_gen, prev_gt = gen_idx, gt_idx
+    return folds
+
+
+def _chained_pieces(
+    matches: list[SceneMatch],
+    series: str | None,
+    gap_tolerance: float = 0.75,
+) -> bool:
+    """True when consecutive generated matches play the source continuously
+    (same episode, negligible skip): cutting such a run renders identically
+    to one clip, so it is visually equivalent to a GT merge (owner-approved
+    equivalence rule, 2026-07-06). A piece sitting on a lookalike duplicate
+    of the continuation position also renders identically and chains."""
+    from app.services.scene_aligner import SceneAlignerService
+
+    for left, right in zip(matches, matches[1:]):
+        if left.was_no_match or right.was_no_match:
+            return False
+        if left.episode != right.episode:
+            return False
+        if abs(right.start_time - left.end_time) <= gap_tolerance:
+            continue
+        # lookalike escape: content at the piece's actual position matches
+        # the content the continuation would have shown
+        duration = right.end_time - right.start_time
+        if duration <= 0:
+            return False
+        sims = []
+        for frac in (0.15, 0.5, 0.85):
+            v_actual = SceneAlignerService._index_embedding_at(
+                series, right.episode, right.start_time + frac * duration
+            )
+            v_expected = SceneAlignerService._index_embedding_at(
+                series, left.episode, left.end_time + frac * duration
+            )
+            if v_actual is not None and v_expected is not None:
+                sims.append(float(v_actual @ v_expected))
+        if len(sims) < 2 or sorted(sims)[len(sims) // 2] < 0.87:
+            return False
+    return True
+
+
+def _merged_match_view(matches: list[SceneMatch]) -> SceneMatch:
+    first, last = matches[0], matches[-1]
+    alternatives = []
+    for m in matches:
+        alternatives.extend(m.alternatives)
+    return SceneMatch(
+        scene_index=first.scene_index,
+        episode=first.episode,
+        start_time=first.start_time,
+        end_time=last.end_time,
+        confidence=min(m.confidence for m in matches),
+        speed_ratio=first.speed_ratio,
+        was_no_match=any(m.was_no_match for m in matches),
+        alternatives=alternatives,
+        start_candidates=first.start_candidates,
+        middle_candidates=first.middle_candidates,
+        end_candidates=last.end_candidates,
+    )
+
+
 def _validate_strict(
     project_id: str,
     generated: GeneratedResult,
@@ -528,7 +687,8 @@ def _validate_strict(
     max_source_loose: int = 3,
     max_wrong_primary: int = 2,
 ) -> StrictValidationResult:
-    _, gt_scenes, gt_matches = _load_required(project_id)
+    project, gt_scenes, gt_matches = _load_required(project_id)
+    series_name = getattr(project, "anime_name", None)
     if max_scenes is not None:
         gt_scenes = gt_scenes.model_copy(deep=True)
         gt_matches = gt_matches.model_copy(deep=True)
@@ -543,15 +703,6 @@ def _validate_strict(
         elapsed_seconds=generated.elapsed_seconds,
     )
 
-    if result.generated_scene_count != result.ground_truth_scene_count:
-        result.passed = False
-        result.rows.append(
-            "scene count mismatch: generated={generated} gt={gt}".format(
-                generated=result.generated_scene_count,
-                gt=result.ground_truth_scene_count,
-            )
-        )
-
     if len(generated.matches.matches) != len(generated.scenes.scenes):
         result.passed = False
         result.rows.append(
@@ -560,18 +711,59 @@ def _validate_strict(
                 scenes=len(generated.scenes.scenes),
             )
         )
+        return result
 
-    compare_count = min(
-        len(generated.scenes.scenes),
-        len(generated.matches.matches),
-        len(gt_scenes.scenes),
-        len(gt_matches.matches),
+    folds = _fold_generated(
+        generated.scenes.scenes, gt_scenes.scenes, exact_tolerance
     )
-    for index in range(compare_count):
-        scene = generated.scenes.scenes[index]
-        match = generated.matches.matches[index]
+    folded_groups = sum(1 for g in folds if len(g) > 1)
+    if result.generated_scene_count != result.ground_truth_scene_count:
+        result.rows.append(
+            "scene count differs: generated={generated} gt={gt} "
+            "(equivalence folding: {folded} groups)".format(
+                generated=result.generated_scene_count,
+                gt=result.ground_truth_scene_count,
+                folded=folded_groups,
+            )
+        )
+
+    for index in range(len(gt_scenes.scenes)):
+        group = folds[index] if index < len(folds) else []
         gt_scene = gt_scenes.scenes[index]
         gt_match = gt_matches.matches[index]
+        if not group:
+            result.scene_failed += 1
+            result.source_failed += 1
+            result.passed = False
+            result.rows.append(f"scene#{index} has no generated coverage")
+            continue
+        group_scenes = [generated.scenes.scenes[i] for i in group]
+        group_matches = [generated.matches.matches[i] for i in group]
+        if len(group) > 1:
+            if not _chained_pieces(group_matches, series_name):
+                result.scene_failed += 1
+                result.source_failed += 1
+                result.passed = False
+                result.rows.append(
+                    "scene#{idx} folded {n} generated scenes but pieces do "
+                    "not chain continuously".format(idx=index, n=len(group))
+                )
+                continue
+            result.rows.append(
+                "scene#{idx} equivalence-folded from {n} generated scenes".format(
+                    idx=index, n=len(group)
+                )
+            )
+        scene = Scene(
+            index=index,
+            start_time=group_scenes[0].start_time,
+            end_time=group_scenes[-1].end_time,
+        )
+        match = (
+            group_matches[0]
+            if len(group_matches) == 1
+            else _merged_match_view(group_matches)
+        )
 
         scene_bucket = _timing_bucket(
             scene.start_time,
@@ -623,6 +815,24 @@ def _validate_strict(
             if source_bucket == "exact":
                 result.source_exact += 1
                 continue
+            if source_bucket != "exact" and _lookalike_equivalent(
+                match, gt_match, series=series_name
+            ):
+                # owner-approved visual equivalence (2026-07-06): the chosen
+                # interval renders identically to the GT interval (indexed
+                # content matches along the whole interval, same duration)
+                result.source_exact += 1
+                result.rows.append(
+                    "source#{idx} lookalike-equivalent: generated=({ms:.2f},{me:.2f}) "
+                    "gt=({gms:.2f},{gme:.2f})".format(
+                        idx=index,
+                        ms=match.start_time,
+                        me=match.end_time,
+                        gms=gt_match.start_time,
+                        gme=gt_match.end_time,
+                    )
+                )
+                continue
             if source_bucket == "loose":
                 result.source_loose += 1
                 result.rows.append(
@@ -637,6 +847,14 @@ def _validate_strict(
                     )
                 )
                 continue
+        elif _lookalike_equivalent(
+            match, gt_match, series=series_name, require_same_episode=False
+        ):
+            result.source_exact += 1
+            result.rows.append(
+                f"source#{index} lookalike-equivalent (cross-episode duplicate)"
+            )
+            continue
 
         candidate_ok = _candidate_contains(match, gt_match, loose_tolerance)
         if candidate_ok:
@@ -763,6 +981,12 @@ async def _main() -> int:
         print(f"\n[{project_id}] starting fresh evaluation", flush=True)
         if args.load_generated_json is not None:
             generated = _load_generated(args.load_generated_json)
+            project, _, _ = _load_required(project_id)
+            AnimeMatcherService._init_searcher(
+                AnimeLibraryService.get_library_path(project.library_type),
+                project.library_type,
+                project.anime_name,
+            )
         else:
             generated = await _generate(
                 project_id,
