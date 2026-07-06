@@ -120,6 +120,8 @@ class ScriptPhasePromptService:
         script_summary: str,
         target_language: str,
         library_type: LibraryType = LibraryType.ANIME,
+        include_title: bool = True,
+        include_category: bool = True,
     ) -> str:
         target_language_code = (target_language or "").strip().lower() or "fr"
         variant = FR if target_language_code == "fr" else MULTI
@@ -129,8 +131,25 @@ class ScriptPhasePromptService:
             language_variant=variant,
             library_type=library_type,
         )
-        return (
+        prompt = (
             template.replace("[OEUVRE]", anime_name)
             .replace("[SCRIPT_SUMMARY]", script_summary)
             .replace("[TARGET]", cls.language_display(target_language_code))
         )
+        if include_title and include_category:
+            return prompt
+        if include_title:
+            scope = (
+                "\nOVERRIDING OUTPUT SCOPE: Generate only `title_hooks`. "
+                "Do not generate `category`. Return exactly "
+                '{"title_hooks": ["hook 1", "..."]}.\n'
+            )
+        elif include_category:
+            scope = (
+                "\nOVERRIDING OUTPUT SCOPE: Generate only `category`. "
+                "Do not generate `title_hooks`. Return exactly "
+                '{"category": "Genre • Genre"}.\n'
+            )
+        else:
+            raise ValueError("At least one overlay field must be requested")
+        return prompt + scope

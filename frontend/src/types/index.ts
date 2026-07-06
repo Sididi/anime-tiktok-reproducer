@@ -116,7 +116,15 @@ export interface ScriptAutomationConfig {
   musics: ScriptAutomationMusic[];
   default_music_key: string | null;
   music_config_error: string | null;
-  templates: Array<{ key: string; label: string; overlay_enabled: boolean }>;
+  templates: Array<{
+    key: string;
+    label: string;
+    overlay_enabled: boolean;
+    overlay_title_enabled: boolean;
+    overlay_category_enabled: boolean;
+    overlay_title_text: string | null;
+    overlay_category_text: string | null;
+  }>;
   llm_presets: Array<{ key: string; label: string }>;
   current: {
     llm_preset: string;
@@ -218,6 +226,8 @@ export interface ScriptPhaseSettingsResponse {
   llm_preset: string;
   template: string;
   min_playback_speed: number;
+  voice_key: string | null;
+  music_key: string | null;
   gaps_recomputing: boolean;
 }
 

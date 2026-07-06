@@ -404,10 +404,11 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
 
     @classmethod
     def _resolve_selected_music_path(cls, project: Project) -> Path | None:
-        if not project.music_key:
+        music_key = project.resolved_music_key()
+        if not music_key:
             return None
         try:
-            music = MusicConfigService.get_music(project.music_key)
+            music = MusicConfigService.get_music(music_key)
         except ValueError:
             return None
         music_path = Path(music.file_path)

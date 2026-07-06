@@ -84,7 +84,7 @@ class ForcedAlignmentService:
     @classmethod
     def _resolve_project_tts_model_id(cls, project_id: str) -> str:
         project = ProjectService.load(project_id)
-        voice_key = project.voice_key if project is not None else None
+        voice_key = project.resolved_voice_key() if project is not None else None
         return ScriptAutomationService.resolve_tts_model_id(voice_key=voice_key)
 
     @classmethod

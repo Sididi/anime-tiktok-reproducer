@@ -56,6 +56,32 @@ def test_overlay_side_style_required():
         OverlaySideConfig(style="", prfpset=None)
 
 
+def test_template_optional_defaults_and_fixed_overlay_text():
+    template = _classic().model_copy(
+        update={
+            "voice_key": "maxime",
+            "music_key": "credits_song_death",
+            "llm_preset": "gemini",
+            "min_playback_speed": 0.6,
+        }
+    )
+    assert template.voice_key == "maxime"
+    assert template.min_playback_speed == 0.6
+    side = OverlaySideConfig(
+        enabled=True,
+        style="minimal",
+        text="  #1  ",
+    )
+    assert side.text == "#1"
+
+
+def test_template_min_playback_speed_uses_project_range():
+    payload = _classic().model_dump()
+    payload["min_playback_speed"] = 0.1
+    with pytest.raises(ValueError):
+        Template.model_validate(payload)
+
+
 def test_templates_config_default_must_exist():
     cfg = TemplatesConfig(default="classic", templates={"classic": _classic()})
     assert cfg.default == "classic"

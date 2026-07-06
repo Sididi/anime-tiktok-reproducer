@@ -95,11 +95,43 @@ class Project(BaseModel):
     def resolved_min_playback_speed(self) -> float:
         if self.min_playback_speed is not None:
             return self.min_playback_speed
+        template_value = self._resolved_template().min_playback_speed
+        if template_value is not None:
+            return template_value
         return settings.min_playback_speed_factor
 
     def resolved_llm_preset_key(self) -> str:
         from ..services.llm_config_service import LLMConfigService
-        return self.llm_preset or LLMConfigService.default_preset_key()
+        return (
+            self.llm_preset
+            or self._resolved_template().llm_preset
+            or LLMConfigService.default_preset_key()
+        )
+
+    def resolved_voice_key(self) -> str | None:
+        from ..services.voice_config_service import VoiceConfigService
+
+        if self.voice_key is not None:
+            return self.voice_key
+        template_value = self._resolved_template().voice_key
+        if template_value is not None:
+            return template_value
+        return VoiceConfigService.get_config().default_voice_key
+
+    def resolved_music_key(self) -> str | None:
+        from ..services.music_config_service import MusicConfigService
+
+        if self.music_key is not None:
+            return self.music_key
+        template_value = self._resolved_template().music_key
+        if template_value is not None:
+            return template_value
+        return MusicConfigService.get_config().default_music_key
+
+    def _resolved_template(self):
+        from ..services.template_service import TemplateService
+
+        return TemplateService.get(self.resolved_template_key())
 
     def resolved_template_key(self) -> str:
         from ..services.template_service import TemplateService

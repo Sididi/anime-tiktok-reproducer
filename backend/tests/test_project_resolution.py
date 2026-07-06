@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -73,3 +74,21 @@ def test_resolved_template_key_falls_back_to_default(monkeypatch):
     )
     p = Project()
     assert p.resolved_template_key() == "classic"
+
+
+def test_template_optional_defaults_are_resolved(monkeypatch):
+    template = SimpleNamespace(
+        min_playback_speed=0.5,
+        llm_preset="mistral",
+        voice_key="nicolas_petit",
+        music_key="montagem_batchi_cut_start_15s",
+    )
+    monkeypatch.setattr(
+        "app.services.template_service.TemplateService.get",
+        classmethod(lambda cls, key: template),
+    )
+    project = Project(template="zoomed")
+    assert project.resolved_min_playback_speed() == 0.5
+    assert project.resolved_llm_preset_key() == "mistral"
+    assert project.resolved_voice_key() == "nicolas_petit"
+    assert project.resolved_music_key() == "montagem_batchi_cut_start_15s"

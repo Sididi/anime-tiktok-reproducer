@@ -7,9 +7,19 @@ from pydantic import BaseModel, Field, model_validator
 class OverlaySideConfig(BaseModel):
     """One side of the overlay (title or category)."""
 
+    enabled: bool = True
     style: str = Field(..., min_length=1)
     prfpset: str | None = None
+    text: str | None = None
     model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def _normalize_fixed_text(self) -> "OverlaySideConfig":
+        if self.text is not None:
+            self.text = self.text.strip()
+            if not self.text:
+                raise ValueError("overlay side text must be non-empty when provided")
+        return self
 
 
 class OverlayConfig(BaseModel):
@@ -55,6 +65,10 @@ class Template(BaseModel):
     subtitles: SubtitlesConfig
     white_border: WhiteBorderConfig
     overlay: OverlayConfig
+    voice_key: str | None = None
+    music_key: str | None = None
+    llm_preset: str | None = None
+    min_playback_speed: float | None = Field(default=None, gt=0.10, le=1.0)
     model_config = {"extra": "forbid"}
 
 

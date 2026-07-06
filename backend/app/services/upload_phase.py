@@ -1582,11 +1582,12 @@ class UploadPhaseService:
         if not project:
             raise ValueError("Project not found")
 
-        if not project.music_key:
+        music_key = project.resolved_music_key()
+        if not music_key:
             return {"copyrighted": False}
 
         try:
-            music = MusicConfigService.get_music(project.music_key)
+            music = MusicConfigService.get_music(music_key)
         except ValueError:
             return {"copyrighted": False}
 
@@ -1618,7 +1619,7 @@ class UploadPhaseService:
 
         return {
             "copyrighted": True,
-            "music_key": project.music_key,
+            "music_key": music_key,
             "music_display_name": music.display_name,
             "no_music_file_id": no_music_file_id,
             "no_music_available": no_music_available,

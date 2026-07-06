@@ -17,14 +17,44 @@ templates:
     overlay:
       enabled: true
       title:
+        enabled: true
         style: "classic"
         prfpset: "SPM Anime Category Title.prfpset"
       category:
+        enabled: false
         style: "classic"
         prfpset: null
 
-  minimal:
-    label: "Minimal (no panel)"
+  zoomed:
+    label: "Minimal (no panel, zoomed)"
+    foreground:
+      prfpset: "SPM Anime Foreground.prfpset"
+      zoom: 0.5
+    background:
+      prfpset: "SPM Anime Background.prfpset"
+    subtitles:
+      mogrt: "SPM_Anime_Subtitle.mogrt"
+      raw_mogrt: "SPM_Anime_Subtitle_Raw.mogrt"
+    white_border:
+      enabled: true
+      mogrt: "White border 10px.mogrt"
+    overlay:
+      enabled: true
+      title:
+        enabled: false
+        style: "minimal"
+        prfpset: null
+      category:
+        enabled: false
+        style: "minimal"
+        prfpset: null
+    voice_key: nicolas_petit
+    music_key: montagem_batchi_cut_start_15s
+    llm_preset: mistral
+    min_playback_speed: 0.5
+
+  squared:
+    label: "Squared"
     foreground:
       prfpset: "SPM Anime Foreground.prfpset"
       zoom: 0.76
@@ -39,8 +69,15 @@ templates:
     overlay:
       enabled: true
       title:
+        enabled: true
         style: "minimal"
         prfpset: null
+        text: "#1"
       category:
+        enabled: true
         style: "minimal"
         prfpset: null
+    voice_key: maxime
+    music_key: credits_song_death
+    llm_preset: gemini
+    min_playback_speed: 0.6

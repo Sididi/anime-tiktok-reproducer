@@ -727,7 +727,29 @@ export function ScriptRestructurePage() {
             }
           }
 
+          const activeTemplate = loadedAutomation?.templates.find(
+            (template) => template.key === loadedAutomation?.current.template,
+          );
+          if (activeTemplate) {
+            if (!activeTemplate.overlay_title_enabled) {
+              savedTitle = "";
+              setOverlayTitle("");
+            } else if (activeTemplate.overlay_title_text) {
+              savedTitle = activeTemplate.overlay_title_text;
+              setOverlayTitle(activeTemplate.overlay_title_text);
+            }
+            if (!activeTemplate.overlay_category_enabled) {
+              savedCategory = "";
+              setOverlayCategory("");
+            } else if (activeTemplate.overlay_category_text) {
+              savedCategory = activeTemplate.overlay_category_text;
+              setOverlayCategory(activeTemplate.overlay_category_text);
+            }
+          }
+
           if (
+            activeTemplate?.overlay_title_enabled !== false &&
+            !activeTemplate?.overlay_title_text &&
             loadedAutomation?.static_overlay_title_enabled &&
             loadedAutomation.static_overlay_title &&
             !hasSavedOverlay &&
@@ -1182,8 +1204,17 @@ export function ScriptRestructurePage() {
         (metadataCandidates?.title_candidates.length || 0) > 0;
       const hasOverlayChoices =
         (normalizedOverlay?.title_hooks?.length || 0) > 0;
+      // A single hook is a template's fixed title: apply it, nothing to decide.
+      const overlayNeedsDecision =
+        (normalizedOverlay?.title_hooks?.length || 0) > 1;
 
-      if (!hasMetadataChoices && !hasOverlayChoices) {
+      if (!hasMetadataChoices && !overlayNeedsDecision) {
+        if (normalizedOverlay && hasOverlayChoices) {
+          applySelectedOverlay({
+            title: normalizedOverlay.title_hooks?.[0] || normalizedOverlay.title,
+            category: normalizedOverlay.category || "",
+          });
+        }
         if (fromAutomation) {
           setAutomationPhase("idle");
         }
@@ -1412,7 +1443,15 @@ export function ScriptRestructurePage() {
           skip_metadata: skipMetadata,
           skip_tts: skipTts,
           pause_after_script: shouldPause,
-          skip_overlay: !!overlayTitle.trim(),
+          skip_overlay: (() => {
+            const template = automationConfig?.templates.find(
+              (item) => item.key === automationConfig.current.template,
+            );
+            return (
+              (!template?.overlay_title_enabled || !!overlayTitle.trim()) &&
+              (!template?.overlay_category_enabled || !!overlayCategory.trim())
+            );
+          })(),
         },
         controller.signal,
       );
@@ -1541,6 +1580,7 @@ export function ScriptRestructurePage() {
     queueTitleSelection,
     validateBeforeTts,
     overlayTitle,
+    overlayCategory,
   ]);
 
   // Resume automation after validation pause (phase 2: TTS + metadata + overlay)
@@ -1591,7 +1631,15 @@ export function ScriptRestructurePage() {
             skip_metadata: false,
             skip_tts: false,
             pause_after_script: false,
-            skip_overlay: !!overlayTitle.trim(),
+            skip_overlay: (() => {
+              const template = automationConfig?.templates.find(
+                (item) => item.key === automationConfig.current.template,
+              );
+              return (
+                (!template?.overlay_title_enabled || !!overlayTitle.trim()) &&
+                (!template?.overlay_category_enabled || !!overlayCategory.trim())
+              );
+            })(),
           },
           controller.signal,
         );
@@ -1676,6 +1724,7 @@ export function ScriptRestructurePage() {
       hydrateAutomationParts,
       queueTitleSelection,
       overlayTitle,
+      overlayCategory,
     ],
   );
 
@@ -2085,6 +2134,23 @@ export function ScriptRestructurePage() {
                   projectId,
                   payload,
                 );
+                setAutomationVoiceKey(result.voice_key ?? "");
+                setAutomationMusicKey(result.music_key);
+                if (payload.template) {
+                  const selectedTemplate = automationConfig.templates.find(
+                    (item) => item.key === result.template,
+                  );
+                  setOverlayTitle(
+                    selectedTemplate?.overlay_title_enabled
+                      ? selectedTemplate.overlay_title_text ?? ""
+                      : "",
+                  );
+                  setOverlayCategory(
+                    selectedTemplate?.overlay_category_enabled
+                      ? selectedTemplate.overlay_category_text ?? ""
+                      : "",
+                  );
+                }
                 setAutomationConfig((prev) =>
                   prev
                     ? {
@@ -2812,10 +2878,15 @@ export function ScriptRestructurePage() {
 
               {/* Video Overlay */}
               {(() => {
-                const overlayDisabledByTemplate = !!automationConfig
-                  && !automationConfig.templates.find(
+                const activeTemplate = automationConfig?.templates.find(
                     (t) => t.key === automationConfig.current.template,
-                  )?.overlay_enabled;
+                  );
+                const overlayDisabledByTemplate = !!automationConfig
+                  && !activeTemplate?.overlay_enabled;
+                const titleDisabledByTemplate = overlayDisabledByTemplate
+                  || !activeTemplate?.overlay_title_enabled;
+                const categoryDisabledByTemplate = overlayDisabledByTemplate
+                  || !activeTemplate?.overlay_category_enabled;
                 return (
                   <div
                     className={`bg-[hsl(var(--card))] rounded-lg p-4 space-y-3 ${
@@ -2840,7 +2911,8 @@ export function ScriptRestructurePage() {
                           overlayDisabledByTemplate ||
                           !jsonValid ||
                           overlayGenerating ||
-                          !!overlayTitle
+                          ((!activeTemplate?.overlay_title_enabled || !!overlayTitle) &&
+                            (!activeTemplate?.overlay_category_enabled || !!overlayCategory))
                         }
                         className="h-7 text-xs"
                       >
@@ -2873,7 +2945,10 @@ export function ScriptRestructurePage() {
                           value={overlayTitle}
                           onChange={(e) => setOverlayTitle(e.target.value)}
                           placeholder="Clickbait title..."
-                          disabled={overlayDisabledByTemplate}
+                          disabled={
+                            titleDisabledByTemplate ||
+                            !!activeTemplate?.overlay_title_text
+                          }
                           className="w-full px-2 py-1.5 text-sm rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--background))]"
                         />
                       </div>
@@ -2886,7 +2961,10 @@ export function ScriptRestructurePage() {
                           value={overlayCategory}
                           onChange={(e) => setOverlayCategory(e.target.value)}
                           placeholder="Genre • Genre"
-                          disabled={overlayDisabledByTemplate}
+                          disabled={
+                            categoryDisabledByTemplate ||
+                            !!activeTemplate?.overlay_category_text
+                          }
                           className="w-full px-2 py-1.5 text-sm rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--background))]"
                         />
                       </div>

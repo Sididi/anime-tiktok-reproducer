@@ -8,6 +8,10 @@ interface TemplateOption {
   key: string;
   label: string;
   overlay_enabled: boolean;
+  overlay_title_enabled: boolean;
+  overlay_category_enabled: boolean;
+  overlay_title_text: string | null;
+  overlay_category_text: string | null;
 }
 
 interface PresetOption {

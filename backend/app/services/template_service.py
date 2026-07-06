@@ -33,9 +33,43 @@ class TemplateService:
         if raw is None:
             raise ValueError(f"Templates config file is empty: {path}")
         try:
-            return TemplatesConfig.model_validate(raw)
+            config = TemplatesConfig.model_validate(raw)
         except ValidationError as exc:
             raise ValueError(f"Invalid templates config: {exc}") from exc
+
+        from .llm_config_service import LLMConfigService
+        from .music_config_service import MusicConfigService
+        from .voice_config_service import VoiceConfigService
+
+        voice_config = (
+            VoiceConfigService.get_config(force_reload=True)
+            if any(template.voice_key for template in config.templates.values())
+            else None
+        )
+        music_config = (
+            MusicConfigService.get_config(force_reload=True)
+            if any(template.music_key for template in config.templates.values())
+            else None
+        )
+        llm_config = (
+            LLMConfigService.get_config(force_reload=True)
+            if any(template.llm_preset for template in config.templates.values())
+            else None
+        )
+        for key, template in config.templates.items():
+            if template.voice_key and template.voice_key not in voice_config.voices:
+                raise ValueError(
+                    f"Invalid template '{key}' voice_key: {template.voice_key}"
+                )
+            if template.music_key and template.music_key not in music_config.musics:
+                raise ValueError(
+                    f"Invalid template '{key}' music_key: {template.music_key}"
+                )
+            if template.llm_preset and template.llm_preset not in llm_config.presets:
+                raise ValueError(
+                    f"Invalid template '{key}' llm_preset: {template.llm_preset}"
+                )
+        return config
 
     @classmethod
     def get_config(cls, *, force_reload: bool = False) -> TemplatesConfig:

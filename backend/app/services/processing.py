@@ -1139,8 +1139,14 @@ class ProcessingService:
         from .template_service import TemplateService
         template = TemplateService.get(project.resolved_template_key())
         overlay = project.video_overlay if isinstance(project.video_overlay, dict) else {}
-        overlay_title_enabled = bool(str(overlay.get("title", "")).strip())
-        overlay_category_enabled = bool(str(overlay.get("category", "")).strip())
+        overlay_title_enabled = bool(
+            template.overlay.title.enabled
+            and str(template.overlay.title.text or overlay.get("title", "")).strip()
+        )
+        overlay_category_enabled = bool(
+            template.overlay.category.enabled
+            and str(template.overlay.category.text or overlay.get("category", "")).strip()
+        )
         return cls._render_jsx_from_template(
             project_id=project.id,
             scenes=scenes,
@@ -1238,8 +1244,16 @@ class ProcessingService:
                 label="CATEGORY_TITLE_PRESET_NAME",
             )
         # White border / overlay enable toggles.
-        effective_title_overlay_enabled = template.overlay.enabled and overlay_title_enabled
-        effective_category_overlay_enabled = template.overlay.enabled and overlay_category_enabled
+        effective_title_overlay_enabled = (
+            template.overlay.enabled
+            and template.overlay.title.enabled
+            and overlay_title_enabled
+        )
+        effective_category_overlay_enabled = (
+            template.overlay.enabled
+            and template.overlay.category.enabled
+            and overlay_category_enabled
+        )
         effective_overlay_enabled = effective_title_overlay_enabled or effective_category_overlay_enabled
         content = cls._replace_template_once(
             content,
@@ -2517,9 +2531,10 @@ class ProcessingService:
                 if not resuming_after_duration_warning:
                     # Resolve auto-editor profile from voice_key if available
                     auto_editor_profile = PRODUCTION_AUTO_EDITOR_PROFILE
-                    if project.voice_key:
+                    resolved_voice_key = project.resolved_voice_key()
+                    if resolved_voice_key:
                         try:
-                            auto_editor_profile = VoiceConfigService.get_auto_editor_profile(project.voice_key)
+                            auto_editor_profile = VoiceConfigService.get_auto_editor_profile(resolved_voice_key)
                         except ValueError:
                             pass  # voice no longer in config, use default
 
@@ -2545,7 +2560,7 @@ class ProcessingService:
                             manifest=ForcedAlignmentService.build_single_audio_manifest(
                                 script_payload=new_script,
                                 model_id=ScriptAutomationService.resolve_tts_model_id(
-                                    voice_key=project.voice_key,
+                                    voice_key=project.resolved_voice_key(),
                                 ),
                             ),
                         )
@@ -2928,11 +2943,12 @@ class ProcessingService:
             # Resolve optional music settings for Premiere automation.
             music_filename = ""
             music_gain_db = -24.0
-            if project.music_key:
+            resolved_music_key = project.resolved_music_key()
+            if resolved_music_key:
                 try:
-                    music = MusicConfigService.get_music(project.music_key)
+                    music = MusicConfigService.get_music(resolved_music_key)
                 except ValueError as exc:
-                    logger.warning("Unknown music key '%s': %s", project.music_key, exc)
+                    logger.warning("Unknown music key '%s': %s", resolved_music_key, exc)
                 else:
                     music_path = Path(music.file_path)
                     if music_path.exists():
@@ -3032,11 +3048,18 @@ class ProcessingService:
             from .template_service import TemplateService
             active_template = TemplateService.get(project.resolved_template_key())
             overlay = project.video_overlay if isinstance(project.video_overlay, dict) else None
-            overlay_title = str(overlay.get("title", "")).strip() if overlay else ""
-            overlay_category = str(overlay.get("category", "")).strip() if overlay else ""
+            overlay_title = (
+                str(active_template.overlay.title.text or (overlay or {}).get("title", "")).strip()
+                if active_template.overlay.title.enabled
+                else ""
+            )
+            overlay_category = (
+                str(active_template.overlay.category.text or (overlay or {}).get("category", "")).strip()
+                if active_template.overlay.category.enabled
+                else ""
+            )
             should_generate_overlay = bool(
                 active_template.overlay.enabled
-                and overlay
                 and (overlay_title or overlay_category)
             )
             if should_generate_overlay:

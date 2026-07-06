@@ -18,7 +18,7 @@ from app.models.template import (
 from app.services.processing import ProcessingService
 
 
-def _template() -> Template:
+def _template(*, title_enabled: bool = True, category_enabled: bool = True) -> Template:
     return Template(
         label="Classic",
         foreground=ForegroundConfig(prfpset="fg.prfpset", zoom=0.76),
@@ -27,8 +27,12 @@ def _template() -> Template:
         white_border=WhiteBorderConfig(enabled=True, mogrt="border.mogrt"),
         overlay=OverlayConfig(
             enabled=True,
-            title=OverlaySideConfig(style="classic", prfpset=None),
-            category=OverlaySideConfig(style="classic", prfpset=None),
+            title=OverlaySideConfig(
+                enabled=title_enabled, style="classic", prfpset=None
+            ),
+            category=OverlaySideConfig(
+                enabled=category_enabled, style="classic", prfpset=None
+            ),
         ),
     )
 
@@ -65,6 +69,26 @@ def test_jsx_enables_only_title_overlay_for_title_only():
     assert "var TITLE_OVERLAY_ENABLED = true;" in jsx
     assert "if (TITLE_OVERLAY_ENABLED)" in jsx
     assert "overlayFadeTrackIndexes.push(5);" in jsx
+
+
+def test_jsx_template_side_disable_wins_over_non_empty_overlay():
+    jsx = ProcessingService._render_jsx_from_template(
+        project_id="test_project",
+        scenes=[],
+        source_audio_policies={},
+        source_fps_num=24000,
+        source_fps_den=1001,
+        subtitle_timing_relative_path="subtitles/subtitle_timings.srt",
+        raw_scene_subtitle_timing_relative_path="raw_scene_subtitles/text_subtitles.srt",
+        raw_scene_subtitle_mogrt_relative_dir="raw_scene_subtitles/text_mogrts",
+        music_filename="",
+        music_gain_db=-23.0,
+        template=_template(title_enabled=True, category_enabled=False),
+        overlay_title_enabled=True,
+        overlay_category_enabled=True,
+    )
+    assert "var TITLE_OVERLAY_ENABLED = true;" in jsx
+    assert "var CATEGORY_OVERLAY_ENABLED = false;" in jsx
 
 
 def test_jsx_enables_only_category_overlay_for_category_only():

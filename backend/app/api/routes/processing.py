@@ -133,7 +133,9 @@ def _normalize_script_payload_or_400(
 
 
 def _resolve_project_tts_model_id(project) -> str:
-    return ScriptAutomationService.resolve_tts_model_id(voice_key=project.voice_key)
+    return ScriptAutomationService.resolve_tts_model_id(
+        voice_key=project.resolved_voice_key()
+    )
 
 
 def _notify_drive_upload_complete(project_id: str, _folder_url: str) -> None:
@@ -299,7 +301,7 @@ async def get_script_automation_config(project_id: str):
             }
             for entry in config.voices.values()
         ]
-        default_voice_key = config.default_voice_key
+        default_voice_key = project.resolved_voice_key()
     except Exception as exc:
         voice_error = str(exc)
 
@@ -312,7 +314,7 @@ async def get_script_automation_config(project_id: str):
             {"key": entry.key, "display_name": entry.display_name}
             for entry in music_config.musics.values()
         ]
-        default_music_key = music_config.default_music_key
+        default_music_key = project.resolved_music_key()
     except Exception as exc:
         music_error = str(exc)
 
@@ -323,7 +325,18 @@ async def get_script_automation_config(project_id: str):
     )
 
     templates_payload = [
-        {"key": key, "label": tpl.label, "overlay_enabled": tpl.overlay.enabled}
+        {
+            "key": key,
+            "label": tpl.label,
+            "overlay_enabled": (
+                tpl.overlay.enabled
+                and (tpl.overlay.title.enabled or tpl.overlay.category.enabled)
+            ),
+            "overlay_title_enabled": tpl.overlay.enabled and tpl.overlay.title.enabled,
+            "overlay_category_enabled": tpl.overlay.enabled and tpl.overlay.category.enabled,
+            "overlay_title_text": tpl.overlay.title.text,
+            "overlay_category_text": tpl.overlay.category.text,
+        }
         for key, tpl in TemplateService.list_templates()
     ]
     presets_payload = [
@@ -747,7 +760,11 @@ async def update_script_settings(project_id: str, request: ScriptSettingsRequest
         project.voice_key = request.voice_key
 
     ProjectService.save(project)
-    return {"status": "ok", "tts_speed": project.tts_speed, "music_key": project.music_key}
+    return {
+        "status": "ok",
+        "tts_speed": project.tts_speed,
+        "music_key": project.resolved_music_key(),
+    }
 
 
 @router.get("/script/settings")
@@ -759,9 +776,9 @@ async def get_script_settings(project_id: str):
 
     return {
         "tts_speed": project.tts_speed,
-        "music_key": project.music_key,
+        "music_key": project.resolved_music_key(),
         "video_overlay": project.video_overlay,
-        "voice_key": project.voice_key,
+        "voice_key": project.resolved_voice_key(),
     }
 
 
@@ -775,6 +792,8 @@ class ScriptPhaseSettingsResponse(BaseModel):
     llm_preset: str
     template: str
     min_playback_speed: float
+    voice_key: str | None
+    music_key: str | None
     gaps_recomputing: bool
 
 
@@ -791,7 +810,21 @@ async def update_script_phase_settings(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    speed_changed = False
+    prior_speed = project.resolved_min_playback_speed()
+
+    if request.template is not None:
+        try:
+            TemplateService.get(request.template)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        project.template = request.template
+        # A template defines defaults. Clear prior per-project choices so the
+        # newly selected template can resolve its own optional overrides.
+        project.llm_preset = None
+        project.min_playback_speed = None
+        project.voice_key = None
+        project.music_key = None
+        project.video_overlay = None
 
     if request.llm_preset is not None:
         try:
@@ -800,21 +833,15 @@ async def update_script_phase_settings(
             raise HTTPException(status_code=400, detail=str(exc))
         project.llm_preset = request.llm_preset
 
-    if request.template is not None:
-        try:
-            TemplateService.get(request.template)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-        project.template = request.template
-
     if request.min_playback_speed is not None:
-        prior = project.resolved_min_playback_speed()
         try:
             project.min_playback_speed = request.min_playback_speed
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
-        if abs(prior - request.min_playback_speed) > 1e-9:
-            speed_changed = True
+
+    speed_changed = abs(
+        prior_speed - project.resolved_min_playback_speed()
+    ) > 1e-9
 
     ProjectService.save(project)
 
@@ -828,13 +855,15 @@ async def update_script_phase_settings(
         llm_preset=project.resolved_llm_preset_key(),
         template=project.resolved_template_key(),
         min_playback_speed=project.resolved_min_playback_speed(),
+        voice_key=project.resolved_voice_key(),
+        music_key=project.resolved_music_key(),
         gaps_recomputing=gaps_recomputing,
     )
 
 
 @router.post("/script/overlay/generate")
 async def generate_overlay(project_id: str, request: OverlayGenerateRequest):
-    """Generate a video overlay (title + category) via Gemini light model."""
+    """Generate the active template's non-fixed overlay fields via its light model."""
     project = ProjectService.load(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")

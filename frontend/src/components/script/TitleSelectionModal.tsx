@@ -79,7 +79,9 @@ export function TitleSelectionModal({
   if (!isOpen) return null;
 
   const hasMetadataPane = metadataOptions.length > 0 || Boolean(metadataError);
-  const hasOverlayPane = overlayOptions.length > 0 || Boolean(overlayError);
+  // A single hook is a template's fixed title: it is applied on confirm but
+  // there is nothing for the user to decide, so the pane stays hidden.
+  const hasOverlayPane = overlayOptions.length > 1 || Boolean(overlayError);
   const twoPaneLayout = hasMetadataPane && hasOverlayPane;
   const effectiveMetadataTitle =
     metadataOptions.includes(selectedMetadataTitle)

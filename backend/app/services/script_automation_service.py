@@ -29,21 +29,6 @@ from .script_phase_prompt_service import ScriptPhasePromptService
 from .tts_text_normalizer import TtsTextNormalizer
 from .voice_config_service import VoiceConfigService
 
-_OVERLAY_RESPONSE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "title_hooks": {
-            "type": "array",
-            "minItems": 8,
-            "maxItems": 8,
-            "items": {"type": "string"},
-        },
-        "category": {"type": "string"},
-    },
-    "required": ["title_hooks", "category"],
-    "additionalProperties": False,
-}
-
 _SENTENCE_END_RE = re.compile(r"[.!?…][\"')\]]*\s*$")
 _SENTENCE_BOUNDARY_RE = re.compile(r"[.!?…][\"')\]]*(?:\s+|$)")
 
@@ -163,27 +148,41 @@ class ScriptAutomationService:
         return truncated.rstrip()
 
     @classmethod
-    def _normalize_overlay_payload(cls, payload: dict[str, Any]) -> dict[str, Any]:
-        raw_hooks = payload.get("title_hooks")
-        if not isinstance(raw_hooks, list):
-            raise RuntimeError("Overlay JSON must contain a 'title_hooks' array")
+    def _normalize_overlay_payload(
+        cls,
+        payload: dict[str, Any],
+        *,
+        include_title: bool,
+        include_category: bool,
+        fixed_title: str | None = None,
+        fixed_category: str | None = None,
+    ) -> dict[str, Any]:
+        title_hooks: list[str] = []
+        if fixed_title:
+            title_hooks = [cls._truncate_overlay_title(fixed_title)]
+        elif include_title:
+            raw_hooks = payload.get("title_hooks")
+            if not isinstance(raw_hooks, list):
+                raise RuntimeError("Overlay JSON must contain a 'title_hooks' array")
+            title_hooks = [
+                cls._truncate_overlay_title(item)
+                for item in raw_hooks
+                if isinstance(item, str) and item.strip()
+            ]
+            if len(title_hooks) != 8:
+                raise RuntimeError(
+                    "Overlay JSON must contain exactly 8 non-empty title hooks "
+                    f"({len(title_hooks)} received)"
+                )
 
-        title_hooks = [
-            cls._truncate_overlay_title(item)
-            for item in raw_hooks
-            if isinstance(item, str) and item.strip()
-        ]
-        if len(title_hooks) != 8:
-            raise RuntimeError(
-                f"Overlay JSON must contain exactly 8 non-empty title hooks ({len(title_hooks)} received)"
-            )
-
-        category = str(payload.get("category", "")).strip()
-        if not category:
-            raise RuntimeError("Overlay JSON must contain a non-empty 'category'")
+        category = (fixed_category or "").strip()
+        if not category and include_category:
+            category = str(payload.get("category", "")).strip()
+            if not category:
+                raise RuntimeError("Overlay JSON must contain a non-empty 'category'")
 
         return {
-            "title": title_hooks[0],
+            "title": title_hooks[0] if title_hooks else "",
             "title_hooks": title_hooks,
             "category": category,
         }
@@ -780,7 +779,27 @@ class ScriptAutomationService:
         target_language: str,
         preset_key: str | None = None,
     ) -> dict[str, Any]:
-        """Generate a video overlay (title hooks + category) via the active LLM preset's light tier."""
+        """Generate only the active template's non-fixed overlay fields."""
+        from .template_service import TemplateService
+
+        template = TemplateService.get(project.resolved_template_key())
+        overlay_config = template.overlay
+        title_enabled = overlay_config.enabled and overlay_config.title.enabled
+        category_enabled = overlay_config.enabled and overlay_config.category.enabled
+        fixed_title = overlay_config.title.text if title_enabled else None
+        fixed_category = overlay_config.category.text if category_enabled else None
+        generate_title = title_enabled and fixed_title is None
+        generate_category = category_enabled and fixed_category is None
+
+        if not generate_title and not generate_category:
+            return cls._normalize_overlay_payload(
+                {},
+                include_title=False,
+                include_category=False,
+                fixed_title=fixed_title,
+                fixed_category=fixed_category,
+            )
+
         anime_name = project.anime_name or "Inconnu"
         script_summary = cls._script_text_from_payload(script_payload)
         prompt = ScriptPhasePromptService.build_overlay_prompt(
@@ -788,6 +807,8 @@ class ScriptAutomationService:
             script_summary=script_summary,
             target_language=target_language,
             library_type=project.library_type,
+            include_title=generate_title,
+            include_category=generate_category,
         )
 
         result = LLMService.generate_json(
@@ -795,10 +816,18 @@ class ScriptAutomationService:
             preset_key=preset_key,
             tier="light",
         )
-        overlay = cls._normalize_overlay_payload(result)
+        overlay = cls._normalize_overlay_payload(
+            result,
+            include_title=generate_title,
+            include_category=generate_category,
+            fixed_title=fixed_title,
+            fixed_category=fixed_category,
+        )
 
-        static_title = cls._truncate_overlay_title(
-            resolve_static_overlay_title(project.library_type)
+        static_title = (
+            cls._truncate_overlay_title(resolve_static_overlay_title(project.library_type))
+            if generate_title
+            else ""
         )
         if static_title and not any(
             hook.strip().casefold() == static_title.casefold()
@@ -1094,6 +1123,10 @@ class ScriptAutomationService:
             if (
                 not skip_overlay
                 and active_template.overlay.enabled
+                and (
+                    active_template.overlay.title.enabled
+                    or active_template.overlay.category.enabled
+                )
                 and settings.automate_metadata_overlay_enabled
                 and LLMService.is_configured()
             ):
