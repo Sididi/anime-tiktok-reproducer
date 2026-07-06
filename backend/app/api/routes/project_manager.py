@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from ...services import UploadPhaseService
 from ...services.google_drive_service import GoogleDriveService
 from ...services.lan_transfer_service import LanTransferService
+from ...services.project_duplication_service import UploadRestrictionService
 from ...services.project_upload_service import project_upload_queue
 from ...services.project_service import ProjectService
 from ...services.upload_phase import PendingProjectDeletionRequiresConfirmation
@@ -74,6 +75,15 @@ async def run_upload_phase(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     return job.model_dump(mode="json")
+
+
+@router.get("/projects/{project_id}/upload-restrictions")
+async def get_upload_restrictions(project_id: str):
+    """Restrictions from linked duplicated projects (blocked accounts/dates)."""
+    project = ProjectService.load(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return await asyncio.to_thread(UploadRestrictionService.describe, project)
 
 
 @router.get("/upload-jobs")

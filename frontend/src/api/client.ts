@@ -163,6 +163,15 @@ export const api = {
   deleteProject: (id: string) =>
     request<{ status: string }>(`/projects/${id}`, { method: "DELETE" }),
 
+  duplicateProject: (id: string, variants: import("@/types").DuplicationVariant[]) =>
+    request<{ projects: import("@/types").Project[] }>(
+      `/projects/${id}/duplicate`,
+      {
+        method: "POST",
+        body: JSON.stringify({ variants }),
+      },
+    ),
+
   activateProjectLibrary: (projectId: string) =>
     request<import("@/types").LibraryActivationState>(
       `/projects/${projectId}/library/activate`,
@@ -216,6 +225,11 @@ export const api = {
           copyright_audio_path: copyrightAudioPath ?? null,
         }),
       },
+    ),
+
+  getUploadRestrictions: (projectId: string) =>
+    request<import("@/types").UploadRestrictions>(
+      `/project-manager/projects/${projectId}/upload-restrictions`,
     ),
 
   listProjectUploadJobs: () =>

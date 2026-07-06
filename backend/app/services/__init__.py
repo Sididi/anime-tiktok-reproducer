@@ -66,6 +66,8 @@ _EXPORTS = {
     "project_startup_queue": (".project_startup_service", "project_startup_queue"),
     "ProjectUploadService": (".project_upload_service", "ProjectUploadService"),
     "project_upload_queue": (".project_upload_service", "project_upload_queue"),
+    "ProjectDuplicationService": (".project_duplication_service", "ProjectDuplicationService"),
+    "UploadRestrictionService": (".project_duplication_service", "UploadRestrictionService"),
 }
 
 __all__ = list(_EXPORTS)

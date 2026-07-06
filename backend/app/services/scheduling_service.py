@@ -403,6 +403,15 @@ class SchedulingService:
     # -------------------------------------------------------------- reservation
 
     @classmethod
+    def _validate_duplication_restrictions(
+        cls, project: Project, account_id: str, slots: list[datetime]
+    ) -> None:
+        """Enforce duplicated-project rules before persisting reservations."""
+        from .project_duplication_service import UploadRestrictionService
+
+        UploadRestrictionService.validate_upload(project, account_id, slots)
+
+    @classmethod
     def _try_reuse_platform_reservation(
         cls,
         project: Project,
@@ -461,6 +470,7 @@ class SchedulingService:
                 return reused
 
             slot_dt, scheduled_at = cls._reserve_platform_inplace(project, account_id, platform)
+            cls._validate_duplication_restrictions(project, account_id, [slot_dt])
             project.scheduled_account_id = account_id
             cls._recompute_aggregates(project)
             ProjectService.save(project)
@@ -492,6 +502,9 @@ class SchedulingService:
             for platform in platforms:
                 results[platform] = cls._reserve_platform_inplace(project, account_id, platform)
 
+            cls._validate_duplication_restrictions(
+                project, account_id, [slot for slot, _ in results.values()]
+            )
             project.scheduled_account_id = account_id
             cls._recompute_aggregates(project)
             ProjectService.save(project)
@@ -583,6 +596,11 @@ class SchedulingService:
                         f"{c.platform}:{c.reason}" for c in resolution.conflicts
                     )
                     raise ValueError(f"Anchor conflicts: {conflict_summary}")
+                cls._validate_duplication_restrictions(
+                    project,
+                    account_id,
+                    [resolved.slot for resolved in resolution.resolved.values()],
+                )
             except Exception:
                 # Roll back every displaced move so the conflict leaves no
                 # partial write on disk.
@@ -631,6 +649,7 @@ class SchedulingService:
             at_utc = cls._normalize_utc_datetime(at)
             if at_utc < cls._earliest_allowed_publish_time():
                 raise ValueError("slot_too_close")
+            cls._validate_duplication_restrictions(project, account_id, [at_utc])
             if project.scheduled_account_id and project.scheduled_account_id != account_id:
                 project.platform_schedules = {}
             schedules = dict(project.platform_schedules or {})

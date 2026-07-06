@@ -1,8 +1,9 @@
 import { useEffect, useState, useCallback, useRef, useMemo } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import {
   Loader2,
   Copy,
+  CopyPlus,
   Check,
   ArrowRight,
   Upload,
@@ -24,6 +25,7 @@ import type { SearchableSelectOption } from "@/components/ui";
 import { useProjectStore, useSceneStore } from "@/stores";
 import { api } from "@/api/client";
 import type {
+  DuplicationVariant,
   MetadataTitleCandidatesPayload,
   Transcription,
   PlatformMetadata,
@@ -35,6 +37,7 @@ import type {
   VideoOverlay,
 } from "@/types";
 import {
+  DuplicateProjectModal,
   ScriptEditorModal,
   MetadataEditorModal,
   TitleSelectionModal,
@@ -443,7 +446,8 @@ function clampPreviewTtsSpeed(speed: number): number {
 export function ScriptRestructurePage() {
   const { projectId } = useParams<{ projectId: string }>();
   const navigate = useNavigate();
-  const { loadProject } = useProjectStore();
+  const [searchParams] = useSearchParams();
+  const { project, loadProject } = useProjectStore();
   const { loadScenes } = useSceneStore();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const automationAbortRef = useRef<AbortController | null>(null);
@@ -553,6 +557,8 @@ export function ScriptRestructurePage() {
   const [uploading, setUploading] = useState(false);
   const [scriptEditorOpen, setScriptEditorOpen] = useState(false);
   const [metadataEditorOpen, setMetadataEditorOpen] = useState(false);
+  const [duplicateModalOpen, setDuplicateModalOpen] = useState(false);
+  const autostartFiredRef = useRef(false);
 
   const parsedScriptPayload = useMemo<Record<string, unknown> | null>(() => {
     if (!jsonValid || !newScriptJson) return null;
@@ -829,6 +835,16 @@ export function ScriptRestructurePage() {
       automationAbortRef.current?.abort();
     };
   }, []);
+
+  // Duplicated projects carry their preset output language in project.json:
+  // initialize the selector from it once the project is loaded.
+  useEffect(() => {
+    if (!projectId || project?.id !== projectId) return;
+    const lang = project.output_language;
+    if (lang === "fr" || lang === "en" || lang === "es") {
+      setTargetLanguage(lang);
+    }
+  }, [projectId, project]);
 
   useEffect(() => {
     if (!projectId || !transcription) {
@@ -2009,6 +2025,65 @@ export function ScriptRestructurePage() {
     }
   }, [filteredVoices, automationVoiceKey]);
 
+  const handleDuplicateConfirm = useCallback(
+    async (variants: DuplicationVariant[], startAutomate: boolean) => {
+      if (!projectId) return;
+      // Open placeholder tabs synchronously (still inside the user gesture)
+      // so popup blockers don't discard them once the API call resolves.
+      const tabs = variants.map(() => window.open("", "_blank"));
+      try {
+        const result = await api.duplicateProject(projectId, variants);
+        result.projects.forEach((created, index) => {
+          const url = `/project/${created.id}/script${
+            startAutomate ? "?autostart=1" : ""
+          }`;
+          const tab = tabs[index];
+          if (tab) {
+            tab.location.href = url;
+          } else {
+            window.open(url, "_blank");
+          }
+        });
+        tabs.slice(result.projects.length).forEach((tab) => tab?.close());
+      } catch (err) {
+        tabs.forEach((tab) => tab?.close());
+        throw err;
+      }
+    },
+    [projectId],
+  );
+
+  // Auto-launch the Automate feature on duplicated projects opened with
+  // ?autostart=1, once config/voice/language are all resolved.
+  const autostartRequested = searchParams.get("autostart") === "1";
+  useEffect(() => {
+    if (!autostartRequested || autostartFiredRef.current) return;
+    if (loading || automationRunning || automationPhase !== "idle") return;
+    if (!automationConfig?.enabled || !automationVoiceKey) return;
+    if (!filteredVoices.some((v) => v.key === automationVoiceKey)) return;
+    if (!projectId || project?.id !== projectId) return;
+    const lang = project.output_language;
+    if ((lang === "fr" || lang === "en" || lang === "es") && lang !== targetLanguage) {
+      return; // wait until the preset language has been applied
+    }
+    if (newScriptJson.trim() !== "") return; // already generated
+    autostartFiredRef.current = true;
+    handleAutomate();
+  }, [
+    autostartRequested,
+    loading,
+    automationRunning,
+    automationPhase,
+    automationConfig,
+    automationVoiceKey,
+    filteredVoices,
+    projectId,
+    project,
+    targetLanguage,
+    newScriptJson,
+    handleAutomate,
+  ]);
+
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center">
@@ -2096,19 +2171,28 @@ export function ScriptRestructurePage() {
               Generate a new script and TTS audio for your video
             </p>
           </div>
-          <Button onClick={handleContinue} disabled={!canContinue || uploading}>
-            {uploading ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin mr-2" />
-                Processing...
-              </>
-            ) : (
-              <>
-                Continue
-                <ArrowRight className="h-4 w-4 ml-2" />
-              </>
-            )}
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              onClick={() => setDuplicateModalOpen(true)}
+            >
+              <CopyPlus className="h-4 w-4 mr-2" />
+              Duplicate
+            </Button>
+            <Button onClick={handleContinue} disabled={!canContinue || uploading}>
+              {uploading ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                  Processing...
+                </>
+              ) : (
+                <>
+                  Continue
+                  <ArrowRight className="h-4 w-4 ml-2" />
+                </>
+              )}
+            </Button>
+          </div>
         </header>
 
         {error && (
@@ -3071,6 +3155,15 @@ export function ScriptRestructurePage() {
         overlay={pendingTitleSelection?.overlay || null}
         overlayError={pendingTitleSelection?.overlayError || null}
         onConfirm={handleTitleSelectionConfirm}
+      />
+
+      <DuplicateProjectModal
+        isOpen={duplicateModalOpen}
+        currentLanguage={targetLanguage}
+        currentTemplate={automationConfig?.current.template ?? null}
+        templates={automationConfig?.templates ?? []}
+        onClose={() => setDuplicateModalOpen(false)}
+        onConfirm={handleDuplicateConfirm}
       />
     </div>
   );

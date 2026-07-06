@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import { Button } from "@/components/ui";
 import { api } from "@/api/client";
-import type { FreeSlot, Platform, ResolveAnchorResult, StealSpec, SwitchMode, SwitchPreview } from "@/types";
+import type { FreeSlot, Platform, ResolveAnchorResult, StealSpec, SwitchMode, SwitchPreview, UploadRestrictions } from "@/types";
 import { PLATFORM_SHORT } from "@/components/planning/platformColors";
 import { SlotPickerCalendar } from "./SlotPickerCalendar";
 import { SlotChips } from "./SlotChips";
@@ -112,6 +112,45 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
     })();
     return () => { cancelled = true; };
   }, [open, monthAnchor, accountId, platformForFetch]);
+
+  // Days blocked by the duplicated-project 30-day rule (per language family).
+  const [restrictions, setRestrictions] = useState<UploadRestrictions | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    api
+      .getUploadRestrictions(projectId)
+      .then((r) => { if (!cancelled) setRestrictions(r); })
+      .catch(() => { if (!cancelled) setRestrictions(null); });
+    return () => { cancelled = true; };
+  }, [open, projectId]);
+
+  const blockedDays = useMemo(() => {
+    const days = new Set<string>();
+    if (!restrictions?.blocked_windows.length) return days;
+    // Cover the whole 42-cell grid: first of month minus 7d to end plus 14d.
+    const rangeStart = new Date(monthAnchor.getFullYear(), monthAnchor.getMonth(), 1);
+    rangeStart.setDate(rangeStart.getDate() - 7);
+    rangeStart.setHours(0, 0, 0, 0);
+    const rangeEnd = new Date(monthAnchor.getFullYear(), monthAnchor.getMonth() + 1, 0);
+    rangeEnd.setDate(rangeEnd.getDate() + 14);
+    rangeEnd.setHours(23, 59, 59, 999);
+    for (const window of restrictions.blocked_windows) {
+      const start = new Date(window.start);
+      const end = new Date(window.end);
+      // Grey out every day the window touches, even partially.
+      const cursor = new Date(Math.max(start.getTime(), rangeStart.getTime()));
+      cursor.setHours(0, 0, 0, 0);
+      const stop = Math.min(end.getTime(), rangeEnd.getTime());
+      while (cursor.getTime() <= stop) {
+        days.add(
+          `${cursor.getFullYear()}-${String(cursor.getMonth() + 1).padStart(2, "0")}-${String(cursor.getDate()).padStart(2, "0")}`,
+        );
+        cursor.setDate(cursor.getDate() + 1);
+      }
+    }
+    return days;
+  }, [restrictions, monthAnchor]);
 
   const { daysWithSlots, daysWithFreeSlots } = useMemo(() => {
     const all = new Set<string>();
@@ -240,6 +279,7 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
           }}
           daysWithSlots={daysWithSlots}
           daysWithFreeSlots={daysWithFreeSlots}
+          blockedDays={blockedDays}
         />
         <div className="border-t border-[hsl(var(--border))] mt-3 pt-2">
           <div className="text-[11px] text-[hsl(var(--muted-foreground))] mb-1.5">

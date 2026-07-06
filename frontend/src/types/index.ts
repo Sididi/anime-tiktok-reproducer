@@ -31,6 +31,7 @@ export interface Project {
   series_id: string | null;
   library_type: LibraryType;
   output_language: string | null;
+  mother_project_id: string | null;
   drive_folder_id: string | null;
   drive_folder_url: string | null;
   generation_discord_message_id: string | null;
@@ -208,12 +209,33 @@ export interface ProjectManagerRow {
   created_at: string | null;
   scheduled_at: string | null;
   scheduled_account_id: string | null;
+  mother_project_id: string | null;
   llm_preset_resolved: string;
   llm_preset_is_default: boolean;
   min_playback_speed_resolved: number;
   min_playback_speed_is_default: boolean;
   template_resolved: string;
   template_is_default: boolean;
+}
+
+export interface DuplicationVariant {
+  language: string;
+  template: string;
+}
+
+export interface UploadRestrictions {
+  mother_project_id: string | null;
+  family_project_ids: string[];
+  blocked_accounts: Array<{
+    account_id: string;
+    linked_project_id: string;
+  }>;
+  blocked_windows: Array<{
+    start: string;
+    end: string;
+    linked_project_id: string;
+  }>;
+  min_spacing_days: number;
 }
 
 export interface ScriptPhaseSettingsRequest {

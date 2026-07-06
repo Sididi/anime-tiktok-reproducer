@@ -36,6 +36,9 @@ class Project(BaseModel):
     """A TikTok reproducer project."""
 
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
+    # Root project this one was duplicated from (family root, never a chain).
+    # Used to cross-link duplicated projects for upload restrictions.
+    mother_project_id: str | None = None
     tiktok_url: str | None = None
     anime_name: str | None = None  # Selected anime from indexed library
     series_id: str | None = None

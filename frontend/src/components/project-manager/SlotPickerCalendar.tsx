@@ -13,6 +13,8 @@ interface SlotPickerCalendarProps {
   /** ISO yyyy-mm-dd of days with at least one FREE slot still bookable. When
    *  undefined we don't strike anything based on availability. */
   daysWithFreeSlots?: Set<string>;
+  /** ISO yyyy-mm-dd of days blocked by the 30-day duplicated-project rule. */
+  blockedDays?: Set<string>;
 }
 
 function fmtMonth(d: Date): string {
@@ -40,6 +42,7 @@ export function SlotPickerCalendar({
   onSelectDate,
   daysWithSlots,
   daysWithFreeSlots,
+  blockedDays,
 }: SlotPickerCalendarProps) {
   const grid = useMemo(() => {
     const first = new Date(monthAnchor.getFullYear(), monthAnchor.getMonth(), 1);
@@ -67,6 +70,7 @@ export function SlotPickerCalendar({
     const key = ymd(d);
     return daysWithSlots.has(key) && !daysWithFreeSlots.has(key);
   };
+  const isDuplicationBlocked = (d: Date) => !!blockedDays?.has(ymd(d));
 
   return (
     <div className="text-xs">
@@ -94,14 +98,17 @@ export function SlotPickerCalendar({
         {grid.map((d, i) => {
           const past = isPast(d);
           const full = isFull(d);
-          const blocked = past || full;
+          const dupBlocked = isDuplicationBlocked(d);
+          const blocked = past || full || dupBlocked;
           const offMonth = !inMonth(d);
           const sel = isSelected(d);
           const title = past
             ? "Date passée"
-            : full
-              ? "Tous les slots sont déjà pris"
-              : undefined;
+            : dupBlocked
+              ? "Bloqué : un projet dupliqué lié (même langue) est publié à moins de 30 jours"
+              : full
+                ? "Tous les slots sont déjà pris"
+                : undefined;
           return (
             <button
               key={i}

@@ -794,6 +794,33 @@ export function ProjectManagerModal({
     return accounts.filter((a) => isAccountCompatibleWithProjectRow(a, row));
   }, [accountPickerForProject, rows, accounts]);
 
+  // Accounts blocked for the picked project because they already uploaded a
+  // linked duplicated project (same mother project) — blocked forever.
+  const [pickerBlockedAccountIds, setPickerBlockedAccountIds] = useState<
+    Set<string>
+  >(new Set());
+  useEffect(() => {
+    if (!accountPickerForProject) {
+      setPickerBlockedAccountIds(new Set());
+      return;
+    }
+    let cancelled = false;
+    api
+      .getUploadRestrictions(accountPickerForProject)
+      .then((restrictions) => {
+        if (cancelled) return;
+        setPickerBlockedAccountIds(
+          new Set(restrictions.blocked_accounts.map((b) => b.account_id)),
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setPickerBlockedAccountIds(new Set());
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [accountPickerForProject]);
+
   const runDelete = useCallback(
     async (projectId: string) => {
       setActiveDeleteId(projectId);
@@ -1009,6 +1036,7 @@ export function ProjectManagerModal({
           <AccountPickerPopup
             open={!!accountPickerForProject && compatibleAccounts.length > 0}
             accounts={compatibleAccounts}
+            blockedAccountIds={pickerBlockedAccountIds}
             onPick={(accountId) => {
               const projectId = accountPickerForProject!;
               const row = rows.find((r) => r.project_id === projectId);

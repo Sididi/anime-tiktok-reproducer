@@ -427,6 +427,7 @@ class UploadPhaseService:
                 "created_at": project.created_at.isoformat() if project.created_at else None,
                 "scheduled_at": project.scheduled_at.isoformat() if project.scheduled_at else None,
                 "scheduled_account_id": project.scheduled_account_id,
+                "mother_project_id": project.mother_project_id,
                 "platform_schedules": {
                     platform: {
                         "slot": ps.slot.isoformat(),
@@ -750,6 +751,16 @@ class UploadPhaseService:
                 else:
                     _, _sched = SchedulingService.find_next_slot_for_platform(account_id, _platform)
                 platform_scheduled_at[_platform] = _sched
+
+        # Duplicated-project restrictions: same account never uploads two
+        # linked projects; same-language duplicates must be >= 30 days apart.
+        from .project_duplication_service import UploadRestrictionService
+
+        UploadRestrictionService.validate_upload(
+            project,
+            account_id,
+            list(platform_scheduled_at.values()) or [datetime.now(timezone.utc)],
+        )
 
         # Build the TikTok payload for the VPS scheduler (server-side publish
         # via Post for Me at slot_time).

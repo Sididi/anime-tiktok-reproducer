@@ -1,10 +1,16 @@
+import asyncio
+
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Any
 
 from ...library_types import DEFAULT_LIBRARY_TYPE, LibraryType
 from ...models import Project, ProjectPhase
 from ...services import LibraryHydrationService, ProjectService
+from ...services.project_duplication_service import (
+    DuplicationVariant,
+    ProjectDuplicationService,
+)
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -37,6 +43,7 @@ class ProjectResponse(BaseModel):
     series_id: str | None
     library_type: LibraryType
     output_language: str | None
+    mother_project_id: str | None
     drive_folder_id: str | None
     drive_folder_url: str | None
     generation_discord_message_id: str | None
@@ -60,6 +67,7 @@ class ProjectResponse(BaseModel):
             series_id=project.series_id,
             library_type=project.library_type,
             output_language=project.output_language,
+            mother_project_id=project.mother_project_id,
             drive_folder_id=project.drive_folder_id,
             drive_folder_url=project.drive_folder_url,
             generation_discord_message_id=project.generation_discord_message_id,
@@ -96,6 +104,36 @@ async def get_project(project_id: str) -> ProjectResponse:
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     return ProjectResponse.from_project(project)
+
+
+class DuplicateVariantRequest(BaseModel):
+    language: str
+    template: str
+
+
+class DuplicateProjectRequest(BaseModel):
+    variants: list[DuplicateVariantRequest] = Field(..., min_length=1)
+
+
+@router.post("/{project_id}/duplicate")
+async def duplicate_project(
+    project_id: str, request: DuplicateProjectRequest
+) -> dict[str, Any]:
+    """Duplicate a project into template/language variants (script phase)."""
+    if ProjectService.load(project_id) is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    try:
+        created = await asyncio.to_thread(
+            ProjectDuplicationService.duplicate,
+            project_id,
+            [
+                DuplicationVariant(language=v.language, template=v.template)
+                for v in request.variants
+            ],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"projects": [ProjectResponse.from_project(p) for p in created]}
 
 
 @router.delete("/{project_id}")
