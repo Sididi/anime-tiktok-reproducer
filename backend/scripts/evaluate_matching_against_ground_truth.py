@@ -491,7 +491,19 @@ def _lookalike_equivalent(
     if dur_gen <= 0 or dur_gt <= 0:
         return False
     if abs(dur_gen - dur_gt) > max(0.35, 0.25 * dur_gt):
-        return False
+        # duration only matters visually when the content moves: a still
+        # frame renders identically at any played length
+        def interval_static(episode: str, start: float, dur: float) -> bool:
+            va = SceneAlignerService._index_embedding_at(series, episode, start + 0.1 * dur)
+            vb = SceneAlignerService._index_embedding_at(series, episode, start + 0.9 * dur)
+            return va is not None and vb is not None and float(va @ vb) >= 0.92
+
+        if not (
+            interval_static(match.episode, match.start_time, dur_gen)
+            and interval_static(gt_match.episode, gt_match.start_time, dur_gt)
+            and abs(dur_gen - dur_gt) <= max(1.5, 0.6 * dur_gt)
+        ):
+            return False
     for frac in (0.1, 0.5, 0.9):
         v_gen = SceneAlignerService._index_embedding_at(
             series, match.episode, match.start_time + frac * dur_gen
@@ -1000,7 +1012,10 @@ async def _main() -> int:
                 verbose=not args.quiet_profile,
             )
             if args.save_generated_json is not None:
-                _save_generated(args.save_generated_json, generated)
+                out = args.save_generated_json
+                if len(args.project_ids) > 1:
+                    out = out.with_name(f"{out.stem}_{project_id}{out.suffix}")
+                _save_generated(out, generated)
         result = _validate_strict(
             project_id,
             generated,

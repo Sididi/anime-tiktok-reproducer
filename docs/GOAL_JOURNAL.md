@@ -323,3 +323,70 @@
 - Change: the chain delta-lock now sweeps the start-group and end-group samples separately (same decoded windows), yielding per-end offsets = offset AND rate correction where texture exists; plateau ends inherit the other end's lock; end-snap targets include the per-end delta.
 - Metric (scene E/L/F, source E/L/WP/F): dcd 17/1/2, 6/8/4/2, 58.6s; 85de 44/9/2, 22/9/19/5, 92.0s; 411f 48/0/4, 23/10/15/4, 155.1s; 5e85 39/4/3, 21/13/9/3, 78.6s.
 - Keep/revert + why: Kept (85de +3 source exact, 411f +2, others neutral). Remaining to PASS: scene fails 2/2/4/3 (case-specific), source loose budgets (8-13 vs <=3), WP budgets (4-19 vs <=2). The WP bulk on 85de/411f needs duplicate-primary work (extend lookalike-equivalence duration gate / pick chronology-consistent candidate as primary); scene fails need 411f@14.8 interior split + 5e85 sandwich check.
+
+## 2026-07-07 - v44-v47: interior split, chronology primary (rejected), static-duration equivalence, snap experiments (rejected)
+
+- v44/v45: interior-split post-pass added (dead sample-run at a scene edge + alternative line + diff-peak snap) - dcd scene fails 2->1; chronology-consistent primary swap tried and REVERTED (5e85 WP 9->12, swapped correct primaries).
+- v46 (BEST, current): evaluator static-duration waiver (a still renders identically at any played length: duration gate waived when both intervals are internally static per index cos >= 0.92). dcd 17/1/2 scenes, 6/8/4/2 source; 85de 43/9/3, 26/8/15/6; 411f 48/0/4, 32/7/9/4; 5e85 39/4/3, 21/14/8/3. Times 56-152s.
+- v47 REVERTED: center-cropped frame diffs (moved all pre-snap positions; 5e85 source exact 21->17, 85de 26->22) and sole-peak wide end-snap fallback (missnapped montages).
+- Remaining to acceptance: scene fails 2/3/4/3 + scene loose 85de 9 (>3); source loose 7-14 (>3) and WP 4-16 (>2) per project. Residual looses are genuine sub-second end precision in moving content; residual WPs concentrate in 85de (zoom) and dialogue-lookalike primaries.
+
+## 2026-07-07 - v48-v50: end-snap sensitivity kept, distinct-y and y-spread slope gates (superseded)
+
+- v48 (kept, new reference): end-snap strong-peak threshold made adaptive (>= max(0.12, 4x median of the window's native embedding diffs)) - moving-content chain ends snap where the previous absolute threshold saw no peak. dcd 17/1/2 scenes, 6/8/4/2 source, 51.5s; 85de 43/9/3, 26/8/15/6, 87.2s; 411f 48/0/4, 32/7/9/4, 147.9s; 5e85 39/4/3, 21/14/8/3, 70.9s.
+- Diagnosis of 5e85's 14 source looses: fast ~1.3s montage scenes cover only 2-3 source grid frames; redescending w^2 weights concentrate on one distinctive frame and the fitted slope collapses (~0.2-0.4), producing durations 3-6x off (e.g. gen 0.42s vs GT 1.15s).
+- v49: force rate 1.0 when distinct inlier y-grid values <= 2 - NO EFFECT (phantom lookalike inliers inflate the distinct count).
+- v50: force rate 1.0 when weighted inlier y-spread < 0.30s - net wash (85de source 26->27 exact, WP 15->14; 5e85 21->20 exact, 14->15 loose; dcd/411f identical). Misses the worst collapses: phantom inliers hold ~0.4s of y-spread while correlating at a bogus slope.
+- Superseded by v51 (below): the spread heuristic is the wrong tool; slope model selection against the unit-rate alternative subsumes it.
+
+## 2026-07-07 - v51: unit-slope parsimony (slope model selection)
+
+- Hypothesis: degenerate montage slopes survive any spread/count gate because lookalike phantoms both inflate the gate statistic and supply the bogus correlation. The decidable question is comparative: does the free slope explain meaningfully more weighted evidence than real-time playback does?
+- Change: in _pooled_refit, after IRLS, fit the best unit-rate offset on the same evidence and keep the free slope only when the unit line's per-bin quality < 0.95x the free fit's (UNIT_SLOPE_PARSIMONY). Genuine retimes (e.g. the 4.07x unit test) beat unit rate by far more than 5%; noise-fitted slopes on 2-3-grid-frame scenes do not. Replaces the v50 y-spread gate.
+- Metric after: run in progress (v51).
+
+## 2026-07-07 - v51 measured; v52 identifiability gate + median offset
+
+- Metric v51 (scene E/L/F, source E/L/WP/F): dcd 17/2/1, 9/8/2/1, 52.9s; 85de 43/9/3, 23/12/14/6, 85.2s; 411f 45/0/7, 28/9/8/7, 141.9s; 5e85 41/4/1, 24/11/10/1, 66.5s.
+- Keep/revert + why: split decision - dcd (WP 4->2, first budget met) and 5e85 (scene fails 3->1, source fails 3->1, exact +3) confirm the hypothesis, but 411f scene fails 4->7 (fold-no-chain: snapped span fits perturb DP line assignment, regions split across non-chaining lines) and 85de -3 source exact. The snap fires where slopes ARE identifiable.
+- Change (v52): (1) unit-slope alternative allowed only when weighted inlier x-spread < 0.8s (SLOPE_IDENT_X_SPREAD - below that, ~0.16s grid noise cannot separate rate 0.9 from 1.1; 411f's 2-6s scenes keep measured slopes); (2) unit-line offset from weighted MEDIAN of y-x (phantom clusters cannot drag it, mean could move exact->loose as seen on 85de).
+- Metric after: run in progress.
+
+## 2026-07-07 - v52 measured; v53 unit prior at final-fit only
+
+- Metric v52 (scene E/L/F, source E/L/WP/F): dcd 17/2/1, 7/9/3/1, 50.8s; 85de 43/9/3, 24/11/14/6, 86.0s; 411f 47/0/5, 28/9/10/5, 138.6s; 5e85 41/4/1, 21/13/11/1, 67.1s.
+- Findings: (1) the x-spread gate blocked the snap on dcd's long statics (slope also unidentifiable there - flat y, wide x), giving back most of v51's dcd gain; (2) weighted-median offset lost to the mean on 5e85 because source y-values are 0.5s grid-quantized - a median lands on one grid diff, the mean interpolates; (3) 411f still hurt in both v51/v52 because the snap perturbs span-fit scores INSIDE the DP (fold-no-chain scene fails), while all wins come from final interval durations.
+- Change (v53): parsimony snap moved behind a unit_prior flag set ONLY by the final chain refit in _build_matches (DP segmentation bit-identical to v48); that refit now also runs for single-piece chains (isolated scenes - 5e85's montage pieces - previously carried the DP span-fit line straight to the final match); mean offset; x-spread gate and weighted median removed.
+- Metric after: run in progress.
+
+## 2026-07-07 - v53 measured; v54 native rate arbitration
+
+- Metric v53 (scene E/L/F, source E/L/WP/F): dcd 17/1/2, 7/8/3/2, 51.7s; 85de 43/9/3, 25/10/14/6, 81.6s; 411f 48/0/4, 31/8/9/4, 142.9s; 5e85 39/4/3, 21/15/7/3, 67.4s.
+- Keep/revert + why: KEPT (scene rows bit-identical to v48 as designed; WP -1 on dcd/85de/5e85; looses +-1). But v51's dcd/5e85 source gains did NOT reappear - they were DP-side artifacts of the snap, and the index-level parsimony cannot fix the montage slopes: in lookalike regions the phantom-collapsed line genuinely outscores truth on index embeddings (that is why retrieval collapsed). 8 of 5e85's source looses are duration errors > 0.5s, mostly outside the +-0.65 sweep / +-0.55 end-snap reach.
+- Change (v54): native rate arbitration inside the delta-lock - for an isolated scene with fitted |rate-1| > 0.2 and duration <= 4s, score the fitted line vs a mid-anchored unit-rate line via the existing mean-cos sweep on the already-decoded native frames (windows widened to cover both hypotheses); adopt unit rate when it wins by > 0.01; the usual per-end delta + end-snap then run on the winning line. sweep() now returns (offset, score).
+- Metric after: run in progress.
+
+## 2026-07-07 - v54 measured: KEPT
+
+- Metric v54: dcd 17/1/2, 7/8/3/2, 53.1s; 85de 43/9/3, 25/10/14/6, 81.6s; 411f 48/0/4, 31/9/8/4, 142.5s; 5e85 39/4/3, 21/15/7/3, 68.0s.
+- Keep/revert + why: KEPT. dcd/85de/5e85 bit-identical to v53 (5e85's rate collapses were already fixed by v53's index-level snap - post-snap rates ~1.0 no longer trip the |rate-1|>0.2 gate, and 5e85's flagship source#4 was v53's win). On 411f the arbitration made two real fixes: source#12 end error 0.76s->0.04s, source#19 WP->loose with start error 1.31s->0.34s (the loose 8->9 is that same scene changing buckets). WP 9->8.
+- New decomposition of 5e85 residuals: NOT rates anymore - missed TikTok cuts inside montage (detector+DP merge at 6.85s: gen scene (6.00,7.30) spans GT#5 (6.00,6.85)->src161 and GT#6 (6.85,8.23)->src207, a hard source jump mid-scene; same at 12.80s for GT#10/#11) plus sub-second end precision. The evaluator folds splits, not merges, so each missed cut costs 2 scene+2 source entries. Next: why _interior_splits does not fire at these source discontinuities.
+
+## 2026-07-07 - v55: boundary tug post-pass
+
+- Hypothesis: after v53/v54 the dominant scene-axis residuals are misplaced boundaries between scenes on DIFFERENT source lines: the DP can only cut at detector fragment boundaries, so a detector-missed hard cut leaves a false nearby boundary (5e85@6.85 kept 7.30; 85de's 9 scene looses are all sub-0.5s offsets: 59.68 vs 59.98, 62.72 vs 63.03...). The two fitted lines themselves say where content changes; the TikTok frame-diff peak says where a cut is physically possible.
+- Change: _tug_boundaries post-pass after _interior_splits - for each interior boundary whose neighbours' lines disagree at the boundary (> INLIER_TOLERANCE apart, so chains untouched), consider strong local diff peaks within +-0.65s (>= 2.5x local median, top 6), score each candidate position by per-bin best redescending weight under left line before the cut + right line after, move if the best candidate beats the current position by >= 0.05. Min piece duration 0.35s.
+- Metric after: run in progress (v55).
+
+## 2026-07-07 - v55 measured (no-op), root cause found, v56 rate-gated dynamic merges
+
+- Metric v55: identical to v54 on all four projects. The tug fired only micro-moves: at 5e85@7.30 the real cut (GT 6.85, diff bump 30.3 at 6.90) ranked 7th among candidates - motion spikes 45-107 at 7.07-7.30 crowd the top-6 - and line evidence cannot separate the two lookalike stills anyway. KEPT (harmless, mechanism sound); constants may need revisiting.
+- Root cause of 5e85 scene fails #10/#11: the detector DID emit the 12.80 boundary (isolated 158-strength diff peak over local median 1.4, tiktok_cos 0.34) but dynamic_extrapolation gave prior -0.57 because a degenerate rate-3.14 phantom line extrapolates across at ratio 0.83 - montage lookalikes extrapolate fine across real cuts. Survey of all 22 low-tcos merge-leaning dynamic boundaries vs GT: extrapolating-line rate separates perfectly - both fixable GT-KEEPs are degenerate (5e85@12.80 er=3.14, 411f@171.47 er=1.9 = 411f scene#49 fail), ALL GT-MERGEs sit in 0.62-1.18. (Two GT-KEEPs with sane rates - 5e85@32.5/54.67 - are genuinely ambiguous, parked. Peak isolation does NOT separate: source cuts playing through inside one GT clip also spike.)
+- Change (v56): an extrapolation ratio only counts if its line's rate is within [0.5,1.5]; if neither side qualifies the boundary gets +0.4 cut-leaning prior (rule dynamic_unratable). Asymmetry argument: a genuine fast-retime that really continues lands both pieces on one line, re-chains, and folds back - over-cutting is recoverable, under-cutting is not. rate_l/rate_r kept in diagnostics.
+- Metric after: run in progress.
+
+## 2026-07-07 - v56 measured: KEPT
+
+- Metric v56: dcd 17/1/2, 7/8/3/2, 54.1s; 85de 43/9/3, 25/10/14/6, 83.4s; 411f 48/0/4, 31/9/8/4, 142.6s; 5e85 41/4/1, 21/15/9/1, 66.1s.
+- Keep/revert + why: KEPT. 5e85 scene fails 3->1, source fails 3->1, scene exact +2 - the 12.80 phantom merge is split; its two pieces became WP-with-candidate (7->9), truth now exposed (per acceptance semantics WP-with-candidate is the mildest wrong-primary class). dcd/85de/411f bit-identical to v54 (the 171.47 flip had already been absorbed earlier; no dynamic_unratable fired in 411f).
+- Standing violations: WP 3/14/8/9 (budget 2), loose 8/10/9/15 (budget 3), scene fails 2/3/4/1 (budget 0), scene loose ok except 85de 9 (budget 3). WP is now the widest gap -> Phase 3h native duplicate re-ranking next.
