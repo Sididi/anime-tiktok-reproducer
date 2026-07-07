@@ -90,3 +90,32 @@ def test_default_must_exist_in_presets(tmp_path, monkeypatch):
     )
     with pytest.raises(ValueError):
         LLMConfigService.get_config(force_reload=True)
+
+
+TRANSLATION_YAML = VALID_YAML + """\
+translation:
+  openrouter_id: google/gemini-2.5-flash-lite
+  thinking: null
+"""
+
+
+def test_translation_entry_from_config(tmp_path, monkeypatch):
+    path = _write(tmp_path, TRANSLATION_YAML)
+    monkeypatch.setattr(
+        "app.services.llm_config_service.settings.llm_config_path", path
+    )
+    LLMConfigService.get_config(force_reload=True)
+    entry = LLMConfigService.translation_entry()
+    assert entry.openrouter_id == "google/gemini-2.5-flash-lite"
+    assert entry.thinking is None
+
+
+def test_translation_entry_falls_back_to_default_light(tmp_path, monkeypatch):
+    path = _write(tmp_path, VALID_YAML)
+    monkeypatch.setattr(
+        "app.services.llm_config_service.settings.llm_config_path", path
+    )
+    LLMConfigService.get_config(force_reload=True)
+    entry = LLMConfigService.translation_entry()
+    # default preset is "claude"; its light model is haiku
+    assert entry.openrouter_id == "anthropic/claude-haiku-4.5"

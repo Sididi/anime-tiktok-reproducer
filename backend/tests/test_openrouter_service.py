@@ -128,3 +128,26 @@ def test_generate_json_value_strips_fence(monkeypatch):
     )
     out = OpenRouterService.generate_json_value("hi")
     assert out == {"a": 1}
+
+
+def test_generate_json_value_with_entry_uses_given_model(monkeypatch):
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.return_value = _make_chat_response(
+        '[{"i": 0, "t": "Bonjour"}]'
+    )
+    monkeypatch.setattr(
+        "app.services.openrouter_service.OpenRouterService._get_client",
+        classmethod(lambda cls: fake_client),
+    )
+    entry = LLMPresetEntry(
+        openrouter_id="google/gemini-2.5-flash-lite", thinking=None
+    )
+    parsed = OpenRouterService.generate_json_value_with_entry(
+        '[{"i": 0, "t": "Hello"}]',
+        entry=entry,
+        system="translate",
+    )
+    assert parsed == [{"i": 0, "t": "Bonjour"}]
+    kwargs = fake_client.chat.completions.create.call_args.kwargs
+    assert kwargs["model"] == "google/gemini-2.5-flash-lite"
+    assert kwargs["messages"][0] == {"role": "system", "content": "translate"}

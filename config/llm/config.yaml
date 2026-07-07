@@ -53,3 +53,7 @@ presets:
       openrouter_id: x-ai/grok-4.3
       thinking:
         effort: low
+
+translation:
+  openrouter_id: google/gemini-2.5-flash-lite
+  thinking: null

@@ -41,6 +41,7 @@ from .project_service import ProjectService
 from .auto_editor_profiles import AutoEditorProfile, PRODUCTION_AUTO_EDITOR_PROFILE
 from .forced_alignment import ForcedAlignmentService, PreparedAlignmentAudio
 from .script_automation_service import ScriptAutomationService
+from .subtitle_translation_service import SubtitleTranslationService
 from .voice_config_service import VoiceConfigService
 from .voice_defingerprint import VoiceDefingerprintService
 
@@ -1805,8 +1806,8 @@ class ProcessingService:
         parsed_cue_cache: dict[str, list[dict[str, Any]]],
         rendered_cue_cache: dict[tuple[str, int], Path | None] | None = None,
         resolve_image_assets: bool,
-    ) -> tuple[list[SrtEntry], list[_RawSceneImageCueCandidate]]:
-        for _language, language_entries in cls._preferred_raw_scene_language_groups(
+    ) -> tuple[list[SrtEntry], list[_RawSceneImageCueCandidate], str | None]:
+        for language, language_entries in cls._preferred_raw_scene_language_groups(
             sidecar_entries,
             target_language=target_language,
         ):
@@ -1844,8 +1845,8 @@ class ProcessingService:
                 blocked_intervals=[(entry.start, entry.end) for entry in resolved_text_entries],
             )
             if resolved_text_entries or resolved_image_entries:
-                return resolved_text_entries, resolved_image_entries
-        return [], []
+                return resolved_text_entries, resolved_image_entries, language
+        return [], [], None
 
     @classmethod
     def generate_srt_entries(
@@ -2018,7 +2019,7 @@ class ProcessingService:
                     sidecar_entries,
                     target_language=target_language,
                 )
-                _, resolved_image_entries = await cls._resolve_raw_scene_sidecar_subtitles(
+                _, resolved_image_entries, _ = await cls._resolve_raw_scene_sidecar_subtitles(
                     resolved_source=resolved_source,
                     timeline_scene_start=scene.start_time,
                     target_language=target_language,
@@ -2117,6 +2118,48 @@ class ProcessingService:
         return render_plan
 
     @classmethod
+    async def _translate_raw_scene_text_entries(
+        cls,
+        *,
+        project_id: str,
+        target_language: str | None,
+        pending_entries: list[tuple[SrtEntry, str | None]],
+    ) -> list[SrtEntry]:
+        """Swap raw-scene cue texts to the project language, grouped by source track language."""
+        results = [entry for entry, _language in pending_entries]
+        if not target_language:
+            return results
+
+        groups: dict[str | None, list[int]] = {}
+        for index, (_entry, language) in enumerate(pending_entries):
+            if language == target_language:
+                continue
+            groups.setdefault(language, []).append(index)
+
+        for source_language, indices in groups.items():
+            translated = await SubtitleTranslationService.translate_texts(
+                project_id=project_id,
+                texts=[results[index].text for index in indices],
+                source_language=source_language,
+                target_language=target_language,
+            )
+            if translated is None:
+                logger.warning(
+                    "Keeping %d untranslated raw-scene subtitle cues (%s)",
+                    len(indices),
+                    source_language or "und",
+                )
+                continue
+            for index, new_text in zip(indices, translated):
+                original = results[index]
+                results[index] = SrtEntry(
+                    start=original.start,
+                    end=original.end,
+                    text=new_text,
+                )
+        return results
+
+    @classmethod
     async def _collect_raw_scene_source_subtitles(
         cls,
         project: Project,
@@ -2135,7 +2178,7 @@ class ProcessingService:
         target_language = AnimeLibraryService.normalize_stream_language(
             project.output_language or transcription.language
         )
-        text_entries: list[SrtEntry] = []
+        pending_text_entries: list[tuple[SrtEntry, str | None]] = []
         image_entries: list[RawSceneSubtitleImageEntry] = []
         parsed_text_cache: dict[str, list[Any]] = {}
         parsed_cue_cache: dict[str, list[dict[str, Any]]] = {}
@@ -2149,17 +2192,21 @@ class ProcessingService:
             sidecar_entries = AnimeLibraryService.load_subtitle_sidecar_entries(
                 resolved_source.source_path
             )
-            scene_text_entries, scene_image_entries = await cls._resolve_raw_scene_sidecar_subtitles(
-                resolved_source=resolved_source,
-                timeline_scene_start=scene.start_time,
-                target_language=target_language,
-                sidecar_entries=sidecar_entries,
-                parsed_text_cache=parsed_text_cache,
-                parsed_cue_cache=parsed_cue_cache,
-                rendered_cue_cache=rendered_cue_cache,
-                resolve_image_assets=True,
+            scene_text_entries, scene_image_entries, scene_language = (
+                await cls._resolve_raw_scene_sidecar_subtitles(
+                    resolved_source=resolved_source,
+                    timeline_scene_start=scene.start_time,
+                    target_language=target_language,
+                    sidecar_entries=sidecar_entries,
+                    parsed_text_cache=parsed_text_cache,
+                    parsed_cue_cache=parsed_cue_cache,
+                    rendered_cue_cache=rendered_cue_cache,
+                    resolve_image_assets=True,
+                )
             )
-            text_entries.extend(scene_text_entries)
+            pending_text_entries.extend(
+                (entry, scene_language) for entry in scene_text_entries
+            )
             for scene_image_entry in scene_image_entries:
                 if scene_image_entry.source_asset_path is None or not scene_image_entry.source_asset_path.exists():
                     continue
@@ -2190,6 +2237,12 @@ class ProcessingService:
                         relative_asset_path=f"raw_scene_subtitles/{target_name}",
                     )
                 )
+
+        text_entries = await cls._translate_raw_scene_text_entries(
+            project_id=project.id,
+            target_language=target_language,
+            pending_entries=pending_text_entries,
+        )
 
         if image_entries:
             manifest_path = raw_output_dir / "manifest.json"

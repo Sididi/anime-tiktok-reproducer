@@ -171,6 +171,24 @@ class OpenRouterService:
         return cls._parse_json_value(raw)
 
     @classmethod
+    def generate_json_value_with_entry(
+        cls,
+        prompt: str,
+        *,
+        entry: LLMPresetEntry,
+        system: str | None = None,
+        max_output_tokens: int | None = None,
+    ) -> Any:
+        """JSON call with an explicit model entry, bypassing preset/tier resolution."""
+        raw = cls._chat(
+            prompt,
+            entry=entry,
+            system=system,
+            max_output_tokens=max_output_tokens,
+        )
+        return cls._parse_json_value(raw)
+
+    @classmethod
     def generate_json(
         cls,
         prompt: str,
