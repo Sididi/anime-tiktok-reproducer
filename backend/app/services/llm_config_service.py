@@ -8,7 +8,7 @@ import yaml
 from pydantic import ValidationError
 
 from ..config import settings
-from ..models.llm_config import LLMConfig, LLMPreset
+from ..models.llm_config import LLMConfig, LLMPreset, LLMPresetEntry
 
 
 class LLMConfigService:
@@ -57,6 +57,14 @@ class LLMConfigService:
                 f"Unknown LLM preset '{key}'. Available: {sorted(cfg.presets.keys())}"
             )
         return preset
+
+    @classmethod
+    def translation_entry(cls) -> LLMPresetEntry:
+        """Model used for subtitle translation; falls back to the default preset's light tier."""
+        cfg = cls.get_config()
+        if cfg.translation is not None:
+            return cfg.translation
+        return cfg.presets[cfg.default].light
 
     @classmethod
     def list_presets(cls) -> list[tuple[str, LLMPreset]]:

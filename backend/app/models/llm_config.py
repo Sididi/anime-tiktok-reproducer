@@ -45,6 +45,7 @@ class LLMConfig(BaseModel):
 
     default: str = Field(..., min_length=1)
     presets: dict[str, LLMPreset]
+    translation: LLMPresetEntry | None = None
     model_config = {"extra": "forbid"}
 
     @model_validator(mode="after")
