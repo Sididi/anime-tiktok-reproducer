@@ -341,3 +341,47 @@ def test_reserve_anchor_with_steals_route(client):
         },
     )
     assert resp.status_code == 409
+
+
+def _save_project_with_tiktok(pid, scheduled_at):
+    project = Project(
+        id=pid, anime_name="Show", scheduled_account_id="acc_a",
+        platform_schedules={
+            "tiktok": PlatformSchedule(slot=scheduled_at, scheduled_at=scheduled_at),
+        },
+    )
+    ProjectService.get_project_dir(project.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(project)
+    return project
+
+
+def test_patch_platform_locked_returns_423(client):
+    # tiktok at _NOW + 5min → lock window opened at _NOW - 5min → locked now
+    locked_at = datetime(2026, 5, 7, 12, 5, tzinfo=timezone.utc)
+    _save_project_with_tiktok("plock", locked_at)
+    r = client.patch(
+        "/api/scheduling/projects/plock/platforms/tiktok",
+        json={"new_slot": datetime(2026, 5, 7, 18, 0, tzinfo=timezone.utc).isoformat()},
+    )
+    assert r.status_code == 423
+    assert "timing_locked" in r.text
+
+
+def test_patch_anchor_locked_returns_423(client):
+    locked_at = datetime(2026, 5, 7, 12, 5, tzinfo=timezone.utc)
+    _save_project_with_tiktok("plock2", locked_at)
+    r = client.patch(
+        "/api/scheduling/projects/plock2/anchor",
+        json={"tiktok_slot": datetime(2026, 5, 7, 18, 0, tzinfo=timezone.utc).isoformat()},
+    )
+    assert r.status_code == 423
+
+
+def test_events_include_timing_locked_flag(client):
+    _save_project_with_tiktok("plocked", datetime(2026, 5, 7, 12, 5, tzinfo=timezone.utc))
+    _save_project_with_tiktok("pfree", datetime(2026, 5, 7, 18, 0, tzinfo=timezone.utc))
+    r = client.get("/api/scheduling/events", params={"range_start": _NOW.isoformat()})
+    assert r.status_code == 200
+    events = {e["project_id"]: e for e in r.json()["events"]}
+    assert events["plocked"]["timing_locked"] is True
+    assert events["pfree"]["timing_locked"] is False

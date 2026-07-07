@@ -40,6 +40,7 @@ class PlanningEvent(BaseModel):
     drive_folder_url: str | None
     status: Literal["scheduled", "running", "complete"]
     manual: bool = False
+    timing_locked: bool = False
 
 
 class FreeSlotResponse(BaseModel):
@@ -81,6 +82,7 @@ def _build_planning_event(
         drive_folder_url=project.drive_folder_url,
         status=_project_event_status(project, platform),  # type: ignore[arg-type]
         manual=sched.manual,
+        timing_locked=SchedulingService.tiktok_timing_locked(project),
     )
 
 
@@ -339,6 +341,8 @@ async def patch_platform(project_id: str, platform: str, req: PatchPlatformReque
             SchedulingService.reschedule_platform, project_id, platform, req.new_slot
         )
     except ValueError as exc:
+        if str(exc) == "timing_locked":
+            raise HTTPException(423, "timing_locked")
         raise HTTPException(422, str(exc))
     notif_status = await asyncio.to_thread(
         _notify_displaced, project_id, platform, sched.scheduled_at
@@ -360,6 +364,8 @@ async def patch_anchor(project_id: str, req: PatchAnchorRequest):
         )
     except ValueError as exc:
         msg = str(exc)
+        if msg == "timing_locked":
+            raise HTTPException(423, "timing_locked")
         if "slot_state_changed" in msg or "pool_busy" in msg:
             raise HTTPException(409, msg)
         raise HTTPException(422, msg)

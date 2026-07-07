@@ -4,6 +4,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.models import Project
@@ -410,3 +412,48 @@ def test_reserve_anchor_rolls_back_steal_on_anchor_conflict(tmp_path, monkeypatc
     assert ProjectService.load("projY").platform_schedules["youtube"].slot == s14
     # ...and "me" reserved nothing.
     assert not (ProjectService.load("me").platform_schedules or {})
+
+
+def test_tiktok_timing_locked_inside_window(tmp_path, monkeypatch):
+    from datetime import timedelta
+    acc = _setup_single_account(tmp_path, monkeypatch)
+    now = datetime(2026, 7, 8, 12, 0, tzinfo=timezone.utc)
+    tiktok_at = now + timedelta(minutes=5)  # lock window opened at now-5min
+    project = _save_scheduled_project("p1", acc, "tiktok", tiktok_at)
+    assert SchedulingService.tiktok_timing_locked(project, now=now) is True
+
+
+def test_tiktok_timing_not_locked_outside_window(tmp_path, monkeypatch):
+    from datetime import timedelta
+    acc = _setup_single_account(tmp_path, monkeypatch)
+    now = datetime(2026, 7, 8, 12, 0, tzinfo=timezone.utc)
+    tiktok_at = now + timedelta(minutes=15)  # lock opens at now+5min
+    project = _save_scheduled_project("p1", acc, "tiktok", tiktok_at)
+    assert SchedulingService.tiktok_timing_locked(project, now=now) is False
+
+
+def test_project_without_tiktok_never_timing_locked(tmp_path, monkeypatch):
+    acc = _setup_single_account(tmp_path, monkeypatch)
+    now = datetime(2026, 7, 8, 12, 0, tzinfo=timezone.utc)
+    project = _save_scheduled_project("p1", acc, "youtube", now)
+    assert SchedulingService.tiktok_timing_locked(project, now=now) is False
+
+
+def test_reschedule_platform_rejects_when_timing_locked(tmp_path, monkeypatch):
+    from datetime import timedelta
+    acc = _setup_single_account(tmp_path, monkeypatch)
+    now = datetime.now(timezone.utc)
+    tiktok_at = now + timedelta(minutes=3)  # inside the 10-min window
+    _save_scheduled_project("p1", acc, "tiktok", tiktok_at)
+    with pytest.raises(ValueError, match="timing_locked"):
+        SchedulingService.reschedule_platform("p1", "tiktok", tiktok_at)
+
+
+def test_reschedule_anchor_rejects_when_timing_locked(tmp_path, monkeypatch):
+    from datetime import timedelta
+    acc = _setup_single_account(tmp_path, monkeypatch)
+    now = datetime.now(timezone.utc)
+    tiktok_at = now + timedelta(minutes=3)
+    _save_scheduled_project("p1", acc, "tiktok", tiktok_at)
+    with pytest.raises(ValueError, match="timing_locked"):
+        SchedulingService.reschedule_anchor("p1", tiktok_at)

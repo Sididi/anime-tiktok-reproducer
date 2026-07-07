@@ -96,6 +96,7 @@ class SchedulingService:
     _MIN_LEAD_MINUTES = 30
     _JITTER_MINUTES = 30
     _MAX_LOOKAHEAD_DAYS = 90
+    TIKTOK_EDIT_LOCK_MINUTES = 10
     _reservation_lock = Lock()
 
     # ------------------------------------------------------------------ helpers
@@ -107,6 +108,22 @@ class SchedulingService:
     @classmethod
     def _normalize_utc_datetime(cls, value: datetime) -> datetime:
         return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+    @classmethod
+    def tiktok_timing_locked(
+        cls, project, *, now: datetime | None = None
+    ) -> bool:
+        """True once a project's TikTok posting has internally begun — i.e.
+        now >= tiktok.scheduled_at - TIKTOK_EDIT_LOCK_MINUTES. Projects without
+        a tiktok schedule are never timing-locked."""
+        sched = (project.platform_schedules or {}).get("tiktok")
+        if sched is None:
+            return False
+        current = now or datetime.now(timezone.utc)
+        lock_at = cls._normalize_utc_datetime(sched.scheduled_at) - timedelta(
+            minutes=cls.TIKTOK_EDIT_LOCK_MINUTES
+        )
+        return current >= lock_at
 
     @classmethod
     def _can_reuse_reserved_slot(cls, scheduled_at: datetime) -> bool:
@@ -679,6 +696,8 @@ class SchedulingService:
             account_id = project.scheduled_account_id
             if not account_id:
                 raise ValueError("Project has no scheduled account")
+            if cls.tiktok_timing_locked(project):
+                raise ValueError("timing_locked")
             # Drop existing per-platform reservations so resolve_anchor sees
             # the slots as free in this pool.
             project.platform_schedules = {}
@@ -704,6 +723,8 @@ class SchedulingService:
             account_id = project.scheduled_account_id
             if not account_id:
                 raise ValueError("Project has no scheduled account")
+            if cls.tiktok_timing_locked(project):
+                raise ValueError("timing_locked")
             slot = cls._normalize_utc_datetime(new_slot)
             if not cls._is_slot_in_account_config(account_id, platform, slot):
                 raise ValueError(f"Slot {slot.isoformat()} not configured for {platform}")
