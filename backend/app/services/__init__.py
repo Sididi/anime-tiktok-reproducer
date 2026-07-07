@@ -40,6 +40,10 @@ _EXPORTS = {
     "LLMService": (".llm_service", "LLMService"),
     "OpenRouterService": (".openrouter_service", "OpenRouterService"),
     "LLMConfigService": (".llm_config_service", "LLMConfigService"),
+    "SubtitleTranslationService": (
+        ".subtitle_translation_service",
+        "SubtitleTranslationService",
+    ),
     "TemplateService": (".template_service", "TemplateService"),
     "ElevenLabsService": (".elevenlabs_service", "ElevenLabsService"),
     "VoiceConfigService": (".voice_config_service", "VoiceConfigService"),
