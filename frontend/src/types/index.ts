@@ -457,6 +457,7 @@ export interface PlanningEvent {
   drive_folder_url: string | null;
   status: "scheduled" | "running" | "complete";
   manual: boolean;
+  timing_locked: boolean;
 }
 
 export interface FreeSlot {

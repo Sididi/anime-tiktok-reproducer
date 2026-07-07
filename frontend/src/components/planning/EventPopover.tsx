@@ -62,6 +62,7 @@ export function EventPopover({
   onCancelAll,
 }: EventPopoverProps) {
   const first = members[0];
+  const projectTimingLocked = first.timing_locked;
   const ordered = [...members].sort(
     (a, b) =>
       ALL_PLATFORMS.indexOf(a.platform) - ALL_PLATFORMS.indexOf(b.platform),
@@ -158,8 +159,17 @@ export function EventPopover({
         <div className="space-y-1.5 mb-3 border-t border-[hsl(var(--border))] pt-2">
           {ordered.map((m) => {
             const statusUi = STATUS_UI[m.status];
-            const locked = m.status !== "scheduled";
-            const lockedReason =
+            const statusLocked = m.status !== "scheduled";
+            const timingLocked = m.timing_locked;
+            // Timing lock forbids MOVING a slot, not cancelling it.
+            const rescheduleLocked = statusLocked || timingLocked;
+            const cancelLocked = statusLocked;
+            const rescheduleLockedReason = statusLocked
+              ? (m.status === "running"
+                  ? "Upload en cours — action impossible"
+                  : "Déjà publié — action impossible")
+              : "La publication TikTok a commencé — horaire verrouillé";
+            const cancelLockedReason =
               m.status === "running"
                 ? "Upload en cours — action impossible"
                 : "Déjà publié — action impossible";
@@ -189,14 +199,14 @@ export function EventPopover({
                   size="sm"
                   variant="ghost"
                   className="h-7 px-2 text-xs"
-                  disabled={locked}
+                  disabled={rescheduleLocked}
                   onClick={() => {
                     setConfirming(null);
                     onReschedulePlatform(m.platform);
                   }}
                   title={
-                    locked
-                      ? lockedReason
+                    rescheduleLocked
+                      ? rescheduleLockedReason
                       : `Déplacer le créneau ${PLATFORM_LABELS[m.platform]}`
                   }
                 >
@@ -210,7 +220,7 @@ export function EventPopover({
                       ? "bg-[hsl(var(--destructive))]/15"
                       : ""
                   }`}
-                  disabled={locked}
+                  disabled={cancelLocked}
                   onClick={() => {
                     if (isConfirmingPlatform(m.platform)) {
                       setConfirming(null);
@@ -220,8 +230,8 @@ export function EventPopover({
                     }
                   }}
                   title={
-                    locked
-                      ? lockedReason
+                    cancelLocked
+                      ? cancelLockedReason
                       : `Annuler le créneau ${PLATFORM_LABELS[m.platform]}`
                   }
                 >
@@ -244,10 +254,12 @@ export function EventPopover({
               setConfirming(null);
               onRescheduleProject();
             }}
-            disabled={rescheduleProjectDisabled}
+            disabled={rescheduleProjectDisabled || projectTimingLocked}
             title={
-              rescheduleProjectDisabledReason ??
-              "Replanifier le projet entier (toutes plateformes)"
+              projectTimingLocked
+                ? "La publication TikTok a commencé — horaire verrouillé"
+                : rescheduleProjectDisabledReason ??
+                  "Replanifier le projet entier (toutes plateformes)"
             }
           >
             <RotateCcw className="h-3.5 w-3.5 mr-1" /> Replanifier projet
