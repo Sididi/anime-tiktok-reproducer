@@ -10,7 +10,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -88,7 +88,7 @@ class SubtitleTranslationService:
                 raise ValueError("translation item is not an object")
             index = item.get("i")
             text = item.get("t")
-            if not isinstance(index, int) or not 0 <= index < expected_count:
+            if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < expected_count:
                 raise ValueError(f"translation index out of range: {index!r}")
             if out[index] is not None:
                 raise ValueError(f"duplicate translation index: {index}")
@@ -177,7 +177,7 @@ class SubtitleTranslationService:
                     cls._translate_chunk(chunk, source_language, target_language)
                 )
             model_id = LLMConfigService.translation_entry().openrouter_id
-            translated_at = datetime.now().isoformat()
+            translated_at = datetime.now(timezone.utc).isoformat()
             for key, source_text, translated_text in zip(
                 missing_keys, missing_texts, translated
             ):
