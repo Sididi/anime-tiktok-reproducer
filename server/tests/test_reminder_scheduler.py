@@ -20,6 +20,8 @@ from app.models.job import (
 from app.services.job_store import JobStore
 from app.services.post_for_me_publisher import TikTokPublishResult
 from app.services.reminder_scheduler import (
+    TIKTOK_LEAD_MINUTES,
+    _platform_due_time,
     dispatch_due_actions,
     run_scheduler_loop,
 )
@@ -739,3 +741,30 @@ async def test_dispatch_instagram_retries_old_prepare_and_download_failures_once
     assert ig.status == "failed"
     assert ig.attempts == 6
     assert publish_mock.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# TikTok lead time tests
+# ---------------------------------------------------------------------------
+
+def test_tiktok_due_time_has_10min_lead():
+    slot = datetime(2026, 7, 8, 20, 0, tzinfo=UTC)
+    job = _make_job(project_id="p1", slot_time=slot)  # adapted: slot_time is required
+    job.platform_scheduled_at = {"tiktok": slot}
+    assert TIKTOK_LEAD_MINUTES == 10
+    assert _platform_due_time(job, "tiktok") == slot - timedelta(minutes=10)
+
+
+def test_instagram_due_time_has_no_lead():
+    slot = datetime(2026, 7, 8, 20, 0, tzinfo=UTC)
+    job = _make_job(project_id="p1", slot_time=slot)
+    job.platform_scheduled_at = {"instagram": slot}
+    assert _platform_due_time(job, "instagram") == slot
+
+
+def test_tiktok_lead_does_not_mutate_stored_time():
+    slot = datetime(2026, 7, 8, 20, 0, tzinfo=UTC)
+    job = _make_job(project_id="p1", slot_time=slot)
+    job.platform_scheduled_at = {"tiktok": slot}
+    _platform_due_time(job, "tiktok")
+    assert job.platform_scheduled_at["tiktok"] == slot  # unchanged

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from app.config import Settings
 from app.models.job import (
@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 _IG_MAX_ATTEMPTS = 5
 _TT_MAX_ATTEMPTS = 5
+TIKTOK_LEAD_MINUTES = 10
 _IG_DEFAULT_POLL_INTERVAL_SECONDS = 60.0
 _IG_DEFAULT_POLL_TIMEOUT_SECONDS = 4 * 60 * 60.0
 _LEGACY_IG_CONTAINER_ERROR = "container status_code = ERROR"
@@ -73,8 +74,14 @@ async def dispatch_due_actions(
 
 
 def _platform_due_time(job: Job, platform: str) -> datetime:
+    """Due time for a platform. TikTok fires TIKTOK_LEAD_MINUTES early so its
+    ~10-min processing finishes around the user-facing slot; the stored time is
+    never mutated, so the head-start stays invisible to the backend and UI."""
     due_time = job.platform_scheduled_at.get(platform) or job.slot_time
-    return _normalize_utc(due_time)
+    due = _normalize_utc(due_time)
+    if platform == "tiktok":
+        due -= timedelta(minutes=TIKTOK_LEAD_MINUTES)
+    return due
 
 
 def _normalize_utc(value: datetime) -> datetime:
