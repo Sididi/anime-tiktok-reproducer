@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
@@ -182,6 +183,31 @@ def _result_error_detail(result: dict[str, Any]) -> str:
     return "post failed without error detail"
 
 
+_TIKTOK_VIDEO_URL_RE = re.compile(r"/video/\d+")
+_TIKTOK_USERNAME_RE = re.compile(r"tiktok\.com/@([A-Za-z0-9_.]+)")
+
+
+def _derive_tiktok_video_url(platform_data: dict[str, Any]) -> str | None:
+    """Build the public /video/<id> permalink from PFM's result payload.
+
+    PFM returns platform_data.url as the channel URL and never updates it to
+    the video permalink, but embeds the TikTok video id in platform_data.id
+    (e.g. "v_pub_url~v2-1.7659653399897655318"). Combine that id with the
+    username parsed from the channel URL. Returns None when either cannot be
+    parsed with confidence, so the caller falls back to the channel URL.
+    """
+    url = str(platform_data.get("url") or "")
+    if _TIKTOK_VIDEO_URL_RE.search(url):
+        return url  # PFM already gave us a permalink
+    username_match = _TIKTOK_USERNAME_RE.search(url)
+    if not username_match:
+        return None
+    trailing = str(platform_data.get("id") or "").rsplit(".", 1)[-1]
+    if not (trailing.isdigit() and 18 <= len(trailing) <= 19):
+        return None
+    return f"https://www.tiktok.com/@{username_match.group(1)}/video/{trailing}"
+
+
 async def publish_to_tiktok(  # noqa: PLR0911, PLR0912, PLR0915
     *,
     api_key: str,
@@ -320,12 +346,13 @@ async def publish_to_tiktok(  # noqa: PLR0911, PLR0912, PLR0915
                 )
                 if result.get("success"):
                     platform_data = result.get("platform_data") or {}
-                    url = platform_data.get("url")
+                    url = _derive_tiktok_video_url(platform_data) or platform_data.get("url")
                     state = replace(state, stage="published", url=url)
                     await _emit_progress(progress_callback, state)
                     logger.info(
-                        "PFM TikTok publish succeeded post_id=%s url=%s elapsed=%.1fs",
-                        post_id, url, time.monotonic() - started,
+                        "PFM TikTok publish succeeded post_id=%s url=%s "
+                        "platform_data=%s elapsed=%.1fs",
+                        post_id, url, platform_data, time.monotonic() - started,
                     )
                     return TikTokPublishResult(
                         success=True, url=url, publish_state=state

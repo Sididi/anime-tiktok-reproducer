@@ -9,7 +9,10 @@ import pytest
 
 from app.models.job import TikTokPublishState
 from app.services import post_for_me_publisher as pfm
-from app.services.post_for_me_publisher import publish_to_tiktok
+from app.services.post_for_me_publisher import (
+    _derive_tiktok_video_url,
+    publish_to_tiktok,
+)
 
 BASE = "https://api.postforme.dev/v1"
 
@@ -217,3 +220,51 @@ async def test_progress_callback_receives_states(fake, tmp_path):
     assert "media_uploaded" in seen
     assert "post_created" in seen
     assert seen[-1] == "published"
+
+
+def test_derive_url_constructs_permalink_from_embedded_id():
+    pd = {
+        "id": "v_pub_url~v2-1.7659653399897655318",
+        "url": "https://www.tiktok.com/@animespm2002",
+    }
+    assert _derive_tiktok_video_url(pd) == (
+        "https://www.tiktok.com/@animespm2002/video/7659653399897655318"
+    )
+
+
+def test_derive_url_passes_through_existing_video_url():
+    pd = {"id": "anything", "url": "https://www.tiktok.com/@a/video/12345"}
+    assert _derive_tiktok_video_url(pd) == "https://www.tiktok.com/@a/video/12345"
+
+
+def test_derive_url_none_when_id_not_video_id():
+    # trailing segment is not an 18-19 digit id
+    pd = {"id": "v_pub_url~v2-1.abc", "url": "https://www.tiktok.com/@a"}
+    assert _derive_tiktok_video_url(pd) is None
+
+
+def test_derive_url_none_when_id_wrong_length():
+    pd = {"id": "v_pub_url~v2-1.123", "url": "https://www.tiktok.com/@a"}
+    assert _derive_tiktok_video_url(pd) is None
+
+
+def test_derive_url_none_when_url_missing_username():
+    pd = {"id": "v_pub_url~v2-1.7659653399897655318", "url": ""}
+    assert _derive_tiktok_video_url(pd) is None
+
+
+async def test_publish_returns_constructed_video_url(fake, tmp_path):
+    fake.results_sequence = [
+        [{"social_account_id": "spc_1", "success": True,
+          "platform_data": {
+              "id": "v_pub_url~v2-1.7659653399897655318",
+              "url": "https://www.tiktok.com/@animespm2002",
+          },
+          "error": None}],
+    ]
+    result = await _publish(fake, tmp_path)
+    assert result.success is True
+    assert result.url == (
+        "https://www.tiktok.com/@animespm2002/video/7659653399897655318"
+    )
+    assert result.publish_state.url == result.url
