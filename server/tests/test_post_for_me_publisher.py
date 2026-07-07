@@ -253,6 +253,20 @@ def test_derive_url_none_when_url_missing_username():
     assert _derive_tiktok_video_url(pd) is None
 
 
+def test_derive_url_accepts_20_digit_upper_bound():
+    # 19 digits is the accepted upper bound; 20 digits must be rejected.
+    pd = {"id": "v_pub_url~v2-1.76596533998976553180", "url": "https://www.tiktok.com/@a"}
+    assert _derive_tiktok_video_url(pd) is None
+
+
+def test_derive_url_none_when_id_is_non_ascii_digits():
+    # Fullwidth digits satisfy str.isdigit() but are not ASCII; must be rejected.
+    non_ascii_digits = "１２３４５６７８９０１２３４５６７８"
+    assert len(non_ascii_digits) == 18
+    pd = {"id": f"v_pub_url~v2-1.{non_ascii_digits}", "url": "https://www.tiktok.com/@a"}
+    assert _derive_tiktok_video_url(pd) is None
+
+
 async def test_publish_returns_constructed_video_url(fake, tmp_path):
     fake.results_sequence = [
         [{"social_account_id": "spc_1", "success": True,

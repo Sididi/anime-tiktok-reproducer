@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 _IG_MAX_ATTEMPTS = 5
 _TT_MAX_ATTEMPTS = 5
-TIKTOK_LEAD_MINUTES = 10
+TIKTOK_LEAD_MINUTES = 10  # Must equal TIKTOK_EDIT_LOCK_MINUTES in backend/app/services/scheduling_service.py
 _IG_DEFAULT_POLL_INTERVAL_SECONDS = 60.0
 _IG_DEFAULT_POLL_TIMEOUT_SECONDS = 4 * 60 * 60.0
 _LEGACY_IG_CONTAINER_ERROR = "container status_code = ERROR"

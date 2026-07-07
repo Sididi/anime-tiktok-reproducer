@@ -223,6 +223,30 @@ def test_reserve_manual_overwrites_previous_manual(tmp_path, monkeypatch):
     assert ProjectService.load("p1").platform_schedules["tiktok"].slot == at2
 
 
+def test_reserve_manual_rejects_when_timing_locked(tmp_path, monkeypatch):
+    from datetime import timedelta
+    acc = _setup_single_account(tmp_path, monkeypatch)
+    now = datetime.now(timezone.utc)
+    tiktok_at = now + timedelta(minutes=3)  # inside the 10-min lock window
+    _save_scheduled_project("p1", acc, "tiktok", tiktok_at)
+    new_at = (now + timedelta(hours=2)).replace(second=0, microsecond=0)
+    with pytest.raises(ValueError, match="timing_locked"):
+        SchedulingService.reserve_manual("p1", acc, new_at, ["tiktok"])
+
+
+def test_reserve_manual_not_blocked_for_fresh_project(tmp_path, monkeypatch):
+    from datetime import timedelta
+    acc = _setup_single_account(tmp_path, monkeypatch)
+    ProjectService.get_project_dir("p1").mkdir(parents=True, exist_ok=True)
+    ProjectService.save(Project(id="p1"))  # no platform_schedules at all
+    at = (datetime.now(timezone.utc) + timedelta(hours=2)).replace(second=0, microsecond=0)
+
+    schedules = SchedulingService.reserve_manual("p1", acc, at, ["tiktok"])
+
+    assert schedules["tiktok"].slot == at
+    assert ProjectService.load("p1").platform_schedules["tiktok"].slot == at
+
+
 # --------------------------------------------------------------- compute_switch
 
 
@@ -343,6 +367,19 @@ def test_apply_switch_stale_occupant_raises(tmp_path, monkeypatch):
     ProjectService.save(Project(id="me"))
     with pytest.raises(ValueError, match="slot_state_changed"):
         SchedulingService.apply_switch("me", acc, "tiktok", s10, "cascade", "someoneelse")
+
+
+def test_apply_switch_rejects_when_switcher_timing_locked(tmp_path, monkeypatch):
+    from datetime import timedelta
+    acc = _setup_single_account(tmp_path, monkeypatch)
+    _patch_pool_not_busy(monkeypatch)
+    now = datetime.now(timezone.utc)
+    locked_at = now + timedelta(minutes=3)  # inside the 10-min lock window
+    _save_scheduled_project("me", acc, "tiktok", locked_at)
+    target_slot = _future_slot(1, 10)  # free slot, no occupant to conflict with
+
+    with pytest.raises(ValueError, match="timing_locked"):
+        SchedulingService.apply_switch("me", acc, "tiktok", target_slot, "cascade", None)
 
 
 def test_reserve_anchor_with_steal_is_atomic(tmp_path, monkeypatch):

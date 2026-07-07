@@ -203,7 +203,7 @@ def _derive_tiktok_video_url(platform_data: dict[str, Any]) -> str | None:
     if not username_match:
         return None
     trailing = str(platform_data.get("id") or "").rsplit(".", 1)[-1]
-    if not (trailing.isdigit() and 18 <= len(trailing) <= 19):
+    if not (trailing.isascii() and trailing.isdigit() and 18 <= len(trailing) <= 19):
         return None
     return f"https://www.tiktok.com/@{username_match.group(1)}/video/{trailing}"
 

@@ -96,7 +96,7 @@ class SchedulingService:
     _MIN_LEAD_MINUTES = 30
     _JITTER_MINUTES = 30
     _MAX_LOOKAHEAD_DAYS = 90
-    TIKTOK_EDIT_LOCK_MINUTES = 10
+    TIKTOK_EDIT_LOCK_MINUTES = 10  # Must equal TIKTOK_LEAD_MINUTES in server/app/services/reminder_scheduler.py
     _reservation_lock = Lock()
 
     # ------------------------------------------------------------------ helpers
@@ -663,6 +663,8 @@ class SchedulingService:
             project = ProjectService.load(project_id)
             if project is None:
                 raise ValueError("Project not found")
+            if cls.tiktok_timing_locked(project):
+                raise ValueError("timing_locked")
             at_utc = cls._normalize_utc_datetime(at)
             if at_utc < cls._earliest_allowed_publish_time():
                 raise ValueError("slot_too_close")
@@ -1115,6 +1117,8 @@ class SchedulingService:
             switcher = ProjectService.load(project_id)
             if switcher is None:
                 raise ValueError("Project not found")
+            if cls.tiktok_timing_locked(switcher):
+                raise ValueError("timing_locked")
             if switcher.scheduled_account_id and switcher.scheduled_account_id != account_id:
                 switcher.platform_schedules = {}
             schedules = dict(switcher.platform_schedules or {})

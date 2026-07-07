@@ -314,6 +314,8 @@ async def reserve_manual(project_id: str, req: ReserveManualRequest):
         )
     except ValueError as exc:
         msg = str(exc)
+        if "timing_locked" in msg:
+            raise HTTPException(423, "timing_locked")
         if "slot_too_close" in msg:
             raise HTTPException(422, "slot_too_close")
         if "Project not found" in msg:
@@ -536,6 +538,8 @@ async def switch_apply(project_id: str, req: SwitchApplyRequest):
         )
     except ValueError as exc:
         msg = str(exc)
+        if msg == "timing_locked":
+            raise HTTPException(423, "timing_locked")
         if "slot_state_changed" in msg or "pool_busy" in msg:
             raise HTTPException(409, msg)
         raise HTTPException(422, msg)
