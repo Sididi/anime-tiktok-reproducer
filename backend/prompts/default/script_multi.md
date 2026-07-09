@@ -58,7 +58,7 @@ Tu reçois un JSON contenant des scènes. Chaque scène possède :
 La langue [TARGET] peut avoir une densité syllabique différente de la langue [SOURCE].
 
 - **La Règle d'Or du débit :** Vise une moyenne de **3 à 4 mots par seconde** de `duration_seconds` (à ajuster légèrement selon la rapidité naturelle de la langue [TARGET]).
-  - *Exemple :* Si une scène dure 2.0s, tu as la place pour environ 6 à 8 mots.
+  - _Exemple :_ Si une scène dure 2.0s, tu as la place pour environ 6 à 8 mots.
 - **Priorité à l'Impact :** Ne cherche pas à "remplir" le temps si ce n'est pas nécessaire. Une phrase courte et tranchante est meilleure qu'une phrase longue.
 - **Gestion du débordement :** Tu as le droit de déborder légèrement de la durée théorique ou d'être plus court. Ce qui compte, c'est que le texte soit percutant.
 
@@ -67,19 +67,25 @@ La langue [TARGET] peut avoir une densité syllabique différente de la langue [
 Si possible, chaque séquence (aggrégat de plans de coupe) doit suivre au moins une de ces logiques :
 
 ## Curiosity
+
 Créer une attente (utilisant les formulations typiques de [TARGET] pour le suspense) :
+
 - "Sauf que…"
 - "Le problème, c'est que…"
 - "Il ne le sait pas encore, mais…"
 
 ## Escalade
+
 Chaque séquence doit :
+
 - augmenter le danger
 - ou augmenter l'enjeu
 - ou révéler une info clé
 
 ## Payoff visuel
+
 Quand une action arrive à l'écran :
+
 - elle doit être annoncée
 - puis livrée
 
@@ -91,8 +97,7 @@ Ton input JSON découpe la vidéo en "plans de coupe" (cuts) très courts. Ne tr
 2. **Redistribution :** Découpe ensuite cette phrase pour la répartir dans les objets JSON correspondants.
 3. **L'Ancrage Visuel (IMPÉRATIF) :** C'est ta seule contrainte rigide lors de la redistribution.
    - Si la scène X montre une action spécifique (ex: un coup de poing), le mot correspondant en [TARGET] DOIT être dans l'objet JSON de la scène X.
-   - *Méthode :* Écris l'histoire fluide, puis "épingle" les mots-clés sur les bons index temporels.
-4. **Interdiction de Spoiler :** Lors du regroupement, ne révèle JAMAIS une information avant le moment où le script source la révèle (ou avant la scène qui la montre à l'écran). Si le script source garde un suspense, ton texte le garde exactement au même endroit.
+   - _Méthode :_ Écris l'histoire fluide, puis "épingle" les mots-clés sur les bons index temporels.
 
 ### 8. FORMATTAGE AUDIO
 
