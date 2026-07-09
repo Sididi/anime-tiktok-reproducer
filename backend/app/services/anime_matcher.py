@@ -6079,6 +6079,29 @@ class AnimeMatcherService:
         return alternatives[:7]
 
     @classmethod
+    def _preserve_skipped_partial_rematch_matches(
+        cls,
+        matches: MatchList,
+        existing_matches: MatchList | None,
+        target_indices: set[int],
+    ) -> MatchList:
+        """Keep partial rematches from mutating scenes outside target_indices."""
+        if existing_matches is None:
+            return matches
+
+        preserved_matches: list[SceneMatch] = []
+        for index, match in enumerate(matches.matches):
+            if index in target_indices or index >= len(existing_matches.matches):
+                preserved_matches.append(match)
+                continue
+
+            existing_match = existing_matches.matches[index].model_copy(deep=True)
+            existing_match.scene_index = match.scene_index
+            preserved_matches.append(existing_match)
+
+        return MatchList(matches=preserved_matches)
+
+    @classmethod
     async def match_scenes(
         cls,
         video_path: Path,
@@ -6512,6 +6535,12 @@ class AnimeMatcherService:
             matches,
         )
         matches = cls._validate_and_repair_matches(scenes, matches)
+        if scene_indices_to_match is not None:
+            matches = cls._preserve_skipped_partial_rematch_matches(
+                matches,
+                existing_matches,
+                target_indices,
+            )
 
         yield MatchProgress(
             "complete",

@@ -78,6 +78,84 @@ def test_video_frame_embedding_cache_is_bounded_lru(monkeypatch) -> None:
     assert ("video", 0, 0, 7) not in cache
 
 
+def test_partial_rematch_preserves_skipped_existing_matches() -> None:
+    existing = MatchList(
+        matches=[
+            SceneMatch(
+                scene_index=0,
+                episode="Manual Episode",
+                start_time=10.0,
+                end_time=11.0,
+                confidence=1.0,
+                speed_ratio=1.0,
+                confirmed=True,
+            ),
+            SceneMatch(
+                scene_index=1,
+                episode="Old Target",
+                start_time=20.0,
+                end_time=21.0,
+                confidence=1.0,
+                speed_ratio=1.0,
+                confirmed=True,
+            ),
+            SceneMatch(
+                scene_index=2,
+                episode="Manual Tail",
+                start_time=30.0,
+                end_time=31.0,
+                confidence=1.0,
+                speed_ratio=1.0,
+                confirmed=True,
+                merged_from=[7, 8],
+            ),
+        ]
+    )
+    rematched = MatchList(
+        matches=[
+            SceneMatch(
+                scene_index=0,
+                episode="Mutated Episode",
+                start_time=90.0,
+                end_time=91.0,
+                confidence=0.5,
+                speed_ratio=1.0,
+            ),
+            SceneMatch(
+                scene_index=1,
+                episode="New Target",
+                start_time=22.0,
+                end_time=23.0,
+                confidence=0.8,
+                speed_ratio=1.0,
+            ),
+            SceneMatch(
+                scene_index=2,
+                episode="Mutated Tail",
+                start_time=99.0,
+                end_time=100.0,
+                confidence=0.5,
+                speed_ratio=1.0,
+                merged_from=[9],
+            ),
+        ]
+    )
+
+    result = AnimeMatcherService._preserve_skipped_partial_rematch_matches(
+        rematched,
+        existing,
+        {1},
+    )
+
+    assert result.matches[0].episode == "Manual Episode"
+    assert result.matches[0].start_time == 10.0
+    assert result.matches[1].episode == "New Target"
+    assert result.matches[1].start_time == 22.0
+    assert result.matches[2].episode == "Manual Tail"
+    assert result.matches[2].start_time == 30.0
+    assert result.matches[2].merged_from == [7, 8]
+
+
 def test_crop_index_memory_cache_is_bounded_lru(monkeypatch) -> None:
     monkeypatch.setattr(
         AnimeMatcherService,
