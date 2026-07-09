@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -62,8 +63,7 @@ def test_persisted_match_choice_ignores_unfilled_no_match_entry():
     )
 
 
-@pytest.mark.asyncio
-async def test_batch_auto_fill_does_not_overwrite_existing_match(monkeypatch):
+def test_batch_auto_fill_does_not_overwrite_existing_match(monkeypatch):
     saved_matches: list[MatchList] = []
     current_matches = MatchList(
         matches=[
@@ -102,18 +102,20 @@ async def test_batch_auto_fill_does_not_overwrite_existing_match(monkeypatch):
         lambda project_id, matches: saved_matches.append(matches.model_copy(deep=True)),
     )
 
-    result = await matching.update_matches_batch(
-        "project-1",
-        matching.BatchUpdateMatchesRequest(
-            updates=[
-                matching.BatchUpdateMatchItem(
-                    scene_index=0,
-                    episode="Auto Episode",
-                    start_time=20.0,
-                    end_time=21.0,
-                    confirmed=True,
-                )
-            ]
+    result = asyncio.run(
+        matching.update_matches_batch(
+            "project-1",
+            matching.BatchUpdateMatchesRequest(
+                updates=[
+                    matching.BatchUpdateMatchItem(
+                        scene_index=0,
+                        episode="Auto Episode",
+                        start_time=20.0,
+                        end_time=21.0,
+                        confirmed=True,
+                    )
+                ]
+            ),
         ),
     )
 
@@ -122,8 +124,79 @@ async def test_batch_auto_fill_does_not_overwrite_existing_match(monkeypatch):
     assert saved_matches[0].matches[0].episode == "Manual Episode"
 
 
-@pytest.mark.asyncio
-async def test_playback_manifest_rejects_stale_active_fingerprint(monkeypatch, tmp_path):
+def test_update_match_rejects_end_time_before_start_time():
+    with pytest.raises(matching.HTTPException) as exc_info:
+        asyncio.run(
+            matching.update_match(
+                "project-1",
+                0,
+                matching.UpdateMatchRequest(
+                    episode="Episode 01",
+                    start_time=20.0,
+                    end_time=19.0,
+                    confirmed=True,
+                ),
+            ),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "end_time must be greater than start_time" in exc_info.value.detail
+
+
+def test_update_matches_batch_rejects_equal_start_and_end_time(monkeypatch):
+    monkeypatch.setattr(
+        matching.ProjectService,
+        "load",
+        lambda project_id: Project(id=project_id, library_type="anime"),
+    )
+    monkeypatch.setattr(
+        matching.ProjectService,
+        "load_matches",
+        lambda project_id: MatchList(
+            matches=[
+                SceneMatch(
+                    scene_index=0,
+                    episode="",
+                    start_time=0.0,
+                    end_time=0.0,
+                    confidence=0.0,
+                    speed_ratio=1.0,
+                    confirmed=False,
+                )
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        matching.ProjectService,
+        "load_scenes",
+        lambda project_id: SceneList(
+            scenes=[Scene(index=0, start_time=0.0, end_time=1.0)]
+        ),
+    )
+
+    with pytest.raises(matching.HTTPException) as exc_info:
+        asyncio.run(
+            matching.update_matches_batch(
+                "project-1",
+                matching.BatchUpdateMatchesRequest(
+                    updates=[
+                        matching.BatchUpdateMatchItem(
+                            scene_index=0,
+                            episode="Episode 01",
+                            start_time=20.0,
+                            end_time=20.0,
+                            confirmed=True,
+                        )
+                    ]
+                ),
+            ),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "end_time must be greater than start_time" in exc_info.value.detail
+
+
+def test_playback_manifest_rejects_stale_active_fingerprint(monkeypatch, tmp_path):
     current_matches = MatchList(
         matches=[
             SceneMatch(
@@ -197,6 +270,6 @@ async def test_playback_manifest_rejects_stale_active_fingerprint(monkeypatch, t
         classmethod(lambda cls, project, scenes, matches, source_by_episode: "new-fingerprint"),
     )
 
-    manifest = await MatchPlaybackService.get_manifest("project-1")
+    manifest = asyncio.run(MatchPlaybackService.get_manifest("project-1"))
 
     assert manifest["ready"] is False

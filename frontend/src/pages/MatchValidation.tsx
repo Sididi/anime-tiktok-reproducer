@@ -1644,6 +1644,9 @@ export function MatchValidation() {
       meta: ManualMatchSaveMeta,
     ) => {
       if (!projectId) return;
+      if (endTime <= startTime) {
+        throw new Error("End time must be after start time.");
+      }
 
       const previousMatch =
         matches.find((m) => m.scene_index === sceneIndex) || null;

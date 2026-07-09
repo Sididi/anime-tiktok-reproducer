@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 from contextlib import suppress
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
@@ -111,6 +112,26 @@ def _dedupe_episode_options(episodes: list[str]) -> list[str]:
 def _has_persisted_match_choice(match: SceneMatch) -> bool:
     """Return True when a match already has a usable persisted source choice."""
     return bool(match.episode and match.confidence > 0)
+
+
+def _validate_match_timing(
+    start_time: float,
+    end_time: float,
+    *,
+    scene_index: int | None = None,
+) -> None:
+    """Reject invalid source ranges before they can be persisted."""
+    if not math.isfinite(start_time) or not math.isfinite(end_time):
+        raise HTTPException(
+            status_code=400,
+            detail="Match start_time and end_time must be finite numbers",
+        )
+    if end_time <= start_time:
+        suffix = f" for scene {scene_index}" if scene_index is not None else ""
+        raise HTTPException(
+            status_code=400,
+            detail=f"Match end_time must be greater than start_time{suffix}",
+        )
 
 
 def _serialize_scenes(scenes: SceneList) -> list[dict[str, float | int]]:
@@ -964,6 +985,12 @@ class BatchUpdateMatchesRequest(BaseModel):
 @router.put("/matches/{scene_index}")
 async def update_match(project_id: str, scene_index: int, request: UpdateMatchRequest):
     """Update or confirm a match for a scene."""
+    _validate_match_timing(
+        request.start_time,
+        request.end_time,
+        scene_index=scene_index,
+    )
+
     project = ProjectService.load(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -1023,6 +1050,12 @@ async def update_matches_batch(project_id: str, request: BatchUpdateMatchesReque
     match_by_scene_index = {match.scene_index: match for match in matches.matches}
 
     for update in request.updates:
+        _validate_match_timing(
+            update.start_time,
+            update.end_time,
+            scene_index=update.scene_index,
+        )
+
         match = match_by_scene_index.get(update.scene_index)
         if not match:
             raise HTTPException(

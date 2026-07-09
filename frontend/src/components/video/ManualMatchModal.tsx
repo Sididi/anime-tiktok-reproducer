@@ -423,6 +423,19 @@ function ManualMatchModalContent({
     seekSourceGlobal(start, true);
   }, [seekSourceGlobal, startTime]);
 
+  const timingValidationError = useMemo(() => {
+    const start = parseTime(startTime);
+    const end = parseTime(endTime);
+
+    if (start === null || end === null) {
+      return "Use mm:ss.xx timing values.";
+    }
+    if (end <= start) {
+      return "End time must be after start time.";
+    }
+    return null;
+  }, [endTime, startTime]);
+
   const handleSave = useCallback(async () => {
     if (saving) {
       return;
@@ -431,6 +444,9 @@ function ManualMatchModalContent({
     const start = parseTime(startTime);
     const end = parseTime(endTime);
     if (start === null || end === null || !selectedEpisode) {
+      return;
+    }
+    if (end <= start) {
       return;
     }
 
@@ -710,6 +726,12 @@ function ManualMatchModalContent({
                   </div>
                 </div>
               </div>
+              {timingValidationError && (
+                <div className="flex items-center gap-2 rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+                  <AlertTriangle className="h-4 w-4 flex-none" />
+                  <span>{timingValidationError}</span>
+                </div>
+              )}
 
               <Button
                 variant="outline"
@@ -728,7 +750,12 @@ function ManualMatchModalContent({
           <Button variant="outline" onClick={onClose} disabled={saving}>
             Cancel
           </Button>
-          <Button onClick={handleSave} disabled={saving}>
+          <Button
+            onClick={handleSave}
+            disabled={
+              saving || Boolean(timingValidationError) || !selectedEpisode
+            }
+          >
             <Check className="mr-2 h-4 w-4" />
             {saving ? "Saving..." : "Save Match"}
           </Button>
