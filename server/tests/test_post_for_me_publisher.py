@@ -11,7 +11,11 @@ from app.models.job import TikTokPublishState
 from app.services import post_for_me_publisher as pfm
 from app.services.post_for_me_publisher import (
     _derive_tiktok_video_url,
+    create_tiktok_post,
+    delete_tiktok_post,
+    poll_tiktok_post_result,
     publish_to_tiktok,
+    stage_media_for_tiktok,
 )
 
 BASE = "https://api.postforme.dev/v1"
@@ -29,6 +33,7 @@ class FakePfm:
         self._results_calls = 0
         self.fail_create_post = False
         self.fail_upload = False
+        self.deleted_posts: list[str] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:  # noqa: PLR0911
         url = str(request.url)
@@ -55,6 +60,9 @@ class FakePfm:
             data = self.results_sequence[idx] if self.results_sequence else []
             self._results_calls += 1
             return httpx.Response(200, json={"data": data})
+        if url.startswith(f"{BASE}/social-posts/") and request.method == "DELETE":
+            self.deleted_posts.append(url.rsplit("/", 1)[-1])
+            return httpx.Response(200, json={"success": True})
         return httpx.Response(404, text=f"unexpected: {request.method} {url}")
 
 
@@ -282,3 +290,119 @@ async def test_publish_returns_constructed_video_url(fake, tmp_path):
         "https://www.tiktok.com/@animespm2002/video/7659653399897655318"
     )
     assert result.publish_state.url == result.url
+
+
+async def test_stage_media_uploads_and_sets_state(fake, tmp_path):
+    result = await stage_media_for_tiktok(
+        api_key="key", download_url="https://drive.example/video.mp4",
+        temp_dir=tmp_path,
+    )
+    assert result.success is True
+    assert result.publish_state.media_url == "https://media.example/abc.mp4"
+    assert result.publish_state.stage == "media_uploaded"
+    assert fake.upload_puts == [fake.video_bytes]
+    assert fake.created_posts == []          # staging never creates a post
+
+
+async def test_stage_media_noop_when_already_staged(fake, tmp_path):
+    state = TikTokPublishState(media_url="https://media.example/abc.mp4",
+                               stage="media_uploaded")
+    result = await stage_media_for_tiktok(
+        api_key="key", download_url="https://drive.example/video.mp4",
+        publish_state=state, temp_dir=tmp_path,
+    )
+    assert result.success is True
+    assert fake.upload_puts == []            # no re-download / re-upload
+
+
+async def test_stage_media_failure_increments_media_attempts(fake, tmp_path):
+    fake.fail_upload = True
+    result = await stage_media_for_tiktok(
+        api_key="key", download_url="https://drive.example/video.mp4",
+        temp_dir=tmp_path,
+    )
+    assert result.success is False
+    assert "upload" in result.detail
+    assert result.publish_state.media_attempts == 1
+    again = await stage_media_for_tiktok(
+        api_key="key", download_url="https://drive.example/video.mp4",
+        publish_state=result.publish_state, temp_dir=tmp_path,
+    )
+    assert again.publish_state.media_attempts == 2
+
+
+async def test_create_post_with_scheduled_at_sends_iso_and_sets_stage(fake, tmp_path):
+    when = datetime(2026, 7, 15, 20, 0, tzinfo=UTC)
+    state = TikTokPublishState(media_url="https://media.example/abc.mp4",
+                               stage="media_uploaded")
+    result = await create_tiktok_post(
+        api_key="key", social_account_id="spc_1", caption="cap",
+        scheduled_at=when, publish_state=state,
+    )
+    assert result.success is True
+    assert result.publish_state.post_id == "post_1"
+    assert result.publish_state.stage == "post_scheduled"
+    assert fake.created_posts[0]["scheduled_at"] == "2026-07-15T20:00:00+00:00"
+
+
+async def test_create_post_instant_omits_scheduled_at(fake, tmp_path):
+    state = TikTokPublishState(media_url="https://media.example/abc.mp4",
+                               stage="media_uploaded")
+    result = await create_tiktok_post(
+        api_key="key", social_account_id="spc_1", caption="cap",
+        publish_state=state,
+    )
+    assert result.success is True
+    assert result.publish_state.stage == "post_created"
+    assert "scheduled_at" not in fake.created_posts[0]
+
+
+async def test_create_post_without_media_fails(fake, tmp_path):
+    result = await create_tiktok_post(
+        api_key="key", social_account_id="spc_1", caption="cap",
+        publish_state=None,
+    )
+    assert result.success is False
+    assert "no staged media_url" in result.detail
+    assert fake.created_posts == []
+
+
+async def test_create_post_noop_when_live_post_exists(fake, tmp_path):
+    state = TikTokPublishState(post_id="post_9", stage="post_scheduled",
+                               media_url="https://media.example/abc.mp4")
+    result = await create_tiktok_post(
+        api_key="key", social_account_id="spc_1", caption="cap",
+        publish_state=state,
+    )
+    assert result.success is True
+    assert fake.created_posts == []          # double-post guard
+
+
+async def test_poll_result_publishes_scheduled_post(fake, tmp_path):
+    fake.results_sequence = [
+        [{"social_account_id": "spc_1", "success": True,
+          "platform_data": {"url": "https://tiktok.com/@a/video/1"}, "error": None}],
+    ]
+    state = TikTokPublishState(post_id="post_1", stage="post_scheduled",
+                               media_url="https://media.example/abc.mp4")
+    result = await poll_tiktok_post_result(
+        api_key="key", social_account_id="spc_1",
+        poll_interval=0.0, poll_timeout=1.0, publish_state=state,
+    )
+    assert result.success is True
+    assert result.url == "https://tiktok.com/@a/video/1"
+    assert result.publish_state.stage == "published"
+
+
+async def test_poll_result_without_post_id_fails(fake, tmp_path):
+    result = await poll_tiktok_post_result(
+        api_key="key", social_account_id="spc_1",
+        poll_interval=0.0, poll_timeout=1.0, publish_state=None,
+    )
+    assert result.success is False
+    assert "no post to poll" in result.detail
+
+
+async def test_delete_post_calls_delete_endpoint(fake, tmp_path):
+    await delete_tiktok_post(api_key="key", post_id="post_1")
+    assert fake.deleted_posts == ["post_1"]

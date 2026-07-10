@@ -1,11 +1,12 @@
 """TikTok publisher via Post for Me (postforme.dev).
 
-Flow:
-  GET  download_url                      -> save the MP4 locally
-  POST {base}/media/create-upload-url    -> {upload_url, media_url}
-  PUT  upload_url                        -> binary upload (signed, no auth)
-  POST {base}/social-posts               -> immediate publish (no scheduled_at)
-  GET  {base}/social-post-results?post_id=... (poll until a result exists)
+Flow (three phases, driven by the scheduler at separate due times):
+  1. stage_media_for_tiktok: GET download_url → POST media/create-upload-url
+     → PUT binary (as soon as the job exists on the VPS)
+  2. create_tiktok_post: POST social-posts with scheduled_at = slot
+     (at slot − TIKTOK_SCHEDULE_LEAD_MINUTES; PFM fires server-side at slot)
+  3. poll_tiktok_post_result: GET social-post-results (from slot)
+publish_to_tiktok composes all three for instant publishing (late jobs).
 
 Managed credentials: Post for Me's audited TikTok app publishes on our behalf.
 The only secret is the project API key (server .env, never persisted in jobs).
@@ -208,115 +209,179 @@ def _derive_tiktok_video_url(platform_data: dict[str, Any]) -> str | None:
     return f"https://www.tiktok.com/@{username_match.group(1)}/video/{trailing}"
 
 
-async def publish_to_tiktok(  # noqa: PLR0911, PLR0912, PLR0915
+def _live_post_id(state: TikTokPublishState | None) -> str | None:
+    """post_id of an existing non-failed post, else None (failed → recreate)."""
+    if state and state.post_id and state.stage != "failed":
+        return state.post_id
+    return None
+
+
+def _client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(30.0, read=None), follow_redirects=True
+    )
+
+
+async def stage_media_for_tiktok(
+    *,
+    api_key: str,
+    download_url: str,
+    base_url: str = DEFAULT_BASE_URL,
+    publish_state: TikTokPublishState | dict[str, Any] | None = None,
+    temp_dir: Path | None = None,
+    progress_callback: TikTokProgressCallback | None = None,
+) -> TikTokPublishResult:
+    """Phase 1: Drive download → PFM storage upload. Idempotent: no-ops when
+    media is already staged or a live post exists. On failure, increments
+    media_attempts in the returned state (quiet pre-window retry counter)."""
+    state = _coerce_state(publish_state)
+    if state and (state.media_url or _live_post_id(state)):
+        return TikTokPublishResult(success=True, url=state.url, publish_state=state)
+    async with _client() as client:
+        try:
+            media_url = await _upload_media(
+                client,
+                base_url=base_url.rstrip("/"),
+                api_key=api_key,
+                download_url=download_url,
+                temp_dir=temp_dir,
+            )
+        except httpx.HTTPStatusError as e:
+            detail = _stage_detail("upload", _response_detail(e.response))
+            state = replace(
+                state or TikTokPublishState(),
+                media_attempts=(state.media_attempts if state else 0) + 1,
+                last_error=detail,
+            )
+            return TikTokPublishResult(success=False, detail=detail, publish_state=state)
+        except (httpx.HTTPError, RuntimeError, KeyError, ValueError) as e:
+            detail = _stage_detail("upload", f"{type(e).__name__}: {e}")
+            state = replace(
+                state or TikTokPublishState(),
+                media_attempts=(state.media_attempts if state else 0) + 1,
+                last_error=detail,
+            )
+            return TikTokPublishResult(success=False, detail=detail, publish_state=state)
+    state = replace(
+        state or TikTokPublishState(),
+        media_url=media_url,
+        stage="media_uploaded",
+        created_at=_utc_now(),
+        last_error=None,
+    )
+    await _emit_progress(progress_callback, state)
+    return TikTokPublishResult(success=True, publish_state=state)
+
+
+async def create_tiktok_post(
     *,
     api_key: str,
     social_account_id: str,
     caption: str,
-    download_url: str,
     privacy_status: str = "public",
     allow_comment: bool = True,
     allow_duet: bool = True,
     allow_stitch: bool = True,
+    scheduled_at: datetime | None = None,
+    base_url: str = DEFAULT_BASE_URL,
+    publish_state: TikTokPublishState | dict[str, Any] | None = None,
+    progress_callback: TikTokProgressCallback | None = None,
+) -> TikTokPublishResult:
+    """Phase 2: create the social post. With scheduled_at, PFM publishes
+    server-side at that instant (stage "post_scheduled"); without it the
+    publish starts immediately (stage "post_created"). Idempotent on a live
+    post_id; requires staged media."""
+    state = _coerce_state(publish_state)
+    if state and state.stage == "published":
+        return TikTokPublishResult(success=True, url=state.url, publish_state=state)
+    if _live_post_id(state):
+        return TikTokPublishResult(success=True, publish_state=state)
+    media_url = state.media_url if state else None
+    if not media_url:
+        return TikTokPublishResult(
+            success=False,
+            detail=_stage_detail("create_post", "no staged media_url"),
+            publish_state=state,
+        )
+    body: dict[str, Any] = {
+        "caption": caption,
+        "social_accounts": [social_account_id],
+        "media": [{"url": media_url}],
+        "platform_configurations": {
+            "tiktok": {
+                "privacy_status": privacy_status,
+                "allow_comment": allow_comment,
+                "allow_duet": allow_duet,
+                "allow_stitch": allow_stitch,
+            }
+        },
+    }
+    if scheduled_at is not None:
+        body["scheduled_at"] = scheduled_at.astimezone(UTC).isoformat()
+    async with _client() as client:
+        try:
+            create = await client.post(
+                f"{base_url.rstrip('/')}/social-posts",
+                headers=_headers(api_key),
+                json=body,
+            )
+            create.raise_for_status()
+            post_id = str(_unwrap(create.json())["id"])
+        except httpx.HTTPStatusError as e:
+            return TikTokPublishResult(
+                success=False,
+                detail=_stage_detail("create_post", _response_detail(e.response)),
+                publish_state=state,
+            )
+        except (httpx.HTTPError, KeyError, ValueError) as e:
+            return TikTokPublishResult(
+                success=False,
+                detail=_stage_detail("create_post", f"{type(e).__name__}: {e}"),
+                publish_state=state,
+            )
+    state = replace(
+        state or TikTokPublishState(),
+        post_id=post_id,
+        stage="post_scheduled" if scheduled_at is not None else "post_created",
+        last_error=None,
+    )
+    await _emit_progress(progress_callback, state)
+    logger.info(
+        "PFM post created social_account_id=%s post_id=%s scheduled_at=%s",
+        social_account_id, post_id,
+        scheduled_at.isoformat() if scheduled_at else "instant",
+    )
+    return TikTokPublishResult(success=True, publish_state=state)
+
+
+async def poll_tiktok_post_result(  # noqa: PLR0911, PLR0912
+    *,
+    api_key: str,
+    social_account_id: str,
     base_url: str = DEFAULT_BASE_URL,
     poll_interval: float = _DEFAULT_POLL_INTERVAL_SECONDS,
     poll_timeout: float = _DEFAULT_POLL_TIMEOUT_SECONDS,
     publish_state: TikTokPublishState | dict[str, Any] | None = None,
     progress_callback: TikTokProgressCallback | None = None,
-    temp_dir: Path | None = None,
 ) -> TikTokPublishResult:
-    base = base_url.rstrip("/")
+    """Phase 3: poll social-post-results until TikTok reports the outcome."""
     state = _coerce_state(publish_state)
-    started = time.monotonic()
-
     if state and state.stage == "published":
         return TikTokPublishResult(success=True, url=state.url, publish_state=state)
-
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(30.0, read=None), follow_redirects=True
-    ) as client:
-        # ---- Ensure media is uploaded (reuse persisted media_url on retry) ----
-        media_url = state.media_url if state else None
-        post_id = state.post_id if state and state.stage != "failed" else None
-
-        if post_id is None and media_url is None:
-            try:
-                media_url = await _upload_media(
-                    client,
-                    base_url=base,
-                    api_key=api_key,
-                    download_url=download_url,
-                    temp_dir=temp_dir,
-                )
-            except httpx.HTTPStatusError as e:
-                return TikTokPublishResult(
-                    success=False,
-                    detail=_stage_detail("upload", _response_detail(e.response)),
-                    publish_state=state,
-                )
-            except (httpx.HTTPError, RuntimeError, KeyError, ValueError) as e:
-                return TikTokPublishResult(
-                    success=False,
-                    detail=_stage_detail("upload", f"{type(e).__name__}: {e}"),
-                    publish_state=state,
-                )
-            state = TikTokPublishState(
-                media_url=media_url,
-                stage="media_uploaded",
-                created_at=_utc_now(),
-            )
-            await _emit_progress(progress_callback, state)
-
-        # ---- Ensure the post exists ----
-        if post_id is None:
-            body = {
-                "caption": caption,
-                "social_accounts": [social_account_id],
-                "media": [{"url": media_url}],
-                "platform_configurations": {
-                    "tiktok": {
-                        "privacy_status": privacy_status,
-                        "allow_comment": allow_comment,
-                        "allow_duet": allow_duet,
-                        "allow_stitch": allow_stitch,
-                    }
-                },
-            }
-            try:
-                create = await client.post(
-                    f"{base}/social-posts", headers=_headers(api_key), json=body
-                )
-                create.raise_for_status()
-                post_id = str(_unwrap(create.json())["id"])
-            except httpx.HTTPStatusError as e:
-                return TikTokPublishResult(
-                    success=False,
-                    detail=_stage_detail("create_post", _response_detail(e.response)),
-                    publish_state=state,
-                )
-            except (httpx.HTTPError, KeyError, ValueError) as e:
-                return TikTokPublishResult(
-                    success=False,
-                    detail=_stage_detail("create_post", f"{type(e).__name__}: {e}"),
-                    publish_state=state,
-                )
-            state = replace(
-                state or TikTokPublishState(),
-                post_id=post_id,
-                stage="post_created",
-                last_error=None,
-            )
-            await _emit_progress(progress_callback, state)
-            logger.info(
-                "PFM post created social_account_id=%s post_id=%s", social_account_id, post_id
-            )
-
-        # ---- Poll results ----
+    post_id = state.post_id if state else None
+    if not post_id:
+        return TikTokPublishResult(
+            success=False,
+            detail=_stage_detail("poll_results", "no post to poll"),
+            publish_state=state,
+        )
+    started = time.monotonic()
+    async with _client() as client:
         elapsed = 0.0
         while True:
             try:
                 results_resp = await client.get(
-                    f"{base}/social-post-results",
+                    f"{base_url.rstrip('/')}/social-post-results",
                     headers=_headers(api_key),
                     params={"post_id": post_id},
                 )
@@ -378,3 +443,63 @@ async def publish_to_tiktok(  # noqa: PLR0911, PLR0912, PLR0915
                 )
             await asyncio.sleep(poll_interval)
             elapsed += max(poll_interval, 0.001)
+
+
+async def delete_tiktok_post(
+    *, api_key: str, post_id: str, base_url: str = DEFAULT_BASE_URL
+) -> None:
+    """Cancel a scheduled post. 404 (already gone) is treated as success."""
+    async with _client() as client:
+        response = await client.delete(
+            f"{base_url.rstrip('/')}/social-posts/{post_id}",
+            headers=_headers(api_key),
+        )
+        if response.status_code == 404:
+            return
+        response.raise_for_status()
+
+
+async def publish_to_tiktok(
+    *,
+    api_key: str,
+    social_account_id: str,
+    caption: str,
+    download_url: str,
+    privacy_status: str = "public",
+    allow_comment: bool = True,
+    allow_duet: bool = True,
+    allow_stitch: bool = True,
+    base_url: str = DEFAULT_BASE_URL,
+    poll_interval: float = _DEFAULT_POLL_INTERVAL_SECONDS,
+    poll_timeout: float = _DEFAULT_POLL_TIMEOUT_SECONDS,
+    publish_state: TikTokPublishState | dict[str, Any] | None = None,
+    progress_callback: TikTokProgressCallback | None = None,
+    temp_dir: Path | None = None,
+) -> TikTokPublishResult:
+    """Instant-publish composition of the three phases (stage → create → poll).
+
+    Kept for the late-job path and API compatibility; the scheduler drives the
+    phases individually so each gets its own due time."""
+    state = _coerce_state(publish_state)
+    if state and state.stage == "published":
+        return TikTokPublishResult(success=True, url=state.url, publish_state=state)
+    staged = await stage_media_for_tiktok(
+        api_key=api_key, download_url=download_url, base_url=base_url,
+        publish_state=state, temp_dir=temp_dir, progress_callback=progress_callback,
+    )
+    if not staged.success:
+        return staged
+    created = await create_tiktok_post(
+        api_key=api_key, social_account_id=social_account_id, caption=caption,
+        privacy_status=privacy_status, allow_comment=allow_comment,
+        allow_duet=allow_duet, allow_stitch=allow_stitch, scheduled_at=None,
+        base_url=base_url, publish_state=staged.publish_state,
+        progress_callback=progress_callback,
+    )
+    if not created.success:
+        return created
+    return await poll_tiktok_post_result(
+        api_key=api_key, social_account_id=social_account_id, base_url=base_url,
+        poll_interval=poll_interval, poll_timeout=poll_timeout,
+        publish_state=created.publish_state, progress_callback=progress_callback,
+    )
