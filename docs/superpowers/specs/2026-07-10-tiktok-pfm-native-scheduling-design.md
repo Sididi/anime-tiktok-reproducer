@@ -54,16 +54,18 @@ a new post is only created after a definitive `failed` result, reusing
 
 ### 2. `reminder_scheduler.py` — per-phase due times
 
-New constant `TIKTOK_SCHEDULE_LEAD_MINUTES = 15` (replaces
-`TIKTOK_LEAD_MINUTES = 10`; must equal `TIKTOK_EDIT_LOCK_MINUTES` in
-`backend/app/services/scheduling_service.py`).
+New constant `TIKTOK_SCHEDULE_LEAD_MINUTES = 10` (replaces
+`TIKTOK_LEAD_MINUTES = 10`). It must stay **≤** `TIKTOK_EDIT_LOCK_MINUTES`
+(15) in `backend/app/services/scheduling_service.py`: the caption/slot freeze
+at `sched − 15 min` must precede post creation at `sched − 10 min`, so the
+post is always created from final data with a 5-min margin.
 
 With `sched = platform_scheduled_at["tiktok"] or slot_time`:
 
 | Phase | Due | Retry |
 | --- | --- | --- |
-| stage_media | immediately on job arrival | every tick, own attempts counter; failure ping if still failing at `sched − 15 min` |
-| create post | `sched − 15 min` | every tick, up to 5 attempts (existing counter) |
+| stage_media | immediately on job arrival | every tick, own attempts counter; failure ping if still failing at `sched − 10 min` |
+| create post | `sched − 10 min` | every tick, up to 5 attempts (existing counter) |
 | poll result | `sched` | resumable; existing attempts/timeout semantics |
 
 `completed_at`, Discord embed re-render, and failure pings keep today's
@@ -83,19 +85,20 @@ the same concurrency for free.
 
 ### 4. Cancellation / reschedule
 
-- Before `sched − 15 min`: no PFM post exists; nothing to do. Staged media
+- Before `sched − 10 min`: no PFM post exists; nothing to do. Staged media
   simply sits unused in PFM storage if the job is deleted.
-- After `sched − 15 min`: the backend edit-lock (now 15 min) already forbids
-  slot changes and caption edits. Job **deletion** inside the window
-  additionally issues `DELETE /v1/social-posts/{post_id}` when a
-  `post_scheduled` state exists.
+- After `sched − 10 min`: the backend edit-lock (15 min, already in force
+  before the post exists) forbids slot changes and caption edits. Job
+  **deletion** inside the window additionally issues
+  `DELETE /v1/social-posts/{post_id}` when a `post_scheduled` state exists.
 
 ## Backend changes
 
 - `TIKTOK_EDIT_LOCK_MINUTES: 10 → 15` in
-  `backend/app/services/scheduling_service.py` (caption freezes when the
-  scheduled post is created). Update the cross-file comment to point at
-  `TIKTOK_SCHEDULE_LEAD_MINUTES`.
+  `backend/app/services/scheduling_service.py` (freeze precedes post
+  creation by 5 min). Update the cross-file comment: the invariant is
+  `TIKTOK_SCHEDULE_LEAD_MINUTES (server) ≤ TIKTOK_EDIT_LOCK_MINUTES
+  (backend)`, no longer equality.
 
 ## Out of scope (YAGNI)
 
