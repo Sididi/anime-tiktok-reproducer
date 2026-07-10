@@ -1100,17 +1100,54 @@ def _print_strict_result(result: StrictValidationResult) -> None:
         print("  none")
 
 
-def _thumb_data_uri(image) -> str:
+def _clip_data_uri(video_path: Path, start: float, end: float) -> str:
+    """Extract [start, end] as a small H.264 clip (veryfast preset, low
+    quality — review pages need timing fidelity, not looks) and return it as
+    a data: URI so the page stays self-contained. `-ss` before `-i` with
+    re-encoding is frame-accurate. Returns "" on any failure."""
     import base64
-    import io
+    import subprocess
+    import tempfile
 
-    if image is None:
+    duration = max(0.3, end - start)
+    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-loglevel", "error",
+                "-ss", f"{max(0.0, start):.3f}",
+                "-t", f"{duration:.3f}",
+                "-i", str(video_path),
+                "-an",
+                "-vf", "scale=-2:360",
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "30",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                str(tmp_path),
+            ],
+            capture_output=True,
+            timeout=120,
+        )
+        if proc.returncode != 0 or not tmp_path.stat().st_size:
+            print(
+                f"  clip failed {video_path.name} {start:.2f}-{end:.2f}: "
+                f"{proc.stderr.decode(errors='replace')[-200:]}",
+                flush=True,
+            )
+            return ""
+        payload = tmp_path.read_bytes()
+        return "data:video/mp4;base64," + base64.b64encode(payload).decode()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"  clip failed {video_path.name} {start:.2f}-{end:.2f}: {exc}", flush=True)
         return ""
-    thumb = image.copy()
-    thumb.thumbnail((214, 120))
-    buffer = io.BytesIO()
-    thumb.convert("RGB").save(buffer, format="JPEG", quality=70)
-    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def _render_review_html(
@@ -1119,57 +1156,59 @@ def _render_review_html(
     out_path: Path,
 ) -> None:
     """§8 owner-review page: one self-contained HTML per project with
-    side-by-side frame strips (TikTok | generated source | GT source) for
+    side-by-side video clips (TikTok | generated source | GT source) for
     every doubtful scene, embedded as data URIs."""
+    from concurrent.futures import ThreadPoolExecutor
+
     project, _, _ = _load_required(project_id)
     video_path = Path(project.video_path)
-    fracs = (0.02, 0.35, 0.65, 0.98)
 
-    # batch all decodes: one pass over the TikTok, one per episode
-    tiktok_targets: list[float] = []
-    episode_targets: dict[str, list[float]] = {}
+    def episode_video(episode: str) -> Path | None:
+        if not episode:
+            return None
+        path = AnimeLibraryService.resolve_episode_path(
+            episode, library_type=project.library_type
+        )
+        return path if path is not None and path.exists() else None
+
+    # collect unique clip jobs across entries, encode in parallel (ffmpeg is
+    # an external process; 4 workers keep the CPU busy without thrashing)
+    jobs: dict[tuple[str, float, float], Path] = {}
     for entry in result.review_entries:
         s, e = entry.tiktok_interval
-        tiktok_targets.extend(s + (e - s) * f for f in fracs)
+        jobs[(str(video_path), round(s, 3), round(e, 3))] = video_path
         for episode, (s0, e0) in (
             (entry.generated_episode, entry.generated_interval),
             (entry.gt_episode, entry.gt_interval),
         ):
-            if episode:
-                episode_targets.setdefault(episode, []).extend(
-                    s0 + (e0 - s0) * f for f in fracs
-                )
-    tiktok_frames = AnimeMatcherService.extract_frames(video_path, tiktok_targets)
-    episode_frames: dict[str, list] = {}
-    for episode, targets in episode_targets.items():
-        episode_path = AnimeLibraryService.resolve_episode_path(
-            episode, library_type=project.library_type
-        )
-        if episode_path is None or not episode_path.exists():
-            episode_frames[episode] = [None] * len(targets)
-            continue
-        episode_frames[episode] = AnimeMatcherService.extract_frames(
-            episode_path, targets
-        )
-    episode_cursor: dict[str, int] = {episode: 0 for episode in episode_targets}
+            path = episode_video(episode)
+            if path is not None and e0 > s0:
+                jobs[(str(path), round(s0, 3), round(e0, 3))] = path
+    print(f"  encoding {len(jobs)} review clips (ffmpeg veryfast)...", flush=True)
+    clips: dict[tuple[str, float, float], str] = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {
+            key: pool.submit(_clip_data_uri, path, key[1], key[2])
+            for key, path in jobs.items()
+        }
+        for key, future in futures.items():
+            clips[key] = future.result()
 
-    def take_episode_strip(episode: str) -> list:
-        if not episode:
-            return [None] * len(fracs)
-        cursor = episode_cursor[episode]
-        episode_cursor[episode] = cursor + len(fracs)
-        return episode_frames[episode][cursor : cursor + len(fracs)]
+    def clip_html(path: Path | None, start: float, end: float) -> str:
+        if path is None or end <= start:
+            return "<em>—</em>"
+        uri = clips.get((str(path), round(start, 3), round(end, 3)), "")
+        if not uri:
+            return "<em>clip failed</em>"
+        return f'<video src="{uri}" controls muted loop preload="metadata"></video>'
 
     sections: list[str] = []
-    for k, entry in enumerate(result.review_entries):
-        tiktok_strip = tiktok_frames[k * len(fracs) : (k + 1) * len(fracs)]
-        generated_strip = take_episode_strip(entry.generated_episode)
-        gt_strip = take_episode_strip(entry.gt_episode)
-
-        def strip_html(frames) -> str:
-            return "".join(
-                f'<img src="{_thumb_data_uri(f)}" loading="lazy">' for f in frames
-            )
+    for entry in result.review_entries:
+        tiktok_clip = clip_html(video_path, *entry.tiktok_interval)
+        generated_clip = clip_html(
+            episode_video(entry.generated_episode), *entry.generated_interval
+        )
+        gt_clip = clip_html(episode_video(entry.gt_episode), *entry.gt_interval)
 
         doubt = (
             " | aligner doubts: " + ", ".join(entry.doubt_reasons)
@@ -1186,6 +1225,7 @@ def _render_review_html(
 <tr><th>Generated {gep} {gi0:.2f}-{gi1:.2f}</th><td>{generated}</td></tr>
 <tr><th>GT {tep} {ki0:.2f}-{ki1:.2f}</th><td>{gt}</td></tr>
 </table>
+<button class="playall">▶ jouer les 3 ensemble</button>
 <p class="verdict">waiver JSON: <code>{{"project_id": "{pid}", "gt_scene_index": {idx},
  "axis": "{axis}", "generated": [{gi0:.2f}, {gi1:.2f}], "verdict": "pass|fail",
  "note": "", "date": "2026-07-10"}}</code></p>
@@ -1197,15 +1237,15 @@ def _render_review_html(
                 doubt=doubt,
                 ti0=entry.tiktok_interval[0],
                 ti1=entry.tiktok_interval[1],
-                tiktok=strip_html(tiktok_strip),
+                tiktok=tiktok_clip,
                 gep=entry.generated_episode or "<none>",
                 gi0=entry.generated_interval[0],
                 gi1=entry.generated_interval[1],
-                generated=strip_html(generated_strip),
+                generated=generated_clip,
                 tep=entry.gt_episode or "<none>",
                 ki0=entry.gt_interval[0],
                 ki1=entry.gt_interval[1],
-                gt=strip_html(gt_strip),
+                gt=gt_clip,
                 pid=project_id,
             )
         )
@@ -1215,13 +1255,35 @@ def _render_review_html(
 <style>
 body {{ font-family: sans-serif; background: #111; color: #eee; margin: 2em; }}
 .entry {{ border: 1px solid #444; padding: 1em; margin-bottom: 2em; }}
-img {{ margin: 2px; max-height: 120px; }}
+video {{ margin: 2px; max-height: 240px; max-width: 100%; background: #000; }}
 th {{ text-align: left; padding-right: 1em; font-weight: normal; color: #9cf; white-space: nowrap; }}
 h3 {{ margin: 0 0 .3em; }}
 .verdict code {{ color: #fc9; font-size: .85em; }}
+.playall {{ background: #333; color: #eee; border: 1px solid #666; padding: .3em .8em; cursor: pointer; }}
+#speed {{ position: fixed; top: .6em; right: .8em; background: #222; padding: .4em .8em; border: 1px solid #555; }}
 </style></head><body>
+<div id="speed">vitesse
+<button data-rate="1">1x</button>
+<button data-rate="0.5">0.5x</button>
+<button data-rate="0.25">0.25x</button>
+</div>
 <h1>{pid} — {n} doubtful scenes ({date})</h1>
 {body}
+<script>
+document.querySelectorAll('#speed button').forEach(function(b) {{
+  b.addEventListener('click', function() {{
+    var rate = parseFloat(b.dataset.rate);
+    document.querySelectorAll('video').forEach(function(v) {{ v.playbackRate = rate; }});
+  }});
+}});
+document.querySelectorAll('.playall').forEach(function(b) {{
+  b.addEventListener('click', function() {{
+    b.closest('.entry').querySelectorAll('video').forEach(function(v) {{
+      v.currentTime = 0; v.play();
+    }});
+  }});
+}});
+</script>
 </body></html>""".format(
         pid=project_id,
         n=len(result.review_entries),

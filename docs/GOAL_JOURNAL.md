@@ -434,3 +434,28 @@ and 85de83ca6323). Version numbering continues from v57 to keep references unamb
   85de#0) are not reachable by tug parameter widening; they need segmentation-level
   treatment (DP boundary priors around loud cuts), which interacts with the whole
   measured stack — deferred with evidence rather than risked blind.
+
+## 2026-07-10 - owner review round 5 integrated + owner-authorized 411f GT fix
+
+- Round-5 verdicts (on the video-clip review5 pages): identical to round 2 except
+  411f #8 pass→FAIL. Owner diagnosis confirmed frame-precise by direct inspection:
+  the TikTok cut (woman→landscape) sits at frame 443/30fps = 14.767, so GT#7's range
+  held the first frame of #8's shot. Owner offered "fix GT automatically or skip
+  #7+#8"; fix chosen (well-determined: cut measured, E02 shot continues past the new
+  #7 source end, E01 landscape shot starts 1079.70-1079.80 < src start). GT edit
+  (owner-authorized exception to the read-only rule, backup in
+  ~/.cache/atr-eval/gt_backup_411f_2026-07-10/): scenes.json #7/#8 boundary
+  14.80→14.766667; matches.json #7 end 1107.95→1107.917, #8 start 1079.91→1079.89
+  (each at its own scene rate; speed_ratio recomputed).
+- Waivers: 54 review5 entries upserted (unmentioned = pass, with generated intervals
+  for the stale guard), (8,scene)+(8,source) → fail, stale (25,source) fail dropped
+  (machine-fixed in v94, owner exhaustive list = valid). 113 entries total.
+- Metric (v99 outputs re-scored, GT fix + round-5 waivers, zero stale):
+  dcd 19/0/1 + 19/0/0/1 (7 waivers); 85de 49/2/3 + 43/0/6/5 (14);
+  411f 50/0/2 + 49/0/0/3 (13); 5e85 44/2/0 + 40/0/6/0 (12). All CEILING-REPORT
+  (>3 waivers); the strict-PASS path remains the owner GT-corrections
+  (GT_CORRECTION_PROPOSALS.md). 411f source exact 48→49 (#25 now counts on its own).
+- Also this round: review generator now embeds real video clips (ffmpeg veryfast,
+  360p, frame-accurate seek, data URIs; global 1x/0.5x/0.25x speed control +
+  per-entry synchronized playback); review5_*.html regenerated from the v99 JSONs
+  with identical entry sets.

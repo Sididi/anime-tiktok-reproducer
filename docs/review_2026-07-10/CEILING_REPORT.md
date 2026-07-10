@@ -1,17 +1,25 @@
-# Per-project ceiling report — post owner-review round 2 (v98 outputs, 2026-07-10)
+# Per-project ceiling report — post owner-review round 5 (v99 outputs, 2026-07-10)
 
-Strict evaluator, tolerances unchanged. Owner verdicts (rounds 1+2, 112 entries)
+Strict evaluator, tolerances unchanged. Owner verdicts (rounds 1-5, 113 entries)
 applied from `backend/data/eval_waivers.json`; a pass-waiver is voided automatically
 if the generated interval later moves >0.35s (stale guard). Zero stale waivers.
 
-## Fresh detection (v99 outputs + round-2 verdicts; pan localizer included)
+Round 5 (2026-07-10 evening): verdicts identical to round 2 except 411f #8
+pass→FAIL — its GT cut was defective (the first frame of #8's shot sat at the end
+of #7's range); owner authorized an automatic GT fix, applied frame-precise:
+#7/#8 boundary 14.80 → 14.767 (measured true cut), source ends adjusted at each
+scene's rate (backup: `~/.cache/atr-eval/gt_backup_411f_2026-07-10/`). The stale
+411f #25 fail entry was dropped (machine-fixed in v94; owner round-5 exhaustive
+list = valid). Review pages carry embedded video clips since round 5.
+
+## Fresh detection (v99 outputs + round-5 verdicts + 411f GT fix)
 
 | Project | Scene E/L/F | Source E/L/WP/F | Waivers | Elapsed | Verdict |
 |---|---|---|---|---|---|
-| dcd74148c7ec | 19/0/1 | 19/0/0/1 | 9 | 86.8s | CEILING-REPORT |
-| 85de83ca6323 | 49/2/3 | 43/0/6/5 | 17 | 168.4s | CEILING-REPORT |
-| 411f73d26c1d | 51/0/1 | 48/0/2/2 | 15 | 242.0s* | CEILING-REPORT |
-| 5e85164d9ff8 | 44/2/0 | 40/0/6/0 | 13 | 160.4s | CEILING-REPORT |
+| dcd74148c7ec | 19/0/1 | 19/0/0/1 | 7 | 86.8s | CEILING-REPORT |
+| 85de83ca6323 | 49/2/3 | 43/0/6/5 | 14 | 168.4s | CEILING-REPORT |
+| 411f73d26c1d | 50/0/2 | 49/0/0/3 | 13 | 242.0s* | CEILING-REPORT |
+| 5e85164d9ff8 | 44/2/0 | 40/0/6/0 | 12 | 160.4s | CEILING-REPORT |
 
 Current review pages: `docs/review_2026-07-10/review5_*.html` (4/23/19/10 entries).
 
