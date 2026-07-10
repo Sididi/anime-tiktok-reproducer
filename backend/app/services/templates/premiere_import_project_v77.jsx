@@ -48,7 +48,6 @@
   var OVERLAY_ENABLED = true;
   var CATEGORY_OVERLAY_ENABLED = true;
   var TITLE_OVERLAY_ENABLED = true;
-  var OVERLAY_END_SEC = 2.5;
   var OVERLAY_FADE_DURATION_SEC = 0.5;
 
   // --- SCENES DATA ---
@@ -2634,13 +2633,13 @@
     );
 
     if (OVERLAY_ENABLED) {
-      log("Adding overlays on V5/V6 until " + OVERLAY_END_SEC + "s...");
+      log("Adding overlays on V5/V6 until " + sequenceEndSec + "s...");
       var overlayFadeTrackIndexes = [];
       if (CATEGORY_OVERLAY_ENABLED) {
         var categoryOverlayItem = placeOverlayOnTrack(
           v5,
           CATEGORY_OVERLAY_FILENAME,
-          OVERLAY_END_SEC,
+          sequenceEndSec,
         );
         if (!categoryOverlayItem) {
           log("Warning: Failed to place " + CATEGORY_OVERLAY_FILENAME + " on V5.");
@@ -2652,7 +2651,7 @@
         var titleOverlayItem = placeOverlayOnTrack(
           v6,
           TITLE_OVERLAY_FILENAME,
-          OVERLAY_END_SEC,
+          sequenceEndSec,
         );
         if (!titleOverlayItem) {
           log("Warning: Failed to place " + TITLE_OVERLAY_FILENAME + " on V6.");

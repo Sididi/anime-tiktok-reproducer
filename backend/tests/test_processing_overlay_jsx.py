@@ -100,12 +100,15 @@ def test_jsx_enables_only_category_overlay_for_category_only():
     assert "overlayFadeTrackIndexes.push(4);" in jsx
 
 
-def test_jsx_enables_both_overlays_with_forced_end_and_fades_each_overlay():
+def test_jsx_enables_both_overlays_until_sequence_end_and_fades_each_overlay():
     jsx = _render(title=True, category=True)
     assert "var OVERLAY_ENABLED = true;" in jsx
     assert "var CATEGORY_OVERLAY_ENABLED = true;" in jsx
     assert "var TITLE_OVERLAY_ENABLED = true;" in jsx
-    assert "var OVERLAY_END_SEC = 2.5;" in jsx
+    assert "var OVERLAY_END_SEC" not in jsx
+    assert 'log("Adding overlays on V5/V6 until " + sequenceEndSec + "s...")' in jsx
+    assert "CATEGORY_OVERLAY_FILENAME,\n          sequenceEndSec," in jsx
+    assert "TITLE_OVERLAY_FILENAME,\n          sequenceEndSec," in jsx
     assert "var OVERLAY_FADE_DURATION_SEC = 0.5;" in jsx
     assert "var overlayFadeTrackIndexes = [];" in jsx
     assert "overlayFadeTrackIndexes.push(4);" in jsx
