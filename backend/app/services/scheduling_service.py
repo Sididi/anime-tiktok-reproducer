@@ -96,7 +96,11 @@ class SchedulingService:
     _MIN_LEAD_MINUTES = 30
     _JITTER_MINUTES = 30
     _MAX_LOOKAHEAD_DAYS = 90
-    TIKTOK_EDIT_LOCK_MINUTES = 10  # Must equal TIKTOK_LEAD_MINUTES in server/app/services/reminder_scheduler.py
+    # Freeze slot/caption 15 min before the TikTok publish instant. Must stay
+    # >= TIKTOK_SCHEDULE_LEAD_MINUTES (server/app/services/reminder_scheduler.py):
+    # the VPS creates the PFM scheduled post from this data at sched-10, so the
+    # freeze precedes post creation by 5 min.
+    TIKTOK_EDIT_LOCK_MINUTES = 15
     _reservation_lock = Lock()
 
     # ------------------------------------------------------------------ helpers
