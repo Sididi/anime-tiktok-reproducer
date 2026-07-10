@@ -249,8 +249,13 @@ export const api = {
       },
     ),
 
-  getFacebookPreviewUrl: (projectId: string, version: "original" | "sped_up") =>
-    `${API_BASE}/project-manager/projects/${projectId}/facebook-preview/${version}`,
+  getUploadSourcePreviewUrl: (projectId: string) =>
+    `${API_BASE}/project-manager/projects/${projectId}/upload-source-preview`,
+
+  getUploadSourceStatus: (projectId: string) =>
+    request<{ state: "ready" | "in_progress" | "error" | "missing"; detail?: string }>(
+      `/project-manager/projects/${projectId}/upload-source-status`,
+    ),
 
   checkYouTubeDuration: (projectId: string, accountId?: string) =>
     request<import("@/types").YouTubeCheckResult>(
@@ -260,9 +265,6 @@ export const api = {
         body: JSON.stringify({ account_id: accountId ?? null }),
       },
     ),
-
-  getYouTubePreviewUrl: (projectId: string, version: "original" | "sped_up") =>
-    `${API_BASE}/project-manager/projects/${projectId}/youtube-preview/${version}`,
 
   checkCopyright: (projectId: string, accountId?: string) =>
     request<import("@/types").CopyrightCheckResult>(

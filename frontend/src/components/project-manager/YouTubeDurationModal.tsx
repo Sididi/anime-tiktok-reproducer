@@ -1,8 +1,8 @@
 import { useEffect, useRef, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Scissors, Zap, X, Ban } from "lucide-react";
+import { Scissors, Zap, X, Ban, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui";
-import { api } from "@/api/client";
+import { useUploadSourcePreview } from "@/hooks/useUploadSourcePreview";
 import type { UploadDurationStrategy } from "@/types";
 
 interface YouTubeDurationModalProps {
@@ -37,6 +37,7 @@ export function YouTubeDurationModal({
   const cutVideoRef = useRef<HTMLVideoElement>(null);
   const spedUpVideoRef = useRef<HTMLVideoElement>(null);
   const maxDuration = 180;
+  const preview = useUploadSourcePreview(projectId, open);
 
   const handleCutTimeUpdate = useCallback(() => {
     const video = cutVideoRef.current;
@@ -69,8 +70,20 @@ export function YouTubeDurationModal({
     return null;
   }
 
-  const originalUrl = api.getYouTubePreviewUrl(projectId, "original");
   const accelPercent = ((speedFactor - 1) * 100).toFixed(0);
+
+  const previewPlaceholder = (
+    <div className="w-full h-full flex flex-col items-center justify-center gap-2 text-white/70">
+      {preview.status === "loading" ? (
+        <>
+          <Loader2 className="h-6 w-6 animate-spin" />
+          <span className="text-xs">Préparation de l'aperçu...</span>
+        </>
+      ) : (
+        <span className="text-xs">Aperçu indisponible</span>
+      )}
+    </div>
+  );
 
   const card = (
     <motion.div
@@ -113,14 +126,18 @@ export function YouTubeDurationModal({
       >
         <div className="flex flex-col gap-3">
           <div className="relative bg-black rounded-lg overflow-hidden aspect-9/16 max-h-[55vh]">
-            <video
-              ref={cutVideoRef}
-              src={originalUrl}
-              className="w-full h-full object-contain"
-              controls
-              preload="metadata"
-              onTimeUpdate={handleCutTimeUpdate}
-            />
+            {preview.status === "ready" ? (
+              <video
+                ref={cutVideoRef}
+                src={preview.url}
+                className="w-full h-full object-contain"
+                controls
+                preload="metadata"
+                onTimeUpdate={handleCutTimeUpdate}
+              />
+            ) : (
+              previewPlaceholder
+            )}
             <div className="absolute top-2 left-2 bg-black/70 text-white text-xs font-medium px-2 py-1 rounded-md flex items-center gap-1.5">
               <Scissors className="h-3 w-3" />
               Coupée à 3:00
@@ -145,14 +162,18 @@ export function YouTubeDurationModal({
         {spedUpAvailable && (
           <div className="flex flex-col gap-3">
             <div className="relative bg-black rounded-lg overflow-hidden aspect-9/16 max-h-[55vh]">
-              <video
-                ref={spedUpVideoRef}
-                src={originalUrl}
-                className="w-full h-full object-contain"
-                controls
-                preload="metadata"
-                onLoadedMetadata={handleSpedUpLoadedMetadata}
-              />
+              {preview.status === "ready" ? (
+                <video
+                  ref={spedUpVideoRef}
+                  src={preview.url}
+                  className="w-full h-full object-contain"
+                  controls
+                  preload="metadata"
+                  onLoadedMetadata={handleSpedUpLoadedMetadata}
+                />
+              ) : (
+                previewPlaceholder
+              )}
               <div className="absolute top-2 left-2 bg-black/70 text-white text-xs font-medium px-2 py-1 rounded-md flex items-center gap-1.5">
                 <Zap className="h-3 w-3" />
                 Accélérée x{speedFactor.toFixed(2)} (+{accelPercent}%)

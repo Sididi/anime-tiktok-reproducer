@@ -441,13 +441,18 @@ function installProjectManagerUploadMocks({
     }
 
     if (
+      /^\/api\/project-manager\/projects\/[^/]+\/upload-source-status$/.test(
+        url.pathname,
+      )
+    ) {
+      return jsonResponse({ state: "ready" });
+    }
+
+    if (
       /^\/api\/project-manager\/projects\/[^/]+\/copyright-video$/.test(
         url.pathname,
       ) ||
-      /^\/api\/project-manager\/projects\/[^/]+\/facebook-preview\/(original|sped_up)$/.test(
-        url.pathname,
-      ) ||
-      /^\/api\/project-manager\/projects\/[^/]+\/youtube-preview\/(original|sped_up)$/.test(
+      /^\/api\/project-manager\/projects\/[^/]+\/upload-source-preview$/.test(
         url.pathname,
       ) ||
       /^\/api\/project-manager\/projects\/[^/]+\/local-video$/.test(
