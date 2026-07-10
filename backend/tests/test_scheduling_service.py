@@ -455,7 +455,7 @@ def test_tiktok_timing_locked_inside_window(tmp_path, monkeypatch):
     from datetime import timedelta
     acc = _setup_single_account(tmp_path, monkeypatch)
     now = datetime(2026, 7, 8, 12, 0, tzinfo=timezone.utc)
-    tiktok_at = now + timedelta(minutes=5)  # lock window opened at now-5min
+    tiktok_at = now + timedelta(minutes=5)  # lock opened at now-10min (lock=15)
     project = _save_scheduled_project("p1", acc, "tiktok", tiktok_at)
     assert SchedulingService.tiktok_timing_locked(project, now=now) is True
 
