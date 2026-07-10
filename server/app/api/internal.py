@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from app.auth.dependencies import require_internal_token
 from app.models.job import Job, PlatformStatus
 from app.services.embed_builder import build_embed
+from app.services.post_for_me_publisher import delete_tiktok_post
 
 logger = logging.getLogger(__name__)
 
@@ -336,6 +337,25 @@ async def delete_job(project_id: str, request: Request) -> None:
             )
         except Exception as e:
             logger.warning("Reminder forward delete failed for %s: %s", project_id, e)
+
+    state = job.tiktok_publish_state
+    if (
+        state is not None
+        and state.post_id
+        and state.stage == "post_scheduled"
+        and settings.pfm_api_key
+    ):
+        try:
+            await delete_tiktok_post(
+                api_key=settings.pfm_api_key,
+                post_id=state.post_id,
+                base_url=settings.pfm_base_url,
+            )
+        except Exception as e:
+            logger.warning(
+                "PFM scheduled-post delete failed for %s (post_id=%s): %s",
+                project_id, state.post_id, e,
+            )
 
     await store.delete(project_id)
 
