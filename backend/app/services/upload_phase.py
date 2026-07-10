@@ -1465,21 +1465,55 @@ class UploadPhaseService:
         return SocialUploadService.is_youtube_configured()
 
     @classmethod
+    def _resolve_final_video_duration(
+        cls,
+        project_id: str,
+        readiness: UploadReadiness,
+        probe_media: Callable[..., Any],
+    ) -> float:
+        """Duration of the final video without downloading it when possible."""
+        if readiness.local_video_path:
+            local = Path(readiness.local_video_path)
+            if local.exists():
+                probe, probe_error = probe_media(video_path=local)
+                if (
+                    not probe_error
+                    and probe is not None
+                    and probe.duration_seconds is not None
+                ):
+                    return probe.duration_seconds
+
+        if readiness.drive_video_id:
+            duration = GoogleDriveService.get_video_duration_seconds(
+                readiness.drive_video_id
+            )
+            if duration is not None:
+                return duration
+
+        # Drive has not exposed video metadata yet: single blocking download
+        # into the shared cache (also feeds the preview modals and the upload).
+        source_path = cls._ensure_source_video(project_id, readiness)
+        probe, probe_error = probe_media(video_path=source_path)
+        if probe_error or probe is None or probe.duration_seconds is None:
+            raise ValueError(
+                f"Unable to probe video duration: {probe_error or 'unknown'}"
+            )
+        return probe.duration_seconds
+
+    @classmethod
     def _check_platform_duration(
         cls,
         project_id: str,
         account_id: str | None,
         *,
-        platform_label: str,
-        prep_dir: Path,
         cleanup_stale: Callable[[], None],
         is_enabled: Callable[[str | None], bool],
         probe_media: Callable[..., Any],
-        transcode_to_limit: Callable[..., Any],
         max_duration: float,
         max_speed: float,
     ) -> dict[str, Any]:
         cleanup_stale()
+        cls.cleanup_stale_source_cache()
 
         project = ProjectService.load(project_id)
         if not project:
@@ -1492,27 +1526,14 @@ class UploadPhaseService:
         if readiness.status != "green" or not (
             readiness.drive_video_id or readiness.local_video_path
         ):
-            raise ValueError(f"Project is not ready for upload: {', '.join(readiness.reasons)}")
+            raise ValueError(
+                f"Project is not ready for upload: {', '.join(readiness.reasons)}"
+            )
 
-        prep_dir.mkdir(parents=True, exist_ok=True)
+        duration_seconds = cls._resolve_final_video_duration(
+            project_id, readiness, probe_media
+        )
 
-        video_name = readiness.drive_video_name or readiness.local_video_name or "final_video.mp4"
-        original_path = prep_dir / video_name
-        if not original_path.exists():
-            if readiness.local_video_path and Path(readiness.local_video_path).exists():
-                shutil.copy2(readiness.local_video_path, original_path)
-            elif readiness.drive_video_id:
-                GoogleDriveService.download_file(readiness.drive_video_id, original_path)
-            else:
-                raise ValueError(
-                    "Final video unavailable: not present locally and no Drive copy"
-                )
-
-        probe, probe_error = probe_media(video_path=original_path)
-        if probe_error or probe is None or probe.duration_seconds is None:
-            raise ValueError(f"Unable to probe video duration: {probe_error or 'unknown'}")
-
-        duration_seconds = probe.duration_seconds
         if duration_seconds <= max_duration + 0.01:
             return {
                 "needed": False,
@@ -1524,9 +1545,9 @@ class UploadPhaseService:
         speed_factor = duration_seconds / max_duration
         sped_up_available = speed_factor <= max_speed + 1e-6
 
-        # Note: We no longer transcode the sped-up preview here.
-        # The frontend uses HTML5 playbackRate for instant preview.
-        # Actual transcoding happens at upload time if user chooses "sped_up" strategy.
+        # A choice modal will open: warm the shared preview cache now so the
+        # previews are ready as soon as possible.  Never blocks the check.
+        cls.start_source_video_download(project_id, readiness)
 
         return {
             "needed": True,
@@ -1544,12 +1565,9 @@ class UploadPhaseService:
         return cls._check_platform_duration(
             project_id,
             account_id,
-            platform_label="Facebook",
-            prep_dir=cls._facebook_prep_dir(project_id),
             cleanup_stale=cls.cleanup_stale_facebook_prep,
             is_enabled=cls._facebook_upload_enabled,
             probe_media=SocialUploadService._probe_facebook_media,
-            transcode_to_limit=SocialUploadService._transcode_facebook_video_to_limit,
             max_duration=SocialUploadService._FACEBOOK_MAX_DURATION_SECONDS,
             max_speed=SocialUploadService._FACEBOOK_MAX_SPEED_FACTOR,
         )
@@ -1563,12 +1581,9 @@ class UploadPhaseService:
         return cls._check_platform_duration(
             project_id,
             account_id,
-            platform_label="YouTube",
-            prep_dir=cls._youtube_prep_dir(project_id),
             cleanup_stale=cls.cleanup_stale_youtube_prep,
             is_enabled=cls._youtube_upload_enabled,
             probe_media=SocialUploadService._probe_youtube_media,
-            transcode_to_limit=SocialUploadService._transcode_youtube_video_to_limit,
             max_duration=SocialUploadService._YOUTUBE_UPLOAD_TARGET_DURATION_SECONDS,
             max_speed=SocialUploadService._YOUTUBE_MAX_SPEED_FACTOR,
         )
