@@ -150,3 +150,18 @@ def test_job_defaults_tiktok_fields_absent():
     job = Job.from_dict(_job_dict_minimal())
     assert job.tiktok_payload is None
     assert job.tiktok_publish_state is None
+
+
+def test_tiktok_publish_state_media_attempts_round_trip():
+    state = TikTokPublishState(media_attempts=3, stage="post_scheduled")
+    d = state.to_dict()
+    assert d["media_attempts"] == 3
+    restored = TikTokPublishState.from_dict(d)
+    assert restored.media_attempts == 3
+    assert restored.stage == "post_scheduled"
+
+
+def test_tiktok_publish_state_media_attempts_defaults_to_zero_for_legacy_dicts():
+    legacy = {"post_id": "sp_1", "stage": "post_created"}
+    restored = TikTokPublishState.from_dict(legacy)
+    assert restored.media_attempts == 0

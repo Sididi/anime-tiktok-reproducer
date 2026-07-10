@@ -143,7 +143,8 @@ class TikTokPublishState:
 
     post_id: str | None = None
     media_url: str | None = None
-    stage: str | None = None  # media_uploaded | post_created | published | failed
+    stage: str | None = None  # media_uploaded | post_scheduled | post_created | published | failed
+    media_attempts: int = 0
     created_at: datetime | None = None
     last_polled_at: datetime | None = None
     last_error: str | None = None
@@ -154,6 +155,7 @@ class TikTokPublishState:
             "post_id": self.post_id,
             "media_url": self.media_url,
             "stage": self.stage,
+            "media_attempts": self.media_attempts,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "last_polled_at": (
                 self.last_polled_at.isoformat() if self.last_polled_at else None
@@ -177,6 +179,7 @@ class TikTokPublishState:
             post_id=d.get("post_id"),
             media_url=d.get("media_url"),
             stage=d.get("stage"),
+            media_attempts=int(d.get("media_attempts", 0)),
             created_at=_dt("created_at"),
             last_polled_at=_dt("last_polled_at"),
             last_error=d.get("last_error"),
