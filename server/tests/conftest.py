@@ -56,3 +56,13 @@ def example_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("ATR_DISCORD_REMINDER_ROLE_ID", "444")
     monkeypatch.setenv("ATR_PUBLIC_BASE_URL", "https://tiktok.sididi.tv")
     yield
+
+
+@pytest.fixture(autouse=True)
+def _clear_dispatch_inflight():
+    """Dispatch tasks run in the background; never leak them across tests."""
+    from app.services import reminder_scheduler
+
+    reminder_scheduler._IN_FLIGHT.clear()
+    yield
+    reminder_scheduler._IN_FLIGHT.clear()

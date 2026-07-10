@@ -57,6 +57,57 @@ _PREPARE_VIDEO_FFMPEG_ERRORED = "prepare_video: ffmpeg errored"
 _DOWNLOAD_STAGE_ERROR = "download:"
 
 
+# (project_id, platform) → running dispatch task. In-memory only: after a
+# process restart this is empty, so a job persisted as 'uploading' is
+# correctly treated as crashed-mid-phase and re-dispatched.
+_IN_FLIGHT: dict[tuple[str, str], asyncio.Task] = {}
+
+
+def _dispatch_worthwhile(job: Job, platform: str) -> bool:
+    """Cheap pre-checks so terminal/misconfigured jobs never spawn a task."""
+    status = job.platform_statuses.get(platform, PlatformStatus(status="pending"))
+    if platform == "tiktok":
+        if status.status in ("uploaded", "failed", "skipped"):
+            return False
+        if not job.tiktok_payload:
+            logger.warning(
+                "Job %s has 'tiktok' in platforms_requested but no tiktok_payload",
+                job.project_id,
+            )
+            return False
+        return True
+    # instagram
+    if not job.instagram_payload:
+        logger.warning(
+            "Job %s has 'instagram' in platforms_requested but no instagram_payload",
+            job.project_id,
+        )
+        return False
+    if status.status in ("uploaded", "skipped"):
+        return False
+    if status.status == "failed":
+        if _should_retry_recoverable_instagram_failure(status):
+            logger.info("Retrying recoverable Instagram failure for %s", job.project_id)
+            return True
+        return False
+    return True
+
+
+async def _run_dispatch(key: tuple[str, str], action) -> None:
+    try:
+        await action
+    except Exception:
+        logger.exception("Dispatch crashed for %s/%s", key[0], key[1])
+    finally:
+        _IN_FLIGHT.pop(key, None)
+
+
+async def wait_for_inflight() -> None:
+    """Await completion of every in-flight dispatch task (tests + shutdown)."""
+    while _IN_FLIGHT:
+        await asyncio.wait(list(_IN_FLIGHT.values()))
+
+
 async def dispatch_due_actions(
     *,
     store: JobStore,
@@ -64,22 +115,30 @@ async def dispatch_due_actions(
     discord,
     now: datetime | None = None,
 ) -> int:
-    """Run per-platform actions for any due job. Returns count of actions taken."""
+    """Start a background dispatch task for every due (job, platform) action
+    not already in flight. Returns the number of tasks started; use
+    wait_for_inflight() to await their completion."""
     current = _normalize_utc(now or datetime.now(tz=UTC))
-    actions = 0
+    started = 0
     for job in await store.list_all():
         for platform in job.platforms_requested:
+            if platform == "tiktok":
+                dispatcher = _dispatch_tiktok_publish
+            elif platform == "instagram":
+                dispatcher = _dispatch_instagram_publish
+            else:
+                continue  # youtube + facebook: main backend schedules natively
+            key = (job.project_id, platform)
+            if key in _IN_FLIGHT:
+                continue
+            if not _dispatch_worthwhile(job, platform):
+                continue
             if _platform_due_time(job, platform) > current:
                 continue
-            if platform == "tiktok":
-                if await _dispatch_tiktok_publish(job, store, settings, discord):
-                    actions += 1
-            elif platform == "instagram" and await _dispatch_instagram_publish(
-                job, store, settings, discord
-            ):
-                actions += 1
-            # youtube + facebook: nothing to do (main backend handles those)
-    return actions
+            action = dispatcher(job, store, settings, discord)
+            _IN_FLIGHT[key] = asyncio.create_task(_run_dispatch(key, action))
+            started += 1
+    return started
 
 
 def _tiktok_sched(job: Job) -> datetime:
@@ -159,10 +218,6 @@ async def _dispatch_tiktok_publish(  # noqa: PLR0911, PLR0912, PLR0915
         return False
     payload = job.tiktok_payload
     if not payload:
-        logger.warning(
-            "Job %s has 'tiktok' in platforms_requested but no tiktok_payload",
-            job.project_id,
-        )
         return False
 
     now = datetime.now(tz=UTC)
@@ -298,23 +353,11 @@ async def _dispatch_instagram_publish(
 ) -> bool:
     payload = job.instagram_payload
     if not payload:
-        logger.warning(
-            "Job %s has 'instagram' in platforms_requested but no instagram_payload",
-            job.project_id,
-        )
         return False
     current = job.platform_statuses.get("instagram", PlatformStatus(status="pending"))
-    # Already terminal — nothing to do
-    if current.status in ("uploaded", "failed", "skipped"):
-        if _should_retry_recoverable_instagram_failure(current):
-            logger.info(
-                "Retrying recoverable Instagram failure for %s",
-                job.project_id,
-            )
-        else:
-            return False
-
     if current.status in ("uploaded", "skipped"):
+        return False
+    if current.status == "failed" and not _should_retry_recoverable_instagram_failure(current):
         return False
 
     next_attempts = current.attempts + 1

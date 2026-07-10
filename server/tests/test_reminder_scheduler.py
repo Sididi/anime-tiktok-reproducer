@@ -24,6 +24,7 @@ from app.services.reminder_scheduler import (
     _platform_due_time,
     dispatch_due_actions,
     run_scheduler_loop,
+    wait_for_inflight,
 )
 
 
@@ -68,6 +69,7 @@ async def test_dispatch_skips_jobs_not_yet_due(
     discord = AsyncMock()
 
     posted = await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    await wait_for_inflight()
 
     assert posted == 0
     discord.post_message.assert_not_called()
@@ -183,6 +185,7 @@ async def test_dispatch_tiktok_happy_path(
     actions = await dispatch_due_actions(
         store=store, settings=settings, discord=discord
     )
+    await wait_for_inflight()
     assert actions == 1
     job = await store.get("p1")
     assert job.platform_statuses["tiktok"].status == "uploaded"
@@ -207,6 +210,7 @@ async def test_dispatch_tiktok_missing_payload_skips(
         actions = await dispatch_due_actions(
             store=store, settings=settings, discord=discord
         )
+        await wait_for_inflight()
     assert actions == 0
     job = await store.get("p1")
     assert (
@@ -234,6 +238,7 @@ async def test_dispatch_tiktok_skipped_status_missing_payload_no_warning(
         actions = await dispatch_due_actions(
             store=store, settings=settings, discord=discord
         )
+        await wait_for_inflight()
     assert actions == 0
     assert not any("no tiktok_payload" in record.message for record in caplog.records)
 
@@ -248,6 +253,7 @@ async def test_dispatch_tiktok_missing_api_key_counts_attempt(
     discord = AsyncMock()
     await store.create(_tiktok_job())
     await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    await wait_for_inflight()
     job = await store.get("p1")
     tt = job.platform_statuses["tiktok"]
     assert tt.status == "pending"          # retried next tick
@@ -273,6 +279,7 @@ async def test_dispatch_tiktok_fails_after_max_attempts_and_pings(
         "p1", "tiktok", PlatformStatus(status="pending", attempts=4)
     )
     await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    await wait_for_inflight()
     updated = await store.get("p1")
     assert updated.platform_statuses["tiktok"].status == "failed"
     assert updated.platform_statuses["tiktok"].attempts == 5
@@ -299,6 +306,7 @@ async def test_dispatch_tiktok_terminal_statuses_are_not_retried(
     actions = await dispatch_due_actions(
         store=store, settings=settings, discord=discord
     )
+    await wait_for_inflight()
     assert actions == 0
     assert calls["stage"] == [] and calls["create"] == []
 
@@ -321,6 +329,7 @@ async def test_dispatch_tiktok_resumes_uploading_after_crash(
         "p1", "tiktok", PlatformStatus(status="uploading", attempts=1)
     )
     await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    await wait_for_inflight()
     assert calls["create"] == []                        # no second post
     assert calls["poll"][0]["publish_state"].post_id == "post_7"
     updated = await store.get("p1")
@@ -365,6 +374,7 @@ async def test_dispatch_instagram_happy_path(
         actions = await dispatch_due_actions(
             store=store, settings=settings, discord=discord
         )
+        await wait_for_inflight()
 
     assert actions == 1
     refreshed = await store.get("ig-job")
@@ -445,8 +455,11 @@ async def test_dispatch_instagram_passes_and_persists_publish_state(
         actions = await dispatch_due_actions(
             store=store, settings=settings, discord=discord
         )
+        await wait_for_inflight()
 
-    assert actions == 0
+    # The dispatch task started (1); it internally fails (still in progress /
+    # poll timeout, not yet at max attempts) and leaves status 'pending'.
+    assert actions == 1
     refreshed = await store.get("ig-resume")
     assert refreshed is not None
     assert refreshed.instagram_publish_state == persisted_state
@@ -493,6 +506,7 @@ async def test_dispatch_instagram_uses_platform_scheduled_time(
             discord=discord,
             now=datetime(2026, 4, 26, 6, 2, tzinfo=UTC),
         )
+        await wait_for_inflight()
 
     assert actions == 1
     assert publish_mock.await_count == 1
@@ -532,12 +546,14 @@ async def test_dispatch_legacy_instagram_uses_slot_time(
             discord=discord,
             now=datetime(2026, 4, 26, 6, 2, tzinfo=UTC),
         )
+        await wait_for_inflight()
         due_actions = await dispatch_due_actions(
             store=store,
             settings=settings,
             discord=discord,
             now=datetime(2026, 4, 26, 21, 1, tzinfo=UTC),
         )
+        await wait_for_inflight()
 
     assert early_actions == 0
     assert due_actions == 1
@@ -567,9 +583,12 @@ async def test_dispatch_instagram_retries_until_max(
 
     with patch("app.services.reminder_scheduler.publish_to_instagram", new=fail):
         # Fire 5 ticks. The first 4 should leave status='pending' with bumped attempts;
-        # the 5th should mark 'failed' and post the ping.
+        # the 5th should mark 'failed' and post the ping. Each tick must fully
+        # complete (wait_for_inflight) before the next, or the in-flight guard
+        # would skip re-dispatch and attempts would never accumulate.
         for _ in range(5):
             await dispatch_due_actions(store=store, settings=settings, discord=discord)
+            await wait_for_inflight()
 
     refreshed = await store.get("ig-fail")
     ig = refreshed.platform_statuses["instagram"]
@@ -599,6 +618,7 @@ async def test_dispatch_instagram_skips_already_uploaded(
         actions = await dispatch_due_actions(
             store=store, settings=settings, discord=discord
         )
+        await wait_for_inflight()
 
     assert actions == 0
     fail.assert_not_called()
@@ -635,6 +655,7 @@ async def test_dispatch_instagram_retries_legacy_container_error_once(
         actions = await dispatch_due_actions(
             store=store, settings=settings, discord=discord
         )
+        await wait_for_inflight()
 
     refreshed = await store.get("ig-legacy-error")
     ig = refreshed.platform_statuses["instagram"]
@@ -675,6 +696,7 @@ async def test_dispatch_instagram_retries_resumable_header_error_once(
         actions = await dispatch_due_actions(
             store=store, settings=settings, discord=discord
         )
+        await wait_for_inflight()
 
     refreshed = await store.get("ig-header-error")
     ig = refreshed.platform_statuses["instagram"]
@@ -724,13 +746,19 @@ async def test_dispatch_instagram_retries_old_prepare_and_download_failures_once
         first_actions = await dispatch_due_actions(
             store=store, settings=settings, discord=discord
         )
+        await wait_for_inflight()
         second_actions = await dispatch_due_actions(
             store=store, settings=settings, discord=discord
         )
+        await wait_for_inflight()
 
     refreshed = await store.get("ig-old-failure")
     ig = refreshed.platform_statuses["instagram"]
-    assert first_actions == 0
+    # First dispatch is worthwhile (attempts still at the retryable threshold)
+    # and starts a task, which then fails permanently (bumped attempts exceed
+    # max). Second dispatch is no longer worthwhile at the bumped attempts, so
+    # no task starts.
+    assert first_actions == 1
     assert second_actions == 0
     assert ig.status == "failed"
     assert ig.attempts == 6
@@ -807,6 +835,7 @@ async def test_tiktok_media_staged_on_arrival_then_waits(
     actions = await dispatch_due_actions(
         store=store, settings=settings, discord=discord
     )
+    await wait_for_inflight()
     assert actions == 1
     assert len(calls["stage"]) == 1
     assert calls["create"] == []
@@ -836,7 +865,9 @@ async def test_tiktok_staging_failure_before_window_is_quiet(
     _patch_phases(monkeypatch, stage=failing_stage)
     await store.create(_tiktok_job(slot_offset_minutes=120))
     await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    await wait_for_inflight()
     await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    await wait_for_inflight()
     job = await store.get("p1")
     assert job.platform_statuses["tiktok"].status == "pending"
     assert job.platform_statuses["tiktok"].attempts == 0   # quiet: no attempts burned
@@ -859,6 +890,7 @@ async def test_tiktok_staging_failure_inside_window_counts_attempts(
     _patch_phases(monkeypatch, stage=failing_stage)
     await store.create(_tiktok_job(slot_offset_minutes=5))   # inside sched−10
     await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    await wait_for_inflight()
     job = await store.get("p1")
     assert job.platform_statuses["tiktok"].status == "pending"
     assert job.platform_statuses["tiktok"].attempts == 1
@@ -878,6 +910,7 @@ async def test_tiktok_scheduled_create_inside_window(
     job.tiktok_publish_state = _ok_state()
     await store.create(job)
     await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    await wait_for_inflight()
     assert len(calls["create"]) == 1
     sched = calls["create"][0]["scheduled_at"]
     assert sched is not None
@@ -902,6 +935,7 @@ async def test_tiktok_instant_create_when_slot_imminent(
     job.tiktok_publish_state = _ok_state()
     await store.create(job)
     await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    await wait_for_inflight()
     assert calls["create"][0]["scheduled_at"] is None
     assert len(calls["poll"]) == 1
     updated = await store.get("p1")
@@ -944,8 +978,107 @@ async def test_tiktok_slow_staging_refreshes_now_for_instant_decision(
     await store.create(job)
 
     await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    await wait_for_inflight()
 
     assert calls["create"][0]["scheduled_at"] is None      # instant, not scheduled
     assert len(calls["poll"]) == 1                          # polled in same dispatch
     updated = await store.get("p1")
     assert updated.platform_statuses["tiktok"].status == "uploaded"
+
+
+# ---------------------------------------------------------------------------
+# Concurrent dispatch tests (in-flight registry)
+# ---------------------------------------------------------------------------
+
+async def test_two_due_jobs_dispatch_concurrently(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
+):
+    """Two same-slot TikTok jobs must overlap, not serialize."""
+    settings = replace(
+        _settings_for(example_yaml, tmp_server_dir / "avatars"), pfm_api_key="key"
+    )
+    store = JobStore(tmp_path / "jobs.json")
+    discord = AsyncMock()
+    gate = asyncio.Event()
+    concurrent = 0
+    peak = 0
+
+    async def blocking_poll(**kwargs):
+        nonlocal concurrent, peak
+        concurrent += 1
+        peak = max(peak, concurrent)
+        await gate.wait()
+        concurrent -= 1
+        return TikTokPublishResult(
+            success=True, url="https://t/v",
+            publish_state=_ok_state(post_id="post_1", stage="published"),
+        )
+
+    _patch_phases(monkeypatch, poll=blocking_poll)
+    await store.create(_tiktok_job(project_id="pA"))
+    await store.create(_tiktok_job(project_id="pB"))
+    started = await dispatch_due_actions(
+        store=store, settings=settings, discord=discord
+    )
+    assert started == 2
+    await asyncio.sleep(0.05)          # let both tasks reach the gate
+    assert peak == 2                   # overlapping, not serialized
+    gate.set()
+    await wait_for_inflight()
+    for pid in ("pA", "pB"):
+        job = await store.get(pid)
+        assert job.platform_statuses["tiktok"].status == "uploaded"
+
+
+async def test_inflight_job_is_not_double_dispatched(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
+):
+    settings = replace(
+        _settings_for(example_yaml, tmp_server_dir / "avatars"), pfm_api_key="key"
+    )
+    store = JobStore(tmp_path / "jobs.json")
+    discord = AsyncMock()
+    gate = asyncio.Event()
+    poll_calls = 0
+
+    async def blocking_poll(**kwargs):
+        nonlocal poll_calls
+        poll_calls += 1
+        await gate.wait()
+        return TikTokPublishResult(
+            success=True, url="https://t/v",
+            publish_state=_ok_state(post_id="post_1", stage="published"),
+        )
+
+    _patch_phases(monkeypatch, poll=blocking_poll)
+    await store.create(_tiktok_job())
+    first = await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    await asyncio.sleep(0.05)
+    second = await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    gate.set()
+    await wait_for_inflight()
+    assert first == 1
+    assert second == 0                 # still in flight → skipped
+    assert poll_calls == 1
+
+
+async def test_dispatch_task_exception_clears_inflight(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
+):
+    """A crashing dispatch must not wedge the (project, platform) key forever."""
+    from app.services import reminder_scheduler
+
+    settings = replace(
+        _settings_for(example_yaml, tmp_server_dir / "avatars"), pfm_api_key="key"
+    )
+    store = JobStore(tmp_path / "jobs.json")
+    discord = AsyncMock()
+
+    async def exploding_stage(**kwargs):
+        raise RuntimeError("boom")
+
+    _patch_phases(monkeypatch, stage=exploding_stage)
+    await store.create(_tiktok_job(slot_offset_minutes=120))
+    await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    await wait_for_inflight()
+    assert reminder_scheduler._IN_FLIGHT == {}
