@@ -873,8 +873,13 @@ class UploadPhaseService:
                 emit_progress(0.30, "download", "Copying final video from local output...")
                 shutil.copy2(local_video, local_video_path)
             else:
-                emit_progress(0.30, "download", "Downloading final video from Drive...")
-                GoogleDriveService.download_file(drive_video_id, local_video_path)
+                cached_source = cls.cached_source_video(project_id)
+                if cached_source is not None and cached_source.exists():
+                    emit_progress(0.30, "download", "Copying final video from preview cache...")
+                    shutil.copy2(cached_source, local_video_path)
+                else:
+                    emit_progress(0.30, "download", "Downloading final video from Drive...")
+                    GoogleDriveService.download_file(drive_video_id, local_video_path)
 
             # When copyright audio replacement is active, re-mux the video with the
             # new audio track.  We keep the *original* direct_drive_download URL for
