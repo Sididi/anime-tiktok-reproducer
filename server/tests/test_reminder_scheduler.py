@@ -906,3 +906,46 @@ async def test_tiktok_instant_create_when_slot_imminent(
     assert len(calls["poll"]) == 1
     updated = await store.get("p1")
     assert updated.platform_statuses["tiktok"].status == "uploaded"
+
+
+async def test_tiktok_slow_staging_refreshes_now_for_instant_decision(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
+):
+    """Media staging (Phase 1) can take a while; the instant/poll decisions in
+    Phases 2+3 must read a fresh clock, not the one captured before staging
+    began. sched sits just past the 60s instant-publish cutoff at dispatch
+    start (61s away); the fake stage sleeps 2s, which is enough for a
+    freshly-read clock to land inside the cutoff by the time Phase 2 runs. A
+    stale pre-staging clock would still read ~61s away and miss the cutoff,
+    scheduling the post instead of publishing instantly and skipping poll."""
+    settings = replace(
+        _settings_for(example_yaml, tmp_server_dir / "avatars"), pfm_api_key="key"
+    )
+    store = JobStore(tmp_path / "jobs.json")
+    discord = AsyncMock()
+
+    async def slow_stage(**kwargs):
+        await asyncio.sleep(2)
+        return TikTokPublishResult(success=True, publish_state=_ok_state())
+
+    calls = _patch_phases(monkeypatch, stage=slow_stage)
+    job = _make_job(
+        project_id="p1",
+        slot_time=datetime.now(tz=UTC) + timedelta(seconds=61),
+    )
+    job.tiktok_payload = {
+        "social_account_id": "spc_1",
+        "caption": "cap",
+        "privacy_status": "public",
+        "allow_comment": True,
+        "allow_duet": True,
+        "allow_stitch": True,
+    }
+    await store.create(job)
+
+    await dispatch_due_actions(store=store, settings=settings, discord=discord)
+
+    assert calls["create"][0]["scheduled_at"] is None      # instant, not scheduled
+    assert len(calls["poll"]) == 1                          # polled in same dispatch
+    updated = await store.get("p1")
+    assert updated.platform_statuses["tiktok"].status == "uploaded"

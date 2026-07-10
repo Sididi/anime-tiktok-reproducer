@@ -208,6 +208,10 @@ async def _dispatch_tiktok_publish(  # noqa: PLR0911, PLR0912, PLR0915
             return False
         logger.info("TikTok media staged for %s", job.project_id)
 
+    # Staging can take minutes (Drive download + PFM upload, up to 900s); the
+    # instant/poll decisions below need a fresh clock, not the pre-staging one.
+    now = datetime.now(tz=UTC)
+
     if now < create_due:
         return True  # staged; post creation comes due at sched - lead
 
