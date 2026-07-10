@@ -873,6 +873,31 @@ class GoogleDriveService:
         return info.get("webViewLink", "")
 
     @classmethod
+    def get_video_duration_seconds(cls, file_id: str) -> float | None:
+        """Video duration from Drive metadata, or None when Drive has not
+        processed the file yet (callers fall back to download+probe)."""
+        try:
+            drive = cls._client()
+            info = drive.files().get(
+                fileId=file_id,
+                fields="videoMediaMetadata(durationMillis)",
+                supportsAllDrives=True,
+            ).execute()
+        except Exception as exc:
+            logger.warning(
+                "Drive video metadata lookup failed: file_id=%s error=%s", file_id, exc
+            )
+            return None
+        metadata = info.get("videoMediaMetadata") or {}
+        duration_millis = metadata.get("durationMillis")
+        if duration_millis is None:
+            return None
+        try:
+            return float(duration_millis) / 1000.0
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
     def download_file(cls, file_id: str, destination: Path) -> None:
         drive = cls._client()
         request = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
