@@ -20,7 +20,7 @@ from app.models.job import (
 from app.services.job_store import JobStore
 from app.services.post_for_me_publisher import TikTokPublishResult
 from app.services.reminder_scheduler import (
-    TIKTOK_LEAD_MINUTES,
+    TIKTOK_SCHEDULE_LEAD_MINUTES,
     _platform_due_time,
     dispatch_due_actions,
     run_scheduler_loop,
@@ -121,27 +121,64 @@ def _tiktok_job(project_id="p1", *, slot_offset_minutes=-1, payload=True, **over
     return job
 
 
+def _ok_state(**kw):
+    defaults = dict(media_url="https://media.example/abc.mp4", stage="media_uploaded")
+    defaults.update(kw)
+    return TikTokPublishState(**defaults)
+
+
+def _patch_phases(monkeypatch, *, stage=None, create=None, poll=None):
+    """Patch the three publisher phases in the scheduler namespace.
+    Unspecified phases succeed with a sensible state progression."""
+    calls: dict[str, list[dict]] = {"stage": [], "create": [], "poll": []}
+
+    async def default_stage(**kwargs):
+        calls["stage"].append(kwargs)
+        return TikTokPublishResult(success=True, publish_state=_ok_state())
+
+    async def default_create(**kwargs):
+        calls["create"].append(kwargs)
+        scheduled = kwargs.get("scheduled_at") is not None
+        return TikTokPublishResult(
+            success=True,
+            publish_state=_ok_state(
+                post_id="post_1",
+                stage="post_scheduled" if scheduled else "post_created",
+            ),
+        )
+
+    async def default_poll(**kwargs):
+        calls["poll"].append(kwargs)
+        return TikTokPublishResult(
+            success=True,
+            url="https://tiktok.com/@a/video/1",
+            publish_state=_ok_state(post_id="post_1", stage="published",
+                                    url="https://tiktok.com/@a/video/1"),
+        )
+
+    monkeypatch.setattr(
+        "app.services.reminder_scheduler.stage_media_for_tiktok", stage or default_stage
+    )
+    monkeypatch.setattr(
+        "app.services.reminder_scheduler.create_tiktok_post", create or default_create
+    )
+    monkeypatch.setattr(
+        "app.services.reminder_scheduler.poll_tiktok_post_result", poll or default_poll
+    )
+    return calls
+
+
 async def test_dispatch_tiktok_happy_path(
     tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
 ):
+    """Past-due job with no state runs all three phases in one dispatch
+    (instant publish: slot already passed)."""
     settings = replace(
         _settings_for(example_yaml, tmp_server_dir / "avatars"), pfm_api_key="key"
     )
     store = JobStore(tmp_path / "jobs.json")
     discord = AsyncMock()
-    calls = {}
-
-    async def fake_publish(**kwargs):
-        calls.update(kwargs)
-        return TikTokPublishResult(
-            success=True,
-            url="https://tiktok.com/@a/video/1",
-            publish_state=TikTokPublishState(post_id="post_1", stage="published"),
-        )
-
-    monkeypatch.setattr(
-        "app.services.reminder_scheduler.publish_to_tiktok", fake_publish
-    )
+    calls = _patch_phases(monkeypatch)
     await store.create(_tiktok_job())
     actions = await dispatch_due_actions(
         store=store, settings=settings, discord=discord
@@ -151,9 +188,12 @@ async def test_dispatch_tiktok_happy_path(
     assert job.platform_statuses["tiktok"].status == "uploaded"
     assert job.platform_statuses["tiktok"].url == "https://tiktok.com/@a/video/1"
     assert job.tiktok_publish_state.stage == "published"
-    assert calls["social_account_id"] == "spc_1"
-    assert calls["caption"] == "cap"
-    assert calls["download_url"] == job.drive_video_url
+    assert len(calls["stage"]) == 1
+    assert calls["create"][0]["scheduled_at"] is None      # late job → instant
+    assert calls["create"][0]["social_account_id"] == "spc_1"
+    assert calls["create"][0]["caption"] == "cap"
+    assert calls["stage"][0]["download_url"] == job.drive_video_url
+    assert len(calls["poll"]) == 1
 
 
 async def test_dispatch_tiktok_missing_payload_skips(
@@ -224,12 +264,10 @@ async def test_dispatch_tiktok_fails_after_max_attempts_and_pings(
     store = JobStore(tmp_path / "jobs.json")
     discord = AsyncMock()
 
-    async def fake_publish(**kwargs):
-        return TikTokPublishResult(success=False, detail="result: tiktok rejected")
+    async def failing_create(**kwargs):
+        return TikTokPublishResult(success=False, detail="create_post: HTTP 400")
 
-    monkeypatch.setattr(
-        "app.services.reminder_scheduler.publish_to_tiktok", fake_publish
-    )
+    _patch_phases(monkeypatch, create=failing_create)
     await store.create(_tiktok_job())
     await store.merge_platform_status(
         "p1", "tiktok", PlatformStatus(status="pending", attempts=4)
@@ -238,7 +276,6 @@ async def test_dispatch_tiktok_fails_after_max_attempts_and_pings(
     updated = await store.get("p1")
     assert updated.platform_statuses["tiktok"].status == "failed"
     assert updated.platform_statuses["tiktok"].attempts == 5
-    # a failure ping mentioning TikTok was posted to the alerts channel
     contents = [
         str(kwargs.get("content") or (args[1] if len(args) > 1 else ""))
         for args, kwargs in discord.post_message.call_args_list
@@ -254,16 +291,7 @@ async def test_dispatch_tiktok_terminal_statuses_are_not_retried(
     )
     store = JobStore(tmp_path / "jobs.json")
     discord = AsyncMock()
-    called = False
-
-    async def fake_publish(**kwargs):
-        nonlocal called
-        called = True
-        return TikTokPublishResult(success=True)
-
-    monkeypatch.setattr(
-        "app.services.reminder_scheduler.publish_to_tiktok", fake_publish
-    )
+    calls = _patch_phases(monkeypatch)
     await store.create(_tiktok_job())
     await store.merge_platform_status(
         "p1", "tiktok", PlatformStatus(status="uploaded")
@@ -272,66 +300,32 @@ async def test_dispatch_tiktok_terminal_statuses_are_not_retried(
         store=store, settings=settings, discord=discord
     )
     assert actions == 0
-    assert called is False
+    assert calls["stage"] == [] and calls["create"] == []
 
 
 async def test_dispatch_tiktok_resumes_uploading_after_crash(
     tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
 ):
-    """A job left in 'uploading' (process crashed mid-publish) is re-dispatched;
-    the persisted publish_state (post_id set) is the double-post protection."""
+    """'uploading' + live post_id + past slot → re-dispatch goes straight to
+    polling; the persisted post_id is the double-post protection."""
     settings = replace(
         _settings_for(example_yaml, tmp_server_dir / "avatars"), pfm_api_key="key"
     )
     store = JobStore(tmp_path / "jobs.json")
     discord = AsyncMock()
-    seen = {}
-
-    async def fake_publish(**kwargs):
-        seen.update(kwargs)
-        return TikTokPublishResult(success=True)
-
-    monkeypatch.setattr(
-        "app.services.reminder_scheduler.publish_to_tiktok", fake_publish
-    )
+    calls = _patch_phases(monkeypatch)
     job = _tiktok_job()
-    job.tiktok_publish_state = TikTokPublishState(
-        post_id="post_7", stage="post_created"
-    )
+    job.tiktok_publish_state = TikTokPublishState(post_id="post_7", stage="post_created")
     await store.create(job)
     await store.merge_platform_status(
         "p1", "tiktok", PlatformStatus(status="uploading", attempts=1)
     )
     await dispatch_due_actions(store=store, settings=settings, discord=discord)
-    assert seen["publish_state"].post_id == "post_7"
+    assert calls["create"] == []                        # no second post
+    assert calls["poll"][0]["publish_state"].post_id == "post_7"
     updated = await store.get("p1")
+    assert updated.platform_statuses["tiktok"].status == "uploaded"
     assert updated.platform_statuses["tiktok"].attempts == 2
-
-
-async def test_dispatch_tiktok_passes_publish_state_for_resume(
-    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
-):
-    settings = replace(
-        _settings_for(example_yaml, tmp_server_dir / "avatars"), pfm_api_key="key"
-    )
-    store = JobStore(tmp_path / "jobs.json")
-    discord = AsyncMock()
-    seen = {}
-
-    async def fake_publish(**kwargs):
-        seen.update(kwargs)
-        return TikTokPublishResult(success=True)
-
-    monkeypatch.setattr(
-        "app.services.reminder_scheduler.publish_to_tiktok", fake_publish
-    )
-    job = _tiktok_job()
-    job.tiktok_publish_state = TikTokPublishState(
-        post_id="post_7", stage="post_created"
-    )
-    await store.create(job)
-    await dispatch_due_actions(store=store, settings=settings, discord=discord)
-    assert seen["publish_state"].post_id == "post_7"
 
 
 # ---------------------------------------------------------------------------
@@ -744,14 +738,39 @@ async def test_dispatch_instagram_retries_old_prepare_and_download_failures_once
 
 
 # ---------------------------------------------------------------------------
-# TikTok lead time tests
+# TikTok due-time tests (phased dispatch)
 # ---------------------------------------------------------------------------
 
-def test_tiktok_due_time_has_10min_lead():
+def test_tiktok_media_staging_due_on_arrival():
     slot = datetime(2026, 7, 8, 20, 0, tzinfo=UTC)
-    job = _make_job(project_id="p1", slot_time=slot)  # adapted: slot_time is required
+    job = _make_job(project_id="p1", slot_time=slot)
     job.platform_scheduled_at = {"tiktok": slot}
-    assert TIKTOK_LEAD_MINUTES == 10
+    assert job.tiktok_publish_state is None
+    assert _platform_due_time(job, "tiktok") == job.created_at
+
+
+def test_tiktok_post_creation_due_at_lead():
+    slot = datetime(2026, 7, 8, 20, 0, tzinfo=UTC)
+    job = _make_job(project_id="p1", slot_time=slot)
+    job.platform_scheduled_at = {"tiktok": slot}
+    job.tiktok_publish_state = _ok_state()             # media staged
+    assert TIKTOK_SCHEDULE_LEAD_MINUTES == 10
+    assert _platform_due_time(job, "tiktok") == slot - timedelta(minutes=10)
+
+
+def test_tiktok_poll_due_at_slot_once_post_exists():
+    slot = datetime(2026, 7, 8, 20, 0, tzinfo=UTC)
+    job = _make_job(project_id="p1", slot_time=slot)
+    job.platform_scheduled_at = {"tiktok": slot}
+    job.tiktok_publish_state = _ok_state(post_id="post_1", stage="post_scheduled")
+    assert _platform_due_time(job, "tiktok") == slot
+
+
+def test_tiktok_failed_post_due_at_lead_for_recreate():
+    slot = datetime(2026, 7, 8, 20, 0, tzinfo=UTC)
+    job = _make_job(project_id="p1", slot_time=slot)
+    job.platform_scheduled_at = {"tiktok": slot}
+    job.tiktok_publish_state = _ok_state(post_id="post_old", stage="failed")
     assert _platform_due_time(job, "tiktok") == slot - timedelta(minutes=10)
 
 
@@ -762,9 +781,128 @@ def test_instagram_due_time_has_no_lead():
     assert _platform_due_time(job, "instagram") == slot
 
 
-def test_tiktok_lead_does_not_mutate_stored_time():
+def test_tiktok_due_does_not_mutate_stored_time():
     slot = datetime(2026, 7, 8, 20, 0, tzinfo=UTC)
     job = _make_job(project_id="p1", slot_time=slot)
     job.platform_scheduled_at = {"tiktok": slot}
     _platform_due_time(job, "tiktok")
-    assert job.platform_scheduled_at["tiktok"] == slot  # unchanged
+    assert job.platform_scheduled_at["tiktok"] == slot
+
+
+# ---------------------------------------------------------------------------
+# TikTok phase-behaviour tests
+# ---------------------------------------------------------------------------
+
+async def test_tiktok_media_staged_on_arrival_then_waits(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
+):
+    """Job far from its slot: dispatch stages media, then stops (no post)."""
+    settings = replace(
+        _settings_for(example_yaml, tmp_server_dir / "avatars"), pfm_api_key="key"
+    )
+    store = JobStore(tmp_path / "jobs.json")
+    discord = AsyncMock()
+    calls = _patch_phases(monkeypatch)
+    await store.create(_tiktok_job(slot_offset_minutes=120))
+    actions = await dispatch_due_actions(
+        store=store, settings=settings, discord=discord
+    )
+    assert actions == 1
+    assert len(calls["stage"]) == 1
+    assert calls["create"] == []
+    job = await store.get("p1")
+    assert job.tiktok_publish_state.stage == "media_uploaded"
+    assert job.platform_statuses["tiktok"].status == "pending"
+    assert job.platform_statuses["tiktok"].attempts == 0   # staging is attempt-free
+
+
+async def test_tiktok_staging_failure_before_window_is_quiet(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
+):
+    settings = replace(
+        _settings_for(example_yaml, tmp_server_dir / "avatars"), pfm_api_key="key"
+    )
+    store = JobStore(tmp_path / "jobs.json")
+    discord = AsyncMock()
+
+    async def failing_stage(**kwargs):
+        prior = kwargs.get("publish_state")
+        n = (prior.media_attempts if prior else 0) + 1
+        return TikTokPublishResult(
+            success=False, detail="upload: boom",
+            publish_state=TikTokPublishState(media_attempts=n, last_error="upload: boom"),
+        )
+
+    _patch_phases(monkeypatch, stage=failing_stage)
+    await store.create(_tiktok_job(slot_offset_minutes=120))
+    await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    job = await store.get("p1")
+    assert job.platform_statuses["tiktok"].status == "pending"
+    assert job.platform_statuses["tiktok"].attempts == 0   # quiet: no attempts burned
+    assert job.tiktok_publish_state.media_attempts == 2
+    discord.post_message.assert_not_called()
+
+
+async def test_tiktok_staging_failure_inside_window_counts_attempts(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
+):
+    settings = replace(
+        _settings_for(example_yaml, tmp_server_dir / "avatars"), pfm_api_key="key"
+    )
+    store = JobStore(tmp_path / "jobs.json")
+    discord = AsyncMock()
+
+    async def failing_stage(**kwargs):
+        return TikTokPublishResult(success=False, detail="upload: boom")
+
+    _patch_phases(monkeypatch, stage=failing_stage)
+    await store.create(_tiktok_job(slot_offset_minutes=5))   # inside sched−10
+    await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    job = await store.get("p1")
+    assert job.platform_statuses["tiktok"].status == "pending"
+    assert job.platform_statuses["tiktok"].attempts == 1
+
+
+async def test_tiktok_scheduled_create_inside_window(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
+):
+    """Slot 5 min out, media staged → create with scheduled_at=sched, no poll."""
+    settings = replace(
+        _settings_for(example_yaml, tmp_server_dir / "avatars"), pfm_api_key="key"
+    )
+    store = JobStore(tmp_path / "jobs.json")
+    discord = AsyncMock()
+    calls = _patch_phases(monkeypatch)
+    job = _tiktok_job(slot_offset_minutes=5)
+    job.tiktok_publish_state = _ok_state()
+    await store.create(job)
+    await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    assert len(calls["create"]) == 1
+    sched = calls["create"][0]["scheduled_at"]
+    assert sched is not None
+    assert sched == job.platform_scheduled_at.get("tiktok") or sched == job.slot_time
+    assert calls["poll"] == []                       # slot not reached yet
+    updated = await store.get("p1")
+    assert updated.tiktok_publish_state.stage == "post_scheduled"
+    assert updated.platform_statuses["tiktok"].status == "uploading"
+
+
+async def test_tiktok_instant_create_when_slot_imminent(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
+):
+    """Slot < 60 s away → scheduled_at omitted and poll runs immediately."""
+    settings = replace(
+        _settings_for(example_yaml, tmp_server_dir / "avatars"), pfm_api_key="key"
+    )
+    store = JobStore(tmp_path / "jobs.json")
+    discord = AsyncMock()
+    calls = _patch_phases(monkeypatch)
+    job = _tiktok_job(slot_offset_minutes=0)         # "now" → < 60 s away
+    job.tiktok_publish_state = _ok_state()
+    await store.create(job)
+    await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    assert calls["create"][0]["scheduled_at"] is None
+    assert len(calls["poll"]) == 1
+    updated = await store.get("p1")
+    assert updated.platform_statuses["tiktok"].status == "uploaded"

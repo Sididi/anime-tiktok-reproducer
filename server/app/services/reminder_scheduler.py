@@ -3,8 +3,8 @@
 Polls every `interval` seconds; for each job, iterates `platforms_requested`
 and runs due per-platform actions:
 
-- tiktok    → publish the video via Post for Me (managed TikTok API).
-              Retries like Instagram; after 5 attempts give up + ping.
+- tiktok    → stage media on arrival, create a PFM post with scheduled_at at
+              sched − TIKTOK_SCHEDULE_LEAD_MINUTES, poll results from sched.
 - instagram → call Instagram Graph API to publish the Reel. On success,
               update the embed. On failure, increment attempts; after
               5 attempts give up + ping the reminder channel.
@@ -30,13 +30,22 @@ from app.models.job import (
 from app.services.embed_builder import build_embed
 from app.services.instagram_publisher import publish_to_instagram
 from app.services.job_store import JobStore
-from app.services.post_for_me_publisher import TikTokPublishResult, publish_to_tiktok
+from app.services.post_for_me_publisher import (
+    create_tiktok_post,
+    poll_tiktok_post_result,
+    stage_media_for_tiktok,
+)
 
 logger = logging.getLogger(__name__)
 
 _IG_MAX_ATTEMPTS = 5
 _TT_MAX_ATTEMPTS = 5
-TIKTOK_LEAD_MINUTES = 10  # Must equal TIKTOK_EDIT_LOCK_MINUTES in backend/app/services/scheduling_service.py
+# Post creation lead: the PFM post (with scheduled_at = the true slot) is
+# created this many minutes before the slot. Must stay <= the backend's
+# TIKTOK_EDIT_LOCK_MINUTES (backend/app/services/scheduling_service.py):
+# job data freezes at sched-15, the post is created from it at sched-10.
+TIKTOK_SCHEDULE_LEAD_MINUTES = 10
+_TT_INSTANT_PUBLISH_CUTOFF_SECONDS = 60  # sched closer than this → publish instantly
 _IG_DEFAULT_POLL_INTERVAL_SECONDS = 60.0
 _IG_DEFAULT_POLL_TIMEOUT_SECONDS = 4 * 60 * 60.0
 _LEGACY_IG_CONTAINER_ERROR = "container status_code = ERROR"
@@ -73,15 +82,28 @@ async def dispatch_due_actions(
     return actions
 
 
+def _tiktok_sched(job: Job) -> datetime:
+    """The user-facing TikTok publish instant (PFM fires at exactly this time)."""
+    return _normalize_utc(job.platform_scheduled_at.get("tiktok") or job.slot_time)
+
+
 def _platform_due_time(job: Job, platform: str) -> datetime:
-    """Due time for a platform. TikTok fires TIKTOK_LEAD_MINUTES early so its
-    ~10-min processing finishes around the user-facing slot; the stored time is
-    never mutated, so the head-start stays invisible to the backend and UI."""
-    due_time = job.platform_scheduled_at.get(platform) or job.slot_time
-    due = _normalize_utc(due_time)
-    if platform == "tiktok":
-        due -= timedelta(minutes=TIKTOK_LEAD_MINUTES)
-    return due
+    """Due time of the platform's next pending action.
+
+    TikTok runs three phases: media staging is due as soon as the job exists;
+    post creation at sched - TIKTOK_SCHEDULE_LEAD_MINUTES (PFM then publishes
+    server-side at sched via scheduled_at); result polling from sched.
+    The stored times are never mutated."""
+    if platform != "tiktok":
+        due_time = job.platform_scheduled_at.get(platform) or job.slot_time
+        return _normalize_utc(due_time)
+    sched = _tiktok_sched(job)
+    state = job.tiktok_publish_state
+    if state and state.post_id and state.stage != "failed":
+        return sched                                        # poll results at slot
+    if state and state.media_url:
+        return sched - timedelta(minutes=TIKTOK_SCHEDULE_LEAD_MINUTES)  # create post
+    return _normalize_utc(job.created_at)                   # stage media on arrival
 
 
 def _normalize_utc(value: datetime) -> datetime:
@@ -90,17 +112,51 @@ def _normalize_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
-async def _dispatch_tiktok_publish(
+async def _record_tiktok_failure(
+    job: Job, store: JobStore, settings: Settings, discord, *,
+    attempts: int, detail: str | None,
+) -> None:
+    """Shared attempt-counted failure handling for the create/poll phases."""
+    now = datetime.now(tz=UTC)
+    if attempts >= _TT_MAX_ATTEMPTS:
+        await store.merge_platform_status(
+            job.project_id, "tiktok",
+            PlatformStatus(
+                status="failed", detail=detail, attempts=attempts, completed_at=now
+            ),
+        )
+        await _rerender_embed(job.project_id, store, settings, discord)
+        await _post_failure_ping(
+            job, settings, discord, detail or "publish failed",
+            platform_label="TikTok",
+        )
+        logger.warning(
+            "TikTok publish failed for %s after %d attempts: %s",
+            job.project_id, attempts, detail,
+        )
+    else:
+        await store.merge_platform_status(
+            job.project_id, "tiktok",
+            PlatformStatus(status="pending", detail=detail, attempts=attempts),
+        )
+        logger.info(
+            "TikTok publish attempt %d/%d failed for %s: %s — will retry next tick",
+            attempts, _TT_MAX_ATTEMPTS, job.project_id, detail,
+        )
+
+
+async def _dispatch_tiktok_publish(  # noqa: PLR0911, PLR0912, PLR0915
     job: Job, store: JobStore, settings: Settings, discord
 ) -> bool:
+    """Run every currently-due TikTok phase for this job (stage → create → poll).
+
+    'uploading' is NOT terminal: with the in-flight registry preventing
+    concurrent dispatch, seeing it here means a previous process crashed
+    mid-phase. The persisted publish_state (post_id → never re-create) is the
+    double-post protection."""
     current = job.platform_statuses.get("tiktok", PlatformStatus(status="pending"))
-    # 'uploading' is NOT terminal: the scheduler loop is sequential, so seeing it
-    # at tick start means the process crashed mid-publish. Re-dispatch; the
-    # persisted tiktok_publish_state (post_id → poll instead of create) is the
-    # double-post protection.
     if current.status in ("uploaded", "failed", "skipped"):
         return False
-
     payload = job.tiktok_payload
     if not payload:
         logger.warning(
@@ -109,40 +165,108 @@ async def _dispatch_tiktok_publish(
         )
         return False
 
+    now = datetime.now(tz=UTC)
+    sched = _tiktok_sched(job)
+    create_due = sched - timedelta(minutes=TIKTOK_SCHEDULE_LEAD_MINUTES)
+    state = job.tiktok_publish_state
+
+    if not settings.pfm_api_key:
+        if now < create_due:
+            return False  # stay quiet until the publish window
+        await _record_tiktok_failure(
+            job, store, settings, discord,
+            attempts=current.attempts + 1,
+            detail="ATR_PFM_API_KEY is not configured",
+        )
+        return False
+
+    # ---- Phase 1: stage media (due on arrival; quiet retries pre-window) ----
+    if not (state and (state.media_url or (state.post_id and state.stage != "failed"))):
+        result = await stage_media_for_tiktok(
+            api_key=settings.pfm_api_key,
+            base_url=settings.pfm_base_url,
+            download_url=job.drive_video_url,
+            publish_state=state,
+            temp_dir=settings.data_dir / "tmp" / "tiktok",
+        )
+        if result.publish_state is not None:
+            await store.set_tiktok_publish_state(job.project_id, result.publish_state)
+            state = result.publish_state
+        if not result.success:
+            if now < create_due:
+                logger.info(
+                    "TikTok media staging failed for %s (quiet attempt %d): %s",
+                    job.project_id,
+                    state.media_attempts if state else 0,
+                    result.detail,
+                )
+                return False
+            await _record_tiktok_failure(
+                job, store, settings, discord,
+                attempts=current.attempts + 1, detail=result.detail,
+            )
+            return False
+        logger.info("TikTok media staged for %s", job.project_id)
+
+    if now < create_due:
+        return True  # staged; post creation comes due at sched - lead
+
+    # ---- Phases 2+3 share one attempt increment per dispatch ----
     next_attempts = current.attempts + 1
-    # merge_platform_status is atomic under the store lock (see the Instagram
-    # dispatcher for the rationale).
     await store.merge_platform_status(
         job.project_id, "tiktok",
         PlatformStatus(status="uploading", attempts=next_attempts),
     )
 
-    async def persist_tiktok_state(state: TikTokPublishState) -> None:
-        await store.set_tiktok_publish_state(job.project_id, state)
+    async def persist_tiktok_state(new_state: TikTokPublishState) -> None:
+        await store.set_tiktok_publish_state(job.project_id, new_state)
 
-    if not settings.pfm_api_key:
-        result = TikTokPublishResult(
-            success=False, detail="ATR_PFM_API_KEY is not configured"
-        )
-    else:
-        result = await publish_to_tiktok(
+    # ---- Phase 2: ensure the post exists (scheduled, or instant when late) ----
+    instant = False
+    if not (state and state.post_id and state.stage != "failed"):
+        instant = (sched - now).total_seconds() < _TT_INSTANT_PUBLISH_CUTOFF_SECONDS
+        result = await create_tiktok_post(
             api_key=settings.pfm_api_key,
             base_url=settings.pfm_base_url,
             social_account_id=payload["social_account_id"],
             caption=payload["caption"],
-            download_url=job.drive_video_url,
             privacy_status=payload.get("privacy_status", "public"),
             allow_comment=bool(payload.get("allow_comment", True)),
             allow_duet=bool(payload.get("allow_duet", True)),
             allow_stitch=bool(payload.get("allow_stitch", True)),
-            publish_state=job.tiktok_publish_state,
-            progress_callback=persist_tiktok_state,
-            temp_dir=settings.data_dir / "tmp" / "tiktok",
+            scheduled_at=None if instant else sched,
+            publish_state=state,
         )
+        if result.publish_state is not None:
+            await store.set_tiktok_publish_state(job.project_id, result.publish_state)
+            state = result.publish_state
+        if not result.success:
+            await _record_tiktok_failure(
+                job, store, settings, discord,
+                attempts=next_attempts, detail=result.detail,
+            )
+            return False
+        logger.info(
+            "TikTok post %s for %s (post_id=%s)",
+            "created for instant publish" if instant
+            else f"scheduled at {sched.isoformat()}",
+            job.project_id, state.post_id,
+        )
+
+    # ---- Phase 3: poll results (from sched; instant posts poll right away) ----
+    if not instant and now < sched:
+        return True  # PFM will fire at sched; polling comes due then
+
+    result = await poll_tiktok_post_result(
+        api_key=settings.pfm_api_key,
+        base_url=settings.pfm_base_url,
+        social_account_id=payload["social_account_id"],
+        publish_state=state,
+        progress_callback=persist_tiktok_state,
+    )
     if result.publish_state is not None:
         await store.set_tiktok_publish_state(job.project_id, result.publish_state)
 
-    now = datetime.now(tz=UTC)
     if result.success:
         await store.merge_platform_status(
             job.project_id, "tiktok",
@@ -150,7 +274,7 @@ async def _dispatch_tiktok_publish(
                 status="uploaded",
                 url=result.url,
                 attempts=next_attempts,
-                completed_at=now,
+                completed_at=datetime.now(tz=UTC),
             ),
         )
         await _rerender_embed(job.project_id, store, settings, discord)
@@ -158,39 +282,10 @@ async def _dispatch_tiktok_publish(
             "TikTok publish succeeded for %s (url=%s)", job.project_id, result.url
         )
         return True
-
-    if next_attempts >= _TT_MAX_ATTEMPTS:
-        await store.merge_platform_status(
-            job.project_id, "tiktok",
-            PlatformStatus(
-                status="failed",
-                detail=result.detail,
-                attempts=next_attempts,
-                completed_at=now,
-            ),
-        )
-        await _rerender_embed(job.project_id, store, settings, discord)
-        await _post_failure_ping(
-            job, settings, discord, result.detail or "publish failed",
-            platform_label="TikTok",
-        )
-        logger.warning(
-            "TikTok publish failed for %s after %d attempts: %s",
-            job.project_id, next_attempts, result.detail,
-        )
-    else:
-        await store.merge_platform_status(
-            job.project_id, "tiktok",
-            PlatformStatus(
-                status="pending",
-                detail=result.detail,
-                attempts=next_attempts,
-            ),
-        )
-        logger.info(
-            "TikTok publish attempt %d/%d failed for %s: %s — will retry next tick",
-            next_attempts, _TT_MAX_ATTEMPTS, job.project_id, result.detail,
-        )
+    await _record_tiktok_failure(
+        job, store, settings, discord,
+        attempts=next_attempts, detail=result.detail,
+    )
     return False
 
 
