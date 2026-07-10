@@ -459,3 +459,64 @@ def test_delete_job_ignores_pfm_delete_failure(
         )
         r = client.delete("/api/internal/jobs/p1", headers=INTERNAL_AUTH)
         assert r.status_code == 204          # deletion proceeds despite PFM error
+
+
+def test_upsert_with_changed_payload_cancels_scheduled_pfm_post(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    from app.models.job import TikTokPublishState  # noqa: PLC0415
+
+    monkeypatch.setenv("ATR_PFM_API_KEY", "key")   # BEFORE app creation: Settings
+    app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    deleted = AsyncMock()
+    monkeypatch.setattr("app.api.internal.delete_tiktok_post", deleted)
+    with TestClient(app) as client:
+        r = client.post("/api/internal/jobs", json=JOB_PAYLOAD, headers=INTERNAL_AUTH)
+        assert r.status_code == 200
+        asyncio.run(
+            app.state.job_store.set_tiktok_publish_state(
+                "p1",
+                TikTokPublishState(post_id="sp_X", stage="post_scheduled"),
+            )
+        )
+        changed_payload = {
+            **JOB_PAYLOAD,
+            "drive_video_url": "https://drive.google.com/uc?id=different",
+        }
+        r = client.post(
+            "/api/internal/jobs", json=changed_payload, headers=INTERNAL_AUTH
+        )
+        assert r.status_code == 200
+    deleted.assert_awaited_once()
+    assert deleted.await_args.kwargs["post_id"] == "sp_X"
+    job = asyncio.run(app.state.job_store.get("p1"))
+    assert job.tiktok_publish_state is None
+
+
+def test_upsert_does_not_cancel_published_post(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    from app.models.job import TikTokPublishState  # noqa: PLC0415
+
+    monkeypatch.setenv("ATR_PFM_API_KEY", "key")
+    app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    deleted = AsyncMock()
+    monkeypatch.setattr("app.api.internal.delete_tiktok_post", deleted)
+    with TestClient(app) as client:
+        r = client.post("/api/internal/jobs", json=JOB_PAYLOAD, headers=INTERNAL_AUTH)
+        assert r.status_code == 200
+        asyncio.run(
+            app.state.job_store.set_tiktok_publish_state(
+                "p1",
+                TikTokPublishState(post_id="sp_X", stage="published"),
+            )
+        )
+        changed_payload = {
+            **JOB_PAYLOAD,
+            "drive_video_url": "https://drive.google.com/uc?id=different",
+        }
+        r = client.post(
+            "/api/internal/jobs", json=changed_payload, headers=INTERNAL_AUTH
+        )
+        assert r.status_code == 200
+    deleted.assert_not_awaited()

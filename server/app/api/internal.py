@@ -160,6 +160,25 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
                 job_id=existing.job_id, discord_message_id=existing.discord_message_id
             )
 
+        state = existing.tiktok_publish_state
+        if (
+            state is not None
+            and state.post_id
+            and state.stage == "post_scheduled"
+            and settings.pfm_api_key
+        ):
+            try:
+                await delete_tiktok_post(
+                    api_key=settings.pfm_api_key,
+                    post_id=state.post_id,
+                    base_url=settings.pfm_base_url,
+                )
+            except Exception as e:
+                logger.warning(
+                    "PFM scheduled-post delete failed for %s (post_id=%s): %s",
+                    req.project_id, state.post_id, e,
+                )
+
         updated = await store.update(
             req.project_id,
             account_id=req.account_id,
