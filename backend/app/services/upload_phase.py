@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 import logging
 import shutil
 import tempfile
+import threading
 import os
 import time
 
@@ -1209,6 +1210,15 @@ class UploadPhaseService:
     _COPYRIGHT_AUDIO_CACHE_DIR = settings.cache_dir / "copyright_audio"
     _COPYRIGHT_AUDIO_MAX_AGE_SECONDS = 7200
 
+    _SOURCE_CACHE_DIR = settings.cache_dir / "upload_source"
+    _SOURCE_CACHE_MAX_AGE_SECONDS = 7200  # 2 hours
+
+    # Shared final-video preview cache bookkeeping (guarded by _source_download_guard)
+    _source_download_guard = threading.Lock()
+    _source_downloads_in_flight: set[str] = set()
+    _source_download_errors: dict[str, str] = {}
+    _source_locks: dict[str, threading.Lock] = {}
+
     @classmethod
     def _normalize_legacy_prep_cache_dir(cls, cache_dir: Path, legacy_cache_dir: Path) -> Path:
         if not legacy_cache_dir.exists() or cache_dir.resolve() == legacy_cache_dir.resolve():
@@ -1252,6 +1262,112 @@ class UploadPhaseService:
         d = cls._COPYRIGHT_AUDIO_CACHE_DIR / project_id
         d.mkdir(parents=True, exist_ok=True)
         return d
+
+    @classmethod
+    def _source_cache_dir(cls, project_id: str) -> Path:
+        return cls._SOURCE_CACHE_DIR / project_id
+
+    @classmethod
+    def _source_lock(cls, project_id: str) -> threading.Lock:
+        with cls._source_download_guard:
+            return cls._source_locks.setdefault(project_id, threading.Lock())
+
+    @classmethod
+    def cached_source_video(cls, project_id: str) -> Path | None:
+        cache_dir = cls._source_cache_dir(project_id)
+        if not cache_dir.exists():
+            return None
+        for f in sorted(cache_dir.iterdir()):
+            if f.is_file() and f.suffix.lower() == ".mp4":
+                return f
+        return None
+
+    @classmethod
+    def _ensure_source_video(
+        cls, project_id: str, readiness: UploadReadiness
+    ) -> Path:
+        """Blocking: return the cached final video, materializing it if needed."""
+        with cls._source_lock(project_id):
+            cached = cls.cached_source_video(project_id)
+            if cached is not None:
+                return cached
+
+            video_name = (
+                readiness.drive_video_name
+                or readiness.local_video_name
+                or "final_video.mp4"
+            )
+            cache_dir = cls._source_cache_dir(project_id)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            destination = cache_dir / video_name
+            partial = cache_dir / f"{video_name}.part"
+
+            try:
+                if readiness.local_video_path and Path(readiness.local_video_path).exists():
+                    shutil.copy2(readiness.local_video_path, partial)
+                elif readiness.drive_video_id:
+                    GoogleDriveService.download_file(readiness.drive_video_id, partial)
+                else:
+                    raise ValueError(
+                        "Final video unavailable: not present locally and no Drive copy"
+                    )
+                partial.replace(destination)
+            finally:
+                partial.unlink(missing_ok=True)
+            return destination
+
+    @classmethod
+    def start_source_video_download(
+        cls, project_id: str, readiness: UploadReadiness | None = None
+    ) -> dict[str, Any]:
+        """Warm the shared source-video cache in the background."""
+        status = cls.source_video_status(project_id)
+        if status["state"] in ("ready", "in_progress"):
+            return status
+
+        if readiness is None:
+            project = ProjectService.load(project_id)
+            if not project:
+                raise ValueError("Project not found")
+            readiness = cls.compute_readiness(project)
+
+        with cls._source_download_guard:
+            if project_id in cls._source_downloads_in_flight:
+                return {"state": "in_progress"}
+            cls._source_downloads_in_flight.add(project_id)
+            cls._source_download_errors.pop(project_id, None)
+
+        def _worker() -> None:
+            try:
+                cls._ensure_source_video(project_id, readiness)
+            except Exception as exc:
+                logger.warning(
+                    "Source video download failed: project_id=%s error=%s",
+                    project_id,
+                    exc,
+                )
+                with cls._source_download_guard:
+                    cls._source_download_errors[project_id] = str(exc)
+            finally:
+                with cls._source_download_guard:
+                    cls._source_downloads_in_flight.discard(project_id)
+
+        threading.Thread(
+            target=_worker, name=f"source-video-{project_id}", daemon=True
+        ).start()
+        return {"state": "in_progress"}
+
+    @classmethod
+    def source_video_status(cls, project_id: str) -> dict[str, Any]:
+        if cls.cached_source_video(project_id) is not None:
+            return {"state": "ready"}
+        with cls._source_download_guard:
+            if project_id in cls._source_downloads_in_flight:
+                return {"state": "in_progress"}
+            error = cls._source_download_errors.get(project_id)
+        if error:
+            return {"state": "error", "detail": error}
+        return {"state": "missing"}
 
     @classmethod
     def _cleanup_prep_dir(cls, prep_dir: Path) -> None:
@@ -1309,6 +1425,12 @@ class UploadPhaseService:
         cls._cleanup_stale_prep_cache(
             cls._COPYRIGHT_AUDIO_CACHE_DIR,
             cls._COPYRIGHT_AUDIO_MAX_AGE_SECONDS,
+        )
+
+    @classmethod
+    def cleanup_stale_source_cache(cls) -> None:
+        cls._cleanup_stale_prep_cache(
+            cls._SOURCE_CACHE_DIR, cls._SOURCE_CACHE_MAX_AGE_SECONDS
         )
 
     @classmethod
