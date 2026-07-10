@@ -17,6 +17,17 @@ def test_default_fields_are_none():
     assert p.llm_preset is None
     assert p.template is None
     assert p.min_playback_speed is None
+    assert p.elevenlabs_seed is None
+
+
+def test_elevenlabs_seed_accepts_unsigned_32_bit_range():
+    assert Project(elevenlabs_seed=0).elevenlabs_seed == 0
+    assert Project(elevenlabs_seed=2**32 - 1).elevenlabs_seed == 2**32 - 1
+
+    with pytest.raises(ValueError):
+        Project(elevenlabs_seed=-1)
+    with pytest.raises(ValueError):
+        Project(elevenlabs_seed=2**32)
 
 
 def test_speed_validator_accepts_valid_range():

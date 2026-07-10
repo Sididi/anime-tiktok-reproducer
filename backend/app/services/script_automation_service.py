@@ -46,6 +46,30 @@ class ScriptAutomationService:
     TTS_HARD_MAX = 800
 
     @classmethod
+    def _generate_and_store_elevenlabs_seed(cls, project_id: str) -> int:
+        """Choose the run seed and persist the exact value sent to ElevenLabs."""
+        seed = secrets.randbits(32)
+        project = ProjectService.load(project_id)
+        if project is None:
+            raise RuntimeError("Project not found while saving the ElevenLabs seed")
+        project.elevenlabs_seed = seed
+        ProjectService.save(project)
+        return seed
+
+    @staticmethod
+    def _tts_seed_and_continuity_kwargs(
+        *,
+        seed: int,
+        is_v3_model: bool,
+        previous_request_id: str | None,
+    ) -> dict[str, Any]:
+        """Build model-compatible seed and request-stitching arguments."""
+        kwargs: dict[str, Any] = {"seed": seed}
+        if not is_v3_model and previous_request_id:
+            kwargs["previous_request_ids"] = [previous_request_id]
+        return kwargs
+
+    @classmethod
     def _event(
         cls,
         event: str,
@@ -1009,7 +1033,7 @@ class ScriptAutomationService:
                 extension = cls._output_extension()
                 part_paths: list[Path] = []
                 previous_request_id: str | None = None
-                v3_seed: int | None = None
+                elevenlabs_seed = cls._generate_and_store_elevenlabs_seed(project_id)
 
                 for idx, chunk in enumerate(chunks, start=1):
                     segment_char_count = len(chunk)
@@ -1027,15 +1051,6 @@ class ScriptAutomationService:
                     )
 
                     outgoing_text = chunk
-                    seed: int | None = None
-                    previous_request_ids: list[str] | None = None
-                    if is_v3_model:
-                        if v3_seed is None:
-                            v3_seed = secrets.randbits(32)
-                        seed = v3_seed
-                    elif previous_request_id:
-                        previous_request_ids = [previous_request_id]
-
                     synthesize_kwargs: dict[str, Any] = {
                         "voice_id": voice.elevenlabs_voice_id,
                         "text": outgoing_text,
@@ -1043,10 +1058,13 @@ class ScriptAutomationService:
                         "output_format": settings.elevenlabs_output_format,
                         "voice_settings": voice.voice_settings or None,
                     }
-                    if previous_request_ids is not None:
-                        synthesize_kwargs["previous_request_ids"] = previous_request_ids
-                    if seed is not None:
-                        synthesize_kwargs["seed"] = seed
+                    synthesize_kwargs.update(
+                        cls._tts_seed_and_continuity_kwargs(
+                            seed=elevenlabs_seed,
+                            is_v3_model=is_v3_model,
+                            previous_request_id=previous_request_id,
+                        )
+                    )
 
                     synthesis_result = await asyncio.to_thread(
                         ElevenLabsService.synthesize,

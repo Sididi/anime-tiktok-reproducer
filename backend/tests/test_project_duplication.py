@@ -142,6 +142,18 @@ def test_duplicate_of_duplicate_links_back_to_root(projects_dir):
     assert second.mother_project_id == mother.id
 
 
+def test_duplicate_starts_without_an_elevenlabs_seed(projects_dir):
+    mother = _make_mother(projects_dir)
+    mother.elevenlabs_seed = 123456789
+    ProjectService.save(mother)
+
+    duplicate = ProjectDuplicationService.duplicate(
+        mother.id, [DuplicationVariant(language="fr", template="zoomed")]
+    )[0]
+
+    assert duplicate.elevenlabs_seed is None
+
+
 def test_duplicate_rejects_unknown_template(projects_dir):
     mother = _make_mother(projects_dir)
     with pytest.raises(ValueError, match="Unknown template"):

@@ -43,6 +43,7 @@ class ProjectResponse(BaseModel):
     series_id: str | None
     library_type: LibraryType
     output_language: str | None
+    elevenlabs_seed: int | None
     mother_project_id: str | None
     drive_folder_id: str | None
     drive_folder_url: str | None
@@ -67,6 +68,7 @@ class ProjectResponse(BaseModel):
             series_id=project.series_id,
             library_type=project.library_type,
             output_language=project.output_language,
+            elevenlabs_seed=project.elevenlabs_seed,
             mother_project_id=project.mother_project_id,
             drive_folder_id=project.drive_folder_id,
             drive_folder_url=project.drive_folder_url,

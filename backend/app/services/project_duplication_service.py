@@ -105,6 +105,7 @@ class ProjectDuplicationService:
                     # Template-resolvable overrides are cleared so the preset
                     # template governs voice/music/LLM/min speed.
                     "voice_key": None,
+                    "elevenlabs_seed": None,
                     "music_key": None,
                     "llm_preset": None,
                     "min_playback_speed": None,

@@ -31,6 +31,7 @@ export interface Project {
   series_id: string | null;
   library_type: LibraryType;
   output_language: string | null;
+  elevenlabs_seed: number | null;
   mother_project_id: string | null;
   drive_folder_id: string | null;
   drive_folder_url: string | null;

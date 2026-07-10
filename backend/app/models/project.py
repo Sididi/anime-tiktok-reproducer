@@ -69,6 +69,8 @@ class Project(BaseModel):
     tts_speed: float | None = None
     video_overlay: dict[str, Any] | None = None
     voice_key: str | None = None
+    # Last seed sent to ElevenLabs for this project's seeded TTS generation.
+    elevenlabs_seed: int | None = Field(default=None, ge=0, le=2**32 - 1)
     llm_preset: str | None = None
     template: str | None = None
     min_playback_speed: float | None = None
