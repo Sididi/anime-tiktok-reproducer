@@ -43,6 +43,22 @@ class GeneratedResult:
 
 
 @dataclass
+class ReviewEntry:
+    """One doubtful scene for the §8 owner-review HTML."""
+
+    gt_scene_index: int
+    axis: str  # "scene" | "source"
+    reason: str  # bucket / equivalence / waiver-candidate label
+    tiktok_interval: tuple[float, float]
+    generated_episode: str
+    generated_interval: tuple[float, float]
+    gt_episode: str
+    gt_interval: tuple[float, float]
+    numbers: str
+    doubt_reasons: list[str] = field(default_factory=list)
+
+
+@dataclass
 class StrictValidationResult:
     project_id: str
     passed: bool
@@ -56,7 +72,29 @@ class StrictValidationResult:
     source_loose: int = 0
     wrong_primary_with_candidate: int = 0
     source_failed: int = 0
+    waived: int = 0  # owner-approved §8 waivers counted as exact
+    ceiling_report: bool = False  # PASS built on >3 waivers is not a PASS
     rows: list[str] = field(default_factory=list)
+    review_entries: list[ReviewEntry] = field(default_factory=list)
+
+
+WAIVERS_PATH = BACKEND_ROOT / "data" / "eval_waivers.json"
+
+
+def _load_waivers(project_id: str) -> dict[tuple[int, str], dict]:
+    """Owner verdicts keyed by (gt_scene_index, axis); §8 protocol."""
+    if not WAIVERS_PATH.exists():
+        return {}
+    try:
+        entries = json.loads(WAIVERS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    result: dict[tuple[int, str], dict] = {}
+    for entry in entries:
+        if entry.get("project_id") != project_id:
+            continue
+        result[(int(entry["gt_scene_index"]), str(entry["axis"]))] = entry
+    return result
 
 
 def _timing_bucket(
@@ -714,6 +752,71 @@ def _validate_strict(
         ground_truth_scene_count=len(gt_scenes.scenes),
         elapsed_seconds=generated.elapsed_seconds,
     )
+    waivers = _load_waivers(project_id)
+    waived_indices: set[int] = set()
+
+    def waived(index: int, axis: str, current=None) -> bool:
+        entry = waivers.get((index, axis))
+        if entry is None or entry.get("verdict") != "pass":
+            return False
+        reviewed = entry.get("generated")
+        if current is not None and reviewed and len(reviewed) == 2:
+            # a waiver certifies the SPECIFIC reviewed interval; once the
+            # algorithm moves it beyond microadaptation range the owner must
+            # re-validate (owner protocol 2026-07-10)
+            if (
+                abs(current[0] - float(reviewed[0])) > 0.35
+                or abs(current[1] - float(reviewed[1])) > 0.35
+            ):
+                result.rows.append(
+                    "{axis}#{idx} waiver STALE (reviewed {r0:.2f},{r1:.2f} vs "
+                    "current {c0:.2f},{c1:.2f}) - needs re-review".format(
+                        axis=axis, idx=index, r0=float(reviewed[0]),
+                        r1=float(reviewed[1]), c0=current[0], c1=current[1],
+                    )
+                )
+                return False
+        result.waived += 1
+        waived_indices.add(index)
+        result.rows.append(
+            "{axis}#{idx} owner-waived (§8): {note}".format(
+                axis=axis, idx=index, note=entry.get("note", "")
+            )
+        )
+        return True
+
+    def add_review(
+        index: int,
+        axis: str,
+        reason: str,
+        scene: Scene | None,
+        match,
+        gt_scene: Scene,
+        gt_match,
+        numbers: str,
+    ) -> None:
+        result.review_entries.append(
+            ReviewEntry(
+                gt_scene_index=index,
+                axis=axis,
+                reason=reason,
+                tiktok_interval=(
+                    (scene.start_time, scene.end_time)
+                    if scene is not None
+                    else (gt_scene.start_time, gt_scene.end_time)
+                ),
+                generated_episode=(match.episode if match is not None else ""),
+                generated_interval=(
+                    (match.start_time, match.end_time)
+                    if match is not None
+                    else (0.0, 0.0)
+                ),
+                gt_episode=gt_match.episode or "",
+                gt_interval=(gt_match.start_time, gt_match.end_time),
+                numbers=numbers,
+                doubt_reasons=list(getattr(match, "doubt_reasons", []) or []),
+            )
+        )
 
     if len(generated.matches.matches) != len(generated.scenes.scenes):
         result.passed = False
@@ -744,21 +847,47 @@ def _validate_strict(
         gt_scene = gt_scenes.scenes[index]
         gt_match = gt_matches.matches[index]
         if not group:
-            result.scene_failed += 1
-            result.source_failed += 1
-            result.passed = False
-            result.rows.append(f"scene#{index} has no generated coverage")
+            if waived(index, "scene"):
+                result.scene_exact += 1
+            else:
+                result.scene_failed += 1
+                result.passed = False
+                result.rows.append(f"scene#{index} has no generated coverage")
+                add_review(
+                    index, "scene", "no_coverage", None, None, gt_scene, gt_match, ""
+                )
+            if waived(index, "source"):
+                result.source_exact += 1
+            else:
+                result.source_failed += 1
+                result.passed = False
             continue
         group_scenes = [generated.scenes.scenes[i] for i in group]
         group_matches = [generated.matches.matches[i] for i in group]
         if len(group) > 1:
-            if not _chained_pieces(group_matches, series_name):
+            if not _chained_pieces(group_matches, series_name) and not waived(
+                index, "scene"
+            ):
                 result.scene_failed += 1
                 result.source_failed += 1
                 result.passed = False
                 result.rows.append(
                     "scene#{idx} folded {n} generated scenes but pieces do "
                     "not chain continuously".format(idx=index, n=len(group))
+                )
+                add_review(
+                    index,
+                    "scene",
+                    "fold_no_chain",
+                    Scene(
+                        index=index,
+                        start_time=group_scenes[0].start_time,
+                        end_time=group_scenes[-1].end_time,
+                    ),
+                    _merged_match_view(group_matches),
+                    gt_scene,
+                    gt_match,
+                    f"{len(group)} pieces",
                 )
                 continue
             result.rows.append(
@@ -785,36 +914,51 @@ def _validate_strict(
             exact_tolerance=exact_tolerance,
             loose_tolerance=loose_tolerance,
         )
+        scene_numbers = (
+            "generated=({gs:.2f},{ge:.2f}) gt=({ts:.2f},{te:.2f})".format(
+                gs=scene.start_time,
+                ge=scene.end_time,
+                ts=gt_scene.start_time,
+                te=gt_scene.end_time,
+            )
+        )
         if scene_bucket == "exact":
+            result.scene_exact += 1
+        elif waived(index, "scene", (match.start_time, match.end_time)):
             result.scene_exact += 1
         elif scene_bucket == "loose":
             result.scene_loose += 1
-            result.rows.append(
-                "scene#{idx} loose timing: generated=({gs:.2f},{ge:.2f}) "
-                "gt=({ts:.2f},{te:.2f})".format(
-                    idx=index,
-                    gs=scene.start_time,
-                    ge=scene.end_time,
-                    ts=gt_scene.start_time,
-                    te=gt_scene.end_time,
-                )
+            result.rows.append(f"scene#{index} loose timing: {scene_numbers}")
+            add_review(
+                index, "scene", "scene_loose", scene, match, gt_scene, gt_match,
+                scene_numbers,
             )
         else:
             result.scene_failed += 1
             result.passed = False
             result.rows.append(
-                "scene#{idx} failed timing: generated=({gs:.2f},{ge:.2f}) "
-                "gt=({ts:.2f},{te:.2f}) delta=({ds:.2f},{de:.2f})".format(
+                "scene#{idx} failed timing: {numbers} delta=({ds:.2f},{de:.2f})".format(
                     idx=index,
-                    gs=scene.start_time,
-                    ge=scene.end_time,
-                    ts=gt_scene.start_time,
-                    te=gt_scene.end_time,
+                    numbers=scene_numbers,
                     ds=scene.start_time - gt_scene.start_time,
                     de=scene.end_time - gt_scene.end_time,
                 )
             )
+            add_review(
+                index, "scene", "scene_failed", scene, match, gt_scene, gt_match,
+                scene_numbers,
+            )
 
+        source_numbers = (
+            "primary={ep} ({ms:.2f},{me:.2f}) gt={gep} ({gms:.2f},{gme:.2f})".format(
+                ep=match.episode or "<none>",
+                ms=match.start_time,
+                me=match.end_time,
+                gep=gt_match.episode or "<none>",
+                gms=gt_match.start_time,
+                gme=gt_match.end_time,
+            )
+        )
         if match.episode == gt_match.episode:
             source_bucket = _timing_bucket(
                 match.start_time,
@@ -835,28 +979,24 @@ def _validate_strict(
                 # content matches along the whole interval, same duration)
                 result.source_exact += 1
                 result.rows.append(
-                    "source#{idx} lookalike-equivalent: generated=({ms:.2f},{me:.2f}) "
-                    "gt=({gms:.2f},{gme:.2f})".format(
-                        idx=index,
-                        ms=match.start_time,
-                        me=match.end_time,
-                        gms=gt_match.start_time,
-                        gme=gt_match.end_time,
-                    )
+                    f"source#{index} lookalike-equivalent: {source_numbers}"
                 )
+                add_review(
+                    index, "source", "equivalence_accepted", scene, match,
+                    gt_scene, gt_match, source_numbers,
+                )
+                continue
+            if waived(index, "source", (match.start_time, match.end_time)):
+                result.source_exact += 1
                 continue
             if source_bucket == "loose":
                 result.source_loose += 1
                 result.rows.append(
-                    "source#{idx} loose timing: episode={ep} generated=({ms:.2f},{me:.2f}) "
-                    "gt=({gms:.2f},{gme:.2f})".format(
-                        idx=index,
-                        ep=match.episode or "<none>",
-                        ms=match.start_time,
-                        me=match.end_time,
-                        gms=gt_match.start_time,
-                        gme=gt_match.end_time,
-                    )
+                    f"source#{index} loose timing: {source_numbers}"
+                )
+                add_review(
+                    index, "source", "source_loose", scene, match,
+                    gt_scene, gt_match, source_numbers,
                 )
                 continue
         elif _lookalike_equivalent(
@@ -866,39 +1006,44 @@ def _validate_strict(
             result.rows.append(
                 f"source#{index} lookalike-equivalent (cross-episode duplicate)"
             )
+            add_review(
+                index, "source", "equivalence_accepted_cross_episode", scene,
+                match, gt_scene, gt_match, source_numbers,
+            )
             continue
 
+        if waived(index, "source", (match.start_time, match.end_time)):
+            result.source_exact += 1
+            continue
         candidate_ok = _candidate_contains(match, gt_match, loose_tolerance)
         if candidate_ok:
             result.wrong_primary_with_candidate += 1
             result.rows.append(
-                "source#{idx} wrong primary but candidate exposed: "
-                "primary={ep} ({ms:.2f},{me:.2f}) gt={gep} ({gms:.2f},{gme:.2f})".format(
-                    idx=index,
-                    ep=match.episode or "<none>",
-                    ms=match.start_time,
-                    me=match.end_time,
-                    gep=gt_match.episode or "<none>",
-                    gms=gt_match.start_time,
-                    gme=gt_match.end_time,
-                )
+                f"source#{index} wrong primary but candidate exposed: {source_numbers}"
+            )
+            add_review(
+                index, "source", "wrong_primary", scene, match, gt_scene,
+                gt_match, source_numbers,
             )
         else:
             result.source_failed += 1
             result.passed = False
             result.rows.append(
-                "source#{idx} failed primary and missing candidate: "
-                "primary={ep} ({ms:.2f},{me:.2f}) gt={gep} ({gms:.2f},{gme:.2f})".format(
-                    idx=index,
-                    ep=match.episode or "<none>",
-                    ms=match.start_time,
-                    me=match.end_time,
-                    gep=gt_match.episode or "<none>",
-                    gms=gt_match.start_time,
-                    gme=gt_match.end_time,
-                )
+                f"source#{index} failed primary and missing candidate: {source_numbers}"
+            )
+            add_review(
+                index, "source", "source_failed", scene, match, gt_scene,
+                gt_match, source_numbers,
             )
 
+    if len(waived_indices) > 3:
+        # §8: a PASS built on more than 3 waivers/project is a ceiling
+        # report, not a PASS
+        result.ceiling_report = True
+        result.passed = False
+        result.rows.append(
+            f"waiver ceiling exceeded: {len(waived_indices)} scenes waived > 3"
+        )
     if result.scene_loose > max_scene_loose:
         result.passed = False
         result.rows.append(
@@ -940,7 +1085,12 @@ def _print_strict_result(result: StrictValidationResult) -> None:
             f"wrong_primary_with_candidate={result.wrong_primary_with_candidate}, "
             f"failed={result.source_failed}"
         )
-    print(f"Strict result: {'PASS' if result.passed else 'FAIL'}")
+        if result.waived:
+            print(f"Owner waivers applied (§8): {result.waived}")
+    verdict = "PASS" if result.passed else "FAIL"
+    if result.ceiling_report:
+        verdict = "CEILING-REPORT (waivers > 3)"
+    print(f"Strict result: {verdict}")
     print("Details:")
     for row in result.rows[:120]:
         print(f"  {row}")
@@ -948,6 +1098,139 @@ def _print_strict_result(result: StrictValidationResult) -> None:
         print(f"  ... {len(result.rows) - 120} more")
     if not result.rows:
         print("  none")
+
+
+def _thumb_data_uri(image) -> str:
+    import base64
+    import io
+
+    if image is None:
+        return ""
+    thumb = image.copy()
+    thumb.thumbnail((214, 120))
+    buffer = io.BytesIO()
+    thumb.convert("RGB").save(buffer, format="JPEG", quality=70)
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+
+def _render_review_html(
+    project_id: str,
+    result: StrictValidationResult,
+    out_path: Path,
+) -> None:
+    """§8 owner-review page: one self-contained HTML per project with
+    side-by-side frame strips (TikTok | generated source | GT source) for
+    every doubtful scene, embedded as data URIs."""
+    project, _, _ = _load_required(project_id)
+    video_path = Path(project.video_path)
+    fracs = (0.02, 0.35, 0.65, 0.98)
+
+    # batch all decodes: one pass over the TikTok, one per episode
+    tiktok_targets: list[float] = []
+    episode_targets: dict[str, list[float]] = {}
+    for entry in result.review_entries:
+        s, e = entry.tiktok_interval
+        tiktok_targets.extend(s + (e - s) * f for f in fracs)
+        for episode, (s0, e0) in (
+            (entry.generated_episode, entry.generated_interval),
+            (entry.gt_episode, entry.gt_interval),
+        ):
+            if episode:
+                episode_targets.setdefault(episode, []).extend(
+                    s0 + (e0 - s0) * f for f in fracs
+                )
+    tiktok_frames = AnimeMatcherService.extract_frames(video_path, tiktok_targets)
+    episode_frames: dict[str, list] = {}
+    for episode, targets in episode_targets.items():
+        episode_path = AnimeLibraryService.resolve_episode_path(
+            episode, library_type=project.library_type
+        )
+        if episode_path is None or not episode_path.exists():
+            episode_frames[episode] = [None] * len(targets)
+            continue
+        episode_frames[episode] = AnimeMatcherService.extract_frames(
+            episode_path, targets
+        )
+    episode_cursor: dict[str, int] = {episode: 0 for episode in episode_targets}
+
+    def take_episode_strip(episode: str) -> list:
+        if not episode:
+            return [None] * len(fracs)
+        cursor = episode_cursor[episode]
+        episode_cursor[episode] = cursor + len(fracs)
+        return episode_frames[episode][cursor : cursor + len(fracs)]
+
+    sections: list[str] = []
+    for k, entry in enumerate(result.review_entries):
+        tiktok_strip = tiktok_frames[k * len(fracs) : (k + 1) * len(fracs)]
+        generated_strip = take_episode_strip(entry.generated_episode)
+        gt_strip = take_episode_strip(entry.gt_episode)
+
+        def strip_html(frames) -> str:
+            return "".join(
+                f'<img src="{_thumb_data_uri(f)}" loading="lazy">' for f in frames
+            )
+
+        doubt = (
+            " | aligner doubts: " + ", ".join(entry.doubt_reasons)
+            if entry.doubt_reasons
+            else ""
+        )
+        sections.append(
+            """
+<div class="entry">
+<h3>GT scene #{idx} — {axis} — {reason}</h3>
+<p>{numbers}{doubt}</p>
+<table>
+<tr><th>TikTok {ti0:.2f}-{ti1:.2f}</th><td>{tiktok}</td></tr>
+<tr><th>Generated {gep} {gi0:.2f}-{gi1:.2f}</th><td>{generated}</td></tr>
+<tr><th>GT {tep} {ki0:.2f}-{ki1:.2f}</th><td>{gt}</td></tr>
+</table>
+<p class="verdict">waiver JSON: <code>{{"project_id": "{pid}", "gt_scene_index": {idx},
+ "axis": "{axis}", "generated": [{gi0:.2f}, {gi1:.2f}], "verdict": "pass|fail",
+ "note": "", "date": "2026-07-10"}}</code></p>
+</div>""".format(
+                idx=entry.gt_scene_index,
+                axis=entry.axis,
+                reason=entry.reason,
+                numbers=entry.numbers,
+                doubt=doubt,
+                ti0=entry.tiktok_interval[0],
+                ti1=entry.tiktok_interval[1],
+                tiktok=strip_html(tiktok_strip),
+                gep=entry.generated_episode or "<none>",
+                gi0=entry.generated_interval[0],
+                gi1=entry.generated_interval[1],
+                generated=strip_html(generated_strip),
+                tep=entry.gt_episode or "<none>",
+                ki0=entry.gt_interval[0],
+                ki1=entry.gt_interval[1],
+                gt=strip_html(gt_strip),
+                pid=project_id,
+            )
+        )
+
+    html = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Review {pid}</title>
+<style>
+body {{ font-family: sans-serif; background: #111; color: #eee; margin: 2em; }}
+.entry {{ border: 1px solid #444; padding: 1em; margin-bottom: 2em; }}
+img {{ margin: 2px; max-height: 120px; }}
+th {{ text-align: left; padding-right: 1em; font-weight: normal; color: #9cf; white-space: nowrap; }}
+h3 {{ margin: 0 0 .3em; }}
+.verdict code {{ color: #fc9; font-size: .85em; }}
+</style></head><body>
+<h1>{pid} — {n} doubtful scenes ({date})</h1>
+{body}
+</body></html>""".format(
+        pid=project_id,
+        n=len(result.review_entries),
+        date=time.strftime("%Y-%m-%d %H:%M"),
+        body="\n".join(sections),
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(html)
+    print(f"Review HTML written: {out_path} ({len(result.review_entries)} entries)")
 
 
 def _print_profile(generated: GeneratedResult) -> None:
@@ -985,6 +1268,8 @@ async def _main() -> int:
     parser.add_argument("--matcher", choices=("legacy", "aligner"), default="legacy")
     parser.add_argument("--load-generated-json", type=Path, default=None)
     parser.add_argument("--save-generated-json", type=Path, default=None)
+    parser.add_argument("--review", type=Path, default=None,
+                        help="write §8 owner-review HTML (per-project suffix added)")
     parser.add_argument("--quiet-profile", action="store_true")
     args = parser.parse_args()
 
@@ -1027,6 +1312,13 @@ async def _main() -> int:
             max_wrong_primary=args.max_wrong_primary,
         )
         _print_strict_result(result)
+        if args.review is not None and result.review_entries:
+            review_out = args.review
+            if len(args.project_ids) > 1:
+                review_out = review_out.with_name(
+                    f"{review_out.stem}_{project_id}{review_out.suffix}"
+                )
+            _render_review_html(project_id, result, review_out)
         if not args.quiet_profile:
             _print_profile(generated)
         exit_code |= 0 if result.passed else 1

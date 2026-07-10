@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dc_replace
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -43,37 +43,22 @@ SEED_PAIR_TIME_LIMIT = 12
 SEED_SPEED_QUANTIZATION = 0.05
 # Keep broad ambiguity for global decode; 80 states keeps DP cheap for 40-60 scenes.
 MAX_SEGMENTS_PER_SCENE = 80
-# Continuity at a cut is judged within roughly one 2 fps index grid step.
-CONTINUITY_GRID_STEPS = 1.25
 # Episode switches are rare intruders, so they pay a mild but survivable penalty.
 EPISODE_SWITCH_PENALTY = 0.25
 # Playback is centered near 1x, but this prior is deliberately weak for fast/slow edits.
 UNIT_SOURCE_RATE_PRIOR_WEIGHT = 0.04
 # Backward source jumps exist, so penalize instead of forbidding them.
 BACKWARD_JUMP_PENALTY = 0.20
-# No-match remains available but should lose to even modest coherent evidence.
-NO_MATCH_PENALTY = 0.60
 # Dense inlier support matters, but repeated anime stills make it weaker than similarity.
 SUPPORT_PRIOR_WEIGHT = 0.15
 # UI contract exposes a compact ranked list, matching the old frontend expectation.
 ALTERNATIVES_PER_SCENE = 5
-# Refinement is authoritative only if it stays near the indexed interval.
-BOUNDARY_REFINE_MAX_SHIFT_SECONDS = 1.25
-# Ten source samples trims refinement cost while preserving sub-grid boundary search.
-ALIGNER_REFINE_FRAMES_PER_BOUNDARY = 10
 # Query-side crop variants are searched when dense direct support stays weak.
 QUERY_VARIANT_MIN_SCENE_SUPPORT = 4
 
-# --- Stage 4 segmentation DP (2026-07-06 rework) ---
-# The 2 fps index quantizes source times to a 0.5s grid: uniform quantization
-# noise sigma = 0.5/sqrt(12) ~ 0.144s, plus decode jitter.
-GRID_SIGMA_SECONDS = 0.16
 # Redescending inlier window ~3.5 sigma keeps legitimate grid scatter while a
 # 0.5s edit skip (a real cut) loses meaningful weight.
 INLIER_TOLERANCE_SECONDS = 0.55
-# Fitted-offset gap noise at a boundary; fits average several samples so this
-# is below the raw grid sigma but keeps extrapolation slack.
-BOUNDARY_GAP_SIGMA_SECONDS = 0.15
 # Longest observed GT scene is 14.5s; spans above this are never one scene.
 MAX_GROUP_SPAN_SECONDS = 20.0
 MAX_GROUP_FRAGMENTS = 16
@@ -82,9 +67,6 @@ MAX_GROUP_FRAGMENTS = 16
 # true flash folds back for free, while lookalike jump cuts at 0.5-0.7
 # wrongly merged are unrecoverable.
 TIKTOK_CUT_CONTINUES_COS = 0.75
-# A source shot change at the mapped boundary explains the TikTok cut
-# (measured: must-merge cuts median 0.23-0.72; edit cuts median 0.85-0.91).
-SOURCE_SHOT_CHANGE_COS = 0.55
 # Weight of the per-boundary keep/merge prior in DP score units (a sample
 # contributes <= ~0.7 similarity mass; one boundary decision is worth ~2).
 CUT_PRIOR_WEIGHT = 1.0
@@ -114,13 +96,6 @@ CONTINUITY_SCALE_SECONDS = 1.5
 # is decoded at this fps around the predicted continuation and an offset
 # sweep checks whether the after-cut content truly lives at the prediction.
 VERIFY_DECODE_FPS = 12.0
-VERIFY_WINDOW_SECONDS = 2.5
-# The across-boundary samples must reach this fraction of the line's own
-# in-fragment similarity at native resolution for a merge to stand.
-VERIFY_CONTINUATION_RATIO = 0.8
-# Pixel-alignment gap (delta_R - delta_L) beyond which the boundary is a
-# deliberate edit trim: >3 source frames at 24 fps, above matching noise.
-PIXEL_GAP_MERGE_TOLERANCE_SECONDS = 0.15
 
 
 @dataclass(frozen=True)
@@ -246,6 +221,112 @@ class _FragmentEvidence:
     episode_ids: np.ndarray  # int codes into episodes list
     time_bins: np.ndarray  # int sample bins (round(t * DENSE_SAMPLE_FPS))
     n_sample_bins: int  # distinct dense sample bins inside the fragment
+
+
+def _presize_images(images: list[Image.Image]) -> list[Image.Image]:
+    """Parallel pre-resize with the embedder's own transform. torchvision
+    Resize is bit-identical on re-application (verified), so the embedder's
+    internal single-threaded resize becomes a no-op while the CPU cost of
+    native-frame embedding drops ~6x."""
+    embedder = AnimeMatcherService._embedder
+    resize = getattr(embedder, "_resize", None)
+    if resize is None or len(images) < 8:
+        return images
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(8) as pool:
+        return list(pool.map(resize, images))
+
+
+class _WindowEmbedCache:
+    """Per-run cache of natively decoded + embedded episode frames on the
+    VERIFY_DECODE_FPS grid, keyed by (episode, zoom). Chains, duplicate
+    candidates and boundary jobs hit the same source neighbourhoods
+    repeatedly (R5); each slot is decoded and embedded at most once."""
+
+    def __init__(self, library_type, zoom_crop, fps: float) -> None:
+        self.library_type = library_type
+        self.zoom_crop = zoom_crop
+        self.fps = fps
+        self.caps: dict[str, object] = {}
+        self.slots: dict[tuple[str, float], dict[int, tuple[float, np.ndarray] | None]] = {}
+
+    def get_cap(self, episode: str):
+        from .anime_library import AnimeLibraryService
+
+        path = AnimeLibraryService.resolve_episode_path(
+            episode, library_type=self.library_type
+        )
+        if path is None or not path.exists():
+            return None
+        cap = self.caps.get(str(path))
+        if cap is None:
+            cv2 = AnimeMatcherService._require_cv2()
+            cap = cv2.VideoCapture(str(path))
+            self.caps[str(path)] = cap
+        return cap
+
+    def window(
+        self, episode: str, zoom: float, lo: float, hi: float
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """(times, embeddings) covering [lo, hi] at the decode grid."""
+        slots = self.slots.setdefault((episode, round(zoom, 2)), {})
+        i0 = int(math.floor(max(0.0, lo) * self.fps))
+        i1 = int(math.ceil(hi * self.fps))
+        missing = [k for k in range(i0, i1 + 1) if k not in slots]
+        if missing:
+            cap = self.get_cap(episode)
+            if cap is None:
+                return None
+            runs: list[tuple[int, int]] = []
+            for k in missing:
+                if runs and k == runs[-1][1] + 1:
+                    runs[-1] = (runs[-1][0], k)
+                else:
+                    runs.append((k, k))
+            for r0, r1 in runs:
+                w_lo = r0 / self.fps
+                w_hi = (r1 + 1) / self.fps
+                frames = AnimeMatcherService._collect_frames_in_window_from_capture(
+                    cap,
+                    w_lo,
+                    w_hi,
+                    max_frames=int((w_hi - w_lo) * 65) + 8,
+                    sample_frames=max(2, int(round((w_hi - w_lo) * self.fps)) + 1),
+                )
+                if frames:
+                    embs = AnimeMatcherService._embed_pil_batch(
+                        _presize_images(
+                            [
+                                self.zoom_crop(im, zoom).convert("RGB")
+                                for _, im in frames
+                            ]
+                        )
+                    )
+                    for (t, _), emb in zip(frames, embs, strict=False):
+                        slot = int(round(t * self.fps))
+                        if r0 <= slot <= r1 and slots.get(slot) is None:
+                            slots[slot] = (t, emb)
+                for k in range(r0, r1 + 1):
+                    slots.setdefault(k, None)
+        entries = [
+            slots[k]
+            for k in range(i0, i1 + 1)
+            if slots.get(k) is not None
+        ]
+        if not entries:
+            return None
+        times = np.array([t for t, _ in entries])
+        embs = np.stack([e for _, e in entries])
+        return times, embs
+
+    def close(self) -> None:
+        for cap in self.caps.values():
+            try:
+                cap.release()
+            except Exception:
+                pass
+        self.caps.clear()
 
 
 class SceneAlignerService:
@@ -396,26 +477,41 @@ class SceneAlignerService:
         diagnostics.stage4_attempts = stage4_attempts
         diagnostics.phase_timings["merge"] = time.perf_counter() - started
 
-        started = time.perf_counter()
-        final_scenes, remapped = cls._interior_splits(
-            final_scenes, remapped, correspondences, diff_times, diffs
+        window_cache = _WindowEmbedCache(
+            library_type, cls._zoom_crop, VERIFY_DECODE_FPS
         )
-        final_scenes = cls._tug_boundaries(
-            final_scenes, remapped, correspondences, diff_times, diffs
-        )
-        diagnostics.phase_timings["interior_split"] = time.perf_counter() - started
+        try:
+            started = time.perf_counter()
+            final_scenes, remapped = cls._interior_splits(
+                final_scenes, remapped, correspondences, diff_times, diffs
+            )
+            final_scenes = cls._tug_boundaries(
+                final_scenes, remapped, correspondences, diff_times, diffs
+            )
+            final_scenes = cls._native_tug_boundaries(
+                video_path,
+                final_scenes,
+                remapped,
+                library_type,
+                window_cache,
+                correspondences=correspondences,
+            )
+            diagnostics.phase_timings["interior_split"] = time.perf_counter() - started
 
-        started = time.perf_counter()
-        matches = cls._build_matches(
-            video_path,
-            final_scenes,
-            remapped,
-            scene_segments,
-            correspondences,
-            library_type,
-            samples,
-        )
-        diagnostics.phase_timings["refine_build"] = time.perf_counter() - started
+            started = time.perf_counter()
+            matches = cls._build_matches(
+                video_path,
+                final_scenes,
+                remapped,
+                scene_segments,
+                correspondences,
+                library_type,
+                samples,
+                window_cache=window_cache,
+            )
+            diagnostics.phase_timings["refine_build"] = time.perf_counter() - started
+        finally:
+            window_cache.close()
         cls._last_diagnostics = diagnostics
         result = AlignmentResult(final_scenes, matches, diagnostics)
         cls._last_result = result
@@ -433,172 +529,9 @@ class SceneAlignerService:
         for segments in scene_segments.values():
             del segments[limit:]
 
-    @classmethod
-    def _add_global_path_segments(
-        cls,
-        scenes: SceneList,
-        correspondences: list[Correspondence],
-        scene_segments: dict[int, list[SegmentHypothesis]],
-        *,
-        max_segments: int,
-    ) -> None:
-        path = cls._decode_sample_path(scenes, correspondences)
-        if not path:
-            return
-        next_id = (
-            max((segment.id for values in scene_segments.values() for segment in values), default=-1)
-            + 1
-        )
-        by_scene: dict[int, list[Correspondence]] = {i: [] for i in range(len(scenes.scenes))}
-        scene_index = 0
-        for corr in path:
-            while (
-                scene_index < len(scenes.scenes)
-                and corr.t_tiktok >= scenes.scenes[scene_index].end_time
-            ):
-                scene_index += 1
-            if scene_index >= len(scenes.scenes):
-                break
-            scene = scenes.scenes[scene_index]
-            if scene.start_time <= corr.t_tiktok < scene.end_time:
-                by_scene[scene_index].append(corr)
 
-        for index, scene in enumerate(scenes.scenes):
-            values = by_scene[index]
-            if len(values) < MIN_SEGMENT_INLIER_TIMES:
-                continue
-            episode_counts: dict[str, int] = {}
-            for corr in values:
-                episode_counts[corr.episode] = episode_counts.get(corr.episode, 0) + 1
-            episode = max(episode_counts, key=episode_counts.get)
-            episode_values = [corr for corr in values if corr.episode == episode]
-            if len(episode_values) < MIN_SEGMENT_INLIER_TIMES:
-                continue
-            seed = cls._refit_line_from_inliers(
-                scene,
-                episode,
-                episode_values,
-                1.0,
-                episode_values[0].t_source - episode_values[0].t_tiktok,
-            )
-            if seed is None:
-                continue
-            segment = SegmentHypothesis(
-                id=next_id,
-                episode=seed.episode,
-                tiktok_start=seed.tiktok_start,
-                tiktok_end=seed.tiktok_end,
-                a=seed.a,
-                b=seed.b,
-                inlier_count=seed.inlier_count,
-                mean_similarity=seed.mean_similarity,
-                score=seed.score,
-                scene_index=seed.scene_index,
-            )
-            next_id += 1
-            scene_segments.setdefault(index, []).append(segment)
-            scene_segments[index].sort(key=lambda item: item.score, reverse=True)
-            del scene_segments[index][max_segments:]
 
-    @classmethod
-    def _decode_sample_path(
-        cls,
-        scenes: SceneList,
-        correspondences: list[Correspondence],
-    ) -> list[Correspondence]:
-        if not correspondences:
-            return []
-        by_time: dict[float, list[Correspondence]] = {}
-        for corr in correspondences:
-            by_time.setdefault(round(corr.t_tiktok, 3), []).append(corr)
-        times = sorted(by_time)
-        if not times:
-            return []
-        states: list[list[Correspondence]] = []
-        for sample_time in times:
-            values = by_time[sample_time]
-            values.sort(key=lambda corr: corr.similarity, reverse=True)
-            states.append(values[:RETRIEVAL_TOP_K])
 
-        scores: list[list[float]] = [[corr.similarity for corr in states[0]]]
-        back: list[list[int]] = [[-1 for _ in states[0]]]
-        for time_index in range(1, len(times)):
-            previous_time = times[time_index - 1]
-            current_time = times[time_index]
-            crosses_boundary = cls._crosses_scene_boundary(
-                scenes,
-                previous_time,
-                current_time,
-            )
-            row: list[float] = []
-            row_back: list[int] = []
-            for current in states[time_index]:
-                best_score = -math.inf
-                best_index = 0
-                for prev_index, previous in enumerate(states[time_index - 1]):
-                    score = (
-                        scores[-1][prev_index]
-                        + current.similarity
-                        + cls._sample_transition_score(
-                            previous,
-                            current,
-                            current_time - previous_time,
-                            crosses_boundary,
-                        )
-                    )
-                    if score > best_score:
-                        best_score = score
-                        best_index = prev_index
-                row.append(best_score)
-                row_back.append(best_index)
-            scores.append(row)
-            back.append(row_back)
-
-        state_index = int(np.argmax(scores[-1]))
-        path: list[Correspondence] = [states[-1][state_index]]
-        for time_index in range(len(times) - 1, 0, -1):
-            state_index = back[time_index][state_index]
-            path.append(states[time_index - 1][state_index])
-        path.reverse()
-        return path
-
-    @classmethod
-    def _crosses_scene_boundary(
-        cls,
-        scenes: SceneList,
-        previous_time: float,
-        current_time: float,
-    ) -> bool:
-        for scene in scenes.scenes:
-            if previous_time < scene.end_time <= current_time:
-                return True
-            if scene.start_time > current_time:
-                break
-        return False
-
-    @staticmethod
-    def _sample_transition_score(
-        previous: Correspondence,
-        current: Correspondence,
-        dt: float,
-        crosses_boundary: bool,
-    ) -> float:
-        if dt <= 0:
-            return 0.0
-        if previous.episode != current.episode:
-            return -EPISODE_SWITCH_PENALTY
-        source_delta = current.t_source - previous.t_source
-        if crosses_boundary:
-            if source_delta < 0:
-                return -BACKWARD_JUMP_PENALTY
-            return 0.0
-        speed = source_delta / dt
-        if not (MIN_EVIDENCE_SPEED <= speed <= MAX_EVIDENCE_SPEED):
-            return -BACKWARD_JUMP_PENALTY
-        return EPISODE_SWITCH_PENALTY - min(
-            EPISODE_SWITCH_PENALTY,
-            SceneAlignerService._speed_prior_penalty(speed),
-        )
 
     @classmethod
     def sample_query_video(cls, video_path: Path) -> list[QuerySample]:
@@ -642,7 +575,7 @@ class SceneAlignerService:
                 if not images:
                     return
                 embeddings = AnimeMatcherService._embed_pil_batch(
-                    [image.convert("RGB") for image in images]
+                    _presize_images([image.convert("RGB") for image in images])
                 )
                 for sample_time, embedding in zip(times, embeddings, strict=False):
                     samples.append(QuerySample(sample_time, embedding, "plain"))
@@ -723,8 +656,8 @@ class SceneAlignerService:
     def _embed_variant_images(images: list[Image.Image]) -> np.ndarray:
         embeddings: list[np.ndarray | None] = [None] * len(images)
         by_size: dict[tuple[int, int], list[tuple[int, Image.Image]]] = {}
-        for index, image in enumerate(images):
-            rgb = image.convert("RGB")
+        presized = _presize_images([image.convert("RGB") for image in images])
+        for index, rgb in enumerate(presized):
             by_size.setdefault(rgb.size, []).append((index, rgb))
         for values in by_size.values():
             batch = AnimeMatcherService._embed_pil_batch([image for _, image in values])
@@ -1227,60 +1160,13 @@ class SceneAlignerService:
                     weak.add(sample_index)
         return weak
 
-    @classmethod
-    def decode_scene_sequence(
-        cls,
-        scenes: SceneList,
-        scene_segments: dict[int, list[SegmentHypothesis]],
-    ) -> list[SegmentHypothesis | None]:
-        states: list[list[_DecodedState]] = []
-        for index in range(len(scenes.scenes)):
-            segments = scene_segments.get(index, [])
-            scene_states = [
-                _DecodedState(segment, cls._emission_score(segment))
-                for segment in segments[:MAX_SEGMENTS_PER_SCENE]
-            ]
-            scene_states.append(_DecodedState(None, -NO_MATCH_PENALTY))
-            states.append(scene_states)
-        if not states:
-            return []
 
-        scores: list[list[float]] = [[state.emission for state in states[0]]]
-        back: list[list[int]] = [[-1 for _ in states[0]]]
-        for scene_index in range(1, len(states)):
-            prev_scores = scores[-1]
-            row: list[float] = []
-            row_back: list[int] = []
-            for state in states[scene_index]:
-                best_score = -math.inf
-                best_index = 0
-                for prev_index, prev_state in enumerate(states[scene_index - 1]):
-                    score = (
-                        prev_scores[prev_index]
-                        + state.emission
-                        + cls._transition_score(
-                            scenes.scenes[scene_index - 1],
-                            scenes.scenes[scene_index],
-                            prev_state.segment,
-                            state.segment,
-                        )
-                    )
-                    if score > best_score:
-                        best_score = score
-                        best_index = prev_index
-                row.append(best_score)
-                row_back.append(best_index)
-            scores.append(row)
-            back.append(row_back)
 
-        last_index = int(np.argmax(scores[-1]))
-        decoded: list[SegmentHypothesis | None] = [None] * len(states)
-        for scene_index in range(len(states) - 1, -1, -1):
-            decoded[scene_index] = states[scene_index][last_index].segment
-            last_index = back[scene_index][last_index]
-            if last_index < 0 and scene_index > 0:
-                last_index = 0
-        return decoded
+
+
+    # ------------------------------------------------------------------
+    # Stage 4 (2026-07-06 rework): global segmentation DP
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _emission_score(segment: SegmentHypothesis) -> float:
@@ -1310,32 +1196,6 @@ class SceneAlignerService:
         if source_rate < COMMON_SOURCE_RATE_MIN:
             return abs(math.log(source_rate / COMMON_SOURCE_RATE_MIN))
         return abs(math.log(source_rate / COMMON_SOURCE_RATE_MAX))
-
-    @classmethod
-    def _transition_score(
-        cls,
-        left_scene: Scene,
-        right_scene: Scene,
-        left: SegmentHypothesis | None,
-        right: SegmentHypothesis | None,
-    ) -> float:
-        if left is None or right is None:
-            return 0.0
-        score = 0.0
-        if left.episode != right.episode:
-            score -= EPISODE_SWITCH_PENALTY
-            return score
-        gap = right.source_at(right_scene.start_time) - left.source_at(left_scene.end_time)
-        index_step = 1.0 / max(AnimeMatcherService.get_index_fps(), 1e-3)
-        if abs(gap) <= CONTINUITY_GRID_STEPS * index_step:
-            score += EPISODE_SWITCH_PENALTY
-        elif gap < 0:
-            score -= BACKWARD_JUMP_PENALTY
-        return score
-
-    # ------------------------------------------------------------------
-    # Stage 4 (2026-07-06 rework): global segmentation DP
-    # ------------------------------------------------------------------
 
     @classmethod
     def _interior_splits(
@@ -1587,6 +1447,206 @@ class SceneAlignerService:
             for k, (s0, s1) in enumerate(zip(starts, ends))
         ]
         return SceneList(scenes=new_scenes)
+
+    @classmethod
+    def _native_tug_boundaries(
+        cls,
+        video_path: Path,
+        scenes: SceneList,
+        remapped: list[tuple[list[int], SegmentHypothesis | None]],
+        library_type: LibraryType | str,
+        window_cache: "_WindowEmbedCache | None" = None,
+        correspondences: list[Correspondence] | None = None,
+    ) -> SceneList:
+        """Native placement of boundaries between scenes on DIFFERENT source
+        lines: decode the TikTok at 24 fps around the boundary and place the
+        cut where left-line similarity ends and right-line similarity begins.
+
+        The TikTok diff curve cannot place these cuts (measured: several GT
+        cuts are invisible in the diff curve while a stronger flash peak
+        sits 0.3-0.5s away); the two fitted lines themselves say where the
+        content changes. A boundary only moves when the split evidence
+        clearly improves, so given-correct boundaries stay (oracle guard)."""
+        sl = scenes.scenes
+        if len(sl) < 2:
+            return scenes
+        cache = window_cache or _WindowEmbedCache(
+            library_type, cls._zoom_crop, VERIFY_DECODE_FPS
+        )
+        tol = INLIER_TOLERANCE_SECONDS
+        decode_corrs = [
+            c
+            for c in (correspondences or [])
+            if c.rank < DECODE_RETRIEVAL_TOP_K
+        ]
+
+        def duplicate_suspect(scene_idx: int, fit: SegmentHypothesis) -> bool:
+            """A wrong duplicate-instance line makes the split evidence
+            meaningless; the tug must not move boundaries it cannot judge
+            (this is how given-true boundaries between WP scenes broke)."""
+            t0 = sl[scene_idx].start_time
+            t1 = sl[scene_idx].end_time
+            support = 0.0
+            clusters: dict[tuple[str, int], float] = {}
+            for c in decode_corrs:
+                if not (t0 <= c.t_tiktok < t1):
+                    continue
+                if (
+                    c.episode == fit.episode
+                    and abs(c.t_source - fit.source_at(c.t_tiktok))
+                    <= SEGMENT_RESIDUAL_SECONDS
+                ):
+                    support = max(support, c.similarity)
+                key = (c.episode, int(round((c.t_source - c.t_tiktok) / 2.0)))
+                clusters[key] = max(clusters.get(key, 0.0), c.similarity)
+            t_mid = 0.5 * (t0 + t1)
+            for (episode, _), sim in clusters.items():
+                if sim < support - 0.05:
+                    continue
+                # distant cluster with near-tie support: duplicate risk
+                for c in decode_corrs:
+                    if (
+                        c.episode == episode
+                        and t0 <= c.t_tiktok < t1
+                        and abs(
+                            (c.t_source - c.t_tiktok + t_mid)
+                            - fit.source_at(t_mid)
+                        )
+                        > 3.0
+                        and c.similarity >= support - 0.05
+                    ):
+                        return True
+            return False
+
+        jobs: list[tuple[int, float, float, bool]] = []
+        for k in range(len(sl) - 1):
+            fl = remapped[k][1]
+            fr = remapped[k + 1][1]
+            if fl is None or fr is None:
+                continue
+            t = sl[k].end_time
+            if fl.episode != fr.episode:
+                # an episode switch is a hard content change the diff curve
+                # always sees; the invisible-cut pathology this pass fixes
+                # only arises WITHIN an episode (lookalike adjacent shots)
+                continue
+            if abs(fr.source_at(t) - fl.source_at(t)) <= tol:
+                continue
+            if duplicate_suspect(k, fl) or duplicate_suspect(k + 1, fr):
+                continue
+            lo = max(t - 0.65, sl[k].start_time + 0.3)
+            hi = min(t + 0.65, sl[k + 1].end_time - 0.3)
+            if hi - lo < 0.15:
+                continue
+            jobs.append((k, lo, hi, False))
+        if not jobs:
+            return scenes
+
+        frame_times: list[float] = []
+        spans: list[tuple[int, int]] = []
+        for _, lo, hi, _suspect in jobs:
+            ts = list(np.arange(lo, hi + 1e-6, 1.0 / 16.0))
+            spans.append((len(frame_times), len(ts)))
+            frame_times.extend(ts)
+        decoded = AnimeMatcherService.extract_frames(video_path, frame_times)
+        keep_rows = [k for k, fr in enumerate(decoded) if fr is not None]
+        if not keep_rows:
+            return scenes
+        all_embs = AnimeMatcherService._embed_pil_batch(
+            _presize_images([decoded[k].convert("RGB") for k in keep_rows])
+        )
+        emb_of: dict[int, np.ndarray] = {
+            row: all_embs[n] for n, row in enumerate(keep_rows)
+        }
+
+        moves: dict[int, float] = {}
+        try:
+            for (k, lo, hi, suspect), (off, cnt) in zip(jobs, spans):
+                q = [
+                    (frame_times[off + d], emb_of[off + d])
+                    for d in range(cnt)
+                    if off + d in emb_of
+                ]
+                if len(q) < 4:
+                    continue
+                fl = remapped[k][1]
+                fr = remapped[k + 1][1]
+
+                def line_sims(fit: SegmentHypothesis) -> np.ndarray | None:
+                    s_lo = min(fit.source_at(lo), fit.source_at(hi)) - 0.4
+                    s_hi = max(fit.source_at(lo), fit.source_at(hi)) + 0.4
+                    win = cache.window(fit.episode, 1.0, s_lo, s_hi)
+                    if win is None:
+                        return None
+                    times, embs = win
+                    sims = np.stack([e for _, e in q]) @ embs.T
+                    preds = np.array([fit.source_at(t) for t, _ in q])
+                    cols = np.clip(np.searchsorted(times, preds), 0, len(times) - 1)
+                    prev_cols = np.clip(cols - 1, 0, len(times) - 1)
+                    use_prev = np.abs(times[prev_cols] - preds) < np.abs(
+                        times[cols] - preds
+                    )
+                    cols = np.where(use_prev, prev_cols, cols)
+                    valid = np.abs(times[cols] - preds) <= 0.25
+                    out = sims[np.arange(len(q)), cols]
+                    return np.where(valid, out, 0.0)
+
+                sim_left = line_sims(fl)
+                sim_right = line_sims(fr)
+                if sim_left is None or sim_right is None:
+                    continue
+                q_times = np.array([t for t, _ in q])
+                current = sl[k].end_time
+
+                def split_score(cut: float) -> float:
+                    left_mask = q_times < cut
+                    return float(
+                        sim_left[left_mask].sum() + sim_right[~left_mask].sum()
+                    )
+
+                cuts = list((q_times[1:] + q_times[:-1]) / 2.0)
+                base = split_score(current)
+                best_t, best_s = current, base
+                for cut in cuts:
+                    s = split_score(cut)
+                    if s > best_s:
+                        best_t, best_s = cut, s
+                # oracle guard: a boundary that is already a local optimum
+                # of the split evidence has strong bilateral support and
+                # must not move (a distant higher score under a wrong line
+                # is exactly how given-true boundaries get broken)
+                locally_optimal = all(
+                    split_score(c) <= base + 1e-9
+                    for c in cuts
+                    if abs(c - current) <= 0.15
+                )
+                # only real misplacements move: sub-0.12s nudges sit inside
+                # the exact tolerance on both axes and only add jitter to
+                # the source interval mapping (measured on 85de). The gain
+                # is a sum over moved frames, so the floor scales with the
+                # query sampling rate (16 fps here).
+                if (
+                    not locally_optimal
+                    and abs(best_t - current) >= 0.12
+                    and best_s >= base + 0.0667
+                ):
+                    moves[k] = float(best_t)
+        finally:
+            if window_cache is None:
+                cache.close()
+        if not moves:
+            return scenes
+        bounds = [s.end_time for s in sl[:-1]]
+        for k, t in moves.items():
+            bounds[k] = t
+        starts = [sl[0].start_time] + bounds
+        ends = bounds + [sl[-1].end_time]
+        return SceneList(
+            scenes=[
+                Scene(index=n, start_time=s0, end_time=s1)
+                for n, (s0, s1) in enumerate(zip(starts, ends))
+            ]
+        )
 
     @classmethod
     def _fragment_evidence(
@@ -2021,255 +2081,6 @@ class SceneAlignerService:
     _last_boundary_diagnostics: list[dict[str, object]] = []
     _last_verify_debug: list[dict[str, object]] = []
 
-    @classmethod
-    def _verify_continuations(
-        cls,
-        pending: list[tuple[int, list[tuple[object, list[int], float, int, str]]]],
-        samples: list[QuerySample],
-        library_type: LibraryType | str,
-        video_path: Path,
-    ) -> dict[int, float]:
-        """Native-decode verification of merge-leaning static boundaries.
-
-        Stage 1 (embedding): the candidate merge line is scored on BOTH sides
-        against native source frames with one rigid slack offset shared by
-        the whole line; the min side ratio must reach
-        VERIFY_CONTINUATION_RATIO (a phantom bridge can fix one side only).
-
-        Stage 2 (pixel gap): for lines that pass, the actual TikTok frames on
-        each side are template-matched into the native source frames, giving
-        per-side alignment offsets; gap = delta_R - delta_L cancels fit
-        offset noise and measures the true source skip at the cut with
-        native precision. |gap| beyond PIXEL_GAP_MERGE_TOLERANCE_SECONDS
-        refutes the merge (a deliberate edit trim); an unreliable match
-        (crop/zoom defeats the template) falls back to the embedding verdict.
-
-        Returns {boundary_index: best_ratio} for boundaries whose merge
-        survived both stages.
-        """
-        from .anime_library import AnimeLibraryService
-
-        cv2 = AnimeMatcherService._require_cv2()
-        started_at = time.perf_counter()
-        cls._last_verify_debug = []
-        jobs = []  # (k, episode, query_embs, pred, ref, fit_id, side, times)
-        tiktok_times: list[float] = []
-        for k, directions in pending:
-            for fit, indices, ref, fit_id, side in directions:
-                query_embs = np.stack([samples[i].embedding for i in indices])
-                t_query = np.array([samples[i].t_tiktok for i in indices])
-                pred = fit.a * t_query + fit.b
-                jobs.append((k, fit.episode, query_embs, pred, ref, fit_id, side, t_query))
-                tiktok_times.extend(float(t) for t in t_query)
-        if not jobs:
-            return {}
-
-        # one batched TikTok decode for the pixel stage
-        uniq_times = sorted(set(round(t, 3) for t in tiktok_times))
-        tik_frames = AnimeMatcherService.extract_frames(video_path, uniq_times)
-        tik_gray: dict[float, np.ndarray] = {}
-        for t, frame in zip(uniq_times, tik_frames):
-            if frame is None:
-                continue
-            arr = cv2.cvtColor(np.asarray(frame.convert("RGB")), cv2.COLOR_RGB2GRAY)
-            h, w = arr.shape
-            scale = 90.0 / h
-            tik_gray[t] = cv2.resize(arr, (max(8, int(round(w * scale))), 90))
-
-        fit_ratio: dict[tuple[int, int], float] = {}
-        fit_gap: dict[tuple[int, int], float | None] = {}
-        by_episode: dict[str, list] = {}
-        for job in jobs:
-            by_episode.setdefault(job[1], []).append(job)
-        for episode, episode_jobs in by_episode.items():
-            episode_path = AnimeLibraryService.resolve_episode_path(
-                episode, library_type=library_type
-            )
-            if episode_path is None or not episode_path.exists():
-                continue
-            windows: list[tuple[float, float]] = sorted(
-                (float(np.min(j[3])) - 0.45, float(np.max(j[3])) + 0.45)
-                for j in episode_jobs
-            )
-            merged: list[list[float]] = []
-            for lo, hi in windows:
-                if merged and lo <= merged[-1][1] + 0.5:
-                    merged[-1][1] = max(merged[-1][1], hi)
-                else:
-                    merged.append([lo, hi])
-            all_times: list[np.ndarray] = []
-            all_embs: list[np.ndarray] = []
-            all_grays: list[np.ndarray] = []
-            cap = cv2.VideoCapture(str(episode_path))
-            try:
-                for lo, hi in merged:
-                    frame_target = max(8, int((hi - lo) * VERIFY_DECODE_FPS))
-                    frames = AnimeMatcherService._collect_frames_in_window_from_capture(
-                        cap,
-                        lo,
-                        hi,
-                        max_frames=int((hi - lo) * 65) + 8,
-                        sample_frames=frame_target,
-                    )
-                    if not frames:
-                        continue
-                    all_times.append(np.array([t for t, _ in frames]))
-                    rgbs = [img.convert("RGB") for _, img in frames]
-                    all_embs.append(AnimeMatcherService._embed_pil_batch(rgbs))
-                    all_grays.extend(
-                        cv2.resize(
-                            cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2GRAY),
-                            (160, 90),
-                        )
-                        for img in rgbs
-                    )
-            finally:
-                cap.release()
-            if not all_times:
-                continue
-            times = np.concatenate(all_times)
-            embs = np.concatenate(all_embs, axis=0)
-            grays = np.stack(all_grays)
-            order = np.argsort(times)
-            times = times[order]
-            embs = embs[order]
-            grays = grays[order]
-
-            def pixel_delta(t_query: np.ndarray, pred: np.ndarray) -> float | None:
-                """Rigid-shift pixel alignment of this side's TikTok frames
-                against the native source frames.
-
-                Builds the mean NCC curve over a shared shift tau and returns
-                the peak location only when the peak is sharp; a flat curve
-                means the content is static there and position is genuinely
-                unobservable (None)."""
-                templates = []
-                preds_used = []
-                for tq, pq in zip(t_query, pred):
-                    templ_full = tik_gray.get(round(float(tq), 3))
-                    if templ_full is None:
-                        continue
-                    templates.append(templ_full)
-                    preds_used.append(float(pq))
-                if len(templates) < 2:
-                    return None
-                lo = min(preds_used) - 0.8
-                hi = max(preds_used) + 0.8
-                in_window = np.where((times >= lo) & (times <= hi))[0]
-                if in_window.size < 4:
-                    return None
-                # NCC of every template against every window frame (best of
-                # a few crop scales; captions sit low, so match the top part)
-                ncc = np.full((len(templates), in_window.size), -1.0)
-                for ti, templ_full in enumerate(templates):
-                    crop = templ_full[: int(templ_full.shape[0] * 0.55)]
-                    for scale in (1.0, 0.85, 0.7):
-                        th = max(20, int(crop.shape[0] * scale))
-                        tw = max(12, int(crop.shape[1] * scale))
-                        if tw >= 158 or th >= 88:
-                            continue
-                        templ = cv2.resize(crop, (tw, th))
-                        for jj, j in enumerate(in_window):
-                            res = cv2.matchTemplate(
-                                grays[j], templ, cv2.TM_CCOEFF_NORMED
-                            )
-                            v = float(res.max())
-                            if v > ncc[ti, jj]:
-                                ncc[ti, jj] = v
-                w_times = times[in_window]
-                taus = np.arange(-0.7, 0.7 + 1e-6, 1.0 / VERIFY_DECODE_FPS)
-                curve = np.full(taus.size, np.nan)
-                for oi, tau in enumerate(taus):
-                    vals = []
-                    for ti, pq in enumerate(preds_used):
-                        j = int(np.argmin(np.abs(w_times - (pq + tau))))
-                        if abs(w_times[j] - (pq + tau)) <= 0.15:
-                            vals.append(ncc[ti, j])
-                    if len(vals) == len(preds_used):
-                        curve[oi] = float(np.mean(vals))
-                valid = ~np.isnan(curve)
-                if valid.sum() < 5:
-                    return None
-                peak_idx = int(np.nanargmax(curve))
-                peak = float(curve[peak_idx])
-                baseline = float(np.nanmedian(curve))
-                if peak < 0.5 or peak - baseline < 0.07:
-                    return None  # plateau: position unobservable
-                return float(taus[peak_idx])
-
-            by_fit: dict[tuple[int, int], list] = {}
-            for job in episode_jobs:
-                by_fit.setdefault((job[0], job[5]), []).append(job)
-            offsets = np.arange(-0.25, 0.25 + 1e-6, 1.0 / VERIFY_DECODE_FPS)
-            for (k, fit_id), fit_jobs in by_fit.items():
-                side_scores = []
-                refs = []
-                deltas: dict[str, float | None] = {"L": None, "R": None}
-                for _, _, query_embs, pred, ref, _, side, t_query in fit_jobs:
-                    sims = query_embs @ embs.T
-                    per_delta = np.full(offsets.size, -1.0)
-                    for oi, delta in enumerate(offsets):
-                        cols = np.searchsorted(times, pred + delta)
-                        cols = np.clip(cols, 0, len(times) - 1)
-                        dist = np.abs(times[cols] - (pred + delta))
-                        values = sims[np.arange(len(pred)), cols]
-                        if (dist <= 0.5).sum() < len(pred):
-                            continue
-                        per_delta[oi] = float(np.mean(values))
-                    side_scores.append(per_delta)
-                    refs.append(ref)
-                    px = pixel_delta(t_query, pred)
-                    if px is not None:
-                        deltas[side] = px
-                combined = np.full(offsets.size, np.inf)
-                for per_delta, ref in zip(side_scores, refs):
-                    ratio = np.where(per_delta >= 0, per_delta / max(ref, 1e-6), 0.0)
-                    combined = np.minimum(combined, ratio)
-                best = float(np.max(combined)) if combined.size else 0.0
-                gap = (
-                    deltas["R"] - deltas["L"]
-                    if deltas["L"] is not None and deltas["R"] is not None
-                    else None
-                )
-                cls._last_verify_debug.append(
-                    {
-                        "boundary_index": k,
-                        "fit_id": fit_id,
-                        "best_combined": round(best, 3),
-                        "pixel_gap": round(gap, 3) if gap is not None else None,
-                        "delta_l": deltas["L"],
-                        "delta_r": deltas["R"],
-                        "sides": [
-                            {
-                                "side": j[6],
-                                "tq": [round(float(x), 2) for x in j[7]],
-                                "pred": [round(float(x), 2) for x in j[3]],
-                                "ref": round(j[4], 3),
-                            }
-                            for j in fit_jobs
-                        ],
-                    }
-                )
-                if best < VERIFY_CONTINUATION_RATIO:
-                    continue
-                if gap is not None and abs(gap) > PIXEL_GAP_MERGE_TOLERANCE_SECONDS:
-                    # the sides align to source positions that differ by a
-                    # real skip: a deliberate edit trim, not one clip
-                    continue
-                fit_ratio[(k, fit_id)] = best
-                fit_gap[(k, fit_id)] = gap
-        AnimeMatcherService._record_runtime_stat(
-            "boundary_verify_seconds", time.perf_counter() - started_at
-        )
-        AnimeMatcherService._record_runtime_stat(
-            "boundary_verify_calls", float(len(jobs))
-        )
-        best_ratio: dict[int, float] = {}
-        for (k, _), ratio in fit_ratio.items():
-            prev = best_ratio.get(k)
-            if prev is None or ratio > prev:
-                best_ratio[k] = ratio
-        return best_ratio
 
     @classmethod
     def _index_embedding_at(
@@ -2506,102 +2317,6 @@ class SceneAlignerService:
             boundary_records.append(record)
         return snapped, remapped, group_records, boundary_records
 
-    @classmethod
-    def _segment_decoded_continuities(
-        cls,
-        video_path: Path,
-        scenes: SceneList,
-        decoded: list[SegmentHypothesis | None],
-        decode_segments: dict[int, list[SegmentHypothesis]],
-        correspondences: list[Correspondence],
-    ) -> tuple[
-        SceneList,
-        list[tuple[list[int], SegmentHypothesis | None]],
-        list[dict[str, object]],
-        list[dict[str, object]],
-    ]:
-        by_fragment = cls._correspondences_by_fragment(scenes, correspondences)
-        attempt_records: list[dict[str, object]] = []
-        groups = cls._decoded_fragment_groups(
-            scenes,
-            decoded,
-            decode_segments,
-            by_fragment,
-            attempt_records,
-        )
-        final_scenes = SceneList(
-            scenes=[
-                Scene(
-                    index=group_index,
-                    start_time=scenes.scenes[indices[0]].start_time,
-                    end_time=scenes.scenes[indices[-1]].end_time,
-                )
-                for group_index, (indices, _) in enumerate(groups)
-            ]
-        )
-
-        snapped = final_scenes
-        remapped: list[tuple[list[int], SegmentHypothesis | None]] = []
-        group_records: list[dict[str, object]] = []
-        for group_index, (indices, fit) in enumerate(groups):
-            scene = snapped.scenes[group_index]
-            if fit is None:
-                remapped.append((indices, None))
-                group_records.append(
-                    {
-                        "scene_index": group_index,
-                        "fragment_indices": list(indices),
-                        "fragment_count": len(indices),
-                        "tiktok_start": scene.start_time,
-                        "tiktok_end": scene.end_time,
-                        "episode": None,
-                    }
-                )
-                continue
-            source_start = fit.segment.source_at(scene.start_time)
-            source_end = fit.segment.source_at(scene.end_time)
-            group_records.append(
-                {
-                    "scene_index": group_index,
-                    "fragment_indices": list(indices),
-                    "fragment_count": len(indices),
-                    "tiktok_start": scene.start_time,
-                    "tiktok_end": scene.end_time,
-                    "episode": fit.segment.episode,
-                    "source_start": source_start,
-                    "source_end": source_end,
-                    "source_rate": fit.segment.a,
-                    "inlier_count": fit.inlier_count,
-                    "mean_abs_residual": fit.mean_abs_residual,
-                    "covered_fragments": sorted(fit.covered_fragments),
-                    "changepoint": cls._group_changepoint_summary(
-                        scenes,
-                        indices,
-                        decoded,
-                        decode_segments,
-                        by_fragment,
-                        fit,
-                    ),
-                }
-            )
-            remapped.append(
-                (
-                    indices,
-                    SegmentHypothesis(
-                        id=fit.segment.id,
-                        episode=fit.segment.episode,
-                        tiktok_start=scene.start_time,
-                        tiktok_end=scene.end_time,
-                        a=fit.segment.a,
-                        b=fit.segment.b,
-                        inlier_count=fit.segment.inlier_count,
-                        mean_similarity=fit.segment.mean_similarity,
-                        score=fit.segment.score,
-                        scene_index=scene.index,
-                    ),
-                )
-            )
-        return snapped, remapped, group_records, attempt_records
 
     @staticmethod
     def _decoded_fragment_records(
@@ -2684,411 +2399,15 @@ class SceneAlignerService:
                 by_fragment[scene_index].append(corr)
         return by_fragment
 
-    @classmethod
-    def _decoded_fragment_groups(
-        cls,
-        scenes: SceneList,
-        decoded: list[SegmentHypothesis | None],
-        decode_segments: dict[int, list[SegmentHypothesis]],
-        by_fragment: dict[int, list[Correspondence]],
-        attempt_records: list[dict[str, object]] | None = None,
-    ) -> list[tuple[list[int], _GroupFit | None]]:
-        groups: list[tuple[list[int], _GroupFit | None]] = []
-        index = 0
-        while index < len(scenes.scenes):
-            segment = decoded[index] if index < len(decoded) else None
-            if segment is None:
-                groups.append(([index], None))
-                index += 1
-                continue
 
-            current_indices = [index]
-            current_fit = cls._fit_decoded_group(
-                scenes,
-                current_indices,
-                decoded,
-                decode_segments,
-                by_fragment,
-            )
-            cursor = index + 1
-            while cursor < len(scenes.scenes):
-                candidate_indices = [*current_indices, cursor]
-                candidate_fit = cls._fit_decoded_group(
-                    scenes,
-                    candidate_indices,
-                    decoded,
-                    decode_segments,
-                    by_fragment,
-                    episode=segment.episode,
-                )
-                if candidate_fit is None:
-                    if attempt_records is not None:
-                        attempt_records.append(
-                            {
-                                "start_fragment": index,
-                                "candidate_indices": candidate_indices,
-                                "accepted": False,
-                                "stop_reason": "no_fit",
-                            }
-                        )
-                    break
-                changepoint = cls._group_changepoint_summary(
-                    scenes,
-                    candidate_indices,
-                    decoded,
-                    decode_segments,
-                    by_fragment,
-                    candidate_fit,
-                )
-                has_changepoint = cls._group_has_clear_changepoint_for_candidate(
-                    scenes,
-                    candidate_indices,
-                    decoded,
-                    candidate_fit,
-                    changepoint,
-                )
-                decoded_gap = cls._decoded_boundary_gap(
-                    scenes,
-                    candidate_indices,
-                    decoded,
-                )
-                if attempt_records is not None:
-                    attempt_records.append(
-                        {
-                            "start_fragment": index,
-                            "candidate_indices": candidate_indices,
-                            "accepted": not has_changepoint,
-                            "stop_reason": "changepoint"
-                            if has_changepoint
-                            else None,
-                            "episode": candidate_fit.segment.episode,
-                            "source_start": candidate_fit.segment.source_at(
-                                scenes.scenes[candidate_indices[0]].start_time
-                            ),
-                            "source_end": candidate_fit.segment.source_at(
-                                scenes.scenes[candidate_indices[-1]].end_time
-                            ),
-                            "source_rate": candidate_fit.segment.a,
-                            "inlier_count": candidate_fit.inlier_count,
-                            "mean_abs_residual": candidate_fit.mean_abs_residual,
-                            "covered_fragments": sorted(candidate_fit.covered_fragments),
-                            "decoded_boundary_gap": decoded_gap,
-                            "changepoint": changepoint,
-                        }
-                    )
-                if has_changepoint:
-                    break
-                current_indices = candidate_indices
-                current_fit = candidate_fit
-                cursor += 1
 
-            groups.append((current_indices, current_fit))
-            index = current_indices[-1] + 1
-        return groups
 
-    @classmethod
-    def _fit_decoded_group(
-        cls,
-        scenes: SceneList,
-        indices: list[int],
-        decoded: list[SegmentHypothesis | None],
-        decode_segments: dict[int, list[SegmentHypothesis]],
-        by_fragment: dict[int, list[Correspondence]],
-        episode: str | None = None,
-    ) -> _GroupFit | None:
-        decoded_segments = [
-            decoded[index]
-            for index in indices
-            if index < len(decoded) and decoded[index] is not None
-        ]
-        if episode is None and not decoded_segments:
-            return None
-        if episode is None:
-            episode = decoded_segments[0].episode
-        if episode is None:
-            return None
-        decoded_segments = [
-            segment for segment in decoded_segments if segment.episode == episode
-        ]
-        group_scene = Scene(
-            index=indices[0],
-            start_time=scenes.scenes[indices[0]].start_time,
-            end_time=scenes.scenes[indices[-1]].end_time,
-        )
-        group_corrs = [
-            corr
-            for index in indices
-            for corr in by_fragment.get(index, [])
-            if corr.episode == episode
-        ]
-        if not group_corrs:
-            return None
 
-        seeds = {(segment.a, segment.b) for segment in decoded_segments}
-        if decoded_segments:
-            first = decoded_segments[0]
-            last = decoded_segments[-1]
-            dt = scenes.scenes[indices[-1]].end_time - scenes.scenes[indices[0]].start_time
-            if dt > 1e-6:
-                source_start = first.source_at(scenes.scenes[indices[0]].start_time)
-                source_end = last.source_at(scenes.scenes[indices[-1]].end_time)
-                speed = (source_end - source_start) / dt
-                if MIN_EVIDENCE_SPEED <= speed <= MAX_EVIDENCE_SPEED:
-                    seeds.add((speed, source_start - speed * scenes.scenes[indices[0]].start_time))
-        if not seeds:
-            best_by_time: dict[float, Correspondence] = {}
-            for corr in group_corrs:
-                key = round(corr.t_tiktok, 3)
-                previous = best_by_time.get(key)
-                if previous is None or corr.similarity > previous.similarity:
-                    best_by_time[key] = corr
-            for corr in best_by_time.values():
-                seeds.add((1.0, corr.t_source - corr.t_tiktok))
-        best_fit: _GroupFit | None = None
-        for speed, offset in cls._dedupe_line_seeds(list(seeds)):
-            segment = cls._refit_line_from_inliers(
-                group_scene,
-                episode,
-                group_corrs,
-                speed,
-                offset,
-            )
-            if segment is None:
-                continue
-            fit = cls._measure_group_fit(segment, scenes, indices, group_corrs)
-            if fit is None:
-                continue
-            if best_fit is None or cls._group_fit_score(fit, len(indices)) > cls._group_fit_score(
-                best_fit,
-                len(indices),
-            ):
-                best_fit = fit
-        return best_fit
 
-    @classmethod
-    def _measure_group_fit(
-        cls,
-        segment: SegmentHypothesis,
-        scenes: SceneList,
-        indices: list[int],
-        correspondences: list[Correspondence],
-    ) -> _GroupFit | None:
-        best_by_time: dict[float, tuple[Correspondence, int]] = {}
-        fragment_by_time: dict[float, int] = {}
-        for fragment_index in indices:
-            scene = scenes.scenes[fragment_index]
-            for corr in correspondences:
-                if not (scene.start_time <= corr.t_tiktok < scene.end_time):
-                    continue
-                residual = abs(corr.t_source - segment.source_at(corr.t_tiktok))
-                if residual > SEGMENT_RESIDUAL_SECONDS:
-                    continue
-                key = round(corr.t_tiktok, 3)
-                previous = best_by_time.get(key)
-                if previous is None or corr.similarity > previous[0].similarity:
-                    best_by_time[key] = (corr, fragment_index)
-                    fragment_by_time[key] = fragment_index
 
-        if len(best_by_time) < MIN_SEGMENT_INLIER_TIMES:
-            return None
-        residuals = np.array(
-            [
-                corr.t_source - segment.source_at(corr.t_tiktok)
-                for corr, _ in best_by_time.values()
-            ],
-            dtype=np.float64,
-        )
-        covered = frozenset(fragment_by_time.values())
-        measured_segment = SegmentHypothesis(
-            id=segment.id,
-            episode=segment.episode,
-            tiktok_start=scenes.scenes[indices[0]].start_time,
-            tiktok_end=scenes.scenes[indices[-1]].end_time,
-            a=segment.a,
-            b=segment.b,
-            inlier_count=len(best_by_time),
-            mean_similarity=segment.mean_similarity,
-            score=segment.score,
-            scene_index=indices[0],
-        )
-        return _GroupFit(
-            segment=measured_segment,
-            inlier_count=len(best_by_time),
-            residual_sse=float(np.sum(residuals * residuals)),
-            mean_abs_residual=float(np.mean(np.abs(residuals))),
-            covered_fragments=covered,
-        )
 
-    @staticmethod
-    def _group_fit_score(fit: _GroupFit, fragment_count: int) -> float:
-        coverage = len(fit.covered_fragments) / max(1, fragment_count)
-        return fit.segment.score + coverage - fit.mean_abs_residual
 
-    @classmethod
-    def _group_has_clear_changepoint(
-        cls,
-        scenes: SceneList,
-        indices: list[int],
-        decoded: list[SegmentHypothesis | None],
-        decode_segments: dict[int, list[SegmentHypothesis]],
-        by_fragment: dict[int, list[Correspondence]],
-        one_fit: _GroupFit,
-    ) -> bool:
-        if len(indices) < 2:
-            return False
-        if cls._group_has_uncovered_source_gap(scenes, indices, decoded, one_fit):
-            return True
-        if len(one_fit.covered_fragments) < max(1, len(indices) - 1):
-            return True
-        summary = cls._group_changepoint_summary(
-            scenes,
-            indices,
-            decoded,
-            decode_segments,
-            by_fragment,
-            one_fit,
-        )
-        return cls._group_has_clear_changepoint_for_candidate(
-            scenes,
-            indices,
-            decoded,
-            one_fit,
-            summary,
-        )
 
-    @classmethod
-    def _group_has_clear_changepoint_for_candidate(
-        cls,
-        scenes: SceneList,
-        indices: list[int],
-        decoded: list[SegmentHypothesis | None],
-        one_fit: _GroupFit,
-        summary: dict[str, object] | None,
-    ) -> bool:
-        if len(indices) < 2:
-            return False
-        if cls._group_has_uncovered_source_gap(scenes, indices, decoded, one_fit):
-            return True
-        if len(one_fit.covered_fragments) < max(1, len(indices) - 1):
-            return True
-        if summary is None:
-            return False
-        return bool(summary["selected_as_clear"])
-
-    @classmethod
-    def _group_has_uncovered_source_gap(
-        cls,
-        scenes: SceneList,
-        indices: list[int],
-        decoded: list[SegmentHypothesis | None],
-        one_fit: _GroupFit,
-    ) -> bool:
-        if len(one_fit.covered_fragments) >= len(indices):
-            return False
-        if len(one_fit.covered_fragments) < max(1, len(indices) - 1):
-            return False
-        gap = cls._decoded_boundary_gap(scenes, indices, decoded)
-        if gap is None:
-            return False
-        index_step = 1.0 / max(AnimeMatcherService.get_index_fps(), 1e-3)
-        return abs(gap) > CONTINUITY_GRID_STEPS * index_step
-
-    @staticmethod
-    def _decoded_boundary_gap(
-        scenes: SceneList,
-        indices: list[int],
-        decoded: list[SegmentHypothesis | None],
-    ) -> float | None:
-        if len(indices) < 2:
-            return None
-        left_index = indices[-2]
-        right_index = indices[-1]
-        if left_index >= len(decoded) or right_index >= len(decoded):
-            return None
-        left = decoded[left_index]
-        right = decoded[right_index]
-        if left is None or right is None or left.episode != right.episode:
-            return None
-        boundary = scenes.scenes[left_index].end_time
-        return right.source_at(boundary) - left.source_at(boundary)
-
-    @classmethod
-    def _group_changepoint_summary(
-        cls,
-        scenes: SceneList,
-        indices: list[int],
-        decoded: list[SegmentHypothesis | None],
-        decode_segments: dict[int, list[SegmentHypothesis]],
-        by_fragment: dict[int, list[Correspondence]],
-        one_fit: _GroupFit,
-    ) -> dict[str, object] | None:
-        if len(indices) < 2:
-            return None
-
-        best: dict[str, object] | None = None
-        for split_offset in range(1, len(indices)):
-            left_indices = indices[:split_offset]
-            right_indices = indices[split_offset:]
-            left_fit = cls._fit_decoded_group(
-                scenes,
-                left_indices,
-                decoded,
-                decode_segments,
-                by_fragment,
-                episode=one_fit.segment.episode,
-            )
-            right_fit = cls._fit_decoded_group(
-                scenes,
-                right_indices,
-                decoded,
-                decode_segments,
-                by_fragment,
-                episode=one_fit.segment.episode,
-            )
-            if left_fit is None or right_fit is None:
-                continue
-            n = left_fit.inlier_count + right_fit.inlier_count
-            if n < 4:
-                continue
-            boundary = scenes.scenes[left_indices[-1]].end_time
-            two_bic = cls._bic(
-                left_fit.residual_sse + right_fit.residual_sse,
-                n,
-                parameter_count=4,
-            )
-            record: dict[str, object] = {
-                "split_after_fragment": left_indices[-1],
-                "boundary": boundary,
-                "two_bic": two_bic,
-                "source_gap": right_fit.segment.source_at(boundary)
-                - left_fit.segment.source_at(boundary),
-                "left_rate": left_fit.segment.a,
-                "right_rate": right_fit.segment.a,
-                "left_inliers": left_fit.inlier_count,
-                "right_inliers": right_fit.inlier_count,
-            }
-            if best is None or two_bic < float(best["two_bic"]):
-                best = record
-
-        if best is None:
-            return None
-        best["one_bic"] = cls._bic(
-            one_fit.residual_sse,
-            one_fit.inlier_count,
-            parameter_count=2,
-        )
-        bic_margin = float(best["one_bic"]) - float(best["two_bic"])
-        clear_margin = 0.5 * math.log(max(one_fit.inlier_count, 2))
-        best["bic_margin"] = bic_margin
-        best["clear_margin"] = clear_margin
-        best["selected_as_clear"] = float(best["two_bic"]) < float(best["one_bic"])
-        return best
-
-    @staticmethod
-    def _bic(sse: float, sample_count: int, *, parameter_count: int) -> float:
-        n = max(1, sample_count)
-        variance = max(sse / n, 1e-6)
-        return n * math.log(variance) + parameter_count * math.log(n)
 
     _last_diff_curve: tuple[list[float], list[float]] = ([], [])
 
@@ -3129,40 +2448,6 @@ class SceneAlignerService:
             return scenes
         return snapped
 
-    @classmethod
-    def _snap_final_boundaries(cls, video_path: Path, scenes: SceneList) -> SceneList:
-        try:
-            from .scene_merger import SceneMergerService
-
-            diff_times, diffs = SceneMergerService._video_frame_diffs(video_path)
-            moves = cls._visual_boundary_snap_candidates(
-                scenes,
-                diff_times,
-                diffs,
-            )
-        except Exception:
-            return scenes
-        if not moves:
-            return scenes
-
-        snapped = scenes.model_copy(deep=True)
-        duration_floor = SceneMergerService.DENSE_VISUAL_SNAP_MIN_SCENE_DURATION
-        for index, boundary in sorted(moves.items()):
-            if index < 0 or index + 1 >= len(snapped.scenes):
-                continue
-            left_scene = snapped.scenes[index]
-            right_scene = snapped.scenes[index + 1]
-            if (
-                boundary - left_scene.start_time < duration_floor
-                or right_scene.end_time - boundary < duration_floor
-            ):
-                continue
-            left_scene.end_time = boundary
-            right_scene.start_time = boundary
-        snapped.renumber()
-        if not snapped.validate_continuity():
-            return scenes
-        return snapped
 
     @staticmethod
     def _visual_boundary_snap_candidates(
@@ -3242,54 +2527,7 @@ class SceneAlignerService:
         closest = min(candidates, key=lambda idx: abs(diff_times[idx] - timestamp))
         return diffs[closest]
 
-    @classmethod
-    def _merge_decoded_continuities(
-        cls,
-        scenes: SceneList,
-        decoded: list[SegmentHypothesis | None],
-    ) -> tuple[SceneList, list[tuple[list[int], SegmentHypothesis | None]]]:
-        merged_scenes: list[Scene] = []
-        remapped: list[tuple[list[int], SegmentHypothesis | None]] = []
-        index = 0
-        while index < len(scenes.scenes):
-            merged_indices = [index]
-            current_segment = decoded[index] if index < len(decoded) else None
-            start = scenes.scenes[index].start_time
-            end = scenes.scenes[index].end_time
-            cursor = index
-            while cursor + 1 < len(scenes.scenes):
-                next_segment = decoded[cursor + 1] if cursor + 1 < len(decoded) else None
-                if not cls._should_merge_pair(
-                    scenes.scenes[cursor],
-                    scenes.scenes[cursor + 1],
-                    current_segment,
-                    next_segment,
-                ):
-                    break
-                cursor += 1
-                merged_indices.append(cursor)
-                end = scenes.scenes[cursor].end_time
-            merged_scenes.append(
-                Scene(index=len(merged_scenes), start_time=start, end_time=end)
-            )
-            remapped.append((merged_indices, current_segment))
-            index = cursor + 1
-        return SceneList(scenes=merged_scenes), remapped
 
-    @classmethod
-    def _should_merge_pair(
-        cls,
-        left_scene: Scene,
-        right_scene: Scene,
-        left: SegmentHypothesis | None,
-        right: SegmentHypothesis | None,
-    ) -> bool:
-        if left is None or right is None or left.episode != right.episode:
-            return False
-        index_step = 1.0 / max(AnimeMatcherService.get_index_fps(), 1e-3)
-        gap = right.source_at(right_scene.start_time) - left.source_at(left_scene.end_time)
-        speed_delta = abs(left.a - right.a)
-        return abs(gap) <= (0.5 * index_step) and speed_delta <= 0.20
 
     @classmethod
     def _build_matches(
@@ -3301,9 +2539,9 @@ class SceneAlignerService:
         correspondences: list[Correspondence],
         library_type: LibraryType | str,
         samples: list[QuerySample] | None = None,
+        window_cache: _WindowEmbedCache | None = None,
     ) -> MatchList:
         matches = MatchList()
-        query_boundaries = cls._query_boundary_embeddings(video_path, final_scenes.scenes)
         n = len(remapped)
 
         # detect source-continuous chains: runs of consecutive scenes whose
@@ -3448,255 +2686,23 @@ class SceneAlignerService:
                 raw[i] = (raw[i][0], shared)
                 raw[i + 1] = (shared, raw[i + 1][1])
 
-        # delta-lock each chain: one shared offset per chain, estimated by
-        # sweeping the pooled line against native-decoded source frames near
-        # both chain ends using several dense samples (prominence-gated).
-        # This replaces per-boundary argmax refinement, whose single-frame
-        # picks jitter on static plateaus and break piece continuity.
+        # Stage 5: native arbitration & precision layer. Per-end anchoring on
+        # the true edge frames replaces the old mean-of-samples delta-lock,
+        # and rate arbitration (fitted vs unit slope) runs on native frames.
         refined_delta: dict[int, tuple[float, float]] = {}
+        scene_doubts: dict[int, list[str]] = {}
         if samples:
-            from .anime_library import AnimeLibraryService
-
-            sample_times = np.array([s.t_tiktok for s in samples])
-            cv2 = AnimeMatcherService._require_cv2()
-            episode_caps: dict[str, object] = {}
-            try:
-                i = 0
-                while i < n:
-                    j = i
-                    while j + 1 < n and chain_of[j + 1] == chain_of[i]:
-                        j += 1
-                    segment_first = remapped[i][1]
-                    if segment_first is None or raw[i] is None or raw[j] is None:
-                        i = j + 1
-                        continue
-                    episode = segment_first.episode
-                    union_start_t = final_scenes.scenes[i].start_time
-                    union_end_t = final_scenes.scenes[j].end_time
-                    # sample indices hugging both chain ends
-                    idxs: list[int] = []
-                    lo_i = int(np.searchsorted(sample_times, union_start_t - 1e-6))
-                    hi_i = int(np.searchsorted(sample_times, union_end_t - 1e-6)) - 1
-                    for base in (lo_i, hi_i - 3):
-                        for d in range(4):
-                            idx = base + d
-                            if 0 <= idx < len(samples) and (
-                                union_start_t - 1e-6
-                                <= samples[idx].t_tiktok
-                                < union_end_t + 1e-6
-                            ):
-                                idxs.append(idx)
-                    idxs = sorted(set(idxs))
-                    if len(idxs) < 2:
-                        i = j + 1
-                        continue
-                    # piecewise line over the chain: per piece (a,b) from raw
-                    def chain_source_at(t: float) -> float:
-                        for piece in range(i, j + 1):
-                            sc = final_scenes.scenes[piece]
-                            if t <= sc.end_time + 1e-6 or piece == j:
-                                seg = remapped[piece][1]
-                                if raw[piece] is None or seg is None:
-                                    return raw[i][0]
-                                dur = max(sc.end_time - sc.start_time, 1e-6)
-                                rate = (raw[piece][1] - raw[piece][0]) / dur
-                                return raw[piece][0] + (t - sc.start_time) * rate
-                        return raw[j][1]
-
-                    pred = np.array(
-                        [chain_source_at(samples[idx].t_tiktok) for idx in idxs]
-                    )
-                    # native rate arbitration candidate: an isolated short
-                    # scene whose fitted rate strays from real-time playback.
-                    # Index-grid lookalikes can collapse a montage scene's
-                    # slope; only native frames can arbitrate the rate.
-                    pred_unit: np.ndarray | None = None
-                    if i == j:
-                        sc = final_scenes.scenes[i]
-                        dur = max(sc.end_time - sc.start_time, 1e-6)
-                        fitted_rate = (raw[i][1] - raw[i][0]) / dur
-                        if abs(fitted_rate - 1.0) > 0.2 and dur <= 4.0:
-                            t_mid = 0.5 * (sc.start_time + sc.end_time)
-                            mid_src = 0.5 * (raw[i][0] + raw[i][1])
-                            pred_unit = np.array(
-                                [
-                                    mid_src + (samples[idx].t_tiktok - t_mid)
-                                    for idx in idxs
-                                ]
-                            )
-                    q = np.stack([samples[idx].embedding for idx in idxs])
-                    episode_path = AnimeLibraryService.resolve_episode_path(
-                        episode, library_type=library_type
-                    )
-                    if episode_path is None or not episode_path.exists():
-                        i = j + 1
-                        continue
-                    cap = episode_caps.get(str(episode_path))
-                    if cap is None:
-                        cap = cv2.VideoCapture(str(episode_path))
-                        episode_caps[str(episode_path)] = cap
-                    p0 = (
-                        pred[:4]
-                        if pred_unit is None
-                        else np.concatenate([pred[:4], pred_unit[:4]])
-                    )
-                    windows = [(float(p0.min()) - 0.85, float(p0.max()) + 0.85)]
-                    if len(idxs) > 4:
-                        p1 = (
-                            pred[4:]
-                            if pred_unit is None
-                            else np.concatenate([pred[4:], pred_unit[4:]])
-                        )
-                        windows.append(
-                            (float(p1.min()) - 0.85, float(p1.max()) + 0.85)
-                        )
-                    if len(windows) == 2 and windows[1][0] <= windows[0][1] + 0.5:
-                        windows = [(windows[0][0], max(windows[0][1], windows[1][1]))]
-                    times_list = []
-                    embs_list = []
-                    for lo, hi in windows:
-                        frames = AnimeMatcherService._collect_frames_in_window_from_capture(
-                            cap,
-                            lo,
-                            hi,
-                            max_frames=int((hi - lo) * 65) + 8,
-                            sample_frames=max(8, int((hi - lo) * VERIFY_DECODE_FPS)),
-                        )
-                        if frames:
-                            times_list.append(np.array([t for t, _ in frames]))
-                            embs_list.append(
-                                AnimeMatcherService._embed_pil_batch(
-                                    [im.convert("RGB") for _, im in frames]
-                                )
-                            )
-                    if not times_list:
-                        i = j + 1
-                        continue
-                    times = np.concatenate(times_list)
-                    embs = np.concatenate(embs_list, axis=0)
-                    order = np.argsort(times)
-                    times = times[order]
-                    embs = embs[order]
-                    sims = q @ embs.T
-                    offsets = np.arange(-0.65, 0.65 + 1e-6, 1.0 / (2 * VERIFY_DECODE_FPS))
-
-                    def sweep(
-                        rows: np.ndarray, line_pred: np.ndarray | None = None
-                    ) -> tuple[float, float] | None:
-                        """(locked offset, peak score) for a sample subset,
-                        None on plateau."""
-                        p = pred if line_pred is None else line_pred
-                        if rows.size < 2:
-                            return None
-                        scores = np.full(offsets.size, np.nan)
-                        for oi, delta in enumerate(offsets):
-                            cols = np.searchsorted(times, p[rows] + delta)
-                            cols = np.clip(cols, 0, len(times) - 1)
-                            dist = np.abs(times[cols] - (p[rows] + delta))
-                            valid = dist <= 0.5
-                            if valid.sum() < max(2, rows.size * 2 // 3):
-                                continue
-                            vals = sims[rows, cols]
-                            scores[oi] = float(np.mean(vals[valid]))
-                        if np.isnan(scores).all():
-                            return None
-                        peak_idx = int(np.nanargmax(scores))
-                        if float(scores[peak_idx]) - float(np.nanmedian(scores)) < 0.015:
-                            return None
-                        return float(offsets[peak_idx]), float(scores[peak_idx])
-
-                    all_rows = np.arange(len(pred))
-                    if pred_unit is not None:
-                        res_fit = sweep(all_rows)
-                        res_unit = sweep(all_rows, pred_unit)
-                        if res_unit is not None and (
-                            res_fit is None or res_unit[1] > res_fit[1] + 0.01
-                        ):
-                            sc = final_scenes.scenes[i]
-                            t_mid = 0.5 * (sc.start_time + sc.end_time)
-                            mid_src = 0.5 * (raw[i][0] + raw[i][1])
-                            raw[i] = (
-                                mid_src + (sc.start_time - t_mid),
-                                mid_src + (sc.end_time - t_mid),
-                            )
-                            pred = pred_unit
-                    half = max(2, len(pred) // 2)
-                    # per-end locks give offset AND rate correction when both
-                    # ends carry texture; a plateau end falls back to the
-                    # other end's lock (rigid shift), then to the raw line
-                    res_all = sweep(all_rows)
-                    res_s = sweep(all_rows[:half])
-                    res_e = sweep(all_rows[half:]) if len(pred) > half else None
-                    delta_all = res_all[0] if res_all is not None else None
-                    delta_s = res_s[0] if res_s is not None else None
-                    delta_e = res_e[0] if res_e is not None else None
-                    if delta_s is None:
-                        delta_s = delta_e if delta_e is not None else delta_all
-                    if delta_e is None:
-                        delta_e = delta_s if delta_s is not None else delta_all
-                    delta_star = delta_all if delta_all is not None else 0.0
-                    if delta_s is not None and delta_e is not None:
-                        for piece in range(i, j + 1):
-                            span = max(
-                                final_scenes.scenes[j].end_time
-                                - final_scenes.scenes[i].start_time,
-                                1e-6,
-                            )
-                            f0 = (
-                                final_scenes.scenes[piece].start_time
-                                - final_scenes.scenes[i].start_time
-                            ) / span
-                            f1 = (
-                                final_scenes.scenes[piece].end_time
-                                - final_scenes.scenes[i].start_time
-                            ) / span
-                            refined_delta[piece] = (
-                                delta_s + (delta_e - delta_s) * f0,
-                                delta_s + (delta_e - delta_s) * f1,
-                            )
-                    elif delta_star:
-                        for piece in range(i, j + 1):
-                            refined_delta[piece] = (delta_star, delta_star)
-                    # GT-style edits cut where the source itself cuts: snap
-                    # the chain's outer source boundaries to a strong native
-                    # frame-change peak nearby (frames already decoded here)
-                    if len(times) >= 3:
-                        emb_diffs = 1.0 - np.sum(embs[1:] * embs[:-1], axis=1)
-                        diff_mid = (times[1:] + times[:-1]) / 2.0
-                        strong = emb_diffs >= max(0.08, 3.0 * float(np.median(emb_diffs)))
-                        for piece, side in ((i, 0), (j, 1)):
-                            if raw[piece] is None:
-                                continue
-                            base_delta = refined_delta.get(piece, (0.0, 0.0))[side]
-                            target = raw[piece][side] + base_delta
-                            near = np.abs(diff_mid - target) <= 0.55
-                            cand = near & strong
-                            if not cand.any():
-                                continue
-                            snap_idx = int(
-                                np.argmin(
-                                    np.where(cand, np.abs(diff_mid - target), np.inf)
-                                )
-                            )
-                            snap_t = float(diff_mid[snap_idx])
-                            prev = refined_delta.get(piece, (delta_star, delta_star))
-                            if side == 0:
-                                refined_delta[piece] = (
-                                    snap_t - raw[piece][0],
-                                    prev[1],
-                                )
-                            else:
-                                refined_delta[piece] = (
-                                    prev[0],
-                                    snap_t - raw[piece][1],
-                                )
-                    i = j + 1
-            finally:
-                for cap in episode_caps.values():
-                    try:
-                        cap.release()
-                    except Exception:
-                        pass
+            refined_delta, scene_doubts = cls._stage5_refine(
+                video_path,
+                final_scenes,
+                remapped,
+                chain_of,
+                raw,
+                library_type,
+                scene_segments=scene_segments,
+                correspondences=correspondences,
+                window_cache=window_cache,
+            )
 
         for final_index, (source_scene_indices, segment) in enumerate(remapped):
             scene = final_scenes.scenes[final_index]
@@ -3743,6 +2749,7 @@ class SceneAlignerService:
                     confidence=float(min(1.0, max(0.0, segment.mean_similarity))),
                     speed_ratio=float(scene.duration / source_duration),
                     was_no_match=False,
+                    doubt_reasons=scene_doubts.get(final_index, []),
                     merged_from=source_scene_indices if len(source_scene_indices) > 1 else None,
                     alternatives=alternatives,
                     start_candidates=start_candidates,
@@ -3752,115 +2759,923 @@ class SceneAlignerService:
             )
         return matches
 
+    # candidate zooms for the edit geometry: edits are 9:16 crops/zooms of
+    # 16:9 sources; the per-project zoom is estimated once from confident
+    # chains and reused (GOAL §4 geometric matcher)
+    _CANDIDATE_ZOOMS: tuple[float, ...] = (1.0, 1.15, 1.3, 1.45)
+
+    @staticmethod
+    def _zoom_crop(image: Image.Image, zoom: float) -> Image.Image:
+        """Center crop matching a zoom factor of the edit over the source."""
+        if zoom <= 1.0:
+            return image
+        w, h = image.size
+        cw, ch = int(w / zoom), int(h / zoom)
+        x0, y0 = (w - cw) // 2, (h - ch) // 2
+        return image.crop((x0, y0, x0 + cw, y0 + ch))
+
+    @staticmethod
+    def _small_gray(image: Image.Image, height: int = 360) -> np.ndarray:
+        """Downscaled grayscale frame for geometric registration."""
+        width = max(1, int(image.size[0] * height / max(1, image.size[1])))
+        return np.asarray(
+            image.convert("L").resize((width, height))
+        ).astype(np.float32)
+
     @classmethod
-    def _query_boundary_embeddings(
+    def _register_affine(
+        cls, q_gray: np.ndarray, s_gray: np.ndarray
+    ) -> np.ndarray | None:
+        """ORB+RANSAC partial-affine registration of the query frame onto the
+        source plane; returns the warped query gray or None. This is the §4
+        geometric matcher at feature level: the edit is a scaled/shifted crop
+        of the source and embeddings/global NCC cannot see past that."""
+        cv2 = AnimeMatcherService._require_cv2()
+        orb = cv2.ORB_create(1500)
+        kq, dq = orb.detectAndCompute(q_gray.astype(np.uint8), None)
+        ks, ds = orb.detectAndCompute(s_gray.astype(np.uint8), None)
+        if dq is None or ds is None or len(kq) < 30 or len(ks) < 30:
+            return None
+        matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matches = matcher.match(dq, ds)
+        if len(matches) < 20:
+            return None
+        qpts = np.float32([kq[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+        spts = np.float32([ks[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+        T, inliers = cv2.estimateAffinePartial2D(
+            qpts, spts, ransacReprojThreshold=3.0
+        )
+        if T is None or inliers is None or int(inliers.sum()) < 15:
+            return None
+        return cv2.warpAffine(q_gray, T, (s_gray.shape[1], s_gray.shape[0]))
+
+    @classmethod
+    def _pan_zero_crossing(
+        cls,
+        edge_gray: np.ndarray,
+        frames: list[tuple[float, Image.Image]],
+    ) -> float | None:
+        """Time-localize a query edge frame inside a PANNING shot: register
+        it onto the source plane, phase-correlate against each native frame,
+        and take the zero crossing of the horizontal-shift-vs-time line (the
+        moment the pan passes the query's position). Measured on the
+        owner-flagged swoosh: error +0.026s where SSCD/NCC fail. Returns the
+        source time or None when the shot does not behave like a pan."""
+        cv2 = AnimeMatcherService._require_cv2()
+        grays = [cls._small_gray(im) for _, im in frames]
+        mid = len(grays) // 2
+        warped = None
+        for ref in (mid, max(0, mid - 6), min(len(grays) - 1, mid + 6)):
+            warped = cls._register_affine(edge_gray, grays[ref])
+            if warped is not None:
+                break
+        if warped is None:
+            return None
+        window = np.outer(
+            np.hanning(warped.shape[0]), np.hanning(warped.shape[1])
+        )
+        wq = (warped * window).astype(np.float64)
+        dxs = np.empty(len(grays))
+        resps = np.empty(len(grays))
+        for n, gray in enumerate(grays):
+            (dx, _), resp = cv2.phaseCorrelate(
+                wq, (gray * window).astype(np.float64)
+            )
+            dxs[n] = dx
+            resps[n] = resp
+        if float(dxs.max() - dxs.min()) < 8.0:
+            return None  # not a pan: no exploitable shift trajectory
+        times = np.array([t for t, _ in frames])
+        best: tuple[float, float] | None = None
+        for n in range(len(times) - 1):
+            if dxs[n] == 0.0 or (dxs[n] < 0.0) != (dxs[n + 1] < 0.0):
+                frac = abs(dxs[n]) / (abs(dxs[n]) + abs(dxs[n + 1]) + 1e-9)
+                t0 = float(times[n] + frac * (times[n + 1] - times[n]))
+                resp = float(max(resps[n], resps[n + 1]))
+                if best is None or resp > best[1]:
+                    best = (t0, resp)
+        if best is None or best[1] < 0.4:
+            return None
+        return best[0]
+
+    @classmethod
+    def _duplicate_candidates(
+        cls,
+        i: int,
+        j: int,
+        scenes: list[Scene],
+        remapped: list[tuple[list[int], SegmentHypothesis | None]],
+        scene_segments: dict[int, list[SegmentHypothesis]],
+        correspondences: list[Correspondence],
+        current_episode: str,
+        current_at,
+    ) -> list[dict[str, float | str]]:
+        """Distant same-content candidates for a chain: alternative fitted
+        lines plus unit-rate correspondence clusters whose index support is
+        near the winner's. These are the duplicate instances the index
+        cannot separate (R1); pixel arbitration decides among them."""
+        t0, t1 = scenes[i].start_time, scenes[j].end_time
+        t_mid = 0.5 * (t0 + t1)
+        seen_pos: list[tuple[str, float]] = [(current_episode, current_at(t_mid))]
+
+        def distinct(episode: str, pos: float) -> bool:
+            return not any(
+                episode == ep and abs(pos - p) < 3.0 for ep, p in seen_pos
+            )
+
+        candidates: list[dict[str, float | str]] = []
+        for piece in range(i, j + 1):
+            for orig in remapped[piece][0]:
+                for seg in scene_segments.get(orig, [])[:8]:
+                    pos = seg.source_at(t_mid)
+                    if not distinct(seg.episode, pos):
+                        continue
+                    seen_pos.append((seg.episode, pos))
+                    candidates.append(
+                        {
+                            "episode": seg.episode,
+                            "a": seg.a,
+                            "b": seg.b,
+                            "rank_sim": seg.mean_similarity,
+                        }
+                    )
+        clusters: dict[tuple[str, int], list[Correspondence]] = {}
+        for corr in correspondences:
+            if corr.rank >= DECODE_RETRIEVAL_TOP_K:
+                continue
+            if not (t0 <= corr.t_tiktok < t1):
+                continue
+            key = (corr.episode, int(round((corr.t_source - corr.t_tiktok) / 2.0)))
+            clusters.setdefault(key, []).append(corr)
+        if clusters:
+            best_sim = max(
+                max(c.similarity for c in cl) for cl in clusters.values()
+            )
+            for (episode, _), cl in clusters.items():
+                sim = max(c.similarity for c in cl)
+                if len(cl) < 2 or sim < best_sim - 0.10:
+                    continue
+                b = float(np.median([c.t_source - c.t_tiktok for c in cl]))
+                if not distinct(episode, t_mid + b):
+                    continue
+                seen_pos.append((episode, t_mid + b))
+                candidates.append(
+                    {"episode": episode, "a": 1.0, "b": b, "rank_sim": sim}
+                )
+        candidates.sort(key=lambda c: c["rank_sim"], reverse=True)
+        candidates = [c for c in candidates if float(c["rank_sim"]) >= 0.35]
+        return candidates[:3]
+
+    @staticmethod
+    def _piecewise_source_at(i0: int, j0: int, scenes: list[Scene], snapshot):
+        """Chain line function over a raw-interval snapshot."""
+
+        def fn(t: float) -> float:
+            for piece in range(i0, j0 + 1):
+                sc = scenes[piece]
+                if t <= sc.end_time + 1e-6 or piece == j0:
+                    rp = snapshot[piece] or snapshot[i0]
+                    dur = max(sc.end_time - sc.start_time, 1e-6)
+                    rate = (rp[1] - rp[0]) / dur
+                    return rp[0] + (t - sc.start_time) * rate
+            return snapshot[j0][1]
+
+        return fn
+
+    @classmethod
+    def _global_duplicate_assignment(
+        cls,
+        chains: list[tuple[int, int]],
+        scenes: list[Scene],
+        remapped: list[tuple[list[int], SegmentHypothesis | None]],
+        raw0: list[tuple[float, float] | None],
+        scene_segments: dict[int, list[SegmentHypothesis]],
+        correspondences: list[Correspondence],
+    ) -> dict[int, dict[str, float | str]]:
+        """Soft global assignment over duplicate near-tie candidate sets.
+
+        Every chain contributes a candidate set (its current line plus the
+        distant duplicate instances the index cannot separate); a linear DP
+        maximizes uniform index support plus a soft forward-continuity
+        reward between consecutive choices (edits mostly cut consecutive
+        source moments — 79-100% of adjacent pairs, measured priors; reuse
+        stays allowed because the reward is soft). Returns the chains whose
+        best assignment differs from their current line plus every chain's
+        candidate set. The caller applies switches only under zoom-SSCD or
+        visual-identity evidence."""
+        decode_corrs = [
+            c for c in correspondences if c.rank < DECODE_RETRIEVAL_TOP_K
+        ]
+
+        def support(ii: int, jj: int, episode: str, line_fn) -> float:
+            """Uniform candidate quality: strongest correspondence lying on
+            the line inside the chain (same scale for every candidate)."""
+            t0 = scenes[ii].start_time
+            t1 = scenes[jj].end_time
+            best = 0.0
+            for c in decode_corrs:
+                if c.episode != episode or not (t0 <= c.t_tiktok < t1):
+                    continue
+                if abs(c.t_source - line_fn(c.t_tiktok)) <= SEGMENT_RESIDUAL_SECONDS:
+                    best = max(best, c.similarity)
+            return best
+
+        candidate_sets: list[list[dict[str, float | str]]] = []
+        for ci, (ii, jj) in enumerate(chains):
+            seg0 = remapped[ii][1]
+            current_fn = cls._piecewise_source_at(ii, jj, scenes, raw0)
+            current = {
+                "episode": seg0.episode,
+                "a": 1.0,
+                "b": 0.0,
+                "start": current_fn(scenes[ii].start_time),
+                "end": current_fn(scenes[jj].end_time),
+                "sim": support(ii, jj, seg0.episode, current_fn),
+                "is_current": 1.0,
+            }
+            cands: list[dict[str, float | str]] = [current]
+            if scenes[jj].end_time - scenes[ii].start_time <= 6.0:
+                for cand in cls._duplicate_candidates(
+                    ii,
+                    jj,
+                    scenes,
+                    remapped,
+                    scene_segments,
+                    correspondences,
+                    seg0.episode,
+                    current_fn,
+                ):
+                    a, b = float(cand["a"]), float(cand["b"])
+                    cand_fn = lambda t, _a=a, _b=b: _a * t + _b
+                    cands.append(
+                        {
+                            "episode": cand["episode"],
+                            "a": a,
+                            "b": b,
+                            "start": cand_fn(scenes[ii].start_time),
+                            "end": cand_fn(scenes[jj].end_time),
+                            "sim": support(
+                                ii, jj, str(cand["episode"]), cand_fn
+                            ),
+                            "is_current": 0.0,
+                        }
+                    )
+            candidate_sets.append(cands)
+
+        # linear DP: node sim + soft forward-continuity between choices
+        def edge(prev_ci: int, prev_c, next_ci: int, next_c) -> float:
+            if prev_c["episode"] != next_c["episode"]:
+                return 0.0
+            tt_gap = (
+                scenes[chains[next_ci][0]].start_time
+                - scenes[chains[prev_ci][1]].end_time
+            )
+            gap = float(next_c["start"]) - (float(prev_c["end"]) + tt_gap)
+            reward = 0.08 * math.exp(-abs(gap) / 8.0)
+            if gap < -0.5:
+                reward *= 0.5
+            return reward
+
+        n_chains = len(chains)
+        scores: list[list[float]] = []
+        back: list[list[int]] = []
+        for ci in range(n_chains):
+            row = []
+            brow = []
+            for c in candidate_sets[ci]:
+                node = float(c["sim"])
+                if ci == 0:
+                    row.append(node)
+                    brow.append(-1)
+                    continue
+                best_prev, best_k = None, -1
+                for k, p in enumerate(candidate_sets[ci - 1]):
+                    val = scores[ci - 1][k] + edge(ci - 1, p, ci, c)
+                    if best_prev is None or val > best_prev:
+                        best_prev, best_k = val, k
+                row.append((best_prev or 0.0) + node)
+                brow.append(best_k)
+            scores.append(row)
+            back.append(brow)
+        switches: dict[int, dict[str, float | str]] = {}
+        if not scores or not scores[-1]:
+            return switches, candidate_sets
+        k = int(np.argmax(scores[-1]))
+        for ci in range(n_chains - 1, -1, -1):
+            choice = candidate_sets[ci][k]
+            if not float(choice["is_current"]):
+                switches[ci] = choice
+            k = back[ci][k]
+            if k < 0 and ci > 0:
+                k = int(np.argmax(scores[ci - 1]))
+        return switches, candidate_sets
+
+    @classmethod
+    def _zoom_sscd_score_line(
+        cls,
+        q_mids: list[tuple[float, np.ndarray]],
+        source_at,
+        cache: _WindowEmbedCache,
+        episode: str,
+        zoom: float,
+    ) -> tuple[float, float, np.ndarray] | None:
+        """(best mean cos, its offset, matched source embeddings) of the
+        chain's mid query embeddings against SSCD embeddings of ZOOM-CROPPED
+        native source frames along a candidate line. Plain native SSCD
+        prefers the wrong duplicate instance and pixel NCC is too noisy;
+        SSCD at the edit's estimated zoom separates them (measured
+        2026-07-10: 12/14 positive GT margins on 85de at z=1.45 vs mixed
+        at z=1.0)."""
+        if not q_mids:
+            return None
+        preds = np.array([source_at(t) for t, _ in q_mids])
+        lo, hi = float(preds.min()) - 0.7, float(preds.max()) + 0.7
+        win = cache.window(episode, zoom, lo, hi)
+        if win is None:
+            return None
+        times, embs = win
+        q = np.stack([e for _, e in q_mids])
+        sims = q @ embs.T
+        best: tuple[float, float, np.ndarray] | None = None
+        rows = np.arange(len(q_mids))
+        for delta in np.arange(-0.6, 0.6 + 1e-6, 1.0 / VERIFY_DECODE_FPS):
+            pos = preds + delta
+            cols = np.clip(np.searchsorted(times, pos), 0, len(times) - 1)
+            prev_cols = np.clip(cols - 1, 0, len(times) - 1)
+            use_prev = np.abs(times[prev_cols] - pos) < np.abs(times[cols] - pos)
+            cols = np.where(use_prev, prev_cols, cols)
+            valid = np.abs(times[cols] - pos) <= 0.15
+            if valid.sum() < max(1, len(q_mids) * 2 // 3):
+                continue
+            score = float(np.mean(sims[rows, cols][valid]))
+            if best is None or score > best[0]:
+                # matched source embeddings at this alignment: the caller's
+                # native identity certificate compares them across candidates
+                matched = np.where(valid[:, None], embs[cols], np.nan)
+                best = (score, float(delta), matched)
+        return best
+
+    @classmethod
+    def _estimate_project_zoom(
+        cls,
+        chains: list[tuple[int, int]],
+        scenes: list[Scene],
+        remapped: list[tuple[list[int], SegmentHypothesis | None]],
+        raw0: list[tuple[float, float] | None],
+        mid_embs: dict[int, list[tuple[float, np.ndarray]]],
+        cache: _WindowEmbedCache,
+    ) -> float:
+        """Estimate the edit's zoom over the source once per project from a
+        few chains spread across the timeline: the zoom whose cropped-source
+        SSCD best matches the query mid frames. Geometry is a property of
+        the edit, not of individual scenes (GOAL §4)."""
+        probes: list[tuple[int, int, int]] = []
+        for ci, (ii, jj) in enumerate(chains):
+            if scenes[jj].end_time - scenes[ii].start_time >= 1.5 and mid_embs.get(ci):
+                probes.append((ci, ii, jj))
+        if not probes:
+            return 1.0
+        step = max(1, len(probes) // 4)
+        probes = probes[::step][:4]
+        totals = {zoom: [] for zoom in cls._CANDIDATE_ZOOMS}
+        for ci, ii, jj in probes:
+            line_fn = cls._piecewise_source_at(ii, jj, scenes, raw0)
+            episode = remapped[ii][1].episode
+            cap = cache.get_cap(episode)
+            if cap is None:
+                continue
+            for t, emb in mid_embs[ci][:2]:
+                pred = line_fn(t)
+                frames = AnimeMatcherService._collect_frames_in_window_from_capture(
+                    cap, pred - 0.25, pred + 0.25, max_frames=8, sample_frames=3
+                )
+                if not frames:
+                    continue
+                nearest = min(frames, key=lambda fr: abs(fr[0] - pred))[1]
+                variants = AnimeMatcherService._embed_pil_batch(
+                    [
+                        cls._zoom_crop(nearest, zoom).convert("RGB")
+                        for zoom in cls._CANDIDATE_ZOOMS
+                    ]
+                )
+                for zoom, v in zip(cls._CANDIDATE_ZOOMS, variants):
+                    totals[zoom].append(float(emb @ v))
+        means = {
+            zoom: float(np.mean(vals))
+            for zoom, vals in totals.items()
+            if vals
+        }
+        if not means:
+            return 1.0
+        return max(means, key=means.get)
+
+    @classmethod
+    def _stage5_refine(
         cls,
         video_path: Path,
-        scenes: list[Scene],
-    ) -> list[tuple[np.ndarray, np.ndarray, float] | None]:
-        timestamps: list[float] = []
-        for scene in scenes:
-            scene_duration = scene.end_time - scene.start_time
-            tiny_offset = min(0.05, scene_duration / 10.0)
-            start_time = scene.start_time + tiny_offset
-            end_time = max(start_time + 1e-3, scene.end_time - tiny_offset)
-            timestamps.extend([start_time, end_time])
-
-        frames = AnimeMatcherService.extract_frames(video_path, timestamps)
-        valid_images = [frame.convert("RGB") for frame in frames if frame is not None]
-        embeddings = AnimeMatcherService._embed_pil_batch(valid_images)
-        embedding_iter = iter(embeddings)
-
-        result: list[tuple[np.ndarray, np.ndarray, float] | None] = []
-        for index in range(0, len(frames), 2):
-            start_frame = frames[index]
-            end_frame = frames[index + 1]
-            if start_frame is None or end_frame is None:
-                if start_frame is not None:
-                    next(embedding_iter, None)
-                if end_frame is not None:
-                    next(embedding_iter, None)
-                result.append(None)
-                continue
-            start_embedding = next(embedding_iter)
-            end_embedding = next(embedding_iter)
-            target_aspect = start_frame.width / max(1, start_frame.height)
-            result.append((start_embedding, end_embedding, target_aspect))
-        return result
-
-    @classmethod
-    def _refine_boundaries_with_query_embeddings(
-        cls,
-        scene: Scene,
-        matched_episode: str,
-        matched_start_ts: float,
-        matched_end_ts: float,
+        final_scenes: SceneList,
+        remapped: list[tuple[list[int], SegmentHypothesis | None]],
+        chain_of: list[int],
+        raw: list[tuple[float, float] | None],
         library_type: LibraryType | str,
-        query_boundary: tuple[np.ndarray, np.ndarray, float] | None,
-    ) -> tuple[float, float] | None:
-        started_at = time.perf_counter()
-        try:
-            AnimeMatcherService._record_runtime_stat("boundary_refine_calls")
-            if query_boundary is None or AnimeMatcherService._embedder is None:
-                return None
+        scene_segments: dict[int, list[SegmentHypothesis]] | None = None,
+        correspondences: list[Correspondence] | None = None,
+        window_cache: _WindowEmbedCache | None = None,
+    ) -> tuple[dict[int, tuple[float, float]], dict[int, list[str]]]:
+        """Stage 5 native arbitration: zoom-SSCD re-ranking of duplicate
+        primaries (R1), per-end offsets anchored on the true TikTok edge
+        frames, argmax'd against natively decoded source frames along the
+        chain line (R2), plus fitted-vs-unit rate arbitration on the same
+        native evidence (R3).
 
-            from .anime_library import AnimeLibraryService
+        A confident (prominent, narrow) per-end peak is trusted as-is: the
+        editor may have trimmed mid-shot, so no source-cut snapping. Only a
+        temporally ambiguous end (static plateau) falls back to the other
+        end's lock and to snapping on a native frame-change peak. Mutates
+        ``raw`` in place when rate arbitration replaces a fitted slope.
+        Returns per-piece (start_delta, end_delta) and per-piece doubt tags.
+        """
+        from .anime_library import AnimeLibraryService
 
-            episode_path = AnimeLibraryService.resolve_episode_path(
-                matched_episode,
-                library_type=library_type,
+        scenes = final_scenes.scenes
+        n = len(scenes)
+        refined_delta: dict[int, tuple[float, float]] = {}
+        doubts: dict[int, list[str]] = {}
+
+        chains: list[tuple[int, int]] = []
+        i = 0
+        while i < n:
+            j = i
+            while j + 1 < n and chain_of[j + 1] == chain_of[i]:
+                j += 1
+            if remapped[i][1] is not None and raw[i] is not None and raw[j] is not None:
+                chains.append((i, j))
+            i = j + 1
+        if not chains:
+            return refined_delta, doubts
+
+        # true edge frames for every chain end plus per-piece mid frames
+        # (pixel arbitration queries), one decode pass + one embed batch;
+        # small inward insets add robustness to transition frames
+        edge_specs: list[tuple[int, int, float]] = []  # (chain_idx, side, t)
+        for ci, (ii, jj) in enumerate(chains):
+            span = scenes[jj].end_time - scenes[ii].start_time
+            for side, base, sign in (
+                (0, scenes[ii].start_time, 1.0),
+                (1, scenes[jj].end_time, -1.0),
+            ):
+                for inset in (0.02, 0.15, 0.30):
+                    if inset > 0.02 and inset >= span / 2.0:
+                        continue
+                    edge_specs.append((ci, side, base + sign * inset))
+            pieces = list(range(ii, jj + 1))
+            if len(pieces) == 1:
+                # single scene: three interior queries — one frame is too
+                # weak for both duplicate scoring and the identity
+                # certificate (a single pair can be a repeated still)
+                sc = scenes[pieces[0]]
+                for frac in (0.3, 0.5, 0.7):
+                    edge_specs.append(
+                        (ci, 2, sc.start_time + frac * sc.duration)
+                    )
+            else:
+                for piece in sorted(
+                    {pieces[0], pieces[len(pieces) // 2], pieces[-1]}
+                ):
+                    sc = scenes[piece]
+                    edge_specs.append(
+                        (ci, 2, 0.5 * (sc.start_time + sc.end_time))
+                    )
+        decoded = AnimeMatcherService.extract_frames(
+            video_path, [t for _, _, t in edge_specs]
+        )
+        images: list[Image.Image] = []
+        kept: list[tuple[int, int, float]] = []
+        for spec, frame in zip(edge_specs, decoded, strict=False):
+            if frame is not None:
+                images.append(frame.convert("RGB"))
+                kept.append(spec)
+        if not images:
+            return refined_delta, doubts
+        edge_embs = AnimeMatcherService._embed_pil_batch(_presize_images(images))
+        edge_queries: dict[tuple[int, int], list[tuple[float, np.ndarray]]] = {}
+        mid_embs: dict[int, list[tuple[float, np.ndarray]]] = {}
+        edge_grays: dict[tuple[int, int], np.ndarray] = {}
+        for k, ((ci, side, t), emb) in enumerate(zip(kept, edge_embs, strict=False)):
+            if side == 2:
+                mid_embs.setdefault(ci, []).append((t, emb))
+            else:
+                if (ci, side) not in edge_queries:
+                    # outermost edge frame, kept small for registration
+                    edge_grays[(ci, side)] = cls._small_gray(images[k])
+                edge_queries.setdefault((ci, side), []).append((t, emb))
+
+        cache = window_cache or _WindowEmbedCache(
+            library_type, cls._zoom_crop, VERIFY_DECODE_FPS
+        )
+        owns_cache = window_cache is None
+        step = 1.0 / (2.0 * VERIFY_DECODE_FPS)
+        offsets = np.arange(-0.65, 0.65 + 1e-6, step)
+
+        # R1 pass 4: soft global assignment over duplicate near-tie sets.
+        # Chronology is resolved GLOBALLY (a DP over all chains) instead of
+        # against possibly-wrong neighbours; switches are applied only under
+        # zoom-SSCD or visual-identity evidence (in-loop below).
+        raw0: list[tuple[float, float] | None] = list(raw)
+        assignment_switch: dict[int, dict[str, float | str]] = {}
+        candidate_sets: list[list[dict[str, float | str]]] = []
+        project_zoom = 1.0
+        if scene_segments is not None and correspondences is not None:
+            assignment_switch, candidate_sets = cls._global_duplicate_assignment(
+                chains, scenes, remapped, raw0, scene_segments, correspondences
             )
-            if episode_path is None or not episode_path.exists():
-                return None
-
-            scene_duration = scene.end_time - scene.start_time
-            if scene_duration <= 0:
-                return None
-
-            index_step = 1.0 / max(AnimeMatcherService.get_index_fps(), 1e-3)
-            window = max(0.5, index_step + 0.15)
-
-            cv2 = AnimeMatcherService._require_cv2()
-            cap = cv2.VideoCapture(str(episode_path))
             try:
-                start_frames = AnimeMatcherService._collect_frames_in_window_from_capture(
-                    cap,
-                    matched_start_ts - window,
-                    matched_start_ts + window,
-                    sample_frames=ALIGNER_REFINE_FRAMES_PER_BOUNDARY,
+                project_zoom = cls._estimate_project_zoom(
+                    chains, scenes, remapped, raw0, mid_embs, cache
                 )
-                end_frames = AnimeMatcherService._collect_frames_in_window_from_capture(
-                    cap,
-                    matched_end_ts - window,
-                    matched_end_ts + window,
-                    sample_frames=ALIGNER_REFINE_FRAMES_PER_BOUNDARY,
+            except Exception:
+                project_zoom = 1.0
+        try:
+            for ci, (i, j) in enumerate(chains):
+                segment_first = remapped[i][1]
+                episode = segment_first.episode
+
+                def chain_source_at(t: float) -> float:
+                    for piece in range(i, j + 1):
+                        sc = scenes[piece]
+                        if t <= sc.end_time + 1e-6 or piece == j:
+                            if raw[piece] is None:
+                                return raw[i][0]
+                            dur = max(sc.end_time - sc.start_time, 1e-6)
+                            rate = (raw[piece][1] - raw[piece][0]) / dur
+                            return raw[piece][0] + (t - sc.start_time) * rate
+                    return raw[j][1]
+
+                q_start = edge_queries.get((ci, 0), [])
+                q_end = edge_queries.get((ci, 1), [])
+                q_all = q_start + q_end
+                if not q_all:
+                    continue
+
+                # R1: duplicate arbitration by zoom-SSCD (content-decided) or
+                # global-assignment chronology (for certified-identical
+                # repeats, where switching cannot change the render).
+                distant = [
+                    c
+                    for c in (candidate_sets[ci] if ci < len(candidate_sets) else [])
+                    if not float(c["is_current"])
+                ]
+                q_mids = mid_embs.get(ci, [])
+                proposed = assignment_switch.get(ci)
+                cur_sim = (
+                    float(candidate_sets[ci][0]["sim"])
+                    if ci < len(candidate_sets) and candidate_sets[ci]
+                    else 0.0
                 )
-            finally:
-                cap.release()
-            if not start_frames or not end_frames:
-                return None
+                index_suspect = any(
+                    float(c["sim"]) >= cur_sim - 0.05 for c in distant
+                )
+                if distant and q_mids and proposed is None and not index_suspect:
+                    # neither the assignment DP nor the index doubts the
+                    # current instance: skip the native scoring, keep the
+                    # doubt tag for near-tie candidates
+                    if any(
+                        float(c["sim"]) >= cur_sim - 0.03 for c in distant
+                    ):
+                        for piece in range(i, j + 1):
+                            tags = doubts.setdefault(piece, [])
+                            if "duplicate_tie" not in tags:
+                                tags.append("duplicate_tie")
+                elif distant and q_mids:
+                    cur_res = cls._zoom_sscd_score_line(
+                        q_mids, chain_source_at, cache, episode, project_zoom
+                    )
+                    switch_to: dict[str, float | str] | None = None
+                    switch_delta = 0.0
+                    switch_reason = ""
+                    if cur_res is not None:
+                        cur_score = cur_res[0]
+                        cur_start = chain_source_at(scenes[i].start_time)
+                        best_margin = None
+                        for cand in distant:
+                            a_c, b_c = float(cand["a"]), float(cand["b"])
+                            res = cls._zoom_sscd_score_line(
+                                q_mids,
+                                lambda t, _a=a_c, _b=b_c: _a * t + _b,
+                                cache,
+                                str(cand["episode"]),
+                                project_zoom,
+                            )
+                            if res is None:
+                                continue
+                            margin = res[0] - cur_score
+                            if best_margin is None or margin > best_margin:
+                                best_margin = margin
+                            is_proposed = proposed is not None and cand is proposed
+                            if margin >= 0.07 or (is_proposed and margin >= 0.02):
+                                # content-decided at the edit's geometry
+                                switch_to, switch_delta = cand, res[1]
+                                switch_reason = "duplicate_rerank"
+                                break
+                            if is_proposed and margin >= -0.02:
+                                # native identity certificate: the two
+                                # aligned decoded windows show the same
+                                # frames, so chronology may decide freely
+                                cross = np.sum(cur_res[2] * res[2], axis=1)
+                                cross = cross[~np.isnan(cross)]
+                                if cross.size and float(np.mean(cross)) >= 0.95:
+                                    switch_to, switch_delta = cand, res[1]
+                                    switch_reason = "chronology_assign"
+                                    break
+                        import os as _os
 
-            q_start, q_end, target_aspect = query_boundary
-            refined_start = AnimeMatcherService._best_boundary_timestamp(
-                query_embedding=q_start,
-                source_frames=start_frames,
-                target_aspect=target_aspect,
-            )
-            refined_end = AnimeMatcherService._best_boundary_timestamp(
-                query_embedding=q_end,
-                source_frames=end_frames,
-                target_aspect=target_aspect,
-            )
-            if refined_end - refined_start <= 0.1:
-                return None
+                        if _os.environ.get("ATR_RERANK_DEBUG"):
+                            print(
+                                f"[dup] chain {i}-{j} tt="
+                                f"{scenes[i].start_time:.1f}-{scenes[j].end_time:.1f} "
+                                f"cur@{cur_start:.1f} score={cur_score:.3f} "
+                                f"zoom={project_zoom} best_margin={best_margin} "
+                                f"-> {switch_reason or 'keep'}"
+                            )
+                        if switch_to is not None:
+                            a_new = float(switch_to["a"])
+                            b_new = float(switch_to["b"]) + switch_delta
+                            episode = str(switch_to["episode"])
+                            for piece in range(i, j + 1):
+                                seg = remapped[piece][1]
+                                sc = scenes[piece]
+                                if seg is not None:
+                                    seg = dc_replace(
+                                        seg, episode=episode, a=a_new, b=b_new
+                                    )
+                                remapped[piece] = (remapped[piece][0], seg)
+                                raw[piece] = (
+                                    a_new * sc.start_time + b_new,
+                                    a_new * sc.end_time + b_new,
+                                )
+                                doubts.setdefault(piece, []).append(switch_reason)
+                        elif best_margin is not None and abs(best_margin) <= 0.04:
+                            for piece in range(i, j + 1):
+                                tags = doubts.setdefault(piece, [])
+                                if "duplicate_tie" not in tags:
+                                    tags.append("duplicate_tie")
 
-            AnimeMatcherService._record_runtime_stat("boundary_refine_successes")
-            return refined_start, refined_end
+                # unit-rate alternative for isolated scenes: index-grid
+                # lookalikes can collapse a slope; only native frames can
+                # arbitrate fitted rate against real-time playback
+                unit_line: tuple[float, float] | None = None
+                if i == j:
+                    sc = scenes[i]
+                    dur = max(sc.end_time - sc.start_time, 1e-6)
+                    fitted_rate = (raw[i][1] - raw[i][0]) / dur
+                    if abs(fitted_rate - 1.0) > 0.1:
+                        t_mid = 0.5 * (sc.start_time + sc.end_time)
+                        mid_src = 0.5 * (raw[i][0] + raw[i][1])
+                        unit_line = (t_mid, mid_src)
+
+                def unit_source_at(t: float) -> float:
+                    return unit_line[1] + (t - unit_line[0])
+
+                targets: list[float] = [chain_source_at(t) for t, _ in q_all]
+                if unit_line is not None:
+                    targets.extend(unit_source_at(t) for t, _ in q_all)
+                targets.sort()
+                windows: list[tuple[float, float]] = []
+                for target in targets:
+                    lo, hi = target - 0.85, target + 0.85
+                    if windows and lo <= windows[-1][1] + 0.5:
+                        windows[-1] = (windows[-1][0], max(windows[-1][1], hi))
+                    else:
+                        windows.append((lo, hi))
+                times_list = []
+                embs_list = []
+                for lo, hi in windows:
+                    win = cache.window(episode, 1.0, lo, hi)
+                    if win is not None:
+                        times_list.append(win[0])
+                        embs_list.append(win[1])
+                if not times_list:
+                    continue
+                times = np.concatenate(times_list)
+                embs = np.concatenate(embs_list, axis=0)
+                order = np.argsort(times)
+                times = times[order]
+                embs = embs[order]
+
+                def sweep(
+                    queries: list[tuple[float, np.ndarray]],
+                    source_at,
+                ) -> tuple[float, float, float, float] | None:
+                    """(delta, peak score, prominence, peak width seconds) of
+                    the offset sweep for a query set under a source line."""
+                    if not queries:
+                        return None
+                    preds = np.array([source_at(t) for t, _ in queries])
+                    q = np.stack([e for _, e in queries])
+                    sims = q @ embs.T
+                    scores = np.full(offsets.size, np.nan)
+                    rows = np.arange(len(queries))
+                    for oi, delta in enumerate(offsets):
+                        pos = preds + delta
+                        cols = np.clip(np.searchsorted(times, pos), 0, len(times) - 1)
+                        prev_cols = np.clip(cols - 1, 0, len(times) - 1)
+                        use_prev = np.abs(times[prev_cols] - pos) < np.abs(
+                            times[cols] - pos
+                        )
+                        cols = np.where(use_prev, prev_cols, cols)
+                        dist = np.abs(times[cols] - pos)
+                        valid = dist <= 0.5
+                        if valid.sum() < max(1, len(queries) * 2 // 3):
+                            continue
+                        scores[oi] = float(np.mean(sims[rows, cols][valid]))
+                    if np.isnan(scores).all():
+                        return None
+                    peak = int(np.nanargmax(scores))
+                    prominence = float(scores[peak]) - float(np.nanmedian(scores))
+                    lo_k = peak
+                    while (
+                        lo_k - 1 >= 0
+                        and not np.isnan(scores[lo_k - 1])
+                        and scores[lo_k - 1] >= scores[peak] - 0.01
+                    ):
+                        lo_k -= 1
+                    hi_k = peak
+                    while (
+                        hi_k + 1 < scores.size
+                        and not np.isnan(scores[hi_k + 1])
+                        and scores[hi_k + 1] >= scores[peak] - 0.01
+                    ):
+                        hi_k += 1
+                    width = (hi_k - lo_k) * step
+                    return float(offsets[peak]), float(scores[peak]), prominence, width
+
+                if unit_line is not None:
+                    res_fit = sweep(q_all, chain_source_at)
+                    res_unit = sweep(q_all, unit_source_at)
+                    if res_unit is not None and (
+                        res_fit is None or res_unit[1] > res_fit[1] + 0.01
+                    ):
+                        sc = scenes[i]
+                        raw[i] = (
+                            unit_source_at(sc.start_time),
+                            unit_source_at(sc.end_time),
+                        )
+                        doubts.setdefault(i, []).append("rate_arbitrated")
+
+                res_s = sweep(q_start, chain_source_at)
+                res_e = sweep(q_end, chain_source_at)
+
+                def confident(res: tuple[float, float, float, float] | None) -> bool:
+                    return res is not None and res[2] >= 0.02 and res[3] <= 0.40
+
+                conf_s = confident(res_s)
+                conf_e = confident(res_e)
+                delta_s = res_s[0] if conf_s else None
+                delta_e = res_e[0] if conf_e else None
+                delta_all: float | None = None
+                if delta_s is None or delta_e is None:
+                    res_all = sweep(q_all, chain_source_at)
+                    if res_all is not None and res_all[2] >= 0.015:
+                        delta_all = res_all[0]
+                def pan_localize(side: int) -> float | None:
+                    """Registered pan localization for an ambiguous end: only
+                    when the scene content moves (a static shot has no pan
+                    trajectory to exploit — measured)."""
+                    edge_gray = edge_grays.get((ci, side))
+                    q_set = q_start if side == 0 else q_end
+                    if edge_gray is None or len(q_set) < 2:
+                        return None
+                    if float(q_set[0][1] @ q_set[-1][1]) >= 0.85:
+                        return None
+                    t_edge = q_set[0][0]
+                    pred = chain_source_at(t_edge)
+                    cap = cache.get_cap(episode)
+                    if cap is None:
+                        return None
+                    pan_frames = (
+                        AnimeMatcherService._collect_frames_in_window_from_capture(
+                            cap,
+                            pred - 1.3,
+                            pred + 1.3,
+                            max_frames=170,
+                            sample_frames=62,
+                        )
+                    )
+                    if len(pan_frames) < 8:
+                        return None
+                    t0 = cls._pan_zero_crossing(edge_gray, pan_frames)
+                    if t0 is None or abs(t0 - pred) > 1.2:
+                        return None
+                    return t0 - pred
+
+                if not conf_s:
+                    pan_delta = pan_localize(0)
+                    if pan_delta is not None:
+                        delta_s = pan_delta
+                        conf_s = True
+                        for piece in range(i, j + 1):
+                            doubts.setdefault(piece, []).append("pan_localized")
+                    else:
+                        for piece in range(i, j + 1):
+                            doubts.setdefault(piece, []).append("static_start")
+                        delta_s = delta_e if delta_e is not None else delta_all
+                if not conf_e:
+                    pan_delta = pan_localize(1)
+                    if pan_delta is not None:
+                        delta_e = pan_delta
+                        conf_e = True
+                        for piece in range(i, j + 1):
+                            doubts.setdefault(piece, []).append("pan_localized")
+                    else:
+                        for piece in range(i, j + 1):
+                            doubts.setdefault(piece, []).append("static_end")
+                        delta_e = delta_s if delta_s is not None else delta_all
+                if delta_s is not None and delta_e is not None:
+                    span = max(scenes[j].end_time - scenes[i].start_time, 1e-6)
+                    for piece in range(i, j + 1):
+                        f0 = (scenes[piece].start_time - scenes[i].start_time) / span
+                        f1 = (scenes[piece].end_time - scenes[i].start_time) / span
+                        refined_delta[piece] = (
+                            delta_s + (delta_e - delta_s) * f0,
+                            delta_s + (delta_e - delta_s) * f1,
+                        )
+
+                # interior chain boundaries: the pooled line smears the
+                # editor's cut position across chained pieces; when a real
+                # source cut sits next to the interior boundary, the TikTok
+                # cut almost surely aligns WITH it (owner-reviewed failure:
+                # a chained piece's last frame came from the next sequence).
+                # Snapping both pieces to the cut keeps near-continuity.
+                for piece in range(i, j):
+                    if raw[piece] is None or raw[piece + 1] is None:
+                        continue
+                    d_left = refined_delta.get(piece, (0.0, 0.0))
+                    d_right = refined_delta.get(piece + 1, (0.0, 0.0))
+                    shared = raw[piece][1] + d_left[1]
+                    win = cache.window(episode, 1.0, shared - 0.75, shared + 0.75)
+                    if win is None or win[0].size < 3:
+                        continue
+                    w_times, w_embs = win
+                    w_diffs = 1.0 - np.sum(w_embs[1:] * w_embs[:-1], axis=1)
+                    w_mids = (w_times[1:] + w_times[:-1]) / 2.0
+                    w_strong = w_diffs >= max(0.08, 3.0 * float(np.median(w_diffs)))
+                    # pull-back only: a boundary PAST a cut renders next-
+                    # shot frames in the left piece (containment violation,
+                    # the owner-confirmed defect); pushing a boundary OUT to
+                    # a later cut extends owner-validated intervals and was
+                    # measured harmful (85de#9 round-2 perturbation)
+                    cuts = [
+                        c
+                        for c, s_ in zip(w_mids, w_strong)
+                        if s_ and 0.0 < shared - c <= 0.55
+                    ]
+                    if not cuts:
+                        continue
+                    c = min(cuts, key=lambda v: abs(v - shared))
+                    if abs(c - shared) < 0.08:
+                        continue
+                    half = 0.5 / VERIFY_DECODE_FPS
+                    refined_delta[piece] = (
+                        d_left[0],
+                        c - half - raw[piece][1],
+                    )
+                    refined_delta[piece + 1] = (
+                        c + half - raw[piece + 1][0],
+                        d_right[1],
+                    )
+
+                # snap-to-source-cut ONLY for ambiguous ends: when the edge
+                # frame cannot place itself in time (static plateau), the
+                # best remaining prior is that the editor cut on a source cut
+                if len(times) >= 3:
+                    emb_diffs = 1.0 - np.sum(embs[1:] * embs[:-1], axis=1)
+                    diff_mid = (times[1:] + times[:-1]) / 2.0
+                    strong = emb_diffs >= max(0.08, 3.0 * float(np.median(emb_diffs)))
+                    for piece, side, was_confident in ((i, 0, conf_s), (j, 1, conf_e)):
+                        if was_confident or raw[piece] is None:
+                            continue
+                        base_delta = refined_delta.get(piece, (0.0, 0.0))[side]
+                        target = raw[piece][side] + base_delta
+                        near = np.abs(diff_mid - target) <= 0.55
+                        cand = near & strong
+                        if not cand.any():
+                            continue
+                        snap_idx = int(
+                            np.argmin(np.where(cand, np.abs(diff_mid - target), np.inf))
+                        )
+                        snap_t = float(diff_mid[snap_idx])
+                        prev = refined_delta.get(piece, (0.0, 0.0))
+                        if side == 0:
+                            refined_delta[piece] = (snap_t - raw[piece][0], prev[1])
+                        else:
+                            refined_delta[piece] = (prev[0], snap_t - raw[piece][1])
+
         finally:
-            AnimeMatcherService._record_runtime_stat(
-                "boundary_refine_seconds",
-                time.perf_counter() - started_at,
-            )
+            if owns_cache:
+                cache.close()
+        return refined_delta, doubts
+
+
 
     @classmethod
     def _alternatives_for_scene(

@@ -37,6 +37,10 @@ class SceneMatch(BaseModel):
     was_no_match: bool = False  # Track if initially no match was found
     merged_from: list[int] | None = None  # Original scene indices before merge (e.g. [3, 4])
 
+    # Why the aligner doubts this match (e.g. 'static_end', 'duplicate_tie').
+    # Empty for confidently arbitrated scenes.
+    doubt_reasons: list[str] = []
+
     # Top 5 alternative matches for quick selection (Weighted Voting algorithm)
     alternatives: list[AlternativeMatch] = []
 

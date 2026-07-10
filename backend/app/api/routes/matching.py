@@ -16,6 +16,7 @@ from ...models import ProjectPhase, MatchList, SceneMatch, Scene, SceneList
 from ...services import (
     ProjectService,
     AnimeMatcherService,
+    SceneAlignerService,
     SceneMergerService,
     AnimeLibraryService,
     LibraryHydrationService,
@@ -412,7 +413,6 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
 
     # Get anime name for filtering (if set on project)
     anime_name = project.anime_name
-    merge_continuous = request.merge_continuous
 
     async def stream_progress():
         if tiny_merge_log:
@@ -425,27 +425,28 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
                 "error": None,
             }) + "\n\n"
 
-        # === PASS 1: Match all scenes ===
-        first_pass_label = "Pass 1: " if merge_continuous else ""
-        first_pass_matches: MatchList | None = None
-
-        async for progress in AnimeMatcherService.match_scenes(
-            video_path, scenes, source_path,
+        # Global scene aligner: dense correspondences, segmentation DP and
+        # the Stage-5 native arbitration layer produce the final scene list
+        # and matches in one pass (it may merge/split/move scene boundaries).
+        completed = False
+        async for progress in SceneAlignerService.align_scenes_progress(
+            video_path,
+            scenes,
+            source_path,
             project.library_type,
             anime_name=anime_name,
-            pass_label=first_pass_label,
         ):
-            if progress.status == "complete" and progress.matches:
-                first_pass_matches = progress.matches
+            if progress.status == "complete":
+                completed = True
                 continue
-
             yield f"data: {json.dumps(progress.to_dict())}\n\n"
             if progress.status == "error":
                 project.phase = ProjectPhase.SCENE_VALIDATION
                 ProjectService.save(project)
                 return
 
-        if not first_pass_matches:
+        align_result = SceneAlignerService.get_last_result()
+        if not completed or align_result is None:
             yield (
                 "data: "
                 + json.dumps(
@@ -464,120 +465,9 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
             ProjectService.save(project)
             return
 
-        final_scenes = scenes
-        final_matches = first_pass_matches
-        total_scenes_for_progress = len(scenes.scenes)
-
-        # If merge disabled, keep first pass output.
-        if not merge_continuous:
-            pass
-        else:
-            # === CONTINUITY DETECTION ===
-            yield (
-                "data: "
-                + json.dumps(
-                    {
-                        "status": "matching",
-                        "progress": 0.5,
-                        "message": "Detecting continuous scenes...",
-                        "current_scene": 0,
-                        "total_scenes": len(scenes.scenes),
-                        "error": None,
-                    }
-                )
-                + "\n\n"
-            )
-
-            index_fps = AnimeMatcherService.get_index_fps()
-            pairs = SceneMergerService.detect_continuous_pairs(
-                scenes, first_pass_matches, index_fps=index_fps,
-            )
-            chains = (
-                SceneMergerService.build_merge_chains(
-                    pairs, scenes, first_pass_matches, index_fps=index_fps,
-                    video_path=video_path,
-                    library_path=source_path,
-                    library_type=project.library_type,
-                    anime_name=anime_name,
-                )
-                if pairs
-                else []
-            )
-
-            if chains:
-                # === MERGE ===
-                merged_count = sum(len(c) for c in chains)
-                group_count = len(chains)
-                merged_scenes, merged_matches, backup = SceneMergerService.merge_scenes_and_matches(
-                    scenes, first_pass_matches, chains,
-                )
-
-                SceneMergerService.save_pre_merge_backup(project_id, backup)
-                ProjectService.save_scenes(project_id, merged_scenes)
-
-                total_scenes_for_progress = len(merged_scenes.scenes)
-                final_scenes = merged_scenes
-                yield (
-                    "data: "
-                    + json.dumps(
-                        {
-                            "status": "matching",
-                            "progress": 0.6,
-                            "message": (
-                                f"Merged {merged_count} scenes into {group_count} groups. "
-                                "Re-matching..."
-                            ),
-                            "current_scene": 0,
-                            "total_scenes": total_scenes_for_progress,
-                            "error": None,
-                        }
-                    )
-                    + "\n\n"
-                )
-
-                # === PASS 2: Re-match only merged scenes ===
-                merged_indices = [
-                    i for i, m in enumerate(merged_matches.matches)
-                    if m.merged_from is not None
-                ]
-
-                pass2_matches: MatchList | None = None
-                async for progress in AnimeMatcherService.match_scenes(
-                    video_path, merged_scenes, source_path,
-                    project.library_type,
-                    anime_name=anime_name,
-                    scene_indices_to_match=merged_indices,
-                    existing_matches=merged_matches,
-                    pass_label="Pass 2: ",
-                ):
-                    if progress.status == "complete" and progress.matches:
-                        # Preserve merged_from metadata on re-matched scenes.
-                        for i in merged_indices:
-                            if i < len(progress.matches.matches) and i < len(merged_matches.matches):
-                                progress.matches.matches[i].merged_from = (
-                                    merged_matches.matches[i].merged_from
-                                )
-                        pass2_matches = progress.matches
-                        continue
-
-                    yield f"data: {json.dumps(progress.to_dict())}\n\n"
-                    if progress.status == "error":
-                        # On pass 2 error, still save what we have from pass 1 merge.
-                        ProjectService.save_matches(project_id, merged_matches)
-                        project.phase = ProjectPhase.MATCH_VALIDATION
-                        ProjectService.save(project)
-                        return
-
-                final_matches = pass2_matches or merged_matches
-
-        snapped_scenes = SceneMergerService.snap_dense_visual_boundaries(
-            video_path,
-            final_scenes,
-        )
-        if snapped_scenes is not final_scenes:
-            final_scenes = snapped_scenes
-            ProjectService.save_scenes(project_id, final_scenes)
-
+        final_scenes = align_result.scenes
+        final_matches = align_result.matches
+        ProjectService.save_scenes(project_id, final_scenes)
         ProjectService.save_matches(project_id, final_matches)
         project.phase = ProjectPhase.MATCH_VALIDATION
         ProjectService.save(project)
@@ -590,7 +480,7 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
                     "progress": 1.0,
                     "message": f"Matched {len(final_matches.matches)} scenes.",
                     "current_scene": len(final_matches.matches),
-                    "total_scenes": total_scenes_for_progress,
+                    "total_scenes": len(final_scenes.scenes),
                     "error": None,
                     "matches": final_matches.model_dump(),
                 }

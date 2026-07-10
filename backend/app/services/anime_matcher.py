@@ -830,6 +830,18 @@ class AnimeMatcherService:
             return np.empty((0, 512), dtype=np.float32)
         if not images:
             return np.empty((0, 512), dtype=np.float32)
+        # Large one-shot batches balloon the CUDA allocator cache (peak
+        # activations scale with batch size and the reserve is never
+        # returned), starving later phases on the 8 GB card. Chunking keeps
+        # results bit-identical while bounding the peak.
+        if len(images) > 64:
+            return np.concatenate(
+                [
+                    cls._embed_pil_batch(images[k : k + 64])
+                    for k in range(0, len(images), 64)
+                ],
+                axis=0,
+            )
         gpu_embed = getattr(embedder, "embed_pil_batch_gpu", None)
         started_at = time.perf_counter()
 
@@ -862,8 +874,16 @@ class AnimeMatcherService:
                 if len(batch) <= 1:
                     # The CPU preprocessing path feeds the model one image at a
                     # time and is the least-memory fallback for a single large
-                    # frame.
-                    return embedder.embed_batch(batch)
+                    # frame. One cache-cleared retry: a single frame only
+                    # fails when the allocator cache is still holding the
+                    # previous burst.
+                    try:
+                        return embedder.embed_batch(batch)
+                    except Exception as retry_exc:
+                        if not is_cuda_oom(retry_exc):
+                            raise
+                        clear_cuda_cache()
+                        return embedder.embed_batch(batch)
                 midpoint = max(1, len(batch) // 2)
                 left = embed_adaptive(batch[:midpoint])
                 right = embed_adaptive(batch[midpoint:])
