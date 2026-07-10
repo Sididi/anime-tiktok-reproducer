@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, Body, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from ...services import UploadPhaseService
@@ -141,7 +141,8 @@ async def facebook_duration_check(
 ):
     """Check if the project video exceeds Facebook's 90s Reel limit.
 
-    If it does, the sped-up version is pre-generated for preview.
+    Uses Drive metadata / local probe only — no video download. When a
+    choice is needed, the shared preview cache is warmed in the background.
     """
     req = payload or FacebookCheckRequest()
     try:
@@ -157,34 +158,33 @@ async def facebook_duration_check(
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@router.get("/projects/{project_id}/facebook-preview/{version}")
-async def facebook_preview_video(
-    project_id: str,
-    version: Literal["original", "sped_up"],
-):
-    """Serve a cached video file for Facebook duration preview."""
-    prep_dir = UploadPhaseService._facebook_prep_dir(project_id)
-    if not prep_dir.exists():
-        raise HTTPException(status_code=404, detail="No Facebook preview cached for this project")
+@router.get("/projects/{project_id}/upload-source-status")
+async def upload_source_status(project_id: str):
+    """State of the shared final-video preview cache; warms it when missing."""
+    try:
+        return await asyncio.to_thread(
+            UploadPhaseService.start_source_video_download, project_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
-    if version == "sped_up":
-        video_path = prep_dir / "sped_up.mp4"
-    else:
-        # Original: find the first .mp4 that isn't the sped_up file
-        video_path = None
-        for f in sorted(prep_dir.iterdir()):
-            if f.suffix.lower() == ".mp4" and f.name != "sped_up.mp4":
-                video_path = f
-                break
 
-    if video_path is None or not video_path.exists():
-        raise HTTPException(status_code=404, detail=f"Preview version '{version}' not found")
-
-    return FileResponse(
-        path=video_path,
-        media_type="video/mp4",
-        filename=f"{project_id}_{version}.mp4",
-    )
+@router.get("/projects/{project_id}/upload-source-preview")
+async def upload_source_preview(project_id: str):
+    """Serve the cached final video used by the duration-choice modals."""
+    video_path = UploadPhaseService.cached_source_video(project_id)
+    if video_path is not None and video_path.exists():
+        return FileResponse(
+            path=video_path,
+            media_type="video/mp4",
+            filename=video_path.name,
+        )
+    status = UploadPhaseService.source_video_status(project_id)
+    if status["state"] == "in_progress":
+        return JSONResponse(status_code=202, content=status)
+    raise HTTPException(status_code=404, detail=status.get("detail") or "Preview not cached")
 
 
 @router.post("/projects/{project_id}/youtube-check")
@@ -205,35 +205,6 @@ async def youtube_duration_check(
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-
-
-@router.get("/projects/{project_id}/youtube-preview/{version}")
-async def youtube_preview_video(
-    project_id: str,
-    version: Literal["original", "sped_up"],
-):
-    """Serve a cached video file for YouTube duration preview."""
-    prep_dir = UploadPhaseService._youtube_prep_dir(project_id)
-    if not prep_dir.exists():
-        raise HTTPException(status_code=404, detail="No YouTube preview cached for this project")
-
-    if version == "sped_up":
-        video_path = prep_dir / "sped_up.mp4"
-    else:
-        video_path = None
-        for f in sorted(prep_dir.iterdir()):
-            if f.suffix.lower() == ".mp4" and f.name != "sped_up.mp4":
-                video_path = f
-                break
-
-    if video_path is None or not video_path.exists():
-        raise HTTPException(status_code=404, detail=f"Preview version '{version}' not found")
-
-    return FileResponse(
-        path=video_path,
-        media_type="video/mp4",
-        filename=f"{project_id}_{version}.mp4",
-    )
 
 
 @router.post("/projects/{project_id}/copyright-check")
