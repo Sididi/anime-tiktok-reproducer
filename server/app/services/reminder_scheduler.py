@@ -398,6 +398,7 @@ async def _dispatch_instagram_publish(
         progress_callback=persist_instagram_state,
         project_id=job.project_id,
         temp_dir=settings.data_dir / "tmp" / "instagram",
+        max_duration_seconds=float(payload.get("max_duration_seconds") or 90.0),
     )
     if (result_state := getattr(result, "publish_state", None)) is not None:
         await store.set_instagram_publish_state(job.project_id, result_state)

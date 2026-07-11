@@ -26,6 +26,7 @@ import type {
   Account,
   CopyrightCheckResult,
   FacebookCheckResult,
+  InstagramCheckResult,
   Platform,
   ProjectManagerRow,
   ProjectUploadJob,
@@ -42,6 +43,7 @@ interface PendingUploadContext {
   projectId: string;
   accountId?: string;
   facebookStrategy?: UploadDurationStrategy;
+  instagramStrategy?: UploadDurationStrategy;
   youtubeStrategy?: UploadDurationStrategy;
   copyrightAudioPath?: string;
 }
@@ -52,6 +54,8 @@ type UploadSessionStatus =
   | "awaiting_copyright_warning"
   | "checking_facebook"
   | "awaiting_facebook_choice"
+  | "checking_instagram"
+  | "awaiting_instagram_choice"
   | "checking_youtube"
   | "awaiting_youtube_choice"
   | "enqueueing";
@@ -63,6 +67,7 @@ interface UploadSession {
   message: string | null;
   copyrightResult?: CopyrightCheckResult;
   facebookResult?: FacebookCheckResult;
+  instagramResult?: InstagramCheckResult;
   youtubeResult?: YouTubeCheckResult;
   startedAt: number;
   updatedAt: number;
@@ -99,6 +104,7 @@ function isPromptSessionStatus(status: UploadSessionStatus): boolean {
     status === "awaiting_copyright_music" ||
     status === "awaiting_copyright_warning" ||
     status === "awaiting_facebook_choice" ||
+    status === "awaiting_instagram_choice" ||
     status === "awaiting_youtube_choice"
   );
 }
@@ -107,11 +113,13 @@ function uploadButtonLabelForSession(session: UploadSession): string {
   switch (session.status) {
     case "checking_copyright":
     case "checking_facebook":
+    case "checking_instagram":
     case "checking_youtube":
       return "Checking";
     case "awaiting_copyright_music":
     case "awaiting_copyright_warning":
     case "awaiting_facebook_choice":
+    case "awaiting_instagram_choice":
     case "awaiting_youtube_choice":
       return "Confirm";
     case "enqueueing":
@@ -459,6 +467,7 @@ export function ProjectManagerModal({
           context.projectId,
           context.accountId,
           context.facebookStrategy,
+          context.instagramStrategy,
           context.youtubeStrategy,
           context.copyrightAudioPath,
         );
@@ -476,7 +485,7 @@ export function ProjectManagerModal({
     [isSessionCurrent, patchUploadSession, removeUploadSession, upsertUploadJob],
   );
 
-  const continueUploadAfterFacebook = useCallback(
+  const continueUploadAfterInstagram = useCallback(
     async (context: PendingUploadContext, token: string) => {
       patchUploadSession(context.projectId, token, {
         context,
@@ -510,6 +519,40 @@ export function ProjectManagerModal({
       }
     },
     [enqueueUpload, isSessionCurrent, patchUploadSession],
+  );
+
+  const continueUploadAfterFacebook = useCallback(
+    async (context: PendingUploadContext, token: string) => {
+      patchUploadSession(context.projectId, token, {
+        context,
+        status: "checking_instagram",
+        message: "Vérification de la durée Instagram...",
+        facebookResult: undefined,
+      });
+      setError(null);
+      try {
+        const result = await api.checkInstagramDuration(
+          context.projectId,
+          context.accountId,
+        );
+        if (!isSessionCurrent(context.projectId, token)) return;
+        if (result.needed || result.recommendation_warning) {
+          patchUploadSession(context.projectId, token, {
+            context,
+            status: "awaiting_instagram_choice",
+            message: null,
+            instagramResult: result,
+          });
+          return;
+        }
+        await continueUploadAfterInstagram(context, token);
+      } catch (err) {
+        console.warn("Instagram check failed, proceeding with auto:", err);
+        if (!isSessionCurrent(context.projectId, token)) return;
+        await continueUploadAfterInstagram(context, token);
+      }
+    },
+    [continueUploadAfterInstagram, isSessionCurrent, patchUploadSession],
   );
 
   const continueUploadAfterCopyright = useCallback(
@@ -1146,12 +1189,50 @@ export function ProjectManagerModal({
                           durationSeconds={session.facebookResult.duration_seconds}
                           speedFactor={session.facebookResult.speed_factor}
                           spedUpAvailable={session.facebookResult.sped_up_available}
+                          maxDurationSeconds={session.facebookResult.max_duration_seconds}
                           onChoice={(strategy) => {
                             const nextContext: PendingUploadContext = {
                               ...session.context,
                               facebookStrategy: strategy,
                             };
                             void continueUploadAfterFacebook(
+                              nextContext,
+                              session.token,
+                            );
+                          }}
+                          onClose={() =>
+                            removeUploadSession(session.context.projectId)
+                          }
+                        />
+                      );
+                    }
+
+                    if (
+                      session.status === "awaiting_instagram_choice" &&
+                      session.instagramResult
+                    ) {
+                      return (
+                        <FacebookDurationModal
+                          key={`${session.context.projectId}:${session.token}:instagram`}
+                          open
+                          stacked
+                          platform="Instagram"
+                          projectId={session.context.projectId}
+                          projectTitle={projectTitle}
+                          durationSeconds={session.instagramResult.duration_seconds}
+                          speedFactor={session.instagramResult.speed_factor}
+                          spedUpAvailable={session.instagramResult.sped_up_available}
+                          maxDurationSeconds={session.instagramResult.max_duration_seconds}
+                          recommendationOnly={
+                            !session.instagramResult.needed &&
+                            session.instagramResult.recommendation_warning
+                          }
+                          onChoice={(strategy) => {
+                            const nextContext: PendingUploadContext = {
+                              ...session.context,
+                              instagramStrategy: strategy,
+                            };
+                            void continueUploadAfterInstagram(
                               nextContext,
                               session.token,
                             );

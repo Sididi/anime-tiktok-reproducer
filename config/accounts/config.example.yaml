@@ -27,6 +27,12 @@ accounts:
       facebook_page_access_token: "EAA..."
       instagram_business_account_id: "456..."
       instagram_access_token: "IGA..."  # optional: defaults to facebook_page_access_token
+    # Keep these at 90 until the non-public capability probe has verified the
+    # exact hard limit for this Page / Instagram identity.
+    facebook:
+      max_reel_duration_seconds: 90
+    instagram:
+      max_reel_duration_seconds: 90
     tiktok:
       # Post for Me social-account id (spc_...) — enables automatic TikTok
       # publishing via the VPS server. See docs/POST_FOR_ME_SETUP.md.

@@ -90,3 +90,32 @@ def test_old_platform_preview_routes_removed(client):
         "/api/project-manager/projects/p1/youtube-preview/original",
     ):
         assert client.get(url).status_code == 404
+
+
+def test_instagram_duration_check_route_forwards_account(client, monkeypatch):
+    expected = {
+        "needed": False,
+        "duration_seconds": 240.0,
+        "speed_factor": 1.0,
+        "sped_up_available": False,
+        "max_duration_seconds": 900.0,
+        "recommendation_max_duration_seconds": 180.0,
+        "recommendation_warning": True,
+    }
+    seen: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(
+        UploadPhaseService,
+        "check_instagram_duration",
+        classmethod(
+            lambda cls, project_id, account_id=None: (
+                seen.append((project_id, account_id)) or expected
+            )
+        ),
+    )
+    response = client.post(
+        "/api/project-manager/projects/p1/instagram-check",
+        json={"account_id": "anime_fr"},
+    )
+    assert response.status_code == 200
+    assert response.json() == expected
+    assert seen == [("p1", "anime_fr")]

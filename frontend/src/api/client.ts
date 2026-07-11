@@ -211,6 +211,7 @@ export const api = {
     projectId: string,
     accountId?: string,
     facebookStrategy?: string,
+    instagramStrategy?: string,
     youtubeStrategy?: string,
     copyrightAudioPath?: string,
   ) =>
@@ -221,6 +222,7 @@ export const api = {
         body: JSON.stringify({
           account_id: accountId ?? null,
           facebook_strategy: facebookStrategy ?? null,
+          instagram_strategy: instagramStrategy ?? null,
           youtube_strategy: youtubeStrategy ?? null,
           copyright_audio_path: copyrightAudioPath ?? null,
         }),
@@ -243,6 +245,15 @@ export const api = {
   checkFacebookDuration: (projectId: string, accountId?: string) =>
     request<import("@/types").FacebookCheckResult>(
       `/project-manager/projects/${projectId}/facebook-check`,
+      {
+        method: "POST",
+        body: JSON.stringify({ account_id: accountId ?? null }),
+      },
+    ),
+
+  checkInstagramDuration: (projectId: string, accountId?: string) =>
+    request<import("@/types").InstagramCheckResult>(
+      `/project-manager/projects/${projectId}/instagram-check`,
       {
         method: "POST",
         body: JSON.stringify({ account_id: accountId ?? null }),

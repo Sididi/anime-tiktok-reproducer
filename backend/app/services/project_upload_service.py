@@ -106,6 +106,7 @@ class UploadRequestSpec:
     account_id: str | None = None
     platforms: list[str] | None = None
     facebook_strategy: str | None = None
+    instagram_strategy: str | None = None
     youtube_strategy: str | None = None
     copyright_audio_path: str | None = None
 
@@ -177,6 +178,7 @@ class ProjectUploadService:
         account_id: str | None = None,
         platforms: list[str] | None = None,
         facebook_strategy: str | None = None,
+        instagram_strategy: str | None = None,
         youtube_strategy: str | None = None,
         copyright_audio_path: str | None = None,
     ) -> ProjectUploadJob:
@@ -195,6 +197,7 @@ class ProjectUploadService:
         job.account_id = account_id
         job.platforms = list(platforms) if platforms is not None else None
         job.facebook_strategy = facebook_strategy
+        job.instagram_strategy = instagram_strategy
         job.youtube_strategy = youtube_strategy
         job.status = "queued"
         job.phase = "queued"
@@ -208,6 +211,7 @@ class ProjectUploadService:
             account_id=account_id,
             platforms=list(platforms) if platforms is not None else None,
             facebook_strategy=facebook_strategy,
+            instagram_strategy=instagram_strategy,
             youtube_strategy=youtube_strategy,
             copyright_audio_path=copyright_audio_path,
         )
@@ -365,6 +369,7 @@ class ProjectUploadService:
                 account_id=request.account_id,
                 platforms=request.platforms,
                 facebook_strategy=request.facebook_strategy,
+                instagram_strategy=request.instagram_strategy,
                 youtube_strategy=request.youtube_strategy,
                 copyright_audio_path=request.copyright_audio_path,
                 reserved_slots=reserved_slots,

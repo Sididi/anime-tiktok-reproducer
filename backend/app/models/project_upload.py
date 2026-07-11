@@ -13,6 +13,7 @@ class ProjectUploadJob(BaseModel):
     account_id: str | None = None
     platforms: list[str] | None = None
     facebook_strategy: str | None = None
+    instagram_strategy: str | None = None
     youtube_strategy: str | None = None
     status: Literal["queued", "running", "complete", "error"] = "queued"
     phase: str | None = None

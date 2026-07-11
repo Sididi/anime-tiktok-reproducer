@@ -12,14 +12,21 @@ interface FacebookDurationModalProps {
   durationSeconds: number;
   speedFactor: number;
   spedUpAvailable: boolean;
+  platform?: "Facebook" | "Instagram";
+  maxDurationSeconds?: number;
+  recommendationOnly?: boolean;
   onChoice: (strategy: UploadDurationStrategy) => void;
   onClose: () => void;
   stacked?: boolean;
 }
 
 function formatDuration(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
   const m = Math.floor(seconds / 60);
   const s = Math.round(seconds % 60);
+  if (h > 0) {
+    return `${h}:${(m % 60).toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+  }
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
@@ -30,13 +37,16 @@ export function FacebookDurationModal({
   durationSeconds,
   speedFactor,
   spedUpAvailable,
+  platform = "Facebook",
+  maxDurationSeconds = 90,
+  recommendationOnly = false,
   onChoice,
   onClose,
   stacked = false,
 }: FacebookDurationModalProps) {
   const cutVideoRef = useRef<HTMLVideoElement>(null);
   const spedUpVideoRef = useRef<HTMLVideoElement>(null);
-  const maxDuration = 90;
+  const maxDuration = maxDurationSeconds;
   const preview = useUploadSourcePreview(projectId, open);
 
   const handleCutTimeUpdate = useCallback(() => {
@@ -45,7 +55,7 @@ export function FacebookDurationModal({
       video.pause();
       video.currentTime = maxDuration;
     }
-  }, []);
+  }, [maxDuration]);
 
   const handleSpedUpLoadedMetadata = useCallback(() => {
     const video = spedUpVideoRef.current;
@@ -101,15 +111,20 @@ export function FacebookDurationModal({
       <div className="flex items-center justify-between">
         <div>
           <h3 className="text-lg font-semibold">
-            Vidéo trop longue pour Facebook
+            {recommendationOnly
+              ? `Portée Instagram réduite au-delà de 3:00`
+              : `Vidéo trop longue pour ${platform}`}
           </h3>
           <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1 font-mono">
             {projectTitle || "Projet"} · {projectId}
           </p>
           <p className="text-sm text-[hsl(var(--muted-foreground))] mt-2">
             Durée originale :{" "}
-            <strong>{formatDuration(durationSeconds)}</strong> — Facebook
-            limite les Reels à <strong>1:30</strong>.
+            <strong>{formatDuration(durationSeconds)}</strong> — {recommendationOnly ? (
+              <>Instagram accepte cette durée, mais les Reels de plus de <strong>3:00</strong> peuvent ne pas être recommandés aux nouvelles audiences.</>
+            ) : (
+              <>{platform} limite ce compte à <strong>{formatDuration(maxDuration)}</strong>.</>
+            )}
           </p>
         </div>
         <Button
@@ -122,7 +137,7 @@ export function FacebookDurationModal({
         </Button>
       </div>
 
-      <div
+      {!recommendationOnly && <div
         className={`grid gap-4 ${spedUpAvailable ? "grid-cols-2" : "grid-cols-1"}`}
       >
         <div className="flex flex-col gap-3">
@@ -196,18 +211,28 @@ export function FacebookDurationModal({
             </div>
           </div>
         )}
-      </div>
+      </div>}
 
       <div className="flex justify-center pt-1">
         <Button
           variant="outline"
           size="sm"
-          onClick={() => onChoice("skip")}
+          onClick={() => onChoice(recommendationOnly ? "auto" : "skip")}
           className="active:scale-95 transition-transform text-[hsl(var(--muted-foreground))]"
         >
           <Ban className="h-4 w-4 mr-1.5" />
-          Ne pas uploader sur Facebook
+          {recommendationOnly ? "Continuer sur Instagram" : `Ne pas uploader sur ${platform}`}
         </Button>
+        {recommendationOnly && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => onChoice("skip")}
+          >
+            <Ban className="h-4 w-4 mr-1.5" />
+            Ne pas uploader sur Instagram
+          </Button>
+        )}
       </div>
     </motion.div>
   );

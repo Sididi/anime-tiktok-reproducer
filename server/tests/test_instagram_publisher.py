@@ -43,6 +43,28 @@ _COMMON = dict(
 )
 
 
+def test_stream_validation_uses_configured_account_duration_limit():
+    payload = {
+        "format": {"format_name": "mov,mp4", "duration": "901"},
+        "streams": [
+            {
+                "codec_type": "video",
+                "codec_name": "h264",
+                "width": 540,
+                "height": 960,
+                "avg_frame_rate": "24/1",
+            }
+        ],
+    }
+    assert "outside 3-900s" in instagram_publisher._validate_video_streams(payload)
+    assert (
+        instagram_publisher._validate_video_streams(
+            payload, max_duration_seconds=1200
+        )
+        is None
+    )
+
+
 def _mock_video_download():
     return respx.get(_COMMON["video_url"]).mock(
         return_value=httpx.Response(

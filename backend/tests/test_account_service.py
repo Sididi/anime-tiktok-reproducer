@@ -137,3 +137,37 @@ accounts:
     AccountService.invalidate()
     assert AccountService.get_account("a1").pool_key_for("tiktok") == "tiktok:spc_123"
     assert AccountService.get_account("a2").pool_key_for("tiktok") is None
+
+
+def test_independent_reel_limits_and_conservative_fallback(tmp_path: Path, monkeypatch):
+    cfg = _write_config(
+        tmp_path,
+        """\
+accounts:
+  verified:
+    name: Verified
+    language: fr
+    facebook:
+      max_reel_duration_seconds: 14400
+    instagram:
+      max_reel_duration_seconds: 1200
+  fallback:
+    name: Fallback
+    language: fr
+    facebook:
+      max_reel_duration_seconds: invalid
+""",
+    )
+    monkeypatch.setattr(
+        "app.services.account_service.settings.accounts_config_path", cfg
+    )
+    AccountService.invalidate()
+    assert AccountService.get_account("verified").max_reel_duration_for("facebook") == 14400
+    assert AccountService.get_account("verified").max_reel_duration_for("instagram") == 1200
+    assert AccountService.get_account("fallback").max_reel_duration_for("facebook") == 90
+    assert AccountService.get_account("fallback").max_reel_duration_for("instagram") == 90
+    rows = {row["id"]: row for row in AccountService.list_accounts_as_dicts()}
+    assert rows["verified"]["max_reel_duration_seconds_by_platform"] == {
+        "facebook": 14400,
+        "instagram": 1200,
+    }

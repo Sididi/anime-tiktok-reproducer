@@ -260,6 +260,7 @@ export interface ProjectUploadJob {
   account_id: string | null;
   platforms?: string[] | null;
   facebook_strategy?: UploadDurationStrategy | null;
+  instagram_strategy?: UploadDurationStrategy | null;
   youtube_strategy?: UploadDurationStrategy | null;
   status: "queued" | "running" | "complete" | "error";
   phase: string | null;
@@ -271,13 +272,21 @@ export interface ProjectUploadJob {
   updated_at: string;
 }
 
-export type UploadDurationStrategy = "cut" | "sped_up" | "skip";
+export type UploadDurationStrategy = "auto" | "cut" | "sped_up" | "skip";
 
 export interface FacebookCheckResult {
   needed: boolean;
   duration_seconds: number;
   speed_factor: number;
   sped_up_available: boolean;
+  max_duration_seconds?: number;
+  recommendation_max_duration_seconds?: number | null;
+  recommendation_warning?: boolean;
+}
+
+export interface InstagramCheckResult extends FacebookCheckResult {
+  recommendation_max_duration_seconds: number | null;
+  recommendation_warning: boolean;
 }
 
 export interface YouTubeCheckResult {
@@ -304,6 +313,7 @@ export interface Account {
   avatar_url: string;
   slots: string[];
   slots_by_platform?: Partial<Record<Platform, string[]>>;
+  max_reel_duration_seconds_by_platform?: Partial<Record<Platform, number>>;
   supported_types: LibraryType[];
 }
 

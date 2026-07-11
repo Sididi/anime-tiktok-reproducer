@@ -1165,18 +1165,21 @@ class SocialUploadService:
         *,
         input_path: Path,
         output_path: Path,
+        max_duration_seconds: float | None = None,
     ) -> str | None:
+        hard_max = max_duration_seconds or cls._FACEBOOK_MAX_DURATION_SECONDS
+        target = max(0.1, hard_max - cls._YOUTUBE_DURATION_SAFETY_BUFFER_SECONDS)
         cut_error = cls._cut_video_to_duration_limit(
             input_path=input_path,
             output_path=output_path,
-            max_duration_seconds=cls._FACEBOOK_UPLOAD_TARGET_DURATION_SECONDS,
+            max_duration_seconds=target,
         )
         if cut_error:
             return cut_error
 
         output_probe, output_probe_error = cls._probe_facebook_media(video_path=output_path)
         if output_probe_error is None and output_probe and output_probe.duration_seconds is not None:
-            if output_probe.duration_seconds <= cls._FACEBOOK_MAX_DURATION_SECONDS:
+            if output_probe.duration_seconds <= hard_max:
                 return None
 
         source_probe, source_probe_error = cls._probe_facebook_media(video_path=input_path)
@@ -1188,7 +1191,7 @@ class SocialUploadService:
             output_path=output_path,
             speed_factor=1.0,
             has_audio=bool(source_probe and source_probe.has_audio),
-            max_duration_seconds=cls._FACEBOOK_UPLOAD_TARGET_DURATION_SECONDS,
+            max_duration_seconds=target,
         )
 
     @classmethod
@@ -1382,11 +1385,12 @@ class SocialUploadService:
         *,
         source_video_path: Path,
         output_path: Path,
-        facebook_strategy: str | None = None,
+        instagram_strategy: str | None = None,
         facebook_prep_dir: Path | None = None,
+        max_duration_seconds: float = 90.0,
     ) -> LimitedDurationVideoPreparation:
         """Prepare the retained Google Drive artifact used by the VPS IG scheduler."""
-        strategy = (facebook_strategy or "auto").strip().lower()
+        strategy = (instagram_strategy or "auto").strip().lower()
         if strategy == "skip":
             return LimitedDurationVideoPreparation(
                 status="skip",
@@ -1403,6 +1407,7 @@ class SocialUploadService:
             cut_error = cls._cut_facebook_video(
                 input_path=source_video_path,
                 output_path=output_path,
+                max_duration_seconds=max_duration_seconds,
             )
             if cut_error:
                 return LimitedDurationVideoPreparation(
@@ -1411,33 +1416,27 @@ class SocialUploadService:
                 )
             candidate = output_path
         elif strategy == "sped_up":
-            cached = (
-                facebook_prep_dir / "sped_up.mp4"
-                if facebook_prep_dir and (facebook_prep_dir / "sped_up.mp4").exists()
-                else None
+            prep = cls._prepare_facebook_video_for_upload(
+                source_video_path=source_video_path,
+                work_dir=output_path.parent,
+                max_duration_seconds=max_duration_seconds,
             )
-            if cached:
-                candidate = cached
-            else:
-                prep = cls._prepare_facebook_video_for_upload(
-                    source_video_path=source_video_path,
-                    work_dir=output_path.parent,
+            if prep.status != "ready" or prep.video_path is None:
+                return LimitedDurationVideoPreparation(
+                    status="error",
+                    detail=prep.detail or "Instagram sped-up transcoding failed.",
+                    original_duration_seconds=prep.original_duration_seconds,
+                    speed_factor=prep.speed_factor,
                 )
-                if prep.status != "ready" or prep.video_path is None:
-                    return LimitedDurationVideoPreparation(
-                        status="error",
-                        detail=prep.detail or "Instagram sped-up transcoding failed.",
-                        original_duration_seconds=prep.original_duration_seconds,
-                        speed_factor=prep.speed_factor,
-                    )
-                candidate = prep.video_path
-                original_duration_seconds = prep.original_duration_seconds
-                speed_factor = prep.speed_factor
-                transcoded = prep.transcoded
+            candidate = prep.video_path
+            original_duration_seconds = prep.original_duration_seconds
+            speed_factor = prep.speed_factor
+            transcoded = prep.transcoded
         else:
             prep = cls._prepare_facebook_video_for_upload(
                 source_video_path=source_video_path,
                 work_dir=output_path.parent,
+                max_duration_seconds=max_duration_seconds,
             )
             if prep.status == "skip":
                 return LimitedDurationVideoPreparation(
@@ -1470,7 +1469,10 @@ class SocialUploadService:
                 speed_factor=speed_factor,
             )
 
-        media_validation_error = cls._validate_facebook_reel_media(video_path=output_path)
+        media_validation_error = cls._validate_facebook_reel_media(
+            video_path=output_path,
+            max_duration_seconds=max_duration_seconds,
+        )
         if media_validation_error:
             return LimitedDurationVideoPreparation(
                 status="error",
@@ -1498,15 +1500,17 @@ class SocialUploadService:
         *,
         source_video_path: Path,
         work_dir: Path,
+        max_duration_seconds: float = 90.0,
     ) -> LimitedDurationVideoPreparation:
+        target = max(0.1, max_duration_seconds - cls._YOUTUBE_DURATION_SAFETY_BUFFER_SECONDS)
         return cls._prepare_video_for_limited_duration_upload(
             source_video_path=source_video_path,
             work_dir=work_dir,
             platform_label="Facebook",
-            max_duration_seconds=cls._FACEBOOK_MAX_DURATION_SECONDS,
+            max_duration_seconds=target,
             max_speed_factor=cls._FACEBOOK_MAX_SPEED_FACTOR,
             max_accel_percent=cls._FACEBOOK_MAX_ACCEL_PERCENT,
-            output_suffix="facebook_90s",
+            output_suffix=f"facebook_{int(max_duration_seconds)}s",
         )
 
     @classmethod
@@ -1563,6 +1567,7 @@ class SocialUploadService:
         scheduled_at: datetime | None = None,
         facebook_strategy: str | None = None,
         facebook_prep_dir: Path | None = None,
+        max_duration_seconds: float = 90.0,
         deadline: float | None = None,
     ) -> PlatformUploadResult:
         deadline = cls._platform_deadline(deadline)
@@ -1608,6 +1613,7 @@ class SocialUploadService:
                 scheduled_at=scheduled_at,
                 facebook_strategy=strategy,
                 facebook_prep_dir=facebook_prep_dir,
+                max_duration_seconds=max_duration_seconds,
                 deadline=deadline,
             )
 
@@ -1622,6 +1628,7 @@ class SocialUploadService:
                     cut_error = cls._cut_facebook_video(
                         input_path=video_path,
                         output_path=cut_output,
+                        max_duration_seconds=max_duration_seconds,
                     )
                     if cut_error:
                         return PlatformUploadResult(
@@ -1645,6 +1652,7 @@ class SocialUploadService:
                         prep = cls._prepare_facebook_video_for_upload(
                             source_video_path=video_path,
                             work_dir=Path(prep_dir),
+                            max_duration_seconds=max_duration_seconds,
                         )
                         if prep.status != "ready" or prep.video_path is None:
                             return PlatformUploadResult(
@@ -1659,6 +1667,7 @@ class SocialUploadService:
                     prep = cls._prepare_facebook_video_for_upload(
                         source_video_path=video_path,
                         work_dir=Path(prep_dir),
+                        max_duration_seconds=max_duration_seconds,
                     )
                     if prep.status == "skip":
                         return PlatformUploadResult(
@@ -1856,6 +1865,7 @@ class SocialUploadService:
         scheduled_at: datetime,
         facebook_strategy: str = "auto",
         facebook_prep_dir: Path | None = None,
+        max_duration_seconds: float = 90.0,
         deadline: float | None = None,
     ) -> PlatformUploadResult:
         """Schedule a Facebook Reel via 3-phase Reels API (video_state=SCHEDULED)."""
@@ -1905,6 +1915,7 @@ class SocialUploadService:
                     cut_error = cls._cut_facebook_video(
                         input_path=video_path,
                         output_path=cut_output,
+                        max_duration_seconds=max_duration_seconds,
                     )
                     if cut_error:
                         return PlatformUploadResult(
@@ -1925,6 +1936,7 @@ class SocialUploadService:
                         prep = cls._prepare_facebook_video_for_upload(
                             source_video_path=video_path,
                             work_dir=Path(prep_dir),
+                            max_duration_seconds=max_duration_seconds,
                         )
                         if prep.status != "ready" or prep.video_path is None:
                             return PlatformUploadResult(
@@ -1938,6 +1950,7 @@ class SocialUploadService:
                     prep = cls._prepare_facebook_video_for_upload(
                         source_video_path=video_path,
                         work_dir=Path(prep_dir),
+                        max_duration_seconds=max_duration_seconds,
                     )
                     if prep.status == "skip":
                         return PlatformUploadResult(
@@ -1960,7 +1973,10 @@ class SocialUploadService:
                         status="failed",
                         detail="Facebook reel source video is empty (0 bytes).",
                     )
-                media_validation_error = cls._validate_facebook_reel_media(video_path=prepared_video_path)
+                media_validation_error = cls._validate_facebook_reel_media(
+                    video_path=prepared_video_path,
+                    max_duration_seconds=max_duration_seconds,
+                )
                 if media_validation_error:
                     return PlatformUploadResult(
                         platform="facebook",
@@ -2617,7 +2633,12 @@ class SocialUploadService:
             pass
 
     @classmethod
-    def _validate_facebook_reel_media(cls, *, video_path: Path) -> str | None:
+    def _validate_facebook_reel_media(
+        cls,
+        *,
+        video_path: Path,
+        max_duration_seconds: float = 90.0,
+    ) -> str | None:
         """
         Best-effort validation against documented Reels media constraints.
         If ffprobe is unavailable, validation is skipped.
@@ -2696,14 +2717,20 @@ class SocialUploadService:
 
         issues: list[str] = []
         # Based on Meta Reels Publishing API docs:
-        # min resolution 540x960, frame rate 24-60 fps, duration 3-90s.
+        # Min resolution and frame rate come from Meta's publishing requirements;
+        # the hard duration is probe-verified per account.
         if width and height:
             if min(width, height) < 540 or max(width, height) < 960:
                 issues.append(f"resolution {width}x{height} is below the minimum 540x960")
         if fps is not None and (fps < 24 or fps > 60):
             issues.append(f"frame rate {fps:.2f}fps is outside the supported 24-60fps range")
-        if duration_seconds is not None and (duration_seconds < 3 or duration_seconds > 90):
-            issues.append(f"duration {duration_seconds:.2f}s is outside the supported 3-90s range")
+        if duration_seconds is not None and (
+            duration_seconds < 3 or duration_seconds > max_duration_seconds + 0.01
+        ):
+            issues.append(
+                f"duration {duration_seconds:.2f}s is outside the supported "
+                f"3-{max_duration_seconds:g}s range"
+            )
 
         if issues:
             return (

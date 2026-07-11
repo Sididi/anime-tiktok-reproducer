@@ -603,15 +603,17 @@ class UploadPhaseService:
         project_id: str,
         source_video_path: Path,
         drive_folder_id: str,
-        facebook_strategy: str | None,
+        instagram_strategy: str | None,
+        max_duration_seconds: float,
         work_dir: Path,
     ) -> tuple[PlatformUploadResult | None, dict[str, str]]:
         output_path = work_dir / cls._INSTAGRAM_DRIVE_FILENAME
         prep = SocialUploadService.prepare_instagram_video_for_drive(
             source_video_path=source_video_path,
             output_path=output_path,
-            facebook_strategy=facebook_strategy,
+            instagram_strategy=instagram_strategy,
             facebook_prep_dir=cls._facebook_prep_dir(project_id),
+            max_duration_seconds=max_duration_seconds,
         )
         if prep.status == "skip":
             return (
@@ -670,6 +672,7 @@ class UploadPhaseService:
         account_id: str | None = None,
         platforms: list[str] | None = None,
         facebook_strategy: str | None = None,
+        instagram_strategy: str | None = None,
         youtube_strategy: str | None = None,
         copyright_audio_path: str | None = None,
         reserved_slots: dict[str, tuple[datetime, datetime]] | None = None,
@@ -716,6 +719,13 @@ class UploadPhaseService:
                 )
         elif configured_accounts:
             raise ValueError("account_id is required when accounts are configured")
+
+        facebook_max_duration = float(
+            account.max_reel_duration_for("facebook") if account else 90
+        )
+        instagram_max_duration = float(
+            account.max_reel_duration_for("instagram") if account else 90
+        )
 
         readiness = cls.compute_readiness(project)
         if readiness.status != "green" or (
@@ -863,6 +873,7 @@ class UploadPhaseService:
                     "graph_api_version": settings.meta_graph_api_version,
                     "poll_interval_seconds": settings.instagram_publish_poll_interval_seconds,
                     "poll_timeout_seconds": settings.instagram_publish_timeout_seconds,
+                    "max_duration_seconds": instagram_max_duration,
                 }
 
         with tempfile.TemporaryDirectory(prefix=f"atr-upload-{project_id}-") as tmp_dir:
@@ -973,6 +984,7 @@ class UploadPhaseService:
                     scheduled_at=_fb_scheduled_at,
                     facebook_strategy=_fb_strategy,
                     facebook_prep_dir=_fb_prep_dir,
+                    max_duration_seconds=facebook_max_duration,
                 )
             elif not account:
                 # Global (backwards compat)
@@ -988,6 +1000,7 @@ class UploadPhaseService:
                         video_url=_fb_video_url_global,
                         facebook_strategy=_fb_strategy_global,
                         facebook_prep_dir=_fb_prep_dir_global,
+                        max_duration_seconds=facebook_max_duration,
                     )
 
             selected_jobs = {platform: jobs[platform] for platform in requested_platforms if platform in jobs}
@@ -1013,7 +1026,8 @@ class UploadPhaseService:
                         project_id=project_id,
                         source_video_path=local_video_path,
                         drive_folder_id=readiness.drive_folder_id,
-                        facebook_strategy=facebook_strategy,
+                        instagram_strategy=instagram_strategy,
+                        max_duration_seconds=instagram_max_duration,
                         work_dir=Path(tmp_dir),
                     )
                     try:
@@ -1461,6 +1475,23 @@ class UploadPhaseService:
         return bool(creds.page_id and creds.facebook_page_access_token)
 
     @classmethod
+    def _instagram_upload_enabled(cls, account_id: str | None) -> bool:
+        if account_id:
+            account = AccountService.get_account(account_id)
+            if not account:
+                raise ValueError(f"Account '{account_id}' not found")
+            return bool(
+                account.meta
+                and account.meta.instagram_business_account_id
+                and (account.meta.instagram_access_token or account.meta.facebook_page_access_token)
+            )
+        try:
+            creds = MetaTokenService.get_upload_credentials()
+        except Exception:
+            return False
+        return bool(creds.instagram_business_account_id and creds.instagram_access_token)
+
+    @classmethod
     def _youtube_upload_enabled(cls, account_id: str | None) -> bool:
         if account_id:
             account = AccountService.get_account(account_id)
@@ -1516,6 +1547,7 @@ class UploadPhaseService:
         probe_media: Callable[..., Any],
         max_duration: float,
         max_speed: float,
+        recommendation_max_duration: float | None = None,
     ) -> dict[str, Any]:
         cleanup_stale()
         cls.cleanup_stale_source_cache()
@@ -1539,12 +1571,20 @@ class UploadPhaseService:
             project_id, readiness, probe_media
         )
 
+        recommendation_warning = bool(
+            recommendation_max_duration is not None
+            and duration_seconds > recommendation_max_duration + 0.01
+            and duration_seconds <= max_duration + 0.01
+        )
         if duration_seconds <= max_duration + 0.01:
             return {
                 "needed": False,
                 "duration_seconds": round(duration_seconds, 2),
                 "speed_factor": 1.0,
                 "sped_up_available": False,
+                "max_duration_seconds": max_duration,
+                "recommendation_max_duration_seconds": recommendation_max_duration,
+                "recommendation_warning": recommendation_warning,
             }
 
         speed_factor = duration_seconds / max_duration
@@ -1559,7 +1599,18 @@ class UploadPhaseService:
             "duration_seconds": round(duration_seconds, 2),
             "speed_factor": round(speed_factor, 4),
             "sped_up_available": sped_up_available,
+            "max_duration_seconds": max_duration,
+            "recommendation_max_duration_seconds": recommendation_max_duration,
+            "recommendation_warning": False,
         }
+
+    @staticmethod
+    def _account_reel_limit(account_id: str | None, platform: str) -> float:
+        if account_id:
+            account = AccountService.get_account(account_id)
+            if account is not None:
+                return float(account.max_reel_duration_for(platform))
+        return 90.0
 
     @classmethod
     def check_facebook_duration(
@@ -1573,8 +1624,25 @@ class UploadPhaseService:
             cleanup_stale=cls.cleanup_stale_facebook_prep,
             is_enabled=cls._facebook_upload_enabled,
             probe_media=SocialUploadService._probe_facebook_media,
-            max_duration=SocialUploadService._FACEBOOK_MAX_DURATION_SECONDS,
+            max_duration=cls._account_reel_limit(account_id, "facebook"),
             max_speed=SocialUploadService._FACEBOOK_MAX_SPEED_FACTOR,
+        )
+
+    @classmethod
+    def check_instagram_duration(
+        cls,
+        project_id: str,
+        account_id: str | None = None,
+    ) -> dict[str, Any]:
+        return cls._check_platform_duration(
+            project_id,
+            account_id,
+            cleanup_stale=lambda: None,
+            is_enabled=cls._instagram_upload_enabled,
+            probe_media=SocialUploadService._probe_facebook_media,
+            max_duration=cls._account_reel_limit(account_id, "instagram"),
+            max_speed=SocialUploadService._FACEBOOK_MAX_SPEED_FACTOR,
+            recommendation_max_duration=180.0,
         )
 
     @classmethod

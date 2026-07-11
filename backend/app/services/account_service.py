@@ -45,11 +45,13 @@ class AccountYouTubeConfig:
 @dataclass
 class AccountFacebookConfig:
     slots: list[str] | None = None
+    max_reel_duration_seconds: int = 90
 
 
 @dataclass
 class AccountInstagramConfig:
     slots: list[str] | None = None
+    max_reel_duration_seconds: int = 90
 
 
 @dataclass
@@ -104,6 +106,14 @@ class AccountConfig:
             override = self.tiktok.slots
         return list(override) if override is not None else list(self.slots)
 
+    def max_reel_duration_for(self, platform: str) -> int:
+        """Configured, probe-verified hard limit; defaults conservatively to 90s."""
+        if platform == "facebook" and self.facebook is not None:
+            return self.facebook.max_reel_duration_seconds
+        if platform == "instagram" and self.instagram is not None:
+            return self.instagram.max_reel_duration_seconds
+        return 90
+
     def pool_key_for(self, platform: str) -> str | None:
         """Shared-pool identity for (this account, platform), or None if unshared.
 
@@ -131,6 +141,23 @@ class AccountService:
 
     _lock = Lock()
     _accounts: dict[str, AccountConfig] | None = None
+
+    @staticmethod
+    def _max_reel_duration(value: Any, *, account_id: str, platform: str) -> int:
+        try:
+            parsed = int(value)
+            if parsed >= 3:
+                return parsed
+        except (TypeError, ValueError):
+            pass
+        if value is not None:
+            logger.warning(
+                "Invalid %s.max_reel_duration_seconds=%r for account %s; using 90",
+                platform,
+                value,
+                account_id,
+            )
+        return 90
 
     @classmethod
     def _config_path(cls) -> Path:
@@ -171,14 +198,28 @@ class AccountService:
 
         facebook_raw = raw.get("facebook")
         facebook = (
-            AccountFacebookConfig(slots=_normalize_slots(facebook_raw.get("slots")))
+            AccountFacebookConfig(
+                slots=_normalize_slots(facebook_raw.get("slots")),
+                max_reel_duration_seconds=cls._max_reel_duration(
+                    facebook_raw.get("max_reel_duration_seconds"),
+                    account_id=account_id,
+                    platform="facebook",
+                ),
+            )
             if isinstance(facebook_raw, dict)
             else None
         )
 
         instagram_raw = raw.get("instagram")
         instagram = (
-            AccountInstagramConfig(slots=_normalize_slots(instagram_raw.get("slots")))
+            AccountInstagramConfig(
+                slots=_normalize_slots(instagram_raw.get("slots")),
+                max_reel_duration_seconds=cls._max_reel_duration(
+                    instagram_raw.get("max_reel_duration_seconds"),
+                    account_id=account_id,
+                    platform="instagram",
+                ),
+            )
             if isinstance(instagram_raw, dict)
             else None
         )
@@ -296,6 +337,10 @@ class AccountService:
                 "avatar_url": f"/api/accounts/{acc.id}/avatar",
                 "slots": acc.slots,
                 "slots_by_platform": {p: acc.slots_for(p) for p in PLATFORM_KEYS},
+                "max_reel_duration_seconds_by_platform": {
+                    "facebook": acc.max_reel_duration_for("facebook"),
+                    "instagram": acc.max_reel_duration_for("instagram"),
+                },
             }
             for acc in cls.list_accounts()
         ]

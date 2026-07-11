@@ -23,11 +23,16 @@ class UploadProjectRequest(BaseModel):
     account_id: str | None = None
     platforms: list[Literal["youtube", "facebook", "instagram"]] | None = None
     facebook_strategy: Literal["auto", "cut", "sped_up", "skip"] | None = None
+    instagram_strategy: Literal["auto", "cut", "sped_up", "skip"] | None = None
     youtube_strategy: Literal["auto", "cut", "sped_up", "skip"] | None = None
     copyright_audio_path: str | None = None
 
 
 class FacebookCheckRequest(BaseModel):
+    account_id: str | None = None
+
+
+class InstagramCheckRequest(BaseModel):
     account_id: str | None = None
 
 
@@ -67,6 +72,7 @@ async def run_upload_phase(
             account_id=req.account_id,
             platforms=req.platforms,
             facebook_strategy=req.facebook_strategy,
+            instagram_strategy=req.instagram_strategy,
             youtube_strategy=req.youtube_strategy,
             copyright_audio_path=req.copyright_audio_path,
         )
@@ -139,7 +145,7 @@ async def facebook_duration_check(
     project_id: str,
     payload: FacebookCheckRequest | None = Body(default=None),
 ):
-    """Check if the project video exceeds Facebook's 90s Reel limit.
+    """Check if the video exceeds the selected account's verified Facebook limit.
 
     Uses Drive metadata / local probe only — no video download. When a
     choice is needed, the shared preview cache is warmed in the background.
@@ -152,6 +158,25 @@ async def facebook_duration_check(
             req.account_id,
         )
         return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/projects/{project_id}/instagram-check")
+async def instagram_duration_check(
+    project_id: str,
+    payload: InstagramCheckRequest | None = Body(default=None),
+):
+    """Check the selected account's hard Instagram limit and discovery warning."""
+    req = payload or InstagramCheckRequest()
+    try:
+        return await asyncio.to_thread(
+            UploadPhaseService.check_instagram_duration,
+            project_id,
+            req.account_id,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:

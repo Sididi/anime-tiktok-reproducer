@@ -104,6 +104,7 @@ function installMocks(payload: { account: typeof ACCOUNT; row: typeof ROW }) {
     }
     if (
       url.pathname.endsWith("/facebook-check") ||
+      url.pathname.endsWith("/instagram-check") ||
       url.pathname.endsWith("/youtube-check")
     ) {
       return json({
@@ -252,6 +253,7 @@ function installCheckDelay() {
     if (
       url.pathname.endsWith("/copyright-check") ||
       url.pathname.endsWith("/facebook-check") ||
+      url.pathname.endsWith("/instagram-check") ||
       url.pathname.endsWith("/youtube-check")
     ) {
       await new Promise((resolve) => setTimeout(resolve, 20));

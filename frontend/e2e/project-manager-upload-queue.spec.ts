@@ -71,6 +71,7 @@ interface UploadRequestBody {
   account_id?: string | null;
   platforms?: string[] | null;
   facebook_strategy?: string | null;
+  instagram_strategy?: string | null;
   youtube_strategy?: string | null;
   copyright_audio_path?: string | null;
 }
@@ -79,6 +80,7 @@ interface MockProjectConfig {
   copyrightCheck?: Record<string, unknown>;
   buildAudioPath?: string;
   facebookCheck?: Record<string, unknown>;
+  instagramCheck?: Record<string, unknown>;
   youtubeCheck?: Record<string, unknown>;
   upload?: {
     jobId: string;
@@ -228,6 +230,35 @@ const YOUTUBE_CHAIN_CONFIGS: Record<string, MockProjectConfig> = {
   },
 };
 
+const INSTAGRAM_WARNING_CONFIGS: Record<string, MockProjectConfig> = {
+  "project-alpha": {
+    copyrightCheck: { copyrighted: false },
+    facebookCheck: {
+      needed: false,
+      duration_seconds: 240,
+      speed_factor: 1,
+      sped_up_available: false,
+      max_duration_seconds: 14400,
+    },
+    instagramCheck: {
+      needed: false,
+      duration_seconds: 240,
+      speed_factor: 1,
+      sped_up_available: false,
+      max_duration_seconds: 900,
+      recommendation_max_duration_seconds: 180,
+      recommendation_warning: true,
+    },
+    youtubeCheck: {
+      needed: false,
+      duration_seconds: 240,
+      speed_factor: 1,
+      sped_up_available: false,
+    },
+    upload: { jobId: "upload-job-instagram-warning" },
+  },
+};
+
 function installProjectManagerUploadMocks({
   sourceDetails,
   initialProjectRows,
@@ -347,7 +378,7 @@ function installProjectManagerUploadMocks({
     }
 
     const projectActionMatch = url.pathname.match(
-      /^\/api\/project-manager\/projects\/([^/]+)\/(copyright-check|copyright-build-audio|facebook-check|youtube-check|upload)$/,
+      /^\/api\/project-manager\/projects\/([^/]+)\/(copyright-check|copyright-build-audio|facebook-check|instagram-check|youtube-check|upload)$/,
     );
 
     if (projectActionMatch) {
@@ -367,6 +398,18 @@ function installProjectManagerUploadMocks({
 
       if (action === "facebook-check" && config.facebookCheck) {
         return jsonResponse(config.facebookCheck);
+      }
+
+      if (action === "instagram-check") {
+        return jsonResponse(config.instagramCheck || {
+          needed: false,
+          duration_seconds: 45,
+          speed_factor: 1,
+          sped_up_available: false,
+          max_duration_seconds: 90,
+          recommendation_max_duration_seconds: 180,
+          recommendation_warning: false,
+        });
       }
 
       if (action === "youtube-check" && config.youtubeCheck) {
@@ -593,6 +636,23 @@ test("Project Manager keeps copyright audio path through YouTube duration prompt
       youtube_strategy: "cut",
       copyright_audio_path: "/tmp/project-alpha-replacement.wav",
     });
+});
+
+test("Project Manager warns without transforming an Instagram Reel over three minutes", async ({ page }) => {
+  await page.addInitScript(installProjectManagerUploadMocks, {
+    sourceDetails: SOURCE_DETAILS,
+    initialProjectRows: [INITIAL_PROJECT_ROWS[0]],
+    projectConfigs: INSTAGRAM_WARNING_CONFIGS,
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Projects" }).click();
+  const row = page.locator("tr").filter({ hasText: "Project Alpha" });
+  await row.getByRole("button", { name: "Upload" }).click();
+  await expect(page.getByText("Portée Instagram réduite au-delà de 3:00")).toBeVisible();
+  await page.getByRole("button", { name: "Continuer sur Instagram" }).click();
+  await expect.poll(async () => latestUploadRequest(page, "project-alpha")).toMatchObject({
+    instagram_strategy: "auto",
+  });
 });
 
 test("Project Manager previews a local-first video via native <video> when no Drive video exists", async ({

@@ -32,6 +32,7 @@ class InstagramPayload(BaseModel):
     poll_timeout_seconds: float | None = None
     share_to_feed: bool | None = None
     thumb_offset: int | None = None
+    max_duration_seconds: float | None = None
 
 
 class TikTokPayload(BaseModel):

@@ -25,6 +25,16 @@ pixi run python scripts/<script>.py ...
    - `debug-token`: inspect token details with `/debug_token`.
    - `verify`: verify page + IG credentials.
 
+4. `meta_reel_duration_probe.py`
+   - Generates tiny synthetic videos and asks Meta to process them only as
+     unpublished Instagram containers or Facebook drafts.
+   - Requires `--confirm-nonpublic-uploads`, emits JSON Lines, removes temporary
+     Drive files/Facebook drafts, and never prints access tokens.
+   - Keep new accounts at the conservative 90-second default until probed.
+   - Instagram has no draft publish operation: a `FINISHED` container above the
+     documented 900-second ceiling proves ingestion only, not publishability.
+     Do not configure above 900 without separate authoritative evidence.
+
 ## Examples
 
 ```bash
@@ -37,4 +47,5 @@ pixi run python scripts/meta_token_helper.py exchange-user-token --env-file .env
 pixi run python scripts/meta_token_helper.py resolve-page-assets --env-file .env --user-token "<TOKEN>" --page-id "<PAGE_ID>"
 pixi run python scripts/meta_token_helper.py resolve-from-page-token --env-file .env --page-id "<PAGE_ID>" --page-token "<PAGE_TOKEN>"
 pixi run python scripts/meta_token_helper.py verify --env-file .env
+pixi run python scripts/meta_reel_duration_probe.py --account-id anime_fr --platform instagram --candidate 899 900 901 --confirm-nonpublic-uploads
 ```

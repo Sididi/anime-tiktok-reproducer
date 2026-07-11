@@ -104,7 +104,8 @@ def test_upload_phase_prepares_instagram_artifact_and_returns_drive_metadata(
         project_id="p1",
         source_video_path=source,
         drive_folder_id="folder_1",
-        facebook_strategy="cut",
+        instagram_strategy="cut",
+        max_duration_seconds=900,
         work_dir=tmp_path,
     )
 
@@ -117,7 +118,8 @@ def test_upload_phase_prepares_instagram_artifact_and_returns_drive_metadata(
     }
     assert calls["prepare"]["source_video_path"] == source
     assert calls["prepare"]["output_path"] == tmp_path / "output_instagram.mp4"
-    assert calls["prepare"]["facebook_strategy"] == "cut"
+    assert calls["prepare"]["instagram_strategy"] == "cut"
+    assert calls["prepare"]["max_duration_seconds"] == 900
     assert calls["upsert"]["parent_id"] == "folder_1"
     assert calls["upsert"]["filename"] == "output_instagram.mp4"
     assert calls["upsert"]["local_path"] == prepared
@@ -151,7 +153,8 @@ def test_upload_phase_instagram_preparation_failure_is_not_schedulable(
         project_id="p1",
         source_video_path=source,
         drive_folder_id="folder_1",
-        facebook_strategy="auto",
+        instagram_strategy="auto",
+        max_duration_seconds=900,
         work_dir=tmp_path,
     )
 

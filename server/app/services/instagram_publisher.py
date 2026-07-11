@@ -562,7 +562,11 @@ def _float_or_none(value: Any) -> float | None:
     return None
 
 
-def _validate_video_streams(payload: dict[str, Any]) -> str | None:  # noqa: PLR0911
+def _validate_video_streams(
+    payload: dict[str, Any],
+    *,
+    max_duration_seconds: float = _MAX_REEL_DURATION_SECONDS,
+) -> str | None:  # noqa: PLR0911
     fmt = payload.get("format") if isinstance(payload.get("format"), dict) else {}
     format_name = str(fmt.get("format_name") or "").lower()
     if format_name and not any(c in format_name for c in _ALLOWED_CONTAINERS):
@@ -570,11 +574,11 @@ def _validate_video_streams(payload: dict[str, Any]) -> str | None:  # noqa: PLR
 
     duration = _float_or_none(fmt.get("duration"))
     if duration is not None and not (
-        _MIN_REEL_DURATION_SECONDS <= duration <= _MAX_REEL_DURATION_SECONDS
+        _MIN_REEL_DURATION_SECONDS <= duration <= max_duration_seconds
     ):
         return (
             f"duration {duration:.2f}s outside "
-            f"{_MIN_REEL_DURATION_SECONDS:.0f}-{_MAX_REEL_DURATION_SECONDS:.0f}s"
+            f"{_MIN_REEL_DURATION_SECONDS:.0f}-{max_duration_seconds:.0f}s"
         )
 
     streams = payload.get("streams") if isinstance(payload.get("streams"), list) else []
@@ -874,7 +878,11 @@ async def _maybe_transcode_for_size(video_path: Path) -> Path:
     return await _prepare_video_for_instagram_upload(video_path)
 
 
-async def _validate_video(video_path: Path) -> str | None:  # noqa: PLR0911
+async def _validate_video(
+    video_path: Path,
+    *,
+    max_duration_seconds: float = _MAX_REEL_DURATION_SECONDS,
+) -> str | None:  # noqa: PLR0911
     file_size = video_path.stat().st_size
     if file_size <= 0:
         return "downloaded video is empty"
@@ -944,7 +952,20 @@ async def _validate_video(video_path: Path) -> str | None:  # noqa: PLR0911
         "Instagram prepared video probe: %s",
         probe_summary,
     )
-    return _validate_video_streams(payload)
+    return _validate_video_streams(payload, max_duration_seconds=max_duration_seconds)
+
+
+async def _validate_video_with_limit(
+    video_path: Path,
+    max_duration_seconds: float,
+) -> str | None:
+    # Preserve the original call shape for the documented default; many callers
+    # and tests replace _validate_video with a one-argument validator.
+    if max_duration_seconds == _MAX_REEL_DURATION_SECONDS:
+        return await _validate_video(video_path)
+    return await _validate_video(
+        video_path, max_duration_seconds=max_duration_seconds
+    )
 
 
 def _upload_resumable_binary_sync(
@@ -1181,6 +1202,7 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
     prepared_media_dir: Path | None = None,
     public_base_url: str | None = None,
     temp_dir: Path | None = None,
+    max_duration_seconds: float = _MAX_REEL_DURATION_SECONDS,
 ) -> InstagramPublishResult:
     base = f"https://graph.facebook.com/{graph_api_version}"
     timeout = httpx.Timeout(30.0, read=None)
@@ -1336,7 +1358,9 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                         publish_state=state,
                     )
 
-                if detail := await _validate_video(video_path):
+                if detail := await _validate_video_with_limit(
+                    video_path, max_duration_seconds
+                ):
                     video_path.unlink(missing_ok=True)
                     return InstagramPublishResult(
                         success=False,
@@ -1503,7 +1527,9 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                         publish_state=state,
                     )
 
-                if detail := await _validate_video(video_path):
+                if detail := await _validate_video_with_limit(
+                    video_path, max_duration_seconds
+                ):
                     video_path.unlink(missing_ok=True)
                     return InstagramPublishResult(
                         success=False,
