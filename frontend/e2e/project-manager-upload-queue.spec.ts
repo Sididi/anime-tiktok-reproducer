@@ -230,7 +230,7 @@ const YOUTUBE_CHAIN_CONFIGS: Record<string, MockProjectConfig> = {
   },
 };
 
-const INSTAGRAM_WARNING_CONFIGS: Record<string, MockProjectConfig> = {
+const SHARED_THREE_MINUTE_CONFIGS: Record<string, MockProjectConfig> = {
   "project-alpha": {
     copyrightCheck: { copyrighted: false },
     facebookCheck: {
@@ -241,19 +241,17 @@ const INSTAGRAM_WARNING_CONFIGS: Record<string, MockProjectConfig> = {
       max_duration_seconds: 14400,
     },
     instagramCheck: {
-      needed: false,
+      needed: true,
       duration_seconds: 240,
-      speed_factor: 1,
-      sped_up_available: false,
-      max_duration_seconds: 900,
-      recommendation_max_duration_seconds: 180,
-      recommendation_warning: true,
+      speed_factor: 1.3333,
+      sped_up_available: true,
+      max_duration_seconds: 180,
     },
     youtubeCheck: {
-      needed: false,
+      needed: true,
       duration_seconds: 240,
-      speed_factor: 1,
-      sped_up_available: false,
+      speed_factor: 1.3333,
+      sped_up_available: true,
     },
     upload: { jobId: "upload-job-instagram-warning" },
   },
@@ -406,9 +404,7 @@ function installProjectManagerUploadMocks({
           duration_seconds: 45,
           speed_factor: 1,
           sped_up_available: false,
-          max_duration_seconds: 90,
-          recommendation_max_duration_seconds: 180,
-          recommendation_warning: false,
+          max_duration_seconds: 180,
         });
       }
 
@@ -638,20 +634,21 @@ test("Project Manager keeps copyright audio path through YouTube duration prompt
     });
 });
 
-test("Project Manager warns without transforming an Instagram Reel over three minutes", async ({ page }) => {
+test("Project Manager applies one three-minute choice to YouTube and Instagram", async ({ page }) => {
   await page.addInitScript(installProjectManagerUploadMocks, {
     sourceDetails: SOURCE_DETAILS,
     initialProjectRows: [INITIAL_PROJECT_ROWS[0]],
-    projectConfigs: INSTAGRAM_WARNING_CONFIGS,
+    projectConfigs: SHARED_THREE_MINUTE_CONFIGS,
   });
   await page.goto("/");
   await page.getByRole("button", { name: "Projects" }).click();
   const row = page.locator("tr").filter({ hasText: "Project Alpha" });
   await row.getByRole("button", { name: "Upload" }).click();
-  await expect(page.getByText("Portée Instagram réduite au-delà de 3:00")).toBeVisible();
-  await page.getByRole("button", { name: "Continuer sur Instagram" }).click();
+  await expect(page.getByText("Vidéo trop longue pour YouTube et Instagram")).toBeVisible();
+  await page.getByRole("button", { name: "Couper à 3:00" }).click();
   await expect.poll(async () => latestUploadRequest(page, "project-alpha")).toMatchObject({
-    instagram_strategy: "auto",
+    instagram_strategy: "cut",
+    youtube_strategy: "cut",
   });
 });
 

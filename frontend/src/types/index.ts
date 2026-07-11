@@ -280,14 +280,9 @@ export interface FacebookCheckResult {
   speed_factor: number;
   sped_up_available: boolean;
   max_duration_seconds?: number;
-  recommendation_max_duration_seconds?: number | null;
-  recommendation_warning?: boolean;
 }
 
-export interface InstagramCheckResult extends FacebookCheckResult {
-  recommendation_max_duration_seconds: number | null;
-  recommendation_warning: boolean;
-}
+export type InstagramCheckResult = FacebookCheckResult;
 
 export interface YouTubeCheckResult {
   needed: boolean;

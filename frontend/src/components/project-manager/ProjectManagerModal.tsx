@@ -26,7 +26,6 @@ import type {
   Account,
   CopyrightCheckResult,
   FacebookCheckResult,
-  InstagramCheckResult,
   Platform,
   ProjectManagerRow,
   ProjectUploadJob,
@@ -54,8 +53,6 @@ type UploadSessionStatus =
   | "awaiting_copyright_warning"
   | "checking_facebook"
   | "awaiting_facebook_choice"
-  | "checking_instagram"
-  | "awaiting_instagram_choice"
   | "checking_youtube"
   | "awaiting_youtube_choice"
   | "enqueueing";
@@ -67,7 +64,6 @@ interface UploadSession {
   message: string | null;
   copyrightResult?: CopyrightCheckResult;
   facebookResult?: FacebookCheckResult;
-  instagramResult?: InstagramCheckResult;
   youtubeResult?: YouTubeCheckResult;
   startedAt: number;
   updatedAt: number;
@@ -104,7 +100,6 @@ function isPromptSessionStatus(status: UploadSessionStatus): boolean {
     status === "awaiting_copyright_music" ||
     status === "awaiting_copyright_warning" ||
     status === "awaiting_facebook_choice" ||
-    status === "awaiting_instagram_choice" ||
     status === "awaiting_youtube_choice"
   );
 }
@@ -113,13 +108,11 @@ function uploadButtonLabelForSession(session: UploadSession): string {
   switch (session.status) {
     case "checking_copyright":
     case "checking_facebook":
-    case "checking_instagram":
     case "checking_youtube":
       return "Checking";
     case "awaiting_copyright_music":
     case "awaiting_copyright_warning":
     case "awaiting_facebook_choice":
-    case "awaiting_instagram_choice":
     case "awaiting_youtube_choice":
       return "Confirm";
     case "enqueueing":
@@ -485,74 +478,45 @@ export function ProjectManagerModal({
     [isSessionCurrent, patchUploadSession, removeUploadSession, upsertUploadJob],
   );
 
-  const continueUploadAfterInstagram = useCallback(
-    async (context: PendingUploadContext, token: string) => {
-      patchUploadSession(context.projectId, token, {
-        context,
-        status: "checking_youtube",
-        message: "Vérification de la durée YouTube...",
-        facebookResult: undefined,
-      });
-      setError(null);
-      try {
-        const result = await api.checkYouTubeDuration(
-          context.projectId,
-          context.accountId,
-        );
-        if (!isSessionCurrent(context.projectId, token)) return;
-
-        if (result.needed) {
-          patchUploadSession(context.projectId, token, {
-            context,
-            status: "awaiting_youtube_choice",
-            message: null,
-            youtubeResult: result,
-          });
-          return;
-        }
-
-        await enqueueUpload(context, token);
-      } catch (err) {
-        console.warn("YouTube check failed, proceeding with auto:", err);
-        if (!isSessionCurrent(context.projectId, token)) return;
-        await enqueueUpload(context, token);
-      }
-    },
-    [enqueueUpload, isSessionCurrent, patchUploadSession],
-  );
-
   const continueUploadAfterFacebook = useCallback(
     async (context: PendingUploadContext, token: string) => {
       patchUploadSession(context.projectId, token, {
         context,
-        status: "checking_instagram",
-        message: "Vérification de la durée Instagram...",
+        status: "checking_youtube",
+        message: "Vérification de la durée YouTube et Instagram...",
         facebookResult: undefined,
       });
       setError(null);
-      try {
-        const result = await api.checkInstagramDuration(
+      const [instagramCheck, youtubeCheck] = await Promise.allSettled([
+        api.checkInstagramDuration(
           context.projectId,
           context.accountId,
-        );
-        if (!isSessionCurrent(context.projectId, token)) return;
-        if (result.needed || result.recommendation_warning) {
-          patchUploadSession(context.projectId, token, {
-            context,
-            status: "awaiting_instagram_choice",
-            message: null,
-            instagramResult: result,
-          });
-          return;
-        }
-        await continueUploadAfterInstagram(context, token);
-      } catch (err) {
-        console.warn("Instagram check failed, proceeding with auto:", err);
-        if (!isSessionCurrent(context.projectId, token)) return;
-        await continueUploadAfterInstagram(context, token);
+        ),
+        api.checkYouTubeDuration(context.projectId, context.accountId),
+      ]);
+      if (!isSessionCurrent(context.projectId, token)) return;
+
+      const fulfilled = [instagramCheck, youtubeCheck]
+        .filter((result) => result.status === "fulfilled")
+        .map((result) => result.value);
+      const needed = fulfilled.filter((result) => result.needed);
+      if (needed.length > 0) {
+        patchUploadSession(context.projectId, token, {
+          context,
+          status: "awaiting_youtube_choice",
+          message: null,
+          youtubeResult: {
+            needed: true,
+            duration_seconds: Math.max(...needed.map((result) => result.duration_seconds)),
+            speed_factor: Math.max(...needed.map((result) => result.speed_factor)),
+            sped_up_available: needed.every((result) => result.sped_up_available),
+          },
+        });
+        return;
       }
+      await enqueueUpload(context, token);
     },
-    [continueUploadAfterInstagram, isSessionCurrent, patchUploadSession],
+    [enqueueUpload, isSessionCurrent, patchUploadSession],
   );
 
   const continueUploadAfterCopyright = useCallback(
@@ -1208,43 +1172,6 @@ export function ProjectManagerModal({
                     }
 
                     if (
-                      session.status === "awaiting_instagram_choice" &&
-                      session.instagramResult
-                    ) {
-                      return (
-                        <FacebookDurationModal
-                          key={`${session.context.projectId}:${session.token}:instagram`}
-                          open
-                          stacked
-                          platform="Instagram"
-                          projectId={session.context.projectId}
-                          projectTitle={projectTitle}
-                          durationSeconds={session.instagramResult.duration_seconds}
-                          speedFactor={session.instagramResult.speed_factor}
-                          spedUpAvailable={session.instagramResult.sped_up_available}
-                          maxDurationSeconds={session.instagramResult.max_duration_seconds}
-                          recommendationOnly={
-                            !session.instagramResult.needed &&
-                            session.instagramResult.recommendation_warning
-                          }
-                          onChoice={(strategy) => {
-                            const nextContext: PendingUploadContext = {
-                              ...session.context,
-                              instagramStrategy: strategy,
-                            };
-                            void continueUploadAfterInstagram(
-                              nextContext,
-                              session.token,
-                            );
-                          }}
-                          onClose={() =>
-                            removeUploadSession(session.context.projectId)
-                          }
-                        />
-                      );
-                    }
-
-                    if (
                       session.status === "awaiting_youtube_choice" &&
                       session.youtubeResult
                     ) {
@@ -1261,6 +1188,7 @@ export function ProjectManagerModal({
                           onChoice={(strategy) => {
                             const nextContext: PendingUploadContext = {
                               ...session.context,
+                              instagramStrategy: strategy,
                               youtubeStrategy: strategy,
                             };
                             void enqueueUpload(nextContext, session.token);

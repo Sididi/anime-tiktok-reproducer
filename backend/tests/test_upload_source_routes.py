@@ -96,11 +96,9 @@ def test_instagram_duration_check_route_forwards_account(client, monkeypatch):
     expected = {
         "needed": False,
         "duration_seconds": 240.0,
-        "speed_factor": 1.0,
-        "sped_up_available": False,
-        "max_duration_seconds": 900.0,
-        "recommendation_max_duration_seconds": 180.0,
-        "recommendation_warning": True,
+        "speed_factor": 1.3333,
+        "sped_up_available": True,
+        "max_duration_seconds": 180.0,
     }
     seen: list[tuple[str, str | None]] = []
     monkeypatch.setattr(

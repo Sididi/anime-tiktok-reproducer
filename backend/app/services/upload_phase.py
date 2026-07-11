@@ -724,7 +724,7 @@ class UploadPhaseService:
             account.max_reel_duration_for("facebook") if account else 90
         )
         instagram_max_duration = float(
-            account.max_reel_duration_for("instagram") if account else 90
+            min(account.max_reel_duration_for("instagram"), 180) if account else 90
         )
 
         readiness = cls.compute_readiness(project)
@@ -1547,7 +1547,6 @@ class UploadPhaseService:
         probe_media: Callable[..., Any],
         max_duration: float,
         max_speed: float,
-        recommendation_max_duration: float | None = None,
     ) -> dict[str, Any]:
         cleanup_stale()
         cls.cleanup_stale_source_cache()
@@ -1571,11 +1570,6 @@ class UploadPhaseService:
             project_id, readiness, probe_media
         )
 
-        recommendation_warning = bool(
-            recommendation_max_duration is not None
-            and duration_seconds > recommendation_max_duration + 0.01
-            and duration_seconds <= max_duration + 0.01
-        )
         if duration_seconds <= max_duration + 0.01:
             return {
                 "needed": False,
@@ -1583,8 +1577,6 @@ class UploadPhaseService:
                 "speed_factor": 1.0,
                 "sped_up_available": False,
                 "max_duration_seconds": max_duration,
-                "recommendation_max_duration_seconds": recommendation_max_duration,
-                "recommendation_warning": recommendation_warning,
             }
 
         speed_factor = duration_seconds / max_duration
@@ -1600,8 +1592,6 @@ class UploadPhaseService:
             "speed_factor": round(speed_factor, 4),
             "sped_up_available": sped_up_available,
             "max_duration_seconds": max_duration,
-            "recommendation_max_duration_seconds": recommendation_max_duration,
-            "recommendation_warning": False,
         }
 
     @staticmethod
@@ -1609,7 +1599,10 @@ class UploadPhaseService:
         if account_id:
             account = AccountService.get_account(account_id)
             if account is not None:
-                return float(account.max_reel_duration_for(platform))
+                configured = float(account.max_reel_duration_for(platform))
+                # Instagram's operational ceiling intentionally follows the
+                # 3-minute YouTube workflow even if Meta can ingest longer media.
+                return min(configured, 180.0) if platform == "instagram" else configured
         return 90.0
 
     @classmethod
@@ -1642,7 +1635,6 @@ class UploadPhaseService:
             probe_media=SocialUploadService._probe_facebook_media,
             max_duration=cls._account_reel_limit(account_id, "instagram"),
             max_speed=SocialUploadService._FACEBOOK_MAX_SPEED_FACTOR,
-            recommendation_max_duration=180.0,
         )
 
     @classmethod

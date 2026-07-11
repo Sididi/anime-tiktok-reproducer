@@ -68,8 +68,6 @@ def test_under_limit_via_drive_metadata_no_download(check_env, monkeypatch):
         "needed": False, "duration_seconds": 80.0,
         "speed_factor": 1.0, "sped_up_available": False,
         "max_duration_seconds": 90.0,
-        "recommendation_max_duration_seconds": None,
-        "recommendation_warning": False,
     }
     assert check_env == []  # no background download for short videos
 
@@ -148,25 +146,14 @@ def test_unprobeable_fallback_raises(check_env, monkeypatch):
         _run_check(monkeypatch, _readiness(), probe_media=lambda **kw: (None, "bad file"))
 
 
-def test_recommendation_warning_does_not_require_transformation(check_env, monkeypatch):
-    monkeypatch.setattr(
-        up.GoogleDriveService,
-        "get_video_duration_seconds",
-        classmethod(lambda cls, fid: 240.0),
+def test_instagram_operational_limit_is_clamped_to_three_minutes(monkeypatch):
+    account = SimpleNamespace(
+        max_reel_duration_for=lambda platform: 900 if platform == "instagram" else 14400
     )
     monkeypatch.setattr(
-        UploadPhaseService, "compute_readiness", classmethod(lambda cls, project: _readiness())
+        up.AccountService,
+        "get_account",
+        classmethod(lambda cls, account_id: account),
     )
-    result = UploadPhaseService._check_platform_duration(
-        "p1",
-        None,
-        cleanup_stale=lambda: None,
-        is_enabled=lambda account_id: True,
-        probe_media=lambda **kw: (None, "unused"),
-        max_duration=900.0,
-        max_speed=1.4,
-        recommendation_max_duration=180.0,
-    )
-    assert result["needed"] is False
-    assert result["recommendation_warning"] is True
-    assert result["max_duration_seconds"] == 900.0
+    assert UploadPhaseService._account_reel_limit("a1", "instagram") == 180.0
+    assert UploadPhaseService._account_reel_limit("a1", "facebook") == 14400.0

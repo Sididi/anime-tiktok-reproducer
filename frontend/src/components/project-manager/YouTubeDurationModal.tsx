@@ -101,14 +101,14 @@ export function YouTubeDurationModal({
       <div className="flex items-center justify-between">
         <div>
           <h3 className="text-lg font-semibold">
-            Vidéo trop longue pour YouTube
+            Vidéo trop longue pour YouTube et Instagram
           </h3>
           <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1 font-mono">
             {projectTitle || "Projet"} · {projectId}
           </p>
           <p className="text-sm text-[hsl(var(--muted-foreground))] mt-2">
             Durée originale : <strong>{formatDuration(durationSeconds)}</strong>
-            {" "}— YouTube limite ce flux à <strong>3:00</strong>.
+            {" "}— YouTube et Instagram limitent ce flux à <strong>3:00</strong>.
           </p>
         </div>
         <Button
@@ -204,7 +204,7 @@ export function YouTubeDurationModal({
           className="active:scale-95 transition-transform text-[hsl(var(--muted-foreground))]"
         >
           <Ban className="h-4 w-4 mr-1.5" />
-          Ne pas uploader sur YouTube
+          Ne pas uploader sur YouTube ni Instagram
         </Button>
       </div>
     </motion.div>

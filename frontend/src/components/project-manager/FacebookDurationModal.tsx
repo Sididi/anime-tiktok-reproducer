@@ -12,9 +12,7 @@ interface FacebookDurationModalProps {
   durationSeconds: number;
   speedFactor: number;
   spedUpAvailable: boolean;
-  platform?: "Facebook" | "Instagram";
   maxDurationSeconds?: number;
-  recommendationOnly?: boolean;
   onChoice: (strategy: UploadDurationStrategy) => void;
   onClose: () => void;
   stacked?: boolean;
@@ -37,9 +35,7 @@ export function FacebookDurationModal({
   durationSeconds,
   speedFactor,
   spedUpAvailable,
-  platform = "Facebook",
   maxDurationSeconds = 90,
-  recommendationOnly = false,
   onChoice,
   onClose,
   stacked = false,
@@ -111,20 +107,15 @@ export function FacebookDurationModal({
       <div className="flex items-center justify-between">
         <div>
           <h3 className="text-lg font-semibold">
-            {recommendationOnly
-              ? `Portée Instagram réduite au-delà de 3:00`
-              : `Vidéo trop longue pour ${platform}`}
+            Vidéo trop longue pour Facebook
           </h3>
           <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1 font-mono">
             {projectTitle || "Projet"} · {projectId}
           </p>
           <p className="text-sm text-[hsl(var(--muted-foreground))] mt-2">
             Durée originale :{" "}
-            <strong>{formatDuration(durationSeconds)}</strong> — {recommendationOnly ? (
-              <>Instagram accepte cette durée, mais les Reels de plus de <strong>3:00</strong> peuvent ne pas être recommandés aux nouvelles audiences.</>
-            ) : (
-              <>{platform} limite ce compte à <strong>{formatDuration(maxDuration)}</strong>.</>
-            )}
+            <strong>{formatDuration(durationSeconds)}</strong> — Facebook limite
+            ce compte à <strong>{formatDuration(maxDuration)}</strong>.
           </p>
         </div>
         <Button
@@ -137,7 +128,7 @@ export function FacebookDurationModal({
         </Button>
       </div>
 
-      {!recommendationOnly && <div
+      <div
         className={`grid gap-4 ${spedUpAvailable ? "grid-cols-2" : "grid-cols-1"}`}
       >
         <div className="flex flex-col gap-3">
@@ -211,28 +202,18 @@ export function FacebookDurationModal({
             </div>
           </div>
         )}
-      </div>}
+      </div>
 
       <div className="flex justify-center pt-1">
         <Button
           variant="outline"
           size="sm"
-          onClick={() => onChoice(recommendationOnly ? "auto" : "skip")}
+          onClick={() => onChoice("skip")}
           className="active:scale-95 transition-transform text-[hsl(var(--muted-foreground))]"
         >
           <Ban className="h-4 w-4 mr-1.5" />
-          {recommendationOnly ? "Continuer sur Instagram" : `Ne pas uploader sur ${platform}`}
+          Ne pas uploader sur Facebook
         </Button>
-        {recommendationOnly && (
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => onChoice("skip")}
-          >
-            <Ban className="h-4 w-4 mr-1.5" />
-            Ne pas uploader sur Instagram
-          </Button>
-        )}
       </div>
     </motion.div>
   );
