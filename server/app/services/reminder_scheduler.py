@@ -55,7 +55,6 @@ _PREPARE_VIDEO_PASS_ERROR = "prepare_video: video preparation pass"
 _PREPARE_VIDEO_FFMPEG_ERROR = "prepare_video: ffmpeg failed"
 _PREPARE_VIDEO_FFMPEG_ERRORED = "prepare_video: ffmpeg errored"
 _DOWNLOAD_STAGE_ERROR = "download:"
-_LEGACY_IG_FILE_SIZE_ERROR = "bytes exceeds 314572800 bytes"
 
 
 # (project_id, platform) → running dispatch task. In-memory only: after a
@@ -488,7 +487,6 @@ def _should_retry_recoverable_instagram_failure(status: PlatformStatus) -> bool:
         _PREPARE_VIDEO_FFMPEG_ERROR: _IG_MAX_ATTEMPTS,
         _PREPARE_VIDEO_FFMPEG_ERRORED: _IG_MAX_ATTEMPTS,
         _DOWNLOAD_STAGE_ERROR: _IG_MAX_ATTEMPTS,
-        _LEGACY_IG_FILE_SIZE_ERROR: _IG_MAX_ATTEMPTS,
     }
     return (
         status.status == "failed"

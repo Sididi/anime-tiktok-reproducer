@@ -711,7 +711,6 @@ async def test_dispatch_instagram_retries_resumable_header_error_once(
     [
         "prepare_video: video preparation pass 2 failed: ffmpeg version 7.1.4",
         "download:",
-        "validate: file size 577593975 bytes exceeds 314572800 bytes",
     ],
 )
 async def test_dispatch_instagram_retries_old_recoverable_failures_once(
