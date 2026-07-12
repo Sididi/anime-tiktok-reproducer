@@ -107,8 +107,17 @@ def mock_meta_side_effects(monkeypatch):
 
 
 @respx.mock
-async def test_happy_path():
+async def test_happy_path(monkeypatch):
     """Full happy path: container → IN_PROGRESS → FINISHED → publish → permalink."""
+    prepared_sizes: list[int] = []
+
+    async def prepare(path):
+        prepared_sizes.append(path.stat().st_size)
+        return path
+
+    monkeypatch.setattr(
+        instagram_publisher, "_prepare_video_for_instagram_upload", prepare
+    )
     download_route = _mock_video_download()
     create_route = _mock_resumable_create()
     status_responses = [
@@ -137,6 +146,7 @@ async def test_happy_path():
     assert status_route.call_count == 2
     assert publish_route.called
     assert permalink_route.called
+    assert prepared_sizes == [len(b"fake mp4 bytes")]
 
 
 @respx.mock
@@ -957,11 +967,13 @@ async def test_caption_limit_failure_happens_before_download():
 
 
 @respx.mock
-async def test_validation_failure_is_stage_prefixed(monkeypatch):
-    async def validate(path):
-        return "duration 1.00s outside 3-900s"
+async def test_preparation_failure_is_stage_prefixed(monkeypatch):
+    async def prepare(path):
+        raise RuntimeError("duration 1.00s outside 3-900s")
 
-    monkeypatch.setattr(instagram_publisher, "_validate_video", validate)
+    monkeypatch.setattr(
+        instagram_publisher, "_prepare_video_for_instagram_upload", prepare
+    )
     _mock_video_download()
 
     result = await publish_to_instagram(
@@ -969,28 +981,30 @@ async def test_validation_failure_is_stage_prefixed(monkeypatch):
     )
 
     assert result.success is False
-    assert result.detail == "validate: duration 1.00s outside 3-900s"
+    assert result.detail == "prepare: duration 1.00s outside 3-900s"
 
 
-async def test_validation_failure_deletes_downloaded_video(tmp_path, monkeypatch):
+async def test_preparation_failure_deletes_downloaded_video(tmp_path, monkeypatch):
     video = tmp_path / "downloaded.mp4"
     video.write_bytes(b"fake mp4 bytes")
 
     async def download(client, video_url, *, temp_dir=None):
         return video
 
-    async def validate(path):
-        return "duration 1.00s outside 3-900s"
+    async def prepare(path):
+        raise RuntimeError("duration 1.00s outside 3-900s")
 
     monkeypatch.setattr(instagram_publisher, "_download_video", download)
-    monkeypatch.setattr(instagram_publisher, "_validate_video", validate)
+    monkeypatch.setattr(
+        instagram_publisher, "_prepare_video_for_instagram_upload", prepare
+    )
 
     result = await publish_to_instagram(
         **_COMMON, poll_interval=0.01, poll_timeout=1.0
     )
 
     assert result.success is False
-    assert result.detail == "validate: duration 1.00s outside 3-900s"
+    assert result.detail == "prepare: duration 1.00s outside 3-900s"
     assert not video.exists()
 
 

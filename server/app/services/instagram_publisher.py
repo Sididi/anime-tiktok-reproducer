@@ -68,8 +68,11 @@ _DEFAULT_CONTENT_PUBLISHING_QUOTA_TOTAL = 50
 _MAX_CAPTION_CHARS = 2200
 _MAX_HASHTAGS = 30
 _MAX_MENTIONS = 20
-_MAX_REEL_BYTES = 300 * 1024 * 1024
-_TARGET_REEL_BYTES = 280 * 1024 * 1024
+# Meta documents a decimal 1 GB maximum for Instagram Reels. Keep a 5% safety
+# margin for files that actually need normalization, while preserving compliant
+# originals below that threshold without a quality-reducing transcode.
+_MAX_REEL_BYTES = 1_000_000_000
+_TARGET_REEL_BYTES = 950_000_000
 _MIN_REEL_DURATION_SECONDS = 3.0
 _MAX_REEL_DURATION_SECONDS = 15 * 60.0
 _ALLOWED_VIDEO_CODECS = {"h264", "hevc"}
@@ -692,7 +695,11 @@ def _video_filter() -> str:
     )
 
 
-async def _normalize_video_for_instagram_upload(video_path: Path) -> Path:  # noqa: PLR0915
+async def _normalize_video_for_instagram_upload(
+    video_path: Path,
+    *,
+    max_duration_seconds: float = _MAX_REEL_DURATION_SECONDS,
+) -> Path:  # noqa: PLR0915
     file_size = video_path.stat().st_size
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
@@ -811,7 +818,9 @@ async def _normalize_video_for_instagram_upload(video_path: Path) -> Path:  # no
                 )
                 continue
 
-            if detail := await _validate_video(out_path):
+            if detail := await _validate_video_with_limit(
+                out_path, max_duration_seconds
+            ):
                 logger.warning(
                     "Instagram video normalization produced invalid file: %s",
                     detail,
@@ -836,7 +845,11 @@ async def _normalize_video_for_instagram_upload(video_path: Path) -> Path:  # no
     )
 
 
-async def _prepare_video_for_instagram_upload(video_path: Path) -> Path:
+async def _prepare_video_for_instagram_upload(
+    video_path: Path,
+    *,
+    max_duration_seconds: float = _MAX_REEL_DURATION_SECONDS,
+) -> Path:
     """Stage a Reel for Instagram while avoiding unnecessary transcoding.
 
     Existing generated videos are usually already compliant. Keep those files
@@ -844,7 +857,9 @@ async def _prepare_video_for_instagram_upload(video_path: Path) -> Path:
     size limits. The caller owns cleanup of the returned path.
     """
     file_size = video_path.stat().st_size
-    original_detail = await _validate_video(video_path)
+    original_detail = await _validate_video_with_limit(
+        video_path, max_duration_seconds
+    )
     if original_detail is None and file_size <= _TARGET_REEL_BYTES:
         logger.info(
             "Instagram video preparation using original compliant file: %d bytes",
@@ -854,7 +869,9 @@ async def _prepare_video_for_instagram_upload(video_path: Path) -> Path:
 
     original_can_fallback = original_detail is None and file_size <= _MAX_REEL_BYTES
     try:
-        return await _normalize_video_for_instagram_upload(video_path)
+        return await _normalize_video_for_instagram_upload(
+            video_path, max_duration_seconds=max_duration_seconds
+        )
     except RuntimeError as e:
         if original_can_fallback:
             logger.warning(
@@ -964,6 +981,17 @@ async def _validate_video_with_limit(
     if max_duration_seconds == _MAX_REEL_DURATION_SECONDS:
         return await _validate_video(video_path)
     return await _validate_video(
+        video_path, max_duration_seconds=max_duration_seconds
+    )
+
+
+async def _prepare_video_with_limit(
+    video_path: Path,
+    max_duration_seconds: float,
+) -> Path:
+    if max_duration_seconds == _MAX_REEL_DURATION_SECONDS:
+        return await _prepare_video_for_instagram_upload(video_path)
+    return await _prepare_video_for_instagram_upload(
         video_path, max_duration_seconds=max_duration_seconds
     )
 
@@ -1358,13 +1386,15 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                         publish_state=state,
                     )
 
-                if detail := await _validate_video_with_limit(
-                    video_path, max_duration_seconds
-                ):
+                try:
+                    video_path = await _prepare_video_with_limit(
+                        video_path, max_duration_seconds
+                    )
+                except RuntimeError as exc:
                     video_path.unlink(missing_ok=True)
                     return InstagramPublishResult(
                         success=False,
-                        detail=_stage_detail("validate", detail),
+                        detail=_stage_detail("prepare", str(exc)),
                         publish_state=state,
                     )
                 expires_at = _utc_now() + timedelta(
@@ -1527,13 +1557,15 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                         publish_state=state,
                     )
 
-                if detail := await _validate_video_with_limit(
-                    video_path, max_duration_seconds
-                ):
+                try:
+                    video_path = await _prepare_video_with_limit(
+                        video_path, max_duration_seconds
+                    )
+                except RuntimeError as exc:
                     video_path.unlink(missing_ok=True)
                     return InstagramPublishResult(
                         success=False,
-                        detail=_stage_detail("validate", detail),
+                        detail=_stage_detail("prepare", str(exc)),
                         publish_state=state,
                     )
                 expires_at = state.expires_at or (
