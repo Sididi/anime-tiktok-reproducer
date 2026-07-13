@@ -271,7 +271,7 @@ def test_stage5_recovers_known_offset(monkeypatch, tmp_path) -> None:
     _install_stage5_fakes(monkeypatch, tmp_path)
     # fitted line is 0.3s early; edge-anchored sweep must recover +0.3
     scenes, remapped, raw = _one_scene_setup(a=1.0, b=_TRUE_QUERY_TO_SOURCE - 0.3)
-    deltas, doubts = SceneAlignerService._stage5_refine(
+    deltas, doubts, _splits = SceneAlignerService._stage5_refine(
         Path("query.mp4"), scenes, remapped, [0], raw, "video"
     )
     assert 0 in deltas
@@ -284,7 +284,7 @@ def test_stage5_rate_arbitration_prefers_unit_slope(monkeypatch, tmp_path) -> No
     _install_stage5_fakes(monkeypatch, tmp_path)
     # phantom 0.5x fit whose midpoint sits on the true unit-rate line
     scenes, remapped, raw = _one_scene_setup(a=0.5, b=_TRUE_QUERY_TO_SOURCE + 0.5)
-    deltas, doubts = SceneAlignerService._stage5_refine(
+    deltas, doubts, _splits = SceneAlignerService._stage5_refine(
         Path("query.mp4"), scenes, remapped, [0], raw, "video"
     )
     assert "rate_arbitrated" in doubts.get(0, [])
@@ -297,7 +297,7 @@ def test_stage5_rate_arbitration_prefers_unit_slope(monkeypatch, tmp_path) -> No
 def test_stage5_static_plateau_yields_doubt_not_shift(monkeypatch, tmp_path) -> None:
     _install_stage5_fakes(monkeypatch, tmp_path, static=True)
     scenes, remapped, raw = _one_scene_setup(a=1.0, b=_TRUE_QUERY_TO_SOURCE - 0.3)
-    deltas, doubts = SceneAlignerService._stage5_refine(
+    deltas, doubts, _splits = SceneAlignerService._stage5_refine(
         Path("query.mp4"), scenes, remapped, [0], raw, "video"
     )
     assert "static_start" in doubts.get(0, [])
@@ -353,7 +353,7 @@ def test_stage5_global_assignment_moves_duplicate_onto_continuous_instance(
         _corr(2, 7.25, 12.25, similarity=0.53),
         _corr(3, 8.25, 13.25, similarity=0.53),
     ]
-    deltas, doubts = SceneAlignerService._stage5_refine(
+    deltas, doubts, _splits = SceneAlignerService._stage5_refine(
         Path("query.mp4"),
         scenes,
         remapped,
@@ -382,7 +382,7 @@ def test_stage5_global_assignment_keeps_static_content_isolated_scene(
         _corr(2, 0.25, 5.25, similarity=0.52),
         _corr(3, 1.25, 6.25, similarity=0.53),
     ]
-    deltas, doubts = SceneAlignerService._stage5_refine(
+    deltas, doubts, _splits = SceneAlignerService._stage5_refine(
         Path("query.mp4"),
         scenes,
         remapped,
@@ -573,3 +573,84 @@ def test_index_duplicate_recall_finds_unretrieved_instance(monkeypatch) -> None:
     t_mid = 10.5
     pos = float(best["a"]) * t_mid + float(best["b"])
     assert abs(pos - 400.5) <= 1.5
+
+
+def test_zoom_rate_measures_progressive_zoom_and_static() -> None:
+    """D3 scale-velocity (v144-v155): a progressive zoom-out reads as a
+    negative log-scale slope; a static shot reads ~0."""
+    import cv2
+
+    rng = np.random.default_rng(11)
+    base = np.kron(
+        rng.integers(0, 255, (48, 72), dtype=np.uint8),
+        np.ones((10, 10), np.uint8),
+    ).astype(np.float32)  # 480 x 720
+    h, w = base.shape
+
+    def zoomed(scale: float) -> np.ndarray:
+        ch, cw = int(h / scale), int(w / scale)
+        y0, x0 = (h - ch) // 2, (w - cw) // 2
+        crop = base[y0 : y0 + ch, x0 : x0 + cw]
+        return cv2.resize(crop, (640, 360)).astype(np.float32)
+
+    # zoom-out at -8%/s over 1.5s: content scale factor exp(-0.08 t)
+    frames_zoom = [
+        (t, zoomed(1.3 * float(np.exp(-0.08 * t))))
+        for t in (0.0, 0.5, 1.0, 1.5)
+    ]
+    rate_zoom = SceneAlignerService._zoom_rate(frames_zoom)
+    assert rate_zoom is not None
+    assert -0.12 <= rate_zoom <= -0.04
+
+    frames_static = [(t, zoomed(1.3)) for t in (0.0, 0.5, 1.0, 1.5)]
+    rate_static = SceneAlignerService._zoom_rate(frames_static)
+    assert rate_static is not None
+    assert abs(rate_static) <= 0.01
+
+    # unmeasurable: too short a span
+    assert (
+        SceneAlignerService._zoom_rate(frames_static[:1]) is None
+    )
+
+
+def test_fadeout_tail_joins_previous_line_and_bright_tail_stays(monkeypatch, tmp_path) -> None:
+    """The edit's final fadeout-to-black (owner round-8, 411f#51) joins the
+    previous chain's line; a bright trailing no-match (appended non-anime
+    content, 5e85#45) stays an honest no-match."""
+    from PIL import Image as PILImage
+
+    from app.services.anime_matcher import AnimeMatcherService
+
+    scenes = [
+        Scene(index=0, start_time=0.0, end_time=2.0),
+        Scene(index=1, start_time=2.0, end_time=2.6),
+    ]
+    seg = SegmentHypothesis(
+        id=1, episode="ep-01.mkv", tiktok_start=0.0, tiktok_end=2.0,
+        a=1.0, b=100.0, inlier_count=10, mean_similarity=0.8, score=1.0,
+        scene_index=0,
+    )
+
+    def run_with(tail_level: int):
+        remapped = [([0], seg), ([1], None)]
+        raw = [(100.0, 102.0), None]
+        doubts: dict[int, list[str]] = {}
+        img = PILImage.new("RGB", (64, 64), (tail_level,) * 3)
+        monkeypatch.setattr(
+            AnimeMatcherService,
+            "extract_frames",
+            classmethod(lambda cls, video_path, ts: [img for _ in ts]),
+        )
+        SceneAlignerService._recover_no_match(
+            tmp_path / "v.mp4", scenes, raw, remapped, {}, [],
+            cache=None, trusted_floor=0.75, doubts=doubts,
+        )
+        return raw, remapped, doubts
+
+    raw, remapped, doubts = run_with(tail_level=2)  # black fadeout
+    assert raw[1] == (102.0, 102.6)
+    assert remapped[1][1] is not None and remapped[1][1].episode == "ep-01.mkv"
+    assert "fadeout_tail" in doubts.get(1, [])
+
+    raw, remapped, doubts = run_with(tail_level=140)  # bright real content
+    assert raw[1] is None and remapped[1][1] is None

@@ -221,9 +221,15 @@ class SceneDetectorService:
                 anime_name=anime_name,
             )
 
+        import os as _os
+
         if (
             threshold <= 16.0
             and len(sanitized_ranges) > SceneDetectorService.AUTO_DENSE_MIN_SCENES
+            # M5 removal experiment (GOAL v4.2): only 411f (78 scenes)
+            # triggers this pass; the v136 static-cut reinject above is
+            # independent and stays
+            and not _os.environ.get("ATR_NO_AUTO_DENSE")
         ):
             dense_ranges, _, dense_fps = SceneDetectorService._detect_ranges(
                 video_path,

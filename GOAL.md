@@ -1,4 +1,4 @@
-Finalize the scene-matching algorithm (`backend/app/services/scene_aligner.py`) against the owner's confirmed failure list, then re-harden performance and finish the production cleanup. This document (v4) was produced on 2026-07-11 after the full v57→v100 execution of GOAL v3 (journal: `docs/GOAL_JOURNAL.md`) and FIVE owner review rounds whose verdicts live in `backend/data/eval_waivers.json` (113 entries, zero stale). The Stage-5 native arbitration layer exists and works; the production route runs the aligner; the remaining work is a precisely enumerated, owner-labeled set of 18 hard-fail scenes plus a tolerable set, with the instruments' limits already measured. Do not re-derive what the journal already settles — its negative results are load-bearing.
+Finalize the scene-matching algorithm (`backend/app/services/scene_aligner.py`) down to the LAST owner-confirmed failures, then execute M5 (200s target, legacy deletion, constants audit). This document (v4.2) was updated on 2026-07-13 after the v101→v136 execution of the v4 milestones (journal: `docs/GOAL_JOURNAL.md` — its negative results are load-bearing, never re-derive them) and SEVEN owner review rounds whose verdicts live in `backend/data/eval_waivers.json` (115 entries: 6 fails = the §2 target, 6 skips, the rest owner-passes; zero stale). Fourteen of the original 18 hard fails are machine-fixed, dcd#6 fell to the v136 motion-conditioned cut detector, all four projects run under 300s on a quiet machine. What remains: FOUR hard scenes plus TWO start-precision fixes (§2), each with fresh owner intelligence (§3), then M5.
 
 # 0. Permissions and hard limits
 
@@ -15,16 +15,16 @@ Hard limits, absolute:
 
 Pipeline: Stage 1-2 dense 8fps sampling + diff curve + FAISS retrieval → Stage 3 per-fragment line hypotheses → Stage 4 segmentation DP (span fits, boundary priors, beam) → Stage 5 native arbitration (per-end anchoring on true edge frames, zoom-SSCD duplicate arbitration + native identity certificate + global assignment, native boundary tug, interior pull-back snap, registered pan localizer) → SceneMatch build with `doubt_reasons`. `/matches` runs the aligner (M5 of v3 shipped); ~1200 lines of legacy deleted.
 
-Standings (v99 outputs + round-5 verdicts + the 411f GT fix; scene E/L/F then source E/L/WP/F; waivers):
+Standings after v136 + the round-6 ledger (scene E/L/F then source E/L/WP/F; quiet-machine elapsed; round-7 re-score due at M0 — dcd's line carries the v136 collaterals now resolved by round-7 verdicts):
 
-| Project | Scene | Source | Waivers | Elapsed |
-|---|---|---|---|---|
-| dcd74148c7ec | 19/0/1 | 19/0/0/1 | 7 | 86.8s |
-| 85de83ca6323 | 49/2/3 | 43/0/6/5 | 14 | 168.4s |
-| 411f73d26c1d | 50/0/2 | 49/0/0/3 | 13 | 242.0s (drift regime; ~195-200s normalized) |
-| 5e85164d9ff8 | 44/2/0 | 40/0/6/0 | 12 | 160.4s |
+| Project | Scene | Source | Elapsed |
+|---|---|---|---|
+| dcd74148c7ec | #6 → loose (was the last scene fail) | 3 looses + #18 WP (round-7: fix #18 start) | 98.5s |
+| 85de83ca6323 | 52/0/2 | 52/0/0/2 | 283.1s |
+| 411f73d26c1d | 51/0/1 | 50/1/0/1 | 298.5s |
+| 5e85164d9ff8 | 46/0/0 | 45/0/1/0 | 225.4s |
 
-Oracle guard (`--gt-scenes` must return given boundaries at/above baseline): holds (19/20, 51/54, 51/52, 46/46).
+Oracle guard (`--gt-scenes` must return given boundaries at/above baseline): holds (19/20, 52/54, 51/52, 46/46).
 
 Measured instrument limits — treat as settled, do not re-attempt blind:
 - Index-side signals (SSCD 2fps cosine) cannot separate duplicate instances (gaps 0.02-0.05) nor rates on lookalike montage. (v33, v53)
@@ -36,25 +36,28 @@ Measured instrument limits — treat as settled, do not re-attempt blind:
 - Tug parameter widening does not reach the structural residuals; they are segmentation-level. (v100)
 - Never validate any change on one project — leave-one-out on all four, fresh AND oracle. (v70/v78-v84 lesson, twice)
 
-# 2. The target: owner-labeled failure set (round 5, exhaustive — unlisted scenes are owner-valid)
+# 2. The target: owner round-7 failure set (2026-07-13, exhaustive — unlisted scenes are owner-valid)
 
-HARD (must be machine-fixed; 18 scenes):
-- H1 wrong instance / duplicates (14): 85de #3 #10 #11 #17 #19 #20 #22 #24 #40 #53 (10 — #20 "start way too early"); 5e85 #11 #45; 411f #28 ("first frame too soon") #51. Each has the owner-validated truth in GT and the wrong machine pick recorded — a fully labeled bench.
-- H2 structural segmentation (4): dcd #6 (+#7 fold — the 16.03 missed cut inside static content; the tug fix exists but is blocked by the duplicate-suspect gate, journal v91); 85de #0 (fold-no-chain); 5e85 #25 #26 (generated interval 2.0s shorter than GT — extent/over-merge; owner hint: #25 is a zoomed, very fast, linear right-to-left swoosh — a motion signature).
+HARD (4 scenes — the survivors of every instrument built so far; per-scene diagnoses in the journal v105-v136):
+- 85de #10 (scene no-coverage inside a chain) and #20 (fold-no-chain): evidence-hole cuts — NO pixel-level cut exists at the GT boundaries even at detector threshold 8 (v134), and both sides are lookalike content. The cut must be INSERTED from source-side reasoning, not found on the TikTok side (§3-D4).
+- 411f #51 (fold-no-chain): duplicate instances with both static signals dead (bench margins ≤0.01).
+- 5e85 #11 (wrong primary): loop content — truth registers at 0.627 but a loop-instance lookalike sits within the 0.07 switch margin; the honest-abstain is correct under current instruments (§3-D3).
 
-TOLERABLE (fix if the instrument reaches them, else owner-waived after honest attempt; 6 scenes):
-- Quasi-static trims: 85de #13 #49 ("first frame too soon"), 5e85 #32 ("too late") #34 ("a bit too early").
-- 411f #7 #8: extreme evidence hole (multi-shot action burst played at 0.59x slow-mo; retrieval sees nothing). GT is now correct there; waivable per owner (2026-07-11).
+START-PRECISION (2 scenes, owner round-7 — the chosen instance/content is approved, only the interval start is wrong):
+- 411f #28: "first frame too soon". Owner intelligence: the machine's instance and GT's are exact duplicates that render identically; the GT one is distinguishable ONLY by having no progressive zoom-out — i.e. instance pairs can differ purely in scale-velocity (§3-D3). The chosen instance stays; fix the start.
+- dcd #18: "first frame too soon" (v136 collateral). Fix the start without losing the v136 dcd#6 conversion.
 
-# 3. Prescribed direction
+SKIPPED (owner-approved permanent ignores, already in the ledger): 411f #7 #8 (buggy GT region, evidence-hole slow-mo burst), 5e85 #45 (a non-anime scene is appended at the edit's very end — also a production reality: guard trailing no-evidence content as honest no-match, never force a match there).
 
-One new instrument, one repair, in this order of leverage:
+# 3. Prescribed direction (v4.2 — each item keyed to §2 scenes, bench-gated per §4)
 
-D1 — Motion/temporal-signature matching (serves H1, the 5e85 #25/#26 pair, and possibly the tolerable statics). Frames lie; trajectories don't: duplicate still-shots and lookalike instances differ in WHEN and HOW things move (mouth flaps, pans, the swoosh direction/speed). Generalize the pan localizer into a scorer: per-frame registered shift (phase correlation on the source plane) and/or coarse flow direction/magnitude time-series over the scene, correlated between the TikTok clip and each candidate source window at native fps. The zoom estimate and `_WindowEmbedCache` already exist; the bench (§4) decides go/no-go before any wiring.
+D3 — Registered SCALE-VELOCITY and LOOP-PHASE signatures (411f #51, 5e85 #11; the owner's #28 remark is the design hint). The registration stack already estimates per-frame geometry (ORB+RANSAC partial-affine returns SCALE, the phase-correlation localizer returns SHIFT) but no instrument compares their TIME-DERIVATIVES: a progressive zoom-out is a monotone scale(t) slope; loop instances differ in motion PHASE (shift(t) trajectory alignment — the pan localizer's zero-crossing generalized to a trajectory correlation). Measure both signatures on the #51 and #11 candidate pairs offline FIRST (§4); wire only what separates. These reuse cached windows — marginal decode cost ~0.
 
-D2 — Segmentation-level repair for H2 (deferred with evidence in v100, now due): the DP must be able to cut at a loud native cut even when index evidence is ambiguous — revisit boundary priors/tug gating around owner-confirmed misses (dcd 16.03: the fix exists, find a gate that admits it without re-breaking the v88 oracle guard; 85de #0: fold-no-chain from the arbitration era; 5e85 #25/#26: the extent error is upstream of arbitration). Full regression guard: fresh + oracle on all four, stale-waiver check zero.
+D4 — Source-side cut INSERTION for evidence-hole boundaries (85de #10 #20). No TikTok-side signal exists (v134 measured), but the machine already knows both neighbouring lines: score the TikTok samples over t under line A and line B on the cached registered windows and insert the cut at the CROSSOVER (where B starts out-explaining A), snapping to the sample grid. This extends the native tug to boundary-less regions and plugs into the per-piece outlier arbitration (v113) as its entry point: a chain whose interior piece scores as an outlier under its own line but well under a neighbour-instance line is the #10/#20 pattern. Guard: insertion only when the crossover margin is clean on ≥3 consecutive samples (over-cutting folds back, but a phantom insertion inside an owner-passed chain is a stale — bench it on the two labeled cases + controls first.
 
-Do NOT build: new index-side scorers, new pixel-NCC variants, audio matching (edits replace audio), or any per-scene special case.
+D5 — Start-precision (411f #28, dcd #18): the start-side containment pass (v124-v128) exists and fixed 85de #12/#13; diagnose why it does not fire on these two starts (reach 0.85s? no native cut at the true start? edge-frame match threshold?) and extend the mechanism generally (never a per-scene branch). dcd #18's fix must keep dcd #6's v136 conversion intact (they share the region — regression-check the pair together).
+
+Do NOT build: new index-side scorers, new pixel-NCC variants, audio matching, threshold-8 global reinjection without the motion gate (v134), or any per-scene special case.
 
 # 4. Methodology: labeled bench first (binding)
 
@@ -66,17 +69,17 @@ Bench artifacts live in `~/.cache/atr-eval/bench/` (survives reboots); probe scr
 
 # 5. Milestones — gated, in order
 
-- M0 Reproduce the §1 standings table (fresh, waivers applied) + oracle guard on current code. Journal as v101.
-- M1 Bench + instrument validation: the §4 bench built; D1 measured on it; go/no-go per failure class with numbers. A no-go on a class ⇒ that class's scenes are candidates for the §6 waiver path, stated explicitly.
-- M2 H1 burndown: hard duplicate fails → 0 across all four projects, zero stale waivers, oracle guard holds.
-- M3 H2 burndown: the four structural scenes fixed (or reclassified with owner sign-off), same guards.
-- M4 Tolerable set: fixed where D1 reaches them; the remainder goes to a review round (video pages) for owner waivers. Full fresh runs ≤300s/project.
-- M5 Re-hardening: elapsed back ≤200s/project on a quiet machine; production cleanup leftovers — `anime_matcher` legacy correction passes + crop-index deletion (with regression coverage for the manual merge/rematch APIs they still serve), `scene_detector` AUTO_DENSE_* gates removal (measured leave-one-out experiment), aligner constants consolidated ≤15 with one-line justifications; `pixi run -e dev pytest backend/tests/` green modulo the pre-existing env failures documented in the journal.
+- M0 Verify the round-7 ledger (115 entries, 6 fails, 6 skips — already upserted 2026-07-13) by re-scoring the latest saved outputs, then reproduce fresh standings + oracle guard on current (v136) code. Journal it.
+- M1 Bench the §3 signatures offline on the labeled pairs: D3 scale-velocity + loop-phase on 411f#51 / 5e85#11, D4 crossover insertion on 85de#10/#20, plus ≥20 owner-passed controls. Go/no-go per scene with margins; a no-go is stated with numbers and closes that scene as a final owner call.
+- M2 Start-precision pair (D5): 411f #28 and dcd #18 fixed, zero stale (dcd #6/#7/#18 checked together), oracle guard holds.
+- M3 Hard burndown (D3/D4 where the bench said GO): target scenes → exact/loose, zero stale, oracle guard, ≤300s.
+- M4 Final review round (video pages, review8) on fresh outputs; integrate verdicts; the goal's matching phase closes when the owner's exhaustive list returns zero non-skip fails OR every remaining fail carries a bench-measured no-go and the owner's explicit final call.
+- M5 Re-hardening (starts immediately after M4, same session): elapsed ≤200s/project on a quiet machine (levers: NVDEC/batch decode, window planning — the serial split measured decode 119.5s / embed 79.7s on 85de); `anime_matcher` legacy correction passes + crop-index deletion behind the existing rematch contract test (`test_anime_matcher_partial_rematch.py`); `scene_detector` AUTO_DENSE_* removal experiment — CAREFUL: the v136 static-cut reinject rides the AUTO_DENSE refine machinery, preserve it; aligner constants consolidated ≤15 with one-line justifications; `pixi run -e dev pytest backend/tests/` green modulo the pre-existing env failures documented in the journal.
 
 # 6. Definition of done (replaces the ≤3-waiver rule — owner decision 2026-07-11)
 
 The owner's verdict ledger is the acceptance record; GT corrections were declined, so owner-passed sub-second disagreements legitimately live as waivers with no cap. Done means, per project, from fresh detection:
-- Zero scenes in the owner-fail set: every H1/H2 scene scores exact/loose against GT, and every tolerable scene either scores or carries an owner pass-waiver from a review round.
+- Zero scenes in the owner-fail set: every §2 hard/start-precision scene scores exact/loose against GT, or carries a bench-measured no-go plus the owner's explicit final call from the M4 review round; skips stay skipped.
 - No NEW failures: every previously owner-passed scene still passes or its waiver is intact (zero stale waivers).
 - Non-waived scenes respect the strict budgets (loose ≤3 per axis, WP ≤2, source fails 0).
 - Oracle guard holds; elapsed ≤300s (M4) then ≤200s (M5); GT folders byte-identical; SceneMatch/MatchList contract and manual APIs unchanged.

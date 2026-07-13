@@ -31,88 +31,20 @@ MAX_EVIDENCE_SPEED = 5.0
 # Common playback range from the domain prior, expressed as source seconds/query second.
 COMMON_SOURCE_RATE_MIN = 1.0 / 1.7
 COMMON_SOURCE_RATE_MAX = 1.0 / 0.5
-# SSCD false positives are common; this keeps extremely weak retrievals out of voting.
-SIMILARITY_FLOOR = 0.20
 # A 2 fps index has a 0.5s grid; inliers tolerate about one grid step plus decode jitter.
 SEGMENT_RESIDUAL_SECONDS = 0.75
 # Dense sampling should provide at least two distinct query times for a real segment.
 MIN_SEGMENT_INLIER_TIMES = 2
-# Pairwise line seeding uses a time subset; 12 points spans long scenes at 8 fps cheaply.
-SEED_PAIR_TIME_LIMIT = 12
-# Seed fits are deduped at coarse speed resolution before expensive inlier scans.
-SEED_SPEED_QUANTIZATION = 0.05
-# Keep broad ambiguity for global decode; 80 states keeps DP cheap for 40-60 scenes.
-MAX_SEGMENTS_PER_SCENE = 80
-# Episode switches are rare intruders, so they pay a mild but survivable penalty.
-EPISODE_SWITCH_PENALTY = 0.25
-# Playback is centered near 1x, but this prior is deliberately weak for fast/slow edits.
-UNIT_SOURCE_RATE_PRIOR_WEIGHT = 0.04
-# Backward source jumps exist, so penalize instead of forbidding them.
-BACKWARD_JUMP_PENALTY = 0.20
-# Dense inlier support matters, but repeated anime stills make it weaker than similarity.
-SUPPORT_PRIOR_WEIGHT = 0.15
-# UI contract exposes a compact ranked list, matching the old frontend expectation.
-ALTERNATIVES_PER_SCENE = 5
-# Query-side crop variants are searched when dense direct support stays weak.
-QUERY_VARIANT_MIN_SCENE_SUPPORT = 4
 
 # Redescending inlier window ~3.5 sigma keeps legitimate grid scatter while a
 # 0.5s edit skip (a real cut) loses meaningful weight.
 INLIER_TOLERANCE_SECONDS = 0.55
-# Longest observed GT scene is 14.5s; spans above this are never one scene.
-MAX_GROUP_SPAN_SECONDS = 20.0
-MAX_GROUP_FRAGMENTS = 16
-# TikTok content resuming across a cut at the 8 fps sample scale marks a
-# flash/in-shot artifact. Set high: under equivalence folding an over-cut
-# true flash folds back for free, while lookalike jump cuts at 0.5-0.7
-# wrongly merged are unrecoverable.
-TIKTOK_CUT_CONTINUES_COS = 0.75
-# Below this cross-boundary cosine the pixels certify a hard cut: no
-# extrapolation evidence may lean the boundary prior toward merging
-# (blur/lookalike extrapolation across the 5e85@32.5 swoosh cut measured
-# 0.67 while its tcos was 0.067).
-HARD_CUT_TIKTOK_COS = 0.30
-# Weight of the per-boundary keep/merge prior in DP score units (a sample
-# contributes <= ~0.7 similarity mass; one boundary decision is worth ~2).
-CUT_PRIOR_WEIGHT = 1.0
-# Emission floor per expected sample for the explicit no-match state; real
-# evidence (median true sim ~0.55) must always beat it.
-NO_MATCH_SAMPLE_SCORE = 0.15
-# Beam width for the segmentation DP; states are (span, fit) pairs.
-DP_BEAM_WIDTH = 8
-# Ridge mass pulling fitted slopes toward 1.0 (real-time playback): strong
-# enough to pin statics (whose slope evidence mass is ~0.1) but weak enough
-# that a 1.3s scene with real retiming keeps its measured slope.
-SLOPE_UNIT_RIDGE = 0.15
-# Parsimony margin for slope model selection: a free slope is kept only when
-# real-time playback (rate 1.0) explains less than this fraction of the free
-# fit's evidence mass. Grid quantization plus lookalike phantoms let a free
-# slope always fit noise slightly better; genuine retimes beat unit rate by
-# far more than 5%.
-UNIT_SLOPE_PARSIMONY = 0.95
-# Weak reward for chronological near-continuity between consecutive scenes:
-# resolves exact-duplicate (OP/ED) ambiguity without forbidding real jumps.
-CONTINUITY_REWARD = 0.35
-# Short scale: the reward's job is picking the source-continuous instance
-# among exact-duplicate candidates (its decisive range must be ~1 grid step,
-# not the scale of legitimate edit jumps).
-CONTINUITY_SCALE_SECONDS = 1.5
 # Native-decode verification of merge-leaning static boundaries: the source
 # is decoded at this fps around the predicted continuation and an offset
 # sweep checks whether the after-cut content truly lives at the prediction.
 # 12 fps is load-bearing for R2 per-end precision: 10 fps cost 8 source
 # exacts and staled 9 waivers across the four GT projects (v111).
 VERIFY_DECODE_FPS = 12.0
-# Index self-similarity floor for duplicate-instance recall: true repeats
-# measure >=0.85 on healthy indices; lookalike non-repeats sit ~0.75-0.8
-# (the squish-index tax measures ~0.77, so 0.80 keeps recall usable there
-# while excluding montage lookalikes).
-DUPLICATE_RECALL_MIN_COS = 0.80
-# Query-side deep-recall floor: cross-geometry (cropped query vs full
-# source frame) cosines run far lower than self-similarity (true instances
-# measured at 0.51-0.54 on owner-labeled fails); candidates are only
-# proposals — the registered-footprint SSCD arbitration decides.
-DEEP_RECALL_MIN_COS = 0.45
 # A chain whose current line scores this high under its own registered
 # footprint needs no duplicate arbitration absent other suspicion, and
 # below it the chain is doubtful enough to pay for recall + chronology
@@ -125,6 +57,10 @@ DUPLICATE_TRUSTED_SSCD = 0.75
 # windows measure <=0.16 (bench 2026-07-11). A recovered line below the
 # bar stays no-match.
 RECOVERY_CERT_SSCD = 0.32
+# Lazy-computation sentinel for the scale-velocity certificate (a zoom
+# rate can legitimately be None = unmeasurable, so None cannot mean
+# "not computed yet").
+_SV_UNSET = object()
 
 
 @dataclass(frozen=True)
@@ -301,7 +237,10 @@ class _WindowEmbedCache:
         )
         self._inflight: dict[tuple[str, int, int], object] = {}
         self._prefetch_caps: dict[tuple[int, str], object] = {}
-        self._prefetch_pool = ThreadPoolExecutor(max_workers=2)
+        # 4 workers: candidate scoring blocks on ~1s window decodes while
+        # registration+embed take ~0.5s — 2 workers measured unable to
+        # keep ahead (v160: 210s window decode of 330s refine on 85de)
+        self._prefetch_pool = ThreadPoolExecutor(max_workers=4)
 
     def get_cap(self, episode: str):
         from .anime_library import AnimeLibraryService
@@ -1008,7 +947,7 @@ class SceneAlignerService:
         for sample_index, (sample, results) in enumerate(zip(samples, raw_results, strict=False)):
             for rank, (similarity, metadata) in enumerate(results):
                 sim = float(similarity)
-                if sim < SIMILARITY_FLOOR:
+                if sim < 0.20:
                     continue
                 correspondences.append(
                     Correspondence(
@@ -1048,7 +987,7 @@ class SceneAlignerService:
         scenes: SceneList,
         correspondences: list[Correspondence],
         *,
-        max_segments: int = MAX_SEGMENTS_PER_SCENE,
+        max_segments: int = 80,
         line_limit: int | None = None,
         include_low_rank_common_seeds: bool = False,
     ) -> dict[int, list[SegmentHypothesis]]:
@@ -1308,7 +1247,7 @@ class SceneAlignerService:
         seen: set[tuple[int, int]] = set()
         for speed, offset in seeds:
             key = (
-                round(speed / SEED_SPEED_QUANTIZATION),
+                round(speed / 0.05),
                 round(offset * AnimeMatcherService.get_index_fps()),
             )
             if key in seen:
@@ -1319,9 +1258,9 @@ class SceneAlignerService:
 
     @staticmethod
     def _seed_times(times: list[float]) -> list[float]:
-        if len(times) <= SEED_PAIR_TIME_LIMIT:
+        if len(times) <= 12:
             return times
-        indices = np.linspace(0, len(times) - 1, SEED_PAIR_TIME_LIMIT, dtype=np.int32)
+        indices = np.linspace(0, len(times) - 1, 12, dtype=np.int32)
         return [times[int(index)] for index in indices]
 
     @classmethod
@@ -1397,7 +1336,7 @@ class SceneAlignerService:
         for scene_index, scene in enumerate(scenes.scenes):
             segments = scene_segments.get(scene_index, [])
             best = segments[0] if segments else None
-            if best is not None and best.inlier_count >= QUERY_VARIANT_MIN_SCENE_SUPPORT:
+            if best is not None and best.inlier_count >= 4:
                 continue
             for sample_index, sample_time in enumerate(sample_times):
                 if scene.start_time <= sample_time < scene.end_time:
@@ -1416,7 +1355,7 @@ class SceneAlignerService:
     def _emission_score(segment: SegmentHypothesis) -> float:
         scene_duration = max(0.0, segment.tiktok_end - segment.tiktok_start)
         expected_sample_times = max(
-            float(QUERY_VARIANT_MIN_SCENE_SUPPORT),
+            float(4),
             scene_duration * DENSE_SAMPLE_FPS,
         )
         support = min(
@@ -1424,9 +1363,9 @@ class SceneAlignerService:
             expected_sample_times,
         ) / expected_sample_times
         speed_prior = SceneAlignerService._speed_prior_penalty(segment.a)
-        unit_rate_prior = UNIT_SOURCE_RATE_PRIOR_WEIGHT * abs(math.log(max(segment.a, 1e-3)))
+        unit_rate_prior = 0.04 * abs(math.log(max(segment.a, 1e-3)))
         return (
-            (support * SUPPORT_PRIOR_WEIGHT)
+            (support * 0.15)
             + segment.mean_similarity
             - speed_prior
             - unit_rate_prior
@@ -1951,7 +1890,7 @@ class SceneAlignerService:
         best: tuple[float, float, float, int, float] | None = None
         seen: set[tuple[int, int]] = set()
         for a0, b0 in seeds:
-            key = (round(a0 / SEED_SPEED_QUANTIZATION), round(b0 * 2.0))
+            key = (round(a0 / 0.05), round(b0 * 2.0))
             if key in seen:
                 continue
             seen.add(key)
@@ -1972,7 +1911,7 @@ class SceneAlignerService:
                     # ridge toward unit playback: in static content the slope
                     # is unidentifiable and real-time playback is the prior
                     num = float(np.sum(ww * (xs - x_mean) * (ys_ - y_mean)))
-                    a = (num + SLOPE_UNIT_RIDGE) / (denom + SLOPE_UNIT_RIDGE)
+                    a = (num + 0.15) / (denom + 0.15)
                     b = y_mean - a * x_mean
                 if not (MIN_EVIDENCE_SPEED <= a <= MAX_EVIDENCE_SPEED):
                     break
@@ -2007,7 +1946,7 @@ class SceneAlignerService:
                         )
                         b1 = float(np.average(y[m1] - x[m1], weights=ww1))
                     q1, pb1 = line_quality(1.0, b1)
-                    if q1 >= UNIT_SLOPE_PARSIMONY * quality:
+                    if q1 >= 0.95 * quality:
                         a, b = 1.0, b1
                         quality, per_bin = q1, pb1
             covered = per_bin > 0.0
@@ -2033,7 +1972,7 @@ class SceneAlignerService:
         plus the explicit no-match state."""
         n_bins = sum(evidence[k].n_sample_bins for k in range(i, j + 1))
         fits: list[_SpanFit] = [
-            _SpanFit(None, 1.0, 0.0, NO_MATCH_SAMPLE_SCORE * n_bins, 0, 0.0)
+            _SpanFit(None, 1.0, 0.0, 0.15 * n_bins, 0, 0.0)
         ]
         # candidate episodes: ranked by the best member-hypothesis score
         episode_rank: dict[str, float] = {}
@@ -2257,7 +2196,7 @@ class SceneAlignerService:
             if 0 <= li < len(samples) and 0 <= ri < len(samples) and li != ri:
                 tcos = float(np.dot(samples[li].embedding, samples[ri].embedding))
             record["tiktok_cos"] = round(tcos, 3) if tcos is not None else None
-            if tcos is not None and tcos >= TIKTOK_CUT_CONTINUES_COS:
+            if tcos is not None and tcos >= 0.75:
                 # TikTok content resumes across the cut (flash/overlay pop);
                 # only a time-compatible line makes this a safe merge - jump
                 # cuts between reused lookalike shots also score high tcos
@@ -2325,7 +2264,7 @@ class SceneAlignerService:
                 record["rule"] = "dynamic_extrapolation"
                 if (
                     tcos is not None
-                    and tcos <= HARD_CUT_TIKTOK_COS
+                    and tcos <= 0.30
                     and intra - tcos >= 0.35
                     and prior < 0.2
                 ):
@@ -2459,7 +2398,7 @@ class SceneAlignerService:
                             continue  # the instance the line already sits on
                         w = index.reconstruct(int(fid))
                         cos = float(v @ (w / (np.linalg.norm(w) + 1e-9)))
-                        if cos < DUPLICATE_RECALL_MIN_COS:
+                        if cos < 0.80:
                             continue
                         b = float(meta.timestamp) - t
                         key = (meta.episode, int(round(b / 2.0)))
@@ -2572,7 +2511,7 @@ class SceneAlignerService:
                             continue
                         w = index.reconstruct(int(fid))
                         cos = float(q @ (w / (np.linalg.norm(w) + 1e-9)))
-                        if cos < DEEP_RECALL_MIN_COS:
+                        if cos < 0.45:
                             continue
                         b = float(meta.timestamp) - t
                         key = (meta.episode, int(round(b / 2.0)))
@@ -2616,11 +2555,11 @@ class SceneAlignerService:
         # span fits, bounded by span duration and fragment count
         span_fits: dict[tuple[int, int], list[_SpanFit]] = {}
         for i in range(n):
-            for j in range(i, min(n, i + MAX_GROUP_FRAGMENTS)):
+            for j in range(i, min(n, i + 16)):
                 if (
                     j > i
                     and scenes.scenes[j].end_time - scenes.scenes[i].start_time
-                    > MAX_GROUP_SPAN_SECONDS
+                    > 20.0
                 ):
                     break
                 span_fits[(i, j)] = cls._fit_span(
@@ -2642,21 +2581,21 @@ class SceneAlignerService:
         # interior boundary prior mass per span (merged boundaries pay -B)
         def span_emission(i: int, j: int, fit: _SpanFit) -> float:
             interior = sum(priors[k] for k in range(i, j))
-            return fit.quality - CUT_PRIOR_WEIGHT * interior
+            return fit.quality - 1.0 * interior
 
         def transition(prev: _SpanFit, nxt: _SpanFit, boundary: float) -> float:
             if prev.episode is None or nxt.episode is None:
                 return 0.0
             if prev.episode != nxt.episode:
-                return -EPISODE_SWITCH_PENALTY
+                return -0.25
             gap = nxt.source_at(boundary) - prev.source_at(boundary)
             score = 0.0
             if gap < -INLIER_TOLERANCE_SECONDS:
-                score -= BACKWARD_JUMP_PENALTY
+                score -= 0.20
             # chronological near-continuity is the norm; this weak reward
             # picks the nearby instance among exact-duplicate candidates
-            score += CONTINUITY_REWARD * math.exp(
-                -abs(gap) / CONTINUITY_SCALE_SECONDS
+            score += 0.35 * math.exp(
+                -abs(gap) / 1.5
             )
             return score
 
@@ -2665,7 +2604,7 @@ class SceneAlignerService:
         entries: list[list[tuple[float, int, _SpanFit, int]]] = [[] for _ in range(n)]
         for j in range(n):
             best_for_j: list[tuple[float, int, _SpanFit, int]] = []
-            for i in range(max(0, j - MAX_GROUP_FRAGMENTS + 1), j + 1):
+            for i in range(max(0, j - 16 + 1), j + 1):
                 fits = span_fits.get((i, j))
                 if not fits:
                     continue
@@ -2675,7 +2614,7 @@ class SceneAlignerService:
                         best_for_j.append((emission, i, fit, -1))
                         continue
                     boundary = scenes.scenes[i - 1].end_time
-                    cut_bonus = CUT_PRIOR_WEIGHT * priors[i - 1]
+                    cut_bonus = 1.0 * priors[i - 1]
                     best_prev = None
                     best_prev_idx = -1
                     for prev_idx, (p_score, _, p_fit, _) in enumerate(entries[i - 1]):
@@ -2689,7 +2628,7 @@ class SceneAlignerService:
                         (best_prev + cut_bonus + emission, i, fit, best_prev_idx)
                     )
             best_for_j.sort(key=lambda item: item[0], reverse=True)
-            entries[j] = best_for_j[:DP_BEAM_WIDTH]
+            entries[j] = best_for_j[:8]
 
         if not entries[-1]:
             # degenerate: no fits anywhere; one no-match group per fragment
@@ -2811,7 +2750,7 @@ class SceneAlignerService:
         records: list[dict[str, object]] = []
         for index, scene in enumerate(scenes.scenes):
             candidates: list[dict[str, object]] = []
-            for segment in decode_segments.get(index, [])[:ALTERNATIVES_PER_SCENE]:
+            for segment in decode_segments.get(index, [])[:5]:
                 candidates.append(
                     {
                         "episode": segment.episode,
@@ -3148,8 +3087,9 @@ class SceneAlignerService:
         # and rate arbitration (fitted vs unit slope) runs on native frames.
         refined_delta: dict[int, tuple[float, float]] = {}
         scene_doubts: dict[int, list[str]] = {}
+        crossover_splits: dict[int, tuple[float, float, float, str, str]] = {}
         if samples:
-            refined_delta, scene_doubts = cls._stage5_refine(
+            refined_delta, scene_doubts, crossover_splits = cls._stage5_refine(
                 video_path,
                 final_scenes,
                 remapped,
@@ -3214,6 +3154,72 @@ class SceneAlignerService:
                     end_candidates=end_candidates,
                 )
             )
+
+        # apply R5c crossover insertions: split the scene at t_split and
+        # hand the outer side to the rival line. Applied descending so
+        # earlier piece indices stay valid; scenes and matches are then
+        # renumbered together (SceneMatch/MatchList contract unchanged —
+        # one match per scene).
+        for p in sorted(crossover_splits, reverse=True):
+            t_split, a_b, b_b, ep_b, side_b = crossover_splits[p]
+            sc_p = final_scenes.scenes[p]
+            m_p = matches.matches[p]
+            if m_p.was_no_match or not (
+                sc_p.start_time + 0.1 < t_split < sc_p.end_time - 0.1
+            ):
+                continue
+            rate_a = (m_p.end_time - m_p.start_time) / max(
+                1e-6, sc_p.end_time - sc_p.start_time
+            )
+            if side_b == "suffix":
+                left_src = (
+                    m_p.start_time,
+                    m_p.start_time
+                    + (t_split - sc_p.start_time) * rate_a,
+                )
+                right_src = (a_b * t_split + b_b, a_b * sc_p.end_time + b_b)
+                left_ep, right_ep = m_p.episode, ep_b
+            else:
+                left_src = (a_b * sc_p.start_time + b_b, a_b * t_split + b_b)
+                right_src = (
+                    m_p.end_time - (sc_p.end_time - t_split) * rate_a,
+                    m_p.end_time,
+                )
+                left_ep, right_ep = ep_b, m_p.episode
+            new_scene = Scene(
+                index=sc_p.index, start_time=t_split, end_time=sc_p.end_time
+            )
+            sc_p.end_time = t_split
+            m_p.episode = left_ep
+            m_p.start_time = float(left_src[0])
+            m_p.end_time = float(left_src[1])
+            m_p.speed_ratio = float(
+                (sc_p.end_time - sc_p.start_time)
+                / max(1e-6, m_p.end_time - m_p.start_time)
+            )
+            new_match = SceneMatch(
+                scene_index=sc_p.index,
+                episode=right_ep,
+                start_time=float(right_src[0]),
+                end_time=float(right_src[1]),
+                confidence=m_p.confidence,
+                speed_ratio=float(
+                    (new_scene.end_time - new_scene.start_time)
+                    / max(1e-6, right_src[1] - right_src[0])
+                ),
+                was_no_match=False,
+                doubt_reasons=list(m_p.doubt_reasons),
+                alternatives=m_p.alternatives,
+                start_candidates=m_p.start_candidates,
+                middle_candidates=m_p.middle_candidates,
+                end_candidates=m_p.end_candidates,
+            )
+            final_scenes.scenes.insert(p + 1, new_scene)
+            matches.matches.insert(p + 1, new_match)
+        if crossover_splits:
+            final_scenes.renumber()
+            for k_m, m_k in enumerate(matches.matches):
+                m_k.scene_index = k_m
         return matches
 
     # candidate zooms for the edit geometry: edits are 9:16 crops/zooms of
@@ -3324,6 +3330,40 @@ class SceneAlignerService:
         if (x1 - x0) * (y1 - y0) > 0.9:
             return None  # effectively full frame: nothing to crop
         return (x0, y0, x1, y1)
+
+    @classmethod
+    def _zoom_rate(
+        cls, frames: list[tuple[float, np.ndarray]]
+    ) -> float | None:
+        """Relative scale drift per second across (time, gray) frames —
+        the SCALE-VELOCITY signature (owner round-7 intelligence: duplicate
+        instances can differ purely in progressive zoom; bench 2026-07-13:
+        static instance −0.0010/s vs zooming instance −0.0664/s, ratio 66x,
+        while every static signal is dead). Least-squares slope of
+        log(scale) of registrations from the first frame onto the others;
+        None when fewer than two registrations succeed or the span is too
+        short to measure (<0.3s)."""
+        if len(frames) < 2:
+            return None
+        t0, g0 = frames[0]
+        pts: list[tuple[float, float]] = [(0.0, 0.0)]
+        for t, g in frames[1:]:
+            T = cls._registration_transform(g0, g)
+            if T is None:
+                continue
+            det = abs(float(np.linalg.det(T[:, :2])))
+            if det <= 1e-9:
+                continue
+            pts.append((t - t0, 0.5 * float(np.log(det))))
+        if len(pts) < 2:
+            return None
+        arr = np.asarray(pts)
+        span = float(arr[:, 0].max() - arr[:, 0].min())
+        if span < 0.3:
+            return None
+        A = np.vstack([arr[:, 0], np.ones(len(arr))]).T
+        sol, *_ = np.linalg.lstsq(A, arr[:, 1], rcond=None)
+        return float(sol[0])
 
     @classmethod
     def _pan_zero_crossing(
@@ -3711,6 +3751,67 @@ class SceneAlignerService:
         for piece in range(n):
             if raw[piece] is not None or remapped[piece][1] is not None:
                 continue
+            if piece == n - 1:
+                # the edit's final FADEOUT-TO-BLACK (owner round-8 fact,
+                # 411f#51: a manually added closing transition) rides the
+                # previous scene's continuing content — join the previous
+                # chain's line when the tail is black/monotone-fading.
+                # Anything else at the tail stays an honest no-match:
+                # production edits append non-anime outros (owner round-6
+                # fact, 5e85#45; its tail measured bright real content,
+                # luminance 80-137 vs the fadeout's 0.0).
+                sc = scenes[piece]
+                if (
+                    piece > 0
+                    and raw[piece - 1] is not None
+                    and remapped[piece - 1][1] is not None
+                    and sc.end_time - sc.start_time <= 2.5
+                ):
+                    ts_f = [
+                        sc.start_time
+                        + f * (sc.end_time - sc.start_time)
+                        for f in (0.1, 0.3, 0.5, 0.7, 0.9)
+                    ]
+                    dec_f = AnimeMatcherService.extract_frames(
+                        video_path, ts_f
+                    )
+                    lums = [
+                        float(cls._small_gray(fr.convert("RGB")).mean())
+                        for fr in dec_f
+                        if fr is not None
+                    ]
+                    fading = (
+                        len(lums) >= 3
+                        and all(
+                            lums[k + 1] <= lums[k] + 3.0
+                            for k in range(len(lums) - 1)
+                        )
+                        and max(lums[-2:]) < 12.0
+                    )
+                    if fading:
+                        prev_seg = remapped[piece - 1][1]
+                        b_f = raw[piece - 1][1] - scenes[piece - 1].end_time
+                        seg_f = SegmentHypothesis(
+                            id=-1,
+                            episode=prev_seg.episode,
+                            tiktok_start=sc.start_time,
+                            tiktok_end=sc.end_time,
+                            a=1.0,
+                            b=b_f,
+                            inlier_count=1,
+                            mean_similarity=0.3,
+                            score=0.0,
+                            scene_index=sc.index,
+                        )
+                        remapped[piece] = (remapped[piece][0], seg_f)
+                        raw[piece] = (
+                            sc.start_time + b_f,
+                            sc.end_time + b_f,
+                        )
+                        doubts.setdefault(piece, []).append(
+                            "fadeout_tail"
+                        )
+                continue
             sc = scenes[piece]
             dur = sc.end_time - sc.start_time
             if dur < 0.4:
@@ -3758,7 +3859,7 @@ class SceneAlignerService:
                         else raw[nb][0] - scenes[nb].start_time
                     )
                     _add(remapped[nb][1].episode, b)
-            for seg in (scene_segments or {}).get(piece, [])[:8]:
+            for seg in (scene_segments or {}).get(piece, [])[:12]:
                 _add(seg.episode, seg.source_at(t_mid) - t_mid)
             # raw correspondence clusters: thin single-frame evidence the
             # segment fitter never promoted to a line still names the
@@ -3782,9 +3883,20 @@ class SceneAlignerService:
 
             import os as _os
 
-            scored: list[tuple[float, str, float]] = []
-            grid_budget = 3  # grid fallbacks cost K windows each
-            for c in cands[:5]:
+            for c_pf in cands[:8]:
+                # stage candidate windows on the decode worker while the
+                # main thread registers/embeds (byte-identical staging,
+                # v116 machinery) — recovery windows were the largest
+                # un-prefetched decode source (v157: +410 window calls
+                # on 411f)
+                cache.prefetch(
+                    str(c_pf["episode"]),
+                    sc.start_time + float(c_pf["b"]) - 1.6,
+                    sc.end_time + float(c_pf["b"]) + 1.6,
+                )
+            scored: list[tuple[float, str, float, int]] = []
+            grid_budget = 4  # grid fallbacks cost K windows each
+            for c in cands[:8]:
                 ep, b = str(c["episode"]), float(c["b"])
                 line_fn = lambda t, _b=b: t + _b
                 rect = None
@@ -3811,10 +3923,37 @@ class SceneAlignerService:
                         q_mids, line_fn, cache, ep, rect, sweep=1.2
                     )
                     if res is not None:
+                        # registration PERSISTENCE (D3 certificate): try
+                        # the outer query frames onto their own mapped
+                        # frames; >=2 total successes = the geometric
+                        # relation holds over time, which no wrong-phase
+                        # loop instance achieved on the bench (reg-rate
+                        # 0.00 for both 5e85#11 lookalikes)
+                        reg_n = 1
+                        for t_q, _ in (q_mids[0], q_mids[-1]):
+                            pred_q = t_q + b + res[1]
+                            for _, im_q in sorted(
+                                cache.probe_frames(ep, pred_q),
+                                key=lambda fr: abs(fr[0] - pred_q),
+                            )[:3]:
+                                g_q = None
+                                for tq2, pil2 in pils:
+                                    if abs(tq2 - t_q) < 1e-6:
+                                        g_q = cls._small_gray(pil2)
+                                        break
+                                if g_q is not None and (
+                                    cls._footprint_rect(
+                                        g_q, cls._small_gray(im_q)
+                                    )
+                                    is not None
+                                ):
+                                    reg_n += 1
+                                    break
                         if _os.environ.get("ATR_RERANK_DEBUG"):
                             print(
                                 f"  [rec] scene {piece} {ep[-12:]}@"
-                                f"{t_mid + b:.1f} reg score={res[0]:.3f}"
+                                f"{t_mid + b:.1f} reg score={res[0]:.3f} "
+                                f"reg_n={reg_n}"
                             )
                         # a successful registration at the position is
                         # itself evidence (>=15 RANSAC inliers on the
@@ -3822,7 +3961,7 @@ class SceneAlignerService:
                         # the chain trust floor; the win-margin gate
                         # still arbitrates lookalikes
                         if res[0] >= max(0.55, trusted_floor - 0.15):
-                            scored.append((res[0], ep, b + res[1]))
+                            scored.append((res[0], ep, b + res[1], reg_n))
                     continue
                 if s_shape is None or grid_budget <= 0:
                     continue
@@ -3845,12 +3984,77 @@ class SceneAlignerService:
                         cache,
                         ep,
                         (x0, 0.0, x0 + span, 1.0),
-                        sweep=1.2,
+                        sweep=2.0,
                     )
                     if res is not None and (
                         g_best is None or res[0] > g_best[0]
                     ):
                         g_best = res
+                if g_best is not None and g_best[0] >= RECOVERY_CERT_SSCD:
+                    # candidate lines from fitted hypotheses carry
+                    # rate-corrupted offsets (5e85#11: the truth
+                    # hypothesis maps 1.9s early); retry registration at
+                    # the grid's own best alignment — a registered truth
+                    # then re-enters the rect path with persistence
+                    pred_r = t_mid + b + g_best[1]
+                    rect_r = None
+                    for _, im_r in sorted(
+                        cache.probe_frames(ep, pred_r),
+                        key=lambda fr: abs(fr[0] - pred_r),
+                    )[:2]:
+                        rect_r = cls._footprint_rect(
+                            q_gray, cls._small_gray(im_r)
+                        )
+                        if rect_r is not None:
+                            break
+                    if rect_r is not None:
+                        res_r = cls._zoom_sscd_score_line(
+                            q_mids,
+                            lambda t, _b=b + g_best[1]: t + _b,
+                            cache,
+                            ep,
+                            rect_r,
+                            sweep=0.6,
+                        )
+                        if res_r is not None and res_r[0] >= max(
+                            0.55, trusted_floor - 0.15
+                        ):
+                            reg_n_r = 1
+                            for t_q, _ in (q_mids[0], q_mids[-1]):
+                                pred_q = t_q + b + g_best[1] + res_r[1]
+                                for _, im_q in sorted(
+                                    cache.probe_frames(ep, pred_q),
+                                    key=lambda fr: abs(fr[0] - pred_q),
+                                )[:3]:
+                                    g_q = None
+                                    for tq2, pil2 in pils:
+                                        if abs(tq2 - t_q) < 1e-6:
+                                            g_q = cls._small_gray(pil2)
+                                            break
+                                    if g_q is not None and (
+                                        cls._footprint_rect(
+                                            g_q, cls._small_gray(im_q)
+                                        )
+                                        is not None
+                                    ):
+                                        reg_n_r += 1
+                                        break
+                            if _os.environ.get("ATR_RERANK_DEBUG"):
+                                print(
+                                    f"  [rec] scene {piece} {ep[-12:]}@"
+                                    f"{t_mid + b + g_best[1]:.1f} "
+                                    f"grid->reg score={res_r[0]:.3f} "
+                                    f"reg_n={reg_n_r}"
+                                )
+                            scored.append(
+                                (
+                                    res_r[0],
+                                    ep,
+                                    b + g_best[1] + res_r[1],
+                                    reg_n_r,
+                                )
+                            )
+                            continue
                 if g_best is not None:
                     if _os.environ.get("ATR_RERANK_DEBUG"):
                         print(
@@ -3858,17 +4062,64 @@ class SceneAlignerService:
                             f"{t_mid + b:.1f} grid score={g_best[0]:.3f}"
                         )
                     if g_best[0] >= RECOVERY_CERT_SSCD:
-                        scored.append((g_best[0], ep, b + g_best[1]))
+                        scored.append((g_best[0], ep, b + g_best[1], 0))
             # the same instance discipline as R1: a recovery must WIN, not
             # merely certify — lookalike instances certify too (5e85#11's
             # neighbour continuation), and a wrong recovery stales waivers
             # where a no-match would have stayed harmless
             scored.sort(reverse=True)
-            if not scored or (
-                len(scored) > 1 and scored[0][0] - scored[1][0] < 0.07
-            ):
+            if not scored:
                 continue
-            score, ep, b_new = scored[0]
+            persistent = [s2 for s2 in scored if s2[3] >= 2]
+            if len(persistent) == 1:
+                # the D3 registration-persistence certificate: a single
+                # candidate whose geometry holds at ALL THREE query
+                # frames beats any number of grid-path lookalikes inside
+                # the SSCD margin (bench 2026-07-13: truth reg 0.41 vs
+                # rivals 0.00 on 5e85#11). ALL-frames is load-bearing:
+                # at 2-of-3 a line explaining only the piece's tail
+                # certified on 85de's g20 (a no-match spanning GT#19+#20,
+                # the v106 trap) and staled the owner-passed #19
+                score, ep, b_new = persistent[0][:3]
+            elif len(scored) > 1 and scored[0][0] - scored[1][0] < 0.07:
+                continue
+            elif scored[0][3] < 1:
+                # a grid-path (unregistered) candidate never wins alone
+                # (a lookalike once won by default when the truth missed
+                # the candidate cap)
+                continue
+            else:
+                score, ep, b_new = scored[0][:3]
+            # a winner that is merely a NEIGHBOUR chain's line continued
+            # into the no-match span is never recovered: either the
+            # content truly continues (the chain machinery would have
+            # joined it — it did not, so the evidence is weak) or the
+            # piece hides a boundary and the line only explains one side
+            # (85de g20 spans GT#19+#20; #20's back-extension registered
+            # 3-of-3 — lookalike shots REGISTER, so per-frame persistence
+    
+            # cannot veto this shape; measured v157-v159). A no-match
+            # stays harmless; a partial recovery stales owner passes.
+            is_nb_cont = False
+            for nb2 in (piece - 1, piece + 1):
+                if not (0 <= nb2 < n):
+                    continue
+                if raw[nb2] is None or remapped[nb2][1] is None:
+                    continue
+                if remapped[nb2][1].episode != ep:
+                    continue
+                shared_t = (
+                    sc.start_time if nb2 == piece - 1 else sc.end_time
+                )
+                nb_val = (
+                    raw[nb2][1] if nb2 == piece - 1 else raw[nb2][0]
+                )
+                own_val = shared_t + b_new
+                if abs(own_val - nb_val) < 0.5:
+                    is_nb_cont = True
+                    break
+            if is_nb_cont:
+                continue
             seg = SegmentHypothesis(
                 id=-1,
                 episode=ep,
@@ -3897,7 +4148,11 @@ class SceneAlignerService:
         scene_segments: dict[int, list[SegmentHypothesis]] | None = None,
         correspondences: list[Correspondence] | None = None,
         window_cache: _WindowEmbedCache | None = None,
-    ) -> tuple[dict[int, tuple[float, float]], dict[int, list[str]]]:
+    ) -> tuple[
+        dict[int, tuple[float, float]],
+        dict[int, list[str]],
+        dict[int, tuple[float, float, float, str, str]],
+    ]:
         """Stage 5 native arbitration: zoom-SSCD re-ranking of duplicate
         primaries (R1), per-end offsets anchored on the true TikTok edge
         frames, argmax'd against natively decoded source frames along the
@@ -3917,6 +4172,10 @@ class SceneAlignerService:
         n = len(scenes)
         refined_delta: dict[int, tuple[float, float]] = {}
         doubts: dict[int, list[str]] = {}
+        # R5c crossover insertions: piece -> (t_split, aB, bB, episodeB,
+        # side) applied by _build_matches after assembly (a split creates
+        # a new Scene, which only the caller can do)
+        splits: dict[int, tuple[float, float, float, str, str]] = {}
         _prof = {"rect": 0.0, "cur": 0.0, "cand": 0.0, "recall": 0.0}
 
         chains: list[tuple[int, int]] = []
@@ -3929,7 +4188,7 @@ class SceneAlignerService:
                 chains.append((i, j))
             i = j + 1
         if not chains:
-            return refined_delta, doubts
+            return refined_delta, doubts, splits
 
         # true edge frames for every chain end plus per-piece mid frames
         # (pixel arbitration queries), one decode pass + one embed batch;
@@ -3973,17 +4232,23 @@ class SceneAlignerService:
                 images.append(frame.convert("RGB"))
                 kept.append(spec)
         if not images:
-            return refined_delta, doubts
+            return refined_delta, doubts, splits
         edge_embs = AnimeMatcherService._embed_pil_batch(_presize_images(images))
         edge_queries: dict[tuple[int, int], list[tuple[float, np.ndarray]]] = {}
         mid_embs: dict[int, list[tuple[float, np.ndarray]]] = {}
         edge_grays: dict[tuple[int, int], np.ndarray] = {}
         mid_grays: dict[int, np.ndarray] = {}
+        # every decoded interior query gray, in time order: the query-side
+        # zoom-rate measurement needs frames spread across the chain
+        mid_gray_seq: dict[int, list[tuple[float, np.ndarray]]] = {}
         for k, ((ci, side, t), emb) in enumerate(zip(kept, edge_embs, strict=False)):
             if side == 2:
                 if ci not in mid_grays:
                     # mid query frame for footprint registration (R1)
                     mid_grays[ci] = cls._small_gray(images[k])
+                mid_gray_seq.setdefault(ci, []).append(
+                    (t, cls._small_gray(images[k]))
+                )
                 mid_embs.setdefault(ci, []).append((t, emb))
             else:
                 if (ci, side) not in edge_queries:
@@ -4387,6 +4652,12 @@ class SceneAlignerService:
                         _prof["recall"] += time.perf_counter() - _t_rec
                         for c in recalled:
                             if not _known(c, distant) and not _known(c, recall):
+                                # recall-cluster offsets drift by up to ~2s
+                                # (v102-104 measured; 85de#20: cluster at
+                                # 719.4 vs true 717.7): their sweep must
+                                # match the drift, unlike exact-offset
+                                # chronology proposals
+                                c["recall"] = 1.0
                                 recall.append(c)
                         proposals: list[dict[str, float | str]] = []
                         if ci > 0:
@@ -4438,7 +4709,20 @@ class SceneAlignerService:
                                 )
                             )
                         for c in proposals if deeply_doubtful else []:
-                            if _known(c, current_as_cand):
+                            # a continuation 0.15-3.0s from the current
+                            # line is NOT the same line: sub-3s duplicate
+                            # instances live exactly there (v109: loop
+                            # instances inside the 3s dedupe radius; dcd
+                            # g37: +0.86s lookalike tail) — only a true
+                            # same-line proposal is redundant
+                            pos_c = float(c["a"]) * t_mid_tt + float(c["b"])
+                            pos_cur = float(
+                                current_as_cand[0]["a"]
+                            ) * t_mid_tt + float(current_as_cand[0]["b"])
+                            if (
+                                c["episode"] == current_as_cand[0]["episode"]
+                                and abs(pos_c - pos_cur) < 0.15
+                            ):
                                 continue
                             c["proposal"] = 1.0
                             replaced = False
@@ -4479,10 +4763,15 @@ class SceneAlignerService:
                     for cand_pf in distant:
                         a_pf, b_pf = float(cand_pf["a"]), float(cand_pf["b"])
                         preds_pf = [a_pf * t + b_pf for t, _ in q_mids]
+                        pad_pf = (
+                            2.2
+                            if cand_pf.get("recall") or cand_pf.get("proposal")
+                            else 1.4
+                        )
                         cache.prefetch(
                             str(cand_pf["episode"]),
-                            min(preds_pf) - 1.4,
-                            max(preds_pf) + 1.4,
+                            min(preds_pf) - pad_pf,
+                            max(preds_pf) + pad_pf,
                         )
                         cache.prefetch_probe(
                             str(cand_pf["episode"]),
@@ -4498,6 +4787,32 @@ class SceneAlignerService:
                         best_switch = None  # (margin, cand, delta)
                         cert_switch = None
                         prop_switch = None
+                        sv_cands: list[tuple[float, dict, float]] = []
+                        sv_q = _SV_UNSET
+                        sv_cur = _SV_UNSET
+
+                        def _line_zoom_rate(ep_z: str, fn_z) -> float | None:
+                            """Source-side zoom rate along a line: one
+                            probe frame near each of three mapped times
+                            across the chain span."""
+                            zf: list[tuple[float, np.ndarray]] = []
+                            t_a = scenes[i].start_time
+                            t_b = scenes[j].end_time
+                            for t_z in (
+                                t_a + 0.1 * (t_b - t_a),
+                                0.5 * (t_a + t_b),
+                                t_b - 0.1 * (t_b - t_a),
+                            ):
+                                pred_z = float(fn_z(t_z))
+                                frames_z = cache.probe_frames(ep_z, pred_z)
+                                if not frames_z:
+                                    continue
+                                t_f, im_f = min(
+                                    frames_z,
+                                    key=lambda fr: abs(fr[0] - pred_z),
+                                )
+                                zf.append((t_f, cls._small_gray(im_f)))
+                            return cls._zoom_rate(zf)
                         for cand in distant:
                             a_c, b_c = float(cand["a"]), float(cand["b"])
                             cand_fn = lambda t, _a=a_c, _b=b_c: _a * t + _b
@@ -4507,11 +4822,53 @@ class SceneAlignerService:
                             # framing understates the truth, measured on
                             # 85de #17/#24); candidates near the decision
                             # boundary pay for their own registration
+                            # recall-cluster candidates register their own
+                            # footprint: their offsets drift ~2s, so the
+                            # chain rect (another shot's geometry) can
+                            # understate them far beyond the [-0.10,+0.09)
+                            # rescore band (85de#20: 0.424 under the
+                            # chain rect vs 0.823 self-registered)
                             res, c_rect = scored_with_rect(
                                 str(cand["episode"]),
                                 cand_fn,
-                                rect=cur_rect,
+                                sweep=2.0 if cand.get("recall") else 1.2,
+                                rect=None if cand.get("recall") else cur_rect,
                             )
+                            if (
+                                cand.get("recall") or cand.get("proposal")
+                            ) and (
+                                res is None
+                                or (
+                                    cur_res is not None
+                                    and res[0] - cur_res[0] < -0.10
+                                )
+                            ):
+                                # a recall/proposal candidate losing
+                                # beyond the rescore band may be scored
+                                # through the wrong geometry AND a drifted
+                                # offset (85de#20: 0.424 under the chain
+                                # rect at sweep 1.2 vs 0.855
+                                # self-registered at its true alignment
+                                # −1.9s): one self-registered wide-sweep
+                                # retry before discarding. Index
+                                # alternatives are EXCLUDED: the wide
+                                # retry re-scores pixel-identical OP/ED
+                                # repeats above the margin threshold
+                                # (measured: 85de#34 switched to the
+                                # episode intro at 21.7s, staling an
+                                # owner pass) — those must stay behind
+                                # the identity certificate.
+                                res_r, rect_r = scored_with_rect(
+                                    str(cand["episode"]),
+                                    cand_fn,
+                                    sweep=2.0,
+                                    rect=None,
+                                )
+                                if res_r is not None and (
+                                    res is None or res_r[0] > res[0]
+                                ):
+                                    res, c_rect = res_r, rect_r
+                                    cand["_retried"] = 1.0
                             if (
                                 res is not None
                                 and cur_rect is not None
@@ -4578,9 +4935,93 @@ class SceneAlignerService:
                                 # continuation with neutral-or-better own
                                 # evidence follows the corrected line — a
                                 # truly different shot loses by a wide
-                                # margin and stays
+                                # margin and stays. A continuation within
+                                # 3s of the current line is a same-shot
+                                # lookalike pair: chronology may override
+                                # the margin only under the native
+                                # identity certificate (the two aligned
+                                # windows show the same frames)
+                                near_cur = (
+                                    str(cand["episode"]) == episode
+                                    and abs(
+                                        (a_c * t_mid_tt + b_c)
+                                        - chain_source_at(t_mid_tt)
+                                    )
+                                    < 3.0
+                                )
+                                if cand.get("_retried"):
+                                    # a RETRIED candidate may only win by
+                                    # a real margin (best_switch): its
+                                    # wide-sweep alignment is
+                                    # max-over-trials-biased on repetitive
+                                    # content, so a near-zero-margin
+                                    # continuity join corrupts the
+                                    # interval even when the certificate
+                                    # holds (measured: 85de chain 36
+                                    # joined the OP repeat at margin
+                                    # −0.005, certificate-aligned at 20.3
+                                    # but switched to 21.7 — staling the
+                                    # owner-passed #34)
+                                    continue
+                                if near_cur:
+                                    cross_p = np.sum(
+                                        cur_res[2] * res[2], axis=1
+                                    )
+                                    cross_p = cross_p[~np.isnan(cross_p)]
+                                    if (
+                                        not cross_p.size
+                                        or float(np.mean(cross_p)) < 0.95
+                                    ):
+                                        continue
                                 if prop_switch is None or margin > prop_switch[0]:
                                     prop_switch = (margin, cand, res[1])
+                            elif abs(margin) <= 0.06:
+                                # scale-velocity certificate (owner round-7
+                                # hint, bench 2026-07-13): a static query
+                                # cannot come from a progressively zooming
+                                # shot. On dead-margin duplicate ties
+                                # (SSCD prefers wrong duplicates by up to
+                                # -0.06, v57), measure the zoom rate of
+                                # the query, the current line and the
+                                # candidate; a candidate qualifies when
+                                # the current line zooms away from the
+                                # query (>=0.04/s) while the candidate
+                                # matches it (<=0.015/s). Bench: zero
+                                # control fires (control slope pairs are
+                                # both-flat or the rival also fails the
+                                # match bound).
+                                if sv_q is _SV_UNSET:
+                                    sv_q = cls._zoom_rate(
+                                        mid_gray_seq.get(ci, [])
+                                    )
+                                if sv_q is not None and sv_cur is _SV_UNSET:
+                                    sv_cur = _line_zoom_rate(
+                                        episode, chain_source_at
+                                    )
+                                if (
+                                    sv_q is not None
+                                    and sv_cur is not None
+                                    and abs(sv_cur - sv_q) >= 0.03
+                                ):
+                                    sv_cand = _line_zoom_rate(
+                                        str(cand["episode"]), cand_fn
+                                    )
+                                    if _os.environ.get("ATR_RERANK_DEBUG"):
+                                        print(
+                                            f"  [sv] chain {i}-{j} "
+                                            f"q={sv_q:+.4f} cur={sv_cur:+.4f} "
+                                            f"cand@{a_c * t_mid_tt + b_c:.1f}"
+                                            f"={sv_cand if sv_cand is None else round(sv_cand, 4)}"
+                                        )
+                                    if (
+                                        sv_cand is not None
+                                        and abs(sv_cand - sv_q) <= 0.015
+                                        and abs(sv_cur - sv_q)
+                                        >= 2.5 * abs(sv_cand - sv_q)
+                                    ):
+                                        sv_cands.append(
+                                            (margin, cand, res[1])
+                                        )
                         if best_switch is not None:
                             _, switch_to, switch_delta = best_switch
                             switch_reason = "duplicate_rerank"
@@ -4590,6 +5031,28 @@ class SceneAlignerService:
                         elif prop_switch is not None:
                             _, switch_to, switch_delta = prop_switch
                             switch_reason = "chronology_assign"
+                        elif sv_cands:
+                            # several instances can match the query's
+                            # zoom physics (loop/OP repeats): prefer the
+                            # neighbours' episode (chronology prior),
+                            # then the best margin
+                            nb_eps = set()
+                            for nb in (ci - 1, ci + 1):
+                                if 0 <= nb < len(chains):
+                                    nb_i = chains[nb][0]
+                                    if remapped[nb_i][1] is not None:
+                                        nb_eps.add(
+                                            remapped[nb_i][1].episode
+                                        )
+                            pool = [
+                                s
+                                for s in sv_cands
+                                if str(s[1]["episode"]) in nb_eps
+                            ] or sv_cands
+                            _, switch_to, switch_delta = max(
+                                pool, key=lambda s: s[0]
+                            )
+                            switch_reason = "scale_velocity"
                         import os as _os
 
                         if _os.environ.get("ATR_RERANK_DEBUG"):
@@ -4883,6 +5346,7 @@ class SceneAlignerService:
                         else:
                             refined_delta[piece] = (prev[0], snap_t - raw[piece][1])
 
+            r5b_moved: set[int] = set()
             # R5b: piece-outlier arbitration. A multi-piece chain can hide
             # ONE wrong piece: the edit jumps away and back (85de GT#10/
             # #11/#12: 256.0 -> 198.6 -> 257.0) while a lookalike keeps the
@@ -5039,6 +5503,190 @@ class SceneAlignerService:
                         )
                         refined_delta.pop(piece, None)
                         doubts.setdefault(piece, []).append("duplicate_rerank")
+                        r5b_moved.add(piece)
+
+            # R5c: crossover cut INSERTION for evidence-hole boundaries
+            # (GOAL v4.2 D4, bench 2026-07-13 crossover_v1 + shift-sweep).
+            # No TikTok-side pixel cut exists at these boundaries even at
+            # detector threshold 8 (v134), and retrieval cannot attribute
+            # supporters between lines <1s apart (corr tolerance 0.35), so
+            # line B is sourced as a SHIFT GRID of the piece's own line —
+            # the near-shift duplicate class. Gated to chains where R5b
+            # moved an interior piece (the measured jump-away-and-back
+            # pattern: 85de #10/#11/#12); a single clean crossover — >=3
+            # samples per side, every B-side margin >=0.05 (bench:
+            # positive suffix margins 0.13-0.14 at deltas 0.60-0.90 for
+            # the true +0.73 shift, crossover err +0.18s; 0/24 control
+            # fires across the whole grid) — inserts a cut at the
+            # sample-grid midpoint and hands the outer side to the
+            # shifted line.
+            _xover_deltas = [
+                d
+                for d in np.arange(-1.2, 1.2 + 1e-9, 0.15)
+                if abs(d) >= 0.3 - 1e-9
+            ]
+            for ci, (i, j) in enumerate(chains):
+                if not any(p in r5b_moved for p in range(i, j + 1)):
+                    continue
+                for piece_x in range(i, j + 1):
+                    if piece_x in r5b_moved:
+                        continue
+                    if raw[piece_x] is None or remapped[piece_x][1] is None:
+                        continue
+                    sc_p = scenes[piece_x]
+                    dur_p = sc_p.end_time - sc_p.start_time
+                    if dur_p < 0.9:
+                        continue
+                    seg_p = remapped[piece_x][1]
+
+                    def line_a(t: float, _p=piece_x) -> float:
+                        sc_l = scenes[_p]
+                        dur_l = max(sc_l.end_time - sc_l.start_time, 1e-6)
+                        rate_l = (raw[_p][1] - raw[_p][0]) / dur_l
+                        return raw[_p][0] + (t - sc_l.start_time) * rate_l
+
+                    d_p = refined_delta.get(piece_x, (0.0, 0.0))
+                    ts_x = np.arange(
+                        sc_p.start_time + 0.04,
+                        sc_p.end_time - 0.04,
+                        1.0 / VERIFY_DECODE_FPS,
+                    )
+                    if ts_x.size < 8:
+                        continue
+                    dec_x = AnimeMatcherService.extract_frames(
+                        video_path, [float(t) for t in ts_x]
+                    )
+                    pils_x = [
+                        (float(t), fr.convert("RGB"))
+                        for t, fr in zip(ts_x, dec_x, strict=False)
+                        if fr is not None
+                    ]
+                    if len(pils_x) < 8:
+                        continue
+                    embs_x = AnimeMatcherService._embed_pil_batch(
+                        _presize_images([im for _, im in pils_x])
+                    )
+                    q_x = [
+                        (t, e)
+                        for (t, _), e in zip(pils_x, embs_x, strict=False)
+                    ]
+                    q_gray_x = cls._small_gray(pils_x[len(pils_x) // 2][1])
+                    pred_m = float(
+                        line_a(0.5 * (sc_p.start_time + sc_p.end_time))
+                        + d_p[0]
+                    )
+                    rect_x = None
+                    for _, im_s in sorted(
+                        cache.probe_frames(seg_p.episode, pred_m),
+                        key=lambda fr: abs(fr[0] - pred_m),
+                    )[:2]:
+                        rect_x = cls._footprint_rect(
+                            q_gray_x, cls._small_gray(im_s)
+                        )
+                        if rect_x is not None:
+                            break
+                    if rect_x is None:
+                        continue
+                    preds_x = np.array(
+                        [line_a(t) + d_p[0] for t, _ in q_x]
+                    )
+                    win_x = cache.window(
+                        seg_p.episode,
+                        rect_x,
+                        float(preds_x.min()) - 1.5,
+                        float(preds_x.max()) + 1.5,
+                    )
+                    if win_x is None or win_x[0].size < 8:
+                        continue
+                    times_x, wembs_x = win_x
+                    qm_x = np.stack([e for _, e in q_x])
+                    sims_x = qm_x @ wembs_x.T
+
+                    def scores_at(delta_x: float) -> np.ndarray:
+                        out = np.full(len(q_x), np.nan)
+                        for k2, pr in enumerate(preds_x + delta_x):
+                            lo_s = np.searchsorted(times_x, pr - 0.15)
+                            hi_s = np.searchsorted(times_x, pr + 0.15)
+                            if hi_s > lo_s:
+                                out[k2] = float(
+                                    sims_x[k2, lo_s:hi_s].max()
+                                )
+                        return out
+
+                    sa_x = scores_at(0.0)
+                    fired_x = None
+                    for delta_x in _xover_deltas:
+                        d_x = scores_at(float(delta_x)) - sa_x
+                        n_x = len(d_x)
+                        for k2 in range(3, n_x - 2):
+                            pre = d_x[:k2][~np.isnan(d_x[:k2])]
+                            suf = d_x[k2:][~np.isnan(d_x[k2:])]
+                            if pre.size < 3 or suf.size < 3:
+                                continue
+                            if (
+                                np.all(suf >= 0.05)
+                                and np.all(pre < 0.05)
+                                and np.sum(pre <= 0.0) >= 2
+                            ):
+                                cand_f = (
+                                    float(np.mean(suf[:3])),
+                                    k2,
+                                    float(delta_x),
+                                    "suffix",
+                                    d_x,
+                                )
+                                if fired_x is None or cand_f[0] > fired_x[0]:
+                                    fired_x = cand_f
+                                break
+                            if (
+                                np.all(pre >= 0.05)
+                                and np.all(suf < 0.05)
+                                and np.sum(suf <= 0.0) >= 2
+                            ):
+                                cand_f = (
+                                    float(np.mean(pre[-3:])),
+                                    k2,
+                                    float(delta_x),
+                                    "prefix",
+                                    d_x,
+                                )
+                                if fired_x is None or cand_f[0] > fired_x[0]:
+                                    fired_x = cand_f
+                                break
+                    if fired_x is None:
+                        continue
+                    _, k2, delta_x, side_x, d_x = fired_x
+                    t_split = 0.5 * (q_x[k2 - 1][0] + q_x[k2][0])
+                    if not (
+                        sc_p.start_time + 0.15
+                        < t_split
+                        < sc_p.end_time - 0.15
+                    ):
+                        continue
+                    dur_l = max(sc_p.end_time - sc_p.start_time, 1e-6)
+                    rate_l = (raw[piece_x][1] - raw[piece_x][0]) / dur_l
+                    b_line = (
+                        raw[piece_x][0]
+                        - rate_l * sc_p.start_time
+                        + d_p[0]
+                        + delta_x
+                    )
+                    splits[piece_x] = (
+                        float(t_split),
+                        float(rate_l),
+                        float(b_line),
+                        str(seg_p.episode),
+                        side_x,
+                    )
+                    doubts.setdefault(piece_x, []).append(
+                        "crossover_insertion"
+                    )
+                    if _os.environ.get("ATR_RERANK_DEBUG"):
+                        print(
+                            f"[xover] piece {piece_x} split@{t_split:.2f} "
+                            f"{side_x} delta={delta_x:+.2f} margins="
+                            f"{[round(float(v), 3) for v in d_x[max(0, k2 - 2):k2 + 3]]}"
+                        )
 
             # start-side containment (owner-endorsed, round 6) as a
             # POST-pass: it must see the raw values AFTER the R5b
@@ -5059,7 +5707,11 @@ class SceneAlignerService:
                 # render-segment starts: the chain start plus any piece
                 # whose predecessor sits on a DIFFERENT line (piece-level
                 # switches break continuity mid-chain — 85de#12's rendered
-                # start is such a piece)
+                # start is such a piece). An all-pieces scan was measured
+                # (v140) and REVERTED: +85s window decode on dcd for zero
+                # effect on the D5 targets (dcd#18's native cut straddles
+                # its start and is correctly excluded; the fix came from
+                # the near-continuation certificate path instead).
                 seg_starts = [i]
                 for p_c in range(i + 1, j + 1):
                     if raw[p_c] is None or raw[p_c - 1] is None:
@@ -5166,15 +5818,16 @@ class SceneAlignerService:
                         )
 
 
-            # R6 no-match recovery: built, measured, and DISABLED — every
-            # owner-labeled target legitimately abstains under the win-
-            # margin discipline (lookalike loops within 0.07; certification
-            # below bar; a piece spanning two GT scenes), so the pass costs
-            # ~40s/project for zero output change (journal v106/v116). The
-            # instrument remains available for M5:
-            # cls._recover_no_match(video_path, scenes, raw, remapped,
-            #     scene_segments, correspondences, cache, trusted_floor,
-            #     doubts)
+            # R6 no-match recovery: RE-ENABLED 2026-07-13 with the D3
+            # registration-persistence certificate (bench geomtraj: the
+            # 5e85#11 truth registers on 41% of samples while BOTH loop
+            # lookalikes register on none) — a persistently-registered
+            # candidate breaks the win-margin abstain against grid-path
+            # rivals; two registered rivals still abstain (v106
+            # discipline).
+            cls._recover_no_match(video_path, scenes, raw, remapped,
+                scene_segments, correspondences, cache, trusted_floor,
+                doubts)
         finally:
             if owns_cache:
                 cache.close()
@@ -5185,7 +5838,7 @@ class SceneAlignerService:
                     "[prof] "
                     + " ".join(f"{k}={v:.1f}s" for k, v in _prof.items())
                 )
-        return refined_delta, doubts
+        return refined_delta, doubts, splits
 
 
 
@@ -5220,7 +5873,7 @@ class SceneAlignerService:
                     algorithm="global_segment",
                 )
             )
-            if len(alternatives) >= ALTERNATIVES_PER_SCENE:
+            if len(alternatives) >= 5:
                 break
         return alternatives
 
