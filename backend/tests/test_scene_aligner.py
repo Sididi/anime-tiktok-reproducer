@@ -485,3 +485,91 @@ def test_pan_zero_crossing_localizes_translating_shot() -> None:
 
     assert t0 is not None
     assert abs(t0 - t_true) <= 0.06
+
+
+def test_footprint_rect_recovers_offcenter_crop() -> None:
+    from PIL import Image as PILImage
+
+    rng = np.random.default_rng(7)
+    # blocky texture gives ORB corners at every scale
+    source = np.kron(
+        rng.integers(0, 255, (36, 64), dtype=np.uint8), np.ones((10, 10), np.uint8)
+    )
+    sh, sw = source.shape  # 360 x 640
+    # off-center full-height vertical crop: x in [0.30, 0.62)
+    x0, x1 = int(0.30 * sw), int(0.62 * sw)
+    query = np.asarray(
+        PILImage.fromarray(source[:, x0:x1]).resize((202, 360))
+    ).astype(np.float32)
+
+    rect = SceneAlignerService._footprint_rect(query, source.astype(np.float32))
+
+    assert rect is not None
+    rx0, ry0, rx1, ry1 = rect
+    assert abs(rx0 - 0.30) <= 0.04 and abs(rx1 - 0.62) <= 0.04
+    assert ry0 <= 0.04 and ry1 >= 0.96
+
+
+def test_zoom_crop_rect_mode_crops_fractional_footprint() -> None:
+    from PIL import Image as PILImage
+
+    img = PILImage.fromarray(np.zeros((360, 640), dtype=np.uint8))
+
+    out = SceneAlignerService._zoom_crop(img, (0.25, 0.0, 0.75, 1.0))
+
+    assert out.size == (320, 360)
+
+
+def test_index_duplicate_recall_finds_unretrieved_instance(monkeypatch) -> None:
+    class _Meta:
+        def __init__(self, episode: str, timestamp: float) -> None:
+            self.episode = episode
+            self.timestamp = timestamp
+
+    rng = np.random.default_rng(11)
+    shot_a = rng.normal(size=512).astype(np.float32)
+    shot_a /= np.linalg.norm(shot_a)
+    other = rng.normal(size=512).astype(np.float32)
+    other /= np.linalg.norm(other)
+
+    # index grid: current instance at 100-101s, duplicate at 400-401s,
+    # unrelated content elsewhere
+    entries = {
+        0: (_Meta("ep1", 100.0), shot_a),
+        1: (_Meta("ep1", 100.5), shot_a),
+        2: (_Meta("ep1", 101.0), shot_a),
+        3: (_Meta("ep1", 400.0), shot_a),
+        4: (_Meta("ep1", 400.5), shot_a),
+        5: (_Meta("ep1", 401.0), shot_a),
+        6: (_Meta("ep1", 250.0), other),
+    }
+
+    class _Index:
+        def reconstruct(self, fid: int) -> np.ndarray:
+            return entries[fid][1]
+
+        def search(self, v: np.ndarray, k: int):
+            sims = np.array([[float(v[0] @ e[1]) for e in entries.values()]])
+            order = np.argsort(-sims[0])[:k]
+            return sims[:, order], order[None, :]
+
+    class _Manager:
+        series_metadata = {"s": {fid: m for fid, (m, _) in entries.items()}}
+        series_indices = {"s": _Index()}
+
+    from app.services.anime_matcher import AnimeMatcherService
+
+    monkeypatch.setattr(AnimeMatcherService, "_index_manager", _Manager())
+    SceneAlignerService._episode_grid_cache.clear()
+
+    # chain line sits on the 100s instance; recall must surface 400s
+    cands = SceneAlignerService._index_duplicate_recall(
+        "ep1", lambda t: 100.0 + (t - 10.0), [10.2, 10.5, 10.8]
+    )
+
+    assert cands, "duplicate instance not recalled"
+    best = cands[0]
+    assert best["episode"] == "ep1"
+    t_mid = 10.5
+    pos = float(best["a"]) * t_mid + float(best["b"])
+    assert abs(pos - 400.5) <= 1.5

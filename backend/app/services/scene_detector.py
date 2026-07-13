@@ -57,6 +57,17 @@ class SceneDetectorService:
     AUTO_DENSE_ACCEPT_MAX_SCENES = 70
     AUTO_DENSE_REFINE_LONG_SCENE_SECONDS = 2.0
     AUTO_DENSE_REFINE_TINY_EDGE_SECONDS = 0.35
+    # Motion-conditioned sensitive pass (GOAL v4, journal v136): cuts
+    # inside STATIC content are invisible at the base threshold
+    # (owner-confirmed dcd@16.03-16.20) while an unconditional sensitive
+    # pass over-cuts action content (v134: 5e85 five stale waivers,
+    # REVERTED). A threshold-8 boundary is reinjected only when BOTH
+    # sides are near-static: measured medians 0.09-0.27 at the true
+    # static cut vs >=14 on the max side of every action boundary that
+    # caused the v134 damage — a physical near-zero-motion gate, not a
+    # tuned threshold.
+    SENSITIVE_REFINE_THRESHOLD = 8.0
+    STATIC_CUT_MOTION_CEILING = 1.0
 
     @classmethod
     async def detect_scenes(
@@ -203,6 +214,13 @@ class SceneDetectorService:
             anime_name=anime_name,
         )
 
+        if threshold <= 16.0:
+            sanitized_ranges = SceneDetectorService._reinject_static_sensitive_cuts(
+                video_path, sanitized_ranges, min_scene_len,
+                library_path=library_path, library_type=library_type,
+                anime_name=anime_name,
+            )
+
         if (
             threshold <= 16.0
             and len(sanitized_ranges) > SceneDetectorService.AUTO_DENSE_MIN_SCENES
@@ -240,6 +258,100 @@ class SceneDetectorService:
             )
             for i, (start, end) in enumerate(sanitized_ranges)
         ]
+
+
+    @staticmethod
+    def _side_static(cap, boundary: float, side: str) -> bool:
+        """Median 64x64 gray frame-diff of one side of a candidate cut."""
+        import cv2
+        import numpy as np
+
+        lo = boundary - 0.65 if side == "L" else boundary + 0.10
+        hi = boundary - 0.10 if side == "L" else boundary + 0.65
+        cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, lo) * 1000)
+        prev = None
+        diffs: list[float] = []
+        t = lo
+        while t < hi:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            t = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            gray = cv2.cvtColor(
+                cv2.resize(frame, (64, 64)), cv2.COLOR_BGR2GRAY
+            ).astype(np.int16)
+            if prev is not None:
+                diffs.append(float(np.mean(np.abs(gray - prev))))
+            prev = gray
+        if not diffs:
+            return False
+        return (
+            float(np.median(diffs))
+            <= SceneDetectorService.STATIC_CUT_MOTION_CEILING
+        )
+
+    @staticmethod
+    def _reinject_static_sensitive_cuts(
+        video_path: Path,
+        base_ranges: list[tuple[float, float]],
+        min_scene_len: int,
+        *,
+        library_path: Path | None,
+        library_type: object,
+        anime_name: str | None,
+    ) -> list[tuple[float, float]]:
+        """Reinject sensitive-threshold boundaries that sit in STATIC
+        content into the base detection (the motion-conditioned cut
+        detector: static cuts are invisible to the base threshold, while
+        unconditional reinjection over-cuts action — both measured)."""
+        try:
+            sensitive_ranges, _, s_fps = SceneDetectorService._detect_ranges(
+                video_path,
+                SceneDetectorService.SENSITIVE_REFINE_THRESHOLD,
+                min_scene_len,
+            )
+            sensitive_ranges = SceneDetectorService._sanitize_extreme_short_ranges(
+                video_path=video_path,
+                ranges=sensitive_ranges,
+                fps=s_fps,
+                library_path=library_path,
+                library_type=library_type,
+                anime_name=anime_name,
+            )
+            base_bounds = {round(e, 2) for _, e in base_ranges[:-1]}
+            novel = [
+                e
+                for _, e in sensitive_ranges[:-1]
+                if not any(abs(e - b) <= 0.15 for b in base_bounds)
+            ]
+            if not novel:
+                return base_ranges
+            import cv2
+
+            cap = cv2.VideoCapture(str(video_path))
+            kept: list[float] = []
+            try:
+                for b in novel:
+                    if SceneDetectorService._side_static(
+                        cap, b, "L"
+                    ) and SceneDetectorService._side_static(cap, b, "R"):
+                        kept.append(b)
+            finally:
+                cap.release()
+            if not kept:
+                return base_ranges
+            duration = base_ranges[-1][1]
+            pseudo: list[tuple[float, float]] = []
+            prev_b = 0.0
+            for b in sorted(kept):
+                pseudo.append((prev_b, b))
+                prev_b = b
+            pseudo.append((prev_b, duration))
+            return SceneDetectorService._refine_dense_ranges_with_sensitive_boundaries(
+                base_ranges, pseudo
+            )
+        except Exception:
+            return base_ranges
 
     @staticmethod
     def _refine_dense_ranges_with_sensitive_boundaries(

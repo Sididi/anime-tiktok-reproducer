@@ -1604,6 +1604,25 @@ class SceneMergerService:
         }
 
     @staticmethod
+    def _reset_merge_provenance(
+        ordered_matches: list[SceneMatch],
+    ) -> list[SceneMatch]:
+        """Treat the current timeline as a fresh manual-merge baseline.
+
+        ``merged_from`` is also emitted by the global scene aligner, but those
+        source indices have no corresponding undo backup.  When manual merge is
+        used for the first time, current scenes are therefore the only state we
+        can safely restore.  Clearing inherited provenance on copies prevents
+        aligner indices from being interpreted as backup indices.
+        """
+        baseline_matches: list[SceneMatch] = []
+        for match in ordered_matches:
+            match_copy = match.model_copy(deep=True)
+            match_copy.merged_from = None
+            baseline_matches.append(match_copy)
+        return baseline_matches
+
+    @staticmethod
     def _normalize_original_indices(indices: list[int] | None) -> list[int]:
         if not indices:
             return []
@@ -1796,6 +1815,7 @@ class SceneMergerService:
 
         backup = cls.load_pre_merge_backup(project_id)
         if not backup:
+            ordered_matches = cls._reset_merge_provenance(ordered_matches)
             backup = cls._build_backup_payload(scenes, ordered_matches)
 
         try:

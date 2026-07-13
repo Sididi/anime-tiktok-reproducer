@@ -67,6 +67,11 @@ MAX_GROUP_FRAGMENTS = 16
 # true flash folds back for free, while lookalike jump cuts at 0.5-0.7
 # wrongly merged are unrecoverable.
 TIKTOK_CUT_CONTINUES_COS = 0.75
+# Below this cross-boundary cosine the pixels certify a hard cut: no
+# extrapolation evidence may lean the boundary prior toward merging
+# (blur/lookalike extrapolation across the 5e85@32.5 swoosh cut measured
+# 0.67 while its tcos was 0.067).
+HARD_CUT_TIKTOK_COS = 0.30
 # Weight of the per-boundary keep/merge prior in DP score units (a sample
 # contributes <= ~0.7 similarity mass; one boundary decision is worth ~2).
 CUT_PRIOR_WEIGHT = 1.0
@@ -95,7 +100,31 @@ CONTINUITY_SCALE_SECONDS = 1.5
 # Native-decode verification of merge-leaning static boundaries: the source
 # is decoded at this fps around the predicted continuation and an offset
 # sweep checks whether the after-cut content truly lives at the prediction.
+# 12 fps is load-bearing for R2 per-end precision: 10 fps cost 8 source
+# exacts and staled 9 waivers across the four GT projects (v111).
 VERIFY_DECODE_FPS = 12.0
+# Index self-similarity floor for duplicate-instance recall: true repeats
+# measure >=0.85 on healthy indices; lookalike non-repeats sit ~0.75-0.8
+# (the squish-index tax measures ~0.77, so 0.80 keeps recall usable there
+# while excluding montage lookalikes).
+DUPLICATE_RECALL_MIN_COS = 0.80
+# Query-side deep-recall floor: cross-geometry (cropped query vs full
+# source frame) cosines run far lower than self-similarity (true instances
+# measured at 0.51-0.54 on owner-labeled fails); candidates are only
+# proposals — the registered-footprint SSCD arbitration decides.
+DEEP_RECALL_MIN_COS = 0.45
+# A chain whose current line scores this high under its own registered
+# footprint needs no duplicate arbitration absent other suspicion, and
+# below it the chain is doubtful enough to pay for recall + chronology
+# proposals: every owner-labeled wrong instance measured <=0.724
+# registered while owner-passed chains measure >=0.78 (2026-07-11).
+# Perf gate, not a correctness gate — margins still decide every switch.
+DUPLICATE_TRUSTED_SSCD = 0.75
+# Certification bar for recovering a no-match scene at fallback (grid)
+# geometry: owner-labeled recoverable truths measure 0.37-0.58 while junk
+# windows measure <=0.16 (bench 2026-07-11). A recovered line below the
+# bar stays no-match.
+RECOVERY_CERT_SSCD = 0.32
 
 
 @dataclass(frozen=True)
@@ -249,7 +278,30 @@ class _WindowEmbedCache:
         self.zoom_crop = zoom_crop
         self.fps = fps
         self.caps: dict[str, object] = {}
-        self.slots: dict[tuple[str, float], dict[int, tuple[float, np.ndarray] | None]] = {}
+        self.slots: dict[tuple, dict[int, tuple[float, np.ndarray] | None]] = {}
+        self.t_decode = 0.0
+        self.t_embed = 0.0
+        # prefetch: one worker decodes upcoming windows on its OWN captures
+        # while the main thread embeds. Staged frames are keyed by the exact
+        # slot run and produced by the same decode call, so window() emits
+        # byte-identical embeddings whether or not the prefetch won the race.
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        self._staged: dict[tuple[str, int, int], list] = {}
+        self._staged_lock = threading.Lock()
+        # decoded-frames LRU: the SAME slot run requested under a second
+        # geometry (gray-zone rescores, zoom<->rect retries, grid sweeps)
+        # reuses the identical frame objects instead of re-decoding —
+        # byte-identical by construction, bounded RAM (~6 windows)
+        from collections import OrderedDict
+
+        self._frames_lru: "OrderedDict[tuple[str, int, int], list]" = (
+            OrderedDict()
+        )
+        self._inflight: dict[tuple[str, int, int], object] = {}
+        self._prefetch_caps: dict[tuple[int, str], object] = {}
+        self._prefetch_pool = ThreadPoolExecutor(max_workers=2)
 
     def get_cap(self, episode: str):
         from .anime_library import AnimeLibraryService
@@ -266,11 +318,142 @@ class _WindowEmbedCache:
             self.caps[str(path)] = cap
         return cap
 
+    def _decode_run(self, cap, r0: int, r1: int) -> list:
+        """The single decode call both window() and the prefetch worker
+        use — identical parameters guarantee identical frames."""
+        w_lo = r0 / self.fps
+        w_hi = (r1 + 1) / self.fps
+        return AnimeMatcherService._collect_frames_in_window_from_capture(
+            cap,
+            w_lo,
+            w_hi,
+            max_frames=int((w_hi - w_lo) * 65) + 8,
+            sample_frames=max(2, int(round((w_hi - w_lo) * self.fps)) + 1),
+        )
+
+    def probe_frames(self, episode: str, pred: float) -> list:
+        """The registration probe's frames (pred +-0.3, max 8, sample 3) —
+        staged by prefetch_probe when the worker got there first, decoded
+        on the caller's capture otherwise. One decode call shape, so the
+        frames are identical either way."""
+        key = ("probe", episode, round(pred, 3))
+        with self._staged_lock:
+            fut = self._inflight.get(key)
+        if fut is not None:
+            try:
+                fut.result()
+            except Exception:
+                pass
+        with self._staged_lock:
+            staged = self._staged.pop(key, None)
+        if staged is not None:
+            return staged
+        cap = self.get_cap(episode)
+        if cap is None:
+            return []
+        return AnimeMatcherService._collect_frames_in_window_from_capture(
+            cap, pred - 0.3, pred + 0.3, max_frames=8, sample_frames=3
+        )
+
+    def prefetch_probe(self, episode: str, pred: float) -> None:
+        key = ("probe", episode, round(pred, 3))
+        with self._staged_lock:
+            if (
+                key in self._staged
+                or key in self._inflight
+                or len(self._inflight) + len(self._staged) > 12
+            ):
+                return
+
+            def work() -> None:
+                from .anime_library import AnimeLibraryService
+
+                path = AnimeLibraryService.resolve_episode_path(
+                    episode, library_type=self.library_type
+                )
+                frames = []
+                if path is not None and path.exists():
+                    import threading
+
+                    cap_key = (threading.get_ident(), str(path))
+                    cap = self._prefetch_caps.get(cap_key)
+                    if cap is None:
+                        cv2 = AnimeMatcherService._require_cv2()
+                        cap = cv2.VideoCapture(str(path))
+                        self._prefetch_caps[cap_key] = cap
+                    frames = (
+                        AnimeMatcherService._collect_frames_in_window_from_capture(
+                            cap, pred - 0.3, pred + 0.3,
+                            max_frames=8, sample_frames=3,
+                        )
+                    )
+                with self._staged_lock:
+                    self._staged[key] = frames
+                    self._inflight.pop(key, None)
+
+            try:
+                self._inflight[key] = self._prefetch_pool.submit(work)
+            except RuntimeError:
+                self._inflight.pop(key, None)
+
+    def prefetch(self, episode: str, lo: float, hi: float) -> None:
+        """Ask the worker to decode [lo, hi] ahead of time. Only the
+        cold-cache full-range run can be staged (partial cache hits change
+        the runs); anything else quietly falls through to normal decode."""
+        i0 = int(math.floor(max(0.0, lo) * self.fps))
+        i1 = int(math.ceil(hi * self.fps))
+        key = (episode, i0, i1)
+        with self._staged_lock:
+            if (
+                key in self._staged
+                or key in self._inflight
+                or len(self._inflight) + len(self._staged) > 8
+            ):
+                return
+
+            def work() -> None:
+                from .anime_library import AnimeLibraryService
+
+                path = AnimeLibraryService.resolve_episode_path(
+                    episode, library_type=self.library_type
+                )
+                if path is None or not path.exists():
+                    frames = []
+                else:
+                    import threading
+
+                    cap_key = (threading.get_ident(), str(path))
+                    cap = self._prefetch_caps.get(cap_key)
+                    if cap is None:
+                        cv2 = AnimeMatcherService._require_cv2()
+                        cap = cv2.VideoCapture(str(path))
+                        self._prefetch_caps[cap_key] = cap
+                    frames = self._decode_run(cap, i0, i1)
+                with self._staged_lock:
+                    self._staged[key] = frames
+                    self._inflight.pop(key, None)
+
+            try:
+                self._inflight[key] = self._prefetch_pool.submit(work)
+            except RuntimeError:
+                self._inflight.pop(key, None)
+
     def window(
-        self, episode: str, zoom: float, lo: float, hi: float
+        self,
+        episode: str,
+        zoom: "float | tuple[float, float, float, float]",
+        lo: float,
+        hi: float,
     ) -> tuple[np.ndarray, np.ndarray] | None:
         """(times, embeddings) covering [lo, hi] at the decode grid."""
-        slots = self.slots.setdefault((episode, round(zoom, 2)), {})
+        geom_key = (
+            # 0.05-fraction quantization: crops within a few percent are
+            # visually the same footprint and share decoded windows
+            tuple(round(v * 20) / 20 for v in zoom)
+            if isinstance(zoom, tuple)
+            else round(zoom, 2)
+        )
+        slots = self.slots.setdefault((episode, geom_key), {})
         i0 = int(math.floor(max(0.0, lo) * self.fps))
         i1 = int(math.ceil(hi * self.fps))
         missing = [k for k in range(i0, i1 + 1) if k not in slots]
@@ -285,16 +468,29 @@ class _WindowEmbedCache:
                 else:
                     runs.append((k, k))
             for r0, r1 in runs:
-                w_lo = r0 / self.fps
-                w_hi = (r1 + 1) / self.fps
-                frames = AnimeMatcherService._collect_frames_in_window_from_capture(
-                    cap,
-                    w_lo,
-                    w_hi,
-                    max_frames=int((w_hi - w_lo) * 65) + 8,
-                    sample_frames=max(2, int(round((w_hi - w_lo) * self.fps)) + 1),
-                )
+                _t0 = time.perf_counter()
+                key = (episode, r0, r1)
+                frames = self._frames_lru.get(key)
+                if frames is not None:
+                    self._frames_lru.move_to_end(key)
+                else:
+                    with self._staged_lock:
+                        fut = self._inflight.get(key)
+                    if fut is not None:
+                        try:
+                            fut.result()
+                        except Exception:
+                            pass
+                    with self._staged_lock:
+                        frames = self._staged.pop(key, None)
+                    if frames is None:
+                        frames = self._decode_run(cap, r0, r1)
+                    self._frames_lru[key] = frames
+                    while len(self._frames_lru) > 6:
+                        self._frames_lru.popitem(last=False)
+                self.t_decode += time.perf_counter() - _t0
                 if frames:
+                    _t1 = time.perf_counter()
                     embs = AnimeMatcherService._embed_pil_batch(
                         _presize_images(
                             [
@@ -303,6 +499,7 @@ class _WindowEmbedCache:
                             ]
                         )
                     )
+                    self.t_embed += time.perf_counter() - _t1
                     for (t, _), emb in zip(frames, embs, strict=False):
                         slot = int(round(t * self.fps))
                         if r0 <= slot <= r1 and slots.get(slot) is None:
@@ -321,12 +518,26 @@ class _WindowEmbedCache:
         return times, embs
 
     def close(self) -> None:
-        for cap in self.caps.values():
+        import os as _os
+
+        if _os.environ.get("ATR_RERANK_DEBUG"):
+            print(
+                f"[winprof] decode={self.t_decode:.1f}s embed={self.t_embed:.1f}s"
+            )
+        self._prefetch_pool.shutdown(wait=False, cancel_futures=True)
+        with self._staged_lock:
+            self._staged.clear()
+            self._inflight.clear()
+        self._frames_lru.clear()
+        for cap in list(self.caps.values()) + list(
+            self._prefetch_caps.values()
+        ):
             try:
                 cap.release()
             except Exception:
                 pass
         self.caps.clear()
+        self._prefetch_caps.clear()
 
 
 class SceneAlignerService:
@@ -567,60 +778,93 @@ class SceneAlignerService:
             if not targets:
                 return [], [], []
 
-            images: list[Image.Image] = []
-            times: list[float] = []
             samples: list[QuerySample] = []
 
-            def flush() -> None:
-                if not images:
-                    return
-                embeddings = AnimeMatcherService._embed_pil_batch(
-                    _presize_images([image.convert("RGB") for image in images])
-                )
-                for sample_time, embedding in zip(times, embeddings, strict=False):
-                    samples.append(QuerySample(sample_time, embedding, "plain"))
-                images.clear()
-                times.clear()
+            # producer/consumer: the worker owns the sequential decode +
+            # diff curve while the main thread embeds each 96-frame batch
+            # — batch composition is unchanged, so embeddings (and every
+            # downstream decision) stay byte-identical to the serial loop
+            import queue as _queue
+            import threading as _threading
 
-            next_target_iter = iter(sorted(targets.items()))
-            try:
-                target_frame, target_time = next(next_target_iter)
-            except StopIteration:
-                return [], [], []
+            batch_q: _queue.Queue = _queue.Queue(maxsize=2)
+            producer_error: list[BaseException] = []
 
-            exhausted = False
-            frame_index = 0
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                small = cv2.resize(frame, (64, 64), interpolation=cv2.INTER_AREA)
-                small = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-                if previous_small is not None:
-                    diff_times.append(frame_index / native_fps)
-                    diffs.append(
-                        float(
-                            np.mean(
-                                np.abs(
-                                    small.astype(np.int16)
-                                    - previous_small.astype(np.int16)
-                                )
-                            )
-                        )
-                    )
-                previous_small = small
-                while not exhausted and frame_index >= target_frame:
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    images.append(Image.fromarray(frame_rgb))
-                    times.append(target_time)
-                    if len(images) >= 96:
-                        flush()
+            def _produce() -> None:
+                images: list[Image.Image] = []
+                times: list[float] = []
+                previous = None
+                try:
+                    next_target_iter = iter(sorted(targets.items()))
                     try:
                         target_frame, target_time = next(next_target_iter)
                     except StopIteration:
-                        exhausted = True
-                frame_index += 1
-            flush()
+                        return
+                    exhausted = False
+                    frame_index = 0
+                    while True:
+                        ret, frame = cap.read()
+                        if not ret:
+                            break
+                        small = cv2.resize(
+                            frame, (64, 64), interpolation=cv2.INTER_AREA
+                        )
+                        small = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                        if previous is not None:
+                            diff_times.append(frame_index / native_fps)
+                            diffs.append(
+                                float(
+                                    np.mean(
+                                        np.abs(
+                                            small.astype(np.int16)
+                                            - previous.astype(np.int16)
+                                        )
+                                    )
+                                )
+                            )
+                        previous = small
+                        while not exhausted and frame_index >= target_frame:
+                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            images.append(Image.fromarray(frame_rgb))
+                            times.append(target_time)
+                            if len(images) >= 96:
+                                batch_q.put((images, times))
+                                images, times = [], []
+                            try:
+                                target_frame, target_time = next(
+                                    next_target_iter
+                                )
+                            except StopIteration:
+                                exhausted = True
+                        frame_index += 1
+                    if images:
+                        batch_q.put((images, times))
+                except BaseException as exc:  # surfaced on the main thread
+                    producer_error.append(exc)
+                finally:
+                    batch_q.put(None)
+
+            worker = _threading.Thread(target=_produce, daemon=True)
+            worker.start()
+            while True:
+                item = batch_q.get()
+                if item is None:
+                    break
+                b_images, b_times = item
+                embeddings = AnimeMatcherService._embed_pil_batch(
+                    _presize_images(
+                        [image.convert("RGB") for image in b_images]
+                    )
+                )
+                for sample_time, embedding in zip(
+                    b_times, embeddings, strict=False
+                ):
+                    samples.append(
+                        QuerySample(sample_time, embedding, "plain")
+                    )
+            worker.join()
+            if producer_error:
+                raise producer_error[0]
             return samples, diff_times, diffs
         finally:
             cap.release()
@@ -1533,6 +1777,11 @@ class SceneAlignerService:
             if abs(fr.source_at(t) - fl.source_at(t)) <= tol:
                 continue
             if duplicate_suspect(k, fl) or duplicate_suspect(k + 1, fr):
+                # certified-tug experiment (2026-07-11): letting a
+                # registered-SSCD certification override the suspect gate
+                # moved owner-passed dcd#11 (stale waiver) without fixing
+                # anything — the dcd#6 target is a MISSED SPLIT, not a
+                # misplaced boundary. Binary gate stays (v88).
                 continue
             lo = max(t - 0.65, sl[k].start_time + 0.3)
             hi = min(t + 0.65, sl[k + 1].end_time - 0.3)
@@ -2072,10 +2321,34 @@ class SceneAlignerService:
                 )
                 ratio = max(ratio_lr, ratio_rl)
                 record["extrapolation_ratio"] = round(ratio, 3)
-                priors.append(float(np.clip((0.60 - ratio) * 2.5, -0.8, 1.0)))
+                prior = float(np.clip((0.60 - ratio) * 2.5, -0.8, 1.0))
                 record["rule"] = "dynamic_extrapolation"
+                if (
+                    tcos is not None
+                    and tcos <= HARD_CUT_TIKTOK_COS
+                    and intra - tcos >= 0.35
+                    and prior < 0.2
+                ):
+                    # the pixels say this boundary is special: content
+                    # coheres on each side (intra) yet craters across the
+                    # cut. Extrapolation success across such a boundary is
+                    # lookalike/blur evidence (5e85@32.5: tcos 0.067,
+                    # intra 0.702, extrapolated 0.67 and wrongly merged).
+                    # Fast action needs the CONTRAST term: within-shot
+                    # motion makes tcos low everywhere, and over-splitting
+                    # an evidence hole does NOT fold back for free (411f
+                    # 73->79 scenes, two new fold-no-chain fails without
+                    # the contrast gate).
+                    prior = 0.2
+                    record["rule"] = "dynamic_hard_cut_floor"
+                priors.append(prior)
 
         cls._last_boundary_diagnostics = diagnostics
+        import os as _os
+
+        if _os.environ.get("ATR_BOUNDARY_DEBUG"):
+            for rec, pr in zip(diagnostics, priors, strict=False):
+                print(f"[prior] {pr:+.2f} {rec}")
         return priors
 
     _last_boundary_diagnostics: list[dict[str, object]] = []
@@ -2134,6 +2407,190 @@ class SceneAlignerService:
             return None
         except Exception:
             return None
+
+    @classmethod
+    def _index_duplicate_recall(
+        cls,
+        episode: str,
+        line_fn,
+        mid_ts: list[float],
+        series: str | None = None,
+    ) -> list[dict[str, float | str]]:
+        """Duplicate instances of the CURRENT line's content elsewhere in
+        the source, recalled by querying the index with the line's own
+        indexed frames. Query-side retrieval misses whole instances when
+        the edit's crop makes one instance dominate top-K (v101: truth
+        absent from Stage-3 candidates on 5 of 10 owner-labeled 85de
+        duplicate fails); source self-similarity is independent of the
+        query's geometry. Returned as unit-rate candidate lines."""
+        manager = AnimeMatcherService._index_manager
+        if manager is None or not mid_ts:
+            return []
+        try:
+            series_names = (
+                [series]
+                if series
+                else list(getattr(manager, "series_metadata", {}))
+            )
+            clusters: dict[tuple[str, int], dict] = {}
+            for name in series_names:
+                metadata = manager.series_metadata.get(name)
+                index = manager.series_indices.get(name)
+                if metadata is None or index is None:
+                    continue
+                for t in mid_ts[:3]:
+                    pos = float(line_fn(t))
+                    v = cls._index_embedding_at(name, episode, pos)
+                    if v is None:
+                        continue
+                    _, ids = index.search(
+                        v[None].astype(np.float32), 24
+                    )
+                    for fid in ids[0]:
+                        if int(fid) < 0:
+                            continue
+                        meta = metadata.get(int(fid))
+                        if meta is None:
+                            continue
+                        if (
+                            meta.episode == episode
+                            and abs(meta.timestamp - pos) <= 3.0
+                        ):
+                            continue  # the instance the line already sits on
+                        w = index.reconstruct(int(fid))
+                        cos = float(v @ (w / (np.linalg.norm(w) + 1e-9)))
+                        if cos < DUPLICATE_RECALL_MIN_COS:
+                            continue
+                        b = float(meta.timestamp) - t
+                        key = (meta.episode, int(round(b / 2.0)))
+                        cur = clusters.get(key)
+                        if cur is None:
+                            clusters[key] = {
+                                "episode": meta.episode,
+                                "bs": [b],
+                                "rank_sim": cos,
+                                "hits": {t},
+                            }
+                        else:
+                            cur["bs"].append(b)
+                            cur["hits"].add(t)
+                            cur["rank_sim"] = max(cur["rank_sim"], cos)
+            return cls._recall_clusters_to_candidates(clusters)
+        except Exception:
+            return []
+
+    @staticmethod
+    def _recall_clusters_to_candidates(
+        clusters: dict[tuple[str, int], dict],
+    ) -> list[dict[str, float | str]]:
+        """>=2 distinct query times must agree (a single-frame hit on a
+        2 fps grid is a lookalike still, not an instance); the offset is
+        the cluster median. Neighbouring keys merge first — the quantized
+        key boundary otherwise splits one instance's hits into two 1-hit
+        clusters that both die at the agreement gate."""
+        merged: list[dict] = []
+        for key in sorted(clusters, key=lambda k: (k[0], k[1])):
+            c = clusters[key]
+            prev = merged[-1] if merged else None
+            if (
+                prev is not None
+                and prev["episode"] == c["episode"]
+                and abs(
+                    float(np.median(prev["bs"])) - float(np.median(c["bs"]))
+                )
+                <= 2.0
+            ):
+                prev["bs"].extend(c["bs"])
+                prev["hits"] |= c["hits"]
+                prev["rank_sim"] = max(prev["rank_sim"], c["rank_sim"])
+            else:
+                merged.append(
+                    {
+                        "episode": c["episode"],
+                        "bs": list(c["bs"]),
+                        "hits": set(c["hits"]),
+                        "rank_sim": c["rank_sim"],
+                    }
+                )
+        out = [
+            {
+                "episode": c["episode"],
+                "a": 1.0,
+                "b": float(np.median(c["bs"])),
+                "rank_sim": c["rank_sim"],
+            }
+            for c in merged
+            if len(c["hits"]) >= 2
+        ]
+        out.sort(key=lambda c: float(c["rank_sim"]), reverse=True)
+        return out[:3]
+
+    @classmethod
+    def _query_deep_recall(
+        cls,
+        q_mids: list[tuple[float, np.ndarray]],
+        line_fn,
+        episode: str,
+        series: str | None = None,
+    ) -> list[dict[str, float | str]]:
+        """Distinct source positions recalled by searching the index
+        DEEPER with the chain's own query embeddings. Montage lookalikes
+        can outrank the true instance inside the retrieval top-K (the
+        query's crop geometry biases the ranking); the true instance still
+        sits in the deep tail, and the registered-footprint SSCD
+        arbitration — not this ranking — decides."""
+        manager = AnimeMatcherService._index_manager
+        if manager is None or not q_mids:
+            return []
+        try:
+            series_names = (
+                [series]
+                if series
+                else list(getattr(manager, "series_metadata", {}))
+            )
+            clusters: dict[tuple[str, int], dict] = {}
+            for name in series_names:
+                metadata = manager.series_metadata.get(name)
+                index = manager.series_indices.get(name)
+                if metadata is None or index is None:
+                    continue
+                for t, emb in q_mids[:8]:
+                    pos = float(line_fn(t))
+                    q = emb.astype(np.float32)
+                    q = q / (np.linalg.norm(q) + 1e-9)
+                    _, ids = index.search(q[None], 40)
+                    for fid in ids[0]:
+                        if int(fid) < 0:
+                            continue
+                        meta = metadata.get(int(fid))
+                        if meta is None:
+                            continue
+                        if (
+                            meta.episode == episode
+                            and abs(meta.timestamp - pos) <= 3.0
+                        ):
+                            continue
+                        w = index.reconstruct(int(fid))
+                        cos = float(q @ (w / (np.linalg.norm(w) + 1e-9)))
+                        if cos < DEEP_RECALL_MIN_COS:
+                            continue
+                        b = float(meta.timestamp) - t
+                        key = (meta.episode, int(round(b / 2.0)))
+                        cur = clusters.get(key)
+                        if cur is None:
+                            clusters[key] = {
+                                "episode": meta.episode,
+                                "bs": [b],
+                                "rank_sim": cos,
+                                "hits": {t},
+                            }
+                        else:
+                            cur["bs"].append(b)
+                            cur["hits"].add(t)
+                            cur["rank_sim"] = max(cur["rank_sim"], cos)
+            return cls._recall_clusters_to_candidates(clusters)
+        except Exception:
+            return []
 
     @classmethod
     def _segment_timeline_dp(
@@ -2765,12 +3222,29 @@ class SceneAlignerService:
     _CANDIDATE_ZOOMS: tuple[float, ...] = (1.0, 1.15, 1.3, 1.45)
 
     @staticmethod
-    def _zoom_crop(image: Image.Image, zoom: float) -> Image.Image:
-        """Center crop matching a zoom factor of the edit over the source."""
-        if zoom <= 1.0:
+    def _zoom_crop(
+        image: Image.Image, geom: "float | tuple[float, float, float, float]"
+    ) -> Image.Image:
+        """Crop matching the edit's geometry over the source: either a
+        center zoom factor (legacy fallback) or a registered fractional
+        footprint rect (x0, y0, x1, y1) — the edit is a full-height,
+        per-scene-framed vertical crop, so a center zoom is the wrong
+        model whenever the editor reframes off-center (bench 2026-07-11)."""
+        if isinstance(geom, tuple):
+            w, h = image.size
+            x0, y0, x1, y1 = geom
+            return image.crop(
+                (
+                    int(x0 * w),
+                    int(y0 * h),
+                    max(int(x0 * w) + 8, int(x1 * w)),
+                    max(int(y0 * h) + 8, int(y1 * h)),
+                )
+            )
+        if geom <= 1.0:
             return image
         w, h = image.size
-        cw, ch = int(w / zoom), int(h / zoom)
+        cw, ch = int(w / geom), int(h / geom)
         x0, y0 = (w - cw) // 2, (h - ch) // 2
         return image.crop((x0, y0, x0 + cw, y0 + ch))
 
@@ -2783,14 +3257,14 @@ class SceneAlignerService:
         ).astype(np.float32)
 
     @classmethod
-    def _register_affine(
+    def _registration_transform(
         cls, q_gray: np.ndarray, s_gray: np.ndarray
     ) -> np.ndarray | None:
-        """ORB+RANSAC partial-affine registration of the query frame onto the
-        source plane; returns the warped query gray or None. This is the §4
-        geometric matcher at feature level: the edit is a scaled/shifted crop
-        of the source and embeddings/global NCC cannot see past that."""
+        """ORB+RANSAC partial-affine transform mapping query-plane points
+        onto the source plane, or None when registration fails."""
         cv2 = AnimeMatcherService._require_cv2()
+        if not hasattr(cv2, "ORB_create"):
+            return None  # minimal cv2 builds / test fakes: no registration
         orb = cv2.ORB_create(1500)
         kq, dq = orb.detectAndCompute(q_gray.astype(np.uint8), None)
         ks, ds = orb.detectAndCompute(s_gray.astype(np.uint8), None)
@@ -2807,7 +3281,49 @@ class SceneAlignerService:
         )
         if T is None or inliers is None or int(inliers.sum()) < 15:
             return None
+        return T
+
+    @classmethod
+    def _register_affine(
+        cls, q_gray: np.ndarray, s_gray: np.ndarray
+    ) -> np.ndarray | None:
+        """ORB+RANSAC partial-affine registration of the query frame onto the
+        source plane; returns the warped query gray or None. This is the §4
+        geometric matcher at feature level: the edit is a scaled/shifted crop
+        of the source and embeddings/global NCC cannot see past that."""
+        cv2 = AnimeMatcherService._require_cv2()
+        T = cls._registration_transform(q_gray, s_gray)
+        if T is None:
+            return None
         return cv2.warpAffine(q_gray, T, (s_gray.shape[1], s_gray.shape[0]))
+
+    @classmethod
+    def _footprint_rect(
+        cls, q_gray: np.ndarray, s_gray: np.ndarray
+    ) -> tuple[float, float, float, float] | None:
+        """The query frame's footprint inside the source plane as a
+        fractional (x0, y0, x1, y1) rect. The edit is a full-height vertical
+        crop whose x-center is framed per scene (measured 0.22-0.65 across
+        GT); SSCD compared at this registered geometry separates duplicate
+        instances the center-zoom model cannot (bench 2026-07-11: margins
+        +0.196..+0.422 on every owner-labeled duplicate, zero control
+        flips)."""
+        T = cls._registration_transform(q_gray, s_gray)
+        if T is None:
+            return None
+        h, w = q_gray.shape
+        corners = np.array(
+            [[0, 0], [w, 0], [0, h], [w, h]], dtype=np.float32
+        )
+        mapped = corners @ T[:, :2].T + T[:, 2]
+        sh, sw = s_gray.shape
+        x0 = float(np.clip(mapped[:, 0].min() / sw, 0.0, 0.95))
+        x1 = float(np.clip(mapped[:, 0].max() / sw, x0 + 0.05, 1.0))
+        y0 = float(np.clip(mapped[:, 1].min() / sh, 0.0, 0.95))
+        y1 = float(np.clip(mapped[:, 1].max() / sh, y0 + 0.05, 1.0))
+        if (x1 - x0) * (y1 - y0) > 0.9:
+            return None  # effectively full frame: nothing to crop
+        return (x0, y0, x1, y1)
 
     @classmethod
     def _pan_zero_crossing(
@@ -3077,7 +3593,8 @@ class SceneAlignerService:
         source_at,
         cache: _WindowEmbedCache,
         episode: str,
-        zoom: float,
+        zoom: "float | tuple[float, float, float, float]",
+        sweep: float = 0.6,
     ) -> tuple[float, float, np.ndarray] | None:
         """(best mean cos, its offset, matched source embeddings) of the
         chain's mid query embeddings against SSCD embeddings of ZOOM-CROPPED
@@ -3089,7 +3606,8 @@ class SceneAlignerService:
         if not q_mids:
             return None
         preds = np.array([source_at(t) for t, _ in q_mids])
-        lo, hi = float(preds.min()) - 0.7, float(preds.max()) + 0.7
+        pad = sweep + 0.2
+        lo, hi = float(preds.min()) - pad, float(preds.max()) + pad
         win = cache.window(episode, zoom, lo, hi)
         if win is None:
             return None
@@ -3098,7 +3616,7 @@ class SceneAlignerService:
         sims = q @ embs.T
         best: tuple[float, float, np.ndarray] | None = None
         rows = np.arange(len(q_mids))
-        for delta in np.arange(-0.6, 0.6 + 1e-6, 1.0 / VERIFY_DECODE_FPS):
+        for delta in np.arange(-sweep, sweep + 1e-6, 1.0 / VERIFY_DECODE_FPS):
             pos = preds + delta
             cols = np.clip(np.searchsorted(times, pos), 0, len(times) - 1)
             prev_cols = np.clip(cols - 1, 0, len(times) - 1)
@@ -3170,6 +3688,204 @@ class SceneAlignerService:
         return max(means, key=means.get)
 
     @classmethod
+    def _recover_no_match(
+        cls,
+        video_path: Path,
+        scenes: list[Scene],
+        raw: list[tuple[float, float] | None],
+        remapped: list[tuple[list[int], SegmentHypothesis | None]],
+        scene_segments: dict[int, list[SegmentHypothesis]] | None,
+        correspondences: list[Correspondence] | None,
+        cache: "_WindowEmbedCache",
+        trusted_floor: float,
+        doubts: dict[int, list[str]],
+    ) -> None:
+        """Recover no-match scenes whose true source the native instruments
+        can certify. The decode DP scores such scenes below the no-match
+        floor when retrieval evidence is thin, but the truth usually sits
+        in the scene's own Stage-3 hypotheses, a neighbour's continuation
+        or the deep-recall tail — and certification separates it from junk
+        (owner-labeled bench 2026-07-11: truth 0.37-0.58 at grid geometry,
+        junk <=0.16). Mutates raw/remapped/doubts in place."""
+        n = len(scenes)
+        for piece in range(n):
+            if raw[piece] is not None or remapped[piece][1] is not None:
+                continue
+            sc = scenes[piece]
+            dur = sc.end_time - sc.start_time
+            if dur < 0.4:
+                continue
+            ts = [sc.start_time + f * dur for f in (0.3, 0.5, 0.7)]
+            decoded = AnimeMatcherService.extract_frames(video_path, ts)
+            pils = [
+                (t, fr.convert("RGB"))
+                for t, fr in zip(ts, decoded, strict=False)
+                if fr is not None
+            ]
+            if not pils:
+                continue
+            embs = AnimeMatcherService._embed_pil_batch(
+                _presize_images([im for _, im in pils])
+            )
+            q_mids = [
+                (t, e) for (t, _), e in zip(pils, embs, strict=False)
+            ]
+            q_gray = cls._small_gray(pils[len(pils) // 2][1])
+            t_mid = 0.5 * (sc.start_time + sc.end_time)
+            seen: list[tuple[str, float]] = []
+            cands: list[dict[str, float | str]] = []
+
+            def _add(ep: str, b: float) -> None:
+                pos = t_mid + b
+                if any(
+                    ep == e2 and abs(pos - p2) < 3.0 for e2, p2 in seen
+                ):
+                    return
+                seen.append((ep, pos))
+                cands.append({"episode": ep, "b": b})
+
+            # neighbour continuations first (the strongest prior), then
+            # the scene's own line hypotheses, then the deep-recall tail
+            for nb, side in ((piece - 1, 1), (piece + 1, 0)):
+                if (
+                    0 <= nb < n
+                    and raw[nb] is not None
+                    and remapped[nb][1] is not None
+                ):
+                    b = (
+                        raw[nb][1] - scenes[nb].end_time
+                        if side == 1
+                        else raw[nb][0] - scenes[nb].start_time
+                    )
+                    _add(remapped[nb][1].episode, b)
+            for seg in (scene_segments or {}).get(piece, [])[:8]:
+                _add(seg.episode, seg.source_at(t_mid) - t_mid)
+            # raw correspondence clusters: thin single-frame evidence the
+            # segment fitter never promoted to a line still names the
+            # position (5e85#45's truth lives only here)
+            corr_clusters: dict[tuple[str, int], list[float]] = {}
+            for corr in correspondences or []:
+                if not (sc.start_time <= corr.t_tiktok < sc.end_time):
+                    continue
+                b_c = corr.t_source - corr.t_tiktok
+                corr_clusters.setdefault(
+                    (corr.episode, int(round(b_c / 2.0))), []
+                ).append(b_c)
+            for (ep_c, _), bs in sorted(
+                corr_clusters.items(), key=lambda kv: -len(kv[1])
+            )[:4]:
+                _add(ep_c, float(np.median(bs)))
+            for c in cls._query_deep_recall(
+                q_mids, lambda t: -1e9, ""
+            ):
+                _add(str(c["episode"]), float(c["b"]))
+
+            import os as _os
+
+            scored: list[tuple[float, str, float]] = []
+            grid_budget = 3  # grid fallbacks cost K windows each
+            for c in cands[:5]:
+                ep, b = str(c["episode"]), float(c["b"])
+                line_fn = lambda t, _b=b: t + _b
+                rect = None
+                s_shape = None
+                cap = cache.get_cap(ep)
+                if cap is not None:
+                    pred = t_mid + b
+                    frames = (
+                        AnimeMatcherService._collect_frames_in_window_from_capture(
+                            cap, pred - 0.3, pred + 0.3,
+                            max_frames=8, sample_frames=3,
+                        )
+                    )
+                    for _, im in sorted(
+                        frames, key=lambda fr: abs(fr[0] - pred)
+                    )[:2]:
+                        s_gray = cls._small_gray(im)
+                        s_shape = s_gray.shape
+                        rect = cls._footprint_rect(q_gray, s_gray)
+                        if rect is not None:
+                            break
+                if rect is not None:
+                    res = cls._zoom_sscd_score_line(
+                        q_mids, line_fn, cache, ep, rect, sweep=1.2
+                    )
+                    if res is not None:
+                        if _os.environ.get("ATR_RERANK_DEBUG"):
+                            print(
+                                f"  [rec] scene {piece} {ep[-12:]}@"
+                                f"{t_mid + b:.1f} reg score={res[0]:.3f}"
+                            )
+                        # a successful registration at the position is
+                        # itself evidence (>=15 RANSAC inliers on the
+                        # candidate's own frame), so the bar sits below
+                        # the chain trust floor; the win-margin gate
+                        # still arbitrates lookalikes
+                        if res[0] >= max(0.55, trusted_floor - 0.15):
+                            scored.append((res[0], ep, b + res[1]))
+                    continue
+                if s_shape is None or grid_budget <= 0:
+                    continue
+                grid_budget -= 1
+                # grid fallback: the query's full-height aspect footprint
+                # swept over plausible x-centers (fast/blurred content
+                # defeats feature registration; the certification bar
+                # still separates truth from junk at 2.6x even on a
+                # coarse grid)
+                span = (q_gray.shape[1] / q_gray.shape[0]) / (
+                    s_shape[1] / s_shape[0]
+                )
+                span = min(0.95, max(0.15, span))
+                g_best = None
+                for cx in (0.35, 0.5, 0.65):
+                    x0 = min(max(cx - span / 2.0, 0.0), 1.0 - span)
+                    res = cls._zoom_sscd_score_line(
+                        q_mids,
+                        line_fn,
+                        cache,
+                        ep,
+                        (x0, 0.0, x0 + span, 1.0),
+                        sweep=1.2,
+                    )
+                    if res is not None and (
+                        g_best is None or res[0] > g_best[0]
+                    ):
+                        g_best = res
+                if g_best is not None:
+                    if _os.environ.get("ATR_RERANK_DEBUG"):
+                        print(
+                            f"  [rec] scene {piece} {ep[-12:]}@"
+                            f"{t_mid + b:.1f} grid score={g_best[0]:.3f}"
+                        )
+                    if g_best[0] >= RECOVERY_CERT_SSCD:
+                        scored.append((g_best[0], ep, b + g_best[1]))
+            # the same instance discipline as R1: a recovery must WIN, not
+            # merely certify — lookalike instances certify too (5e85#11's
+            # neighbour continuation), and a wrong recovery stales waivers
+            # where a no-match would have stayed harmless
+            scored.sort(reverse=True)
+            if not scored or (
+                len(scored) > 1 and scored[0][0] - scored[1][0] < 0.07
+            ):
+                continue
+            score, ep, b_new = scored[0]
+            seg = SegmentHypothesis(
+                id=-1,
+                episode=ep,
+                tiktok_start=sc.start_time,
+                tiktok_end=sc.end_time,
+                a=1.0,
+                b=b_new,
+                inlier_count=1,
+                mean_similarity=float(min(score, 0.5)),
+                score=0.0,
+                scene_index=sc.index,
+            )
+            remapped[piece] = (remapped[piece][0], seg)
+            raw[piece] = (sc.start_time + b_new, sc.end_time + b_new)
+            doubts.setdefault(piece, []).append("recovered")
+
+    @classmethod
     def _stage5_refine(
         cls,
         video_path: Path,
@@ -3201,6 +3917,7 @@ class SceneAlignerService:
         n = len(scenes)
         refined_delta: dict[int, tuple[float, float]] = {}
         doubts: dict[int, list[str]] = {}
+        _prof = {"rect": 0.0, "cur": 0.0, "cand": 0.0, "recall": 0.0}
 
         chains: list[tuple[int, int]] = []
         i = 0
@@ -3261,8 +3978,12 @@ class SceneAlignerService:
         edge_queries: dict[tuple[int, int], list[tuple[float, np.ndarray]]] = {}
         mid_embs: dict[int, list[tuple[float, np.ndarray]]] = {}
         edge_grays: dict[tuple[int, int], np.ndarray] = {}
+        mid_grays: dict[int, np.ndarray] = {}
         for k, ((ci, side, t), emb) in enumerate(zip(kept, edge_embs, strict=False)):
             if side == 2:
+                if ci not in mid_grays:
+                    # mid query frame for footprint registration (R1)
+                    mid_grays[ci] = cls._small_gray(images[k])
                 mid_embs.setdefault(ci, []).append((t, emb))
             else:
                 if (ci, side) not in edge_queries:
@@ -3295,10 +4016,165 @@ class SceneAlignerService:
                 )
             except Exception:
                 project_zoom = 1.0
+        # per-project trust calibration: registered SSCD scores run on a
+        # project-wide scale (0.72-0.93 on one style, 0.64-0.79 on
+        # another); anchor the arbitration trust floor to confident probe
+        # chains so one style does not arbitrate everything (perf) while
+        # another trusts wrong instances (correctness). Probe windows land
+        # in the shared cache, so the loop re-scores them for free.
+        trusted_floor = DUPLICATE_TRUSTED_SSCD
         try:
-            for ci, (i, j) in enumerate(chains):
+            probe_scores: list[float] = []
+            probe_cis = [
+                ci
+                for ci, (ii, jj) in enumerate(chains)
+                if scenes[jj].end_time - scenes[ii].start_time >= 1.5
+                and mid_embs.get(ci)
+                and ci in mid_grays
+            ]
+            step_p = max(1, len(probe_cis) // 5)
+            for ci in probe_cis[::step_p][:5]:
+                ii, jj = chains[ci]
+                line_fn = cls._piecewise_source_at(ii, jj, scenes, raw0)
+                seg_ep = remapped[ii][1].episode
+                cap = cache.get_cap(seg_ep)
+                if cap is None:
+                    continue
+                t_mid_p = 0.5 * (scenes[ii].start_time + scenes[jj].end_time)
+                pred_p = float(line_fn(t_mid_p))
+                frames_p = (
+                    AnimeMatcherService._collect_frames_in_window_from_capture(
+                        cap, pred_p - 0.3, pred_p + 0.3,
+                        max_frames=8, sample_frames=3,
+                    )
+                )
+                rect_p = None
+                for _, im in sorted(
+                    frames_p, key=lambda fr: abs(fr[0] - pred_p)
+                )[:2]:
+                    rect_p = cls._footprint_rect(
+                        mid_grays[ci], cls._small_gray(im)
+                    )
+                    if rect_p is not None:
+                        break
+                if rect_p is None:
+                    continue
+                res_p = cls._zoom_sscd_score_line(
+                    mid_embs[ci], line_fn, cache, seg_ep, rect_p, sweep=0.3
+                )
+                if res_p is not None:
+                    probe_scores.append(res_p[0])
+            if probe_scores:
+                trusted_floor = min(
+                    DUPLICATE_TRUSTED_SSCD,
+                    max(0.60, max(probe_scores) - 0.12),
+                )
+        except Exception:
+            trusted_floor = DUPLICATE_TRUSTED_SSCD
+        try:
+            # visit queue: one pass over all chains, plus bounded forced
+            # revisits of a switched chain's neighbours — a partial switch
+            # inside a fold leaves siblings on the abandoned line and the
+            # merged interval incoherent (dcd#19, v102); the revisit sees
+            # the switched neighbour's continuation as a proposal
+            def _r2_specs(
+                cix: int,
+            ) -> tuple[str, list[tuple[float, float]]] | None:
+                """The R2 anchoring pass's exact (episode, window) specs
+                for a chain, computed from LIVE raw — shared between the
+                pass itself and the decode prefetcher so staged runs match
+                byte-for-byte."""
+                ii, jj = chains[cix]
+                seg0 = remapped[ii][1]
+                if seg0 is None or raw[ii] is None or raw[jj] is None:
+                    return None
+                q_all_x = edge_queries.get((cix, 0), []) + edge_queries.get(
+                    (cix, 1), []
+                )
+                if not q_all_x:
+                    return None
+
+                def src_at(t: float) -> float:
+                    for piece in range(ii, jj + 1):
+                        sc = scenes[piece]
+                        if t <= sc.end_time + 1e-6 or piece == jj:
+                            if raw[piece] is None:
+                                return raw[ii][0]
+                            dur = max(sc.end_time - sc.start_time, 1e-6)
+                            rate = (raw[piece][1] - raw[piece][0]) / dur
+                            return raw[piece][0] + (t - sc.start_time) * rate
+                    return raw[jj][1]
+
+                targets_x = [src_at(t) for t, _ in q_all_x]
+                if ii == jj:
+                    sc = scenes[ii]
+                    dur = max(sc.end_time - sc.start_time, 1e-6)
+                    fitted_rate = (raw[ii][1] - raw[ii][0]) / dur
+                    if abs(fitted_rate - 1.0) > 0.1:
+                        t_mid_x = 0.5 * (sc.start_time + sc.end_time)
+                        mid_src_x = 0.5 * (raw[ii][0] + raw[ii][1])
+                        targets_x.extend(
+                            mid_src_x + (t - t_mid_x) for t, _ in q_all_x
+                        )
+                targets_x.sort()
+                wins_x: list[tuple[float, float]] = []
+                for target in targets_x:
+                    lo_x, hi_x = target - 0.85, target + 0.85
+                    if wins_x and lo_x <= wins_x[-1][1] + 0.5:
+                        wins_x[-1] = (
+                            wins_x[-1][0],
+                            max(wins_x[-1][1], hi_x),
+                        )
+                    else:
+                        wins_x.append((lo_x, hi_x))
+                return seg0.episode, wins_x
+
+            visit_queue: list[tuple[int, bool]] = [
+                (ci, False) for ci in range(len(chains))
+            ]
+            revisited: set[int] = set()
+            qi = -1
+            while qi + 1 < len(visit_queue):
+                qi += 1
+                ci, forced_visit = visit_queue[qi]
+                i, j = chains[ci]
                 segment_first = remapped[i][1]
                 episode = segment_first.episode
+                for lookahead in (1, 2):
+                    # stage the upcoming chains' trust + R2 windows while
+                    # this chain registers/scores (their raw is untouched
+                    # until their own turn)
+                    if qi + lookahead >= len(visit_queue):
+                        break
+                    nci = visit_queue[qi + lookahead][0]
+                    ni_p, nj_p = chains[nci]
+                    seg_n = remapped[ni_p][1]
+                    if (
+                        seg_n is not None
+                        and raw[ni_p] is not None
+                        and mid_embs.get(nci)
+                    ):
+                        fn_n = cls._piecewise_source_at(
+                            ni_p, nj_p, scenes, raw
+                        )
+                        preds_n = [
+                            float(fn_n(t)) for t, _ in mid_embs[nci]
+                        ]
+                        cache.prefetch(
+                            seg_n.episode,
+                            min(preds_n) - 0.5,
+                            max(preds_n) + 0.5,
+                        )
+                        t_mid_n = 0.5 * (
+                            scenes[ni_p].start_time + scenes[nj_p].end_time
+                        )
+                        cache.prefetch_probe(
+                            seg_n.episode, float(fn_n(t_mid_n))
+                        )
+                        spec_n = _r2_specs(nci)
+                        if spec_n is not None:
+                            for lo_n, hi_n in spec_n[1]:
+                                cache.prefetch(spec_n[0], lo_n, hi_n)
 
                 def chain_source_at(t: float) -> float:
                     for piece in range(i, j + 1):
@@ -3317,9 +4193,10 @@ class SceneAlignerService:
                 if not q_all:
                     continue
 
-                # R1: duplicate arbitration by zoom-SSCD (content-decided) or
-                # global-assignment chronology (for certified-identical
-                # repeats, where switching cannot change the render).
+                # R1: duplicate arbitration by registered-footprint SSCD
+                # (content-decided) or global-assignment chronology (for
+                # certified-identical repeats, where switching cannot
+                # change the render).
                 distant = [
                     c
                     for c in (candidate_sets[ci] if ci < len(candidate_sets) else [])
@@ -3335,10 +4212,125 @@ class SceneAlignerService:
                 index_suspect = any(
                     float(c["sim"]) >= cur_sim - 0.05 for c in distant
                 )
-                if distant and q_mids and proposed is None and not index_suspect:
-                    # neither the assignment DP nor the index doubts the
-                    # current instance: skip the native scoring, keep the
-                    # doubt tag for near-tie candidates
+                # candidate recall beyond the assignment sets: index-side
+                # self-similarity (duplicate instances that carry no
+                # correspondences) plus query-side deep search (true
+                # instances outranked by montage lookalikes inside top-K)
+                recall: list[dict[str, float | str]] = []
+                t_mid_tt = 0.5 * (scenes[i].start_time + scenes[j].end_time)
+
+                def _known(c, known) -> bool:
+                    pos = float(c["a"]) * t_mid_tt + float(c["b"])
+                    return any(
+                        d["episode"] == c["episode"]
+                        and abs(
+                            pos - (float(d["a"]) * t_mid_tt + float(d["b"]))
+                        )
+                        < 3.0
+                        for d in known
+                    )
+
+                import os as _os
+
+                def cand_rect(ep: str, source_fn):
+                    """Registered footprint of the query inside this
+                    candidate's shot, or None when registration fails."""
+                    _t0 = time.perf_counter()
+                    q_gray = mid_grays.get(ci)
+                    if q_gray is None:
+                        _prof["rect"] += time.perf_counter() - _t0
+                        return None
+                    t_mid = 0.5 * (
+                        scenes[i].start_time + scenes[j].end_time
+                    )
+                    pred = float(source_fn(t_mid))
+                    frames = cache.probe_frames(ep, pred)
+                    out_rect = None
+                    for _, im in sorted(
+                        frames, key=lambda fr: abs(fr[0] - pred)
+                    )[:2]:
+                        out_rect = cls._footprint_rect(
+                            q_gray, cls._small_gray(im)
+                        )
+                        if out_rect is not None:
+                            break
+                    _prof["rect"] += time.perf_counter() - _t0
+                    return out_rect
+
+                def scored_with_rect(
+                    ep: str,
+                    line_fn,
+                    sweep: float = 1.2,
+                    rect: "tuple | None" = None,
+                ) -> tuple[tuple | None, object]:
+                    """Score a line under the edit's registered footprint.
+                    The footprint is a property of the EDIT's framing, not
+                    of the candidate (bench v4 2026-07-11: a shared crop
+                    separates every owner-labeled duplicate), so callers
+                    pass the chain's rect when they have one; otherwise
+                    register at the line midpoint and — when that frame
+                    belongs to another shot — retry at the scorer's own
+                    best alignment."""
+                    if rect is None:
+                        rect = cand_rect(ep, line_fn)
+                    res = cls._zoom_sscd_score_line(
+                        q_mids,
+                        line_fn,
+                        cache,
+                        ep,
+                        rect if rect is not None else project_zoom,
+                        sweep=sweep,
+                    )
+                    if res is not None and rect is None:
+                        rect2 = cand_rect(
+                            ep,
+                            lambda t, _d=res[1]: line_fn(t) + _d,
+                        )
+                        if rect2 is not None:
+                            res2 = cls._zoom_sscd_score_line(
+                                q_mids, line_fn, cache, ep, rect2,
+                                sweep=sweep,
+                            )
+                            if res2 is not None:
+                                return res2, rect2
+                    return res, rect
+
+                # the current line is its own fit, so its peak sits within
+                # a narrow sweep; candidates keep the wide sweep because
+                # their offsets come from recall medians and cluster fits
+                _t_cur = time.perf_counter()
+                cur_res, cur_rect = (
+                    scored_with_rect(episode, chain_source_at, sweep=0.3)
+                    if q_mids
+                    else (None, None)
+                )
+                _prof["cur"] += time.perf_counter() - _t_cur
+                cur_doubt = (
+                    cur_res is None
+                    or cur_rect is None
+                    or cur_res[0] < trusted_floor
+                )
+                arbitrate = bool(q_mids) and (
+                    index_suspect
+                    or proposed is not None
+                    or cur_doubt
+                    or forced_visit
+                )
+                if _os.environ.get("ATR_RERANK_DEBUG"):
+                    print(
+                        f"[chain] {i}-{j} tt={scenes[i].start_time:.1f}-"
+                        f"{scenes[j].end_time:.1f} n_distant={len(distant)} "
+                        f"cur={cur_res[0] if cur_res else None} "
+                        f"rect={'y' if cur_rect else 'n'} "
+                        f"doubt={cur_doubt} arbitrate={arbitrate} "
+                        f"proposed={proposed is not None} "
+                        f"suspect={index_suspect}"
+                    )
+                if not arbitrate:
+                    # the current line explains the query at the edit's
+                    # own registered geometry and nothing else doubts it:
+                    # skip arbitration, keep the doubt tag for near-tie
+                    # index candidates
                     if any(
                         float(c["sim"]) >= cur_sim - 0.03 for c in distant
                     ):
@@ -3346,47 +4338,258 @@ class SceneAlignerService:
                             tags = doubts.setdefault(piece, [])
                             if "duplicate_tie" not in tags:
                                 tags.append("duplicate_tie")
-                elif distant and q_mids:
-                    cur_res = cls._zoom_sscd_score_line(
-                        q_mids, chain_source_at, cache, episode, project_zoom
-                    )
+                elif cur_res is not None:
+                    # chronology proposals: retrieval can be entirely
+                    # blind to the true instance (montage lookalike
+                    # dominating top-K), but the source mostly continues
+                    # across consecutive chains (measured 79-100%
+                    # adjacency prior) — propose the neighbours'
+                    # unit-rate continuations at NOVEL positions;
+                    # registered scoring decides. Each side then scores
+                    # under its own registered footprint (project-zoom
+                    # fallback). Bench 2026-07-11: with both sides
+                    # registered true duplicates separate at >=0.104 and
+                    # identical repeats sit <=0.03 (threshold 0.07); with
+                    # one side registered the margins are larger but
+                    # unmeasured in the reverse direction (bar 0.12).
+                    proposals: list[dict[str, float | str]] = []
+                    current_as_cand = [
+                        {
+                            "episode": episode,
+                            "a": 1.0,
+                            "b": chain_source_at(t_mid_tt) - t_mid_tt,
+                        }
+                    ]
+                    if (
+                        (cur_doubt or forced_visit)
+                        and scenes[j].end_time - scenes[i].start_time <= 6.0
+                    ):
+                        # recall runs only for doubtful chains: index-side
+                        # self-similarity (duplicate instances carrying no
+                        # correspondences) plus query-side deep search
+                        # (true instances outranked by montage lookalikes;
+                        # edge-inset queries included — fast montages need
+                        # more than three query frames to hit the right
+                        # sub-shot)
+                        mid_ts = [t for t, _ in q_mids]
+                        q_recall = (q_mids + q_start[1:] + q_end[1:])[:8]
+                        _t_rec = time.perf_counter()
+                        recalled = (
+                            cls._index_duplicate_recall(
+                                episode, chain_source_at, mid_ts
+                            )
+                            + cls._query_deep_recall(
+                                q_recall, chain_source_at, episode
+                            )
+                            if cur_doubt
+                            else []  # forced revisits only need proposals
+                        )
+                        _prof["recall"] += time.perf_counter() - _t_rec
+                        for c in recalled:
+                            if not _known(c, distant) and not _known(c, recall):
+                                recall.append(c)
+                        proposals: list[dict[str, float | str]] = []
+                        if ci > 0:
+                            _pi2, pj2 = chains[ci - 1]
+                            if raw[pj2] is not None and remapped[pj2][1] is not None:
+                                proposals.append(
+                                    {
+                                        "episode": remapped[pj2][1].episode,
+                                        "a": 1.0,
+                                        "b": raw[pj2][1]
+                                        - scenes[pj2].end_time,
+                                        "rank_sim": 0.0,
+                                    }
+                                )
+                        if ci + 1 < len(chains):
+                            ni2, _nj2 = chains[ci + 1]
+                            if raw[ni2] is not None and remapped[ni2][1] is not None:
+                                proposals.append(
+                                    {
+                                        "episode": remapped[ni2][1].episode,
+                                        "a": 1.0,
+                                        "b": raw[ni2][0]
+                                        - scenes[ni2].start_time,
+                                        "rank_sim": 0.0,
+                                    }
+                                )
+                        current_as_cand = [
+                            {
+                                "episode": episode,
+                                "a": 1.0,
+                                "b": chain_source_at(t_mid_tt) - t_mid_tt,
+                            }
+                        ]
+                        # proposals are only worth their native windows on
+                        # deeply doubtful chains: every proposal-fixed
+                        # chain measured cur <= 0.638 registered
+                        deeply_doubtful = (
+                            cur_res is None
+                            or cur_res[0] < trusted_floor - 0.05
+                            or forced_visit
+                        )
+                        if _os.environ.get("ATR_RERANK_DEBUG"):
+                            print(
+                                f"  [prop] chain {i}-{j} deep={deeply_doubtful} "
+                                + " ".join(
+                                    f"{str(p['episode'])[-10:]}@"
+                                    f"{float(p['a']) * t_mid_tt + float(p['b']):.1f}"
+                                    for p in proposals
+                                )
+                            )
+                        for c in proposals if deeply_doubtful else []:
+                            if _known(c, current_as_cand):
+                                continue
+                            c["proposal"] = 1.0
+                            replaced = False
+                            for lst in (recall, distant):
+                                for k2, d in enumerate(lst):
+                                    if not _known(c, [d]):
+                                        continue
+                                    # same instance: the chronology offset
+                                    # is exact where cluster/fit offsets
+                                    # drift by seconds — the proposal's
+                                    # line wins (unless the entry is the
+                                    # assignment DP's own proposal, whose
+                                    # identity the certificate tier needs)
+                                    if d is not proposed:
+                                        lst[k2] = c
+                                    else:
+                                        d["proposal"] = 1.0
+                                    replaced = True
+                                    break
+                                if replaced:
+                                    break
+                            if not replaced:
+                                recall.append(c)
+                    # native scoring is the expensive step (a decoded +
+                    # embedded window per candidate): drop assignment-set
+                    # candidates that are not even index near-ties — they
+                    # lose by wide margins (measured -0.13..-0.50) — and
+                    # score recall/proposals first
+                    strong = [
+                        c
+                        for c in distant
+                        if float(c.get("sim", 1.0)) >= cur_sim - 0.10
+                        or (proposed is not None and c is proposed)
+                    ]
+                    distant = (recall + strong)[:5]
+                    # stage every candidate's window on the decode worker
+                    # while the main thread registers and embeds
+                    for cand_pf in distant:
+                        a_pf, b_pf = float(cand_pf["a"]), float(cand_pf["b"])
+                        preds_pf = [a_pf * t + b_pf for t, _ in q_mids]
+                        cache.prefetch(
+                            str(cand_pf["episode"]),
+                            min(preds_pf) - 1.4,
+                            max(preds_pf) + 1.4,
+                        )
+                        cache.prefetch_probe(
+                            str(cand_pf["episode"]),
+                            a_pf * t_mid_tt + b_pf,
+                        )
                     switch_to: dict[str, float | str] | None = None
                     switch_delta = 0.0
                     switch_reason = ""
-                    if cur_res is not None:
+                    if distant:
                         cur_score = cur_res[0]
                         cur_start = chain_source_at(scenes[i].start_time)
                         best_margin = None
+                        best_switch = None  # (margin, cand, delta)
+                        cert_switch = None
+                        prop_switch = None
                         for cand in distant:
                             a_c, b_c = float(cand["a"]), float(cand["b"])
-                            res = cls._zoom_sscd_score_line(
-                                q_mids,
-                                lambda t, _a=a_c, _b=b_c: _a * t + _b,
-                                cache,
+                            cand_fn = lambda t, _a=a_c, _b=b_c: _a * t + _b
+                            _t_cand = time.perf_counter()
+                            # the chain's rect is a cheap LOWER BOUND for a
+                            # true candidate (a wrong current instance's
+                            # framing understates the truth, measured on
+                            # 85de #17/#24); candidates near the decision
+                            # boundary pay for their own registration
+                            res, c_rect = scored_with_rect(
                                 str(cand["episode"]),
-                                project_zoom,
+                                cand_fn,
+                                rect=cur_rect,
                             )
+                            if (
+                                res is not None
+                                and cur_rect is not None
+                                and -0.10 <= res[0] - cur_res[0] < 0.09
+                            ):
+                                # rescore around the first pass's own best
+                                # alignment: the wide sweep already found
+                                # the offset, the rescore only swaps in
+                                # the candidate's registered geometry
+                                d0 = res[1]
+                                res2, c_rect2 = scored_with_rect(
+                                    str(cand["episode"]),
+                                    lambda t, _d=d0: cand_fn(t) + _d,
+                                    sweep=0.3,
+                                )
+                                if res2 is not None and res2[0] > res[0]:
+                                    res = (res2[0], res2[1] + d0, res2[2])
+                                    c_rect = c_rect2
+                            _prof["cand"] += time.perf_counter() - _t_cand
                             if res is None:
                                 continue
                             margin = res[0] - cur_score
+                            if _os.environ.get("ATR_RERANK_DEBUG"):
+                                print(
+                                    f"  [cand] chain {i}-{j} "
+                                    f"{str(cand['episode'])[-14:]} "
+                                    f"pos@{a_c * t_mid_tt + b_c:.1f} "
+                                    f"rect={'y' if c_rect else 'n'} "
+                                    f"score={res[0]:.3f} margin={margin:+.3f} "
+                                    f"rank_sim={float(cand['rank_sim']) if 'rank_sim' in cand else -1:.2f}"
+                                )
                             if best_margin is None or margin > best_margin:
                                 best_margin = margin
                             is_proposed = proposed is not None and cand is proposed
-                            if margin >= 0.07 or (is_proposed and margin >= 0.02):
-                                # content-decided at the edit's geometry
-                                switch_to, switch_delta = cand, res[1]
-                                switch_reason = "duplicate_rerank"
-                                break
-                            if is_proposed and margin >= -0.02:
+                            threshold = (
+                                0.07
+                                if cur_rect is not None and c_rect is not None
+                                else 0.12
+                            )
+                            if margin >= threshold or (
+                                is_proposed and margin >= 0.02
+                            ):
+                                # content-decided at the edit's geometry;
+                                # ALL candidates are scored and the best
+                                # margin wins (first-past-post picked an
+                                # inferior instance when recall widened
+                                # the candidate set)
+                                if best_switch is None or margin > best_switch[0]:
+                                    best_switch = (margin, cand, res[1])
+                            elif is_proposed and margin >= -0.02:
                                 # native identity certificate: the two
                                 # aligned decoded windows show the same
                                 # frames, so chronology may decide freely
                                 cross = np.sum(cur_res[2] * res[2], axis=1)
                                 cross = cross[~np.isnan(cross)]
                                 if cross.size and float(np.mean(cross)) >= 0.95:
-                                    switch_to, switch_delta = cand, res[1]
-                                    switch_reason = "chronology_assign"
-                                    break
+                                    cert_switch = (margin, cand, res[1])
+                            elif (
+                                forced_visit
+                                and cand.get("proposal")
+                                and margin >= -0.02
+                            ):
+                                # fold continuity: a switched neighbour's
+                                # continuation with neutral-or-better own
+                                # evidence follows the corrected line — a
+                                # truly different shot loses by a wide
+                                # margin and stays
+                                if prop_switch is None or margin > prop_switch[0]:
+                                    prop_switch = (margin, cand, res[1])
+                        if best_switch is not None:
+                            _, switch_to, switch_delta = best_switch
+                            switch_reason = "duplicate_rerank"
+                        elif cert_switch is not None:
+                            _, switch_to, switch_delta = cert_switch
+                            switch_reason = "chronology_assign"
+                        elif prop_switch is not None:
+                            _, switch_to, switch_delta = prop_switch
+                            switch_reason = "chronology_assign"
                         import os as _os
 
                         if _os.environ.get("ATR_RERANK_DEBUG"):
@@ -3394,7 +4597,9 @@ class SceneAlignerService:
                                 f"[dup] chain {i}-{j} tt="
                                 f"{scenes[i].start_time:.1f}-{scenes[j].end_time:.1f} "
                                 f"cur@{cur_start:.1f} score={cur_score:.3f} "
-                                f"zoom={project_zoom} best_margin={best_margin} "
+                                f"rect={'y' if cur_rect else 'n'} "
+                                f"n_cand={len(distant)} n_recall={len(recall)} "
+                                f"best_margin={best_margin} "
                                 f"-> {switch_reason or 'keep'}"
                             )
                         if switch_to is not None:
@@ -3414,11 +4619,26 @@ class SceneAlignerService:
                                     a_new * sc.end_time + b_new,
                                 )
                                 doubts.setdefault(piece, []).append(switch_reason)
+                            for nb in (ci - 1, ci + 1):
+                                if 0 <= nb < len(chains) and nb not in revisited:
+                                    revisited.add(nb)
+                                    visit_queue.append((nb, True))
                         elif best_margin is not None and abs(best_margin) <= 0.04:
                             for piece in range(i, j + 1):
                                 tags = doubts.setdefault(piece, [])
                                 if "duplicate_tie" not in tags:
                                     tags.append("duplicate_tie")
+                    if switch_to is None and forced_visit and any(
+                        _known(p, current_as_cand) for p in proposals
+                    ):
+                        # this revisited chain already agrees with the
+                        # switched neighbour: the fold may extend further —
+                        # keep propagating so every sibling piece gets the
+                        # chance to join the corrected line
+                        for nb in (ci - 1, ci + 1):
+                            if 0 <= nb < len(chains) and nb not in revisited:
+                                revisited.add(nb)
+                                visit_queue.append((nb, True))
 
                 # unit-rate alternative for isolated scenes: index-grid
                 # lookalikes can collapse a slope; only native frames can
@@ -3436,17 +4656,10 @@ class SceneAlignerService:
                 def unit_source_at(t: float) -> float:
                     return unit_line[1] + (t - unit_line[0])
 
-                targets: list[float] = [chain_source_at(t) for t, _ in q_all]
-                if unit_line is not None:
-                    targets.extend(unit_source_at(t) for t, _ in q_all)
-                targets.sort()
-                windows: list[tuple[float, float]] = []
-                for target in targets:
-                    lo, hi = target - 0.85, target + 0.85
-                    if windows and lo <= windows[-1][1] + 0.5:
-                        windows[-1] = (windows[-1][0], max(windows[-1][1], hi))
-                    else:
-                        windows.append((lo, hi))
+                spec_r2 = _r2_specs(ci)
+                windows: list[tuple[float, float]] = (
+                    spec_r2[1] if spec_r2 is not None else []
+                )
                 times_list = []
                 embs_list = []
                 for lo, hi in windows:
@@ -3670,9 +4883,308 @@ class SceneAlignerService:
                         else:
                             refined_delta[piece] = (prev[0], snap_t - raw[piece][1])
 
+            # R5b: piece-outlier arbitration. A multi-piece chain can hide
+            # ONE wrong piece: the edit jumps away and back (85de GT#10/
+            # #11/#12: 256.0 -> 198.6 -> 257.0) while a lookalike keeps the
+            # pieces' lines continuous, so whole-chain arbitration sees a
+            # healthy chain. Per-piece registered scores on the chain's
+            # own cached window expose the odd piece (bench margin +0.40
+            # registered for the owner-labeled case); the outlier piece
+            # then arbitrates alone via deep recall.
+            for ci, (i, j) in enumerate(chains):
+                if j <= i:
+                    continue
+                q_mids = mid_embs.get(ci, [])
+                q_gray = mid_grays.get(ci)
+                if len(q_mids) < 2 or q_gray is None:
+                    continue
+                segment_first = remapped[i][1]
+                if segment_first is None or raw[i] is None:
+                    continue
+                episode = segment_first.episode
+
+                def chain_line(t: float, _i=i, _j=j) -> float:
+                    for piece in range(_i, _j + 1):
+                        sc = scenes[piece]
+                        if t <= sc.end_time + 1e-6 or piece == _j:
+                            if raw[piece] is None:
+                                return raw[_i][0]
+                            dur = max(sc.end_time - sc.start_time, 1e-6)
+                            rate = (raw[piece][1] - raw[piece][0]) / dur
+                            return raw[piece][0] + (t - sc.start_time) * rate
+                    return raw[_j][1]
+
+                cap0 = cache.get_cap(episode)
+                if cap0 is None:
+                    continue
+                pred0 = float(chain_line(0.5 * (scenes[i].start_time + scenes[j].end_time)))
+                frames0 = AnimeMatcherService._collect_frames_in_window_from_capture(
+                    cap0, pred0 - 0.3, pred0 + 0.3, max_frames=8, sample_frames=3
+                )
+                rect0 = None
+                for _, im in sorted(frames0, key=lambda fr: abs(fr[0] - pred0))[:2]:
+                    rect0 = cls._footprint_rect(q_gray, cls._small_gray(im))
+                    if rect0 is not None:
+                        break
+                if rect0 is None:
+                    continue
+                piece_scores: dict[int, float] = {}
+                for piece in range(i, j + 1):
+                    sc = scenes[piece]
+                    pm = [
+                        (t, e)
+                        for t, e in q_mids
+                        if sc.start_time <= t <= sc.end_time
+                    ]
+                    if not pm or raw[piece] is None:
+                        continue
+                    r = cls._zoom_sscd_score_line(
+                        pm, chain_line, cache, episode, rect0, sweep=0.3
+                    )
+                    if r is not None:
+                        piece_scores[piece] = r[0]
+                if _os.environ.get("ATR_RERANK_DEBUG"):
+                    print(
+                        f"[pieces] chain {i}-{j} "
+                        + " ".join(
+                            f"{p}:{v:.2f}" for p, v in sorted(piece_scores.items())
+                        )
+                    )
+                if len(piece_scores) < 2:
+                    continue
+                vmax = max(piece_scores.values())
+                for piece, v in piece_scores.items():
+                    if v >= vmax - 0.25 or v >= trusted_floor:
+                        continue
+                    sc = scenes[piece]
+                    # the chain carries one mid per piece; recall's >=2
+                    # distinct-query-time agreement gate needs more, so
+                    # the outlier piece decodes its own mids (rare, cheap)
+                    ts_p = [
+                        sc.start_time + f * (sc.end_time - sc.start_time)
+                        for f in (0.3, 0.5, 0.7)
+                    ]
+                    dec_p = AnimeMatcherService.extract_frames(
+                        video_path, ts_p
+                    )
+                    pils_p = [
+                        (t, fr.convert("RGB"))
+                        for t, fr in zip(ts_p, dec_p, strict=False)
+                        if fr is not None
+                    ]
+                    if not pils_p:
+                        continue
+                    embs_p = AnimeMatcherService._embed_pil_batch(
+                        _presize_images([im for _, im in pils_p])
+                    )
+                    pm = [
+                        (t, e)
+                        for (t, _), e in zip(pils_p, embs_p, strict=False)
+                    ]
+                    cands_p = cls._query_deep_recall(pm, chain_line, episode)
+                    best_p: tuple[float, dict, float] | None = None
+                    for cand in cands_p[:3]:
+                        a_c, b_c = float(cand["a"]), float(cand["b"])
+                        cand_fn = lambda t, _a=a_c, _b=b_c: _a * t + _b
+                        cap_c = cache.get_cap(str(cand["episode"]))
+                        rect_c = None
+                        if cap_c is not None:
+                            pred_c = float(cand_fn(0.5 * (sc.start_time + sc.end_time)))
+                            frames_c = AnimeMatcherService._collect_frames_in_window_from_capture(
+                                cap_c, pred_c - 0.3, pred_c + 0.3,
+                                max_frames=8, sample_frames=3,
+                            )
+                            for _, im in sorted(
+                                frames_c, key=lambda fr: abs(fr[0] - pred_c)
+                            )[:2]:
+                                rect_c = cls._footprint_rect(
+                                    q_gray, cls._small_gray(im)
+                                )
+                                if rect_c is not None:
+                                    break
+                        res_p = cls._zoom_sscd_score_line(
+                            pm,
+                            cand_fn,
+                            cache,
+                            str(cand["episode"]),
+                            rect_c if rect_c is not None else project_zoom,
+                            sweep=1.2,
+                        )
+                        if res_p is None:
+                            continue
+                        margin_p = res_p[0] - v
+                        threshold_p = 0.07 if rect_c is not None else 0.12
+                        if _os.environ.get("ATR_RERANK_DEBUG"):
+                            print(
+                                f"  [piece] chain {i}-{j} piece {piece} "
+                                f"v={v:.3f} cand@"
+                                f"{a_c * 0.5 * (sc.start_time + sc.end_time) + b_c:.1f} "
+                                f"score={res_p[0]:.3f} margin={margin_p:+.3f}"
+                            )
+                        if margin_p >= threshold_p and (
+                            best_p is None or res_p[0] > best_p[0]
+                        ):
+                            best_p = (res_p[0], cand, res_p[1])
+                    if best_p is not None:
+                        _, cand, delta_p = best_p
+                        a_n, b_n = float(cand["a"]), float(cand["b"]) + delta_p
+                        ep_n = str(cand["episode"])
+                        seg_p = remapped[piece][1]
+                        if seg_p is not None:
+                            seg_p = dc_replace(seg_p, episode=ep_n, a=a_n, b=b_n)
+                        remapped[piece] = (remapped[piece][0], seg_p)
+                        raw[piece] = (
+                            a_n * sc.start_time + b_n,
+                            a_n * sc.end_time + b_n,
+                        )
+                        refined_delta.pop(piece, None)
+                        doubts.setdefault(piece, []).append("duplicate_rerank")
+
+            # start-side containment (owner-endorsed, round 6) as a
+            # POST-pass: it must see the raw values AFTER the R5b
+            # piece switches — 85de#12's rendered start only becomes a
+            # render-segment start once piece 12 has moved to its own
+            # line.
+            for ci, (i, j) in enumerate(chains):
+                if remapped[i][1] is None:
+                    continue
+                episode = remapped[i][1].episode
+                # start-side containment (owner-endorsed, round 6): the
+                # locked interval must not CROSS a native source cut that
+                # the TikTok start frame sits after — a start placed before
+                # the cut renders frames from a different sequence (85de
+                # #12/#13: starts 0.84-1.03s early across a hard cut). The
+                # scan extends the already-cached window by a few slots;
+                # the start only ever pulls FORWARD, onto the cut.
+                # render-segment starts: the chain start plus any piece
+                # whose predecessor sits on a DIFFERENT line (piece-level
+                # switches break continuity mid-chain — 85de#12's rendered
+                # start is such a piece)
+                seg_starts = [i]
+                for p_c in range(i + 1, j + 1):
+                    if raw[p_c] is None or raw[p_c - 1] is None:
+                        continue
+                    ep_a = (
+                        remapped[p_c][1].episode
+                        if remapped[p_c][1] is not None
+                        else None
+                    )
+                    ep_b = (
+                        remapped[p_c - 1][1].episode
+                        if remapped[p_c - 1][1] is not None
+                        else None
+                    )
+                    if ep_a != ep_b or abs(
+                        raw[p_c][0] - raw[p_c - 1][1]
+                    ) > INLIER_TOLERANCE_SECONDS:
+                        seg_starts.append(p_c)
+                for p_c in seg_starts:
+                    if raw[p_c] is None:
+                        continue
+                    seg_ep = (
+                        remapped[p_c][1].episode
+                        if remapped[p_c][1] is not None
+                        else episode
+                    )
+                    # segment end: last piece before the next segment start
+                    p_end = j
+                    for q_c in seg_starts:
+                        if q_c > p_c:
+                            p_end = q_c - 1
+                            break
+                    if raw[p_end] is None:
+                        continue
+                    d_start = refined_delta.get(p_c, (0.0, 0.0))
+                    s0 = raw[p_c][0] + d_start[0]
+                    s1 = raw[p_end][1] + refined_delta.get(
+                        p_end, (0.0, 0.0)
+                    )[1]
+                    if s1 - s0 < 0.3:
+                        continue
+                    # 0.85 reach = the R2 anchoring window's own span:
+                    # the scan is a pure cache hit (zero new decode); both
+                    # owner cases needed <=0.35
+                    win_c = cache.window(
+                        seg_ep, 1.0, s0, min(s0 + 0.85, s1)
+                    )
+                    if win_c is None or win_c[0].size < 4:
+                        continue
+                    ct, ce = win_c
+                    cd = 1.0 - np.sum(ce[1:] * ce[:-1], axis=1)
+                    cmid = (ct[1:] + ct[:-1]) / 2.0
+                    floor_c = max(0.08, 3.0 * float(np.median(cd)))
+                    # a cut pair counts when its POST-cut frame lands
+                    # inside the interval (the pair may straddle s0
+                    # itself); the start pulls onto that first clean frame
+                    cuts_c = ct[1:][
+                        (cd >= floor_c)
+                        & (ct[1:] > s0 + 0.01)
+                        & (cmid < s1 - 0.1)
+                    ]
+                    import os as _os2
+
+                    if _os2.environ.get("ATR_RERANK_DEBUG"):
+                        print(
+                            f"[contain] chain {i}-{j} piece {p_c} "
+                            f"s0={s0:.3f} s1={s1:.3f} n_cuts={cuts_c.size} "
+                            f"maxd={float(cd.max()) if cd.size else -1:.3f} "
+                            f"t0={float(ct[0]):.3f} t1={float(ct[-1]):.3f} "
+                            f"cuts={[round(float(c), 2) for c in cuts_c[:3]]}"
+                        )
+                    if not cuts_c.size:
+                        continue
+                    cut_t = float(cuts_c.min())
+                    # start-edge query: the chain edge frame for the chain
+                    # start; a freshly decoded frame for mid-chain starts
+                    if p_c == i and edge_queries.get((ci, 0)):
+                        q0_emb = edge_queries[(ci, 0)][0][1]
+                    else:
+                        dec_c = AnimeMatcherService.extract_frames(
+                            video_path, [scenes[p_c].start_time + 0.02]
+                        )
+                        if not dec_c or dec_c[0] is None:
+                            continue
+                        q0_emb = AnimeMatcherService._embed_pil_batch(
+                            _presize_images([dec_c[0].convert("RGB")])
+                        )[0]
+                    pre_m = ct < cut_t
+                    post_m = (ct >= cut_t) & (ct <= min(cut_t + 0.8, s1))
+                    if not (pre_m.any() and post_m.any()):
+                        continue
+                    sims_c = ce @ q0_emb
+                    sim_pre = float(sims_c[pre_m].max())
+                    sim_post = float(sims_c[post_m].max())
+                    if _os2.environ.get("ATR_RERANK_DEBUG"):
+                        print(
+                            f"[contain]   cut@{cut_t:.2f} pre={sim_pre:.3f} "
+                            f"post={sim_post:.3f}"
+                        )
+                    if sim_post >= sim_pre + 0.05:
+                        refined_delta[p_c] = (
+                            cut_t - raw[p_c][0],
+                            d_start[1],
+                        )
+
+
+            # R6 no-match recovery: built, measured, and DISABLED — every
+            # owner-labeled target legitimately abstains under the win-
+            # margin discipline (lookalike loops within 0.07; certification
+            # below bar; a piece spanning two GT scenes), so the pass costs
+            # ~40s/project for zero output change (journal v106/v116). The
+            # instrument remains available for M5:
+            # cls._recover_no_match(video_path, scenes, raw, remapped,
+            #     scene_segments, correspondences, cache, trusted_floor,
+            #     doubts)
         finally:
             if owns_cache:
                 cache.close()
+            import os as _os
+
+            if _os.environ.get("ATR_RERANK_DEBUG"):
+                print(
+                    "[prof] "
+                    + " ".join(f"{k}={v:.1f}s" for k, v in _prof.items())
+                )
         return refined_delta, doubts
 
 

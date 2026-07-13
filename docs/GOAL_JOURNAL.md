@@ -459,3 +459,419 @@ and 85de83ca6323). Version numbering continues from v57 to keep references unamb
   360p, frame-accurate seek, data URIs; global 1x/0.5x/0.25x speed control +
   per-entry synchronized playback); review5_*.html regenerated from the v99 JSONs
   with identical entry sets.
+
+## 2026-07-11 - GOAL.md v4: finalization phase opened
+
+- Owner decisions (2026-07-11): GT corrections DECLINED (GT_CORRECTION_PROPOSALS.md is
+  historical; GT final as-is, 411f #7/#8 repair was the one exception); hard set =
+  duplicates + structural (18 scenes), quasi-static trims + 411f #7/#8 tolerable
+  (waivable after honest attempt); dev cap 300s/project, back to 200s at M5; the
+  <=3-waiver ceiling rule is RETIRED — done = owner-fail set empty + zero stale
+  waivers + strict budgets on non-waived scenes (the verdict ledger is the
+  acceptance record).
+- GOAL.md rewritten (v4): targets the owner-labeled 24 scenes (18 hard: 14 wrong-
+  instance H1, 4 structural H2; 6 tolerable), prescribes D1 motion/temporal-signature
+  instrument (pan-localizer generalization) + D2 segmentation repair, and makes the
+  offline labeled bench MANDATORY before wiring any scorer (v61 lesson codified).
+  Milestones M0 reproduce -> M1 bench go/no-go -> M2 H1 -> M3 H2 -> M4 tolerable+
+  review -> M5 re-hardening (200s, anime_matcher legacy deletion, AUTO_DENSE
+  experiment, constants <=15).
+
+## 2026-07-11 - v101: M0 reproduction (fresh + oracle, unmodified code)
+
+- Fresh (round-5 waivers + 411f GT fix, JSONs ~/.cache/atr-eval/v101_fresh_*.json):
+  dcd 19/0/1 + 19/0/0/1 (78.5s, 9 waiver entries), 85de 49/2/3 + 43/0/6/5 (167.2s,
+  17), 411f 50/0/2 + 49/0/0/3 (233.6s, 14), 5e85 44/2/0 + 40/0/6/0 (144.8s, 13).
+  Identical to the GOAL v4 §1 standings table on every axis; zero stale waivers;
+  all four under the 300s dev cap (411f back under its drift-regime 242s).
+- Oracle (--gt-scenes): scene 19/20, 51/54, 51/52, 46/46 — identical to the §1
+  guard line; source 18/1/0/1, 43/1/8/2, 45/0/6/1, 38/1/7/0 = v99 oracle. The 9
+  STALE lines in oracle output are expected mode noise (waivers certify the
+  FRESH reviewed intervals; given-GT boundaries shift them) — fresh stale = 0.
+- GT folders: git diff + untracked check clean. M0 done.
+
+## 2026-07-11 - M1: labeled bench built + D1 measured; go/no-go per class
+
+- Bench (`build_motion_bench.py` -> ~/.cache/atr-eval/bench/, manifest.json + 360p
+  clips): 24 target scenes + 24 owner-passed controls; per scene the TikTok clip,
+  the GT-truth window and the machine's claimed window (max-overlap generated
+  line evaluated over the GT TikTok span — merging folded intervals is incoherent
+  across broken chains) at native fps, +-1.25s pad. Probe:
+  `probe_motion_signature.py` (motion + optional --sscd, signature caching).
+- D1 as prescribed (motion/temporal-signature: 12Hz frame-diff energy global+3x3
+  cells + phase-correlation velocity, Pearson under the candidate line, +-0.6s
+  sweep): NO-GO as a standalone arbiter. Best variant (v4/v6 files): H1/distant
+  7/9 positive but min -0.144; H1/near 0/2; controls 13/13 positive. Variants
+  measured and rejected: 60fps densification (compression noise: truth r
+  0.71->0.26), +-1.0s sweep (max-over-trials bias, 2 control flips) — the v61
+  lesson reproduced offline, exactly what the bench is for.
+- THE bench discovery — registered-footprint SSCD: registering the query frame
+  onto each candidate's frame (ORB+RANSAC, the pan-localizer's first stage)
+  shows the edit is a FULL-HEIGHT vertical crop (y-span 1.0, x-span 1/2.1-1/4.3
+  of source width) whose x-center varies per scene (0.22-0.65 measured) — the
+  production center `_zoom_crop` at z=1.45 is the wrong geometry model for
+  off-center-framed scenes. SSCD scored on per-candidate registered footprints
+  (production-faithful: each candidate registered independently, truth never
+  consulted): ALL NINE rival-bearing 85de H1 duplicates separate, margins
+  +0.196..+0.422 (incl. the 0.73s near-shift #10 at +0.278); 13/13 controls
+  positive margin (distant min +0.143); ZERO false switches at threshold 0.10.
+  GO for the H1 rerank class.
+- Dead classes (both signals |margin| <= 0.03): 411f #28 (sscd -0.009, both
+  absolutes ~0.80 — visually identical instances, only chronology/assignment can
+  decide) and #51 (+0.008); quasi-static trims 85de #13 (+0.004), 5e85 #32/#34
+  (+0.091/+0.026) — the round-1-2 verdict reconfirmed at registered geometry.
+- Recovery class (was_no_match, no rival to outscore): 85de #19 truth certifies
+  at 0.751 registered-SSCD (GO); 5e85 #11/#45 and 411f #8 defeat registration on
+  every frame pair (fast action / 0.59x slow-mo; relaxed ORB yields degenerate
+  rects) — recovery needs a fallback geometry, attempt due in M2 before any
+  ceiling claim.
+- H2: 5e85 #26 separates (+0.384 registered-SSCD); #25 dead (+0.010); dcd #6 and
+  85de #0 are segmentation-shaped (D2/M3), bench margins irrelevant there.
+
+## 2026-07-11 - v102-v104: M2 registered-footprint arbitration (iterated on 85de/dcd, then all four)
+
+Instrument wired into Stage-5 R1, converging over ~10 debug iterations (logs
+~/.cache/atr-eval/v102*_debug_*.log, v103*, v104*):
+- `_footprint_rect` (ORB+RANSAC corners->fractional rect) + rect-crop support in
+  `_zoom_crop`/`_WindowEmbedCache` (geom keys quantized 0.05); per-chain rect from
+  the chain's own mid frame; candidates score under the chain rect as a cheap
+  LOWER BOUND and re-register themselves only near the decision boundary
+  (margin in [-0.10, +0.09) — a wrong current instance's framing understates the
+  truth: 85de #17/#24 lost under shared-rect-only).
+- Candidate recall: `_index_duplicate_recall` (source self-similarity >=0.80,
+  >=2 distinct query times, neighbouring-cluster merge — the quantized key
+  boundary otherwise splits one instance into two 1-hit clusters) +
+  `_query_deep_recall` (query embeddings incl. edge insets, floor 0.45 — true
+  instances measured at cos 0.51-0.54, rank 2-3, while sitting OUTSIDE the
+  decode top-K) + chronology proposals (neighbours' unit-rate continuations;
+  proposals REPLACE colliding candidates — their offset is exact where cluster
+  offsets drift ~2s, dcd#19's fix needed exactly this).
+- Decision tiers: switch at margin >=0.07 both-registered / >=0.12 one-sided
+  (bench: identical repeats <=0.03, near controls <=0.047, true duplicates
+  >=0.104); assignment-proposed >=0.02; certificate path unchanged; NEW
+  fold-continuity tier: on forced revisits a proposal with margin >=-0.02 joins
+  the switched neighbour's line. Best-margin wins over ALL candidates
+  (first-past-post picked an inferior instance once recall widened the set).
+- Revisit queue: a switch enqueues both neighbour chains (forced); revisits that
+  already agree with the switched line propagate onward (dcd#19: 3-piece fold
+  converged 773.9->777.0 across two hops, now strictly EXACT, waiver unused).
+- Sweep: candidates +-1.2s (production offsets err by up to ~1s; +-0.8 lost
+  switches), current line +-0.3 (its own fit); rescores +-0.3 at the first
+  pass's alignment.
+- Perf gates (v102h hit 504s on 85de): trust gate — chains whose current line
+  scores >= trusted_floor registered with no suspicion skip arbitration
+  entirely; recall only for doubtful chains; proposals only for deeply doubtful
+  (< floor-0.05); assignment candidates filtered to index near-ties (junk
+  measured -0.13..-0.50); scored set capped at 5.
+- v104 all-four fresh: dcd 19/0/1 + 19/0/0/1 (108.8s, #19 EXACT beyond its
+  waiver), 85de 50/2/2 + 48/1/2/3 (316.0s), 411f 50/0/2 + 49/0/0/3 (316.5s),
+  5e85 44/2/0 + 40/0/6/0 (234.2s). ZERO stale. Aggregate source exact +5 vs
+  v101; machine-fixed 85de H1: #17 #20(source) #22 #24 #40 #53 + #0(H2, now
+  loose) + dcd#19. 85de/411f ~16s over the 300s cap -> v105 adds a per-project
+  trust-floor calibration (registered scores run 0.72-0.93 on one style,
+  0.64-0.79 on another; floor = max(probe scores) - 0.12 clipped [0.60, 0.75]
+  on confident >=1.5s chains, windows cached for reuse).
+
+## 2026-07-11 - v105: M2 rerank phase validated (fresh + oracle, all four)
+
+- Fresh (waivers applied, JSONs v105_fresh_*.json): dcd 19/0/1 + 19/0/0/1
+  (105.4s), 85de 50/2/2 + 48/1/2/3 (304.5s), 411f 50/0/2 + 49/0/0/3 (292.7s),
+  5e85 44/2/0 + 40/0/6/0 (238.7s). Zero stale. 85de 4.5s over the cap
+  (drift-noise level; the real cut is M5 work).
+- Oracle guard HOLDS and improves: scene 19/20, 52/54 (was 51 — the registered
+  arbitration helps the oracle too), 51/52, 46/46; source 18/1/0/1, 48/2/4/0,
+  45/0/6/1, 38/1/7/0.
+- H1 burndown after v105: fixed 85de #17 #22 #24 #40 #53 (+#20 source axis,
+  +#0 H2 source loose, +dcd#19 exact-beyond-waiver). Remaining: 85de #3 (no
+  instrument reaches truth: not in stage-3/recall/proposals), #10 (scene
+  no-coverage inside a 3-piece chain — segmentation-shaped), #11 (piece-level
+  wrong instance INSIDE a chained run — whole-chain switching can't see it),
+  #19 + 5e85 #11 #45 (no-match recovery class, bench-certified reachable:
+  truth 0.37-0.58 vs junk <=0.16 at grid geometry), #20 scene axis
+  (fold-no-chain), 411f #28 #51 (both-signals-dead, chronology class).
+
+## 2026-07-11 - v106: no-match recovery (wired, honest-abstain)
+
+- R6 `_recover_no_match`: no-match scenes score candidate lines (neighbour
+  continuations, own Stage-3 hypotheses, raw correspondence clusters, deep
+  recall) under registered rects (bar max(0.55, floor-0.15) — registration
+  success is itself >=15-inlier evidence) or a full-height grid of aspect
+  footprints (bar 0.32, bench-derived); the SAME win-margin discipline as R1
+  (best >= second + 0.07) or ABSTAIN — first cut recovered 5e85#11 to a
+  lookalike (the neighbour continuation certified too; a wrong recovery stales
+  waivers where a no-match stays harmless).
+- Outcome: all three recovery targets ABSTAIN legitimately — 5e85#11: truth
+  registers at 0.627 but the 251-lookalike scores 0.387-0.56 within 0.07 (loop
+  content); 5e85#45: truth@790 enters via corr-clusters but scores 0.289 grid
+  (< 0.32); 85de#19: its no-match piece spans GT#19+#20 (segmentation), the
+  #20-half certifies (0.677) and wins — recovered content is #20's, #19 stays
+  WP. No metric change on any project, zero stale; kept for the honest-attempt
+  record and future reach.
+
+## 2026-07-11 - v107/v108: dcd#6 instruments (both NEGATIVE, reverted)
+
+- v107 certified tug (registered-SSCD certification overriding the v88
+  duplicate-suspect gate): moved owner-passed dcd#11 (+0.36s end, waiver
+  STALE) without touching #6 — #6 has NO boundary to move ("no generated
+  coverage": the detector+DP timeline spans [15.33,17.73] across the 16.03
+  cut). REVERTED per the §0 regression rule.
+- v108 residual-step interior split (a missed cut inside static content
+  prints a signed-residual step where the line smooths across the source
+  skip 643.3->644.2): detector measured top-steps 0.5-1.0 in MANY owner-
+  passed scenes (2fps grid + lookalikes) — the spread gate that protects
+  them also blocks the target. NO-GO with n=1 labeled instance; REVERTED.
+- dcd#6 diff-curve probe: the 16.03 cut itself is pixel-invisible (diff 0.33
+  vs noise 0.2-0.5); a strong peak sits at 16.20 (8.7) inside a flash burst
+  the detector merged. The reachable path is detector-level (the M5
+  AUTO_DENSE/base-threshold experiment — AUTO_DENSE itself is inactive on
+  dcd, <=70 scenes); until then #6 is a ceiling candidate: the missing
+  instrument is a static-content cut detector.
+
+## 2026-07-11 - v109: D2 hard-cut boundary-prior floor (M3) — 5e85 #26 fixed
+
+- Root cause of the 5e85 #25/#26 fold: fragments split exactly at tt 32.50
+  (tiktok_cos 0.067 — as hard as pixel cuts get) but the DP's dynamic-regime
+  extrapolation prior measured 0.668 (blur/lookalike swoosh content) and
+  leaned merge (-0.17). Fix: HARD_CUT_TIKTOK_COS=0.30 floor — at a certified
+  hard pixel cut the prior never goes below +0.2 (over-keeping folds back for
+  free under scene equivalence; a wrong merge is unrecoverable — the design's
+  own stated asymmetry).
+- 5e85: scene 44/2/0 -> 45/0/1, source 40/0/6/0 -> 41/0/4/1, zero stale.
+  #26 EXACT (scene+source); two additional WPs fixed. #25 becomes the sole
+  scene fail (fold-no-chain: the swoosh pieces sit on a 1.6s-early loop
+  instance; the pan localizer GEOMETRICALLY places the query at the machine's
+  position (479.39, response-best zero crossing) not GT's 481.0 — a looping
+  pan whose instances sit INSIDE the 3s dedupe radius; margins dead
+  (bench +0.018). Flag for owner arbitration in the next review round.
+
+## 2026-07-11 - v110-v112: leave-one-out of the M3 floor + perf experiments
+
+- v110 all-four exposed a 411f regression from the raw hard-cut floor: fast
+  action has low tcos WITHIN shots too (73->79 generated scenes, two new
+  fold-no-chain fails, +145s) — over-splitting an evidence hole does NOT fold
+  back for free. Fix: contrast gate (floor only when intra - tcos >= 0.35 —
+  content coheres on each side yet craters across the boundary). 411f
+  restored, 5e85 gains kept.
+- v111 perf experiment VERIFY_DECODE_FPS 12->10: REVERTED — the 0.1s grid
+  cost 8 source exacts and staled 9 waivers across the four projects; 12 fps
+  is load-bearing for R2 per-end precision. Recovery trims kept (grid 5->3
+  x-centers, grid budget 3, candidates [:5]; 411f 386->338s).
+- v112 FINAL M2+M3 state (fresh, zero stale; JSONs v112_fresh_*.json):
+  dcd 19/0/1 + 19/0/0/1 (121.5s), 85de 50/2/2 + 48/1/2/3 (321.9s),
+  411f 50/0/2 + 49/0/0/3 (338.1s), 5e85 45/0/1 + 41/0/4/1 (260.2s).
+  Aggregate vs v101: scene exact 162->164, source exact 151->157, WP 12->6,
+  source fails 9->8. Oracle guard HOLDS: scene 19/20, 52/54, 51/52, 46/46
+  (at/above the v57/v58 baseline on every project; 85de +1 over the §1 line).
+- Elapsed: 85de 322 / 411f 338 exceed the 300s M4 cap by 7-13% — inside the
+  v96 drift-regime band but not claimable as met; the M5 re-hardening
+  (pixel-retaining cache, batched multi-geometry embeds, decode reuse) is the
+  real fix and is due regardless for the 200s target. Flagged as an M5
+  dependency rather than papered over with micro-trims that kept costing
+  correctness (v111).
+
+## 2026-07-11 - v113/v114: piece-outlier arbitration — 85de #11 fixed
+
+- R5b: a multi-piece chain can hide ONE wrong piece (the edit jumps away and
+  back, 256.0 -> 198.6 -> 257.0, while a lookalike keeps the lines
+  continuous). Per-piece registered scores on the chain's own cached window
+  expose the outlier (chain 11-13 measured 0.87 / 0.57 / 0.76); the outlier
+  piece decodes its own mids (the recall agreement gate needs >=2 distinct
+  query times — one chain-mid is structurally insufficient) and arbitrates
+  alone. 85de #11: winner @198.1 (margin +0.145) vs GT 198.59 -> EXACT.
+- v114 all-four fresh + oracle: dcd 19/0/1 + 19/0/0/1 (113.2s), 85de 50/2/2 +
+  49/1/1/3 (327.6s), 411f 50/0/2 + 49/0/0/3 (347.4s), 5e85 45/0/1 + 41/0/4/1
+  (261.0s); ZERO stale; oracle 19/20, 52/54, 51/52, 46/46 — guard holds.
+  Hard-set per-scene audit: 9 of 18 pass (85de #0 #11 #17 #22 #24 #40 #53,
+  5e85 #26, 411f #28 via lookalike-equivalence); TOL 85de #13 #49 FIXED,
+  411f #7 waived. review6_*.html regenerated from v114.
+
+## 2026-07-11 - v115: perf ceiling measured (six attempts, all traded correctness)
+
+- Attempts and their measured cost: candidate sweep 1.2->1.0 (85de -1 exact,
+  411f -1 + 2 stale), sweep 0.8 (v103, -3), fps 12->10 (v111, -8 + 9 stale),
+  shared-rect-only (v103, -2), chunked decode/embed pipelining (decode 119.5
+  -> 202.8s: per-chunk seeks; results shifted), assignment-candidate filter
+  -0.05 (411f -1), candidate cap 5->4 (411f -1). Serial split measured:
+  decode 119.5s / embed 79.7s on 85de. Config restored to v114 exactly and
+  re-verified (411f 49/0/0/3, zero stale).
+- Verdict: at the current architecture the M4 300s cap conflicts with the §0
+  regression rule on 85de/411f (305-347s); dcd 113s and 5e85 261s comply.
+  The remaining levers are structural (M5): batch/NVDEC decode,
+  pixel-retaining multi-geometry embeds, per-episode window planning.
+- Ceiling report v3 written: docs/review_2026-07-10/CEILING_REPORT_V3.md
+  (hard-set burndown, per-scene bench margins, missing instruments, owner
+  asks for review round 6 incl. the 5e85#25 GT-vs-pan-localizer arbitration).
+
+## 2026-07-11 - v116-v119: byte-identical pipelining for the M4 cap
+
+After the correctness-trading trims were all rejected, the cap work moved to
+output-preserving overlap only (validated per change: metrics + zero stale
+identical on every run):
+- Window prefetch: a decode worker (2 threads, per-thread captures) stages
+  upcoming windows keyed by the EXACT slot run — a staged run is produced by
+  the same decode call with the same parameters, so embeddings are
+  byte-identical; partial-cache runs simply fall through to normal decode.
+  Prefetch issue points: next-2-chains trust windows + R2 window specs
+  (the R2 spec computation factored into `_r2_specs`, shared between the
+  pass and the prefetcher for exact key match) + the current chain's
+  candidate windows + registration probes (`prefetch_probe`/`probe_frames`).
+- Stage-1 sampling producer/consumer: the worker owns the sequential decode
+  + diff curve, the main thread embeds each 96-frame batch (unchanged batch
+  composition). 411f sampling 48.8 -> 31.4s.
+- R6 recovery invocation DISABLED (kept as documented experiment): every
+  owner-labeled target legitimately abstains, so it cost ~40s/project for
+  zero output change.
+- Failed variants this phase (reverted): chunked decode+embed pipelining
+  inside window() (per-chunk seeks ballooned decode 119->203s AND changed
+  the sampling grid -> different results); cv2 FFmpeg threads option
+  (already threaded, no change, hashes identical).
+- Measured after: dcd 113-117s, 5e85 261-264s (comfortably under); 85de and
+  411f oscillate 294-326s run-to-run with IDENTICAL code and outputs — the
+  v96 drift regime straddles the cap on the two heavy projects; a 3-run
+  median series decides the cap claim (v120).
+
+## 2026-07-11 - v120-v123: cap measurement series + final M2/M3 validation
+
+- v120 3-run series on the heavies: 85de 316/327/331, 411f 322/310/329 —
+  consistently over after ~6h of continuous load. Thermal check: package
+  83C, cores throttled to 800-950MHz — the drift is the machine, not the
+  code. Cooled (72C): 85de 299.8 (v119a) and 411f 288.6 (v121) with the
+  exact final code — the quiet-machine cap numbers; a last lookahead-4
+  prefetch experiment showed no gain and was reverted to the measured
+  state. Production runs one project per process, so per-invocation
+  measurement is the production-faithful unit.
+- v123 final M2+M3 validation (per-project fresh + all-four oracle):
+  metrics identical to v114 on every axis, zero fresh stale, oracle
+  19/20, 52/54, 51/52, 46/46 — guard holds.
+
+## 2026-07-11 - owner review ROUND 6 integrated + start-side containment
+
+- Round-6 verdicts (review6_*.html, exhaustive): all PASS except dcd #6,
+  85de #10 #20, 411f #51, 5e85 #11 (the five machine failures stand);
+  411f #7/#8 SKIP (GT region buggy: evidence-hole slow-mo burst) and
+  5e85 #45 SKIP (NEW FACT: a non-anime scene is appended at the edit end,
+  contaminating matching there; truth timings verified present among
+  primary/secondary candidates). Evaluator gained a "skip" verdict:
+  owner-approved permanent ignore, no stale-interval guard.
+- Start-side containment (owner-endorsed spec, v124-v128): once the line
+  is locked, the interval must not CROSS a native source cut the TikTok
+  start frame sits after. Runs as a POST-pass (after R5b piece switches —
+  85de#12's rendered start only becomes a render-segment start once piece
+  12 moved), per render-segment (chain starts + intra-chain line
+  discontinuities), scanning [s0, s0+1.25] on the shared window cache; a
+  cut pair counts when its POST-cut frame lands inside the interval (the
+  pair can straddle s0 itself — the dcd-grid places the 85de#13 cut mid at
+  s0-0.02), and the start pulls onto the first clean frame when the start
+  edge frame matches the post side by >=0.05. FIXED per the owner's
+  complaint: 85de #13 491.72->491.78 (the single pre-cut frame removed;
+  the GT 492.75 "cut" measures diff 0.003 — invisible static, renders
+  identically), #12 256.21->256.55. Leave-one-out v128: dcd/411f
+  unchanged, 5e85 improved (WP 4->3), zero stale, oracle guard holds
+  (19/20, 52/54, 51/52, 46/46).
+- Round-6 ledger upsert (`upsert_round6_waivers.py`, 121 entries; ran
+  twice — a fold-no-chain scene failure short-circuits its source review
+  entry, so second-order entries only emerge once the scene-axis waiver
+  lands). FINAL round-6 standings (v128 outputs, zero stale):
+    dcd  19/0/1 + 19/0/0/1   (#6 the sole failure)
+    85de 52/0/2 + 52/0/0/2   (#10, #20)
+    411f 51/0/1 + 51/0/0/1   (#51)
+    5e85 46/0/0 + 45/0/1/0   (#11, WP)
+  Non-waived budgets: loose 0 on every axis (<=3), WP 1 (<=2), and the
+  only source fails are the owner-confirmed five. Every remaining failure
+  IS the owner acceptance-record fail set; each carries its bench margins,
+  honest integration attempts, and named missing instrument
+  (CEILING_REPORT_V3).
+
+## 2026-07-11 - v129/v130: round-6 fresh validation + cap evidence closed
+
+- Fresh detection under the round-6 ledger (per-project invocations):
+  dcd 19/0/1 + 19/0/0/1 (104.0s), 85de 52/0/2 + 52/0/0/2, 411f 51/0/1 +
+  51/0/0/1, 5e85 46/0/0 + 45/0/1/0 (233.1s). Zero stale on every run; the
+  #12/#13 containment intervals (256.55 / 491.78) hold from fresh detection.
+  The only remaining non-waived failures are the owner's five acceptance-
+  record fails.
+- Containment reach trimmed 1.25 -> 0.85s: the scan is now a pure cache hit
+  on the R2 window (both owner cases needed <=0.35); metrics identical.
+- Cap evidence: the afternoon "drift" was identified as a REAL competing
+  workload (Discord call at ~105% CPU, machine idle floor 72C) — not code.
+  Quiet-machine per-invocation measurements (production-faithful: /matches
+  serves one project per process): dcd 104-117s, 5e85 233-267s, 411f 288.6s
+  (v121), 85de 299.8s (v119a); the code deltas since those runs (start-side
+  containment after the 0.85 trim, scoring-side skip verdicts) measured ~0
+  marginal cost on same-day comparisons (v129 vs v121-code both 313-314
+  warm). Busy-machine numbers run +10-20% and are documented, not claimed.
+
+## 2026-07-12 - v133: quiet-machine cap measurement — ALL FOUR under 300s
+
+- The machine finally went quiet (Discord call ended; package back at its
+  71C idle floor). Final-code per-invocation fresh runs, round-6 ledger:
+  85de 52/0/2 + 52/0/0/2 in 271.8s; 411f 51/0/1 + 51/0/0/1 in 250.5s;
+  zero stale. With dcd 104.0s and 5e85 233.1s (v130), every project runs
+  the full fresh pipeline within the M4 300s cap on a quiet machine —
+  the entire 314-359s band measured earlier was workload/thermal
+  contention (journal v129), not code.
+- M4 is complete: round-6 verdicts integrated, review pages delivered,
+  tolerable set fixed-or-waived, budgets met, the five owner-confirmed
+  fails carried by the ceiling report. M5 (200s target, legacy deletion —
+  rematch contract test already in place at
+  test_anime_matcher_partial_rematch.py — detector experiment, constants
+  audit) is the next phase.
+
+## 2026-07-12 - v134/v135: the named detector-level experiment (RUN, negative, REVERTED)
+
+- The ceiling report named a detector-level path for dcd#6 (and possibly
+  85de#10/#20) that had never been attempted: the M5 AUTO_DENSE/base-
+  threshold experiment. Probe: threshold 8 emits boundaries 15.47 + 16.20
+  around the invisible dcd cut (16.20 = 0.17 from GT — exact range).
+  Implemented as an unconditional sensitive pass reusing the existing
+  AUTO_DENSE reinjection (`_refine_dense_ranges_with_sensitive_boundaries`
+  with threshold-8 boundaries injected into the base-16 skeleton).
+- dcd alone: #6 CONVERTED (scene fail -> loose (15.46,16.57) vs GT
+  (15.33,16.03); source fail -> WP-with-candidate; source fails 0) at the
+  cost of owner-passed #7 slipping exact -> loose + 1 stale (its interval
+  actually moved CLOSER to GT: 644.50/645.78 vs 644.20/645.90).
+- Leave-one-out KILLED it: 5e85 collapsed 46/0/0 -> 41/2/3 scene with
+  FIVE stale waivers and 2 new source fails (threshold-8 over-cuts fast
+  action into no-evidence pieces -> fold-no-chain + interval churn);
+  411f -1 source exact + 1 stale; 85de -1 source exact and #10/#20
+  unmoved. A dcd-only gate would be fixture-keying (forbidden). REVERTED;
+  revert verified (dcd 19/0/1 + 19/0/0/1 in 97.0s, 5e85 46/0/0 +
+  45/0/1/0 in 213.6s, zero stale).
+- The dcd#6 exception record is now complete at every identified layer:
+  three aligner-level instruments (certified tug v107, residual-step
+  split v108, containment reach) plus the detector-level experiment, all
+  measured. The missing instrument stands: a cut detector that can emit
+  static-content boundaries WITHOUT over-cutting action content — a
+  motion-conditioned sensitivity the current ContentDetector cannot
+  express. Same verdict transfers to 85de#10/#20 (their boundaries did
+  not materialize even under threshold 8's global over-cutting).
+
+## 2026-07-12 - v136: the MOTION-CONDITIONED cut detector — dcd#6 CONVERTED (KEEP)
+
+- The v134 negative result refined the missing instrument to "a cut
+  detector that emits static-content boundaries without over-cutting
+  action". Measured signature: the true static cut's sides run 0.09-0.27
+  median 64px frame-diff while every v134-damaging action boundary has a
+  side >=14 (min-side 0.49 but max-side 27) — a physical near-zero-motion
+  gate, not a tuned threshold. Implemented:
+  `_reinject_static_sensitive_cuts` (threshold-8 boundaries novel vs the
+  base skeleton, kept only when BOTH sides are static <=1.0, reinjected
+  via the existing AUTO_DENSE refine; STATIC_CUT_MOTION_CEILING=1.0).
+- dcd: #6 scene FAIL -> LOOSE (15.33,16.57 vs GT 15.33,16.03 — start
+  exact) AND source FAIL -> LOOSE (642.72,643.96 vs 642.60,643.30). The
+  owner-labeled static missed cut is machine-fixed within §6.
+- Leave-one-out: 85de 52/0/2 + 52/0/0/2 and 5e85 46/0/0 + 45/0/1/0 —
+  byte-stable, ZERO stale (the gate fully prevents the v134 collapse);
+  411f 51/0/1 + 50/1/0/1 (#12 exact -> loose, 1 stale). Oracle guard
+  HOLDS: 19/20, 52/54, 51/52, 46/46.
+- Cost, per §0 permitted (a hard fail is fixed): three owner re-reviews —
+  dcd #7 (643.96,645.12 — start toward GT, end 0.78 off, still loose),
+  dcd #18 (end +1.22), 411f #12 (43.17,46.14, loose). All within the §6
+  budgets (dcd source loose 3<=3, 411f loose 1). review7_*.html generated
+  for the round.
+- Hard-fail set after v136: FOUR — 85de #10 #20 (detector boundaries did
+  not materialize even at threshold 8: no pixel-level cut exists at
+  12.15/21.22 — evidence-hole class), 411f #51, 5e85 #11 (both
+  instrument-dead with bench margins <=0.01). Elapsed (quiet machine,
+  same-session): dcd 98.5s, 5e85 225.4s, 85de 283.1s, 411f 298.5s — all
+  four within the 300s cap WITH the new detector pass.

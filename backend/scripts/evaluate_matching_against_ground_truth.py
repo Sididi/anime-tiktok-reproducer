@@ -757,8 +757,20 @@ def _validate_strict(
 
     def waived(index: int, axis: str, current=None) -> bool:
         entry = waivers.get((index, axis))
-        if entry is None or entry.get("verdict") != "pass":
+        if entry is None or entry.get("verdict") not in ("pass", "skip"):
             return False
+        if entry.get("verdict") == "skip":
+            # owner-approved permanent ignore (round 6: GT region buggy /
+            # out-of-scope content): no stale-interval guard — the scene
+            # never counts as a machine failure whatever it emits
+            result.waived += 1
+            waived_indices.add(index)
+            result.rows.append(
+                "{axis}#{idx} owner-SKIPPED (round 6): {note}".format(
+                    axis=axis, idx=index, note=entry.get("note", "")
+                )
+            )
+            return True
         reviewed = entry.get("generated")
         if current is not None and reviewed and len(reviewed) == 2:
             # a waiver certifies the SPECIFIC reviewed interval; once the

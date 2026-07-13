@@ -97,3 +97,31 @@ def test_stale_merge_backup_is_reanchored_after_manual_split() -> None:
     assert updated_matches[0].merged_from == [0, 1]
     assert rebuilt_backup["scenes"][2]["start_time"] == 2.0
     assert rebuilt_backup["scenes"][3]["start_time"] == 2.5
+
+
+def test_first_manual_merge_rebases_aligner_provenance_without_backup() -> None:
+    scenes = SceneList(
+        scenes=[
+            Scene(index=0, start_time=0.0, end_time=2.0),
+            Scene(index=1, start_time=2.0, end_time=3.0),
+            Scene(index=2, start_time=3.0, end_time=4.0),
+        ]
+    )
+    matches = MatchList(matches=[_match(index) for index in range(3)])
+    matches.matches[0].merged_from = [10, 11]
+
+    merged_scenes, merged_matches, backup, merged_index = (
+        SceneMergerService.prepare_manual_merge_with_previous(
+            "missing-test-project",
+            2,
+            scenes,
+            matches,
+        )
+    )
+
+    assert merged_index == 1
+    assert len(merged_scenes.scenes) == 2
+    assert merged_matches.matches[0].merged_from is None
+    assert merged_matches.matches[1].merged_from == [1, 2]
+    assert len(backup["scenes"]) == 3
+    assert all(match["merged_from"] is None for match in backup["matches"])
