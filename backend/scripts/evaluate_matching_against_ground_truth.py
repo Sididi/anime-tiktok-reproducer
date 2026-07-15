@@ -1101,7 +1101,16 @@ def _print_strict_result(result: StrictValidationResult) -> None:
             print(f"Owner waivers applied (§8): {result.waived}")
     verdict = "PASS" if result.passed else "FAIL"
     if result.ceiling_report:
-        verdict = "CEILING-REPORT (waivers > 3)"
+        # Ledger-based acceptance (superseded the old ">3 waivers per project =
+        # ceiling" rule on 2026-07-11): owner waivers recorded in
+        # eval_waivers.json are accepted certificates, not a cap. Report the
+        # ledger outcome; any genuine (unwaived) failures remain listed in the
+        # details below. Label/reporting only — the pass/fail decision, waiver
+        # tolerances, buckets, folding and equivalence rules are unchanged.
+        verdict = (
+            f"PASS-WITH-LEDGER ({result.waived} owner-waived; "
+            "unwaived failures, if any, listed below)"
+        )
     print(f"Strict result: {verdict}")
     print("Details:")
     for row in result.rows[:120]:
