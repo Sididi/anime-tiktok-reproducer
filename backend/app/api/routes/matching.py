@@ -428,18 +428,37 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
         # Global scene aligner: dense correspondences, segmentation DP and
         # the Stage-5 native arbitration layer produce the final scene list
         # and matches in one pass (it may merge/split/move scene boundaries).
+        #
+        # Share the indexation queue's GPU-concurrency budget: matching and
+        # indexing are both GPU-heavy (SSCD embedder on the 8 GB card), so a
+        # match run acquires one of MAX_CONCURRENT slots and waits if two heavy
+        # tasks are already in flight — the card is never oversubscribed.
+        from ...services.indexation_queue import indexation_queue
+
+        gpu_sem = indexation_queue.gpu_semaphore()
+        if gpu_sem.locked():
+            yield "data: " + json.dumps({
+                "status": "matching",
+                "progress": 0.0,
+                "message": "Waiting for a GPU slot (indexation in progress)…",
+                "current_scene": 0,
+                "total_scenes": len(scenes.scenes),
+                "error": None,
+            }) + "\n\n"
+
         completed = False
-        async for progress in SceneAlignerService.align_scenes_progress(
-            video_path,
-            scenes,
-            source_path,
-            project.library_type,
-            anime_name=anime_name,
-        ):
-            if progress.status == "complete":
-                completed = True
-                continue
-            yield f"data: {json.dumps(progress.to_dict())}\n\n"
+        async with gpu_sem:
+            async for progress in SceneAlignerService.align_scenes_progress(
+                video_path,
+                scenes,
+                source_path,
+                project.library_type,
+                anime_name=anime_name,
+            ):
+                if progress.status == "complete":
+                    completed = True
+                    continue
+                yield f"data: {json.dumps(progress.to_dict())}\n\n"
             if progress.status == "error":
                 project.phase = ProjectPhase.SCENE_VALIDATION
                 ProjectService.save(project)

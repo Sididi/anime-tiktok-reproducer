@@ -95,3 +95,34 @@ async def test_update_job_publishes_as_merged_release(
     assert len(publish_calls) == 1
     assert publish_calls[0]["merge_existing_release"] is True
     assert publish_calls[0]["expected_min_episodes"] == 22
+
+
+@pytest.mark.asyncio
+async def test_gpu_semaphore_caps_concurrent_heavy_tasks() -> None:
+    """The shared GPU budget bounds indexation + /matches to MAX_CONCURRENT
+    heavy tasks (8 GB VRAM worst case: 2x SSCD embedder). A third acquirer
+    waits until a slot frees (GOAL v5.3 W5)."""
+    import asyncio
+
+    service = IndexationQueueService()
+    sem = service.gpu_semaphore()
+    assert sem is service.gpu_semaphore()  # stable shared object
+    assert service.MAX_CONCURRENT == 2
+
+    # Two heavy tasks (e.g. one index job + one match run) hold both slots.
+    await sem.acquire()
+    await sem.acquire()
+    assert sem.locked()  # fully subscribed
+
+    # A third heavy task (a second /matches) must wait for a slot.
+    third = asyncio.ensure_future(sem.acquire())
+    await asyncio.sleep(0.05)
+    assert not third.done(), "third heavy task should block while 2 are in flight"
+
+    # Free one slot -> the waiter proceeds.
+    sem.release()
+    await asyncio.wait_for(third, timeout=1.0)
+    assert third.done()
+
+    sem.release()
+    sem.release()

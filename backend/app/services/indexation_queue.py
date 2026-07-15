@@ -355,6 +355,23 @@ class IndexationQueueService:
     def list_jobs(self) -> list[IndexationJob]:
         return list(self._jobs.values())
 
+    def gpu_semaphore(self) -> asyncio.Semaphore:
+        """The shared GPU-concurrency budget (``MAX_CONCURRENT`` slots).
+
+        Indexation jobs (:meth:`_run_job`) and ``/matches`` both acquire this so
+        no more than ``MAX_CONCURRENT`` GPU-heavy tasks run at once — the 8 GB
+        card is never oversubscribed. Worst case under the cap is 2 concurrent
+        SSCD embedders: the fp32 model (~0.3 GB) plus per-query activations and
+        the CUDA allocator reserve, comfortably under 8 GB with headroom (frame
+        decode stays on CPU/cv2 — GOAL v5.3 left the GPU-decoder LRU out of the
+        pipeline, so it adds no VRAM here). A CUDA OOM inside a task is absorbed
+        by the embedder's cache-clear retry
+        (:meth:`AnimeMatcherService._embed_pil_batch`) and, for jobs, the
+        terminal-OOM path; the cap makes such contention rare rather than the
+        norm.
+        """
+        return self._semaphore
+
 
 # Singleton
 indexation_queue = IndexationQueueService()
