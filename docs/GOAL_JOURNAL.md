@@ -1219,3 +1219,703 @@ identical on every run):
   owner-confirmed start. Ledger final: 115 entries = 109 pass + 6 skip,
   ZERO fail — the owner-fail set is EMPTY. Leave-one-out + oracle
   running (v164).
+
+## 2026-07-13 - GOAL v5: M5 performance phase opened (owner validates the algorithm)
+
+- Owner (2026-07-13): the algorithm is VALIDATED as-is (round-8 ledger: 115 entries,
+  109 pass + 6 skip, ZERO fail; v164 dcd 20/20, 411f 52/52, 5e85 46/46 source-exact,
+  85de validated v161). The interrupted v164 85de re-run + oracle were CUT by owner
+  decision (not needed — v161/v163 cover them).
+- GOAL.md rewritten (v5): speed-only phase, target <=200s/project quiet machine.
+  Precision FROZEN: tier-A (byte-identical hashes) / tier-B (metric-identical on all
+  four, zero stale, oracle guard) validation gates; decision-shaping constants
+  untouchable; STOP-RULE — if 200s is unreachable without risk, return an objective
+  verdict (floor decomposition + recommended cap) instead of forcing it.
+- Levers (from measured evidence): L1 window planning + sequential per-episode decode
+  (the v115 per-chunk-seek failure inverted), L2 NVDEC (bit-identical recipe proven on
+  this machine in the indexer rework), L3 embed economy (pixel-retaining cache, batch
+  consolidation), L4 CPU parallelism (32 threads), L5 inert-work elimination.
+- Production concurrency spec (owner): default = /matches through the existing
+  indexation queue (MAX_CONCURRENT=2 shared); a separate matching queue only if the
+  worst case (2 match + 2 index) measurably sustains on the 8GB card. Machine: i9-
+  14900HX, RTX 4070 8GB, 32GB RAM, Chrome+Discord+VSCode coexistence as design input.
+
+## 2026-07-13 - v164/v165: FINAL validation — the goal's matching phase is CLOSED
+
+- Leave-one-out fresh under the round-8 ledger: dcd 20/20 + 20/20;
+  85de 54/54 + 53/1 (source#20 loose — the missed round-8 source-axis
+  pass entry added: the owner's review8 was exhaustive); 411f 52/52 +
+  52/52; 5e85 46/46 + 46/46 with the non-anime tail correctly STILL
+  no-match (the fadeout instrument's control case held in production).
+- Re-score of the four final outputs under the FINAL ledger (116
+  entries = 110 pass + 6 skip + 0 fail): EVERY project, BOTH axes,
+  100%: 20/20+20/20, 54/54+54/54, 52/52+52/52, 46/46+46/46. Zero
+  stale, zero fails, zero WP anywhere.
+- Oracle (v165, final code): scene 19/20, 52/54, 52/52, 46/46 — at
+  baseline everywhere and ABOVE it on 411f (52 vs 51: the fadeout-tail
+  continuation helps the oracle too).
+- pytest: 406 passed (the two new synthetic instrument tests included),
+  11 failed = the documented pre-existing set (10 env + 1 HEAD-reproduced
+  test-order pollution). GT folders byte-identical, zero untracked.
+- review9_411f73d26c1d.html generated (the fixed #51 with clips) for
+  the owner's records. §6 definition of done: owner-fail set EMPTY,
+  zero stale, budgets met (all zero), oracle held, GT untouched,
+  SceneMatch/MatchList contract unchanged. The matching phase of GOAL
+  v4.2 is COMPLETE; the one open M5 item remains the <=200s cap
+  (measured quiet: dcd 113s ✓, others 312-416s; the window-planning +
+  sequential-NVDEC decode redesign is the named next phase).
+
+## 2026-07-14 - v166: M0 freeze + profile — the §0 stop-rule verdict (200s unreachable on the heavies)
+
+GOAL v5 speed phase opened. M0 executed in full: reference frozen (fresh, all
+four, per-project invocations, `--matcher aligner`) + canonical decision hashes,
+per-phase + critical-path + re-decode profiling on all four, oracle baselines.
+The production `/matches/find` route runs `SceneAlignerService.align_scenes_progress`
+→ evaluator `--matcher aligner` is the faithful pipeline.
+
+### Frozen reference (fresh, untouched v165 code) — hashes reproduce byte-identical
+
+    dcd  892d366…  41 scenes/matches   111.9s
+    5e85 0c29f18…  55 scenes/matches   302.8s (cooled)
+    85de b423cda…  59 scenes/matches   384.1s (cooled)
+    411f 9df22c8…  78 scenes/matches   417.0s (cooled)
+
+Determinism confirmed: cooled re-runs of ALL THREE heavies reproduced the
+reference hash EXACTLY (5e85 0c29f18 / 85de b423cda / 411f 9df22c8). Tier-A
+validation by hash is sound and the aligner is run-to-run deterministic. All
+scene+source timing lines 20/20, 46/46, 54/54, 52/52 exact (reference is the
+round-8 validated output). Env-gated instrumentation (ATR_DECODE_PROF /
+ATR_RERANK_DEBUG) proven inert: identical hash with it on.
+
+### Measured floor decomposition (clean cooled, main-thread critical path)
+
+| proj | elapsed | scene_det | sample | win-decode(crit) | win-embed(crit) | reg/DP/other | redecode× |
+|------|---------|-----------|--------|------------------|-----------------|--------------|-----------|
+| dcd  | 111.9   | 6.5       | 11.2   | (small)          | ~22             | —            | —         |
+| 5e85 | 302.8   | 5.7       | 11.8   | 81.4             | 79.5            | ~115         | 2.28      |
+| 85de | 384.1   | 17.9      | 20.3   | 140.4            | 103.9           | ~83          | 2.68      |
+| 411f | 417.0   | 19.7      | 29.9   | 131.0            | 94.4            | ~96          | 2.10      |
+(411f also: variant_retrieve 14.0s, interior_split 19.7s — extra frozen work
+that makes it the tall pole despite lower window decode than 85de.)
+
+Cross-cutting facts:
+- **GPU idle 0–2%** almost the whole run (sampled), spiking briefly. The pipeline
+  is decode/CPU-bound, GPU-starved — the SSCD model is NOT the bottleneck.
+- **CPU thermally throttles** under sustained decode: idle 71°C → 95–97°C, cores
+  drop to ~0.8–1.4 GHz avg. Decode is CPU/OpenCV seek-based (`CAP_PROP_POS_MSEC`).
+- **Re-decode factor 2.28–2.68**: the 6-deep native-frame LRU (bounded by ~6 MB/
+  frame RAM) evicts regions that get re-requested under later geometries → each
+  source slot is decoded ~2.3–2.7×.
+
+### The impossibility argument (measured, airtight)
+
+For every heavy, subtract the ENTIRE main-thread window decode (the physically
+impossible ideal of source decode → 0):
+- 5e85: 302.8 − 81.4 = **221.8s > 200s**
+- 85de: 384.1 − 140.4 = **243.7s > 200s**
+- 411f: 417.0 − 131.0 = **286.0s > 200s** (the tall pole)
+
+Even with source window decode removed completely, the heavies exceed 200s,
+because the residual is dominated by INVARIANT-LOCKED work:
+- **SSCD embed at fp32** (79–104s window-embed on the heavies): fp16 FORBIDDEN
+  (measured cos 0.02 divergence, memory); the embedded-image count is fixed by
+  the sweep/geometry decisions (v111/v115 measured correctness loss on any trim).
+- **Scene detection** (PySceneDetect, 6–25s): changing the detector changes scene
+  boundaries → a matching decision (v111 12→10 fps cost 8 exacts).
+- **Registration (ORB/RANSAC D3 certificate) + segment-DP + native arbitration**
+  (~80–115s): load-bearing decision logic (5e85#11, 85de recovery; round-8 closed
+  exactly here — GOAL §2 "do not disable R6/persistence").
+
+### §0 STOP-RULE VERDICT: 200s is not reachable without endangering the invariant
+
+dcd already passes (111.9s). The three heavies cannot reach 200s with any
+output-preserving optimization. The safe lever set and its measured ceiling:
+
+- **L1 window planning** (decode each region once; redecode 2.3–2.7×→~1.0):
+  TIER-A byte-identical (pure caching/scheduling). Ceiling: −44s (5e85) / −88s
+  (85de) of window decode. Cannot be a naive LRU bump — native frames are ~6 MB
+  each, ~4–5k unique/project ≈ 25–30 GB to fully retain (RAM wall on 32 GB w/
+  Chrome+Discord+VSCode); the RAM-safe form is the invasive plan→decode→serve
+  redesign that never holds many native frames at once.
+- **L2 NVDEC** (bit-identical recipe from the indexer rework): TIER-B. ~2× on the
+  de-duped decode AND moves it off the thermally-throttled CPU onto the idle GPU.
+  Risk: the backend decode is seek-based; transferring bit-identical NVDEC to
+  arbitrary-seek windows is non-trivial and any pixel delta shifts embeddings →
+  metric lines (revert-on-any-change per §3).
+- **L4 more decode parallelism**: thermally capped (CPU already at ~1.4 GHz under
+  load).
+
+Combined SAFE ceiling (L1 tier-A dedup + L2 tier-B NVDEC, applied to the
+measured critical paths):
+- 5e85: win-decode 81→~30 ⇒ ≈ **250s**
+- 85de: win-decode 140→~52 ⇒ ≈ **295s**
+- 411f: win-decode 131→~62, + NVDEC query ⇒ ≈ **300s** (floor@decode→0 is 286s)
+All still above 200s; 411f's frozen residual (embed 94 + reg/DP 96 + scene-det
+20 ≈ 210s) alone exceeds 200s.
+
+**What WOULD unlock 200s — all require breaking the invariant (out of scope):**
+1. fp16 embedding (−40–52s embed) — highest impact, breaks matches (cos 0.02).
+2. Prune registration/DP probes on "sealed" chains (−part of 80–115s) — high risk,
+   the D3 persistence certificate is load-bearing (round-8).
+3. Fewer geometry/sweep positions (−embed images) — decision-shaping, measured loss.
+4. Faster detector / lower sample fps — changes scene boundaries, measured loss.
+
+**Recommended realistic cap: ~300–320s quiet** (dcd ~120s). Set by the tall pole
+411f, whose theoretical decode→0 floor is already 286s and whose safe-optimized
+best is ~300s; 5e85/85de land lower (~250/295s). WITHOUT any optimization the
+current ceiling is 302/384/417s. The desktop-load band adds +10–20% (Discord
+call / thermal → ~350–380s worst). An honest 300–320s beats a 195s that trades
+the round-8-validated algorithm.
+
+### M4 production concurrency (recommendation — the speed verdict makes this the next decision, not this session's)
+
+The stop-rule closes the SPEED phase; M4 wiring is downstream. Recommendation
+per GOAL §4: route `/matches` through the EXISTING indexation queue
+(`indexation_queue.py`, `MAX_CONCURRENT=2`, asyncio semaphore) — the safe
+default — so matchings + indexations SHARE the 2-slot GPU budget. This is
+low-risk and needs no new measurement. The separate-matching-queue UPGRADE is
+NOT justified without the worst-case measurement (2 match + 2 index): each
+matching already peaks the pipeline (VRAM: SSCD + FAISS + decode; the profiled
+runs sat ~2.5 GB but embed batches ≤64 + two decode pipelines would contend the
+8 GB wall), and matching is decode/CPU-bound so two concurrent matchings fight
+the SAME thermally-throttled CPU (measured 1.4 GHz under one). Expect >1.5×
+quiet degradation under the worst case → stay on the shared queue. Left as the
+owner's call with these numbers.
+
+### Validation guarantees on the final state
+- Reference frozen + reproducible (fresh hashes above, byte-identical on re-run).
+- Oracle guard at baseline on all four (scene-exact, `--gt-scenes`): dcd 19/20,
+  5e85 46/46, 85de 52/54, 411f 52/52 — EXACTLY the v165 documented baseline,
+  zero stale. (Elapsed dcd 98s, 5e85 ~290s, 85de ~340s, 411f 273.9s.)
+- Ledger `eval_waivers.json`: 116 entries = 110 pass + 6 skip, ZERO fail.
+- GT folders untouched (gitignored; evaluator never writes there; zero files
+  modified 2026-07-14 in the four folders).
+- Instrumentation reverted → scene_aligner.py byte-identical to committed v165
+  (git diff empty). No algorithm change this session.
+- pytest: 406 passed / 11 failed (259s) = the documented set exactly — 7×
+  test_lan_transfer_routes + 3× test_upload_readiness_local_first (env) + 1×
+  test_anime_matcher_partial_rematch (test-order pollution). No new failures.
+
+### Artifacts
+- `~/.cache/atr-eval/v5ref_*.json` (frozen fresh reference), `v5oracle_*.json`
+  (oracle baseline), `v5prof_*.log` (critical-path + re-decode profiles),
+  `ref_hash.py` (canonical decision hash), `run_m0_freeze.sh` / `run_m0_rest.sh`.
+
+## 2026-07-14 - GOAL v5.1: relaxed-invariant speed phase (supersedes the v166 verdict's frame)
+
+- Owner decisions (2026-07-14): (1) invariant relaxed from metric-identical to
+  EVALUATION-EQUIVALENT (identical-or-better evaluator lines, zero stale, ledger
+  zero-fail, oracle at baseline; timestamps may drift ms-scale) — unlocks tier-C
+  numeric modes (TF32/bf16/fp16, each gated by a bench margin-erosion check since
+  arbitration margins live at 0.02-0.07); (2) persistent cross-run embedding cache
+  EXCLUDED (one matching per project; duplicates never re-run /matches; in-run
+  caches capture the real redundancy); (3) scene detector stays at threshold 16
+  with byte-identical boundary semantics — validated operating point (v134
+  threshold-8 catastrophic; excess cuts fold via DP; v136 covers statics); only
+  its decode COST is optimizable (single-pass TikTok decode fusion).
+- Why 200s is credible where v166 said no: the v166 floor was measured UNDER the
+  throttle its own CPU decode causes (97C, ~1.4GHz) — GPU utilization 0-2%
+  end-to-end; and redecode× 2.10-2.68 means 55-63% of decode work is repeats a
+  RAM cache kills at tier A. Lever order: L0 redecode RAM cache + L3 TikTok
+  single-decode (tier A) -> L1 window planning -> L2 NVDEC/VRAM-resident GPU
+  pipeline (bit-identical recipe proven on this machine, indexer rework) -> L4
+  hygiene -> L5 numeric modes only if still short. Queue wiring (shared
+  indexation queue, MAX_CONCURRENT=2) carried over — v166 documented but did not
+  wire it.
+
+## 2026-07-15 — GOAL v5.1 speed phase (v167): §0 STOP-RULE VERDICT — 200s unreachable in-env without a §1 violation
+
+v5.1 relaxed the invariant and endorsed the architectural levers v166 never tried,
+on two premises: (P1) redecode× 2.10–2.68 means a RAM cache kills 55–63% of decode
+at tier A (L0/L1); (P2) the v166 floor was measured under throttle, so moving decode
+off-CPU (L2) un-throttles the residual toward ≤200s. This session INSTRUMENTED and
+TESTED both. **P1 is FALSE. P2 is TRUE but unrealizable in this environment without
+breaking the round-8 evaluation-equivalence.**
+
+### M0/M1 — direct instrumentation falsifies the L0/L1 premise (all three heavies)
+Added env-gated probes to `_WindowEmbedCache` (run-level redecode + reuse distance)
+and `_collect_frames_in_window_from_capture` (codec-level seek amplification). Measured
+at the actual decode primitive, no behaviour change (scene/source lines identical to
+reference on every probe run: 5e85 46/46, 85de 54/54, 411f 52/52):
+
+| project | window-decode | redecode× (run-level) | seek_amp (codec-level) | full-retain RAM |
+|---|---|---|---|---|
+| 5e85 | 78s | 0.98 | — | 38.4 GB |
+| 85de | ~140s | 1.03 | 1.04 (preroll 4%) | 77.6 GB |
+| 411f | 126s | 0.99 | 1.05 (preroll 5%) | 67.2 GB |
+
+- **L0 (run-output RAM cache) is DEAD**: redecode ≈ 1.0 → the same source runs are NOT
+  re-requested across geometries; a full-retain cache would save ~0s and cost 38–78 GB.
+  v166's "redecode 2.1–2.68" was never measured at the run primitive — it does not exist
+  there. The permanent per-geometry embedding `slots` + the 6-deep frame LRU already
+  achieve unit redecode.
+- **L1 (seek-merge → monotone decode) is NEAR-DEAD**: seek amplification ≈ 1.04–1.05,
+  i.e. keyframe-seek preroll waste is only 4–5% of decode. The window decode is genuine
+  unique-frame decode; merging scattered seeks recovers ~4%, not the assumed 55–63%.
+- L3 (single TikTok decode) worth 5–24s but requires fusing PySceneDetect's internal
+  decode loop with byte-identical boundaries — small ROI, not pursued once the headline
+  levers collapsed.
+
+### M2 — un-throttle thesis VALIDATED (the one v5.1 premise that held)
+Un-throttle micro-bench (`unthrottle_bench.py`) on real 411f frames: SSCD embed (GPU)
+and ORB/RANSAC registration (CPU, the D3 certificate path), COOL (idle) vs HOT+loaded.
+The 14-burner heat reproduced the real run's thermal state (bench all-core ~1900 MHz /
+97 °C ≈ real 411f 1841 MHz / 100 °C), so the ratios transfer:
+- **ORB registration hot/cool = 2.01×** (10.4s → 20.9s) — the CPU residual runs TWICE as
+  fast un-throttled.
+- **Embed hot/cool = 1.46×** (CPU-preprocess-bound; GPU idle 0–2% end-to-end).
+Applying these to 411f's decode→0 residual (286s, measured under throttle by v166):
+un-throttled ≈ 145–196s < 200s. **So v166's floor was an artefact of measuring the
+residual under the throttle the CPU decode itself causes.** ≤200s is reachable IN
+PRINCIPLE — iff decode leaves the CPU.
+
+### M2 — L2 tested end-to-end and FAILS: no eval-equivalent off-CPU decode exists in-env
+GPU-decode availability audit: cv2 5.0.0 (bundled ffmpeg, NO NVDEC — hwaccel silently
+falls back to CPU), torchaudio (no `hevc_cuvid`), torchvision 0.23 (dropped `device=`
+GPU decode). **Only PyAV 15.1.0 has an in-process NVDEC path** (libavcodec 61.19 +
+`hevc_cuvid` + cuda hwaccel; confirmed GPU decoder util 7–32% during decode). The GT
+source is **10-bit HEVC, colorspace UNSPECIFIED** → cv2 and PyAV pick different default
+YUV→RGB matrices → an irreducible mean≈1.1 / max≈14 pixel delta (bit-identical/tier-A
+is impossible). Wired a PyAV-NVDEC drop-in behind `ATR_NVDEC` (frame selection made
+cv2-equivalent via the `pts − 1 frame` label fix, verified to select the SAME source
+frames). Full 5e85 run vs the cv2 baseline (295s):
+- **Slower: 330.5s (+35s)** — PyAV's per-window seek + CPU colorspace (`to_ndarray`
+  swscale) + PIL overhead exceeds the NVDEC decode saving (standalone loop: 104 fps).
+- **No un-throttle: all-core 1459 MHz, pkg 98 °C** — the colorspace conversion stays on
+  the CPU, so the chip stays loaded; NVDEC offloads only the raw HEVC decode.
+- **Evaluation-equivalence BROKEN: source 44/46 exact +1 wrong_primary_with_candidate**
+  (ref 46/46). Scenes stayed 46/46 (prefetch-disable is behaviour-neutral as designed),
+  so the regression is purely the colorspace pixel delta shifting a razor-thin
+  arbitration margin — the exact §1 tier-B failure mode the spec warns about (margins
+  live at 0.02–0.07). Since PyAV hw=True and hw=False produce identical frames, this
+  break is inherent to ANY PyAV decode swap, NVDEC or not — not fixable by parallelising.
+
+Full GPU-resident L2 (NVDEC → CUDA frames → GPU resize/normalize → SSCD, no CPU
+colorspace) is the only shape that could actually un-throttle, but it needs a NEW
+dependency (PyNvVideoCodec / torchcodec — not installed) AND a GPU preprocess whose
+pixel deltas vs the current PIL path would break the SAME margins that already broke
+under a mere mean-1.1 CPU-colorspace delta. That is precisely the "heroics that could
+damage the round-8-validated algorithm" the stop-rule forbids.
+
+### §0 VERDICT
+`dcd` already passes (~112s). For 5e85/85de/411f, ≤200s is **unreachable without a §1
+violation**:
+- Tier-A decode levers (L0, L1) are empirically dead — the decode is near-optimal unique
+  work with ≤5% waste.
+- The residual IS ~2× throttle-bound (un-throttle would reach the floor), but the only
+  way to un-throttle is an off-CPU decode, and the sole in-env GPU decoder (PyAV) is
+  simultaneously slower, non-un-throttling (CPU colorspace remains), and
+  eval-equivalence-breaking (measured). L5 numeric modes are near-useless (GPU idle
+  0–2%) and carry the same margin-erosion risk.
+
+**Un-throttled floor decomposition (411f, tall pole):** scene-det ~19s (fixed inputs) +
+window decode ~126s (unique-frame, off-CPU would need eval-breaking NVDEC) + embed ~93s
+(1.46× throttle-bound) + retrieve/DP/registration/native-arb residual (~2.0× throttle-
+bound). At restored clocks with an *ideal* eval-equivalent off-CPU decode the projection
+is ~200–245s; the physics permits ≤200 but no lever delivers it eval-equivalently here.
+
+**Recommended cap: ~300–320s quiet** (unchanged from v166; the safe optimisation surface
+is empty — L0/L1 gains are ~0, not the 44–88s v166 hoped). dcd ~112s. Desktop-load band
++10–20%.
+
+**Ranked unlocks (all require breaking §1 or a major-dep GPU-resident rewrite):**
+1. GPU-resident NVDEC+preprocess pipeline (PyNvVideoCodec dep) — the only path that
+   actually un-throttles; HIGH risk (GPU-preprocess pixel deltas break 0.02–0.07 margins,
+   already demonstrated to break under mean-1.1) + new dependency.
+2. fp16/bf16 embedding (L5) — limited gain (GPU idle 0–2%) + margin-erosion risk.
+3. Accept tier-B decoder swap despite the measured wrong_primary regression — a §1
+   violation (forbidden).
+
+### Validation guarantees on the final state
+- All algorithm code REVERTED to byte-identical committed v166 (`git checkout` clean;
+  `git diff` empty on scene_aligner.py + anime_matcher.py; instrumentation + NVDEC
+  prototype removed). Working tree = session start (only GOAL.md / title_image_generator
+  / this journal / untracked fonts, none of them the matcher).
+- Reference reproduced on the reverted code: dcd fresh hash =
+  `892d36602d2b8d5944e376934dcaa0e3520408b5fcd7984592f64ca04a192087` == v5ref
+  (scenes=41 matches=41), scene 20/20 + source 20/20. Behaviour-neutral probe runs this
+  session already reproduced 5e85/85de/411f scene+source lines exactly.
+- Oracle guard at baseline (unchanged — code byte-identical to v166 that froze it): dcd
+  19/20, 5e85 46/46, 85de 52/54, 411f 52/52.
+- Ledger `eval_waivers.json`: 110 pass + 6 skip, zero fail (untouched).
+- GT folders byte-identical: 0 files modified today in all four project folders; no
+  project-data git changes.
+- pytest `pixi run -e dev pytest backend/tests/`: 406 passed / 11 failed in 268s = the
+  documented baseline exactly (env/order: LAN-transfer routes, upload-readiness-local,
+  partial-rematch order, remote-catalog RuntimeError). No new failures.
+
+### Artifacts (`~/.cache/atr-eval/`)
+`v51_worknotes.md` (full trail), `v167_l0probe_*.log` (redecode+seek probes),
+`v167_unthrottle.log` (un-throttle bench), `unthrottle_bench.py`, `test_pyav_nvdec.py`
+/`test_window_match.py`/`test_label.py` (NVDEC feasibility), `v168_nvdec3_5e85*.log`
+(L2 end-to-end failure), `v168_verify_dcd.log` (reference reproduction).
+
+## 2026-07-14 - GOAL v5.2: the v167 audit gap + the indexer NVDEC recipe (last speed attempt)
+
+- Post-v167 review (owner + assistant) found the L2 audit incomplete: it covered
+  in-process Python decoders only. Verified on this machine: env cv2 5.0 links
+  libavcodec DYNAMICALLY from the pixi env (conda-forge, no cuvid) while the
+  SYSTEM ffmpeg n8.1.1 has hevc_cuvid/h264_cuvid + hwaccel cuda (same soname
+  major, libavcodec.so.62). And the project already ships a PROVEN bit-identical
+  NVDEC recipe, merged in anime_searcher main (indexer/frame_extractor.py):
+  system-ffmpeg subprocess + cuda_decode_plan (hevc_cuvid with LOSSLESS
+  hwdownload,p010le->yuv420p10le download chain — no colorspace conversion is
+  replaced, which is exactly why PyAV broke and this does not; HEVC decode is
+  exact by spec) + rawvideo pipe, E2E vector-bit-identical at ~2x HEVC.
+- GOAL v5.2 written: port the recipe into backend/ (reimplement; submodule stays
+  untouched), N0 offline BGR-calibration gate first (pixel-delta vs cv2, both
+  output strategies), N1 window-planned subprocess streaming for source windows
+  (the un-throttle IS the product: v167 measured ORB 2.01x / embed 1.46x
+  hot/cool -> 411f residual ~145-196s un-throttled), N2 TikTok h264_cuvid
+  (detector byte-identity required), queue wiring carried over AGAIN (documented
+  in v166+v167, wired in neither). TERMINAL stop-rule: if N0 fails or N1 is
+  slower than cv2 on the real pattern -> cap ~300-320s, surface proven empty
+  twice, case closed for good.
+
+## 2026-07-15 — GOAL v5.2 (v168): §0 TERMINAL VERDICT — N0 passes, N1 is 2.55× SLOWER on the matcher's scattered access pattern
+
+v5.2's premise held where it mattered (N0) and failed exactly where v166/v167 said the
+real wall is (the incremental scattered-access decode). The recipe is faithful and
+frame-exact; it just cannot be *fast* on this matcher's access pattern with a
+subprocess-streaming decoder. This is the LAST speed attempt per §0 — case closed.
+
+### M0 / N0 — CALIBRATION GATE PASSED (the v167 audit gap was real and is now closed)
+Verified this machine: SYSTEM `/usr/bin/ffmpeg` n8.1.1 has hevc_cuvid/h264_cuvid+cuda
+(cv2's conda ffmpeg 5.0 does not). Reimplemented the indexer recipe in
+`backend/app/services/nvdec_decode.py` (submodule untouched): `-copyts -ss S -hwaccel cuda
+-hwaccel_output_format cuda -c:v hevc_cuvid -i F -to E -vf {chain},showinfo -f rawvideo
+-pix_fmt bgr24 -`, LD_LIBRARY_PATH sanitized so the system binary loads system libavcodec.
+- **NVDEC == system-CPU ffmpeg: byte-identical (mean 0 / max 0)** on all probes — the
+  indexer's bit-identity claim reproduces exactly.
+- **NVDEC bgr24 vs cv2 (the gate), conversion delta (aligned frames):** TikToks (hevc
+  yuv420p, all 4) **byte-EXACT 0/0**; 10-bit episodes (hevc yuv420p10le, colorspace
+  unknown) mean **0.03–0.19 / max ≤21**, a zero-bias ±1 chroma-upsampling edge dither
+  (cv2 invokes swscale slightly differently than ffmpeg CLI even at identical build
+  9.5.102) — **6–15× smaller than PyAV's mean 1.1** that broke v167.
+- **§3 margin proxy:** that pixel delta → SSCD embedding 1-cos **≤5.5e-4 (full) / 1.0e-3
+  (zoom1.45)**, ≪ the 0.025–0.035 half-headroom of the 0.02–0.07 arbitration margins.
+- **Frame-selection correspondence SOLVED:** cv2 `CAP_PROP_POS_MSEC` labels each frame as
+  `true_pts − 1 native frame` (v167's "pts−1" confirmed). Labelling NVDEC showinfo pts as
+  `pts − 1/native_fps` + cv2's exact collect+linspace ⇒ **frame set IDENTICAL** (6/6 real
+  85de windows: same count, same labels, pixΔ = conversion delta only). `_probe_cuvid_ok`
+  gate + per-episode fallback keep production safe when NVDEC/cuvid/a plan is absent.
+GO on the calibration gate. (Artifacts `~/.cache/atr-eval/…` via scratchpad probes
+`n0_probe/n0_table/margin_proxy2/corr_test.py`.)
+
+### M1 — N1 WIRED behind ATR_NVDEC, measured end-to-end on 85de (paired, same machine state)
+Region-buffered NVDEC reader wired into `_WindowEmbedCache` (`_decode_run`/`probe_frames`;
+cv2 prefetch disabled under NVDEC as the reader owns look-ahead), grid-aligned block cache.
+
+| run (85de) | Elapsed | CPU clock | GPU dec | scene | source |
+|---|---|---|---|---|---|
+| NVDEC (ATR_NVDEC=1) | **1064.5s** | 1863 MHz | engaged (109 samples) | 53/54 +1L | 53/54 +1L |
+| cv2 baseline (ATR_NVDEC=0) | **417.4s** | 1841 MHz | 0 | 54/54 | 54/54 |
+
+**NVDEC is 2.55× SLOWER, with NO un-throttle** (CPU 1863 ≈ 1841 MHz — the swscale
+colorspace + subprocess/block management keep the chip loaded, PyAV's exact failure mode),
+and it even **degraded 1 line** (54→53 exact +1 loose, both axes: the ±1 delta / block-seam
+eroded one razor-thin margin). cv2 reproduces the 54/54 reference exactly ⇒ the slowdown +
+degradation are real, not machine noise.
+
+### WHY the recipe cannot be fast here (the decisive, measured root cause)
+Instrumented the real 617 `_WindowEmbedCache.window()` requests of an 85de run:
+- **Global merge (all windows known up front): NVDEC 3× FASTER** — 617 windows collapse to
+  37–46 monotone regions (gap 2–5s); region-streaming decodes the merged span **native in
+  43.0s vs cv2's 155.9s** (the number GOAL v5.2/N1 hoped for — it is REAL).
+- **But the access is scattered and data-dependent:** 407/616 *consecutive* requests jump to
+  a different 10s block; working set = 70 blocks. To realize the global merge incrementally
+  you must EITHER pre-plan all windows (impossible — duplicate candidates + boundary refines
+  are chosen *from the embeddings* mid-run) OR hold the decoded working set to avoid
+  re-decode — but native 1080p frames are ~6 MB each, ~9.7k unique = **~60 GB** (the v166
+  RAM wall; a 16 GB buffer swap-thrashed 32 GB RAM and ran even slower).
+- **A subprocess NVDEC can only STREAM, not cheap-seek.** cv2's one persistent capture does
+  cheap `POS_MSEC` seeks to scattered positions (~0.18s/window incl. decode); each scattered
+  NVDEC access needs a fresh ffmpeg+CUDA-context spawn (~0.4–0.55s, 3× cv2) — so a
+  small-buffer config pays per-window spawn (first run >850s) and a large-buffer config hits
+  the RAM wall. Either way: slower than cv2. A persistent *seekable* GPU decoder
+  (PyNvVideoCodec/torchcodec-cuda) is the only shape that could do cheap scattered GPU seeks —
+  a new dependency whose non-bit-identical output carries the same margin risk v167 already
+  ruled out (torchcodec is explicit-only / not auto-bit-identical even in the indexer).
+
+### §0 VERDICT (unchanged cap, surface now proven empty THREE times)
+`dcd` passes (~119s). For 5e85/85de/411f, ≤200s is **unreachable**: the safe optimisation
+surface is empty — L0/L1 dead (v167 redecode≈1.0, seek_amp≈1.04), L2 in-process decoders
+absent/eval-breaking (v167), and now L2-via-system-ffmpeg-subprocess is frame-exact +
+margin-safe but **2.55× slower** because the matcher's scattered, data-dependent,
+RAM-unbounded decode pattern is the worst case for a stream-only NVDEC. **Recommended cap
+~300–320s quiet** (dcd ~120s; desktop-load band +10–20%). No further heroics — owner accepts.
+The un-throttle physics is real (v167: ORB 2.0×/embed 1.46×) but no in-env lever delivers an
+eval-equivalent off-CPU decode of a scattered random-access pattern.
+
+### Validation guarantees on the reverted final state
+- **All code REVERTED byte-identical to committed v166/v167:** `git checkout` of
+  `scene_aligner.py` (git diff empty); `nvdec_decode.py` deleted. Working tree = session
+  start (GOAL.md / title_image_generator.py / this journal / untracked fonts — none the matcher).
+- **Reference reproduces on the reverted code:** dcd fresh 20/20 + 20/20 (119.2s), hash
+  `892d36602d2b8d5944e376934dcaa0e3520408b5fcd7984592f64ca04a192087` == v5ref (scenes=41
+  matches=41). 85de cv2 baseline this session = 54/54 + 54/54.
+- **Oracle guard at baseline** by determinism (code byte-identical to the v166 freeze; hash
+  reproduced): dcd 19/20, 5e85 46/46, 85de 52/54, 411f 52/52.
+- **Ledger** `eval_waivers.json` untouched: 110 pass + 6 skip, zero fail.
+- **GT folders byte-identical:** git diff empty, 0 files modified today in the four folders.
+- **pytest:** documented baseline (406 pass / 11 fail env+order) — see run below.
+
+### Queue wiring (§4) — still recommended, still the owner's downstream call
+Unchanged from v166/v167: route `/matches` through the existing `indexation_queue.py`
+(`MAX_CONCURRENT=2`) so matchings share the 2-slot GPU budget (low-risk default). A
+separate matching queue is NOT justified — matching is decode/CPU-bound and two concurrent
+matchings fight the same throttled CPU (>1.5× degradation). Not wired here because the
+speed phase closed; it is a downstream decision, not part of the terminal verdict.
+
+## 2026-07-15 - G0 probes (pre-goal, assistant session): PyNvVideoCodec feasibility PROVEN
+
+- Post-v168 hypothesis "persistent seekable GPU decoder" tested empirically before
+  writing GOAL v5.3. Environment facts: torchcodec-CUDA is dead in-env (needs an
+  FFmpeg 4-7 with NVDEC; env conda ffmpeg has no cuda hwaccel, system ffmpeg4.4
+  libs built without cuda, system 8.x unsupported major; third-party FFmpeg builds
+  denied by policy). PyNvVideoCodec 2.1 (NVIDIA, PyPI) + nvidia-npp-cu12 installed
+  via uv (NOT yet in pixi.toml — W0 of the goal).
+- Measured (episode = 10-bit HEVC 1080p, [Judas] S-Rank Musume S01E01):
+  - SimpleDecoder init 0.23s; scattered 12 windows x 24 frames = 0.076s/window,
+    315 f/s sustained (v168's spawn killer: 0.4-0.55s/access — gone).
+  - 100-window CPU test: PyNv 7.67s wall / 2.84s CPU (37% of ONE core) vs cv2
+    25.1s wall / ~630% CPU. 3.3x wall, ~55x CPU relief. VRAM +412 MiB/session.
+  - Calibration: swscale treats untagged sources as BT.601 limited (both 10-bit
+    episodes and TikToks). P016 NATIVE buffer has a BUGGY dlpack descriptor
+    (strides in bytes; reconstruct via as_strided flat + /64). BT.601 torch
+    conversion: mean |d| 0.73 episode / 0.80 tiktok (residual = swscale dither +
+    a fixable +0.37 truncation bias; chroma filter/siting variants measured
+    irrelevant). OutputColorType.RGB (PyNv's own matrix) = delta 2.9, do not use.
+  - DECISION-LEVEL proxy: SSCD 1-cos between cv2 and PyNv frames = 1.0e-3..4.8e-3
+    vs arbitration margins 0.02-0.07 -> x4-15 headroom pre-rounding-fix.
+- GOAL v5.3 written on these numbers: W0 deps into pixi.toml, W1 PyNvWindowDecoder
+  (session LRU, P016 reconstruction, per-stream index mapping, rounding fix),
+  W2 window-decode swap (tier-B + margin-erosion), W3 TikTok pass (detector
+  byte-identity rule), W4 medians, W5 queue wiring (3rd carry), W6 final.
+  Probe preserved: backend/scripts/diagnostics/probe_pynv_calibration.py.
+
+## 2026-07-15 — GOAL v5.3 (v169): PyNv GPU decode BUILT + measured — two-gate verdict (faster, but < gates)
+
+v5.3's premise (persistent in-process NVDEC works, v168's spawn-killer gone) is TRUE
+and was built end-to-end. The decode genuinely moved to the GPU and is consistently
+~14% faster. But BOTH terminal gates fail: ≤200s is unreachable (the un-throttle did
+not materialise) AND the swap fails evaluation-equivalence (the ~0.6 px swscale-dither
+residual flips argmax boundaries/coarse matches). Shipped state = cv2 (flag default OFF,
+proven byte-identical to v5ref); PyNv is an opt-in experimental accelerator behind
+`ATR_PYNV_DECODE=1` with transparent per-file cv2 fallback.
+
+### W0 — deps durable (DONE)
+`pynvvideocodec==2.1.0` + `nvidia-npp-cu12>=12.4` added to pixi.toml pypi-deps;
+`pixi install` clean, lockfile updated (8 refs), env still imports. Capability probe
+(`pynv_decode.open_capture`) creates a live decoder on the actual file and falls back
+to cv2 on any failure, per-file, logged.
+
+### W1 — reconstruction + calibration (DONE, corrected the G0 probe's bug)
+- The committed G0 probe (`probe_pynv_calibration.py`) is the NAIVE reshape — it is
+  BROKEN for 10-bit (episode mean|Δ|=53, not 0.73) and its "-1" episode offset is an
+  artefact. Correct recipe (`backend/app/services/pynv_decode.py`):
+  - P016 dlpack reports uint16 (1.5h,w) strides (w,**2**) — the 2 is BYTES misread as
+    elements (reads every other uint16). Buffer is contiguous (framesize=1.5·h·w·2,
+    plane ptrs exactly h·w·2 apart, NO pitch). Fix: `t.as_strided((1.5h,w),(w,1))`.
+  - 10-bit→8-bit float = **value/256** (/64 gives 10-bit code, then /4). NV12 8-bit is
+    already contiguous (strides (w,1)) — same as_strided works.
+  - BT.601 limited YUV→RGB, round at end. Result: episode mean|Δ|=**0.707** (== G0 0.73),
+    tiktok 0.804. Signed bias +0.377 (swscale rounding residual; debias/floor/bilinear
+    chroma all fail to reduce the worst-case cos — the residual is the dither floor).
+  - Alignment is **+0** (pynv[i]==cv2.set(POS_FRAMES,i)) for BOTH streams under the
+    correct reconstruction. cv2 window semantics (both CFR): landing n=round(start·F),
+    each frame tagged pos_ts=(n−1)/F, keep when start≤pos_ts≤end, content=dec[n].
+    Reproduced exactly: 0 count-mismatches, ts within 1.6 ms on all probed windows.
+  - Decision-level SSCD 1-cos (cv2 vs PyNv embeddings, 93 real frames): mean 0.0042,
+    p95 0.0118, **max 0.0125** — vs arbitration margins 0.02-0.07 → only ×1.6 headroom
+    at the tightest margin (G0's 4.8e-3 was on 5 clean frames; real windows are worse).
+
+### W2 — window-decode swap wired behind the flag (DONE) + tier-B result (FAILS)
+Swap surface = 3 source-cap sites in `_WindowEmbedCache` (get_cap + 2 prefetch workers)
++ the `_collect_frames_in_window_from_capture` classmethod dispatch. PyNvCap is a
+lightweight path holder; a process-global `_SessionPool` keeps an LRU of ≤3 open
+SimpleDecoder sessions (+412 MiB each), per-session lock (PyNv not thread-safe per
+session). Stage-1 TikTok decode (699) kept on cv2 (W3, detector byte-identity).
+
+Measured (fresh, aligner, quiet ~72°C; `~/.cache/atr-eval/v169_*`):
+| project | cv2 (this box) | PyNv | Δ | decode(GPU) | equivalence |
+|---|---|---|---|---|---|
+| dcd (light) | 111.3s | **95.8s** (−14%) | scene 20/20 | %dec active | source **15/20** (5 loose) FAIL |
+| 85de (heavy)| ~384s (GOAL)  | **328.5s** (−15%)| aligner 310.7 | %dec peak 98, active 191/329 | scene 52/54 (2 loose) + source 53/54 (1 **fail**) FAIL |
+- CPU un-throttled to 3804 MHz peak / 3470 mean during the PyNv run (frequency evidence
+  the CPU is NOT the bottleneck once decode leaves it) — yet 85de only fell 384→328s.
+  The residual is embedding/GPU-bound (fp32 SSCD), exactly v166's impossibility floor;
+  the v167 un-throttle thesis (145-196s) does NOT materialise. **≤200s unreachable.**
+- Drift is NOT a bug: no episode changes, no scene-boundary changes; only source
+  start/end timing shifts. Small shifts (~0.02-0.12s) stay within exact ±0.3s; a few
+  large uniform shifts (85de #13 +0.68s, #23 +0.87s; dcd 5 scenes) are coarse-match/
+  boundary-refine argmax flips driven by the ~0.6 px residual. Chroma-upsampling
+  (nn vs bilinear) and rounding/debias variants do NOT reduce the worst-case cos —
+  bit-identity would be required, which G0 established is infeasible (swscale dither).
+
+### W3-W4 not reached — decode gate already failed at W2
+Per the stop-rule ("one degraded line ⇒ fix or revert"; "never ship a decode path that
+fails margin-erosion"), the swap cannot ship ON, so the remaining tier-B leave-one-out,
+the margin-erosion bench probes, W3 TikTok pass and W4 3-run medians were not run — they
+would only re-confirm a failed gate at heavy cost.
+
+### W5 — `/matches` through the shared GPU budget (DONE — the standing carry retired)
+This item is decode-independent (carried since v166), so it was completed even though the
+decode swap was reverted. `IndexationQueueService.gpu_semaphore()` exposes the singleton's
+`MAX_CONCURRENT=2` semaphore; `/matches/find` (`stream_progress`) now acquires it via
+`async with` around `align_scenes_progress`, emitting a "Waiting for a GPU slot" SSE frame
+when both slots are busy. So indexation jobs AND match runs draw from ONE 2-slot GPU
+budget — the 8 GB card is never oversubscribed. **Worst-case VRAM check**: under the cap
+the max is 2 concurrent SSCD embedders (fp32 model ~0.3 GB + query activations + allocator
+reserve) — well under 8 GB; frame decode stays on CPU/cv2 (the GPU-decoder LRU was left out
+of the pipeline, so it adds zero VRAM here); a CUDA OOM inside a task is absorbed by the
+embedder's cache-clear retry and, for jobs, the terminal-OOM path. New test
+`test_gpu_semaphore_caps_concurrent_heavy_tasks` proves the cap: two acquirers fill both
+slots, a third blocks until one releases (queue suite 2 passed).
+
+### Margin-erosion — measured directly (NOT inferred), via end-to-end tier-B
+The margin-erosion check asks "do PyNv-decoded frames erode decision margins?" That was
+answered in the strongest form: the full tier-B eval decisions DRIFTED on both projects
+(dcd source 15/20, 85de scene 52/54 + source 53/54 w/ 1 fail). Real decisions flipping is
+a superset of the bench-probe proxy — margins ARE eroded, measured end-to-end. Running
+`probe_rerank_margins`/`probe_sscd_zoom`/geometry/crossover would only re-confirm an
+already-observed failure, so they were not run.
+
+### FINAL STATE — pipeline REVERTED byte-identical to v166 (passes every gate)
+Per "never ship a decode path that fails the margin-erosion check", the flag-gated swap
+was REVERTED: `git checkout` of `anime_matcher.py` + `scene_aligner.py` → **empty diff**
+(byte-identical v166). The PyNv module was moved OUT of the pipeline to
+`backend/scripts/diagnostics/pynv_decode.py` (reference recipe, imported by nothing in
+`backend/app/`). What remains changed: only pixi.toml (W0 deps — durable, harmless; the
+env carries the packages, the pipeline uses none) + the two diagnostics scripts.
+- Pipeline byte-identical: `git diff backend/app/services/{anime_matcher,scene_aligner}.py`
+  empty; `grep pynv_decode backend/app/` → NONE.
+- dcd on the reverted pipeline (final state) reproduces baseline — see run below.
+- pytest `pixi run -e dev pytest backend/tests/`: **406 passed / 11 failed** = documented
+  baseline exactly (LAN-transfer/upload-readiness/partial-rematch; zero new failures).
+  Reverted pipeline == committed HEAD, so this is the baseline by construction.
+- GT byte-identical: `git status backend/data/projects/` + `modules/anime_searcher/` empty.
+- Scene detector: never touched (§1) — stays on cv2, byte-identical inputs.
+
+### Verdict
+PyNv persistent NVDEC is the first off-CPU decode lever that actually WORKS in-env
+(v167/v168 had none): ~14% faster, decode on the GPU, CPU un-throttled. But it clears
+NEITHER terminal gate — ≤200s is unreachable (embedding floor, not decode) and the
+faithful-but-not-bit-identical frames fail evaluation-equivalence. Recommended cap
+unchanged (~300-320s quiet). Deps kept durable; PyNv left as a documented opt-in
+(default OFF) so the shipped path stays byte-identical cv2. G0-prediction vs realised:
+seek/CPU-relief confirmed (%dec 98, CPU 37%→un-throttled); calibration 0.73/0.80 == G0;
+the un-throttle → ≤200s prediction FALSIFIED; the ×4-15 margin headroom prediction
+FALSIFIED at the decision level (real worst-case ×1.6, flips boundaries). Pipeline
+left byte-identical v166; PyNv preserved as a diagnostics reference + durable deps only.
+
+## 2026-07-16 - GOAL v6-closure + GOAL_FAST.md written (owner decisions)
+
+- Owner accepts the four-verdict outcome (v166-v169): speed case CLOSED on the
+  validated path, official cap ~320s quiet. GOAL.md rewritten as v6-closure:
+  C0 final validation, C1 W5 E2E via the real route + one 2-concurrent
+  throughput measurement (200s was a throughput proxy; 2 parallel matchings may
+  already beat it effectively), C2 evaluator verdict label fix (retired
+  waivers>3 wording), C3 logical commits of the finished tree, C4 freeze (v170).
+- NEW separate experiment, owner-gated: GOAL_FAST.md — "fast mode" on branch
+  feat/fast-gpu-matching behind ATR_FAST_MATCHING: bit-identity and
+  eval-equivalence deliberately NOT gates; precision deltas REPORTED via a
+  scoreboard, owner judges on a real project and keeps or deletes the branch.
+  GPU-oriented as prime directive (desktop usability: host CPU <200% target vs
+  630% today), levers F1 PyNv wiring (recipe ready in diagnostics), F2 Stage-1,
+  F3 numeric modes now allowed (TF32/fp16/compile), F4 bounded CPU; detector
+  stays cv2; shared 2-slot GPU queue stays law with a fast-mode worst-case
+  VRAM re-verification (owner asked this be explicit).
+- Queue question answered (verified in code): /matches/find acquires the
+  indexation queue's shared MAX_CONCURRENT=2 semaphore -> max 2 heavy tasks
+  TOTAL (2 matchings, or 1+1), matching the owner's chosen safe default;
+  E2E route check scheduled in C1.
+
+## 2026-07-16 — v170: GOAL v6-closure DONE — matching workstream FROZEN (official cap ~320s quiet)
+
+Terminal closure of the v57→v169 matching workstream. No algorithm or performance
+change: this entry records the final validation of the shipped cv2 state, the W5
+concurrency wiring proven end-to-end, one throughput datum, the evaluator label fix,
+and the official production cap. Speed case CLOSED (four convergent verdicts v166–v169).
+
+### C0 — final validation of the shipped working tree (fresh + oracle, `--matcher aligner`)
+FRESH (production path — fresh scene detection + aligner), all four GT projects:
+| project | scenes gen/GT | scene exact | source exact | waivers | elapsed | decision hash vs v5ref |
+|---|---|---|---|---|---|---|
+| dcd74148c7ec  | 41/20 | 20/20 | 20/20 | 9  | 111.2s | **IDENTICAL** (892d366…) |
+| 5e85164d9ff8  | 55/46 | 46/46 | 46/46 | 19 | 303.0s | **IDENTICAL** (0c29f18…) |
+| 85de83ca6323  | 59/54 | 54/54 | 54/54 | 20 | 393.3s | **IDENTICAL** (b423cda…) |
+| 411f73d26c1d  | 78/52 | 52/52 | 52/52 | 18 | 421.2s | **IDENTICAL** (9df22c8…) |
+- All four fresh decision-bearing hashes are byte-identical to the frozen `v5ref`
+  reference (`ref_hash.py`, scenes+matches projection) → decisions reproduce exactly.
+- FRESH path is **zero-stale**: no waiver's reviewed interval drifted (the ledger is
+  current for the shipped pipeline).
+ORACLE guard (`--gt-scenes` — skip fresh detection, match GT scenes directly):
+scene-axis exact reproduces the v169 baseline exactly — dcd 19/20, 5e85 46/46,
+85de 52/54, 411f 52/52. Oracle mode reports 20 STALE waiver lines on the SOURCE axis:
+inherent and pre-existing (the ledger's reviewed intervals were calibrated against the
+fresh pipeline; oracle's GT-scene inputs yield slightly different source intervals, so
+fresh-calibrated waivers read stale here — identical pattern in the 2026-07-11 v101
+oracle baseline). NOT a regression and un-fixable without touching the frozen ledger
+(forbidden). The zero-stale guarantee holds on the shipped/fresh path, which is what ships.
+- **pytest** `pixi run -e dev pytest backend/tests/`: **407 passed / 11 failed** — the
+  documented 11-failure baseline (LAN-transfer ×7 + upload-readiness ×3 + partial-rematch
+  ×1), failure set BYTE-IDENTICAL to v169; +1 pass vs v169's 406 is exactly the new W5
+  test `test_gpu_semaphore_caps_concurrent_heavy_tasks`. Zero new failures.
+- **GT byte-identical**: 0 files modified today in all four GT folders (the evaluator does
+  not write to GT). **Submodule** `modules/anime_searcher` clean. **Ledger**
+  `eval_waivers.json` untouched: 116 = 110 pass + 6 skip + 0 fail.
+
+### C1 — W5 concurrency wiring, end-to-end through the REAL `/matches` route
+Backend started; two lean dcd copies (video_path → original, GT untouched) fired at
+`/api/projects/{id}/matches/find` filled both `MAX_CONCURRENT=2` GPU slots; a third
+copy fired ~1s later. Timestamped SSE from the third request:
+- `+0.3s` → `Waiting for a GPU slot (indexation in progress)…` (both slots held)
+- `+207.8s` → `Initializing global aligner…` / `Building dense correspondences…`
+  (a slot freed at +208.2s when one of the first two completed — the third acquired then)
+- `+311.8s` → `complete` (Matched 19 scenes)
+So the route genuinely acquires the shared semaphore and a third heavy task waits for a
+slot before starting. The unit test proved the semaphore; this proves the wiring. GT
+untouched throughout (copies deleted on exit; 0 GT files modified).
+
+### C1 — throughput datum (informational, quiet machine, draw no new work)
+Two evaluator processes matched CONCURRENTLY (sanctioned machine-contention proxy).
+Run 1 — the two HEAVIEST (85de + 411f): **hit the 32 GB system-RAM wall**. Each heavy
+process peaked ~13 GB anon-rss; combined ~26 GB + caches triggered a `global_oom` kill
+of 411f (python pid, total-vm 70 GB) at ~9 min. 85de survived at **635.6s** (1.62× its
+393.3s solo) once 411f died and freed RAM. So on this 32 GB box the two heaviest cannot
+coexist — the documented RAM wall (v166/v168) is also a concurrency wall; 2-heavy
+concurrency is not viable here (a job is OOM-killed), so it cannot beat sequential.
+Run 2 — a pair that FITS RAM, both to completion (dcd light + 5e85 medium-heavy;
+peak RAM ~15 GB, 16 GB free): concurrent wall **374s**; dcd **159.7s** (1.44× its 111.2s
+solo), 5e85 **370.1s** (1.22× its 303.0s solo). Per-project contention slowdown 1.2–1.4×.
+Effective seconds-per-project = wall/2 = **187s** vs sequential (111.2+303.0)/2 = **207s**
+— concurrency wins ~10% when the pair fits (187s even beats the old 200s throughput
+proxy). Verdict: 2-concurrent helps modestly ONLY when both working sets fit in RAM; the
+two heaviest OOM, so the shared 2-slot GPU queue + the sequential ~320s cap stand. Datum
+only — no new work drawn (per C1). (Both runs used `--quiet-profile`; the non-zero exit
+is the unchanged `ceiling_report` passed=False path, not a run failure — see C2.)
+
+### C2 — evaluator verdict label fixed (label/reporting only)
+`_print_strict_result` printed the RETIRED `CEILING-REPORT (waivers > 3)` rule
+(superseded 2026-07-11 by ledger-based acceptance). Reworded to ledger semantics:
+`PASS-WITH-LEDGER (N owner-waived; unwaived failures, if any, listed below)`. Only the
+printed verdict string changed — the pass/fail decision, `ceiling_report` flag, waiver
+tolerances, buckets, folding and equivalence rules are all untouched. Demonstrated on
+dcd (reusing the saved fresh JSON): before `CEILING-REPORT (waivers > 3)` → after
+`PASS-WITH-LEDGER (9 owner-waived; …)`, timings unchanged (20/20 + 20/20).
+
+### C3 — commits (logical units, finished tree)
+See `git log --oneline`. Note: `pixi.lock` and `backend/data/projects/` are gitignored,
+so the lock is not a tracked commit input (env carries the packages) and GT integrity is
+mtime-verified, not git-tracked.
+
+### C4 — FREEZE: official production cap
+**Matching workstream FROZEN.** Official production cap **~320s quiet per heavy project**
+(dcd ~110s), the desktop-load band adding +10–20%. Rationale trail: v166 impossibility
+floor (≤200s unreachable, decode→0 still 221–286s), v167 no eval-equivalent off-CPU decode
+in-env, v168 system-ffmpeg NVDEC frame-exact but 2.55× slower on the scattered access
+pattern, v169 PyNv GPU decode works (−14%, decode on GPU) but fails BOTH gates (≤200s
+unreachable = embedding floor; ~0.6px swscale-dither residual breaks eval-equivalence).
+The safe-optimization surface is proven empty. Future speed work lives only in the
+owner-gated `GOAL_FAST.md` experiment (relaxed gates, branch `feat/fast-gpu-matching`).
