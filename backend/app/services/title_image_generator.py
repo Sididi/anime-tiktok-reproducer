@@ -468,10 +468,54 @@ class TitleImageGeneratorService:
 # WIDTH x HEIGHT (1080x1920) to the path. Templates pick a renderer by name
 # via overlay.title.style / overlay.category.style.
 
-# Minimal palette — refine constants once compared against reference screenshot.
-_MINIMAL_COLOR = (242, 213, 138, 255)  # cream gold
-_MINIMAL_SHADOW = (0, 0, 0, 180)
-_MINIMAL_CATEGORY_COLOR = (242, 213, 138, 200)  # cream gold ~78% opacity
+# Minimal style — all values measured on the owner's reference edit
+# (example.mp4, 1080x1920). Reference geometry: hook "#1" ink rows 455-512
+# centered; category ink cap rows 1421-1462 centered.
+#
+# The reference hook font is Integral CF Medium (commercial, not bundled):
+# drop the licensed IntegralCF-Medium.otf into assets/fonts to use it.
+# SofiaSans-W1000 (OFL, bundled) is the closest free match and is used
+# otherwise. The category font is bundled Archivo ExtraBold (OFL), whose
+# uppercase matches the reference letterforms and per-letter widths.
+_MINIMAL_TITLE_FONT_PATHS = [
+    FONT_DIR / "IntegralCF-Medium.otf",
+    FONT_DIR / "IntegralCF-Medium.ttf",
+    FONT_DIR / "SofiaSans-W1000.ttf",
+]
+_MINIMAL_CAT_FONT_PATHS = [FONT_DIR / "Archivo-ExtraBold.ttf"]
+
+_MINIMAL_TITLE_INK_TOP = 455  # top row of "#1" ink
+_MINIMAL_TITLE_INK_HEIGHT = 58  # digit ink height (digits and '#' share it)
+_MINIMAL_TITLE_COLOR = (255, 255, 255, 255)  # opaque white, no shadow/outline
+
+_MINIMAL_CAT_INK_TOP = 1421  # top row of uppercase ink
+_MINIMAL_CAT_CAP_HEIGHT = 42  # uppercase ink height
+_MINIMAL_CAT_COLOR = (255, 255, 255, 102)  # white at 40% opacity
+_MINIMAL_CAT_LETTER_SPACING = -2.0  # px; reference tracking is tighter than font default
+
+
+def _minimal_font(paths: list[Path], sample: str, target_ink_h: int) -> ImageFont.FreeTypeFont:
+    """Load the first available font, sized so `sample` ink height == target."""
+    path = next((p for p in paths if p.exists()), None)
+    if path is None:
+        raise FileNotFoundError(
+            f"No minimal-style font found among: {[str(p) for p in paths]}"
+        )
+    size = target_ink_h
+    for _ in range(6):
+        font = ImageFont.truetype(str(path), size)
+        bbox = font.getbbox(sample)
+        ink_h = bbox[3] - bbox[1]
+        if ink_h == target_ink_h:
+            break
+        new_size = max(4, round(size * target_ink_h / max(ink_h, 1)))
+        if new_size == size:
+            size += 1 if ink_h < target_ink_h else -1
+        else:
+            size = new_size
+    else:
+        font = ImageFont.truetype(str(path), size)
+    return font
 
 
 def _render_title_classic(text: str, output_path: Path) -> None:
@@ -485,48 +529,33 @@ def _render_category_classic(text: str, output_path: Path) -> None:
 
 
 def _render_title_minimal(text: str, output_path: Path) -> None:
-    """Minimal title renderer — gold cream text, no panel, drop shadow.
-
-    Placeholder — refine constants once compared against reference screenshot.
-    """
+    """Minimal title renderer — opaque white hook ("#1") above the frame."""
     img = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    font = (
-        ImageFont.truetype(str(TITLE_FONT_PATH), TITLE_FONT_SIZE)
-        if TITLE_FONT_PATH.exists()
-        else ImageFont.load_default()
-    )
     rendered_text = text.upper()
-    bbox = draw.textbbox((0, 0), rendered_text, font=font)
-    w = bbox[2] - bbox[0]
-    h = bbox[3] - bbox[1]
-    x = (WIDTH - w) // 2
-    y = CENTER_FRAME_TOP - h - TITLE_GAP_ABOVE_CENTER
-    # Drop shadow
-    draw.text((x + 3, y + 3), rendered_text, fill=_MINIMAL_SHADOW, font=font)
-    # Main text
-    draw.text((x, y), rendered_text, fill=_MINIMAL_COLOR, font=font)
+    font = _minimal_font(
+        _MINIMAL_TITLE_FONT_PATHS, rendered_text, _MINIMAL_TITLE_INK_HEIGHT
+    )
+    bbox = font.getbbox(rendered_text)
+    x = (WIDTH - (bbox[2] - bbox[0])) / 2 - bbox[0]
+    y = _MINIMAL_TITLE_INK_TOP - bbox[1]
+    draw.text((x, y), rendered_text, fill=_MINIMAL_TITLE_COLOR, font=font)
     img.save(output_path, "PNG")
 
 
 def _render_category_minimal(text: str, output_path: Path) -> None:
-    """Minimal category renderer — semi-transparent gold cream text.
-
-    Placeholder — refine constants once compared against reference screenshot.
-    """
+    """Minimal category renderer — semi-transparent white text below the frame."""
     img = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    font = (
-        ImageFont.truetype(str(CAT_FONT_PATH), CAT_FONT_SIZE)
-        if CAT_FONT_PATH.exists()
-        else ImageFont.load_default()
-    )
     rendered_text = text.upper()
-    bbox = draw.textbbox((0, 0), rendered_text, font=font)
-    w = bbox[2] - bbox[0]
-    x = (WIDTH - w) // 2
-    y = CENTER_FRAME_BOT + CAT_GAP_BELOW_CENTER
-    draw.text((x, y), rendered_text, fill=_MINIMAL_CATEGORY_COLOR, font=font)
+    font = _minimal_font(_MINIMAL_CAT_FONT_PATHS, "A", _MINIMAL_CAT_CAP_HEIGHT)
+    ls = _MINIMAL_CAT_LETTER_SPACING
+    svc = TitleImageGeneratorService
+    text_w = svc._measure_text(rendered_text, font, ls)
+    cap_bbox = font.getbbox("A")
+    x = (WIDTH - text_w) / 2
+    y = _MINIMAL_CAT_INK_TOP - cap_bbox[1]
+    svc._draw_spaced_text(draw, (x, y), rendered_text, font, _MINIMAL_CAT_COLOR, ls)
     img.save(output_path, "PNG")
 
 
