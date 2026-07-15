@@ -27,6 +27,13 @@ torchaudio = { version = ">=2.8.0,<2.9.0", index = "https://download.pytorch.org
 torchvision = { version = ">=0.23.0", index = "https://download.pytorch.org/whl/cu128" }
 torchcodec = ">=0.7.0,<0.8.0"
 
+# GPU source decode for the aligner window primitive (GOAL v5.3). Persistent
+# in-process NVDEC via NVIDIA's PyNvVideoCodec; nvidia-npp-cu12 provides the
+# NPP runtime it links. Both are optional at runtime: a capability probe falls
+# back transparently to cv2 per-process when the decoder/driver is unavailable.
+pynvvideocodec = "==2.1.0"
+nvidia-npp-cu12 = ">=12.4,<13"
+
 # WhisperX (requires torch 2.8.x) - GPU accelerated transcription
 # Held <3.8: whisperx 3.8+ requires pyannote-audio>=4 (breaking major)
 whisperx = ">=3.7.6,<3.8"
