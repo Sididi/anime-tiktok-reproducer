@@ -699,23 +699,10 @@ class SceneAlignerService:
         cap = cv2.VideoCapture(str(video_path))
         diff_times: list[float] = []
         diffs: list[float] = []
-        previous_small: np.ndarray | None = None
         try:
             native_fps = cap.get(cv2.CAP_PROP_FPS)
             if not native_fps or native_fps <= 0:
                 native_fps = 30.0
-            frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-            duration = frame_count / native_fps if frame_count and frame_count > 0 else None
-            if duration is None:
-                return [], [], []
-
-            sample_times = np.arange(0.0, max(0.0, duration), 1.0 / DENSE_SAMPLE_FPS)
-            targets = {
-                max(0, int(round(float(t) * native_fps))): float(t)
-                for t in sample_times
-            }
-            if not targets:
-                return [], [], []
 
             samples: list[QuerySample] = []
 
@@ -732,50 +719,79 @@ class SceneAlignerService:
             def _produce() -> None:
                 images: list[Image.Image] = []
                 times: list[float] = []
-                previous = None
+                previous_small: np.ndarray | None = None
+                previous_frame: np.ndarray | None = None
+                previous_pts: float | None = None
                 try:
-                    next_target_iter = iter(sorted(targets.items()))
-                    try:
-                        target_frame, target_time = next(next_target_iter)
-                    except StopIteration:
-                        return
-                    exhausted = False
                     frame_index = 0
+                    next_sample_time = 0.0
+                    sample_step = 1.0 / DENSE_SAMPLE_FPS
+
+                    def append_sample(frame: np.ndarray, sample_time: float) -> None:
+                        nonlocal images, times
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        images.append(Image.fromarray(frame_rgb))
+                        times.append(sample_time)
+                        if len(images) >= 96:
+                            batch_q.put((images, times))
+                            images, times = [], []
+
                     while True:
                         ret, frame = cap.read()
                         if not ret:
                             break
+                        raw_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+                        pts = (
+                            float(raw_ms) / 1000.0
+                            if math.isfinite(raw_ms) and raw_ms >= 0.0
+                            else frame_index / native_fps
+                        )
+                        if previous_pts is not None and pts <= previous_pts + 1e-9:
+                            nominal = frame_index / native_fps
+                            pts = (
+                                nominal
+                                if nominal > previous_pts + 1e-9
+                                else previous_pts + 1.0 / native_fps
+                            )
                         small = cv2.resize(
                             frame, (64, 64), interpolation=cv2.INTER_AREA
                         )
                         small = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-                        if previous is not None:
-                            diff_times.append(frame_index / native_fps)
+                        if previous_small is not None:
+                            diff_times.append(pts)
                             diffs.append(
                                 float(
                                     np.mean(
                                         np.abs(
                                             small.astype(np.int16)
-                                            - previous.astype(np.int16)
+                                            - previous_small.astype(np.int16)
                                         )
                                     )
                                 )
                             )
-                        previous = small
-                        while not exhausted and frame_index >= target_frame:
-                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                            images.append(Image.fromarray(frame_rgb))
-                            times.append(target_time)
-                            if len(images) >= 96:
-                                batch_q.put((images, times))
-                                images, times = [], []
-                            try:
-                                target_frame, target_time = next(
-                                    next_target_iter
-                                )
-                            except StopIteration:
-                                exhausted = True
+
+                        if previous_frame is None or previous_pts is None:
+                            while next_sample_time <= pts + 1e-9:
+                                append_sample(frame, next_sample_time)
+                                next_sample_time += sample_step
+                        else:
+                            # Once the current PTS passes the midpoint, the
+                            # previous decoded frame is the nearest frame for
+                            # every outstanding target on its side.
+                            midpoint = 0.5 * (previous_pts + pts)
+                            while next_sample_time <= midpoint + 1e-9:
+                                append_sample(previous_frame, next_sample_time)
+                                next_sample_time += sample_step
+
+                        previous_small = small
+                        previous_frame = frame
+                        previous_pts = pts
                         frame_index += 1
+
+                    if previous_frame is not None and previous_pts is not None:
+                        while next_sample_time <= previous_pts + 1e-9:
+                            append_sample(previous_frame, next_sample_time)
+                            next_sample_time += sample_step
                     if images:
                         batch_q.put((images, times))
                 except BaseException as exc:  # surfaced on the main thread

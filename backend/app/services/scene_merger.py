@@ -177,11 +177,25 @@ class SceneMergerService:
                 diff_times: list[float] = []
                 diffs: list[float] = []
                 previous = None
+                previous_pts: float | None = None
                 frame_index = 0
                 while True:
                     ok, frame = cap.read()
                     if not ok:
                         break
+                    raw_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+                    pts = (
+                        float(raw_ms) / 1000.0
+                        if np.isfinite(raw_ms) and raw_ms >= 0.0
+                        else frame_index / fps
+                    )
+                    if previous_pts is not None and pts <= previous_pts + 1e-9:
+                        nominal = frame_index / fps
+                        pts = (
+                            nominal
+                            if nominal > previous_pts + 1e-9
+                            else previous_pts + 1.0 / fps
+                        )
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                     small = cv2.resize(gray, (64, 64), interpolation=cv2.INTER_AREA)
                     if previous is not None:
@@ -191,9 +205,10 @@ class SceneMergerService:
                                 - previous.astype(np.int16)
                             )
                         )
-                        diff_times.append(frame_index / fps)
+                        diff_times.append(pts)
                         diffs.append(float(diff))
                     previous = small
+                    previous_pts = pts
                     frame_index += 1
                 return diff_times, diffs
             finally:

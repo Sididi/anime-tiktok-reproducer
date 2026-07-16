@@ -6,6 +6,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.models import Scene, SceneList
+from app.services import scene_aligner as aligner_module
 from app.services.scene_aligner import (
     Correspondence,
     MAX_EVIDENCE_SPEED,
@@ -30,6 +31,89 @@ def _corr(
         series="series",
         rank=0,
     )
+
+
+def test_dense_sampler_uses_actual_pts_for_vfr(monkeypatch) -> None:
+    class FakeCV2:
+        CAP_PROP_FPS = 1
+        CAP_PROP_POS_MSEC = 2
+        COLOR_BGR2RGB = 3
+        COLOR_BGR2GRAY = 4
+        INTER_AREA = 5
+
+        @staticmethod
+        def resize(frame, size, interpolation):
+            return frame
+
+        @staticmethod
+        def cvtColor(frame, code):
+            if code == FakeCV2.COLOR_BGR2GRAY:
+                return frame[:, :, 0]
+            return frame
+
+    class FakeCapture:
+        pts = [0.0, 0.25, 0.5, 2.0, 2.25]
+
+        def __init__(self) -> None:
+            self.next_index = 0
+            self.last_index: int | None = None
+
+        def get(self, prop: int) -> float:
+            if prop == FakeCV2.CAP_PROP_FPS:
+                return 2.5
+            if prop == FakeCV2.CAP_PROP_POS_MSEC:
+                return (
+                    self.pts[self.last_index] * 1000.0
+                    if self.last_index is not None
+                    else 0.0
+                )
+            return 0.0
+
+        def read(self):
+            if self.next_index >= len(self.pts):
+                return False, None
+            self.last_index = self.next_index
+            self.next_index += 1
+            frame = np.full((2, 2, 3), self.last_index, dtype=np.uint8)
+            return True, frame
+
+        def release(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        FakeCV2,
+        "VideoCapture",
+        staticmethod(lambda path: FakeCapture()),
+        raising=False,
+    )
+    from app.services.anime_matcher import AnimeMatcherService
+
+    monkeypatch.setattr(
+        AnimeMatcherService,
+        "_require_cv2",
+        classmethod(lambda cls: FakeCV2),
+    )
+    monkeypatch.setattr(aligner_module, "_presize_images", lambda images: images)
+    monkeypatch.setattr(
+        AnimeMatcherService,
+        "_embed_pil_batch",
+        classmethod(
+            lambda cls, images: np.asarray(
+                [[float(np.asarray(image)[0, 0, 0])] for image in images],
+                dtype=np.float32,
+            )
+        ),
+    )
+
+    samples, diff_times, _ = SceneAlignerService.sample_query_video_with_diffs(
+        Path("vfr.mp4")
+    )
+    by_time = {sample.t_tiktok: int(sample.embedding[0]) for sample in samples}
+
+    # 1.5s is nearest the frame presented at 2.0s (value/index 3). The old
+    # timestamp*average-FPS path selected frame 4 at 2.25s instead.
+    assert by_time[1.5] == 3
+    assert diff_times == [0.25, 0.5, 2.0, 2.25]
 
 
 def test_segment_extraction_recovers_fast_affine_segment() -> None:

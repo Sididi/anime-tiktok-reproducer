@@ -276,6 +276,135 @@ def test_extract_frames_seeks_across_large_frame_gaps(monkeypatch) -> None:
     assert cap.grab_calls < AnimeMatcherService.MAX_SEQUENTIAL_GRAB_FRAMES
 
 
+def test_extract_frames_uses_presentation_timestamps_for_vfr(monkeypatch) -> None:
+    class FakeCV2:
+        CAP_PROP_FPS = 1
+        CAP_PROP_POS_FRAMES = 2
+        CAP_PROP_POS_MSEC = 3
+        COLOR_BGR2RGB = 4
+
+        @staticmethod
+        def cvtColor(frame, code):
+            return frame
+
+    class FakeCapture:
+        # Four frames spread across ten seconds: timestamp * average FPS would
+        # map 2s to frame 1, while its actual PTS belongs to frame 2.
+        pts = [0.0, 1.0, 2.0, 10.0]
+
+        def __init__(self) -> None:
+            self.next_index = 0
+            self.last_index: int | None = None
+
+        def get(self, prop: int) -> float:
+            if prop == FakeCV2.CAP_PROP_FPS:
+                return 0.4
+            if prop == FakeCV2.CAP_PROP_POS_FRAMES:
+                return float(self.next_index)
+            if prop == FakeCV2.CAP_PROP_POS_MSEC:
+                return (
+                    self.pts[self.last_index] * 1000.0
+                    if self.last_index is not None
+                    else 0.0
+                )
+            return 0.0
+
+        def set(self, prop: int, value: float) -> bool:
+            if prop == FakeCV2.CAP_PROP_POS_MSEC:
+                target = float(value) / 1000.0
+                self.next_index = next(
+                    (i for i, pts in enumerate(self.pts) if pts >= target),
+                    len(self.pts),
+                )
+                self.last_index = None
+            return True
+
+        def read(self):
+            if self.next_index >= len(self.pts):
+                return False, None
+            self.last_index = self.next_index
+            self.next_index += 1
+            frame = np.full((2, 2, 3), self.last_index, dtype=np.uint8)
+            return True, frame
+
+    monkeypatch.setattr(
+        AnimeMatcherService,
+        "_require_cv2",
+        classmethod(lambda cls: FakeCV2),
+    )
+
+    frames = AnimeMatcherService._extract_frames_from_capture(
+        FakeCapture(),
+        [0.0, 2.0, 10.0],
+    )
+
+    assert [int(np.asarray(frame)[0, 0, 0]) for frame in frames] == [0, 2, 3]
+
+
+def test_scene_merger_frame_diffs_use_presentation_timestamps(monkeypatch) -> None:
+    class FakeCV2:
+        CAP_PROP_FPS = 1
+        CAP_PROP_POS_MSEC = 2
+        COLOR_BGR2GRAY = 3
+        INTER_AREA = 4
+
+        @staticmethod
+        def cvtColor(frame, code):
+            return frame[:, :, 0]
+
+        @staticmethod
+        def resize(frame, size, interpolation):
+            return frame
+
+    class FakeCapture:
+        pts = [0.0, 0.25, 2.0]
+
+        def __init__(self) -> None:
+            self.next_index = 0
+            self.last_index: int | None = None
+
+        def isOpened(self) -> bool:
+            return True
+
+        def get(self, prop: int) -> float:
+            if prop == FakeCV2.CAP_PROP_FPS:
+                return 1.5
+            if prop == FakeCV2.CAP_PROP_POS_MSEC:
+                return (
+                    self.pts[self.last_index] * 1000.0
+                    if self.last_index is not None
+                    else 0.0
+                )
+            return 0.0
+
+        def read(self):
+            if self.next_index >= len(self.pts):
+                return False, None
+            self.last_index = self.next_index
+            self.next_index += 1
+            return True, np.full((2, 2, 3), self.last_index, dtype=np.uint8)
+
+        def release(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        FakeCV2,
+        "VideoCapture",
+        staticmethod(lambda path: FakeCapture()),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        AnimeMatcherService,
+        "_require_cv2",
+        classmethod(lambda cls: FakeCV2),
+    )
+
+    diff_times, diffs = SceneMergerService._video_frame_diffs(Path("vfr.mp4"))
+
+    assert diff_times == [0.25, 2.0]
+    assert diffs == [1.0, 1.0]
+
+
 def test_tail_interval_candidates_include_exposed_alternatives() -> None:
     scene = Scene(index=0, start_time=0.0, end_time=2.0)
     match = SceneMatch(

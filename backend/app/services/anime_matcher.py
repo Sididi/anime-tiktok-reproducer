@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json
+import math
 import sys
 import time
 from bisect import bisect_left, bisect_right
@@ -406,70 +407,116 @@ class AnimeMatcherService:
         cap,
         timestamps: list[float],
     ) -> list[Image.Image | None]:
-        """Decode frames at the given timestamps using one ordered seek+grab pass.
+        """Decode frames nearest the requested presentation timestamps."""
+        frames, _ = cls._extract_frames_with_indices_from_capture(cap, timestamps)
+        return frames
 
-        Replaces the naive ``cap.set(POS_MSEC) + cap.read()`` per-timestamp pattern,
-        which forces a full keyframe seek per sample. We sort the targets, seek
-        once to the first frame, then ``cap.grab()`` forward to subsequent
-        targets. Identical pixels, far fewer container/codec restarts.
+    @classmethod
+    def _extract_frames_with_indices_from_capture(
+        cls,
+        cap,
+        timestamps: list[float],
+    ) -> tuple[list[Image.Image | None], list[int | None]]:
+        """Decode frames by media PTS, retaining decoded frame indices for caches.
+
+        ``CAP_PROP_FPS`` is an average rate for variable-frame-rate inputs, so
+        ``timestamp * fps`` can point many seconds away from the requested
+        content.  Use ``CAP_PROP_POS_MSEC`` as the source of truth and only fall
+        back to frame-number arithmetic for capture backends that do not expose
+        timestamps.
         """
         cv2 = cls._require_cv2()
         frames: list[Image.Image | None] = [None] * len(timestamps)
+        frame_indices: list[int | None] = [None] * len(timestamps)
         if not timestamps:
-            return frames
+            return frames, frame_indices
 
         native_fps = cap.get(cv2.CAP_PROP_FPS)
-        if not native_fps or native_fps <= 0:
+        has_pts = hasattr(cv2, "CAP_PROP_POS_MSEC")
+        if not has_pts:
+            # Compatibility fallback for minimal/test capture backends. Real
+            # OpenCV backends expose POS_MSEC even when FPS metadata is absent.
+            native_fps = float(native_fps or 0.0)
             for index, timestamp in enumerate(timestamps):
-                cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, float(timestamp)) * 1000.0)
+                target_frame_index = max(
+                    0,
+                    int(round(max(0.0, float(timestamp)) * native_fps)),
+                )
+                cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame_index)
                 ret, frame = cap.read()
                 if not ret:
                     continue
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frames[index] = Image.fromarray(frame_rgb)
-            return frames
+                frame_indices[index] = target_frame_index
+            return frames, frame_indices
 
         ordered_targets = sorted(
             enumerate(timestamps),
             key=lambda item: max(0.0, float(item[1])),
         )
+        fps_fallback = float(native_fps) if native_fps and native_fps > 0 else 30.0
+        max_sequential_seconds = cls.MAX_SEQUENTIAL_GRAB_FRAMES / fps_fallback
+        seek_preroll_seconds = min(2.0, max_sequential_seconds)
 
-        next_frame_index = 0
-        last_frame_index = -1
-        last_image: Image.Image | None = None
+        # (presentation timestamp, frame index, BGR frame)
+        previous: tuple[float, int | None, np.ndarray] | None = None
+        current: tuple[float, int | None, np.ndarray] | None = None
+
+        def read_decoded(
+            last_pts: float | None = None,
+        ) -> tuple[float, int | None, np.ndarray] | None:
+            ret, frame = cap.read()
+            if not ret:
+                return None
+            raw_index = cap.get(cv2.CAP_PROP_POS_FRAMES)
+            frame_index = (
+                max(0, int(round(raw_index)) - 1)
+                if math.isfinite(raw_index) and raw_index > 0
+                else None
+            )
+            raw_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+            pts = float(raw_ms) / 1000.0 if math.isfinite(raw_ms) else -1.0
+            if pts < 0.0 or (last_pts is not None and pts <= last_pts + 1e-9):
+                if frame_index is not None:
+                    pts = frame_index / fps_fallback
+                elif last_pts is not None:
+                    pts = last_pts + 1.0 / fps_fallback
+                else:
+                    pts = 0.0
+            return pts, frame_index, frame
+
         for original_index, raw_timestamp in ordered_targets:
             timestamp = max(0.0, float(raw_timestamp))
-            target_frame_index = max(0, int(round(timestamp * float(native_fps))))
-            if target_frame_index == last_frame_index:
-                frames[original_index] = (
-                    last_image.copy() if last_image is not None else None
-                )
-                continue
-
             if (
-                target_frame_index < next_frame_index
-                or target_frame_index - next_frame_index > cls.MAX_SEQUENTIAL_GRAB_FRAMES
+                current is None
+                or timestamp < current[0] - 1e-6
+                or timestamp - current[0] > max_sequential_seconds
             ):
-                cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame_index)
-                next_frame_index = target_frame_index
+                # Timestamp seeks may land on either side of the requested PTS,
+                # especially around VFR keyframes. Start slightly early so the
+                # ordered decode can bracket the target and choose its nearest
+                # presented frame.
+                seek_time = max(0.0, timestamp - seek_preroll_seconds)
+                cap.set(cv2.CAP_PROP_POS_MSEC, seek_time * 1000.0)
+                previous = None
+                current = read_decoded()
 
-            while next_frame_index < target_frame_index:
-                if not cap.grab():
+            while current is not None and current[0] < timestamp:
+                decoded = read_decoded(current[0])
+                if decoded is None:
                     break
-                next_frame_index += 1
-            ret, frame = cap.read()
-            if ret:
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                image = Image.fromarray(frame_rgb)
-            else:
-                image = None
+                previous, current = current, decoded
 
-            last_frame_index = target_frame_index
-            last_image = image
-            next_frame_index = target_frame_index + 1
-            frames[original_index] = image
+            candidates = [item for item in (previous, current) if item is not None]
+            if not candidates:
+                continue
+            chosen = min(candidates, key=lambda item: abs(item[0] - timestamp))
+            frame_rgb = cv2.cvtColor(chosen[2], cv2.COLOR_BGR2RGB)
+            frames[original_index] = Image.fromarray(frame_rgb)
+            frame_indices[original_index] = chosen[1]
 
-        return frames
+        return frames, frame_indices
 
     @staticmethod
     def _scene_probe_times(scene: Scene) -> tuple[float, float, float]:
@@ -529,8 +576,6 @@ class AnimeMatcherService:
                     targets.append((max(0.0, timestamp), scene_index, position))
             targets.sort(key=lambda item: item[0])
 
-            native_fps = cap.get(cv2.CAP_PROP_FPS)
-
             def assign(scene_index: int, position: int, image, frame_idx) -> None:
                 scene_frames = list(frames_by_scene[scene_index])
                 scene_frames[position] = image
@@ -547,48 +592,17 @@ class AnimeMatcherService:
                     scene_indices[2],
                 )
 
-            if not native_fps or native_fps <= 0:
-                for timestamp, scene_index, position in targets:
-                    cap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
-                    ret, frame = cap.read()
-                    image = (
-                        Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                        if ret
-                        else None
-                    )
-                    assign(scene_index, position, image, None)
-                return frames_by_scene, indices_by_scene
-
-            next_frame_index = 0
-            last_frame_index = -1
-            last_image: Image.Image | None = None
-            for timestamp, scene_index, position in targets:
-                target_frame_index = max(0, int(round(timestamp * float(native_fps))))
-                if target_frame_index == last_frame_index:
-                    image = last_image.copy() if last_image is not None else None
-                else:
-                    if (
-                        target_frame_index < next_frame_index
-                        or target_frame_index - next_frame_index
-                        > cls.MAX_SEQUENTIAL_GRAB_FRAMES
-                    ):
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame_index)
-                        next_frame_index = target_frame_index
-                    while next_frame_index < target_frame_index:
-                        if not cap.grab():
-                            break
-                        next_frame_index += 1
-                    ret, frame = cap.read()
-                    if ret:
-                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        image = Image.fromarray(frame_rgb)
-                    else:
-                        image = None
-                    last_frame_index = target_frame_index
-                    last_image = image
-                    next_frame_index = target_frame_index + 1
-
-                assign(scene_index, position, image, target_frame_index)
+            decoded, frame_indices = cls._extract_frames_with_indices_from_capture(
+                cap,
+                [timestamp for timestamp, _, _ in targets],
+            )
+            for (_, scene_index, position), image, frame_index in zip(
+                targets,
+                decoded,
+                frame_indices,
+                strict=False,
+            ):
+                assign(scene_index, position, image, frame_index)
         finally:
             cap.release()
             cls._record_runtime_stat(
