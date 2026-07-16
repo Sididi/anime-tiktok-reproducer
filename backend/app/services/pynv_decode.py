@@ -49,9 +49,11 @@ _KB_B = 1.772
 
 # At most this many decoder sessions stay open at once (recipe §0.4d: ~412 MiB
 # each, 8 GB shared with the SSCD embedder). LRU-evicted sessions are stopped so
-# their VRAM is returned. Under fast-mode concurrency (§4) two matchings share
-# this process-global pool, so the ceiling bounds decoder VRAM across both.
-_MAX_SESSIONS = 3
+# their VRAM is returned. Kept at 2 (not 3): under fast-mode concurrency (§4)
+# TWO processes each hold their own pool, so 2 sessions/process is 4 decoders
+# (~1.6 GB) on the shared card — 3 would push the peak into the embed's OOM
+# margin. One matching only ever touches ~1-2 source files per window anyway.
+_MAX_SESSIONS = 2
 
 _ENV_FLAG = "ATR_PYNV_DECODE"
 
@@ -286,30 +288,24 @@ def decode_window(
     width, height = sess.width, sess.height
     num_frames = sess.num_frames or (1 << 30)
     start_ts = max(0.0, start_ts)
-    kept_ts: list[float] = []
-    gpu_rgbs: list[torch.Tensor] = []
+    frames: list[tuple[float, Image.Image]] = []
     n = int(round(start_ts * fps))
     with sess.lock:
         decoder = sess.decoder
-        while len(kept_ts) < max_frames and n < num_frames:
+        while len(frames) < max_frames and n < num_frames:
             pos_ts = (n - 1) / fps
             if pos_ts > end_ts:
                 break
             if pos_ts >= start_ts and n >= 0:
-                # Convert immediately to an independent GPU tensor: the decoder
-                # may recycle the buffer that ``decoder[n]`` views, so we must
-                # not hold raw frames past this iteration.
-                gpu_rgbs.append(_native_frame_to_rgb_gpu(decoder[n], width, height))
-                kept_ts.append(pos_ts)
+                # Convert one frame at a time and move it straight to host. The
+                # decoder may recycle the buffer that ``decoder[n]`` views, so we
+                # convert immediately; and moving per frame (rather than stacking
+                # the whole window on the GPU) bounds decode VRAM to a single
+                # frame's intermediates — a wide window otherwise stacks >1 GiB
+                # of RGB and OOMs the shared 8 GB card under §4 concurrency.
+                rgb = _native_frame_to_rgb_gpu(decoder[n], width, height).cpu().numpy()
+                frames.append((pos_ts, Image.fromarray(rgb)))
             n += 1
-    if gpu_rgbs:
-        stacked = torch.stack(gpu_rgbs, dim=0).cpu().numpy()  # one host transfer
-        rgbs = [stacked[i] for i in range(stacked.shape[0])]
-    else:
-        rgbs = []
-    frames = [
-        (ts, Image.fromarray(rgb)) for ts, rgb in zip(kept_ts, rgbs, strict=False)
-    ]
     if sample_frames is not None and len(frames) > sample_frames:
         indices = np.linspace(0, len(frames) - 1, sample_frames, dtype=np.int32)
         return [frames[int(i)] for i in indices]

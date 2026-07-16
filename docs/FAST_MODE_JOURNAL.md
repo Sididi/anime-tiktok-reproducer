@@ -137,3 +137,150 @@ The precision cost is exactly the documented GPU-decode source-boundary drift
 (BT.601 vs swscale, ~0.04–0.9s sub-second boundary shifts) — same source
 episodes chosen, refined boundaries moved by ≤~1s. This is the "reported not
 gated" trade the owner judges visually.
+
+## vF4 — SCOREBOARD: full fast, 3-run quiet medians (2026-07-16)
+
+`ATR_FAST_MATCHING=1` (GPU decode + fp32 + TF32) vs mainref (main HEAD).
+Elapsed = median of 3 quiet runs (cooled to ≤76 °C between runs); host CPU% =
+median of the 3 getrusage(children) means; scene/source line Δ from `diff_vs_ref`.
+
+| project | elapsed (was) | host CPU% (was) | scene Δ | source line Δ | Scene / Source timing (fast) |
+|---|---|---|---|---|---|
+| dcd74148c7ec | **101s** (113.5) −11% | **202%** (428) | 0 | 35 (23 material) | 20/20 · 17/20 exact,3 loose |
+| 5e85164d9ff8 | **261s** (303.7) −14% | **156%** (399) | 0 | 53 (17 material) | 46/46 · 40/46 exact,3 loose,3 wrong-prim |
+| 85de83ca6323 | **378s** (394.4) −4% | **168%** (458) | 0 | 55 (23 material) | 52/54 · 52/54 exact,1 loose,1 fail |
+| 411f73d26c1d | **368s** (420.1) −13% | **183%** (454) | 0 | 70 (23 material) | 52/52 · 50/52 exact,1 loose,1 wrong-prim |
+
+3-run wall stability (very tight): dcd [100.5,100.6,101.1]; 5e85
+[262.6,260.3,261.3]; 85de [378.0,373.3,377.5]; 411f [370.4,368.2,367.8].
+Hashes reproduce across all 3 runs per project (deterministic).
+
+**scene line Δ = 0 everywhere — scene boundaries byte-identical to mainline**
+(detector kept on cv2 per §0). All deltas are on the source axis. Every flip is
+a boundary shift, NOT an episode change, except the handful of material
+decisions below (the ones `doubt_reasons` will surface for the owner):
+- 5e85 scene 12: episode → no-match (lost a match)
+- 85de scene 27: source jumped +76.5s (wrong location within the right episode)
+- 5e85 scene 25: +1.24s source-start shift
+- the rest are ≤~0.9s sub-second boundary drift (cosmetic).
+
+Headline: **−4 to −14% wall AND host CPU roughly a third to a half of mainline
+(400–460% → 156–202%)** — the desktop-usability prime directive, met on all 4.
+The mean CPU sits at/under the ~200% target; the machine no longer thermally
+throttles under matching (decode left the CPU).
+
+## vF5 — PER-LEVER: F1 is the whole win, F3/TF32 is droppable (2026-07-16)
+
+Single run each vs mainref. F1-only = `ATR_FAST_NUMERICS=0` (GPU decode, fp32,
+no TF32). F3-only = `ATR_FAST_DECODE=0` (cv2 decode, fp32 + TF32).
+
+| lever | dcd | 5e85 | 85de | 411f |
+|---|---|---|---|---|
+| **F1** GPU decode wall | 101s −12% | 264s −14% | 379s −4% | 370s −12% |
+| **F1** host CPU% | 202% | 155% | 169% | 182% |
+| **F1** Source exact | 18/20 | 40/46 | 52/54 | 50/52 |
+| **F3** TF32 wall | 118s +3% | 305s +0% | 386s −2% | 407s −3% |
+| **F3** host CPU% | 433% | 400% | 454% | 456% |
+| **F3** Source exact | 19/20 | 43/46 | 53/54 | 52/52 |
+
+Verdict:
+- **F1 (GPU decode) delivers 100% of the win** — the whole CPU drop
+  (400–460%→155–202%) and the whole wall gain (−4…−14%). Its cost is the
+  source-boundary drift (BT.601). Keep it: this is fast mode.
+- **F3 (TF32) buys ~nothing here**: wall within ±3% of mainline (embed is not
+  the wall bottleneck once decode is on GPU; DP/ORB dominate), CPU unchanged
+  (cv2 decode still on CPU). TF32 is bit-safe on the model (cos 1.0) but at
+  margin 0.02 still perturbs a couple decisions — FULL(+TF32) dcd 17/20 vs
+  F1-only 18/20. **Droppable with `ATR_FAST_NUMERICS=0`** for identical speed
+  and equal-or-slightly-better precision. Kept ON by default only because a
+  more embed-heavy real project could benefit; owner cherry-picks.
+- **F2 (Stage-1 TikTok sampling via PyNv)**: NOT wired — the mainline Stage-1
+  dense sampler already runs one sequential cv2 pass over the short TikTok
+  source (seconds), overlapped with embed; it is a negligible slice of wall and
+  not a scattered-access decode, so PyNv offers no meaningful gain there and
+  the §0 detector-input stability is easier to keep on cv2. Left as cv2.
+- **F4 (CPU bounding)**: mainline pools were already bounded — aligner
+  `ThreadPoolExecutor(8)` + prefetch `ThreadPoolExecutor(4)`; fast mode adds no
+  new pools and pins nothing. Confirmed: host CPU% dropping to 156–202% (from
+  400–460%) is the direct evidence the CPU is no longer saturated — the F4 goal
+  ("well under ~200%, never pin all 32 threads") is met by F1 offloading decode,
+  with the existing bounds intact.
+
+## vF6 — §4 concurrency: found a fast-mode OOM crash, fixed it (2026-07-16)
+
+First 2-concurrent-fast run (85de + 411f, the 2 heaviest, sharing the 8 GB card)
+exposed a **fast-mode-introduced crash**: peak VRAM 7756/7834 MiB (99%), and
+411f died with a hard `torch.OutOfMemoryError` (tried 1.38 GiB, 759 MiB free) at
+`pynv_decode.decode_window` — my **batched `torch.stack(window).cpu()`** was
+stacking a wide (~222-frame) zoom window as >1 GiB of RGB on the GPU, unguarded
+by the embed OOM retry. 85de survived (528.9s under contention, CPU 159%).
+
+Two fixes:
+1. **Per-frame host transfer** in `decode_window` (revert the batched-stack
+   optimization to the proven recipe behaviour): each frame → `.cpu()`
+   immediately, bounding decode VRAM to a single frame's intermediates. Bit-
+   identical output (same values), so hashes are unchanged.
+2. **OOM guard + cv2 fallback** in `_collect_frames_in_window_from_capture`: a
+   CUDA-OOM from the GPU decode clears the cache and decodes THAT window on a
+   transient cv2 capture — transparent, per-window, no crash. Stat
+   `fast_decode_oom_cv2_fallback` counts it.
+3. `_MAX_SESSIONS` 3 → 2: two concurrent processes now hold ≤4 decoders
+   (~1.6 GB) instead of 6, keeping the peak out of the embed's OOM margin.
+
+**Post-fix re-verification (2 concurrent FAST matchings, 85de + 411f):**
+
+| metric | value |
+|---|---|
+| both complete without crash | ✓ (was: 411f OOM-crashed) |
+| peak VRAM | 7767 / 7834 MiB (99% — full but non-fatal) |
+| peak GPU util | 100% (both saturate the SM) |
+| 85de elapsed (concurrent) | 520.9s (solo fast 378s → ~1.4× under contention) |
+| 411f elapsed (concurrent) | 524.1s (solo fast 368s → ~1.4×) |
+| 85de host CPU% | 156% · 411f host CPU% | 166% |
+| combined host CPU% | ~322% of 3200% (32 threads) → **CPU ~90% idle** |
+| output hashes | match each project's solo fast hash (deterministic) |
+| natural OOMs this run | 0 (per-frame transfer + 2-session cap keep the peak just under the wall) |
+| OOM→cv2 fallback mechanism | verified functional by fault injection: a simulated CUDA-OOM in `decode_window` falls back to cv2 and returns the correct window (stat `fast_decode_oom_cv2_fallback`=1) |
+| embed adaptive OOM retry (pre-existing, cache-clear + batch split) | unchanged, still in place |
+
+The shared 2-slot GPU queue (`indexation_queue.gpu_semaphore()`,
+`MAX_CONCURRENT=2`) is untouched — its semantics still cap the machine at two
+heavy GPU tasks total. Fast mode's key §4 win: under 2 concurrent matchings the
+host CPU stays ~90% idle (combined ~322% of 3200%), so the desktop remains
+usable at full matching load — vs mainline where two concurrent matchings
+saturate CPU and pressure the 32 GB RAM wall (GOAL_JOURNAL v170). The cost moves
+to VRAM (peak ~99%), held below the crash line by the fixes above.
+
+## vF7 — final validation summary (2026-07-16)
+
+- Flag-OFF byte-identical to current main HEAD on all 4 GT (vF2); re-confirmed
+  on dcd after the OOM fix (`c1aac14…`).
+- Per-frame decode transfer bit-identical to the batched version (dcd fast
+  `17705f6c…` unchanged pre/post fix).
+- GT folders, `anime_searcher` submodule, `eval_waivers.json` untouched
+  (`git status` clean; no diff vs main on data/ledger; submodule pointer
+  unchanged).
+- Scene detector kept on cv2: scene_line_delta = 0 on every project.
+
+## How to try it (owner test protocol)
+
+```bash
+git checkout feat/fast-gpu-matching
+# fast mode is ON by default on this branch — just run a project through
+# /matches as usual (backend picks it up automatically).
+#   default : GPU NVDEC decode + fp32 + TF32   (ATR_FAST_MATCHING unset/1)
+#   compare : ATR_FAST_MATCHING=0  -> exact mainline (byte-identical) for A/B
+# Optional lever toggles (all default to the fast setting):
+#   ATR_FAST_NUMERICS=0  -> drop TF32 (identical speed, slightly better precision)
+#   ATR_FAST_DECODE=0    -> keep cv2 decode, TF32 only (isolate F3)
+```
+
+What to look at: the frontend flags doubtful scenes via `doubt_reasons`; those
+plus any scene whose source differs from a mainline (`ATR_FAST_MATCHING=0`) run
+are what to inspect. Expect same scene boundaries (identical), same source
+episodes, and source in/out points shifted by ≤~1s on some scenes, with a few
+material flips per project (listed in vF4). Judge those visually; keep the flag
+(merge, default OFF on main, opt-in ON) or discard the branch.
+
+Keep-or-discard is trivially reversible: `ATR_FAST_MATCHING=0` is proven
+byte-identical to current mainline on all 4 GT projects (vF2).

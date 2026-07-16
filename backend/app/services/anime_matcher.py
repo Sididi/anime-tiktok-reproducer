@@ -975,13 +975,42 @@ class AnimeMatcherService:
         if isinstance(cap, pynv_decode.PyNvCap):
             frames: list[tuple[float, Image.Image]] = []
             try:
-                frames = pynv_decode.decode_window(
-                    cap.path,
-                    start_ts,
-                    end_ts,
-                    max_frames=max_frames,
-                    sample_frames=sample_frames,
-                )
+                try:
+                    frames = pynv_decode.decode_window(
+                        cap.path,
+                        start_ts,
+                        end_ts,
+                        max_frames=max_frames,
+                        sample_frames=sample_frames,
+                    )
+                except Exception as exc:  # CUDA OOM under §4 concurrency, etc.
+                    if "out of memory" not in str(exc).lower():
+                        raise
+                    # The shared 8 GB card is momentarily full (two concurrent
+                    # matchings). Clear our cache and decode THIS window on cv2
+                    # instead — transparent, per-window, no crash. The pooled
+                    # decoder session stays open for the next (post-contention)
+                    # window.
+                    cls._record_runtime_stat("fast_decode_oom_cv2_fallback")
+                    try:
+                        import torch
+
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    _cv2 = cls._require_cv2()
+                    _fallback = _cv2.VideoCapture(cap.path)
+                    try:
+                        frames = cls._collect_frames_in_window_from_capture(
+                            _fallback,
+                            start_ts,
+                            end_ts,
+                            max_frames=max_frames,
+                            sample_frames=sample_frames,
+                        )
+                    finally:
+                        _fallback.release()
                 return frames
             finally:
                 cls._record_runtime_stat(
