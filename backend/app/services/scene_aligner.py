@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import time
 from collections import OrderedDict
@@ -16,6 +17,9 @@ from PIL import Image, ImageFilter, ImageOps
 from ..library_types import LibraryType
 from ..models import AlternativeMatch, MatchCandidate, MatchList, Scene, SceneMatch, SceneList
 from .anime_matcher import AnimeMatcherService, MatchProgress
+
+
+logger = logging.getLogger("uvicorn.error")
 
 
 # 8 fps gives several samples even in 0.5-1.0s montage scenes while staying cheap.
@@ -674,6 +678,29 @@ class SceneAlignerService:
         cls._last_diagnostics = diagnostics
         result = AlignmentResult(final_scenes, matches, diagnostics)
         cls._last_result = result
+        runtime_stats = AnimeMatcherService.get_runtime_stats()
+        logger.info(
+            "matching_profile %s",
+            {
+                "phase_seconds": {
+                    name: round(seconds, 2)
+                    for name, seconds in diagnostics.phase_timings.items()
+                },
+                "window_decode_seconds": round(
+                    runtime_stats.get("frame_decode_window_seconds", 0.0), 2
+                ),
+                "sscd_embedding_seconds": round(
+                    runtime_stats.get("sscd_embedding_seconds", 0.0), 2
+                ),
+                "faiss_search_seconds": round(
+                    runtime_stats.get("faiss_search_seconds", 0.0), 2
+                ),
+                "window_decode_calls": int(
+                    runtime_stats.get("frame_decode_window_calls", 0.0)
+                ),
+                "output_scenes": len(final_scenes.scenes),
+            },
+        )
         return result
 
     @staticmethod

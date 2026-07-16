@@ -267,6 +267,44 @@ def _native_frame_to_rgb_gpu(frame, width: int, height: int) -> torch.Tensor:
     return torch.round(rgb).to(torch.uint8)
 
 
+def _window_candidate_indices(
+    start_ts: float,
+    end_ts: float,
+    fps: float,
+    num_frames: int,
+    max_frames: int,
+) -> list[tuple[int, float]]:
+    """Return the native frames visited by the legacy CFR decode loop."""
+    start_ts = max(0.0, start_ts)
+    candidates: list[tuple[int, float]] = []
+    n = int(round(start_ts * fps))
+    while len(candidates) < max_frames and n < num_frames:
+        pos_ts = (n - 1) / fps
+        if pos_ts > end_ts:
+            break
+        if pos_ts >= start_ts and n >= 0:
+            candidates.append((n, pos_ts))
+        n += 1
+    return candidates
+
+
+def _sample_window_frame_indices(
+    candidates: list[tuple[int, float]],
+    sample_frames: int | None,
+) -> list[tuple[int, float]]:
+    """Apply the legacy post-decode linspace selection without pixel copies."""
+
+    if sample_frames is not None and len(candidates) > sample_frames:
+        positions = np.linspace(
+            0,
+            len(candidates) - 1,
+            sample_frames,
+            dtype=np.int32,
+        )
+        return [candidates[int(position)] for position in positions]
+    return candidates
+
+
 def decode_window(
     path: str,
     start_ts: float,
@@ -287,26 +325,29 @@ def decode_window(
     fps = sess.fps
     width, height = sess.width, sess.height
     num_frames = sess.num_frames or (1 << 30)
-    start_ts = max(0.0, start_ts)
+    candidate_frames = _window_candidate_indices(
+        start_ts,
+        end_ts,
+        fps,
+        num_frames,
+        max_frames,
+    )
+    selected_frames = _sample_window_frame_indices(
+        candidate_frames,
+        sample_frames,
+    )
+    selected_indices = {index for index, _timestamp in selected_frames}
     frames: list[tuple[float, Image.Image]] = []
-    n = int(round(start_ts * fps))
     with sess.lock:
         decoder = sess.decoder
-        while len(frames) < max_frames and n < num_frames:
-            pos_ts = (n - 1) / fps
-            if pos_ts > end_ts:
-                break
-            if pos_ts >= start_ts and n >= 0:
-                # Convert one frame at a time and move it straight to host. The
-                # decoder may recycle the buffer that ``decoder[n]`` views, so we
-                # convert immediately; and moving per frame (rather than stacking
-                # the whole window on the GPU) bounds decode VRAM to a single
-                # frame's intermediates — a wide window otherwise stacks >1 GiB
-                # of RGB and OOMs the shared 8 GB card under §4 concurrency.
-                rgb = _native_frame_to_rgb_gpu(decoder[n], width, height).cpu().numpy()
-                frames.append((pos_ts, Image.fromarray(rgb)))
-            n += 1
-    if sample_frames is not None and len(frames) > sample_frames:
-        indices = np.linspace(0, len(frames) - 1, sample_frames, dtype=np.int32)
-        return [frames[int(i)] for i in indices]
+        for n, pos_ts in candidate_frames:
+            # Keep the decoder's original sequential access pattern: NVIDIA's
+            # stateful GOP traversal can produce small boundary differences if
+            # indices are skipped. Only selected frames pay for RGB conversion
+            # and the full-resolution device-to-host copy.
+            native_frame = decoder[n]
+            if n not in selected_indices:
+                continue
+            rgb = _native_frame_to_rgb_gpu(native_frame, width, height).cpu().numpy()
+            frames.append((pos_ts, Image.fromarray(rgb)))
     return frames

@@ -262,6 +262,31 @@ to VRAM (peak ~99%), held below the crash line by the fixes above.
   unchanged).
 - Scene detector kept on cv2: scene_line_delta = 0 on every project.
 
+## vF8 — post-merge RAM-launcher investigation (2026-07-16)
+
+A real-project regression check on `85de83ca6323` showed that the new native
+thread caps were not the source of the slowdown:
+
+| configuration | elapsed | window decode | SSCD embed |
+|---|---:|---:|---:|
+| RAM-safe launcher, 4 threads | 505.2s | 273.5s | 97.3s |
+| same launcher, 8 threads | 486.9s | 258.0s | 95.1s |
+| 4 threads + preselected RGB conversion | **370.7s** | **150.4s** | 92.4s |
+
+The regression came from the vF6 OOM fix converting every native source frame
+to a full-resolution host RGB image before the existing 12-fps linspace
+subsample discarded roughly half. The corrected decoder still visits every
+native index in the original order (required for stateful GOP output identity),
+but performs GPU RGB conversion and device-to-host copying only for indices the
+sampler will return. It retains the one-frame-at-a-time VRAM bound.
+
+The final 4-thread output is byte-identical to the original 505.2s run
+(`scenes` + `matches` SHA-256 `43bab278ea483e151c2e2c37454803f94b48b809bf3948d9b768aaa9a9a69dbf`).
+Peak process RSS during active refinement remained high at about 15.3 GiB, but
+the heavy-job phase cleanup returns it after matching; the optimization targets
+the conversion/copy churn without weakening the two-job queue or allocator
+limits.
+
 ## How to try it (owner test protocol)
 
 ```bash
