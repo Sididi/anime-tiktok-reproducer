@@ -321,7 +321,14 @@ class AnimeMatcherService:
 
             cls._index_manager = IndexManager(library_path)
             cls._index_manager.load_or_create()
-            cls._embedder = SSCDEmbedder(model_path, precision="fp32")
+            # FAST MODE (F3): fp16 embedder + TF32 when the flag is on; exact
+            # fp32 mainline otherwise. Numeric config is global-but-idempotent
+            # and only touched inside the fast branch (flag-off byte-identity).
+            from . import fast_matching
+
+            fast_matching.configure_numerics()
+            _precision = fast_matching.embedder_precision(default="fp32")
+            cls._embedder = SSCDEmbedder(model_path, precision=_precision)
             cls._query_processor = QueryProcessor(cls._index_manager, cls._embedder)
             cls._loaded_library_path = library_path
             cls._loaded_library_type = scoped_type
@@ -900,6 +907,25 @@ class AnimeMatcherService:
             cap.release()
 
     @classmethod
+    def _open_source_capture(cls, path):
+        """Open a capture for a SOURCE-episode window decode.
+
+        FAST MODE (F1): returns a :class:`pynv_decode.PyNvCap` (GPU NVDEC) when
+        fast decode is requested and live for this file; otherwise a plain
+        ``cv2.VideoCapture``. Use ONLY for captures consumed exclusively through
+        :meth:`_collect_frames_in_window_from_capture` — a PyNvCap supports no
+        other cv2 operations. ``release()`` parity keeps every caller's
+        ``finally: cap.release()`` valid.
+        """
+        from . import pynv_decode
+
+        gpu_cap = pynv_decode.open_capture(str(path))
+        if gpu_cap is not None:
+            return gpu_cap
+        cv2 = cls._require_cv2()
+        return cv2.VideoCapture(str(path))
+
+    @classmethod
     def _collect_frames_in_window(
         cls,
         video_path: Path,
@@ -914,8 +940,7 @@ class AnimeMatcherService:
         Timestamps returned are the decoded frames' actual PTS (from
         CAP_PROP_POS_MSEC read before the decode advances the position).
         """
-        cv2 = cls._require_cv2()
-        cap = cv2.VideoCapture(str(video_path))
+        cap = cls._open_source_capture(video_path)
         try:
             return cls._collect_frames_in_window_from_capture(
                 cap,
@@ -942,6 +967,29 @@ class AnimeMatcherService:
         end-boundary windows instead of opening the source episode twice.
         """
         started_at = time.perf_counter()
+        # FAST MODE (F1): a PyNvCap routes this window to the persistent NVDEC
+        # decoder (GPU), reproducing cv2's POS_MSEC window selection. Any other
+        # capture type is the exact mainline cv2 path below.
+        from . import pynv_decode
+
+        if isinstance(cap, pynv_decode.PyNvCap):
+            frames: list[tuple[float, Image.Image]] = []
+            try:
+                frames = pynv_decode.decode_window(
+                    cap.path,
+                    start_ts,
+                    end_ts,
+                    max_frames=max_frames,
+                    sample_frames=sample_frames,
+                )
+                return frames
+            finally:
+                cls._record_runtime_stat(
+                    "frame_decode_window_seconds",
+                    time.perf_counter() - started_at,
+                )
+                cls._record_runtime_stat("frame_decode_window_calls")
+                cls._record_runtime_stat("frame_decode_window_frames", len(frames))
         cv2 = cls._require_cv2()
         start_ts = max(0.0, start_ts)
         frames: list[tuple[float, Image.Image]] = []
@@ -1029,12 +1077,12 @@ class AnimeMatcherService:
             index_step = 1.0 / max(cls.get_index_fps(), 1e-3)
             window = max(0.5, index_step + 0.15)
 
-            # Share one VideoCapture across both boundary windows. Walking forward
-            # from the start window into the end window avoids a second container
-            # open + codec reinit and lets the decoder grab through without a
-            # second keyframe seek when the windows are close together.
-            cv2 = cls._require_cv2()
-            cap = cv2.VideoCapture(str(episode_path))
+            # Share one capture across both boundary windows. For cv2, walking
+            # forward from the start window into the end window avoids a second
+            # container open + codec reinit; for the FAST-MODE PyNvCap (F1) the
+            # pooled NVDEC session is shared by path anyway, so both windows land
+            # on the same decoder with identical frame selection.
+            cap = cls._open_source_capture(episode_path)
             sample_frames = sample_frames_per_boundary or cls.REFINE_MAX_FRAMES_PER_BOUNDARY
             try:
                 start_frames = cls._collect_frames_in_window_from_capture(

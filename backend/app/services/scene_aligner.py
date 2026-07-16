@@ -252,8 +252,9 @@ class _WindowEmbedCache:
             return None
         cap = self.caps.get(str(path))
         if cap is None:
-            cv2 = AnimeMatcherService._require_cv2()
-            cap = cv2.VideoCapture(str(path))
+            # FAST MODE (F1): source-episode captures feed only the window
+            # primitive, so route them to NVDEC when fast decode is live.
+            cap = AnimeMatcherService._open_source_capture(path)
             self.caps[str(path)] = cap
         return cap
 
@@ -317,8 +318,7 @@ class _WindowEmbedCache:
                     cap_key = (threading.get_ident(), str(path))
                     cap = self._prefetch_caps.get(cap_key)
                     if cap is None:
-                        cv2 = AnimeMatcherService._require_cv2()
-                        cap = cv2.VideoCapture(str(path))
+                        cap = AnimeMatcherService._open_source_capture(path)
                         self._prefetch_caps[cap_key] = cap
                     frames = (
                         AnimeMatcherService._collect_frames_in_window_from_capture(
@@ -364,8 +364,7 @@ class _WindowEmbedCache:
                     cap_key = (threading.get_ident(), str(path))
                     cap = self._prefetch_caps.get(cap_key)
                     if cap is None:
-                        cv2 = AnimeMatcherService._require_cv2()
-                        cap = cv2.VideoCapture(str(path))
+                        cap = AnimeMatcherService._open_source_capture(path)
                         self._prefetch_caps[cap_key] = cap
                     frames = self._decode_run(cap, i0, i1)
                 with self._staged_lock:
@@ -477,6 +476,15 @@ class _WindowEmbedCache:
                 pass
         self.caps.clear()
         self._prefetch_caps.clear()
+        # FAST MODE (F1/§4): PyNvCap.release() is a no-op (the pool owns the
+        # NVDEC sessions), so drop the pooled decoders here to return their VRAM
+        # before the next queued task / concurrent matching acquires the card.
+        try:
+            from . import pynv_decode
+
+            pynv_decode.close_pool()
+        except Exception:
+            pass
 
 
 class SceneAlignerService:
