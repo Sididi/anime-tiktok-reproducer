@@ -19,6 +19,7 @@ from PIL import Image, ImageOps
 from ..config import settings
 from ..library_types import LibraryType, coerce_library_type
 from ..models import AlternativeMatch, MatchCandidate, MatchList, Scene, SceneMatch, SceneList
+from .runtime_memory import release_unused_memory
 
 
 @dataclass
@@ -112,6 +113,56 @@ class AnimeMatcherService:
     DENSE_VISUAL_RERANK_MAX_SCENES = 10
     DENSE_VISUAL_RERANK_MAX_CANDIDATES = 6
     DENSE_VISUAL_RERANK_MARGIN = 0.012
+
+    @classmethod
+    def _clear_dependent_index_caches(cls) -> None:
+        """Drop caches that contain data derived from the current FAISS manager."""
+        try:
+            from .scene_aligner import SceneAlignerService
+
+            SceneAlignerService.clear_index_caches()
+        except Exception:
+            pass
+
+    @classmethod
+    def release_matching_resources(cls, *, reason: str = "matching_phase_exit") -> None:
+        """Release SSCD, FAISS shards, decoder sessions, and matching caches."""
+        cls._clear_dependent_index_caches()
+
+        manager = cls._index_manager
+        unloaded_series = 0
+        if manager is not None:
+            try:
+                unloaded_series = manager.unload_all_series()
+            except Exception:
+                pass
+
+        # QueryProcessor owns both manager and embedder, so break it first.
+        cls._query_processor = None
+        cls._index_manager = None
+        cls._embedder = None
+        cls._loaded_library_path = None
+        cls._loaded_library_type = None
+        cls._loaded_index_signature = None
+        cls._loaded_series_index_signatures = {}
+        cls._episode_paths_cache = {}
+        cls._video_frame_embedding_cache.clear()
+        cls.reset_runtime_stats()
+
+        pynv_decode = sys.modules.get(f"{__package__}.pynv_decode")
+        if pynv_decode is not None:
+            try:
+                pynv_decode.close_pool()
+            except Exception:
+                pass
+
+        # Return freed native FAISS/model pages now, at the phase boundary,
+        # rather than waiting until transcription eventually finishes.
+        release_unused_memory(
+            "matching_resources_released",
+            reason=reason,
+            unloaded_faiss_series=unloaded_series,
+        )
 
     @classmethod
     def _get_cached_video_frame_embedding(
@@ -319,8 +370,8 @@ class AnimeMatcherService:
             if not model_path.exists():
                 raise FileNotFoundError(f"SSCD model not found at {model_path}")
 
-            cls._index_manager = IndexManager(library_path)
-            cls._index_manager.load_or_create()
+            new_index_manager = IndexManager(library_path)
+            new_index_manager.load_or_create()
             # FAST MODE (F3): fp16 embedder + TF32 when the flag is on; exact
             # fp32 mainline otherwise. Numeric config is global-but-idempotent
             # and only touched inside the fast branch (flag-off byte-identity).
@@ -328,18 +379,34 @@ class AnimeMatcherService:
 
             fast_matching.configure_numerics()
             _precision = fast_matching.embedder_precision(default="fp32")
-            cls._embedder = SSCDEmbedder(model_path, precision=_precision)
-            cls._query_processor = QueryProcessor(cls._index_manager, cls._embedder)
+            # Index manifests may change while the 95 MiB SSCD model remains
+            # identical. Reuse the model so a shard refresh does not create a
+            # transient second CUDA model and another allocator burst.
+            embedder = cls._embedder
+            if embedder is None:
+                embedder = SSCDEmbedder(model_path, precision=_precision)
+            new_query_processor = QueryProcessor(new_index_manager, embedder)
+
+            old_index_manager = cls._index_manager
+            cls._clear_dependent_index_caches()
+            cls._index_manager = new_index_manager
+            cls._embedder = embedder
+            cls._query_processor = new_query_processor
             cls._loaded_library_path = library_path
             cls._loaded_library_type = scoped_type
             cls._loaded_index_signature = cls._index_signature(library_path, None)
             cls._loaded_series_index_signatures = {}
             cls._episode_paths_cache = {}
-            for series_name in cls._index_manager.get_series_list():
+            for series_name in new_index_manager.get_series_list():
                 cls._loaded_series_index_signatures[series_name] = cls._index_signature(
                     library_path,
                     series_name,
                 )
+            if old_index_manager is not None and old_index_manager is not new_index_manager:
+                try:
+                    old_index_manager.unload_all_series()
+                except Exception:
+                    pass
             # Full reload brings all series up to date.
             stale_series.clear()
 

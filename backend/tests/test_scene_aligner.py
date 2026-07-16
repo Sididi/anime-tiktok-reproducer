@@ -659,6 +659,39 @@ def test_index_duplicate_recall_finds_unretrieved_instance(monkeypatch) -> None:
     assert abs(pos - 400.5) <= 1.5
 
 
+def test_episode_grid_cache_is_bounded_generation_scoped_and_does_not_pin_index(
+    monkeypatch,
+) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(SceneAlignerService, "EPISODE_GRID_CACHE_MAX_ENTRIES", 2)
+    SceneAlignerService.clear_index_caches()
+    manager_one = object()
+
+    for ordinal, episode in enumerate(("ep1", "ep2", "ep3")):
+        metadata = {
+            ordinal: SimpleNamespace(timestamp=float(ordinal), episode=episode)
+        }
+        grid = SceneAlignerService._episode_grid(
+            manager_one, "Series", episode, metadata
+        )
+        assert grid is not None
+
+    assert len(SceneAlignerService._episode_grid_cache) == 2
+    assert all(
+        len(value) == 2 for value in SceneAlignerService._episode_grid_cache.values()
+    )
+    assert all(
+        key[0] == id(manager_one)
+        for key in SceneAlignerService._episode_grid_cache
+    )
+
+    manager_two = object()
+    metadata = {9: SimpleNamespace(timestamp=9.0, episode="ep3")}
+    SceneAlignerService._episode_grid(manager_two, "Series", "ep3", metadata)
+    assert any(key[0] == id(manager_two) for key in SceneAlignerService._episode_grid_cache)
+
+
 def test_zoom_rate_measures_progressive_zoom_and_static() -> None:
     """D3 scale-velocity (v144-v155): a progressive zoom-out reads as a
     negative log-scale slope; a static shot reads ~0."""

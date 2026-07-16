@@ -2666,8 +2666,10 @@ class ProcessingService:
 
                 # Step 2: Run forced alignment in a worker thread
                 loop = asyncio.get_event_loop()
-                try:
-                    alignment_result = await loop.run_in_executor(
+                from .indexation_queue import indexation_queue
+
+                async with indexation_queue.heavy_slot("forced_alignment"):
+                    alignment_future = loop.run_in_executor(
                         None,
                         lambda: ForcedAlignmentService.align_known_script(
                             project_id=project.id,
@@ -2677,20 +2679,30 @@ class ProcessingService:
                             output_dir=output_dir,
                         ),
                     )
-                    new_transcription = alignment_result.transcription
-                    cls.normalize_transcription_timings(new_transcription)
-                    new_transcription, playback_segments = cls.build_authoritative_playback_timeline(
-                        new_transcription,
-                        playback_scene_sources,
-                    )
-                    cls.rebuild_tts_audio_with_playback_segments(
-                        edited_audio_path,
-                        edited_audio_path,
-                        playback_segments,
-                    )
-                finally:
-                    # Always attempt model unload, including failure paths.
-                    TranscriberService.unload_models()
+                    try:
+                        alignment_result = await asyncio.shield(alignment_future)
+                        new_transcription = alignment_result.transcription
+                        cls.normalize_transcription_timings(new_transcription)
+                        new_transcription, playback_segments = cls.build_authoritative_playback_timeline(
+                            new_transcription,
+                            playback_scene_sources,
+                        )
+                        cls.rebuild_tts_audio_with_playback_segments(
+                            edited_audio_path,
+                            edited_audio_path,
+                            playback_segments,
+                        )
+                    except asyncio.CancelledError:
+                        # Preserve the queue reservation until the non-cancellable
+                        # native worker exits; otherwise a disconnect could start
+                        # a third heavyweight operation behind our back.
+                        with suppress(Exception):
+                            await asyncio.shield(alignment_future)
+                        raise
+                    finally:
+                        # A cancellation while run_in_executor is active requests
+                        # deferred unload; the worker releases on session exit.
+                        TranscriberService.unload_models()
 
                 # Save transcription for gap detection
                 transcription_timing_path = output_dir / "transcription_timing.json"

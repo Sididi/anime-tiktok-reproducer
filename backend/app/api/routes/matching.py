@@ -435,34 +435,38 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
         # tasks are already in flight — the card is never oversubscribed.
         from ...services.indexation_queue import indexation_queue
 
-        gpu_sem = indexation_queue.gpu_semaphore()
-        if gpu_sem.locked():
+        heavy_sem = indexation_queue.gpu_semaphore()
+        if heavy_sem.locked():
             yield "data: " + json.dumps({
                 "status": "matching",
                 "progress": 0.0,
-                "message": "Waiting for a GPU slot (indexation in progress)…",
+                "message": "Waiting for a heavy-processing slot…",
                 "current_scene": 0,
                 "total_scenes": len(scenes.scenes),
                 "error": None,
             }) + "\n\n"
 
         completed = False
-        async with gpu_sem:
-            async for progress in SceneAlignerService.align_scenes_progress(
-                video_path,
-                scenes,
-                source_path,
-                project.library_type,
-                anime_name=anime_name,
-            ):
-                if progress.status == "complete":
-                    completed = True
-                    continue
-                yield f"data: {json.dumps(progress.to_dict())}\n\n"
-            if progress.status == "error":
-                project.phase = ProjectPhase.SCENE_VALIDATION
-                ProjectService.save(project)
-                return
+        # AnimeMatcherService owns one process-global model/index manager.
+        # Wait for that state before consuming a heavy slot, so a second queued
+        # match does not prevent transcription/indexation from using slot two.
+        async with indexation_queue.matching_lock():
+            async with indexation_queue.heavy_slot("matching"):
+                async for progress in SceneAlignerService.align_scenes_progress(
+                    video_path,
+                    scenes,
+                    source_path,
+                    project.library_type,
+                    anime_name=anime_name,
+                ):
+                    if progress.status == "complete":
+                        completed = True
+                        continue
+                    yield f"data: {json.dumps(progress.to_dict())}\n\n"
+                if progress.status == "error":
+                    project.phase = ProjectPhase.SCENE_VALIDATION
+                    ProjectService.save(project)
+                    return
 
         align_result = SceneAlignerService.get_last_result()
         if not completed or align_result is None:
@@ -831,28 +835,32 @@ async def merge_with_previous(project_id: str, scene_index: int):
 
     SceneMergerService.save_pre_merge_backup(project_id, backup)
 
-    rematched_matches: MatchList | None = None
-    async for progress in AnimeMatcherService.match_scenes(
-        video_path,
-        merged_scenes,
-        source_path,
-        project.library_type,
-        anime_name=project.anime_name,
-        scene_indices_to_match=[merged_scene_index],
-        existing_matches=merged_matches,
-    ):
-        if progress.status == "complete" and progress.matches:
-            merged_from = merged_matches.matches[merged_scene_index].merged_from
-            if merged_scene_index < len(progress.matches.matches):
-                progress.matches.matches[merged_scene_index].merged_from = merged_from
-            rematched_matches = progress.matches
-            continue
+    from ...services.indexation_queue import indexation_queue
 
-        if progress.status == "error":
-            raise HTTPException(
-                status_code=500,
-                detail=progress.error or "Failed to re-match merged scene",
-            )
+    rematched_matches: MatchList | None = None
+    async with indexation_queue.matching_lock():
+        async with indexation_queue.heavy_slot("partial_matching"):
+            async for progress in AnimeMatcherService.match_scenes(
+                video_path,
+                merged_scenes,
+                source_path,
+                project.library_type,
+                anime_name=project.anime_name,
+                scene_indices_to_match=[merged_scene_index],
+                existing_matches=merged_matches,
+            ):
+                if progress.status == "complete" and progress.matches:
+                    merged_from = merged_matches.matches[merged_scene_index].merged_from
+                    if merged_scene_index < len(progress.matches.matches):
+                        progress.matches.matches[merged_scene_index].merged_from = merged_from
+                    rematched_matches = progress.matches
+                    continue
+
+                if progress.status == "error":
+                    raise HTTPException(
+                        status_code=500,
+                        detail=progress.error or "Failed to re-match merged scene",
+                    )
 
     if not rematched_matches:
         raise HTTPException(

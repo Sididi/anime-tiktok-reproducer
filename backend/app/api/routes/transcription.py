@@ -1,11 +1,12 @@
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+import asyncio
 import json
 
 from ...config import settings
 from ...models import ProjectPhase, Transcription, SceneTranscription
-from ...services import ProjectService, TranscriberService
+from ...services import AnimeMatcherService, ProjectService, TranscriberService
 from ...services.match_playback_service import MatchPlaybackService
 
 router = APIRouter(prefix="/projects/{project_id}/transcription", tags=["transcription"])
@@ -43,6 +44,17 @@ async def start_transcription(project_id: str, request: StartTranscriptionReques
                 "Playback preparation is still running for this project. "
                 "Wait for /matches warmup to complete before starting transcription."
             ),
+        )
+
+    # Crossing this phase boundary ends the period where split/merge actions
+    # need instant local rematching. Wait for any active matcher before
+    # releasing its process-global SSCD/FAISS state.
+    from ...services.indexation_queue import indexation_queue
+
+    async with indexation_queue.matching_lock():
+        await asyncio.to_thread(
+            AnimeMatcherService.release_matching_resources,
+            reason=f"project_{project_id}_started_transcription",
         )
 
     # Update phase

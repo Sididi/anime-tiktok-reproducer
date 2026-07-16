@@ -3,7 +3,8 @@
 import asyncio
 import json
 import logging
-from contextlib import AsyncExitStack
+from collections import Counter
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 
 from ..library_types import LibraryType
@@ -14,6 +15,7 @@ from .indexation_preflight import IndexationPreflightService
 from .library_hydration_service import LibraryHydrationService
 from .storage_box_progress import ProgressSnapshot
 from .storage_box_repository import StorageBoxRepository
+from .runtime_memory import log_memory, release_unused_memory
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".webm", ".ts", ".m4v"}
 
@@ -26,7 +28,53 @@ class IndexationQueueService:
     def __init__(self) -> None:
         self._jobs: dict[str, IndexationJob] = {}
         self._semaphore = asyncio.Semaphore(self.MAX_CONCURRENT)
+        self._matching_lock = asyncio.Lock()
+        self._active_heavy_jobs = 0
+        self._active_heavy_kinds: Counter[str] = Counter()
         self._subscribers: list[asyncio.Queue[dict]] = []
+
+    async def acquire_heavy_slot(self, kind: str) -> None:
+        """Acquire one of the two process-wide heavyweight work slots."""
+        await self._semaphore.acquire()
+        self._active_heavy_jobs += 1
+        self._active_heavy_kinds[kind] += 1
+        log_memory(
+            "heavy_job_started",
+            heavy_kind=kind,
+            heavy_active=self._active_heavy_jobs,
+            heavy_kinds=dict(self._active_heavy_kinds),
+        )
+
+    def release_heavy_slot(self, kind: str) -> None:
+        """Release a slot and trim native memory once the process is truly idle."""
+        if self._active_heavy_kinds[kind] > 0:
+            self._active_heavy_kinds[kind] -= 1
+            if self._active_heavy_kinds[kind] == 0:
+                del self._active_heavy_kinds[kind]
+        self._active_heavy_jobs = max(0, self._active_heavy_jobs - 1)
+        self._semaphore.release()
+
+        details = {
+            "heavy_kind": kind,
+            "heavy_active": self._active_heavy_jobs,
+            "heavy_kinds": dict(self._active_heavy_kinds),
+        }
+        if self._active_heavy_jobs == 0:
+            release_unused_memory("heavy_jobs_idle", **details)
+        else:
+            log_memory("heavy_job_finished", **details)
+
+    @asynccontextmanager
+    async def heavy_slot(self, kind: str):
+        await self.acquire_heavy_slot(kind)
+        try:
+            yield
+        finally:
+            self.release_heavy_slot(kind)
+
+    def matching_lock(self) -> asyncio.Lock:
+        """Serialize access to the process-global matcher singleton state."""
+        return self._matching_lock
 
     async def enqueue(
         self,
@@ -115,7 +163,7 @@ class IndexationQueueService:
         self._broadcast(job)
 
     async def _run_job(self, job: IndexationJob) -> None:
-        await self._semaphore.acquire()
+        await self.acquire_heavy_slot("indexation")
         try:
             async with AsyncExitStack() as stack:
                 self._reset_job_transient_fields(job)
@@ -257,7 +305,7 @@ class IndexationQueueService:
             self._finalize_job_error(job, str(e))
             logger.exception("Indexation job %s failed", job.id)
         finally:
-            self._semaphore.release()
+            self.release_heavy_slot("indexation")
 
     @staticmethod
     def _collect_direct_video_files(source_folder: Path) -> list[Path]:

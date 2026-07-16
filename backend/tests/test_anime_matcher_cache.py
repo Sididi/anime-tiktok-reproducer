@@ -1311,3 +1311,54 @@ def test_init_searcher_preloads_cv2_before_searcher_import(
 
     assert order[0] == "cv2"
     assert order.index("cv2") < order.index("import:anime_searcher.indexer.embedder")
+
+
+def test_release_matching_resources_drops_model_indices_and_project_caches(
+    monkeypatch,
+) -> None:
+    unloaded: list[bool] = []
+    dependent_caches_cleared: list[bool] = []
+
+    class FakeManager:
+        _loaded_series = {"SeriesA", "SeriesB"}
+        series_indices = {}
+
+        def unload_all_series(self) -> int:
+            unloaded.append(True)
+            return 2
+
+    monkeypatch.setattr(AnimeMatcherService, "_index_manager", FakeManager())
+    monkeypatch.setattr(AnimeMatcherService, "_embedder", object())
+    monkeypatch.setattr(AnimeMatcherService, "_query_processor", object())
+    monkeypatch.setattr(AnimeMatcherService, "_loaded_library_path", Path("/tmp/library"))
+    monkeypatch.setattr(AnimeMatcherService, "_loaded_library_type", "anime")
+    monkeypatch.setattr(
+        AnimeMatcherService,
+        "_episode_paths_cache",
+        {("anime", "SeriesA", "sig", None): {"ep": Path("ep.mp4")}},
+    )
+    monkeypatch.setattr(
+        AnimeMatcherService,
+        "_video_frame_embedding_cache",
+        type(AnimeMatcherService._video_frame_embedding_cache)(
+            [(("video", 1, 2, 3), np.zeros(512, dtype=np.float32))]
+        ),
+    )
+    monkeypatch.setattr(
+        AnimeMatcherService,
+        "_clear_dependent_index_caches",
+        classmethod(lambda cls: dependent_caches_cleared.append(True)),
+    )
+    monkeypatch.setattr(
+        matcher_module, "release_unused_memory", lambda *args, **kwargs: {}
+    )
+
+    AnimeMatcherService.release_matching_resources(reason="test")
+
+    assert unloaded == [True]
+    assert dependent_caches_cleared == [True]
+    assert AnimeMatcherService._index_manager is None
+    assert AnimeMatcherService._embedder is None
+    assert AnimeMatcherService._query_processor is None
+    assert AnimeMatcherService._episode_paths_cache == {}
+    assert AnimeMatcherService._video_frame_embedding_cache == {}

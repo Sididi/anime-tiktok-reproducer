@@ -70,33 +70,37 @@ class RawSceneDetectorService:
         device = cls._get_device()
         logger.info("Loading pyannote diarization pipeline on %s", device)
 
-        pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            use_auth_token=hf_token,
-        )
-
         import torch
-        if device == "cuda":
-            pipeline.to(torch.device("cuda"))
+        pipeline = None
+        diarization = None
+        try:
+            pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=hf_token,
+            )
 
-        logger.info("Running diarization on %s", wav_path.name)
-        diarization = pipeline(str(wav_path))
+            if device == "cuda":
+                pipeline.to(torch.device("cuda"))
 
-        segments = []
-        for turn, _, speaker in diarization.itertracks(yield_label=True):
-            segments.append((turn.start, turn.end, speaker))
+            logger.info("Running diarization on %s", wav_path.name)
+            diarization = pipeline(str(wav_path))
 
-        # Unload pipeline and free GPU memory
-        del pipeline
-        del diarization
-        gc.collect()
-        gc.collect()
-        with suppress(Exception):
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            segments = []
+            for turn, _, speaker in diarization.itertracks(yield_label=True):
+                segments.append((turn.start, turn.end, speaker))
 
-        logger.info("Diarization complete: %d segments found", len(segments))
-        return segments
+            logger.info("Diarization complete: %d segments found", len(segments))
+            return segments
+        finally:
+            # Also runs for model-download failures, CUDA OOMs, and cancelled
+            # request workers; the previous straight-line cleanup did not.
+            pipeline = None
+            diarization = None
+            gc.collect()
+            gc.collect()
+            with suppress(Exception):
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     @staticmethod
     def _identify_tts_speaker(

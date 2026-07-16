@@ -5,6 +5,7 @@ import os
 import re
 import statistics
 import subprocess
+import sys
 import tempfile
 import threading
 import unicodedata
@@ -174,17 +175,22 @@ class TranscriberService:
                         with suppress(Exception):
                             item.cpu()
 
-        cls._cleanup_runtime_workers()
+        # process_cleanup imports torch._inductor.  Torch may have been loaded
+        # transitively by another route, so only touch its compile-worker
+        # machinery when this service actually owned a model to clean up.
+        if had_asr or had_align:
+            cls._cleanup_runtime_workers()
 
         # Force multiple GC passes to break reference cycles in ML model graphs.
         gc.collect()
         gc.collect()
 
+        torch = sys.modules.get("torch")
+        cuda = getattr(torch, "cuda", None)
         with suppress(Exception):
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                vram_mib = torch.cuda.memory_allocated() / (1024 * 1024)
+            if cuda is not None and cuda.is_initialized():
+                cuda.empty_cache()
+                vram_mib = cuda.memory_allocated() / (1024 * 1024)
                 logger.info(
                     "unload_models: freed %d ASR + %d align models, "
                     "PyTorch VRAM after empty_cache: %.0f MiB",
@@ -1378,9 +1384,37 @@ class TranscriberService:
         project_id: str,
         language: str = "auto",
     ) -> AsyncIterator[TranscriptionProgress]:
+        """Run transcription + diarization inside the shared two-job budget."""
+        from .indexation_queue import indexation_queue
+
+        if indexation_queue.gpu_semaphore().locked():
+            yield TranscriptionProgress(
+                "starting",
+                0,
+                "Waiting for a heavy-processing slot...",
+            )
+
+        try:
+            async with indexation_queue.heavy_slot("transcription_diarization"):
+                async for progress in cls._transcribe_impl(project_id, language):
+                    yield progress
+        finally:
+            # On SSE disconnect/cancellation this requests deferred cleanup if
+            # the shielded native worker is still running. _end_transcription_session
+            # performs the actual unload as soon as the last worker exits.
+            with suppress(Exception):
+                cls.unload_models()
+
+    @classmethod
+    async def _transcribe_impl(
+        cls,
+        project_id: str,
+        language: str = "auto",
+    ) -> AsyncIterator[TranscriptionProgress]:
         """Transcribe a project's video and yield progress updates."""
         yield TranscriptionProgress("starting", 0, "Loading project...")
 
+        native_futures: list[asyncio.Future[Any]] = []
         try:
             # Load project and scenes
             project = ProjectService.load(project_id)
@@ -1410,6 +1444,7 @@ class TranscriberService:
                 extraction_task = asyncio.create_task(
                     asyncio.to_thread(cls._extract_audio_for_whisper, video_path, wav_path)
                 )
+                native_futures.append(extraction_task)
                 while True:
                     try:
                         await asyncio.wait_for(
@@ -1438,6 +1473,7 @@ class TranscriberService:
                 None,
                 lambda: cls._transcribe_sync(wav_path, lang_code, "large-v3"),
             )
+            native_futures.append(transcription_future)
             while True:
                 try:
                     words, detected_lang = await asyncio.wait_for(
@@ -1489,6 +1525,7 @@ class TranscriberService:
                         [scene.model_copy(deep=True) for scene in original_scenes],
                     ),
                 )
+                native_futures.append(diarization_future)
                 while True:
                     try:
                         updated_scenes, detection_result = await asyncio.wait_for(
@@ -1565,6 +1602,18 @@ class TranscriberService:
                 transcription=transcription,
             )
 
+        except (asyncio.CancelledError, GeneratorExit):
+            # A shielded executor call keeps running after its SSE consumer
+            # disconnects. Keep the heavy slot reserved until that native work
+            # actually ends, then let the wrapper release/trim the process.
+            for future in native_futures:
+                if future.done():
+                    continue
+                with suppress(Exception):
+                    await asyncio.shield(future)
+            with suppress(Exception):
+                cls.unload_models()
+            raise
         except Exception as e:
             with suppress(Exception):
                 cls.unload_models()

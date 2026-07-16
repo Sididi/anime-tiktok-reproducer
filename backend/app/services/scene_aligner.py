@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace as dc_replace
 from pathlib import Path
 from typing import AsyncIterator
@@ -2070,30 +2071,17 @@ class SceneAlignerService:
                     index = manager.series_indices.get(name)
                     if metadata is None or index is None:
                         continue
-                cache_key = (name, episode)
-                cached = cls._episode_grid_cache.get(cache_key)
+                cached = cls._episode_grid(manager, name, episode, metadata)
                 if cached is None:
-                    entries = sorted(
-                        (meta.timestamp, frame_id)
-                        for frame_id, meta in metadata.items()
-                        if meta.episode == episode
-                    )
-                    if not entries:
-                        continue
-                    cached = (
-                        np.array([t for t, _ in entries], dtype=np.float64),
-                        [fid for _, fid in entries],
-                        index,
-                    )
-                    cls._episode_grid_cache[cache_key] = cached
-                times, ids, idx = cached
+                    continue
+                times, ids = cached
                 vectors = []
                 for target in (t_source - half, t_source + half):
                     pos = int(np.argmin(np.abs(times - target)))
                     if abs(times[pos] - target) > half + 0.11:
                         vectors = []
                         break
-                    v = idx.reconstruct(int(ids[pos]))
+                    v = index.reconstruct(int(ids[pos]))
                     v = v / (np.linalg.norm(v) + 1e-9)
                     vectors.append(v)
                 if len(vectors) == 2:
@@ -2102,7 +2090,54 @@ class SceneAlignerService:
         except Exception:
             return None
 
-    _episode_grid_cache: dict[tuple[str, str], tuple[np.ndarray, list[int], object]] = {}
+    EPISODE_GRID_CACHE_MAX_ENTRIES = 64
+    _episode_grid_cache: "OrderedDict[tuple[int, str, str], tuple[np.ndarray, list[int]]]" = (
+        OrderedDict()
+    )
+
+    @classmethod
+    def _episode_grid(
+        cls,
+        manager,
+        series: str,
+        episode: str,
+        metadata,
+    ) -> tuple[np.ndarray, list[int]] | None:
+        """Return a bounded grid tied to the current manager generation.
+
+        The cache intentionally does not own a FAISS index. The previous value
+        stored the index object itself, which pinned obsolete native indices
+        after a matcher reload.
+        """
+        cache_key = (id(manager), series, episode)
+        cached = cls._episode_grid_cache.get(cache_key)
+        if cached is not None:
+            cls._episode_grid_cache.move_to_end(cache_key)
+            return cached
+
+        entries = sorted(
+            (meta.timestamp, frame_id)
+            for frame_id, meta in metadata.items()
+            if meta.episode == episode
+        )
+        if not entries:
+            return None
+        cached = (
+            np.array([timestamp for timestamp, _ in entries], dtype=np.float64),
+            [frame_id for _, frame_id in entries],
+        )
+        cls._episode_grid_cache[cache_key] = cached
+        cls._episode_grid_cache.move_to_end(cache_key)
+        while len(cls._episode_grid_cache) > cls.EPISODE_GRID_CACHE_MAX_ENTRIES:
+            cls._episode_grid_cache.popitem(last=False)
+        return cached
+
+    @classmethod
+    def clear_index_caches(cls) -> None:
+        """Invalidate every cache derived from a FAISS manager generation."""
+        cls._episode_grid_cache.clear()
+        cls._last_boundary_diagnostics = []
+        cls._last_verify_debug = []
 
     @classmethod
     def _boundary_priors(
@@ -2345,27 +2380,14 @@ class SceneAlignerService:
                     index = manager.series_indices.get(name)
                     if metadata is None or index is None:
                         continue
-                cache_key = (name, episode)
-                cached = cls._episode_grid_cache.get(cache_key)
+                cached = cls._episode_grid(manager, name, episode, metadata)
                 if cached is None:
-                    entries = sorted(
-                        (meta.timestamp, frame_id)
-                        for frame_id, meta in metadata.items()
-                        if meta.episode == episode
-                    )
-                    if not entries:
-                        continue
-                    cached = (
-                        np.array([t for t, _ in entries], dtype=np.float64),
-                        [fid for _, fid in entries],
-                        index,
-                    )
-                    cls._episode_grid_cache[cache_key] = cached
-                times, ids, idx = cached
+                    continue
+                times, ids = cached
                 pos = int(np.argmin(np.abs(times - t_source)))
                 if abs(times[pos] - t_source) > 0.6:
                     return None
-                v = idx.reconstruct(int(ids[pos]))
+                v = index.reconstruct(int(ids[pos]))
                 return v / (np.linalg.norm(v) + 1e-9)
             return None
         except Exception:

@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 
 # Set BEFORE any import that may transitively load torch (e.g. anime_searcher).
@@ -9,6 +10,16 @@ from contextlib import asynccontextmanager, suppress
 # setdefault in transcriber.py has no effect, leading to dozens of compile
 # worker processes that never get cleaned up.
 os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+os.environ.setdefault("JOBLIB_MULTIPROCESSING", "0")
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("MKL_NUM_THREADS", "4")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "4")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "4")
+# These two only take full effect when supplied before Python starts. The
+# scripts/backend.sh launcher does that; these defaults still document the
+# intended direct-uvicorn behavior and help subprocesses inherit the limits.
+os.environ.setdefault("MALLOC_ARENA_MAX", "4")
+os.environ.setdefault("MALLOC_TRIM_THRESHOLD_", "131072")
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,6 +36,7 @@ from .services.project_startup_service import project_startup_queue
 from .services.project_upload_service import project_upload_queue
 from .services.reschedule_retry_service import RescheduleRetryService
 from .services.storage_box_sftp_client import StorageBoxSftpClient
+from .services.runtime_memory import log_memory, release_unused_memory
 
 
 # Reuse uvicorn's logger so startup diagnostics are visible in normal dev logs.
@@ -121,6 +133,18 @@ async def _run_integration_health_check_background() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load local state quickly, then warm external readiness in the background."""
+    try:
+        backend_workers = int(os.environ.get("ATR_BACKEND_THREAD_WORKERS", "8"))
+    except ValueError:
+        backend_workers = 8
+    backend_worker_count = max(2, min(backend_workers, 16))
+    backend_executor = ThreadPoolExecutor(
+        max_workers=backend_worker_count,
+        thread_name_prefix="atr-backend",
+    )
+    asyncio.get_running_loop().set_default_executor(backend_executor)
+    app.state.backend_executor = backend_executor
+
     AccountService.load()
     ProjectService.sync_all_project_pins()
     await LibraryHydrationService.startup_cleanup()
@@ -162,10 +186,21 @@ async def lifespan(app: FastAPI):
             ),
         )
 
+    log_memory("backend_startup", backend_thread_workers=backend_worker_count)
     yield
     reschedule_retry_stop.set()
     await _cancel_app_tasks(app)
     await StorageBoxSftpClient.close_pool()
+    with suppress(Exception):
+        from .services.anime_matcher import AnimeMatcherService
+
+        AnimeMatcherService.release_matching_resources(reason="backend_shutdown")
+    with suppress(Exception):
+        from .services.transcriber import TranscriberService
+
+        TranscriberService.unload_models()
+    release_unused_memory("backend_shutdown")
+    backend_executor.shutdown(wait=True, cancel_futures=True)
 
 
 app = FastAPI(
