@@ -102,6 +102,15 @@ class MatchPlaybackService:
     FFMPEG_TIMEOUT_SECONDS = 300
     CLIP_ID_TIME_PRECISION = 3
     ULTRA_LONG_SOURCE_SECONDS = 60.0
+    # Absolute floor for a clip's encode window. Sub-frame matches (the matcher
+    # can emit windows shorter than a single frame) would otherwise make the
+    # `fps` filter emit zero frames — see MIN_ENCODE_FRAME_PERIODS below.
+    MIN_ENCODE_SECONDS = 0.1
+    # The `fps` filter needs strictly more than one output-frame period of input
+    # to reliably flush a frame: a `-t` cut at exactly 1/fps can leave the filter
+    # holding a buffered-but-never-emitted frame, producing a valid container
+    # with *zero* video streams (ffmpeg still exits 0). Require two periods.
+    MIN_ENCODE_FRAME_PERIODS = 2.0
     CLIP_STORE_MAX_BYTES = 8 * 1024 * 1024 * 1024
     CLIP_STORE_STALE_SECONDS = 7 * 24 * 3600
     WEB_COMPATIBLE_CODECS = {"h264", "hevc"}
@@ -563,6 +572,22 @@ class MatchPlaybackService:
         return duration if duration > 0 else None
 
     @classmethod
+    def _clip_is_reusable_sync(cls, project_id: str, clip_id: str) -> bool:
+        """A cached clip is reusable only if it exists, is non-empty, and has a
+        validated ``.json`` meta sidecar.
+
+        The meta sidecar is written only after ``_validate_clip_sync`` passes
+        (see ``_encode_clip_sync``/``_get_clip_duration_sync``), so its presence
+        certifies the clip is decodable. A clip file without a sidecar is either
+        invalid or unverified; treat it as not reusable so it is re-encoded
+        rather than blindly served and later crashing manifest building.
+        """
+        clip_path = cls._clip_file(project_id, clip_id)
+        if not clip_path.exists() or clip_path.stat().st_size == 0:
+            return False
+        return cls._read_clip_meta_sync(project_id, clip_id) is not None
+
+    @classmethod
     def _get_clip_duration_sync(cls, project_id: str, clip_id: str) -> float:
         clip_path = cls._clip_file(project_id, clip_id)
         if not clip_path.exists() or clip_path.stat().st_size == 0:
@@ -806,7 +831,10 @@ class MatchPlaybackService:
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         duration = plan.end_time - plan.start_time
-        min_duration = max(1.0 / max(profile.fps, 1), 0.01)
+        min_duration = max(
+            cls.MIN_ENCODE_FRAME_PERIODS / max(profile.fps, 1),
+            cls.MIN_ENCODE_SECONDS,
+        )
         if duration < min_duration:
             duration = min_duration
         tmp_path = output_path.with_suffix(".tmp.mp4")
@@ -914,8 +942,19 @@ class MatchPlaybackService:
                 )
             )
 
+        # Validate the temp file *before* moving it into the clip store. If the
+        # encode produced a file with no decodable video stream (e.g. an input
+        # seek past the end of the source yields an empty container with a
+        # zero exit code), we must not leave it behind: reuse detection would
+        # later treat it as a valid cached clip and manifest building would then
+        # fail on the whole project. Fail cleanly instead, leaving nothing.
+        try:
+            validated_duration = cls._validate_clip_sync(tmp_path)
+        except RuntimeError:
+            tmp_path.unlink(missing_ok=True)
+            raise
+
         tmp_path.replace(output_path)
-        validated_duration = cls._validate_clip_sync(output_path)
         cls._write_clip_meta_sync(
             project_id,
             clip_id=plan.clip_id,
@@ -990,8 +1029,7 @@ class MatchPlaybackService:
                 clip_id = clip_entry.get("clip_id")
                 if not isinstance(clip_id, str) or not clip_id:
                     return False
-                clip_path = cls._clip_file(project_id, clip_id)
-                if not clip_path.exists() or clip_path.stat().st_size == 0:
+                if not cls._clip_is_reusable_sync(project_id, clip_id):
                     return False
         return True
 
@@ -1419,10 +1457,14 @@ class MatchPlaybackService:
         missing_plans: list[_ClipPlan] = []
         reused_count = 0
         for plan in unique_clip_plans.values():
-            clip_path = cls._clip_file(project_id, plan.clip_id)
-            if clip_path.exists() and clip_path.stat().st_size > 0:
+            if cls._clip_is_reusable_sync(project_id, plan.clip_id):
                 reused_count += 1
             else:
+                # Drop any stale/invalid clip left behind by a previous run so
+                # the re-encode starts clean and a corrupt file can never be
+                # picked up as a valid cache entry.
+                cls._clip_file(project_id, plan.clip_id).unlink(missing_ok=True)
+                cls._clip_meta_file(project_id, plan.clip_id).unlink(missing_ok=True)
                 missing_plans.append(plan)
 
         encoded_count = 0
@@ -1699,10 +1741,11 @@ class MatchPlaybackService:
         reused_count = 0
         encoded_count = 0
         for plan in target_clips:
-            clip_path = cls._clip_file(project_id, plan.clip_id)
-            if clip_path.exists() and clip_path.stat().st_size > 0:
+            if cls._clip_is_reusable_sync(project_id, plan.clip_id):
                 reused_count += 1
             else:
+                cls._clip_file(project_id, plan.clip_id).unlink(missing_ok=True)
+                cls._clip_meta_file(project_id, plan.clip_id).unlink(missing_ok=True)
                 missing_target.append(plan)
 
         scene_status_map: dict[int, str] = {scene.index: "ready" for scene in scenes.scenes}

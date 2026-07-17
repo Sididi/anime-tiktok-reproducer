@@ -3207,7 +3207,32 @@ class SceneAlignerService:
                 new_start = start_time + start_delta
                 new_end = end_time + end_delta
                 if new_end > new_start:
-                    start_time, end_time = new_start, new_end
+                    # A Stage-5 boundary refinement (notably the `static_end`
+                    # fallback, which pulls the end anchor back when it cannot be
+                    # localized) can collapse the source window far below any
+                    # evidence-backed span. The result is a physically impossible
+                    # speed (source playing many times too fast) and a sub-frame
+                    # clip that later breaks playback encoding. Accept the refined
+                    # window only when its source span stays at/above the evidence
+                    # floor, or when the un-refined base is already below it (no
+                    # saner window to fall back to).
+                    scene_dur = scene.duration
+                    floor = MIN_EVIDENCE_SPEED * scene_dur
+                    refined_ok = scene_dur <= 0 or (new_end - new_start) >= floor
+                    base_ok = scene_dur > 0 and (end_time - start_time) >= floor
+                    if refined_ok or not base_ok:
+                        start_time, end_time = new_start, new_end
+                    else:
+                        logger.warning(
+                            "REFINE_SPEED_GUARD scene=%d kept base window: "
+                            "refined_span=%.4fs (speed=%.3f < floor=%.2f) "
+                            "base_span=%.4fs",
+                            scene.index,
+                            new_end - new_start,
+                            (new_end - new_start) / scene_dur,
+                            MIN_EVIDENCE_SPEED,
+                            end_time - start_time,
+                        )
 
             source_duration = max(1e-6, end_time - start_time)
             matches.matches.append(
