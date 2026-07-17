@@ -2124,11 +2124,15 @@ class ProcessingService:
         project_id: str,
         target_language: str | None,
         pending_entries: list[tuple[SrtEntry, str | None]],
-    ) -> list[SrtEntry]:
-        """Swap raw-scene cue texts to the project language, grouped by source track language."""
+    ) -> tuple[list[SrtEntry], int]:
+        """Swap raw-scene cue texts to the project language, grouped by source track language.
+
+        Returns the (possibly partially) translated entries and the number of cues that
+        stayed untranslated — non-zero means the video ships with some source-language cues.
+        """
         results = [entry for entry, _language in pending_entries]
         if not target_language:
-            return results
+            return results, 0
 
         groups: dict[str | None, list[int]] = {}
         for index, (_entry, language) in enumerate(pending_entries):
@@ -2136,28 +2140,32 @@ class ProcessingService:
                 continue
             groups.setdefault(language, []).append(index)
 
+        untranslated_count = 0
         for source_language, indices in groups.items():
-            translated = await SubtitleTranslationService.translate_texts(
+            outcome = await SubtitleTranslationService.translate_texts(
                 project_id=project_id,
                 texts=[results[index].text for index in indices],
                 source_language=source_language,
                 target_language=target_language,
             )
-            if translated is None:
+            untranslated_count += outcome.failed_count
+            if outcome.failed_count:
                 logger.warning(
-                    "Keeping %d untranslated raw-scene subtitle cues (%s)",
+                    "Keeping %d/%d untranslated raw-scene subtitle cues (%s)",
+                    outcome.failed_count,
                     len(indices),
                     source_language or "und",
                 )
-                continue
-            for index, new_text in zip(indices, translated):
+            # outcome.texts is aligned 1:1 and keeps the original where translation failed,
+            # so applying it is a no-op for the untranslated cues.
+            for index, new_text in zip(indices, outcome.texts):
                 original = results[index]
                 results[index] = SrtEntry(
                     start=original.start,
                     end=original.end,
                     text=new_text,
                 )
-        return results
+        return results, untranslated_count
 
     @classmethod
     async def _collect_raw_scene_source_subtitles(
@@ -2238,10 +2246,15 @@ class ProcessingService:
                     )
                 )
 
-        text_entries = await cls._translate_raw_scene_text_entries(
+        text_entries, untranslated_count = await cls._translate_raw_scene_text_entries(
             project_id=project.id,
             target_language=target_language,
             pending_entries=pending_text_entries,
+        )
+        SubtitleTranslationService.record_untranslated_warning(
+            project.id,
+            failed_count=untranslated_count,
+            target_language=target_language,
         )
 
         if image_entries:

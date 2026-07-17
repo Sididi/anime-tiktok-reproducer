@@ -9,10 +9,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.services.processing import ProcessingService, SrtEntry
+from app.services.subtitle_translation_service import SubtitleTranslationOutcome
 
 
 def _install_fake_translate(monkeypatch, results):
-    """results: maps source_language -> list[str] | None."""
+    """results: maps source_language -> SubtitleTranslationOutcome."""
     calls: list[dict] = []
 
     async def fake_translate(**kwargs):
@@ -26,20 +27,25 @@ def _install_fake_translate(monkeypatch, results):
     return calls
 
 
+def _ok(texts):
+    return SubtitleTranslationOutcome(texts=texts, failed_count=0)
+
+
 @pytest.mark.asyncio
 async def test_translates_only_non_target_entries(monkeypatch):
-    calls = _install_fake_translate(monkeypatch, {"en": ["FR-Hello", "FR-World"]})
+    calls = _install_fake_translate(monkeypatch, {"en": _ok(["FR-Hello", "FR-World"])})
     pending = [
         (SrtEntry(start=0.0, end=1.0, text="Hello"), "en"),
         (SrtEntry(start=1.0, end=2.0, text="Déjà bon"), "fr"),
         (SrtEntry(start=2.0, end=3.0, text="World"), "en"),
     ]
-    out = await ProcessingService._translate_raw_scene_text_entries(
+    entries, failed = await ProcessingService._translate_raw_scene_text_entries(
         project_id="proj1", target_language="fr", pending_entries=pending
     )
-    assert [entry.text for entry in out] == ["FR-Hello", "Déjà bon", "FR-World"]
+    assert [entry.text for entry in entries] == ["FR-Hello", "Déjà bon", "FR-World"]
+    assert failed == 0
     # timing preserved
-    assert [(entry.start, entry.end) for entry in out] == [
+    assert [(entry.start, entry.end) for entry in entries] == [
         (0.0, 1.0),
         (1.0, 2.0),
         (2.0, 3.0),
@@ -57,37 +63,66 @@ async def test_translates_only_non_target_entries(monkeypatch):
 @pytest.mark.asyncio
 async def test_groups_by_source_language(monkeypatch):
     calls = _install_fake_translate(
-        monkeypatch, {"en": ["FR-en"], None: ["FR-unknown"]}
+        monkeypatch, {"en": _ok(["FR-en"]), None: _ok(["FR-unknown"])}
     )
     pending = [
         (SrtEntry(start=0.0, end=1.0, text="english"), "en"),
         (SrtEntry(start=1.0, end=2.0, text="mystery"), None),
     ]
-    out = await ProcessingService._translate_raw_scene_text_entries(
+    entries, failed = await ProcessingService._translate_raw_scene_text_entries(
         project_id="proj1", target_language="fr", pending_entries=pending
     )
-    assert [entry.text for entry in out] == ["FR-en", "FR-unknown"]
+    assert [entry.text for entry in entries] == ["FR-en", "FR-unknown"]
+    assert failed == 0
     assert {call["source_language"] for call in calls} == {"en", None}
 
 
 @pytest.mark.asyncio
-async def test_failure_keeps_originals(monkeypatch):
-    _install_fake_translate(monkeypatch, {"en": None})
-    pending = [(SrtEntry(start=0.0, end=1.0, text="Hello"), "en")]
-    out = await ProcessingService._translate_raw_scene_text_entries(
+async def test_failure_keeps_originals_and_reports_count(monkeypatch):
+    # partial failure: one cue translated, one kept as original
+    _install_fake_translate(
+        monkeypatch,
+        {"en": SubtitleTranslationOutcome(texts=["FR-Hi", "World"], failed_count=1)},
+    )
+    pending = [
+        (SrtEntry(start=0.0, end=1.0, text="Hi"), "en"),
+        (SrtEntry(start=1.0, end=2.0, text="World"), "en"),
+    ]
+    entries, failed = await ProcessingService._translate_raw_scene_text_entries(
         project_id="proj1", target_language="fr", pending_entries=pending
     )
-    assert [entry.text for entry in out] == ["Hello"]
+    assert [entry.text for entry in entries] == ["FR-Hi", "World"]
+    assert failed == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_counts_sum_across_groups(monkeypatch):
+    _install_fake_translate(
+        monkeypatch,
+        {
+            "en": SubtitleTranslationOutcome(texts=["English"], failed_count=1),
+            "ja": SubtitleTranslationOutcome(texts=["Japanese"], failed_count=1),
+        },
+    )
+    pending = [
+        (SrtEntry(start=0.0, end=1.0, text="English"), "en"),
+        (SrtEntry(start=1.0, end=2.0, text="Japanese"), "ja"),
+    ]
+    _entries, failed = await ProcessingService._translate_raw_scene_text_entries(
+        project_id="proj1", target_language="fr", pending_entries=pending
+    )
+    assert failed == 2
 
 
 @pytest.mark.asyncio
 async def test_no_target_language_skips_translation(monkeypatch):
     calls = _install_fake_translate(monkeypatch, {})
     pending = [(SrtEntry(start=0.0, end=1.0, text="Hello"), "en")]
-    out = await ProcessingService._translate_raw_scene_text_entries(
+    entries, failed = await ProcessingService._translate_raw_scene_text_entries(
         project_id="proj1", target_language=None, pending_entries=pending
     )
-    assert [entry.text for entry in out] == ["Hello"]
+    assert [entry.text for entry in entries] == ["Hello"]
+    assert failed == 0
     assert calls == []
 
 
@@ -95,8 +130,9 @@ async def test_no_target_language_skips_translation(monkeypatch):
 async def test_all_entries_already_target_language(monkeypatch):
     calls = _install_fake_translate(monkeypatch, {})
     pending = [(SrtEntry(start=0.0, end=1.0, text="Bonjour"), "fr")]
-    out = await ProcessingService._translate_raw_scene_text_entries(
+    entries, failed = await ProcessingService._translate_raw_scene_text_entries(
         project_id="proj1", target_language="fr", pending_entries=pending
     )
-    assert [entry.text for entry in out] == ["Bonjour"]
+    assert [entry.text for entry in entries] == ["Bonjour"]
+    assert failed == 0
     assert calls == []
