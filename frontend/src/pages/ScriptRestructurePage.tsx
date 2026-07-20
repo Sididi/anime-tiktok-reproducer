@@ -1447,6 +1447,12 @@ export function ScriptRestructurePage() {
 
     const shouldPause = validateBeforeTts && !skipScript;
 
+    // Set when the run fails with a script the user can fix by hand (e.g. an
+    // empty scene) — lets the catch block route back to the validation step
+    // instead of idle, so retrying reuses the fixed script rather than
+    // regenerating one from scratch.
+    let recoverableScriptJson = false;
+
     try {
       const response = await api.automateScript(
         projectId,
@@ -1488,6 +1494,12 @@ export function ScriptRestructurePage() {
           }
           if (event.run_id) {
             setCurrentRunId(event.run_id);
+          }
+          if (event.event === "error" && event.script_json) {
+            const prettyScript = JSON.stringify(event.script_json, null, 2);
+            handleJsonChange(prettyScript);
+            setScriptEditorOpen(true);
+            recoverableScriptJson = true;
           }
         },
         controller.signal,
@@ -1574,7 +1586,10 @@ export function ScriptRestructurePage() {
         return;
       }
       setError((err as Error).message);
-      setAutomationPhase("idle");
+      // A recovered script stays in "validating" so the user can fix it in
+      // Step 2 and retry via handleResumeAfterValidation, instead of the
+      // next "Automate" click silently regenerating from scratch.
+      setAutomationPhase(recoverableScriptJson ? "validating" : "idle");
     } finally {
       setAutomationRunning(false);
       automationAbortRef.current = null;
@@ -1637,6 +1652,10 @@ export function ScriptRestructurePage() {
       const controller = new AbortController();
       automationAbortRef.current = controller;
 
+      // See handleAutomate: keeps the phase on "validating" (instead of
+      // "idle") when the failure comes back with a script to fix by hand.
+      let recoverableScriptJson = false;
+
       try {
         const response = await api.automateScript(
           projectId,
@@ -1666,6 +1685,12 @@ export function ScriptRestructurePage() {
             setAutomationStep(event.event);
             setAutomationMessage(event.message || null);
             if (event.run_id) setCurrentRunId(event.run_id);
+            if (event.event === "error" && event.script_json) {
+              const prettyScript = JSON.stringify(event.script_json, null, 2);
+              handleJsonChange(prettyScript);
+              setScriptEditorOpen(true);
+              recoverableScriptJson = true;
+            }
           },
           controller.signal,
         );
@@ -1723,7 +1748,7 @@ export function ScriptRestructurePage() {
       } catch (err) {
         if ((err as Error).name === "AbortError") return;
         setError((err as Error).message);
-        setAutomationPhase("idle");
+        setAutomationPhase(recoverableScriptJson ? "validating" : "idle");
       } finally {
         setAutomationRunning(false);
         automationAbortRef.current = null;

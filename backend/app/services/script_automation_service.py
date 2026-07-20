@@ -917,6 +917,9 @@ class ScriptAutomationService:
         pause_after_script: bool = False,
         skip_overlay: bool = False,
     ) -> AsyncIterator[dict[str, Any]]:
+        # Tracked across the whole run so a failure after generation (e.g. TTS)
+        # can still hand back whatever script was already produced.
+        script_payload: dict[str, Any] | None = None
         try:
             if not settings.script_automate_enabled:
                 raise RuntimeError("Script automation is disabled (ATR_SCRIPT_AUTOMATE_ENABLED=false)")
@@ -950,11 +953,21 @@ class ScriptAutomationService:
             # --- Script generation (or reuse existing) ---
             if existing_script_json is not None:
                 yield cls._event("llm_script", message="Script JSON provided — skipping generation")
-                script_payload = cls._normalize_script_payload(
-                    payload=existing_script_json,
-                    transcription=transcription,
-                    target_language=target_language,
-                )
+                try:
+                    script_payload = cls._normalize_script_payload(
+                        payload=existing_script_json,
+                        transcription=transcription,
+                        target_language=target_language,
+                    )
+                except RuntimeError as exc:
+                    yield {
+                        "event": "error",
+                        "status": "error",
+                        "message": "Script automation failed",
+                        "error": str(exc),
+                        "script_json": existing_script_json,
+                    }
+                    return
             else:
                 yield cls._event("llm_script", message=f"Generating script JSON ({project.resolved_llm_preset_key()})...")
                 prompt = cls._build_script_prompt(
@@ -968,14 +981,32 @@ class ScriptAutomationService:
                     preset_key=project.resolved_llm_preset_key(),
                     tier="big",
                 )
-                script_payload = cls._normalize_script_payload(
-                    payload=cls._coerce_generated_script_payload(
+                coerced_script_payload: dict[str, Any] | None = None
+                try:
+                    coerced_script_payload = cls._coerce_generated_script_payload(
                         payload=raw_script_payload,
                         target_language=target_language,
-                    ),
-                    transcription=transcription,
-                    target_language=target_language,
-                )
+                    )
+                    script_payload = cls._normalize_script_payload(
+                        payload=coerced_script_payload,
+                        transcription=transcription,
+                        target_language=target_language,
+                    )
+                except RuntimeError as exc:
+                    # Validation failed (e.g. an empty scene) — hand back whatever
+                    # was generated so it can be fixed by hand in Step 2 and
+                    # resubmitted, instead of losing the LLM output entirely.
+                    failed_payload = coerced_script_payload
+                    if failed_payload is None and isinstance(raw_script_payload, (dict, list)):
+                        failed_payload = raw_script_payload
+                    yield {
+                        "event": "error",
+                        "status": "error",
+                        "message": "Script automation failed",
+                        "error": str(exc),
+                        "script_json": failed_payload,
+                    }
+                    return
 
             script_path = run_dir / "script.json"
             script_path.write_text(
@@ -1190,4 +1221,7 @@ class ScriptAutomationService:
                 "status": "error",
                 "message": "Script automation failed",
                 "error": str(exc),
+                # If a script was already generated/normalized before this failure
+                # (e.g. a TTS error), still hand it back so it isn't lost.
+                "script_json": script_payload,
             }

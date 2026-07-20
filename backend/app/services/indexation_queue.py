@@ -33,29 +33,49 @@ class IndexationQueueService:
         self._active_heavy_kinds: Counter[str] = Counter()
         self._subscribers: list[asyncio.Queue[dict]] = []
 
-    async def acquire_heavy_slot(self, kind: str) -> None:
-        """Acquire one of the two process-wide heavyweight work slots."""
-        await self._semaphore.acquire()
+    async def acquire_heavy_slot(self, kind: str, slots: int = 1) -> None:
+        """Acquire ``slots`` units of the process-wide heavyweight work budget.
+
+        Multi-slot acquirers (fast-mode matching reserves the whole budget)
+        are all serialized behind ``matching_lock``, so two of them can never
+        interleave partial acquisitions — the only other acquirers are
+        single-slot jobs that always complete and release, hence no deadlock.
+        """
+        acquired = 0
+        try:
+            for _ in range(slots):
+                await self._semaphore.acquire()
+                acquired += 1
+        except BaseException:
+            # A cancelled waiter (e.g. an SSE client disconnecting while the
+            # match waits for its second slot) must hand back what it grabbed,
+            # or the budget shrinks permanently.
+            for _ in range(acquired):
+                self._semaphore.release()
+            raise
         self._active_heavy_jobs += 1
         self._active_heavy_kinds[kind] += 1
         log_memory(
             "heavy_job_started",
             heavy_kind=kind,
+            heavy_slots=slots,
             heavy_active=self._active_heavy_jobs,
             heavy_kinds=dict(self._active_heavy_kinds),
         )
 
-    def release_heavy_slot(self, kind: str) -> None:
-        """Release a slot and trim native memory once the process is truly idle."""
+    def release_heavy_slot(self, kind: str, slots: int = 1) -> None:
+        """Release a job's slots and trim native memory once truly idle."""
         if self._active_heavy_kinds[kind] > 0:
             self._active_heavy_kinds[kind] -= 1
             if self._active_heavy_kinds[kind] == 0:
                 del self._active_heavy_kinds[kind]
         self._active_heavy_jobs = max(0, self._active_heavy_jobs - 1)
-        self._semaphore.release()
+        for _ in range(slots):
+            self._semaphore.release()
 
         details = {
             "heavy_kind": kind,
+            "heavy_slots": slots,
             "heavy_active": self._active_heavy_jobs,
             "heavy_kinds": dict(self._active_heavy_kinds),
         }
@@ -65,12 +85,16 @@ class IndexationQueueService:
             log_memory("heavy_job_finished", **details)
 
     @asynccontextmanager
-    async def heavy_slot(self, kind: str):
-        await self.acquire_heavy_slot(kind)
+    async def heavy_slot(self, kind: str, slots: int = 1):
+        await self.acquire_heavy_slot(kind, slots=slots)
         try:
             yield
         finally:
-            self.release_heavy_slot(kind)
+            self.release_heavy_slot(kind, slots=slots)
+
+    def available_heavy_slots(self) -> int:
+        """Free units of the heavy budget (for pre-wait UI messages only)."""
+        return self._semaphore._value
 
     def matching_lock(self) -> asyncio.Lock:
         """Serialize access to the process-global matcher singleton state."""
@@ -163,15 +187,17 @@ class IndexationQueueService:
         self._broadcast(job)
 
     async def _run_job(self, job: IndexationJob) -> None:
-        await self.acquire_heavy_slot("indexation")
+        slot_held = False
         try:
             async with AsyncExitStack() as stack:
-                self._reset_job_transient_fields(job)
-                job.status = "indexing"
-                job.phase = "starting"
-                self._broadcast(job)
                 current_update_manifest: dict | None = None
                 if job.job_type == "update":
+                    # Hydration is pure network I/O: run it before taking a
+                    # heavy slot so a multi-minute Storage Box download never
+                    # blocks GPU work, and surface byte progress on the job
+                    # (the jobs panel renders the network_* fields).
+                    self._reset_job_transient_fields(job)
+                    job.status = "indexing"
                     job.phase = "hydrate_index"
                     job.message = "Hydrating matcher cache from Storage Box..."
                     job.progress = 0.02
@@ -188,19 +214,45 @@ class IndexationQueueService:
                         )
                     # Hold the series lock across the entire update+publish so
                     # the flow cannot race with eviction, deletion, hydration,
-                    # or another concurrent update on the same series.
+                    # or another concurrent update on the same series. Taking
+                    # it before the heavy slot matches the matching routes'
+                    # order (they hydrate before acquiring slots), and index/
+                    # update jobs for the same series are deduped at enqueue,
+                    # so lock-then-slot cannot form a cycle with the publish
+                    # path's slot-then-lock.
                     await stack.enter_async_context(
                         LibraryHydrationService._series_lock(
                             job.library_type, job.series_id
                         )
                     )
+                    network_progress = self._make_network_progress_callback(job)
+
+                    async def _hydration_progress(snapshot: ProgressSnapshot) -> None:
+                        if snapshot.bytes_total:
+                            job.progress = 0.02 + 0.08 * min(
+                                1.0, snapshot.bytes_transferred / snapshot.bytes_total
+                            )
+                        await network_progress(snapshot)
+
                     current_update_manifest = (
                         await LibraryHydrationService.ensure_series_index_hydrated(
                             library_type=job.library_type,
                             series_id=job.series_id,
                             already_locked=True,
+                            network_progress_callback=_hydration_progress,
                         )
                     )
+                    self._reset_network_progress_fields(job)
+                    job.message = "Waiting for a processing slot..."
+                    self._broadcast(job)
+
+                await self.acquire_heavy_slot("indexation")
+                slot_held = True
+                self._reset_job_transient_fields(job)
+                job.status = "indexing"
+                job.phase = "starting"
+                self._broadcast(job)
+                if job.job_type == "update":
                     source_files = self._collect_direct_video_files(Path(job.source_path))
                     if not source_files:
                         raise RuntimeError(f"No video files found in {job.source_path}")
@@ -241,6 +293,12 @@ class IndexationQueueService:
                             if warning not in job.warnings:
                                 job.warnings.append(warning)
                     if progress.status == "complete":
+                        # Everything after the searcher stream is disk and
+                        # network work (torrent linking, packaging, upload):
+                        # hand the GPU slot back so a queued heavy job can
+                        # start during the publish.
+                        self.release_heavy_slot("indexation")
+                        slot_held = False
                         job.phase = "link_sources"
                         job.message = "Linking fallback torrent sources..."
                         self._broadcast(job)
@@ -305,7 +363,8 @@ class IndexationQueueService:
             self._finalize_job_error(job, str(e))
             logger.exception("Indexation job %s failed", job.id)
         finally:
-            self.release_heavy_slot("indexation")
+            if slot_held:
+                self.release_heavy_slot("indexation")
 
     @staticmethod
     def _collect_direct_video_files(source_folder: Path) -> list[Path]:
@@ -407,16 +466,18 @@ class IndexationQueueService:
         """The shared GPU-concurrency budget (``MAX_CONCURRENT`` slots).
 
         Indexation jobs (:meth:`_run_job`) and ``/matches`` both acquire this so
-        no more than ``MAX_CONCURRENT`` GPU-heavy tasks run at once — the 8 GB
-        card is never oversubscribed. Worst case under the cap is 2 concurrent
-        SSCD embedders: the fp32 model (~0.3 GB) plus per-query activations and
-        the CUDA allocator reserve, comfortably under 8 GB with headroom (frame
-        decode stays on CPU/cv2 — GOAL v5.3 left the GPU-decoder LRU out of the
-        pipeline, so it adds no VRAM here). A CUDA OOM inside a task is absorbed
-        by the embedder's cache-clear retry
+        the 8 GB card is never oversubscribed. Slot weights encode measured
+        footprints: a fast-mode matching run (``ATR_FAST_MATCHING`` GPU decode,
+        PyNv sessions + fp32 SSCD + correspondences) holds ~5.3 GB in-process
+        (measured 2026-07-19: 5.25 GB matching + 1.03 GB indexer subprocess +
+        4x274 MB ffmpeg_cuda NVDEC decoders OOM'd the 7.65 GB card), so it
+        reserves the WHOLE budget (``slots=MAX_CONCURRENT``); mainline matching
+        (``ATR_FAST_MATCHING=0``) and indexation jobs are 1 slot each — two
+        concurrent GPU-decode indexations still fit. A CUDA OOM inside a task
+        is absorbed by the embedder's cache-clear retry
         (:meth:`AnimeMatcherService._embed_pil_batch`) and, for jobs, the
-        terminal-OOM path; the cap makes such contention rare rather than the
-        norm.
+        batch-downshift retry then the terminal-OOM path; the weights make such
+        contention rare rather than the norm.
         """
         return self._semaphore
 

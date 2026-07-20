@@ -430,13 +430,20 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
         # and matches in one pass (it may merge/split/move scene boundaries).
         #
         # Share the indexation queue's GPU-concurrency budget: matching and
-        # indexing are both GPU-heavy (SSCD embedder on the 8 GB card), so a
-        # match run acquires one of MAX_CONCURRENT slots and waits if two heavy
-        # tasks are already in flight — the card is never oversubscribed.
+        # indexing are both GPU-heavy (SSCD embedder on the 8 GB card). A
+        # fast-mode match (GPU decode) holds ~5.3 GiB in-process — measured
+        # 2026-07-19, it OOM'd a concurrent GPU-decode indexation — so it
+        # reserves the whole budget; mainline matching keeps its proven
+        # single slot.
+        from ...services import fast_matching
         from ...services.indexation_queue import indexation_queue
 
-        heavy_sem = indexation_queue.gpu_semaphore()
-        if heavy_sem.locked():
+        matching_slots = (
+            indexation_queue.MAX_CONCURRENT
+            if fast_matching.decode_enabled()
+            else 1
+        )
+        if indexation_queue.available_heavy_slots() < matching_slots:
             yield "data: " + json.dumps({
                 "status": "matching",
                 "progress": 0.0,
@@ -451,7 +458,7 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
         # Wait for that state before consuming a heavy slot, so a second queued
         # match does not prevent transcription/indexation from using slot two.
         async with indexation_queue.matching_lock():
-            async with indexation_queue.heavy_slot("matching"):
+            async with indexation_queue.heavy_slot("matching", slots=matching_slots):
                 async for progress in SceneAlignerService.align_scenes_progress(
                     video_path,
                     scenes,
@@ -835,11 +842,17 @@ async def merge_with_previous(project_id: str, scene_index: int):
 
     SceneMergerService.save_pre_merge_backup(project_id, backup)
 
+    from ...services import fast_matching
     from ...services.indexation_queue import indexation_queue
 
+    # Same weighting as /matches/find: fast-mode GPU decode cannot share the
+    # card with another heavy job, so it reserves the whole budget.
+    partial_slots = (
+        indexation_queue.MAX_CONCURRENT if fast_matching.decode_enabled() else 1
+    )
     rematched_matches: MatchList | None = None
     async with indexation_queue.matching_lock():
-        async with indexation_queue.heavy_slot("partial_matching"):
+        async with indexation_queue.heavy_slot("partial_matching", slots=partial_slots):
             async for progress in AnimeMatcherService.match_scenes(
                 video_path,
                 merged_scenes,

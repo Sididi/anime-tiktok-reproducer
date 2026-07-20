@@ -1050,15 +1050,17 @@ class AnimeMatcherService:
                         max_frames=max_frames,
                         sample_frames=sample_frames,
                     )
-                except Exception as exc:  # CUDA OOM under §4 concurrency, etc.
-                    if "out of memory" not in str(exc).lower():
+                except Exception as exc:  # CUDA OOM, cuvid errors, VRAM gate
+                    if not pynv_decode.should_fallback_to_cv2(exc):
                         raise
-                    # The shared 8 GB card is momentarily full (two concurrent
-                    # matchings). Clear our cache and decode THIS window on cv2
-                    # instead — transparent, per-window, no crash. The pooled
-                    # decoder session stays open for the next (post-contention)
-                    # window.
+                    # The shared 8 GB card is momentarily full (concurrent
+                    # matching, NVENC preview encodes, indexation). Drop the
+                    # pooled session — a decoder that went through a cuvid
+                    # failure can be internally corrupt (2026-07-19 SIGSEGV) —
+                    # clear our cache, and decode THIS window on cv2 instead:
+                    # transparent, per-window, byte-identical.
                     cls._record_runtime_stat("fast_decode_oom_cv2_fallback")
+                    pynv_decode.invalidate_session(cap.path)
                     try:
                         import torch
 

@@ -48,18 +48,47 @@ _KG_V = 0.714136
 _KB_B = 1.772
 
 # At most this many decoder sessions stay open at once (recipe §0.4d: ~412 MiB
-# each, 8 GB shared with the SSCD embedder). LRU-evicted sessions are stopped so
-# their VRAM is returned. Kept at 2 (not 3): under fast-mode concurrency (§4)
-# TWO processes each hold their own pool, so 2 sessions/process is 4 decoders
-# (~1.6 GB) on the shared card — 3 would push the peak into the embed's OOM
-# margin. One matching only ever touches ~1-2 source files per window anyway.
+# each, 8 GB shared with the SSCD embedder). LRU-evicted sessions are dropped so
+# their VRAM is returned when the last in-flight reference dies (upstream
+# 2.1.0's SimpleDecoder.stop() is broken — the native object has no ``stop`` —
+# so teardown is refcount-driven). Kept at 2 (not 3): under fast-mode
+# concurrency (§4) TWO processes each hold their own pool, so 2
+# sessions/process is 4 decoders (~1.6 GB) on the shared card — 3 would push
+# the peak into the embed's OOM margin. One matching only ever touches ~1-2
+# source files per window anyway.
 _MAX_SESSIONS = 2
 
 _ENV_FLAG = "ATR_PYNV_DECODE"
 
+# Free-VRAM floor below which window decode is refused (raised as
+# :class:`PyNvDecodeUnavailable`, caught by the matcher's per-window cv2
+# fallback). PyNvVideoCodec's allocation-failure path SEGFAULTS the process
+# under concurrent session use (2026-07-19 crash, reproduced): when the card is
+# this full — NVENC preview encodes, a second matching, indexation — NVDEC must
+# not even be attempted. cv2 frames are byte-identical, only slower.
+_MIN_FREE_MIB_ENV = "ATR_PYNV_MIN_FREE_MIB"
+_DEFAULT_MIN_FREE_MIB = 600
+
+# Retries when the session we fetched was LRU-evicted between the pool lookup
+# and taking its lock (the pool rebuilds a fresh one on re-get).
+_EVICTION_RETRIES = 3
+
 _import_lock = threading.Lock()
 _nvc = None  # cached module handle
 _import_failed = False
+
+# Serialises EVERY native SimpleDecoder call (session build + indexed decode)
+# process-wide. PyNvVideoCodec 2.1.0 is not safe with two sessions inside
+# ``__getitem__`` concurrently once VRAM runs short: its cuvid error path
+# corrupts state and SIGSEGVs (reproduced 2026-07-19; two backend crashes in
+# production). Per-session locks still serialise same-file windows; this lock
+# closes the cross-session hole. Decode throughput is unaffected in practice —
+# the card has a single NVDEC engine.
+_NATIVE_LOCK = threading.Lock()
+
+
+class PyNvDecodeUnavailable(RuntimeError):
+    """GPU window decode refused/aborted; caller should decode via cv2."""
 
 
 def enabled() -> bool:
@@ -150,54 +179,77 @@ class _SessionPool:
     def get(self, path: str) -> _Session:
         with self._lock:
             sess = self._pool.get(path)
-            if sess is not None:
+            if sess is not None and sess.decoder is not None:
                 self._pool.move_to_end(path)
                 return sess
         # Build outside the pool lock (decoder init ~0.23s): a concurrent
         # builder for the same path just means one extra transient session,
         # resolved by the re-check below.
         sess = self._build(path)
+        evicted: list[_Session] = []
         with self._lock:
             existing = self._pool.get(path)
-            if existing is not None:
+            if existing is not None and existing.decoder is not None:
                 self._pool.move_to_end(path)
-                self._stop(sess)
-                return existing
-            self._pool[path] = sess
-            self._pool.move_to_end(path)
-            while len(self._pool) > self._max:
-                _old_path, old = self._pool.popitem(last=False)
-                self._stop(old)
-            return sess
+                evicted.append(sess)
+                sess = existing
+            else:
+                self._pool[path] = sess
+                self._pool.move_to_end(path)
+                while len(self._pool) > self._max:
+                    _old_path, old = self._pool.popitem(last=False)
+                    evicted.append(old)
+        # Tear down evicted sessions outside the pool lock: _stop waits on each
+        # session's own lock, i.e. on any in-flight window decode — that wait
+        # must not stall unrelated pool lookups.
+        for old in evicted:
+            self._stop(old)
+        return sess
 
     def _build(self, path: str) -> _Session:
         nvc = _load_nvc()
         if nvc is None:
             raise RuntimeError("PyNvVideoCodec unavailable")
-        decoder = nvc.SimpleDecoder(
-            path,
-            gpu_id=0,
-            use_device_memory=True,
-            output_color_type=nvc.OutputColorType.NATIVE,
-        )
-        md = decoder.get_stream_metadata()
+        with _NATIVE_LOCK:
+            decoder = nvc.SimpleDecoder(
+                path,
+                gpu_id=0,
+                use_device_memory=True,
+                output_color_type=nvc.OutputColorType.NATIVE,
+            )
+            md = decoder.get_stream_metadata()
         return _Session(decoder, md.width, md.height, md.average_fps, md.num_frames)
 
     @staticmethod
     def _stop(sess: _Session) -> None:
+        # Serialise with any in-flight decode_window on this session: the
+        # decoder must never be nulled (let alone torn down) under a live
+        # native call — that race produced silent TypeErrors in every
+        # multi-file prefetch run.
+        with sess.lock:
+            decoder, sess.decoder = sess.decoder, None
+        if decoder is None:
+            return
         try:
-            stop = getattr(sess.decoder, "stop", None)
+            stop = getattr(decoder, "stop", None)
             if callable(stop):
-                stop()
+                stop()  # upstream 2.1.0 raises AttributeError; VRAM is
+                # actually freed when the last reference dies
         except Exception:  # pragma: no cover
             pass
-        sess.decoder = None
+
+    def invalidate(self, path: str) -> None:
+        with self._lock:
+            sess = self._pool.pop(path, None)
+        if sess is not None:
+            self._stop(sess)
 
     def close_all(self) -> None:
         with self._lock:
-            while self._pool:
-                _p, s = self._pool.popitem(last=False)
-                self._stop(s)
+            sessions = list(self._pool.values())
+            self._pool.clear()
+        for s in sessions:
+            self._stop(s)
 
     def session_count(self) -> int:
         with self._lock:
@@ -211,6 +263,48 @@ def close_pool() -> None:
     """Release all decoder sessions (VRAM). Called on matcher teardown so a
     fast run does not leave NVDEC sessions pinned for the next queue task."""
     _POOL.close_all()
+
+
+def invalidate_session(path: str) -> None:
+    """Drop the pooled session for ``path`` after a decode error: a session
+    that has been through a cuvid failure (VRAM pressure) must not be reused —
+    its internal state can be corrupt (the 2026-07-19 SIGSEGV class). The next
+    window rebuilds fresh, or falls back to cv2 if the card is still full."""
+    _POOL.invalidate(str(path))
+
+
+def should_fallback_to_cv2(exc: BaseException) -> bool:
+    """Is this decode_window failure one the matcher should absorb by decoding
+    the window on cv2 (byte-identical, slower) instead of failing the probe?
+
+    Covers the VRAM-pressure gate, torch CUDA OOM ("out of memory"), and every
+    PyNvVideoCodec native error — cuvid failures report "Error code : 208"-style
+    texts that the old "out of memory" substring check silently missed."""
+    if isinstance(exc, PyNvDecodeUnavailable):
+        return True
+    if "out of memory" in str(exc).lower():
+        return True
+    if _nvc is not None:
+        native_exc = getattr(_nvc, "PyNvVCException", None)
+        if native_exc is not None and isinstance(exc, native_exc):
+            return True
+    return type(exc).__name__.startswith("PyNvVC")
+
+
+def _vram_pressure() -> tuple[bool, int]:
+    """(free VRAM below the floor?, floor in MiB). Unknown free => no gate."""
+    raw = os.environ.get(_MIN_FREE_MIB_ENV, "").strip()
+    try:
+        floor_mib = int(raw) if raw else _DEFAULT_MIN_FREE_MIB
+    except ValueError:
+        floor_mib = _DEFAULT_MIN_FREE_MIB
+    if floor_mib <= 0:
+        return False, floor_mib
+    try:
+        free, _total = torch.cuda.mem_get_info()
+    except Exception:  # pragma: no cover - env-dependent
+        return False, floor_mib
+    return free < floor_mib * (1 << 20), floor_mib
 
 
 def _probe(path: str) -> bool:
@@ -321,33 +415,52 @@ def decode_window(
     with the identical ``np.linspace`` rule. Content at POS_FRAMES ``n`` is
     ``decoder[n]`` (alignment offset +0).
     """
-    sess = _POOL.get(str(path))
-    fps = sess.fps
-    width, height = sess.width, sess.height
-    num_frames = sess.num_frames or (1 << 30)
-    candidate_frames = _window_candidate_indices(
-        start_ts,
-        end_ts,
-        fps,
-        num_frames,
-        max_frames,
-    )
-    selected_frames = _sample_window_frame_indices(
-        candidate_frames,
-        sample_frames,
-    )
-    selected_indices = {index for index, _timestamp in selected_frames}
-    frames: list[tuple[float, Image.Image]] = []
-    with sess.lock:
-        decoder = sess.decoder
-        for n, pos_ts in candidate_frames:
-            # Keep the decoder's original sequential access pattern: NVIDIA's
-            # stateful GOP traversal can produce small boundary differences if
-            # indices are skipped. Only selected frames pay for RGB conversion
-            # and the full-resolution device-to-host copy.
-            native_frame = decoder[n]
-            if n not in selected_indices:
+    pressured, floor_mib = _vram_pressure()
+    if pressured:
+        raise PyNvDecodeUnavailable(
+            f"free VRAM below {floor_mib} MiB; NVDEC refused for this window"
+        )
+    for _attempt in range(_EVICTION_RETRIES):
+        sess = _POOL.get(str(path))
+        fps = sess.fps
+        width, height = sess.width, sess.height
+        num_frames = sess.num_frames or (1 << 30)
+        candidate_frames = _window_candidate_indices(
+            start_ts,
+            end_ts,
+            fps,
+            num_frames,
+            max_frames,
+        )
+        selected_frames = _sample_window_frame_indices(
+            candidate_frames,
+            sample_frames,
+        )
+        selected_indices = {index for index, _timestamp in selected_frames}
+        frames: list[tuple[float, Image.Image]] = []
+        with sess.lock:
+            if sess.decoder is None:
+                # Evicted between the pool lookup and our lock; re-get builds
+                # a fresh session.
                 continue
-            rgb = _native_frame_to_rgb_gpu(native_frame, width, height).cpu().numpy()
-            frames.append((pos_ts, Image.fromarray(rgb)))
-    return frames
+            decoder = sess.decoder
+            with _NATIVE_LOCK:
+                for n, pos_ts in candidate_frames:
+                    # Keep the decoder's original sequential access pattern:
+                    # NVIDIA's stateful GOP traversal can produce small
+                    # boundary differences if indices are skipped. Only
+                    # selected frames pay for RGB conversion and the
+                    # full-resolution device-to-host copy.
+                    native_frame = decoder[n]
+                    if n not in selected_indices:
+                        continue
+                    rgb = (
+                        _native_frame_to_rgb_gpu(native_frame, width, height)
+                        .cpu()
+                        .numpy()
+                    )
+                    frames.append((pos_ts, Image.fromarray(rgb)))
+        return frames
+    raise PyNvDecodeUnavailable(
+        f"decoder session for {path} evicted {_EVICTION_RETRIES} times in a row"
+    )

@@ -126,3 +126,50 @@ async def test_gpu_semaphore_caps_concurrent_heavy_tasks() -> None:
 
     sem.release()
     sem.release()
+
+
+@pytest.mark.asyncio
+async def test_multi_slot_heavy_job_reserves_full_budget() -> None:
+    """A fast-mode matching run (slots=MAX_CONCURRENT) holds the whole GPU
+    budget: an indexation job must wait until it exits, and both slots come
+    back afterwards (2026-07-19 OOM: matching ~5.3 GiB cannot share the card
+    with a GPU-decode indexation)."""
+    import asyncio
+
+    service = IndexationQueueService()
+
+    async with service.heavy_slot("matching", slots=service.MAX_CONCURRENT):
+        assert service.available_heavy_slots() == 0
+        waiter = asyncio.ensure_future(service.acquire_heavy_slot("indexation"))
+        await asyncio.sleep(0.05)
+        assert not waiter.done(), "indexation must wait while matching holds the budget"
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+    assert service.available_heavy_slots() == service.MAX_CONCURRENT
+
+
+@pytest.mark.asyncio
+async def test_cancelled_multi_slot_acquire_releases_partial() -> None:
+    """Cancelling a multi-slot acquire mid-wait (SSE client disconnects while
+    the match waits for its second slot) must return the partially-acquired
+    slot instead of leaking it."""
+    import asyncio
+
+    service = IndexationQueueService()
+    await service.acquire_heavy_slot("indexation")  # hold 1 of 2
+
+    pending = asyncio.ensure_future(
+        service.acquire_heavy_slot("matching", slots=service.MAX_CONCURRENT)
+    )
+    await asyncio.sleep(0.05)
+    assert not pending.done()
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+
+    # The slot matching had already grabbed must be back in the budget.
+    assert service.available_heavy_slots() == service.MAX_CONCURRENT - 1
+    service.release_heavy_slot("indexation")
+    assert service.available_heavy_slots() == service.MAX_CONCURRENT
