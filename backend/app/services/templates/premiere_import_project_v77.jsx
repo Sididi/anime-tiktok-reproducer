@@ -684,6 +684,9 @@
   var TRACK_ITEM_WAIT_MAX_STEP_MS = 45;
   var TRACK_ITEM_WAIT_STEP_BACKOFF_MS = 10;
   var TRACK_ITEM_WAIT_MAX_MS = 180;
+  var BORDER_MOGRT_MAX_ATTEMPTS = 5;
+  var BORDER_MOGRT_WAIT_MAX_MS = 1000;
+  var BORDER_MOGRT_RETRY_BASE_MS = 250;
   var SPEED_RETRY_FAST_WAIT_MS = 12;
   var SPEED_RETRY_LONG_WAIT_MS = 60;
   var SOURCE_AUDIO_POLICY_RETRY_WAIT_MS = 40;
@@ -1550,6 +1553,92 @@
       return true;
     } catch (e1) {}
     return false;
+  }
+
+  function ensureWhiteBorderMogrt(sequence, track, endSec) {
+    if (!WHITE_BORDER_ENABLED) {
+      log("Skipping V2 border (template white_border.enabled=false).");
+      return null;
+    }
+    if (!sequence || !track) {
+      log("Warning: V2 track unavailable; Border Mogrt not inserted.");
+      return null;
+    }
+    if (!new File(BORDER_MOGRT_PATH).exists) {
+      log(
+        "Warning: Border Mogrt file missing at " +
+          BORDER_MOGRT_PATH +
+          "; border not inserted.",
+      );
+      return null;
+    }
+
+    // V2 is dedicated to the white border. Check the timeline before importing
+    // so a delayed result from a previous attempt cannot create duplicates.
+    var borderItem = findTrackItemAtStart(track, 0, null);
+    if (!borderItem) {
+      log("Adding Border Mogrt to V2...");
+    }
+
+    for (
+      var borderAttempt = 1;
+      borderAttempt <= BORDER_MOGRT_MAX_ATTEMPTS && !borderItem;
+      borderAttempt++
+    ) {
+      try {
+        perfCounterInc("importMGTCalls");
+        // Premiere's API requires insertion time as a string of ticks.
+        borderItem = sequence.importMGT(BORDER_MOGRT_PATH, "0", 1, 0);
+      } catch (eBorder) {
+        log(
+          "Border Mogrt attempt " +
+            borderAttempt +
+            " error: " +
+            (eBorder && eBorder.message ? eBorder.message : eBorder),
+        );
+      }
+
+      if (!borderItem) {
+        // importMGT can finish updating the timeline after its return value is
+        // available. Refresh and inspect V2 before deciding the attempt failed.
+        refreshSequenceUI(sequence);
+        borderItem = waitForTrackItemAtStart(
+          track,
+          0,
+          null,
+          BORDER_MOGRT_WAIT_MAX_MS,
+        );
+      }
+
+      if (!borderItem && borderAttempt < BORDER_MOGRT_MAX_ATTEMPTS) {
+        log(
+          "Border Mogrt attempt " +
+            borderAttempt +
+            " produced no V2 item; retrying...",
+        );
+        sleep(BORDER_MOGRT_RETRY_BASE_MS * borderAttempt);
+      }
+    }
+
+    if (!borderItem) {
+      log(
+        "Warning: Border Mogrt could not be found on V2 after " +
+          BORDER_MOGRT_MAX_ATTEMPTS +
+          " attempts; V2 border is missing.",
+      );
+      return null;
+    }
+
+    if (!setTrackItemEndSeconds(borderItem, endSec)) {
+      log(
+        "Warning: Border Mogrt inserted but end time could not be set to " +
+          endSec +
+          "s.",
+      );
+    } else {
+      log("Border Mogrt verified on V2. Duration: " + endSec);
+    }
+    return borderItem;
   }
 
   function getMotionComponent(item) {
@@ -2566,62 +2655,6 @@
 
     var sequenceEndSec = ttsEndSec;
 
-    // --- V2: BORDER MOGRT ---
-    if (!WHITE_BORDER_ENABLED) {
-      log("Skipping V2 border (template white_border.enabled=false).");
-    } else if (!v2) {
-      log("Warning: V2 track unavailable; Border Mogrt not inserted.");
-    } else if (!new File(BORDER_MOGRT_PATH).exists) {
-      log(
-        "Warning: Border Mogrt file missing at " +
-          BORDER_MOGRT_PATH +
-          "; border not inserted.",
-      );
-    } else {
-      log("Adding Border Mogrt to V2...");
-      var borderItem = null;
-      for (
-        var borderAttempt = 1;
-        borderAttempt <= 3 && !borderItem;
-        borderAttempt++
-      ) {
-        try {
-          borderItem = sequence.importMGT(BORDER_MOGRT_PATH, 0, 1, 0);
-        } catch (eBorder) {
-          log(
-            "Border Mogrt attempt " +
-              borderAttempt +
-              " error: " +
-              eBorder.message,
-          );
-        }
-        if (!borderItem && borderAttempt < 3) {
-          log(
-            "Border Mogrt attempt " +
-              borderAttempt +
-              " returned no item; retrying...",
-          );
-          $.sleep(250);
-        }
-      }
-      if (borderItem) {
-        if (!setTrackItemEndSeconds(borderItem, sequenceEndSec)) {
-          log(
-            "Warning: Border Mogrt inserted but end time could not be set to " +
-              sequenceEndSec +
-              "s.",
-          );
-        } else {
-          log("Border Mogrt inserted. Duration: " + sequenceEndSec);
-        }
-      } else {
-        log(
-          "Warning: Border Mogrt could not be inserted after 3 attempts " +
-            "(importMGT returned no item); V2 border is missing.",
-        );
-      }
-    }
-
     validateAndRepairRawSceneVideoPlacement(v1, v3, scenes);
     clearRawAudioZone(sequence, RAW_AUDIO_TRACK_START_INDEX, rawAudioZoneWidth);
     duplicateRawSceneAudioToTrack(
@@ -2761,6 +2794,11 @@
       true,
     );
     perfEnd("subtitles", "Subtitles");
+
+    // Import the border after subtitle MOGRT processing. This avoids making
+    // the border the first importMGT call against a cold Motion Graphics
+    // engine, and gives us one final, verified repair point before completion.
+    ensureWhiteBorderMogrt(sequence, v2, sequenceEndSec);
     refreshSequenceUI(sequence);
     perfEnd("total");
     perfLogSummary();

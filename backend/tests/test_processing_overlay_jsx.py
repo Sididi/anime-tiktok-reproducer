@@ -128,3 +128,19 @@ def test_jsx_tries_native_fondu_additif_then_opacity_fallback():
     assert "opProp.setValueAtKey(fadeStartTime, 100);" in jsx
     assert "opProp.setValueAtKey(clipEndTime, 0);" in jsx
     assert "effect component did not appear" not in jsx
+
+
+def test_jsx_verifies_white_border_after_subtitle_mogrt_warmup():
+    jsx = _render(title=True, category=True)
+
+    subtitle_import = jsx.index("importUnifiedSubtitles(")
+    border_import = jsx.index(
+        "ensureWhiteBorderMogrt(sequence, v2, sequenceEndSec);"
+    )
+    assert subtitle_import < border_import
+
+    assert 'sequence.importMGT(BORDER_MOGRT_PATH, "0", 1, 0)' in jsx
+    assert "sequence.importMGT(BORDER_MOGRT_PATH, 0, 1, 0)" not in jsx
+    assert "BORDER_MOGRT_MAX_ATTEMPTS = 5" in jsx
+    assert "waitForTrackItemAtStart(" in jsx
+    assert "Border Mogrt verified on V2" in jsx
