@@ -173,14 +173,50 @@ async def _upload_media(
         video_path.unlink(missing_ok=True)
 
 
+def _platform_error_summary(details: Any) -> str | None:
+    """Dig the platform-side error out of PFM's result `details` payload.
+
+    PFM's top-level `error` is a generic string ("Failed to post to TikTok");
+    the actionable code lives at details.error.response.data.error.{code,message}
+    (e.g. "reached_active_user_cap"). Falls back to details.error.message.
+    """
+    if not isinstance(details, dict):
+        return None
+    err = details.get("error")
+    if not isinstance(err, dict):
+        return None
+    response = err.get("response")
+    if isinstance(response, dict):
+        data = response.get("data")
+        platform_error = data.get("error") if isinstance(data, dict) else None
+        if isinstance(platform_error, dict):
+            code = platform_error.get("code")
+            message = platform_error.get("message")
+            parts = [str(code)] if code else []
+            if message and message != code:
+                parts.append(str(message))
+            status = response.get("status")
+            if status:
+                parts.append(f"HTTP {status}")
+            if parts:
+                return ", ".join(parts)
+    message = err.get("message")
+    return str(message) if message else None
+
+
 def _result_error_detail(result: dict[str, Any]) -> str:
     error = result.get("error")
     if isinstance(error, dict):
-        message = error.get("message") or error.get("detail")
-        if message:
-            return str(message)[:500]
-    if error:
-        return str(error)[:500]
+        base = error.get("message") or error.get("detail")
+    else:
+        base = error
+    platform = _platform_error_summary(result.get("details"))
+    if base and platform:
+        return f"{base} [{platform}]"[:500]
+    if base:
+        return str(base)[:500]
+    if platform:
+        return platform[:500]
     return "post failed without error detail"
 
 

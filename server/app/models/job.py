@@ -15,6 +15,9 @@ class PlatformStatus:
     detail: str | None = None
     completed_at: datetime | None = None
     attempts: int = 0
+    # Earliest instant the scheduler may retry this platform (transient quota
+    # errors set it to space retries out); None = retry on the next tick.
+    retry_not_before: datetime | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -23,17 +26,22 @@ class PlatformStatus:
             "detail": self.detail,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
             "attempts": self.attempts,
+            "retry_not_before": (
+                self.retry_not_before.isoformat() if self.retry_not_before else None
+            ),
         }
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> PlatformStatus:
         ca = d.get("completed_at")
+        rnb = d.get("retry_not_before")
         return cls(
             status=d["status"],
             url=d.get("url"),
             detail=d.get("detail"),
             completed_at=datetime.fromisoformat(ca) if ca else None,
             attempts=int(d.get("attempts", 0)),
+            retry_not_before=datetime.fromisoformat(rnb) if rnb else None,
         )
 
 

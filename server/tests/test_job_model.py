@@ -61,6 +61,20 @@ def test_platform_status_round_trip():
     assert PlatformStatus.from_dict(ps.to_dict()) == ps
 
 
+def test_platform_status_retry_not_before_round_trip():
+    ps = PlatformStatus(
+        status="pending",
+        attempts=5,
+        retry_not_before=datetime(2026, 7, 21, 15, 30, tzinfo=UTC),
+    )
+    assert PlatformStatus.from_dict(ps.to_dict()) == ps
+
+
+def test_platform_status_from_dict_without_retry_not_before():
+    ps = PlatformStatus.from_dict({"status": "pending"})
+    assert ps.retry_not_before is None
+
+
 def test_instagram_publish_state_round_trip_with_fallback_fields():
     state = InstagramPublishState(
         container_id="container_video_url",

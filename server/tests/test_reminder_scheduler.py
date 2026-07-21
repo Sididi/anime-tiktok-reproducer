@@ -290,6 +290,104 @@ async def test_dispatch_tiktok_fails_after_max_attempts_and_pings(
     assert any("TikTok" in c for c in contents)
 
 
+_QUOTA_DETAIL = "result: Failed to post to TikTok [reached_active_user_cap, HTTP 403]"
+
+
+def _quota_failing_poll():
+    async def failing_poll(**kwargs):
+        return TikTokPublishResult(
+            success=False,
+            detail=_QUOTA_DETAIL,
+            publish_state=_ok_state(post_id="post_1", stage="failed"),
+        )
+    return failing_poll
+
+
+async def test_dispatch_tiktok_quota_error_delays_retry_past_normal_cap(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
+):
+    """A TikTok-side quota error (reached_active_user_cap) must not fail
+    terminally at the normal attempt cap: it stays pending with a spaced-out
+    retry_not_before, and the due-time gate blocks immediate redispatch."""
+    settings = replace(
+        _settings_for(example_yaml, tmp_server_dir / "avatars"), pfm_api_key="key"
+    )
+    store = JobStore(tmp_path / "jobs.json")
+    discord = AsyncMock()
+    _patch_phases(monkeypatch, poll=_quota_failing_poll())
+    await store.create(_tiktok_job())
+    await store.merge_platform_status(
+        "p1", "tiktok", PlatformStatus(status="pending", attempts=4)
+    )
+    before = datetime.now(tz=UTC)
+    await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    await wait_for_inflight()
+    job = await store.get("p1")
+    tt = job.platform_statuses["tiktok"]
+    assert tt.status == "pending"          # not terminal despite attempts == 5
+    assert tt.attempts == 5
+    assert tt.retry_not_before is not None
+    assert tt.retry_not_before >= before + timedelta(minutes=4)
+    discord.post_message.assert_not_called()  # first-error ping fired at attempt 1
+    assert _platform_due_time(job, "tiktok") == tt.retry_not_before
+    actions = await dispatch_due_actions(
+        store=store, settings=settings, discord=discord
+    )
+    await wait_for_inflight()
+    assert actions == 0                    # gated until retry_not_before
+
+
+async def test_dispatch_tiktok_first_failure_pings_with_error_detail(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
+):
+    """The very first failed attempt warns immediately (with the platform
+    error code) instead of staying silent until the terminal failure."""
+    settings = replace(
+        _settings_for(example_yaml, tmp_server_dir / "avatars"), pfm_api_key="key"
+    )
+    store = JobStore(tmp_path / "jobs.json")
+    discord = AsyncMock()
+    _patch_phases(monkeypatch, poll=_quota_failing_poll())
+    await store.create(_tiktok_job())
+    await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    await wait_for_inflight()
+    job = await store.get("p1")
+    tt = job.platform_statuses["tiktok"]
+    assert tt.status == "pending"          # still retrying
+    assert tt.attempts == 1
+    contents = [
+        str(kwargs.get("content") or (args[1] if len(args) > 1 else ""))
+        for args, kwargs in discord.post_message.call_args_list
+    ]
+    assert any("reached_active_user_cap" in c and "retrying" in c for c in contents)
+
+
+async def test_dispatch_tiktok_quota_error_fails_after_extended_cap(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
+):
+    settings = replace(
+        _settings_for(example_yaml, tmp_server_dir / "avatars"), pfm_api_key="key"
+    )
+    store = JobStore(tmp_path / "jobs.json")
+    discord = AsyncMock()
+    _patch_phases(monkeypatch, poll=_quota_failing_poll())
+    await store.create(_tiktok_job())
+    await store.merge_platform_status(
+        "p1", "tiktok", PlatformStatus(status="pending", attempts=11)
+    )
+    await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    await wait_for_inflight()
+    job = await store.get("p1")
+    tt = job.platform_statuses["tiktok"]
+    assert tt.status == "failed"
+    assert tt.attempts == 12
+    contents = [
+        str(kwargs.get("content") or (args[1] if len(args) > 1 else ""))
+        for args, kwargs in discord.post_message.call_args_list
+    ]
+    assert any("reached_active_user_cap" in c for c in contents)
+
+
 async def test_dispatch_tiktok_terminal_statuses_are_not_retried(
     tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
 ):

@@ -152,6 +152,30 @@ async def test_failed_result_reports_error(fake, tmp_path):
     assert result.publish_state.stage == "failed"
 
 
+async def test_failed_result_surfaces_platform_error_code(fake, tmp_path):
+    """PFM's top-level error is a generic string; the actionable TikTok code
+    (e.g. reached_active_user_cap) lives in details and must reach the detail."""
+    fake.results_sequence = [
+        [{"social_account_id": "spc_1", "success": False,
+          "platform_data": {},
+          "error": "Failed to post to TikTok",
+          "details": {"error": {
+              "message": "Request failed with status code 403",
+              "request": {"url": "/v2/post/publish/video/init/", "method": "POST"},
+              "response": {"status": 403, "data": {"error": {
+                  "code": "reached_active_user_cap",
+                  "log_id": "20260721145956...",
+                  "message": "reached_active_user_cap"}}},
+          }}}],
+    ]
+    result = await _publish(fake, tmp_path)
+    assert result.success is False
+    assert "Failed to post to TikTok" in result.detail
+    assert "reached_active_user_cap" in result.detail
+    assert "HTTP 403" in result.detail
+    assert result.publish_state.stage == "failed"
+
+
 async def test_poll_timeout_keeps_resumable_state(fake, tmp_path):
     fake.results_sequence = [[]]  # never a result
     result = await _publish(fake, tmp_path, poll_timeout=0.0)
