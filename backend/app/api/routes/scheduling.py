@@ -178,16 +178,22 @@ class ReserveAnchorRequest(BaseModel):
     tiktok_slot: datetime
     overrides: dict[str, datetime] | None = None
     steals: dict[str, StealSpecModel] | None = None
+    # User acknowledged the "a displaced project's TikTok would land after
+    # its other platforms" warning.
+    confirm_before_tiktok: bool = False
 
 
 class PatchPlatformRequest(BaseModel):
     new_slot: datetime
+    # User acknowledged the "another platform would post before TikTok" warning.
+    confirm_before_tiktok: bool = False
 
 
 class PatchAnchorRequest(BaseModel):
     tiktok_slot: datetime
     overrides: dict[str, datetime] | None = None
     steals: dict[str, StealSpecModel] | None = None
+    confirm_before_tiktok: bool = False
 
 
 def _platform_schedules_to_dict(schedules):
@@ -228,7 +234,7 @@ def _notify_displaced(project_id: str, platform: str, new_scheduled_at: datetime
 async def resolve_anchor(req: ResolveAnchorRequest):
     result = await asyncio.to_thread(
         SchedulingService.resolve_anchor,
-        req.account_id, req.tiktok_slot, req.overrides,
+        req.account_id, req.tiktok_slot, req.overrides, req.project_id,
     )
     return {
         "resolved": {
@@ -272,9 +278,12 @@ async def reserve_anchor(project_id: str, req: ReserveAnchorRequest):
         schedules, switches = await asyncio.to_thread(
             SchedulingService.reserve_anchor,
             project_id, req.account_id, req.tiktok_slot, req.overrides, steals,
+            req.confirm_before_tiktok,
         )
     except ValueError as exc:
         msg = str(exc)
+        if msg.startswith("tiktok_precedence"):
+            raise HTTPException(409, msg)
         if "slot_state_changed" in msg or "pool_busy" in msg:
             raise HTTPException(409, msg)
         if "tiktok" in msg and "slot_taken" in msg:
@@ -340,11 +349,14 @@ async def reserve_manual(project_id: str, req: ReserveManualRequest):
 async def patch_platform(project_id: str, platform: str, req: PatchPlatformRequest):
     try:
         sched = await asyncio.to_thread(
-            SchedulingService.reschedule_platform, project_id, platform, req.new_slot
+            SchedulingService.reschedule_platform,
+            project_id, platform, req.new_slot, req.confirm_before_tiktok,
         )
     except ValueError as exc:
         if str(exc) == "timing_locked":
             raise HTTPException(423, "timing_locked")
+        if str(exc) == "tiktok_precedence":
+            raise HTTPException(409, "tiktok_precedence")
         raise HTTPException(422, str(exc))
     notif_status = await asyncio.to_thread(
         _notify_displaced, project_id, platform, sched.scheduled_at
@@ -363,11 +375,14 @@ async def patch_anchor(project_id: str, req: PatchAnchorRequest):
         schedules, switches = await asyncio.to_thread(
             SchedulingService.reschedule_anchor,
             project_id, req.tiktok_slot, req.overrides, steals,
+            req.confirm_before_tiktok,
         )
     except ValueError as exc:
         msg = str(exc)
         if msg == "timing_locked":
             raise HTTPException(423, "timing_locked")
+        if msg.startswith("tiktok_precedence"):
+            raise HTTPException(409, msg)
         if "slot_state_changed" in msg or "pool_busy" in msg:
             raise HTTPException(409, msg)
         raise HTTPException(422, msg)
@@ -413,6 +428,18 @@ async def delete_all(project_id: str):
 
 class CascadeRequest(BaseModel):
     account_id: str
+    confirm_before_tiktok: bool = False
+
+
+def _precedence_warnings_payload(warnings) -> list[dict]:
+    return [
+        {
+            "project_id": w.project_id,
+            "anime_title": w.anime_title,
+            "platforms": list(w.platforms),
+        }
+        for w in warnings
+    ]
 
 
 def _cascade_to_payload(result) -> dict:
@@ -432,6 +459,7 @@ def _cascade_to_payload(result) -> dict:
                     }
                     for d in p.displaced
                 ],
+                "precedence_warnings": _precedence_warnings_payload(p.precedence_warnings),
             }
             for p in result.per_platform
         ],
@@ -451,10 +479,13 @@ async def cascade_preview(project_id: str, req: CascadeRequest):
 async def cascade_apply(project_id: str, req: CascadeRequest):
     try:
         result = await asyncio.to_thread(
-            SchedulingService.apply_cascade, project_id, req.account_id
+            SchedulingService.apply_cascade,
+            project_id, req.account_id, req.confirm_before_tiktok,
         )
     except ValueError as exc:
         msg = str(exc)
+        if msg.startswith("tiktok_precedence"):
+            raise HTTPException(409, msg)
         if "pool_busy" in msg:
             raise HTTPException(409, msg)
         if "facebook_horizon_exceeded" in msg or "pool_full" in msg:
@@ -489,6 +520,8 @@ class SwitchPreviewRequest(BaseModel):
 class SwitchApplyRequest(SwitchPreviewRequest):
     mode: Literal["cascade", "next_free"]
     expected_occupant_id: str | None = None
+    # User acknowledged the "another platform would post before TikTok" warning.
+    confirm_before_tiktok: bool = False
 
 
 def _switch_plan_payload(plan) -> dict:
@@ -504,6 +537,7 @@ def _switch_plan_payload(plan) -> dict:
             for d in plan.displaced
         ],
         "blockers": [{"platform": b.platform, "reason": b.reason} for b in plan.blockers],
+        "precedence_warnings": _precedence_warnings_payload(plan.precedence_warnings),
     }
 
 
@@ -534,12 +568,14 @@ async def switch_apply(project_id: str, req: SwitchApplyRequest):
         result = await asyncio.to_thread(
             SchedulingService.apply_switch,
             project_id, req.account_id, req.platform, req.slot,
-            req.mode, req.expected_occupant_id,
+            req.mode, req.expected_occupant_id, req.confirm_before_tiktok,
         )
     except ValueError as exc:
         msg = str(exc)
         if msg == "timing_locked":
             raise HTTPException(423, "timing_locked")
+        if msg.startswith("tiktok_precedence"):
+            raise HTTPException(409, msg)
         if "slot_state_changed" in msg or "pool_busy" in msg:
             raise HTTPException(409, msg)
         raise HTTPException(422, msg)

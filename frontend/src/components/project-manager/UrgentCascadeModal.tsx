@@ -3,6 +3,7 @@ import { motion } from "framer-motion";
 import { AlertTriangle } from "lucide-react";
 import { Button } from "@/components/ui";
 import { api } from "@/api/client";
+import { confirmTikTokPrecedence } from "@/utils/tiktokPrecedence";
 import type { CascadePreview, Platform } from "@/types";
 import { PLATFORM_SHORT, platformBgHsl } from "@/components/planning/platformColors";
 
@@ -80,6 +81,12 @@ export function UrgentCascadeModal({
                     ↳ {d.anime_title} · {fmt(d.from_slot)} → {fmt(d.to_slot)}
                   </div>
                 ))}
+                {(p.precedence_warnings ?? []).map((w) => (
+                  <div key={`warn-${w.project_id}`} className="text-amber-500 pl-4">
+                    ⚠ {w.anime_title} : {w.platforms.join(", ")} publierait avant
+                    son TikTok repoussé
+                  </div>
+                ))}
               </div>
             ))}
             {preview.blockers.map((b, i) => (
@@ -105,7 +112,14 @@ export function UrgentCascadeModal({
             onClick={async () => {
               setSubmitting(true);
               try {
-                await api.cascadeApply(projectId, accountId);
+                try {
+                  await api.cascadeApply(projectId, accountId);
+                } catch (err) {
+                  const confirmed = confirmTikTokPrecedence(err);
+                  if (confirmed === null) throw err;
+                  if (!confirmed) return;
+                  await api.cascadeApply(projectId, accountId, true);
+                }
                 onClose();
                 onConfirmed();
               } catch (err) {

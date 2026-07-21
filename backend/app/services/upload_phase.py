@@ -760,7 +760,9 @@ class UploadPhaseService:
                 if _pre is not None:
                     _, _sched = _pre
                 else:
-                    _, _sched = SchedulingService.find_next_slot_for_platform(account_id, _platform)
+                    _, _sched = SchedulingService.find_next_slot_for_platform(
+                        account_id, _platform, project_id=project_id
+                    )
                 platform_scheduled_at[_platform] = _sched
 
         # Duplicated-project restrictions: same account never uploads two

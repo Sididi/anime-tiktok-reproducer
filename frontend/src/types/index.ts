@@ -486,6 +486,12 @@ export interface ResolveAnchorResult {
 
 export type SwitchMode = "cascade" | "next_free";
 export interface StealSpec { mode: SwitchMode; expected_occupant_id: string | null; }
+/** A displaced project whose TikTok would land after its other platforms. */
+export interface PrecedenceWarning {
+  project_id: string;
+  anime_title: string;
+  platforms: Platform[];
+}
 export interface SwitchPlanDto {
   displaced: Array<{
     project_id: string; anime_title: string;
@@ -493,6 +499,7 @@ export interface SwitchPlanDto {
     requires_platform_notification: boolean;
   }>;
   blockers: Array<{ platform: Platform; reason: string }>;
+  precedence_warnings?: PrecedenceWarning[];
 }
 export interface SwitchPreview {
   platform: Platform; slot: string;
@@ -515,6 +522,7 @@ export interface CascadePreview {
       to_slot: string;
       requires_platform_notification: boolean;
     }>;
+    precedence_warnings?: PrecedenceWarning[];
   }>;
   blockers: Array<{ platform: Platform; reason: string }>;
 }

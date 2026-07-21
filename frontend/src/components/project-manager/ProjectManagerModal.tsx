@@ -4,6 +4,7 @@ import { Loader2, RefreshCw, X, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui";
 import { api } from "@/api/client";
 import { readSSEStream } from "@/utils/sse";
+import { confirmTikTokPrecedence } from "@/utils/tiktokPrecedence";
 import { AccountSelectorDropdown } from "./AccountSelectorDropdown";
 import { AccountPickerPopup } from "./AccountPickerPopup";
 import { CopyrightMusicModal } from "./CopyrightMusicModal";
@@ -568,13 +569,23 @@ export function ProjectManagerModal({
       }
 
       if (mode === "scheduled" && anchorPayload) {
-        try {
-          await api.reserveAnchor(projectId, {
+        const reserve = (confirm_before_tiktok: boolean) =>
+          api.reserveAnchor(projectId, {
             account_id: accountId!,
             tiktok_slot: anchorPayload.tiktok_slot,
             overrides: anchorPayload.overrides,
             steals: anchorPayload.steals,
+            confirm_before_tiktok,
           });
+        try {
+          try {
+            await reserve(false);
+          } catch (err) {
+            const confirmed = confirmTikTokPrecedence(err);
+            if (confirmed === null) throw err;
+            if (!confirmed) return;
+            await reserve(true);
+          }
         } catch (err) {
           setError((err as Error).message);
           return;
@@ -583,7 +594,14 @@ export function ProjectManagerModal({
 
       if (mode === "urgent") {
         try {
-          await api.cascadeApply(projectId, accountId!);
+          try {
+            await api.cascadeApply(projectId, accountId!);
+          } catch (err) {
+            const confirmed = confirmTikTokPrecedence(err);
+            if (confirmed === null) throw err;
+            if (!confirmed) return;
+            await api.cascadeApply(projectId, accountId!, true);
+          }
         } catch (err) {
           setError((err as Error).message);
           return;

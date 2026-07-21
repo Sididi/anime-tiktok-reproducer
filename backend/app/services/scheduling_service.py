@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from threading import Lock
 
@@ -47,11 +48,21 @@ class DisplacedItem:
 
 
 @dataclass
+class DisplacedPrecedenceWarning:
+    """A displaced project whose TikTok would land after its other platforms."""
+
+    project_id: str
+    anime_title: str
+    platforms: list[str]
+
+
+@dataclass
 class CascadePlatform:
     platform: str
     target_slot: datetime
     target_scheduled_at: datetime
     displaced: list[DisplacedItem]
+    precedence_warnings: list[DisplacedPrecedenceWarning] = field(default_factory=list)
 
 
 @dataclass
@@ -71,6 +82,7 @@ class SwitchPlan:
     mode: str
     displaced: list[DisplacedItem]
     blockers: list[CascadeBlocker]
+    precedence_warnings: list[DisplacedPrecedenceWarning] = field(default_factory=list)
 
 
 @dataclass
@@ -204,6 +216,92 @@ class SchedulingService:
         offset = random.randint(0, delta_minutes)
         return (lower + timedelta(minutes=offset)).replace(second=0, microsecond=0)
 
+    @classmethod
+    def _project_jitter_minutes(cls, project_id: str) -> int:
+        """Deterministic per-project jitter in [-_JITTER_MINUTES, +_JITTER_MINUTES].
+
+        One shared offset per project: every platform's scheduled_at keeps the
+        same order as their slots, so a platform whose slot is >= the TikTok
+        slot can never publish before TikTok because of the jitter.
+        """
+        digest = hashlib.sha256(project_id.encode("utf-8")).digest()
+        span = 2 * cls._JITTER_MINUTES + 1
+        return int.from_bytes(digest[:4], "big") % span - cls._JITTER_MINUTES
+
+    @classmethod
+    def _scheduled_at_for(
+        cls, project_id: str | None, slot_dt: datetime, now_utc: datetime
+    ) -> datetime:
+        """Publish instant for `slot_dt`: slot + the project's shared jitter."""
+        if project_id is None:
+            return cls._randomize_slot(slot_dt, now_utc)
+        scheduled = slot_dt + timedelta(minutes=cls._project_jitter_minutes(project_id))
+        min_publish = now_utc + timedelta(minutes=cls._MIN_LEAD_MINUTES)
+        if scheduled < min_publish:
+            scheduled = min_publish
+        return scheduled.replace(second=0, microsecond=0)
+
+    @classmethod
+    def _breaks_tiktok_precedence(
+        cls, project: Project, platform: str, new_slot: datetime
+    ) -> bool:
+        """True when moving `platform` to `new_slot` would let a platform
+        publish before the project's TikTok time (or push TikTok after another
+        platform). Manual entries are the user's exact choice and are ignored."""
+        schedules = project.platform_schedules or {}
+        if platform == "tiktok":
+            return any(
+                new_slot > cls._normalize_utc_datetime(sched.slot)
+                for plat, sched in schedules.items()
+                if plat != "tiktok" and not sched.manual
+            )
+        tt = schedules.get("tiktok")
+        if tt is None or tt.manual:
+            return False
+        return new_slot < cls._normalize_utc_datetime(tt.slot)
+
+    @classmethod
+    def _displaced_tiktok_warnings(
+        cls, platform: str, displaced: list[DisplacedItem]
+    ) -> list[DisplacedPrecedenceWarning]:
+        """Displaced projects whose TikTok would move after their other platforms.
+
+        Only TikTok displacements can break precedence: pushing a non-TikTok
+        slot later never makes it publish before TikTok.
+        """
+        if platform != "tiktok":
+            return []
+        warnings: list[DisplacedPrecedenceWarning] = []
+        for item in displaced:
+            moved = ProjectService.load(item.project_id)
+            if moved is None:
+                continue
+            to_slot = cls._normalize_utc_datetime(item.to_slot)
+            late = sorted(
+                plat
+                for plat, sched in (moved.platform_schedules or {}).items()
+                if plat != "tiktok"
+                and not sched.manual
+                and cls._normalize_utc_datetime(sched.slot) < to_slot
+            )
+            if late:
+                warnings.append(
+                    DisplacedPrecedenceWarning(
+                        project_id=item.project_id,
+                        anime_title=item.anime_title,
+                        platforms=late,
+                    )
+                )
+        return warnings
+
+    @classmethod
+    def _raise_if_displaced_precedence_broken(
+        cls, warnings: list[DisplacedPrecedenceWarning]
+    ) -> None:
+        if warnings:
+            titles = ", ".join(w.anime_title for w in warnings)
+            raise ValueError(f"tiktok_precedence_displaced:{titles}")
+
     # ------------------------------------------------------------------- lookup
 
     @classmethod
@@ -211,8 +309,14 @@ class SchedulingService:
         cls,
         account_id: str,
         platform: str,
+        project_id: str | None = None,
+        not_before: datetime | None = None,
     ) -> tuple[datetime, datetime]:
-        """Find the next free (slot_dt, scheduled_at) for (account, platform)."""
+        """Find the next free (slot_dt, scheduled_at) for (account, platform).
+
+        `not_before` lower-bounds the slot (TikTok precedence: other platforms
+        never take a slot before the project's TikTok slot).
+        """
         account = AccountService.get_account(account_id)
         if not account:
             raise ValueError(f"Account {account_id} not found")
@@ -236,6 +340,9 @@ class SchedulingService:
 
         now_utc = datetime.now(timezone.utc)
         earliest_allowed = cls._earliest_allowed_publish_time()
+        if not_before is not None:
+            not_before = cls._normalize_utc_datetime(not_before)
+            earliest_allowed = max(earliest_allowed, not_before)
 
         current_date = now_utc.date()
         end_date = current_date + timedelta(days=cls._MAX_LOOKAHEAD_DAYS)
@@ -251,7 +358,7 @@ class SchedulingService:
                     continue
                 if slot_dt.isoformat() in reserved_slots:
                     continue
-                return slot_dt, cls._randomize_slot(slot_dt, now_utc)
+                return slot_dt, cls._scheduled_at_for(project_id, slot_dt, now_utc)
 
             current_date += timedelta(days=1)
 
@@ -348,6 +455,7 @@ class SchedulingService:
         account_id: str,
         tiktok_slot: datetime,
         overrides: dict[str, datetime] | None = None,
+        project_id: str | None = None,
     ) -> "ResolveAnchorResult":
         """Resolve which slot will be reserved per platform, given a TT anchor.
 
@@ -372,7 +480,7 @@ class SchedulingService:
             else:
                 resolved["tiktok"] = ResolvedSlot(
                     slot=anchor,
-                    scheduled_at=cls._randomize_slot(anchor, now_utc),
+                    scheduled_at=cls._scheduled_at_for(project_id, anchor, now_utc),
                     available=True,
                 )
 
@@ -394,7 +502,7 @@ class SchedulingService:
                     continue
                 resolved[platform] = ResolvedSlot(
                     slot=slot,
-                    scheduled_at=cls._randomize_slot(slot, now_utc),
+                    scheduled_at=cls._scheduled_at_for(project_id, slot, now_utc),
                     available=True,
                 )
                 continue
@@ -415,7 +523,7 @@ class SchedulingService:
                 continue
             resolved[platform] = ResolvedSlot(
                 slot=free_avail.slot,
-                scheduled_at=cls._randomize_slot(free_avail.slot, now_utc),
+                scheduled_at=cls._scheduled_at_for(project_id, free_avail.slot, now_utc),
                 available=True,
             )
 
@@ -456,22 +564,47 @@ class SchedulingService:
         project: Project,
         account_id: str,
         platform: str,
+        not_before: datetime | None = None,
     ) -> tuple[datetime, datetime]:
         """Reserve a single platform slot on `project` in memory (no save).
 
-        Reuses an existing per-platform reservation when still valid. Always
-        re-collects the reserved-slots set so sibling reservations made earlier
-        in the same call are seen.
+        Reuses an existing per-platform reservation when still valid and not
+        earlier than `not_before` (the TikTok anchor). Always re-collects the
+        reserved-slots set so sibling reservations made earlier in the same
+        call are seen. An expired manual reservation raises instead of
+        silently falling back to the slot system.
         """
+        existing = (project.platform_schedules or {}).get(platform)
         reused = cls._try_reuse_platform_reservation(project, account_id, platform)
         if reused is not None:
-            return reused
+            is_manual = existing is not None and existing.manual
+            if is_manual or not_before is None or reused[0] >= not_before:
+                return reused
+            # Non-manual reservation sits before the TikTok anchor: re-reserve.
+        elif (
+            existing is not None
+            and existing.manual
+            and project.scheduled_account_id == account_id
+        ):
+            raise ValueError(f"manual_schedule_expired:{platform}")
 
-        slot_dt, scheduled_at = cls.find_next_slot_for_platform(account_id, platform)
+        slot_dt, scheduled_at = cls.find_next_slot_for_platform(
+            account_id, platform, project_id=project.id, not_before=not_before
+        )
         schedules = dict(project.platform_schedules or {})
         schedules[platform] = PlatformSchedule(slot=slot_dt, scheduled_at=scheduled_at)
         project.platform_schedules = schedules
         return slot_dt, scheduled_at
+
+    @classmethod
+    def _tiktok_anchor_for(
+        cls, project: Project, account_id: str
+    ) -> datetime | None:
+        """The project's TikTok slot, if reserved under `account_id`."""
+        if project.scheduled_account_id != account_id:
+            return None
+        tt = (project.platform_schedules or {}).get("tiktok")
+        return cls._normalize_utc_datetime(tt.slot) if tt is not None else None
 
     @classmethod
     def reserve_next_platform_slot(
@@ -486,11 +619,14 @@ class SchedulingService:
             if project is None:
                 raise ValueError("Project not found")
 
-            reused = cls._try_reuse_platform_reservation(project, account_id, platform)
-            if reused is not None:
-                return reused
-
-            slot_dt, scheduled_at = cls._reserve_platform_inplace(project, account_id, platform)
+            not_before = (
+                cls._tiktok_anchor_for(project, account_id)
+                if platform != "tiktok"
+                else None
+            )
+            slot_dt, scheduled_at = cls._reserve_platform_inplace(
+                project, account_id, platform, not_before=not_before
+            )
             cls._validate_duplication_restrictions(project, account_id, [slot_dt])
             project.scheduled_account_id = account_id
             cls._recompute_aggregates(project)
@@ -506,6 +642,11 @@ class SchedulingService:
     ) -> dict[str, tuple[datetime, datetime]]:
         """Atomically reserve slots for every requested platform on the project.
 
+        TikTok is reserved first and its slot becomes the anchor: every other
+        platform takes its first free slot at or after it, so no platform ever
+        publishes before TikTok. Without TikTok in the mix, platforms keep the
+        independent nearest-slot behavior.
+
         Holds the reservation lock once so sibling platforms in the same call
         never collide with each other. Reuses valid per-platform reservations.
         """
@@ -519,9 +660,18 @@ class SchedulingService:
             if project.scheduled_account_id and project.scheduled_account_id != account_id:
                 project.platform_schedules = {}
 
+            ordered = sorted(platforms, key=lambda p: p != "tiktok")
+            tiktok_anchor: datetime | None = None
             results: dict[str, tuple[datetime, datetime]] = {}
-            for platform in platforms:
-                results[platform] = cls._reserve_platform_inplace(project, account_id, platform)
+            for platform in ordered:
+                results[platform] = cls._reserve_platform_inplace(
+                    project,
+                    account_id,
+                    platform,
+                    not_before=None if platform == "tiktok" else tiktok_anchor,
+                )
+                if platform == "tiktok":
+                    tiktok_anchor = results[platform][0]
 
             cls._validate_duplication_restrictions(
                 project, account_id, [slot for slot, _ in results.values()]
@@ -539,6 +689,7 @@ class SchedulingService:
         tiktok_slot: datetime,
         overrides: dict[str, datetime] | None = None,
         steals: dict[str, StealSpec] | None = None,
+        allow_before_tiktok: bool = False,
     ) -> tuple[dict[str, PlatformSchedule], dict[str, SwitchResult]]:
         """Reserve TT (anchor) + each other configured platform on `project`.
 
@@ -583,6 +734,8 @@ class SchedulingService:
                 if plan.blockers:
                     summary = ", ".join(f"{b.platform}:{b.reason}" for b in plan.blockers)
                     raise ValueError(f"Switch blocked: {summary}")
+                if not allow_before_tiktok:
+                    cls._raise_if_displaced_precedence_broken(plan.precedence_warnings)
                 steal_plans.append((platform, plan))
                 applied_switches[platform] = result
 
@@ -611,7 +764,9 @@ class SchedulingService:
                 cls._apply_displacements(platform, plan.displaced, now_utc)
 
             try:
-                resolution = cls.resolve_anchor(account_id, anchor, overrides)
+                resolution = cls.resolve_anchor(
+                    account_id, anchor, overrides, project_id=project_id
+                )
                 if resolution.conflicts:
                     conflict_summary = ", ".join(
                         f"{c.platform}:{c.reason}" for c in resolution.conflicts
@@ -693,6 +848,7 @@ class SchedulingService:
         tiktok_slot: datetime,
         overrides: dict[str, datetime] | None = None,
         steals: dict[str, StealSpec] | None = None,
+        allow_before_tiktok: bool = False,
     ) -> tuple[dict[str, PlatformSchedule], dict[str, SwitchResult]]:
         """Re-anchor a project's reservations on a new TT slot."""
         with cls._reservation_lock:
@@ -715,11 +871,16 @@ class SchedulingService:
             tiktok_slot=tiktok_slot,
             overrides=overrides,
             steals=steals,
+            allow_before_tiktok=allow_before_tiktok,
         )
 
     @classmethod
     def reschedule_platform(
-        cls, project_id: str, platform: str, new_slot: datetime
+        cls,
+        project_id: str,
+        platform: str,
+        new_slot: datetime,
+        allow_before_tiktok: bool = False,
     ) -> PlatformSchedule:
         """Replace a single platform's slot. Validates against the pool."""
         with cls._reservation_lock:
@@ -734,6 +895,10 @@ class SchedulingService:
             slot = cls._normalize_utc_datetime(new_slot)
             if not cls._is_slot_in_account_config(account_id, platform, slot):
                 raise ValueError(f"Slot {slot.isoformat()} not configured for {platform}")
+            if not allow_before_tiktok and cls._breaks_tiktok_precedence(
+                project, platform, slot
+            ):
+                raise ValueError("tiktok_precedence")
 
             # Free old slot before checking pool: must NOT see ourselves as taking it.
             schedules = dict(project.platform_schedules or {})
@@ -753,7 +918,7 @@ class SchedulingService:
 
                 new_sched = PlatformSchedule(
                     slot=slot,
-                    scheduled_at=cls._randomize_slot(slot, now_utc),
+                    scheduled_at=cls._scheduled_at_for(project_id, slot, now_utc),
                 )
                 schedules[platform] = new_sched
                 project.platform_schedules = schedules
@@ -912,17 +1077,23 @@ class SchedulingService:
     def compute_cascade(cls, project_id: str, account_id: str) -> CascadeResult:
         """Pure simulation: which projects move where if `project_id` jumps in.
 
-        Anchor per platform = first configured slot >= now+30min.
+        TikTok-first: TikTok's anchor = first configured slot >= now+30min;
+        every other platform's anchor = its first configured slot >= the
+        TikTok anchor (no platform lands before TikTok). Without TikTok,
+        each platform anchors independently at now+30min.
         Cascade rule: occupant of anchor slot moves to next configured slot;
         if that's also taken, occupant moves further; repeat until empty slot
         or lookahead window exhausted.
         """
         platforms = cls._platforms_for_project(project_id, account_id)
+        if "tiktok" in platforms:
+            platforms = ["tiktok"] + [p for p in platforms if p != "tiktok"]
         per_platform: list[CascadePlatform] = []
         blockers: list[CascadeBlocker] = []
         now_utc = datetime.now(timezone.utc)
         earliest_allowed = now_utc + timedelta(minutes=cls._MIN_LEAD_MINUTES)
         fb_horizon = now_utc + timedelta(days=29)
+        tiktok_anchor: datetime | None = None
 
         for platform in platforms:
             busy, _busy_pid = cls._pool_is_busy_uploading(account_id, platform)
@@ -930,10 +1101,15 @@ class SchedulingService:
                 blockers.append(CascadeBlocker(platform, "pool_busy"))
                 continue
 
-            anchor = cls._earliest_slot_at_or_after(account_id, platform, earliest_allowed)
+            lower_bound = earliest_allowed
+            if platform != "tiktok" and tiktok_anchor is not None:
+                lower_bound = max(earliest_allowed, tiktok_anchor)
+            anchor = cls._earliest_slot_at_or_after(account_id, platform, lower_bound)
             if anchor is None:
                 blockers.append(CascadeBlocker(platform, "pool_full"))
                 continue
+            if platform == "tiktok":
+                tiktok_anchor = anchor
 
             pool_key = cls._resolve_pool_key(account_id, platform)
 
@@ -974,12 +1150,13 @@ class SchedulingService:
                 continue
 
             target_slot = anchor
-            target_scheduled_at = cls._randomize_slot(target_slot, now_utc)
+            target_scheduled_at = cls._scheduled_at_for(project_id, target_slot, now_utc)
             per_platform.append(CascadePlatform(
                 platform=platform,
                 target_slot=target_slot,
                 target_scheduled_at=target_scheduled_at,
                 displaced=displaced,
+                precedence_warnings=cls._displaced_tiktok_warnings(platform, displaced),
             ))
 
         return CascadeResult(per_platform=per_platform, blockers=blockers)
@@ -1064,6 +1241,13 @@ class SchedulingService:
                     ),
                 ))
 
+        cascade.precedence_warnings = cls._displaced_tiktok_warnings(
+            platform, cascade.displaced
+        )
+        next_free.precedence_warnings = cls._displaced_tiktok_warnings(
+            platform, next_free.displaced
+        )
+
         uploaded_count = sum(
             1 for d in cascade.displaced if d.requires_platform_notification
         )
@@ -1089,7 +1273,7 @@ class SchedulingService:
             schedules = dict(project.platform_schedules or {})
             schedules[platform] = PlatformSchedule(
                 slot=item.to_slot,
-                scheduled_at=cls._randomize_slot(item.to_slot, now_utc),
+                scheduled_at=cls._scheduled_at_for(item.project_id, item.to_slot, now_utc),
             )
             project.platform_schedules = schedules
             cls._recompute_aggregates(project)
@@ -1104,6 +1288,7 @@ class SchedulingService:
         slot: datetime,
         mode: str,
         expected_occupant_id: str | None,
+        allow_before_tiktok: bool = False,
     ) -> SwitchResult:
         """Steal `slot` on `platform`: displace the occupant per `mode`."""
         with cls._reservation_lock:
@@ -1114,21 +1299,32 @@ class SchedulingService:
             if plan.blockers:
                 summary = ", ".join(f"{b.platform}:{b.reason}" for b in plan.blockers)
                 raise ValueError(f"Switch blocked: {summary}")
+            if not allow_before_tiktok:
+                cls._raise_if_displaced_precedence_broken(plan.precedence_warnings)
 
-            now_utc = datetime.now(timezone.utc)
-            cls._apply_displacements(platform, plan.displaced, now_utc)
-
+            # Validate the switcher BEFORE persisting any displacement, so a
+            # rejection leaves zero side effects.
             switcher = ProjectService.load(project_id)
             if switcher is None:
                 raise ValueError("Project not found")
             if cls.tiktok_timing_locked(switcher):
                 raise ValueError("timing_locked")
+            slot_utc = cls._normalize_utc_datetime(slot)
+            if (
+                not allow_before_tiktok
+                and switcher.scheduled_account_id == account_id
+                and cls._breaks_tiktok_precedence(switcher, platform, slot_utc)
+            ):
+                raise ValueError("tiktok_precedence")
+
+            now_utc = datetime.now(timezone.utc)
+            cls._apply_displacements(platform, plan.displaced, now_utc)
+
             if switcher.scheduled_account_id and switcher.scheduled_account_id != account_id:
                 switcher.platform_schedules = {}
             schedules = dict(switcher.platform_schedules or {})
-            slot_utc = cls._normalize_utc_datetime(slot)
             schedules[platform] = PlatformSchedule(
-                slot=slot_utc, scheduled_at=cls._randomize_slot(slot_utc, now_utc)
+                slot=slot_utc, scheduled_at=cls._scheduled_at_for(project_id, slot_utc, now_utc)
             )
             switcher.platform_schedules = schedules
             switcher.scheduled_account_id = account_id
@@ -1137,13 +1333,19 @@ class SchedulingService:
             return result
 
     @classmethod
-    def apply_cascade(cls, project_id: str, account_id: str) -> CascadeResult:
+    def apply_cascade(
+        cls, project_id: str, account_id: str, allow_before_tiktok: bool = False
+    ) -> CascadeResult:
         """Compute and persist a cascade. Reserves the urgent project's slots."""
         with cls._reservation_lock:
             result = cls.compute_cascade(project_id, account_id)
             if result.blockers:
                 summary = ", ".join(f"{b.platform}:{b.reason}" for b in result.blockers)
                 raise ValueError(f"Cascade blocked: {summary}")
+            if not allow_before_tiktok:
+                cls._raise_if_displaced_precedence_broken(
+                    [w for plat in result.per_platform for w in plat.precedence_warnings]
+                )
 
             urgent = ProjectService.load(project_id)
             if urgent is None:
@@ -1162,7 +1364,9 @@ class SchedulingService:
                     schedules = dict(project.platform_schedules or {})
                     schedules[plat.platform] = PlatformSchedule(
                         slot=item.to_slot,
-                        scheduled_at=cls._randomize_slot(item.to_slot, now_utc),
+                        scheduled_at=cls._scheduled_at_for(
+                            item.project_id, item.to_slot, now_utc
+                        ),
                     )
                     project.platform_schedules = schedules
                     cls._recompute_aggregates(project)

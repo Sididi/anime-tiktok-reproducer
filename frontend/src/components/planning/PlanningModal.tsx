@@ -12,6 +12,7 @@ import { PlanningHeader } from "./PlanningHeader";
 import { PlanningCalendar } from "./PlanningCalendar";
 import { EventPopover } from "./EventPopover";
 import { SlotPickerPopover } from "@/components/project-manager/SlotPickerPopover";
+import { confirmTikTokPrecedence } from "@/utils/tiktokPrecedence";
 
 const LS_ACCOUNT = "atr.planning.account_id";
 const LS_PLATFORMS = "atr.planning.platforms";
@@ -289,17 +290,27 @@ export function PlanningModal({ open, onClose }: PlanningModalProps) {
               initialIso={reslottingSingle.slot}
               onClose={() => setReslottingSingle(null)}
               onConfirm={async (payload) => {
+                // The backend rejects moves that would break TikTok
+                // precedence (409); the user can confirm to force the move.
                 if ("slot" in payload && payload.steal) {
-                  const res = await api.switchApply(
-                    reslottingSingle.project_id,
-                    {
+                  const doApply = (confirm_before_tiktok: boolean) =>
+                    api.switchApply(reslottingSingle.project_id, {
                       account_id: reslottingSingle.account_id,
                       platform: reslottingSingle.platform,
                       slot: payload.slot,
-                      mode: payload.steal.mode,
-                      expected_occupant_id: payload.steal.expected_occupant_id,
-                    },
-                  );
+                      mode: payload.steal!.mode,
+                      expected_occupant_id: payload.steal!.expected_occupant_id,
+                      confirm_before_tiktok,
+                    });
+                  let res;
+                  try {
+                    res = await doApply(false);
+                  } catch (err) {
+                    const confirmed = confirmTikTokPrecedence(err);
+                    if (confirmed === null) throw err;
+                    if (!confirmed) return;
+                    res = await doApply(true);
+                  }
                   if (
                     Object.values(res.notification_status).includes(
                       "pending_retry",
@@ -310,11 +321,23 @@ export function PlanningModal({ open, onClose }: PlanningModalProps) {
                     );
                   }
                 } else if ("slot" in payload) {
-                  await api.reschedulePlatform(
-                    reslottingSingle.project_id,
-                    reslottingSingle.platform,
-                    payload.slot,
-                  );
+                  try {
+                    await api.reschedulePlatform(
+                      reslottingSingle.project_id,
+                      reslottingSingle.platform,
+                      payload.slot,
+                    );
+                  } catch (err) {
+                    const confirmed = confirmTikTokPrecedence(err);
+                    if (confirmed === null) throw err;
+                    if (!confirmed) return;
+                    await api.reschedulePlatform(
+                      reslottingSingle.project_id,
+                      reslottingSingle.platform,
+                      payload.slot,
+                      true,
+                    );
+                  }
                 }
                 setReslottingSingle(null);
                 setPopover(null);
@@ -362,7 +385,17 @@ export function PlanningModal({ open, onClose }: PlanningModalProps) {
                     platforms,
                   });
                 } else if ("tiktok_slot" in payload) {
-                  await api.rescheduleAnchor(reAnchoring.project_id, payload);
+                  try {
+                    await api.rescheduleAnchor(reAnchoring.project_id, payload);
+                  } catch (err) {
+                    const confirmed = confirmTikTokPrecedence(err);
+                    if (confirmed === null) throw err;
+                    if (!confirmed) return;
+                    await api.rescheduleAnchor(reAnchoring.project_id, {
+                      ...payload,
+                      confirm_before_tiktok: true,
+                    });
+                  }
                 }
                 setReAnchoring(null);
                 setPopover(null);

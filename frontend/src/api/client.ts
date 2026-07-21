@@ -1213,6 +1213,7 @@ export const api = {
       tiktok_slot: string;
       overrides?: Partial<Record<import("@/types").Platform, string>>;
       steals?: Partial<Record<import("@/types").Platform, import("@/types").StealSpec>>;
+      confirm_before_tiktok?: boolean;
     },
   ): Promise<{
     platform_schedules: Record<string, { slot: string; scheduled_at: string }>;
@@ -1227,6 +1228,7 @@ export const api = {
     project_id: string,
     platform: import("@/types").Platform,
     new_slot: string,
+    confirm_before_tiktok = false,
   ): Promise<{
     slot: string;
     scheduled_at: string;
@@ -1234,7 +1236,7 @@ export const api = {
   }> {
     return request(`/scheduling/projects/${project_id}/platforms/${platform}`, {
       method: "PATCH",
-      body: JSON.stringify({ new_slot }),
+      body: JSON.stringify({ new_slot, confirm_before_tiktok }),
     });
   },
 
@@ -1244,6 +1246,7 @@ export const api = {
       tiktok_slot: string;
       overrides?: Partial<Record<import("@/types").Platform, string>>;
       steals?: Partial<Record<import("@/types").Platform, import("@/types").StealSpec>>;
+      confirm_before_tiktok?: boolean;
     },
   ): Promise<{
     platform_schedules: Record<string, { slot: string; scheduled_at: string }>;
@@ -1286,6 +1289,7 @@ export const api = {
   async cascadeApply(
     project_id: string,
     account_id: string,
+    confirm_before_tiktok = false,
   ): Promise<
     import("@/types").CascadePreview & {
       notification_status: Record<string, Record<string, string>>;
@@ -1293,7 +1297,7 @@ export const api = {
   > {
     return request(`/scheduling/projects/${project_id}/cascade-apply`, {
       method: "POST",
-      body: JSON.stringify({ account_id }),
+      body: JSON.stringify({ account_id, confirm_before_tiktok }),
     });
   },
 
@@ -1339,6 +1343,7 @@ export const api = {
       slot: string;
       mode: import("@/types").SwitchMode;
       expected_occupant_id: string | null;
+      confirm_before_tiktok?: boolean;
     },
   ): Promise<
     import("@/types").SwitchPreview & {
