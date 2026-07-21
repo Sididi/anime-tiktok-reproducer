@@ -7,6 +7,7 @@ from typing import Any, Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from zoneinfo import ZoneInfo
 import logging
+import re
 import shutil
 import tempfile
 import threading
@@ -71,6 +72,54 @@ def _uploaded_fields(project: "Project") -> dict[str, Any]:
     return {
         "uploaded": has_discord,
         "uploaded_status": "green" if has_discord else "red",
+    }
+
+
+def _upload_locked(project: "Project") -> bool:
+    """True when the manager's Upload action is disabled for this project.
+
+    Mirrors the frontend rule (`uploaded_status !== "red"`): the project is
+    already posted, or scheduled with a dispatched upload. Drive readiness is
+    irrelevant to such rows, so the manager view skips their Drive lookups.
+    """
+    return _uploaded_fields(project)["uploaded_status"] != "red"
+
+
+# Drive file ids as they appear in webViewLink (/file/d/<id>/view) and in the
+# direct-download URL (?id=<id>&export=download).
+_DRIVE_FILE_ID_PATTERNS = (
+    re.compile(r"/file/d/([A-Za-z0-9_-]+)"),
+    re.compile(r"[?&]id=([A-Za-z0-9_-]+)"),
+)
+
+
+def _persisted_drive_video(project: "Project") -> dict[str, Any] | None:
+    """Final-video Drive info recovered from the persisted upload result.
+
+    Uploads persist `drive_video_id`/`drive_video_name` explicitly; older
+    projects only stored the video URLs, so fall back to extracting the file
+    id from them.
+    """
+    result = project.upload_last_result or {}
+    video_id = result.get("drive_video_id")
+    web_url = result.get("drive_video_url")
+    if not video_id:
+        for url in (web_url, result.get("direct_drive_download")):
+            if not url:
+                continue
+            for pattern in _DRIVE_FILE_ID_PATTERNS:
+                match = pattern.search(str(url))
+                if match:
+                    video_id = match.group(1)
+                    break
+            if video_id:
+                break
+    if not video_id:
+        return None
+    return {
+        "id": video_id,
+        "name": result.get("drive_video_name"),
+        "webViewLink": web_url if web_url and "/file/d/" in str(web_url) else None,
     }
 
 
@@ -173,6 +222,29 @@ class UploadPhaseService:
         if not found:
             return None, None
         return found["id"], found.get("webViewLink")
+
+    @classmethod
+    def _resolve_drive_folder_offline(
+        cls,
+        project: Project,
+        folder_candidates_by_name: dict[str, dict[str, Any]] | None,
+    ) -> tuple[str | None, str | None]:
+        """Folder id/url from persisted project data or an already-fetched
+        folder listing — never issues a Drive call."""
+        if project.drive_folder_id:
+            url = project.drive_folder_url or (
+                f"https://drive.google.com/drive/folders/{project.drive_folder_id}"
+            )
+            return project.drive_folder_id, url
+        if folder_candidates_by_name:
+            found = folder_candidates_by_name.get(ExportService.output_folder_name(project))
+            if found:
+                folder_id = found["id"]
+                folder_url = found.get("webViewLink") or (
+                    f"https://drive.google.com/drive/folders/{folder_id}"
+                )
+                return folder_id, folder_url
+        return None, None
 
     @classmethod
     def _ensure_drive_video(cls, project, readiness: "UploadReadiness") -> tuple[str | None, str | None]:
@@ -321,7 +393,15 @@ class UploadPhaseService:
         local_videos: dict[str, Path | None] = {
             project.id: LanTransferService.find_local_upload_video(project.id) for project in projects
         }
+        # Upload-locked rows (already posted, or scheduled with a dispatched
+        # upload) render with the Upload button disabled, so their Drive
+        # readiness is never shown: keep them out of the batch video lookup
+        # and serve their video/folder info from persisted data instead.
+        upload_locked: dict[str, bool] = {
+            project.id: _upload_locked(project) for project in projects
+        }
         folder_candidates_by_name: dict[str, dict[str, Any]] = {}
+        folder_listing_ok = False
         drive_root_videos: dict[str, list[dict[str, Any]]] = {}
         drive_batch_lookup_failed = False
         if GoogleDriveService.is_configured():
@@ -331,7 +411,7 @@ class UploadPhaseService:
                     folder_candidates_by_name = GoogleDriveService.list_project_folders_under_parent(drive=drive)
                     folder_ids: list[str] = []
                     for project in projects:
-                        if local_videos[project.id] is not None:
+                        if local_videos[project.id] is not None or upload_locked[project.id]:
                             continue
                         folder_id, _ = cls._resolve_drive_folder(
                             project,
@@ -350,6 +430,7 @@ class UploadPhaseService:
                         for folder_id, files in drive_root_videos.items()
                     }
                     drive_batch_lookup_failed = False
+                    folder_listing_ok = True
                     break
                 except Exception as exc:
                     drive_batch_lookup_failed = True
@@ -380,10 +461,28 @@ class UploadPhaseService:
                     video_files=[],
                     local_video=local_video,
                 )
+            elif upload_locked[project.id]:
+                # Upload-locked: the row's readiness is never surfaced, so
+                # answer from persisted data (folder link, preview video id)
+                # without touching Drive or the shared video cache.
+                folder_id, folder_url = cls._resolve_drive_folder_offline(
+                    project, folder_candidates_by_name
+                )
+                video = _persisted_drive_video(project) or cls._cached_drive_video(
+                    project_id=project.id,
+                    folder_id=folder_id,
+                )
+                readiness = cls._build_readiness(
+                    metadata_exists=metadata_exists,
+                    folder_id=folder_id,
+                    folder_url=folder_url,
+                    video_files=[video] if video else [],
+                    video_lookup_failed=video is None,
+                )
             else:
                 folder_id, folder_url = cls._resolve_drive_folder(
                     project,
-                    folder_candidates_by_name=folder_candidates_by_name if folder_candidates_by_name else None,
+                    folder_candidates_by_name=folder_candidates_by_name if folder_listing_ok else None,
                     resolve_remote_url=False,
                 )
                 video_files = drive_root_videos.get(folder_id or "", [])
@@ -1188,6 +1287,8 @@ class UploadPhaseService:
             "requested_platforms": list(requested_platforms),
             "drive_video_url": drive_video_url,
             "direct_drive_download": direct_drive_download,
+            "drive_video_id": drive_video_id,
+            "drive_video_name": drive_video_name,
             **instagram_drive_metadata,
         }
 
