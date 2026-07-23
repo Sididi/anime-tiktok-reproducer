@@ -1545,12 +1545,25 @@
   function setTrackItemEndSeconds(item, endSec) {
     if (!item || typeof endSec !== "number") return false;
     try {
-      item.end = endSec;
-      return true;
+      // TrackItem.end is documented as a Time object. Use that form first so
+      // Premiere cannot silently interpret a seconds number as raw ticks.
+      item.end = buildSequenceTimeFromSeconds(endSec);
+      var timeEndSec = getTrackItemEndSeconds(item);
+      if (
+        typeof timeEndSec === "number" &&
+        Math.abs(timeEndSec - endSec) <= 1 / SEQ_FPS
+      ) {
+        return true;
+      }
     } catch (e0) {}
     try {
-      item.end = buildSequenceTimeFromSeconds(endSec);
-      return true;
+      // Compatibility fallback for Premiere versions that accept seconds.
+      item.end = endSec;
+      var numericEndSec = getTrackItemEndSeconds(item);
+      return (
+        typeof numericEndSec === "number" &&
+        Math.abs(numericEndSec - endSec) <= 1 / SEQ_FPS
+      );
     } catch (e1) {}
     return false;
   }
@@ -1561,16 +1574,14 @@
       return null;
     }
     if (!sequence || !track) {
-      log("Warning: V2 track unavailable; Border Mogrt not inserted.");
-      return null;
+      throw new Error(
+        "V2 track unavailable; required Border Mogrt not inserted.",
+      );
     }
     if (!new File(BORDER_MOGRT_PATH).exists) {
-      log(
-        "Warning: Border Mogrt file missing at " +
-          BORDER_MOGRT_PATH +
-          "; border not inserted.",
+      throw new Error(
+        "Required Border Mogrt file missing at " + BORDER_MOGRT_PATH + ".",
       );
-      return null;
     }
 
     // V2 is dedicated to the white border. Check the timeline before importing
@@ -1585,10 +1596,16 @@
       borderAttempt <= BORDER_MOGRT_MAX_ATTEMPTS && !borderItem;
       borderAttempt++
     ) {
+      var importedBorderCandidate = null;
       try {
         perfCounterInc("importMGTCalls");
         // Premiere's API requires insertion time as a string of ticks.
-        borderItem = sequence.importMGT(BORDER_MOGRT_PATH, "0", 1, 0);
+        importedBorderCandidate = sequence.importMGT(
+          BORDER_MOGRT_PATH,
+          "0",
+          1,
+          0,
+        );
       } catch (eBorder) {
         log(
           "Border Mogrt attempt " +
@@ -1598,9 +1615,43 @@
         );
       }
 
-      if (!borderItem) {
-        // importMGT can finish updating the timeline after its return value is
-        // available. Refresh and inspect V2 before deciding the attempt failed.
+      // Never trust importMGT's return value alone. In a reused Premiere
+      // session it can return a TrackItem that never appears in V2.
+      refreshSequenceUI(sequence);
+      borderItem = waitForTrackItemAtStart(
+        track,
+        0,
+        null,
+        BORDER_MOGRT_WAIT_MAX_MS,
+      );
+
+      var importedBorderProjectItem = null;
+      try {
+        importedBorderProjectItem = importedBorderCandidate
+          ? importedBorderCandidate.projectItem
+          : null;
+      } catch (eBorderProjectItem) {
+        importedBorderProjectItem = null;
+      }
+
+      if (!borderItem && importedBorderProjectItem) {
+        log(
+          "Border Mogrt attempt " +
+            borderAttempt +
+            " returned a non-persisted item; placing its project item on V2...",
+        );
+        try {
+          // importMGT has already materialized the MOGRT project item. Standard
+          // overwrite placement is more reliable than repeating the import.
+          track.overwriteClip(importedBorderProjectItem, "0");
+        } catch (eOverwriteBorder) {
+          log(
+            "Border Mogrt overwrite fallback error: " +
+              (eOverwriteBorder && eOverwriteBorder.message
+                ? eOverwriteBorder.message
+                : eOverwriteBorder),
+          );
+        }
         refreshSequenceUI(sequence);
         borderItem = waitForTrackItemAtStart(
           track,
@@ -1621,23 +1672,21 @@
     }
 
     if (!borderItem) {
-      log(
-        "Warning: Border Mogrt could not be found on V2 after " +
+      throw new Error(
+        "Required Border Mogrt could not be found on V2 after " +
           BORDER_MOGRT_MAX_ATTEMPTS +
-          " attempts; V2 border is missing.",
+          " attempts.",
       );
-      return null;
     }
 
     if (!setTrackItemEndSeconds(borderItem, endSec)) {
-      log(
-        "Warning: Border Mogrt inserted but end time could not be set to " +
+      throw new Error(
+        "Border Mogrt exists on V2 but its end time could not be verified at " +
           endSec +
           "s.",
       );
-    } else {
-      log("Border Mogrt verified on V2. Duration: " + endSec);
     }
+    log("Border Mogrt verified on V2. Duration: " + endSec);
     return borderItem;
   }
 

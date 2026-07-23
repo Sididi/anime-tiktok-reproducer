@@ -139,8 +139,20 @@ def test_jsx_verifies_white_border_after_subtitle_mogrt_warmup():
     )
     assert subtitle_import < border_import
 
-    assert 'sequence.importMGT(BORDER_MOGRT_PATH, "0", 1, 0)' in jsx
+    assert "importedBorderCandidate = sequence.importMGT(" in jsx
+    assert 'BORDER_MOGRT_PATH,\n          "0",\n          1,\n          0,' in jsx
     assert "sequence.importMGT(BORDER_MOGRT_PATH, 0, 1, 0)" not in jsx
     assert "BORDER_MOGRT_MAX_ATTEMPTS = 5" in jsx
-    assert "waitForTrackItemAtStart(" in jsx
+    assert "borderItem = waitForTrackItemAtStart(" in jsx
+    assert "track.overwriteClip(importedBorderProjectItem, \"0\")" in jsx
+    assert "Required Border Mogrt could not be found on V2" in jsx
     assert "Border Mogrt verified on V2" in jsx
+
+
+def test_jsx_verifies_border_end_with_documented_time_object():
+    jsx = _render(title=True, category=True)
+
+    time_assignment = jsx.index("item.end = buildSequenceTimeFromSeconds(endSec);")
+    numeric_fallback = jsx.index("item.end = endSec;", time_assignment)
+    assert time_assignment < numeric_fallback
+    assert "Math.abs(timeEndSec - endSec) <= 1 / SEQ_FPS" in jsx
