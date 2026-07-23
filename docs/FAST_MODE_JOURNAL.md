@@ -365,6 +365,106 @@ GT project folders, `anime_searcher` submodule, and `backend/data/
 eval_waivers.json` untouched (evaluations are read-only against them; no
 diffs). Evaluations run strictly sequentially, one GT project at a time.
 
+## vF10 — Fast Matching Round 2, Task 2: profiling baseline (2026-07-24)
+
+**Step 1 — `_prof` dump**: already present. `_stage5_refine`'s `finally`
+block (`scene_aligner.py:5934-5938`) already prints the stage-5 `_prof` dict
+(`rect`/`cur`/`cand`/`recall`, seconds) under `ATR_RERANK_DEBUG`, tagged
+`[prof]` (not `[s5prof]` as the brief's illustrative snippet used — same
+dict, same gate, pre-existing code, no functional gap). No code change
+needed; `git status` on this task's start and end is otherwise clean besides
+the journal edit.
+
+**Step 2/3 — profiled the two heavies**, `ATR_RERANK_DEBUG=1`, same
+`--matcher aligner [--save-generated-json ...]` invocation as vF9, run
+strictly sequentially in the foreground (one `pixi run python
+scripts/evaluate_matching_against_ground_truth.py <pid> --matcher aligner`
+per heavy, 600s Bash timeout, nothing else heavy running — GPU idle 74MiB/
+8188MiB before starting). Logs teed to
+`/tmp/claude-1000/-home-sid-Projects-anime-tiktok-reproducer/277f86be-e242-4349-a808-205fb701a97f/scratchpad/vf10_prof_{85de,411f}.log`.
+
+**Hash-inertness re-confirmed**: `ref_hash.py` over each debug run's
+`--save-generated-json` output reproduces the exact vF9 r2ref hash for both
+heavies —
+
+| project | vF10 hash (debug run) | vF9 r2ref hash | match |
+|---|---|---|---|
+| 85de83ca6323 | `b7034eaf7a249ff257d9a4156e80b67d27aef4f618b5f830ded990a5a5865f86` | same | identical |
+| 411f73d26c1d | `fe9393966d95e02d849e9e7ef65300654022f68fc7771ded8b2e0f63e5a3bd2b` | same | identical |
+
+`ATR_RERANK_DEBUG=1` stays decision-inert, per the GOAL v5 M0 precedent.
+
+**vF10 phase-timing table (single debug run per heavy, elapsed within vF9's
+run-to-run spread):**
+
+| project | elapsed | scene/source verdict | stage-5 `[prof]` (s) | `[winprof]` (s) | `aligner_refine_build_seconds` |
+|---|---:|---|---|---|---:|
+| 85de83ca6323 | 292.6s | Scene exact=52/54,loose=2; Source exact=52/54,loose=1,failed=1 | rect=26.9, cur=19.9, cand=144.3, recall=0.2 | decode=75.1, embed=99.9 | 234.44s |
+| 411f73d26c1d | 324.8s | Scene exact=52/52; Source exact=50/52,loose=1,wrong_primary=1 | rect=29.1, cur=25.2, cand=97.8, recall=0.8 | decode=64.9, embed=96.9 | 219.88s |
+
+(Scene/source verdicts and generated/GT scene counts match vF9 exactly for
+both projects — 59/54 and 78/52 — consistent with the hash match above; not
+re-derived here, see vF9 table.)
+
+Full `aligner_*_seconds` breakdown (both heavies), for completeness:
+
+| phase | 85de83ca6323 | 411f73d26c1d |
+|---|---:|---:|
+| aligner_segment_seconds | 1.99s | 10.27s |
+| aligner_sample_seconds | 20.91s | 34.20s |
+| aligner_variant_retrieve_seconds | — | 16.51s |
+| aligner_retrieve_seconds | 0.14s | 0.69s |
+| aligner_refine_build_seconds | 234.44s | 219.88s |
+| aligner_interior_split_seconds | 12.58s | 18.03s |
+| aligner_merge_seconds | 1.11s | 1.55s |
+| aligner_presnap_seconds | 0.00s | 0.00s |
+
+`aligner_refine_build_seconds` (the `_stage5_refine` call) dominates total
+aligner time on both heavies (234.44s of the 273.1s aligner phase = ~86% for
+85de; 219.88s of the 302.8s aligner phase = ~73% for 411f) and is exactly
+the phase the `[prof]` rect/cur/cand/recall split decomposes.
+
+**Derived decision 1 — Task 6 (A4) go/no-go**: rule is *go only if
+`rect + cur ≥ 20s` on either heavy*.
+
+- 85de83ca6323: rect(26.9) + cur(19.9) = **46.8s** ≥ 20s
+- 411f73d26c1d: rect(29.1) + cur(25.2) = **54.3s** ≥ 20s
+
+Both heavies clear the 20s bar by more than 2×, so **Task 6 (A4): GO.**
+
+**Derived decision 2 — Task 7 (B1) sizing note**: the `[winprof] embed=`
+total (99.9s / 96.9s) is a cumulative counter over the whole `_stage5_refine`
+call, not scoped per `_prof` phase, so it cannot be split exactly by phase;
+the operational estimate here is `embed / (cand + cur)` — the fraction of
+the two wide-sweep, window-scoring phases' wall time that is upper-bounded
+by embed compute (cand does exhaustive candidate-window scoring, cur does
+current-window scoring; both call the embed cache):
+
+- 85de83ca6323: cand+cur = 144.3+19.9 = 164.2s; embed=99.9s → **~61%** of
+  wide-sweep wall time is embed-bound.
+- 411f73d26c1d: cand+cur = 97.8+25.2 = 123.0s; embed=96.9s → **~79%** of
+  wide-sweep wall time is embed-bound.
+
+**B1 payoff estimate**: wide-sweep (`cand`+`cur`) phases are 164.2s/292.6s
+(~56%) of 85de's total run and 123.0s/324.8s (~38%) of 411f's. The `[winprof]
+embed=` totals (99.9s / 96.9s) are themselves entirely attributable to those
+wide-sweep phases (nothing else in `_stage5_refine` touches the embed
+cache), so a B1 optimization that drove embed cost to zero in the
+wide-sweep path has a theoretical ceiling of roughly **~100s (85de) / ~97s
+(411f)** of the current per-project wall time — i.e. B1 is sized as the
+largest single lever surfaced by this profiling pass (bigger than the A4
+rect+cur target, ~47-54s). This is an upper bound (embed cannot realistically
+reach zero); actual achievable savings depend on how much of `cand`/`cur`
+non-embed overhead (scoring math, candidate enumeration) is irreducible —
+the 61%/79% embed-share figures above bound how much of the wide-sweep wall
+time is even addressable by an embed-side fix.
+
+Environment unchanged from vF9: i9-14900HX, RTX 4070 Laptop 8GB, 32GB RAM;
+torch 2.8.0+cu128, PyNvVideoCodec 2.1.0. GT project folders,
+`anime_searcher` submodule, and `backend/data/eval_waivers.json` untouched.
+Evaluations run strictly sequentially, one GT project at a time, nothing
+else heavy running concurrently.
+
 ## How to try it (owner test protocol)
 
 ```bash
