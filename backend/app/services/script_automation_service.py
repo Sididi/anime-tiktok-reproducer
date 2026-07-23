@@ -56,6 +56,21 @@ class ScriptAutomationService:
         ProjectService.save(project)
         return seed
 
+    @classmethod
+    def _persist_run_voice_key(cls, project_id: str, voice_key: str) -> None:
+        """Persist the voice this run generates TTS with.
+
+        Downstream consumers (upload segment-count validation, auto-editor
+        profiles) resolve the voice from the project, so it must match the
+        voice the parts were actually generated with.
+        """
+        project = ProjectService.load(project_id)
+        if project is None:
+            raise RuntimeError("Project not found while saving the run voice")
+        if project.voice_key != voice_key:
+            project.voice_key = voice_key
+            ProjectService.save(project)
+
     @staticmethod
     def _tts_seed_and_continuity_kwargs(
         *,
@@ -1042,6 +1057,7 @@ class ScriptAutomationService:
                 yield cls._event("tts_generating", message="TTS generation skipped")
             else:
                 yield cls._event("tts_segmenting", message="Segmenting script for TTS...")
+                cls._persist_run_voice_key(project_id, voice_key)
                 effective_model = cls.resolve_tts_model_id(model_id=voice.model_id)
                 normalized_model = effective_model.lower()
                 is_v3_model = normalized_model.startswith("eleven_v3")

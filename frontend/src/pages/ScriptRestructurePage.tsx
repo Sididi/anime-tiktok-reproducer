@@ -1413,6 +1413,20 @@ export function ScriptRestructurePage() {
     setPreviewUrl(null);
   }, []);
 
+  // Persist the voice as soon as the user picks it, so server-side re-syncs
+  // (page load, phase-settings responses) can never revert the selection to
+  // the template default. Only a template copy/change may reset the voice.
+  const handleVoiceChange = useCallback(
+    (key: string) => {
+      setAutomationVoiceKey(key);
+      if (!projectId || !key) return;
+      api.updateScriptSettings(projectId, { voice_key: key }).catch(() => {
+        setError("Failed to save the selected voice — it may reset on reload");
+      });
+    },
+    [projectId],
+  );
+
   const handleAutomate = useCallback(async () => {
     if (!projectId || !automationConfig) return;
     if (!automationConfig.enabled) {
@@ -2832,7 +2846,7 @@ export function ScriptRestructurePage() {
                         }) as SearchableSelectOption,
                     )}
                     value={automationVoiceKey || null}
-                    onChange={(key) => setAutomationVoiceKey(key || "")}
+                    onChange={(key) => handleVoiceChange(key || "")}
                     placeholder="Select voice..."
                     disabled={automationRunning}
                     onPreview={(url, key) => playOptionPreview(url, key, 1)}
