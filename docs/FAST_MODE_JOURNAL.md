@@ -287,6 +287,84 @@ the heavy-job phase cleanup returns it after matching; the optimization targets
 the conversion/copy churn without weakening the two-job queue or allocator
 limits.
 
+## vF9 — Fast Matching Round 2, Task 1: branch, R2 flags, frozen reference (2026-07-23/24)
+
+New branch `feat/fast-matching-r2` off main HEAD (this journal's vF8 state plus
+whatever landed since — see below), starting the R2 wall-time push
+(`docs/superpowers/specs/2026-07-23-fast-matching-r2-design.md`). Added the
+master switch and per-lever helper to `fast_matching.py` (TDD: 4 failing tests
+→ 4 passing):
+
+```python
+_R2_FLAG = "ATR_FAST_R2"
+
+def fast_r2_enabled() -> bool:
+    if not fast_enabled():
+        return False
+    return not _off(os.environ.get(_R2_FLAG))
+
+def r2_lever(name: str, default: bool = True) -> bool:
+    if not fast_r2_enabled():
+        return False
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return not _off(val)
+```
+
+`ATR_FAST_R2` rides on `ATR_FAST_MATCHING` — master OFF kills R2 too, so the
+proven `ATR_FAST_MATCHING=0` mainline escape hatch stays intact. Individual
+levers (`ATR_R2_COARSE`, `ATR_R2_FP16_WIN`, `ATR_R2_THIN`, wired in Tasks 3-9)
+default ON but are dead the instant the master is off. No lever is consulted
+by any code path yet on this commit — this task only lands the flag plumbing
+and the reference numbers Tasks 3-10 compare against.
+
+**Reference freeze protocol**: same invocation as vF1/vF4 —
+`evaluate_matching_against_ground_truth.py <pid> --matcher aligner
+[--save-generated-json ...]`, fast mode ON (`ATR_FAST_MATCHING`/`ATR_FAST_R2`
+unset ⇒ both default ON, no lever wired yet so this is plain F1+F3 fast mode),
+machine quiet (GPU idle 74MiB/8188MiB, load avg ~0.9 before the first run).
+Decision hash = `sha256` over the canonical scenes+matches projection (drops
+`thumbnail`, keeps every other field, sorted keys) via the same
+`~/.cache/atr-eval/ref_hash.py` helper used for vF2/vF8. 3-run medians on both
+heavies (85de83ca6323, 411f73d26c1d) plus dcd74148c7ec (ran 3 for extra
+margin, cheap at ~85s/run); 2 runs on 5e85164d9ff8 per the practicality
+allowance (a full 3×4 matrix would have added ~4 more minutes for a project
+whose 2-run spread was already 2.2s).
+
+**vF9 frozen reference — r2ref (fast mode ON, no R2 lever wired):**
+
+| project | sc/mt | elapsed runs (s) | median | r2ref hash | scenes=/matches= | Scene timing | Source timing |
+|---|---|---|---:|---|---|---|---|
+| dcd74148c7ec | 42/42 | 85.3, 83.4, 85.4 | **85.3s** | `27acedd58ea169fb3eb2d9f7eab55e67c01216a7292fbecee58adf39c0ab9e46` | 42/42 | exact=20/20 | exact=17/20, loose=3 |
+| 5e85164d9ff8 | 56/56 | 234.8, 232.6 (2-run) | **233.7s** | `e2916b5e807cca98a92cd62fee209a7102360e11f23873e09b5cb7739724e9b6` | 56/56 | exact=46/46 | exact=40/46, loose=3, wrong_primary=3 |
+| 85de83ca6323 | 59/59 | 300.6, 302.5, 323.8 | **302.5s** | `b7034eaf7a249ff257d9a4156e80b67d27aef4f618b5f830ded990a5a5865f86` | 59/59 | exact=52/54, loose=2 | exact=52/54, loose=1, failed=1 |
+| 411f73d26c1d | 78/78 | 334.5, 345.5, 324.6 | **334.5s** | `fe9393966d95e02d849e9e7ef65300654022f68fc7771ded8b2e0f63e5a3bd2b` | 78/78 | exact=52/52 | exact=50/52, loose=1, wrong_primary=1 |
+
+Every project reproduced the identical scene/source line counts and evaluator
+verdict (`PASS-WITH-LEDGER`, pre-existing waiver-ceiling notices, untouched
+`eval_waivers.json`) across all runs — decision hashes are only computed from
+the first (saved) run per project but the printed scene/source stats matched
+byte-for-byte run to run, consistent with vF4's "hashes reproduce across all 3
+runs" finding.
+
+**These numbers are markedly faster than vF4/vF8** (dcd 101s→85s, 5e85
+261s→234s, 85de 378s→302s, 411f 368s→335s) despite being the *same* fast-mode
+code path (F1 GPU decode + fp32/TF32, no R2 lever wired) — main HEAD has moved
+since 2026-07-16 (vF6 OOM fix, vF8 RGB-preselection fix, and whatever else
+landed on main in the interim). This is exactly the vF1 lesson repeated: never
+compare a new change against a stale journal number — always refreeze on
+current HEAD before measuring a delta. **vF9, not vF4/vF8, is the baseline
+Tasks 3-10 diff against.**
+
+Generated JSON saved at `~/.cache/atr-eval/r2ref_<project>.json` for all 4
+projects (first run each). Environment unchanged from vF1: i9-14900HX, RTX
+4070 Laptop 8GB, 32GB RAM; torch 2.8.0+cu128, PyNvVideoCodec 2.1.0.
+
+GT project folders, `anime_searcher` submodule, and `backend/data/
+eval_waivers.json` untouched (evaluations are read-only against them; no
+diffs). Evaluations run strictly sequentially, one GT project at a time.
+
 ## How to try it (owner test protocol)
 
 ```bash
