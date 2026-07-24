@@ -642,6 +642,110 @@ RAM; torch 2.8.0+cu128, PyNvVideoCodec 2.1.0. GT project folders,
 Evaluations run strictly sequentially, one GT project at a time in the
 foreground, nothing else heavy running concurrently.
 
+## vF13 — Fast Matching Round 2, Task 5 (A3): deeper decode<->embed prefetch overlap — REGRESSION, REVERTED (2026-07-24)
+
+**Implemented per the brief.** `_WindowEmbedCache.__init__` gained
+`ATR_R2_PREFETCH_WORKERS` (brief default 6) sizing the prefetch
+`ThreadPoolExecutor`, and `ATR_R2_PREFETCH_DEPTH` (brief default 16)
+replacing the hard-coded staged/inflight ceilings in both `prefetch()`
+(previously `> 8`) and `prefetch_probe()` (previously `> 12`), gated by
+`fast_r2_enabled()`.
+
+**Hash-identity: dcd confirmed at the brief's proposed defaults**
+(`27acedd5…`), and 85de matched `b7034eaf…` on all 4 measured runs — but
+**411f did NOT match `fe939396…` on any of its 4 runs**, landing instead on
+a stable `923abc6f…` every time. Diffing the two generated JSONs against
+the frozen reference isolated the discrepancy to exactly one field: match
+#51's `doubt_reasons` gained an extra `'duplicate_tie'` entry
+(`['static_end']` → `['duplicate_tie', 'static_end']`); the match's episode/
+source/target selection was byte-identical. This is a real, deterministic
+consequence of the code (identical `923abc6f…` hash reproduced across 3
+quiet runs + 1 debug run) — a near-tie score-margin diagnostic flipped, not
+a decision. Traced to the extra prefetch concurrency perturbing GPU batch
+composition/ordering enough to move a borderline score margin across the
+tie threshold in `_collect_doubt_reasons`-style scoring — plausible given
+`[winprof]` (below) shows both decode and embed doing measurably more wall
+work under the deeper queue, i.e. genuinely different execution timing, not
+just a relabeling.
+
+**Wall-clock: 85de and 411f 3-run quiet medians + 1 `ATR_RERANK_DEBUG=1` run
+each** (all `--save-generated-json`, foreground, explicit 600000ms Bash
+timeouts):
+
+| project | quiet runs (s) | median | debug elapsed | `[winprof]` decode / embed |
+|---|---|---:|---:|---|
+| 85de83ca6323 | 435.9, 448.9, 466.6 | **448.9s** | 470.7s | decode=118.6s embed=136.9s |
+| 411f73d26c1d | 485.7, 488.9, 516.5 | **488.9s** | 528.7s | decode=110.9s embed=136.2s |
+
+Both numbers are well above the running vF9-vF12 baseline band (85de
+292.6-306.4s / 411f ~324.8-345.5s) and both `[winprof]` components moved the
+*wrong* direction — decode nearly **+60%** over vF10-vF12's 74-75s, embed
+**+35-40%** over the 97-102s band — i.e. the deeper queue made the main
+thread wait *longer* on decode, not shorter, and slowed embedding too. This
+is the opposite of A3's premise (overlap should shrink decode-blocked time,
+never touch embed). Mechanism: 6 Python threads all contending for
+`pynv_decode`'s global native decoder lock plus the GIL cost more in
+scheduling/contention overhead than the extra staged-window overlap
+recovers — the lock still fully serialises real decode work (as the brief
+itself anticipated), so extra workers only add queueing and thread-switch
+overhead, not parallel decode throughput.
+
+**Confounding factor, disclosed for honesty**: this session ran noticeably
+warmer/noisier than vF9-vF12's (background load average climbed from ~0.9 at
+session start to 3-5 after ~90 minutes of consecutive heavy runs; GPU idle
+temp drifted 59°C→76°C). A control run of the *unmodified* HEAD commit
+(`git stash` of this task's diff, no code change at all) on 411f measured
+415.9s — itself ~20-28% above the historical 324.8-345.5s band — confirming
+part of today's elevated numbers is session/thermal drift, not this task's
+code. Controlling for that (same-session, same-day A3-active vs.
+reverted-equivalent comparisons below), A3-active still measured slower on
+every axis on both projects, so the regression conclusion holds; only its
+precise magnitude is uncertain against the noisier session.
+
+**Second bug, found while implementing the revert.** The brief's Step 1
+collapses two *different* pre-existing hard-coded ceilings — `prefetch()`'s
+`8` and `prefetch_probe()`'s `12` — onto one shared `self._prefetch_depth`.
+A naive revert (set both env defaults back to the legacy numeric values, `4`
+and `8`) is **not** byte-identical to the pre-task code: it still forces
+`prefetch_probe()`'s ceiling down from its original `12` to `8` any time
+`fast_r2_enabled()` is true (the evaluator's default), because the two call
+sites now share one variable. This reproduced 411f's exact same wrong hash
+(`923abc6f…`) even after "reverting" the defaults — caught by the hash gate,
+not assumed away. Fixed by making `self._prefetch_depth` a **`None` sentinel**
+when `ATR_R2_PREFETCH_DEPTH` is unset; `prefetch()` and `prefetch_probe()`
+each fall back to their own original literal (`8` / `12`) in that case, and
+only unify under one shared value when a caller explicitly sets the env var.
+Re-verified after the fix: dcd (`27acedd5…`), 85de (`b7034eaf…`, quiet
+434.2s, debug decode=95.0s embed=116.6s elapsed=368.2s), and 411f
+(`fe939396…`, 366.6s) all hash-match `r2ref` exactly — byte-identity
+restored. The reverted-code decode/embed numbers above still sit above the
+vF9-vF12 band (same session-drift caveat as above) but are consistently
+below every A3-active number measured in the same session, on both
+`[winprof]` components.
+
+**Conclusion**: A3 as specified (workers=6, depth=16 defaults) is a
+**regression, not a null result** — slower on `[winprof]` decode *and*
+embed on both heavies, and it broke strict hash-identity on 411f via a
+near-tie diagnostic field (traced to real, if minor, execution-order
+sensitivity from the added concurrency, not a fluke). Per the brief's
+binding stop-rule (built for a "<2% gain" case, but applying a fortiori to
+an outright loss): **defaults reverted** to the exact legacy behaviour —
+`ATR_R2_PREFETCH_WORKERS` defaults to `4`, and the depth ceilings default to
+each call site's original literal (`8` for `prefetch()`, `12` for
+`prefetch_probe()`) via the `None`-sentinel fix, proven byte-identical on
+all 3 GT projects exercised. `ATR_R2_PREFETCH_WORKERS` /
+`ATR_R2_PREFETCH_DEPTH` remain wired for future manual experimentation
+(e.g. smaller increments like workers=5/depth=10) but ship inert by
+default — no speculative config carried forward.
+
+Environment unchanged from vF9-vF12 in hardware/software versions (i9-14900HX,
+RTX 4070 Laptop 8GB, 32GB RAM; torch 2.8.0+cu128, PyNvVideoCodec 2.1.0), though
+see the confound note above re: session-level load/thermal drift. GT project
+folders, `anime_searcher` submodule, and `backend/data/eval_waivers.json`
+untouched. Evaluations run strictly sequentially, one GT project at a time in
+the foreground, nothing else heavy running concurrently, every invocation an
+explicit-timeout blocking foreground call.
+
 ## How to try it (owner test protocol)
 
 ```bash

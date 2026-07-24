@@ -259,7 +259,35 @@ class _WindowEmbedCache:
         # 4 workers: candidate scoring blocks on ~1s window decodes while
         # registration+embed take ~0.5s — 2 workers measured unable to
         # keep ahead (v160: 210s window decode of 330s refine on 85de)
-        self._prefetch_pool = ThreadPoolExecutor(max_workers=4)
+        # A3 (R2): env-tunable prefetch depth/workers, intended to deepen
+        # decode<->embed overlap. vF13 measured this as an active
+        # REGRESSION (+42-50% wall time on both heavies, [winprof] decode
+        # AND embed both slower under debug) at workers=6/depth=16 — more
+        # Python threads contending for the global native decode lock and
+        # the GIL cost more than the extra overlap bought. Default workers
+        # is therefore held at the legacy 4 even under R2; the knobs stay
+        # available for future experimentation via ATR_R2_PREFETCH_WORKERS /
+        # ATR_R2_PREFETCH_DEPTH. See docs/FAST_MODE_JOURNAL.md vF13.
+        #
+        # self._prefetch_depth is None when the knob is unset: prefetch()
+        # and prefetch_probe() originally had DIFFERENT hard-coded depth
+        # caps (8 and 12). Collapsing both to one shared default value
+        # would silently change one of them even at the "off" setting
+        # (caught by vF13's hash gate on 411f — a None sentinel preserves
+        # each call site's original constant when the knob is unset, and
+        # only unifies them under an explicit ATR_R2_PREFETCH_DEPTH override).
+        from .fast_matching import fast_r2_enabled
+
+        workers = (
+            int(os.environ.get("ATR_R2_PREFETCH_WORKERS", "4"))
+            if fast_r2_enabled()
+            else 4
+        )
+        _depth_env = os.environ.get("ATR_R2_PREFETCH_DEPTH")
+        self._prefetch_depth = (
+            int(_depth_env) if (fast_r2_enabled() and _depth_env is not None) else None
+        )
+        self._prefetch_pool = ThreadPoolExecutor(max_workers=workers)
 
     def get_cap(self, episode: str):
         from .anime_library import AnimeLibraryService
@@ -338,11 +366,12 @@ class _WindowEmbedCache:
 
     def prefetch_probe(self, episode: str, pred: float) -> None:
         key = ("probe", episode, round(pred, 3))
+        depth = self._prefetch_depth if self._prefetch_depth is not None else 12
         with self._staged_lock:
             if (
                 key in self._staged
                 or key in self._inflight
-                or len(self._inflight) + len(self._staged) > 12
+                or len(self._inflight) + len(self._staged) > depth
             ):
                 return
 
@@ -383,11 +412,12 @@ class _WindowEmbedCache:
         i0 = int(math.floor(max(0.0, lo) * self.fps))
         i1 = int(math.ceil(hi * self.fps))
         key = (episode, i0, i1)
+        depth = self._prefetch_depth if self._prefetch_depth is not None else 8
         with self._staged_lock:
             if (
                 key in self._staged
                 or key in self._inflight
-                or len(self._inflight) + len(self._staged) > 8
+                or len(self._inflight) + len(self._staged) > depth
             ):
                 return
 
