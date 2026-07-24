@@ -268,6 +268,10 @@ class _WindowEmbedCache:
         # is therefore held at the legacy 4 even under R2; the knobs stay
         # available for future experimentation via ATR_R2_PREFETCH_WORKERS /
         # ATR_R2_PREFETCH_DEPTH. See docs/FAST_MODE_JOURNAL.md vF13.
+        # WARNING: setting ATR_R2_PREFETCH_DEPTH above defaults (8 for
+        # prefetch, 12 for prefetch_probe) reproducibly broke hash-identity
+        # on 411f (vF13, doubt_reasons flip) — these knobs risk eval-
+        # equivalence, experiment only.
         #
         # self._prefetch_depth is None when the knob is unset: prefetch()
         # and prefetch_probe() originally had DIFFERENT hard-coded depth
@@ -276,7 +280,6 @@ class _WindowEmbedCache:
         # (caught by vF13's hash gate on 411f — a None sentinel preserves
         # each call site's original constant when the knob is unset, and
         # only unifies them under an explicit ATR_R2_PREFETCH_DEPTH override).
-        from .fast_matching import fast_r2_enabled
 
         workers = (
             int(os.environ.get("ATR_R2_PREFETCH_WORKERS", "4"))
@@ -327,6 +330,16 @@ class _WindowEmbedCache:
             _, evicted = self._frames_lru.popitem(last=False)
             self._frames_lru_bytes -= self._frames_nbytes(evicted)
 
+    def _prefetch_depth_limit(self) -> int:
+        """Fallback to prefetch()'s legacy depth constant (8) when the knob
+        is unset; otherwise use the explicit override."""
+        return self._prefetch_depth if self._prefetch_depth is not None else 8
+
+    def _probe_depth_limit(self) -> int:
+        """Fallback to prefetch_probe()'s legacy depth constant (12) when
+        the knob is unset; otherwise use the explicit override."""
+        return self._prefetch_depth if self._prefetch_depth is not None else 12
+
     def _decode_run(self, cap, r0: int, r1: int) -> list:
         """The single decode call both window() and the prefetch worker
         use — identical parameters guarantee identical frames."""
@@ -366,7 +379,7 @@ class _WindowEmbedCache:
 
     def prefetch_probe(self, episode: str, pred: float) -> None:
         key = ("probe", episode, round(pred, 3))
-        depth = self._prefetch_depth if self._prefetch_depth is not None else 12
+        depth = self._probe_depth_limit()
         with self._staged_lock:
             if (
                 key in self._staged
@@ -412,7 +425,7 @@ class _WindowEmbedCache:
         i0 = int(math.floor(max(0.0, lo) * self.fps))
         i1 = int(math.ceil(hi * self.fps))
         key = (episode, i0, i1)
-        depth = self._prefetch_depth if self._prefetch_depth is not None else 8
+        depth = self._prefetch_depth_limit()
         with self._staged_lock:
             if (
                 key in self._staged

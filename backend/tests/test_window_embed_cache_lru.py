@@ -50,3 +50,21 @@ def test_zero_budget_keeps_legacy_six_window_bound():
         cache._frames_lru_bytes += _WindowEmbedCache._frames_nbytes(run)
         cache._trim_frames_lru()
     assert len(cache._frames_lru) == 6
+
+
+def test_prefetch_depth_fallbacks_preserve_legacy_constants():
+    """Verify that prefetch() and prefetch_probe() each preserve their own
+    legacy depth constants when the knob is unset. vF13 caught a regression
+    where collapsing both to one shared default silently changed one of them
+    even at the "off" setting, breaking hash-identity on 411f (doubt_reasons
+    flip)."""
+    cache = _WindowEmbedCache.__new__(_WindowEmbedCache)  # skip heavy __init__
+    cache._prefetch_depth = None
+    # When unset, prefetch() falls back to 8, prefetch_probe() to 12.
+    assert cache._prefetch_depth_limit() == 8
+    assert cache._probe_depth_limit() == 12
+
+    # When explicitly set, both use the same override value.
+    cache._prefetch_depth = 16
+    assert cache._prefetch_depth_limit() == 16
+    assert cache._probe_depth_limit() == 16
