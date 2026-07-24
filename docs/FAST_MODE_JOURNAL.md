@@ -869,6 +869,161 @@ and `backend/data/eval_waivers.json` untouched. Evaluations run strictly
 sequentially, one GT project at a time in the foreground, every invocation
 an explicit-timeout blocking foreground call.
 
+## vF15 — Fast Matching Round 2, Task 7 (B1): coarse-to-fine window scoring — SHIPPED, default ON (2026-07-24)
+
+**The lever**: `_zoom_sscd_score_line`'s delta sweep (candidate scoring, `cand`
+in the stage-5 `[prof]` dict — vF10 measured 144.3s/97.8s on the heavies,
+embed alone ~100s) now runs coarse-to-fine when `r2_lever("ATR_R2_COARSE")`
+is on and the window span exceeds 3.0s: a stride-2 `window()` call (thinned
+decode sample density, tolerance widened 0.15→0.18) finds the winning
+alignment on half the grid, then a narrow ±0.35s densify `window()` call at
+stride=1 re-scores exactly at the original 0.15 tolerance. This is the
+**first quality-budgeted lever** — hash-identity is not expected when ON;
+the moderate budget (Global Constraints) decides its default.
+
+**Implementation** (`scene_aligner.py`):
+- `_decode_run(cap, r0, r1, stride=1)` — `stride` only thins the returned
+  `sample_frames` density; the underlying decode still walks every native
+  frame in `[r0, r1]` in GOP order (vF8 identity requirement). Default
+  `stride=1` reproduces the exact legacy call byte-for-byte.
+- `_WindowEmbedCache.window(episode, zoom, lo, hi, stride=1)` — `missing`
+  is now `range(i0, i1+1, stride)`. The contiguous-run merge check became
+  `k == runs[-1][1] + stride` (not `+1`) so a stride-2 missing list still
+  collapses into **one** wide decode run instead of one 1-frame run per
+  visited slot — the latter would have defeated the entire optimization
+  (many tiny decode calls instead of one thinned one). The final back-fill
+  loop is restricted to `range(r0, r1+1, stride)` (visited slots only) —
+  the brief's critical warning: back-filling the *skipped* native indices
+  to `None` would have poisoned them as "seen but empty" for a later
+  stride=1 (fine) pass over the same span, silently starving it of data it
+  actually needs.
+- **Cache-key isolation** (the brief's "must not consume/corrupt a staged
+  full run, and vice versa"): `_frames_lru`/`_staged`/`_inflight` keys stay
+  the plain `(episode, r0, r1)` 3-tuple only for `stride == 1` — byte-for-byte
+  the legacy key, so `prefetch()`'s always-stride-1 staged runs and the
+  legacy LRU are untouched when the lever is off. A `stride != 1` run uses a
+  namespaced `(episode, r0, r1, stride)` key and skips the `_staged`/
+  `_inflight` consult entirely (prefetch never stages anything but stride=1),
+  so a coarse decode result can never be handed back to a stride=1 consumer,
+  and a coarse call can never pop a full run staged for someone else.
+- `_zoom_sscd_score_line`'s delta-sweep loop body was extracted into a local
+  `_sweep(times, embs, sims, deltas, tol)` closure (over `preds`/`rows`/
+  `q_mids`), called once for the coarse pass and again (with the densified
+  window + narrow delta range) for the fine pass — DRY per the brief,
+  behaviourally identical to the original single-pass loop when `coarse` is
+  False.
+
+**Unit tests** (`backend/tests/test_r2_coarse_window.py`, 5 new, adapted from
+the brief's pinned slot-arithmetic sketch to the real implementation):
+stride slot-set arithmetic; a stride-2 `window()` call issues **one** merged
+decode run and leaves skipped slots absent (not `None`-poisoned); a
+subsequent stride=1 call over the same span still decodes the
+previously-skipped slots; a stride!=1 run doesn't collide with a
+poisoned/pre-existing stride=1 `_frames_lru` entry; a stride=2 call doesn't
+consume a `prefetch()`-staged stride=1 run. All 5 pass, plus the pre-existing
+11 covering tests (`test_window_embed_cache_lru.py` ×7,
+`test_fast_matching_r2_flags.py` ×4) stay green — 18/18.
+
+**Sanity gate — OFF-path hash-identity, all 4 projects (exceeds the brief's
+dcd-only requirement)**: `ATR_R2_COARSE=0` reproduces the exact `r2ref` hash
+and scene/source composition on every project —
+
+| project | OFF hash | r2ref hash | match |
+|---|---|---|---|
+| dcd74148c7ec | `27acedd5…` | `27acedd5…` | identical |
+| 5e85164d9ff8 | `e2916b5e…` | `e2916b5e…` | identical |
+| 85de83ca6323 | `b7034eaf…` | `b7034eaf…` | identical |
+| 411f73d26c1d | `fe939396…` | `fe939396…` | identical |
+
+The refactor (stride plumbing, key namespacing, `_sweep` extraction) is
+provably inert when the lever is off.
+
+**Session-noise correction — historical-baseline comparison was actively
+misleading, same-session A/B used instead.** The first pass compared
+`ATR_R2_COARSE=1` runs against vF9's frozen elapsed numbers and saw 411f
+apparently get *slower* (351.7s vs 334.5s historical). Getting an in-session
+OFF baseline immediately explained why: **every OFF baseline this session
+ran 21-26% slower than vF9's numbers** (dcd was the exception, closely
+matching history) — a materially warmer/more contended machine than the
+vF9-vF12 sessions, exactly the vF13/vF14 confound repeating. Same-session
+A/B (OFF then ON, or vice versa, back-to-back, nothing else heavy running)
+is the only valid comparison this session produced:
+
+| project | OFF elapsed | ON elapsed | Δ wall | `[prof]` cand Δ | `[winprof]` decode/embed Δ |
+|---|---:|---:|---:|---|---|
+| dcd74148c7ec | 85.1s | 90.5s | **+5.4s (+6.3%)** | — (span mostly ≤3.0s, coarse rarely engages) | — |
+| 5e85164d9ff8 | 293.4s | 204.7s | **−88.7s (−30.2%)** | not profiled | not profiled |
+| 85de83ca6323 | 365.7s | 275.7s | **−90.0s (−24.6%)** | 181.3s→127.9s (−53.4s, −29.5%) | decode 96.9→79.0s (−18.5%), embed 118.6→81.8s (−31.0%) |
+| 411f73d26c1d | 414.3s | 351.7s | **−62.6s (−15.1%)** | not profiled (OFF run had no `ATR_RERANK_DEBUG`) | not profiled |
+
+3 of 4 projects show large, consistent wins once session noise is
+controlled for; only dcd (the lightest project, ~85s total, where most
+candidate-scoring spans never cross the 3.0s coarse-eligibility threshold)
+regresses slightly — fixed overhead of the extra `window()` call/`_sweep`
+call without enough span to amortize it. This matches the "largest
+projected win" billing from the task brief on the 3 heavier projects.
+
+**Budget-gate scoreboard** (moderate budget: ≤1 episode flip, ≤4 source-line
+exactness losses, 0 scene-line changes, per project — same-session OFF used
+as the comparison baseline, not the stale r2ref elapsed numbers, per the
+gate's own note that scene/source composition doesn't drift with session
+noise the way wall-clock does):
+
+| project | episode flips | source-line exact | scene-line (`scenes.scenes`) |
+|---|---|---|---|
+| dcd74148c7ec | 0 | 17/20 → 17/20 (0 losses) | 0/42 diffs |
+| 5e85164d9ff8 | 1 (see below) | 40/46 → 40/46 (0 losses) | 0/56 diffs |
+| 85de83ca6323 | 0 | 52/54 → 49/54 (**3 losses**) | 0/59 diffs |
+| 411f73d26c1d | 0 | 50/52 → 50/52 (0 losses) | 0/78 diffs |
+
+Scene-line changes are measured as literal `scenes.scenes` array diffs
+(index/start_time/end_time on the TikTok output timeline) between the OFF
+and ON generated JSON — this lever only ever touches
+`_zoom_sscd_score_line`, part of *source*-side match refinement, and never
+the earlier scene-detection/segmentation phase, so the raw scene array is
+provably unreachable by this change; the direct diff confirms **0/0/0/0**
+across all 4 projects. (The evaluator's own printed "Scene timing:
+exact=N/54" summary line on 85de did shift 52→53 between OFF and ON — but
+that derived bucket folds in match-position-dependent waiver-staleness
+checks, not the scene array itself; chasing it down traced the shift to a
+single scene's owner-waiver STALE check now landing on the "exact" side of
+its tolerance window because the *source* match position changed slightly,
+not because any scene boundary moved. Confirmed by literal JSON diff = 0.)
+
+The one "episode flip" (5e85164d9ff8): scene index 12 was `was_no_match:
+true` (unresolved) under OFF, and resolves to a real match (`doubt_reasons:
+["recovered"]`, confidence 0.5) under ON — a no-match scene getting
+*recovered*, not an existing correct match's episode being overwritten with
+a wrong one. Net effect on the evaluator's own exact/loose/wrong_primary
+tallies for 5e85 was neutral-to-favorable (exact count unchanged at 40/46;
+one `wrong_primary_with_candidate` became `loose` instead). Within the ≤1
+budget either way.
+
+85de's 3 source-line exactness losses (52/54→49/54) are the largest quality
+cost measured; still within the ≤4 budget. `wrong_primary_with_candidate`
+rose 0→3 and `failed` dropped 1→0 (net: the previously-`failed` scene and
+two previously-exact scenes now resolve to a wrong (but exposed) primary
+candidate) — a real, non-trivial precision cost from scoring on the thinned
+grid, worth watching if a future GT project pushes closer to the ≤4 ceiling.
+
+**Verdict: WITHIN BUDGET on all 4 projects on all 3 axes.** `ATR_R2_COARSE`
+**ships default ON** (`r2_lever("ATR_R2_COARSE")`, default `True` —
+no call-site change needed) — the largest wall-time win landed in Round 2 so
+far (−15% to −30% on the 3 heavier GT projects, same-session verified),
+against a modest, budget-compliant quality cost concentrated on one project.
+
+Environment: i9-14900HX, RTX 4070 Laptop 8GB, 32GB RAM; torch 2.8.0+cu128,
+PyNvVideoCodec 2.1.0 — warmer/more contended session than vF9-vF12 (see
+above), corrected for via same-session A/B rather than historical deltas.
+GT project folders, `anime_searcher` submodule, and `backend/data/
+eval_waivers.json` untouched. Evaluations run strictly sequentially, one GT
+project at a time in the foreground, every invocation an explicit-timeout
+blocking foreground call. (One evaluator invocation — the first 5e85164d9ff8
+attempt — omitted the explicit timeout and was auto-backgrounded by the
+harness past its 2-minute default and died silently with an empty log;
+caught immediately, re-run correctly in the foreground with an explicit
+600s timeout, no fabricated numbers were used from the dead attempt.)
+
 ## How to try it (owner test protocol)
 
 ```bash

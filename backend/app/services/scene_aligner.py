@@ -340,9 +340,17 @@ class _WindowEmbedCache:
         the knob is unset; otherwise use the explicit override."""
         return self._prefetch_depth if self._prefetch_depth is not None else 12
 
-    def _decode_run(self, cap, r0: int, r1: int) -> list:
+    def _decode_run(self, cap, r0: int, r1: int, stride: int = 1) -> list:
         """The single decode call both window() and the prefetch worker
-        use — identical parameters guarantee identical frames."""
+        use — identical parameters guarantee identical frames.
+
+        `stride` (B1/R2, ATR_R2_COARSE) thins the returned SAMPLE density
+        only: the underlying decoder still walks every native frame in
+        [r0, r1] in GOP order (no cheap seeking, per the vF8 identity
+        requirement) but `sample_frames` is halved so roughly every other
+        native slot is actually converted/embedded. Default stride=1
+        reproduces the exact legacy call (byte-identical when the lever
+        is off or unused, e.g. prefetch())."""
         w_lo = r0 / self.fps
         w_hi = (r1 + 1) / self.fps
         return AnimeMatcherService._collect_frames_in_window_from_capture(
@@ -350,7 +358,9 @@ class _WindowEmbedCache:
             w_lo,
             w_hi,
             max_frames=int((w_hi - w_lo) * 65) + 8,
-            sample_frames=max(2, int(round((w_hi - w_lo) * self.fps)) + 1),
+            sample_frames=max(
+                2, int(round((w_hi - w_lo) * self.fps / max(1, stride))) + 1
+            ),
         )
 
     def probe_frames(self, episode: str, pred: float) -> list:
@@ -481,8 +491,14 @@ class _WindowEmbedCache:
         zoom: "float | tuple[float, float, float, float]",
         lo: float,
         hi: float,
+        stride: int = 1,
     ) -> tuple[np.ndarray, np.ndarray] | None:
-        """(times, embeddings) covering [lo, hi] at the decode grid."""
+        """(times, embeddings) covering [lo, hi] at the decode grid.
+
+        `stride` (B1/R2, ATR_R2_COARSE) requests only every Nth native
+        decode slot in this call — the coarse pass of a coarse-to-fine
+        scoring sweep. Default stride=1 is the exact legacy path."""
+        stride = max(1, stride)
         geom_key = (
             # 0.05-fraction quantization: crops within a few percent are
             # visually the same footprint and share decoded windows
@@ -493,14 +509,14 @@ class _WindowEmbedCache:
         slots = self.slots.setdefault((episode, geom_key), {})
         i0 = int(math.floor(max(0.0, lo) * self.fps))
         i1 = int(math.ceil(hi * self.fps))
-        missing = [k for k in range(i0, i1 + 1) if k not in slots]
+        missing = [k for k in range(i0, i1 + 1, stride) if k not in slots]
         if missing:
             cap = self.get_cap(episode)
             if cap is None:
                 return None
             runs: list[tuple[int, int]] = []
             for k in missing:
-                if runs and k == runs[-1][1] + 1:
+                if runs and k == runs[-1][1] + stride:
                     runs[-1] = (runs[-1][0], k)
                 else:
                     runs.append((k, k))
@@ -510,24 +526,33 @@ class _WindowEmbedCache:
             _dbg = bool(os.environ.get("ATR_LRU_DEBUG"))
             for r0, r1 in runs:
                 _t0 = time.perf_counter()
-                key = (episode, r0, r1)
+                # B1/R2: stride!=1 (coarse) runs use a namespaced key so a
+                # thinned decode can never be handed back to a stride=1
+                # (fine/legacy) request from `_frames_lru`, and never pops
+                # a `prefetch()`-staged full run (which stages stride=1
+                # only, keyed as a plain 3-tuple) out from under a later
+                # stride=1 consumer. stride=1 keeps the exact legacy 3-tuple
+                # key so the lever-off path is byte-identical.
+                key = (episode, r0, r1) if stride == 1 else (episode, r0, r1, stride)
                 frames = self._frames_lru.get(key)
                 if frames is not None:
                     self._frames_lru.move_to_end(key)
                     if _dbg:
                         self._lru_debug_hits = getattr(self, "_lru_debug_hits", 0) + 1
                 else:
-                    with self._staged_lock:
-                        fut = self._inflight.get(key)
-                    if fut is not None:
-                        try:
-                            fut.result()
-                        except Exception:
-                            pass
-                    with self._staged_lock:
-                        frames = self._staged.pop(key, None)
+                    frames = None
+                    if stride == 1:
+                        with self._staged_lock:
+                            fut = self._inflight.get(key)
+                        if fut is not None:
+                            try:
+                                fut.result()
+                            except Exception:
+                                pass
+                        with self._staged_lock:
+                            frames = self._staged.pop(key, None)
                     if frames is None:
-                        frames = self._decode_run(cap, r0, r1)
+                        frames = self._decode_run(cap, r0, r1, stride)
                     self._frames_lru[key] = frames
                     self._frames_lru_bytes += self._frames_nbytes(frames)
                     _before_len = len(self._frames_lru)
@@ -553,7 +578,14 @@ class _WindowEmbedCache:
                         slot = int(round(t * self.fps))
                         if r0 <= slot <= r1 and slots.get(slot) is None:
                             slots[slot] = (t, emb)
-                for k in range(r0, r1 + 1):
+                # CRITICAL (B1/R2): back-fill only the VISITED slots. A
+                # stride>1 pass must not mark skipped native indices as
+                # "seen but empty" (slots[k] = None) — a later stride=1
+                # request over the same span needs `k not in slots` to
+                # still be True for those indices so it actually decodes
+                # them, instead of silently treating them as permanently
+                # missing (poisoning the fine pass).
+                for k in range(r0, r1 + 1, stride):
                     slots.setdefault(k, None)
         entries = [
             slots[k]
@@ -3877,29 +3909,78 @@ class SceneAlignerService:
         preds = np.array([source_at(t) for t, _ in q_mids])
         pad = sweep + 0.2
         lo, hi = float(preds.min()) - pad, float(preds.max()) + pad
-        win = cache.window(episode, zoom, lo, hi)
+
+        # B1 (R2, ATR_R2_COARSE): coarse-to-fine window scoring. The full
+        # delta sweep at full decode density is the stage-5 candidate-
+        # scoring hotspot (vF10: ~144s/98s on the heavies, embed ~100s).
+        # A stride-2 coarse pass over the whole span finds the winning
+        # alignment on a thinned grid (halved decode/embed cost, tolerance
+        # widened to 0.18 to keep the 2/3-valid quorum reachable under
+        # stride-2 slot misses); a narrow +-0.35s densify re-decodes at
+        # full density and re-scores with the original exact 0.15
+        # tolerance, so the reported alignment is always fine-grid exact.
+        # Only worth it on spans wide enough to amortize the extra window
+        # fetch (span > 3.0s); the lever is OFF (or span too small)
+        # reproduces the exact legacy single-pass call.
+        from .fast_matching import r2_lever
+
+        span = hi - lo
+        coarse = r2_lever("ATR_R2_COARSE") and span > 3.0
+        win = cache.window(episode, zoom, lo, hi, stride=2 if coarse else 1)
         if win is None:
             return None
         times, embs = win
         q = np.stack([e for _, e in q_mids])
         sims = q @ embs.T
-        best: tuple[float, float, np.ndarray] | None = None
         rows = np.arange(len(q_mids))
-        for delta in np.arange(-sweep, sweep + 1e-6, 1.0 / VERIFY_DECODE_FPS):
-            pos = preds + delta
-            cols = np.clip(np.searchsorted(times, pos), 0, len(times) - 1)
-            prev_cols = np.clip(cols - 1, 0, len(times) - 1)
-            use_prev = np.abs(times[prev_cols] - pos) < np.abs(times[cols] - pos)
-            cols = np.where(use_prev, prev_cols, cols)
-            valid = np.abs(times[cols] - pos) <= 0.15
-            if valid.sum() < max(1, len(q_mids) * 2 // 3):
-                continue
-            score = float(np.mean(sims[rows, cols][valid]))
-            if best is None or score > best[0]:
-                # matched source embeddings at this alignment: the caller's
-                # native identity certificate compares them across candidates
-                matched = np.where(valid[:, None], embs[cols], np.nan)
-                best = (score, float(delta), matched)
+
+        def _sweep(
+            times: np.ndarray,
+            embs: np.ndarray,
+            sims: np.ndarray,
+            deltas: np.ndarray,
+            tol: float,
+        ) -> tuple[float, float, np.ndarray] | None:
+            best_local: tuple[float, float, np.ndarray] | None = None
+            for delta in deltas:
+                pos = preds + delta
+                cols = np.clip(np.searchsorted(times, pos), 0, len(times) - 1)
+                prev_cols = np.clip(cols - 1, 0, len(times) - 1)
+                use_prev = np.abs(times[prev_cols] - pos) < np.abs(times[cols] - pos)
+                cols = np.where(use_prev, prev_cols, cols)
+                valid = np.abs(times[cols] - pos) <= tol
+                if valid.sum() < max(1, len(q_mids) * 2 // 3):
+                    continue
+                score = float(np.mean(sims[rows, cols][valid]))
+                if best_local is None or score > best_local[0]:
+                    # matched source embeddings at this alignment: the
+                    # caller's native identity certificate compares them
+                    # across candidates
+                    matched = np.where(valid[:, None], embs[cols], np.nan)
+                    best_local = (score, float(delta), matched)
+            return best_local
+
+        deltas = np.arange(-sweep, sweep + 1e-6, 1.0 / VERIFY_DECODE_FPS)
+        best = _sweep(times, embs, sims, deltas, 0.18 if coarse else 0.15)
+
+        if coarse and best is not None:
+            best_c = best[1]
+            fine = cache.window(
+                episode,
+                zoom,
+                max(lo, float(preds.min()) + best_c - 0.35),
+                min(hi, float(preds.max()) + best_c + 0.35),
+                stride=1,
+            )
+            if fine is not None:
+                f_times, f_embs = fine
+                f_sims = q @ f_embs.T
+                f_deltas = np.arange(
+                    best_c - 0.35, best_c + 0.35 + 1e-6, 1.0 / VERIFY_DECODE_FPS
+                )
+                refined = _sweep(f_times, f_embs, f_sims, f_deltas, 0.15)
+                if refined is not None:
+                    best = refined
         return best
 
     @classmethod
