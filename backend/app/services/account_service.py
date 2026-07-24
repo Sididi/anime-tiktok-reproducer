@@ -30,11 +30,6 @@ def _normalize_slots(value: Any) -> list[str] | None:
 
 
 @dataclass
-class AccountSlots:
-    hours: list[str]  # e.g. ["14:00", "18:00"]
-
-
-@dataclass
 class AccountYouTubeConfig:
     refresh_token: str
     channel_id: str | None = None

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from typing import Any
 
 from ..library_types import LibraryType
 from ..models import Project, Transcription

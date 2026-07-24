@@ -71,15 +71,6 @@ class QBittorrentClient:
         )
         resp.raise_for_status()
 
-    async def get_torrent_info(self, info_hash: str) -> dict | None:
-        await self._ensure_auth()
-        resp = await self._client.get(
-            "/api/v2/torrents/info", params={"hashes": info_hash}
-        )
-        resp.raise_for_status()
-        torrents = resp.json()
-        return torrents[0] if torrents else None
-
     async def delete_torrent(
         self, info_hash: str, delete_files: bool = True
     ) -> None:

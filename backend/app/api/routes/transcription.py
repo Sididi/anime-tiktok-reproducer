@@ -5,7 +5,7 @@ import asyncio
 import json
 
 from ...config import settings
-from ...models import ProjectPhase, Transcription, SceneTranscription
+from ...models import ProjectPhase
 from ...services import AnimeMatcherService, ProjectService, TranscriberService
 from ...services.match_playback_service import MatchPlaybackService
 

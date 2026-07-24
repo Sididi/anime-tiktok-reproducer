@@ -45,7 +45,7 @@ def _fake_frame(t: float) -> tuple[float, Image.Image]:
 
 
 def _patch_embed(monkeypatch):
-    def fake_embed(images):
+    def fake_embed(images, *, half=False):
         return np.zeros((len(images), 3), dtype=np.float32)
 
     monkeypatch.setattr(AnimeMatcherService, "_embed_pil_batch", staticmethod(fake_embed))

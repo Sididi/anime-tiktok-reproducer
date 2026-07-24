@@ -4,7 +4,6 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
-from ..models import Project
 from .platform_reschedule_service import PlatformRescheduleService
 from .project_service import ProjectService
 

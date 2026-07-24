@@ -16,7 +16,7 @@ export interface MediaSessionDemand {
   kind: "video" | "audio";
 }
 
-export interface MediaTabBudget {
+interface MediaTabBudget {
   attached: number;
   warmup: number;
 }

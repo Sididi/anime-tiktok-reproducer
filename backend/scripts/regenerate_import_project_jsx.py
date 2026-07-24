@@ -20,7 +20,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
-from app.models import MatchList, Transcription
+from app.models import Transcription
 from app.services.export_service import ExportService
 from app.services.google_drive_service import GoogleDriveService
 from app.services.otio_timing import FrameRateInfo

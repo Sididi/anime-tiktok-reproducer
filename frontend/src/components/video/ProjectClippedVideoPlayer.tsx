@@ -6,7 +6,7 @@ import {
   type ClippedVideoPlayerProps,
 } from "./ClippedVideoPlayer";
 
-export interface ProjectClippedVideoPlayerProps
+interface ProjectClippedVideoPlayerProps
   extends Omit<ClippedVideoPlayerProps, "src" | "fallbackSrc"> {
   projectId: string;
 }

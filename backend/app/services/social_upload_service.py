@@ -65,10 +65,6 @@ class LimitedDurationVideoPreparation:
     speed_factor: float | None = None
 
 
-FacebookMediaProbe = MediaProbe
-FacebookVideoPreparation = LimitedDurationVideoPreparation
-
-
 def _extract_http_error_detail(exc: HttpError) -> str:
     """Return a readable message from Google API HttpError."""
     try:

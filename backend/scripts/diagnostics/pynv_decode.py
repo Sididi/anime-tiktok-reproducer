@@ -31,7 +31,6 @@ import logging
 import os
 import threading
 from collections import OrderedDict
-from pathlib import Path
 
 import numpy as np
 from PIL import Image

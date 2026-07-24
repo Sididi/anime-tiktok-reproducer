@@ -13,13 +13,6 @@ class LibraryType(str, Enum):
 
 DEFAULT_LIBRARY_TYPE = LibraryType.ANIME
 
-LIBRARY_TYPE_LABELS: dict[LibraryType, str] = {
-    LibraryType.ANIME: "Anime",
-    LibraryType.SIMPSONS: "Simpsons",
-    LibraryType.FILMS_SERIES: "Films/Séries",
-    LibraryType.DESSIN_ANIME: "Dessin Animé",
-}
-
 STATIC_OVERLAY_TITLES: dict[LibraryType, str] = {
     LibraryType.ANIME: "CET ANIME EST INCROYABLE !",
     LibraryType.FILMS_SERIES: "CE FILM EST INCROYABLE !",

@@ -6,7 +6,7 @@ import {
   type ManagedVideoPlayerProps,
 } from "./ManagedVideoPlayer";
 
-export interface ProjectManagedVideoPlayerProps
+interface ProjectManagedVideoPlayerProps
   extends Omit<ManagedVideoPlayerProps, "src" | "fallbackSrc"> {
   projectId: string;
 }

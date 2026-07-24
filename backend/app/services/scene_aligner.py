@@ -565,13 +565,24 @@ class _WindowEmbedCache:
                 self.t_decode += time.perf_counter() - _t0
                 if frames:
                     _t1 = time.perf_counter()
+                    # B2 (R2, ATR_R2_FP16_WIN): fp16-autocast compute for
+                    # this window's embeddings. SAFE per the vF3 hard rule —
+                    # `window()` embeddings are only ever compared against
+                    # other `window()` embeddings or against fresh
+                    # edge/mid-query embeddings inside stage 5 (see the
+                    # vF16 journal audit trail); they never reach
+                    # `_index_cos_across`, `_index_embedding_at`, or a FAISS
+                    # `index.search`/`index.reconstruct` call.
+                    from .fast_matching import r2_lever
+
                     embs = AnimeMatcherService._embed_pil_batch(
                         _presize_images(
                             [
                                 self.zoom_crop(im, zoom).convert("RGB")
                                 for _, im in frames
                             ]
-                        )
+                        ),
+                        half=r2_lever("ATR_R2_FP16_WIN"),
                     )
                     self.t_embed += time.perf_counter() - _t1
                     for (t, _), emb in zip(frames, embs, strict=False):
@@ -4574,6 +4585,19 @@ class SceneAlignerService:
                 kept.append(spec)
         if not images:
             return refined_delta, doubts, splits
+        # B2 (R2, ATR_R2_FP16_WIN) audit (vF16): the task-8 brief listed this
+        # call as one of two half=True sites, on the assumption its output
+        # (edge_embs -> edge_queries/mid_embs below) is only ever compared
+        # fresh-vs-fresh (against `window()` embeddings inside
+        # `_zoom_sscd_score_line`, which IS true and safe). But `mid_embs`/
+        # `edge_queries` are ALSO reused verbatim as `q_recall` in the
+        # cur_doubt deep-recall branch a few hundred lines down, which feeds
+        # `_query_deep_recall` -> FAISS `index.search` + a direct cosine
+        # against `index.reconstruct`-ed vectors. That is exactly the vF3
+        # hard-rule violation ("never compared against index embeddings or
+        # FAISS") the brief told us to check for. Verdict: this consumer
+        # keeps fp32 — `half` is deliberately NOT wired here. Only
+        # `_WindowEmbedCache.window()` gets `half=r2_lever("ATR_R2_FP16_WIN")`.
         edge_embs = AnimeMatcherService._embed_pil_batch(_presize_images(images))
         edge_queries: dict[tuple[int, int], list[tuple[float, np.ndarray]]] = {}
         mid_embs: dict[int, list[tuple[float, np.ndarray]]] = {}

@@ -12,7 +12,7 @@ import re
 logger = logging.getLogger("uvicorn.error")
 
 from ...config import settings
-from ...models import ProjectPhase, MatchList, SceneMatch, Scene, SceneList
+from ...models import ProjectPhase, MatchList, SceneMatch, SceneList
 from ...services import (
     ProjectService,
     AnimeMatcherService,

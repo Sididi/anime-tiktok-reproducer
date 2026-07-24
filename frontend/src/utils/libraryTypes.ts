@@ -10,7 +10,7 @@ export const LIBRARY_TYPE_OPTIONS: Array<{
   { value: "dessin_anime", label: "Dessin Animé" },
 ];
 
-export const LIBRARY_TYPE_LABELS: Record<LibraryType, string> = {
+const LIBRARY_TYPE_LABELS: Record<LibraryType, string> = {
   anime: "Anime",
   simpsons: "Simpsons",
   films_series: "Films/Séries",
@@ -33,7 +33,7 @@ export function getSupportedTypeLabels(
   return supportedTypes.map((item) => getLibraryTypeLabel(item)).join(", ");
 }
 
-export function accountSupportsLibraryType(
+function accountSupportsLibraryType(
   account: Account,
   libraryType: LibraryType,
 ): boolean {

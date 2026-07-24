@@ -13,9 +13,9 @@ import logging
 import time
 from collections import deque
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, AsyncIterator, Awaitable, Callable, Literal
+from typing import AsyncIterator, Awaitable, Callable, Literal
 
 from .storage_box_sftp_client import StorageBoxSftpClient
 
@@ -73,7 +73,6 @@ class TransferSession:
         self._samples: deque[tuple[float, int]] = deque(maxlen=self._SAMPLE_WINDOW)
         self._poller_task: asyncio.Task[None] | None = None
         self._closed = False
-        self._last_snapshot_at: float = 0.0
 
     @asynccontextmanager
     async def track(
@@ -257,8 +256,3 @@ class StorageBoxTransferProgress:
         await session.close()
         async with cls._lock:
             cls._sessions.pop(session.session_id, None)
-
-
-async def noop_progress_callback(_snapshot: ProgressSnapshot) -> None:
-    """Default callback used when callers don't subscribe."""
-    return None

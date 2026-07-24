@@ -1,12 +1,10 @@
 """Anime source matching service using anime_searcher module."""
 
 import asyncio
-import hashlib
-import json
 import math
 import sys
 import time
-from bisect import bisect_left, bisect_right
+from bisect import bisect_left
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from functools import partial
@@ -110,9 +108,6 @@ class AnimeMatcherService:
     DENSE_SOURCE_CUT_MIN_SCENE_LEN = 3
     DENSE_SOURCE_CUT_FRAME_SKIP = 0
     DENSE_SOURCE_CUT_MAX_EPISODES = 3
-    DENSE_VISUAL_RERANK_MAX_SCENES = 10
-    DENSE_VISUAL_RERANK_MAX_CANDIDATES = 6
-    DENSE_VISUAL_RERANK_MARGIN = 0.012
 
     @classmethod
     def _clear_dependent_index_caches(cls) -> None:
@@ -859,11 +854,22 @@ class AnimeMatcherService:
         return candidates_by_scene
 
     @classmethod
-    def _embed_pil_batch(cls, images: list[Image.Image]) -> np.ndarray:
+    def _embed_pil_batch(
+        cls, images: list[Image.Image], *, half: bool = False
+    ) -> np.ndarray:
         """Embed a batch of PIL images, preferring the GPU-resident preprocessing
         path on the SSCD embedder when available.
 
         Falls back to ``embed_batch`` for test fakes and non-CUDA builds.
+
+        ``half`` (R2/B2, `ATR_R2_FP16_WIN`) wraps the model forward in a
+        `torch.autocast` fp16 region — a *compute*-precision hint only. The
+        returned ndarray is always float32 (storage contract unchanged);
+        autocast composes with the OOM-adaptive chunking below because it
+        only affects op dtype selection inside `embed_chunk`, not batch size.
+        HARD RULE (vF3): fp16-computed embeddings must never be compared
+        against index embeddings or FAISS — only callers that compare
+        fresh-vs-fresh (both sides half) may pass ``half=True``.
         """
         embedder = cls._embedder
         if embedder is None:
@@ -877,7 +883,7 @@ class AnimeMatcherService:
         if len(images) > 64:
             return np.concatenate(
                 [
-                    cls._embed_pil_batch(images[k : k + 64])
+                    cls._embed_pil_batch(images[k : k + 64], half=half)
                     for k in range(0, len(images), 64)
                 ],
                 axis=0,
@@ -899,9 +905,13 @@ class AnimeMatcherService:
                 pass
 
         def embed_chunk(batch: list[Image.Image]) -> np.ndarray:
-            if callable(gpu_embed):
-                return gpu_embed(batch)
-            return embedder.embed_batch(batch)
+            import torch
+
+            use_half = half and torch.cuda.is_available()
+            with torch.autocast("cuda", dtype=torch.float16, enabled=use_half):
+                if callable(gpu_embed):
+                    return gpu_embed(batch)
+                return embedder.embed_batch(batch)
 
         def embed_adaptive(batch: list[Image.Image]) -> np.ndarray:
             try:
@@ -1244,19 +1254,6 @@ class AnimeMatcherService:
         source_embs = cls._embed_pil_batch(source_images)
         scores = source_embs @ query_embedding
         best_index = int(np.argmax(scores))
-        best_score = float(scores[best_index])
-        sorted_scores = np.sort(scores)
-        margin = (
-            best_score - float(sorted_scores[-2])
-            if sorted_scores.size >= 2
-            else best_score
-        )
-
-        source_aspect = (
-            source_images[0].width / max(1, source_images[0].height)
-            if source_images
-            else 1.0
-        )
         return float(source_frames[best_index][0])
 
     @classmethod

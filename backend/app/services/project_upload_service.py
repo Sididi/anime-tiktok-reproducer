@@ -148,9 +148,6 @@ class ProjectUploadService:
             reverse=True,
         )
 
-    def get_job(self, project_id: str) -> ProjectUploadJob | None:
-        return self._jobs.get(project_id)
-
     @staticmethod
     def _ordered_platform_results(
         platform_results: list[dict[str, Any]] | None,
