@@ -1122,6 +1122,186 @@ the OFF-path gate + the fix's local-only nature) — flips 0/0 (≤1), source-
 line losses 2/~1 (≤4), scene-line diffs 0/0.** The MEDIUM defect is fixed;
 `ATR_R2_COARSE` stays default ON.
 
+## vF16 — Fast Matching Round 2, Task 8 (B2): fp16 autocast for fresh-vs-fresh window scoring — SHIPPED, default ON (2026-07-24)
+
+**The lever**: `AnimeMatcherService._embed_pil_batch(images, *, half=False)` grew
+a `half` kwarg that wraps the model forward call (inside `embed_chunk`, still
+nested under the existing OOM-adaptive chunking) in
+`torch.autocast("cuda", dtype=torch.float16, enabled=half and cuda_available)`.
+The SSCD model itself stays fp32 (only op-level compute casts to fp16 where
+autocast's op list allows it, fp32 accumulate); the returned ndarray is always
+float32 — `half` is a compute-precision hint, not a storage/dtype contract
+change. This composes cleanly with the OOM-adaptive chunk-halving retry
+because autocast only affects op dtype selection inside `embed_chunk`, not
+batch size or control flow.
+
+### Audit trail (the brief's own required gate, vF3 hard rule: fp16
+embeddings must never be compared against index embeddings or FAISS)
+
+The brief named **two** candidate call sites for `half=True`: (a)
+`_WindowEmbedCache.window()`'s own embed call, and (b) stage-5's edge/mid
+embed (`edge_embs = AnimeMatcherService._embed_pil_batch(...)` in
+`_stage5_refine`), on the stated assumption that both only ever feed
+fresh-vs-fresh comparisons. Auditing every consumer of `window()`'s returned
+embeddings and of `edge_embs`/`edge_queries`/`mid_embs`:
+
+- `_index_cos_across` and `_index_embedding_at` are self-contained — they
+  `index.reconstruct()` straight from the FAISS index and take **no external
+  embedding parameter at all**. Structurally, neither `window()` output nor
+  `edge_embs` can ever reach them, regardless of which call site gets
+  `half=True`.
+- `_query_deep_recall(q, source_at, episode)` **does** take an external query
+  array and runs `index.search(q[None], 40)` plus a direct
+  `cos = q @ (index.reconstruct(fid) / ||...||)` against real FAISS vectors —
+  this is exactly the FAISS-facing shape the hard rule bans. It has 3 call
+  sites in `scene_aligner.py`:
+  1. `~4220` (`for c in cls._query_deep_recall(q_mids, ...)`) — `q_mids` here
+     is a **locally-scoped** array built a few lines above from its own
+     dedicated `_embed_pil_batch(...)` call (no `half` passed) — untouched by
+     this lever, safe regardless.
+  2. `~5002-5003` (`cls._query_deep_recall(q_recall, chain_source_at,
+     episode)`, `q_recall = (q_mids + q_start[1:] + q_end[1:])[:8]`) — here
+     `q_mids`/`q_start`/`q_end` **are** `mid_embs.get(ci, [])` /
+     `edge_queries.get((ci, 0/1), [])`, i.e. the literal output of stage-5's
+     edge/mid embed call (site b). **This is the conflict**: if site (b) got
+     `half=True`, this branch would search/cosine fp16-computed query vectors
+     against the exact fp32 FAISS index — the hard-rule violation the brief
+     told us to check for.
+  3. `~5886` (`cands_p = cls._query_deep_recall(pm, chain_line, episode)`) —
+     `pm` is again a **separate**, dedicated `_embed_pil_batch(...)` call a
+     few lines above (no `half`) — safe regardless.
+- Every other consumer of `window()` embeddings or of `edge_embs`/`mid_embs`
+  (`_zoom_sscd_score_line`'s `sims = q @ embs.T`, the cross-candidate
+  `cur_res[2] * res[2]` identity-certificate dot product, `q_all` emptiness
+  checks, `cand_rect`/`_footprint_rect` on grayscale copies) is fresh-vs-fresh
+  — window vs window, or window vs edge/mid-query — never index-facing.
+
+**Verdict: site (a) `window()` is fully safe for `half=True`** (no path from
+its output to FAISS/`_index_*` exists anywhere in the file). **Site (b),
+stage-5's edge/mid embed, is NOT safe** — its output is reused verbatim as
+`_query_deep_recall`'s query in the `cur_doubt` deep-recall branch. Per the
+brief's own escape hatch ("that consumer keeps an fp32 path or the lever is
+dead"), **site (b) keeps fp32**; `half` is deliberately not wired at the
+`edge_embs = ...` call in `_stage5_refine` (a code comment there documents
+why, referencing this entry). Only `window()` gets
+`half=r2_lever("ATR_R2_FP16_WIN")`. This is a deviation from the brief's
+Interfaces section (which listed both sites as allowed) — exactly the outcome
+the brief's mandated audit step exists to catch.
+
+Since `[winprof] embed=` is tallied **only** from `_WindowEmbedCache.t_embed`
+(i.e. only from site (a)), the brief's own "expect ~92s → 50-60s" target is
+unaffected by dropping site (b) — window() was always the dominant cost.
+
+### Divergence probe (brief Step 4, gate before any long eval)
+
+32 frames sampled evenly from a local project's `tiktok.mp4` (project
+`6f284c2cb490`, unrelated to any GT project), embedded through the real fp32
+SSCD model both ways (`half=False` vs `half=True`, same 32 images), per-pair
+`1 - cos`:
+
+| stat | value |
+|---|---:|
+| min | 0.000003 |
+| median | 0.000013 |
+| mean | 0.000167 |
+| max | 0.004774 |
+
+All 32 pairs land at 1e-6-to-1e-3 order — an order of magnitude (or more)
+below the 0.02 danger line, and even below the brief's own "~1e-3 order"
+expectation. Cleared to proceed to the budget-gate eval. (For contrast: vF3's
+full `.half()`-model measurement — a materially different, harsher change
+that also casts the model weights — measured `cos(fp32, fp16) = 0.079`;
+autocast's fp32-weights/fp32-accumulate design is why this lever's divergence
+is ~4 orders of magnitude smaller.)
+
+### OFF-path gate
+
+`ATR_R2_FP16_WIN=0 ATR_R2_COARSE=0` on dcd74148c7ec reproduces the exact
+frozen `r2ref` hash: `27acedd58ea169fb3eb2d9f7eab55e67c01216a7292fbecee58adf39c0ab9e46`
+— the refactor (kwarg plumbing, autocast wrapper) is inert when the lever is
+off.
+
+### Budget-gate eval — lever solo (`ATR_R2_FP16_WIN=1 ATR_R2_COARSE=0`)
+
+Session was measurably warmer/more contended than vF9-vF15's sessions (load
+average ~6.6 at the start, vs ~0.9-2 previously; dcd OFF this session ran
+144.4s vs vF9's 85.3s/vF15's 85.1s) — same-session A/B (OFF immediately
+before ON, nothing else heavy running) is the only wall-time comparison that
+matters here, per the vF13-vF15 confound already on file.
+
+| project | OFF elapsed | ON elapsed | Δ wall | `[winprof]` embed OFF→ON | episode flips | source-line exact | scene-line diffs |
+|---|---:|---:|---:|---|---|---|---|
+| dcd74148c7ec | 144.4s | 134.2s | **−10.2s (−7.1%)** | not profiled (no `ATR_RERANK_DEBUG`); `sscd_embedding_seconds` (whole-run matcher stat, broader than `[winprof]`) 25.96s→20.86s | 0 | 17/20 → **18/20** (improvement) | 0/42 |
+| 5e85164d9ff8 | 227.3s | 198.3s | **−29.0s (−12.8%)** | 79.0s → 50.8s (**−35.7%**) | 0 | 40/46 → 40/46 (0 losses) | 0/56 |
+| 85de83ca6323 | 457.5s | 314.0s | **−143.5s (−31.4%)** | 125.5s → 78.9s (**−37.1%**) | 0 | 52/54 → 52/54 (0 losses) | 0/59 |
+| 411f73d26c1d | 314.3s | 291.3s | **−23.0s (−7.3%)** | 92.0s → 62.0s (**−32.6%**) | 0 | 50/52 → 50/52 (0 losses) | 0/78 |
+
+A second, independently-run 411f OFF/ON pair (captured alongside the VRAM
+poll below) agrees on direction and magnitude: 370.3s → 271.9s (**−26.6%**),
+identical source/scene buckets — the first 411f pair's smaller −7.3% wasn't a
+sign flip, just session-noise variance in magnitude.
+
+Episode flips and scene-line diffs (literal `scenes.scenes` array comparison,
+same method as vF15) are **0/0/0/0 across all 4 projects** — this lever only
+ever touches `_zoom_sscd_score_line`'s embedding compute path, never scene
+detection. Source-line exactness (the evaluator's own printed bucket) has
+**zero losses on any of the 4 projects** — 85de/411f/5e85 reproduce their
+r2ref exact/loose/failed counts exactly, and dcd's own bucket *improved*
+(17/20→18/20: a source-time drift of 0.59s on scene#11 crossed from "loose"
+into the evaluator's exact tolerance, not a regression). This is a materially
+cleaner budget result than B1's (which cost 85de 3 source-line losses) — B2
+has **zero measured quality cost** on any GT project this session.
+
+`compare_gt.py` (Task 7's scratch script) confirms per-scene: 85de has 1
+sub-frame source drift (0.010s), 411f has 3 (≤0.083s), dcd has 1 (0.590s, the
+improvement above), 5e85 is **byte-identical** to r2ref (0 drifts). Scene
+arrays are 0-diff everywhere.
+
+### VRAM
+
+Peak `nvidia-smi` memory.used polled at 1s resolution across a full 411f run,
+same-session A/B: **OFF 5823 MiB → ON 3217 MiB (−2606 MiB, −44.7%)** — fp16
+autocast activations measurably lower peak VRAM, a larger drop than the
+brief's qualitative "expect lower" anticipated.
+
+**Verdict: WITHIN BUDGET on all 4 projects (0 flips, 0 source-line losses, 0
+scene-line diffs — the cleanest scoreboard of any Round-2 lever so far).**
+`ATR_R2_FP16_WIN` ships **default ON** (`r2_lever("ATR_R2_FP16_WIN")`, default
+`True`, wired only at `window()`; the stage-5 edge/mid embed call
+deliberately keeps `half` unset/fp32 per the audit above).
+
+Environment: i9-14900HX, RTX 4070 Laptop 8GB, 32GB RAM; torch 2.8.0+cu128,
+PyNvVideoCodec 2.1.0. GT project folders, `anime_searcher` submodule, and
+`backend/data/eval_waivers.json` untouched. Evaluations run strictly
+sequentially, one GT project at a time, every invocation a single foreground
+Bash call with an explicit 600s timeout (no backgrounded/omitted-timeout
+invocations this task).
+
+### Process note: concurrent-session commit collision
+
+This branch's working directory was shared (not worktree-isolated) with a
+different, concurrently-running Claude Code session doing unrelated work
+("metadata prompts CTR rework", "overlay prompt retention rework", a
+repo-wide dead-code simplification pass) during this task. That session's
+`git commit` calls landed on `feat/fast-matching-r2` while this task's code
+edits were still sitting uncommitted in the shared working tree, and its last
+commit (`2ea9622`, "refactor: remove unused exports and types, simplify code
+structure across components") swept this task's `anime_matcher.py`,
+`scene_aligner.py`, `test_r2_coarse_window.py` edits and the new
+`test_r2_fp16_embed.py` file in alongside its own unrelated changes — this
+task never ran `git add`/`git commit` itself. `git diff` of that commit
+against the pre-task baseline (`baabca6`) confirms the four files carry
+*exactly* this task's intended diff, byte for byte, with no unrelated edits
+inside those specific hunks — the code is correct and complete — but the
+commit message and boundary do not reflect Task 8 in isolation, and it is
+bundled with unrelated frontend/backend cleanup. Rewriting that commit
+(rebase/reset/cherry-pick) was judged too risky given the other session may
+still be active on the same branch/working tree, and interactive rebase is
+outside this task's tool access regardless — so history was left as-is. This
+journal entry and this task's own dedicated follow-up commit (the
+`FAST_MODE_JOURNAL.md` update above) are the closest available record tying
+the change back to Task 8.
+
 ## How to try it (owner test protocol)
 
 ```bash
