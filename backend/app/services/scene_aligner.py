@@ -1588,12 +1588,15 @@ class SceneAlignerService:
         samples: list[QuerySample],
         scene_segments: dict[int, list[SegmentHypothesis]],
     ) -> set[int]:
+        from .fast_matching import r2_lever
+
+        floor = 3 if r2_lever("ATR_R2_THIN") else 4
         weak: set[int] = set()
         sample_times = [sample.t_tiktok for sample in samples]
         for scene_index, scene in enumerate(scenes.scenes):
             segments = scene_segments.get(scene_index, [])
             best = segments[0] if segments else None
-            if best is not None and best.inlier_count >= 4:
+            if best is not None and best.inlier_count >= floor:
                 continue
             for sample_index, sample_time in enumerate(sample_times):
                 if scene.start_time <= sample_time < scene.end_time:

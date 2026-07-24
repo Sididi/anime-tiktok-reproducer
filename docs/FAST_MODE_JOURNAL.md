@@ -1302,6 +1302,138 @@ journal entry and this task's own dedicated follow-up commit (the
 `FAST_MODE_JOURNAL.md` update above) are the closest available record tying
 the change back to Task 8.
 
+## vF17 — Fast Matching Round 2, Task 9 (B3): variant-retrieval thinning — SHIPPED, default ON (2026-07-24/25)
+
+**The lever**: `_weak_scene_sample_indices` decides which scenes are "weak"
+enough to trigger the expensive variant-retrieval tail (`sample_query_
+variants` + `retrieve_correspondences` + re-running `extract_scene_segments`
++ `_decode_correspondences`, the `variant_retrieve` phase, plus its knock-on
+cost inside stage-4's `refine_build`/DP). Mainline skips a scene when its
+best segment has `inlier_count >= 4`; under `r2_lever("ATR_R2_THIN")` the
+floor drops to 3, so a scene whose best segment already has exactly 3
+inliers is no longer treated as weak and skips variant retrieval entirely.
+
+**Implementation** (`scene_aligner.py`, `_weak_scene_sample_indices`):
+
+```python
+from .fast_matching import r2_lever
+
+floor = 3 if r2_lever("ATR_R2_THIN") else 4
+...
+if best is not None and best.inlier_count >= floor:
+    continue
+```
+
+The import stays local to the method (matching the existing call-site style
+at the `ATR_R2_COARSE`/`ATR_R2_FP16_WIN` sites — module-level would be the
+brief's suggestion, but the file's established convention for these
+per-lever probes is a local import right where it's consulted, so that
+convention was kept instead).
+
+**Unit tests** (`backend/tests/test_r2_variant_thinning.py`, 3 new — one more
+than the brief's 2-test sketch, added a mainline-explicit-off case for
+symmetry): mainline (`ATR_FAST_MATCHING=0`) treats `inlier_count=3` as weak;
+`ATR_R2_THIN=1` treats it as not-weak; `ATR_R2_THIN=0` (fast+R2 on, lever
+explicitly off) still treats it as weak. Adapted from the brief's
+`SimpleNamespace`-stub sketch with two simplifications, both verified before
+applying: (1) dropped the `importlib.reload(fast_matching)` dance — reading
+`fast_matching.py` confirms `r2_lever`/`fast_r2_enabled`/`fast_enabled` all
+call `os.environ.get` fresh on every invocation with no module-level cache,
+so a plain `monkeypatch.setenv` is sufficient; (2) the brief's stubs needed
+no extra attributes — `_weak_scene_sample_indices` only touches
+`scene.start_time`/`end_time`, `sample.t_tiktok`, and `segment.inlier_count`,
+all already present in the sketch. All pass, plus the pre-existing 22
+covering tests stay green — **25/25**
+(`test_r2_variant_thinning.py` ×3 + `test_r2_fp16_embed.py` ×5 +
+`test_r2_coarse_window.py` ×6 + `test_window_embed_cache_lru.py` ×7 +
+`test_fast_matching_r2_flags.py` ×4).
+
+**OFF-path gate**: `ATR_R2_COARSE=0 ATR_R2_FP16_WIN=0 ATR_R2_THIN=0` on
+dcd74148c7ec and 411f73d26c1d both reproduce their exact frozen `r2ref`
+hashes byte-for-byte (`27acedd5…` and `fe939396…` respectively) — the
+`floor` plumbing is fully inert when the lever is off.
+
+**Budget-gate eval — lever solo (`ATR_R2_COARSE=0 ATR_R2_FP16_WIN=0
+ATR_R2_THIN=1`), all 4 GT projects, foreground, `--save-generated-json`,
+`ATR_RERANK_DEBUG=1` on the two heavies for phase-timing deltas:**
+
+| project | `aligner_variant_retrieve_seconds` OFF→ON | `weak_variant_sample_count` OFF→ON | aligner phase wall OFF→ON | episode flips | source-line exact | scene-line diffs |
+|---|---|---|---|---|---|---|
+| dcd74148c7ec | 10.39s → 5.34s (**−5.05s, −49%**) | 46 → 10 | 83.70s → 82.92s (noise) | 0 | 17/20 → 17/20 (0 losses) | 0/42 |
+| 5e85164d9ff8 | not measured OFF this session (ON: 4.61s, `weak_variant_sample_count`=9) | — → 9 | not measured OFF this session | 0 | 40/46 → 40/46 (0 losses) | 0/56 |
+| 85de83ca6323 | **phase never runs, either side** (`weak_variant_sample_count`=0 OFF and ON — no scene's best segment ever lands in `[3,4)`; the lever is a structural no-op on this project) | 0 → 0 | 397.07s → 400.46s (noise) | 0 | 52/54 → 52/54 (0 losses) | 0/59 |
+| 411f73d26c1d | 20.98s → 17.66s (**−3.32s, −16%**, smaller than the brief's ~14.0s-ceiling framing — this session's OFF baseline for the same phase measured 20.98s, not 14.0s, a session/measurement-point difference, not a regression) | 45 → 15 | 466.44s → 382.66s (**−83.78s, −18%**) | 0 | 50/52 → 50/52 (0 losses) | 0/78 |
+
+411f's larger aligner-phase win (−83.78s) is not fully explained by the
+isolated `variant_retrieve` line (−3.32s) — `aligner_correspondence_count`
+dropped 84444→82900 (fewer variant correspondences registered), and
+`aligner_refine_build_seconds` (stage-4's global DP, downstream of the
+correspondence pool) dropped 356.74s→281.92s alongside it. Plausible
+knock-on effect (a smaller correspondence pool is cheaper to segment), not
+separately isolated/attributed — flagged as a real but not fully-decomposed
+part of the win.
+
+**Hash comparison** (decision-bearing `scenes`+`matches` projection,
+same tool as every prior Round-2 task): dcd and 85de ON reproduce their
+`r2ref` hash **exactly** (`27acedd5…`, `b7034eaf7a24…`) — genuinely
+byte-identical outputs on those two, not just bucket-identical. 5e85 and
+411f ON hashes diverge from `r2ref` (expected for a quality-budgeted lever,
+same framing as vF15/vF16: fewer variant correspondences feeding the
+scoring/DP can shift sub-frame source positions and confidence/doubt-reason
+fields even when the episode assignment and scene boundaries don't move).
+411f's literal per-scene diff (`compare_gt.py`) shows 5 sub-frame drifts
+(≤0.126s, all pre-existing evaluator-tolerance-interior positions) plus one
+larger drift on scene#75 (end time 586.252→584.541, Δ1.711s) that still
+lands on the same side of every evaluator bucket boundary as `r2ref`
+(confirmed by the unchanged Scene/Source timing summary line below) — a
+source-position wobble from the thinned correspondence pool, not a
+misclassification.
+
+**Budget-gate scoreboard** (moderate budget: ≤1 episode flip, ≤4 source-line
+exactness losses, 0 scene-line changes, per project):
+
+| project | episode flips | source-line exact (r2ref → ON) | scene-line diffs |
+|---|---|---|---|
+| dcd74148c7ec | 0 | 17/20 → 17/20 | 0/42 |
+| 5e85164d9ff8 | 0 | 40/46 → 40/46 | 0/56 |
+| 85de83ca6323 | 0 | 52/54 → 52/54 | 0/59 |
+| 411f73d26c1d | 0 | 50/52 → 50/52 | 0/78 |
+
+**Zero measured quality cost on any of the 4 GT projects, on any axis** —
+the cleanest scoreboard of any Round-2 lever so far (B1 cost 85de 2-3
+source-line losses; B2 was already clean). 411f — the project this task
+specifically flagged as the risk case (variants exist to rescue
+zoomed/cropped edits, and 411f's weak scenes are exactly where that rescue
+matters) — shows **0 flips and 0 source-line losses** despite
+`weak_variant_sample_count` dropping 45→15; the 30 scenes that stopped
+getting variant retrieval evidently didn't need the rescue.
+
+**Verdict: WITHIN BUDGET on all 4 projects, zero quality cost.** The
+brief's own framing ("expected payoff is SMALL... if quality cost shows up
+at all, default-OFF is the likely right verdict") does not trigger here —
+no quality cost showed up on any project, and the wall-time win, while
+modest and concentrated on the lighter project (dcd −49% on the isolated
+phase) plus a real (if not fully decomposed) −18% aligner-phase win on
+411f, is real and free. `ATR_R2_THIN` ships **default ON**
+(`r2_lever("ATR_R2_THIN")`, default `True`). 85de is a structural no-op for
+this lever (never had a segment in the `[3,4)` band) — not a quality risk,
+just a project where the lever has nothing to thin.
+
+**Process note**: the first 5e85164d9ff8 attempt was launched without the
+explicit `timeout` parameter, got auto-backgrounded by the harness past its
+2-minute default, and was caught immediately via `pgrep`; the backgrounded
+process was killed (confirmed dead via a second `pgrep`, and the harness's
+own notification reported the killed command as `failed`) before any
+number from it was used, and the run was redone correctly as a single
+foreground call with an explicit 600s timeout. No fabricated numbers from
+the dead attempt appear anywhere in this entry.
+
+Environment: i9-14900HX, RTX 4070 Laptop 8GB, 32GB RAM; torch 2.8.0+cu128,
+PyNvVideoCodec 2.1.0. GT project folders, `anime_searcher` submodule, and
+`backend/data/eval_waivers.json` untouched. Evaluations run strictly
+sequentially, one GT project at a time, every invocation (after the caught
+mistake above) a single foreground Bash call with an explicit 600s timeout.
+
 ## How to try it (owner test protocol)
 
 ```bash
