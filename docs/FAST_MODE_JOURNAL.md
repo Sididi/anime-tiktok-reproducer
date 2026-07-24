@@ -624,19 +624,7 @@ holds both semaphore units, so the read always reports `2` (not `≤1`) and
 the budget resolves to **2, never 3**, regardless of whether any other GPU
 job is actually running. The same is true of the `partial_matching` route
 (`partial_slots = MAX_CONCURRENT if fast_matching.decode_enabled() else 1`).
-Only the single-slot `forced_alignment` caller (`processing.py:2684`, always
-`slots=1`) can actually observe a live `0` vs `1` from another concurrent
-heavy job and reach budget=3. The measurements above were taken through the
-evaluator script (`evaluate_matching_against_ground_truth.py`), which calls
-`align_scenes_progress` directly and never touches `indexation_queue`'s
-semaphore at all — so `gpu_slots_in_use()` read `0` there and these numbers
-reflect the **budget=3 branch**, not what the full-budget production
-`matching`/`partial_matching` routes will actually exercise (which is
-always budget=2, i.e. a no-op versus the vF6 baseline). This is a pre-existing
-consequence of how `heavy_slot` weighting works (vF6/A2 didn't create it),
-not a bug in this task's code, but it means A2's real-world effect on the
-main `/matches` path is smaller than these measurements suggest — the lever
-only ever fires for `forced_alignment`.
+On every current production HTTP route, the 3-session branch is dead code — `gpu_slots_in_use()` always reads 2 (since this task itself holds both semaphore units before calling `align_scenes_sync`), and the budget unconditionally resolves to 2. The 3-session branch is reachable only via the evaluator's direct-call harness (`evaluate_matching_against_ground_truth.py`), which bypasses `indexation_queue`'s semaphore entirely — so `gpu_slots_in_use()` read `0` there and the measured numbers reflect the **budget=3 branch**, not what the full-budget production routes exercise. The single-slot `forced_alignment` caller (`processing.py:2684`) does not invoke the scene aligner or pynv_decode (it is WhisperX audio alignment), so this control point never reaches it either. This means A2's real-world effect on the main `/matches` path is smaller than these measurements suggest — in production, the sessions cap is effectively always 2, making this a no-op versus the vF6 baseline.
 
 **Conclusion**: A2 is implemented, tested, hash-safe, and trivially
 reversible (`set_session_budget` always available; the two production
