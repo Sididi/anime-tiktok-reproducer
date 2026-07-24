@@ -550,6 +550,17 @@ RAM; torch 2.8.0+cu128, PyNvVideoCodec 2.1.0. GT project folders,
 Evaluations run strictly sequentially, one GT project at a time in the
 foreground, nothing else heavy running concurrently.
 
+**Post-review decision**: vF11 measured null wall-time benefit (−0.9s decode noise
+on 85de, +2.4s embed, net ~0s) but +6GiB peak RSS against the vF8 fast-mode
+baseline (15.3GB→21.25GB). The A1 premise—"fixed 6-window evicts regions that
+later geometries re-request"—does not hold in the current codebase; cache hits
+are ~0–3% regardless of capacity, because current geometry variants compute
+different missing-run boundaries and permanently cache results per-geometry (no
+LRU churn to address). Trade is net-negative (RAM cost, no speed gain). **Default
+`ATR_R2_FRAMES_LRU_MB` flipped to `0`** (opt-in only, legacy 6-window reserved).
+Re-enable with `ATR_R2_FRAMES_LRU_MB=<MB>` if future changes unlock frame-reuse
+patterns; current choice balances simplicity + honesty with future flexibility.
+
 ## How to try it (owner test protocol)
 
 ```bash

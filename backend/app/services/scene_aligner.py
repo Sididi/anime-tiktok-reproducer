@@ -243,12 +243,14 @@ class _WindowEmbedCache:
         )
         # A1 (R2): the 6-window bound was sized for the 32GB wall under CPU
         # decode; it costs redecode ×2.3-2.7 (GOAL v5 M0). Under R2 the LRU
-        # is byte-budgeted instead. Budget 0 = legacy behaviour.
+        # is byte-budgeted instead. Default 0 = legacy 6-window behaviour
+        # (vF11 measured null benefit +6GiB RSS, ~0% hit rate) — opt-in via
+        # ATR_R2_FRAMES_LRU_MB=<MB> if future architecture changes unlock reuse.
         from .fast_matching import fast_r2_enabled
 
         self._frames_lru_bytes = 0
         self._frames_lru_budget = (
-            int(os.environ.get("ATR_R2_FRAMES_LRU_MB", "4096")) * 1024 * 1024
+            int(os.environ.get("ATR_R2_FRAMES_LRU_MB", "0")) * 1024 * 1024
             if fast_r2_enabled()
             else 0
         )
