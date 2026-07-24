@@ -922,7 +922,9 @@ previously-skipped slots; a stride!=1 run doesn't collide with a
 poisoned/pre-existing stride=1 `_frames_lru` entry; a stride=2 call doesn't
 consume a `prefetch()`-staged stride=1 run. All 5 pass, plus the pre-existing
 11 covering tests (`test_window_embed_cache_lru.py` ×7,
-`test_fast_matching_r2_flags.py` ×4) stay green — 18/18.
+`test_fast_matching_r2_flags.py` ×4) stay green — **16/16** (post-review
+correction: this entry originally miscounted the total as "18/18"; 5+11=16.
+See the post-review-fix addendum below for the current, post-fix count).
 
 **Sanity gate — OFF-path hash-identity, all 4 projects (exceeds the brief's
 dcd-only requirement)**: `ATR_R2_COARSE=0` reproduces the exact `r2ref` hash
@@ -1023,6 +1025,102 @@ attempt — omitted the explicit timeout and was auto-backgrounded by the
 harness past its 2-minute default and died silently with an empty log;
 caught immediately, re-run correctly in the foreground with an explicit
 600s timeout, no fabricated numbers were used from the dead attempt.)
+
+### Post-review fix (2026-07-24): linspace-vs-stride-grid mismatch (MEDIUM)
+
+An opus-level review of this task found a MEDIUM defect: `window()`'s embed
+loop placed each decoded frame at `slot = round(t * fps)` — its *actual*
+native slot — but the back-fill afterward unconditionally None-poisoned the
+*assumed* stride grid `range(r0, r1+1, stride)`. `_decode_run`'s underlying
+subsample (`np.linspace` over the full native-frame candidate list, in both
+`_collect_frames_in_window_from_capture` and
+`pynv_decode._sample_window_frame_indices`) does **not** guarantee a
+selected frame lands exactly on that assumed grid — its integer-truncated
+steps routinely miss it. Consequence, confirmed by simulation: for many run
+geometries (e.g. `(0, 35)` at stride=2), most decoded frames land at
+off-grid native indices, get inserted into `slots` under their own
+(off-grid) key, while the grid points they were meant to approximate get
+None-poisoned by the back-fill anyway — so a later stride=1 densify call
+over a narrow sub-range finds `missing` empty and decodes nothing. The
+"fine-grid exact" claim in `_zoom_sscd_score_line`'s code comment, and the
+"re-scores exactly at the original 0.15 tolerance" language above, were
+**not actually true** for affected spans — the densify pass was silently a
+no-op, re-scoring the same thinned coarse grid instead. This is also the
+likely mechanism behind 85de's 3 source-line losses and part of dcd's
++6.3% (a wasted extra `window()` call that bought nothing).
+
+**Fix** (`_WindowEmbedCache.window`, `backend/app/services/scene_aligner.py`):
+snap each decoded frame's raw slot to the *nearest* stride-grid point
+(`slot = r0 + stride * round((raw_slot - r0) / stride)`) before inserting
+into `slots`, instead of trusting the raw native index. This guarantees (a)
+every stride-grid point gets a real value grounded in a genuinely close
+decoded frame instead of discarding it, and (b) no off-grid native index
+can ever become a `slots` key — restoring the invariant the fine pass
+depends on: a stride-grid native is `None` only when decode truly produced
+nothing near it, and every non-grid native stays *absent* so the fine pass
+will actually decode it. `stride == 1` is unaffected (snap is a no-op when
+stride is 1), so the byte-identical OFF path is untouched.
+
+Also fixed: the `_frames_lru` type annotation (was missing the `stride != 1`
+4-tuple key variant) and this section's own test-count typo (the "18/18"
+above was already wrong at authoring time; 5 new + 11 pre-existing = 16).
+
+**New test**: `test_window_coarse_snaps_offgrid_linspace_frames_and_fine_pass_densifies`
+in `backend/tests/test_r2_coarse_window.py` — a fake `_decode_run` returns
+natives off the stride grid (`[0,1,3,5,7,9,11,13]` for a `(0,13)` stride=2
+run, mimicking real linspace behaviour); asserts every `slots` key stays on
+the assumed grid (no off-grid native ever becomes a key), and that a
+subsequent stride=1 pass over a narrow sub-range genuinely redecodes the
+previously-untouched off-grid natives (decode call count increases, the
+returned grid gains those natives). All pre-existing tests pass unchanged
+(the fix is a no-op on the fake decoders those tests already use, which
+happen to return exactly on-grid frames). **Corrected total: 17/17**
+(6 in `test_r2_coarse_window.py` + 7 in `test_window_embed_cache_lru.py` +
+4 in `test_fast_matching_r2_flags.py`).
+
+**Re-measurement** (foreground, explicit 600s timeout; one evaluator
+invocation — the first 85de83ca6323 attempt — was launched without
+`run_in_background: false`, got auto-backgrounded by the harness past its
+2-minute default, and its process/log confirmed dead with no output file;
+caught via `pgrep`, re-run correctly in the foreground):
+
+- **OFF-path gate**: `ATR_R2_COARSE=0` on dcd74148c7ec still reproduces the
+  exact frozen `r2ref` hash, `27acedd58ea169fb3eb2d9f7eab55e67c01216a7292fbecee58adf39c0ab9e46`
+  — the fix changes ON-path frame placement only, confirmed still fully
+  inert when the lever is off.
+- **dcd ON vs OFF (same session, 3 pairs)**: OFF 87.7s/93.5s/108.5s (median
+  93.5s), ON 103.3s/108.0s/131.4s (median 108.0s) → **+14.5s (+15.5%)**,
+  not smaller than vF15's +6.3%. However this session's load average
+  climbed from 2.2 to 4.2 over the ~11-minute dcd test window (desktop
+  Chrome/Discord/VS Code contention, confirmed via `ps aux`/`uptime`) and
+  the OFF-only reruns alone drifted 87.7s→108.5s (+24%) with *zero* code
+  difference between them — dcd (the lightest, most fixed-overhead-
+  sensitive project per vF15's own analysis) does not produce a clean
+  wall-time signal on a warming desktop session. The hope that the fine
+  pass "no longer being redundant" would shrink the regression is
+  **neither confirmed nor refuted** by this measurement; it is noise-
+  dominated. What matters — hash-identity OFF, and the quality-budget
+  gates below — held.
+- **85de ON, `--save-generated-json`**: wall 410.0s. Source timing
+  exact=50/54 (r2ref/OFF: 52/54) → **2 losses**, down from vF15's 3, still
+  well inside the ≤4 ceiling. `scenes.scenes` literal diff vs r2ref: **0**
+  (byte-identical). Episode/`was_no_match` diff vs r2ref across all 54
+  matches: **0 flips** (unchanged from vF15's 0).
+- **5e85 ON**: wall 268.8s. Source timing exact=39/46 (r2ref/OFF: 40/46,
+  vF15's own ON: 40/46) — the one boundary case moved from exact to loose,
+  not to wrong_primary or failed. `scenes.scenes` diff vs r2ref: **0**.
+  Episode/`was_no_match` diff vs r2ref: **0 flips** — vF15's single
+  no-match→recovered flip (scene 12) did **not** reproduce this run (scene
+  12 stayed `was_no_match: true` in both r2ref and this ON run), confirming
+  that specific case sits on a run-to-run non-deterministic boundary (fast
+  mode's GPU decode/embed path is not bit-exact run-to-run by design) rather
+  than being a stable effect of either the bug or the fix. 0 ≤ 1 budget
+  trivially holds either way.
+
+**Verdict: still WITHIN BUDGET on all 4 (2 measured directly, dcd/411f by
+the OFF-path gate + the fix's local-only nature) — flips 0/0 (≤1), source-
+line losses 2/~1 (≤4), scene-line diffs 0/0.** The MEDIUM defect is fixed;
+`ATR_R2_COARSE` stays default ON.
 
 ## How to try it (owner test protocol)
 

@@ -238,9 +238,9 @@ class _WindowEmbedCache:
         # byte-identical by construction, bounded RAM (~6 windows)
         from collections import OrderedDict
 
-        self._frames_lru: "OrderedDict[tuple[str, int, int], list]" = (
-            OrderedDict()
-        )
+        self._frames_lru: (
+            "OrderedDict[tuple[str, int, int] | tuple[str, int, int, int], list]"
+        ) = OrderedDict()
         # A1 (R2): the 6-window bound was sized for the 32GB wall under CPU
         # decode; it costs redecode ×2.3-2.7 (GOAL v5 M0). Under R2 the LRU
         # is byte-budgeted instead. Default 0 = legacy 6-window behaviour
@@ -575,16 +575,47 @@ class _WindowEmbedCache:
                     )
                     self.t_embed += time.perf_counter() - _t1
                     for (t, _), emb in zip(frames, embs, strict=False):
-                        slot = int(round(t * self.fps))
+                        raw_slot = int(round(t * self.fps))
+                        # B1/R2 post-review fix: `_decode_run`'s underlying
+                        # sample_frames subsample (np.linspace over the full
+                        # native-frame candidate list, see
+                        # `_collect_frames_in_window_from_capture` /
+                        # `pynv_decode._sample_window_frame_indices`) does
+                        # NOT guarantee a decoded frame lands exactly on the
+                        # assumed r0, r0+stride, r0+2*stride, ... grid that
+                        # the back-fill below marks None for. Left
+                        # unsnapped, a real frame at an off-grid native slot
+                        # (a) sits in `slots` under a key the fine pass's
+                        # `missing` check never looks for, wasting the
+                        # sample, and (b) leaves the grid slot it should
+                        # have approximated to be poisoned to None by the
+                        # back-fill, so the fine (stride=1) pass sees it as
+                        # already "seen" and never redecodes it. Snapping to
+                        # the NEAREST stride-grid point keeps every decoded
+                        # sample useful and guarantees no off-grid native
+                        # ever becomes a `slots` key — restoring the
+                        # invariant the fine pass depends on: a stride-grid
+                        # native is None only when decode truly produced
+                        # nothing near it, and every non-grid native stays
+                        # ABSENT (not None) so the fine pass will decode it.
+                        if stride > 1:
+                            slot = r0 + stride * int(
+                                round((raw_slot - r0) / stride)
+                            )
+                        else:
+                            slot = raw_slot
                         if r0 <= slot <= r1 and slots.get(slot) is None:
                             slots[slot] = (t, emb)
-                # CRITICAL (B1/R2): back-fill only the VISITED slots. A
-                # stride>1 pass must not mark skipped native indices as
-                # "seen but empty" (slots[k] = None) — a later stride=1
-                # request over the same span needs `k not in slots` to
-                # still be True for those indices so it actually decodes
-                # them, instead of silently treating them as permanently
-                # missing (poisoning the fine pass).
+                # CRITICAL (B1/R2): back-fill only the VISITED (stride-grid)
+                # slots. A stride>1 pass must not mark skipped native
+                # indices as "seen but empty" (slots[k] = None) — a later
+                # stride=1 request over the same span needs `k not in
+                # slots` to still be True for those indices so it actually
+                # decodes them, instead of silently treating them as
+                # permanently missing (poisoning the fine pass). This is
+                # only correct because the snap-to-grid above guarantees
+                # nothing but stride-grid keys ever lands in `slots` for a
+                # stride>1 run.
                 for k in range(r0, r1 + 1, stride):
                     slots.setdefault(k, None)
         entries = [
