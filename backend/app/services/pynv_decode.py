@@ -57,6 +57,24 @@ _KB_B = 1.772
 # the peak into the embed's OOM margin. One matching only ever touches ~1-2
 # source files per window anyway.
 _MAX_SESSIONS = 2
+# A2 (R2): mutable budget — 3 when a matching runs solo on the GPU queue,
+# 2 under concurrency (vF6: 2 procs × 3 sessions = ~2.4GB pushed the embed
+# into its OOM margin). Clamped [1, 3]; ~412MiB per session.
+_session_budget = _MAX_SESSIONS
+
+
+def set_session_budget(n: int) -> None:
+    global _session_budget
+    _session_budget = max(1, min(3, int(n)))
+
+
+def get_session_budget() -> int:
+    return _session_budget
+
+
+def _pool_max_sessions() -> int:
+    return _session_budget
+
 
 _ENV_FLAG = "ATR_PYNV_DECODE"
 
@@ -196,7 +214,7 @@ class _SessionPool:
             else:
                 self._pool[path] = sess
                 self._pool.move_to_end(path)
-                while len(self._pool) > self._max:
+                while len(self._pool) > _pool_max_sessions():
                     _old_path, old = self._pool.popitem(last=False)
                     evicted.append(old)
         # Tear down evicted sessions outside the pool lock: _stop waits on each

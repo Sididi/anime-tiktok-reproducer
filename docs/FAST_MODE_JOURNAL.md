@@ -561,6 +561,99 @@ LRU churn to address). Trade is net-negative (RAM cost, no speed gain). **Defaul
 Re-enable with `ATR_R2_FRAMES_LRU_MB=<MB>` if future changes unlock frame-reuse
 patterns; current choice balances simplicity + honesty with future flexibility.
 
+## vF12 — Fast Matching Round 2, Task 4 (A2): NVDEC session budget 3-solo/2-concurrent — NULL RESULT (2026-07-24)
+
+**Implemented exactly as specified.** `pynv_decode.set_session_budget(n)` /
+`get_session_budget()` (clamped `[1, 3]`, module-level `_session_budget`
+initialized to the old fixed `_MAX_SESSIONS=2`), `_pool_max_sessions()` reads
+the live budget; `_SessionPool.get()`'s eviction loop now reads
+`_pool_max_sessions()` instead of the constructor-frozen `self._max` (the
+constructor parameter is kept, just no longer consulted for the live cap — no
+test relied on it for eviction counting). `IndexationQueueService.gpu_slots_in_use()`
+added next to `gpu_semaphore()`, reading `MAX_CONCURRENT - self._semaphore._value`
+(same private-attribute pattern already in production use one method up, in
+`available_heavy_slots()` — not a new risk). `SceneAlignerService.align_scenes_sync`
+sets the budget at entry: `3 if indexation_queue.gpu_slots_in_use() <= 1 else 2`,
+gated behind `fast_r2_enabled()` and wrapped in `try/except Exception: pass`
+per the brief. TDD: 2 tests written first
+(`backend/tests/test_pynv_session_budget.py`), confirmed failing
+(`AttributeError: ... has no attribute 'set_session_budget'`), then both
+passed after implementation.
+
+**Hash-identity: CONFIRMED.** `ref_hash.py` reproduces the vF9 r2ref hash
+exactly — dcd74148c7ec (`27acedd5…`, single run, 85.4s) and 85de83ca6323
+(`b7034eaf…`, all 4 measured runs: 3 quiet + 1 `ATR_RERANK_DEBUG=1`). Session
+budget changes only reorder decoder eviction, never frame values, as
+expected.
+
+**Wall-clock: NO measurable improvement — NULL RESULT, same shape as vF11.**
+3-run quiet elapsed on 85de83ca6323: 291.3, 302.2, 306.4s → **median 302.2s**
+— statistically indistinguishable from vF9's 302.5s, vF10's single 292.6s,
+and vF11's 295.1s median (this project's historical run-to-run spread is
+±10-20s). One `ATR_RERANK_DEBUG=1` debug run for apples-to-apples
+`[winprof]` comparison: `decode=74.1s` — matching vF10's 75.1s and vF11's
+74.2s almost exactly; embed=102.4s, elapsed=303.1s.
+
+| lever state | 85de elapsed median | 85de `[winprof] decode=` |
+|---|---:|---:|
+| vF9 (pre-R2 fast mode) | 302.5s | — |
+| vF10 (profiling only) | 292.6s (1 run) | 75.1s |
+| vF11 (+A1 frames-LRU) | 295.1s | 74.2s |
+| vF12 (+A2 session budget) | 302.2s | 74.1s |
+
+**Root cause, found the same way vF11 found A1's**: this GT project's window
+decode already touches at most 1-2 distinct source episode files per
+`_SessionPool` lookup window (per the pre-existing comment at
+`pynv_decode.py:57-58` — true before this task too), so raising the cap from
+2 to 3 sessions removes evictions that were not happening in the first place
+on this project; 3 vs 2 live sessions never actually diverged from 2 during
+these runs. This mirrors vF11's finding: the A2 premise (vF6's "session
+churn" concern) was measured under **2-concurrent-process** contention
+(6 sessions total across 2 procs), not solo — solo runs on this hardware
+apparently were never churning sessions enough for the extra slot to matter.
+
+**Second finding, more structural — the "solo" check is inert for the
+production `matching` and `partial_matching` entry points.** Tracing
+`gpu_slots_in_use()`'s call site: `matching.py`'s `/matches` route acquires
+`indexation_queue.heavy_slot("matching", slots=matching_slots)` — and
+`matching_slots = MAX_CONCURRENT` (i.e. the **whole** 2-slot budget) whenever
+`fast_matching.decode_enabled()` — *before* calling into
+`align_scenes_progress` → `align_scenes_sync`. By the time
+`align_scenes_sync` reads `gpu_slots_in_use()`, this task itself already
+holds both semaphore units, so the read always reports `2` (not `≤1`) and
+the budget resolves to **2, never 3**, regardless of whether any other GPU
+job is actually running. The same is true of the `partial_matching` route
+(`partial_slots = MAX_CONCURRENT if fast_matching.decode_enabled() else 1`).
+Only the single-slot `forced_alignment` caller (`processing.py:2684`, always
+`slots=1`) can actually observe a live `0` vs `1` from another concurrent
+heavy job and reach budget=3. The measurements above were taken through the
+evaluator script (`evaluate_matching_against_ground_truth.py`), which calls
+`align_scenes_progress` directly and never touches `indexation_queue`'s
+semaphore at all — so `gpu_slots_in_use()` read `0` there and these numbers
+reflect the **budget=3 branch**, not what the full-budget production
+`matching`/`partial_matching` routes will actually exercise (which is
+always budget=2, i.e. a no-op versus the vF6 baseline). This is a pre-existing
+consequence of how `heavy_slot` weighting works (vF6/A2 didn't create it),
+not a bug in this task's code, but it means A2's real-world effect on the
+main `/matches` path is smaller than these measurements suggest — the lever
+only ever fires for `forced_alignment`.
+
+**Conclusion**: A2 is implemented, tested, hash-safe, and trivially
+reversible (`set_session_budget` always available; the two production
+callers that reserve the whole budget make the 3-session branch
+unreachable in practice, and the one caller that can reach it —
+`forced_alignment` — showed no measurable wall-time change on this GT
+project either). Recommend the owner treat A2, like A1, as **not worth
+further investment** at current codebase behaviour — the vF6 session-churn
+concern it targeted does not reproduce solo, and the "solo vs concurrent"
+signal it does compute correctly only reaches one, less-hot, call site.
+
+Environment unchanged from vF9-vF11: i9-14900HX, RTX 4070 Laptop 8GB, 32GB
+RAM; torch 2.8.0+cu128, PyNvVideoCodec 2.1.0. GT project folders,
+`anime_searcher` submodule, and `backend/data/eval_waivers.json` untouched.
+Evaluations run strictly sequentially, one GT project at a time in the
+foreground, nothing else heavy running concurrently.
+
 ## How to try it (owner test protocol)
 
 ```bash
