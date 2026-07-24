@@ -61,18 +61,13 @@ def test_platform_status_round_trip():
     assert PlatformStatus.from_dict(ps.to_dict()) == ps
 
 
-def test_platform_status_retry_not_before_round_trip():
-    ps = PlatformStatus(
-        status="pending",
-        attempts=5,
-        retry_not_before=datetime(2026, 7, 21, 15, 30, tzinfo=UTC),
+def test_platform_status_from_dict_ignores_stale_retry_not_before():
+    # jobs.json written by the reverted spaced-retry build may still carry
+    # the key; loading must not choke on it.
+    ps = PlatformStatus.from_dict(
+        {"status": "pending", "retry_not_before": "2026-07-21T15:30:00+00:00"}
     )
-    assert PlatformStatus.from_dict(ps.to_dict()) == ps
-
-
-def test_platform_status_from_dict_without_retry_not_before():
-    ps = PlatformStatus.from_dict({"status": "pending"})
-    assert ps.retry_not_before is None
+    assert ps.status == "pending"
 
 
 def test_instagram_publish_state_round_trip_with_fallback_fields():

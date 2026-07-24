@@ -40,15 +40,10 @@ logger = logging.getLogger(__name__)
 
 _IG_MAX_ATTEMPTS = 5
 _TT_MAX_ATTEMPTS = 5
-# TikTok-side quota errors (403 reached_active_user_cap: PFM's TikTok app hit
-# its daily active-publishing-user cap; rate limits likewise) clear on their
-# own after minutes-to-hours, so tick-speed retries just burn the attempt
-# budget (seen 2026-07-21: 4 attempts in 11 min, all same 403, while the same
-# app published fine 12 min after the last one). Space those retries out and
-# give them a longer budget instead of failing terminally within minutes.
-_TT_TRANSIENT_ERROR_MARKERS = ("reached_active_user_cap", "rate_limit_exceeded")
-_TT_TRANSIENT_MAX_ATTEMPTS = 12
-_TT_TRANSIENT_RETRY_DELAY = timedelta(minutes=5)
+# Quota errors (403 reached_active_user_cap) are NOT retried on a long spaced
+# window: the owner prefers a fast terminal failure + Discord ping so the
+# video can be posted manually near its slot, over an hour-long retry window
+# that may still fail (owner decision 2026-07-24, reverting the 07-21 pacing).
 # Post creation lead: the PFM post (with scheduled_at = the true slot) is
 # created this many minutes before the slot. Must stay <= the backend's
 # TIKTOK_EDIT_LOCK_MINUTES (backend/app/services/scheduling_service.py):
@@ -168,15 +163,10 @@ def _platform_due_time(job: Job, platform: str) -> datetime:
     sched = _tiktok_sched(job)
     state = job.tiktok_publish_state
     if state and state.post_id and state.stage != "failed":
-        due = sched                                         # poll results at slot
-    elif state and state.media_url:
-        due = sched - timedelta(minutes=TIKTOK_SCHEDULE_LEAD_MINUTES)  # create post
-    else:
-        due = _normalize_utc(job.created_at)                # stage media on arrival
-    status = job.platform_statuses.get(platform)
-    if status and status.retry_not_before:
-        return max(due, _normalize_utc(status.retry_not_before))
-    return due
+        return sched                                        # poll results at slot
+    if state and state.media_url:
+        return sched - timedelta(minutes=TIKTOK_SCHEDULE_LEAD_MINUTES)  # create post
+    return _normalize_utc(job.created_at)                   # stage media on arrival
 
 
 def _normalize_utc(value: datetime) -> datetime:
@@ -191,9 +181,7 @@ async def _record_tiktok_failure(
 ) -> None:
     """Shared attempt-counted failure handling for the create/poll phases."""
     now = datetime.now(tz=UTC)
-    transient = any(m in (detail or "") for m in _TT_TRANSIENT_ERROR_MARKERS)
-    max_attempts = _TT_TRANSIENT_MAX_ATTEMPTS if transient else _TT_MAX_ATTEMPTS
-    if attempts >= max_attempts:
+    if attempts >= _TT_MAX_ATTEMPTS:
         await store.merge_platform_status(
             job.project_id, "tiktok",
             PlatformStatus(
@@ -210,25 +198,20 @@ async def _record_tiktok_failure(
             job.project_id, attempts, detail,
         )
     else:
-        retry_not_before = now + _TT_TRANSIENT_RETRY_DELAY if transient else None
         await store.merge_platform_status(
             job.project_id, "tiktok",
-            PlatformStatus(
-                status="pending", detail=detail, attempts=attempts,
-                retry_not_before=retry_not_before,
-            ),
+            PlatformStatus(status="pending", detail=detail, attempts=attempts),
         )
         if attempts == 1:
             await _post_failure_ping(
                 job, settings, discord,
-                f"{detail or 'publish failed'} (attempt 1/{max_attempts}, retrying)",
+                f"{detail or 'publish failed'} "
+                f"(attempt 1/{_TT_MAX_ATTEMPTS}, retrying)",
                 platform_label="TikTok",
             )
         logger.info(
-            "TikTok publish attempt %d/%d failed for %s: %s — retrying %s",
-            attempts, max_attempts, job.project_id, detail,
-            f"not before {retry_not_before.isoformat()}" if retry_not_before
-            else "next tick",
+            "TikTok publish attempt %d/%d failed for %s: %s — will retry next tick",
+            attempts, _TT_MAX_ATTEMPTS, job.project_id, detail,
         )
 
 
