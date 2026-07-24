@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace as dc_replace
@@ -240,6 +241,17 @@ class _WindowEmbedCache:
         self._frames_lru: "OrderedDict[tuple[str, int, int], list]" = (
             OrderedDict()
         )
+        # A1 (R2): the 6-window bound was sized for the 32GB wall under CPU
+        # decode; it costs redecode ×2.3-2.7 (GOAL v5 M0). Under R2 the LRU
+        # is byte-budgeted instead. Budget 0 = legacy behaviour.
+        from .fast_matching import fast_r2_enabled
+
+        self._frames_lru_bytes = 0
+        self._frames_lru_budget = (
+            int(os.environ.get("ATR_R2_FRAMES_LRU_MB", "4096")) * 1024 * 1024
+            if fast_r2_enabled()
+            else 0
+        )
         self._inflight: dict[tuple[str, int, int], object] = {}
         self._prefetch_caps: dict[tuple[int, str], object] = {}
         # 4 workers: candidate scoring blocks on ~1s window decodes while
@@ -262,6 +274,28 @@ class _WindowEmbedCache:
             cap = AnimeMatcherService._open_source_capture(path)
             self.caps[str(path)] = cap
         return cap
+
+    @staticmethod
+    def _frames_nbytes(frames: list) -> int:
+        total = 0
+        for _, im in frames:
+            w, h = im.size
+            total += w * h * 3
+        return total
+
+    def _trim_frames_lru(self) -> None:
+        if self._frames_lru_budget <= 0:
+            while len(self._frames_lru) > 6:
+                _, evicted = self._frames_lru.popitem(last=False)
+                self._frames_lru_bytes -= self._frames_nbytes(evicted)
+            self._frames_lru_bytes = max(0, self._frames_lru_bytes)
+            return
+        while (
+            self._frames_lru_bytes > self._frames_lru_budget
+            and len(self._frames_lru) > 1
+        ):
+            _, evicted = self._frames_lru.popitem(last=False)
+            self._frames_lru_bytes -= self._frames_nbytes(evicted)
 
     def _decode_run(self, cap, r0: int, r1: int) -> list:
         """The single decode call both window() and the prefetch worker
@@ -410,12 +444,18 @@ class _WindowEmbedCache:
                     runs[-1] = (runs[-1][0], k)
                 else:
                     runs.append((k, k))
+            # A1 debug (ATR_LRU_DEBUG): hit/miss/eviction/peak counters for
+            # verifying the byte-budgeted LRU actually retains more windows
+            # and to attribute wall-time deltas to cache behaviour, not noise.
+            _dbg = bool(os.environ.get("ATR_LRU_DEBUG"))
             for r0, r1 in runs:
                 _t0 = time.perf_counter()
                 key = (episode, r0, r1)
                 frames = self._frames_lru.get(key)
                 if frames is not None:
                     self._frames_lru.move_to_end(key)
+                    if _dbg:
+                        self._lru_debug_hits = getattr(self, "_lru_debug_hits", 0) + 1
                 else:
                     with self._staged_lock:
                         fut = self._inflight.get(key)
@@ -429,8 +469,14 @@ class _WindowEmbedCache:
                     if frames is None:
                         frames = self._decode_run(cap, r0, r1)
                     self._frames_lru[key] = frames
-                    while len(self._frames_lru) > 6:
-                        self._frames_lru.popitem(last=False)
+                    self._frames_lru_bytes += self._frames_nbytes(frames)
+                    _before_len = len(self._frames_lru)
+                    self._trim_frames_lru()
+                    if _dbg:
+                        self._lru_debug_evictions = getattr(self, "_lru_debug_evictions", 0) + (_before_len - len(self._frames_lru))
+                        self._lru_debug_peak_len = max(getattr(self, "_lru_debug_peak_len", 0), len(self._frames_lru))
+                        self._lru_debug_peak_bytes = max(getattr(self, "_lru_debug_peak_bytes", 0), self._frames_lru_bytes)
+                        self._lru_debug_misses = getattr(self, "_lru_debug_misses", 0) + 1
                 self.t_decode += time.perf_counter() - _t0
                 if frames:
                     _t1 = time.perf_counter()
@@ -466,6 +512,18 @@ class _WindowEmbedCache:
         if _os.environ.get("ATR_RERANK_DEBUG"):
             print(
                 f"[winprof] decode={self.t_decode:.1f}s embed={self.t_embed:.1f}s"
+            )
+        if _os.environ.get("ATR_LRU_DEBUG"):
+            print(
+                "[lrudbg] budget=%d hits=%d misses=%d evictions=%d peak_len=%d peak_bytes=%d"
+                % (
+                    self._frames_lru_budget,
+                    getattr(self, "_lru_debug_hits", 0),
+                    getattr(self, "_lru_debug_misses", 0),
+                    getattr(self, "_lru_debug_evictions", 0),
+                    getattr(self, "_lru_debug_peak_len", 0),
+                    getattr(self, "_lru_debug_peak_bytes", 0),
+                )
             )
         self._prefetch_pool.shutdown(wait=False, cancel_futures=True)
         with self._staged_lock:

@@ -465,6 +465,91 @@ torch 2.8.0+cu128, PyNvVideoCodec 2.1.0. GT project folders,
 Evaluations run strictly sequentially, one GT project at a time, nothing
 else heavy running concurrently.
 
+## vF11 — Fast Matching Round 2, Task 3 (A1): byte-budgeted decoded-frames LRU — NULL RESULT (2026-07-24)
+
+**Implemented exactly as specified.** `_WindowEmbedCache._frames_lru_budget`
+(bytes; `ATR_R2_FRAMES_LRU_MB`, default 4096, 0 under `fast_r2_enabled()==False`
+⇒ legacy 6-window behaviour preserved), `_frames_nbytes(frames)`,
+`_trim_frames_lru()`; `window()`'s insertion now tracks
+`_frames_lru_bytes` and calls `_trim_frames_lru()` instead of the fixed
+`while len() > 6: popitem()`. TDD: 3 tests written first
+(`backend/tests/test_window_embed_cache_lru.py`), confirmed failing
+(`AttributeError: ... has no attribute '_frames_nbytes'`), then 3 passed
+after implementation.
+
+**Hash-identity: CONFIRMED on every run.** `ref_hash.py` reproduces the vF9
+r2ref hash exactly on dcd74148c7ec (`27acedd5…`) and on all 5 measured runs
+of 85de83ca6323 (`b7034eaf…`) — 3 quiet runs, 1 `ATR_RERANK_DEBUG=1` run, 1
+RSS-wrapped run. Byte-identical by construction, verified.
+
+**Wall-clock / decode-time: NO measurable improvement — root cause found.**
+Added a temporary `ATR_LRU_DEBUG=1` counter (hits/misses/evictions/peak_len/
+peak_bytes, gated the same way as `ATR_RERANK_DEBUG`/`ATR_TUG_DEBUG`,
+zero-cost when unset) to check whether the larger budget was actually being
+used:
+
+| project | budget | hits | misses | evictions | peak_len | peak_bytes |
+|---|---|---:|---:|---:|---:|---:|
+| dcd74148c7ec | 4096MB | **0** | 111 | 74 | 39 | 4.00GiB |
+| 85de83ca6323 | 4096MB | **13** | 417 | 401 | 31 | 4.00GiB |
+
+The budget is real (peak_len rose from the old hard cap of 6 to 31-39
+entries, filling to the byte budget as designed) but **cache hits are
+near-zero regardless of capacity** (0/111 on dcd, 13/430 on 85de = ~3%).
+`window()`'s cache key is the literal `(episode, r0, r1)` decode-run
+boundary; a raw window is only reused when a *later* request's `missing`
+gap resolves to the exact same `(r0, r1)` pair under a different geometry.
+In the current codebase this coincidence is rare — most geometry variants
+compute different `missing` boundaries against their own `slots` dict
+(which caches embeddings permanently per-geometry and never evicts), so the
+frames LRU mostly serves single-use decode results no matter how large it
+is. Raising the cap from 6 to "however many fit in 4GB" therefore holds far
+more RAM without intercepting more redecodes.
+
+Direct before/after on the `[winprof]` scoped counter (apples-to-apples
+with vF10's methodology, `ATR_RERANK_DEBUG=1` single run, decision hash
+confirmed `b7034eaf…` == vF9/vF10):
+
+| project | decode (vF10, pre-A1) | decode (vF11, post-A1) | Δ | embed (vF10) | embed (vF11) |
+|---|---:|---:|---:|---:|---:|
+| 85de83ca6323 | 75.1s | **74.2s** | −0.9s (noise) | 99.9s | 102.3s |
+
+3-run quiet elapsed median on 85de83ca6323 (post-A1): 295.1, 291.6, 298.8s →
+**median 295.1s** — statistically indistinguishable from vF9's 302.5s / vF10's
+292.6s single run (run-to-run spread on this project has historically been
+±10-20s, e.g. vF9's 300.6/302.5/323.8).
+
+**RSS**: measured via a `getrusage(RUSAGE_CHILDREN)` subprocess wrapper
+(GNU `time -v` unavailable, per vF1 precedent) on one 85de run:
+**peak_rss = 21.25GiB** (rc=1 is the pre-existing waiver-ceiling exit
+convention, not a crash — hash still confirmed identical on this run). vF8's
+prior baseline (pre-R2, plain fast mode) was 15.3GiB — this task added
+**~+6GiB** for the ~0s speed delta above. 21.25GiB is comfortably under the
+32GB wall (66%), so the stop-rule ("halve the knob if RSS approaches the
+wall") does not trigger, but the trade as measured is net-negative
+(RAM cost, no speed benefit) on both GT projects tested.
+
+**Conclusion**: the A1 premise — "the fixed 6-window LRU evicts regions that
+later geometries re-request, costing redecode ×2.28-2.68" (GOAL v5 M0) — does
+not hold against the *current* codebase's request pattern. That estimate
+predates several architecture changes that landed since (863cb42's frame-
+timestamp rewrite, F1 GPU decode, the prefetch/staged-frame threading layer,
+and the permanent per-geometry `slots` cache), any of which could have
+already eliminated the redecode churn A1 targeted. Implementation is correct,
+tested, and shipped behind `ATR_R2_FRAMES_LRU_MB` exactly as specified (default
+4096MB, 0 = legacy under `fast_r2_enabled()==False`) — trivially reversible —
+but delivers no measured wall-time win on either GT project exercised here.
+Recommend the owner treat A1 as **not worth its RAM cost** at the default
+budget; lowering `ATR_R2_FRAMES_LRU_MB` (e.g. to 512 or lower) would recover
+most of the RSS delta at no further decode cost, since hits are already rare
+at 4096MB.
+
+Environment unchanged from vF9/vF10: i9-14900HX, RTX 4070 Laptop 8GB, 32GB
+RAM; torch 2.8.0+cu128, PyNvVideoCodec 2.1.0. GT project folders,
+`anime_searcher` submodule, and `backend/data/eval_waivers.json` untouched.
+Evaluations run strictly sequentially, one GT project at a time in the
+foreground, nothing else heavy running concurrently.
+
 ## How to try it (owner test protocol)
 
 ```bash
