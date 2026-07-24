@@ -746,6 +746,125 @@ untouched. Evaluations run strictly sequentially, one GT project at a time in
 the foreground, nothing else heavy running concurrently, every invocation an
 explicit-timeout blocking foreground call.
 
+## vF14 — Fast Matching Round 2, Task 6 (A4): candidate registration probes — Step 1 ALREADY SHIPPED, escalation NULL RESULT (2026-07-24)
+
+**Go/no-go**: vF10 measured `rect + cur` = 46.8s (85de) / 54.3s (411f), both
+≥ 20s → **GO**.
+
+**Step 1 finding — the brief's primary ask already exists in the codebase.**
+The brief's sketch ("for each chain visit, `prefetch_probe` is issued for
+every candidate episode's midpoint prediction as soon as the candidate list
+is assembled, before the first `cand_rect` call") is not new: it is exactly
+what `scene_aligner.py`'s `for cand_pf in distant: ... cache.prefetch_probe(
+str(cand_pf["episode"]), a_pf * t_mid_tt + b_pf)` loop already does,
+positioned right before the candidate scoring loop that calls `cand_rect`
+via `scored_with_rect`. `git log -L` on that loop traces it to `d99e80b`
+("Refactor code structure..."), predating the `v99` "Big improve" commit —
+i.e. this pre-issue has been in place since before Fast Matching Round 1.
+The companion mechanism the brief's contract also implies — pre-staging the
+*current* line's own registration probe — likewise already exists via the
+per-visit lookahead loop (`for lookahead in (1, 2): ... cache.prefetch_probe
+(seg_n.episode, float(fn_n(t_mid_n)))`, same `d99e80b`/pre-v99 vintage),
+which stages chain `qi+1`/`qi+2`'s own line 1-2 visits ahead of when it
+becomes current (their `raw` is untouched until their own turn, so this is
+safe under the order-dependency constraint). Verified both use the exact
+`(episode, round(pred, 3))` key `probe_frames`/`prefetch_probe` share, and
+both land on the identical chain-midpoint `t` the later `cand_rect` call
+uses. **No code change was needed or made for Step 1** — vF10's rect/cur
+numbers already reflect this pre-issue in effect; there is no "before" state
+without it to diff against on this codebase.
+
+**Step 2 — the brief's escalation** (attempted since Step 1 is a no-op and
+`rect` was still ≥15s per vF10). Traced which candidates actually call
+`cand_rect` fresh: `scored_with_rect(ep, cand_fn, rect=None if
+cand.get("recall") else cur_rect, ...)` — every non-"recall" candidate
+(assignment-set "strong" ties and chronology "proposal" continuations)
+passes `rect=cur_rect` and never calls `cand_rect` at all (design comment:
+the chain's own registration is a cheap lower bound for those). Only
+**recall-cluster candidates** (drifted-offset duplicates from
+`_index_duplicate_recall`/`_query_deep_recall`) hit `cand_rect` fresh.
+Implemented exactly the brief's escalation, scoped to those: a
+`_precomputed_rects: dict[(ep, round(pred,3)), rect|None]` populated by a
+bounded `ThreadPoolExecutor(max_workers=4)` running `cls._footprint_rect`
+(pure-CPU cv2, reentrant) over the visit's recall candidates — only when
+there are ≥2 of them (below that, a pool buys no parallelism, only
+teardown overhead) — right after the existing prefetch loop and before the
+(unchanged, strictly sequential) scoring loop. `cand_rect` consults the dict
+first, by the identical `(ep, round(pred, 3))` key. Gated by a new lever,
+`r2_lever("ATR_R2_PROBE_PREISSUE", default=False)` (see decision below).
+
+**Hash-identity: CONFIRMED**, lever ON and OFF, on all three GT projects
+measured — dcd74148c7ec (`27acedd5…`), 85de83ca6323 (`b7034eaf…`, both lever
+states), 411f73d26c1d (`fe939396…`, 3 runs: ON, OFF, ON again). `ref_hash.py`
+reproduced the exact `r2ref` hash every time.
+
+**How often the escalation even fires**: added a permanent `[a4]`
+`ATR_RERANK_DEBUG` counter (`recall_cands=N` per visit, `precomputed N
+recall rect(s)` when the pool actually runs). On 85de83ca6323, **it never
+fired** — no visit ever had ≥2 recall candidates across ~90 chains,
+consistent across both measured runs. On 411f73d26c1d it fired 3 distinct
+chain positions per pass (chains 11-11, 48-48, 75-75; each exactly 2 recall
+candidates), reproduced identically across all 3 runs (ON, OFF, ON) —
+deterministic, but a small fraction of the ~90 chains this project visits.
+
+**Wall-clock / `[prof]` measurement — session-noise dominated, no
+detectable lever effect.** Ran 85de ON→OFF and 411f ON→OFF→ON back-to-back
+in one session (interleaved per the brief's guidance) specifically to
+isolate the lever's effect from drift:
+
+| project | run order | lever | rect | cur | cand | decode | embed | elapsed |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| 85de83ca6323 | 1st | ON | 36.4s | 23.0s | 168.5s | 85.7s | 110.7s | 337.3s |
+| 85de83ca6323 | 2nd | OFF | 40.3s | 25.5s | 188.8s | 97.6s | 121.3s | 387.2s |
+| 411f73d26c1d | 1st | ON | 38.0s | 34.3s | 124.4s | 87.9s | 112.2s | 422.0s |
+| 411f73d26c1d | 2nd | OFF | 44.1s | 33.4s | 133.8s | 90.4s | 116.0s | 489.7s |
+| 411f73d26c1d | 3rd | ON | 47.5s | 37.1s | 143.7s | 100.6s | 128.7s | 462.5s |
+
+Every column rose **monotonically with run order on 411f**, regardless of
+lever state (ON→OFF→ON: rect 38.0→44.1→47.5, cand 124.4→133.8→143.7, decode
+87.9→90.4→100.6) — if the escalation were doing real work, the 3rd run
+(lever ON again) should have looked like the 1st, not been the *slowest* of
+the three. `ps aux` mid-session showed the confound directly: Chrome (6+
+renderer processes), Discord, and VS Code were all live and consuming CPU on
+this shared workstation, and `uptime`'s load average climbed from 2.19 (session
+start) to 7.58 (five-minute average, by the 411f-ON-2nd-time run) over the
+~35 minutes these 5 runs spanned — a materially worse confound than vF13's
+already-flagged warm-session effect. No interleaving pattern available in
+this session recovers a clean signal at these `rect`/`cur` magnitudes.
+
+**Structural bound, independent of the noisy measurement**: the escalation
+is eligible for at most 3 chains per 411f run (2 recall candidates each) and
+0 chains on 85de. Parallelizing 2 items over a pool saves at most one
+serial `_footprint_rect` call's duration per eligible chain — a cv2 ORB
+match over two ~360px-tall grayscale frames, empirically a small fraction of
+a second based on the `cand`/`rect` totals here (hundreds of calls summing
+to tens of seconds ⇒ low-tens-of-ms each). Even a generous per-call estimate
+(0.3s) over 3 chains caps the true ceiling at **≈0.9s** on 411f and **0s**
+on 85de — both far under the 2%-of-runtime stop-rule bar (2% of ~330-490s is
+6.6-9.8s). The mechanism is implemented correctly and triggers exactly where
+intended, but the codebase's actual recall-candidate density on these two
+heavies makes it structurally too rare to matter, independent of whatever
+the session noise obscures.
+
+**Conclusion, same shape as vF11/vF12 (implemented + hash-safe + tested,
+no measurable win)**: Step 1's ask was already shipped pre-Round-2 (nothing
+to add); the Step 2 escalation is correct, deterministic, and byte-identical
+but structurally bounded to ≤~1s of possible savings on the measured
+heavies — below the 2% bar even before the session-noise confound is
+considered. Per the brief's stop-rule, **`ATR_R2_PROBE_PREISSUE` ships
+default `False`** (opt-in only; `r2_lever("ATR_R2_PROBE_PREISSUE", default=False)`
+inside `fast_r2_enabled()`'s master gate) — trivially reversible, and worth
+revisiting only if a future GT project or production workload shows denser
+recall-candidate clustering per chain than these two heavies do.
+
+Environment: i9-14900HX, RTX 4070 Laptop 8GB, 32GB RAM; torch 2.8.0+cu128,
+PyNvVideoCodec 2.1.0 — same hardware as vF9-vF13, but see the load-average
+confound noted above (this was a warmer, more contended session than
+vF9-vF12's ~0.9 baseline). GT project folders, `anime_searcher` submodule,
+and `backend/data/eval_waivers.json` untouched. Evaluations run strictly
+sequentially, one GT project at a time in the foreground, every invocation
+an explicit-timeout blocking foreground call.
+
 ## How to try it (owner test protocol)
 
 ```bash

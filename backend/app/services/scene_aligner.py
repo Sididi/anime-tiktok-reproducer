@@ -4711,6 +4711,17 @@ class SceneAlignerService:
 
                 import os as _os
 
+                # A4 (R2) escalation: populated below, right before the
+                # candidate scoring loop, by a bounded thread pool that runs
+                # cls._footprint_rect (pure-CPU cv2, reentrant) in parallel
+                # over the candidates that actually need a fresh
+                # registration (the "recall" ones — see the population
+                # site). cand_rect consumes a match here instead of
+                # repeating the CPU-bound ORB match inline. Keyed exactly
+                # like cand_rect's own (ep, round(pred, 3)) computation so
+                # a hit is only ever used for the identical decode target.
+                _precomputed_rects: dict[tuple[str, float], "tuple | None"] = {}
+
                 def cand_rect(ep: str, source_fn):
                     """Registered footprint of the query inside this
                     candidate's shot, or None when registration fails."""
@@ -4723,6 +4734,10 @@ class SceneAlignerService:
                         scenes[i].start_time + scenes[j].end_time
                     )
                     pred = float(source_fn(t_mid))
+                    _rk = (ep, round(pred, 3))
+                    if _rk in _precomputed_rects:
+                        _prof["rect"] += time.perf_counter() - _t0
+                        return _precomputed_rects.pop(_rk)
                     frames = cache.probe_frames(ep, pred)
                     out_rect = None
                     for _, im in sorted(
@@ -4991,6 +5006,63 @@ class SceneAlignerService:
                             str(cand_pf["episode"]),
                             a_pf * t_mid_tt + b_pf,
                         )
+                    # A4 (R2) escalation: every OTHER candidate below
+                    # (`scored_with_rect(..., rect=cur_rect)`) reuses the
+                    # chain's own registration as a cheap lower bound and
+                    # never calls cand_rect fresh — only "recall" candidates
+                    # do (they pass rect=None; their offsets drift from the
+                    # chain's own framing, per the comment at the scoring
+                    # loop below). With >=2 such candidates, precompute
+                    # their registrations in a bounded pool while the
+                    # decode workers staged above finish, instead of
+                    # letting the (sequential) scoring loop pay for each
+                    # ORB match one at a time. The scoring loop itself
+                    # stays strictly sequential — this only precomputes an
+                    # input it will later consult, per the chain-visit
+                    # order dependency (scene_aligner.py:4437-4441).
+                    from .fast_matching import r2_lever as _r2_probe_lever
+
+                    _recall_cands = [c for c in distant if c.get("recall")]
+                    if _recall_cands and _os.environ.get("ATR_RERANK_DEBUG"):
+                        print(
+                            f"  [a4] chain {i}-{j} recall_cands="
+                            f"{len(_recall_cands)}"
+                        )
+                    if (
+                        _r2_probe_lever("ATR_R2_PROBE_PREISSUE", default=False)
+                        and len(_recall_cands) >= 2
+                        and mid_grays.get(ci) is not None
+                    ):
+                        from concurrent.futures import ThreadPoolExecutor as _TPE
+
+                        def _precompute_rect(_cand):
+                            _a, _b = float(_cand["a"]), float(_cand["b"])
+                            _pred = _a * t_mid_tt + _b
+                            _q_gray = mid_grays[ci]
+                            _frames = cache.probe_frames(
+                                str(_cand["episode"]), _pred
+                            )
+                            _out = None
+                            for _, _im in sorted(
+                                _frames, key=lambda fr: abs(fr[0] - _pred)
+                            )[:2]:
+                                _out = cls._footprint_rect(
+                                    _q_gray, cls._small_gray(_im)
+                                )
+                                if _out is not None:
+                                    break
+                            return (str(_cand["episode"]), round(_pred, 3)), _out
+
+                        with _TPE(max_workers=4) as _rect_pool:
+                            for _rk, _rv in _rect_pool.map(
+                                _precompute_rect, _recall_cands
+                            ):
+                                _precomputed_rects[_rk] = _rv
+                        if _os.environ.get("ATR_RERANK_DEBUG"):
+                            print(
+                                f"  [a4] chain {i}-{j} precomputed "
+                                f"{len(_recall_cands)} recall rect(s)"
+                            )
                     switch_to: dict[str, float | str] | None = None
                     switch_delta = 0.0
                     switch_reason = ""
