@@ -377,6 +377,21 @@ class _WindowEmbedCache:
             cap, pred - 0.3, pred + 0.3, max_frames=8, sample_frames=3
         )
 
+    def probe_staged(self, episode: str, pred: float) -> bool:
+        """True when this probe's frames are already sitting in `_staged`
+        or being decoded by an `_inflight` prefetch worker future — i.e.
+        `probe_frames()` can be called on this key without falling through
+        to `self.get_cap()`. That fallback mutates the unlocked `self.caps`
+        dict and can hand two threads the same native capture object (the
+        concurrent-decode data race behind a prior production segfault —
+        see `prefetch_probe`'s deliberate use of per-thread captures).
+        Callers that want to run `probe_frames` from a worker pool must
+        gate on this first and leave unstaged keys to the single-threaded
+        sequential caller instead."""
+        key = ("probe", episode, round(pred, 3))
+        with self._staged_lock:
+            return key in self._staged or key in self._inflight
+
     def prefetch_probe(self, episode: str, pred: float) -> None:
         key = ("probe", episode, round(pred, 3))
         depth = self._probe_depth_limit()
@@ -5035,6 +5050,29 @@ class SceneAlignerService:
                     ):
                         from concurrent.futures import ThreadPoolExecutor as _TPE
 
+                        # Thread-safety gate: `probe_frames()` falls through
+                        # to `cache.get_cap(episode)` on a staged-cache miss,
+                        # which mutates the unlocked `self.caps` dict and can
+                        # share one native capture across threads — the exact
+                        # concurrent-decode race behind a prior production
+                        # segfault (`prefetch_probe`'s worker deliberately
+                        # uses per-thread captures to avoid it). Only hand
+                        # this pool candidates whose probe is already staged
+                        # or in flight (from the `prefetch_probe` loop just
+                        # above); unstaged candidates are left out of
+                        # `_precomputed_rects` entirely so `cand_rect`'s
+                        # existing sequential fallback (single-threaded,
+                        # `get_cap`-safe) handles them later exactly as
+                        # before this escalation existed.
+                        _staged_recall_cands = [
+                            _c
+                            for _c in _recall_cands
+                            if cache.probe_staged(
+                                str(_c["episode"]),
+                                float(_c["a"]) * t_mid_tt + float(_c["b"]),
+                            )
+                        ]
+
                         def _precompute_rect(_cand):
                             _a, _b = float(_cand["a"]), float(_cand["b"])
                             _pred = _a * t_mid_tt + _b
@@ -5053,14 +5091,16 @@ class SceneAlignerService:
                                     break
                             return (str(_cand["episode"]), round(_pred, 3)), _out
 
-                        with _TPE(max_workers=4) as _rect_pool:
-                            for _rk, _rv in _rect_pool.map(
-                                _precompute_rect, _recall_cands
-                            ):
-                                _precomputed_rects[_rk] = _rv
+                        if _staged_recall_cands:
+                            with _TPE(max_workers=4) as _rect_pool:
+                                for _rk, _rv in _rect_pool.map(
+                                    _precompute_rect, _staged_recall_cands
+                                ):
+                                    _precomputed_rects[_rk] = _rv
                         if _os.environ.get("ATR_RERANK_DEBUG"):
                             print(
                                 f"  [a4] chain {i}-{j} precomputed "
+                                f"{len(_staged_recall_cands)}/"
                                 f"{len(_recall_cands)} recall rect(s)"
                             )
                     switch_to: dict[str, float | str] | None = None

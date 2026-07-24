@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 from collections import OrderedDict
 from pathlib import Path
 
@@ -68,3 +69,44 @@ def test_prefetch_depth_fallbacks_preserve_legacy_constants():
     cache._prefetch_depth = 16
     assert cache._prefetch_depth_limit() == 16
     assert cache._probe_depth_limit() == 16
+
+
+def _probe_gate_cache() -> _WindowEmbedCache:
+    cache = _WindowEmbedCache.__new__(_WindowEmbedCache)  # skip heavy __init__
+    cache._staged = {}
+    cache._inflight = {}
+    cache._staged_lock = threading.Lock()
+    return cache
+
+
+def test_probe_staged_true_when_key_in_staged():
+    """A4 escalation gate: probe_staged() must report True for a key that
+    prefetch_probe already staged, so the parallel precompute path is
+    allowed to call probe_frames() (which will hit the staged dict, not
+    the thread-unsafe get_cap() fallback)."""
+    cache = _probe_gate_cache()
+    cache._staged[("probe", "ep1", 12.345)] = [(12.3, object())]
+    assert cache.probe_staged("ep1", 12.345) is True
+
+
+def test_probe_staged_true_when_key_inflight():
+    """Same gate, but for a probe still being decoded by a prefetch worker
+    (future present in _inflight, not yet moved to _staged) — probe_frames()
+    will block on the future then find it in _staged, so this must also
+    count as safe for the parallel path."""
+    cache = _probe_gate_cache()
+    cache._inflight[("probe", "ep1", 12.345)] = object()
+    assert cache.probe_staged("ep1", 12.345) is True
+
+
+def test_probe_staged_false_when_key_absent():
+    """No prefetch_probe ever ran for this (episode, pred) — probe_frames()
+    would fall through to the unlocked get_cap()/self.caps mutation, so the
+    A4 escalation must leave this candidate out of the parallel pool and let
+    the existing sequential cand_rect path handle it instead."""
+    cache = _probe_gate_cache()
+    cache._staged[("probe", "ep1", 12.345)] = [(12.3, object())]
+    assert cache.probe_staged("ep2", 99.999) is False
+    # rounding must match prefetch_probe's own `round(pred, 3)` key shape
+    assert cache.probe_staged("ep1", 12.3450001) is True
+    assert cache.probe_staged("ep1", 12.35) is False

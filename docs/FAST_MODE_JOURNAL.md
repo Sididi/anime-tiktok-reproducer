@@ -759,12 +759,16 @@ what `scene_aligner.py`'s `for cand_pf in distant: ... cache.prefetch_probe(
 str(cand_pf["episode"]), a_pf * t_mid_tt + b_pf)` loop already does,
 positioned right before the candidate scoring loop that calls `cand_rect`
 via `scored_with_rect`. `git log -L` on that loop traces it to `d99e80b`
-("Refactor code structure..."), predating the `v99` "Big improve" commit —
-i.e. this pre-issue has been in place since before Fast Matching Round 1.
-The companion mechanism the brief's contract also implies — pre-staging the
-*current* line's own registration probe — likewise already exists via the
-per-visit lookahead loop (`for lookahead in (1, 2): ... cache.prefetch_probe
-(seg_n.episode, float(fn_n(t_mid_n)))`, same `d99e80b`/pre-v99 vintage),
+("Refactor code structure..."), introduced 2026-07-13 — **after** `v99`
+("Big improve", `e22eac5`, 2026-07-10), not before it (the original write-up
+had this backwards). `d99e80b` still predates Fast Matching Round 1 (merged
+2026-07-16), so the conclusion stands: this pre-issue has been in place
+since before Fast Matching Round 1, just introduced post-v99 rather than
+pre-v99. The companion mechanism the brief's contract also implies —
+pre-staging the *current* line's own registration probe — likewise already
+exists via the per-visit lookahead loop (`for lookahead in (1, 2): ...
+cache.prefetch_probe(seg_n.episode, float(fn_n(t_mid_n)))`, same `d99e80b`
+vintage, i.e. post-v99/pre-R1),
 which stages chain `qi+1`/`qi+2`'s own line 1-2 visits ahead of when it
 becomes current (their `raw` is untouched until their own turn, so this is
 safe under the order-dependency constraint). Verified both use the exact
