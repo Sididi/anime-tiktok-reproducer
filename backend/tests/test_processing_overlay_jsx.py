@@ -150,6 +150,9 @@ def test_jsx_verifies_white_border_after_subtitle_mogrt_warmup():
     assert "[BORDER_MOGRT_PATH]" in jsx
     assert "BORDER_MOGRT_INSTALL_WAIT_MS = 2000" in jsx
     assert "Required Border Mogrt could not be found on V2" in jsx
+    assert 'var borderInstallFallbackStatus = "was not attempted";' in jsx
+    assert "if (borderInstallAttempted)" in jsx
+    assert "? borderInstallSucceeded" not in jsx
     assert "Border Mogrt verified on V2" in jsx
 
 

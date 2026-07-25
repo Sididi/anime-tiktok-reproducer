@@ -1732,15 +1732,20 @@
     }
 
     if (!borderItem) {
+      // Keep this deliberately simple for Premiere's legacy ExtendScript
+      // parser. A nested ternary inside string concatenation can fail while
+      // evaluating the generated JSX on some Premiere environments.
+      var borderInstallFallbackStatus = "was not attempted";
+      if (borderInstallAttempted) {
+        borderInstallFallbackStatus = borderInstallSucceeded
+          ? "succeeded"
+          : "failed";
+      }
       throw new Error(
         "Required Border Mogrt could not be found on V2 after " +
           BORDER_MOGRT_MAX_ATTEMPTS +
           " attempts (installation fallback " +
-          (borderInstallAttempted
-            ? borderInstallSucceeded
-              ? "succeeded"
-              : "failed"
-            : "was not attempted") +
+          borderInstallFallbackStatus +
           ").",
       );
     }
