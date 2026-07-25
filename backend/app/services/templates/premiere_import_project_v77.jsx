@@ -687,6 +687,7 @@
   var BORDER_MOGRT_MAX_ATTEMPTS = 5;
   var BORDER_MOGRT_WAIT_MAX_MS = 1000;
   var BORDER_MOGRT_RETRY_BASE_MS = 250;
+  var BORDER_MOGRT_INSTALL_WAIT_MS = 2000;
   var SPEED_RETRY_FAST_WAIT_MS = 12;
   var SPEED_RETRY_LONG_WAIT_MS = 60;
   var SOURCE_AUDIO_POLICY_RETRY_WAIT_MS = 40;
@@ -1568,6 +1569,58 @@
     return false;
   }
 
+  function installBorderMogrtFromFile(sequence) {
+    if (!app || !app.project || !app.project.importFiles) {
+      log(
+        "Border Mogrt installation fallback unavailable: " +
+          "app.project.importFiles is missing.",
+      );
+      return false;
+    }
+
+    var targetBin = PROJECT_IMPORT_BIN;
+    if (!targetBin) {
+      try {
+        targetBin = app.project.rootItem;
+      } catch (eRoot) {
+        targetBin = null;
+      }
+    }
+
+    log(
+      "Direct Border Mogrt placement failed; installing bundled template " +
+        "through Premiere media import...",
+    );
+    var importResult = false;
+    try {
+      // Premiere 25+ treats regular media import of a .mogrt as installation
+      // into My Templates, matching File > Import / Graphics Templates install.
+      importResult = app.project.importFiles(
+        [BORDER_MOGRT_PATH],
+        true,
+        targetBin,
+        false,
+      );
+    } catch (eInstallBorder) {
+      log(
+        "Border Mogrt installation error: " +
+          (eInstallBorder && eInstallBorder.message
+            ? eInstallBorder.message
+            : eInstallBorder),
+      );
+      return false;
+    }
+
+    refreshSequenceUI(sequence);
+    sleep(BORDER_MOGRT_INSTALL_WAIT_MS);
+    if (importResult === false) {
+      log("Border Mogrt media import reported installation failure.");
+      return false;
+    }
+    log("Bundled Border Mogrt installed through Premiere media import.");
+    return true;
+  }
+
   function ensureWhiteBorderMogrt(sequence, track, endSec) {
     if (!WHITE_BORDER_ENABLED) {
       log("Skipping V2 border (template white_border.enabled=false).");
@@ -1590,6 +1643,8 @@
     if (!borderItem) {
       log("Adding Border Mogrt to V2...");
     }
+    var borderInstallAttempted = false;
+    var borderInstallSucceeded = false;
 
     for (
       var borderAttempt = 1;
@@ -1661,6 +1716,11 @@
         );
       }
 
+      if (!borderItem && !borderInstallAttempted) {
+        borderInstallAttempted = true;
+        borderInstallSucceeded = installBorderMogrtFromFile(sequence);
+      }
+
       if (!borderItem && borderAttempt < BORDER_MOGRT_MAX_ATTEMPTS) {
         log(
           "Border Mogrt attempt " +
@@ -1675,7 +1735,13 @@
       throw new Error(
         "Required Border Mogrt could not be found on V2 after " +
           BORDER_MOGRT_MAX_ATTEMPTS +
-          " attempts.",
+          " attempts (installation fallback " +
+          (borderInstallAttempted
+            ? borderInstallSucceeded
+              ? "succeeded"
+              : "failed"
+            : "was not attempted") +
+          ").",
       );
     }
 

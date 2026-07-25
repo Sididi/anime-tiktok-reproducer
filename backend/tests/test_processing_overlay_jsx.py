@@ -145,6 +145,10 @@ def test_jsx_verifies_white_border_after_subtitle_mogrt_warmup():
     assert "BORDER_MOGRT_MAX_ATTEMPTS = 5" in jsx
     assert "borderItem = waitForTrackItemAtStart(" in jsx
     assert "track.overwriteClip(importedBorderProjectItem, \"0\")" in jsx
+    assert "installBorderMogrtFromFile(sequence)" in jsx
+    assert "app.project.importFiles(" in jsx
+    assert "[BORDER_MOGRT_PATH]" in jsx
+    assert "BORDER_MOGRT_INSTALL_WAIT_MS = 2000" in jsx
     assert "Required Border Mogrt could not be found on V2" in jsx
     assert "Border Mogrt verified on V2" in jsx
 
