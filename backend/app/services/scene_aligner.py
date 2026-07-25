@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace as dc_replace
@@ -237,15 +238,59 @@ class _WindowEmbedCache:
         # byte-identical by construction, bounded RAM (~6 windows)
         from collections import OrderedDict
 
-        self._frames_lru: "OrderedDict[tuple[str, int, int], list]" = (
-            OrderedDict()
+        self._frames_lru: (
+            "OrderedDict[tuple[str, int, int] | tuple[str, int, int, int], list]"
+        ) = OrderedDict()
+        # A1 (R2): the 6-window bound was sized for the 32GB wall under CPU
+        # decode; it costs redecode ×2.3-2.7 (GOAL v5 M0). Under R2 the LRU
+        # is byte-budgeted instead. Default 0 = legacy 6-window behaviour
+        # (vF11 measured null benefit +6GiB RSS, ~0% hit rate) — opt-in via
+        # ATR_R2_FRAMES_LRU_MB=<MB> if future architecture changes unlock reuse.
+        from .fast_matching import fast_r2_enabled
+
+        self._frames_lru_bytes = 0
+        self._frames_lru_budget = (
+            int(os.environ.get("ATR_R2_FRAMES_LRU_MB", "0")) * 1024 * 1024
+            if fast_r2_enabled()
+            else 0
         )
         self._inflight: dict[tuple[str, int, int], object] = {}
         self._prefetch_caps: dict[tuple[int, str], object] = {}
         # 4 workers: candidate scoring blocks on ~1s window decodes while
         # registration+embed take ~0.5s — 2 workers measured unable to
         # keep ahead (v160: 210s window decode of 330s refine on 85de)
-        self._prefetch_pool = ThreadPoolExecutor(max_workers=4)
+        # A3 (R2): env-tunable prefetch depth/workers, intended to deepen
+        # decode<->embed overlap. vF13 measured this as an active
+        # REGRESSION (+42-50% wall time on both heavies, [winprof] decode
+        # AND embed both slower under debug) at workers=6/depth=16 — more
+        # Python threads contending for the global native decode lock and
+        # the GIL cost more than the extra overlap bought. Default workers
+        # is therefore held at the legacy 4 even under R2; the knobs stay
+        # available for future experimentation via ATR_R2_PREFETCH_WORKERS /
+        # ATR_R2_PREFETCH_DEPTH. See docs/FAST_MODE_JOURNAL.md vF13.
+        # WARNING: setting ATR_R2_PREFETCH_DEPTH above defaults (8 for
+        # prefetch, 12 for prefetch_probe) reproducibly broke hash-identity
+        # on 411f (vF13, doubt_reasons flip) — these knobs risk eval-
+        # equivalence, experiment only.
+        #
+        # self._prefetch_depth is None when the knob is unset: prefetch()
+        # and prefetch_probe() originally had DIFFERENT hard-coded depth
+        # caps (8 and 12). Collapsing both to one shared default value
+        # would silently change one of them even at the "off" setting
+        # (caught by vF13's hash gate on 411f — a None sentinel preserves
+        # each call site's original constant when the knob is unset, and
+        # only unifies them under an explicit ATR_R2_PREFETCH_DEPTH override).
+
+        workers = (
+            int(os.environ.get("ATR_R2_PREFETCH_WORKERS", "4"))
+            if fast_r2_enabled()
+            else 4
+        )
+        _depth_env = os.environ.get("ATR_R2_PREFETCH_DEPTH")
+        self._prefetch_depth = (
+            int(_depth_env) if (fast_r2_enabled() and _depth_env is not None) else None
+        )
+        self._prefetch_pool = ThreadPoolExecutor(max_workers=workers)
 
     def get_cap(self, episode: str):
         from .anime_library import AnimeLibraryService
@@ -263,9 +308,49 @@ class _WindowEmbedCache:
             self.caps[str(path)] = cap
         return cap
 
-    def _decode_run(self, cap, r0: int, r1: int) -> list:
+    @staticmethod
+    def _frames_nbytes(frames: list) -> int:
+        total = 0
+        for _, im in frames:
+            w, h = im.size
+            total += w * h * 3
+        return total
+
+    def _trim_frames_lru(self) -> None:
+        if self._frames_lru_budget <= 0:
+            while len(self._frames_lru) > 6:
+                _, evicted = self._frames_lru.popitem(last=False)
+                self._frames_lru_bytes -= self._frames_nbytes(evicted)
+            self._frames_lru_bytes = max(0, self._frames_lru_bytes)
+            return
+        while (
+            self._frames_lru_bytes > self._frames_lru_budget
+            and len(self._frames_lru) > 1
+        ):
+            _, evicted = self._frames_lru.popitem(last=False)
+            self._frames_lru_bytes -= self._frames_nbytes(evicted)
+
+    def _prefetch_depth_limit(self) -> int:
+        """Fallback to prefetch()'s legacy depth constant (8) when the knob
+        is unset; otherwise use the explicit override."""
+        return self._prefetch_depth if self._prefetch_depth is not None else 8
+
+    def _probe_depth_limit(self) -> int:
+        """Fallback to prefetch_probe()'s legacy depth constant (12) when
+        the knob is unset; otherwise use the explicit override."""
+        return self._prefetch_depth if self._prefetch_depth is not None else 12
+
+    def _decode_run(self, cap, r0: int, r1: int, stride: int = 1) -> list:
         """The single decode call both window() and the prefetch worker
-        use — identical parameters guarantee identical frames."""
+        use — identical parameters guarantee identical frames.
+
+        `stride` (B1/R2, ATR_R2_COARSE) thins the returned SAMPLE density
+        only: the underlying decoder still walks every native frame in
+        [r0, r1] in GOP order (no cheap seeking, per the vF8 identity
+        requirement) but `sample_frames` is halved so roughly every other
+        native slot is actually converted/embedded. Default stride=1
+        reproduces the exact legacy call (byte-identical when the lever
+        is off or unused, e.g. prefetch())."""
         w_lo = r0 / self.fps
         w_hi = (r1 + 1) / self.fps
         return AnimeMatcherService._collect_frames_in_window_from_capture(
@@ -273,7 +358,9 @@ class _WindowEmbedCache:
             w_lo,
             w_hi,
             max_frames=int((w_hi - w_lo) * 65) + 8,
-            sample_frames=max(2, int(round((w_hi - w_lo) * self.fps)) + 1),
+            sample_frames=max(
+                2, int(round((w_hi - w_lo) * self.fps / max(1, stride))) + 1
+            ),
         )
 
     def probe_frames(self, episode: str, pred: float) -> list:
@@ -300,13 +387,29 @@ class _WindowEmbedCache:
             cap, pred - 0.3, pred + 0.3, max_frames=8, sample_frames=3
         )
 
+    def probe_staged(self, episode: str, pred: float) -> bool:
+        """True when this probe's frames are already sitting in `_staged`
+        or being decoded by an `_inflight` prefetch worker future — i.e.
+        `probe_frames()` can be called on this key without falling through
+        to `self.get_cap()`. That fallback mutates the unlocked `self.caps`
+        dict and can hand two threads the same native capture object (the
+        concurrent-decode data race behind a prior production segfault —
+        see `prefetch_probe`'s deliberate use of per-thread captures).
+        Callers that want to run `probe_frames` from a worker pool must
+        gate on this first and leave unstaged keys to the single-threaded
+        sequential caller instead."""
+        key = ("probe", episode, round(pred, 3))
+        with self._staged_lock:
+            return key in self._staged or key in self._inflight
+
     def prefetch_probe(self, episode: str, pred: float) -> None:
         key = ("probe", episode, round(pred, 3))
+        depth = self._probe_depth_limit()
         with self._staged_lock:
             if (
                 key in self._staged
                 or key in self._inflight
-                or len(self._inflight) + len(self._staged) > 12
+                or len(self._inflight) + len(self._staged) > depth
             ):
                 return
 
@@ -347,11 +450,12 @@ class _WindowEmbedCache:
         i0 = int(math.floor(max(0.0, lo) * self.fps))
         i1 = int(math.ceil(hi * self.fps))
         key = (episode, i0, i1)
+        depth = self._prefetch_depth_limit()
         with self._staged_lock:
             if (
                 key in self._staged
                 or key in self._inflight
-                or len(self._inflight) + len(self._staged) > 8
+                or len(self._inflight) + len(self._staged) > depth
             ):
                 return
 
@@ -387,8 +491,14 @@ class _WindowEmbedCache:
         zoom: "float | tuple[float, float, float, float]",
         lo: float,
         hi: float,
+        stride: int = 1,
     ) -> tuple[np.ndarray, np.ndarray] | None:
-        """(times, embeddings) covering [lo, hi] at the decode grid."""
+        """(times, embeddings) covering [lo, hi] at the decode grid.
+
+        `stride` (B1/R2, ATR_R2_COARSE) requests only every Nth native
+        decode slot in this call — the coarse pass of a coarse-to-fine
+        scoring sweep. Default stride=1 is the exact legacy path."""
+        stride = max(1, stride)
         geom_key = (
             # 0.05-fraction quantization: crops within a few percent are
             # visually the same footprint and share decoded windows
@@ -399,55 +509,125 @@ class _WindowEmbedCache:
         slots = self.slots.setdefault((episode, geom_key), {})
         i0 = int(math.floor(max(0.0, lo) * self.fps))
         i1 = int(math.ceil(hi * self.fps))
-        missing = [k for k in range(i0, i1 + 1) if k not in slots]
+        missing = [k for k in range(i0, i1 + 1, stride) if k not in slots]
         if missing:
             cap = self.get_cap(episode)
             if cap is None:
                 return None
             runs: list[tuple[int, int]] = []
             for k in missing:
-                if runs and k == runs[-1][1] + 1:
+                if runs and k == runs[-1][1] + stride:
                     runs[-1] = (runs[-1][0], k)
                 else:
                     runs.append((k, k))
+            # A1 debug (ATR_LRU_DEBUG): hit/miss/eviction/peak counters for
+            # verifying the byte-budgeted LRU actually retains more windows
+            # and to attribute wall-time deltas to cache behaviour, not noise.
+            _dbg = bool(os.environ.get("ATR_LRU_DEBUG"))
             for r0, r1 in runs:
                 _t0 = time.perf_counter()
-                key = (episode, r0, r1)
+                # B1/R2: stride!=1 (coarse) runs use a namespaced key so a
+                # thinned decode can never be handed back to a stride=1
+                # (fine/legacy) request from `_frames_lru`, and never pops
+                # a `prefetch()`-staged full run (which stages stride=1
+                # only, keyed as a plain 3-tuple) out from under a later
+                # stride=1 consumer. stride=1 keeps the exact legacy 3-tuple
+                # key so the lever-off path is byte-identical.
+                key = (episode, r0, r1) if stride == 1 else (episode, r0, r1, stride)
                 frames = self._frames_lru.get(key)
                 if frames is not None:
                     self._frames_lru.move_to_end(key)
+                    if _dbg:
+                        self._lru_debug_hits = getattr(self, "_lru_debug_hits", 0) + 1
                 else:
-                    with self._staged_lock:
-                        fut = self._inflight.get(key)
-                    if fut is not None:
-                        try:
-                            fut.result()
-                        except Exception:
-                            pass
-                    with self._staged_lock:
-                        frames = self._staged.pop(key, None)
+                    frames = None
+                    if stride == 1:
+                        with self._staged_lock:
+                            fut = self._inflight.get(key)
+                        if fut is not None:
+                            try:
+                                fut.result()
+                            except Exception:
+                                pass
+                        with self._staged_lock:
+                            frames = self._staged.pop(key, None)
                     if frames is None:
-                        frames = self._decode_run(cap, r0, r1)
+                        frames = self._decode_run(cap, r0, r1, stride)
                     self._frames_lru[key] = frames
-                    while len(self._frames_lru) > 6:
-                        self._frames_lru.popitem(last=False)
+                    self._frames_lru_bytes += self._frames_nbytes(frames)
+                    _before_len = len(self._frames_lru)
+                    self._trim_frames_lru()
+                    if _dbg:
+                        self._lru_debug_evictions = getattr(self, "_lru_debug_evictions", 0) + (_before_len - len(self._frames_lru))
+                        self._lru_debug_peak_len = max(getattr(self, "_lru_debug_peak_len", 0), len(self._frames_lru))
+                        self._lru_debug_peak_bytes = max(getattr(self, "_lru_debug_peak_bytes", 0), self._frames_lru_bytes)
+                        self._lru_debug_misses = getattr(self, "_lru_debug_misses", 0) + 1
                 self.t_decode += time.perf_counter() - _t0
                 if frames:
                     _t1 = time.perf_counter()
+                    # B2 (R2, ATR_R2_FP16_WIN): fp16-autocast compute for
+                    # this window's embeddings. SAFE per the vF3 hard rule —
+                    # `window()` embeddings are only ever compared against
+                    # other `window()` embeddings or against fresh
+                    # edge/mid-query embeddings inside stage 5 (see the
+                    # vF16 journal audit trail); they never reach
+                    # `_index_cos_across`, `_index_embedding_at`, or a FAISS
+                    # `index.search`/`index.reconstruct` call.
+                    from .fast_matching import r2_lever
+
                     embs = AnimeMatcherService._embed_pil_batch(
                         _presize_images(
                             [
                                 self.zoom_crop(im, zoom).convert("RGB")
                                 for _, im in frames
                             ]
-                        )
+                        ),
+                        half=r2_lever("ATR_R2_FP16_WIN"),
                     )
                     self.t_embed += time.perf_counter() - _t1
                     for (t, _), emb in zip(frames, embs, strict=False):
-                        slot = int(round(t * self.fps))
+                        raw_slot = int(round(t * self.fps))
+                        # B1/R2 post-review fix: `_decode_run`'s underlying
+                        # sample_frames subsample (np.linspace over the full
+                        # native-frame candidate list, see
+                        # `_collect_frames_in_window_from_capture` /
+                        # `pynv_decode._sample_window_frame_indices`) does
+                        # NOT guarantee a decoded frame lands exactly on the
+                        # assumed r0, r0+stride, r0+2*stride, ... grid that
+                        # the back-fill below marks None for. Left
+                        # unsnapped, a real frame at an off-grid native slot
+                        # (a) sits in `slots` under a key the fine pass's
+                        # `missing` check never looks for, wasting the
+                        # sample, and (b) leaves the grid slot it should
+                        # have approximated to be poisoned to None by the
+                        # back-fill, so the fine (stride=1) pass sees it as
+                        # already "seen" and never redecodes it. Snapping to
+                        # the NEAREST stride-grid point keeps every decoded
+                        # sample useful and guarantees no off-grid native
+                        # ever becomes a `slots` key — restoring the
+                        # invariant the fine pass depends on: a stride-grid
+                        # native is None only when decode truly produced
+                        # nothing near it, and every non-grid native stays
+                        # ABSENT (not None) so the fine pass will decode it.
+                        if stride > 1:
+                            slot = r0 + stride * int(
+                                round((raw_slot - r0) / stride)
+                            )
+                        else:
+                            slot = raw_slot
                         if r0 <= slot <= r1 and slots.get(slot) is None:
                             slots[slot] = (t, emb)
-                for k in range(r0, r1 + 1):
+                # CRITICAL (B1/R2): back-fill only the VISITED (stride-grid)
+                # slots. A stride>1 pass must not mark skipped native
+                # indices as "seen but empty" (slots[k] = None) — a later
+                # stride=1 request over the same span needs `k not in
+                # slots` to still be True for those indices so it actually
+                # decodes them, instead of silently treating them as
+                # permanently missing (poisoning the fine pass). This is
+                # only correct because the snap-to-grid above guarantees
+                # nothing but stride-grid keys ever lands in `slots` for a
+                # stride>1 run.
+                for k in range(r0, r1 + 1, stride):
                     slots.setdefault(k, None)
         entries = [
             slots[k]
@@ -466,6 +646,18 @@ class _WindowEmbedCache:
         if _os.environ.get("ATR_RERANK_DEBUG"):
             print(
                 f"[winprof] decode={self.t_decode:.1f}s embed={self.t_embed:.1f}s"
+            )
+        if _os.environ.get("ATR_LRU_DEBUG"):
+            print(
+                "[lrudbg] budget=%d hits=%d misses=%d evictions=%d peak_len=%d peak_bytes=%d"
+                % (
+                    self._frames_lru_budget,
+                    getattr(self, "_lru_debug_hits", 0),
+                    getattr(self, "_lru_debug_misses", 0),
+                    getattr(self, "_lru_debug_evictions", 0),
+                    getattr(self, "_lru_debug_peak_len", 0),
+                    getattr(self, "_lru_debug_peak_bytes", 0),
+                )
             )
         self._prefetch_pool.shutdown(wait=False, cancel_futures=True)
         with self._staged_lock:
@@ -562,6 +754,19 @@ class SceneAlignerService:
     ) -> AlignmentResult:
         diagnostics = AlignmentDiagnostics()
         started = time.perf_counter()
+
+        from .fast_matching import fast_r2_enabled
+        if fast_r2_enabled():
+            try:
+                from . import pynv_decode
+                from .indexation_queue import indexation_queue
+
+                pynv_decode.set_session_budget(
+                    3 if indexation_queue.gpu_slots_in_use() <= 1 else 2
+                )
+            except Exception:
+                pass
+
         samples, diff_times, diffs = cls.sample_query_video_with_diffs(video_path)
         diagnostics.phase_timings["sample"] = time.perf_counter() - started
         diagnostics.sample_count = len(samples)
@@ -1383,12 +1588,15 @@ class SceneAlignerService:
         samples: list[QuerySample],
         scene_segments: dict[int, list[SegmentHypothesis]],
     ) -> set[int]:
+        from .fast_matching import r2_lever
+
+        floor = 3 if r2_lever("ATR_R2_THIN") else 4
         weak: set[int] = set()
         sample_times = [sample.t_tiktok for sample in samples]
         for scene_index, scene in enumerate(scenes.scenes):
             segments = scene_segments.get(scene_index, [])
             best = segments[0] if segments else None
-            if best is not None and best.inlier_count >= 4:
+            if best is not None and best.inlier_count >= floor:
                 continue
             for sample_index, sample_time in enumerate(sample_times):
                 if scene.start_time <= sample_time < scene.end_time:
@@ -3746,29 +3954,80 @@ class SceneAlignerService:
         preds = np.array([source_at(t) for t, _ in q_mids])
         pad = sweep + 0.2
         lo, hi = float(preds.min()) - pad, float(preds.max()) + pad
-        win = cache.window(episode, zoom, lo, hi)
+
+        # B1 (R2, ATR_R2_COARSE): coarse-to-fine window scoring. The full
+        # delta sweep at full decode density is the stage-5 candidate-
+        # scoring hotspot (vF10: ~144s/98s on the heavies, embed ~100s).
+        # A stride-2 coarse pass over the whole span finds the winning
+        # alignment on a thinned grid (halved decode/embed cost, tolerance
+        # widened to 0.18 to keep the 2/3-valid quorum reachable under
+        # stride-2 slot misses); a narrow +-0.35s densify re-decodes at
+        # full density and re-scores with the original exact 0.15
+        # tolerance, so the reported alignment is always fine-grid exact.
+        # Only worth it on spans wide enough to amortize the extra window
+        # fetch (span > 3.0s); the lever is OFF (or span too small)
+        # reproduces the exact legacy single-pass call.
+        from .fast_matching import r2_lever
+
+        span = hi - lo
+        # Owner decision 2026-07-25 (vF18a: fine-pass decode is a net cold
+        # cost) — default OFF; opt-in via ATR_R2_COARSE=1.
+        coarse = r2_lever("ATR_R2_COARSE", default=False) and span > 3.0
+        win = cache.window(episode, zoom, lo, hi, stride=2 if coarse else 1)
         if win is None:
             return None
         times, embs = win
         q = np.stack([e for _, e in q_mids])
         sims = q @ embs.T
-        best: tuple[float, float, np.ndarray] | None = None
         rows = np.arange(len(q_mids))
-        for delta in np.arange(-sweep, sweep + 1e-6, 1.0 / VERIFY_DECODE_FPS):
-            pos = preds + delta
-            cols = np.clip(np.searchsorted(times, pos), 0, len(times) - 1)
-            prev_cols = np.clip(cols - 1, 0, len(times) - 1)
-            use_prev = np.abs(times[prev_cols] - pos) < np.abs(times[cols] - pos)
-            cols = np.where(use_prev, prev_cols, cols)
-            valid = np.abs(times[cols] - pos) <= 0.15
-            if valid.sum() < max(1, len(q_mids) * 2 // 3):
-                continue
-            score = float(np.mean(sims[rows, cols][valid]))
-            if best is None or score > best[0]:
-                # matched source embeddings at this alignment: the caller's
-                # native identity certificate compares them across candidates
-                matched = np.where(valid[:, None], embs[cols], np.nan)
-                best = (score, float(delta), matched)
+
+        def _sweep(
+            times: np.ndarray,
+            embs: np.ndarray,
+            sims: np.ndarray,
+            deltas: np.ndarray,
+            tol: float,
+        ) -> tuple[float, float, np.ndarray] | None:
+            best_local: tuple[float, float, np.ndarray] | None = None
+            for delta in deltas:
+                pos = preds + delta
+                cols = np.clip(np.searchsorted(times, pos), 0, len(times) - 1)
+                prev_cols = np.clip(cols - 1, 0, len(times) - 1)
+                use_prev = np.abs(times[prev_cols] - pos) < np.abs(times[cols] - pos)
+                cols = np.where(use_prev, prev_cols, cols)
+                valid = np.abs(times[cols] - pos) <= tol
+                if valid.sum() < max(1, len(q_mids) * 2 // 3):
+                    continue
+                score = float(np.mean(sims[rows, cols][valid]))
+                if best_local is None or score > best_local[0]:
+                    # matched source embeddings at this alignment: the
+                    # caller's native identity certificate compares them
+                    # across candidates
+                    matched = np.where(valid[:, None], embs[cols], np.nan)
+                    best_local = (score, float(delta), matched)
+            return best_local
+
+        deltas = np.arange(-sweep, sweep + 1e-6, 1.0 / VERIFY_DECODE_FPS)
+        best = _sweep(times, embs, sims, deltas, 0.18 if coarse else 0.15)
+
+        if coarse and best is not None:
+            best_c = best[1]
+            fine = cache.window(
+                episode,
+                zoom,
+                max(lo, float(preds.min()) + best_c - 0.35),
+                min(hi, float(preds.max()) + best_c + 0.35),
+                stride=1,
+            )
+            if fine is not None:
+                f_times, f_embs = fine
+                f_sims = q @ f_embs.T
+                f_deltas = np.arange(
+                    best_c - 0.35, best_c + 0.35 + 1e-6, 1.0 / VERIFY_DECODE_FPS
+                )
+                refined = _sweep(f_times, f_embs, f_sims, f_deltas, 0.15)
+                if refined is not None:
+                    best = refined
         return best
 
     @classmethod
@@ -4331,6 +4590,19 @@ class SceneAlignerService:
                 kept.append(spec)
         if not images:
             return refined_delta, doubts, splits
+        # B2 (R2, ATR_R2_FP16_WIN) audit (vF16): the task-8 brief listed this
+        # call as one of two half=True sites, on the assumption its output
+        # (edge_embs -> edge_queries/mid_embs below) is only ever compared
+        # fresh-vs-fresh (against `window()` embeddings inside
+        # `_zoom_sscd_score_line`, which IS true and safe). But `mid_embs`/
+        # `edge_queries` are ALSO reused verbatim as `q_recall` in the
+        # cur_doubt deep-recall branch a few hundred lines down, which feeds
+        # `_query_deep_recall` -> FAISS `index.search` + a direct cosine
+        # against `index.reconstruct`-ed vectors. That is exactly the vF3
+        # hard-rule violation ("never compared against index embeddings or
+        # FAISS") the brief told us to check for. Verdict: this consumer
+        # keeps fp32 — `half` is deliberately NOT wired here. Only
+        # `_WindowEmbedCache.window()` gets `half=r2_lever("ATR_R2_FP16_WIN")`.
         edge_embs = AnimeMatcherService._embed_pil_batch(_presize_images(images))
         edge_queries: dict[tuple[int, int], list[tuple[float, np.ndarray]]] = {}
         mid_embs: dict[int, list[tuple[float, np.ndarray]]] = {}
@@ -4595,6 +4867,17 @@ class SceneAlignerService:
 
                 import os as _os
 
+                # A4 (R2) escalation: populated below, right before the
+                # candidate scoring loop, by a bounded thread pool that runs
+                # cls._footprint_rect (pure-CPU cv2, reentrant) in parallel
+                # over the candidates that actually need a fresh
+                # registration (the "recall" ones — see the population
+                # site). cand_rect consumes a match here instead of
+                # repeating the CPU-bound ORB match inline. Keyed exactly
+                # like cand_rect's own (ep, round(pred, 3)) computation so
+                # a hit is only ever used for the identical decode target.
+                _precomputed_rects: dict[tuple[str, float], "tuple | None"] = {}
+
                 def cand_rect(ep: str, source_fn):
                     """Registered footprint of the query inside this
                     candidate's shot, or None when registration fails."""
@@ -4607,6 +4890,10 @@ class SceneAlignerService:
                         scenes[i].start_time + scenes[j].end_time
                     )
                     pred = float(source_fn(t_mid))
+                    _rk = (ep, round(pred, 3))
+                    if _rk in _precomputed_rects:
+                        _prof["rect"] += time.perf_counter() - _t0
+                        return _precomputed_rects.pop(_rk)
                     frames = cache.probe_frames(ep, pred)
                     out_rect = None
                     for _, im in sorted(
@@ -4875,6 +5162,88 @@ class SceneAlignerService:
                             str(cand_pf["episode"]),
                             a_pf * t_mid_tt + b_pf,
                         )
+                    # A4 (R2) escalation: every OTHER candidate below
+                    # (`scored_with_rect(..., rect=cur_rect)`) reuses the
+                    # chain's own registration as a cheap lower bound and
+                    # never calls cand_rect fresh — only "recall" candidates
+                    # do (they pass rect=None; their offsets drift from the
+                    # chain's own framing, per the comment at the scoring
+                    # loop below). With >=2 such candidates, precompute
+                    # their registrations in a bounded pool while the
+                    # decode workers staged above finish, instead of
+                    # letting the (sequential) scoring loop pay for each
+                    # ORB match one at a time. The scoring loop itself
+                    # stays strictly sequential — this only precomputes an
+                    # input it will later consult, per the chain-visit
+                    # order dependency (scene_aligner.py:4437-4441).
+                    from .fast_matching import r2_lever as _r2_probe_lever
+
+                    _recall_cands = [c for c in distant if c.get("recall")]
+                    if _recall_cands and _os.environ.get("ATR_RERANK_DEBUG"):
+                        print(
+                            f"  [a4] chain {i}-{j} recall_cands="
+                            f"{len(_recall_cands)}"
+                        )
+                    if (
+                        _r2_probe_lever("ATR_R2_PROBE_PREISSUE", default=False)
+                        and len(_recall_cands) >= 2
+                        and mid_grays.get(ci) is not None
+                    ):
+                        from concurrent.futures import ThreadPoolExecutor as _TPE
+
+                        # Thread-safety gate: `probe_frames()` falls through
+                        # to `cache.get_cap(episode)` on a staged-cache miss,
+                        # which mutates the unlocked `self.caps` dict and can
+                        # share one native capture across threads — the exact
+                        # concurrent-decode race behind a prior production
+                        # segfault (`prefetch_probe`'s worker deliberately
+                        # uses per-thread captures to avoid it). Only hand
+                        # this pool candidates whose probe is already staged
+                        # or in flight (from the `prefetch_probe` loop just
+                        # above); unstaged candidates are left out of
+                        # `_precomputed_rects` entirely so `cand_rect`'s
+                        # existing sequential fallback (single-threaded,
+                        # `get_cap`-safe) handles them later exactly as
+                        # before this escalation existed.
+                        _staged_recall_cands = [
+                            _c
+                            for _c in _recall_cands
+                            if cache.probe_staged(
+                                str(_c["episode"]),
+                                float(_c["a"]) * t_mid_tt + float(_c["b"]),
+                            )
+                        ]
+
+                        def _precompute_rect(_cand):
+                            _a, _b = float(_cand["a"]), float(_cand["b"])
+                            _pred = _a * t_mid_tt + _b
+                            _q_gray = mid_grays[ci]
+                            _frames = cache.probe_frames(
+                                str(_cand["episode"]), _pred
+                            )
+                            _out = None
+                            for _, _im in sorted(
+                                _frames, key=lambda fr: abs(fr[0] - _pred)
+                            )[:2]:
+                                _out = cls._footprint_rect(
+                                    _q_gray, cls._small_gray(_im)
+                                )
+                                if _out is not None:
+                                    break
+                            return (str(_cand["episode"]), round(_pred, 3)), _out
+
+                        if _staged_recall_cands:
+                            with _TPE(max_workers=4) as _rect_pool:
+                                for _rk, _rv in _rect_pool.map(
+                                    _precompute_rect, _staged_recall_cands
+                                ):
+                                    _precomputed_rects[_rk] = _rv
+                        if _os.environ.get("ATR_RERANK_DEBUG"):
+                            print(
+                                f"  [a4] chain {i}-{j} precomputed "
+                                f"{len(_staged_recall_cands)}/"
+                                f"{len(_recall_cands)} recall rect(s)"
+                            )
                     switch_to: dict[str, float | str] | None = None
                     switch_delta = 0.0
                     switch_reason = ""

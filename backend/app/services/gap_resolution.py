@@ -129,26 +129,6 @@ class GapCandidate:
         }
 
 
-@dataclass
-class GapResolutionProgress:
-    """Progress information for gap resolution operations."""
-
-    status: str  # 'starting', 'detecting', 'complete', 'error'
-    progress: float = 0.0
-    message: str = ""
-    error: str | None = None
-    gaps: list[GapInfo] | None = None
-
-    def to_dict(self) -> dict:
-        return {
-            "status": self.status,
-            "progress": self.progress,
-            "message": self.message,
-            "error": self.error,
-            "gaps": [g.to_dict() for g in self.gaps] if self.gaps else None,
-        }
-
-
 @dataclass(frozen=True)
 class _AutoFillState:
     """Internal candidate state used by overlap-aware autofill DP."""

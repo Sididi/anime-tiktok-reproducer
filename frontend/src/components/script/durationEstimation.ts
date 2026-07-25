@@ -18,7 +18,7 @@ export function estimateTtsDuration(text: string, language: string): number {
   return (words / wpm) * 60 / ELEVENLABS_SPEED_FACTOR;
 }
 
-export type DeltaCategory = "green" | "yellow" | "red";
+type DeltaCategory = "green" | "yellow" | "red";
 
 /**
  * Categorize based on clip speed ratio (estimated / original).

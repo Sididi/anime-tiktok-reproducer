@@ -5,7 +5,6 @@ import hashlib
 import json
 import collections
 import os
-import shutil
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone

@@ -11,7 +11,7 @@ import math
 from pathlib import Path
 from typing import NamedTuple
 
-from opentimelineio.opentime import RationalTime, TimeRange
+from opentimelineio.opentime import RationalTime
 
 from ..config import settings
 
@@ -214,8 +214,6 @@ class OTIOTimingCalculator:
     DEFAULT_SEQUENCE_RATE = FrameRateInfo(timebase=60, ntsc=False)
     # Default source rate: 23.976fps (common anime frame rate)
     DEFAULT_SOURCE_RATE = FrameRateInfo(timebase=24, ntsc=True)
-    # Legacy default minimum speed; the runtime floor is read from settings.
-    DEFAULT_MIN_SPEED = Fraction(75, 100)
 
     @classproperty
     def MIN_SPEED(cls) -> Fraction:
@@ -383,19 +381,3 @@ class OTIOTimingCalculator:
 
         return issues
 
-    def calculate_total_duration(self, clips: list[ClipTiming]) -> RationalTime:
-        """Calculate total timeline duration from clips.
-
-        Returns the end position of the last clip (accounting for speed).
-        """
-        if not clips:
-            return RationalTime(0, float(self.sequence_rate.rate))
-
-        # Find the clip that ends latest
-        latest_end = 0.0
-        for clip in clips:
-            end = clip.actual_end_seconds
-            if end > latest_end:
-                latest_end = end
-
-        return self.seconds_to_timeline_time(latest_end)

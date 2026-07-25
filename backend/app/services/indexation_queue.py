@@ -481,6 +481,12 @@ class IndexationQueueService:
         """
         return self._semaphore
 
+    def gpu_slots_in_use(self) -> int:
+        """Busy GPU slots right now (0..MAX_CONCURRENT). Reads the asyncio
+        semaphore's internal counter — advisory only, used to size the NVDEC
+        session budget; correctness never depends on it."""
+        return self.MAX_CONCURRENT - self._semaphore._value
+
 
 # Singleton
 indexation_queue = IndexationQueueService()

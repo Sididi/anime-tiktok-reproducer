@@ -641,25 +641,6 @@ class ValidateBatchFoldersRequest(BaseModel):
     library_type: LibraryType
 
 
-class ConflictDetails(BaseModel):
-    new_episodes: list[str]
-    removed_episodes: list[str]
-    existing_episode_count: int
-    existing_torrent_count: int
-
-
-class FolderValidationResult(BaseModel):
-    path: str
-    name: str
-    has_videos: bool
-    suggested_path: str | None = None
-    resolution: str = "new"
-    series_id: str | None = None
-    storage_release_id: str | None = None
-    conflict_details: ConflictDetails | None = None
-    orphan_reason: str | None = None
-
-
 def _find_first_video_dir(root: Path) -> str | None:
     """BFS for the first subdirectory that directly contains video files."""
     from collections import deque
@@ -691,19 +672,6 @@ def _find_first_video_dir(root: Path) -> str | None:
 def _batch_episode_stems(video_names: list[str]) -> set[str]:
     """Normalize batch comparison to logical episode names without extensions."""
     return {Path(video_name).stem for video_name in video_names}
-
-
-def _validate_batch_folders_sync(
-    paths: list[str],
-    library_type: LibraryType,
-) -> list[dict]:
-    items = [{"path": path} for path in paths]
-    return asyncio.run(
-        IndexationPreflightService.validate_batch_items(
-            items=items,
-            library_type=library_type,
-        )
-    )
 
 
 @router.post("/validate-batch-folders")

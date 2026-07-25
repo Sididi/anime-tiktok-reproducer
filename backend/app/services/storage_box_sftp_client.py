@@ -7,7 +7,7 @@ import random
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, AsyncIterator, Awaitable, Callable, TypeVar
+from typing import AsyncIterator, Awaitable, Callable, TypeVar
 
 from ..config import settings
 

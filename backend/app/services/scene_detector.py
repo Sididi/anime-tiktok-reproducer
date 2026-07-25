@@ -4,7 +4,7 @@ import asyncio
 
 from scenedetect import open_video, SceneManager, ContentDetector
 
-from ..models import Scene, SceneList
+from ..models import Scene
 
 
 class SceneDetectionProgress:

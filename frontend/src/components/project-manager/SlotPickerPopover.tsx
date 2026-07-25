@@ -9,9 +9,9 @@ import { SlotChips } from "./SlotChips";
 import { PerPlatformOverride } from "./PerPlatformOverride";
 import { SwitchSlotConfirmModal } from "./SwitchSlotConfirmModal";
 
-export type SlotPickerMode = "anchor" | "single-platform";
+type SlotPickerMode = "anchor" | "single-platform";
 
-export type SlotPickerConfirmPayload =
+type SlotPickerConfirmPayload =
   | {
       tiktok_slot: string;
       overrides?: Partial<Record<Platform, string>>;

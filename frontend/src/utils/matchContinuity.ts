@@ -36,12 +36,12 @@ interface PendingContinuityClaim {
   tooltip: string;
 }
 
-export interface MatchContinuitySummary {
+interface MatchContinuitySummary {
   claimsBySceneIndex: Record<number, ContinuityClaim>;
   claimedSceneIndices: number[];
 }
 
-export function normalizeContinuityEpisodeKey(episode: string): string {
+function normalizeContinuityEpisodeKey(episode: string): string {
   const trimmed = String(episode || "").trim();
   if (!trimmed) {
     return "";
@@ -75,7 +75,7 @@ function addEpisodeKey(keys: Set<string>, episode: string | undefined | null) {
   }
 }
 
-export function collectMatchEpisodeKeys(match: SceneMatch | undefined): Set<string> {
+function collectMatchEpisodeKeys(match: SceneMatch | undefined): Set<string> {
   const keys = new Set<string>();
   if (!match) {
     return keys;

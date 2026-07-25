@@ -5,8 +5,6 @@ compared against cv2's BGR output for the SAME frames.
 Alignment: find the frame-index offset (in {-1,0,+1}) that minimizes luma
 delta, then measure color deltas for BT.601 vs BT.709 limited-range matrices.
 """
-import sys
-import time
 
 import cv2
 import numpy as np

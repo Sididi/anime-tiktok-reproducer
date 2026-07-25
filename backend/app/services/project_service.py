@@ -1,4 +1,3 @@
-import json
 import re
 from pathlib import Path
 from datetime import datetime
@@ -209,7 +208,6 @@ class ProjectService:
     @classmethod
     def save_matches(cls, project_id: str, matches: "MatchList") -> None:
         """Save matches for a project."""
-        from ..models import MatchList
         matches_file = cls.get_matches_file(project_id)
         matches_file.write_text(matches.model_dump_json(indent=2))
 
@@ -230,7 +228,6 @@ class ProjectService:
     @classmethod
     def save_transcription(cls, project_id: str, transcription: "Transcription") -> None:
         """Save transcription for a project."""
-        from ..models import Transcription
         transcription_file = cls.get_transcription_file(project_id)
         transcription_file.write_text(transcription.model_dump_json(indent=2))
 

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "@/api/client";
 
-export type UploadSourcePreviewStatus = "loading" | "ready" | "error";
+type UploadSourcePreviewStatus = "loading" | "ready" | "error";
 
 /**
  * Polls the backend until the shared final-video preview cache is ready.

@@ -1985,139 +1985,6 @@ class ProcessingService:
         return entries
 
     @classmethod
-    async def _build_raw_scene_image_render_plan(
-        cls,
-        project: Project,
-        transcription: Transcription,
-        resolved_scene_sources: dict[int, ResolvedSceneSource],
-    ) -> dict[Path, dict[int, list[tuple[float, float]]]]:
-        raw_scenes = [scene for scene in transcription.scenes if scene.is_raw]
-        if not raw_scenes:
-            return {}
-
-        target_language = AnimeLibraryService.normalize_stream_language(
-            project.output_language or transcription.language
-        )
-        probe_cache: dict[str, Any] = {}
-        render_plan: dict[Path, dict[int, list[tuple[float, float]]]] = {}
-        parsed_text_cache: dict[str, list[Any]] = {}
-        parsed_cue_cache: dict[str, list[dict[str, Any]]] = {}
-
-        for scene in raw_scenes:
-            resolved_source = resolved_scene_sources.get(scene.scene_index)
-            if resolved_source is None:
-                continue
-
-            sidecar_source_path = AnimeLibraryService.resolve_subtitle_sidecar_source_path(
-                resolved_source.source_path
-            )
-            if sidecar_source_path is not None:
-                sidecar_entries = AnimeLibraryService.load_subtitle_sidecar_entries(
-                    sidecar_source_path
-                )
-                language_groups = cls._preferred_raw_scene_language_groups(
-                    sidecar_entries,
-                    target_language=target_language,
-                )
-                _, resolved_image_entries, _ = await cls._resolve_raw_scene_sidecar_subtitles(
-                    resolved_source=resolved_source,
-                    timeline_scene_start=scene.start_time,
-                    target_language=target_language,
-                    sidecar_entries=sidecar_entries,
-                    parsed_text_cache=parsed_text_cache,
-                    parsed_cue_cache=parsed_cue_cache,
-                    resolve_image_assets=False,
-                )
-                planned_stream_positions = {
-                    entry.stream_position for entry in resolved_image_entries
-                }
-                if not planned_stream_positions:
-                    for _language, language_entries in language_groups:
-                        fallback_stream_positions = {
-                            entry.stream_position
-                            for entry in language_entries
-                            if entry.kind == "image"
-                            and (
-                                (
-                                    cue_manifest_path := AnimeLibraryService.get_subtitle_sidecar_cue_manifest_path(
-                                        resolved_source.source_path,
-                                        entry,
-                                    )
-                                )
-                                is None
-                                or not cue_manifest_path.exists()
-                            )
-                        }
-                        if fallback_stream_positions:
-                            planned_stream_positions = fallback_stream_positions
-                            break
-                if not planned_stream_positions:
-                    continue
-
-                for stream_position in sorted(planned_stream_positions):
-                    render_plan.setdefault(resolved_source.source_path, {}).setdefault(
-                        stream_position,
-                        [],
-                    ).append(
-                        (
-                            resolved_source.source_in_seconds,
-                            resolved_source.source_out_seconds,
-                        )
-                    )
-                continue
-
-            source_key = str(resolved_source.source_path.resolve())
-            probe = probe_cache.get(source_key)
-            if probe is None:
-                probe = await asyncio.to_thread(
-                    AnimeLibraryService.probe_source_media_sync,
-                    resolved_source.source_path,
-                )
-                probe_cache[source_key] = probe
-            if probe is None or not probe.subtitle_streams:
-                continue
-
-            synthetic_entries = [
-                SubtitleSidecarEntry(
-                    stream_index=stream.index,
-                    stream_position=stream.stream_position,
-                    codec_name=stream.codec_name,
-                    language=stream.language,
-                    raw_language=stream.raw_language,
-                    title=stream.title,
-                    handler_name=stream.handler_name,
-                    kind=AnimeLibraryService._subtitle_kind_for_codec(stream.codec_name),
-                    asset_filename="planned",
-                )
-                for stream in probe.subtitle_streams
-            ]
-            planned_stream_positions = sorted(
-                {
-                    entry.stream_position
-                    for _language, language_entries in (
-                        cls._preferred_raw_scene_language_groups(
-                            synthetic_entries,
-                            target_language=target_language,
-                        )
-                    )
-                    for entry in language_entries
-                    if entry.kind == "image"
-                }
-            )
-            for stream_position in planned_stream_positions:
-                render_plan.setdefault(resolved_source.source_path, {}).setdefault(
-                    stream_position,
-                    [],
-                ).append(
-                    (
-                        resolved_source.source_in_seconds,
-                        resolved_source.source_out_seconds,
-                    )
-                )
-
-        return render_plan
-
-    @classmethod
     async def _translate_raw_scene_text_entries(
         cls,
         *,
@@ -2858,11 +2725,6 @@ class ProcessingService:
                 source_rate,
                 library_type=project.library_type,
             )
-            raw_scene_image_render_plan = await cls._build_raw_scene_image_render_plan(
-                project,
-                new_transcription,
-                playback_scene_sources,
-            )
             try:
                 required_source_paths = cls._collect_required_source_paths(
                     playback_scene_sources,
@@ -2878,11 +2740,6 @@ class ProcessingService:
                     matches,
                     source_rate,
                     library_type=project.library_type,
-                )
-                raw_scene_image_render_plan = await cls._build_raw_scene_image_render_plan(
-                    project,
-                    new_transcription,
-                    playback_scene_sources,
                 )
                 required_source_paths = cls._collect_required_source_paths(
                     playback_scene_sources,

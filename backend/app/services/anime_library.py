@@ -21,7 +21,7 @@ from typing import Any, AsyncIterator
 from PIL import Image
 
 from ..config import settings
-from ..library_types import DEFAULT_LIBRARY_TYPE, LibraryType, coerce_library_type, resolve_scoped_library_path
+from ..library_types import LibraryType, coerce_library_type, resolve_scoped_library_path
 from ..utils.media_binaries import (
     get_media_subprocess_env,
     is_media_binary_override_error,
@@ -213,7 +213,6 @@ class AnimeLibraryService:
     SOURCE_IMPORT_MANIFEST_SUFFIX = ".atr_source.json"
     INDEX_DIR_NAME = ".index"
     MANIFEST_FILE = "manifest.json"
-    LEGACY_METADATA_FILE = "metadata.json"
     STATE_FILE = "state.json"
     LIST_TIMEOUT_SECONDS = 120.0
     SEARCH_TIMEOUT_SECONDS = 120.0
@@ -224,7 +223,6 @@ class AnimeLibraryService:
     SEARCHER_CUDA_OOM_BATCH_RETRY_LIMIT = 1
     SEARCHER_CUDA_OOM_RETRY_REASON = "cuda_oom_batch_downshift"
     PREVIEW_PROXY_TIMEOUT_SECONDS = 3600.0
-    SOURCE_NORMALIZATION_TIMEOUT_SECONDS = 7200.0
     SUBTITLE_EXTRACTION_TIMEOUT_SECONDS = 1800.0
     FFPROBE_TIMEOUT_SECONDS = 30.0
     SOURCE_NORMALIZATION_AUDIO_BITRATE = "192k"
@@ -3290,7 +3288,6 @@ class AnimeLibraryService:
             Sorted list of anime series names.
         """
         scoped_type = coerce_library_type(library_type)
-        library_path = cls.get_library_path(scoped_type)
         searcher_path = cls.get_anime_searcher_path()
 
         # Call anime_searcher directly via pixi to avoid task-shell quoting issues.
@@ -4460,7 +4457,6 @@ class AnimeLibraryService:
             List of search results.
         """
         scoped_type = coerce_library_type(library_type)
-        library_path = cls.get_library_path(scoped_type)
         searcher_path = cls.get_anime_searcher_path()
 
         cmd = [

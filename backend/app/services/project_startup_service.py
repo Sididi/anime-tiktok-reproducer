@@ -88,9 +88,6 @@ class ProjectStartupService:
             reverse=True,
         )
 
-    def get_job(self, project_id: str) -> ProjectStartupJob | None:
-        return self._jobs.get(project_id)
-
     async def start_project(
         self,
         *,

@@ -17,7 +17,6 @@ from ..models.torrent import (
     ReplacementProgress,
     ReplaceTorrentsRequest,
     TorrentEntry,
-    TorrentFileMapping,
     VerificationResult,
 )
 from .anime_library import AnimeLibraryService
@@ -491,7 +490,7 @@ class TorrentReplacerService:
             key=lambda m: m.torrent_filename,
         )
 
-        for map_idx, mapping in enumerate(torrent_entry.files):
+        for mapping in torrent_entry.files:
             old_ep_num = extract_episode_number(
                 Path(mapping.torrent_filename).name
             )
@@ -548,7 +547,6 @@ class TorrentReplacerService:
         # Wait for downloads to complete
         from .torrent_verification import (
             DOWNLOAD_TIMEOUT_SECONDS,
-            MAX_STALL_RETRIES,
             STALL_TIMEOUT_SECONDS,
         )
 

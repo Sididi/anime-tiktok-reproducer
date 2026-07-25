@@ -12,7 +12,6 @@ from pathlib import Path
 
 import cv2
 
-from ..config import settings
 from ..library_types import LibraryType
 from ..models.torrent import TorrentEntry, TorrentFileMapping, VerificationResult
 from .anime_library import AnimeLibraryService

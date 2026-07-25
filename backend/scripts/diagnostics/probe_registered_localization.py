@@ -31,7 +31,6 @@ H = 360
 
 
 def small_gray(img) -> np.ndarray:
-    import PIL.Image
     w, h = img.size
     scale = H / h
     return np.asarray(

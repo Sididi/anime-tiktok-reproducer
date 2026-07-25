@@ -96,3 +96,27 @@ def configure_numerics() -> None:
             logger.info("fast mode: TF32 matmul/cudnn enabled")
     except Exception as exc:  # pragma: no cover - env dependent
         logger.warning("fast mode: could not enable TF32: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Round 2 (2026-07-23 spec): wall-time levers behind a master switch.
+# ATR_FAST_R2 rides on top of ATR_FAST_MATCHING: fast mode OFF kills R2 too,
+# so ATR_FAST_MATCHING=0 stays the proven byte-identical mainline escape hatch.
+# ---------------------------------------------------------------------------
+_R2_FLAG = "ATR_FAST_R2"
+
+
+def fast_r2_enabled() -> bool:
+    if not fast_enabled():
+        return False
+    return not _off(os.environ.get(_R2_FLAG))
+
+
+def r2_lever(name: str, default: bool = True) -> bool:
+    """Per-lever toggle (e.g. ATR_R2_COARSE); dead when the master is off."""
+    if not fast_r2_enabled():
+        return False
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return not _off(val)

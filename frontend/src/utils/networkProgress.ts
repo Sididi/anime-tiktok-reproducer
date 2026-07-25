@@ -1,4 +1,4 @@
-export function formatBytes(bytes: number | null | undefined): string {
+function formatBytes(bytes: number | null | undefined): string {
   if (bytes == null || !Number.isFinite(bytes) || bytes < 0) return "—";
   if (bytes < 1024) return `${bytes} B`;
   const units = ["KB", "MB", "GB", "TB"];
@@ -12,7 +12,7 @@ export function formatBytes(bytes: number | null | undefined): string {
   return `${value.toFixed(decimals)} ${units[i]}`;
 }
 
-export function formatSpeed(mibPerSec: number | null | undefined): string | null {
+function formatSpeed(mibPerSec: number | null | undefined): string | null {
   if (mibPerSec == null || !Number.isFinite(mibPerSec) || mibPerSec <= 0) {
     return null;
   }
@@ -24,7 +24,7 @@ export function formatSpeed(mibPerSec: number | null | undefined): string | null
   return `${mibPerSec.toFixed(2)} MB/s`;
 }
 
-export function formatEta(seconds: number | null | undefined): string | null {
+function formatEta(seconds: number | null | undefined): string | null {
   if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return null;
   if (seconds < 1) return "<1s";
   if (seconds < 60) return `${Math.round(seconds)}s`;
@@ -38,7 +38,7 @@ export function formatEta(seconds: number | null | undefined): string | null {
   return remMin > 0 ? `${hours}h ${remMin}m` : `${hours}h`;
 }
 
-export interface NetworkProgressFields {
+interface NetworkProgressFields {
   network_bytes_transferred?: number | null;
   network_bytes_total?: number | null;
   network_mib_per_sec?: number | null;

@@ -1,4 +1,4 @@
-export interface DriveUploadProgressLike {
+interface DriveUploadProgressLike {
   step?: string;
   status?: string;
   message?: string | null;
@@ -12,7 +12,7 @@ export interface DriveUploadProgressLike {
   clear_items_completed?: number | null;
 }
 
-export function formatByteCount(bytes?: number | null): string {
+function formatByteCount(bytes?: number | null): string {
   const value = Number(bytes ?? 0);
   if (!Number.isFinite(value) || value <= 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"] as const;

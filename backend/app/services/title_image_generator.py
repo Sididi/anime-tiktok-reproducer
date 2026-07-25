@@ -23,7 +23,6 @@ TITLE_PAD_H = 38
 TITLE_SCREEN_MARGIN = 60  # min px from screen edge to panel edge
 TITLE_GAP_ABOVE_CENTER = 90  # px between panel bottom and center frame top
 TITLE_LETTER_SPACING = -1.5  # px offset between characters (negative = tighter)
-TITLE_MAX_LINES = 2
 
 # --- Category style ---
 CAT_FONT_SIZE = 50
