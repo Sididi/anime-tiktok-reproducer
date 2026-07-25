@@ -52,6 +52,85 @@ async def test_rebuild_catalog_does_not_write_empty_catalog_when_series_listing_
 
 
 @pytest.mark.asyncio
+async def test_upsert_catalog_entry_updates_only_selected_series_without_rebuild(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    written: dict[str, object] = {}
+
+    async def read_catalog(remote_path: PurePosixPath, *, context: str) -> dict:
+        assert remote_path.as_posix() == "v1/anime/catalog.json"
+        return {
+            "schema_version": 1,
+            "library_type": "anime",
+            "items": [
+                {
+                    "series_id": "series-1",
+                    "name": "Old Name",
+                    "storage_release_id": "release-1",
+                },
+                {
+                    "series_id": "series-2",
+                    "name": "Untouched",
+                    "storage_release_id": "release-9",
+                },
+            ],
+        }
+
+    async def write_catalog(remote_path: PurePosixPath, payload: dict) -> None:
+        written["path"] = remote_path
+        written["payload"] = payload
+
+    async def replace_catalog(
+        src: str | PurePosixPath,
+        dst: str | PurePosixPath,
+    ) -> None:
+        written["replace"] = (
+            PurePosixPath(src).as_posix(),
+            PurePosixPath(dst).as_posix(),
+        )
+
+    async def fail_if_rebuilt(library_type: str) -> dict:
+        raise AssertionError("single-series catalog updates must not rebuild the catalog")
+
+    monkeypatch.setattr(StorageBoxRepository, "_catalog_cache", {"anime": (0.0, [])})
+    monkeypatch.setattr(StorageBoxRepository, "_read_remote_json", read_catalog)
+    monkeypatch.setattr(StorageBoxRepository, "_write_remote_json", write_catalog)
+    monkeypatch.setattr(StorageBoxSftpClient, "replace_file", replace_catalog)
+    monkeypatch.setattr(StorageBoxRepository, "rebuild_catalog", fail_if_rebuilt)
+
+    result = await StorageBoxRepository.upsert_catalog_entry(
+        "anime",
+        current={"published_at": "2026-07-25T00:00:00Z"},
+        manifest={
+            "series_id": "series-1",
+            "release_id": "release-2",
+            "display_name": "New Name",
+            "episode_count": 12,
+            "total_size_bytes": 1234,
+            "fps": 2.0,
+            "torrent_count": 1,
+        },
+    )
+
+    entries = {item["series_id"]: item for item in result["items"]}
+    assert entries["series-1"] == {
+        "schema_version": 1,
+        "series_id": "series-1",
+        "name": "New Name",
+        "storage_release_id": "release-2",
+        "episode_count": 12,
+        "total_size_bytes": 1234,
+        "fps": 2.0,
+        "torrent_count": 1,
+        "updated_at": "2026-07-25T00:00:00Z",
+    }
+    assert entries["series-2"]["name"] == "Untouched"
+    assert str(written["path"]).startswith("v1/anime/catalog.")
+    assert written["replace"][1] == "v1/anime/catalog.json"
+    assert "anime" not in StorageBoxRepository._catalog_cache
+
+
+@pytest.mark.asyncio
 async def test_delete_series_moves_remote_tree_and_prunes_catalog_without_rebuild(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

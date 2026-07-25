@@ -550,6 +550,73 @@ class StorageBoxRepository:
         return payload
 
     @classmethod
+    async def upsert_catalog_entry(
+        cls,
+        library_type: LibraryType | str,
+        *,
+        current: dict[str, Any],
+        manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Update one catalog entry without rescanning every remote series."""
+        scoped_type = coerce_library_type(library_type)
+        catalog_path = cls._catalog_path(scoped_type)
+        try:
+            payload = await cls._read_remote_json(
+                catalog_path,
+                context=f"{scoped_type.value} catalog",
+            )
+        except Exception as exc:
+            if _is_transient_error(exc):
+                raise
+            # A missing or malformed catalog still needs the repair behavior
+            # provided by the full rebuild. This should be an exceptional path,
+            # not the normal cost of changing one series.
+            return await cls.rebuild_catalog(scoped_type)
+
+        series_id = str(manifest["series_id"])
+        items = payload.get("items", [])
+        if not isinstance(items, list):
+            items = []
+        retained_items = [
+            dict(item)
+            for item in items
+            if isinstance(item, dict)
+            and str(item.get("series_id") or "").strip() != series_id
+        ]
+        retained_items.append(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "series_id": series_id,
+                "name": str(manifest["display_name"]),
+                "storage_release_id": str(manifest["release_id"]),
+                "episode_count": int(
+                    manifest.get("episode_count", len(manifest.get("episodes", [])))
+                ),
+                "total_size_bytes": int(manifest.get("total_size_bytes", 0)),
+                "fps": float(manifest.get("fps", 0.0) or 0.0),
+                "torrent_count": int(manifest.get("torrent_count", 0)),
+                "updated_at": str(
+                    current.get("published_at")
+                    or manifest.get("created_at")
+                    or _utc_now_iso()
+                ),
+            }
+        )
+
+        payload = {
+            **payload,
+            "schema_version": SCHEMA_VERSION,
+            "library_type": scoped_type.value,
+            "updated_at": _utc_now_iso(),
+            "items": cls._dedupe_catalog_entries(retained_items),
+        }
+        tmp_path = catalog_path.with_name(f"catalog.{uuid.uuid4().hex[:8]}.tmp")
+        await cls._write_remote_json(tmp_path, payload)
+        await StorageBoxSftpClient.replace_file(tmp_path, catalog_path)
+        cls._invalidate_catalog_cache(scoped_type)
+        return payload
+
+    @classmethod
     async def remove_catalog_entry(
         cls,
         library_type: LibraryType | str,
@@ -1421,7 +1488,11 @@ class StorageBoxRepository:
             tmp_current = current_path.with_name(f"current.{publish_id}.tmp")
             await cls._write_remote_json(tmp_current, current_payload)
             await StorageBoxSftpClient.replace_file(tmp_current, current_path)
-            await cls.rebuild_catalog(scoped_type)
+            await cls.upsert_catalog_entry(
+                scoped_type,
+                current=current_payload,
+                manifest=renamed_manifest,
+            )
             return {
                 "series_id": series_id,
                 "release_id": new_release_id,
