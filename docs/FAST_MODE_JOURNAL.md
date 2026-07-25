@@ -1763,9 +1763,12 @@ cost, cold, and removing it (B2-only) both recovers wall-time and removes
 the extra quality risk B1 was contributing on top of B2's already-clean
 scoreboard.
 
-**Recommendation**: the data plainly favors B2-only (`ATR_R2_COARSE=0
-ATR_R2_THIN=0`, `ATR_R2_FP16_WIN` at its default `1`) over the combined
-default on these 3 projects, judged purely on this cold-session cherry-pick
+**Recommendation**: drop B1 (`ATR_R2_COARSE=0`), keeping B2+B3 — B3's solo
+scoreboard is already verified zero-cost with independent dcd/411f wins
+(vF17), so the analytically-best default is B2+B3; the B2-only configuration
+measured here (`ATR_R2_COARSE=0 ATR_R2_THIN=0`) bounds that combination's
+wall-time from below. Judged purely on this cold-session cherry-pick the
+data plainly favors dropping B1 on these 3 projects
 — faster-or-tied, strictly cleaner on quality, and it sidesteps the new
 5e85 ceiling notice entirely. This is presented as data, not a shipped
 change: B1 and B3 were each independently verified clean-or-acceptable
