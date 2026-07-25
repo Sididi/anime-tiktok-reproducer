@@ -3970,7 +3970,9 @@ class SceneAlignerService:
         from .fast_matching import r2_lever
 
         span = hi - lo
-        coarse = r2_lever("ATR_R2_COARSE") and span > 3.0
+        # Owner decision 2026-07-25 (vF18a: fine-pass decode is a net cold
+        # cost) — default OFF; opt-in via ATR_R2_COARSE=1.
+        coarse = r2_lever("ATR_R2_COARSE", default=False) and span > 3.0
         win = cache.window(episode, zoom, lo, hi, stride=2 if coarse else 1)
         if win is None:
             return None

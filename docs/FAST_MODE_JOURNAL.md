@@ -1785,6 +1785,87 @@ reversible per the existing per-lever escape hatches) to capture B2's full
 cold benefit without B1's decode tax. No code change was made in this task
 either way — `fast_matching.py` is byte-identical to `30e8260`.
 
+### vF18b — owner decision: B1 default OFF; pre-merge confirmations (2026-07-25)
+
+**Decision.** Owner reviewed vF18a's B2-only cherry-pick data (Finding 1:
+B1's fine-pass second decode is a net cold cost, eating back a large
+fraction of B2's real win; Finding 2: combined newly trips a 5e85
+loose-source evaluator ceiling that r2ref sat exactly at) and chose to drop
+B1: `ATR_R2_COARSE` now defaults **OFF** at its one call site in
+`scene_aligner.py` (`_delta_search`'s coarse-to-fine gate, line ~3973),
+via `r2_lever("ATR_R2_COARSE", default=False)`. The lever's escape hatch is
+preserved — `ATR_R2_COARSE=1` re-enables it — and the generic `r2_lever()`
+helper default is untouched (still `True`) since only this call site pins
+its own default; `test_r2_lever_toggles` still asserts the helper's generic
+behavior, and a new test (`test_r2_coarse_call_site_default_off`) pins the
+call site via source-inspection. **Shipped default set is now B2 (fp16
+autocast window scoring) + B3 (variant-retrieval thinning); A-levers remain
+inert; B1 is opt-in only.**
+
+**New-defaults confirmation** (plain env, no overrides — B2+B3 only under
+the new code). Foreground, explicit 600s timeout, machine quiet (GPU idle,
+load ~0.7-0.9) both runs; one process note: the first 85de attempt was
+launched without an explicit Bash `timeout` and was auto-backgrounded past
+the harness's 2-minute default (same failure mode vF18a hit on 5e85) — caught
+before any GPU work completed ("Building dense correspondences", no
+generated-JSON written), killed, and re-run correctly as a single foreground
+call with `timeout: 600000`.
+
+| project | vF9 r2ref median | new-defaults (B2+B3) | Δ vs r2ref | scene timing | source timing | flips | scene-line diffs |
+|---|---:|---:|---:|---|---|---:|---:|
+| 85de83ca6323 | 302.5s | **252.8s** | **−49.7s (−16.4%)** | exact=52/54, loose=2 (= r2ref) | exact=52/54, loose=1, failed=1 (= r2ref) | 0 | 0 |
+| 411f73d26c1d | 334.5s | **268.7s** | **−65.8s (−19.7%)** | exact=52/52, loose=0 (= r2ref) | exact=50/52, loose=1, wrong_primary=1 (= r2ref) | 0 | 0 |
+
+Both at or beyond the expected −12..−15% B2-only-class range (in fact
+slightly better than the earlier B2-only-solo cherry-pick medians of 265.05s/
+285.05s, consistent with B3 now also contributing on top of B2 in this
+confirmation run, whereas the B2-only cherry-pick had `ATR_R2_THIN=0` too).
+Both source-line exactness buckets are byte-identical to r2ref's own bucket
+(0 losses); `compare_gt.py` reports 0 episode flips and 0 scene-line diffs on
+both projects. Sub-frame drift check: 85de 1 drift (0.010s end-time), same
+magnitude vF18a's B2-only data reported. 411f showed 9 drifts, 8 sub-frame
+(≤0.126s) plus one larger one (scene-array index 75, end-time 586.252s→
+584.541s, Δ1.71s) — traced directly against this project's curated
+`matches.json`: the new run's value (582.5405, 584.5405) lands within
+0.001s of the actual GT source segment (582.54, 584.54) at that index, while
+r2ref's broader span (582.41-586.25) straddled two separate GT segments
+less precisely (the adjacent GT segment is 588.0-591.0). This is a precision
+*improvement* at that index, not a regression — consistent with the
+evaluator's own bucket count staying unchanged (50/52 exact, same 2 non-exact
+sources #41/#42 as r2ref) and with B2's autocast window scoring (not B1,
+which is off in this run) doing the underlying re-scoring. Neither project
+newly trips the 5e85-style loose-source ceiling (waiver-ceiling notices on
+both runs are pre-existing STALE-waiver ledger facts, same shape as every
+prior R2 round's PASS-WITH-LEDGER runs). Full logs/JSON/compare_gt output at
+`newdefaults_{85de,411f}_run1.{log,json}` and
+`newdefaults_{85de,411f}_comparegt.log` in this task's scratchpad.
+
+**5e85 flag-OFF gate.** `ATR_FAST_MATCHING=0` on 5e85164d9ff8, foreground,
+explicit 600s timeout: elapsed 316.6s, scene timing exact=46/46, source
+timing exact=42/46 (loose=2, wrong_primary=2) — the mainline (fast-mode-off)
+path, untouched by any R2 lever change. Hash via `ref_hash.py`:
+
+```
+4e5cf3799dea9585c37ac5340a8ab5e14089046188d18dba9332295ecd16df03
+```
+
+**Exact match** to the vF2-era flag-OFF reference for 5e85164d9ff8
+(`docs/FAST_MODE_JOURNAL.md` vF2 table, same hash). The B1 default flip is
+scoped entirely inside the `fast_r2_enabled()` guard chain and does not
+touch the `ATR_FAST_MATCHING=0` mainline path — confirmed byte-identical as
+expected. Full log at `flagoff_5e85_run1.{log,json}` in this task's
+scratchpad.
+
+**Covering tests.** 28/28 green:
+`test_r2_variant_thinning.py` (3), `test_r2_fp16_embed.py` (5),
+`test_r2_coarse_window.py` (6), `test_window_embed_cache_lru.py` (7),
+`test_pynv_session_budget.py` (2), `test_fast_matching_r2_flags.py` (5,
+including the new `test_r2_coarse_call_site_default_off`).
+
+**Result: both pre-merge follow-ups from the final review CLOSED clean.**
+The shipped default lever set at HEAD is **B2 + B3 ON, B1 OFF (opt-in via
+`ATR_R2_COARSE=1`), A-levers inert** — ready to merge to main.
+
 ## How to try it (owner test protocol)
 
 ```bash
