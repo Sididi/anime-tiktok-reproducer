@@ -39,7 +39,7 @@ These rules come from statistical analysis of the channel's last 200 videos. The
 3. NO exclamation marks (×0.78). NO digits (×0.81).
 4. NO isekai/RPG jargon: mage, level, guild, build, boss, stats (×0.91 — that vocabulary shrinks the audience to gamers).
 5. By default, open on a character pronoun or possessive ("He / She / His / Her / This …" in [TARGET]): character-story openers measure ×1.31 — unless the slot formula says otherwise.
-6. Vagueness kills: "not like the others", "very special", "incredible" are banned. Always a concrete detail instead.
+6. Vagueness kills: "not like the others", "very special", "incredible" are banned. Always a concrete detail instead. Exception: slot 2 (exposed secret) intentionally stays detail-free.
 7. No hashtags inside titles.
 8. Each title must work as-is on YouTube, Facebook, Instagram, and TikTok.
 

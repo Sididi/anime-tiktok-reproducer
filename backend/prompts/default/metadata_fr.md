@@ -12,7 +12,7 @@ Le titre final sera choisi plus tard dans l'application, puis réinjecté automa
 
 - Ne mentionne JAMAIS [OEUVRE] dans les titres, les descriptions ni les hashtags.
 - N'utilise JAMAIS les noms propres des personnages de [OEUVRE].
-- Remplace-les par des archétypes ou descriptions contextuelles : «ce lycéen», «cette assassin», «son voisin», «sa femme».
+- Remplace-les par des archétypes ou descriptions contextuelles : «ce lycéen», «cette assassine», «son voisin», «sa femme».
 - Preuve chiffrée : les 2 seules vidéos de la chaîne qui nommaient l'œuvre dans le titre sont les 2 pires de toute son histoire (7 900 et 1 500 vues, contre 68 000 de médiane). Le mystère sur l'œuvre EST le moteur de clics et de commentaires.
 - Exception unique : les champs `tags` YouTube et Facebook (invisibles au moment du clic) doivent contenir [OEUVRE].
 
@@ -23,6 +23,7 @@ Le titre final sera choisi plus tard dans l'application, puis réinjecté automa
 - Argot autorisé (avec parcimonie) : «dinguerie», «banger», «masterclass», «pépite».
 - Argot interdit : «wesh», «frérot», tout langage «quartier/gamin».
 - Phrases courtes. Impactantes. Lisibles en une demi-seconde.
+- Emojis hors titres : 0 à 2 maximum par champ.
 
 # Bloc 1 : les 8 titres (le cœur de ta mission)
 
@@ -30,12 +31,12 @@ Ces règles sortent de l'analyse statistique des 200 dernières vidéos de la ch
 
 ## Règles dures
 
-1. Longueur cible : 36 à 48 caractères, espaces comprise (le sweet spot mesuré : ×1,27). Maximum absolu : 62 — au-delà, l'application tronque le titre en plein mot et le titre est mort.
+1. Longueur cible : 36 à 48 caractères, espaces comprises (le sweet spot mesuré : ×1,27). Maximum absolu : 62 — au-delà, l'application tronque le titre en plein mot et le titre est mort.
 2. AUCUNE question générique : les titres en «?» font ×0,54 vs la médiane. Seule exception autorisée : la construction «Et si … toi ?» du slot 1.
 3. AUCUN point d'exclamation (×0,78). AUCUN chiffre (×0,81).
 4. AUCUN jargon isekai/RPG : mage, niveau, guilde, build, boss, stats, level (×0,91 — ce vocabulaire rétrécit l'audience aux gamers).
 5. Par défaut, ouvre sur un pronom-personnage : Il / Elle / Son / Sa / Cette (×1,31) — sauf si la formule du slot impose autre chose.
-6. Le vague tue : «pas comme les autres», «très particulier», «incroyable» sont interdits. Toujours un détail concret à la place.
+6. Le vague tue : «pas comme les autres», «très particulier», «incroyable» sont interdits. Toujours un détail concret à la place. Exception : le slot 2 (secret découvert) reste volontairement sans détail.
 7. 0 à 1 emoji maximum, seulement s'il ajoute une émotion (😭 par exemple). Aucun hashtag dans les titres.
 8. Chaque titre doit fonctionner tel quel sur YouTube, Facebook, Instagram et TikTok.
 

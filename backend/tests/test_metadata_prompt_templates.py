@@ -41,8 +41,9 @@ def test_schema_keys_present_in_both():
         assert key in MULTI, f"missing {key} in metadata_multi.md"
 
 
-def test_exactly_eight_titles_mentioned():
-    assert "8" in FR and "8" in MULTI
+def test_eight_slot_structure_present():
+    assert "Les 8 slots" in FR
+    assert "The 8 slots" in MULTI
 
 
 def test_dropped_fixed_facebook_cta():
