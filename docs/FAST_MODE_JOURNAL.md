@@ -1635,6 +1635,153 @@ Claude Code session (the working tree carries uncommitted
 task — not staged, not touched, not this task's concern); HEAD did not move
 during this task (`8234952` start to finish).
 
+### vF18a — post-review reconciliation + cold B2-only cherry-pick data (2026-07-25)
+
+An opus-level merge-gate review of vF18 found two documentation findings and
+asked for one follow-on measurement, all addressed here. No lever default
+changed — `fast_matching.py` is untouched by this entry; every number below
+is presentation/decision-support only.
+
+**Finding 1 (HIGH) — vF18's "combined wins are smaller than solo" framing
+needs the warm-baseline reconciliation spelled out, not just gestured at.**
+vF15's headline B1-solo numbers (−24.6% on 85de, −15.1% on 411f) were a
+same-session A/B against an **OFF baseline that ran 21-26% slower than the
+cold vF9 reference** (vF15's own text: "every OFF baseline this session ran
+21-26% slower than vF9's numbers"). Re-based against the actual cold vF9
+reference instead of that inflated same-session OFF baseline, B1-solo ON
+was **−8.9% on 85de** (275.7s vs vF9's 302.5s) and **+5.1% on 411f** —
+*slower*, not faster (351.7s vs vF9's 334.5s). B1-solo's own ON numbers
+(275.7s/351.7s) sit close to the cold r2ref reference (one modestly better,
+one modestly worse), not two-digit-percent below it either way. The −15 to
+−30% figures in vF15
+are real deltas against that session's own OFF run, but that OFF run itself
+was already running hot — they are not deltas against the frozen cold
+reference, and reading them as if they were (as a skim of "B1: SHIPPED,
+−15% to −30%" invites) overstates B1's standalone cold value substantially.
+
+Cold **combined** (vF18's own Step 1, this entry's baseline) breaks down
+per-phase as: embed **−28% to −31%** (B2's fp16 autocast — this is the real
+driver of the combined win) but decode **+19% to +29%** (B1's coarse+fine
+two-pass window scoring issues a second decode call per span, and cold
+decode is not amortized the way a warm-cache same-session OFF/ON pair makes
+it look). Net: **−6.1%/−6.9%** on the two heavies, **−17.7%** on 5e85,
+**~flat** on dcd. **This is the honest owner expectation for what shipping
+combined (B1+B2+B3) actually buys on a cold run**: roughly −6-7% (≈18-23s)
+on 85de/411f, ≈−18% on 5e85, and no measurable win on dcd — not the
+20-30%-class numbers a reader would extrapolate from the individual B1/B2
+task entries in isolation. B2 (fp16 embed) is the component doing essentially
+all of the real work; B1's fine-pass decode overhead is eating back a large
+fraction of what B2 buys, cold.
+
+**Finding 2 (MEDIUM) — combined newly trips a evaluator ceiling on 5e85 that
+r2ref sat exactly at, and vF18 didn't call this out.** Re-checked directly
+against the saved Task 10 logs
+(`combined_5e85_run1.log`/`run2.log` in that task's scratchpad): combined's
+5e85 source-timing bucket is `exact=39/46, loose=4,
+wrong_primary_with_candidate=3`, which prints
+`too many loose source timings: 4 > 3` — a ceiling notice the r2ref baseline
+(`loose=3`) does not trip (r2ref sits exactly at the `3` boundary). The
+overall verdict is unaffected — **`PASS-WITH-LEDGER` on both r2ref and
+combined**, and this is an evaluator *ceiling notice*, not a hard failure —
+but an owner scanning vF18's scoreboard for "did anything newly break" would
+not see this from the "1 loss" line alone; it is now on record here so a
+future re-run that also lands `loose=4` (or worse) on 5e85 isn't a surprise.
+
+#### Cold B2-only A/B (cherry-pick datum)
+
+Ran the evaluator with `ATR_R2_COARSE=0 ATR_R2_THIN=0` (B1 and B3 off, B2 —
+fp16-autocast window embed — the only active R2 lever) on the 3 heavier GT
+projects, 2 runs each, foreground, explicit 600s timeout every call, first
+run of each project saved via `--save-generated-json`. **Machine
+conditions**: uptime 1h22m at the start (not a fresh reboot, but nothing
+else running), GPU idle 15 MiB/8188 MiB at 0% utilization, load average
+0.10/0.23/0.89 at the start — closely matching vF18's own "freshly
+rebooted... load 0.34" session, and materially cooler/quieter than every
+solo-lever session (vF13-vF17, load 0.9-6.6). Load drifted up to ~1.8-2.4 by
+the end of the ~35-minute run window (desktop background contention, GPU
+stayed idle/0% between invocations throughout) — noted as a mild caveat, but
+each project's own 2-run pair stayed tight (≤4s spread on 5e85/85de, ≤0.3s on
+411f), so this session does not show the pronounced warming pattern that
+undermined vF15/vF16's first-pass comparisons.
+
+One process note: the first 5e85164d9ff8 attempt was launched without the
+required explicit `timeout` parameter and was auto-backgrounded by the
+harness past its 2-minute default; caught via `pgrep`, confirmed it had only
+reached "Building dense correspondences" with no generated-JSON written (no
+number used from it), killed, and re-run correctly as a single foreground
+call with an explicit 600000ms timeout.
+
+| project | r2ref (vF9) | B2-only runs (s) | B2-only median | Δ vs r2ref | combined median (vF18) | Δ B2-only vs combined |
+|---|---:|---|---:|---:|---:|---:|
+| 5e85164d9ff8 | 233.7s | 189.3, 193.3 | **191.3s** | **−42.4s (−18.1%)** | 192.3s | **−1.0s (−0.5%, tied)** |
+| 85de83ca6323 | 302.5s | 264.4, 265.7 | **265.05s** | **−37.45s (−12.4%)** | 284.2s | **−19.15s (−6.7%)** |
+| 411f73d26c1d | 334.5s | 285.2, 284.9 | **285.05s** | **−49.45s (−14.8%)** | 311.4s | **−26.35s (−8.5%)** |
+
+(Methodology note: the r2ref and B2-only elapsed figures are both the
+evaluator script's own printed `Elapsed:` line, matching vF9's original
+measurement method; vF18's published combined medians used external `time`
+wall-clock wrapping the whole invocation, which the saved Task 10 logs show
+runs ~1.5s higher than the script's internal `Elapsed:` line on the same
+runs — e.g. 85de's internal Elapsed values were 280.2/282.7/286.8s, median
+282.7s, vs the report's 284.2s. This ~0.5% offset does not change any
+conclusion below; B2-only still ties or beats combined on all 3 projects
+under either basis.)
+
+**Quality** (source-line exactness bucket, r2ref → B2-only, via the
+evaluator's own printed bucket; flips/scene-line diffs via `compare_gt.py`
+against each project's `r2ref_<pid>.json`):
+
+| project | source-line exact (r2ref → B2-only) | episode flips | scene-line diffs | source-line exact (r2ref → combined, vF18) |
+|---|---|---|---|---|
+| 5e85164d9ff8 | 40/46 → 40/46 (0 losses; also `loose=3`, matches r2ref exactly — **no ceiling trip**) | 0 | 0/56 | 40/46 → 39/46 (1 loss, **`loose=4` trips the ceiling**) |
+| 85de83ca6323 | 52/54 → 52/54 (0 losses) | 0 | 0/59 | 52/54 → 51/54 (1 loss) |
+| 411f73d26c1d | 50/52 → 50/52 (0 losses) | 0 | 0/78 | 50/52 → 49/52 (1 loss) |
+
+`compare_gt.py` confirms **0/0/0 flips and 0/0/0 scene-line diffs across all
+3 projects** — matching vF16's B2-solo finding exactly (0 measured quality
+cost on any GT project, any axis). Sub-frame source drifts vs r2ref: 5e85
+byte-identical (0 drifts), 85de 1 drift (0.010s), 411f 3 drifts (≤0.083s) —
+same magnitudes vF16 reported for B2-solo, confirming this run reproduces
+that lever's behavior faithfully in combination with the other two levers
+being off.
+
+Generated JSON saved at
+`/tmp/claude-1000/.../scratchpad/b2only_{5e85,85de,411f}_run1.json`; raw logs
+`b2only_*_run{1,2}.log`; compare_gt.py output
+`b2only_compare_gt_all.log` in the same directory.
+
+#### Owner decision: combined (B1+B2+B3) vs B2-only
+
+On this measurement set, **B2-only is not worse than combined on any axis
+and is clearly better on two of three**: it ties combined on 5e85 wall-time
+(−0.5%, within run-to-run noise) while *avoiding* combined's new
+loose-source-ceiling trip there, and it beats combined by 6.7-8.5% wall-time
+on both heavies (85de, 411f) — while paying **zero** source-line-exactness
+cost anywhere, versus combined's 1 loss per project on all 3. The mechanism
+is consistent with Finding 1 above: B1's fine-pass second decode is a net
+cost, cold, and removing it (B2-only) both recovers wall-time and removes
+the extra quality risk B1 was contributing on top of B2's already-clean
+scoreboard.
+
+**Recommendation**: the data plainly favors B2-only (`ATR_R2_COARSE=0
+ATR_R2_THIN=0`, `ATR_R2_FP16_WIN` at its default `1`) over the combined
+default on these 3 projects, judged purely on this cold-session cherry-pick
+— faster-or-tied, strictly cleaner on quality, and it sidesteps the new
+5e85 ceiling notice entirely. This is presented as data, not a shipped
+change: B1 and B3 were each independently verified clean-or-acceptable
+*solo* (vF15's own re-measurement after its post-review fix, and vF17's
+zero-cost scoreboard), so there may be reasons beyond this 3-project cold
+snapshot to keep them (e.g. B3's real, independent wall-time win on dcd/411f
+in vF17, which this B2-only measurement forgoes since `ATR_R2_THIN=0` here
+too — a natural next cherry-pick worth trying is B2+B3 without B1, not
+measured in this task). The owner should treat this table as the deciding
+input and choose: keep the current combined default (accept the 1
+source-line loss + 5e85 ceiling trip in exchange for B3's dcd/411f-side
+wins not captured here), or flip `ATR_R2_COARSE=0` (drop B1 only, trivially
+reversible per the existing per-lever escape hatches) to capture B2's full
+cold benefit without B1's decode tax. No code change was made in this task
+either way — `fast_matching.py` is byte-identical to `30e8260`.
+
 ## How to try it (owner test protocol)
 
 ```bash
