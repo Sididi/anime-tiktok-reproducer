@@ -1434,6 +1434,207 @@ PyNvVideoCodec 2.1.0. GT project folders, `anime_searcher` submodule, and
 sequentially, one GT project at a time, every invocation (after the caught
 mistake above) a single foreground Bash call with an explicit 600s timeout.
 
+## vF18 — Fast Matching Round 2, Task 10: final merge-gate — combined scoreboard, §4 re-check, flag-OFF byte-identity, hand-off (2026-07-25)
+
+Machine freshly rebooted before this task (GPU idle 15 MiB/8188 MiB, load
+average 0.34 at the start) — the quietest session of Round 2. Plain env at
+HEAD (`8234952`) = combined defaults: `ATR_R2_COARSE`/`ATR_R2_FP16_WIN`/
+`ATR_R2_THIN` all ON (B1+B2+B3), A-levers (A1 frames-LRU, A2 session budget,
+A3 prefetch depth) inert at their opt-in-0 defaults per Tasks 3-6. No env
+overrides anywhere in this task except where explicitly named per step.
+
+### Step 1 — combined scoreboard, all 4 GT, vs r2ref (vF9)
+
+3-run medians on the two heavies (one run each with `ATR_RERANK_DEBUG=1` for
+phase-timing/session-count visibility), 2-run medians on the lighter two
+(vF9's own practicality allowance), every invocation a single foreground
+`pixi run python scripts/evaluate_matching_against_ground_truth.py <pid>
+--matcher aligner [--save-generated-json ...]` call with an explicit 600s
+timeout. Raw per-run elapsed (`time`'s wall-clock):
+
+| project | r2ref elapsed | combined runs (s) | combined median | Δ vs r2ref |
+|---|---:|---|---:|---:|
+| dcd74148c7ec | 85.3s | 82.16, 79.86 | **81.0s** | **−4.3s (−5.0%)** |
+| 5e85164d9ff8 | 233.7s | 188.88, 195.71 | **192.3s** | **−41.4s (−17.7%)** |
+| 85de83ca6323 | 302.5s | 281.94, 284.19, 288.38 | **284.2s** | **−18.3s (−6.1%)** |
+| 411f73d26c1d | 334.5s | 311.65, 309.09, 311.42 | **311.4s** | **−23.1s (−6.9%)** |
+
+**Wins are real but materially smaller than the sum of the solo-lever wins**
+(B1 alone measured −15 to −30% on the heavies, B2 alone −7 to −31%, B3 a
+further few percent on top). This is diminishing returns from overlapping
+optimization targets, not a regression or a measurement artifact: B1
+(coarse-to-fine window scoring) already cuts the number of `window()`
+decode/embed calls roughly in half on the heavies before B2's per-call fp16
+speedup ever applies, so B2's −33 to −37% embed-compute saving lands on an
+already-shrunk embed budget, not the original one — Amdahl-style
+composition, not additive stacking. Session-noise (the recurring vF13-vF17
+confound) is not the explanation here: this session was colder/quieter than
+any prior Round-2 session (fresh reboot, load 0.34 vs the 0.9-6.6 range
+during Tasks 7-9), so if anything the r2ref-vs-combined comparison here is
+cleaner than most of the solo-lever ones.
+
+**Budget-gate scoreboard** (moderate budget: ≤1 episode flip, ≤4 source-line
+exactness losses, 0 scene-line changes, per project — episode flips and
+scene-line diffs via `compare_gt.py` literal comparison against each
+project's r2ref generated JSON; source-line exactness via the evaluator's own
+printed bucket):
+
+| project | episode flips | source-line exact (r2ref → combined) | scene-line diffs |
+|---|---|---|---|
+| dcd74148c7ec | 0 | 17/20 → **18/20** (improvement, 0 losses) | 0/42 |
+| 5e85164d9ff8 | 0 | 40/46 → 39/46 (**1 loss**) | 0/56 |
+| 85de83ca6323 | 0 | 52/54 → 51/54 (**1 loss**) | 0/59 |
+| 411f73d26c1d | 0 | 50/52 → 49/52 (**1 loss**) | 0/78 |
+
+`compare_gt.py` confirms 0 episode flips and 0 scene-array diffs on all 4
+(the `EPISODE FLIPS: 0` line, cross-checked against the `episode` field being
+a real per-match filename, not a null/placeholder — a `was_no_match` scene
+recovering to a real match would show up here as a flip, same detection
+method vF15 used for its single 5e85 flip). 85de's scene-timing bucket also
+*improved* (52/54→54/54 exact) alongside its 1 source-line loss. dcd's single
+source-line change is the same B2-attributable drift vF16 found (scene#11
+end-time 639.624→640.214, a 0.590s shift crossing into the evaluator's exact
+tolerance) — an improvement, not a cost.
+
+**Verdict: WITHIN BUDGET on all 4 projects, all 3 axes — no combined-breach,
+no lever interaction cost beyond what each lever already paid solo.** The
+brief's named risk pairing (B1's coarse grid × B2's fp16 noise) did not
+compound: total source-line losses per project (≤1) are smaller than B1's
+solo worst case (85de: 2-3 losses solo → 1 loss combined). No lever is
+disabled; **B1+B2+B3 all stay default ON**, matching HEAD's pre-existing
+code — no `fast_matching.py` default change needed.
+
+### Step 2 — §4 concurrency re-check (85de + 411f, combined defaults)
+
+Per the binding dispatch-notes protocol (the one sanctioned background use):
+both evaluator invocations launched `run_in_background: true` in the same
+message, immediately followed by a **foreground**
+`nvidia-smi --query-gpu=timestamp,memory.used,utilization.gpu --format=csv
+-l 5` poll (timeout 600000) teed to scratch; both background tasks reported
+completion (exit 0) while the poll was still running, so no separate
+`tail --pid` wait was needed beyond the poll itself.
+
+A temporary log line was added at `SceneAlignerService.align_scenes_sync`'s
+session-budget call site and just before its `return result` (removed
+immediately after this measurement — `git diff` on `scene_aligner.py`
+confirms byte-identical to HEAD afterward) to assert the Task-4
+(`pynv_decode.set_session_budget`) budget value live during the concurrent
+run:
+
+| metric | value |
+|---|---|
+| both complete without crash | ✓ (exit 0 both; no traceback/OOM/segfault in either log) |
+| 85de elapsed (concurrent) | 389.2s (solo combined median 284.2s → **1.37×** under contention) |
+| 411f elapsed (concurrent) | 424.3s (solo combined median 311.4s → **1.36×** under contention) |
+| peak VRAM (poll) | **5687 / 8188 MiB (69%)** — well under vF6's near-OOM 7756-7834 MiB (95-99%) ceiling |
+| `fast_decode_oom_cv2_fallback` | **0** (stat never fired — key absent from either project's printed Matcher profile) |
+| verdicts vs solo combined | **unchanged**: 85de 51/54 source / 54/54 scene, 411f 49/52 source / 52/52 scene — deterministic under contention |
+| Task-4 session budget (both processes) | **3, not 2** (`TASK10_DEBUG pid=66005 budget=3`, `pid=66165 budget=3`) |
+
+The budget=3 finding **confirms vF12's "dead on production routes" defect
+extends to the CLI evaluator harness itself**: each concurrent evaluator
+invocation is a separate OS process with its own `indexation_queue` state, so
+`gpu_slots_in_use()` reads 0 independently in *both* processes (neither one's
+in-process semaphore sees the other), and the "solo" branch (budget=3) fires
+in both simultaneously — the exact 2-procs-×-3-sessions worst case the vF6-era
+code comment at `pynv_decode.py:53-58` names as the reason the cap was pulled
+from 3 to 2 in the first place. **It did not cause an OOM or crash this run**
+— peak VRAM stayed at 69% of the card, comfortably below the 95-99% vF6 hit
+pre-fix — most likely because B2's fp16-autocast VRAM saving (vF16: −44.7%
+peak embed VRAM) landed on top of vF6's per-frame-transfer fix and left
+enough headroom to absorb the extra (uncapped) session pressure even under
+this artificial worst case. Framing unchanged from vF12/the dispatch notes:
+**production `/matches` cannot reach this state at all** — `matching.py`'s
+route acquires the *whole* `MAX_CONCURRENT` GPU-slot budget via
+`indexation_queue.heavy_slot(..., slots=matching_slots)` before
+`align_scenes_sync` ever runs, so `gpu_slots_in_use()` always reads 2 (not
+≤1) on every production entry point, and the 3-session branch is
+structurally unreachable there — this concurrency scenario exists only
+because the evaluator harness bypasses the queue entirely to get two
+matchings running at once. **Pass** (both completed; no crash; the "either 0
+or fired-and-recovered" fallback-stat criterion is trivially satisfied by 0).
+
+### Step 3 — flag-OFF byte-identity
+
+```
+ATR_FAST_MATCHING=0 dcd74148c7ec → c1aac14c5a0f19ff332bc70c474b6f3c842ca28ada0be962f963f1034e5bd6c9
+ATR_FAST_R2=0        dcd74148c7ec → 27acedd58ea169fb3eb2d9f7eab55e67c01216a7292fbecee58adf39c0ab9e46
+```
+
+(a) `ATR_FAST_MATCHING=0` reproduces vF2's frozen pre-branch mainline hash
+(`c1aac14c5a0f…`) **exactly** — main has not moved in any way that breaks
+this branch's mainline escape hatch; no worktree comparison was needed since
+the hash matched on the first attempt. (b) `ATR_FAST_R2=0` (fast mode ON, R2
+master off) reproduces vF9's frozen `r2ref` hash (`27acedd5…`) **exactly** —
+proves every R2-gated code path (Tasks 3, 5's shared-code touches included)
+stays fully inert when the R2 master switch is off, same result Tasks 7-9
+already found per-lever. Only dcd was run for this step (the binding minimum
+per the dispatch notes); no non-default-touching change landed in Tasks 3-9
+that would require re-running all 4.
+
+### Step 5 — full suite, new-failure check
+
+`pixi run -e dev pytest tests/` (the default env lacks pytest-asyncio +
+respx — confirmed by a collection error on the first attempt with plain
+`pixi run pytest`, corrected per the standing memory note): **17 failed, 477
+passed** (445s). The 17 failures are an **exact name-for-name match** to the
+2026-07-24 dev-env baseline (itself dependency-attributed, zero diff to the
+files under test): `test_lan_transfer_routes.py` ×7 (pre-existing
+`ATR_LAN_TRANSFER_ENABLED` kill-switch drift), `test_upload_readiness_local_
+first.py` ×3 (stale test fixture missing `anime_name`),
+`test_scene_aligner.py` stage5/native-tug ×6 (unrelated in-flight work),
+`test_anime_matcher_partial_rematch.py` ×1 (order-dependent flake, passes
+standalone). **Zero new failures** — no worktree main-baseline run was
+needed given the exact match (the "if unsure, check main" escalation in the
+dispatch notes did not trigger). Separately, the 25 R2-covering tests
+(`test_r2_coarse_window.py` ×6, `test_r2_fp16_embed.py` ×5,
+`test_r2_variant_thinning.py` ×3, `test_window_embed_cache_lru.py` ×7,
+`test_fast_matching_r2_flags.py` ×4) all **PASS** (`25 passed in 1.06s`).
+
+### How to try R2 (owner hand-off)
+
+```bash
+git checkout feat/fast-matching-r2
+# R2 is ON by default on top of the already-merged Round-1 fast mode — just
+# run a real project through /matches as usual.
+#   default            : F1 GPU decode + F3 TF32 + B1 coarse-to-fine window
+#                         scoring + B2 fp16-autocast window embed + B3
+#                         variant-retrieval thinning (all ON, ATR_FAST_R2 unset/1)
+#   compare (R2 only)  : ATR_FAST_R2=0      -> Round-1 fast mode, R2 OFF
+#   compare (all fast) : ATR_FAST_MATCHING=0 -> exact mainline (byte-identical, vF2)
+# Per-lever escape hatches (each defaults to the fast setting):
+#   ATR_R2_COARSE=0    -> drop B1 (coarse-to-fine window scoring)
+#   ATR_R2_FP16_WIN=0  -> drop B2 (fp16-autocast window embed)
+#   ATR_R2_THIN=0      -> drop B3 (variant-retrieval thinning)
+```
+
+What to look at: the frontend's `doubt_reasons` on scenes, plus any scene
+whose source differs from an `ATR_FAST_R2=0` run of the same project — those
+are exactly what the Round-2 budget gate measured (≤1 episode flip, ≤4
+source-line drifts, 0 scene-boundary changes, per project, across all 4 GT
+projects and the combined-defaults concurrency re-check above). Expect
+source in/out points to shift by well under a second on a small number of
+scenes (the "source-line exactness" losses in the scoreboard above), never a
+scene boundary and, on this measurement set, never an episode assignment.
+Judge visually; keep the current defaults (merge as-is) or flip a lever off
+via the escape hatches above and re-measure — every lever is independently
+and trivially reversible without touching code.
+
+**Keep-or-discard is trivially reversible at three levels**: per-lever
+(`ATR_R2_COARSE`/`ATR_R2_FP16_WIN`/`ATR_R2_THIN`), all-of-R2
+(`ATR_FAST_R2=0`), or all-of-fast-mode (`ATR_FAST_MATCHING=0`, proven
+byte-identical to current mainline on dcd this task, and on all 4 GT
+projects historically per vF2).
+
+Environment: i9-14900HX, RTX 4070 Laptop 8GB, 32GB RAM; torch 2.8.0+cu128,
+PyNvVideoCodec 2.1.0 — freshly rebooted, quietest session of Round 2. GT
+project folders, `anime_searcher` submodule, and `backend/data/
+eval_waivers.json` untouched. This tree is shared with another, unrelated
+Claude Code session (the working tree carries uncommitted
+`storage_box_repository.py` + its test from that session throughout this
+task — not staged, not touched, not this task's concern); HEAD did not move
+during this task (`8234952` start to finish).
+
 ## How to try it (owner test protocol)
 
 ```bash
