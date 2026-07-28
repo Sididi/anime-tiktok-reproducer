@@ -16,6 +16,7 @@ import time
 
 from ..config import settings
 from ..library_types import coerce_library_type
+from ..utils.video_color import ensure_bt709_tags
 from ..models import Project
 from .account_service import AccountConfig, AccountService
 from .discord_service import DiscordService
@@ -1433,6 +1434,7 @@ class UploadPhaseService:
                     raise ValueError(
                         "Final video unavailable: not present locally and no Drive copy"
                     )
+                ensure_bt709_tags(partial)
                 partial.replace(destination)
             finally:
                 partial.unlink(missing_ok=True)

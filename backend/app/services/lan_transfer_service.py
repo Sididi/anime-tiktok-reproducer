@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import settings
+from ..utils.video_color import ensure_bt709_tags
 from .export_service import ExportService, ManifestEntry
 from .project_service import ProjectService
 
@@ -126,6 +127,8 @@ class LanTransferService:
                 async for chunk in stream:
                     if chunk:
                         await asyncio.to_thread(fh.write, chunk)
+            if filename.lower().endswith(".mp4"):
+                await asyncio.to_thread(ensure_bt709_tags, tmp_path)
             tmp_path.replace(final_path)
         except BaseException:
             tmp_path.unlink(missing_ok=True)

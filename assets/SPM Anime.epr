@@ -637,7 +637,7 @@
 		<ParamIdentifier>ADBEVideoMinBitrate</ParamIdentifier>
 	</ExporterParam>
 	<ExporterParam ObjectID="83" ClassID="018cf63d-c58d-4d39-97df-36b6b2d6ef88" Version="1">
-		<ParamValue>15.</ParamValue>
+		<ParamValue>12.</ParamValue>
 		<ParamType>3</ParamType>
 		<ParamOrdinalValue>3</ParamOrdinalValue>
 		<ParamMinValue>0.192000000000000003996803</ParamMinValue>
@@ -646,7 +646,7 @@
 		<ParamIdentifier>ADBEVideoTargetBitrate</ParamIdentifier>
 	</ExporterParam>
 	<ExporterParam ObjectID="84" ClassID="018cf63d-c58d-4d39-97df-36b6b2d6ef88" Version="1">
-		<ParamValue>20.</ParamValue>
+		<ParamValue>16.</ParamValue>
 		<ParamType>3</ParamType>
 		<ParamOrdinalValue>4</ParamOrdinalValue>
 		<ParamMinValue>0.192000000000000003996803</ParamMinValue>
