@@ -114,6 +114,14 @@ interface MatchCardProps {
 
 const MAX_MEDIA_SCENES = 16;
 const MEDIA_OBSERVER_ROOT_MARGIN = "600px";
+// Browsers reject playbackRate outside this range (Chrome throws).
+const MIN_PLAYBACK_RATE = 0.0625;
+const MAX_PLAYBACK_RATE = 16;
+
+const clampPlaybackRate = (rate: number) => {
+  if (!Number.isFinite(rate) || rate <= 0) return 1;
+  return Math.min(MAX_PLAYBACK_RATE, Math.max(MIN_PLAYBACK_RATE, rate));
+};
 
 interface MatchCardHandle {
   playBothAndWait: () => Promise<void>;
@@ -153,6 +161,7 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
     ref,
   ) {
     const [showManualModal, setShowManualModal] = useState(false);
+    const [pairPlaybackActive, setPairPlaybackActive] = useState(false);
     const tiktokPlayerRef = useRef<MatchesClipPlayerHandle>(null);
     const sourcePlayerRef = useRef<MatchesClipPlayerHandle>(null);
     const pendingResolverRef = useRef<(() => void) | null>(null);
@@ -201,6 +210,19 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
     const sourceDuration = hasMatchedScene
       ? match.end_time - match.start_time
       : 0;
+    // The TikTok clip is already retimed (source is stretched/compressed to fit
+    // the scene). Playing both at the same rate makes the source drift and end
+    // late/early, so during paired playback (Play Both / Fast Watch) the source
+    // player runs at the retiming ratio: both clips then move at the same
+    // apparent speed and end together.
+    const pairSpeedRatio =
+      hasMatchedScene && tiktokDuration > 0 && sourceDuration > 0
+        ? sourceDuration / tiktokDuration
+        : 1;
+    const pairSpeedSynced = fastWatchMode || pairPlaybackActive;
+    const sourcePlaybackRate = pairSpeedSynced
+      ? clampPlaybackRate(playbackRate * pairSpeedRatio)
+      : playbackRate;
     const fastWatchMinReadyState =
       playbackRate >= 3
         ? HTMLMediaElement.HAVE_FUTURE_DATA
@@ -300,6 +322,9 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
         return;
       }
 
+      // Applied before playback starts so the source player already carries the
+      // synced rate when play() fires.
+      setPairPlaybackActive(true);
       endedRef.current = { tiktok: false, source: false };
       if (primedForFastWatchRef.current) {
         primedForFastWatchRef.current = false;
@@ -394,6 +419,7 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
     const stop = useCallback(() => {
       primedForFastWatchRef.current = false;
       loadFailureRef.current = false;
+      setPairPlaybackActive(false);
       tiktokPlayerRef.current?.pause();
       sourcePlayerRef.current?.pause();
       if (pendingResolverRef.current) {
@@ -405,6 +431,7 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
     const onClipEnded = useCallback((player: "tiktok" | "source") => {
       endedRef.current[player] = true;
       if (endedRef.current.tiktok && endedRef.current.source) {
+        setPairPlaybackActive(false);
         if (pendingResolverRef.current) {
           pendingResolverRef.current();
           pendingResolverRef.current = null;
@@ -631,7 +658,7 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
                   ref={sourcePlayerRef}
                   src={sourceVideoUrl}
                   onClipEnded={() => onClipEnded("source")}
-                  playbackRate={playbackRate}
+                  playbackRate={sourcePlaybackRate}
                   controls
                   preloadMode={preloadMode}
                   disableInteraction={controlsDisabled}
@@ -667,7 +694,14 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
               )}
             </div>
             {hasMatchedScene ? (
-              <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
+              <p
+                className="text-xs text-[hsl(var(--muted-foreground))] mt-1"
+                title={
+                  pairSpeedSynced
+                    ? `Paired playback: source plays at ${sourcePlaybackRate.toFixed(2)}x to match the TikTok clip`
+                    : undefined
+                }
+              >
                 {formatTime(match.start_time)} - {formatTime(match.end_time)} (
                 <strong>{formatTime(sourceDuration)}</strong> ~
                 {match.speed_ratio.toFixed(2)}x speed)

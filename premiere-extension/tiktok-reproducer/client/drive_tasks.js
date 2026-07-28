@@ -1782,6 +1782,9 @@ function removePathWithWindowsFallback(targetPath) {
     };
   }
   try {
+    var powershellEnv = Object.assign({}, process.env, {
+      ATR_CLEANUP_TARGET_PATH: targetPath,
+    });
     childProcess.execFileSync(
       "powershell.exe",
       [
@@ -1790,10 +1793,12 @@ function removePathWithWindowsFallback(targetPath) {
         "-ExecutionPolicy",
         "Bypass",
         "-Command",
-        "Remove-Item -LiteralPath $args[0] -Recurse -Force -ErrorAction Stop",
-        targetPath,
+        "Remove-Item -LiteralPath $env:ATR_CLEANUP_TARGET_PATH -Recurse -Force -ErrorAction Stop",
       ],
-      { windowsHide: true },
+      {
+        windowsHide: true,
+        env: powershellEnv,
+      },
     );
     return {
       attempted: true,
@@ -1885,9 +1890,19 @@ function removePathOnce(targetPath) {
     var fallbackAfterError = removePathWithWindowsFallback(normalized);
     windowsFallbackUsed = !!fallbackAfterError.attempted;
     if (!fallbackAfterError.ok) {
+      // Keep the Node filesystem error when it identifies a Windows media
+      // lock. child_process errors from cmd/PowerShell often have no POSIX
+      // code; replacing EBUSY/EPERM with that shell error used to turn a
+      // temporary Premiere lock into a terminal cleanup failure.
+      var reportedError = isCleanupRetryableError(e)
+        ? e
+        : fallbackAfterError.error || e;
       return {
         ok: false,
-        error: fallbackAfterError.error || e,
+        error: reportedError,
+        retryable_lock_hint:
+          isCleanupRetryableError(e) ||
+          (process.platform === "win32" && fs.existsSync(normalized)),
         windows_delete_fallback_used: windowsFallbackUsed,
       };
     }
@@ -1902,6 +1917,8 @@ function removePathOnce(targetPath) {
         error:
           fallbackAfterExists.error ||
           new Error("Path still exists after cleanup: " + normalized),
+        retryable_lock_hint:
+          process.platform === "win32" && fs.existsSync(normalized),
         windows_delete_fallback_used: windowsFallbackUsed,
       };
     }
@@ -1931,7 +1948,8 @@ function performRemoveLocalPath(payload) {
       });
     }
 
-    var retryable = isCleanupRetryableError(result.error);
+    var retryable =
+      !!result.retryable_lock_hint || isCleanupRetryableError(result.error);
     if (retryable && attempt < maxAttempts) {
       var waitMs = Math.min(
         CLEANUP_BACKOFF_MAX_MS,

@@ -60,6 +60,9 @@
   var CLEANUP_BACKGROUND_MAX_ATTEMPTS = 3;
   var CLEANUP_RETRYABLE_MAX_PASSES = 240;
   var CLEANUP_RETRY_DELAY_MS = 15000;
+  var CLEANUP_PROXY_SETTLE_MS = 1000;
+  var CLEANUP_MEDIA_SETTLE_MS = 1000;
+  var CLEANUP_PURGE_SETTLE_MS = 2500;
   var PROXY_RECONCILE_MAX_ATTACH_ATTEMPTS = 120;
   var MAX_LOG_ENTRIES = 200;
   var AME_CLEAR_MAX_ATTEMPTS = 3;
@@ -1970,15 +1973,13 @@
     } else if (String(localRootPath || "").trim()) {
       cleanupRoots = [String(localRootPath || "").trim()];
     }
-    var hostCall =
-      'cleanupImportedProjectsForLocalRoots("' +
-      escapeForEval(JSON.stringify(cleanupRoots)) +
-      '")';
 
-    return evalHost(hostCall).then(function (result) {
+    function parseCleanupHostResult(result, phaseLabel) {
       var raw = String(result || "").trim();
       if (!raw) {
-        throw new Error("Host cleanup returned an empty response");
+        throw new Error(
+          "Premiere " + phaseLabel + " returned an empty response",
+        );
       }
       if (raw.indexOf("ERROR:") === 0) {
         throw new Error(raw);
@@ -1988,45 +1989,112 @@
       try {
         parsed = JSON.parse(raw);
       } catch (eJson) {
-        parsed = null;
-      }
-
-      var summary = parsed || { ok: true, raw: raw };
-      if (!quiet && summary) {
-        var sequencesDeleted = Number(summary.sequences_deleted || 0);
-        var movedItems = Number(summary.items_moved_to_purge_bin || 0);
-        var remainingSequences = Number(summary.remaining_sequences || 0);
-        var remainingRootItems = Number(summary.remaining_root_items || 0);
-        var warningCount = Array.isArray(summary.warnings)
-          ? summary.warnings.length
-          : Number(summary.warning_count || 0);
-        var detachedProxyCount = Number(summary.detached_proxy_count || 0);
-        var detachFailedCount = Number(summary.detach_failed_count || 0);
-        var mediaOfflineCount = Number(summary.media_offline_count || 0);
-        log(
-          "Premiere cleanup for " +
-            projectId +
-            ": sequencesDeleted=" +
-            sequencesDeleted +
-            ", movedToPurgeBin=" +
-            movedItems +
-            ", remainingSequences=" +
-            remainingSequences +
-            ", remainingRootItems=" +
-            remainingRootItems +
-            ", detachedProxies=" +
-            detachedProxyCount +
-            ", detachFailed=" +
-            detachFailedCount +
-            ", mediaOffline=" +
-            mediaOfflineCount +
-            ", warnings=" +
-            warningCount,
-          detachFailedCount > 0 ? "warn" : "info",
+        throw new Error(
+          "Premiere " +
+            phaseLabel +
+            " returned an invalid response: " +
+            raw.substring(0, 240),
         );
       }
-      return summary;
-    });
+      if (
+        !parsed ||
+        typeof parsed !== "object" ||
+        typeof parsed.ok !== "boolean"
+      ) {
+        throw new Error(
+          "Premiere " + phaseLabel + " returned no cleanup summary",
+        );
+      }
+      return parsed;
+    }
+
+    function runPreparationStage(stage) {
+      var hostCall =
+        'prepareImportedProjectsForCleanup("' +
+        escapeForEval(JSON.stringify(cleanupRoots)) +
+        '","' +
+        escapeForEval(stage) +
+        '")';
+      return evalHost(hostCall).then(function (result) {
+        var summary = parseCleanupHostResult(
+          result,
+          stage + " preparation",
+        );
+        return summary;
+      });
+    }
+
+    var preparation = {};
+    return runPreparationStage("detach")
+      .then(function (detachSummary) {
+        preparation.detach = detachSummary;
+        // This panel-side timer is intentional: unlike $.sleep(), it returns
+        // control to Premiere so Windows can commit detachProxy() and release
+        // proxy handles before the next host operation.
+        return sleep(CLEANUP_PROXY_SETTLE_MS);
+      })
+      .then(function () {
+        return runPreparationStage("offline");
+      })
+      .then(function (offlineSummary) {
+        preparation.offline = offlineSummary;
+        return sleep(CLEANUP_MEDIA_SETTLE_MS);
+      })
+      .then(function () {
+        var hostCall =
+          'cleanupImportedProjectsForLocalRoots("' +
+          escapeForEval(JSON.stringify(cleanupRoots)) +
+          '")';
+        return evalHost(hostCall);
+      })
+      .then(function (result) {
+        var summary = parseCleanupHostResult(result, "project purge");
+        summary.preparation = preparation;
+        if (!quiet && summary) {
+          var sequencesDeleted = Number(summary.sequences_deleted || 0);
+          var movedItems = Number(summary.items_moved_to_purge_bin || 0);
+          var remainingSequences = Number(summary.remaining_sequences || 0);
+          var remainingRootItems = Number(summary.remaining_root_items || 0);
+          var warningCount = Array.isArray(summary.warnings)
+            ? summary.warnings.length
+            : Number(summary.warning_count || 0);
+          var detachedProxyCount = Number(summary.detached_proxy_count || 0);
+          var detachFailedCount = Number(summary.detach_failed_count || 0);
+          var mediaOfflineCount = Number(summary.media_offline_count || 0);
+          var mediaOfflineDeferredProxyCount = Number(
+            summary.media_offline_deferred_proxy_count || 0,
+          );
+          log(
+            "Premiere cleanup for " +
+              projectId +
+              ": sequencesDeleted=" +
+              sequencesDeleted +
+              ", movedToPurgeBin=" +
+              movedItems +
+              ", remainingSequences=" +
+              remainingSequences +
+              ", remainingRootItems=" +
+              remainingRootItems +
+              ", detachedProxies=" +
+              detachedProxyCount +
+              ", detachFailed=" +
+              detachFailedCount +
+              ", mediaOffline=" +
+              mediaOfflineCount +
+              ", mediaOfflineDeferredForProxy=" +
+              mediaOfflineDeferredProxyCount +
+              ", warnings=" +
+              warningCount,
+            detachFailedCount > 0 ? "warn" : "info",
+          );
+        }
+        // Project-item deletion and setOffline() also release file handles
+        // asynchronously on Windows. Do not start recursive disk deletion in
+        // the same event-loop turn as the purge.
+        return sleep(CLEANUP_PURGE_SETTLE_MS).then(function () {
+          return summary;
+        });
+      });
   }
 
   // --- Persistent project states ---

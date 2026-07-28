@@ -7,7 +7,7 @@
 
 var ATR_EXTENSION_ID = "com.animetiktok.tiktokreproducer.panel";
 // Must stay in sync with ATR_BUILD_ID in client/constants.js.
-var ATR_HOST_BUILD_ID = "2026-07-06-panel-cleanup-v9";
+var ATR_HOST_BUILD_ID = "2026-07-28-windows-cleanup-v10";
 var __atrEncoderEvents = [];
 var __atrEncoderJobProjectMap = {};
 var __atrEncoderJobMetaMap = {};
@@ -952,40 +952,25 @@ function __atrDetachManagedProxiesForCleanupObject(localRootPath) {
       continue;
     }
 
-    // detachProxy() returns before Premiere commits the change on Windows, so
-    // trusting its return value reports a false success: purge then deletes the
-    // item and the folder delete removes the proxy file while Premiere still
-    // has it attached, which queues the "link missing proxies" modal and holds
-    // the media file handles (leaving sources/proxies on disk). Confirm the
-    // proxy is actually gone via hasProxy(), mirroring the verified attach path.
+    // detachProxy() can return before Premiere commits the change on Windows.
+    // Do one request and return control to the panel; the panel deliberately
+    // yields between cleanup phases so Premiere's UI thread can commit it.
+    // Repeated detach/refresh/sleep calls in one ExtendScript invocation do not
+    // yield to Premiere and can keep the proxy registered until after the disk
+    // file is removed, which queues the "link missing proxies" modal.
     var detachCommitted = false;
     var lastDetachError = null;
-    for (
-      var detachAttempt = 0;
-      detachAttempt < 4 && !detachCommitted;
-      detachAttempt += 1
-    ) {
-      try {
-        item.detachProxy();
-      } catch (eDetach) {
-        lastDetachError = eDetach;
-      }
-      try {
-        if (item.refreshMedia) {
-          item.refreshMedia();
-        }
-      } catch (eRefreshDetach) {}
-      if (detachAttempt > 0) {
-        try {
-          $.sleep(200);
-        } catch (eSleepDetach) {}
-      }
-      try {
-        detachCommitted = !item.hasProxy();
-      } catch (eHasProxyAfter) {
-        // Item can no longer be queried for proxy state; treat as detached.
-        detachCommitted = true;
-      }
+    try {
+      item.detachProxy();
+    } catch (eDetach) {
+      lastDetachError = eDetach;
+    }
+    try {
+      detachCommitted = !item.hasProxy();
+    } catch (eHasProxyAfter) {
+      // Item can no longer be queried for proxy state; project purge will
+      // release it.
+      detachCommitted = true;
     }
 
     if (detachCommitted) {
@@ -1025,6 +1010,7 @@ function __atrSetImportedMediaOfflineForCleanupObject(localRootPath) {
     media_offline_count: 0,
     media_offline_unavailable_count: 0,
     media_offline_failed_count: 0,
+    media_offline_deferred_proxy_count: 0,
     media_release_warnings: [],
   };
 
@@ -1041,6 +1027,21 @@ function __atrSetImportedMediaOfflineForCleanupObject(localRootPath) {
       continue;
     }
     result.considered_media_items += 1;
+
+    // Never make the original media offline while a to-be-deleted proxy is
+    // still registered. On Windows that ordering can open Premiere's missing
+    // proxy confirmation modal. The preceding panel phase normally detaches
+    // it; if the detach is still pending, project purge is the safe fallback.
+    try {
+      if (item.hasProxy && item.getProxyPath && item.hasProxy()) {
+        var attachedProxyPath = __atrSafeString(item.getProxyPath());
+        if (__atrPathStartsWith(attachedProxyPath, normalizedRootPath)) {
+          result.media_offline_deferred_proxy_count += 1;
+          continue;
+        }
+      }
+    } catch (eAttachedProxyState) {}
+
     if (!item.setOffline) {
       result.media_offline_unavailable_count += 1;
       continue;
@@ -1917,7 +1918,16 @@ function purgeActiveProject() {
         }
 
         try {
-          purgeBinDeleted = !!purgeBin.deleteBin();
+          var deleteBinResult = purgeBin.deleteBin();
+          // Premiere's ExtendScript API returns 0 on a successful deleteBin().
+          // Boolean coercion inverted that result and incorrectly ran the
+          // fallback path against an already-deleted bin.
+          purgeBinDeleted =
+            deleteBinResult === 0 ||
+            deleteBinResult === "0" ||
+            deleteBinResult === true ||
+            (deleteBinResult === undefined &&
+              __atrGetRootChildCount(root) === 0);
         } catch (eDeleteBin0) {
           purgeBinDeleted = false;
         }
@@ -1972,6 +1982,111 @@ function purgeActiveProject() {
   }
 }
 
+function prepareImportedProjectsForCleanup(localRootsJson, stage) {
+  try {
+    var roots = [];
+    try {
+      roots =
+        typeof localRootsJson === "string"
+          ? JSON.parse(localRootsJson || "[]")
+          : localRootsJson;
+    } catch (eParse) {
+      roots = [];
+    }
+    if (!roots || !roots.length) {
+      roots = [];
+    }
+
+    var normalizedStage = __atrSafeString(stage).toLowerCase();
+    var result = {
+      ok: true,
+      stage: normalizedStage,
+      root_count: 0,
+      detached_proxy_count: 0,
+      detach_failed_count: 0,
+      media_offline_count: 0,
+      media_offline_failed_count: 0,
+      media_offline_deferred_proxy_count: 0,
+      summaries: [],
+      warnings: [],
+    };
+
+    if (normalizedStage !== "detach" && normalizedStage !== "offline") {
+      return "ERROR: Unknown Premiere cleanup preparation stage: " + stage;
+    }
+
+    for (var i = 0; i < roots.length; i += 1) {
+      var rootPath = __atrSafeString(roots[i]);
+      if (!rootPath) {
+        continue;
+      }
+      result.root_count += 1;
+
+      if (normalizedStage === "detach") {
+        var detachSummary =
+          __atrDetachManagedProxiesForCleanupObject(rootPath);
+        detachSummary.local_root = rootPath;
+        result.summaries.push(detachSummary);
+        result.detached_proxy_count += Number(
+          detachSummary.detached_proxy_count || 0,
+        );
+        result.detach_failed_count += Number(
+          detachSummary.detach_proxy_failed_count || 0,
+        );
+        if (
+          detachSummary.detach_proxy_warnings &&
+          detachSummary.detach_proxy_warnings.length
+        ) {
+          for (
+            var dw = 0;
+            dw < detachSummary.detach_proxy_warnings.length;
+            dw += 1
+          ) {
+            if (result.warnings.length < 10) {
+              result.warnings.push(detachSummary.detach_proxy_warnings[dw]);
+            }
+          }
+        }
+      } else {
+        var offlineSummary =
+          __atrSetImportedMediaOfflineForCleanupObject(rootPath);
+        offlineSummary.local_root = rootPath;
+        result.summaries.push(offlineSummary);
+        result.media_offline_count += Number(
+          offlineSummary.media_offline_count || 0,
+        );
+        result.media_offline_failed_count += Number(
+          offlineSummary.media_offline_failed_count || 0,
+        );
+        result.media_offline_deferred_proxy_count += Number(
+          offlineSummary.media_offline_deferred_proxy_count || 0,
+        );
+        if (
+          offlineSummary.media_release_warnings &&
+          offlineSummary.media_release_warnings.length
+        ) {
+          for (
+            var ow = 0;
+            ow < offlineSummary.media_release_warnings.length;
+            ow += 1
+          ) {
+            if (result.warnings.length < 10) {
+              result.warnings.push(offlineSummary.media_release_warnings[ow]);
+            }
+          }
+        }
+      }
+    }
+
+    result.ok =
+      result.detach_failed_count === 0 &&
+      result.media_offline_failed_count === 0;
+    return JSON.stringify(result);
+  } catch (e) {
+    return "ERROR: " + e.message + " (line " + e.line + ")";
+  }
+}
+
 function cleanupImportedProjectsForLocalRoots(localRootsJson) {
   try {
     var roots = [];
@@ -1992,6 +2107,7 @@ function cleanupImportedProjectsForLocalRoots(localRootsJson) {
     var detachedProxyCount = 0;
     var detachFailedCount = 0;
     var mediaOfflineCount = 0;
+    var mediaOfflineDeferredProxyCount = 0;
     var detachWarnings = [];
     var mediaReleaseWarnings = [];
     for (var i = 0; i < roots.length; i += 1) {
@@ -2017,6 +2133,9 @@ function cleanupImportedProjectsForLocalRoots(localRootsJson) {
       mediaReleaseSummary.local_root = rootPath;
       mediaReleaseSummaries.push(mediaReleaseSummary);
       mediaOfflineCount += Number(mediaReleaseSummary.media_offline_count || 0);
+      mediaOfflineDeferredProxyCount += Number(
+        mediaReleaseSummary.media_offline_deferred_proxy_count || 0,
+      );
       if (
         mediaReleaseSummary.media_release_warnings &&
         mediaReleaseSummary.media_release_warnings.length
@@ -2038,11 +2157,6 @@ function cleanupImportedProjectsForLocalRoots(localRootsJson) {
     try {
       __atrCloseSourceMonitorForCleanup(null);
     } catch (eCloseBeforePurge) {}
-    try {
-      if ($ && $.sleep) {
-        $.sleep(300);
-      }
-    } catch (eSleepBeforePurge) {}
 
     var purgeRaw = purgeActiveProject();
     if (purgeRaw && String(purgeRaw).indexOf("ERROR:") === 0) {
@@ -2061,17 +2175,14 @@ function cleanupImportedProjectsForLocalRoots(localRootsJson) {
     try {
       __atrCloseSourceMonitorForCleanup(null);
     } catch (eCloseAfterPurge) {}
-    try {
-      if ($ && $.sleep) {
-        $.sleep(300);
-      }
-    } catch (eSleepAfterPurge) {}
 
     purgeSummary.detach_proxy_summaries = detachSummaries;
     purgeSummary.media_release_summaries = mediaReleaseSummaries;
     purgeSummary.detached_proxy_count = detachedProxyCount;
     purgeSummary.detach_failed_count = detachFailedCount;
     purgeSummary.media_offline_count = mediaOfflineCount;
+    purgeSummary.media_offline_deferred_proxy_count =
+      mediaOfflineDeferredProxyCount;
     purgeSummary.detach_proxy_warnings = detachWarnings;
     purgeSummary.media_release_warnings = mediaReleaseWarnings;
     purgeSummary.warning_count =
@@ -2089,6 +2200,11 @@ function cleanupImportedProjectsForLocalRoots(localRootsJson) {
         purgeSummary.warnings.push(mediaReleaseWarnings[k]);
       }
     }
+    try {
+      if ($ && $.gc) {
+        $.gc();
+      }
+    } catch (eCleanupGc) {}
     return JSON.stringify(purgeSummary);
   } catch (e) {
     return "ERROR: " + e.message + " (line " + e.line + ")";
@@ -2825,4 +2941,3 @@ function pullEncoderEvents() {
     return "[]";
   }
 }
-
