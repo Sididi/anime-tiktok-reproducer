@@ -97,7 +97,7 @@ class Settings(BaseSettings):
     processing_gdrive_full_auto_enabled: bool = False
     elevenlabs_api_key: str | None = None
     elevenlabs_model_id: str = "eleven_multilingual_v2"
-    elevenlabs_output_format: str = "pcm_44100"
+    elevenlabs_output_format: str = "pcm_48000"
     # Post-process the published TTS voiceover to reduce ElevenLabs/AI fingerprints.
     # Env: ATR_VOICE_DEFINGERPRINT_LEVEL.
     # One of: off, default, light, moderate, aggressive, nvidia, nvidia_strong_hq.

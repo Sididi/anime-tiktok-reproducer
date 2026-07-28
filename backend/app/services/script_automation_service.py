@@ -756,6 +756,18 @@ class ScriptAutomationService:
     def _is_pcm_format(cls) -> bool:
         return (settings.elevenlabs_output_format or "").strip().lower().startswith("pcm")
 
+    @classmethod
+    def _pcm_sample_rate(cls) -> int:
+        fmt = (settings.elevenlabs_output_format or "").strip().lower()
+        match = re.fullmatch(r"pcm_(\d+)", fmt)
+        if match:
+            return int(match.group(1))
+        return 44100
+
+    @classmethod
+    def _wrap_pcm_for_settings(cls, pcm_data: bytes) -> bytes:
+        return cls._wrap_pcm_as_wav(pcm_data, sample_rate=cls._pcm_sample_rate())
+
     @staticmethod
     def _wrap_pcm_as_wav(
         pcm_data: bytes,
@@ -1124,7 +1136,7 @@ class ScriptAutomationService:
                     )
                     previous_request_id = getattr(synthesis_result, "request_id", None) or None
                     if cls._is_pcm_format():
-                        audio_bytes = cls._wrap_pcm_as_wav(audio_bytes)
+                        audio_bytes = cls._wrap_pcm_for_settings(audio_bytes)
                     part_path = parts_dir / f"part_{idx}.{extension}"
                     part_path.write_bytes(audio_bytes)
                     part_paths.append(part_path)
