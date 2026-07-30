@@ -24,14 +24,27 @@ logger = logging.getLogger("uvicorn.error")
 
 class IndexationQueueService:
     MAX_CONCURRENT = 2
+    # The registry lives for the whole process; without eviction it retains
+    # every job ever enqueued (including per-file warning/unmatched lists).
+    MAX_TERMINAL_JOBS = 50
 
     def __init__(self) -> None:
         self._jobs: dict[str, IndexationJob] = {}
+        self._job_tasks: set[asyncio.Task] = set()
         self._semaphore = asyncio.Semaphore(self.MAX_CONCURRENT)
         self._matching_lock = asyncio.Lock()
         self._active_heavy_jobs = 0
         self._active_heavy_kinds: Counter[str] = Counter()
         self._subscribers: list[asyncio.Queue[dict]] = []
+
+    def _prune_terminal_jobs(self) -> None:
+        terminal_ids = [
+            job_id
+            for job_id, job in self._jobs.items()
+            if job.status in {"complete", "error"}
+        ]
+        for job_id in terminal_ids[: max(0, len(terminal_ids) - self.MAX_TERMINAL_JOBS)]:
+            del self._jobs[job_id]
 
     async def acquire_heavy_slot(self, kind: str, slots: int = 1) -> None:
         """Acquire ``slots`` units of the process-wide heavyweight work budget.
@@ -128,9 +141,12 @@ class IndexationQueueService:
             fps=fps,
             series_id=series_id,
         )
+        self._prune_terminal_jobs()
         self._jobs[job.id] = job
         self._broadcast(job)
-        asyncio.create_task(self._run_job(job))
+        task = asyncio.create_task(self._run_job(job))
+        self._job_tasks.add(task)
+        task.add_done_callback(self._job_tasks.discard)
         return job.id
 
     @classmethod

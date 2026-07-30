@@ -256,7 +256,10 @@ class GapResolutionService:
     ] = OrderedDict()
 
     # FPS cache: avoids redundant ffprobe calls for the same video file.
-    _fps_cache: dict[str, Fraction] = {}
+    # Bounded LRU like its siblings above — one entry per distinct episode
+    # path would otherwise accumulate for the process lifetime.
+    _fps_cache: OrderedDict[str, Fraction] = OrderedDict()
+    FPS_CACHE_MAX_ENTRIES = 256
 
     # Default timeline rate (60fps for TikTok)
     TIMELINE_RATE = FrameRateInfo(timebase=60, ntsc=False)
@@ -303,8 +306,10 @@ class GapResolutionService:
             Frame rate as a Fraction (e.g., Fraction(24000, 1001) for 23.976fps)
         """
         cache_key = str(video_path.resolve())
-        if cache_key in cls._fps_cache:
-            return cls._fps_cache[cache_key]
+        cached = cls._fps_cache.get(cache_key)
+        if cached is not None:
+            cls._fps_cache.move_to_end(cache_key)
+            return cached
 
         cmd = [
             "ffprobe", "-v", "quiet",
@@ -341,8 +346,17 @@ class GapResolutionService:
                     else:
                         result = Fraction(int(round(fps_float)), 1)
 
-        cls._fps_cache[cache_key] = result
+        cls._remember_fps(cache_key, result)
         return result
+
+    @classmethod
+    def _remember_fps(cls, cache_key: str, fps: Fraction) -> None:
+        """Store an fps probe in the bounded LRU, evicting the oldest past the cap."""
+        cache = cls._fps_cache
+        cache[cache_key] = fps
+        cache.move_to_end(cache_key)
+        while len(cache) > cls.FPS_CACHE_MAX_ENTRIES:
+            cache.popitem(last=False)
 
     @classmethod
     async def get_frame_offset(cls, video_path: Path) -> float:
@@ -424,7 +438,7 @@ class GapResolutionService:
             elif probe.duration is not None and probe.duration > 0:
                 duration_seconds = probe.duration
 
-        cls._fps_cache[cache_key] = fps_fraction
+        cls._remember_fps(cache_key, fps_fraction)
         return _EpisodeVideoMetadata(
             fps_fraction=fps_fraction,
             duration_seconds=max(0.0, duration_seconds),

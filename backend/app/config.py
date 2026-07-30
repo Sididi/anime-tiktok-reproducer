@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     library_state_db_path: Path = Path(__file__).parent.parent / "data" / "library_state.db"
     ffmpeg_binary: str | None = None
     ffprobe_binary: str | None = None
+    ytdlp_binary: str | None = None
+    ytdlp_cookies_from_browser: str | None = None
 
     # anime_searcher
     anime_searcher_path: Path = Path(__file__).parent.parent.parent / "modules" / "anime_searcher"

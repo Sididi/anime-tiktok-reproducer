@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -166,6 +167,61 @@ class IndexationPreflightService:
         )
 
     @classmethod
+    def _is_resumable_local_import(
+        cls,
+        *,
+        source_path: Path,
+        library_type: LibraryType | str,
+        display_name: str,
+    ) -> bool:
+        """Confirm that an orphan is an interrupted import of this source.
+
+        Resume is deliberately path-bound: at least one valid import manifest
+        must refer to a direct source video, and every manifest in the local
+        series must refer to this same source folder.
+        """
+        local_series_dir = AnimeLibraryService.get_library_path(library_type) / display_name
+        if not local_series_dir.is_dir():
+            return False
+
+        source_scan = AnimeLibraryService.scan_direct_video_files_sync(source_path)
+        source_files = {
+            path.resolve()
+            for path in source_scan.readable_files
+        }
+        if not source_files:
+            return False
+
+        manifest_paths = sorted(
+            local_series_dir.glob(
+                f"*{AnimeLibraryService.SOURCE_IMPORT_MANIFEST_SUFFIX}"
+            )
+        )
+        if not manifest_paths:
+            return False
+
+        matched_sources: set[Path] = set()
+        for manifest_path in manifest_paths:
+            try:
+                payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+                imported_source = Path(str(payload["source_path"])).resolve()
+                prepared_path = Path(str(payload["prepared_path"])).resolve()
+            except (KeyError, OSError, TypeError, json.JSONDecodeError):
+                return False
+
+            if imported_source not in source_files:
+                return False
+            try:
+                prepared_path.relative_to(local_series_dir.resolve())
+            except ValueError:
+                return False
+            if not prepared_path.is_file():
+                return False
+            matched_sources.add(imported_source)
+
+        return bool(matched_sources)
+
+    @classmethod
     async def preflight_source(
         cls,
         *,
@@ -187,6 +243,7 @@ class IndexationPreflightService:
             "storage_release_id": None,
             "conflict_details": None,
             "orphan_reason": None,
+            "resume_available": False,
             "invalid_video_files": [],
         }
 
@@ -226,6 +283,13 @@ class IndexationPreflightService:
         if orphan_reason:
             result["resolution"] = RESOLUTION_BLOCKED_ORPHAN
             result["orphan_reason"] = orphan_reason
+            if remote_series_id is None:
+                result["resume_available"] = await asyncio.to_thread(
+                    cls._is_resumable_local_import,
+                    source_path=folder,
+                    library_type=scoped_type,
+                    display_name=display_name,
+                )
             return result
 
         if remote is None:

@@ -52,7 +52,9 @@ logger = logging.getLogger("uvicorn.error")
 # spaCy helpers for determiner detection
 # =============================================================================
 
-# Cache of loaded spaCy models
+# Cache of loaded spaCy models, keyed by model name (NOT by the caller's
+# language string: target_language is client-controlled, and keying by it
+# would load a fresh multi-MB pipeline per distinct unknown code).
 _SPACY_MODELS: dict[str, spacy.Language] = {}
 
 SPACY_MODEL_MAP = {
@@ -61,21 +63,25 @@ SPACY_MODEL_MAP = {
     "es": "es_core_news_sm",
 }
 
+_SPACY_FALLBACK_MODEL = "en_core_web_sm"
+
 
 def _get_spacy_model(lang: str) -> spacy.Language:
     """Load and cache the spaCy model for the given language."""
-    if lang not in _SPACY_MODELS:
-        model_name = SPACY_MODEL_MAP.get(lang, "en_core_web_sm")
+    model_name = SPACY_MODEL_MAP.get(lang, _SPACY_FALLBACK_MODEL)
+    if model_name not in _SPACY_MODELS:
         try:
-            _SPACY_MODELS[lang] = spacy.load(model_name, disable=["ner", "parser"])
+            _SPACY_MODELS[model_name] = spacy.load(model_name, disable=["ner", "parser"])
         except OSError:
             # Model not installed, fall back to English
             import sys
-            print(f"[WARNING] spaCy model '{model_name}' not found, falling back to en_core_web_sm", file=sys.stderr)
-            if "en" not in _SPACY_MODELS:
-                _SPACY_MODELS["en"] = spacy.load("en_core_web_sm", disable=["ner", "parser"])
-            _SPACY_MODELS[lang] = _SPACY_MODELS["en"]
-    return _SPACY_MODELS[lang]
+            print(f"[WARNING] spaCy model '{model_name}' not found, falling back to {_SPACY_FALLBACK_MODEL}", file=sys.stderr)
+            if _SPACY_FALLBACK_MODEL not in _SPACY_MODELS:
+                _SPACY_MODELS[_SPACY_FALLBACK_MODEL] = spacy.load(
+                    _SPACY_FALLBACK_MODEL, disable=["ner", "parser"]
+                )
+            _SPACY_MODELS[model_name] = _SPACY_MODELS[_SPACY_FALLBACK_MODEL]
+    return _SPACY_MODELS[model_name]
 
 
 def is_determiner(word: str, language: str) -> bool:

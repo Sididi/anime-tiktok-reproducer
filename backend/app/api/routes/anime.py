@@ -764,6 +764,7 @@ class IndexAnimeAsyncRequest(BaseModel):
     library_type: LibraryType
     anime_name: str | None = None
     fps: float = 2.0
+    resume_existing: bool = False
 
 
 @router.post("/index-async")
@@ -780,7 +781,14 @@ async def index_anime_async(request: IndexAnimeAsyncRequest):
         library_type=request.library_type,
         anime_name=target_anime_name,
     )
-    _raise_index_preflight_error(preflight)
+    resume_allowed = (
+        request.resume_existing
+        and preflight.get("resolution") == "blocked_orphan"
+        and preflight.get("series_id") is None
+        and preflight.get("resume_available") is True
+    )
+    if not resume_allowed:
+        _raise_index_preflight_error(preflight)
     job_id = await indexation_queue.enqueue(
         source_path=request.source_path,
         library_type=request.library_type,

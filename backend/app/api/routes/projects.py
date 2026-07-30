@@ -143,6 +143,11 @@ async def delete_project(project_id: str) -> dict:
     """Delete a project."""
     if not ProjectService.delete(project_id):
         raise HTTPException(status_code=404, detail="Project not found")
+    from ...services.project_startup_service import project_startup_queue
+    from ...services.project_upload_service import project_upload_queue
+
+    await project_startup_queue.remove_project_jobs(project_id)
+    await project_upload_queue.remove_project_jobs(project_id)
     return {"status": "deleted"}
 
 

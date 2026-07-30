@@ -11,6 +11,7 @@ from ..config import settings
 from ..utils.media_binaries import (
     get_media_subprocess_env,
     get_ytdlp_ffmpeg_location,
+    get_ytdlp_binary,
     is_media_binary_override_error,
 )
 from ..utils.subprocess_runner import CommandTimeoutError, run_command, terminate_process
@@ -49,6 +50,10 @@ class DownloaderService:
     DOWNLOAD_TIMEOUT_SECONDS = 1800.0
     DOWNLOAD_HEARTBEAT_INTERVAL_SECONDS = 5.0
     DOWNLOAD_STALL_SECONDS = 60.0
+    EXTRACTION_RETRY_DELAYS_SECONDS = (2.0, 5.0)
+    RETRYABLE_EXTRACTION_ERRORS = (
+        "Unable to extract universal data for rehydration",
+    )
     FFPROBE_TIMEOUT_SECONDS = 30.0
     MUX_TIMEOUT_SECONDS = 300.0
     AUDIO_RECOVERY_DURATION_TOLERANCE_SECONDS = 0.25
@@ -76,13 +81,15 @@ class DownloaderService:
     @classmethod
     def _build_download_command(
         cls,
-        url: str,
+        url: str | None,
         output_path: Path,
         *,
         format_selector: str,
+        write_info_json: bool = False,
+        load_info_json: Path | None = None,
     ) -> list[str]:
         cmd = [
-            "yt-dlp",
+            get_ytdlp_binary(),
             "--no-warnings",
             "--progress",
             "--newline",
@@ -95,10 +102,24 @@ class DownloaderService:
             str(output_path),
             "--force-overwrites",
         ]
+        if write_info_json:
+            cmd.append("--write-info-json")
+        if load_info_json is not None:
+            cmd.extend(["--load-info-json", str(load_info_json)])
+        elif settings.ytdlp_cookies_from_browser:
+            cmd.extend(
+                [
+                    "--cookies-from-browser",
+                    settings.ytdlp_cookies_from_browser,
+                ]
+            )
         ffmpeg_location = get_ytdlp_ffmpeg_location()
         if ffmpeg_location is not None:
             cmd.extend(["--ffmpeg-location", ffmpeg_location])
-        cmd.append(url)
+        if load_info_json is None:
+            if url is None:
+                raise ValueError("A URL is required when no info JSON is provided")
+            cmd.append(url)
         return cmd
 
     @classmethod
@@ -107,15 +128,27 @@ class DownloaderService:
             url,
             output_path,
             format_selector=cls.PRIMARY_FORMAT_SELECTOR,
+            write_info_json=True,
         )
 
     @classmethod
-    def _build_audio_recovery_command(cls, url: str, output_path: Path) -> list[str]:
+    def _build_audio_recovery_command(
+        cls,
+        url: str,
+        output_path: Path,
+        *,
+        info_json_path: Path | None = None,
+    ) -> list[str]:
         return cls._build_download_command(
-            url,
+            None if info_json_path is not None else url,
             output_path,
             format_selector=cls.AUDIO_RECOVERY_FORMAT_SELECTOR,
+            load_info_json=info_json_path,
         )
+
+    @staticmethod
+    def _get_info_json_path(output_path: Path) -> Path:
+        return output_path.with_suffix(".info.json")
 
     @staticmethod
     def _cleanup_paths(*paths: Path) -> None:
@@ -153,6 +186,55 @@ class DownloaderService:
             return path.stat().st_size
         except OSError:
             return None
+
+    @classmethod
+    def _is_retryable_extraction_failure(cls, result: _DownloadCommandResult) -> bool:
+        return (
+            result.error is None
+            and result.returncode not in (None, 0)
+            and any(
+                marker in result.stderr
+                for marker in cls.RETRYABLE_EXTRACTION_ERRORS
+            )
+        )
+
+    @classmethod
+    async def _stream_download_command_with_retries(
+        cls,
+        cmd: list[str],
+        *,
+        progress_message_prefix: str,
+        retry_message: str,
+        cleanup_path: Path,
+    ) -> AsyncIterator[DownloadProgress | _DownloadCommandResult]:
+        retry_delays = cls.EXTRACTION_RETRY_DELAYS_SECONDS
+        for attempt in range(len(retry_delays) + 1):
+            result: _DownloadCommandResult | None = None
+            async for event in cls._stream_download_command(
+                cmd,
+                progress_message_prefix=progress_message_prefix,
+            ):
+                if isinstance(event, DownloadProgress):
+                    yield event
+                else:
+                    result = event
+
+            if (
+                result is None
+                or not cls._is_retryable_extraction_failure(result)
+                or attempt >= len(retry_delays)
+            ):
+                if result is not None:
+                    yield result
+                return
+
+            cls._cleanup_paths(cleanup_path)
+            yield DownloadProgress(
+                "downloading",
+                0,
+                f"{retry_message} ({attempt + 1}/{len(retry_delays)})...",
+            )
+            await asyncio.sleep(retry_delays[attempt])
 
     @classmethod
     async def _stream_download_command(
@@ -399,13 +481,16 @@ class DownloaderService:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         recovery_path = output_path.with_name(f"{output_path.stem}.recovery{output_path.suffix}")
         mux_path = output_path.with_name(f"{output_path.stem}.muxed{output_path.suffix}")
-        cls._cleanup_paths(recovery_path, mux_path)
+        info_json_path = cls._get_info_json_path(output_path)
+        cls._cleanup_paths(recovery_path, mux_path, info_json_path)
 
         try:
             primary_result: _DownloadCommandResult | None = None
-            async for event in cls._stream_download_command(
+            async for event in cls._stream_download_command_with_retries(
                 cls._build_primary_download_command(url, output_path),
                 progress_message_prefix="Downloading",
+                retry_message="TikTok did not return video data; retrying",
+                cleanup_path=output_path,
             ):
                 if isinstance(event, DownloadProgress):
                     yield event
@@ -452,9 +537,15 @@ class DownloaderService:
                 yield DownloadProgress("downloading", 0.0, "Recovering audio track...")
 
                 recovery_result: _DownloadCommandResult | None = None
-                async for event in cls._stream_download_command(
-                    cls._build_audio_recovery_command(url, recovery_path),
+                async for event in cls._stream_download_command_with_retries(
+                    cls._build_audio_recovery_command(
+                        url,
+                        recovery_path,
+                        info_json_path=info_json_path if info_json_path.exists() else None,
+                    ),
                     progress_message_prefix="Recovering audio",
+                    retry_message="TikTok did not return audio data; retrying",
+                    cleanup_path=recovery_path,
                 ):
                     if isinstance(event, DownloadProgress):
                         yield event
@@ -548,7 +639,7 @@ class DownloaderService:
             cls._cleanup_paths(recovery_path, mux_path)
             yield DownloadProgress("error", 0, "", error=str(exc))
         finally:
-            cls._cleanup_paths(recovery_path, mux_path)
+            cls._cleanup_paths(recovery_path, mux_path, info_json_path)
 
     @classmethod
     async def download_project_video(

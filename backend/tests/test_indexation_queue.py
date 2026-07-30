@@ -151,6 +151,79 @@ async def test_multi_slot_heavy_job_reserves_full_budget() -> None:
 
 
 @pytest.mark.asyncio
+async def test_enqueue_prunes_oldest_terminal_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The job registry is process-lifetime: terminal jobs must be evicted
+    beyond a bounded history or the dict grows for every job ever enqueued."""
+
+    async def fake_run_job(self: IndexationQueueService, job: IndexationJob) -> None:
+        return None
+
+    monkeypatch.setattr(IndexationQueueService, "_run_job", fake_run_job)
+    service = IndexationQueueService()
+    limit = IndexationQueueService.MAX_TERMINAL_JOBS
+
+    for i in range(limit + 5):
+        job_id = await service.enqueue(
+            source_path=f"/tmp/source-{i}",
+            library_type=LibraryType.ANIME,
+            anime_name=f"Series {i}",
+            fps=2.0,
+        )
+        service._jobs[job_id].status = "complete"
+
+    active_id = await service.enqueue(
+        source_path="/tmp/source-active",
+        library_type=LibraryType.ANIME,
+        anime_name="Active Series",
+        fps=2.0,
+    )
+
+    jobs = service.list_jobs()
+    terminal = [j for j in jobs if j.status in {"complete", "error"}]
+    assert len(terminal) <= limit
+    names = {j.source_name for j in jobs}
+    # Oldest terminal jobs are evicted, newest are kept.
+    assert "Series 0" not in names
+    assert f"Series {limit + 4}" in names
+    # The still-active job is untouched.
+    assert any(j.id == active_id for j in jobs)
+
+
+@pytest.mark.asyncio
+async def test_enqueue_keeps_strong_reference_to_job_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bare asyncio.create_task results can be garbage-collected mid-flight;
+    the queue must hold a strong reference until the job task finishes."""
+    import asyncio
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_run_job(self: IndexationQueueService, job: IndexationJob) -> None:
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(IndexationQueueService, "_run_job", fake_run_job)
+    service = IndexationQueueService()
+    await service.enqueue(
+        source_path="/tmp/source-task",
+        library_type=LibraryType.ANIME,
+        anime_name="Task Series",
+        fps=2.0,
+    )
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    assert len(service._job_tasks) == 1
+
+    release.set()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert len(service._job_tasks) == 0
+
+
+@pytest.mark.asyncio
 async def test_cancelled_multi_slot_acquire_releases_partial() -> None:
     """Cancelling a multi-slot acquire mid-wait (SSE client disconnects while
     the match waits for its second slot) must return the partially-acquired

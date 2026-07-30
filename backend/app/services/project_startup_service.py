@@ -68,6 +68,8 @@ class ProjectStartupService:
         self._subscribers: list[asyncio.Queue[dict[str, Any]]] = []
 
     async def startup_cleanup(self) -> None:
+        from .project_service import ProjectService
+
         updated = False
         for job in self._jobs.values():
             if job.status not in {"queued", "running"}:
@@ -78,7 +80,21 @@ class ProjectStartupService:
             job.error = self.RESTART_INTERRUPTED_ERROR
             job.updated_at = _utc_now()
             updated = True
-        if updated:
+        stale_ids = [
+            project_id
+            for project_id in self._jobs
+            if ProjectService.load(project_id) is None
+        ]
+        for project_id in stale_ids:
+            del self._jobs[project_id]
+        if updated or stale_ids:
+            await asyncio.to_thread(_write_jobs_atomic, self._jobs_path, self._jobs)
+
+    async def remove_project_jobs(self, project_id: str) -> None:
+        """Evict a deleted project's job; the registry is persisted and reloaded
+        at boot, so without eviction it grows with every project ever started."""
+        removed = self._jobs.pop(project_id, None)
+        if removed is not None:
             await asyncio.to_thread(_write_jobs_atomic, self._jobs_path, self._jobs)
 
     def list_jobs(self) -> list[ProjectStartupJob]:

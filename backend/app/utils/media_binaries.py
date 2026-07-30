@@ -176,6 +176,15 @@ def get_ffprobe_binary() -> str:
     return value
 
 
+def get_ytdlp_binary() -> str:
+    value, _ = _resolve_binary(
+        binary_name="yt-dlp",
+        explicit_override=settings.ytdlp_binary,
+        env_name="ATR_YTDLP_BINARY",
+    )
+    return value
+
+
 def rewrite_media_command(cmd: Sequence[str]) -> list[str]:
     if not cmd:
         return []

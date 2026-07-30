@@ -217,6 +217,8 @@ class AnimeLibraryService:
     LIST_TIMEOUT_SECONDS = 120.0
     SEARCH_TIMEOUT_SECONDS = 120.0
     REMUX_TIMEOUT_SECONDS = 600.0
+    # Maximum silence from anime_searcher, not a cap on total command runtime.
+    # Large healthy libraries can legitimately take longer than two hours.
     INDEX_TIMEOUT_SECONDS = 7200.0
     SEARCHER_INDEX_FORMAT_VERSION = 4
     SEARCHER_ENGINE_PROFILE = "sscd_exact_resize_v1"
@@ -3745,19 +3747,19 @@ class AnimeLibraryService:
             return "".join(stderr_chunks).strip()
 
         stderr_task = asyncio.create_task(_drain_stderr())
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + cls.INDEX_TIMEOUT_SECONDS
         aborted = False
         saw_explicit_error = False
 
         try:
             assert process.stdout is not None
             while True:
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    raise asyncio.TimeoutError
-
-                line = await asyncio.wait_for(process.stdout.readline(), timeout=remaining)
+                # Treat the timeout as a stall detector. Every progress line
+                # starts a fresh window, allowing large active series to run
+                # for as long as they need.
+                line = await asyncio.wait_for(
+                    process.stdout.readline(),
+                    timeout=cls.INDEX_TIMEOUT_SECONDS,
+                )
                 if not line:
                     break
                 decoded = line.decode()
@@ -3781,10 +3783,10 @@ class AnimeLibraryService:
                     return
                 yield progress
 
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                raise asyncio.TimeoutError
-            await asyncio.wait_for(process.wait(), timeout=remaining)
+            await asyncio.wait_for(
+                process.wait(),
+                timeout=cls.INDEX_TIMEOUT_SECONDS,
+            )
         except asyncio.CancelledError:
             aborted = True
             await terminate_process(process, kill_group=True)
@@ -3795,8 +3797,9 @@ class AnimeLibraryService:
             yield IndexProgress(
                 status="error",
                 error=(
-                    f"anime_searcher command timed out after {int(cls.INDEX_TIMEOUT_SECONDS)} seconds. "
-                    "Try reducing library size or retrying."
+                    "anime_searcher command produced no progress for "
+                    f"{int(cls.INDEX_TIMEOUT_SECONDS)} seconds. "
+                    "The subprocess was stopped so its processing slot could be released."
                 ),
             )
             return
