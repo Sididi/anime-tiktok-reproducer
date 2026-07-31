@@ -192,10 +192,6 @@ export function ProjectManagerModal({
   const [showMultiDeleteConfirm, setShowMultiDeleteConfirm] = useState(false);
   const [multiDeleting, setMultiDeleting] = useState(false);
 
-  useEffect(() => {
-    uploadSessionsRef.current = uploadSessions;
-  }, [uploadSessions]);
-
   const selectedAccount = useMemo(
     () => accounts.find((a) => a.id === selectedAccountId) ?? null,
     [accounts, selectedAccountId],
@@ -395,6 +391,7 @@ export function ProjectManagerModal({
 
   useEffect(() => {
     if (!open) {
+      uploadSessionsRef.current = {};
       setUploadSessions({});
       setAccountPickerForProject(null);
       setAccountDropdownOpen(false);
@@ -407,10 +404,12 @@ export function ProjectManagerModal({
   }, []);
 
   const setUploadSession = useCallback((session: UploadSession) => {
-    setUploadSessions((prev) => ({
-      ...prev,
+    const next = {
+      ...uploadSessionsRef.current,
       [session.context.projectId]: session,
-    }));
+    };
+    uploadSessionsRef.current = next;
+    setUploadSessions(next);
   }, []);
 
   const patchUploadSession = useCallback(
@@ -419,33 +418,30 @@ export function ProjectManagerModal({
       token: string,
       patch: Partial<UploadSession>,
     ) => {
-      setUploadSessions((prev) => {
-        const current = prev[projectId];
-        if (!current || current.token !== token) {
-          return prev;
-        }
-        return {
-          ...prev,
-          [projectId]: {
-            ...current,
-            ...patch,
-            updatedAt: Date.now(),
-          },
-        };
-      });
+      const current = uploadSessionsRef.current[projectId];
+      if (!current || current.token !== token) return;
+
+      const next = {
+        ...uploadSessionsRef.current,
+        [projectId]: {
+          ...current,
+          ...patch,
+          updatedAt: Date.now(),
+        },
+      };
+      uploadSessionsRef.current = next;
+      setUploadSessions(next);
     },
     [],
   );
 
   const removeUploadSession = useCallback((projectId: string) => {
-    setUploadSessions((prev) => {
-      if (!prev[projectId]) {
-        return prev;
-      }
-      const next = { ...prev };
-      delete next[projectId];
-      return next;
-    });
+    if (!uploadSessionsRef.current[projectId]) return;
+
+    const next = { ...uploadSessionsRef.current };
+    delete next[projectId];
+    uploadSessionsRef.current = next;
+    setUploadSessions(next);
   }, []);
 
   const enqueueUpload = useCallback(

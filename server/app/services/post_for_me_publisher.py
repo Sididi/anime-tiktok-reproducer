@@ -28,7 +28,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
@@ -42,6 +42,8 @@ _DEFAULT_POLL_TIMEOUT_SECONDS = 30 * 60.0
 _UPLOAD_TIMEOUT_SECONDS = 900.0
 
 TikTokProgressCallback = Callable[[TikTokPublishState], Awaitable[None] | None]
+PostForMeTikTokPlatform = Literal["tiktok", "tiktok_business"]
+_POST_FOR_ME_TIKTOK_PLATFORMS = frozenset(("tiktok", "tiktok_business"))
 
 
 @dataclass
@@ -62,6 +64,16 @@ def _headers(api_key: str) -> dict[str, str]:
 
 def _stage_detail(stage: str, detail: str) -> str:
     return f"{stage}: {detail}"
+
+
+def _platform_configuration_key(platform: str) -> str:
+    if platform not in _POST_FOR_ME_TIKTOK_PLATFORMS:
+        supported = ", ".join(sorted(_POST_FOR_ME_TIKTOK_PLATFORMS))
+        raise ValueError(
+            f"unsupported Post for Me TikTok platform {platform!r}; "
+            f"expected one of: {supported}"
+        )
+    return platform
 
 
 def _response_detail(response: httpx.Response) -> str:
@@ -313,6 +325,7 @@ async def create_tiktok_post(
     *,
     api_key: str,
     social_account_id: str,
+    post_for_me_platform: PostForMeTikTokPlatform = "tiktok",
     caption: str,
     privacy_status: str = "public",
     allow_comment: bool = True,
@@ -327,6 +340,7 @@ async def create_tiktok_post(
     server-side at that instant (stage "post_scheduled"); without it the
     publish starts immediately (stage "post_created"). Idempotent on a live
     post_id; requires staged media."""
+    platform_configuration_key = _platform_configuration_key(post_for_me_platform)
     state = _coerce_state(publish_state)
     if state and state.stage == "published":
         return TikTokPublishResult(success=True, url=state.url, publish_state=state)
@@ -344,7 +358,7 @@ async def create_tiktok_post(
         "social_accounts": [social_account_id],
         "media": [{"url": media_url}],
         "platform_configurations": {
-            "tiktok": {
+            platform_configuration_key: {
                 "privacy_status": privacy_status,
                 "allow_comment": allow_comment,
                 "allow_duet": allow_duet,
@@ -383,8 +397,8 @@ async def create_tiktok_post(
     )
     await _emit_progress(progress_callback, state)
     logger.info(
-        "PFM post created social_account_id=%s post_id=%s scheduled_at=%s",
-        social_account_id, post_id,
+        "PFM post created platform=%s social_account_id=%s post_id=%s scheduled_at=%s",
+        post_for_me_platform, social_account_id, post_id,
         scheduled_at.isoformat() if scheduled_at else "instant",
     )
     return TikTokPublishResult(success=True, publish_state=state)
@@ -499,6 +513,7 @@ async def publish_to_tiktok(
     *,
     api_key: str,
     social_account_id: str,
+    post_for_me_platform: PostForMeTikTokPlatform = "tiktok",
     caption: str,
     download_url: str,
     privacy_status: str = "public",
@@ -517,6 +532,14 @@ async def publish_to_tiktok(
     Kept for the late-job path and API compatibility; the scheduler drives the
     phases individually so each gets its own due time."""
     state = _coerce_state(publish_state)
+    try:
+        _platform_configuration_key(post_for_me_platform)
+    except ValueError as e:
+        return TikTokPublishResult(
+            success=False,
+            detail=_stage_detail("create_post", str(e)),
+            publish_state=state,
+        )
     if state and state.stage == "published":
         return TikTokPublishResult(success=True, url=state.url, publish_state=state)
     staged = await stage_media_for_tiktok(
@@ -527,6 +550,7 @@ async def publish_to_tiktok(
         return staged
     created = await create_tiktok_post(
         api_key=api_key, social_account_id=social_account_id, caption=caption,
+        post_for_me_platform=post_for_me_platform,
         privacy_status=privacy_status, allow_comment=allow_comment,
         allow_duet=allow_duet, allow_stitch=allow_stitch, scheduled_at=None,
         base_url=base_url, publish_state=staged.publish_state,

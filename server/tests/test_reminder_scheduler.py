@@ -181,7 +181,9 @@ async def test_dispatch_tiktok_happy_path(
     store = JobStore(tmp_path / "jobs.json")
     discord = AsyncMock()
     calls = _patch_phases(monkeypatch)
-    await store.create(_tiktok_job())
+    business_job = _tiktok_job()
+    business_job.tiktok_payload["post_for_me_platform"] = "tiktok_business"
+    await store.create(business_job)
     actions = await dispatch_due_actions(
         store=store, settings=settings, discord=discord
     )
@@ -194,6 +196,7 @@ async def test_dispatch_tiktok_happy_path(
     assert len(calls["stage"]) == 1
     assert calls["create"][0]["scheduled_at"] is None      # late job → instant
     assert calls["create"][0]["social_account_id"] == "spc_1"
+    assert calls["create"][0]["post_for_me_platform"] == "tiktok_business"
     assert calls["create"][0]["caption"] == "cap"
     assert calls["stage"][0]["download_url"] == job.drive_video_url
     assert len(calls["poll"]) == 1

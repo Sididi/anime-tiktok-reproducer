@@ -5,7 +5,7 @@ import mimetypes
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from google.oauth2.credentials import Credentials
@@ -18,6 +18,8 @@ logger = logging.getLogger("uvicorn.error")
 
 
 PLATFORM_KEYS: tuple[str, ...] = ("youtube", "facebook", "instagram", "tiktok")
+PostForMeTikTokPlatform = Literal["tiktok", "tiktok_business"]
+_POST_FOR_ME_TIKTOK_PLATFORMS = frozenset(("tiktok", "tiktok_business"))
 
 
 def _normalize_slots(value: Any) -> list[str] | None:
@@ -53,6 +55,7 @@ class AccountInstagramConfig:
 class AccountTikTokConfig:
     slots: list[str] | None = None
     post_for_me_account_id: str | None = None
+    post_for_me_platform: PostForMeTikTokPlatform = "tiktok"
     privacy_status: str = "public"
     allow_comment: bool = True
     allow_duet: bool = True
@@ -222,6 +225,15 @@ class AccountService:
         tiktok_raw = raw.get("tiktok")
         tiktok = None
         if isinstance(tiktok_raw, dict):
+            post_for_me_platform = str(
+                tiktok_raw.get("post_for_me_platform") or "tiktok"
+            )
+            if post_for_me_platform not in _POST_FOR_ME_TIKTOK_PLATFORMS:
+                supported = ", ".join(sorted(_POST_FOR_ME_TIKTOK_PLATFORMS))
+                raise ValueError(
+                    f"Invalid tiktok.post_for_me_platform={post_for_me_platform!r} "
+                    f"for account {account_id}; expected one of: {supported}"
+                )
             tiktok = AccountTikTokConfig(
                 slots=_normalize_slots(tiktok_raw.get("slots")),
                 post_for_me_account_id=(
@@ -229,6 +241,7 @@ class AccountService:
                     if tiktok_raw.get("post_for_me_account_id")
                     else None
                 ),
+                post_for_me_platform=post_for_me_platform,
                 privacy_status=str(tiktok_raw.get("privacy_status") or "public"),
                 allow_comment=bool(tiktok_raw.get("allow_comment", True)),
                 allow_duet=bool(tiktok_raw.get("allow_duet", True)),

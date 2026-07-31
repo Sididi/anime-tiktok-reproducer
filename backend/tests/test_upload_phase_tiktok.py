@@ -22,6 +22,7 @@ def _account(tiktok: AccountTikTokConfig | None) -> AccountConfig:
 def test_build_tiktok_payload_full():
     account = _account(AccountTikTokConfig(
         post_for_me_account_id="spc_123",
+        post_for_me_platform="tiktok_business",
         privacy_status="public",
         allow_comment=True,
         allow_duet=False,
@@ -30,6 +31,7 @@ def test_build_tiktok_payload_full():
     payload = UploadPhaseService._build_tiktok_payload(account, "my description")
     assert payload == {
         "social_account_id": "spc_123",
+        "post_for_me_platform": "tiktok_business",
         "caption": "my description",
         "privacy_status": "public",
         "allow_comment": True,

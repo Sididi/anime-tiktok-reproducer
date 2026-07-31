@@ -363,7 +363,150 @@ def test_create_job_stores_tiktok_payload(
 
     job = asyncio.run(app.state.job_store.get("p1"))
     assert job is not None
-    assert job.tiktok_payload == tiktok
+    assert job.tiktok_payload == {
+        **tiktok,
+        "post_for_me_platform": "tiktok",
+    }
+
+
+def test_create_job_rejects_unknown_tiktok_connector(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    discord.post_message.return_value = "msg_embed"
+    payload = {
+        **JOB_PAYLOAD,
+        "tiktok": {
+            "social_account_id": "spc_1",
+            "post_for_me_platform": "tiktok_enterprise",
+            "caption": "cap",
+        },
+    }
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/internal/jobs", json=payload, headers=INTERNAL_AUTH
+        )
+    assert response.status_code == 422
+
+
+def test_legacy_tiktok_payload_without_connector_remains_idempotent(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    from app.models.job import TikTokPublishState  # noqa: PLC0415
+
+    app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    discord.post_message.return_value = "msg_embed"
+    tiktok = {
+        "social_account_id": "spc_1",
+        "caption": "cap",
+        "privacy_status": "public",
+        "allow_comment": True,
+        "allow_duet": True,
+        "allow_stitch": True,
+    }
+    payload = {**JOB_PAYLOAD, "tiktok": tiktok}
+    with TestClient(app) as client:
+        first = client.post("/api/internal/jobs", json=payload, headers=INTERNAL_AUTH)
+        assert first.status_code == 200
+        asyncio.run(
+            app.state.job_store.update(
+                "p1",
+                tiktok_payload=tiktok,
+                tiktok_publish_state=TikTokPublishState(
+                    post_id="post_live", stage="post_created"
+                ),
+            )
+        )
+        repeated = client.post(
+            "/api/internal/jobs", json=payload, headers=INTERNAL_AUTH
+        )
+    assert repeated.status_code == 200
+    job = asyncio.run(app.state.job_store.get("p1"))
+    assert "post_for_me_platform" not in job.tiktok_payload
+    assert job.tiktok_publish_state.post_id == "post_live"
+
+
+def test_create_job_blocks_connector_switch_with_live_post(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    from app.models.job import TikTokPublishState  # noqa: PLC0415
+
+    app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    discord.post_message.return_value = "msg_embed"
+    payload = {
+        **JOB_PAYLOAD,
+        "tiktok": {
+            "social_account_id": "spc_consumer",
+            "caption": "cap",
+        },
+    }
+    with TestClient(app) as client:
+        first = client.post("/api/internal/jobs", json=payload, headers=INTERNAL_AUTH)
+        assert first.status_code == 200
+        asyncio.run(
+            app.state.job_store.set_tiktok_publish_state(
+                "p1",
+                TikTokPublishState(post_id="post_live", stage="post_created"),
+            )
+        )
+        switched = {
+            **payload,
+            "tiktok": {
+                "social_account_id": "spc_business",
+                "post_for_me_platform": "tiktok_business",
+                "caption": "cap",
+            },
+        }
+        response = client.post(
+            "/api/internal/jobs", json=switched, headers=INTERNAL_AUTH
+        )
+    assert response.status_code == 409
+    assert "tiktok_target_locked" in response.json()["detail"]
+    job = asyncio.run(app.state.job_store.get("p1"))
+    assert job.tiktok_payload["social_account_id"] == "spc_consumer"
+    assert job.tiktok_publish_state.post_id == "post_live"
+
+
+def test_create_job_allows_connector_switch_after_definitive_failure(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    from app.models.job import TikTokPublishState  # noqa: PLC0415
+
+    app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    discord.post_message.return_value = "msg_embed"
+    payload = {
+        **JOB_PAYLOAD,
+        "tiktok": {"social_account_id": "spc_consumer", "caption": "cap"},
+    }
+    with TestClient(app) as client:
+        first = client.post("/api/internal/jobs", json=payload, headers=INTERNAL_AUTH)
+        assert first.status_code == 200
+        asyncio.run(
+            app.state.job_store.set_tiktok_publish_state(
+                "p1",
+                TikTokPublishState(
+                    post_id="post_failed",
+                    stage="failed",
+                    last_error="reached_active_user_cap",
+                ),
+            )
+        )
+        switched = {
+            **payload,
+            "tiktok": {
+                "social_account_id": "spc_business",
+                "post_for_me_platform": "tiktok_business",
+                "caption": "cap",
+            },
+        }
+        response = client.post(
+            "/api/internal/jobs", json=switched, headers=INTERNAL_AUTH
+        )
+    assert response.status_code == 200
+    job = asyncio.run(app.state.job_store.get("p1"))
+    assert job.tiktok_payload["social_account_id"] == "spc_business"
+    assert job.tiktok_payload["post_for_me_platform"] == "tiktok_business"
+    assert job.tiktok_publish_state is None
 
 
 def test_update_job_replaces_tiktok_payload_and_resets_state(

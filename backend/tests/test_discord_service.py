@@ -182,11 +182,19 @@ def test_create_job_forwards_tiktok_payload():
         description="Desc",
         drive_video_url="https://drive/x",
         platforms_requested=["tiktok"],
-        tiktok={"social_account_id": "spc_1", "caption": "c"},
+        tiktok={
+            "social_account_id": "spc_1",
+            "post_for_me_platform": "tiktok_business",
+            "caption": "c",
+        },
     )
     assert route.called
     sent_body = json.loads(route.calls.last.request.content)
-    assert sent_body["tiktok"] == {"social_account_id": "spc_1", "caption": "c"}
+    assert sent_body["tiktok"] == {
+        "social_account_id": "spc_1",
+        "post_for_me_platform": "tiktok_business",
+        "caption": "c",
+    }
 
 
 @respx.mock

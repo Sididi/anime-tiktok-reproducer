@@ -38,6 +38,7 @@ class InstagramPayload(BaseModel):
 class TikTokPayload(BaseModel):
     social_account_id: str
     caption: str
+    post_for_me_platform: Literal["tiktok", "tiktok_business"] = "tiktok"
     privacy_status: str = "public"
     allow_comment: bool = True
     allow_duet: bool = True
@@ -122,6 +123,25 @@ def _tiktok_payload(req: CreateJobRequest) -> dict | None:
     return req.tiktok.model_dump() if req.tiktok else None
 
 
+def _normalized_tiktok_payload(payload: dict | None) -> dict | None:
+    """Treat legacy payloads without a connector as consumer TikTok payloads."""
+    if payload is None:
+        return None
+    normalized = dict(payload)
+    normalized.setdefault("post_for_me_platform", "tiktok")
+    return normalized
+
+
+def _tiktok_target(payload: dict | None) -> tuple[str, str] | None:
+    normalized = _normalized_tiktok_payload(payload)
+    if normalized is None:
+        return None
+    return (
+        str(normalized.get("social_account_id") or ""),
+        str(normalized["post_for_me_platform"]),
+    )
+
+
 def _job_payload_changed(
     job: Job,
     req: CreateJobRequest,
@@ -137,7 +157,8 @@ def _job_payload_changed(
         or job.drive_video_url != req.drive_video_url
         or job.platforms_requested != list(req.platforms_requested)
         or job.instagram_payload != instagram_payload
-        or job.tiktok_payload != tiktok_payload
+        or _normalized_tiktok_payload(job.tiktok_payload)
+        != _normalized_tiktok_payload(tiktok_payload)
     )
 
 
@@ -162,6 +183,17 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
             )
 
         state = existing.tiktok_publish_state
+        if (
+            _tiktok_target(existing.tiktok_payload) != _tiktok_target(tiktok_payload)
+            and state is not None
+            and state.post_id
+            and state.stage != "failed"
+        ):
+            raise HTTPException(
+                409,
+                "tiktok_target_locked: existing TikTok post has a non-definitive "
+                "or successful result; keep polling it instead of switching connectors",
+            )
         if (
             state is not None
             and state.post_id

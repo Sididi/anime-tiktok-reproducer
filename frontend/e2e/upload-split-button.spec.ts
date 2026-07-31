@@ -234,38 +234,9 @@ function installSchedulingMocks() {
   };
 }
 
-// Wrap fetch one more time so that copyright/facebook/youtube check responses
-// resolve on a macrotask (setTimeout). Otherwise React 18 doesn't have time to
-// commit `setUploadSession` and update the session ref before the awaited check
-// resolves, which causes `isSessionCurrent` to return false and the upload flow
-// to halt at "checking_copyright". The auto path doesn't trip on this because
-// it has no preceding await before the first setUploadSession.
-function installCheckDelay() {
-  const orig = window.fetch.bind(window);
-  window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
-    const requestUrl =
-      typeof input === "string"
-        ? input
-        : input instanceof URL
-          ? input.toString()
-          : input.url;
-    const url = new URL(requestUrl, window.location.origin);
-    if (
-      url.pathname.endsWith("/copyright-check") ||
-      url.pathname.endsWith("/facebook-check") ||
-      url.pathname.endsWith("/instagram-check") ||
-      url.pathname.endsWith("/youtube-check")
-    ) {
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-    return orig(input, init);
-  };
-}
-
-test("Schedule mode reserves anchor before upload", async ({ page }) => {
+test("Schedule mode queues upload when checks resolve immediately", async ({ page }) => {
   await page.addInitScript(installSchedulingMocks);
   await page.addInitScript(installMocks, { account: ACCOUNT, row: ROW });
-  await page.addInitScript(installCheckDelay);
   await page.goto("/");
   await page.getByRole("button", { name: "Projects" }).click();
 
@@ -357,10 +328,9 @@ function installCascadeMocks() {
   };
 }
 
-test("Urgent mode previews and applies cascade", async ({ page }) => {
+test("Urgent mode queues upload when checks resolve immediately", async ({ page }) => {
   await page.addInitScript(installCascadeMocks);
   await page.addInitScript(installMocks, { account: ACCOUNT, row: ROW });
-  await page.addInitScript(installCheckDelay);
   await page.goto("/");
   await page.getByRole("button", { name: "Projects" }).click();
 
@@ -559,7 +529,6 @@ test.describe("manual custom-time + slot switching", () => {
   test("Custom time schedules a manual reservation", async ({ page }) => {
     await page.addInitScript(installManualMocks);
     await page.addInitScript(installMocks, { account: ACCOUNT, row: ROW });
-    await page.addInitScript(installCheckDelay);
     await page.goto("/");
     await page.getByRole("button", { name: "Projects" }).click();
 
@@ -602,7 +571,6 @@ test.describe("manual custom-time + slot switching", () => {
   }) => {
     await page.addInitScript(installStealAnchorMocks);
     await page.addInitScript(installMocks, { account: ACCOUNT, row: ROW });
-    await page.addInitScript(installCheckDelay);
     await page.goto("/");
     await page.getByRole("button", { name: "Projects" }).click();
 

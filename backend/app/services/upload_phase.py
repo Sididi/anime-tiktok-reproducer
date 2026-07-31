@@ -632,6 +632,7 @@ class UploadPhaseService:
             return None
         return {
             "social_account_id": tiktok.post_for_me_account_id,
+            "post_for_me_platform": tiktok.post_for_me_platform,
             "caption": tiktok_description,
             "privacy_status": tiktok.privacy_status,
             "allow_comment": tiktok.allow_comment,

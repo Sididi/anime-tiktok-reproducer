@@ -26,33 +26,51 @@ public direct posting works as soon as an account is connected.
    The key is used only by the VPS server. Do not put it in the backend `.env` or in
    `config/accounts/config.yaml`.
 
-## 3. Connect each TikTok account
+## 3. Choose and connect the TikTok API
 
-For every TikTok account (currently 4, target 10):
+For every TikTok account:
 
-1. In the Post for Me dashboard, choose **Connect account** → **TikTok**
-   (platform `tiktok`, not `tiktok_business`).
-2. Log in to the TikTok account in the OAuth window and approve. Default posting scopes
-   are enough (`user.info.basic`, `video.list`, `video.upload`, `video.publish`).
-3. The account appears in the dashboard with an id starting with `spc_`.
+1. Prefer **TikTok Business API** (Post for Me platform `tiktok_business`) for
+   production publishing. It uses TikTok's Accounts/Business API and does not share
+   the consumer Direct Post API's active-publishing-user quota.
+2. Log in to the existing TikTok profile and approve the OAuth permissions.
+   `tiktok_business` can connect a **Personal TikTok Account**. It does not require
+   changing the TikTok profile to a Business Account.
+3. If TikTok asks to *switch the profile type* to Business or Organization, cancel.
+   That is not part of OAuth and can affect creator monetisation. The profile must
+   remain Personal and enrolled in Creator Rewards.
+4. Request only Post for Me's `posts` permission. Do not request `feeds` unless this
+   application later starts consuming TikTok analytics. The Business connector still
+   presents broader TikTok scopes than the consumer connector; review them before
+   approving.
+5. The account appears in the dashboard with an ID starting with `spc_`.
 
-Tip — if you prefer doing it via API (e.g. to connect from the phone where the TikTok
-session lives), generate the OAuth URL yourself and open it on that device:
+Generate a fresh Business OAuth URL for each connection and open it on the device where
+that TikTok session lives:
 
 ```bash
 curl -s -X POST https://api.postforme.dev/v1/social-accounts/auth-url \
   -H "Authorization: Bearer $ATR_PFM_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"platform": "tiktok", "external_id": "anime_fr"}'
-# → {"url": "https://…", "platform": "tiktok"}   open the url on the device
+  -d '{
+    "platform": "tiktok_business",
+    "external_id": "anime_fr_2",
+    "permissions": ["posts"]
+  }'
+# → open the returned url on the device
 ```
 
-List connected accounts and their `spc_` ids:
+Use the matching account key as `external_id` (`anime_fr_2`, `anime_fr_4`, or
+`anime_fr_bis`). List the resulting Business connections and record their `spc_` IDs:
 
 ```bash
-curl -s "https://api.postforme.dev/v1/social-accounts?platform=tiktok" \
+curl -s "https://api.postforme.dev/v1/social-accounts?platform=tiktok_business" \
   -H "Authorization: Bearer $ATR_PFM_API_KEY"
 ```
+
+Before changing local configuration, verify each result has `status: connected` and
+the expected username/user id. Also record the old `platform=tiktok` connection. Do
+not disconnect or delete it during rollout; it is the rollback path.
 
 ## 4. Fill the accounts config
 
@@ -64,7 +82,8 @@ anime_fr:
   tiktok:
     slots:
       - "13:00"
-    post_for_me_account_id: "spc_..."   # ← from step 3
+    post_for_me_account_id: "spc_..."   # from the selected OAuth flow
+    post_for_me_platform: "tiktok_business"
     # optional overrides (defaults shown):
     # privacy_status: "public"
     # allow_comment: true
@@ -75,20 +94,42 @@ anime_fr:
 Accounts without `post_for_me_account_id` are skipped at upload time with an explicit
 "no Post for Me account configured" status — nothing fails silently.
 
-## 5. Smoke test
+`post_for_me_account_id` and `post_for_me_platform` are an atomic pair: never combine
+an ID from a consumer `tiktok` connection with `tiktok_business`, or the reverse.
+Omitting `post_for_me_platform` preserves the legacy `tiktok` behavior.
 
-After deploying the server with the key configured:
+## 5. Safe migration and smoke test
 
-1. Run a normal upload for a test project with only `tiktok` requested, with a slot a
-   few minutes ahead.
-2. Watch the Discord embed: the TikTok line should go ⏳ → ✅ with the published
-   TikTok URL at slot time.
-3. Verify the video on TikTok: public visibility, comments/duet/stitch as configured.
+Before authorizing each account, record that TikTok still shows **Personal Account**,
+Creator Rewards is enrolled, and current earnings are visible. Repeat those checks
+immediately after OAuth. Stop and restore the consumer connection if any changed.
+
+After deploying the dual-connector code:
+
+1. Migrate `anime_fr_2` first and run its next normal public upload with only `tiktok`
+   requested and a slot a few minutes ahead.
+2. Watch the Discord embed: the TikTok line should go ⏳ → ✅ with the published URL.
+3. Verify public visibility, caption, comments/duet/stitch, Personal Account status,
+   and Creator Rewards eligibility in TikTok Studio.
+4. Only after that post passes, change `anime_fr_4` and `anime_fr_bis` to their new
+   Business connection IDs and repeat the verification.
+5. Retain all consumer mappings for at least seven days. Roll back by restoring the
+   old ID and `post_for_me_platform: "tiktok"`; no code rollback is needed.
+
+Existing VPS jobs snapshot the connector and account ID. Leave jobs with a scheduled,
+publishing, timed-out, or successful `post_id` on their original connector. A request
+that tries to switch such a job returns HTTP 409 `tiktok_target_locked`. Definitively
+failed jobs (including `reached_active_user_cap`) and pending jobs without a `post_id`
+can be resubmitted after the account configuration changes.
 
 ## Notes & limits
 
-- **TikTok daily caps:** TikTok limits API posts per creator per 24h (provider-
-  independent). At 1 post/day/account this is never an issue.
+- **Connector limits:** the consumer Direct Post API has both per-creator posting caps
+  and an app-wide active-creator quota. `tiktok_business` avoids the latter, but normal
+  Post for Me and TikTok rate limits still apply.
+- **Reach:** the Business connector publishes an organic public post, but TikTok does
+  not guarantee identical distribution for any posting method. Compare several posts
+  with the account's own baseline; one low-view post alone is not a rollback signal.
 - **Token health:** if a TikTok session is revoked (password change, security event),
   the account shows `disconnected` in Post for Me and publishes fail with a clear
   error → the server pings Discord after 5 attempts. Reconnect via step 3 (same

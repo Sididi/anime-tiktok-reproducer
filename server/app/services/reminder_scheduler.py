@@ -299,6 +299,7 @@ async def _dispatch_tiktok_publish(  # noqa: PLR0911, PLR0912, PLR0915
             api_key=settings.pfm_api_key,
             base_url=settings.pfm_base_url,
             social_account_id=payload["social_account_id"],
+            post_for_me_platform=payload.get("post_for_me_platform", "tiktok"),
             caption=payload["caption"],
             privacy_status=payload.get("privacy_status", "public"),
             allow_comment=bool(payload.get("allow_comment", True)),

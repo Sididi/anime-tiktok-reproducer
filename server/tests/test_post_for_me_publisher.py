@@ -141,6 +141,30 @@ async def test_platform_options_forwarded(fake, tmp_path):
     }
 
 
+async def test_business_platform_options_use_business_configuration(fake, tmp_path):
+    fake.results_sequence = [[{"social_account_id": "spc_1", "success": True,
+                               "platform_data": {"url": "u"}, "error": None}]]
+    await _publish(fake, tmp_path, post_for_me_platform="tiktok_business")
+    configurations = fake.created_posts[0]["platform_configurations"]
+    assert "tiktok" not in configurations
+    assert configurations["tiktok_business"] == {
+        "privacy_status": "public",
+        "allow_comment": True,
+        "allow_duet": True,
+        "allow_stitch": True,
+    }
+
+
+async def test_unknown_post_for_me_platform_is_rejected_before_upload(fake, tmp_path):
+    result = await _publish(
+        fake, tmp_path, post_for_me_platform="tiktok_enterprise"
+    )
+    assert result.success is False
+    assert "unsupported Post for Me TikTok platform" in result.detail
+    assert fake.created_posts == []
+    assert fake.upload_puts == []
+
+
 async def test_failed_result_reports_error(fake, tmp_path):
     fake.results_sequence = [
         [{"social_account_id": "spc_1", "success": False,

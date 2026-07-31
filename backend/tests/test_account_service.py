@@ -75,6 +75,7 @@ accounts:
       slots:
         - "20:00"
       post_for_me_account_id: spc_123
+      post_for_me_platform: tiktok_business
       privacy_status: private
       allow_comment: false
       allow_duet: false
@@ -87,6 +88,7 @@ accounts:
     AccountService.invalidate()
     account = AccountService.get_account("anime_fr")
     assert account.tiktok.post_for_me_account_id == "spc_123"
+    assert account.tiktok.post_for_me_platform == "tiktok_business"
     assert account.tiktok.privacy_status == "private"
     assert account.tiktok.allow_comment is False
     assert account.tiktok.allow_duet is False
@@ -112,8 +114,24 @@ accounts:
     )
     AccountService.invalidate()
     account = AccountService.get_account("anime_fr")
+    assert account.tiktok.post_for_me_platform == "tiktok"
     assert account.tiktok.privacy_status == "public"
     assert account.tiktok.allow_comment is True
+
+
+def test_tiktok_config_rejects_unknown_post_for_me_platform():
+    with pytest.raises(ValueError, match="post_for_me_platform"):
+        AccountService._parse_account(
+            "anime_fr",
+            {
+                "name": "Anime FR",
+                "language": "fr",
+                "tiktok": {
+                    "post_for_me_account_id": "spc_123",
+                    "post_for_me_platform": "tiktok_enterprise",
+                },
+            },
+        )
 
 
 def test_tiktok_pool_key(tmp_path: Path, monkeypatch):

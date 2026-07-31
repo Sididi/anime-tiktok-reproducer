@@ -37,6 +37,12 @@ accounts:
       # Post for Me social-account id (spc_...) — enables automatic TikTok
       # publishing via the VPS server. See docs/POST_FOR_ME_SETUP.md.
       post_for_me_account_id: "spc_..."
+      # Connector used when this spc_ id was authorized. Keep the default
+      # "tiktok" for consumer connections; use "tiktok_business" only with
+      # an id returned by that OAuth flow. The Business API connector supports
+      # Personal TikTok accounts and must not be confused with changing the
+      # TikTok profile itself to a Business Account.
+      post_for_me_platform: "tiktok"
       # Optional post options (defaults shown):
       # privacy_status: "public"
       # allow_comment: true
