@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   ChevronDown,
@@ -21,64 +21,81 @@ export function IndexJobsPanel({ onJobComplete }: IndexJobsPanelProps) {
   const [jobs, setJobs] = useState<IndexationJob[]>([]);
   const [expanded, setExpanded] = useState(true);
   const abortRef = useRef<AbortController | null>(null);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const completedTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(
     new Map(),
   );
 
-  const connectSSE = useCallback(() => {
-    abortRef.current?.abort();
-    const controller = new AbortController();
-    abortRef.current = controller;
-
-    api.streamIndexationJobs().then((resp) => {
-      readSSEStream<IndexationJob>(
-        resp,
-        (job) => {
-          setJobs((prev) => {
-            const idx = prev.findIndex((j) => j.id === job.id);
-            if (idx >= 0) {
-              const next = [...prev];
-              next[idx] = job;
-              return next;
-            }
-            return [...prev, job];
-          });
-
-          // Auto-remove completed jobs after 5s
-          if (job.status === "complete" && !completedTimers.current.has(job.id)) {
-            completedTimers.current.set(
-              job.id,
-              setTimeout(() => {
-                setJobs((prev) => prev.filter((j) => j.id !== job.id));
-                completedTimers.current.delete(job.id);
-              }, 5000),
-            );
-            onJobComplete?.(job);
-          }
-        },
-        { signal: controller.signal },
-      ).catch(() => {
-        // SSE connection closed or aborted — reconnect after delay
-        if (!controller.signal.aborted) {
-          setTimeout(connectSSE, 3000);
-        }
-      });
-    }).catch(() => {
-      // fetch itself failed — retry
-      if (!controller.signal.aborted) {
-        setTimeout(connectSSE, 3000);
-      }
-    });
-  }, [onJobComplete]);
-
   useEffect(() => {
+    let disposed = false;
+    const completionTimers = completedTimers.current;
+
+    const connectSSE = () => {
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+
+      const scheduleReconnect = () => {
+        if (
+          disposed ||
+          controller.signal.aborted ||
+          reconnectTimerRef.current !== null
+        ) {
+          return;
+        }
+        reconnectTimerRef.current = setTimeout(() => {
+          reconnectTimerRef.current = null;
+          connectSSE();
+        }, 3000);
+      };
+
+      api
+        .streamIndexationJobs(controller.signal)
+        .then((resp) => {
+          readSSEStream<IndexationJob>(
+            resp,
+            (job) => {
+              setJobs((prev) => {
+                const idx = prev.findIndex((item) => item.id === job.id);
+                if (idx >= 0) {
+                  const next = [...prev];
+                  next[idx] = job;
+                  return next;
+                }
+                return [...prev, job];
+              });
+
+              if (job.status === "complete" && !completionTimers.has(job.id)) {
+                completionTimers.set(
+                  job.id,
+                  setTimeout(() => {
+                    setJobs((prev) =>
+                      prev.filter((item) => item.id !== job.id),
+                    );
+                    completionTimers.delete(job.id);
+                  }, 5000),
+                );
+                onJobComplete?.(job);
+              }
+            },
+            { signal: controller.signal },
+          ).catch(scheduleReconnect);
+        })
+        .catch(scheduleReconnect);
+    };
+
     connectSSE();
     return () => {
+      disposed = true;
       abortRef.current?.abort();
-      completedTimers.current.forEach((t) => clearTimeout(t));
-      completedTimers.current.clear();
+      if (reconnectTimerRef.current !== null) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+      completionTimers.forEach((timer) => clearTimeout(timer));
+      completionTimers.clear();
     };
-  }, [connectSSE]);
+  }, [onJobComplete]);
 
   const activeJobs = jobs.filter(
     (j) => j.status === "queued" || j.status === "indexing",

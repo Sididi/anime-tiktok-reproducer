@@ -172,62 +172,73 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
         raise HTTPException(400, f"Unknown account {req.account_id!r}")
     account = settings.accounts[req.account_id]
 
-    existing = await store.get(req.project_id)
     instagram_payload = _instagram_payload(req)
     tiktok_payload = _tiktok_payload(req)
     platform_statuses = _initial_platform_statuses(req)
-    if existing is not None:
-        if not _job_payload_changed(existing, req, instagram_payload, tiktok_payload):
-            return CreateJobResponse(
-                job_id=existing.job_id, discord_message_id=existing.discord_message_id
-            )
-
-        state = existing.tiktok_publish_state
-        if (
-            _tiktok_target(existing.tiktok_payload) != _tiktok_target(tiktok_payload)
-            and state is not None
-            and state.post_id
-            and state.stage != "failed"
-        ):
-            raise HTTPException(
-                409,
-                "tiktok_target_locked: existing TikTok post has a non-definitive "
-                "or successful result; keep polling it instead of switching connectors",
-            )
-        if (
-            state is not None
-            and state.post_id
-            and state.stage == "post_scheduled"
-            and settings.pfm_api_key
-        ):
-            try:
-                await delete_tiktok_post(
-                    api_key=settings.pfm_api_key,
-                    post_id=state.post_id,
-                    base_url=settings.pfm_base_url,
-                )
-            except Exception as e:
-                logger.warning(
-                    "PFM scheduled-post delete failed for %s (post_id=%s): %s",
-                    req.project_id, state.post_id, e,
+    updated: Job | None = None
+    async with store.tiktok_publish_transition(req.project_id):
+        # Re-read while holding the same transition lock used for PFM post
+        # creation. Once a publisher has created a post, its post_id is therefore
+        # guaranteed to be visible to the target-lock check below.
+        existing = await store.get(req.project_id)
+        if existing is not None:
+            if not _job_payload_changed(
+                existing, req, instagram_payload, tiktok_payload
+            ):
+                return CreateJobResponse(
+                    job_id=existing.job_id,
+                    discord_message_id=existing.discord_message_id,
                 )
 
-        updated = await store.update(
-            req.project_id,
-            account_id=req.account_id,
-            device_id=account.device,
-            anime_title=req.anime_title,
-            description=req.description,
-            drive_video_url=req.drive_video_url,
-            slot_time=req.slot_time,
-            platform_scheduled_at=dict(req.platform_scheduled_at or {}),
-            platforms_requested=list(req.platforms_requested),
-            platform_statuses=platform_statuses,
-            instagram_payload=instagram_payload,
-            instagram_publish_state=None,
-            tiktok_payload=tiktok_payload,
-            tiktok_publish_state=None,
-        )
+            state = existing.tiktok_publish_state
+            if (
+                _tiktok_target(existing.tiktok_payload)
+                != _tiktok_target(tiktok_payload)
+                and state is not None
+                and state.post_id
+                and state.stage != "failed"
+            ):
+                raise HTTPException(
+                    409,
+                    "tiktok_target_locked: existing TikTok post has a non-definitive "
+                    "or successful result; keep polling it instead of switching connectors",
+                )
+            if (
+                state is not None
+                and state.post_id
+                and state.stage == "post_scheduled"
+                and settings.pfm_api_key
+            ):
+                try:
+                    await delete_tiktok_post(
+                        api_key=settings.pfm_api_key,
+                        post_id=state.post_id,
+                        base_url=settings.pfm_base_url,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "PFM scheduled-post delete failed for %s (post_id=%s): %s",
+                        req.project_id, state.post_id, e,
+                    )
+
+            updated = await store.update(
+                req.project_id,
+                account_id=req.account_id,
+                device_id=account.device,
+                anime_title=req.anime_title,
+                description=req.description,
+                drive_video_url=req.drive_video_url,
+                slot_time=req.slot_time,
+                platform_scheduled_at=dict(req.platform_scheduled_at or {}),
+                platforms_requested=list(req.platforms_requested),
+                platform_statuses=platform_statuses,
+                instagram_payload=instagram_payload,
+                instagram_publish_state=None,
+                tiktok_payload=tiktok_payload,
+                tiktok_publish_state=None,
+            )
+
+    if updated is not None:
         if updated.discord_message_id:
             try:
                 embed = build_embed(updated, settings.accounts, settings.public_base_url)

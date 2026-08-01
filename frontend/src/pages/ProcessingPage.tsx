@@ -106,6 +106,7 @@ export function ProcessingPage() {
   const resumeAfterGapsRef = useRef(false);
   const gapsAutoEnabledRef = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
+  const exportAbortRef = useRef<AbortController | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [processing, setProcessing] = useState(false);
@@ -179,6 +180,7 @@ export function ProcessingPage() {
   // Reset local processing state when returning to this page
   useEffect(() => {
     abortRef.current?.abort();
+    exportAbortRef.current?.abort();
     hasStartedProcessing.current = false;
     autoUploadAttemptedRef.current = false;
     resumeAfterGapsRef.current = Boolean(
@@ -202,6 +204,8 @@ export function ProcessingPage() {
 
   const startProcessing = useCallback(async () => {
     if (!projectId) return;
+
+    abortRef.current?.abort();
 
     setProcessing(true);
     setError(null);
@@ -232,6 +236,7 @@ export function ProcessingPage() {
     try {
       const response = await fetch(`/api/projects/${projectId}/process`, {
         method: "POST",
+        signal: controller.signal,
       });
 
       await readSSEStream<ProcessingProgress>(
@@ -325,14 +330,26 @@ export function ProcessingPage() {
             );
           }
         },
-        controller.signal,
+        {
+          signal: controller.signal,
+          stopWhen: (data) =>
+            data.status === "complete" ||
+            data.status === "error" ||
+            data.status === "gaps_detected" ||
+            data.status === "duration_warning",
+        },
       );
     } catch (err) {
-      setError((err as Error).message);
+      if (!controller.signal.aborted) {
+        setError((err as Error).message);
+      }
     } finally {
-      setProcessing(false);
+      if (abortRef.current === controller) {
+        abortRef.current = null;
+        setProcessing(false);
+      }
     }
-  }, [projectId]);
+  }, [projectId, navigate]);
 
   // Start processing automatically
   useEffect(() => {
@@ -361,18 +378,30 @@ export function ProcessingPage() {
 
   const handleBuildAndDownload = useCallback(async () => {
     if (!projectId || bundleLoading || driveLoading) return;
+    exportAbortRef.current?.abort();
+    const controller = new AbortController();
+    exportAbortRef.current = controller;
     setBundleLoading(true);
     setError(null);
     setActionMessage("Building project bundle...");
 
     try {
-      const response = await api.createBundleExport(projectId);
+      const response = await api.createBundleExport(
+        projectId,
+        controller.signal,
+      );
       const finalEvent = await readSSEStream<ProcessingProgress>(
         response,
         (data) => {
           if (data.message) setActionMessage(data.message);
         },
+        {
+          signal: controller.signal,
+          stopWhen: (data) =>
+            data.status === "complete" || data.status === "error",
+        },
       );
+      if (controller.signal.aborted) return;
       const downloadUrl = finalEvent?.download_url;
       if (!downloadUrl) {
         throw new Error("Bundle endpoint did not return a download URL");
@@ -380,9 +409,14 @@ export function ProcessingPage() {
       window.location.href = downloadUrl;
       setActionMessage("Download started.");
     } catch (err) {
-      setError((err as Error).message);
+      if (!controller.signal.aborted) {
+        setError((err as Error).message);
+      }
     } finally {
-      setBundleLoading(false);
+      if (exportAbortRef.current === controller) {
+        exportAbortRef.current = null;
+        setBundleLoading(false);
+      }
     }
   }, [projectId, bundleLoading, driveLoading]);
 
@@ -396,7 +430,9 @@ export function ProcessingPage() {
         ? "Auto-uploading project to Google Drive..."
         : "Uploading project to Google Drive...",
     );
+    exportAbortRef.current?.abort();
     const controller = new AbortController();
+    exportAbortRef.current = controller;
     let timedOut = false;
     let stallTimeoutId: number | undefined;
     const resetStallTimeout = () => {
@@ -409,9 +445,11 @@ export function ProcessingPage() {
     resetStallTimeout();
 
     try {
-      const response = await api.uploadExportToGDrive(projectId, {
-        auto: autoUpload,
-      });
+      const response = await api.uploadExportToGDrive(
+        projectId,
+        { auto: autoUpload },
+        controller.signal,
+      );
       const finalEvent = await readSSEStream<ProcessingProgress>(
         response,
         (data) => {
@@ -426,7 +464,9 @@ export function ProcessingPage() {
       );
 
       if (!finalEvent || finalEvent.status !== "complete") {
-        throw new Error("Drive upload stream ended unexpectedly before completion.");
+        throw new Error(
+          "Drive upload stream ended unexpectedly before completion.",
+        );
       }
 
       if (finalEvent.skipped_auto) {
@@ -456,6 +496,8 @@ export function ProcessingPage() {
         setError(
           `Drive upload stalled: no progress update received for ${stallMinutes} minutes. Please retry.`,
         );
+      } else if (controller.signal.aborted) {
+        return;
       } else if (
         message === "Upload already in progress for this project" ||
         message === "Drive upload already running for this project"
@@ -466,9 +508,19 @@ export function ProcessingPage() {
       }
     } finally {
       if (stallTimeoutId !== undefined) window.clearTimeout(stallTimeoutId);
-      setDriveLoading(false);
+      if (exportAbortRef.current === controller) {
+        exportAbortRef.current = null;
+        setDriveLoading(false);
+      }
     }
   }, [projectId, driveLoading, bundleLoading]);
+
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort();
+      exportAbortRef.current?.abort();
+    };
+  }, []);
 
   useEffect(() => {
     if (

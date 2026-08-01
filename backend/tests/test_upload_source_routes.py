@@ -8,7 +8,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pytest
 from fastapi.testclient import TestClient
 
-from app.services.upload_phase import UploadPhaseService
+from app.services.upload_phase import (
+    UploadPhaseService,
+    UploadPreflightUnavailableError,
+)
 
 
 @pytest.fixture
@@ -117,3 +120,26 @@ def test_instagram_duration_check_route_forwards_account(client, monkeypatch):
     assert response.status_code == 200
     assert response.json() == expected
     assert seen == [("p1", "anime_fr")]
+
+
+@pytest.mark.parametrize("platform", ["facebook", "instagram", "youtube"])
+def test_duration_check_reports_transient_preflight_as_503(
+    client, monkeypatch, platform
+):
+    method_name = f"check_{platform}_duration"
+
+    def unavailable(cls, project_id, account_id=None):
+        raise UploadPreflightUnavailableError("Drive metadata temporarily unavailable")
+
+    monkeypatch.setattr(
+        UploadPhaseService,
+        method_name,
+        classmethod(unavailable),
+    )
+    response = client.post(
+        f"/api/project-manager/projects/p1/{platform}-check",
+        json={"account_id": "anime_fr"},
+    )
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "5"
+    assert response.json()["detail"] == "Drive metadata temporarily unavailable"

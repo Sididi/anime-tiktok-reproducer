@@ -903,9 +903,33 @@ export function MatchValidation() {
   const mediaEnabledSceneIndicesRef = useRef<Set<number>>(new Set());
   const prefetchQueueRef = useRef<Promise<void>>(Promise.resolve());
   const preparePlaybackInFlightRef = useRef<Promise<void> | null>(null);
+  const activeStreamControllersRef = useRef<Set<AbortController>>(new Set());
+  const matchRunControllerRef = useRef<AbortController | null>(null);
   const autoScrollRef = useRef(true);
   const toastCounterRef = useRef(0);
   autoScrollRef.current = autoScroll;
+
+  const createStreamController = useCallback(() => {
+    const controller = new AbortController();
+    activeStreamControllersRef.current.add(controller);
+    return controller;
+  }, []);
+
+  const releaseStreamController = useCallback(
+    (controller: AbortController) => {
+      activeStreamControllersRef.current.delete(controller);
+    },
+    [],
+  );
+
+  const abortActiveStreams = useCallback(() => {
+    for (const controller of activeStreamControllersRef.current) {
+      controller.abort();
+    }
+    activeStreamControllersRef.current.clear();
+  }, []);
+
+  useEffect(() => abortActiveStreams, [projectId, abortActiveStreams]);
 
   const fastWatchPrefetchAhead = useMemo(() => {
     // At extreme speeds clips play in <0.3s. Scale lookahead so the
@@ -1179,11 +1203,18 @@ export function MatchValidation() {
     [],
   );
 
-  const handleDeferredDownload = useCallback(async (): Promise<boolean> => {
-    if (!projectId) return true;
-    setDownloadPhase({ phase: "check", message: "Checking source files...", progress: 0 });
-    try {
-      const response = await api.deferredDownload(projectId);
+  const handleDeferredDownload = useCallback(
+    async (externalSignal?: AbortSignal): Promise<boolean> => {
+      if (!projectId) return true;
+      const ownedController = externalSignal ? null : createStreamController();
+      const signal = externalSignal ?? ownedController!.signal;
+      setDownloadPhase({
+        phase: "check",
+        message: "Checking source files...",
+        progress: 0,
+      });
+      try {
+      const response = await api.deferredDownload(projectId, signal);
       let success = true;
       await readSSEStream<{
         status: string;
@@ -1199,45 +1230,67 @@ export function MatchValidation() {
         network_mib_per_sec?: number | null;
         network_eta_seconds?: number | null;
         network_active_transfers?: number | null;
-      }>(response, (data) => {
-        if (data.status === "torrent_failed") {
-          setTorrentFailure({
-            sourceName: data.source_name || "",
-            torrentId: data.torrent_id || "",
-            message: data.message || "Torrent expiré",
-          });
-          success = false;
+      }>(
+        response,
+        (data) => {
+          if (data.status === "torrent_failed") {
+            setTorrentFailure({
+              sourceName: data.source_name || "",
+              torrentId: data.torrent_id || "",
+              message: data.message || "Torrent expiré",
+            });
+            success = false;
+          }
+          if (
+            data.phase &&
+            data.status !== "complete" &&
+            data.status !== "error"
+          ) {
+            setDownloadPhase({
+              phase: data.phase as
+                | "check"
+                | "recover"
+                | "download"
+                | "remux"
+                | "hydrate_index"
+                | "hydrate_episode",
+              message: data.message || "",
+              progress: data.progress ?? 0,
+              network_bytes_transferred: data.network_bytes_transferred ?? null,
+              network_bytes_total: data.network_bytes_total ?? null,
+              network_mib_per_sec: data.network_mib_per_sec ?? null,
+              network_eta_seconds: data.network_eta_seconds ?? null,
+              network_active_transfers: data.network_active_transfers ?? null,
+            });
+          }
+        },
+        {
+          signal,
+          stopWhen: (data) =>
+            data.status === "complete" ||
+            data.status === "error" ||
+            data.status === "torrent_failed",
+        },
+      );
+        setDownloadPhase(null);
+        return !signal.aborted && success;
+      } catch (err) {
+        setDownloadPhase(null);
+        if (!signal.aborted) {
+          setPlaybackError((err as Error).message);
         }
-        if (data.phase && data.status !== "complete" && data.status !== "error") {
-          setDownloadPhase({
-            phase: data.phase as
-              | "check"
-              | "recover"
-              | "download"
-              | "remux"
-              | "hydrate_index"
-              | "hydrate_episode",
-            message: data.message || "",
-            progress: data.progress ?? 0,
-            network_bytes_transferred: data.network_bytes_transferred ?? null,
-            network_bytes_total: data.network_bytes_total ?? null,
-            network_mib_per_sec: data.network_mib_per_sec ?? null,
-            network_eta_seconds: data.network_eta_seconds ?? null,
-            network_active_transfers: data.network_active_transfers ?? null,
-          });
+        return false;
+      } finally {
+        if (ownedController) {
+          releaseStreamController(ownedController);
         }
-      });
-      setDownloadPhase(null);
-      return success;
-    } catch (err) {
-      setDownloadPhase(null);
-      setPlaybackError((err as Error).message);
-      return false;
-    }
-  }, [projectId]);
+      }
+    },
+    [projectId, createStreamController, releaseStreamController],
+  );
 
   const preparePlaybackClips = useCallback(
-    async (force = false) => {
+    async (force = false, externalSignal?: AbortSignal) => {
       if (!projectId) return;
 
       const pending = preparePlaybackInFlightRef.current;
@@ -1248,6 +1301,10 @@ export function MatchValidation() {
         }
         await pending;
       }
+
+      if (externalSignal?.aborted) return;
+      const ownedController = externalSignal ? null : createStreamController();
+      const signal = externalSignal ?? ownedController!.signal;
 
       const run = (async () => {
         setPlaybackError(null);
@@ -1280,7 +1337,11 @@ export function MatchValidation() {
             message: "Preparing playback clips...",
           });
 
-          const response = await api.prepareMatchesPlayback(projectId, force);
+          const response = await api.prepareMatchesPlayback(
+            projectId,
+            force,
+            signal,
+          );
           const lastEvent = await readSSEStream<PlaybackPrepareProgress>(
             response,
             (data) => {
@@ -1289,7 +1350,14 @@ export function MatchValidation() {
                 setPlaybackManifest(data.manifest);
               }
             },
+            {
+              signal,
+              stopWhen: (data) =>
+                data.status === "complete" || data.status === "error",
+            },
           );
+
+          if (signal.aborted) return;
 
           if (!lastEvent || lastEvent.status !== "complete") {
             const manifest = await api.getMatchesPlaybackManifest(projectId);
@@ -1321,10 +1389,14 @@ export function MatchValidation() {
           }
           setPlaybackManifest(manifest);
         } catch (err) {
-          setPlaybackManifest(null);
-          setPlaybackError((err as Error).message);
+          if (!signal.aborted) {
+            setPlaybackManifest(null);
+            setPlaybackError((err as Error).message);
+          }
         } finally {
-          setPlaybackPreparing(false);
+          if (!signal.aborted) {
+            setPlaybackPreparing(false);
+          }
         }
       })();
 
@@ -1335,9 +1407,12 @@ export function MatchValidation() {
         if (preparePlaybackInFlightRef.current === run) {
           preparePlaybackInFlightRef.current = null;
         }
+        if (ownedController) {
+          releaseStreamController(ownedController);
+        }
       }
     },
-    [projectId],
+    [projectId, createStreamController, releaseStreamController],
   );
 
   const applyStructuralSceneChange = useCallback(
@@ -1576,6 +1651,11 @@ export function MatchValidation() {
   const handleFindMatches = useCallback(async () => {
     if (!projectId) return;
 
+    abortActiveStreams();
+    const controller = createStreamController();
+    matchRunControllerRef.current = controller;
+    const { signal } = controller;
+
     stopFastWatch();
     setPendingSceneUpdates({});
     setSceneWarnings({});
@@ -1597,45 +1677,68 @@ export function MatchValidation() {
         projectId,
         undefined,
         mergeContinuous,
+        signal,
       );
-      let completeHandled = false;
+      const finalEvent = await readSSEStream<MatchProgress>(
+        response,
+        (data) => {
+          setMatchProgress(data);
+        },
+        {
+          signal,
+          stopWhen: (data) =>
+            data.status === "complete" || data.status === "error",
+        },
+      );
 
-      await readSSEStream<MatchProgress>(response, async (data) => {
-        setMatchProgress(data);
+      if (
+        signal.aborted ||
+        finalEvent?.status !== "complete" ||
+        !finalEvent.matches
+      ) {
+        return;
+      }
 
-        if (data.status === "complete" && data.matches) {
-          if (completeHandled) {
-            return;
-          }
-          completeHandled = true;
-          const matchesData = data.matches as unknown as {
-            matches: SceneMatch[];
-          };
-          const matchesWithTracking = (matchesData.matches || []).map((m) => ({
-            ...m,
-            was_no_match: m.was_no_match ?? (m.confidence === 0 && !m.episode),
-          }));
-          setMatches(matchesWithTracking);
-          await loadScenes(projectId);
-          if (matchesWithTracking.length > 0) {
-            // Trigger deferred download for missing source files before playback
-            setTorrentFailure(null);
-            const downloadOk = await handleDeferredDownload();
-            if (downloadOk) await preparePlaybackClips(true);
-          } else {
-            setPlaybackManifest(null);
-            setPlaybackProgress(null);
-            setPlaybackError(null);
-          }
+      const matchesData = finalEvent.matches as unknown as {
+        matches: SceneMatch[];
+      };
+      const completedMatches = (matchesData.matches || []).map((match) => ({
+        ...match,
+        was_no_match:
+          match.was_no_match ?? (match.confidence === 0 && !match.episode),
+      }));
 
-          // Keep /matches visible so the user can manually continue.
+      setMatches(completedMatches);
+      await loadScenes(projectId);
+      if (signal.aborted) return;
+
+      if (completedMatches.length > 0) {
+        // The download and playback streams belong to this match run. Keeping
+        // them in the awaited chain ensures navigation/retry can cancel all
+        // three requests through the same signal.
+        setTorrentFailure(null);
+        const downloadOk = await handleDeferredDownload(signal);
+        if (downloadOk && !signal.aborted) {
+          await preparePlaybackClips(true, signal);
         }
-      });
+      } else {
+        setPlaybackManifest(null);
+        setPlaybackProgress(null);
+        setPlaybackError(null);
+      }
+
+      // Keep /matches visible so the user can manually continue.
     } catch (err) {
-      setError((err as Error).message);
-      setMatchProgress(null);
+      if (!signal.aborted) {
+        setError((err as Error).message);
+        setMatchProgress(null);
+      }
     } finally {
-      setMatching(false);
+      releaseStreamController(controller);
+      if (matchRunControllerRef.current === controller) {
+        matchRunControllerRef.current = null;
+        setMatching(false);
+      }
     }
   }, [
     projectId,
@@ -1644,6 +1747,9 @@ export function MatchValidation() {
     stopFastWatch,
     handleDeferredDownload,
     preparePlaybackClips,
+    abortActiveStreams,
+    createStreamController,
+    releaseStreamController,
   ]);
 
   // Auto-start matching when skipUiEnabled and no matches exist
@@ -1741,6 +1847,8 @@ export function MatchValidation() {
       });
 
       let persisted = false;
+      const controller = createStreamController();
+      const { signal } = controller;
 
       try {
         stopFastWatch();
@@ -1755,6 +1863,8 @@ export function MatchValidation() {
           },
         );
         persisted = true;
+
+        if (signal.aborted) return;
 
         setMatches((prev) =>
           prev.map((m) => {
@@ -1777,8 +1887,9 @@ export function MatchValidation() {
           },
         }));
 
-        const downloadOk = await handleDeferredDownload();
+        const downloadOk = await handleDeferredDownload(signal);
         if (!downloadOk) {
+          if (signal.aborted) return;
           throw new Error("Source episode hydration failed");
         }
 
@@ -1794,6 +1905,7 @@ export function MatchValidation() {
           projectId,
           sceneIndex,
           false,
+          signal,
         );
         const lastEvent = await readSSEStream<PlaybackPrepareProgress>(
           response,
@@ -1811,7 +1923,14 @@ export function MatchValidation() {
               patchPlaybackSceneAsset(sceneIndex, data.scene_asset);
             }
           },
+          {
+            signal,
+            stopWhen: (data) =>
+              data.status === "complete" || data.status === "error",
+          },
         );
+
+        if (signal.aborted) return;
 
         const completedAsset =
           lastEvent?.scene_asset ||
@@ -1841,6 +1960,7 @@ export function MatchValidation() {
           return next;
         });
       } catch (err) {
+        if (signal.aborted) return;
         const message =
           err instanceof Error ? err.message : "Manual match update failed";
         setPendingSceneUpdates((prev) => {
@@ -1880,6 +2000,8 @@ export function MatchValidation() {
           `Manual save failed for scene ${sceneIndex + 1}. Previous match restored.`,
         );
         throw err;
+      } finally {
+        releaseStreamController(controller);
       }
     },
     [
@@ -1892,6 +2014,8 @@ export function MatchValidation() {
       handleDeferredDownload,
       patchPlaybackSceneAsset,
       showToast,
+      createStreamController,
+      releaseStreamController,
     ],
   );
 

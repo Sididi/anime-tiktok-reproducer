@@ -48,6 +48,7 @@ export function TranscriptionPage() {
   const [activeSceneIndex, setActiveSceneIndex] = useState(-1);
   const [autoScroll, setAutoScroll] = useState(true);
   const sceneRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const transcriptionAbortRef = useRef<AbortController | null>(null);
   const autoScrollRef = useRef(true);
   autoScrollRef.current = autoScroll;
 
@@ -130,6 +131,9 @@ export function TranscriptionPage() {
   const handleStartTranscription = useCallback(async (forcedLanguage?: string) => {
     if (!projectId) return;
     const selectedLanguage = forcedLanguage ?? language;
+    transcriptionAbortRef.current?.abort();
+    const controller = new AbortController();
+    transcriptionAbortRef.current = controller;
 
     setTranscribing(true);
     setProgress({
@@ -141,22 +145,35 @@ export function TranscriptionPage() {
     setError(null);
 
     try {
-      const response = await api.startTranscription(projectId, selectedLanguage);
+      const response = await api.startTranscription(
+        projectId,
+        selectedLanguage,
+        controller.signal,
+      );
 
-      const finalEvent = await readSSEStream<TranscriptionProgress>(response, (data) => {
-        setProgress(data);
+      const finalEvent = await readSSEStream<TranscriptionProgress>(
+        response,
+        (data) => {
+          setProgress(data);
 
-        if (data.status === "complete" && data.transcription) {
-          setTranscription(data.transcription);
-          const texts: Record<number, string> = {};
-          data.transcription.scenes.forEach((s) => {
-            texts[s.scene_index] = s.text;
-          });
-          setEditedTexts(texts);
-        }
-      });
+          if (data.status === "complete" && data.transcription) {
+            setTranscription(data.transcription);
+            const texts: Record<number, string> = {};
+            data.transcription.scenes.forEach((s) => {
+              texts[s.scene_index] = s.text;
+            });
+            setEditedTexts(texts);
+          }
+        },
+        {
+          signal: controller.signal,
+          stopWhen: (data) =>
+            data.status === "complete" || data.status === "error",
+        },
+      );
 
       if (
+        !controller.signal.aborted &&
         fullAutoEnabled &&
         finalEvent?.status === "complete" &&
         finalEvent.transcription
@@ -169,11 +186,22 @@ export function TranscriptionPage() {
         }
       }
     } catch (err) {
-      setError((err as Error).message);
+      if (!controller.signal.aborted) {
+        setError((err as Error).message);
+      }
     } finally {
-      setTranscribing(false);
+      if (transcriptionAbortRef.current === controller) {
+        transcriptionAbortRef.current = null;
+        setTranscribing(false);
+      }
     }
   }, [projectId, language, fullAutoEnabled, navigate]);
+
+  useEffect(() => {
+    return () => {
+      transcriptionAbortRef.current?.abort();
+    };
+  }, [projectId]);
 
   useEffect(() => {
     if (

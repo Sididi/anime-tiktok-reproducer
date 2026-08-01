@@ -2,13 +2,17 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock
 
+import httpx
 from fastapi.testclient import TestClient
 
-from app.models.job import Job, PlatformStatus
+from app.models.job import Job, PlatformStatus, TikTokPublishState
+from app.services.post_for_me_publisher import TikTokPublishResult
+from app.services.reminder_scheduler import dispatch_due_actions, wait_for_inflight
 
 
 def _make_app(monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path):
@@ -465,6 +469,104 @@ def test_create_job_blocks_connector_switch_with_live_post(
     job = asyncio.run(app.state.job_store.get("p1"))
     assert job.tiktok_payload["social_account_id"] == "spc_consumer"
     assert job.tiktok_publish_state.post_id == "post_live"
+
+
+async def test_connector_switch_cannot_race_inflight_post_creation(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    app.state.settings = replace(app.state.settings, pfm_api_key="key")
+    discord.post_message.return_value = "msg_embed"
+    create_started = asyncio.Event()
+    allow_create_to_finish = asyncio.Event()
+    create_calls: list[dict] = []
+
+    async def create_post(**kwargs):
+        create_calls.append(kwargs)
+        create_started.set()
+        await allow_create_to_finish.wait()
+        return TikTokPublishResult(
+            success=True,
+            publish_state=TikTokPublishState(
+                media_url="https://media.example/video.mp4",
+                post_id="post_consumer",
+                stage="post_created",
+            ),
+        )
+
+    async def poll_post(**_kwargs):
+        return TikTokPublishResult(
+            success=True,
+            url="https://tiktok.com/@a/video/1",
+            publish_state=TikTokPublishState(
+                media_url="https://media.example/video.mp4",
+                post_id="post_consumer",
+                stage="published",
+                url="https://tiktok.com/@a/video/1",
+            ),
+        )
+
+    monkeypatch.setattr(
+        "app.services.reminder_scheduler.create_tiktok_post", create_post
+    )
+    monkeypatch.setattr(
+        "app.services.reminder_scheduler.poll_tiktok_post_result", poll_post
+    )
+
+    consumer_payload = {
+        **JOB_PAYLOAD,
+        "tiktok": {"social_account_id": "spc_consumer", "caption": "cap"},
+    }
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as client:
+        first = await client.post(
+            "/api/internal/jobs", json=consumer_payload, headers=INTERNAL_AUTH
+        )
+        assert first.status_code == 200
+        await app.state.job_store.set_tiktok_publish_state(
+            "p1",
+            TikTokPublishState(
+                media_url="https://media.example/video.mp4",
+                stage="media_uploaded",
+            ),
+        )
+
+        actions = await dispatch_due_actions(
+            store=app.state.job_store,
+            settings=app.state.settings,
+            discord=discord,
+        )
+        assert actions == 1
+        await asyncio.wait_for(create_started.wait(), timeout=1)
+
+        business_payload = {
+            **consumer_payload,
+            "tiktok": {
+                "social_account_id": "spc_business",
+                "post_for_me_platform": "tiktok_business",
+                "caption": "cap",
+            },
+        }
+        switch_task = asyncio.create_task(
+            client.post(
+                "/api/internal/jobs", json=business_payload, headers=INTERNAL_AUTH
+            )
+        )
+        await asyncio.sleep(0)
+        assert not switch_task.done()
+
+        allow_create_to_finish.set()
+        await wait_for_inflight()
+        switched = await asyncio.wait_for(switch_task, timeout=1)
+
+    assert switched.status_code == 409
+    assert create_calls[0]["social_account_id"] == "spc_consumer"
+    job = await app.state.job_store.get("p1")
+    assert job is not None
+    assert job.tiktok_payload["social_account_id"] == "spc_consumer"
+    assert job.tiktok_publish_state.post_id == "post_consumer"
 
 
 def test_create_job_allows_connector_switch_after_definitive_failure(

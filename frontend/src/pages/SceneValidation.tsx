@@ -1,4 +1,4 @@
-import { useEffect, useCallback, useState } from 'react';
+import { useEffect, useCallback, useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { Loader2, Wand2, ArrowRight, Info } from 'lucide-react';
 import { VideoPlayer } from '@/components/video';
@@ -78,6 +78,7 @@ function SceneValidationContent() {
   const [detectionProgress, setDetectionProgress] = useState<DetectionProgress | null>(null);
   const [skipUiEnabled, setSkipUiEnabled] = useState(false);
   const [threshold, setThreshold] = useState(16.0);
+  const detectionAbortRef = useRef<AbortController | null>(null);
 
   const currentScene = getSceneAtTime(currentTime);
 
@@ -101,11 +102,20 @@ function SceneValidationContent() {
   const handleDetectScenes = useCallback(async () => {
     if (!projectId) return;
 
+    detectionAbortRef.current?.abort();
+    const controller = new AbortController();
+    detectionAbortRef.current = controller;
+
     setDetecting(true);
     setDetectionProgress({ status: 'starting', progress: 0, message: 'Starting detection...', error: null });
 
     try {
-      const response = await api.detectScenes(projectId, threshold);
+      const response = await api.detectScenes(
+        projectId,
+        threshold,
+        10,
+        controller.signal,
+      );
 
       await readSSEStream<DetectionProgress>(
         response,
@@ -117,20 +127,33 @@ function SceneValidationContent() {
           }
         },
         {
-          stopWhen: (data) => data.status === 'complete',
+          signal: controller.signal,
+          stopWhen: (data) =>
+            data.status === 'complete' || data.status === 'error',
         },
       );
     } catch (err) {
-      setDetectionProgress({
-        status: 'error',
-        progress: 0,
-        message: '',
-        error: (err as Error).message,
-      });
+      if (!controller.signal.aborted) {
+        setDetectionProgress({
+          status: 'error',
+          progress: 0,
+          message: '',
+          error: (err as Error).message,
+        });
+      }
     } finally {
-      setDetecting(false);
+      if (detectionAbortRef.current === controller) {
+        detectionAbortRef.current = null;
+        setDetecting(false);
+      }
     }
   }, [projectId, setScenes, threshold]);
+
+  useEffect(() => {
+    return () => {
+      detectionAbortRef.current?.abort();
+    };
+  }, [projectId]);
 
   const handleSeek = useCallback(
     (time: number) => {

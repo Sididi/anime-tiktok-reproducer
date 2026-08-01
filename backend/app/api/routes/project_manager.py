@@ -12,7 +12,10 @@ from ...services.lan_transfer_service import LanTransferService
 from ...services.project_duplication_service import UploadRestrictionService
 from ...services.project_upload_service import project_upload_queue
 from ...services.project_service import ProjectService
-from ...services.upload_phase import PendingProjectDeletionRequiresConfirmation
+from ...services.upload_phase import (
+    PendingProjectDeletionRequiresConfirmation,
+    UploadPreflightUnavailableError,
+)
 
 
 router = APIRouter(prefix="/project-manager", tags=["project-manager"])
@@ -157,6 +160,12 @@ async def facebook_duration_check(
             req.account_id,
         )
         return result
+    except UploadPreflightUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc),
+            headers={"Retry-After": "5"},
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -176,6 +185,12 @@ async def instagram_duration_check(
             project_id,
             req.account_id,
         )
+    except UploadPreflightUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc),
+            headers={"Retry-After": "5"},
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -225,6 +240,12 @@ async def youtube_duration_check(
             req.account_id,
         )
         return result
+    except UploadPreflightUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc),
+            headers={"Retry-After": "5"},
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:

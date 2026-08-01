@@ -254,7 +254,7 @@ export function ProjectSetup() {
 
     const connect = async () => {
       try {
-        const response = await api.streamProjectStartupJobs();
+        const response = await api.streamProjectStartupJobs(controller.signal);
         await readSSEStream<ProjectStartupJob>(
           response,
           (job) => {

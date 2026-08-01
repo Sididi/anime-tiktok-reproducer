@@ -12,7 +12,9 @@ from threading import Lock, local
 import time
 from typing import Callable, Iterable, Any, TypeVar
 
+import httplib2
 from google.auth.transport.requests import Request
+from google_auth_httplib2 import AuthorizedHttp
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -31,6 +33,39 @@ RETRYABLE_403_REASONS = {
 }
 logger = logging.getLogger("uvicorn.error")
 _RequestResultT = TypeVar("_RequestResultT")
+_GOOGLE_AUTH_HTTP_TIMEOUT_SECONDS = 10
+
+
+class DriveVideoMetadataLookupError(RuntimeError):
+    """Drive could not answer a final-video metadata request."""
+
+
+class _BoundedGoogleAuthRequest(Request):
+    """Keep OAuth token refreshes from outliving an interactive request."""
+
+    def __call__(
+        self,
+        url,
+        method="GET",
+        body=None,
+        headers=None,
+        timeout=120,
+        **kwargs,
+    ):
+        try:
+            bounded_timeout = min(
+                float(timeout), float(_GOOGLE_AUTH_HTTP_TIMEOUT_SECONDS)
+            )
+        except (TypeError, ValueError):
+            bounded_timeout = float(_GOOGLE_AUTH_HTTP_TIMEOUT_SECONDS)
+        return super().__call__(
+            url=url,
+            method=method,
+            body=body,
+            headers=headers,
+            timeout=bounded_timeout,
+            **kwargs,
+        )
 
 
 def _escape_query_value(s: str) -> str:
@@ -47,6 +82,15 @@ class GoogleDriveService:
     _lock = Lock()
     _credentials_cache: Credentials | None = None
     _client_local = local()
+    _video_duration_cache_lock = Lock()
+    _video_duration_cache: dict[str, tuple[float, float]] = {}
+
+    # The normal Drive client deliberately keeps Google's generous socket
+    # timeout for large transfers. Preflight metadata requests need a separate,
+    # bounded client so a broken route to Google cannot strand the UI.
+    _VIDEO_METADATA_HTTP_TIMEOUT_SECONDS = 10
+    _VIDEO_METADATA_MAX_ATTEMPTS = 2
+    _VIDEO_DURATION_CACHE_TTL_SECONDS = 60.0
 
     _SMALL_FILE_BYTES = 8 * 1024 * 1024
 
@@ -96,7 +140,7 @@ class GoogleDriveService:
                 )
                 refresh_soon = expiry_utc <= now + timedelta(minutes=5)
             if cached.token is None or refresh_soon:
-                cached.refresh(Request())
+                cached.refresh(_BoundedGoogleAuthRequest())
             return cached
 
     @classmethod
@@ -130,6 +174,42 @@ class GoogleDriveService:
             except Exception:
                 pass
         for attr in ("client", "creds_ref"):
+            if hasattr(cls._client_local, attr):
+                delattr(cls._client_local, attr)
+
+    @classmethod
+    def _video_metadata_client(cls):
+        """Return a thread-local Drive client with a short socket timeout."""
+        creds = cls._credentials()
+        cached_client = getattr(cls._client_local, "video_metadata_client", None)
+        cached_creds_ref = getattr(
+            cls._client_local, "video_metadata_creds_ref", None
+        )
+        if cached_client is None or cached_creds_ref is not creds:
+            authorized_http = AuthorizedHttp(
+                creds,
+                http=httplib2.Http(timeout=cls._VIDEO_METADATA_HTTP_TIMEOUT_SECONDS),
+            )
+            cached_client = build(
+                "drive",
+                "v3",
+                http=authorized_http,
+                cache_discovery=False,
+            )
+            cls._client_local.video_metadata_client = cached_client
+            cls._client_local.video_metadata_creds_ref = creds
+        return cached_client
+
+    @classmethod
+    def _reset_video_metadata_client(cls) -> None:
+        cached_client = getattr(cls._client_local, "video_metadata_client", None)
+        http = getattr(cached_client, "_http", None)
+        if http is not None and hasattr(http, "close"):
+            try:
+                http.close()
+            except Exception:
+                pass
+        for attr in ("video_metadata_client", "video_metadata_creds_ref"):
             if hasattr(cls._client_local, attr):
                 delattr(cls._client_local, attr)
 
@@ -874,28 +954,76 @@ class GoogleDriveService:
 
     @classmethod
     def get_video_duration_seconds(cls, file_id: str) -> float | None:
-        """Video duration from Drive metadata, or None when Drive has not
-        processed the file yet (callers fall back to download+probe)."""
-        try:
-            drive = cls._client()
-            info = drive.files().get(
-                fileId=file_id,
-                fields="videoMediaMetadata(durationMillis)",
-                supportsAllDrives=True,
-            ).execute()
-        except Exception as exc:
-            logger.warning(
-                "Drive video metadata lookup failed: file_id=%s error=%s", file_id, exc
+        """Return Drive's video duration without ever downloading the file.
+
+        ``None`` has one precise meaning: Drive answered successfully but has
+        not exposed usable video metadata yet. Transport/API failures raise a
+        distinct exception so callers cannot mistake an outage for missing
+        metadata and start a large fallback download.
+        """
+        now = time.monotonic()
+        with cls._video_duration_cache_lock:
+            cached = cls._video_duration_cache.get(file_id)
+            if cached is not None:
+                duration, cached_at = cached
+                if now - cached_at <= cls._VIDEO_DURATION_CACHE_TTL_SECONDS:
+                    return duration
+                cls._video_duration_cache.pop(file_id, None)
+
+        info: dict[str, Any] | None = None
+        for attempt in range(1, cls._VIDEO_METADATA_MAX_ATTEMPTS + 1):
+            try:
+                drive = cls._video_metadata_client()
+                info = drive.files().get(
+                    fileId=file_id,
+                    fields="videoMediaMetadata(durationMillis)",
+                    supportsAllDrives=True,
+                ).execute(num_retries=0)
+                break
+            except Exception as exc:
+                cls._reset_video_metadata_client()
+                retryable = (
+                    not isinstance(exc, HttpError)
+                    or cls._is_retryable_http_error(exc)
+                )
+                if retryable and attempt < cls._VIDEO_METADATA_MAX_ATTEMPTS:
+                    logger.warning(
+                        "Transient Drive video metadata lookup failure; retrying: "
+                        "file_id=%s attempt=%d/%d error=%s",
+                        file_id,
+                        attempt,
+                        cls._VIDEO_METADATA_MAX_ATTEMPTS,
+                        exc,
+                    )
+                    time.sleep(0.25)
+                    continue
+                logger.warning(
+                    "Drive video metadata lookup failed: file_id=%s attempts=%d error=%s",
+                    file_id,
+                    attempt,
+                    exc,
+                )
+                raise DriveVideoMetadataLookupError(
+                    "Google Drive did not answer the final-video metadata request"
+                ) from exc
+
+        if info is None:  # pragma: no cover - loop either returns data or raises
+            raise DriveVideoMetadataLookupError(
+                "Google Drive did not answer the final-video metadata request"
             )
-            return None
         metadata = info.get("videoMediaMetadata") or {}
         duration_millis = metadata.get("durationMillis")
         if duration_millis is None:
             return None
         try:
-            return float(duration_millis) / 1000.0
+            duration = float(duration_millis) / 1000.0
         except (TypeError, ValueError):
             return None
+        if duration <= 0:
+            return None
+        with cls._video_duration_cache_lock:
+            cls._video_duration_cache[file_id] = (duration, time.monotonic())
+        return duration
 
     @classmethod
     def download_file(cls, file_id: str, destination: Path) -> None:

@@ -9,7 +9,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pytest
 
 import app.services.upload_phase as up
-from app.services.upload_phase import UploadPhaseService, UploadReadiness
+from app.services.google_drive_service import DriveVideoMetadataLookupError
+from app.services.lan_transfer_service import LanTransferService
+from app.services.upload_phase import (
+    UploadPhaseService,
+    UploadPreflightUnavailableError,
+    UploadReadiness,
+)
 
 
 def _readiness(**overrides):
@@ -45,7 +51,7 @@ def check_env(tmp_path, monkeypatch):
 
 def _run_check(monkeypatch, readiness, *, probe_media=None, max_duration=90.0, max_speed=1.4):
     monkeypatch.setattr(
-        UploadPhaseService, "compute_readiness",
+        UploadPhaseService, "_compute_preflight_readiness",
         classmethod(lambda cls, project: readiness),
     )
     return UploadPhaseService._check_platform_duration(
@@ -106,44 +112,76 @@ def test_local_video_probed_in_place(check_env, tmp_path, monkeypatch):
     assert result["needed"] is True
 
 
-def test_missing_metadata_falls_back_to_download_probe(check_env, monkeypatch):
+def test_preflight_reuses_recent_manager_drive_result(tmp_path, monkeypatch):
+    metadata = tmp_path / "metadata.json"
+    metadata.write_text("{}")
+    project = SimpleNamespace(
+        id="p1",
+        drive_folder_id="folder-1",
+        drive_folder_url="https://drive.example/folder-1",
+        upload_last_result=None,
+    )
+    monkeypatch.setattr(UploadPhaseService, "_drive_video_cache", {})
+    UploadPhaseService._cache_drive_video(
+        project_id="p1",
+        folder_id="folder-1",
+        folder_url=project.drive_folder_url,
+        video_files=[{"id": "d1", "name": "final.mp4"}],
+    )
+    monkeypatch.setattr(
+        up.ProjectService,
+        "get_metadata_file",
+        classmethod(lambda cls, project_id: metadata),
+    )
+    monkeypatch.setattr(
+        LanTransferService,
+        "find_local_upload_video",
+        classmethod(lambda cls, project_id: None),
+    )
+    monkeypatch.setattr(
+        UploadPhaseService,
+        "compute_readiness",
+        classmethod(lambda cls, p: pytest.fail("must not query Drive again")),
+    )
+
+    readiness = UploadPhaseService._compute_preflight_readiness(project)
+
+    assert readiness.status == "green"
+    assert readiness.drive_video_id == "d1"
+
+
+def test_missing_metadata_fails_fast_without_downloading(check_env, monkeypatch):
     monkeypatch.setattr(
         up.GoogleDriveService, "get_video_duration_seconds",
         classmethod(lambda cls, fid: None),
     )
-    ensured = []
-
-    def fake_ensure(cls, project_id, readiness):
-        ensured.append(project_id)
-        path = cls._source_cache_dir(project_id) / "final.mp4"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"x")
-        return path
-
     monkeypatch.setattr(
-        UploadPhaseService, "_ensure_source_video", classmethod(fake_ensure)
+        UploadPhaseService,
+        "_ensure_source_video",
+        classmethod(
+            lambda cls, project_id, readiness: pytest.fail("must not download")
+        ),
     )
 
-    def probe(video_path):
-        return SimpleNamespace(duration_seconds=100.0), None
-
-    result = _run_check(monkeypatch, _readiness(), probe_media=probe)
-    assert ensured == ["p1"]
-    assert result["needed"] is True
-    assert result["duration_seconds"] == 100.0
+    with pytest.raises(UploadPreflightUnavailableError, match="still processing"):
+        _run_check(monkeypatch, _readiness())
 
 
-def test_unprobeable_fallback_raises(check_env, monkeypatch):
+def test_drive_lookup_failure_fails_fast_without_downloading(check_env, monkeypatch):
     monkeypatch.setattr(
         up.GoogleDriveService, "get_video_duration_seconds",
-        classmethod(lambda cls, fid: None),
+        classmethod(
+            lambda cls, fid: (_ for _ in ()).throw(
+                DriveVideoMetadataLookupError("network unavailable")
+            )
+        ),
     )
     monkeypatch.setattr(
         UploadPhaseService, "_ensure_source_video",
-        classmethod(lambda cls, pid, r: Path("/nonexistent/final.mp4")),
+        classmethod(lambda cls, pid, r: pytest.fail("must not download")),
     )
-    with pytest.raises(ValueError, match="Unable to probe video duration"):
-        _run_check(monkeypatch, _readiness(), probe_media=lambda **kw: (None, "bad file"))
+    with pytest.raises(UploadPreflightUnavailableError, match="could not be reached"):
+        _run_check(monkeypatch, _readiness())
 
 
 def test_instagram_operational_limit_is_clamped_to_three_minutes(monkeypatch):

@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import tempfile
+from collections.abc import AsyncIterator
 from dataclasses import fields as _dc_fields
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,6 +20,21 @@ class JobStore:
     def __init__(self, path: Path) -> None:
         self._path = path
         self._lock = asyncio.Lock()
+        # Serializes the only target-sensitive part of TikTok publishing:
+        # checking/replacing a job target versus creating and persisting its
+        # Post for Me post. Media staging and result polling deliberately stay
+        # outside this lock because they can take many minutes.
+        self._tiktok_publish_transitions: dict[str, asyncio.Lock] = {}
+
+    @contextlib.asynccontextmanager
+    async def tiktok_publish_transition(
+        self, project_id: str
+    ) -> AsyncIterator[None]:
+        lock = self._tiktok_publish_transitions.setdefault(
+            project_id, asyncio.Lock()
+        )
+        async with lock:
+            yield
 
     def _read(self) -> dict[str, dict]:
         if not self._path.is_file():

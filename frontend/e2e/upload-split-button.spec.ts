@@ -44,13 +44,23 @@ const ROW = {
   template_is_default: true,
 };
 
-function installMocks(payload: { account: typeof ACCOUNT; row: typeof ROW }) {
-  const { account, row } = payload;
+function installMocks(payload: {
+  account: typeof ACCOUNT;
+  row: typeof ROW;
+  failingPreflight?: "copyright" | "facebook" | "instagram" | "youtube";
+}) {
+  const { account, row, failingPreflight } = payload;
   const testWindow = window as Window &
     typeof globalThis & {
       __uploadCalled?: boolean;
+      __uploadStreamAborted?: boolean;
+      __uploadStreamCancelled?: boolean;
+      __uploadStreamHasSignal?: boolean;
     };
   testWindow.__uploadCalled = false;
+  testWindow.__uploadStreamAborted = false;
+  testWindow.__uploadStreamCancelled = false;
+  testWindow.__uploadStreamHasSignal = false;
   const orig = window.fetch.bind(window);
   window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     const requestUrl =
@@ -85,7 +95,23 @@ function installMocks(payload: { account: typeof ACCOUNT; row: typeof ROW }) {
       return json({ jobs: [] });
     }
     if (url.pathname === "/api/project-manager/upload-jobs/stream") {
-      return emptyStream();
+      const signal = init?.signal;
+      testWindow.__uploadStreamHasSignal = signal instanceof AbortSignal;
+      signal?.addEventListener(
+        "abort",
+        () => {
+          testWindow.__uploadStreamAborted = true;
+        },
+        { once: true },
+      );
+      return new Response(
+        new ReadableStream({
+          cancel() {
+            testWindow.__uploadStreamCancelled = true;
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "text/event-stream" } },
+      );
     }
     if (url.pathname === "/api/anime/source-details") {
       return json([]);
@@ -100,6 +126,12 @@ function installMocks(payload: { account: typeof ACCOUNT; row: typeof ROW }) {
       return json({ jobs: [] });
     }
     if (url.pathname.endsWith("/copyright-check")) {
+      if (failingPreflight === "copyright") {
+        return new Response(
+          JSON.stringify({ detail: "Drive metadata temporarily unavailable" }),
+          { status: 503, headers: { "Content-Type": "application/json" } },
+        );
+      }
       return json({ copyrighted: false });
     }
     if (
@@ -107,6 +139,12 @@ function installMocks(payload: { account: typeof ACCOUNT; row: typeof ROW }) {
       url.pathname.endsWith("/instagram-check") ||
       url.pathname.endsWith("/youtube-check")
     ) {
+      if (failingPreflight && url.pathname.endsWith(`/${failingPreflight}-check`)) {
+        return new Response(
+          JSON.stringify({ detail: "Drive metadata temporarily unavailable" }),
+          { status: 503, headers: { "Content-Type": "application/json" } },
+        );
+      }
       return json({
         needed: false,
         duration_seconds: 30,
@@ -156,6 +194,67 @@ test("Auto upload (single click on Upload) still works as before", async ({
   await page.waitForFunction(
     () => (window as unknown as { __uploadCalled?: boolean }).__uploadCalled === true,
   );
+});
+
+test("failed preflight clears Checking and never queues an upload", async ({
+  page,
+}) => {
+  await page.addInitScript(installMocks, {
+    account: ACCOUNT,
+    row: ROW,
+    failingPreflight: "facebook",
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Projects" }).click();
+
+  const projectRow = page.locator("tr").filter({ hasText: "Show Alpha" });
+  await expect(projectRow).toBeVisible();
+  await page.getByRole("button", { name: "All Projects" }).click();
+  await page.getByRole("button", { name: "Account A" }).click();
+  await projectRow.getByRole("button", { name: /^Upload$/ }).click();
+
+  await expect(page.getByText("Drive metadata temporarily unavailable")).toBeVisible();
+  await expect(projectRow.getByRole("button", { name: /^Upload$/ })).toBeVisible();
+  expect(
+    await page.evaluate(
+      () => (window as unknown as { __uploadCalled?: boolean }).__uploadCalled,
+    ),
+  ).toBe(false);
+});
+
+test("closing Project Manager aborts and cancels its upload event stream", async ({
+  page,
+}) => {
+  await page.addInitScript(installMocks, { account: ACCOUNT, row: ROW });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Projects" }).click();
+
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as unknown as { __uploadStreamHasSignal?: boolean })
+            .__uploadStreamHasSignal,
+      ),
+    )
+    .toBe(true);
+
+  await page.keyboard.press("Escape");
+
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const testWindow = window as unknown as {
+          __uploadStreamAborted?: boolean;
+          __uploadStreamCancelled?: boolean;
+        };
+        return {
+          aborted: testWindow.__uploadStreamAborted,
+          cancelled: testWindow.__uploadStreamCancelled,
+        };
+      }),
+    )
+    .toEqual({ aborted: true, cancelled: true });
 });
 
 function installSchedulingMocks() {

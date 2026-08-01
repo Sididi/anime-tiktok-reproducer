@@ -60,11 +60,9 @@ export async function readSSEStream<T extends { status?: string; error?: string 
         }
         if (stopWhen?.(data)) {
           shouldStop = true;
-          try {
-            reader.cancel();
-          } catch {
+          void reader.cancel().catch(() => {
             // Ignore cancel errors on already-closed readers
-          }
+          });
           break;
         }
       } catch (e) {
@@ -76,11 +74,9 @@ export async function readSSEStream<T extends { status?: string; error?: string 
 
   const handleAbort = () => {
     shouldStop = true;
-    try {
-      reader.cancel();
-    } catch {
+    void reader.cancel().catch(() => {
       // Ignore cancel errors on already-closed readers
-    }
+    });
   };
   if (signal) {
     if (signal.aborted) {
@@ -108,7 +104,7 @@ export async function readSSEStream<T extends { status?: string; error?: string 
       signal.removeEventListener("abort", handleAbort);
     }
     try {
-      reader.cancel();
+      await reader.cancel();
     } catch {
       // Ignore cancel errors on already-closed readers
     }

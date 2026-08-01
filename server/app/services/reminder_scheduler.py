@@ -274,55 +274,83 @@ async def _dispatch_tiktok_publish(  # noqa: PLR0911, PLR0912, PLR0915
             return False
         logger.info("TikTok media staged for %s", job.project_id)
 
-    # Staging can take minutes (Drive download + PFM upload, up to 900s); the
-    # instant/poll decisions below need a fresh clock, not the pre-staging one.
-    now = datetime.now(tz=UTC)
+    instant = False
+    async with store.tiktok_publish_transition(job.project_id):
+        # Staging may have overlapped a job/connector update. Refresh every
+        # target-sensitive value under the transition lock before creating a
+        # post, so a stale dispatcher can never publish to its old target.
+        refreshed = await store.get(job.project_id)
+        if refreshed is None or "tiktok" not in refreshed.platforms_requested:
+            return False
+        job = refreshed
+        current = job.platform_statuses.get(
+            "tiktok", PlatformStatus(status="pending")
+        )
+        if current.status in ("uploaded", "failed", "skipped"):
+            return False
+        payload = job.tiktok_payload
+        if not payload:
+            return False
+        state = job.tiktok_publish_state
+        sched = _tiktok_sched(job)
+        create_due = sched - timedelta(minutes=TIKTOK_SCHEDULE_LEAD_MINUTES)
+        now = datetime.now(tz=UTC)
 
-    if now < create_due:
-        return True  # staged; post creation comes due at sched - lead
+        if now < create_due:
+            return True  # staged; post creation comes due at sched - lead
 
-    # ---- Phases 2+3 share one attempt increment per dispatch ----
-    next_attempts = current.attempts + 1
-    await store.merge_platform_status(
-        job.project_id, "tiktok",
-        PlatformStatus(status="uploading", attempts=next_attempts),
-    )
+        has_live_post = bool(state and state.post_id and state.stage != "failed")
+        if not has_live_post and not (state and state.media_url):
+            # A concurrent job update reset the staged state before this lock
+            # was acquired. The next scheduler tick will stage the media for
+            # the refreshed job; never create from the stale snapshot.
+            return True
+
+        # ---- Phases 2+3 share one attempt increment per dispatch ----
+        next_attempts = current.attempts + 1
+        await store.merge_platform_status(
+            job.project_id, "tiktok",
+            PlatformStatus(status="uploading", attempts=next_attempts),
+        )
+
+        # ---- Phase 2: ensure the post exists (scheduled, or instant when late) ----
+        if not has_live_post:
+            instant = (
+                sched - now
+            ).total_seconds() < _TT_INSTANT_PUBLISH_CUTOFF_SECONDS
+            result = await create_tiktok_post(
+                api_key=settings.pfm_api_key,
+                base_url=settings.pfm_base_url,
+                social_account_id=payload["social_account_id"],
+                post_for_me_platform=payload.get("post_for_me_platform", "tiktok"),
+                caption=payload["caption"],
+                privacy_status=payload.get("privacy_status", "public"),
+                allow_comment=bool(payload.get("allow_comment", True)),
+                allow_duet=bool(payload.get("allow_duet", True)),
+                allow_stitch=bool(payload.get("allow_stitch", True)),
+                scheduled_at=None if instant else sched,
+                publish_state=state,
+            )
+            if result.publish_state is not None:
+                await store.set_tiktok_publish_state(
+                    job.project_id, result.publish_state
+                )
+                state = result.publish_state
+            if not result.success:
+                await _record_tiktok_failure(
+                    job, store, settings, discord,
+                    attempts=next_attempts, detail=result.detail,
+                )
+                return False
+            logger.info(
+                "TikTok post %s for %s (post_id=%s)",
+                "created for instant publish" if instant
+                else f"scheduled at {sched.isoformat()}",
+                job.project_id, state.post_id,
+            )
 
     async def persist_tiktok_state(new_state: TikTokPublishState) -> None:
         await store.set_tiktok_publish_state(job.project_id, new_state)
-
-    # ---- Phase 2: ensure the post exists (scheduled, or instant when late) ----
-    instant = False
-    if not (state and state.post_id and state.stage != "failed"):
-        instant = (sched - now).total_seconds() < _TT_INSTANT_PUBLISH_CUTOFF_SECONDS
-        result = await create_tiktok_post(
-            api_key=settings.pfm_api_key,
-            base_url=settings.pfm_base_url,
-            social_account_id=payload["social_account_id"],
-            post_for_me_platform=payload.get("post_for_me_platform", "tiktok"),
-            caption=payload["caption"],
-            privacy_status=payload.get("privacy_status", "public"),
-            allow_comment=bool(payload.get("allow_comment", True)),
-            allow_duet=bool(payload.get("allow_duet", True)),
-            allow_stitch=bool(payload.get("allow_stitch", True)),
-            scheduled_at=None if instant else sched,
-            publish_state=state,
-        )
-        if result.publish_state is not None:
-            await store.set_tiktok_publish_state(job.project_id, result.publish_state)
-            state = result.publish_state
-        if not result.success:
-            await _record_tiktok_failure(
-                job, store, settings, discord,
-                attempts=next_attempts, detail=result.detail,
-            )
-            return False
-        logger.info(
-            "TikTok post %s for %s (post_id=%s)",
-            "created for instant publish" if instant
-            else f"scheduled at {sched.isoformat()}",
-            job.project_id, state.post_id,
-        )
 
     # ---- Phase 3: poll results (from sched; instant posts poll right away) ----
     if not instant and now < sched:

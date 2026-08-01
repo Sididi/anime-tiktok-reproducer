@@ -321,7 +321,7 @@ export function ProjectManagerModal({
 
     const connect = async () => {
       try {
-        const response = await api.streamProjectUploadJobs();
+        const response = await api.streamProjectUploadJobs(controller.signal);
         await readSSEStream<ProjectUploadJob>(
           response,
           (job) => {
@@ -484,19 +484,30 @@ export function ProjectManagerModal({
         facebookResult: undefined,
       });
       setError(null);
-      const [instagramCheck, youtubeCheck] = await Promise.allSettled([
-        api.checkInstagramDuration(
-          context.projectId,
-          context.accountId,
-        ),
-        api.checkYouTubeDuration(context.projectId, context.accountId),
-      ]);
+      let instagramCheck: Awaited<
+        ReturnType<typeof api.checkInstagramDuration>
+      >;
+      let youtubeCheck: Awaited<ReturnType<typeof api.checkYouTubeDuration>>;
+      try {
+        [instagramCheck, youtubeCheck] = await Promise.all([
+          api.checkInstagramDuration(context.projectId, context.accountId),
+          api.checkYouTubeDuration(context.projectId, context.accountId),
+        ]);
+      } catch (err) {
+        if (!isSessionCurrent(context.projectId, token)) return;
+        removeUploadSession(context.projectId);
+        setError(
+          err instanceof Error
+            ? err.message
+            : "Upload preflight failed. Nothing was queued; please retry.",
+        );
+        return;
+      }
       if (!isSessionCurrent(context.projectId, token)) return;
 
-      const fulfilled = [instagramCheck, youtubeCheck]
-        .filter((result) => result.status === "fulfilled")
-        .map((result) => result.value);
-      const needed = fulfilled.filter((result) => result.needed);
+      const needed = [instagramCheck, youtubeCheck].filter(
+        (result) => result.needed,
+      );
       if (needed.length > 0) {
         patchUploadSession(context.projectId, token, {
           context,
@@ -513,7 +524,12 @@ export function ProjectManagerModal({
       }
       await enqueueUpload(context, token);
     },
-    [enqueueUpload, isSessionCurrent, patchUploadSession],
+    [
+      enqueueUpload,
+      isSessionCurrent,
+      patchUploadSession,
+      removeUploadSession,
+    ],
   );
 
   const continueUploadAfterCopyright = useCallback(
@@ -544,12 +560,17 @@ export function ProjectManagerModal({
 
         await continueUploadAfterFacebook(context, token);
       } catch (err) {
-        console.warn("Facebook check failed, proceeding with auto:", err);
         if (!isSessionCurrent(context.projectId, token)) return;
-        await continueUploadAfterFacebook(context, token);
+        removeUploadSession(context.projectId);
+        setError((err as Error).message);
       }
     },
-    [continueUploadAfterFacebook, isSessionCurrent, patchUploadSession],
+    [
+      continueUploadAfterFacebook,
+      isSessionCurrent,
+      patchUploadSession,
+      removeUploadSession,
+    ],
   );
 
   const startUploadWithChecks = useCallback(
@@ -631,13 +652,21 @@ export function ProjectManagerModal({
           return;
         }
       } catch (err) {
-        console.warn("Copyright check failed, proceeding:", err);
         if (!isSessionCurrent(projectId, token)) return;
+        removeUploadSession(projectId);
+        setError((err as Error).message);
+        return;
       }
 
       await continueUploadAfterCopyright(context, token);
     },
-    [continueUploadAfterCopyright, isSessionCurrent, patchUploadSession, setUploadSession],
+    [
+      continueUploadAfterCopyright,
+      isSessionCurrent,
+      patchUploadSession,
+      removeUploadSession,
+      setUploadSession,
+    ],
   );
 
   const exitMultiDeleteMode = useCallback(() => {

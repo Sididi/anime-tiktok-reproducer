@@ -21,7 +21,10 @@ from ..models import Project
 from .account_service import AccountConfig, AccountService
 from .discord_service import DiscordService
 from .export_service import ExportService
-from .google_drive_service import GoogleDriveService
+from .google_drive_service import (
+    DriveVideoMetadataLookupError,
+    GoogleDriveService,
+)
 from .metadata import MetadataService
 from .meta_token_service import MetaTokenService
 from .music_config_service import MusicConfigService
@@ -38,6 +41,10 @@ class PendingProjectDeletionRequiresConfirmation(ValueError):
         super().__init__("Scheduled project deletion requires explicit confirmation")
         self.project_id = project_id
         self.platforms = platforms
+
+
+class UploadPreflightUnavailableError(RuntimeError):
+    """A transient dependency prevented a safe upload preflight decision."""
 
 
 @dataclass
@@ -143,6 +150,7 @@ class UploadPhaseService:
     _FRENCH_TZ = ZoneInfo("Europe/Paris")
     _TIKTOK_NOT_CONFIGURED_DETAIL = "No Post for Me account configured for this account"
     _drive_video_cache: dict[str, dict[str, Any]] = {}
+    _DRIVE_VIDEO_CACHE_TTL_SECONDS = 300.0
     _DRIVE_BATCH_LOOKUP_MAX_ATTEMPTS = 3
 
     @classmethod
@@ -167,6 +175,7 @@ class UploadPhaseService:
             "webViewLink": video.get("webViewLink"),
             "folder_id": folder_id,
             "folder_url": folder_url,
+            "cached_at": time.monotonic(),
         }
 
     @classmethod
@@ -178,6 +187,12 @@ class UploadPhaseService:
     ) -> dict[str, Any] | None:
         cached = cls._drive_video_cache.get(project_id)
         if not cached:
+            return None
+        cached_at = cached.get("cached_at")
+        if not isinstance(cached_at, (int, float)) or (
+            time.monotonic() - cached_at > cls._DRIVE_VIDEO_CACHE_TTL_SECONDS
+        ):
+            cls._drive_video_cache.pop(project_id, None)
             return None
         cached_folder_id = cached.get("folder_id")
         if folder_id and cached_folder_id and cached_folder_id != folder_id:
@@ -385,6 +400,41 @@ class UploadPhaseService:
             video_files=video_files,
             video_lookup_failed=video_lookup_failed,
         )
+
+    @classmethod
+    def _compute_preflight_readiness(cls, project: Project) -> UploadReadiness:
+        """Reuse the manager's recent Drive result before issuing another query."""
+        metadata_exists = ProjectService.get_metadata_file(project.id).exists()
+
+        from .lan_transfer_service import LanTransferService
+
+        local_video = LanTransferService.find_local_upload_video(project.id)
+        if local_video is not None:
+            return cls._build_readiness(
+                metadata_exists=metadata_exists,
+                folder_id=project.drive_folder_id,
+                folder_url=project.drive_folder_url,
+                video_files=[],
+                local_video=local_video,
+            )
+
+        folder_id, folder_url = cls._resolve_drive_folder_offline(project, None)
+        cached_video = _persisted_drive_video(project) or cls._cached_drive_video(
+            project_id=project.id,
+            folder_id=folder_id,
+        )
+        if cached_video is not None:
+            return cls._build_readiness(
+                metadata_exists=metadata_exists,
+                folder_id=folder_id,
+                folder_url=folder_url,
+                video_files=[cached_video],
+            )
+
+        # Direct API calls and expired manager caches still perform one live
+        # verification. compute_readiness caches the result for the remaining
+        # platform checks in this preflight sequence.
+        return cls.compute_readiness(project)
 
     @classmethod
     def list_manager_rows(cls) -> list[dict[str, Any]]:
@@ -1609,11 +1659,10 @@ class UploadPhaseService:
     @classmethod
     def _resolve_final_video_duration(
         cls,
-        project_id: str,
         readiness: UploadReadiness,
         probe_media: Callable[..., Any],
     ) -> float:
-        """Duration of the final video without downloading it when possible."""
+        """Duration of the final video without downloading a Drive-only file."""
         if readiness.local_video_path:
             local = Path(readiness.local_video_path)
             if local.exists():
@@ -1626,21 +1675,24 @@ class UploadPhaseService:
                     return probe.duration_seconds
 
         if readiness.drive_video_id:
-            duration = GoogleDriveService.get_video_duration_seconds(
-                readiness.drive_video_id
-            )
+            try:
+                duration = GoogleDriveService.get_video_duration_seconds(
+                    readiness.drive_video_id
+                )
+            except DriveVideoMetadataLookupError as exc:
+                raise UploadPreflightUnavailableError(
+                    "Google Drive could not be reached while checking the final "
+                    "video duration. Nothing was queued; please retry."
+                ) from exc
             if duration is not None:
                 return duration
-
-        # Drive has not exposed video metadata yet: single blocking download
-        # into the shared cache (also feeds the preview modals and the upload).
-        source_path = cls._ensure_source_video(project_id, readiness)
-        probe, probe_error = probe_media(video_path=source_path)
-        if probe_error or probe is None or probe.duration_seconds is None:
-            raise ValueError(
-                f"Unable to probe video duration: {probe_error or 'unknown'}"
+            raise UploadPreflightUnavailableError(
+                "Google Drive is still processing the final video's duration "
+                "metadata. No video was downloaded and nothing was queued; "
+                "please retry shortly."
             )
-        return probe.duration_seconds
+
+        raise ValueError("Final video unavailable: no local or Drive video found")
 
     @classmethod
     def _check_platform_duration(
@@ -1664,7 +1716,7 @@ class UploadPhaseService:
         if not is_enabled(account_id):
             return cls._neutral_duration_check_result()
 
-        readiness = cls.compute_readiness(project)
+        readiness = cls._compute_preflight_readiness(project)
         if readiness.status != "green" or not (
             readiness.drive_video_id or readiness.local_video_path
         ):
@@ -1673,7 +1725,7 @@ class UploadPhaseService:
             )
 
         duration_seconds = cls._resolve_final_video_duration(
-            project_id, readiness, probe_media
+            readiness, probe_media
         )
 
         if duration_seconds <= max_duration + 0.01:

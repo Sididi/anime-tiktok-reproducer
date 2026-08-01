@@ -12,6 +12,7 @@ const DEFAULT_INDEX_PREFETCH_BATCHES = 3;
 const DEFAULT_INDEX_TRANSFORM_WORKERS = 4;
 const DEFAULT_INDEX_DECODE_BACKEND = "auto";
 const DEFAULT_INDEX_PRECISION = "auto";
+const UPLOAD_PREFLIGHT_TIMEOUT_MS = 35_000;
 
 // Gap resolution types
 interface GapInfo {
@@ -91,6 +92,28 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   }
 
   return res.json();
+}
+
+async function uploadPreflightRequest<T>(
+  path: string,
+  options: RequestInit,
+): Promise<T> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => {
+    controller.abort();
+  }, UPLOAD_PREFLIGHT_TIMEOUT_MS);
+  try {
+    return await request<T>(path, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(
+        "Upload preflight timed out. Nothing was queued; please retry.",
+      );
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+  }
 }
 
 function toMediaUrl(pathOrUrl: string): string {
@@ -194,8 +217,8 @@ export const api = {
       "/projects/startup/jobs",
     ),
 
-  streamProjectStartupJobs: () =>
-    fetch(`${API_BASE}/projects/startup/jobs/stream`),
+  streamProjectStartupJobs: (signal?: AbortSignal) =>
+    fetch(`${API_BASE}/projects/startup/jobs/stream`, { signal }),
 
   // Accounts
   listAccounts: () =>
@@ -239,11 +262,11 @@ export const api = {
       "/project-manager/upload-jobs",
     ),
 
-  streamProjectUploadJobs: () =>
-    fetch(`${API_BASE}/project-manager/upload-jobs/stream`),
+  streamProjectUploadJobs: (signal?: AbortSignal) =>
+    fetch(`${API_BASE}/project-manager/upload-jobs/stream`, { signal }),
 
   checkFacebookDuration: (projectId: string, accountId?: string) =>
-    request<import("@/types").FacebookCheckResult>(
+    uploadPreflightRequest<import("@/types").FacebookCheckResult>(
       `/project-manager/projects/${projectId}/facebook-check`,
       {
         method: "POST",
@@ -252,7 +275,7 @@ export const api = {
     ),
 
   checkInstagramDuration: (projectId: string, accountId?: string) =>
-    request<import("@/types").InstagramCheckResult>(
+    uploadPreflightRequest<import("@/types").InstagramCheckResult>(
       `/project-manager/projects/${projectId}/instagram-check`,
       {
         method: "POST",
@@ -269,7 +292,7 @@ export const api = {
     ),
 
   checkYouTubeDuration: (projectId: string, accountId?: string) =>
-    request<import("@/types").YouTubeCheckResult>(
+    uploadPreflightRequest<import("@/types").YouTubeCheckResult>(
       `/project-manager/projects/${projectId}/youtube-check`,
       {
         method: "POST",
@@ -278,7 +301,7 @@ export const api = {
     ),
 
   checkCopyright: (projectId: string, accountId?: string) =>
-    request<import("@/types").CopyrightCheckResult>(
+    uploadPreflightRequest<import("@/types").CopyrightCheckResult>(
       `/project-manager/projects/${projectId}/copyright-check`,
       {
         method: "POST",
@@ -375,20 +398,27 @@ export const api = {
     ),
 
   // Download
-  downloadVideo: (projectId: string, url: string) => {
+  downloadVideo: (projectId: string, url: string, signal?: AbortSignal) => {
     return fetch(`${API_BASE}/projects/${projectId}/download`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url }),
+      signal,
     });
   },
 
   // Scene Detection
-  detectScenes: (projectId: string, threshold = 16.0, minSceneLen = 10) => {
+  detectScenes: (
+    projectId: string,
+    threshold = 16.0,
+    minSceneLen = 10,
+    signal?: AbortSignal,
+  ) => {
     return fetch(`${API_BASE}/projects/${projectId}/scenes/detect`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ threshold, min_scene_len: minSceneLen }),
+      signal,
     });
   },
 
@@ -412,6 +442,7 @@ export const api = {
     projectId: string,
     sourcePath?: string,
     mergeContinuous = true,
+    signal?: AbortSignal,
   ) => {
     return fetch(`${API_BASE}/projects/${projectId}/matches/find`, {
       method: "POST",
@@ -420,6 +451,7 @@ export const api = {
         source_path: sourcePath,
         merge_continuous: mergeContinuous,
       }),
+      signal,
     });
   },
 
@@ -434,23 +466,30 @@ export const api = {
     ),
 
   // Deferred download — check and download missing source episodes
-  deferredDownload: (projectId: string) =>
+  deferredDownload: (projectId: string, signal?: AbortSignal) =>
     fetch(`${API_BASE}/projects/${projectId}/matches/deferred-download`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal,
     }),
 
-  prepareMatchesPlayback: (projectId: string, force = false) =>
+  prepareMatchesPlayback: (
+    projectId: string,
+    force = false,
+    signal?: AbortSignal,
+  ) =>
     fetch(`${API_BASE}/projects/${projectId}/matches/playback/prepare`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ force }),
+      signal,
     }),
 
   prepareMatchesPlaybackScene: (
     projectId: string,
     sceneIndex: number,
     force = false,
+    signal?: AbortSignal,
   ) =>
     fetch(
       `${API_BASE}/projects/${projectId}/matches/playback/prepare-scene/${sceneIndex}`,
@@ -458,6 +497,7 @@ export const api = {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ force }),
+        signal,
       },
     ),
 
@@ -540,11 +580,16 @@ export const api = {
     ),
 
   // Transcription
-  startTranscription: (projectId: string, language = "auto") => {
+  startTranscription: (
+    projectId: string,
+    language = "auto",
+    signal?: AbortSignal,
+  ) => {
     return fetch(`${API_BASE}/projects/${projectId}/transcription/start`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ language }),
+      signal,
     });
   },
 
@@ -731,7 +776,8 @@ export const api = {
   listIndexationJobs: () =>
     request<{ jobs: import("@/types").IndexationJob[] }>("/anime/jobs"),
 
-  streamIndexationJobs: () => fetch(`${API_BASE}/anime/jobs/stream`),
+  streamIndexationJobs: (signal?: AbortSignal) =>
+    fetch(`${API_BASE}/anime/jobs/stream`, { signal }),
 
   // Library - Purge
   purgeLibrary: (
@@ -1098,12 +1144,17 @@ export const api = {
     ),
 
   // Exports
-  createBundleExport: (projectId: string) =>
+  createBundleExport: (projectId: string, signal?: AbortSignal) =>
     fetch(`${API_BASE}/projects/${projectId}/exports/bundle`, {
       method: "POST",
+      signal,
     }),
 
-  uploadExportToGDrive: (projectId: string, options?: { auto?: boolean }) => {
+  uploadExportToGDrive: (
+    projectId: string,
+    options?: { auto?: boolean },
+    signal?: AbortSignal,
+  ) => {
     const params = new URLSearchParams();
     if (options?.auto) {
       params.set("auto", "true");
@@ -1113,6 +1164,7 @@ export const api = {
       `${API_BASE}/projects/${projectId}/exports/gdrive${query ? `?${query}` : ""}`,
       {
         method: "POST",
+        signal,
       },
     );
   },
@@ -1130,6 +1182,7 @@ export const api = {
     sourceName: string,
     libraryType: import("@/types").LibraryType,
     replacements: Array<{ torrent_id: string; new_magnet_uri: string }>,
+    signal?: AbortSignal,
   ) =>
     fetch(
       `${API_BASE}/anime/${encodeURIComponent(sourceName)}/torrents/replace`,
@@ -1140,6 +1193,7 @@ export const api = {
           library_type: libraryType,
           replacements,
         }),
+        signal,
       },
     ),
 
@@ -1147,6 +1201,7 @@ export const api = {
     sourceName: string,
     libraryType: import("@/types").LibraryType,
     torrentIds: string[],
+    signal?: AbortSignal,
   ) =>
     fetch(
       `${API_BASE}/anime/${encodeURIComponent(sourceName)}/torrents/replace/confirm-reindex`,
@@ -1157,6 +1212,7 @@ export const api = {
           library_type: libraryType,
           torrent_ids: torrentIds,
         }),
+        signal,
       },
     ),
 

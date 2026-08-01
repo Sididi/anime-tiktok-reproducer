@@ -158,6 +158,7 @@ export function TorrentManagementModal({
     setError(null);
     setVerificationProgress(null);
 
+    abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
 
@@ -170,6 +171,7 @@ export function TorrentManagementModal({
         sourceName,
         libraryType,
         replacements,
+        controller.signal,
       );
 
       await readSSEStream<ReplacementProgressEvent & { status?: string; error?: string | null; message?: string | null }>(
@@ -191,6 +193,10 @@ export function TorrentManagementModal({
       if (e instanceof Error && e.name !== "AbortError") {
         setError(e.message);
         setState("results");
+      }
+    } finally {
+      if (abortRef.current === controller) {
+        abortRef.current = null;
       }
     }
   }, [hasChanges, editedMagnets, sourceName, libraryType]);
@@ -214,6 +220,7 @@ export function TorrentManagementModal({
     setError(null);
     setReindexProgress(null);
 
+    abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
 
@@ -222,6 +229,7 @@ export function TorrentManagementModal({
         sourceName,
         libraryType,
         warnIds,
+        controller.signal,
       );
 
       await readSSEStream<ReplacementProgressEvent & { status?: string; error?: string | null; message?: string | null }>(
@@ -241,6 +249,10 @@ export function TorrentManagementModal({
     } catch (e: unknown) {
       if (e instanceof Error && e.name !== "AbortError") {
         setError(e.message);
+      }
+    } finally {
+      if (abortRef.current === controller) {
+        abortRef.current = null;
       }
     }
   }, [results, sourceName, libraryType, onComplete, onClose]);
@@ -322,6 +334,13 @@ export function TorrentManagementModal({
       abortRef.current?.abort();
     };
   }, []);
+
+  useEffect(() => {
+    if (!open) {
+      abortRef.current?.abort();
+      abortRef.current = null;
+    }
+  }, [open]);
 
   if (!open) return null;
 
