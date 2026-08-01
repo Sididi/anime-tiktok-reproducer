@@ -218,7 +218,7 @@ async def upload_source_preview(project_id: str):
         return FileResponse(
             path=video_path,
             media_type="video/mp4",
-            filename=video_path.name,
+            headers={"Cache-Control": "private, no-cache"},
         )
     status = UploadPhaseService.source_video_status(project_id)
     if status["state"] == "in_progress":

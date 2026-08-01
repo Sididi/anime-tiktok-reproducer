@@ -283,11 +283,17 @@ export const api = {
       },
     ),
 
-  getUploadSourcePreviewUrl: (projectId: string) =>
-    `${API_BASE}/project-manager/projects/${projectId}/upload-source-preview`,
+  getUploadSourcePreviewUrl: (projectId: string, version?: string) => {
+    const base = `${API_BASE}/project-manager/projects/${projectId}/upload-source-preview`;
+    return version ? `${base}?v=${encodeURIComponent(version)}` : base;
+  },
 
   getUploadSourceStatus: (projectId: string) =>
-    request<{ state: "ready" | "in_progress" | "error" | "missing"; detail?: string }>(
+    request<{
+      state: "ready" | "in_progress" | "error" | "missing";
+      detail?: string;
+      version?: string;
+    }>(
       `/project-manager/projects/${projectId}/upload-source-status`,
     ),
 

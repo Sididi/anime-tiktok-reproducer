@@ -1534,8 +1534,17 @@ class UploadPhaseService:
 
     @classmethod
     def source_video_status(cls, project_id: str) -> dict[str, Any]:
-        if cls.cached_source_video(project_id) is not None:
-            return {"state": "ready"}
+        cached = cls.cached_source_video(project_id)
+        if cached is not None:
+            try:
+                stat = cached.stat()
+            except OSError:
+                pass
+            else:
+                return {
+                    "state": "ready",
+                    "version": f"{stat.st_mtime_ns}-{stat.st_size}",
+                }
         with cls._source_download_guard:
             if project_id in cls._source_downloads_in_flight:
                 return {"state": "in_progress"}

@@ -96,7 +96,9 @@ def test_status_ready_when_cached(source_cache):
     cache_dir = source_cache / "p1"
     cache_dir.mkdir(parents=True)
     (cache_dir / "final.mp4").write_bytes(b"x")
-    assert UploadPhaseService.source_video_status("p1")["state"] == "ready"
+    status = UploadPhaseService.source_video_status("p1")
+    assert status["state"] == "ready"
+    assert status["version"].endswith("-1")
 
 
 def _wait_until(predicate, timeout=5.0):

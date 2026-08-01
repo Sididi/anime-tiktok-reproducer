@@ -10,6 +10,7 @@ type UploadSourcePreviewStatus = "loading" | "ready" | "error";
  */
 export function useUploadSourcePreview(projectId: string, active: boolean) {
   const [status, setStatus] = useState<UploadSourcePreviewStatus>("loading");
+  const [version, setVersion] = useState<string>();
 
   useEffect(() => {
     if (!active) return;
@@ -21,6 +22,10 @@ export function useUploadSourcePreview(projectId: string, active: boolean) {
         const result = await api.getUploadSourceStatus(projectId);
         if (cancelled) return;
         if (result.state === "ready") {
+          // The version makes the first playable request distinct from any
+          // stale/failed response the browser may have seen while the cache
+          // file was being prepared.
+          setVersion(result.version || String(Date.now()));
           setStatus("ready");
           return;
         }
@@ -36,7 +41,6 @@ export function useUploadSourcePreview(projectId: string, active: boolean) {
       }
     };
 
-    setStatus("loading");
     void poll();
     return () => {
       cancelled = true;
@@ -44,5 +48,8 @@ export function useUploadSourcePreview(projectId: string, active: boolean) {
     };
   }, [projectId, active]);
 
-  return { status, url: api.getUploadSourcePreviewUrl(projectId) };
+  return {
+    status,
+    url: api.getUploadSourcePreviewUrl(projectId, version),
+  };
 }

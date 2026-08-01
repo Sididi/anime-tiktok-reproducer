@@ -85,6 +85,16 @@ def test_preview_serves_cached_file(client, monkeypatch, tmp_path):
     assert resp.status_code == 200
     assert resp.content == b"mp4-bytes"
     assert resp.headers["content-type"] == "video/mp4"
+    assert resp.headers["cache-control"] == "private, no-cache"
+    assert "content-disposition" not in resp.headers
+
+    range_resp = client.get(
+        "/api/project-manager/projects/p1/upload-source-preview?v=test-version",
+        headers={"Range": "bytes=0-2"},
+    )
+    assert range_resp.status_code == 206
+    assert range_resp.content == b"mp4"
+    assert range_resp.headers["content-range"] == "bytes 0-2/9"
 
 
 def test_old_platform_preview_routes_removed(client):

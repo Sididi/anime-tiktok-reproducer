@@ -1,9 +1,10 @@
-import { useEffect, useRef, useCallback } from "react";
+import { useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Scissors, Zap, X, Ban, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui";
 import { useUploadSourcePreview } from "@/hooks/useUploadSourcePreview";
 import type { UploadDurationStrategy } from "@/types";
+import { DurationPreviewVideo } from "./DurationPreviewVideo";
 
 interface YouTubeDurationModalProps {
   open: boolean;
@@ -34,25 +35,8 @@ export function YouTubeDurationModal({
   onClose,
   stacked = false,
 }: YouTubeDurationModalProps) {
-  const cutVideoRef = useRef<HTMLVideoElement>(null);
-  const spedUpVideoRef = useRef<HTMLVideoElement>(null);
   const maxDuration = 180;
   const preview = useUploadSourcePreview(projectId, open);
-
-  const handleCutTimeUpdate = useCallback(() => {
-    const video = cutVideoRef.current;
-    if (video && video.currentTime >= maxDuration) {
-      video.pause();
-      video.currentTime = maxDuration;
-    }
-  }, []);
-
-  const handleSpedUpLoadedMetadata = useCallback(() => {
-    const video = spedUpVideoRef.current;
-    if (video) {
-      video.playbackRate = speedFactor;
-    }
-  }, [speedFactor]);
 
   useEffect(() => {
     if (!open || stacked) return;
@@ -127,13 +111,10 @@ export function YouTubeDurationModal({
         <div className="flex flex-col gap-3">
           <div className="relative bg-black rounded-lg overflow-hidden aspect-9/16 max-h-[55vh]">
             {preview.status === "ready" ? (
-              <video
-                ref={cutVideoRef}
+              <DurationPreviewVideo
+                key={preview.url}
                 src={preview.url}
-                className="w-full h-full object-contain"
-                controls
-                preload="metadata"
-                onTimeUpdate={handleCutTimeUpdate}
+                maxDuration={maxDuration}
               />
             ) : (
               previewPlaceholder
@@ -163,13 +144,10 @@ export function YouTubeDurationModal({
           <div className="flex flex-col gap-3">
             <div className="relative bg-black rounded-lg overflow-hidden aspect-9/16 max-h-[55vh]">
               {preview.status === "ready" ? (
-                <video
-                  ref={spedUpVideoRef}
+                <DurationPreviewVideo
+                  key={preview.url}
                   src={preview.url}
-                  className="w-full h-full object-contain"
-                  controls
-                  preload="metadata"
-                  onLoadedMetadata={handleSpedUpLoadedMetadata}
+                  playbackRate={speedFactor}
                 />
               ) : (
                 previewPlaceholder
