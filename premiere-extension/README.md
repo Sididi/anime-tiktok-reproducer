@@ -80,7 +80,7 @@ On `/p/{project_id}`:
 2. download folder recursively into a fresh local folder suffixed with `_hhhh`,
 3. extract `subtitles/atr_subtitles.zip` when present,
 4. write `.atr_project_context.json`,
-5. auto-run `import_project.jsx`,
+5. auto-run the downloaded `import_project.jsx` unchanged,
 6. arm `output.mp4` monitor.
 
 ## Export and Upload Flow

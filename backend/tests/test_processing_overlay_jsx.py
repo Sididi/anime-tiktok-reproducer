@@ -145,15 +145,21 @@ def test_jsx_verifies_white_border_after_subtitle_mogrt_warmup():
     assert "BORDER_MOGRT_MAX_ATTEMPTS = 5" in jsx
     assert "borderItem = waitForTrackItemAtStart(" in jsx
     assert "track.overwriteClip(importedBorderProjectItem, \"0\")" in jsx
-    assert "installBorderMogrtFromFile(sequence)" in jsx
-    assert "app.project.importFiles(" in jsx
-    assert "[BORDER_MOGRT_PATH]" in jsx
-    assert "BORDER_MOGRT_INSTALL_WAIT_MS = 2000" in jsx
+    assert "findReusableWhiteBorderProjectItem(sequence)" in jsx
+    assert "function normalizeMogrtNameKey(name)" in jsx
+    assert "candidateName === BATCH_SEQUENCE_NAME" in jsx
+    assert "projectItemKey === expectedBorderName" in jsx
+    assert "trackItemKey === expectedBorderName" in jsx
+    assert 'track.overwriteClip(reusableBorderProjectItem, "0")' in jsx
+    assert "installBorderMogrtFromFile" not in jsx
+    assert "[BORDER_MOGRT_PATH]" not in jsx
+    assert "BORDER_MOGRT_INSTALL_WAIT_MS" not in jsx
     assert "Required Border Mogrt could not be found on V2" in jsx
-    assert 'var borderInstallFallbackStatus = "was not attempted";' in jsx
-    assert "if (borderInstallAttempted)" in jsx
-    assert "? borderInstallSucceeded" not in jsx
     assert "Border Mogrt verified on V2" in jsx
+
+    reuse_lookup = jsx.index("findReusableWhiteBorderProjectItem(sequence)")
+    direct_import = jsx.index("importedBorderCandidate = sequence.importMGT(")
+    assert reuse_lookup < direct_import
 
 
 def test_jsx_verifies_border_end_with_documented_time_object():

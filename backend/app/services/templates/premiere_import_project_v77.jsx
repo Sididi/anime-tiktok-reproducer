@@ -687,7 +687,6 @@
   var BORDER_MOGRT_MAX_ATTEMPTS = 5;
   var BORDER_MOGRT_WAIT_MAX_MS = 1000;
   var BORDER_MOGRT_RETRY_BASE_MS = 250;
-  var BORDER_MOGRT_INSTALL_WAIT_MS = 2000;
   var SPEED_RETRY_FAST_WAIT_MS = 12;
   var SPEED_RETRY_LONG_WAIT_MS = 60;
   var SOURCE_AUDIO_POLICY_RETRY_WAIT_MS = 40;
@@ -1569,56 +1568,78 @@
     return false;
   }
 
-  function installBorderMogrtFromFile(sequence) {
-    if (!app || !app.project || !app.project.importFiles) {
-      log(
-        "Border Mogrt installation fallback unavailable: " +
-          "app.project.importFiles is missing.",
-      );
-      return false;
-    }
-
-    var targetBin = PROJECT_IMPORT_BIN;
-    if (!targetBin) {
-      try {
-        targetBin = app.project.rootItem;
-      } catch (eRoot) {
-        targetBin = null;
-      }
-    }
-
-    log(
-      "Direct Border Mogrt placement failed; installing bundled template " +
-        "through Premiere media import...",
-    );
-    var importResult = false;
+  function normalizeMogrtNameKey(name) {
+    var text = name ? name.toString().replace(/^\s+|\s+$/g, "") : "";
     try {
-      // Premiere 25+ treats regular media import of a .mogrt as installation
-      // into My Templates, matching File > Import / Graphics Templates install.
-      importResult = app.project.importFiles(
-        [BORDER_MOGRT_PATH],
-        true,
-        targetBin,
-        false,
-      );
-    } catch (eInstallBorder) {
-      log(
-        "Border Mogrt installation error: " +
-          (eInstallBorder && eInstallBorder.message
-            ? eInstallBorder.message
-            : eInstallBorder),
-      );
-      return false;
+      text = decodeURI(text);
+    } catch (eDecodeMogrtName) {}
+    if (text.toLowerCase().substr(-6) === ".mogrt") {
+      text = text.substring(0, text.length - 6);
     }
+    return normalizeNameKey(text);
+  }
 
-    refreshSequenceUI(sequence);
-    sleep(BORDER_MOGRT_INSTALL_WAIT_MS);
-    if (importResult === false) {
-      log("Border Mogrt media import reported installation failure.");
-      return false;
+  function findReusableWhiteBorderProjectItem(currentSequence) {
+    if (!app || !app.project || !app.project.sequences) return null;
+    var sequences = app.project.sequences;
+    var sequenceCount = Number(sequences.numSequences || 0);
+    var borderFile = new File(BORDER_MOGRT_PATH);
+    var expectedBorderName = normalizeMogrtNameKey(
+      borderFile.displayName || borderFile.name || "",
+    );
+    if (!expectedBorderName) return null;
+
+    // Every generated ATR sequence reserves V2 exclusively for the border.
+    // Reuse its ProjectItem instead of importing/installing the same MOGRT
+    // again for every project in a batch.
+    for (var i = sequenceCount - 1; i >= 0; i--) {
+      var candidateSequence = sequences[i];
+      if (!candidateSequence || candidateSequence === currentSequence) continue;
+
+      var candidateName = "";
+      try {
+        candidateName = candidateSequence.name
+          ? candidateSequence.name.toString()
+          : "";
+      } catch (eSequenceName) {}
+      if (candidateName.indexOf("ATR_BATCH__") !== 0) continue;
+      if (candidateName === BATCH_SEQUENCE_NAME) continue;
+
+      var candidateTrack = null;
+      try {
+        candidateTrack =
+          candidateSequence.videoTracks.numTracks > 1
+            ? candidateSequence.videoTracks[1]
+            : null;
+      } catch (eCandidateTrack) {}
+      if (!candidateTrack) continue;
+
+      var candidateBorder = findTrackItemAtStart(candidateTrack, 0, null);
+      if (!candidateBorder) continue;
+
+      try {
+        if (candidateBorder.projectItem) {
+          var candidateProjectItem = candidateBorder.projectItem;
+          // Touch and compare the name so stale references and a different
+          // configured border variant (for example 5px vs 10px) are rejected.
+          var projectItemName = candidateProjectItem.name
+            ? candidateProjectItem.name.toString()
+            : "";
+          var trackItemName = candidateBorder.name
+            ? candidateBorder.name.toString()
+            : "";
+          var projectItemKey = normalizeMogrtNameKey(projectItemName);
+          var trackItemKey = normalizeMogrtNameKey(trackItemName);
+          if (
+            projectItemKey === expectedBorderName ||
+            trackItemKey === expectedBorderName
+          ) {
+            return candidateProjectItem;
+          }
+        }
+      } catch (eCandidateProjectItem) {}
     }
-    log("Bundled Border Mogrt installed through Premiere media import.");
-    return true;
+    return null;
   }
 
   function ensureWhiteBorderMogrt(sequence, track, endSec) {
@@ -1643,8 +1664,34 @@
     if (!borderItem) {
       log("Adding Border Mogrt to V2...");
     }
-    var borderInstallAttempted = false;
-    var borderInstallSucceeded = false;
+
+    if (!borderItem) {
+      var reusableBorderProjectItem =
+        findReusableWhiteBorderProjectItem(sequence);
+      if (reusableBorderProjectItem) {
+        log("Reusing Border Mogrt project item from an earlier batch sequence...");
+        try {
+          track.overwriteClip(reusableBorderProjectItem, "0");
+        } catch (eReuseBorder) {
+          log(
+            "Border Mogrt reuse error: " +
+              (eReuseBorder && eReuseBorder.message
+                ? eReuseBorder.message
+                : eReuseBorder),
+          );
+        }
+        refreshSequenceUI(sequence);
+        borderItem = waitForTrackItemAtStart(
+          track,
+          0,
+          null,
+          BORDER_MOGRT_WAIT_MAX_MS,
+        );
+        if (borderItem) {
+          log("Reused existing Border Mogrt on V2 without re-importing it.");
+        }
+      }
+    }
 
     for (
       var borderAttempt = 1;
@@ -1716,11 +1763,6 @@
         );
       }
 
-      if (!borderItem && !borderInstallAttempted) {
-        borderInstallAttempted = true;
-        borderInstallSucceeded = installBorderMogrtFromFile(sequence);
-      }
-
       if (!borderItem && borderAttempt < BORDER_MOGRT_MAX_ATTEMPTS) {
         log(
           "Border Mogrt attempt " +
@@ -1732,21 +1774,10 @@
     }
 
     if (!borderItem) {
-      // Keep this deliberately simple for Premiere's legacy ExtendScript
-      // parser. A nested ternary inside string concatenation can fail while
-      // evaluating the generated JSX on some Premiere environments.
-      var borderInstallFallbackStatus = "was not attempted";
-      if (borderInstallAttempted) {
-        borderInstallFallbackStatus = borderInstallSucceeded
-          ? "succeeded"
-          : "failed";
-      }
       throw new Error(
         "Required Border Mogrt could not be found on V2 after " +
           BORDER_MOGRT_MAX_ATTEMPTS +
-          " attempts (installation fallback " +
-          borderInstallFallbackStatus +
-          ").",
+          " direct attempts.",
       );
     }
 
