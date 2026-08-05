@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -250,19 +251,35 @@ async def _generate(
     phase_start = time.perf_counter()
     if matcher == "aligner":
         align_diagnostics = None
-        async for progress in SceneAlignerService.align_scenes_progress(
-            video_path,
-            scenes,
-            library_path,
-            project.library_type,
-            anime_name=project.anime_name,
-        ):
-            if verbose and progress.status == "matching":
-                print(f"[{project_id}] aligner: {progress.message}", flush=True)
-            if progress.status == "error":
-                raise RuntimeError(progress.error or "aligner failed")
-            if progress.status == "complete":
-                align_diagnostics = SceneAlignerService.get_last_diagnostics()
+        # This is the historical comparison evaluator: "aligner" means the
+        # original SceneAlignerService, so pin the flag. Without this it would
+        # silently benchmark the bounded matcher while labelling the results
+        # "aligner". Use scripts/evaluate_matching_v2.py for the bounded path.
+        previous_flag = os.environ.get("ATR_MATCHER_V2")
+        os.environ["ATR_MATCHER_V2"] = "1"
+        print(
+            f"[{project_id}] aligner: pinned ATR_MATCHER_V2=1 (original matcher)",
+            flush=True,
+        )
+        try:
+            async for progress in SceneAlignerService.align_scenes_progress(
+                video_path,
+                scenes,
+                library_path,
+                project.library_type,
+                anime_name=project.anime_name,
+            ):
+                if verbose and progress.status == "matching":
+                    print(f"[{project_id}] aligner: {progress.message}", flush=True)
+                if progress.status == "error":
+                    raise RuntimeError(progress.error or "aligner failed")
+                if progress.status == "complete":
+                    align_diagnostics = SceneAlignerService.get_last_diagnostics()
+        finally:
+            if previous_flag is None:
+                os.environ.pop("ATR_MATCHER_V2", None)
+            else:
+                os.environ["ATR_MATCHER_V2"] = previous_flag
         align_result = SceneAlignerService.get_last_result()
         if align_result is None:
             raise RuntimeError("aligner completed without results")
@@ -585,6 +602,14 @@ def _stage3_evidence_recall(project_id: str, tolerance: float = 0.5) -> tuple[in
     _, gt_scenes, gt_matches = _load_required(project_id)
     segments = SceneAlignerService.get_last_diagnostics().segments
     if not segments:
+        # Only the original matcher populates diagnostics.segments; the bounded
+        # matcher's adapter leaves it empty. A silent 0 here reads as "recalled
+        # nothing" rather than "not measured", so say which it is.
+        print(
+            f"[{project_id}] stage3 evidence recall unavailable: "
+            "no aligner segments in diagnostics (not measured, not 0 recall)",
+            flush=True,
+        )
         return 0, len(gt_scenes.scenes)
 
     recalled = 0

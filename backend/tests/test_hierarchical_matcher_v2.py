@@ -26,7 +26,6 @@ def _candidate(
     *,
     episode: str = "episode-1",
     similarity: float = 0.65,
-    rank: int = 0,
     variant: str = "plain",
 ) -> RetrievalCandidate:
     return RetrievalCandidate(
@@ -36,7 +35,6 @@ def _candidate(
         source,
         similarity,
         "series",
-        rank,
         variant,
     )
 
@@ -179,13 +177,12 @@ def test_continuity_beats_a_higher_scoring_repeated_instance_jump():
     samples = [_sample(value) for value in (0.0, 0.25, 0.5, 0.75)]
     values = []
     for index, sample in enumerate(samples):
-        truth = _candidate(index, sample.t_query, 10.0 + sample.t_query, similarity=0.60, rank=1)
+        truth = _candidate(index, sample.t_query, 10.0 + sample.t_query, similarity=0.60)
         repeated = _candidate(
             index,
             sample.t_query,
             100.0 + index * 25.0,
             similarity=0.66,
-            rank=0,
         )
         values.append([repeated, truth])
     state = _decode(samples, values)
@@ -273,7 +270,6 @@ def test_top60_consensus_can_replace_a_weaker_primary_track():
             sample.t_query,
             30.0 + sample.t_query,
             similarity=0.70,
-            rank=20,
         )
         primary_points.append(primary)
         candidates.append([alternate, primary])
@@ -301,7 +297,7 @@ def test_native_recovery_budget_exhaustion_is_deterministic(monkeypatch):
         candidates.append(
             [
                 _candidate(index, sample.t_query, 10.0 + sample.t_query),
-                _candidate(index, sample.t_query, 40.0 + sample.t_query, rank=1),
+                _candidate(index, sample.t_query, 40.0 + sample.t_query),
             ]
         )
         segments.append(
@@ -405,6 +401,355 @@ def test_alternative_proposals_are_temporally_clustered_and_diverse():
     }
     assert ("episode-1", 30) in mids
     assert any(episode == "episode-2" for episode, _ in mids)
+
+
+def test_empty_matcher_flag_is_not_a_choice(monkeypatch):
+    from app.config import settings
+
+    # An exported-but-empty value must not silently select the old matcher.
+    monkeypatch.setattr(settings, "matcher_v2", False)
+    monkeypatch.setenv("ATR_MATCHER_V2", "")
+    assert matcher_v2_enabled() is False
+    assert bounded_matcher_enabled() is True
+
+    monkeypatch.setenv("ATR_MATCHER_V2", "   ")
+    assert matcher_v2_enabled() is False
+
+    monkeypatch.setattr(settings, "matcher_v2", True)
+    monkeypatch.setenv("ATR_MATCHER_V2", "")
+    assert matcher_v2_enabled() is True
+
+
+def test_target_times_span_restriction_leaves_full_match_untouched():
+    scenes = SceneList(
+        scenes=[
+            Scene(index=0, start_time=0.0, end_time=4.0),
+            Scene(index=1, start_time=4.0, end_time=8.0),
+        ]
+    )
+    full = HierarchicalMatcherService._target_times(scenes)
+    assert HierarchicalMatcherService._target_times(scenes, None) == full
+
+    restricted = HierarchicalMatcherService._target_times(scenes, [(4.0, 8.0)])
+    assert restricted
+    assert all(4.0 <= value <= 8.0 for value in restricted)
+    assert set(restricted).issubset(set(full))
+    assert len(restricted) < len(full)
+
+
+def test_short_span_still_receives_its_detector_probes():
+    scenes = SceneList(
+        scenes=[
+            Scene(index=0, start_time=0.0, end_time=10.0),
+            Scene(index=1, start_time=10.0, end_time=10.4),
+            Scene(index=2, start_time=10.4, end_time=20.0),
+        ]
+    )
+    restricted = HierarchicalMatcherService._target_times(scenes, [(10.0, 10.4)])
+    assert len(restricted) >= 3
+
+
+def test_collapse_picks_the_dominant_episode_and_pins_the_span():
+    # A long, well-supported stretch of episode-1 plus a two-point burst of
+    # episode-2: the merged scene must resolve to one episode-1 match spanning
+    # exactly the fixed boundaries.
+    dominant_points = [
+        _candidate(index, 2.0 + 0.25 * index, 50.0 + 0.25 * index)
+        for index in range(12)
+    ]
+    intruder_points = [
+        _candidate(index, 5.1 + 0.25 * index, 900.0 + 0.25 * index, episode="episode-2")
+        for index in range(2)
+    ]
+    segments = [
+        TrackSegment(2.0, 5.0, "episode-1", 1.0, 48.0, points=dominant_points, confidence=0.7),
+        TrackSegment(5.0, 5.5, "episode-2", 1.0, 894.9, points=intruder_points, confidence=0.9),
+    ]
+    collapsed = HierarchicalMatcherService._collapse_to_single_segment(segments, 2.0, 5.5)
+
+    assert collapsed.episode == "episode-1"
+    assert collapsed.q_start == 2.0
+    assert collapsed.q_end == 5.5
+    assert "partial_rematch_collapsed" in collapsed.doubt_reasons
+    assert collapsed.source_at(2.0) == pytest.approx(50.0, abs=0.2)
+
+
+def test_collapse_recomputes_geometry_doubts_against_the_fixed_span():
+    # _segments_from_state measures support against its own interval, which
+    # starts at 0.0 on the partial path. Dense evidence over the real span must
+    # not inherit that stale "sparse_support" verdict.
+    points = [
+        _candidate(index, 2.0 + 0.25 * index, 50.0 + 0.25 * index)
+        for index in range(12)
+    ]
+    segment = TrackSegment(
+        0.0, 5.0, "episode-1", 1.0, 48.0,
+        points=points, confidence=0.7,
+        uncertain=True,
+        doubt_reasons=["sparse_support", "duplicate_margin"],
+    )
+    collapsed = HierarchicalMatcherService._collapse_to_single_segment(
+        [segment], 2.0, 5.0
+    )
+    assert "sparse_support" not in collapsed.doubt_reasons
+    # Non-geometric doubts still carry over.
+    assert "duplicate_margin" in collapsed.doubt_reasons
+
+
+def _prior(episode="episode-1", q=(0.0, 2.0), source=(48.0, 50.0), confidence=0.85):
+    from app.services.hierarchical_matcher import RematchPrior
+
+    return RematchPrior(
+        episode=episode,
+        q_start=q[0],
+        q_end=q[1],
+        source_start=source[0],
+        source_end=source[1],
+        confidence=confidence,
+    )
+
+
+def test_prior_breaks_a_near_tie_toward_the_merged_fragment():
+    # Two episodes with comparable support. Without the prior the later,
+    # slightly denser group wins; the prior tips it back to the fragment the
+    # owner said this span continues.
+    a_points = [_candidate(i, 2.0 + 0.25 * i, 50.0 + 0.25 * i) for i in range(5)]
+    b_points = [
+        _candidate(i, 3.5 + 0.25 * i, 900.0 + 0.25 * i, episode="episode-2")
+        for i in range(6)
+    ]
+    segments = [
+        TrackSegment(2.0, 3.5, "episode-1", 1.0, 48.0, points=a_points, confidence=0.6),
+        TrackSegment(3.5, 5.0, "episode-2", 1.0, 896.5, points=b_points, confidence=0.6),
+    ]
+
+    without = HierarchicalMatcherService._collapse_to_single_segment(
+        [s for s in segments], 2.0, 5.0
+    )
+    assert without.episode == "episode-2"
+
+    with_prior = HierarchicalMatcherService._collapse_to_single_segment(
+        segments, 2.0, 5.0, _prior(q=(0.0, 2.0), source=(48.0, 50.0))
+    )
+    assert with_prior.episode == "episode-1"
+
+
+def test_clear_evidence_still_overrules_the_prior():
+    # One weak point for the prior's episode against a dense contrary body.
+    weak = [_candidate(0, 2.0, 50.0)]
+    strong = [
+        _candidate(i, 2.25 + 0.25 * i, 900.0 + 0.25 * i, episode="episode-2")
+        for i in range(11)
+    ]
+    segments = [
+        TrackSegment(2.0, 2.25, "episode-1", 1.0, 48.0, points=weak, confidence=0.5),
+        TrackSegment(2.25, 5.0, "episode-2", 1.0, 897.75, points=strong, confidence=0.7),
+    ]
+    collapsed = HierarchicalMatcherService._collapse_to_single_segment(
+        segments, 2.0, 5.0, _prior()
+    )
+    assert collapsed.episode == "episode-2"
+    assert "prior_episode_overruled" in collapsed.doubt_reasons
+
+
+def test_prior_anchors_the_line_without_counting_as_confidence():
+    points = [_candidate(i, 2.0 + 0.25 * i, 50.0 + 0.25 * i) for i in range(8)]
+    segments = [
+        TrackSegment(2.0, 4.0, "episode-1", 1.0, 48.0, points=points, confidence=0.65)
+    ]
+    collapsed = HierarchicalMatcherService._collapse_to_single_segment(
+        segments, 2.0, 4.0, _prior(q=(0.0, 2.0), source=(48.0, 50.0))
+    )
+    # The prior agrees with the evidence, so the line still lands on it.
+    assert collapsed.source_at(2.0) == pytest.approx(50.0, abs=0.2)
+    # Confidence is measured on real retrieval only, not the synthetic anchors.
+    assert collapsed.confidence == pytest.approx(0.65, abs=0.01)
+
+
+def test_prior_rescues_a_span_with_no_fresh_evidence():
+    segments = [
+        TrackSegment(0.0, 3.0, None, uncertain=True, doubt_reasons=["no_evidence"])
+    ]
+    collapsed = HierarchicalMatcherService._collapse_to_single_segment(
+        segments, 2.0, 5.0, _prior(q=(0.0, 2.0), source=(48.0, 50.0))
+    )
+    # Extending the previous fragment's line beats abstaining outright.
+    assert collapsed.episode == "episode-1"
+    assert collapsed.uncertain is True
+    assert "prior_only" in collapsed.doubt_reasons
+    assert collapsed.source_at(2.0) == pytest.approx(50.0, abs=0.2)
+
+
+def test_no_prior_still_abstains_without_evidence():
+    segments = [
+        TrackSegment(0.0, 3.0, None, uncertain=True, doubt_reasons=["no_evidence"])
+    ]
+    collapsed = HierarchicalMatcherService._collapse_to_single_segment(
+        segments, 2.0, 5.0, None
+    )
+    assert collapsed.episode is None
+    assert "no_evidence" in collapsed.doubt_reasons
+
+
+def test_collapse_without_evidence_abstains():
+    segments = [
+        TrackSegment(0.0, 1.0, None, uncertain=True, doubt_reasons=["no_evidence"]),
+    ]
+    collapsed = HierarchicalMatcherService._collapse_to_single_segment(segments, 0.0, 1.0)
+    assert collapsed.episode is None
+    assert collapsed.uncertain is True
+    assert collapsed.q_start == 0.0 and collapsed.q_end == 1.0
+
+
+def test_rematch_scene_sync_replaces_one_match_and_preserves_the_rest(monkeypatch):
+    scenes = SceneList(
+        scenes=[
+            Scene(index=0, start_time=0.0, end_time=2.0),
+            Scene(index=1, start_time=2.0, end_time=5.0),
+            Scene(index=2, start_time=5.0, end_time=7.0),
+        ]
+    )
+    existing = MatchList(
+        matches=[
+            SceneMatch(
+                scene_index=0, episode="episode-9", start_time=1.0, end_time=3.0,
+                confidence=0.9, speed_ratio=1.0, confirmed=True,
+            ),
+            SceneMatch(
+                scene_index=1, episode="stale", start_time=0.0, end_time=1.0,
+                confidence=0.1, speed_ratio=1.0, merged_from=[1, 2],
+            ),
+            SceneMatch(
+                scene_index=2, episode="episode-9", start_time=8.0, end_time=10.0,
+                confidence=0.8, speed_ratio=1.0, confirmed=True,
+            ),
+        ]
+    )
+
+    samples = [_sample(2.0 + 0.25 * index) for index in range(12)]
+    candidates = [
+        [_candidate(index, sample.t_query, 100.0 + sample.t_query)]
+        for index, sample in enumerate(samples)
+    ]
+
+    monkeypatch.setattr(
+        "app.services.anime_matcher.AnimeMatcherService._query_processor",
+        object(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        HierarchicalMatcherService,
+        "_sample_query_video",
+        classmethod(lambda cls, path, scenes_arg, spans=None: (samples, [], [], 7.0)),
+    )
+    monkeypatch.setattr(
+        HierarchicalMatcherService,
+        "_retrieve",
+        classmethod(lambda cls, samples_arg, anime: candidates),
+    )
+
+    result = HierarchicalMatcherService.rematch_scene_sync(
+        "video.mp4", scenes, "anime", "series",
+        scene_index=1, existing_matches=existing,
+    )
+
+    assert len(result.matches) == 3
+    # Untouched siblings, including their confirmations.
+    assert result.matches[0].episode == "episode-9"
+    assert result.matches[0].confirmed is True
+    assert result.matches[2].start_time == 8.0
+    assert result.matches[2].confirmed is True
+    # The target scene was actually re-matched from the faked evidence.
+    assert result.matches[1].episode == "episode-1"
+    assert result.matches[1].start_time == pytest.approx(102.0, abs=0.3)
+    assert [match.scene_index for match in result.matches] == [0, 1, 2]
+
+
+def test_rematch_scene_sync_survives_a_span_that_decoded_no_samples(monkeypatch):
+    """Prior-only rescue must not reach verification, which needs a query frame."""
+    scenes = SceneList(
+        scenes=[
+            Scene(index=0, start_time=0.0, end_time=2.0),
+            Scene(index=1, start_time=2.0, end_time=5.0),
+        ]
+    )
+    existing = MatchList(
+        matches=[
+            SceneMatch(
+                scene_index=0, episode="episode-1", start_time=48.0, end_time=50.0,
+                confidence=0.85, speed_ratio=1.0,
+            ),
+            SceneMatch(
+                scene_index=1, episode="", start_time=0.0, end_time=0.0,
+                confidence=0.0, speed_ratio=1.0, was_no_match=True,
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        "app.services.anime_matcher.AnimeMatcherService._query_processor",
+        object(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        HierarchicalMatcherService,
+        "_sample_query_video",
+        classmethod(lambda cls, path, scenes_arg, spans=None: ([], [], [], 5.0)),
+    )
+    monkeypatch.setattr(
+        HierarchicalMatcherService,
+        "_retrieve",
+        classmethod(lambda cls, samples_arg, anime: []),
+    )
+
+    result = HierarchicalMatcherService.rematch_scene_sync(
+        "video.mp4", scenes, "anime", "series",
+        scene_index=1, existing_matches=existing,
+        prior=_prior(q=(0.0, 2.0), source=(48.0, 50.0)),
+    )
+    assert len(result.matches) == 2
+    assert result.matches[1].episode == "episode-1"
+    assert "prior_only" in result.matches[1].doubt_reasons
+
+
+def test_rematch_scene_sync_rejects_an_out_of_range_index(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.anime_matcher.AnimeMatcherService._query_processor",
+        object(),
+        raising=False,
+    )
+    scenes = SceneList(scenes=[Scene(index=0, start_time=0.0, end_time=1.0)])
+    with pytest.raises(IndexError):
+        HierarchicalMatcherService.rematch_scene_sync(
+            "video.mp4", scenes, "anime", None,
+            scene_index=5, existing_matches=MatchList(),
+        )
+
+
+def test_undecoded_verification_window_does_not_reject_the_segment(monkeypatch):
+    """Absence of source evidence must not read as evidence against."""
+    samples = [_sample(0.5 + index) for index in range(4)]
+    candidates = [
+        [_candidate(index, sample.t_query, 10.0 + sample.t_query)]
+        for index, sample in enumerate(samples)
+    ]
+    segment = TrackSegment(
+        0.0, 4.0, "episode-1", 1.0, 9.5,
+        points=[values[0] for values in candidates],
+        confidence=0.4,
+        uncertain=True,
+    )
+    # No episode path resolves, so nothing is decoded.
+    monkeypatch.setattr(
+        "app.services.anime_library.AnimeLibraryService.resolve_episode_path",
+        classmethod(lambda cls, episode, library_type=None: None),
+    )
+    decoded = HierarchicalMatcherService._verify_ambiguous_segments(
+        [segment], samples, candidates, "anime", 10.0
+    )
+    assert decoded == 0.0
+    assert segment.episode == "episode-1"
+    assert "native_rejected" not in segment.doubt_reasons
+    assert "native_unavailable" in segment.doubt_reasons
 
 
 # Imported late so the helpers above remain usable in environments that only

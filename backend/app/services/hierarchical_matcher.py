@@ -50,6 +50,10 @@ TRACK_RESIDUAL_SECONDS = 0.75
 VARIANT_EMBED_FRACTION = 0.25
 VERIFY_FPS = 6.0
 MAX_ALTERNATIVES = 7
+# How much a manual-merge prior tilts the episode vote. Big enough to break a
+# near-tie toward the fragment the owner said this span continues, small enough
+# that a clear body of fresh retrieval still overrules it.
+PRIOR_EPISODE_WEIGHT = 1.5
 
 
 @dataclass(frozen=True)
@@ -68,8 +72,45 @@ class RetrievalCandidate:
     t_source: float
     similarity: float
     series: str
-    rank: int
     variant_id: str = "plain"
+
+
+@dataclass(frozen=True)
+class RematchPrior:
+    """The pre-merge match of the fragment a merged scene was absorbed into.
+
+    Pressing merge-with-previous asserts that the merged span *continues* the
+    previous fragment. That fragment's existing match is therefore real evidence
+    — it names the episode and pins where on the source timeline the span
+    starts. It is evidence, not proof: it breaks near-ties and anchors the fitted
+    line, but a body of fresh retrieval that disagrees still wins.
+    """
+
+    episode: str
+    q_start: float
+    q_end: float
+    source_start: float
+    source_end: float
+    confidence: float = 0.0
+
+    def anchor_candidates(self) -> list[RetrievalCandidate]:
+        """The prior expressed as two synthetic correspondences for the fit."""
+        similarity = float(np.clip(self.confidence, 0.30, 0.95))
+        return [
+            RetrievalCandidate(
+                sample_index=-1,
+                t_query=t_query,
+                episode=self.episode,
+                t_source=t_source,
+                similarity=similarity,
+                series="",
+                variant_id="prior",
+            )
+            for t_query, t_source in (
+                (self.q_start, self.source_start),
+                (self.q_end, self.source_end),
+            )
+        ]
 
 
 @dataclass(frozen=True)
@@ -138,21 +179,6 @@ class HierarchicalDiagnostics:
     phase_timings: dict[str, float] = field(default_factory=dict)
     counters: dict[str, float] = field(default_factory=dict)
 
-    def stats(self) -> dict[str, float]:
-        result = {
-            "aligner_sample_count": float(self.sample_count),
-            "aligner_correspondence_count": float(self.correspondence_count),
-            "aligner_segment_count": float(self.segment_count),
-            "aligner_weak_variant_sample_count": float(
-                self.weak_variant_sample_count
-            ),
-        }
-        result.update(
-            {f"aligner_{name}_seconds": value for name, value in self.phase_timings.items()}
-        )
-        result.update({f"aligner_v2_{name}": value for name, value in self.counters.items()})
-        return result
-
 
 @dataclass
 class HierarchicalResult:
@@ -204,15 +230,18 @@ class HierarchicalMatcherService:
 
         # Adaptive query variants are bounded by work count and by the UX
         # watchdog.  No source decode occurs in this phase.
-        target_seconds = 60.0 if duration <= 90.0 else 120.0
+        #
+        # The watchdog keys off the decoded video length, not the scene list's
+        # end time: a scene list that stops short of the tail must not shrink
+        # the wall target or the native verify budget.
+        video_duration = max(duration, diff_times[-1] if diff_times else 0.0)
+        target_seconds = 60.0 if video_duration <= 90.0 else 120.0
+        deadline = run_started + target_seconds * 0.8
         variant_indices = cls._variant_sample_indices(samples, candidates, state)
         variant_budget = int(math.ceil(len(samples) * VARIANT_EMBED_FRACTION))
         variant_count = 0
-        if (
-            variant_indices
-            and variant_budget > 0
-            and time.perf_counter() - run_started < target_seconds * 0.8
-        ):
+        variant_sample_count = 0
+        if variant_indices and variant_budget > 0 and time.perf_counter() < deadline:
             started = time.perf_counter()
             variant_frames: list[QueryFrame] = []
             variant_to_sample: list[int] = []
@@ -220,6 +249,10 @@ class HierarchicalMatcherService:
                 sample = samples[sample_index]
                 if sample.preview is None:
                     continue
+                # The deadline bounds the phase itself, not only its entry:
+                # a phase entered just under the gate must still stop at it.
+                if time.perf_counter() >= deadline:
+                    break
                 for variant_id, image in cls._query_variants(sample.preview):
                     if variant_count >= variant_budget:
                         break
@@ -250,8 +283,11 @@ class HierarchicalMatcherService:
                     detector_boundaries,
                     strong_boundaries,
                 )
+                variant_sample_count = len(set(variant_to_sample))
             diagnostics.phase_timings["v2_variants"] = time.perf_counter() - started
-        diagnostics.weak_variant_sample_count = variant_count
+        # Samples that received a variant, not variant images: the image count
+        # is reported separately as counters["variant_embeddings"].
+        diagnostics.weak_variant_sample_count = variant_sample_count
 
         started = time.perf_counter()
         segments = cls._segments_from_state(
@@ -283,13 +319,14 @@ class HierarchicalMatcherService:
 
         started = time.perf_counter()
         native_seconds = 0.0
-        if time.perf_counter() - run_started < target_seconds * 0.8:
+        if time.perf_counter() < deadline:
             native_seconds = cls._verify_ambiguous_segments(
                 segments,
                 samples,
                 candidates,
                 library_type,
-                duration,
+                video_duration,
+                deadline=deadline,
             )
         diagnostics.phase_timings["v2_native_verify"] = time.perf_counter() - started
         diagnostics.counters["native_source_seconds"] = native_seconds
@@ -320,8 +357,267 @@ class HierarchicalMatcherService:
         )
         return HierarchicalResult(final_scenes, matches, diagnostics)
 
+    @classmethod
+    def rematch_scene_sync(
+        cls,
+        video_path: Path,
+        scenes: SceneList,
+        library_type: LibraryType | str,
+        anime_name: str | None = None,
+        *,
+        scene_index: int,
+        existing_matches: MatchList,
+        prior: RematchPrior | None = None,
+    ) -> MatchList:
+        """Re-match exactly one scene, keeping its boundaries and its siblings.
+
+        This is the bounded matcher's partial path, used by the manual
+        merge-with-previous route. Unlike :meth:`align_scenes_sync` it never
+        reshapes the scene list: the owner just chose these boundaries by hand,
+        so the result is exactly one match over exactly that span, spliced into
+        ``existing_matches``.
+        """
+        if AnimeMatcherService._query_processor is None:
+            raise RuntimeError("anime_searcher must be initialized before bounded matching")
+        if not scenes.scenes:
+            raise ValueError("scenes must not be empty")
+        if not 0 <= scene_index < len(scenes.scenes):
+            raise IndexError(f"scene_index {scene_index} out of range")
+
+        # Native verification below opens PyNv source captures, so size the
+        # NVDEC session budget as the full-match path does.
+        from .fast_matching import fast_r2_enabled
+
+        if fast_r2_enabled():
+            try:
+                from . import pynv_decode
+                from .indexation_queue import indexation_queue
+
+                pynv_decode.set_session_budget(
+                    3 if indexation_queue.gpu_slots_in_use() <= 1 else 2
+                )
+            except Exception:
+                pass
+
+        run_started = time.perf_counter()
+        target = scenes.scenes[scene_index]
+        q_start = float(target.start_time)
+        q_end = float(max(target.end_time, target.start_time + 1e-3))
+
+        # Only this scene's span is embedded and retrieved. The decode still
+        # walks the file (the diff curve is per-frame) but embedding and FAISS
+        # search — the dominant cost — stay proportional to the merged scene.
+        samples, _, _, _ = cls._sample_query_video(
+            video_path, scenes, [(q_start, q_end)]
+        )
+        samples = [
+            sample for sample in samples if q_start - 1e-9 <= sample.t_query <= q_end + 1e-9
+        ]
+        candidates = cls._retrieve(samples, anime_name)
+
+        # No detector or difference boundaries: the owner explicitly merged this
+        # span, so the beam must have no reset evidence that could re-split it.
+        state = cls._decode_beam(samples, candidates, [], [])
+        segments = cls._segments_from_state(
+            state, samples, candidates, q_end, [], []
+        )
+        segment = cls._collapse_to_single_segment(segments, q_start, q_end, prior)
+
+        native_seconds = 0.0
+        # Verification arbitrates against a query frame, so it needs at least
+        # one sample. A prior-only rescue can reach here with none.
+        if samples and segment.episode is not None and segment.uncertain:
+            native_seconds = cls._verify_ambiguous_segments(
+                [segment],
+                samples,
+                candidates,
+                library_type,
+                q_end - q_start,
+                deadline=run_started + 30.0,
+            )
+
+        _, built = cls._build_output([segment], samples, candidates)
+        rematched = built.matches[0]
+
+        result = MatchList()
+        for index, scene in enumerate(scenes.scenes):
+            if index == scene_index:
+                match = rematched.model_copy()
+            elif index < len(existing_matches.matches):
+                match = existing_matches.matches[index].model_copy()
+            else:
+                match = SceneMatch(
+                    scene_index=scene.index,
+                    episode="",
+                    start_time=0.0,
+                    end_time=0.0,
+                    confidence=0.0,
+                    speed_ratio=1.0,
+                    was_no_match=True,
+                )
+            match.scene_index = scene.index
+            result.matches.append(match)
+
+        logger.info(
+            "matching_v2_partial %s",
+            {
+                "scene_index": scene_index,
+                "span": [round(q_start, 3), round(q_end, 3)],
+                "samples": len(samples),
+                "prior_episode": prior.episode if prior else "",
+                "episode": segment.episode or "",
+                "confidence": round(segment.confidence, 3),
+                "native_source_seconds": round(native_seconds, 2),
+                "doubt_reasons": sorted(set(segment.doubt_reasons)),
+                "elapsed_seconds": round(time.perf_counter() - run_started, 2),
+            },
+        )
+        return result
+
+    @classmethod
+    def _collapse_to_single_segment(
+        cls,
+        segments: list[TrackSegment],
+        q_start: float,
+        q_end: float,
+        prior: RematchPrior | None = None,
+    ) -> TrackSegment:
+        """Reduce tracked segments to exactly one over fixed query boundaries.
+
+        The dominant episode wins on evidence count weighted by how much of the
+        span it covers, and its line is refit over every point supporting it.
+        A ``prior`` from a manual merge tilts the episode vote and anchors the
+        fitted line without being able to override clear contrary evidence.
+        """
+        span = max(1e-6, q_end - q_start)
+        prior_episode = prior.episode if prior and prior.episode else None
+
+        def covered(segment: TrackSegment) -> float:
+            return max(
+                0.0, min(segment.q_end, q_end) - max(segment.q_start, q_start)
+            )
+
+        def evidence_weight(segment: TrackSegment) -> float:
+            weight = len(segment.points) * max(
+                covered(segment), 1.0 / BASE_SAMPLE_FPS
+            )
+            if prior_episode and segment.episode == prior_episode:
+                weight *= PRIOR_EPISODE_WEIGHT
+            return weight
+
+        supported = [
+            segment
+            for segment in segments
+            if segment.episode is not None and segment.points
+        ]
+        if not supported:
+            reasons = {reason for segment in segments for reason in segment.doubt_reasons}
+            if prior_episode:
+                # No fresh evidence at all, but the owner told us this span
+                # continues an already-matched fragment. Extending that line is
+                # a better answer than abstaining outright.
+                anchors = prior.anchor_candidates()
+                a, b, residual = cls._fit_points(anchors)
+                return TrackSegment(
+                    q_start=q_start,
+                    q_end=q_end,
+                    episode=prior_episode,
+                    a=a,
+                    b=b,
+                    points=anchors,
+                    confidence=float(np.clip(prior.confidence, 0.0, 1.0)),
+                    residual=residual,
+                    uncertain=True,
+                    doubt_reasons=sorted(reasons | {"prior_only"}),
+                )
+            return TrackSegment(
+                q_start, q_end, None, uncertain=True,
+                doubt_reasons=sorted(reasons | {"no_evidence"}),
+            )
+
+        winner = max(
+            supported,
+            key=lambda segment: (evidence_weight(segment), len(segment.points)),
+        )
+        same_episode = [
+            segment for segment in supported if segment.episode == winner.episode
+        ]
+        points = [point for segment in same_episode for point in segment.points]
+
+        # The prior only steers geometry when it agrees on the episode, and it
+        # never counts toward confidence or support below — those stay measured
+        # on real retrieval alone.
+        anchors = (
+            prior.anchor_candidates()
+            if prior_episode and winner.episode == prior_episode
+            else []
+        )
+
+        # Pooling same-episode groups recovers support the beam split at a
+        # reset, but only while one line still explains them: a real source
+        # discontinuity inside the span makes the pooled fit worse, and there
+        # the winner's own coherent line is the honest answer.
+        a, b, residual = cls._fit_points(points + anchors)
+        own_a, own_b, own_residual = cls._fit_points(list(winner.points) + anchors)
+        if len(same_episode) > 1 and residual > own_residual + 0.10:
+            a, b, residual = own_a, own_b, own_residual
+            points = list(winner.points)
+
+        confidence = float(np.median([point.similarity for point in points]))
+        support_expected = max(1, int(round(span * BASE_SAMPLE_FPS)))
+        support_ratio = min(1.0, len(points) / support_expected)
+
+        # Geometry-derived reasons are recomputed below against the FIXED span.
+        # Inheriting them too would carry over a sub-segment's verdict measured
+        # against a different interval — the sub-segments start at 0.0, not at
+        # q_start, so their support ratio is not this segment's.
+        recomputed = {"weak_similarity", "sparse_support", "timing_residual"}
+        reasons = {
+            reason
+            for segment in same_episode
+            for reason in segment.doubt_reasons
+            if reason not in recomputed
+        }
+        if confidence < 0.36:
+            reasons.add("weak_similarity")
+        if support_ratio < 0.50:
+            reasons.add("sparse_support")
+        if residual > 0.45:
+            reasons.add("timing_residual")
+        if len({segment.episode for segment in supported}) > 1:
+            reasons.add("partial_rematch_collapsed")
+        if prior_episode and winner.episode != prior_episode:
+            # The owner said this span continues the previous fragment, yet the
+            # evidence points elsewhere. Surface the conflict rather than hide
+            # it behind either answer.
+            reasons.add("prior_episode_overruled")
+        elif anchors and abs((a * prior.q_start + b) - prior.source_start) > 1.0:
+            reasons.add("prior_offset_disagreement")
+
+        return TrackSegment(
+            q_start=q_start,
+            q_end=q_end,
+            episode=winner.episode,
+            a=a,
+            b=b,
+            points=points,
+            confidence=confidence,
+            residual=residual,
+            uncertain=bool(reasons),
+            doubt_reasons=sorted(reasons),
+        )
+
     @staticmethod
-    def _target_times(scenes: SceneList) -> list[float]:
+    def _target_times(
+        scenes: SceneList,
+        spans: list[tuple[float, float]] | None = None,
+    ) -> list[float]:
+        """Query timestamps to embed.
+
+        ``spans`` restricts the result to the given query intervals, used by the
+        partial rematch path so a single merged scene pays only for its own
+        embeddings. ``spans=None`` returns the full-match target list unchanged.
+        """
         if not scenes.scenes:
             return []
         duration = max(0.0, scenes.scenes[-1].end_time)
@@ -334,24 +630,32 @@ class HierarchicalMatcherService:
                 targets.add(
                     round(scene.start_time + fraction * max(0.0, scene.duration), 6)
                 )
-        return sorted(value for value in targets if 0.0 <= value < duration)
+        ordered = sorted(value for value in targets if 0.0 <= value < duration)
+        if spans is None:
+            return ordered
+        return [
+            value
+            for value in ordered
+            if any(start - 1e-9 <= value <= end + 1e-9 for start, end in spans)
+        ]
 
     @classmethod
     def _sample_query_video(
         cls,
         video_path: Path,
         scenes: SceneList,
+        spans: list[tuple[float, float]] | None = None,
     ) -> tuple[list[QueryFrame], list[float], list[float], float]:
         """Decode once with PTS-preserving PyAV, with an OpenCV fallback."""
         try:
             import av  # type: ignore[import-not-found]
         except ImportError:
-            return cls._sample_query_video_cv2(video_path, scenes)
+            return cls._sample_query_video_cv2(video_path, scenes, spans)
         try:
-            return cls._sample_query_video_av(av, video_path, scenes)
+            return cls._sample_query_video_av(av, video_path, scenes, spans)
         except Exception:
             logger.exception("PyAV query decode failed; using OpenCV fallback")
-            return cls._sample_query_video_cv2(video_path, scenes)
+            return cls._sample_query_video_cv2(video_path, scenes, spans)
 
     @classmethod
     def _sample_query_video_av(
@@ -359,6 +663,7 @@ class HierarchicalMatcherService:
         av_module: Any,
         video_path: Path,
         scenes: SceneList,
+        spans: list[tuple[float, float]] | None = None,
     ) -> tuple[list[QueryFrame], list[float], list[float], float]:
         """Collect native-rate luma diffs and query frames in one decode.
 
@@ -366,7 +671,7 @@ class HierarchicalMatcherService:
         selected query frames are converted to RGB, avoiding the dominant
         full-resolution BGR conversion cost on 60fps portrait inputs.
         """
-        targets = cls._target_times(scenes)
+        targets = cls._target_times(scenes, spans)
         target_pos = 0
         samples: list[QueryFrame] = []
         diff_times: list[float] = []
@@ -493,11 +798,12 @@ class HierarchicalMatcherService:
         cls,
         video_path: Path,
         scenes: SceneList,
+        spans: list[tuple[float, float]] | None = None,
     ) -> tuple[list[QueryFrame], list[float], list[float], float]:
         """Decode once, collecting target frames and a native diff curve."""
         cv2 = AnimeMatcherService._require_cv2()
         cap = cv2.VideoCapture(str(video_path))
-        targets = cls._target_times(scenes)
+        targets = cls._target_times(scenes, spans)
         target_pos = 0
         samples: list[QueryFrame] = []
         diff_times: list[float] = []
@@ -638,10 +944,9 @@ class HierarchicalMatcherService:
                     t_source=float(metadata.timestamp),
                     similarity=float(similarity),
                     series=metadata.series,
-                    rank=rank,
                     variant_id=sample.variant_id,
                 )
-                for rank, (similarity, metadata) in enumerate(values)
+                for similarity, metadata in values
                 if float(similarity) >= 0.20
             ]
             output.append(cls._dedupe_candidates(candidates))
@@ -962,10 +1267,9 @@ class HierarchicalMatcherService:
                     t_source=float(metadata.timestamp),
                     similarity=float(similarity),
                     series=metadata.series,
-                    rank=rank,
                     variant_id=frame.variant_id,
                 )
-                for rank, (similarity, metadata) in enumerate(values)
+                for similarity, metadata in values
                 if float(similarity) >= 0.20
             ]
             base[sample_index] = cls._dedupe_candidates(base[sample_index] + extra)
@@ -1624,11 +1928,16 @@ class HierarchicalMatcherService:
         candidates: list[list[RetrievalCandidate]],
         library_type: LibraryType | str,
         duration: float,
+        deadline: float | None = None,
     ) -> float:
         """Use a capped amount of consolidated source decode to arbitrate a bounded track.
 
         The return value is decoded source-window duration, the deterministic
         work unit used by the evaluator.
+
+        ``deadline`` is a ``time.perf_counter()`` instant past which no further
+        source decode starts, so the caller's wall target bounds this phase and
+        not merely its entry.
         """
         from .anime_library import AnimeLibraryService
 
@@ -1688,7 +1997,13 @@ class HierarchicalMatcherService:
             str, list[tuple[float, np.ndarray, Image.Image]]
         ] = {}
         actual_decoded_duration = 0.0
+        timed_out = False
         for episode, episode_windows in windows.items():
+            # Source decode is the expensive half of this phase; stop opening
+            # new episodes once the caller's wall target is spent.
+            if deadline is not None and time.perf_counter() >= deadline:
+                timed_out = True
+                break
             path = AnimeLibraryService.resolve_episode_path(
                 episode, library_type=library_type
             )
@@ -1704,6 +2019,9 @@ class HierarchicalMatcherService:
             frames: list[tuple[float, Image.Image]] = []
             try:
                 for start, end in merged_windows:
+                    if deadline is not None and time.perf_counter() >= deadline:
+                        timed_out = True
+                        break
                     actual_decoded_duration += end - start
                     frames.extend(
                         AnimeMatcherService._collect_frames_in_window_from_capture(
@@ -1729,6 +2047,7 @@ class HierarchicalMatcherService:
 
         for segment_index, query, proposals in accepted:
             scores: list[float] = []
+            decoded_any = False
             for proposal in proposals:
                 predicted = proposal.source_at(query.t_query)
                 frames = embedded_windows.get(proposal.episode, [])
@@ -1737,6 +2056,7 @@ class HierarchicalMatcherService:
                     for timestamp, embedding, image in frames
                     if abs(timestamp - predicted) <= 0.80
                 ]
+                decoded_any = decoded_any or bool(local)
                 score = (
                     max(float(embedding @ query.embedding) for _, embedding, _ in local)
                     if local
@@ -1779,8 +2099,17 @@ class HierarchicalMatcherService:
                 scores.append(score)
             if not scores:
                 continue
-            best_index = int(np.argmax(scores))
             segment = segments[segment_index]
+            if not decoded_any:
+                # No source window was decoded for any proposal (unresolved
+                # episode path, or the wall deadline cut the decode short).
+                # Absence of evidence must not read as evidence against: leave
+                # the retrieval verdict standing instead of rejecting it.
+                segment.doubt_reasons.append(
+                    "native_timeout" if timed_out else "native_unavailable"
+                )
+                continue
+            best_index = int(np.argmax(scores))
             switch_margin = (
                 0.15
                 if "dominant_retrieval" in segment.doubt_reasons

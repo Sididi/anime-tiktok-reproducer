@@ -787,6 +787,21 @@ class SceneAlignerService:
             flag_source,
         )
 
+        # Both matchers open PyNv source captures through
+        # AnimeMatcherService._open_source_capture, so the NVDEC session budget
+        # must be sized before either runs — not only on the legacy path.
+        from .fast_matching import fast_r2_enabled
+        if fast_r2_enabled():
+            try:
+                from . import pynv_decode
+                from .indexation_queue import indexation_queue
+
+                pynv_decode.set_session_budget(
+                    3 if indexation_queue.gpu_slots_in_use() <= 1 else 2
+                )
+            except Exception:
+                pass
+
         if not use_legacy_v2:
             from .hierarchical_matcher import HierarchicalMatcherService
 
@@ -817,18 +832,6 @@ class SceneAlignerService:
 
         diagnostics = AlignmentDiagnostics()
         started = time.perf_counter()
-
-        from .fast_matching import fast_r2_enabled
-        if fast_r2_enabled():
-            try:
-                from . import pynv_decode
-                from .indexation_queue import indexation_queue
-
-                pynv_decode.set_session_budget(
-                    3 if indexation_queue.gpu_slots_in_use() <= 1 else 2
-                )
-            except Exception:
-                pass
 
         samples, diff_times, diffs = cls.sample_query_video_with_diffs(video_path)
         diagnostics.phase_timings["sample"] = time.perf_counter() - started

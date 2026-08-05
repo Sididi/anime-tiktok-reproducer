@@ -2,6 +2,7 @@ import asyncio
 import logging
 import math
 from contextlib import suppress
+from functools import partial
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -851,34 +852,110 @@ async def merge_with_previous(project_id: str, scene_index: int):
         indexation_queue.MAX_CONCURRENT if fast_matching.decode_enabled() else 1
     )
     rematched_matches: MatchList | None = None
+    # Follow the same matcher the project's other matches came from, so a
+    # manually merged scene is not re-matched by an algorithm that produced
+    # none of its neighbours.
+    use_bounded = fast_matching.bounded_matcher_enabled()
+    loop = asyncio.get_running_loop()
     async with indexation_queue.matching_lock():
         async with indexation_queue.heavy_slot("partial_matching", slots=partial_slots):
-            async for progress in AnimeMatcherService.match_scenes(
-                video_path,
-                merged_scenes,
-                source_path,
-                project.library_type,
-                anime_name=project.anime_name,
-                scene_indices_to_match=[merged_scene_index],
-                existing_matches=merged_matches,
-            ):
-                if progress.status == "complete" and progress.matches:
-                    merged_from = merged_matches.matches[merged_scene_index].merged_from
-                    if merged_scene_index < len(progress.matches.matches):
-                        progress.matches.matches[merged_scene_index].merged_from = merged_from
-                    rematched_matches = progress.matches
-                    continue
+            if use_bounded:
+                from ...services.hierarchical_matcher import (
+                    HierarchicalMatcherService,
+                    RematchPrior,
+                )
 
-                if progress.status == "error":
+                # Merging asserts the span continues the previous fragment, so
+                # that fragment's existing match is evidence about episode and
+                # source offset. Matches are keyed by scene.index, not position.
+                previous_scene = scenes.scenes[scene_index - 1]
+                previous_match = next(
+                    (
+                        item
+                        for item in matches.matches
+                        if item.scene_index == previous_scene.index
+                    ),
+                    None,
+                )
+                prior = None
+                if (
+                    previous_match is not None
+                    and previous_match.episode
+                    and previous_match.end_time > previous_match.start_time
+                ):
+                    prior = RematchPrior(
+                        episode=previous_match.episode,
+                        q_start=previous_scene.start_time,
+                        q_end=previous_scene.end_time,
+                        source_start=previous_match.start_time,
+                        source_end=previous_match.end_time,
+                        confidence=previous_match.confidence,
+                    )
+
+                # match_scenes initializes the searcher itself; the bounded
+                # partial path requires it to be live already.
+                init_success = await loop.run_in_executor(
+                    None,
+                    AnimeMatcherService._init_searcher,
+                    source_path,
+                    project.library_type,
+                    project.anime_name,
+                )
+                if not init_success:
                     raise HTTPException(
                         status_code=500,
-                        detail=progress.error or "Failed to re-match merged scene",
+                        detail="Failed to initialize anime_searcher for re-match",
                     )
+                try:
+                    rematched_matches = await loop.run_in_executor(
+                        None,
+                        partial(
+                            HierarchicalMatcherService.rematch_scene_sync,
+                            video_path,
+                            merged_scenes,
+                            project.library_type,
+                            project.anime_name,
+                            scene_index=merged_scene_index,
+                            existing_matches=merged_matches,
+                            prior=prior,
+                        ),
+                    )
+                except Exception as exc:
+                    logger.exception("Bounded partial re-match failed")
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to re-match merged scene: {exc}",
+                    ) from exc
+            else:
+                async for progress in AnimeMatcherService.match_scenes(
+                    video_path,
+                    merged_scenes,
+                    source_path,
+                    project.library_type,
+                    anime_name=project.anime_name,
+                    scene_indices_to_match=[merged_scene_index],
+                    existing_matches=merged_matches,
+                ):
+                    if progress.status == "complete" and progress.matches:
+                        rematched_matches = progress.matches
+                        continue
+
+                    if progress.status == "error":
+                        raise HTTPException(
+                            status_code=500,
+                            detail=progress.error or "Failed to re-match merged scene",
+                        )
 
     if not rematched_matches:
         raise HTTPException(
             status_code=500,
             detail="Merged scene re-match completed without results",
+        )
+
+    # The merge provenance is a route-level fact; neither matcher knows it.
+    if merged_scene_index < len(rematched_matches.matches):
+        rematched_matches.matches[merged_scene_index].merged_from = (
+            merged_matches.matches[merged_scene_index].merged_from
         )
 
     ProjectService.save_scenes(project_id, merged_scenes)

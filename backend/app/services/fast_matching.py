@@ -138,7 +138,10 @@ def matcher_v2_enabled() -> bool:
     ``settings`` and (correctly) does not export it into ``os.environ``.
     """
     value = os.environ.get(_MATCHER_V2_FLAG)
-    if value is not None:
+    # An exported-but-empty value is not a choice. Treating it as one would
+    # silently select the old matcher, while the same empty value in .env makes
+    # pydantic raise — so fall through to settings instead.
+    if value is not None and value.strip():
         return not _off(value)
 
     # Keep this import lazy: fast_matching is also imported by lightweight
