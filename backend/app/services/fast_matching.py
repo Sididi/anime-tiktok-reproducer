@@ -104,6 +104,7 @@ def configure_numerics() -> None:
 # so ATR_FAST_MATCHING=0 stays the proven byte-identical mainline escape hatch.
 # ---------------------------------------------------------------------------
 _R2_FLAG = "ATR_FAST_R2"
+_MATCHER_V2_FLAG = "ATR_MATCHER_V2"
 
 
 def fast_r2_enabled() -> bool:
@@ -120,3 +121,37 @@ def r2_lever(name: str, default: bool = True) -> bool:
     if val is None:
         return default
     return not _off(val)
+
+
+def matcher_v2_enabled() -> bool:
+    """Whether the original matcher (the V2 compatibility path) is selected.
+
+    The rollout flag is intentionally inverted: ``ATR_MATCHER_V2=1`` opts into
+    the old matcher, while an unset flag or a normal false value selects the
+    bounded hierarchical matcher by default.  This keeps the fast bounded
+    path as the normal application behavior and preserves the old matcher as
+    an explicit escape hatch.
+
+    Explicit process environment takes precedence.  When the process was
+    started from the backend launcher, the value may instead come from the
+    application's pydantic ``.env`` settings; pydantic reads that file into
+    ``settings`` and (correctly) does not export it into ``os.environ``.
+    """
+    value = os.environ.get(_MATCHER_V2_FLAG)
+    if value is not None:
+        return not _off(value)
+
+    # Keep this import lazy: fast_matching is also imported by lightweight
+    # tests and diagnostics that do not need to initialize the full settings
+    # object.  The backend's normal app import has already constructed it.
+    try:
+        from ..config import settings
+
+        return bool(settings.matcher_v2)
+    except Exception:  # pragma: no cover - defensive fallback for utilities
+        return False
+
+
+def bounded_matcher_enabled() -> bool:
+    """Whether the new bounded hierarchical matcher should run by default."""
+    return not matcher_v2_enabled()

@@ -1,0 +1,1923 @@
+"""Bounded hierarchical source-timeline matcher.
+
+This is the default bounded matching path.  It deliberately reuses the frozen
+anime_searcher index/model through :class:`AnimeMatcherService`, but replaces
+the original matcher's unbounded source-window refinement tail with:
+
+* one PTS-aware query decode;
+* a bounded correspondence beam;
+* adaptive query variants; and
+* a deterministic native verification budget.
+
+The service has no persistence responsibilities.  Its caller decides whether
+the returned scenes and matches are saved.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import time
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from PIL import Image, ImageFilter, ImageOps
+
+from ..library_types import LibraryType
+from ..models import (
+    AlternativeMatch,
+    MatchCandidate,
+    MatchList,
+    Scene,
+    SceneMatch,
+    SceneList,
+)
+from .anime_matcher import AnimeMatcherService
+
+
+logger = logging.getLogger("uvicorn.error")
+
+
+BASE_SAMPLE_FPS = 4.0
+RETRIEVAL_TOP_K = 60
+PRIMARY_TOP_K = 20
+BEAM_WIDTH = 32
+MIN_SOURCE_RATE = 0.25
+MAX_SOURCE_RATE = 5.0
+TRACK_RESIDUAL_SECONDS = 0.75
+VARIANT_EMBED_FRACTION = 0.25
+VERIFY_FPS = 6.0
+MAX_ALTERNATIVES = 7
+
+
+@dataclass(frozen=True)
+class QueryFrame:
+    t_query: float
+    embedding: np.ndarray
+    preview: Image.Image | None = None
+    variant_id: str = "plain"
+
+
+@dataclass(frozen=True)
+class RetrievalCandidate:
+    sample_index: int
+    t_query: float
+    episode: str
+    t_source: float
+    similarity: float
+    series: str
+    rank: int
+    variant_id: str = "plain"
+
+
+@dataclass(frozen=True)
+class LineProposal:
+    episode: str
+    a: float
+    b: float
+    confidence: float
+    support: int
+    algorithm: str
+
+    def source_at(self, timestamp: float) -> float:
+        return self.a * timestamp + self.b
+
+
+@dataclass
+class TrackSegment:
+    q_start: float
+    q_end: float
+    episode: str | None
+    a: float = 1.0
+    b: float = 0.0
+    points: list[RetrievalCandidate] = field(default_factory=list)
+    confidence: float = 0.0
+    residual: float = 0.0
+    uncertain: bool = False
+    doubt_reasons: list[str] = field(default_factory=list)
+
+    def source_at(self, timestamp: float) -> float:
+        return self.a * timestamp + self.b
+
+
+@dataclass(frozen=True)
+class _BeamState:
+    score: float
+    path: tuple[RetrievalCandidate | None, ...]
+    breaks: tuple[bool, ...]
+    episode: str | None
+    count: int
+    sum_w: float
+    sum_t: float
+    sum_y: float
+    sum_tt: float
+    sum_ty: float
+    first_t: float
+    first_y: float
+    last_t: float
+    last_y: float
+
+    @property
+    def line(self) -> tuple[float, float] | None:
+        denom = self.sum_w * self.sum_tt - self.sum_t * self.sum_t
+        if self.count < 2 or abs(denom) <= 1e-9:
+            return None
+        a = (self.sum_w * self.sum_ty - self.sum_t * self.sum_y) / denom
+        b = (self.sum_y - a * self.sum_t) / max(self.sum_w, 1e-9)
+        return float(a), float(b)
+
+
+@dataclass
+class HierarchicalDiagnostics:
+    sample_count: int = 0
+    correspondence_count: int = 0
+    segment_count: int = 0
+    weak_variant_sample_count: int = 0
+    phase_timings: dict[str, float] = field(default_factory=dict)
+    counters: dict[str, float] = field(default_factory=dict)
+
+    def stats(self) -> dict[str, float]:
+        result = {
+            "aligner_sample_count": float(self.sample_count),
+            "aligner_correspondence_count": float(self.correspondence_count),
+            "aligner_segment_count": float(self.segment_count),
+            "aligner_weak_variant_sample_count": float(
+                self.weak_variant_sample_count
+            ),
+        }
+        result.update(
+            {f"aligner_{name}_seconds": value for name, value in self.phase_timings.items()}
+        )
+        result.update({f"aligner_v2_{name}": value for name, value in self.counters.items()})
+        return result
+
+
+@dataclass
+class HierarchicalResult:
+    scenes: SceneList
+    matches: MatchList
+    diagnostics: HierarchicalDiagnostics
+
+
+class HierarchicalMatcherService:
+    """Fast, bounded matcher selected when ``ATR_MATCHER_V2`` is unset/false."""
+
+    @classmethod
+    def align_scenes_sync(
+        cls,
+        video_path: Path,
+        scenes: SceneList,
+        library_type: LibraryType | str,
+        anime_name: str | None = None,
+    ) -> HierarchicalResult:
+        if AnimeMatcherService._query_processor is None:
+            raise RuntimeError("anime_searcher must be initialized before bounded matching")
+
+        diagnostics = HierarchicalDiagnostics()
+        run_started = time.perf_counter()
+
+        started = time.perf_counter()
+        samples, diff_times, diffs, duration = cls._sample_query_video(
+            video_path, scenes
+        )
+        diagnostics.phase_timings["v2_query"] = time.perf_counter() - started
+        diagnostics.sample_count = len(samples)
+
+        started = time.perf_counter()
+        candidates = cls._retrieve(samples, anime_name)
+        diagnostics.phase_timings["v2_retrieve"] = time.perf_counter() - started
+        diagnostics.correspondence_count = sum(len(values) for values in candidates)
+
+        detector_boundaries = [scene.end_time for scene in scenes.scenes[:-1]]
+        strong_boundaries = cls._strong_diff_boundaries(diff_times, diffs)
+
+        started = time.perf_counter()
+        state = cls._decode_beam(
+            samples,
+            candidates,
+            detector_boundaries,
+            strong_boundaries,
+        )
+        diagnostics.phase_timings["v2_track"] = time.perf_counter() - started
+
+        # Adaptive query variants are bounded by work count and by the UX
+        # watchdog.  No source decode occurs in this phase.
+        target_seconds = 60.0 if duration <= 90.0 else 120.0
+        variant_indices = cls._variant_sample_indices(samples, candidates, state)
+        variant_budget = int(math.ceil(len(samples) * VARIANT_EMBED_FRACTION))
+        variant_count = 0
+        if (
+            variant_indices
+            and variant_budget > 0
+            and time.perf_counter() - run_started < target_seconds * 0.8
+        ):
+            started = time.perf_counter()
+            variant_frames: list[QueryFrame] = []
+            variant_to_sample: list[int] = []
+            for sample_index in variant_indices:
+                sample = samples[sample_index]
+                if sample.preview is None:
+                    continue
+                for variant_id, image in cls._query_variants(sample.preview):
+                    if variant_count >= variant_budget:
+                        break
+                    variant_frames.append(
+                        QueryFrame(sample.t_query, np.empty(0, dtype=np.float32), image, variant_id)
+                    )
+                    variant_to_sample.append(sample_index)
+                    variant_count += 1
+                if variant_count >= variant_budget:
+                    break
+            if variant_frames:
+                embeddings = AnimeMatcherService._embed_pil_batch(
+                    [frame.preview.convert("RGB") for frame in variant_frames if frame.preview]
+                )
+                embedded_variants = [
+                    replace(frame, embedding=embedding)
+                    for frame, embedding in zip(variant_frames, embeddings, strict=False)
+                ]
+                cls._merge_variant_candidates(
+                    candidates,
+                    embedded_variants,
+                    variant_to_sample,
+                    anime_name,
+                )
+                state = cls._decode_beam(
+                    samples,
+                    candidates,
+                    detector_boundaries,
+                    strong_boundaries,
+                )
+            diagnostics.phase_timings["v2_variants"] = time.perf_counter() - started
+        diagnostics.weak_variant_sample_count = variant_count
+
+        started = time.perf_counter()
+        segments = cls._segments_from_state(
+            state,
+            samples,
+            candidates,
+            duration,
+            detector_boundaries,
+            strong_boundaries,
+        )
+        unsplit_count = len(segments)
+        segments = cls._split_supported_discontinuities(
+            segments,
+            detector_boundaries,
+            samples,
+            candidates,
+        )
+        diagnostics.counters["evidence_splits"] = float(
+            max(0, len(segments) - unsplit_count)
+        )
+        segments = cls._promote_dominant_proposals(
+            segments,
+            candidates,
+            samples,
+        )
+        segments = cls._merge_continuous_segments(segments)
+        segments = cls._absorb_tiny_segments(segments)
+        diagnostics.phase_timings["v2_assemble_tracks"] = time.perf_counter() - started
+
+        started = time.perf_counter()
+        native_seconds = 0.0
+        if time.perf_counter() - run_started < target_seconds * 0.8:
+            native_seconds = cls._verify_ambiguous_segments(
+                segments,
+                samples,
+                candidates,
+                library_type,
+                duration,
+            )
+        diagnostics.phase_timings["v2_native_verify"] = time.perf_counter() - started
+        diagnostics.counters["native_source_seconds"] = native_seconds
+        diagnostics.counters["variant_embeddings"] = float(variant_count)
+
+        started = time.perf_counter()
+        final_scenes, matches = cls._build_output(segments, samples, candidates)
+        diagnostics.phase_timings["v2_output"] = time.perf_counter() - started
+        diagnostics.segment_count = len(final_scenes.scenes)
+        diagnostics.counters["abstained_segments"] = float(
+            sum(1 for segment in segments if segment.episode is None)
+        )
+        diagnostics.counters["elapsed_seconds"] = time.perf_counter() - run_started
+
+        logger.info(
+            "matching_v2_profile %s",
+            {
+                "phase_seconds": {
+                    name: round(seconds, 2)
+                    for name, seconds in diagnostics.phase_timings.items()
+                },
+                "counters": {
+                    name: round(value, 2)
+                    for name, value in diagnostics.counters.items()
+                },
+                "output_scenes": len(final_scenes.scenes),
+            },
+        )
+        return HierarchicalResult(final_scenes, matches, diagnostics)
+
+    @staticmethod
+    def _target_times(scenes: SceneList) -> list[float]:
+        if not scenes.scenes:
+            return []
+        duration = max(0.0, scenes.scenes[-1].end_time)
+        targets = set(
+            round(float(value), 6)
+            for value in np.arange(0.0, duration + 1e-9, 1.0 / BASE_SAMPLE_FPS)
+        )
+        for scene in scenes.scenes:
+            for fraction in (0.2, 0.5, 0.8):
+                targets.add(
+                    round(scene.start_time + fraction * max(0.0, scene.duration), 6)
+                )
+        return sorted(value for value in targets if 0.0 <= value < duration)
+
+    @classmethod
+    def _sample_query_video(
+        cls,
+        video_path: Path,
+        scenes: SceneList,
+    ) -> tuple[list[QueryFrame], list[float], list[float], float]:
+        """Decode once with PTS-preserving PyAV, with an OpenCV fallback."""
+        try:
+            import av  # type: ignore[import-not-found]
+        except ImportError:
+            return cls._sample_query_video_cv2(video_path, scenes)
+        try:
+            return cls._sample_query_video_av(av, video_path, scenes)
+        except Exception:
+            logger.exception("PyAV query decode failed; using OpenCV fallback")
+            return cls._sample_query_video_cv2(video_path, scenes)
+
+    @classmethod
+    def _sample_query_video_av(
+        cls,
+        av_module: Any,
+        video_path: Path,
+        scenes: SceneList,
+    ) -> tuple[list[QueryFrame], list[float], list[float], float]:
+        """Collect native-rate luma diffs and query frames in one decode.
+
+        PyAV leaves decoded frames in their native YUV representation. Only
+        selected query frames are converted to RGB, avoiding the dominant
+        full-resolution BGR conversion cost on 60fps portrait inputs.
+        """
+        targets = cls._target_times(scenes)
+        target_pos = 0
+        samples: list[QueryFrame] = []
+        diff_times: list[float] = []
+        diffs: list[float] = []
+        pending_images: list[Image.Image] = []
+        pending_times: list[float] = []
+        seen_native_indices: set[int] = set()
+
+        def flush() -> None:
+            if not pending_images:
+                return
+            embeddings = AnimeMatcherService._embed_pil_batch(pending_images)
+            samples.extend(
+                QueryFrame(
+                    timestamp,
+                    embedding,
+                    ImageOps.contain(image, (384, 384)),
+                )
+                for timestamp, embedding, image in zip(
+                    pending_times,
+                    embeddings,
+                    pending_images,
+                    strict=False,
+                )
+            )
+            pending_images.clear()
+            pending_times.clear()
+
+        def query_image(frame: Any) -> Image.Image:
+            # Preserve the exact input resolution for the frozen SSCD
+            # processor. Only ~4fps query frames take this RGB path; every
+            # other decoded frame remains a cheap 64px luma diff frame.
+            return frame.to_image().convert("RGB")
+
+        def append_sample(
+            frame: Any,
+            target: float,
+            native_index: int,
+        ) -> None:
+            if native_index in seen_native_indices:
+                return
+            seen_native_indices.add(native_index)
+            pending_images.append(query_image(frame))
+            pending_times.append(target)
+            if len(pending_images) >= 64:
+                flush()
+
+        previous_frame: Any | None = None
+        previous_pts: float | None = None
+        previous_small: np.ndarray | None = None
+        previous_index = 0
+        first_pts: float | None = None
+        last_pts = 0.0
+        frame_index = 0
+        container = av_module.open(str(video_path))
+        try:
+            stream = container.streams.video[0]
+            stream.thread_type = "AUTO"
+            fallback_fps = float(stream.average_rate or 30.0)
+            for frame in container.decode(stream):
+                raw_pts = (
+                    float(frame.pts * frame.time_base)
+                    if frame.pts is not None and frame.time_base is not None
+                    else frame_index / max(fallback_fps, 1e-6)
+                )
+                if first_pts is None:
+                    first_pts = raw_pts
+                pts = max(0.0, raw_pts - first_pts)
+                if previous_pts is not None and pts <= previous_pts + 1e-9:
+                    pts = previous_pts + 1.0 / max(fallback_fps, 1e-6)
+                last_pts = pts
+
+                small = frame.reformat(width=64, height=64, format="gray").to_ndarray()
+                if previous_small is not None:
+                    diff_times.append(pts)
+                    diffs.append(
+                        float(
+                            np.mean(
+                                np.abs(
+                                    small.astype(np.int16)
+                                    - previous_small.astype(np.int16)
+                                )
+                            )
+                        )
+                    )
+
+                if previous_frame is None or previous_pts is None:
+                    while target_pos < len(targets) and targets[target_pos] <= pts + 1e-9:
+                        append_sample(frame, targets[target_pos], frame_index)
+                        target_pos += 1
+                else:
+                    midpoint = 0.5 * (previous_pts + pts)
+                    while target_pos < len(targets) and targets[target_pos] <= midpoint + 1e-9:
+                        append_sample(
+                            previous_frame,
+                            targets[target_pos],
+                            previous_index,
+                        )
+                        target_pos += 1
+
+                previous_frame = frame
+                previous_pts = pts
+                previous_small = small
+                previous_index = frame_index
+                frame_index += 1
+
+            if previous_frame is not None:
+                while target_pos < len(targets) and targets[target_pos] <= last_pts + 1e-9:
+                    append_sample(
+                        previous_frame,
+                        targets[target_pos],
+                        previous_index,
+                    )
+                    target_pos += 1
+            flush()
+        finally:
+            container.close()
+        samples.sort(key=lambda item: item.t_query)
+        duration = scenes.scenes[-1].end_time if scenes.scenes else last_pts
+        return samples, diff_times, diffs, float(duration)
+
+    @classmethod
+    def _sample_query_video_cv2(
+        cls,
+        video_path: Path,
+        scenes: SceneList,
+    ) -> tuple[list[QueryFrame], list[float], list[float], float]:
+        """Decode once, collecting target frames and a native diff curve."""
+        cv2 = AnimeMatcherService._require_cv2()
+        cap = cv2.VideoCapture(str(video_path))
+        targets = cls._target_times(scenes)
+        target_pos = 0
+        samples: list[QueryFrame] = []
+        diff_times: list[float] = []
+        diffs: list[float] = []
+        pending_images: list[Image.Image] = []
+        pending_previews: list[Image.Image] = []
+        pending_times: list[float] = []
+        seen_native_indices: set[int] = set()
+
+        def flush() -> None:
+            if not pending_images:
+                return
+            embeddings = AnimeMatcherService._embed_pil_batch(pending_images)
+            samples.extend(
+                QueryFrame(t, emb, preview)
+                for t, emb, preview in zip(
+                    pending_times,
+                    embeddings,
+                    pending_previews,
+                    strict=False,
+                )
+            )
+            pending_images.clear()
+            pending_previews.clear()
+            pending_times.clear()
+
+        def append_sample(frame: np.ndarray, target: float, native_index: int) -> None:
+            if native_index in seen_native_indices:
+                return
+            seen_native_indices.add(native_index)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image = Image.fromarray(rgb)
+            pending_images.append(image)
+            pending_previews.append(ImageOps.contain(image, (384, 384)))
+            pending_times.append(target)
+            if len(pending_images) >= 64:
+                flush()
+
+        previous_frame: np.ndarray | None = None
+        previous_pts: float | None = None
+        previous_small: np.ndarray | None = None
+        previous_index = 0
+        frame_index = 0
+        last_pts = 0.0
+        try:
+            native_fps = cap.get(cv2.CAP_PROP_FPS)
+            if not native_fps or native_fps <= 0:
+                native_fps = 30.0
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                raw_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+                pts = (
+                    float(raw_ms) / 1000.0
+                    if math.isfinite(raw_ms) and raw_ms >= 0.0
+                    else frame_index / native_fps
+                )
+                if previous_pts is not None and pts <= previous_pts + 1e-9:
+                    pts = max(frame_index / native_fps, previous_pts + 1.0 / native_fps)
+                last_pts = pts
+
+                small = cv2.cvtColor(
+                    cv2.resize(frame, (64, 64), interpolation=cv2.INTER_AREA),
+                    cv2.COLOR_BGR2GRAY,
+                )
+                if previous_small is not None:
+                    diff_times.append(pts)
+                    diffs.append(
+                        float(
+                            np.mean(
+                                np.abs(
+                                    small.astype(np.int16)
+                                    - previous_small.astype(np.int16)
+                                )
+                            )
+                        )
+                    )
+
+                if previous_frame is None or previous_pts is None:
+                    while target_pos < len(targets) and targets[target_pos] <= pts + 1e-9:
+                        append_sample(frame, targets[target_pos], frame_index)
+                        target_pos += 1
+                else:
+                    midpoint = 0.5 * (previous_pts + pts)
+                    while target_pos < len(targets) and targets[target_pos] <= midpoint + 1e-9:
+                        append_sample(
+                            previous_frame,
+                            targets[target_pos],
+                            previous_index,
+                        )
+                        target_pos += 1
+
+                previous_frame = frame
+                previous_pts = pts
+                previous_small = small
+                previous_index = frame_index
+                frame_index += 1
+
+            if previous_frame is not None:
+                while target_pos < len(targets) and targets[target_pos] <= last_pts + 1e-9:
+                    append_sample(previous_frame, targets[target_pos], previous_index)
+                    target_pos += 1
+            flush()
+        finally:
+            cap.release()
+        samples.sort(key=lambda item: item.t_query)
+        duration = scenes.scenes[-1].end_time if scenes.scenes else last_pts
+        return samples, diff_times, diffs, float(duration)
+
+    @classmethod
+    def _retrieve(
+        cls,
+        samples: list[QueryFrame],
+        anime_name: str | None,
+    ) -> list[list[RetrievalCandidate]]:
+        processor = AnimeMatcherService._query_processor
+        if processor is None or not samples:
+            return [[] for _ in samples]
+        embeddings = np.stack([sample.embedding for sample in samples]).astype(
+            np.float32, copy=False
+        )
+        started = time.perf_counter()
+        raw = processor.index_manager.search_batch(
+            embeddings, RETRIEVAL_TOP_K, None, series=anime_name
+        )
+        AnimeMatcherService._record_runtime_stat(
+            "faiss_search_seconds", time.perf_counter() - started
+        )
+        AnimeMatcherService._record_runtime_stat("faiss_search_queries", len(samples))
+        output: list[list[RetrievalCandidate]] = []
+        for sample_index, (sample, values) in enumerate(zip(samples, raw, strict=False)):
+            candidates = [
+                RetrievalCandidate(
+                    sample_index=sample_index,
+                    t_query=sample.t_query,
+                    episode=metadata.episode,
+                    t_source=float(metadata.timestamp),
+                    similarity=float(similarity),
+                    series=metadata.series,
+                    rank=rank,
+                    variant_id=sample.variant_id,
+                )
+                for rank, (similarity, metadata) in enumerate(values)
+                if float(similarity) >= 0.20
+            ]
+            output.append(cls._dedupe_candidates(candidates))
+        return output
+
+    @staticmethod
+    def _dedupe_candidates(
+        candidates: list[RetrievalCandidate],
+    ) -> list[RetrievalCandidate]:
+        deduped: dict[tuple[str, int], RetrievalCandidate] = {}
+        for candidate in candidates:
+            key = (candidate.episode, round(candidate.t_source * 2.0))
+            previous = deduped.get(key)
+            if previous is None or candidate.similarity > previous.similarity:
+                deduped[key] = candidate
+        return sorted(
+            deduped.values(), key=lambda item: item.similarity, reverse=True
+        )[:RETRIEVAL_TOP_K]
+
+    @staticmethod
+    def _strong_diff_boundaries(
+        diff_times: list[float], diffs: list[float]
+    ) -> list[float]:
+        if not diff_times or len(diff_times) != len(diffs):
+            return []
+        values = np.asarray(diffs, dtype=np.float32)
+        if len(diff_times) > 1:
+            step = max(1e-3, float(np.median(np.diff(diff_times))))
+        else:
+            step = 1.0 / 30.0
+        radius = max(3, int(round(0.5 / step)))
+        result: list[float] = []
+        for index in range(2, len(values) - 2):
+            value = float(values[index])
+            lo = max(0, index - radius)
+            hi = min(len(values), index + radius + 1)
+            local = values[lo:hi]
+            local_floor = float(np.median(local))
+            if (
+                value < max(12.0, 3.0 * local_floor)
+                or value < float(np.max(values[index - 2 : index + 3]))
+            ):
+                continue
+            timestamp = float(diff_times[index])
+            if not result or timestamp - result[-1] >= 0.12:
+                result.append(timestamp)
+            elif value > float(values[index - 1]):
+                result[-1] = timestamp
+        return result
+
+    @staticmethod
+    def _boundary_incentive(
+        timestamp: float,
+        detector_boundaries: list[float],
+        strong_boundaries: list[float],
+    ) -> float:
+        if strong_boundaries and min(abs(timestamp - value) for value in strong_boundaries) <= 0.30:
+            return 1.0
+        if detector_boundaries and min(abs(timestamp - value) for value in detector_boundaries) <= 0.30:
+            return 0.70
+        return 0.0
+
+    @staticmethod
+    def _start_state(
+        candidate: RetrievalCandidate,
+        *,
+        previous: _BeamState | None = None,
+        reset_penalty: float = 0.0,
+    ) -> _BeamState:
+        weight = max(0.05, candidate.similarity) ** 2
+        base_score = previous.score if previous is not None else 0.0
+        emission = 1.5 * (candidate.similarity - 0.20)
+        return _BeamState(
+            score=base_score + emission - reset_penalty,
+            path=(previous.path if previous else ()) + (candidate,),
+            breaks=(previous.breaks if previous else ()) + (True,),
+            episode=candidate.episode,
+            count=1,
+            sum_w=weight,
+            sum_t=weight * candidate.t_query,
+            sum_y=weight * candidate.t_source,
+            sum_tt=weight * candidate.t_query * candidate.t_query,
+            sum_ty=weight * candidate.t_query * candidate.t_source,
+            first_t=candidate.t_query,
+            first_y=candidate.t_source,
+            last_t=candidate.t_query,
+            last_y=candidate.t_source,
+        )
+
+    @classmethod
+    def _continue_state(
+        cls, state: _BeamState, candidate: RetrievalCandidate
+    ) -> _BeamState | None:
+        if state.episode != candidate.episode or candidate.t_query <= state.last_t:
+            return None
+        dt_total = candidate.t_query - state.first_t
+        dy_total = candidate.t_source - state.first_y
+        if dy_total < MIN_SOURCE_RATE * dt_total - 0.55:
+            return None
+        if dy_total > MAX_SOURCE_RATE * dt_total + 0.55:
+            return None
+
+        residual = 0.0
+        rate_penalty = 0.0
+        line = state.line
+        if line is not None:
+            a, b = line
+            residual = abs(candidate.t_source - (a * candidate.t_query + b))
+            if residual > TRACK_RESIDUAL_SECONDS:
+                return None
+            if a < MIN_SOURCE_RATE or a > MAX_SOURCE_RATE:
+                rate_penalty = 0.20
+            else:
+                rate_penalty = 0.18 * abs(math.log(max(a, 1e-6)))
+        elif dt_total > 1e-6:
+            coarse_rate = max(MIN_SOURCE_RATE, dy_total / dt_total)
+            rate_penalty = 0.12 * abs(math.log(coarse_rate))
+
+        weight = max(0.05, candidate.similarity) ** 2
+        emission = 1.5 * (candidate.similarity - 0.20)
+        return _BeamState(
+            score=state.score + emission + 0.30 - 0.45 * residual - rate_penalty,
+            path=state.path + (candidate,),
+            breaks=state.breaks + (False,),
+            episode=state.episode,
+            count=state.count + 1,
+            sum_w=state.sum_w + weight,
+            sum_t=state.sum_t + weight * candidate.t_query,
+            sum_y=state.sum_y + weight * candidate.t_source,
+            sum_tt=state.sum_tt + weight * candidate.t_query * candidate.t_query,
+            sum_ty=state.sum_ty + weight * candidate.t_query * candidate.t_source,
+            first_t=state.first_t,
+            first_y=state.first_y,
+            last_t=candidate.t_query,
+            last_y=candidate.t_source,
+        )
+
+    @classmethod
+    def _decode_beam(
+        cls,
+        samples: list[QueryFrame],
+        candidates: list[list[RetrievalCandidate]],
+        detector_boundaries: list[float],
+        strong_boundaries: list[float],
+    ) -> _BeamState:
+        if not samples:
+            return _BeamState(0.0, (), (), None, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+        first_values = candidates[0][:PRIMARY_TOP_K]
+        beam = [cls._start_state(value) for value in first_values]
+        beam.append(
+            _BeamState(-0.15, (None,), (True,), None, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        )
+        beam = sorted(beam, key=lambda item: item.score, reverse=True)[:BEAM_WIDTH]
+
+        for sample_index in range(1, len(samples)):
+            values = candidates[sample_index][:PRIMARY_TOP_K]
+            previous_best = max(beam, key=lambda item: item.score)
+            midpoint = 0.5 * (
+                samples[sample_index - 1].t_query + samples[sample_index].t_query
+            )
+            incentive = cls._boundary_incentive(
+                midpoint, detector_boundaries, strong_boundaries
+            )
+            # A native diff peak is affirmative cut evidence, not merely a
+            # weaker continuity penalty. Detector-only boundaries remain
+            # soft because they deliberately over-segment flashes/action.
+            if incentive >= 1.0:
+                reset_penalty = -0.05
+            elif incentive > 0.0:
+                reset_penalty = 0.05
+            else:
+                reset_penalty = 0.95
+            expanded: list[_BeamState] = []
+
+            for state in beam:
+                for candidate in values:
+                    continued = cls._continue_state(state, candidate)
+                    if continued is not None:
+                        expanded.append(continued)
+            for candidate in values:
+                expanded.append(
+                    cls._start_state(
+                        candidate,
+                        previous=previous_best,
+                        reset_penalty=reset_penalty,
+                    )
+                )
+            expanded.append(
+                _BeamState(
+                    score=previous_best.score - 0.18,
+                    path=previous_best.path + (None,),
+                    breaks=previous_best.breaks + (True,),
+                    episode=None,
+                    count=0,
+                    sum_w=0.0,
+                    sum_t=0.0,
+                    sum_y=0.0,
+                    sum_tt=0.0,
+                    sum_ty=0.0,
+                    first_t=samples[sample_index].t_query,
+                    first_y=0.0,
+                    last_t=samples[sample_index].t_query,
+                    last_y=0.0,
+                )
+            )
+
+            deduped: dict[tuple[Any, ...], _BeamState] = {}
+            for state in expanded:
+                last = state.path[-1]
+                line = state.line
+                key = (
+                    last.episode if last else None,
+                    round(last.t_source * 2) if last else -1,
+                    round(line[0] / 0.10) if line else -1,
+                    min(state.count, 6),
+                )
+                previous = deduped.get(key)
+                if previous is None or state.score > previous.score:
+                    deduped[key] = state
+            beam = sorted(
+                deduped.values(), key=lambda item: item.score, reverse=True
+            )[:BEAM_WIDTH]
+        return max(beam, key=lambda item: item.score)
+
+    @staticmethod
+    def _variant_sample_indices(
+        samples: list[QueryFrame],
+        candidates: list[list[RetrievalCandidate]],
+        state: _BeamState,
+    ) -> list[int]:
+        uncertain: list[tuple[float, int]] = []
+        for index, sample in enumerate(samples):
+            values = candidates[index]
+            selected = state.path[index] if index < len(state.path) else None
+            if selected is None:
+                uncertain.append((1.0, index))
+                continue
+            distinct = [
+                value
+                for value in values
+                if value.episode != selected.episode
+                or abs(value.t_source - selected.t_source) >= 2.0
+            ]
+            rival = distinct[0].similarity if distinct else 0.0
+            margin = selected.similarity - rival
+            if selected.similarity < 0.36 or margin < 0.04:
+                priority = (0.36 - selected.similarity) + max(0.0, 0.04 - margin)
+                uncertain.append((priority, index))
+        uncertain.sort(reverse=True)
+        # Keep the escalation spatially distributed rather than spending the
+        # whole allowance on adjacent samples from one difficult frame.
+        selected_indices: list[int] = []
+        for _, index in uncertain:
+            if any(abs(samples[index].t_query - samples[other].t_query) < 0.20 for other in selected_indices):
+                continue
+            selected_indices.append(index)
+        return selected_indices
+
+    @staticmethod
+    def _query_variants(image: Image.Image) -> list[tuple[str, Image.Image]]:
+        rgb = image.convert("RGB")
+        width, height = rgb.size
+        variants: list[tuple[str, Image.Image]] = []
+        landscape_height = min(height, int(round(width * 9.0 / 16.0)))
+        if landscape_height < height:
+            top = (height - landscape_height) // 2
+            variants.append(
+                ("center_landscape", rgb.crop((0, top, width, top + landscape_height)))
+            )
+        gray = np.asarray(ImageOps.grayscale(rgb))
+        row_energy = gray.mean(axis=1)
+        non_dark = np.where(row_energy > 8.0)[0]
+        if non_dark.size:
+            top = int(non_dark[0])
+            bottom = int(non_dark[-1]) + 1
+            if bottom - top >= height * 0.65 and (top > 2 or bottom < height - 2):
+                variants.append(("trim_bars", rgb.crop((0, top, width, bottom))))
+        if len(variants) < 2 and height > width:
+            wide_width = max(width, int(round(height * 16.0 / 9.0)))
+            background = ImageOps.fit(rgb, (wide_width, height)).filter(
+                ImageFilter.GaussianBlur(radius=max(2, width // 40))
+            )
+            background.paste(rgb, ((wide_width - width) // 2, 0))
+            variants.append(("wide_pad", ImageOps.contain(background, (384, 384))))
+        return variants[:2]
+
+    @classmethod
+    def _merge_variant_candidates(
+        cls,
+        base: list[list[RetrievalCandidate]],
+        variants: list[QueryFrame],
+        variant_to_sample: list[int],
+        anime_name: str | None,
+    ) -> None:
+        processor = AnimeMatcherService._query_processor
+        if processor is None or not variants:
+            return
+        embeddings = np.stack([frame.embedding for frame in variants]).astype(
+            np.float32, copy=False
+        )
+        started = time.perf_counter()
+        raw = processor.index_manager.search_batch(
+            embeddings, RETRIEVAL_TOP_K, None, series=anime_name
+        )
+        AnimeMatcherService._record_runtime_stat(
+            "faiss_search_seconds", time.perf_counter() - started
+        )
+        AnimeMatcherService._record_runtime_stat("faiss_search_queries", len(variants))
+        for frame, sample_index, values in zip(
+            variants, variant_to_sample, raw, strict=False
+        ):
+            extra = [
+                RetrievalCandidate(
+                    sample_index=sample_index,
+                    t_query=frame.t_query,
+                    episode=metadata.episode,
+                    t_source=float(metadata.timestamp),
+                    similarity=float(similarity),
+                    series=metadata.series,
+                    rank=rank,
+                    variant_id=frame.variant_id,
+                )
+                for rank, (similarity, metadata) in enumerate(values)
+                if float(similarity) >= 0.20
+            ]
+            base[sample_index] = cls._dedupe_candidates(base[sample_index] + extra)
+
+    @staticmethod
+    def _fit_points(
+        points: list[RetrievalCandidate],
+    ) -> tuple[float, float, float]:
+        if not points:
+            return 1.0, 0.0, 0.0
+        if len(points) == 1:
+            point = points[0]
+            return 1.0, point.t_source - point.t_query, 0.0
+        x = np.asarray([point.t_query for point in points], dtype=np.float64)
+        y = np.asarray([point.t_source for point in points], dtype=np.float64)
+        w = np.asarray(
+            [max(0.05, point.similarity) ** 2 for point in points],
+            dtype=np.float64,
+        )
+        a = 1.0
+        b = float(np.average(y - x, weights=w))
+        for _ in range(3):
+            residual = y - (a * x + b)
+            mask = np.abs(residual) <= TRACK_RESIDUAL_SECONDS
+            if int(mask.sum()) < 2:
+                break
+            xx, yy, ww = x[mask], y[mask], w[mask]
+            x_mean = float(np.average(xx, weights=ww))
+            y_mean = float(np.average(yy, weights=ww))
+            denom = float(np.sum(ww * (xx - x_mean) ** 2))
+            if denom > 1e-9:
+                a = float(np.sum(ww * (xx - x_mean) * (yy - y_mean)) / denom)
+                b = y_mean - a * x_mean
+        if not (MIN_SOURCE_RATE <= a <= MAX_SOURCE_RATE):
+            a = 1.0
+            b = float(np.average(y - x, weights=w))
+        residual = float(np.median(np.abs(y - (a * x + b))))
+        # Indexed timestamps live on a 0.5s grid. Free slopes can explain
+        # which side of that grid adjacent samples landed on while producing
+        # implausible 2-4x playback. Prefer real-time playback whenever it is
+        # statistically indistinguishable at the matching tolerance.
+        unit_b = float(np.average(y - x, weights=w))
+        unit_residual = float(np.median(np.abs(y - (x + unit_b))))
+        unit_equivalence_margin = 0.08 + 0.04 * abs(math.log(max(a, 1e-6)))
+        if unit_residual <= residual + unit_equivalence_margin:
+            a, b, residual = 1.0, unit_b, unit_residual
+        return a, b, residual
+
+    @staticmethod
+    def _snap_boundary(
+        timestamp: float,
+        detector_boundaries: list[float],
+        strong_boundaries: list[float],
+    ) -> float:
+        nearby_strong = [
+            value for value in strong_boundaries if abs(value - timestamp) <= 0.45
+        ]
+        if nearby_strong:
+            return min(nearby_strong, key=lambda value: abs(value - timestamp))
+        nearby_detector = [
+            value for value in detector_boundaries if abs(value - timestamp) <= 0.30
+        ]
+        if nearby_detector:
+            return min(nearby_detector, key=lambda value: abs(value - timestamp))
+        return timestamp
+
+    @classmethod
+    def _segments_from_state(
+        cls,
+        state: _BeamState,
+        samples: list[QueryFrame],
+        candidates: list[list[RetrievalCandidate]],
+        duration: float,
+        detector_boundaries: list[float],
+        strong_boundaries: list[float],
+    ) -> list[TrackSegment]:
+        if not samples:
+            return [TrackSegment(0.0, duration, None, uncertain=True, doubt_reasons=["no_samples"])]
+        groups: list[tuple[int, int, list[RetrievalCandidate]]] = []
+        start = 0
+        current: list[RetrievalCandidate] = []
+        for index, point in enumerate(state.path):
+            reset = index == 0 or state.breaks[index]
+            point_episode = point.episode if point else None
+            current_episode = current[-1].episode if current else None
+            if index > start and (reset or point_episode != current_episode):
+                groups.append((start, index - 1, current))
+                start = index
+                current = []
+            if point is not None:
+                current.append(point)
+        groups.append((start, len(samples) - 1, current))
+
+        raw_boundaries = [0.0]
+        for left, right in zip(groups, groups[1:], strict=False):
+            left_end = samples[left[1]].t_query
+            right_start = samples[right[0]].t_query
+            raw_boundaries.append(
+                cls._snap_boundary(
+                    0.5 * (left_end + right_start),
+                    detector_boundaries,
+                    strong_boundaries,
+                )
+            )
+        raw_boundaries.append(duration)
+
+        # Enforce monotone, non-empty intervals after snapping.
+        for index in range(1, len(raw_boundaries) - 1):
+            lower = raw_boundaries[index - 1] + 0.02
+            upper = raw_boundaries[index + 1] - 0.02
+            raw_boundaries[index] = min(max(raw_boundaries[index], lower), upper)
+
+        result: list[TrackSegment] = []
+        for group_index, (_, _, points) in enumerate(groups):
+            q_start = raw_boundaries[group_index]
+            q_end = raw_boundaries[group_index + 1]
+            if not points:
+                result.append(
+                    TrackSegment(
+                        q_start,
+                        q_end,
+                        None,
+                        uncertain=True,
+                        doubt_reasons=["no_evidence"],
+                    )
+                )
+                continue
+            a, b, residual = cls._fit_points(points)
+            confidence = float(np.median([point.similarity for point in points]))
+            support_expected = max(1, int(round((q_end - q_start) * BASE_SAMPLE_FPS)))
+            support_ratio = min(1.0, len(points) / support_expected)
+            reasons: list[str] = []
+            if confidence < 0.36:
+                reasons.append("weak_similarity")
+            if support_ratio < 0.50:
+                reasons.append("sparse_support")
+            if residual > 0.45:
+                reasons.append("timing_residual")
+            result.append(
+                TrackSegment(
+                    q_start=q_start,
+                    q_end=q_end,
+                    episode=points[0].episode,
+                    a=a,
+                    b=b,
+                    points=points,
+                    confidence=confidence,
+                    residual=residual,
+                    uncertain=bool(reasons),
+                    doubt_reasons=reasons,
+                )
+            )
+        for segment in result:
+            if segment.episode is None:
+                continue
+            midpoint = 0.5 * (segment.q_start + segment.q_end)
+            required_support = max(2, int(math.ceil(len(segment.points) * 0.30)))
+            for proposal in cls._line_proposals(segment, candidates, samples):
+                distinct = (
+                    proposal.episode != segment.episode
+                    or abs(proposal.source_at(midpoint) - segment.source_at(midpoint))
+                    >= 2.0
+                )
+                if (
+                    distinct
+                    and proposal.support >= required_support
+                    and proposal.confidence >= segment.confidence - 0.04
+                ):
+                    segment.uncertain = True
+                    segment.doubt_reasons.append("duplicate_margin")
+                    break
+        return result
+
+    @classmethod
+    def _proposal_for_interval(
+        cls,
+        parent: TrackSegment,
+        q_start: float,
+        q_end: float,
+        candidates: list[list[RetrievalCandidate]],
+        samples: list[QueryFrame],
+    ) -> LineProposal | None:
+        """Return a well-supported local line, excluding one-frame anchors."""
+        indices = [
+            index
+            for index, sample in enumerate(samples)
+            if q_start <= sample.t_query < q_end
+        ]
+        if len(indices) < 2:
+            return None
+        probe = TrackSegment(
+            q_start,
+            q_end,
+            parent.episode,
+            parent.a,
+            parent.b,
+            confidence=parent.confidence,
+        )
+        required = max(2, int(math.ceil(len(indices) * 0.35)))
+        supported = [
+            proposal
+            for proposal in cls._line_proposals(probe, candidates, samples)
+            if proposal.support >= required
+            and proposal.confidence >= max(0.32, parent.confidence - 0.10)
+        ]
+        return supported[0] if supported else None
+
+    @classmethod
+    def _segment_from_proposal(
+        cls,
+        parent: TrackSegment,
+        q_start: float,
+        q_end: float,
+        proposal: LineProposal,
+        candidates: list[list[RetrievalCandidate]],
+        samples: list[QueryFrame],
+    ) -> TrackSegment:
+        points: list[RetrievalCandidate] = []
+        for index, sample in enumerate(samples):
+            if not (q_start <= sample.t_query < q_end):
+                continue
+            nearby = [
+                candidate
+                for candidate in candidates[index]
+                if candidate.episode == proposal.episode
+                and abs(candidate.t_source - proposal.source_at(sample.t_query))
+                <= TRACK_RESIDUAL_SECONDS
+            ]
+            if nearby:
+                points.append(
+                    max(
+                        nearby,
+                        key=lambda candidate: candidate.similarity
+                        - 0.06
+                        * abs(
+                            candidate.t_source
+                            - proposal.source_at(sample.t_query)
+                        ),
+                    )
+                )
+        if len(points) >= 2:
+            a, b, residual = cls._fit_points(points)
+            confidence = float(np.median([point.similarity for point in points]))
+        else:
+            a, b, residual = proposal.a, proposal.b, 0.0
+            confidence = proposal.confidence
+        return TrackSegment(
+            q_start=q_start,
+            q_end=q_end,
+            episode=proposal.episode,
+            a=a,
+            b=b,
+            points=points,
+            confidence=confidence,
+            residual=residual,
+            uncertain=True,
+            doubt_reasons=sorted(
+                set(parent.doubt_reasons + ["detector_discontinuity"])
+            ),
+        )
+
+    @classmethod
+    def _line_evidence(
+        cls,
+        episode: str,
+        a: float,
+        b: float,
+        q_start: float,
+        q_end: float,
+        candidates: list[list[RetrievalCandidate]],
+        samples: list[QueryFrame],
+    ) -> tuple[int, float]:
+        similarities: list[float] = []
+        for index, sample in enumerate(samples):
+            if not (q_start <= sample.t_query < q_end):
+                continue
+            predicted = a * sample.t_query + b
+            supported = [
+                candidate.similarity
+                for candidate in candidates[index]
+                if candidate.episode == episode
+                and abs(candidate.t_source - predicted) <= TRACK_RESIDUAL_SECONDS
+            ]
+            if supported:
+                similarities.append(max(supported))
+        return len(similarities), (
+            float(np.median(similarities)) if similarities else 0.0
+        )
+
+    @classmethod
+    def _split_supported_discontinuities(
+        cls,
+        segments: list[TrackSegment],
+        detector_boundaries: list[float],
+        samples: list[QueryFrame],
+        candidates: list[list[RetrievalCandidate]],
+    ) -> list[TrackSegment]:
+        """Split only where both sides support incompatible source lines.
+
+        Detector cuts are deliberately over-complete. They do not force beam
+        resets; they provide bounded places at which two correspondence
+        clusters can prove a missed source-timeline jump.
+        """
+
+        def split_one(segment: TrackSegment, depth: int = 0) -> list[TrackSegment]:
+            if segment.episode is None or depth >= 8:
+                return [segment]
+            choices: list[tuple[float, float, LineProposal, LineProposal]] = []
+            for boundary in detector_boundaries:
+                if (
+                    boundary - segment.q_start < 0.55
+                    or segment.q_end - boundary < 0.55
+                ):
+                    continue
+                left = cls._proposal_for_interval(
+                    segment,
+                    max(segment.q_start, boundary - 2.5),
+                    boundary,
+                    candidates,
+                    samples,
+                )
+                right = cls._proposal_for_interval(
+                    segment,
+                    boundary,
+                    min(segment.q_end, boundary + 2.5),
+                    candidates,
+                    samples,
+                )
+                if left is None or right is None:
+                    continue
+                if left.episode != right.episode:
+                    discontinuity = 100.0
+                else:
+                    discontinuity = abs(
+                        right.source_at(boundary) - left.source_at(boundary)
+                    )
+                if discontinuity <= TRACK_RESIDUAL_SECONDS:
+                    continue
+
+                parent_source = segment.source_at(boundary)
+                left_distance = (
+                    abs(left.source_at(boundary) - parent_source)
+                    if left.episode == segment.episode
+                    else 100.0
+                )
+                right_distance = (
+                    abs(right.source_at(boundary) - parent_source)
+                    if right.episode == segment.episode
+                    else 100.0
+                )
+                # One side must explain the current beam track. This rejects
+                # unrelated high-scoring duplicate clusters on both sides.
+                if min(left_distance, right_distance) > TRACK_RESIDUAL_SECONDS:
+                    continue
+                far = right if right_distance >= left_distance else left
+                far_start, far_end = (
+                    (boundary, min(segment.q_end, boundary + 2.5))
+                    if far is right
+                    else (max(segment.q_start, boundary - 2.5), boundary)
+                )
+                far_support, far_similarity = cls._line_evidence(
+                    far.episode,
+                    far.a,
+                    far.b,
+                    far_start,
+                    far_end,
+                    candidates,
+                    samples,
+                )
+                parent_support, parent_similarity = cls._line_evidence(
+                    segment.episode,
+                    segment.a,
+                    segment.b,
+                    far_start,
+                    far_end,
+                    candidates,
+                    samples,
+                )
+                interval_samples = sum(
+                    far_start <= sample.t_query < far_end for sample in samples
+                )
+                required = max(2, int(math.ceil(interval_samples * 0.35)))
+                if far_support < required:
+                    continue
+                # When the beam's line remains well supported, a competing
+                # duplicate must win by a real similarity margin. This keeps
+                # ordinary detector cuts continuous.
+                if (
+                    parent_support >= required
+                    and far_similarity < parent_similarity + 0.035
+                    and far.confidence < segment.confidence + 0.07
+                ):
+                    continue
+                if far_similarity < segment.confidence - 0.04:
+                    continue
+                evidence = discontinuity + 0.25 * (
+                    left.confidence + right.confidence + far_similarity
+                )
+                choices.append((evidence, boundary, left, right))
+
+            if not choices:
+                return [segment]
+            _, boundary, left, right = max(choices, key=lambda value: value[0])
+            left_segment = cls._segment_from_proposal(
+                segment,
+                segment.q_start,
+                boundary,
+                left,
+                candidates,
+                samples,
+            )
+            right_segment = cls._segment_from_proposal(
+                segment,
+                boundary,
+                segment.q_end,
+                right,
+                candidates,
+                samples,
+            )
+            return split_one(left_segment, depth + 1) + split_one(
+                right_segment, depth + 1
+            )
+
+        output: list[TrackSegment] = []
+        for segment in segments:
+            output.extend(split_one(segment))
+        return output
+
+    @classmethod
+    def _promote_dominant_proposals(
+        cls,
+        segments: list[TrackSegment],
+        candidates: list[list[RetrievalCandidate]],
+        samples: list[QueryFrame],
+    ) -> list[TrackSegment]:
+        """Let broad top-60 consensus correct a weaker top-20 beam line."""
+        output: list[TrackSegment] = []
+        for segment in segments:
+            if segment.episode is None:
+                output.append(segment)
+                continue
+            proposals = cls._line_proposals(segment, candidates, samples)
+            if not proposals:
+                output.append(segment)
+                continue
+            proposal = proposals[0]
+            midpoint = 0.5 * (segment.q_start + segment.q_end)
+            distinct = (
+                proposal.episode != segment.episode
+                or abs(proposal.source_at(midpoint) - segment.source_at(midpoint))
+                >= 2.0
+            )
+            required = max(3, int(math.ceil(len(segment.points) * 0.80)))
+            if (
+                distinct
+                and proposal.support >= required
+                and proposal.confidence >= segment.confidence + 0.05
+            ):
+                promoted = cls._segment_from_proposal(
+                    segment,
+                    segment.q_start,
+                    segment.q_end,
+                    proposal,
+                    candidates,
+                    samples,
+                )
+                promoted.doubt_reasons = sorted(
+                    set(promoted.doubt_reasons + ["dominant_retrieval"])
+                )
+                output.append(promoted)
+            else:
+                output.append(segment)
+        return output
+
+    @classmethod
+    def _merge_continuous_segments(
+        cls, segments: list[TrackSegment]
+    ) -> list[TrackSegment]:
+        merged: list[TrackSegment] = []
+        for segment in segments:
+            if not merged:
+                merged.append(segment)
+                continue
+            previous = merged[-1]
+            if previous.episode is None and segment.episode is None:
+                previous.q_end = segment.q_end
+                previous.doubt_reasons = sorted(
+                    set(previous.doubt_reasons + segment.doubt_reasons)
+                )
+                continue
+            if previous.episode is None or previous.episode != segment.episode:
+                merged.append(segment)
+                continue
+            boundary = segment.q_start
+            source_gap = segment.source_at(boundary) - previous.source_at(boundary)
+            if abs(source_gap) > TRACK_RESIDUAL_SECONDS or abs(segment.a - previous.a) > 0.60:
+                merged.append(segment)
+                continue
+            points = previous.points + segment.points
+            if points:
+                a, b, residual = cls._fit_points(points)
+                confidence = float(
+                    np.median([point.similarity for point in points])
+                )
+            else:
+                a = 0.5 * (previous.a + segment.a)
+                b = 0.5 * (previous.b + segment.b)
+                residual = max(previous.residual, segment.residual)
+                confidence = min(previous.confidence, segment.confidence)
+            merged[-1] = TrackSegment(
+                q_start=previous.q_start,
+                q_end=segment.q_end,
+                episode=previous.episode,
+                a=a,
+                b=b,
+                points=points,
+                confidence=confidence,
+                residual=residual,
+                uncertain=previous.uncertain or segment.uncertain,
+                doubt_reasons=sorted(
+                    set(previous.doubt_reasons + segment.doubt_reasons)
+                ),
+            )
+        return merged
+
+    @staticmethod
+    def _absorb_tiny_segments(
+        segments: list[TrackSegment], minimum_duration: float = 0.35
+    ) -> list[TrackSegment]:
+        """Remove snap-created slivers without erasing real short edits."""
+        result = list(segments)
+        index = 0
+        while len(result) > 1 and index < len(result):
+            segment = result[index]
+            if segment.q_end - segment.q_start >= minimum_duration:
+                index += 1
+                continue
+            if index + 1 < len(result):
+                result[index + 1].q_start = segment.q_start
+                result[index + 1].doubt_reasons = sorted(
+                    set(result[index + 1].doubt_reasons + segment.doubt_reasons)
+                )
+                result.pop(index)
+                continue
+            result[index - 1].q_end = segment.q_end
+            result[index - 1].doubt_reasons = sorted(
+                set(result[index - 1].doubt_reasons + segment.doubt_reasons)
+            )
+            result.pop(index)
+            index = max(0, index - 1)
+        return result
+
+    @classmethod
+    def _line_proposals(
+        cls,
+        segment: TrackSegment,
+        candidates: list[list[RetrievalCandidate]],
+        samples: list[QueryFrame],
+    ) -> list[LineProposal]:
+        if segment.q_end <= segment.q_start:
+            return []
+        sample_indices = [
+            index
+            for index, sample in enumerate(samples)
+            if segment.q_start <= sample.t_query < segment.q_end
+        ]
+        rate = segment.a if segment.episode else 1.0
+        clusters: dict[tuple[str, int], list[RetrievalCandidate]] = {}
+        # Internal retrieval clusters stay fine-grained enough for native
+        # duplicate arbitration. The UI applies its broader scene-duration
+        # separation later when choosing diverse alternatives.
+        separation = 2.0
+        for index in sample_indices:
+            for candidate in candidates[index]:
+                offset = candidate.t_source - rate * candidate.t_query
+                key = (candidate.episode, round(offset / separation))
+                clusters.setdefault(key, []).append(candidate)
+        proposals: list[LineProposal] = []
+        for values in clusters.values():
+            distinct_times = {round(value.t_query, 3) for value in values}
+            if not distinct_times:
+                continue
+            weights = np.asarray(
+                [max(0.05, value.similarity) ** 2 for value in values]
+            )
+            offsets = np.asarray(
+                [value.t_source - rate * value.t_query for value in values]
+            )
+            proposals.append(
+                LineProposal(
+                    episode=values[0].episode,
+                    a=rate,
+                    b=float(np.average(offsets, weights=weights)),
+                    confidence=float(max(value.similarity for value in values)),
+                    support=len(distinct_times),
+                    algorithm=(
+                        "crop_variant"
+                        if any(value.variant_id != "plain" for value in values)
+                        else "timeline_cluster"
+                    ),
+                )
+            )
+
+        for label, target in (
+            ("start_anchor", segment.q_start),
+            ("middle_anchor", 0.5 * (segment.q_start + segment.q_end)),
+            ("end_anchor", segment.q_end),
+        ):
+            if not sample_indices:
+                continue
+            index = min(
+                sample_indices,
+                key=lambda value: abs(samples[value].t_query - target),
+            )
+            if candidates[index]:
+                candidate = candidates[index][0]
+                proposals.append(
+                    LineProposal(
+                        candidate.episode,
+                        rate,
+                        candidate.t_source - rate * candidate.t_query,
+                        candidate.similarity,
+                        1,
+                        label,
+                    )
+                )
+
+        proposals.sort(
+            key=lambda value: (
+                min(value.support, 8) * 0.05 + value.confidence,
+                value.support,
+            ),
+            reverse=True,
+        )
+        deduped: list[LineProposal] = []
+        for proposal in proposals:
+            midpoint = proposal.source_at(0.5 * (segment.q_start + segment.q_end))
+            if any(
+                other.episode == proposal.episode
+                and abs(
+                    other.source_at(0.5 * (segment.q_start + segment.q_end))
+                    - midpoint
+                )
+                < separation
+                for other in deduped
+            ):
+                continue
+            deduped.append(proposal)
+        return deduped[: MAX_ALTERNATIVES + 2]
+
+    @classmethod
+    def _verify_ambiguous_segments(
+        cls,
+        segments: list[TrackSegment],
+        samples: list[QueryFrame],
+        candidates: list[list[RetrievalCandidate]],
+        library_type: LibraryType | str,
+        duration: float,
+    ) -> float:
+        """Use a capped amount of consolidated source decode to arbitrate a bounded track.
+
+        The return value is decoded source-window duration, the deterministic
+        work unit used by the evaluator.
+        """
+        from .anime_library import AnimeLibraryService
+
+        budget = min(24.0, max(8.0, 0.15 * duration))
+        jobs: list[tuple[float, int, QueryFrame, list[LineProposal]]] = []
+        for segment_index, segment in enumerate(segments):
+            if segment.episode is None or not segment.uncertain:
+                continue
+            proposals = [
+                LineProposal(
+                    segment.episode,
+                    segment.a,
+                    segment.b,
+                    segment.confidence,
+                    len(segment.points),
+                    "primary",
+                )
+            ]
+            for proposal in cls._line_proposals(segment, candidates, samples):
+                mid = 0.5 * (segment.q_start + segment.q_end)
+                if (
+                    proposal.episode != segment.episode
+                    or abs(proposal.source_at(mid) - segment.source_at(mid)) >= 2.0
+                ):
+                    proposals.append(proposal)
+                    break
+            query = min(
+                samples,
+                key=lambda value: abs(
+                    value.t_query - 0.5 * (segment.q_start + segment.q_end)
+                ),
+            )
+            priority = (segment.q_end - segment.q_start) * (
+                1.0 + max(0.0, 0.40 - segment.confidence)
+            )
+            jobs.append((priority, segment_index, query, proposals[:2]))
+        jobs.sort(reverse=True, key=lambda value: value[0])
+
+        accepted: list[tuple[int, QueryFrame, list[LineProposal]]] = []
+        windows: dict[str, list[tuple[float, float]]] = {}
+        used = 0.0
+        for _, segment_index, query, proposals in jobs:
+            requested = []
+            for proposal in proposals:
+                predicted = proposal.source_at(query.t_query)
+                requested.append((proposal.episode, max(0.0, predicted - 0.75), predicted + 0.75))
+            incremental = sum(end - start for _, start, end in requested)
+            if used + incremental > budget:
+                segments[segment_index].doubt_reasons.append("verification_budget")
+                continue
+            used += incremental
+            accepted.append((segment_index, query, proposals))
+            for episode, start, end in requested:
+                windows.setdefault(episode, []).append((start, end))
+
+        embedded_windows: dict[
+            str, list[tuple[float, np.ndarray, Image.Image]]
+        ] = {}
+        actual_decoded_duration = 0.0
+        for episode, episode_windows in windows.items():
+            path = AnimeLibraryService.resolve_episode_path(
+                episode, library_type=library_type
+            )
+            if path is None or not path.exists():
+                continue
+            merged_windows: list[list[float]] = []
+            for start, end in sorted(episode_windows):
+                if merged_windows and start <= merged_windows[-1][1] + 0.10:
+                    merged_windows[-1][1] = max(merged_windows[-1][1], end)
+                else:
+                    merged_windows.append([start, end])
+            cap = AnimeMatcherService._open_source_capture(path)
+            frames: list[tuple[float, Image.Image]] = []
+            try:
+                for start, end in merged_windows:
+                    actual_decoded_duration += end - start
+                    frames.extend(
+                        AnimeMatcherService._collect_frames_in_window_from_capture(
+                            cap,
+                            start,
+                            end,
+                            max_frames=max(4, int(math.ceil((end - start) * 65)) + 4),
+                            sample_frames=max(3, int(math.ceil((end - start) * VERIFY_FPS)) + 1),
+                        )
+                    )
+            finally:
+                cap.release()
+            if frames:
+                embeddings = AnimeMatcherService._embed_pil_batch(
+                    [image.convert("RGB") for _, image in frames]
+                )
+                embedded_windows[episode] = [
+                    (timestamp, embedding, image)
+                    for (timestamp, image), embedding in zip(
+                        frames, embeddings, strict=False
+                    )
+                ]
+
+        for segment_index, query, proposals in accepted:
+            scores: list[float] = []
+            for proposal in proposals:
+                predicted = proposal.source_at(query.t_query)
+                frames = embedded_windows.get(proposal.episode, [])
+                local = [
+                    (timestamp, embedding, image)
+                    for timestamp, embedding, image in frames
+                    if abs(timestamp - predicted) <= 0.80
+                ]
+                score = (
+                    max(float(embedding @ query.embedding) for _, embedding, _ in local)
+                    if local
+                    else -1.0
+                )
+                # Registration is paid only for the two arbitration tracks
+                # already admitted by the deterministic source-duration
+                # budget. It preserves the legacy matcher’s useful geometric
+                # duplicate signal without restoring its unbounded tail.
+                if local and query.preview is not None:
+                    try:
+                        from .scene_aligner import SceneAlignerService
+
+                        query_gray = SceneAlignerService._small_gray(query.preview)
+                        registered: list[Image.Image] = []
+                        for _, _, image in sorted(
+                            local, key=lambda value: abs(value[0] - predicted)
+                        )[:2]:
+                            rect = SceneAlignerService._footprint_rect(
+                                query_gray,
+                                SceneAlignerService._small_gray(image),
+                            )
+                            if rect is not None:
+                                registered.append(
+                                    SceneAlignerService._zoom_crop(image, rect).convert("RGB")
+                                )
+                        if registered:
+                            registered_embeddings = AnimeMatcherService._embed_pil_batch(
+                                registered
+                            )
+                            score = max(
+                                score,
+                                max(
+                                    float(embedding @ query.embedding)
+                                    for embedding in registered_embeddings
+                                ),
+                            )
+                    except Exception:
+                        pass
+                scores.append(score)
+            if not scores:
+                continue
+            best_index = int(np.argmax(scores))
+            segment = segments[segment_index]
+            switch_margin = (
+                0.15
+                if "dominant_retrieval" in segment.doubt_reasons
+                else 0.05
+            )
+            if (
+                best_index > 0
+                and scores[best_index] >= scores[0] + switch_margin
+            ):
+                winner = proposals[best_index]
+                segment.episode = winner.episode
+                segment.a = winner.a
+                segment.b = winner.b
+                segment.confidence = max(segment.confidence, scores[best_index])
+                segment.doubt_reasons.append("native_alternative")
+            elif scores[best_index] < 0.28:
+                segment.episode = None
+                segment.doubt_reasons.append("native_rejected")
+            else:
+                segment.confidence = max(segment.confidence, scores[best_index])
+                segment.uncertain = False
+        return actual_decoded_duration
+
+    @staticmethod
+    def _nearest_match_candidates(
+        timestamp: float,
+        samples: list[QueryFrame],
+        candidates: list[list[RetrievalCandidate]],
+    ) -> list[MatchCandidate]:
+        if not samples:
+            return []
+        index = min(
+            range(len(samples)),
+            key=lambda value: abs(samples[value].t_query - timestamp),
+        )
+        return [
+            MatchCandidate(
+                episode=value.episode,
+                timestamp=value.t_source,
+                similarity=value.similarity,
+                series=value.series,
+            )
+            for value in candidates[index][:RETRIEVAL_TOP_K]
+        ]
+
+    @classmethod
+    def _build_output(
+        cls,
+        segments: list[TrackSegment],
+        samples: list[QueryFrame],
+        candidates: list[list[RetrievalCandidate]],
+    ) -> tuple[SceneList, MatchList]:
+        scene_list = SceneList()
+        match_list = MatchList()
+        for index, segment in enumerate(segments):
+            scene = Scene(index=index, start_time=segment.q_start, end_time=segment.q_end)
+            scene_list.scenes.append(scene)
+            start_candidates = cls._nearest_match_candidates(
+                segment.q_start, samples, candidates
+            )
+            middle_candidates = cls._nearest_match_candidates(
+                0.5 * (segment.q_start + segment.q_end), samples, candidates
+            )
+            end_candidates = cls._nearest_match_candidates(
+                max(segment.q_start, segment.q_end - 1e-3), samples, candidates
+            )
+            proposals = cls._line_proposals(segment, candidates, samples)
+            alternatives: list[AlternativeMatch] = []
+            primary_mid = (
+                segment.source_at(0.5 * (segment.q_start + segment.q_end))
+                if segment.episode
+                else None
+            )
+            separation = max(2.0, scene.duration)
+            for proposal in proposals:
+                proposal_mid = proposal.source_at(
+                    0.5 * (segment.q_start + segment.q_end)
+                )
+                if (
+                    segment.episode
+                    and proposal.episode == segment.episode
+                    and primary_mid is not None
+                    and abs(proposal_mid - primary_mid) < separation
+                    and len(proposals) > 1
+                ):
+                    continue
+                source_start = max(0.0, proposal.source_at(segment.q_start))
+                source_end = max(source_start + 1e-3, proposal.source_at(segment.q_end))
+                alternatives.append(
+                    AlternativeMatch(
+                        episode=proposal.episode,
+                        start_time=source_start,
+                        end_time=source_end,
+                        confidence=float(np.clip(proposal.confidence, 0.0, 1.0)),
+                        speed_ratio=scene.duration / max(1e-6, source_end - source_start),
+                        vote_count=proposal.support,
+                        algorithm=proposal.algorithm,
+                    )
+                )
+                if len(alternatives) >= MAX_ALTERNATIVES:
+                    break
+
+            if segment.episode is None:
+                match_list.matches.append(
+                    SceneMatch(
+                        scene_index=index,
+                        episode="",
+                        start_time=0.0,
+                        end_time=0.0,
+                        confidence=0.0,
+                        speed_ratio=1.0,
+                        was_no_match=True,
+                        doubt_reasons=sorted(set(segment.doubt_reasons)),
+                        alternatives=alternatives,
+                        start_candidates=start_candidates,
+                        middle_candidates=middle_candidates,
+                        end_candidates=end_candidates,
+                    )
+                )
+                continue
+            source_start = max(0.0, segment.source_at(segment.q_start))
+            source_end = max(source_start + 1e-3, segment.source_at(segment.q_end))
+            match_list.matches.append(
+                SceneMatch(
+                    scene_index=index,
+                    episode=segment.episode,
+                    start_time=source_start,
+                    end_time=source_end,
+                    confidence=float(np.clip(segment.confidence, 0.0, 1.0)),
+                    speed_ratio=scene.duration / max(1e-6, source_end - source_start),
+                    was_no_match=False,
+                    doubt_reasons=sorted(set(segment.doubt_reasons)),
+                    alternatives=alternatives,
+                    start_candidates=start_candidates,
+                    middle_candidates=middle_candidates,
+                    end_candidates=end_candidates,
+                )
+            )
+        scene_list.renumber()
+        return scene_list, match_list

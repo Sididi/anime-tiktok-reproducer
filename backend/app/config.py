@@ -52,6 +52,12 @@ class Settings(BaseSettings):
     match_playback_max_workers_per_episode: int = 1
     min_playback_speed_factor: float = 0.75
 
+    # Original matcher compatibility switch.  ATR_MATCHER_V2=1 selects the
+    # old matcher; unset/0 selects the bounded hierarchical matcher.  This is
+    # intentionally kept in application settings so values from .env are
+    # available to feature code; pydantic's env_file does not mutate os.environ.
+    matcher_v2: bool = False
+
     # TikTok server (VPS) integration — replaces previous Discord webhook
     tiktok_server_base_url: str | None = None
     # Internal API base for /api/internal/jobs/* (planning/reschedule path).

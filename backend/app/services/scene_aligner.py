@@ -120,6 +120,7 @@ class AlignmentDiagnostics:
     decoded_fragments: list[dict[str, object]] = field(default_factory=list)
     decoded_candidates: list[dict[str, object]] = field(default_factory=list)
     stage4_attempts: list[dict[str, object]] = field(default_factory=list)
+    counters: dict[str, float] = field(default_factory=dict)
 
     def stats(self) -> dict[str, float]:
         result = {
@@ -142,6 +143,9 @@ class AlignmentDiagnostics:
             )
         for name, seconds in self.phase_timings.items():
             result[f"aligner_{name}_seconds"] = seconds
+        result.update(
+            {f"aligner_v2_{name}": value for name, value in self.counters.items()}
+        )
         return result
 
 
@@ -726,7 +730,20 @@ class SceneAlignerService:
             )
             return
 
-        yield MatchProgress("matching", 0.05, "Building dense correspondences...", 0, total)
+        from .fast_matching import bounded_matcher_enabled
+
+        matcher_label = (
+            "bounded hierarchical matcher"
+            if bounded_matcher_enabled()
+            else "legacy V2 matcher"
+        )
+        yield MatchProgress(
+            "matching",
+            0.05,
+            f"Building dense correspondences ({matcher_label})...",
+            0,
+            total,
+        )
         result = await loop.run_in_executor(
             None,
             cls.align_scenes_sync,
@@ -752,6 +769,52 @@ class SceneAlignerService:
         library_type: LibraryType | str,
         anime_name: str | None = None,
     ) -> AlignmentResult:
+        # The bounded matcher is the default route-compatible implementation.
+        # ATR_MATCHER_V2=1 selects the old implementation as an emergency
+        # compatibility escape hatch.
+        from .fast_matching import matcher_v2_enabled
+
+        use_legacy_v2 = matcher_v2_enabled()
+        flag_source = (
+            "process environment"
+            if os.environ.get("ATR_MATCHER_V2") is not None
+            else "application settings/.env"
+        )
+        logger.info(
+            "Scene alignment matcher selected: %s (effective ATR_MATCHER_V2=%s, source=%s)",
+            "legacy-v2" if use_legacy_v2 else "bounded-default",
+            int(use_legacy_v2),
+            flag_source,
+        )
+
+        if not use_legacy_v2:
+            from .hierarchical_matcher import HierarchicalMatcherService
+
+            v2_result = HierarchicalMatcherService.align_scenes_sync(
+                video_path,
+                scenes,
+                library_type,
+                anime_name,
+            )
+            diagnostics = AlignmentDiagnostics(
+                sample_count=v2_result.diagnostics.sample_count,
+                correspondence_count=v2_result.diagnostics.correspondence_count,
+                segment_count=v2_result.diagnostics.segment_count,
+                weak_variant_sample_count=(
+                    v2_result.diagnostics.weak_variant_sample_count
+                ),
+                phase_timings=dict(v2_result.diagnostics.phase_timings),
+                counters=dict(v2_result.diagnostics.counters),
+            )
+            cls._last_diagnostics = diagnostics
+            result = AlignmentResult(
+                v2_result.scenes,
+                v2_result.matches,
+                diagnostics,
+            )
+            cls._last_result = result
+            return result
+
         diagnostics = AlignmentDiagnostics()
         started = time.perf_counter()
 
