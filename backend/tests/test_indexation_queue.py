@@ -246,3 +246,106 @@ async def test_cancelled_multi_slot_acquire_releases_partial() -> None:
     assert service.available_heavy_slots() == service.MAX_CONCURRENT - 1
     service.release_heavy_slot("indexation")
     assert service.available_heavy_slots() == service.MAX_CONCURRENT
+
+
+@pytest.mark.asyncio
+async def test_publish_progress_spans_and_phase_flips(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Indexing owns 0→0.90 of the bar; hashing maps to 0.90→0.93 and the
+    upload byte snapshots to 0.93→0.995, with phases flipped by the callbacks
+    themselves (no hard-coded pins)."""
+    import asyncio
+
+    from app.services.storage_box_progress import ProgressSnapshot
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+
+    service = IndexationQueueService()
+    job = IndexationJob(
+        job_type="index",
+        source_name="Sakamoto Days",
+        library_type=LibraryType.ANIME,
+        source_path=str(source_dir),
+    )
+
+    observed: dict[str, Any] = {}
+
+    async def fake_index_anime(**kwargs: Any):
+        yield IndexProgress(
+            status="indexing",
+            progress=0.5,
+            anime_name="Sakamoto Days",
+        )
+        observed["progress_mid_indexing"] = job.progress
+        yield IndexProgress(
+            status="complete",
+            progress=1.0,
+            anime_name="Sakamoto Days",
+        )
+
+    async def fake_publish_series_release(**kwargs: Any) -> dict[str, Any]:
+        observed["phase_at_publish"] = job.phase
+        observed["progress_at_publish"] = job.progress
+
+        hashing = kwargs["hashing_progress_callback"]
+        hashing(0, 100)
+        hashing(50, 100)
+        await asyncio.sleep(0)  # run the call_soon_threadsafe callbacks
+        observed["progress_after_hashing"] = job.progress
+        observed["phase_after_hashing"] = job.phase
+
+        progress_callback = kwargs["progress_callback"]
+        await progress_callback(
+            ProgressSnapshot(
+                bytes_transferred=500,
+                bytes_total=1000,
+                mib_per_sec=12.5,
+                eta_seconds=40.0,
+                active_transfers=2,
+            )
+        )
+        observed["progress_mid_upload"] = job.progress
+        observed["phase_mid_upload"] = job.phase
+        observed["network_mid_upload"] = (
+            job.network_bytes_transferred,
+            job.network_bytes_total,
+            job.network_mib_per_sec,
+        )
+        return {"series_id": "series-1", "release_id": "release-1"}
+
+    async def fake_link_torrents(
+        self: IndexationQueueService,
+        inner_job: IndexationJob,
+    ) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "app.services.indexation_queue.AnimeLibraryService.index_anime",
+        fake_index_anime,
+    )
+    monkeypatch.setattr(
+        "app.services.indexation_queue.LibraryHydrationService.publish_series_release",
+        fake_publish_series_release,
+    )
+    monkeypatch.setattr(IndexationQueueService, "_link_torrents", fake_link_torrents)
+    monkeypatch.setattr(
+        "app.services.indexation_queue.AnimeMatcherService.mark_series_updated",
+        lambda *args, **kwargs: None,
+    )
+
+    await service._run_job(job)
+
+    assert job.status == "complete"
+    assert observed["progress_mid_indexing"] == pytest.approx(0.45)  # 0.5 * 0.90
+    assert observed["phase_at_publish"] == "package_release"
+    assert observed["progress_at_publish"] == pytest.approx(0.90)
+    assert observed["progress_after_hashing"] == pytest.approx(0.915)
+    assert observed["phase_after_hashing"] == "package_release"
+    assert observed["progress_mid_upload"] == pytest.approx(0.9625)
+    assert observed["phase_mid_upload"] == "upload_release"
+    assert observed["network_mid_upload"] == (500, 1000, 12.5)
+    assert job.progress == 1.0
+    assert job.network_bytes_transferred is None  # reset after completion

@@ -57,7 +57,7 @@ _EXPORTS = {
     "DeferredDownloadService": (".deferred_download", "DeferredDownloadService"),
     "TikTokUrlDbService": (".tiktok_url_db_service", "TikTokUrlDbService"),
     "StorageBoxSftpClient": (".storage_box_sftp_client", "StorageBoxSftpClient"),
-    "StorageBoxTransferService": (".storage_box_transfer", "StorageBoxTransferService"),
+    "StorageBoxRclone": (".storage_box_rclone", "StorageBoxRclone"),
     "StorageBoxRepository": (".storage_box_repository", "StorageBoxRepository"),
     "LibraryHydrationService": (".library_hydration_service", "LibraryHydrationService"),
     "LibraryStateDb": (".library_state_db", "LibraryStateDb"),

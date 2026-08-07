@@ -13,15 +13,19 @@ function formatBytes(bytes: number | null | undefined): string {
 }
 
 function formatSpeed(mibPerSec: number | null | undefined): string | null {
-  if (mibPerSec == null || !Number.isFinite(mibPerSec) || mibPerSec <= 0) {
+  // 0 is a real measurement (stalled transfer) and must stay visible;
+  // only unknown/invalid values hide the speed segment.
+  if (mibPerSec == null || !Number.isFinite(mibPerSec) || mibPerSec < 0) {
     return null;
   }
-  if (mibPerSec >= 1024) {
-    return `${(mibPerSec / 1024).toFixed(2)} GB/s`;
+  // Backend reports MiB/s; display decimal MB/s to match the label.
+  const mbPerSec = mibPerSec * 1.048576;
+  if (mbPerSec >= 1000) {
+    return `${(mbPerSec / 1000).toFixed(2)} GB/s`;
   }
-  if (mibPerSec >= 100) return `${mibPerSec.toFixed(0)} MB/s`;
-  if (mibPerSec >= 10) return `${mibPerSec.toFixed(1)} MB/s`;
-  return `${mibPerSec.toFixed(2)} MB/s`;
+  if (mbPerSec >= 100) return `${mbPerSec.toFixed(0)} MB/s`;
+  if (mbPerSec >= 10) return `${mbPerSec.toFixed(1)} MB/s`;
+  return `${mbPerSec.toFixed(2)} MB/s`;
 }
 
 function formatEta(seconds: number | null | undefined): string | null {

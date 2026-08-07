@@ -53,6 +53,7 @@ A web application to remaster TikTok videos featuring anime content for other sh
 - **pixi** - Package manager for GPU-accelerated Python environments
 - **NVIDIA GPU** with CUDA 12.4+ for GPU acceleration
 - **Adobe Premiere Pro 2025** - For final project generation
+- **rclone** - Storage Box series uploads (Arch: `sudo pacman -S rclone`)
 
 ### Python Dependencies (Managed by pixi)
 

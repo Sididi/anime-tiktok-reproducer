@@ -185,9 +185,9 @@ class Settings(BaseSettings):
     storage_box_max_connections: int = 8
     storage_box_upload_max_parallel: int = 6
     storage_box_download_max_parallel: int = 6
-    storage_box_transfer_mode: str = "auto"
-    storage_box_rsync_min_file_size_mb: int = 4
-    storage_box_rsync_timeout_seconds: int = 1800
+    # Concurrent file transfers for the rclone publish batch. Hetzner Storage
+    # Boxes cap SSH connections around 10; rclone uses ~transfers+1.
+    storage_box_rclone_transfers: int = 4
     # Retry settings for transient SFTP/network errors (VPN flaps, NAT timeouts,
     # brief Hetzner reachability dips). Per-operation retry — the retried
     # operation re-acquires a fresh SSH session, so a half-dead pooled
@@ -195,9 +195,6 @@ class Settings(BaseSettings):
     storage_box_retry_max_attempts: int = 5
     storage_box_retry_base_delay_seconds: float = 1.0
     storage_box_retry_max_delay_seconds: float = 30.0
-    # lftp settings (explicit lftp mode and directory mirror flows)
-    storage_box_lftp_segments: int = 4
-    storage_box_lftp_min_file_size_mb: int = 50
 
     @property
     def drive_google_client_id(self) -> str | None:
@@ -295,14 +292,6 @@ class Settings(BaseSettings):
         stripped = value.strip()
         return stripped or None
 
-    @field_validator("storage_box_transfer_mode")
-    @classmethod
-    def _normalize_storage_box_transfer_mode(cls, value: str) -> str:
-        normalized = str(value or "").strip().lower() or "auto"
-        if normalized not in {"auto", "sftp", "rsync", "lftp"}:
-            raise ValueError("ATR_STORAGE_BOX_TRANSFER_MODE must be one of auto, sftp, rsync, lftp")
-        return normalized
-
     @field_validator("library_state_db_path")
     @classmethod
     def _resolve_library_state_db_path(cls, value: Path) -> Path:
@@ -356,10 +345,10 @@ class Settings(BaseSettings):
     def _clamp_storage_box_parallelism(cls, value: int) -> int:
         return max(1, min(16, value))
 
-    @field_validator("storage_box_rsync_min_file_size_mb")
+    @field_validator("storage_box_rclone_transfers")
     @classmethod
-    def _clamp_storage_box_rsync_min_file_size_mb(cls, value: int) -> int:
-        return max(1, min(1024, value))
+    def _clamp_storage_box_rclone_transfers(cls, value: int) -> int:
+        return max(1, min(8, value))
 
     @field_validator("storage_box_retry_max_attempts")
     @classmethod
@@ -375,11 +364,6 @@ class Settings(BaseSettings):
     @classmethod
     def _clamp_storage_box_retry_max_delay_seconds(cls, value: float) -> float:
         return max(1.0, min(600.0, value))
-
-    @field_validator("storage_box_rsync_timeout_seconds")
-    @classmethod
-    def _clamp_storage_box_rsync_timeout_seconds(cls, value: int) -> int:
-        return max(30, min(24 * 3600, value))
 
     @field_validator("match_playback_max_workers_per_episode")
     @classmethod

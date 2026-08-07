@@ -1,8 +1,9 @@
-"""Polling-based aggregate transfer progress for Storage Box operations.
+"""Polling-based aggregate download progress for Storage Box hydration.
 
-Tracks active uploads/downloads by stat'ing destination file sizes
+Tracks active downloads by stat'ing the growing local destination files
 periodically and emitting `ProgressSnapshot`s to a subscriber callback.
-Backend-agnostic: works for sftp, rsync, and lftp transfers alike.
+Uploads report progress through `StorageBoxRclone` instead (rclone's own
+per-second stats), reusing the same `ProgressSnapshot` contract.
 """
 
 from __future__ import annotations
@@ -15,15 +16,12 @@ from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import AsyncIterator, Awaitable, Callable, Literal
-
-from .storage_box_sftp_client import StorageBoxSftpClient
+from typing import AsyncIterator, Awaitable, Callable
 
 
 logger = logging.getLogger("uvicorn.error")
 
 
-Direction = Literal["upload", "download"]
 ProgressCallback = Callable[["ProgressSnapshot"], Awaitable[None] | None]
 
 
@@ -57,13 +55,11 @@ class TransferSession:
         self,
         session_id: str,
         *,
-        direction: Direction,
         total_bytes: int,
         on_update: ProgressCallback,
         poll_interval_seconds: float = 0.5,
     ) -> None:
         self.session_id = session_id
-        self.direction: Direction = direction
         self.total_bytes = max(0, int(total_bytes))
         self._on_update = on_update
         self._poll_interval = max(0.05, float(poll_interval_seconds))
@@ -87,7 +83,7 @@ class TransferSession:
             yield
             return
 
-        initial_size = await self._stat_size(local_path, remote_path)
+        initial_size = self._stat_size(local_path)
         transfer = _ActiveTransfer(
             local_path=local_path,
             remote_path=remote_path,
@@ -173,7 +169,7 @@ class TransferSession:
 
         active_delta = 0
         for transfer in active_copy:
-            current = await self._stat_size(transfer.local_path, transfer.remote_path)
+            current = self._stat_size(transfer.local_path)
             if current > transfer.initial_size:
                 active_delta += min(
                     current - transfer.initial_size,
@@ -211,17 +207,12 @@ class TransferSession:
             active_transfers=active_count,
         )
 
-    async def _stat_size(self, local_path: Path, remote_path: PurePosixPath) -> int:
-        if self.direction == "download":
-            try:
-                return local_path.stat().st_size
-            except OSError:
-                return 0
+    @staticmethod
+    def _stat_size(local_path: Path) -> int:
         try:
-            stat_result = await StorageBoxSftpClient.stat(remote_path)
-        except Exception:
+            return local_path.stat().st_size
+        except OSError:
             return 0
-        return int(getattr(stat_result, "size", 0) or 0)
 
 
 class StorageBoxTransferProgress:
@@ -235,14 +226,12 @@ class StorageBoxTransferProgress:
         cls,
         session_id: str,
         *,
-        direction: Direction,
         total_bytes: int,
         on_update: ProgressCallback,
         poll_interval_seconds: float = 0.5,
     ) -> TransferSession:
         session = TransferSession(
             session_id,
-            direction=direction,
             total_bytes=total_bytes,
             on_update=on_update,
             poll_interval_seconds=poll_interval_seconds,

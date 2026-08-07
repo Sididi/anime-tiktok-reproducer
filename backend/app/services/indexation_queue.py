@@ -175,16 +175,64 @@ class IndexationQueueService:
         job.network_eta_seconds = None
         job.network_active_transfers = 0
 
-    def _make_network_progress_callback(self, job: IndexationJob):
+    def _make_network_progress_callback(
+        self,
+        job: IndexationJob,
+        *,
+        progress_span: tuple[float, float] | None = None,
+        phase: str | None = None,
+        message: str | None = None,
+    ):
+        """Mirror transfer snapshots onto the job's network_* fields.
+
+        When ``progress_span`` is given, the overall job.progress also advances
+        linearly with the transferred bytes across that (start, end) span, and
+        the phase/message flip as soon as the first snapshot arrives — the
+        callbacks drive the phase transitions, not guessed pins.
+        """
+
         async def _on_progress(snapshot: ProgressSnapshot) -> None:
             job.network_bytes_transferred = snapshot.bytes_transferred
             job.network_bytes_total = snapshot.bytes_total
             job.network_mib_per_sec = snapshot.mib_per_sec
             job.network_eta_seconds = snapshot.eta_seconds
             job.network_active_transfers = snapshot.active_transfers
+            if progress_span is not None and snapshot.bytes_total > 0:
+                span_start, span_end = progress_span
+                fraction = min(
+                    1.0, snapshot.bytes_transferred / snapshot.bytes_total
+                )
+                job.progress = max(
+                    job.progress, span_start + (span_end - span_start) * fraction
+                )
+            if phase is not None and job.phase != phase:
+                job.phase = phase
+                if message is not None:
+                    job.message = message
             self._broadcast(job)
 
         return _on_progress
+
+    def _make_hashing_progress_callback(self, job: IndexationJob):
+        """Thread-safe packaging (hashing) progress over the 0.90→0.93 span.
+
+        Called from hashing worker threads, so mutations are marshalled back
+        onto the event loop.
+        """
+        loop = asyncio.get_running_loop()
+
+        def _hashing_progress(bytes_hashed: int, bytes_to_hash: int) -> None:
+            def _apply() -> None:
+                if bytes_to_hash > 0:
+                    job.progress = max(
+                        job.progress,
+                        0.90 + 0.03 * min(1.0, bytes_hashed / bytes_to_hash),
+                    )
+                self._broadcast(job)
+
+            loop.call_soon_threadsafe(_apply)
+
+        return _hashing_progress
 
     @classmethod
     def _terminal_oom_message(cls, message: str) -> str:
@@ -286,7 +334,9 @@ class IndexationQueueService:
                     )
 
                 async for progress in progress_stream:
-                    job.progress = progress.progress
+                    # Indexing owns the 0→0.90 span of the overall bar; the
+                    # remaining 0.10 belongs to packaging (hashing) and upload.
+                    job.progress = min(progress.progress, 1.0) * 0.90
                     job.phase = progress.status
                     job.message = progress.message
                     job.current_file = progress.current_file or None
@@ -321,11 +371,7 @@ class IndexationQueueService:
                         await self._link_torrents(job)
                         job.phase = "package_release"
                         job.message = "Packaging release for Storage Box..."
-                        job.progress = max(job.progress, 0.96)
-                        self._broadcast(job)
-                        job.phase = "upload_release"
-                        job.message = "Uploading release to Storage Box..."
-                        job.progress = max(job.progress, 0.98)
+                        job.progress = max(job.progress, 0.90)
                         self._reset_network_progress_fields(job)
                         self._broadcast(job)
                         prepared = progress.prepared_library_paths or []
@@ -356,7 +402,15 @@ class IndexationQueueService:
                             ),
                             expected_min_episodes=expected_min_episodes,
                             merge_existing_release=merge_existing_release,
-                            progress_callback=self._make_network_progress_callback(job),
+                            progress_callback=self._make_network_progress_callback(
+                                job,
+                                progress_span=(0.93, 0.995),
+                                phase="upload_release",
+                                message="Uploading release to Storage Box...",
+                            ),
+                            hashing_progress_callback=(
+                                self._make_hashing_progress_callback(job)
+                            ),
                         )
                         job.series_id = str(publish_result["series_id"])
                         job.storage_release_id = str(publish_result["release_id"])

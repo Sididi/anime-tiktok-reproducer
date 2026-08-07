@@ -9,21 +9,20 @@ import shutil
 import tempfile
 import time
 import uuid
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Callable
 
 from ..config import settings
 from ..library_types import LibraryType, coerce_library_type
 from .anime_library import AnimeLibraryService
-from .storage_box_progress import (
-    ProgressCallback,
-    StorageBoxTransferProgress,
-)
+from .storage_box_progress import ProgressCallback
+from .storage_box_rclone import StorageBoxRclone
 from .storage_box_sftp_client import StorageBoxSftpClient, _is_transient_error
-from .storage_box_transfer import StorageBoxTransferService
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -33,7 +32,14 @@ SCHEMA_VERSION = 1
 REPOSITORY_VERSION = "v1"
 LOCAL_STORAGE_BOX_METADATA = ".atr_storage_box.json"
 TORRENT_METADATA_FILENAME = ".atr_torrents.json"
+HASH_CACHE_FILENAME = ".atr_hash_cache.json"
 MEDIA_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".ts"}
+
+# Called from hashing worker threads as (bytes_hashed, bytes_to_hash).
+HashingProgressCallback = Callable[[int, int], None]
+
+_HASH_WORKERS = 4
+_HASH_PROGRESS_EMIT_BYTES = 32 * 1024 * 1024
 
 
 def _utc_now_iso() -> str:
@@ -48,12 +54,36 @@ def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _sha256_file(path: Path) -> str:
+def _sha256_file(path: Path, *, on_bytes: Callable[[int], None] | None = None) -> str:
     hasher = hashlib.sha256()
     with path.open("rb") as handle:
         while chunk := handle.read(1024 * 1024):
             hasher.update(chunk)
+            if on_bytes is not None:
+                on_bytes(len(chunk))
     return hasher.hexdigest()
+
+
+def _load_hash_cache(series_dir: Path) -> dict[str, dict[str, Any]]:
+    cache_path = series_dir / HASH_CACHE_FILENAME
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    files = payload.get("files") if isinstance(payload, dict) else None
+    return files if isinstance(files, dict) else {}
+
+
+def _store_hash_cache(series_dir: Path, files: dict[str, dict[str, Any]]) -> None:
+    cache_path = series_dir / HASH_CACHE_FILENAME
+    tmp_path = cache_path.with_name(f"{cache_path.name}.tmp")
+    try:
+        tmp_path.write_text(
+            _json_dumps({"version": 1, "files": files}), encoding="utf-8"
+        )
+        tmp_path.replace(cache_path)
+    except OSError:
+        logger.warning("Failed to write hash cache %s", cache_path, exc_info=True)
 
 
 def _uuid7_string() -> str:
@@ -714,6 +744,83 @@ class StorageBoxRepository:
         return manifest_fragment, state_fragment, shard_key
 
     @classmethod
+    def _resolve_series_hashes(
+        cls,
+        *,
+        series_dir: Path,
+        series_files: list[tuple[Path, Path, int, int]],
+        index_files: list[tuple[Path, int]],
+        hashing_progress_callback: HashingProgressCallback | None,
+    ) -> dict[Path, str]:
+        """Return sha256 per file, reusing the local hash cache for unchanged files.
+
+        ``series_files`` entries are (path, relative, size, mtime_ns); cache hits
+        require identical size+mtime_ns. ``index_files`` (path, size) are always
+        hashed — they are freshly staged copies. Misses are hashed on a small
+        thread pool with throttled byte progress.
+        """
+        cache = _load_hash_cache(series_dir)
+        new_cache: dict[str, dict[str, Any]] = {}
+        hashes: dict[Path, str] = {}
+        # (path, cache_key or None, size, mtime_ns or None)
+        to_hash: list[tuple[Path, str | None, int, int | None]] = []
+
+        for path, relative, size, mtime_ns in series_files:
+            key = relative.as_posix()
+            entry = cache.get(key)
+            if (
+                isinstance(entry, dict)
+                and entry.get("size") == size
+                and entry.get("mtime_ns") == mtime_ns
+                and isinstance(entry.get("sha256"), str)
+            ):
+                hashes[path] = entry["sha256"]
+                new_cache[key] = entry
+            else:
+                to_hash.append((path, key, size, mtime_ns))
+        for path, size in index_files:
+            to_hash.append((path, None, size, None))
+
+        bytes_to_hash = sum(size for _, _, size, _ in to_hash)
+        if hashing_progress_callback is not None:
+            hashing_progress_callback(0, bytes_to_hash)
+
+        progress_lock = threading.Lock()
+        progress_state = {"done": 0, "last_emit": 0}
+
+        def _on_bytes(count: int) -> None:
+            if hashing_progress_callback is None:
+                return
+            with progress_lock:
+                progress_state["done"] += count
+                done = progress_state["done"]
+                if (
+                    done - progress_state["last_emit"] < _HASH_PROGRESS_EMIT_BYTES
+                    and done < bytes_to_hash
+                ):
+                    return
+                progress_state["last_emit"] = done
+            hashing_progress_callback(done, bytes_to_hash)
+
+        def _hash_one(item: tuple[Path, str | None, int, int | None]) -> str:
+            return _sha256_file(item[0], on_bytes=_on_bytes)
+
+        if to_hash:
+            with ThreadPoolExecutor(max_workers=_HASH_WORKERS) as pool:
+                for item, sha in zip(to_hash, pool.map(_hash_one, to_hash)):
+                    path, key, size, mtime_ns = item
+                    hashes[path] = sha
+                    if key is not None:
+                        new_cache[key] = {
+                            "size": size,
+                            "mtime_ns": mtime_ns,
+                            "sha256": sha,
+                        }
+
+        _store_hash_cache(series_dir, new_cache)
+        return hashes
+
+    @classmethod
     def _collect_series_artifacts(
         cls,
         *,
@@ -721,6 +828,7 @@ class StorageBoxRepository:
         series_dir: Path,
         display_name: str,
         series_id: str,
+        hashing_progress_callback: HashingProgressCallback | None = None,
     ) -> tuple[list[LocalArtifact], list[dict[str, Any]], Path]:
         payload_library_root = cls._payload_library_root(display_name)
         payload_index_root = cls._payload_index_root(series_id)
@@ -733,18 +841,67 @@ class StorageBoxRepository:
         # AND, when it is a top-level media file, into the episode set. Using one
         # scan avoids a race where the set of artifacts and the set of episodes
         # are observed at different moments and disagree.
+        series_files: list[tuple[Path, Path, int, int]] = []
         for path in sorted(series_dir.rglob("*")):
             if not path.is_file():
                 continue
-            if path.name == LOCAL_STORAGE_BOX_METADATA:
+            if path.name in (
+                LOCAL_STORAGE_BOX_METADATA,
+                HASH_CACHE_FILENAME,
+                f"{HASH_CACHE_FILENAME}.tmp",
+            ):
                 continue
             relative = path.relative_to(series_dir)
+            stat_result = path.stat()
+            series_files.append(
+                (path, relative, stat_result.st_size, stat_result.st_mtime_ns)
+            )
+
+        manifest_fragment, state_fragment, shard_key = cls._read_local_index_series_payload(
+            library_type=library_type,
+            display_name=display_name,
+        )
+
+        temp_root = Path(tempfile.mkdtemp(prefix="storage_box_release_", dir=settings.cache_dir))
+        index_root = temp_root / "index" / series_id
+        shard_src_dir = (
+            AnimeLibraryService.get_library_path(library_type)
+            / AnimeLibraryService.INDEX_DIR_NAME
+            / "series"
+            / shard_key
+        )
+        shard_dst_dir = index_root / "series" / shard_key
+        shard_dst_dir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(shard_src_dir, shard_dst_dir, dirs_exist_ok=True)
+        (index_root / "manifest.fragment.json").write_text(
+            _json_dumps(manifest_fragment),
+            encoding="utf-8",
+        )
+        (index_root / "state.fragment.json").write_text(
+            _json_dumps(state_fragment),
+            encoding="utf-8",
+        )
+
+        index_files: list[tuple[Path, int]] = []
+        for path in sorted(index_root.rglob("*")):
+            if not path.is_file():
+                continue
+            index_files.append((path, path.stat().st_size))
+
+        hashes = cls._resolve_series_hashes(
+            series_dir=series_dir,
+            series_files=series_files,
+            index_files=index_files,
+            hashing_progress_callback=hashing_progress_callback,
+        )
+
+        for path, relative, size, _mtime_ns in series_files:
             remote_relative = payload_library_root / PurePosixPath(relative.as_posix())
             artifact = LocalArtifact(
                 local_path=path,
                 remote_relative_path=remote_relative,
-                size_bytes=path.stat().st_size,
-                sha256=_sha256_file(path),
+                size_bytes=size,
+                sha256=hashes[path],
                 artifact_type="library",
                 local_relative_path=f"{display_name}/{relative.as_posix()}",
             )
@@ -801,42 +958,15 @@ class StorageBoxRepository:
                 }
             )
 
-        manifest_fragment, state_fragment, shard_key = cls._read_local_index_series_payload(
-            library_type=library_type,
-            display_name=display_name,
-        )
-
-        temp_root = Path(tempfile.mkdtemp(prefix="storage_box_release_", dir=settings.cache_dir))
-        index_root = temp_root / "index" / series_id
-        shard_src_dir = (
-            AnimeLibraryService.get_library_path(library_type)
-            / AnimeLibraryService.INDEX_DIR_NAME
-            / "series"
-            / shard_key
-        )
-        shard_dst_dir = index_root / "series" / shard_key
-        shard_dst_dir.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(shard_src_dir, shard_dst_dir, dirs_exist_ok=True)
-        (index_root / "manifest.fragment.json").write_text(
-            _json_dumps(manifest_fragment),
-            encoding="utf-8",
-        )
-        (index_root / "state.fragment.json").write_text(
-            _json_dumps(state_fragment),
-            encoding="utf-8",
-        )
-
-        for path in sorted(index_root.rglob("*")):
-            if not path.is_file():
-                continue
+        for path, size in index_files:
             relative = path.relative_to(index_root)
             remote_relative = payload_index_root / PurePosixPath(relative.as_posix())
             local_artifacts.append(
                 LocalArtifact(
                     local_path=path,
                     remote_relative_path=remote_relative,
-                    size_bytes=path.stat().st_size,
-                    sha256=_sha256_file(path),
+                    size_bytes=size,
+                    sha256=hashes[path],
                     artifact_type="index",
                 )
             )
@@ -890,16 +1020,6 @@ class StorageBoxRepository:
                 f"Remote size mismatch for {artifact.remote_relative_path.as_posix()}: "
                 f"expected {artifact.size_bytes}, got {remote_size}"
             )
-
-    @classmethod
-    async def _remove_staged_artifact(
-        cls,
-        *,
-        staging_root: PurePosixPath,
-        artifact: LocalArtifact,
-    ) -> None:
-        with suppress(Exception):
-            await StorageBoxSftpClient.remove_file(staging_root / artifact.remote_relative_path)
 
     @classmethod
     async def _resolve_or_create_series_id(
@@ -1406,16 +1526,13 @@ class StorageBoxRepository:
             )
             manifest_text = _json_dumps(renamed_manifest)
 
-            async def _upload_artifact(artifact: LocalArtifact) -> None:
-                await StorageBoxTransferService.upload_file(
-                    artifact.local_path,
-                    staging_root / artifact.remote_relative_path,
-                )
-
-            await _run_bounded(
-                upload_artifacts,
-                settings.storage_box_upload_max_parallel,
-                _upload_artifact,
+            await StorageBoxRclone.upload_batch(
+                [
+                    (a.local_path, a.remote_relative_path)
+                    for a in upload_artifacts
+                ],
+                remote_base=staging_root,
+                total_bytes=sum(a.size_bytes for a in upload_artifacts),
             )
 
             if hardlink_artifacts:
@@ -1446,24 +1563,30 @@ class StorageBoxRepository:
                         "falling back to upload for %d artifact(s)",
                         len(hardlink_artifacts),
                     )
-                    async def _copy_remote_artifact(
+                    async def _download_remote_artifact(
                         item: tuple[LocalArtifact, PurePosixPath],
                     ) -> None:
                         artifact, source_remote = item
                         artifact.local_path.parent.mkdir(parents=True, exist_ok=True)
-                        await StorageBoxTransferService.download_file(
+                        await StorageBoxSftpClient.download_file(
                             source_remote,
                             artifact.local_path,
-                        )
-                        await StorageBoxTransferService.upload_file(
-                            artifact.local_path,
-                            staging_root / artifact.remote_relative_path,
                         )
 
                     await _run_bounded(
                         hardlink_artifacts,
-                        settings.storage_box_upload_max_parallel,
-                        _copy_remote_artifact,
+                        settings.storage_box_download_max_parallel,
+                        _download_remote_artifact,
+                    )
+                    await StorageBoxRclone.upload_batch(
+                        [
+                            (a.local_path, a.remote_relative_path)
+                            for a, _ in hardlink_artifacts
+                        ],
+                        remote_base=staging_root,
+                        total_bytes=sum(
+                            a.size_bytes for a, _ in hardlink_artifacts
+                        ),
                     )
 
             await cls._verify_remote_artifacts(
@@ -1518,6 +1641,7 @@ class StorageBoxRepository:
         expected_min_episodes: int | None = None,
         merge_existing_release: bool = False,
         progress_callback: ProgressCallback | None = None,
+        hashing_progress_callback: HashingProgressCallback | None = None,
     ) -> dict[str, Any]:
         scoped_type = coerce_library_type(library_type)
         if not cls.is_enabled():
@@ -1574,6 +1698,7 @@ class StorageBoxRepository:
             series_dir=series_dir,
             display_name=display_name,
             series_id=effective_series_id,
+            hashing_progress_callback=hashing_progress_callback,
         )
 
         try:
@@ -1742,55 +1867,12 @@ class StorageBoxRepository:
                     _human_size(link_bytes),
                 )
 
-            upload_total_bytes = sum(a.size_bytes for a in to_upload)
-            session = await StorageBoxTransferProgress.open_session(
-                f"publish:{publish_id}",
-                direction="upload",
-                total_bytes=upload_total_bytes,
-                on_update=progress_callback,
-            ) if progress_callback is not None else None
-
-            async def _upload_artifact(artifact: LocalArtifact) -> None:
-                max_attempts = max(1, settings.storage_box_retry_max_attempts)
-                for attempt in range(1, max_attempts + 1):
-                    if attempt > 1:
-                        await cls._remove_staged_artifact(
-                            staging_root=staging_root,
-                            artifact=artifact,
-                        )
-                    await StorageBoxTransferService.upload_file(
-                        artifact.local_path,
-                        staging_root / artifact.remote_relative_path,
-                        session=session,
-                    )
-                    try:
-                        await cls._verify_remote_artifact(
-                            staging_root=staging_root,
-                            artifact=artifact,
-                        )
-                        return
-                    except RuntimeError:
-                        if attempt >= max_attempts:
-                            raise
-                        logger.warning(
-                            "Publish %s: uploaded artifact failed remote size "
-                            "verification; retrying (%d/%d): %s",
-                            display_name,
-                            attempt,
-                            max_attempts,
-                            artifact.remote_relative_path.as_posix(),
-                            exc_info=True,
-                        )
-
-            try:
-                await _run_bounded(
-                    to_upload,
-                    settings.storage_box_upload_max_parallel,
-                    _upload_artifact,
-                )
-            finally:
-                if session is not None:
-                    await StorageBoxTransferProgress.close_session(session)
+            await StorageBoxRclone.upload_batch(
+                [(a.local_path, a.remote_relative_path) for a in to_upload],
+                remote_base=staging_root,
+                total_bytes=sum(a.size_bytes for a in to_upload),
+                progress_callback=progress_callback,
+            )
 
             # Hardlink unchanged artifacts from previous release.
             # If hardlinks fail (server doesn't support them), fall back to
@@ -1825,10 +1907,12 @@ class StorageBoxRepository:
                         "falling back to upload for %d artifact(s)",
                         len(to_hardlink),
                     )
-                    await _run_bounded(
-                        [a for a, _ in to_hardlink],
-                        settings.storage_box_upload_max_parallel,
-                        _upload_artifact,
+                    fallback = [a for a, _ in to_hardlink]
+                    await StorageBoxRclone.upload_batch(
+                        [(a.local_path, a.remote_relative_path) for a in fallback],
+                        remote_base=staging_root,
+                        total_bytes=sum(a.size_bytes for a in fallback),
+                        progress_callback=progress_callback,
                     )
 
             if preserved_artifacts:

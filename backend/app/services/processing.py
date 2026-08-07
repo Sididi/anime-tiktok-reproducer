@@ -12,7 +12,7 @@ import wave
 from contextlib import suppress
 from dataclasses import dataclass
 from fractions import Fraction
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator
 
 import spacy
@@ -30,7 +30,7 @@ from .anime_library import (
     SubtitleSidecarEntry,
 )
 from .storage_box_repository import StorageBoxRepository
-from .storage_box_transfer import StorageBoxTransferService
+from .storage_box_rclone import StorageBoxRclone
 from .transcriber import TranscriberService
 from .otio_timing import ClipTiming, OTIOTimingCalculator, FrameRateInfo
 from .gap_resolution import GapResolutionService
@@ -452,8 +452,10 @@ class ProcessingService:
                             / StorageBoxRepository._payload_library_root(display_name)
                             / source_path.name
                         )
-                        await StorageBoxTransferService.upload_file(
-                            source_path, remote_path
+                        await StorageBoxRclone.upload_batch(
+                            [(source_path, PurePosixPath(source_path.name))],
+                            remote_base=remote_path.parent,
+                            total_bytes=source_path.stat().st_size,
                         )
                         logger.info(
                             "Reuploaded audio-fixed file to storage box: %s",

@@ -8,7 +8,7 @@ import logging
 import shutil
 import uuid
 from contextlib import nullcontext, suppress
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Awaitable, Callable
 
 from ..config import settings
@@ -21,8 +21,8 @@ from .storage_box_progress import (
     StorageBoxTransferProgress,
     TransferSession,
 )
-from .storage_box_repository import StorageBoxRepository
-from .storage_box_transfer import StorageBoxTransferService
+from .storage_box_repository import HashingProgressCallback, StorageBoxRepository
+from .storage_box_sftp_client import StorageBoxSftpClient
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -794,7 +794,6 @@ class LibraryHydrationService:
 
                 session = await StorageBoxTransferProgress.open_session(
                     f"hydrate-series:{scoped_type.value}:{series_id}:{uuid.uuid4().hex[:8]}",
-                    direction="download",
                     total_bytes=total_bytes,
                     on_update=progress_callback,
                 ) if progress_callback is not None else None
@@ -1371,6 +1370,7 @@ class LibraryHydrationService:
         expected_min_episodes: int | None = None,
         merge_existing_release: bool = False,
         progress_callback: ProgressCallback | None = None,
+        hashing_progress_callback: HashingProgressCallback | None = None,
     ) -> dict[str, Any]:
         scoped_type = coerce_library_type(library_type)
 
@@ -1382,6 +1382,7 @@ class LibraryHydrationService:
                 expected_min_episodes=expected_min_episodes,
                 merge_existing_release=merge_existing_release,
                 progress_callback=progress_callback,
+                hashing_progress_callback=hashing_progress_callback,
             )
             await cls.sync_local_series_state(
                 library_type=scoped_type,
@@ -1912,6 +1913,34 @@ class LibraryHydrationService:
         )
 
     @classmethod
+    async def _download_with_session(
+        cls,
+        remote_path: PurePosixPath,
+        local_path: Path,
+        *,
+        size_bytes: int,
+        session: TransferSession | None,
+    ) -> None:
+        """Download one file over SFTP, feeding the local-stat progress session.
+
+        Manifest sizes are trusted for the progress target, so no remote stat
+        round-trip is needed per file.
+        """
+        remote = StorageBoxSftpClient.normalize_remote_path(remote_path)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        track_cm = (
+            session.track(
+                local_path=local_path,
+                remote_path=remote,
+                target_size=max(0, size_bytes),
+            )
+            if session is not None
+            else nullcontext()
+        )
+        async with track_cm:
+            await StorageBoxSftpClient.download_file(remote, local_path)
+
+    @classmethod
     async def _hydrate_index_artifacts(
         cls,
         library_type: LibraryType,
@@ -1939,7 +1968,6 @@ class LibraryHydrationService:
         )
         session = await StorageBoxTransferProgress.open_session(
             f"hydrate-index:{manifest['series_id']}:{uuid.uuid4().hex[:8]}",
-            direction="download",
             total_bytes=total_bytes,
             on_update=network_progress_callback,
         ) if network_progress_callback is not None else None
@@ -1953,9 +1981,10 @@ class LibraryHydrationService:
                 relative_path = str(artifact["relative_path"])
                 local_relative_path = Path(relative_path).relative_to("payload/index")
                 download_path = temp_root / local_relative_path
-                await StorageBoxTransferService.download_file(
+                await cls._download_with_session(
                     release_root / relative_path,
                     download_path,
+                    size_bytes=int(artifact.get("size_bytes") or 0),
                     session=session,
                 )
                 actual_sha = await asyncio.to_thread(_sha256_file, download_path)
@@ -2114,9 +2143,10 @@ class LibraryHydrationService:
                 if not remote_relative_path or not local_relative_path:
                     raise RuntimeError("Episode artifact is missing relative paths")
                 temp_path = temp_root / local_relative_path
-                await StorageBoxTransferService.download_file(
+                await cls._download_with_session(
                     release_root / remote_relative_path,
                     temp_path,
+                    size_bytes=int(item.get("size_bytes") or 0),
                     session=session,
                 )
                 expected_sha = str(item.get("sha256") or "")
