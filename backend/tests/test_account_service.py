@@ -269,3 +269,99 @@ def test_resolve_templates_ignores_nested_template_key():
     resolved = _resolve_templates("acc", {"template": "a", "name": "Acc"}, templates)
     # Nested reference is NOT resolved: language comes from "a", not "b".
     assert resolved == {"language": "fr", "name": "Acc"}
+
+
+# ---------------------------------------------------------------------------
+# Template system: integration through _load_from_disk
+
+
+def test_templates_resolved_from_yaml(tmp_path: Path, monkeypatch):
+    cfg = _write_config(
+        tmp_path,
+        """\
+templates:
+  yt_main:
+    youtube:
+      refresh_token: "tok-main"
+      channel_id: "UC123"
+  fr_defaults:
+    language: "fr"
+    supported_types: ["anime"]
+    slots: ["06:00", "12:00", "18:00", "22:00"]
+
+accounts:
+  anime_fr:
+    template: [fr_defaults, yt_main]
+    name: "AnimeSPM"
+    avatar: "anime_fr.jpg"
+    slots: ["07:00"]
+    youtube:
+      slots: ["16:00"]
+  standalone:
+    name: "Standalone"
+    language: "en"
+""",
+    )
+    monkeypatch.setattr(
+        "app.services.account_service.settings.accounts_config_path", cfg
+    )
+    AccountService.invalidate()
+    acc = AccountService.get_account("anime_fr")
+    assert acc is not None
+    # Template scalars/lists inherited or replaced by account keys.
+    assert acc.language == "fr"
+    assert acc.slots == ["07:00"]  # account list replaces template list
+    # Deep merge: youtube.slots overridden, refresh_token/channel_id inherited.
+    assert acc.youtube is not None
+    assert acc.youtube.refresh_token == "tok-main"
+    assert acc.youtube.channel_id == "UC123"
+    assert acc.slots_for("youtube") == ["16:00"]
+    # Account without template: unchanged behavior.
+    standalone = AccountService.get_account("standalone")
+    assert standalone is not None and standalone.language == "en"
+
+
+def test_unknown_template_skips_only_that_account(tmp_path: Path, monkeypatch):
+    cfg = _write_config(
+        tmp_path,
+        """\
+templates:
+  good:
+    language: "fr"
+
+accounts:
+  broken:
+    template: missing
+    name: "Broken"
+  fine:
+    template: good
+    name: "Fine"
+""",
+    )
+    monkeypatch.setattr(
+        "app.services.account_service.settings.accounts_config_path", cfg
+    )
+    AccountService.invalidate()
+    assert AccountService.get_account("broken") is None
+    fine = AccountService.get_account("fine")
+    assert fine is not None and fine.language == "fr"
+
+
+def test_non_mapping_templates_section_ignored(tmp_path: Path, monkeypatch):
+    cfg = _write_config(
+        tmp_path,
+        """\
+templates: "oops"
+
+accounts:
+  anime_fr:
+    name: "Anime FR"
+    language: "fr"
+""",
+    )
+    monkeypatch.setattr(
+        "app.services.account_service.settings.accounts_config_path", cfg
+    )
+    AccountService.invalidate()
+    acc = AccountService.get_account("anime_fr")
+    assert acc is not None and acc.language == "fr"

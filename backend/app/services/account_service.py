@@ -353,12 +353,21 @@ class AccountService:
         accounts_raw = raw.get("accounts", {})
         if not isinstance(accounts_raw, dict):
             return {}
+        templates_raw = raw.get("templates") or {}
+        if not isinstance(templates_raw, dict):
+            logger.warning(
+                "Top-level 'templates' in %s is not a mapping; ignoring it", path
+            )
+            templates_raw = {}
         result: dict[str, AccountConfig] = {}
         for account_id, account_raw in accounts_raw.items():
             if not isinstance(account_raw, dict):
                 continue
             try:
-                result[str(account_id)] = cls._parse_account(str(account_id), account_raw)
+                resolved = _resolve_templates(
+                    str(account_id), account_raw, templates_raw
+                )
+                result[str(account_id)] = cls._parse_account(str(account_id), resolved)
             except Exception:
                 logger.exception("Failed to parse account %s", account_id)
         logger.info("Loaded %d account(s) from %s", len(result), path)
