@@ -4,6 +4,48 @@
 # Global credentials (Meta app_id/secret, Google OAuth client, Discord, Drive)
 # stay in .env. Only per-account tokens go here.
 
+# --- Optional templates -----------------------------------------------------
+#
+# Accounts often share a social identity (same YouTube channel, same Facebook
+# Page) while differing elsewhere. Define partial account configs here and
+# reference them from accounts with `template:` (a name, or a list of names).
+#
+# Merge rules:
+#   - Templates apply left-to-right; the account's own keys always win last.
+#   - Nested blocks (youtube:, meta:, ...) merge key-by-key, so an account can
+#     override just `youtube.slots` and inherit the rest from the template.
+#   - Lists and scalars replace wholesale (same replace-semantics as slots).
+#   - Templates cannot reference other templates.
+#   - An unknown template name skips that account (logged), others still load.
+#
+# templates:
+#   yt_main:                      # shared YouTube channel
+#     youtube:
+#       refresh_token: "1//0..."
+#       channel_id: "UC..."
+#   meta_main:                    # shared Facebook Page + Instagram identity
+#     meta:
+#       token_mode: "system_user"
+#       facebook_page_id: "123..."
+#       facebook_page_access_token: "EAA..."
+#       instagram_business_account_id: "456..."
+#     facebook:
+#       max_reel_duration_seconds: 90
+#     instagram:
+#       max_reel_duration_seconds: 90
+#   fr_defaults:                  # shared scheduling defaults
+#     language: "fr"
+#     supported_types: ["anime"]
+#     slots: ["06:00", "12:00", "18:00", "22:00"]
+#
+# accounts:
+#   anime_fr:
+#     template: [fr_defaults, yt_main, meta_main]
+#     name: "Anime FR"
+#     avatar: "anime_fr.jpg"
+#     tiktok:                     # TikTok differs per account — keep it inline
+#       post_for_me_account_id: "spc_..."
+
 accounts:
   anime_fr:
     name: "Anime FR"
