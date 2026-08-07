@@ -777,6 +777,56 @@ class TranscriberService:
         return None, alignment_model, alignment_metadata, align_device
 
     @classmethod
+    def _uncovered_window_segments(
+        cls,
+        *,
+        segments: list[dict],
+        asr_windows: list[tuple[float, float]],
+    ) -> list[dict]:
+        """Find spans of the raw ASR/VAD windows left uncovered by aligned words.
+
+        The decoder is responsible for the full audio span of each VAD chunk it
+        was handed.  When it silently skips content (a known large-v3 failure
+        mode on speech over music), the aligned words only cover part of the
+        window.  Each uncovered span longer than the repair threshold is
+        returned as an empty pseudo-segment so the degenerate-segment repair
+        pass can re-transcribe it locally.
+        """
+        word_spans = sorted(
+            (float(word["start"]), float(word["end"]))
+            for word in cls._extract_words_from_segments(segments)
+            if word.get("start") is not None and word.get("end") is not None
+        )
+
+        gap_segments: list[dict] = []
+        for window_start, window_end in asr_windows:
+            if window_end - window_start < ALIGNMENT_REPAIR_MIN_SEGMENT_DURATION:
+                continue
+
+            cursor = window_start
+            for word_start, word_end in word_spans:
+                if word_end <= window_start or word_start >= window_end:
+                    continue
+                if word_start - cursor >= ALIGNMENT_REPAIR_MIN_SEGMENT_DURATION:
+                    gap_segments.append({
+                        "start": cursor,
+                        "end": word_start,
+                        "text": "",
+                        "words": [],
+                    })
+                cursor = max(cursor, word_end)
+
+            if window_end - cursor >= ALIGNMENT_REPAIR_MIN_SEGMENT_DURATION:
+                gap_segments.append({
+                    "start": cursor,
+                    "end": window_end,
+                    "text": "",
+                    "words": [],
+                })
+
+        return gap_segments
+
+    @classmethod
     def _repair_degenerate_aligned_segments(
         cls,
         *,
@@ -883,13 +933,53 @@ class TranscriberService:
                 detected_language = result.get("language") or (language or "en")
                 segments = result.get("segments") or []
 
+                # The raw ASR segments carry the true VAD chunk spans the
+                # decoder was responsible for.  whisperx.align rewrites
+                # start/end to the aligned word span, so degenerate decodes
+                # (e.g. 6 words emitted for an 18s chunk) must be caught on
+                # these windows, before alignment collapses them.
+                asr_windows = [
+                    (float(seg["start"]), float(seg["end"]))
+                    for seg in segments
+                    if isinstance(seg.get("start"), (int, float))
+                    and isinstance(seg.get("end"), (int, float))
+                ]
+
                 align_device = device
+                segments, model_a, metadata, align_device = cls._repair_degenerate_aligned_segments(
+                    segments=segments,
+                    audio=audio,
+                    model=model,
+                    batch_size=batch_size,
+                    detected_language=detected_language,
+                    alignment_model=None,
+                    alignment_metadata=None,
+                    align_device=align_device,
+                )
                 segments, model_a, metadata, align_device = cls._align_segments(
                     segments=segments,
                     audio=audio,
                     detected_language=detected_language,
                     align_device=align_device,
+                    alignment_model=model_a,
+                    alignment_metadata=metadata,
                 )
+
+                gap_segments = cls._uncovered_window_segments(
+                    segments=segments,
+                    asr_windows=asr_windows,
+                )
+                if gap_segments:
+                    logger.info(
+                        "Transcription left %d uncovered window span(s): %s",
+                        len(gap_segments),
+                        [(round(g["start"], 2), round(g["end"], 2)) for g in gap_segments],
+                    )
+                    segments = sorted(
+                        segments + gap_segments,
+                        key=lambda seg: float(seg.get("start", 0.0) or 0.0),
+                    )
+
                 segments, _, _, _ = cls._repair_degenerate_aligned_segments(
                     segments=segments,
                     audio=audio,
@@ -902,6 +992,7 @@ class TranscriberService:
                 )
 
                 words = cls._extract_words_from_segments(segments)
+                words.sort(key=lambda word: (word["start"], word["end"]))
                 return words, detected_language
 
             if last_exc is not None:
