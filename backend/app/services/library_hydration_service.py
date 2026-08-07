@@ -15,6 +15,7 @@ from ..config import settings
 from ..library_types import LibraryType, coerce_library_type
 from .anime_library import AnimeLibraryService
 from .library_state_db import LibraryStateDb, OperationRow, SeriesStateRow
+from .pending_publish_store import PendingPublishRecord, PendingPublishStore
 from .project_service import ProjectService
 from .storage_box_progress import (
     ProgressCallback,
@@ -39,6 +40,8 @@ OPERATION_PENDING = "pending"
 OPERATION_RUNNING = "running"
 OPERATION_COMPLETE = "complete"
 OPERATION_ERROR = "error"
+
+OPERATION_TYPE_PUBLISH = "publish"
 
 
 class SeriesDeleteBlockedError(RuntimeError):
@@ -303,6 +306,32 @@ class LibraryHydrationService:
                 for stale in cache_root.glob(f"{prefix}*"):
                     if stale.is_dir():
                         await asyncio.to_thread(shutil.rmtree, stale, True)
+
+        # Reconcile durable pending publishes. Their staged index dirs live
+        # outside the swept globs on purpose (uploads must resume across
+        # restarts); here we only drop what can no longer be uploaded.
+        records = await asyncio.to_thread(PendingPublishStore.list_all)
+        known_publish_ids = {record.publish_id for record in records}
+        pending_staging_root = PendingPublishStore.staging_dir_root()
+        if pending_staging_root.exists():
+            for entry in pending_staging_root.iterdir():
+                if entry.is_dir() and entry.name not in known_publish_ids:
+                    await asyncio.to_thread(shutil.rmtree, entry, True)
+        for record in records:
+            if not Path(record.series_dir).exists():
+                # The series was removed locally; the pending publish is moot.
+                logger.info(
+                    "Dropping pending publish %s: local series dir %s is gone",
+                    record.publish_id,
+                    record.series_dir,
+                )
+                await asyncio.to_thread(PendingPublishStore.delete, record.publish_id)
+            elif not Path(record.staged_index_dir).exists():
+                record.last_error = (
+                    "Staged index artifacts are missing (cache directory "
+                    "wiped?). Re-index the series to rebuild the release."
+                )
+                await asyncio.to_thread(PendingPublishStore.save, record)
 
     @classmethod
     async def ensure_catalog_available(cls, library_type: LibraryType | str) -> None:
@@ -1101,19 +1130,47 @@ class LibraryHydrationService:
         library_type: LibraryType | str,
     ) -> list[dict[str, Any]]:
         scoped_type = coerce_library_type(library_type)
-        catalog = await StorageBoxRepository.list_catalog(scoped_type)
+        try:
+            catalog = await StorageBoxRepository.list_catalog(scoped_type)
+        except Exception:
+            # A dead Storage Box must not blank out the library: series with
+            # a pending (not yet uploaded) publish are fully usable locally
+            # and are listed below from their durable records.
+            logger.warning(
+                "Storage Box catalog unavailable for %s; listing pending "
+                "local series only",
+                scoped_type.value,
+                exc_info=True,
+            )
+            catalog = []
+        pending_records = [
+            record
+            for record in await asyncio.to_thread(PendingPublishStore.list_all)
+            if record.library_type == scoped_type.value
+        ]
+        pending_by_series = {record.series_id: record for record in pending_records}
         library_path = AnimeLibraryService.get_library_path(scoped_type)
         state_by_series = await asyncio.to_thread(LibraryStateDb.list_series_states, scoped_type)
         pin_counts = await asyncio.to_thread(
             LibraryStateDb.get_project_pin_counts,
-            [str(entry.get("series_id")) for entry in catalog],
+            list(
+                {str(entry.get("series_id")) for entry in catalog}
+                | set(pending_by_series)
+            ),
         )
         results: list[dict[str, Any]] = []
         for entry in catalog:
             series_id = str(entry.get("series_id"))
             state = state_by_series.get(series_id)
             storage_release_id = str(entry.get("storage_release_id", ""))
-            if state is None or (storage_release_id and state.release_id != storage_release_id):
+            pending_record = pending_by_series.get(series_id)
+            if pending_record is None and (
+                state is None
+                or (storage_release_id and state.release_id != storage_release_id)
+            ):
+                # Skipped when a pending publish exists: the state row then
+                # points at the newer, locally-finalized release and syncing
+                # against the (older) catalog release would clobber it.
                 display_name = str(entry.get("name", "")).strip()
                 local_series_dir = library_path / display_name
                 local_metadata = await asyncio.to_thread(
@@ -1134,6 +1191,17 @@ class LibraryHydrationService:
             local_episode_count = state.local_episode_count if state else 0
             expected_episode_count = state.expected_episode_count if state else int(entry.get("episode_count", 0) or 0)
             hydration_status = state.hydration_status if state else HYDRATION_STATUS_NOT_HYDRATED
+            if pending_record is not None:
+                manifest = pending_record.manifest
+                entry = {
+                    **entry,
+                    "episode_count": manifest.get("episode_count", entry.get("episode_count", 0)),
+                    "total_size_bytes": manifest.get("total_size_bytes", entry.get("total_size_bytes", 0)),
+                    "fps": manifest.get("fps", entry.get("fps", 0.0)),
+                    "torrent_count": manifest.get("torrent_count", entry.get("torrent_count", 0)),
+                    "storage_release_id": pending_record.release_id,
+                }
+                storage_release_id = pending_record.release_id
             results.append(
                 {
                     "name": str(entry.get("name", "")),
@@ -1148,10 +1216,51 @@ class LibraryHydrationService:
                     "storage_release_id": storage_release_id,
                     "torrent_count": int(entry.get("torrent_count", 0) or 0),
                     "hydration_status": hydration_status,
+                    "pending_upload": pending_record is not None,
                     "updated_at": str(
                         (state.updated_at if state else None)
                         or entry.get("updated_at")
                         or ""
+                    ),
+                }
+            )
+
+        # Series that only exist locally so far (finalized, upload pending or
+        # in flight): surface them exactly like published ones.
+        emitted = {row["series_id"] for row in results}
+        for record in pending_records:
+            if record.series_id in emitted:
+                continue
+            manifest = record.manifest
+            state = state_by_series.get(record.series_id)
+            local_episode_count = state.local_episode_count if state else 0
+            expected_episode_count = (
+                state.expected_episode_count
+                if state
+                else int(manifest.get("episode_count", 0) or 0)
+            )
+            results.append(
+                {
+                    "name": record.display_name,
+                    "series_id": record.series_id,
+                    "episode_count": int(manifest.get("episode_count", 0) or 0),
+                    "local_episode_count": local_episode_count,
+                    "total_size_bytes": int(manifest.get("total_size_bytes", 0) or 0),
+                    "fps": float(manifest.get("fps", 0.0) or 0.0),
+                    "is_fully_local": expected_episode_count > 0
+                    and local_episode_count >= expected_episode_count,
+                    "project_pin_count": pin_counts.get(record.series_id, 0),
+                    "permanent_pin": bool(state.permanent_pin) if state else False,
+                    "storage_release_id": record.release_id,
+                    "torrent_count": int(manifest.get("torrent_count", 0) or 0),
+                    "hydration_status": (
+                        state.hydration_status
+                        if state
+                        else HYDRATION_STATUS_INDEX_READY
+                    ),
+                    "pending_upload": True,
+                    "updated_at": str(
+                        (state.updated_at if state else None) or record.created_at
                     ),
                 }
             )
@@ -1232,11 +1341,32 @@ class LibraryHydrationService:
         scoped_type = coerce_library_type(library_type)
         manifest = await cls._load_or_fetch_manifest(scoped_type, series_id)
         state = await asyncio.to_thread(LibraryStateDb.get_series_state, scoped_type, series_id)
-        torrent_metadata = await StorageBoxRepository.read_remote_torrent_metadata(
-            scoped_type,
-            series_id,
-            str(manifest["release_id"]),
-        )
+        try:
+            torrent_metadata = await StorageBoxRepository.read_remote_torrent_metadata(
+                scoped_type,
+                series_id,
+                str(manifest["release_id"]),
+            )
+        except Exception:
+            # For a pending (not yet uploaded) release the remote artifact
+            # doesn't exist yet — the series dir's local copy is identical.
+            torrent_metadata = None
+            local_torrents_path = (
+                AnimeLibraryService.get_library_path(scoped_type)
+                / str(manifest.get("display_name") or "")
+                / ".atr_torrents.json"
+            )
+            if local_torrents_path.is_file():
+                with suppress(Exception):
+                    torrent_metadata = await asyncio.to_thread(
+                        _json_load, local_torrents_path
+                    )
+            if torrent_metadata is None:
+                logger.warning(
+                    "Torrent metadata unavailable for %s/%s (remote and local)",
+                    scoped_type.value,
+                    series_id,
+                )
         episodes: list[dict[str, Any]] = []
         for episode in manifest.get("episodes", []):
             if not isinstance(episode, dict):
@@ -1360,6 +1490,194 @@ class LibraryHydrationService:
             logger.exception("Background eviction failed for %s/%s", library_type, series_id)
 
     @classmethod
+    async def finalize_series_release(
+        cls,
+        *,
+        library_type: LibraryType | str,
+        display_name: str,
+        series_id: str | None = None,
+        already_locked: bool = False,
+        expected_min_episodes: int | None = None,
+        merge_existing_release: bool = False,
+        hashing_progress_callback: HashingProgressCallback | None = None,
+    ) -> PendingPublishRecord:
+        """Prepare a release and commit it as a durable pending publish.
+
+        After this returns, the series is fully usable locally (listable,
+        matchable) regardless of when — or whether — the remote upload runs.
+        Saving the record is the commit point; :meth:`run_pending_upload`
+        executes or resumes the frozen upload plan later.
+        """
+        scoped_type = coerce_library_type(library_type)
+
+        async def _finalize() -> PendingPublishRecord:
+            record = await StorageBoxRepository.prepare_series_release(
+                library_type=scoped_type,
+                display_name=display_name,
+                series_id=series_id,
+                expected_min_episodes=expected_min_episodes,
+                merge_existing_release=merge_existing_release,
+                hashing_progress_callback=hashing_progress_callback,
+            )
+            # Supersede: prepare snapshots the entire series dir, so a newer
+            # pending publish strictly replaces any older one for the series.
+            # The caller (indexation queue) has already cancelled the stale
+            # upload job before starting this finalize.
+            stale = await asyncio.to_thread(
+                PendingPublishStore.find_by_series,
+                record.library_type,
+                record.series_id,
+            )
+            if stale is not None and stale.publish_id != record.publish_id:
+                await StorageBoxRepository.abandon_prepared_release(stale)
+                await asyncio.to_thread(PendingPublishStore.delete, stale.publish_id)
+            await asyncio.to_thread(PendingPublishStore.save, record)
+            await cls.apply_local_publish_state(record)
+            return record
+
+        if series_id and not already_locked:
+            async with cls._series_lock(scoped_type, series_id):
+                return await _finalize()
+        return await _finalize()
+
+    @classmethod
+    async def apply_local_publish_state(cls, record: PendingPublishRecord) -> None:
+        """Make a finalized-but-not-yet-uploaded release fully usable locally.
+
+        Writes everything the purely-local matching gate
+        (:meth:`ensure_index_ready`) checks: the cached manifest, the series
+        dir's ``.atr_storage_box.json``, and the ``series_state`` row. The
+        state is computed locally on purpose — ``sync_local_series_state``
+        would fall back to a remote manifest fetch that cannot succeed before
+        the upload. Idempotent; re-run on startup resume to heal a crashed
+        upload's local state.
+        """
+        scoped_type = coerce_library_type(record.library_type)
+        manifest = record.manifest
+        await cls._cache_manifest(scoped_type, manifest)
+        await asyncio.to_thread(
+            StorageBoxRepository.write_local_series_metadata,
+            series_dir=Path(record.series_dir),
+            series_id=record.series_id,
+            display_name=record.display_name,
+            release_id=record.release_id,
+        )
+        local_episode_count = await asyncio.to_thread(
+            cls._count_local_episodes_from_manifest,
+            scoped_type,
+            manifest,
+        )
+        expected_episode_count = int(
+            manifest.get("episode_count", len(manifest.get("episodes", [])))
+        )
+        await asyncio.to_thread(
+            LibraryStateDb.upsert_series_state,
+            library_type=scoped_type,
+            series_id=record.series_id,
+            release_id=record.release_id,
+            hydration_status=(
+                HYDRATION_STATUS_FULLY_LOCAL
+                if expected_episode_count > 0
+                and local_episode_count >= expected_episode_count
+                else HYDRATION_STATUS_INDEX_READY
+            ),
+            local_episode_count=local_episode_count,
+            expected_episode_count=expected_episode_count,
+            last_error=None,
+        )
+        await asyncio.to_thread(
+            LibraryStateDb.upsert_operation,
+            library_type=scoped_type,
+            series_id=record.series_id,
+            operation_type=OPERATION_TYPE_PUBLISH,
+            status=OPERATION_PENDING,
+        )
+
+    @classmethod
+    async def run_pending_upload(
+        cls,
+        record: PendingPublishRecord,
+        *,
+        progress_callback: ProgressCallback | None = None,
+        already_locked: bool = False,
+    ) -> dict[str, Any] | None:
+        """Execute (or resume) the remote upload of a pending publish.
+
+        Returns ``None`` when the record no longer exists (superseded or
+        cancelled between enqueue and execution). On success the record is
+        deleted; on failure it is kept with ``attempts``/``last_error``
+        updated — the remote staging dir stays in place as resume state.
+        """
+        scoped_type = coerce_library_type(record.library_type)
+        lock_ctx = (
+            nullcontext()
+            if already_locked
+            else cls._series_lock(scoped_type, record.series_id)
+        )
+        async with lock_ctx:
+            fresh = await asyncio.to_thread(PendingPublishStore.load, record.publish_id)
+            if fresh is None:
+                logger.info(
+                    "Pending publish %s for '%s' no longer exists "
+                    "(superseded or cancelled); skipping upload",
+                    record.publish_id,
+                    record.display_name,
+                )
+                return None
+            record = fresh
+            await asyncio.to_thread(
+                LibraryStateDb.upsert_operation,
+                library_type=scoped_type,
+                series_id=record.series_id,
+                operation_type=OPERATION_TYPE_PUBLISH,
+                status=OPERATION_RUNNING,
+            )
+            try:
+                await StorageBoxRepository.sweep_series_staging(
+                    scoped_type,
+                    record.series_id,
+                    keep_publish_ids={record.publish_id},
+                )
+                result = await StorageBoxRepository.upload_prepared_release(
+                    record,
+                    progress_callback=progress_callback,
+                )
+                # The release is remote now: the regular (remote-backed) sync
+                # is safe and refreshes episode counts against the manifest.
+                await cls.sync_local_series_state(
+                    library_type=scoped_type,
+                    series_id=record.series_id,
+                    release_id=record.release_id,
+                )
+                await asyncio.to_thread(
+                    LibraryStateDb.upsert_operation,
+                    library_type=scoped_type,
+                    series_id=record.series_id,
+                    operation_type=OPERATION_TYPE_PUBLISH,
+                    status=OPERATION_COMPLETE,
+                    progress=1.0,
+                )
+                await asyncio.to_thread(PendingPublishStore.delete, record.publish_id)
+                return result
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                record.attempts += 1
+                record.last_error = str(exc)
+                with suppress(Exception):
+                    await asyncio.to_thread(PendingPublishStore.save, record)
+                with suppress(Exception):
+                    await asyncio.to_thread(
+                        LibraryStateDb.upsert_operation,
+                        library_type=scoped_type,
+                        series_id=record.series_id,
+                        operation_type=OPERATION_TYPE_PUBLISH,
+                        status=OPERATION_ERROR,
+                        error=str(exc),
+                    )
+                raise
+
+    @classmethod
     async def publish_series_release(
         cls,
         *,
@@ -1372,29 +1690,32 @@ class LibraryHydrationService:
         progress_callback: ProgressCallback | None = None,
         hashing_progress_callback: HashingProgressCallback | None = None,
     ) -> dict[str, Any]:
-        scoped_type = coerce_library_type(library_type)
+        """Synchronous publish: finalize + upload in one call.
 
-        async def _publish() -> dict[str, Any]:
-            publish_result = await StorageBoxRepository.publish_series(
-                library_type=scoped_type,
-                display_name=display_name,
-                series_id=series_id,
-                expected_min_episodes=expected_min_episodes,
-                merge_existing_release=merge_existing_release,
-                progress_callback=progress_callback,
-                hashing_progress_callback=hashing_progress_callback,
+        Kept for the legacy SSE ``/anime/index`` and ``/anime/update``
+        routes. The queue-based flow uses :meth:`finalize_series_release`
+        followed by a background :meth:`run_pending_upload`.
+        """
+        record = await cls.finalize_series_release(
+            library_type=library_type,
+            display_name=display_name,
+            series_id=series_id,
+            already_locked=already_locked,
+            expected_min_episodes=expected_min_episodes,
+            merge_existing_release=merge_existing_release,
+            hashing_progress_callback=hashing_progress_callback,
+        )
+        result = await cls.run_pending_upload(
+            record,
+            progress_callback=progress_callback,
+            already_locked=already_locked,
+        )
+        if result is None:
+            raise RuntimeError(
+                "Publish was superseded by a newer pending publish before "
+                "its upload could run."
             )
-            await cls.sync_local_series_state(
-                library_type=scoped_type,
-                series_id=str(publish_result["series_id"]),
-                release_id=str(publish_result["release_id"]),
-            )
-            return publish_result
-
-        if series_id and not already_locked:
-            async with cls._series_lock(scoped_type, series_id):
-                return await _publish()
-        return await _publish()
+        return result
 
     @classmethod
     async def delete_series(
@@ -1431,6 +1752,18 @@ class LibraryHydrationService:
                     series_id=series_id,
                     referencing_projects=referencing_projects,
                 )
+
+            # A pending (not yet uploaded) publish dies with the series: the
+            # caller has already cancelled its upload job; reclaim the record,
+            # staged artifacts, and any partial remote staging.
+            pending = await asyncio.to_thread(
+                PendingPublishStore.find_by_series,
+                scoped_type.value,
+                series_id,
+            )
+            if pending is not None:
+                await StorageBoxRepository.abandon_prepared_release(pending)
+                await asyncio.to_thread(PendingPublishStore.delete, pending.publish_id)
 
             state = await asyncio.to_thread(
                 LibraryStateDb.get_series_state,

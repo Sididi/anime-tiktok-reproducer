@@ -856,6 +856,42 @@ async def stream_jobs():
     )
 
 
+@router.get("/pending-publishes")
+async def list_pending_publishes():
+    """List durable pending publishes (finalized locally, upload unfinished)."""
+    from ...services.pending_publish_store import PendingPublishStore
+
+    records = await asyncio.to_thread(PendingPublishStore.list_all)
+    return {
+        "pending_publishes": [
+            {
+                "publish_id": record.publish_id,
+                "library_type": record.library_type,
+                "series_id": record.series_id,
+                "release_id": record.release_id,
+                "display_name": record.display_name,
+                "created_at": record.created_at,
+                "attempts": record.attempts,
+                "last_error": record.last_error,
+            }
+            for record in records
+        ]
+    }
+
+
+@router.post("/publish/{publish_id}/retry")
+async def retry_pending_publish(publish_id: str):
+    """Re-enqueue the background upload of a pending publish."""
+    from ...services.indexation_queue import indexation_queue
+    from ...services.pending_publish_store import PendingPublishStore
+
+    record = await asyncio.to_thread(PendingPublishStore.load, publish_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Pending publish not found.")
+    job_id = indexation_queue.enqueue_upload(record)
+    return {"job_id": job_id, "publish_id": publish_id}
+
+
 # ---------------------------------------------------------------------------
 # Purge system
 # ---------------------------------------------------------------------------
@@ -1034,7 +1070,17 @@ async def delete_series(
     library_type: LibraryType = Query(...),
 ):
     """Permanently delete a series from local storage and the Storage Box."""
+    from ...services.indexation_queue import indexation_queue
+    from ...services.pending_publish_store import PendingPublishStore
+
     try:
+        pending = await asyncio.to_thread(
+            PendingPublishStore.find_by_series,
+            library_type.value,
+            series_id,
+        )
+        if pending is not None:
+            await indexation_queue.cancel_upload(pending.publish_id)
         result = await LibraryHydrationService.delete_series(
             library_type=library_type,
             series_id=series_id,

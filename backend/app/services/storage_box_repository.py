@@ -20,6 +20,11 @@ from typing import Any, Callable
 from ..config import settings
 from ..library_types import LibraryType, coerce_library_type
 from .anime_library import AnimeLibraryService
+from .pending_publish_store import (
+    PendingArtifact,
+    PendingPublishRecord,
+    PendingPublishStore,
+)
 from .storage_box_progress import ProgressCallback
 from .storage_box_rclone import StorageBoxRclone
 from .storage_box_sftp_client import StorageBoxSftpClient, _is_transient_error
@@ -994,9 +999,9 @@ class StorageBoxRepository:
         cls,
         *,
         staging_root: PurePosixPath,
-        artifacts: list[LocalArtifact | RemoteArtifact],
+        artifacts: list[LocalArtifact | RemoteArtifact | PendingArtifact],
     ) -> None:
-        async def _verify(artifact: LocalArtifact | RemoteArtifact) -> None:
+        async def _verify(artifact: LocalArtifact | RemoteArtifact | PendingArtifact) -> None:
             await cls._verify_remote_artifact(staging_root=staging_root, artifact=artifact)
 
         await _run_bounded(
@@ -1010,14 +1015,15 @@ class StorageBoxRepository:
         cls,
         *,
         staging_root: PurePosixPath,
-        artifact: LocalArtifact | RemoteArtifact,
+        artifact: LocalArtifact | RemoteArtifact | PendingArtifact,
     ) -> None:
-        remote_path = staging_root / artifact.remote_relative_path
+        remote_relative = PurePosixPath(str(artifact.remote_relative_path))
+        remote_path = staging_root / remote_relative
         stat_result = await StorageBoxSftpClient.stat(remote_path)
         remote_size = int(getattr(stat_result, "size", 0))
         if remote_size != artifact.size_bytes:
             raise RuntimeError(
-                f"Remote size mismatch for {artifact.remote_relative_path.as_posix()}: "
+                f"Remote size mismatch for {remote_relative.as_posix()}: "
                 f"expected {artifact.size_bytes}, got {remote_size}"
             )
 
@@ -1632,7 +1638,7 @@ class StorageBoxRepository:
             shutil.rmtree(temp_root, ignore_errors=True)
 
     @classmethod
-    async def publish_series(
+    async def prepare_series_release(
         cls,
         *,
         library_type: LibraryType | str,
@@ -1640,9 +1646,16 @@ class StorageBoxRepository:
         series_id: str | None = None,
         expected_min_episodes: int | None = None,
         merge_existing_release: bool = False,
-        progress_callback: ProgressCallback | None = None,
         hashing_progress_callback: HashingProgressCallback | None = None,
-    ) -> dict[str, Any]:
+    ) -> PendingPublishRecord:
+        """Build a release fully locally and freeze its remote upload plan.
+
+        Only cheap remote reads happen here (series-id resolution and the
+        previous-release manifest used for sha256 dedup). The heavy network
+        phase is deferred to :meth:`upload_prepared_release`, driven entirely
+        by the returned record so it can run — and resume across process
+        restarts — without re-hashing or re-collecting anything.
+        """
         scoped_type = coerce_library_type(library_type)
         if not cls.is_enabled():
             raise RuntimeError("Storage Box is not configured.")
@@ -1659,27 +1672,26 @@ class StorageBoxRepository:
         )
         publish_id = uuid.uuid4().hex[:12]
         release_id = _uuid7_string()
-        staging_root = cls._staging_root(scoped_type, effective_series_id, publish_id)
-        release_root = cls._release_root(scoped_type, effective_series_id, release_id)
 
         # -- Fetch previous release manifest for incremental diffing ----------
         # is_brand_new_series stays True until we confirm the remote already
-        # has a current.json for this series_id. On failure that flag decides
-        # whether we wipe just the staging dir or the entire series root —
-        # see the except branch at the end of the publish.
+        # has a current.json for this series_id; abandon_prepared_release
+        # uses it to decide between wiping just the staging dir or the whole
+        # series root.
         previous_sha_to_remote: dict[str, PurePosixPath] = {}
         previous_manifest: dict[str, Any] | None = None
         previous_release_root: PurePosixPath | None = None
+        previous_release_id: str | None = None
         is_brand_new_series = True
         try:
             prev_current = await cls.get_current_release(scoped_type, effective_series_id)
             is_brand_new_series = False
-            prev_release_id = str(prev_current["release_id"])
+            previous_release_id = str(prev_current["release_id"])
             previous_release_root = cls._release_root(
-                scoped_type, effective_series_id, prev_release_id,
+                scoped_type, effective_series_id, previous_release_id,
             )
             previous_manifest = await cls.get_series_manifest(
-                scoped_type, effective_series_id, prev_release_id,
+                scoped_type, effective_series_id, previous_release_id,
             )
             for art in previous_manifest.get("artifacts", []):
                 sha = art.get("sha256")
@@ -1842,8 +1854,6 @@ class StorageBoxRepository:
                 "episodes": episodes,
                 "artifacts": manifest_artifacts,
             }
-            manifest_text = _json_dumps(manifest_payload)
-
             # -- Partition artifacts: upload new/changed, hardlink unchanged ----
             to_upload: list[LocalArtifact] = []
             to_hardlink: list[tuple[LocalArtifact, PurePosixPath]] = []
@@ -1867,33 +1877,155 @@ class StorageBoxRepository:
                     _human_size(link_bytes),
                 )
 
+            # Relocate the staged index tree out of the crash-swept
+            # storage_box_release_* tempdir into the durable pending-publish
+            # area so the upload can resume after a restart.
+            staged_dir = PendingPublishStore.staging_dir_root() / publish_id
+            staged_dir.parent.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(shutil.move, str(temp_root), str(staged_dir))
+
+            def _durable_path(path: Path) -> str:
+                try:
+                    return str(staged_dir / path.relative_to(temp_root))
+                except ValueError:
+                    return str(path)
+
+            def _pending_upload(artifact: LocalArtifact) -> PendingArtifact:
+                return PendingArtifact(
+                    remote_relative_path=artifact.remote_relative_path.as_posix(),
+                    size_bytes=artifact.size_bytes,
+                    sha256=artifact.sha256,
+                    artifact_type=artifact.artifact_type,
+                    local_path=_durable_path(artifact.local_path),
+                    local_relative_path=artifact.local_relative_path,
+                )
+
+            return PendingPublishRecord(
+                publish_id=publish_id,
+                library_type=scoped_type.value,
+                series_id=effective_series_id,
+                release_id=release_id,
+                display_name=display_name,
+                series_dir=str(series_dir),
+                staged_index_dir=str(staged_dir),
+                is_brand_new_series=is_brand_new_series,
+                previous_release_id=previous_release_id,
+                uploads=[_pending_upload(artifact) for artifact in to_upload],
+                hardlinks=[
+                    _pending_upload(artifact).model_copy(
+                        update={"previous_remote_path": prev_remote.as_posix()}
+                    )
+                    for artifact, prev_remote in to_hardlink
+                ],
+                preserved=[
+                    PendingArtifact(
+                        remote_relative_path=artifact.remote_relative_path.as_posix(),
+                        size_bytes=artifact.size_bytes,
+                        sha256=artifact.sha256,
+                        artifact_type=artifact.artifact_type,
+                        local_relative_path=artifact.local_relative_path,
+                        previous_remote_path=artifact.previous_remote_path.as_posix(),
+                    )
+                    for artifact in preserved_artifacts
+                ],
+                manifest=manifest_payload,
+            )
+        except Exception:
+            # If the move already happened, the staged tree belongs to a
+            # record that will never be saved — reclaim it.
+            shutil.rmtree(
+                PendingPublishStore.staging_dir_root() / publish_id,
+                ignore_errors=True,
+            )
+            raise
+        finally:
+            # On success the tree was moved into staged_dir and this is a
+            # no-op; on failure it removes the partially-built tempdir.
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+    @classmethod
+    async def upload_prepared_release(
+        cls,
+        record: PendingPublishRecord,
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> dict[str, Any]:
+        """Execute (or resume) the remote phase of a prepared release.
+
+        Idempotent by construction: the staging dir is keyed by the record's
+        publish_id so rclone skips already-transferred files, hardlinks
+        tolerate already-existing targets, and a release committed by a
+        previous attempt (crash between the staging rename and the
+        current.json replace) is detected and finished instead of re-uploaded.
+        On failure the remote staging dir is intentionally left in place —
+        it is the resume state. Use :meth:`abandon_prepared_release` when a
+        pending publish is superseded or cancelled.
+        """
+        scoped_type = coerce_library_type(record.library_type)
+        if not cls.is_enabled():
+            raise RuntimeError("Storage Box is not configured.")
+
+        series_dir = Path(record.series_dir)
+        staging_root = cls._staging_root(
+            scoped_type, record.series_id, record.publish_id
+        )
+        release_root = cls._release_root(
+            scoped_type, record.series_id, record.release_id
+        )
+        manifest_text = _json_dumps(record.manifest)
+
+        release_already_committed = await StorageBoxSftpClient.exists(release_root)
+        if not release_already_committed:
+            missing_local = [
+                artifact.local_path
+                for artifact in (*record.uploads, *record.hardlinks)
+                if artifact.local_path and not Path(artifact.local_path).exists()
+            ]
+            if missing_local:
+                raise RuntimeError(
+                    f"Cannot upload release for '{record.display_name}': "
+                    f"{len(missing_local)} local artifact(s) vanished since the "
+                    f"release was prepared (first: {missing_local[0]}). If the "
+                    "cache directory was wiped, re-index the series to rebuild "
+                    "the release."
+                )
+
             await StorageBoxRclone.upload_batch(
-                [(a.local_path, a.remote_relative_path) for a in to_upload],
+                [
+                    (Path(a.local_path), PurePosixPath(a.remote_relative_path))
+                    for a in record.uploads
+                    if a.local_path
+                ],
                 remote_base=staging_root,
-                total_bytes=sum(a.size_bytes for a in to_upload),
+                total_bytes=sum(a.size_bytes for a in record.uploads),
                 progress_callback=progress_callback,
             )
 
-            # Hardlink unchanged artifacts from previous release.
-            # If hardlinks fail (server doesn't support them), fall back to
-            # a regular upload for the remaining artifacts.
-            if to_hardlink:
-                hardlink_ok = await cls._try_hardlink_first(
-                    to_hardlink[0][1],
-                    staging_root / to_hardlink[0][0].remote_relative_path,
+            # Hardlink unchanged artifacts from the previous release. If
+            # hardlinks fail (server doesn't support them), fall back to a
+            # regular upload for the remaining artifacts.
+            if record.hardlinks:
+                first = record.hardlinks[0]
+                hardlink_ok = await cls._hardlink_resumable(
+                    PurePosixPath(str(first.previous_remote_path)),
+                    staging_root / PurePosixPath(first.remote_relative_path),
+                    expected_size=first.size_bytes,
                 )
                 if hardlink_ok:
-                    # First hardlink succeeded — do the rest in parallel.
-                    remaining = to_hardlink[1:]
+                    remaining = record.hardlinks[1:]
                     if remaining:
-                        async def _hardlink_artifact(
-                            item: tuple[LocalArtifact, PurePosixPath],
-                        ) -> None:
-                            artifact, source_remote = item
-                            await StorageBoxSftpClient.hardlink(
-                                source_remote,
-                                staging_root / artifact.remote_relative_path,
+                        async def _hardlink_artifact(artifact: PendingArtifact) -> None:
+                            ok = await cls._hardlink_resumable(
+                                PurePosixPath(str(artifact.previous_remote_path)),
+                                staging_root
+                                / PurePosixPath(artifact.remote_relative_path),
+                                expected_size=artifact.size_bytes,
                             )
+                            if not ok:
+                                raise RuntimeError(
+                                    "Hardlink failed for "
+                                    f"{artifact.remote_relative_path}"
+                                )
 
                         await _run_bounded(
                             remaining,
@@ -1901,25 +2033,28 @@ class StorageBoxRepository:
                             _hardlink_artifact,
                         )
                 else:
-                    # Hardlinks not supported — upload all unchanged artifacts.
                     logger.warning(
                         "Hardlink unsupported on this Storage Box; "
                         "falling back to upload for %d artifact(s)",
-                        len(to_hardlink),
+                        len(record.hardlinks),
                     )
-                    fallback = [a for a, _ in to_hardlink]
                     await StorageBoxRclone.upload_batch(
-                        [(a.local_path, a.remote_relative_path) for a in fallback],
+                        [
+                            (Path(a.local_path), PurePosixPath(a.remote_relative_path))
+                            for a in record.hardlinks
+                            if a.local_path
+                        ],
                         remote_base=staging_root,
-                        total_bytes=sum(a.size_bytes for a in fallback),
+                        total_bytes=sum(a.size_bytes for a in record.hardlinks),
                         progress_callback=progress_callback,
                     )
 
-            if preserved_artifacts:
-                hardlink_probe = preserved_artifacts[0]
-                hardlink_ok = await cls._try_hardlink_first(
-                    hardlink_probe.previous_remote_path,
-                    staging_root / hardlink_probe.remote_relative_path,
+            if record.preserved:
+                probe = record.preserved[0]
+                hardlink_ok = await cls._hardlink_resumable(
+                    PurePosixPath(str(probe.previous_remote_path)),
+                    staging_root / PurePosixPath(probe.remote_relative_path),
+                    expected_size=probe.size_bytes,
                 )
                 if not hardlink_ok:
                     raise RuntimeError(
@@ -1927,13 +2062,20 @@ class StorageBoxRepository:
                         "incremental update while preserving non-hydrated episodes."
                     )
 
-                remaining_preserved = preserved_artifacts[1:]
+                remaining_preserved = record.preserved[1:]
                 if remaining_preserved:
-                    async def _hardlink_preserved(artifact: RemoteArtifact) -> None:
-                        await StorageBoxSftpClient.hardlink(
-                            artifact.previous_remote_path,
-                            staging_root / artifact.remote_relative_path,
+                    async def _hardlink_preserved(artifact: PendingArtifact) -> None:
+                        ok = await cls._hardlink_resumable(
+                            PurePosixPath(str(artifact.previous_remote_path)),
+                            staging_root
+                            / PurePosixPath(artifact.remote_relative_path),
+                            expected_size=artifact.size_bytes,
                         )
+                        if not ok:
+                            raise RuntimeError(
+                                "Hardlink failed for preserved artifact "
+                                f"{artifact.remote_relative_path}"
+                            )
 
                     await _run_bounded(
                         remaining_preserved,
@@ -1943,7 +2085,7 @@ class StorageBoxRepository:
 
             await cls._verify_remote_artifacts(
                 staging_root=staging_root,
-                artifacts=[*artifacts, *preserved_artifacts],
+                artifacts=[*record.uploads, *record.hardlinks, *record.preserved],
             )
             await StorageBoxSftpClient.write_text(
                 staging_root / "series_manifest.json",
@@ -1951,53 +2093,129 @@ class StorageBoxRepository:
             )
             await StorageBoxSftpClient.rename(staging_root, release_root)
 
-            current_payload = {
-                "schema_version": SCHEMA_VERSION,
-                "series_id": effective_series_id,
-                "release_id": release_id,
-                "published_at": _utc_now_iso(),
-                "display_name": display_name,
-                "manifest_checksum": _sha256_text(manifest_text),
-            }
-            current_path = cls._current_path(scoped_type, effective_series_id)
-            tmp_current = current_path.with_name(f"current.{publish_id}.tmp")
-            with suppress(Exception):
-                existing_current = await StorageBoxSftpClient.read_text(current_path)
+        current_payload = {
+            "schema_version": SCHEMA_VERSION,
+            "series_id": record.series_id,
+            "release_id": record.release_id,
+            "published_at": _utc_now_iso(),
+            "display_name": record.display_name,
+            "manifest_checksum": _sha256_text(manifest_text),
+        }
+        current_path = cls._current_path(scoped_type, record.series_id)
+        tmp_current = current_path.with_name(f"current.{record.publish_id}.tmp")
+        with suppress(Exception):
+            existing_current = await StorageBoxSftpClient.read_text(current_path)
+            if series_dir.exists():
                 backup_path = series_dir / ".atr_storage_box.current.backup.json"
                 backup_path.write_text(existing_current, encoding="utf-8")
-            await cls._write_remote_json(tmp_current, current_payload)
-            await StorageBoxSftpClient.replace_file(tmp_current, current_path)
-            await cls.rebuild_catalog(scoped_type)
+        await cls._write_remote_json(tmp_current, current_payload)
+        await StorageBoxSftpClient.replace_file(tmp_current, current_path)
+        await cls.rebuild_catalog(scoped_type)
+        if series_dir.exists():
             await asyncio.to_thread(
                 cls.write_local_series_metadata,
                 series_dir=series_dir,
-                series_id=effective_series_id,
-                display_name=display_name,
-                release_id=release_id,
+                series_id=record.series_id,
+                display_name=record.display_name,
+                release_id=record.release_id,
             )
-            return {
-                "series_id": effective_series_id,
-                "release_id": release_id,
-                "manifest": manifest_payload,
-                "current": current_payload,
-            }
+        return {
+            "series_id": record.series_id,
+            "release_id": record.release_id,
+            "manifest": record.manifest,
+            "current": current_payload,
+        }
+
+    @classmethod
+    async def abandon_prepared_release(cls, record: PendingPublishRecord) -> None:
+        """Best-effort remote cleanup for a superseded/cancelled pending publish.
+
+        Never removes anything an existing current.json still advertises.
+        """
+        scoped_type = coerce_library_type(record.library_type)
+        if not cls.is_enabled():
+            return
+
+        current_release_id: str | None = None
+        current_exists = False
+        with suppress(Exception):
+            current = await cls.get_current_release(scoped_type, record.series_id)
+            current_exists = True
+            current_release_id = str(current.get("release_id") or "")
+
+        if record.is_brand_new_series and not current_exists:
+            # Nothing was ever advertised for this series_id: the series root
+            # only contains our partial staging (and possibly a committed but
+            # never-advertised release). Wipe the whole tree so an orphan
+            # remote dir doesn't leak.
+            with suppress(Exception):
+                await StorageBoxSftpClient.remove_tree(
+                    cls._series_root(scoped_type, record.series_id)
+                )
+            return
+
+        with suppress(Exception):
+            await StorageBoxSftpClient.remove_tree(
+                cls._staging_root(scoped_type, record.series_id, record.publish_id)
+            )
+        if current_release_id != record.release_id:
+            with suppress(Exception):
+                await StorageBoxSftpClient.remove_tree(
+                    cls._release_root(scoped_type, record.series_id, record.release_id)
+                )
+
+    @classmethod
+    async def sweep_series_staging(
+        cls,
+        library_type: LibraryType | str,
+        series_id: str,
+        *,
+        keep_publish_ids: set[str],
+    ) -> None:
+        """Remove remote ``staging/<publish_id>`` dirs not in ``keep_publish_ids``.
+
+        Crashed uploads from before the durable pending-publish records (or
+        records that were deleted without remote cleanup) leave staging dirs
+        behind forever; this reclaims them, scoped to one series.
+        """
+        scoped_type = coerce_library_type(library_type)
+        if not cls.is_enabled():
+            return
+        staging_parent = cls._series_root(scoped_type, series_id) / "staging"
+        try:
+            entries = await StorageBoxSftpClient.listdir(staging_parent)
         except Exception:
-            if is_brand_new_series:
-                # First publish for this series_id never wrote a current.json,
-                # so the entire series root only contains our partial staging.
-                # Wipe the whole tree to avoid leaking an orphan series dir
-                # (the next publish would generate a fresh series_id and never
-                # reuse this one).
-                with suppress(Exception):
-                    await StorageBoxSftpClient.remove_tree(
-                        cls._series_root(scoped_type, effective_series_id)
-                    )
-            else:
-                with suppress(Exception):
-                    await StorageBoxSftpClient.remove_tree(staging_root)
-            raise
-        finally:
-            shutil.rmtree(temp_root, ignore_errors=True)
+            return
+        for name in entries:
+            if name in {".", ".."} or name in keep_publish_ids:
+                continue
+            logger.info(
+                "Sweeping orphaned remote staging dir %s for series %s",
+                name,
+                series_id,
+            )
+            with suppress(Exception):
+                await StorageBoxSftpClient.remove_tree(staging_parent / name)
+
+    @classmethod
+    async def _hardlink_resumable(
+        cls,
+        src: PurePosixPath,
+        dst: PurePosixPath,
+        *,
+        expected_size: int,
+    ) -> bool:
+        """Hardlink ``src`` → ``dst``, treating an existing correctly-sized
+        target (a resumed upload re-running the hardlink pass) as success."""
+        try:
+            await StorageBoxSftpClient.hardlink(src, dst)
+            return True
+        except Exception:
+            with suppress(Exception):
+                stat_result = await StorageBoxSftpClient.stat(dst)
+                if int(getattr(stat_result, "size", -1)) == expected_size:
+                    return True
+            return False
 
     @classmethod
     async def delete_series(

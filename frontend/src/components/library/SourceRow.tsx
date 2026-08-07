@@ -3,6 +3,7 @@ import {
   ShieldCheck,
   FolderDown,
   Cable,
+  CloudUpload,
   Loader2,
   Pencil,
   Trash2,
@@ -103,6 +104,14 @@ export function SourceRow({
             title="Hydratation locale en cours"
           >
             <Loader2 className="h-4 w-4 animate-spin" />
+          </div>
+        )}
+        {source.pending_upload && (
+          <div
+            className="p-1 text-amber-400 opacity-70"
+            title="Upload Storage Box en attente/en cours — la série est déjà utilisable"
+          >
+            <CloudUpload className="h-4 w-4" />
           </div>
         )}
         <button

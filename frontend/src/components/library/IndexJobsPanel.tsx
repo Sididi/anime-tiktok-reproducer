@@ -243,6 +243,7 @@ function StatusIcon({ status }: { status: IndexationJob["status"] }) {
 function statusLabel(job: IndexationJob): string {
   switch (job.status) {
     case "queued":
+      if (job.job_type === "upload") return "Upload en attente";
       return job.job_type === "update" ? "Mise à jour en attente" : "En attente";
     case "indexing":
       if (job.phase === "indexing" && job.total_files > 0) {
@@ -252,8 +253,14 @@ function statusLabel(job: IndexationJob): string {
       if (job.phase === "link_sources") return job.message || "Association des sources...";
       if (job.phase === "package_release") return job.message || "Préparation de la release...";
       if (job.phase === "upload_release") return job.message || "Upload vers le Storage Box...";
+      if (job.phase === "upload_retry_wait") return job.message || "Upload en pause avant nouvelle tentative...";
       return job.message || (job.job_type === "update" ? "Mise à jour..." : "Indexation...");
     case "complete": {
+      if (job.job_type === "upload") {
+        return job.phase === "superseded"
+          ? "Upload remplacé par une publication plus récente"
+          : "Upload terminé";
+      }
       if (job.warnings?.length > 0) {
         return ignoredFilesLabel(job.warnings.length);
       }

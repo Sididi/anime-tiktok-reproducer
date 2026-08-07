@@ -11,6 +11,7 @@ export interface SourceDetails {
   storage_release_id: string;
   torrent_count: number;
   hydration_status: string;
+  pending_upload?: boolean;
   updated_at: string;
 }
 
@@ -30,7 +31,7 @@ export interface BrowseResult {
 
 export interface IndexationJob {
   id: string;
-  job_type: "index" | "update";
+  job_type: "index" | "update" | "upload";
   source_name: string;
   library_type: import("./index").LibraryType;
   source_path: string;
@@ -52,6 +53,7 @@ export interface IndexationJob {
   linked_torrents: number;
   series_id: string | null;
   storage_release_id: string | null;
+  publish_id: string | null;
   network_bytes_transferred: number | null;
   network_bytes_total: number | null;
   network_mib_per_sec: number | null;

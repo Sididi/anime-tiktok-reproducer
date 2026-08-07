@@ -8,6 +8,7 @@ from typing import Any
 
 from ..library_types import LibraryType, coerce_library_type
 from .anime_library import AnimeLibraryService
+from .pending_publish_store import PendingPublishStore
 from .storage_box_repository import StorageBoxRepository
 
 
@@ -267,10 +268,29 @@ class IndexationPreflightService:
             result["resolution"] = RESOLUTION_NEEDS_FIX
             return result
 
-        remote = await cls._resolve_remote_series(
-            library_type=scoped_type,
-            display_name=display_name,
+        # A pending (finalized locally, upload not finished) publish is newer
+        # than anything remote and is invisible in the catalog: resolve it
+        # first so re-index/update decisions run against the local manifest
+        # instead of blocking on a phantom orphan.
+        remote: dict[str, Any] | None = None
+        pending = await asyncio.to_thread(
+            PendingPublishStore.find_by_display_name,
+            scoped_type.value,
+            display_name,
         )
+        if pending is not None and pending.manifest:
+            remote = {
+                "series_id": pending.series_id,
+                "release_id": pending.release_id,
+                "current": None,
+                "manifest": pending.manifest,
+                "catalog_entry": None,
+            }
+        if remote is None:
+            remote = await cls._resolve_remote_series(
+                library_type=scoped_type,
+                display_name=display_name,
+            )
         remote_series_id = str(remote["series_id"]) if remote else None
         result["series_id"] = remote_series_id
         result["storage_release_id"] = str(remote["release_id"]) if remote else None

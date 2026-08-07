@@ -87,7 +87,7 @@ class ReplacementProgress(BaseModel):
 
 class IndexationJob(BaseModel):
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:16])
-    job_type: Literal["index", "update"] = "index"
+    job_type: Literal["index", "update", "upload"] = "index"
     source_name: str
     library_type: LibraryType
     source_path: str
@@ -113,6 +113,7 @@ class IndexationJob(BaseModel):
     linked_torrents: int = 0  # number of torrents linked after indexation
     series_id: str | None = None
     storage_release_id: str | None = None
+    publish_id: str | None = None
     network_bytes_transferred: int | None = None
     network_bytes_total: int | None = None
     network_mib_per_sec: float | None = None

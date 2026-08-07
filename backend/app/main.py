@@ -28,6 +28,7 @@ from .config import settings
 from .api import api_router
 from .library_types import LibraryType
 from .services.account_service import AccountService
+from .services.indexation_queue import indexation_queue
 from .services.integration_health_service import IntegrationHealthService
 from .services.lan_transfer_service import LanTransferService
 from .services.library_hydration_service import LibraryHydrationService
@@ -151,6 +152,9 @@ async def lifespan(app: FastAPI):
     await LibraryHydrationService.startup_cleanup()
     await project_startup_queue.startup_cleanup()
     await project_upload_queue.startup_cleanup()
+    # Resume Storage Box uploads for releases finalized locally before a
+    # crash/stop: the series stays usable; only the upload restarts.
+    await indexation_queue.resume_pending_uploads()
     if settings.lan_transfer_enabled:
         LanTransferService.sweep_stale_tmp_files()
 

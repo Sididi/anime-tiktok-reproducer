@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from collections import Counter
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from pathlib import Path
 
 from ..library_types import LibraryType
@@ -13,6 +13,7 @@ from .anime_library import AnimeLibraryService
 from .anime_matcher import AnimeMatcherService
 from .indexation_preflight import IndexationPreflightService
 from .library_hydration_service import LibraryHydrationService
+from .pending_publish_store import PendingPublishRecord, PendingPublishStore
 from .storage_box_progress import ProgressSnapshot
 from .storage_box_repository import StorageBoxRepository
 from .runtime_memory import log_memory, release_unused_memory
@@ -27,6 +28,13 @@ class IndexationQueueService:
     # The registry lives for the whole process; without eviction it retains
     # every job ever enqueued (including per-file warning/unmatched lists).
     MAX_TERMINAL_JOBS = 50
+    # Background uploads always yield to indexation/matching/other heavy
+    # work: they only start when the system is idle, re-checked at this
+    # cadence, and run one at a time.
+    UPLOAD_IDLE_POLL_SECONDS = 5.0
+    # In-process auto-retry backoff after rclone's own retries are exhausted;
+    # the durable pending record additionally survives restarts.
+    UPLOAD_RETRY_DELAYS = (30.0, 120.0, 600.0)
 
     def __init__(self) -> None:
         self._jobs: dict[str, IndexationJob] = {}
@@ -36,6 +44,8 @@ class IndexationQueueService:
         self._active_heavy_jobs = 0
         self._active_heavy_kinds: Counter[str] = Counter()
         self._subscribers: list[asyncio.Queue[dict]] = []
+        self._upload_semaphore = asyncio.Semaphore(1)
+        self._upload_tasks: dict[str, asyncio.Task] = {}
 
     def _prune_terminal_jobs(self) -> None:
         terminal_ids = [
@@ -126,7 +136,10 @@ class IndexationQueueService:
         normalized_target = IndexationPreflightService.normalize_target_name(source_name)
         for existing_job in self._jobs.values():
             if (
-                existing_job.library_type == library_type
+                # Upload jobs never block a new index/update of the same
+                # series: the fresh publish supersedes the pending one.
+                existing_job.job_type != "upload"
+                and existing_job.library_type == library_type
                 and IndexationPreflightService.normalize_target_name(existing_job.source_name)
                 == normalized_target
                 and existing_job.status in {"queued", "indexing"}
@@ -213,20 +226,28 @@ class IndexationQueueService:
 
         return _on_progress
 
-    def _make_hashing_progress_callback(self, job: IndexationJob):
-        """Thread-safe packaging (hashing) progress over the 0.90→0.93 span.
+    def _make_hashing_progress_callback(
+        self,
+        job: IndexationJob,
+        *,
+        progress_span: tuple[float, float] = (0.90, 0.99),
+    ):
+        """Thread-safe packaging (hashing) progress over ``progress_span``.
 
         Called from hashing worker threads, so mutations are marshalled back
         onto the event loop.
         """
         loop = asyncio.get_running_loop()
+        span_start, span_end = progress_span
 
         def _hashing_progress(bytes_hashed: int, bytes_to_hash: int) -> None:
             def _apply() -> None:
                 if bytes_to_hash > 0:
                     job.progress = max(
                         job.progress,
-                        0.90 + 0.03 * min(1.0, bytes_hashed / bytes_to_hash),
+                        span_start
+                        + (span_end - span_start)
+                        * min(1.0, bytes_hashed / bytes_to_hash),
                     )
                 self._broadcast(job)
 
@@ -267,6 +288,16 @@ class IndexationQueueService:
                     job.progress = 0.02
                     self._broadcast(job)
                     if not job.series_id:
+                        # A finalized-but-not-yet-uploaded series is invisible
+                        # remotely; its pending record is the authority.
+                        pending = await asyncio.to_thread(
+                            PendingPublishStore.find_by_display_name,
+                            job.library_type.value,
+                            job.source_name,
+                        )
+                        if pending is not None:
+                            job.series_id = pending.series_id
+                    if not job.series_id:
                         resolved_series_id = await StorageBoxRepository.find_remote_series_id_by_name(
                             job.library_type,
                             job.source_name,
@@ -298,14 +329,30 @@ class IndexationQueueService:
                             )
                         await network_progress(snapshot)
 
-                    current_update_manifest = (
-                        await LibraryHydrationService.ensure_series_index_hydrated(
-                            library_type=job.library_type,
-                            series_id=job.series_id,
-                            already_locked=True,
-                            network_progress_callback=_hydration_progress,
+                    # Local-first baseline: for a series whose upload is still
+                    # pending, the remote has no current.json — the locally
+                    # cached manifest written at finalize time is authoritative
+                    # (and for uploaded series it skips a remote round-trip).
+                    if await LibraryHydrationService.ensure_index_ready(
+                        library_type=job.library_type,
+                        series_id=job.series_id,
+                    ):
+                        current_update_manifest = (
+                            await LibraryHydrationService._load_or_fetch_manifest(
+                                job.library_type,
+                                job.series_id,
+                            )
                         )
-                    )
+                        job.progress = 0.10
+                    else:
+                        current_update_manifest = (
+                            await LibraryHydrationService.ensure_series_index_hydrated(
+                                library_type=job.library_type,
+                                series_id=job.series_id,
+                                already_locked=True,
+                                network_progress_callback=_hydration_progress,
+                            )
+                        )
                     self._reset_network_progress_fields(job)
                     job.message = "Waiting for a processing slot..."
                     self._broadcast(job)
@@ -393,7 +440,13 @@ class IndexationQueueService:
                             expected_min_episodes = len(
                                 remote_episode_keys | prepared_episode_keys
                             )
-                        publish_result = await LibraryHydrationService.publish_series_release(
+                        # A still-pending upload of an older release for this
+                        # series is about to be superseded — stop its transfer
+                        # before finalize deletes its record and remote staging.
+                        await self._cancel_stale_upload_for(
+                            job.library_type, job.source_name
+                        )
+                        record = await LibraryHydrationService.finalize_series_release(
                             library_type=job.library_type,
                             display_name=job.source_name,
                             series_id=job.series_id or None,
@@ -402,19 +455,17 @@ class IndexationQueueService:
                             ),
                             expected_min_episodes=expected_min_episodes,
                             merge_existing_release=merge_existing_release,
-                            progress_callback=self._make_network_progress_callback(
-                                job,
-                                progress_span=(0.93, 0.995),
-                                phase="upload_release",
-                                message="Uploading release to Storage Box...",
-                            ),
                             hashing_progress_callback=(
                                 self._make_hashing_progress_callback(job)
                             ),
                         )
-                        job.series_id = str(publish_result["series_id"])
-                        job.storage_release_id = str(publish_result["release_id"])
-                        job.message = "Published release to Storage Box"
+                        job.series_id = record.series_id
+                        job.storage_release_id = record.release_id
+                        job.publish_id = record.publish_id
+                        job.message = (
+                            "Series indexed — available locally; "
+                            "Storage Box upload queued in background"
+                        )
                         job.progress = 1.0
                         job.status = "complete"
                         job.error = None
@@ -422,6 +473,7 @@ class IndexationQueueService:
                         AnimeMatcherService.mark_series_updated(
                             job.library_type, job.source_name
                         )
+                        self.enqueue_upload(record)
                     elif progress.status == "error":
                         self._finalize_job_error(
                             job,
@@ -435,6 +487,191 @@ class IndexationQueueService:
         finally:
             if slot_held:
                 self.release_heavy_slot("indexation")
+
+    def enqueue_upload(self, record: PendingPublishRecord) -> str:
+        """Register a background upload job for a pending publish.
+
+        Upload jobs share the indexation jobs registry/SSE panel but never
+        touch the GPU heavy-slot budget; an idle gate defers the actual
+        transfer while any indexation/matching/heavy work is active.
+        """
+        for existing_job in self._jobs.values():
+            if (
+                existing_job.job_type == "upload"
+                and existing_job.publish_id == record.publish_id
+                and existing_job.status in {"queued", "indexing"}
+            ):
+                return existing_job.id
+
+        job = IndexationJob(
+            job_type="upload",
+            source_name=record.display_name,
+            library_type=LibraryType(record.library_type),
+            source_path=record.series_dir,
+            series_id=record.series_id,
+            storage_release_id=record.release_id,
+            publish_id=record.publish_id,
+            phase="upload_release",
+            message="Storage Box upload queued...",
+        )
+        self._prune_terminal_jobs()
+        self._jobs[job.id] = job
+        self._broadcast(job)
+        task = asyncio.create_task(self._run_upload_job(job, record))
+        self._upload_tasks[record.publish_id] = task
+        self._job_tasks.add(task)
+
+        def _cleanup(done_task: asyncio.Task) -> None:
+            self._job_tasks.discard(done_task)
+            if self._upload_tasks.get(record.publish_id) is done_task:
+                del self._upload_tasks[record.publish_id]
+
+        task.add_done_callback(_cleanup)
+        return job.id
+
+    async def cancel_upload(self, publish_id: str) -> None:
+        """Cancel the queued/running upload job for ``publish_id`` and wait
+        for it to settle. The pending record itself is left untouched — the
+        caller decides whether it is superseded, deleted, or retried."""
+        task = self._upload_tasks.get(publish_id)
+        if task is None:
+            return
+        task.cancel()
+        with suppress(BaseException):
+            await task
+
+    async def _cancel_stale_upload_for(
+        self, library_type: LibraryType, display_name: str
+    ) -> None:
+        record = await asyncio.to_thread(
+            PendingPublishStore.find_by_display_name,
+            library_type.value,
+            display_name,
+        )
+        if record is not None:
+            await self.cancel_upload(record.publish_id)
+
+    def _upload_busy_reason(self) -> str | None:
+        """What the upload should yield to right now, or None when idle.
+
+        Uploads are strictly lowest-priority: any queued/active indexation
+        job or any held heavy slot (matching, transcription, forced
+        alignment, indexation) defers them.
+        """
+        for other in self._jobs.values():
+            if other.job_type != "upload" and other.status in {"queued", "indexing"}:
+                return f"indexation '{other.source_name}'"
+        if self._active_heavy_jobs > 0:
+            kinds = ", ".join(sorted(self._active_heavy_kinds)) or "heavy work"
+            return kinds
+        return None
+
+    async def _wait_until_idle(self, job: IndexationJob) -> None:
+        last_reason: str | None = None
+        while (reason := self._upload_busy_reason()) is not None:
+            if reason != last_reason:
+                last_reason = reason
+                job.message = f"Upload waiting for {reason} to finish..."
+                self._broadcast(job)
+                logger.info("Upload job %s yielding to %s", job.id, reason)
+            await asyncio.sleep(self.UPLOAD_IDLE_POLL_SECONDS)
+
+    async def _run_upload_job(
+        self, job: IndexationJob, record: PendingPublishRecord
+    ) -> None:
+        try:
+            async with self._upload_semaphore:
+                await self._wait_until_idle(job)
+                job.status = "indexing"
+                attempt = 0
+                while True:
+                    try:
+                        job.error = None
+                        self._reset_network_progress_fields(job)
+                        job.phase = "upload_release"
+                        job.message = "Uploading release to Storage Box..."
+                        self._broadcast(job)
+                        result = await LibraryHydrationService.run_pending_upload(
+                            record,
+                            progress_callback=self._make_network_progress_callback(
+                                job,
+                                progress_span=(0.0, 0.995),
+                                phase="upload_release",
+                            ),
+                        )
+                        break
+                    except Exception as exc:
+                        if attempt >= len(self.UPLOAD_RETRY_DELAYS):
+                            raise
+                        delay = self.UPLOAD_RETRY_DELAYS[attempt]
+                        attempt += 1
+                        logger.warning(
+                            "Upload job %s for '%s' failed (attempt %d/%d): %s; "
+                            "retrying in %.0fs",
+                            job.id,
+                            job.source_name,
+                            attempt,
+                            len(self.UPLOAD_RETRY_DELAYS) + 1,
+                            exc,
+                            delay,
+                        )
+                        job.phase = "upload_retry_wait"
+                        job.message = (
+                            f"Upload failed ({exc}); retrying in {int(delay)}s"
+                        )
+                        self._broadcast(job)
+                        await asyncio.sleep(delay)
+
+                self._reset_network_progress_fields(job)
+                if result is None:
+                    # Superseded/cancelled between enqueue and execution.
+                    job.message = "Upload superseded by a newer publish"
+                    job.phase = "superseded"
+                else:
+                    job.series_id = str(result["series_id"])
+                    job.storage_release_id = str(result["release_id"])
+                    job.message = "Release uploaded to Storage Box"
+                job.progress = 1.0
+                job.status = "complete"
+                job.error = None
+                self._broadcast(job)
+        except asyncio.CancelledError:
+            self._reset_job_transient_fields(job)
+            job.status = "error"
+            job.phase = "cancelled"
+            job.error = "Upload cancelled (superseded by a newer indexation)."
+            self._broadcast(job)
+            raise
+        except Exception as e:
+            self._finalize_job_error(job, str(e))
+            logger.exception("Upload job %s failed", job.id)
+
+    async def resume_pending_uploads(self) -> None:
+        """Re-enqueue every durable pending publish (called at startup).
+
+        Re-applies the local availability state first — this is what heals
+        the local 'orphan folder' left by a crash between finalize and the
+        end of the upload — then queues the upload itself.
+        """
+        if not StorageBoxRepository.is_enabled():
+            return
+        records = await asyncio.to_thread(PendingPublishStore.list_all)
+        for record in records:
+            try:
+                await LibraryHydrationService.apply_local_publish_state(record)
+            except Exception:
+                logger.exception(
+                    "Failed to re-apply local publish state for pending "
+                    "publish %s ('%s')",
+                    record.publish_id,
+                    record.display_name,
+                )
+            logger.info(
+                "Resuming pending Storage Box upload %s for '%s'",
+                record.publish_id,
+                record.display_name,
+            )
+            self.enqueue_upload(record)
 
     @staticmethod
     def _collect_direct_video_files(source_folder: Path) -> list[Path]:
