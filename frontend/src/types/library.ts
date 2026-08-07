@@ -95,6 +95,12 @@ export interface LibraryActivationState {
     progress: number;
     error: string | null;
     updated_at: string;
+    // Present while a Storage Box download is running (cleared on completion).
+    network_bytes_transferred?: number | null;
+    network_bytes_total?: number | null;
+    network_mib_per_sec?: number | null;
+    network_eta_seconds?: number | null;
+    network_active_transfers?: number | null;
   } | null;
   updated_at: string | null;
 }

@@ -36,6 +36,7 @@ from .services.project_service import ProjectService
 from .services.project_startup_service import project_startup_queue
 from .services.project_upload_service import project_upload_queue
 from .services.reschedule_retry_service import RescheduleRetryService
+from .services.google_drive_service import GoogleDriveService
 from .services.storage_box_rclone import StorageBoxRclone
 from .services.storage_box_sftp_client import StorageBoxSftpClient
 from .services.runtime_memory import log_memory, release_unused_memory
@@ -174,13 +175,15 @@ async def lifespan(app: FastAPI):
         library_types=list(LibraryType),
     )
 
+    if StorageBoxRclone.binary() is None and (
+        settings.storage_box_enabled or GoogleDriveService.is_configured()
+    ):
+        logger.error(
+            "rclone not found on PATH: Storage Box transfers (series "
+            "publish + hydration) and Google Drive exports will fail until "
+            "it is installed (Arch: sudo pacman -S rclone)."
+        )
     if settings.storage_box_enabled:
-        if StorageBoxRclone.binary() is None:
-            logger.error(
-                "rclone not found on PATH: Storage Box uploads (series "
-                "publish) will fail until it is installed "
-                "(Arch: sudo pacman -S rclone). Downloads keep working."
-            )
         _track_app_task(
             app,
             asyncio.create_task(

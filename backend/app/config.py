@@ -188,6 +188,12 @@ class Settings(BaseSettings):
     # Concurrent file transfers for the rclone publish batch. Hetzner Storage
     # Boxes cap SSH connections around 10; rclone uses ~transfers+1.
     storage_box_rclone_transfers: int = 4
+    # rclone Drive export sync: parallel transfers and per-request chunk size.
+    # Memory cost ≈ chunk × transfers (512 MB at defaults).
+    drive_rclone_transfers: int = 4
+    drive_rclone_chunk_mb: int = 128
+    # Set when google_drive_parent_folder_id lives inside a Shared Drive.
+    google_drive_team_drive_id: str | None = None
     # Retry settings for transient SFTP/network errors (VPN flaps, NAT timeouts,
     # brief Hetzner reachability dips). Per-operation retry — the retried
     # operation re-acquires a fresh SSH session, so a half-dead pooled
@@ -349,6 +355,16 @@ class Settings(BaseSettings):
     @classmethod
     def _clamp_storage_box_rclone_transfers(cls, value: int) -> int:
         return max(1, min(8, value))
+
+    @field_validator("drive_rclone_transfers")
+    @classmethod
+    def _clamp_drive_rclone_transfers(cls, value: int) -> int:
+        return max(1, min(8, value))
+
+    @field_validator("drive_rclone_chunk_mb")
+    @classmethod
+    def _clamp_drive_rclone_chunk_mb(cls, value: int) -> int:
+        return max(8, min(512, value))
 
     @field_validator("storage_box_retry_max_attempts")
     @classmethod

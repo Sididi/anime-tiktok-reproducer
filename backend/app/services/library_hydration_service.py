@@ -6,8 +6,11 @@ import inspect
 import json
 import logging
 import shutil
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext, suppress
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Awaitable, Callable
 
@@ -17,11 +20,8 @@ from .anime_library import AnimeLibraryService
 from .library_state_db import LibraryStateDb, OperationRow, SeriesStateRow
 from .pending_publish_store import PendingPublishRecord, PendingPublishStore
 from .project_service import ProjectService
-from .storage_box_progress import (
-    ProgressCallback,
-    StorageBoxTransferProgress,
-    TransferSession,
-)
+from .storage_box_progress import ProgressCallback, ProgressSnapshot
+from .storage_box_rclone import StorageBoxRclone
 from .storage_box_repository import HashingProgressCallback, StorageBoxRepository
 from .storage_box_sftp_client import StorageBoxSftpClient
 
@@ -97,7 +97,6 @@ def _sha256_file(path: Path) -> str:
 
 
 ActivationProgressCallback = Callable[[float, str], Awaitable[None] | None]
-ArtifactProgressCallback = Callable[[int, int, str], Awaitable[None] | None]
 
 
 async def _call_progress_callback(callback, *args: Any) -> None:
@@ -108,16 +107,52 @@ async def _call_progress_callback(callback, *args: Any) -> None:
         await result
 
 
-async def _run_bounded(items: list[Any], limit: int, worker) -> None:
-    semaphore = asyncio.Semaphore(max(1, limit))
+async def _sha256_files_parallel(
+    paths: list[Path], *, max_workers: int = 4
+) -> dict[Path, str]:
+    """Hash all files on a small thread pool (post-download verification)."""
+    if not paths:
+        return {}
 
-    async def _run_one(item: Any) -> None:
-        async with semaphore:
-            await worker(item)
+    def _hash_all() -> dict[Path, str]:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            return dict(zip(paths, pool.map(_sha256_file, paths)))
 
-    async with asyncio.TaskGroup() as task_group:
-        for item in items:
-            task_group.create_task(_run_one(item))
+    return await asyncio.to_thread(_hash_all)
+
+
+def _format_bytes(value: int) -> str:
+    size = float(max(0, value))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024.0 or unit == "TB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} TB"  # pragma: no cover - unreachable
+
+
+def _network_detail(snapshot: ProgressSnapshot) -> dict[str, Any]:
+    """Operation-row payload matching the frontend network_* field names."""
+    return {
+        "network_bytes_transferred": snapshot.bytes_transferred,
+        "network_bytes_total": snapshot.bytes_total,
+        "network_mib_per_sec": snapshot.mib_per_sec,
+        "network_eta_seconds": snapshot.eta_seconds,
+        "network_active_transfers": snapshot.active_transfers,
+    }
+
+
+@dataclass(frozen=True)
+class _EpisodeDownloadItem:
+    remote_relative: PurePosixPath
+    final_target: Path
+    sha256: str
+    size_bytes: int
+
+
+@dataclass(frozen=True)
+class _EpisodeDownloadPlan:
+    episode_key: str
+    items: tuple[_EpisodeDownloadItem, ...]
 
 
 class LibraryHydrationService:
@@ -590,13 +625,13 @@ class LibraryHydrationService:
                         "Hydrating matcher cache from Storage Box...",
                     )
 
-                    async def _artifact_progress(
-                        completed: int,
-                        total: int,
-                        relative_path: str,
-                    ) -> None:
-                        artifact_progress = completed / max(total, 1)
-                        activation_progress = 0.15 + (0.75 * artifact_progress)
+                    async def _network_progress(snapshot: ProgressSnapshot) -> None:
+                        ratio = (
+                            snapshot.bytes_transferred / snapshot.bytes_total
+                            if snapshot.bytes_total > 0
+                            else 0.0
+                        )
+                        activation_progress = 0.15 + 0.75 * min(1.0, ratio)
                         await asyncio.to_thread(
                             LibraryStateDb.upsert_operation,
                             library_type=scoped_type,
@@ -605,20 +640,27 @@ class LibraryHydrationService:
                             status=OPERATION_RUNNING,
                             progress=activation_progress,
                             error=None,
+                            detail=_network_detail(snapshot),
+                        )
+                        speed = (
+                            f" · {(snapshot.mib_per_sec or 0.0) * 1.048576:.0f} MB/s"
+                            if snapshot.mib_per_sec is not None
+                            else ""
                         )
                         await _call_progress_callback(
                             progress_callback,
                             activation_progress,
                             (
-                                "Hydrating matcher cache "
-                                f"({completed}/{total}): {Path(relative_path).name}"
+                                "Downloading matcher cache — "
+                                f"{_format_bytes(snapshot.bytes_transferred)} / "
+                                f"{_format_bytes(snapshot.bytes_total)}{speed}"
                             ),
                         )
 
                     await cls._hydrate_index_artifacts(
                         scoped_type,
                         manifest,
-                        progress_callback=_artifact_progress,
+                        network_progress_callback=_network_progress,
                     )
                     local_episode_count = await asyncio.to_thread(
                         cls._count_local_episodes_from_manifest,
@@ -806,57 +848,112 @@ class LibraryHydrationService:
                         )
                     ]
 
-                total = len(selected_episodes)
-                completed = 0
-                progress_lock = asyncio.Lock()
+                plans = await asyncio.to_thread(
+                    cls._plan_episode_downloads,
+                    scoped_type,
+                    manifest,
+                    selected_episodes,
+                )
+                total_bytes = sum(
+                    item.size_bytes for plan in plans for item in plan.items
+                )
+                release_root = StorageBoxRepository._release_root(
+                    scoped_type,
+                    series_id,
+                    str(manifest["release_id"]),
+                )
+                batch_temp_root = (
+                    cls._temp_root()
+                    / scoped_type.value
+                    / series_id
+                    / "episodes-batch"
+                    / uuid.uuid4().hex[:8]
+                )
 
-                total_bytes = 0
-                for episode_entry in selected_episodes:
-                    media = episode_entry.get("media") or {}
-                    if isinstance(media, dict):
-                        total_bytes += int(media.get("size_bytes") or 0)
-                    sidecars = episode_entry.get("sidecars") or []
-                    if isinstance(sidecars, list):
-                        for sidecar in sidecars:
-                            if isinstance(sidecar, dict):
-                                total_bytes += int(sidecar.get("size_bytes") or 0)
+                last_db_write = 0.0
 
-                session = await StorageBoxTransferProgress.open_session(
-                    f"hydrate-series:{scoped_type.value}:{series_id}:{uuid.uuid4().hex[:8]}",
-                    total_bytes=total_bytes,
-                    on_update=progress_callback,
-                ) if progress_callback is not None else None
-
-                async def _hydrate_with_progress(episode: dict[str, Any]) -> None:
-                    nonlocal completed
-                    await cls._hydrate_episode(scoped_type, manifest, episode, session)
-                    async with progress_lock:
-                        completed += 1
+                async def _batch_progress(snapshot: ProgressSnapshot) -> None:
+                    # Persist byte progress on the operation row (throttled)
+                    # so /state pollers render bytes/speed, then forward the
+                    # snapshot to the caller's own display (e.g. SSE).
+                    nonlocal last_db_write
+                    now = time.monotonic()
+                    if now - last_db_write >= 1.0:
+                        last_db_write = now
+                        ratio = (
+                            snapshot.bytes_transferred / snapshot.bytes_total
+                            if snapshot.bytes_total > 0
+                            else 0.0
+                        )
                         await asyncio.to_thread(
                             LibraryStateDb.upsert_operation,
                             library_type=scoped_type,
                             series_id=series_id,
                             operation_type="hydrate",
                             status=OPERATION_RUNNING,
-                            progress=completed / max(total, 1),
+                            progress=0.05 + 0.9 * min(1.0, ratio),
                             error=None,
+                            detail=_network_detail(snapshot),
                         )
+                    await _call_progress_callback(progress_callback, snapshot)
 
+                episode_errors: list[str] = []
                 try:
-                    await _run_bounded(
-                        selected_episodes,
-                        settings.storage_box_download_max_parallel,
-                        _hydrate_with_progress,
-                    )
+                    if plans:
+                        await StorageBoxRclone.download_batch(
+                            [
+                                item.remote_relative
+                                for plan in plans
+                                for item in plan.items
+                            ],
+                            remote_base=release_root,
+                            dest_root=batch_temp_root,
+                            total_bytes=total_bytes,
+                            progress_callback=_batch_progress,
+                        )
+                        downloaded_paths = [
+                            batch_temp_root / Path(*item.remote_relative.parts)
+                            for plan in plans
+                            for item in plan.items
+                        ]
+                        hashes = await _sha256_files_parallel(downloaded_paths)
+
+                        def _verify_and_move_all() -> None:
+                            for plan in plans:
+                                try:
+                                    cls._verify_and_move_episode(
+                                        plan, batch_temp_root, hashes
+                                    )
+                                except Exception as exc:
+                                    episode_errors.append(
+                                        f"{plan.episode_key}: {exc}"
+                                    )
+
+                        await asyncio.to_thread(_verify_and_move_all)
+                        display_name = str(manifest["display_name"])
+                        await asyncio.to_thread(
+                            StorageBoxRepository.write_local_series_metadata,
+                            series_dir=AnimeLibraryService.get_library_path(
+                                scoped_type
+                            )
+                            / display_name,
+                            series_id=series_id,
+                            display_name=display_name,
+                            release_id=str(manifest["release_id"]),
+                        )
                 finally:
-                    if session is not None:
-                        await StorageBoxTransferProgress.close_session(session)
+                    await asyncio.to_thread(shutil.rmtree, batch_temp_root, True)
                     # Newly hydrated episode files must become visible to
                     # AnimeLibraryService.resolve_episode_path consumers
                     # (processing pipeline, gap resolution, playback).
                     await AnimeLibraryService.ensure_episode_manifest(
                         force_refresh=True,
                         library_type=scoped_type,
+                    )
+
+                if episode_errors:
+                    raise RuntimeError(
+                        "Episode hydration failed for: " + "; ".join(episode_errors)
                     )
 
                 local_episode_count = await asyncio.to_thread(
@@ -2246,39 +2343,10 @@ class LibraryHydrationService:
         )
 
     @classmethod
-    async def _download_with_session(
-        cls,
-        remote_path: PurePosixPath,
-        local_path: Path,
-        *,
-        size_bytes: int,
-        session: TransferSession | None,
-    ) -> None:
-        """Download one file over SFTP, feeding the local-stat progress session.
-
-        Manifest sizes are trusted for the progress target, so no remote stat
-        round-trip is needed per file.
-        """
-        remote = StorageBoxSftpClient.normalize_remote_path(remote_path)
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        track_cm = (
-            session.track(
-                local_path=local_path,
-                remote_path=remote,
-                target_size=max(0, size_bytes),
-            )
-            if session is not None
-            else nullcontext()
-        )
-        async with track_cm:
-            await StorageBoxSftpClient.download_file(remote, local_path)
-
-    @classmethod
     async def _hydrate_index_artifacts(
         cls,
         library_type: LibraryType,
         manifest: dict[str, Any],
-        progress_callback: ArtifactProgressCallback | None = None,
         network_progress_callback: ProgressCallback | None = None,
     ) -> None:
         index_artifacts = [
@@ -2290,7 +2358,6 @@ class LibraryHydrationService:
             raise RuntimeError("No index artifacts found in the active release manifest.")
 
         temp_root = cls._temp_root() / library_type.value / str(manifest["series_id"]) / "index" / uuid.uuid4().hex[:8]
-        temp_root.mkdir(parents=True, exist_ok=True)
         release_root = StorageBoxRepository._release_root(
             library_type,
             str(manifest["series_id"]),
@@ -2299,48 +2366,34 @@ class LibraryHydrationService:
         total_bytes = sum(
             int(artifact.get("size_bytes") or 0) for artifact in index_artifacts
         )
-        session = await StorageBoxTransferProgress.open_session(
-            f"hydrate-index:{manifest['series_id']}:{uuid.uuid4().hex[:8]}",
-            total_bytes=total_bytes,
-            on_update=network_progress_callback,
-        ) if network_progress_callback is not None else None
+        items = [
+            PurePosixPath(str(artifact["relative_path"]))
+            for artifact in index_artifacts
+        ]
         try:
-            completed = 0
-            total = len(index_artifacts)
-            progress_lock = asyncio.Lock()
-
-            async def _download_artifact(artifact: dict[str, Any]) -> None:
-                nonlocal completed
-                relative_path = str(artifact["relative_path"])
-                local_relative_path = Path(relative_path).relative_to("payload/index")
-                download_path = temp_root / local_relative_path
-                await cls._download_with_session(
-                    release_root / relative_path,
-                    download_path,
-                    size_bytes=int(artifact.get("size_bytes") or 0),
-                    session=session,
-                )
-                actual_sha = await asyncio.to_thread(_sha256_file, download_path)
-                if actual_sha != str(artifact["sha256"]):
-                    raise RuntimeError(f"Checksum mismatch for {relative_path}")
-                async with progress_lock:
-                    completed += 1
-                    await _call_progress_callback(
-                        progress_callback,
-                        completed,
-                        total,
-                        relative_path,
-                    )
-
-            await _run_bounded(
-                index_artifacts,
-                settings.storage_box_download_max_parallel,
-                _download_artifact,
+            await StorageBoxRclone.download_batch(
+                items,
+                remote_base=release_root,
+                dest_root=temp_root,
+                total_bytes=total_bytes,
+                progress_callback=network_progress_callback,
             )
-            await cls._materialize_local_matcher_cache(library_type, manifest, temp_root)
+            downloaded_paths = [temp_root / Path(*item.parts) for item in items]
+            hashes = await _sha256_files_parallel(downloaded_paths)
+            for artifact, path in zip(index_artifacts, downloaded_paths):
+                relative_path = str(artifact["relative_path"])
+                if not path.is_file():
+                    raise RuntimeError(
+                        f"Downloaded index artifact missing: {relative_path}"
+                    )
+                if hashes.get(path) != str(artifact["sha256"]):
+                    raise RuntimeError(f"Checksum mismatch for {relative_path}")
+            # The downloaded tree mirrors remote-relative paths, so the
+            # payload the materializer expects lives under payload/index.
+            await cls._materialize_local_matcher_cache(
+                library_type, manifest, temp_root / "payload" / "index"
+            )
         finally:
-            if session is not None:
-                await StorageBoxTransferProgress.close_session(session)
             await asyncio.to_thread(shutil.rmtree, temp_root, True)
 
     @classmethod
@@ -2433,76 +2486,86 @@ class LibraryHydrationService:
         )
 
     @classmethod
-    async def _hydrate_episode(
+    def _plan_episode_downloads(
         cls,
         library_type: LibraryType,
         manifest: dict[str, Any],
-        episode: dict[str, Any],
-        session: TransferSession | None = None,
-    ) -> None:
-        media = episode.get("media", {})
-        if not isinstance(media, dict):
-            raise RuntimeError("Invalid episode media payload")
-
+        episodes: list[dict[str, Any]],
+    ) -> list[_EpisodeDownloadPlan]:
+        """Collect the (remote, target) pairs for episodes not fully local."""
         library_root = AnimeLibraryService.get_library_path(library_type)
-        media_local_rel = str(media.get("local_relative_path") or "")
-        if not media_local_rel:
-            raise RuntimeError("Episode media is missing local_relative_path")
+        plans: list[_EpisodeDownloadPlan] = []
+        for episode in episodes:
+            media = episode.get("media", {})
+            if not isinstance(media, dict):
+                raise RuntimeError("Invalid episode media payload")
+            media_local_rel = str(media.get("local_relative_path") or "")
+            if not media_local_rel:
+                raise RuntimeError("Episode media is missing local_relative_path")
 
-        media_target = library_root / media_local_rel
-        sidecars = [item for item in episode.get("sidecars", []) if isinstance(item, dict)]
-        if media_target.exists() and all(
-            (library_root / str(item.get("local_relative_path"))).exists()
-            for item in sidecars
-            if item.get("local_relative_path")
-        ):
-            return
+            media_target = library_root / media_local_rel
+            sidecars = [
+                item for item in episode.get("sidecars", []) if isinstance(item, dict)
+            ]
+            if media_target.exists() and all(
+                (library_root / str(item.get("local_relative_path"))).exists()
+                for item in sidecars
+                if item.get("local_relative_path")
+            ):
+                continue
 
-        temp_root = cls._temp_root() / library_type.value / str(manifest["series_id"]) / "episodes" / str(episode.get("episode_key") or uuid.uuid4().hex[:8])
-        if temp_root.exists():
-            await asyncio.to_thread(shutil.rmtree, temp_root, True)
-        temp_root.mkdir(parents=True, exist_ok=True)
-        release_root = StorageBoxRepository._release_root(
-            library_type,
-            str(manifest["series_id"]),
-            str(manifest["release_id"]),
-        )
-
-        try:
-            downloaded: list[tuple[Path, Path]] = []
+            items: list[_EpisodeDownloadItem] = []
             for item in [media, *sidecars]:
                 remote_relative_path = str(item.get("relative_path") or "")
                 local_relative_path = str(item.get("local_relative_path") or "")
                 if not remote_relative_path or not local_relative_path:
                     raise RuntimeError("Episode artifact is missing relative paths")
-                temp_path = temp_root / local_relative_path
-                await cls._download_with_session(
-                    release_root / remote_relative_path,
-                    temp_path,
-                    size_bytes=int(item.get("size_bytes") or 0),
-                    session=session,
+                items.append(
+                    _EpisodeDownloadItem(
+                        remote_relative=PurePosixPath(remote_relative_path),
+                        final_target=library_root / local_relative_path,
+                        sha256=str(item.get("sha256") or ""),
+                        size_bytes=int(item.get("size_bytes") or 0),
+                    )
                 )
-                expected_sha = str(item.get("sha256") or "")
-                if expected_sha and (await asyncio.to_thread(_sha256_file, temp_path)) != expected_sha:
-                    raise RuntimeError(f"Checksum mismatch for {remote_relative_path}")
-                downloaded.append((temp_path, library_root / local_relative_path))
+            plans.append(
+                _EpisodeDownloadPlan(
+                    episode_key=str(episode.get("episode_key") or media_local_rel),
+                    items=tuple(items),
+                )
+            )
+        return plans
 
-            for _temp_path, target_path in downloaded:
-                target_path.parent.mkdir(parents=True, exist_ok=True)
-            for temp_path, target_path in downloaded:
-                if target_path.exists():
-                    target_path.unlink()
-                temp_path.replace(target_path)
-        finally:
-            await asyncio.to_thread(shutil.rmtree, temp_root, True)
+    @staticmethod
+    def _verify_and_move_episode(
+        plan: _EpisodeDownloadPlan,
+        batch_temp_root: Path,
+        hashes: dict[Path, str],
+    ) -> None:
+        """Checksum-gate then atomically move one episode's files.
 
-        display_name = str(manifest["display_name"])
-        StorageBoxRepository.write_local_series_metadata(
-            series_dir=AnimeLibraryService.get_library_path(library_type) / display_name,
-            series_id=str(manifest["series_id"]),
-            display_name=display_name,
-            release_id=str(manifest["release_id"]),
-        )
+        All of the episode's files are verified before ANY of them moves,
+        so a failed episode leaves the library untouched.
+        """
+        moves: list[tuple[Path, Path]] = []
+        for item in plan.items:
+            temp_path = batch_temp_root / Path(*item.remote_relative.parts)
+            if not temp_path.is_file():
+                raise RuntimeError(
+                    f"Downloaded file missing for {item.remote_relative.as_posix()}"
+                )
+            if item.sha256 and hashes.get(temp_path) != item.sha256:
+                raise RuntimeError(
+                    f"Checksum mismatch for {item.remote_relative.as_posix()}"
+                )
+            moves.append((temp_path, item.final_target))
+
+        for _temp_path, target_path in moves:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+        for temp_path, target_path in moves:
+            if target_path.exists():
+                target_path.unlink()
+            temp_path.replace(target_path)
 
     @classmethod
     def _evict_local_series_sync(
@@ -2615,6 +2678,9 @@ class LibraryHydrationService:
                     "progress": operation.progress,
                     "error": operation.error,
                     "updated_at": operation.updated_at,
+                    # Network bytes/speed persisted while a download runs
+                    # (cleared on terminal upserts).
+                    **(operation.detail or {}),
                 }
                 if operation is not None
                 else None

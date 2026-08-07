@@ -1,53 +1,52 @@
-"""Single-transport Storage Box uploads via one rclone batch process.
+"""Single-transport Storage Box bulk transfers via one rclone batch process.
 
-Replaces the old sftp/rsync/lftp selector for the publish path: every
-publish uploads its whole ``to_upload`` batch with a single ``rclone copy``
-invocation over SFTP. rclone owns transfer parallelism, retries and
-low-level resume; we read its per-second JSON stats from stderr and map
-them onto the existing :class:`ProgressSnapshot` contract so the SSE
-progress chain is byte-accurate instead of stat-polling remote paths.
+Replaces the old sftp/rsync/lftp selector: publishes upload their whole
+``to_upload`` batch and hydration downloads its whole episode/index batch
+with a single ``rclone copy`` invocation over SFTP. rclone owns transfer
+parallelism, retries and low-level resume; the shared
+:mod:`rclone_runner` streams per-second JSON stats which are mapped onto
+the existing :class:`ProgressSnapshot` contract so the progress chain is
+byte-accurate instead of stat-polling paths.
 """
 
 from __future__ import annotations
 
-import asyncio
 import inspect
-import json
 import logging
 import os
 import shutil
 import tempfile
-from collections import deque
 from pathlib import Path, PurePosixPath
 
 from ..config import settings
-from ..utils.subprocess_runner import terminate_process
+from .rclone_runner import (
+    RcloneError,
+    RcloneStats,
+    find_binary,
+    obscure_password,
+    run_rclone,
+)
 from .storage_box_progress import ProgressCallback, ProgressSnapshot
 from .storage_box_sftp_client import StorageBoxSftpClient
 
 logger = logging.getLogger("uvicorn.error")
 
 _INSTALL_HINT = (
-    "rclone is required for Storage Box uploads but was not found on PATH. "
+    "rclone is required for Storage Box transfers but was not found on PATH. "
     "Install it first (Arch: sudo pacman -S rclone)."
 )
 
-# stderr lines are JSON logs; stats lines stay small but keep headroom for
-# long "transferring" arrays.
-_STDERR_LINE_LIMIT = 1024 * 1024
-_MAX_ERROR_LINES = 5
 
-
-class StorageBoxRcloneError(RuntimeError):
+class StorageBoxRcloneError(RcloneError):
     """Raised when the rclone subprocess fails or rclone is unavailable."""
 
 
 class StorageBoxRclone:
-    """Batch uploader for the Storage Box using one rclone process."""
+    """Batch uploader/downloader for the Storage Box using one rclone process."""
 
     @classmethod
     def binary(cls) -> str | None:
-        return shutil.which("rclone")
+        return find_binary()
 
     @classmethod
     def ensure_available(cls) -> None:
@@ -89,9 +88,18 @@ class StorageBoxRclone:
                 link_path.parent.mkdir(parents=True, exist_ok=True)
                 os.symlink(Path(local_path).resolve(), link_path)
 
-            await cls._run_copy(
-                tree_dir,
-                remote_root,
+            binary = cls.binary() or ""
+            cmd = [
+                binary,
+                "copy",
+                str(tree_dir),
+                f":sftp:{remote_root.as_posix()}",
+                "--copy-links",
+                *cls._sftp_flags(checkers=4),
+            ]
+            await cls._run_transfer(
+                cmd,
+                binary=binary,
                 total_bytes=total_bytes,
                 progress_callback=progress_callback,
             )
@@ -99,24 +107,71 @@ class StorageBoxRclone:
             shutil.rmtree(tree_dir, ignore_errors=True)
 
     @classmethod
-    async def _run_copy(
+    async def download_batch(
         cls,
-        tree_dir: Path,
-        remote_root: PurePosixPath,
+        items: list[PurePosixPath],
         *,
-        total_bytes: int | None,
-        progress_callback: ProgressCallback | None,
+        remote_base: str | PurePosixPath,
+        dest_root: Path,
+        total_bytes: int | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> None:
-        binary = cls.binary()
-        if binary is None:  # pragma: no cover - ensure_available already ran
-            raise StorageBoxRcloneError(_INSTALL_HINT)
+        """Download ``items`` (remote paths relative to ``remote_base``).
 
-        cmd = [
-            binary,
-            "copy",
-            str(tree_dir),
-            f":sftp:{remote_root.as_posix()}",
-            "--copy-links",
+        One ``rclone copy`` with ``--files-from``; each item lands at
+        ``dest_root/<item>`` (rclone preserves source-relative layout —
+        callers map results to their final targets). Raises
+        :class:`StorageBoxRcloneError` on failure.
+        """
+        if not items:
+            return
+        cls.ensure_available()
+
+        remote_root = StorageBoxSftpClient.normalize_remote_path(remote_base)
+        for item in items:
+            if item.is_absolute():
+                raise StorageBoxRcloneError(
+                    f"download_batch expects remote paths relative to the batch "
+                    f"root, got absolute path: {item}"
+                )
+
+        dest_root.mkdir(parents=True, exist_ok=True)
+        list_file = tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            prefix="atr-rclone-files-",
+            suffix=".txt",
+            dir=str(settings.cache_dir),
+            delete=False,
+        )
+        try:
+            with list_file:
+                for item in items:
+                    list_file.write(f"{item.as_posix()}\n")
+
+            binary = cls.binary() or ""
+            cmd = [
+                binary,
+                "copy",
+                f":sftp:{remote_root.as_posix()}",
+                str(dest_root),
+                "--files-from",
+                list_file.name,
+                "--no-traverse",
+                *cls._sftp_flags(checkers=8),
+            ]
+            await cls._run_transfer(
+                cmd,
+                binary=binary,
+                total_bytes=total_bytes,
+                progress_callback=progress_callback,
+            )
+        finally:
+            _unlink_quietly(Path(list_file.name))
+
+    @classmethod
+    def _sftp_flags(cls, *, checkers: int) -> list[str]:
+        flags = [
             "--config",
             "/dev/null",
             "--sftp-host",
@@ -128,7 +183,7 @@ class StorageBoxRclone:
             "--transfers",
             str(max(1, settings.storage_box_rclone_transfers)),
             "--checkers",
-            "4",
+            str(checkers),
             "--sftp-concurrency",
             "64",
             "--sftp-chunk-size",
@@ -154,59 +209,49 @@ class StorageBoxRclone:
             "NOTICE",
         ]
         if settings.storage_box_ssh_key_path:
-            cmd += ["--sftp-key-file", str(settings.storage_box_ssh_key_path)]
+            flags += ["--sftp-key-file", str(settings.storage_box_ssh_key_path)]
         if settings.storage_box_known_hosts_path:
-            cmd += [
+            flags += [
                 "--sftp-known-hosts-file",
                 str(settings.storage_box_known_hosts_path),
             ]
+        return flags
 
+    @classmethod
+    async def _run_transfer(
+        cls,
+        cmd: list[str],
+        *,
+        binary: str,
+        total_bytes: int | None,
+        progress_callback: ProgressCallback | None,
+    ) -> None:
         env = dict(os.environ)
         if not settings.storage_box_ssh_key_path and settings.storage_box_password:
-            env["RCLONE_SFTP_PASS"] = await cls._obscure_password(
-                binary, settings.storage_box_password
-            )
-
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-            limit=_STDERR_LINE_LIMIT,
-        )
-        error_lines: deque[str] = deque(maxlen=_MAX_ERROR_LINES)
-        last_snapshot: ProgressSnapshot | None = None
-        try:
-            assert process.stderr is not None
-            while True:
-                try:
-                    line = await process.stderr.readline()
-                except (asyncio.LimitOverrunError, ValueError):
-                    continue
-                if not line:
-                    break
-                snapshot = cls._handle_stderr_line(
-                    line, total_bytes=total_bytes, error_lines=error_lines
+            try:
+                env["RCLONE_SFTP_PASS"] = await obscure_password(
+                    binary, settings.storage_box_password
                 )
-                if snapshot is not None:
-                    last_snapshot = snapshot
-                    await cls._emit(progress_callback, snapshot)
-            returncode = await process.wait()
-        except asyncio.CancelledError:
-            await terminate_process(process)
-            raise
+            except RcloneError as exc:
+                raise StorageBoxRcloneError(str(exc)) from exc
 
-        if returncode != 0:
-            details = "; ".join(error_lines) or "no error output captured"
-            raise StorageBoxRcloneError(
-                f"rclone exited with code {returncode}: {details}"
+        async def _on_stats(stats: RcloneStats) -> None:
+            await cls._emit(
+                progress_callback, cls._snapshot_from_stats(stats, total_bytes)
             )
+
+        try:
+            last_stats = await run_rclone(
+                cmd, env=env, stats_callback=_on_stats
+            )
+        except RcloneError as exc:
+            raise StorageBoxRcloneError(str(exc)) from exc
 
         # Terminal snapshot so the UI lands exactly on 100%.
         final_total = (
             total_bytes
             if total_bytes is not None
-            else (last_snapshot.bytes_total if last_snapshot else 0)
+            else (last_stats.bytes_total if last_stats else 0)
         )
         await cls._emit(
             progress_callback,
@@ -219,51 +264,22 @@ class StorageBoxRclone:
             ),
         )
 
-    @classmethod
-    def _handle_stderr_line(
-        cls,
-        raw_line: bytes,
-        *,
-        total_bytes: int | None,
-        error_lines: deque[str],
-    ) -> ProgressSnapshot | None:
-        try:
-            payload = json.loads(raw_line.decode("utf-8", errors="replace"))
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            return None
-        if not isinstance(payload, dict):
-            return None
-
-        if payload.get("level") == "error":
-            message = str(payload.get("msg") or "").strip()
-            if message:
-                error_lines.append(message)
-
-        stats = payload.get("stats")
-        if not isinstance(stats, dict):
-            return None
-        try:
-            transferred = int(stats.get("bytes") or 0)
-            # Prefer our exact precomputed total: rclone's totalBytes grows
-            # while it is still scanning the source tree.
-            reported_total = int(stats.get("totalBytes") or 0)
-            total = total_bytes if total_bytes is not None else reported_total
-            speed = float(stats.get("speed") or 0.0)
-            eta = stats.get("eta")
-            transferring = stats.get("transferring")
-        except (TypeError, ValueError):
-            return None
-
+    @staticmethod
+    def _snapshot_from_stats(
+        stats: RcloneStats, total_bytes: int | None
+    ) -> ProgressSnapshot:
+        # Prefer our exact precomputed total: rclone's totalBytes grows while
+        # it is still scanning the source tree.
+        total = total_bytes if total_bytes is not None else stats.bytes_total
+        transferred = stats.bytes_transferred
         if total > 0:
             transferred = min(transferred, total)
         return ProgressSnapshot(
             bytes_transferred=max(0, transferred),
             bytes_total=max(0, total),
-            mib_per_sec=round(speed / (1024 * 1024), 2),
-            eta_seconds=float(eta) if isinstance(eta, (int, float)) else None,
-            active_transfers=(
-                len(transferring) if isinstance(transferring, list) else 0
-            ),
+            mib_per_sec=round(stats.speed_bytes_per_sec / (1024 * 1024), 2),
+            eta_seconds=stats.eta_seconds,
+            active_transfers=len(stats.transferring_names),
         )
 
     @staticmethod
@@ -281,21 +297,9 @@ class StorageBoxRclone:
                 "rclone progress callback raised; continuing", exc_info=True
             )
 
-    @staticmethod
-    async def _obscure_password(binary: str, password: str) -> str:
-        # Password goes through stdin (never argv) and reaches rclone as an
-        # obscured env value, matching rclone's expectations for RCLONE_SFTP_PASS.
-        process = await asyncio.create_subprocess_exec(
-            binary,
-            "obscure",
-            "-",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await process.communicate(password.encode("utf-8"))
-        if process.returncode != 0:
-            raise StorageBoxRcloneError(
-                f"rclone obscure failed: {stderr.decode(errors='replace').strip()}"
-            )
-        return stdout.decode("utf-8").strip()
+
+def _unlink_quietly(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass

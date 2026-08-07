@@ -184,7 +184,7 @@ def _get_gdrive_upload_lock(project_id: str) -> Lock:
         return lock
 
 
-def _upload_manifest_and_persist(
+async def _upload_manifest_and_persist(
     project_id: str,
     project,
     matches,
@@ -195,15 +195,19 @@ def _upload_manifest_and_persist(
     if not lock.acquire(blocking=False):
         raise DriveUploadInProgressError("Upload already in progress for this project")
     try:
-        result = ExportService.upload_manifest_to_drive(
+        result = await ExportService.upload_manifest_to_drive(
             project,
             matches,
             progress_callback=progress_callback,
         )
-        project.drive_folder_id = result["folder_id"]
-        project.drive_folder_url = result["folder_url"]
-        project.drive_export_uploaded_once = True
-        ProjectService.save(project)
+
+        def _persist() -> None:
+            project.drive_folder_id = result["folder_id"]
+            project.drive_folder_url = result["folder_url"]
+            project.drive_export_uploaded_once = True
+            ProjectService.save(project)
+
+        await asyncio.to_thread(_persist)
         return result
     finally:
         lock.release()
@@ -1179,6 +1183,47 @@ async def create_bundle(project_id: str):
     )
 
 
+def _gdrive_progress_to_fraction(payload: dict[str, Any]) -> float:
+    phase = str(payload.get("phase") or "")
+    if phase == "manifest":
+        return 0.12
+    if phase == "clear":
+        total = int(payload.get("clear_item_count") or 0)
+        completed = int(payload.get("clear_items_completed") or 0)
+        if total <= 0:
+            return 0.25
+        return min(0.3, 0.15 + (completed / total) * 0.15)
+    if phase == "upload":
+        total_bytes = int(payload.get("total_bytes") or 0)
+        uploaded_bytes = int(payload.get("uploaded_bytes") or 0)
+        if total_bytes <= 0:
+            return 0.35
+        return min(0.96, 0.3 + (uploaded_bytes / total_bytes) * 0.65)
+    if phase == "persist":
+        return 0.98
+    return 0.1
+
+
+def _gdrive_progress_to_sse_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    message = str(payload.get("message") or "Uploading project to Google Drive...")
+    return {
+        "status": "processing",
+        "step": "gdrive",
+        "progress": _gdrive_progress_to_fraction(payload),
+        "message": message,
+        "phase": payload.get("phase"),
+        "file_count": payload.get("file_count"),
+        "files_completed": payload.get("files_completed"),
+        "total_bytes": payload.get("total_bytes"),
+        "uploaded_bytes": payload.get("uploaded_bytes"),
+        "current_file": payload.get("current_file"),
+        "clear_item_count": payload.get("clear_item_count"),
+        "clear_items_completed": payload.get("clear_items_completed"),
+        "elapsed_ms": payload.get("elapsed_ms"),
+        "throughput_mb_per_sec": payload.get("throughput_mb_per_sec"),
+    }
+
+
 @router.post("/exports/gdrive")
 async def upload_to_gdrive(project_id: str, auto: bool = False):
     """Upload the project export tree to Google Drive and notify via Discord webhook."""
@@ -1205,45 +1250,6 @@ async def upload_to_gdrive(project_id: str, auto: bool = False):
     if not matches:
         raise HTTPException(status_code=400, detail="No matches found")
 
-    def _gdrive_progress_to_fraction(payload: dict[str, Any]) -> float:
-        phase = str(payload.get("phase") or "")
-        if phase == "manifest":
-            return 0.12
-        if phase == "clear":
-            total = int(payload.get("clear_item_count") or 0)
-            completed = int(payload.get("clear_items_completed") or 0)
-            if total <= 0:
-                return 0.25
-            return min(0.3, 0.15 + (completed / total) * 0.15)
-        if phase == "upload":
-            total_bytes = int(payload.get("total_bytes") or 0)
-            uploaded_bytes = int(payload.get("uploaded_bytes") or 0)
-            if total_bytes <= 0:
-                return 0.35
-            return min(0.96, 0.3 + (uploaded_bytes / total_bytes) * 0.65)
-        if phase == "persist":
-            return 0.98
-        return 0.1
-
-    def _gdrive_progress_to_sse_payload(payload: dict[str, Any]) -> dict[str, Any]:
-        message = str(payload.get("message") or "Uploading project to Google Drive...")
-        return {
-            "status": "processing",
-            "step": "gdrive",
-            "progress": _gdrive_progress_to_fraction(payload),
-            "message": message,
-            "phase": payload.get("phase"),
-            "file_count": payload.get("file_count"),
-            "files_completed": payload.get("files_completed"),
-            "total_bytes": payload.get("total_bytes"),
-            "uploaded_bytes": payload.get("uploaded_bytes"),
-            "current_file": payload.get("current_file"),
-            "clear_item_count": payload.get("clear_item_count"),
-            "clear_items_completed": payload.get("clear_items_completed"),
-            "elapsed_ms": payload.get("elapsed_ms"),
-            "throughput_mb_per_sec": payload.get("throughput_mb_per_sec"),
-        }
-
     async def stream_progress():
         yield (
             "data: "
@@ -1259,25 +1265,26 @@ async def upload_to_gdrive(project_id: str, auto: bool = False):
             + "\n\n"
         )
         try:
-            loop = asyncio.get_running_loop()
             progress_queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
             sentinel = object()
 
+            # The rclone adapter emits on the event loop; no cross-thread
+            # marshalling needed.
             def _progress_callback(payload: dict[str, Any]) -> None:
-                loop.call_soon_threadsafe(progress_queue.put_nowait, payload)
+                progress_queue.put_nowait(payload)
 
-            def _run_upload():
+            async def _run_upload():
                 try:
-                    return _upload_manifest_and_persist(
+                    return await _upload_manifest_and_persist(
                         project_id,
                         project,
                         matches.matches,
                         _progress_callback,
                     )
                 finally:
-                    loop.call_soon_threadsafe(progress_queue.put_nowait, sentinel)
+                    progress_queue.put_nowait(sentinel)
 
-            worker = asyncio.create_task(asyncio.to_thread(_run_upload))
+            worker = asyncio.create_task(_run_upload())
             while True:
                 payload = await progress_queue.get()
                 if payload is sentinel:

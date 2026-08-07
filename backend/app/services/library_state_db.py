@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -35,6 +36,30 @@ class OperationRow:
     progress: float
     error: str | None
     updated_at: str
+    # Free-form JSON payload for transient operation metadata (e.g. network
+    # bytes/speed during hydration downloads). None when not applicable.
+    detail: dict | None = None
+
+
+def _operation_row(row: sqlite3.Row) -> OperationRow:
+    raw_detail = row["detail"]
+    detail: dict | None = None
+    if raw_detail:
+        try:
+            parsed = json.loads(raw_detail)
+            detail = parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            detail = None
+    return OperationRow(
+        library_type=row["library_type"],
+        series_id=row["series_id"],
+        operation_type=row["operation_type"],
+        status=row["status"],
+        progress=float(row["progress"]),
+        error=row["error"],
+        updated_at=row["updated_at"],
+        detail=detail,
+    )
 
 
 class LibraryStateDb:
@@ -88,6 +113,12 @@ class LibraryStateDb:
                 );
                 """
             )
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(operations)").fetchall()
+            }
+            if "detail" not in columns:
+                conn.execute("ALTER TABLE operations ADD COLUMN detail TEXT")
 
     @classmethod
     def mark_incomplete_operations_interrupted(cls) -> None:
@@ -330,6 +361,7 @@ class LibraryStateDb:
         status: str,
         progress: float = 0.0,
         error: str | None = None,
+        detail: dict | None = None,
     ) -> None:
         scoped_type = coerce_library_type(library_type).value
         now = _utc_now_iso()
@@ -337,13 +369,14 @@ class LibraryStateDb:
             conn.execute(
                 """
                 INSERT INTO operations (
-                    library_type, series_id, operation_type, status, progress, error, updated_at
+                    library_type, series_id, operation_type, status, progress, error, detail, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(library_type, series_id, operation_type) DO UPDATE SET
                     status = excluded.status,
                     progress = excluded.progress,
                     error = excluded.error,
+                    detail = excluded.detail,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -353,6 +386,7 @@ class LibraryStateDb:
                     status,
                     max(0.0, min(1.0, float(progress))),
                     error,
+                    json.dumps(detail) if detail is not None else None,
                     now,
                 ),
             )
@@ -368,7 +402,7 @@ class LibraryStateDb:
         with cls.connect() as conn:
             row = conn.execute(
                 """
-                SELECT library_type, series_id, operation_type, status, progress, error, updated_at
+                SELECT library_type, series_id, operation_type, status, progress, error, detail, updated_at
                 FROM operations
                 WHERE library_type = ? AND series_id = ? AND operation_type = ?
                 """,
@@ -376,15 +410,7 @@ class LibraryStateDb:
             ).fetchone()
         if row is None:
             return None
-        return OperationRow(
-            library_type=row["library_type"],
-            series_id=row["series_id"],
-            operation_type=row["operation_type"],
-            status=row["status"],
-            progress=float(row["progress"]),
-            error=row["error"],
-            updated_at=row["updated_at"],
-        )
+        return _operation_row(row)
 
     @classmethod
     def list_operations(
@@ -403,7 +429,7 @@ class LibraryStateDb:
             params.append(series_id)
 
         query = """
-            SELECT library_type, series_id, operation_type, status, progress, error, updated_at
+            SELECT library_type, series_id, operation_type, status, progress, error, detail, updated_at
             FROM operations
         """
         if where:
@@ -412,18 +438,7 @@ class LibraryStateDb:
 
         with cls.connect() as conn:
             rows = conn.execute(query, tuple(params)).fetchall()
-        return [
-            OperationRow(
-                library_type=row["library_type"],
-                series_id=row["series_id"],
-                operation_type=row["operation_type"],
-                status=row["status"],
-                progress=float(row["progress"]),
-                error=row["error"],
-                updated_at=row["updated_at"],
-            )
-            for row in rows
-        ]
+        return [_operation_row(row) for row in rows]
 
     @classmethod
     def delete_operation(

@@ -39,12 +39,18 @@ if capture:
                     "is_symlink": os.path.islink(path),
                 }
             )
+    files_from_content = None
+    if "--files-from" in sys.argv:
+        files_from_path = sys.argv[sys.argv.index("--files-from") + 1]
+        with open(files_from_path, "r", encoding="utf-8") as fh:
+            files_from_content = fh.read()
     with open(capture, "w") as fh:
         json.dump(
             {
                 "argv": sys.argv[1:],
                 "env_pass": os.environ.get("RCLONE_SFTP_PASS"),
                 "tree": sorted(tree, key=lambda item: item["rel"]),
+                "files_from": files_from_content,
             },
             fh,
         )
@@ -306,3 +312,114 @@ async def test_absolute_remote_relative_path_rejected(
             [(source, PurePosixPath("/absolute/path.bin"))],
             remote_base="staging/pub-1",
         )
+
+
+@pytest.mark.asyncio
+async def test_download_batch_command_flags_and_files_from(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_rclone: Path
+) -> None:
+    capture_path = tmp_path / "capture.json"
+    monkeypatch.setenv("FAKE_RCLONE_CAPTURE", str(capture_path))
+    dest_root = tmp_path / "dest"
+    items = [
+        PurePosixPath("payload/library/Series Name/episode.mkv"),
+        PurePosixPath("payload/index/manifest.fragment.json"),
+    ]
+
+    await StorageBoxRclone.download_batch(
+        items, remote_base="staging/pub-1", dest_root=dest_root
+    )
+
+    captured = json.loads(capture_path.read_text(encoding="utf-8"))
+    argv = captured["argv"]
+    assert argv[0] == "copy"
+    assert argv[1] == ":sftp:/home/box/root/staging/pub-1"
+    assert argv[2] == str(dest_root)
+    assert "--no-traverse" in argv
+    assert "--files-from" in argv
+    assert captured["files_from"] == (
+        "payload/library/Series Name/episode.mkv\n"
+        "payload/index/manifest.fragment.json\n"
+    )
+
+    def flag(name: str) -> str:
+        return argv[argv.index(name) + 1]
+
+    assert flag("--checkers") == "8"
+    assert flag("--transfers") == "4"
+    assert flag("--sftp-host") == "storage.example"
+    assert "--copy-links" not in argv
+
+    leftovers = list(settings.cache_dir.glob("atr-rclone-files-*"))
+    assert leftovers == []
+
+
+@pytest.mark.asyncio
+async def test_download_batch_progress_mapping(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_rclone: Path
+) -> None:
+    _set_stderr_lines(
+        monkeypatch,
+        [
+            _stats_line(bytes_done=250, total_bytes=800, speed=2097152.0, eta=5, transferring=1),
+        ],
+    )
+    snapshots: list[ProgressSnapshot] = []
+
+    await StorageBoxRclone.download_batch(
+        [PurePosixPath("payload/library/e.mkv")],
+        remote_base="staging/pub-1",
+        dest_root=tmp_path / "dest",
+        total_bytes=1000,
+        progress_callback=snapshots.append,
+    )
+
+    assert len(snapshots) == 2
+    first, final = snapshots
+    assert first.bytes_transferred == 250
+    assert first.bytes_total == 1000  # precomputed total wins
+    assert first.mib_per_sec == 2.0
+    assert first.eta_seconds == 5.0
+    assert first.active_transfers == 1
+    assert final.bytes_transferred == 1000
+    assert final.eta_seconds == 0.0
+
+
+@pytest.mark.asyncio
+async def test_download_batch_error_exit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_rclone: Path
+) -> None:
+    _set_stderr_lines(
+        monkeypatch,
+        [json.dumps({"level": "error", "msg": "sftp: no such file"})],
+    )
+    monkeypatch.setenv("FAKE_RCLONE_EXIT", "4")
+
+    with pytest.raises(StorageBoxRcloneError) as excinfo:
+        await StorageBoxRclone.download_batch(
+            [PurePosixPath("payload/library/e.mkv")],
+            remote_base="staging/pub-1",
+            dest_root=tmp_path / "dest",
+        )
+    assert "code 4" in str(excinfo.value)
+    assert "sftp: no such file" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_download_batch_rejects_absolute_items(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_rclone: Path
+) -> None:
+    with pytest.raises(StorageBoxRcloneError, match="relative"):
+        await StorageBoxRclone.download_batch(
+            [PurePosixPath("/absolute/file.mkv")],
+            remote_base="staging/pub-1",
+            dest_root=tmp_path / "dest",
+        )
+
+
+@pytest.mark.asyncio
+async def test_download_batch_empty_noop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(StorageBoxRclone, "binary", classmethod(lambda cls: None))
+    await StorageBoxRclone.download_batch(
+        [], remote_base="staging/pub-1", dest_root=tmp_path / "dest"
+    )

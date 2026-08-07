@@ -20,6 +20,7 @@ import type {
   LibraryActivationState,
 } from "@/types/library";
 import { api } from "@/api/client";
+import { formatNetworkProgressLine } from "@/utils/networkProgress";
 import { readSSEStream } from "@/utils/sse";
 
 type ModalState = "editing" | "verifying" | "results" | "reindexing";
@@ -61,6 +62,9 @@ export function TorrentManagementModal({
     useState<ReplacementProgressEvent | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [hydrateProgressLine, setHydrateProgressLine] = useState<string | null>(
+    null,
+  );
   const [hydrateTarget, setHydrateTarget] = useState<string | "all" | null>(
     null,
   );
@@ -273,6 +277,14 @@ export function TorrentManagementModal({
         latestState = state;
         const operation = state.operation;
 
+        if (operation && (operation.status === "pending" || operation.status === "running")) {
+          const networkLine = formatNetworkProgressLine(operation);
+          const percent = Math.round((operation.progress ?? 0) * 100);
+          setHydrateProgressLine(
+            networkLine ? `${percent}% · ${networkLine}` : `${percent}%`,
+          );
+        }
+
         if (!operation || (operation.status !== "pending" && operation.status !== "running")) {
           if (operation?.status === "error") {
             throw new Error(
@@ -323,6 +335,7 @@ export function TorrentManagementModal({
         setError((e as Error).message);
       } finally {
         setHydrateTarget(null);
+        setHydrateProgressLine(null);
       }
     },
     [libraryType, loadEpisodeSources, onSourcesChanged, seriesId, waitForSeriesOperation],
@@ -425,6 +438,7 @@ export function TorrentManagementModal({
                 localEpisodeCount={episodeSources.storage_box.local_episode_count}
                 episodes={episodeSources.storage_box.episodes}
                 hydratingTarget={hydrateTarget}
+                hydrateProgressLine={hydrateProgressLine}
                 onHydrateAll={() => void handleHydrate()}
                 onHydrateEpisode={(episodeKey) => void handleHydrate(episodeKey)}
               />
@@ -800,6 +814,7 @@ function StorageBoxSection({
   localEpisodeCount,
   episodes,
   hydratingTarget,
+  hydrateProgressLine,
   onHydrateAll,
   onHydrateEpisode,
 }: {
@@ -808,6 +823,7 @@ function StorageBoxSection({
   localEpisodeCount: number;
   episodes: EpisodeSourcesPayload["storage_box"]["episodes"];
   hydratingTarget: string | "all" | null;
+  hydrateProgressLine: string | null;
   onHydrateAll: () => void;
   onHydrateEpisode: (episodeKey: string) => void;
 }) {
@@ -849,6 +865,15 @@ function StorageBoxSection({
           {hydratingTarget === "all" ? "Hydratation..." : "Télécharger tout"}
         </button>
       </div>
+
+      {hydratingTarget !== null && hydrateProgressLine && (
+        <p
+          className="text-xs"
+          style={{ color: "hsl(var(--muted-foreground))" }}
+        >
+          {hydrateProgressLine}
+        </p>
+      )}
 
       {episodes.length === 0 ? (
         <p

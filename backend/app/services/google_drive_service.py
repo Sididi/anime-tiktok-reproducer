@@ -149,6 +149,31 @@ class GoogleDriveService:
         return cls._credentials()
 
     @classmethod
+    def rclone_token_json(cls) -> str:
+        """OAuth token payload for rclone's drive backend (RCLONE_DRIVE_TOKEN).
+
+        Ships a freshly-refreshed access token so rclone starts hot, plus the
+        refresh token so it can self-refresh in memory if a transfer outlives
+        the access token (~1h).
+        """
+        creds = cls._credentials()
+        expiry = creds.expiry
+        if expiry is not None and expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        return json.dumps(
+            {
+                "access_token": creds.token,
+                "token_type": "Bearer",
+                "refresh_token": creds.refresh_token,
+                "expiry": (
+                    expiry.isoformat()
+                    if expiry is not None
+                    else datetime.now(timezone.utc).isoformat()
+                ),
+            }
+        )
+
+    @classmethod
     def client(cls):
         """Return a thread-local Drive API client bound to refreshed credentials."""
         creds = cls._credentials()
