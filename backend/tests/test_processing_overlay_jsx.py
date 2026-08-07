@@ -141,7 +141,9 @@ def test_jsx_verifies_white_border_after_subtitle_mogrt_warmup():
 
     assert "importedBorderCandidate = sequence.importMGT(" in jsx
     assert 'BORDER_MOGRT_PATH,\n          "0",\n          1,\n          0,' in jsx
-    assert "sequence.importMGT(BORDER_MOGRT_PATH, 0, 1, 0)" not in jsx
+    # Ticks-string form first, then the numeric-seconds second form (same
+    # two-form pattern the subtitle MOGRT code uses).
+    assert jsx.count("importedBorderCandidate = sequence.importMGT(") == 2
     assert "BORDER_MOGRT_MAX_ATTEMPTS = 5" in jsx
     assert "borderItem = waitForTrackItemAtStart(" in jsx
     assert "track.overwriteClip(importedBorderProjectItem, \"0\")" in jsx
@@ -151,15 +153,48 @@ def test_jsx_verifies_white_border_after_subtitle_mogrt_warmup():
     assert "projectItemKey === expectedBorderName" in jsx
     assert "trackItemKey === expectedBorderName" in jsx
     assert 'track.overwriteClip(reusableBorderProjectItem, "0")' in jsx
-    assert "installBorderMogrtFromFile" not in jsx
-    assert "[BORDER_MOGRT_PATH]" not in jsx
-    assert "BORDER_MOGRT_INSTALL_WAIT_MS" not in jsx
-    assert "Required Border Mogrt could not be found on V2" in jsx
+    assert "function installBorderMogrtFromFile(" in jsx
+    assert "var BORDER_MOGRT_INSTALL_WAIT_MS = 2000;" in jsx
+    assert "[BORDER_MOGRT_PATH]," in jsx
+    assert "borderAttempt >= 2" in jsx
     assert "Border Mogrt verified on V2" in jsx
 
     reuse_lookup = jsx.index("findReusableWhiteBorderProjectItem(sequence)")
     direct_import = jsx.index("importedBorderCandidate = sequence.importMGT(")
     assert reuse_lookup < direct_import
+
+
+def test_jsx_border_failure_is_nonfatal_and_publishes_warnings():
+    jsx = _render(title=True, category=True)
+
+    # The border block must never throw: a border miss is a warning, not a
+    # failed import (a throw marks the project error and blocks the batch).
+    border_fn = jsx[
+        jsx.index("function ensureWhiteBorderMogrt")
+        : jsx.index("function getMotionComponent")
+    ]
+    assert "throw new Error" not in border_fn
+    assert border_fn.count("recordImportWarning(") == 4
+
+    assert "function recordImportWarning(" in jsx
+    assert "function findInstalledBorderMogrtProjectItem(" in jsx
+    assert "function placeBorderProjectItemOnTrack(" in jsx
+    assert "function pruneExtraBorderClips(" in jsx
+    assert "Border Mogrt could not be placed on V2 after" in jsx
+    assert "Drag the border MOGRT onto V2 manually before export." in jsx
+
+    # Old fatal messages must be gone.
+    assert "Required Border Mogrt could not be found on V2" not in jsx
+    assert "V2 track unavailable; required Border Mogrt not inserted." not in jsx
+    assert (
+        "Border Mogrt exists on V2 but its end time could not be verified"
+        not in jsx
+    )
+
+    # Warnings are published to the shared engine global only after main()
+    # returns, so a mid-run throw cannot leak a partial warning list.
+    publish = jsx.index("$.global.__ATR_IMPORT_WARNINGS__ =")
+    assert jsx.index("\n  main();") < publish
 
 
 def test_jsx_verifies_border_end_with_documented_time_object():

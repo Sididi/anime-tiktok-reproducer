@@ -7,7 +7,7 @@
 
 var ATR_EXTENSION_ID = "com.animetiktok.tiktokreproducer.panel";
 // Must stay in sync with ATR_BUILD_ID in client/constants.js.
-var ATR_HOST_BUILD_ID = "2026-07-28-windows-cleanup-v10";
+var ATR_HOST_BUILD_ID = "2026-08-07-border-nonfatal-v11";
 var __atrEncoderEvents = [];
 var __atrEncoderJobProjectMap = {};
 var __atrEncoderJobMetaMap = {};
@@ -2222,6 +2222,11 @@ function runScript(scriptPath) {
     if (!file.exists) {
       return "ERROR: File not found: " + scriptPath;
     }
+    // Clear before every run so a previous script's warnings can never leak
+    // into this run's report (the ExtendScript engine is persistent).
+    try {
+      $.global.__ATR_IMPORT_WARNINGS__ = "";
+    } catch (eClearImportWarnings) {}
     $.evalFile(file);
     // The panel shares one persistent ExtendScript engine across every run.
     // import_project.jsx is a large (~200 KB) script, so reclaim its transient
@@ -2233,6 +2238,25 @@ function runScript(scriptPath) {
   } catch (e) {
     return "ERROR: " + e.message + " (line " + e.line + ")";
   }
+}
+
+/**
+ * Return the warnings the last runScript() execution published (empty string
+ * when none), then clear them. Generated import_project.jsx scripts set
+ * $.global.__ATR_IMPORT_WARNINGS__ for non-fatal issues such as a missing
+ * V2 border; older generated scripts never set it.
+ */
+function ATR_getLastImportWarnings() {
+  var warningsText = "";
+  try {
+    if ($.global.__ATR_IMPORT_WARNINGS__) {
+      warningsText = String($.global.__ATR_IMPORT_WARNINGS__);
+    }
+  } catch (eGetImportWarnings) {}
+  try {
+    $.global.__ATR_IMPORT_WARNINGS__ = "";
+  } catch (eResetImportWarnings) {}
+  return warningsText;
 }
 
 /**

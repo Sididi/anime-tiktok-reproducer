@@ -1775,12 +1775,31 @@
         }
         log("Completed: " + path.basename(jsxPath), "success");
         updateGlobalStatus();
-        return {
-          host_import_elapsed_ms: hostImportElapsedMs,
-          host_result: result,
-          subtitle_expand_elapsed_ms: subtitleExpandElapsedMs,
-          total_elapsed_ms: Math.max(0, Date.now() - runStartedAt),
-        };
+        return evalHost("ATR_getLastImportWarnings()").then(
+          function (warningsRaw) {
+            var warningsText = String(warningsRaw || "").trim();
+            if (warningsText === "EvalScript error.") {
+              // Stale host.jsx without the getter (extension redeployed but
+              // Premiere not restarted) — not a real warning.
+              warningsText = "";
+            }
+            if (warningsText) {
+              log(
+                "Import warning for " +
+                  path.basename(jsxPath) +
+                  ": " +
+                  warningsText,
+                "warn",
+              );
+            }
+            return {
+              host_import_elapsed_ms: hostImportElapsedMs,
+              host_result: result,
+              subtitle_expand_elapsed_ms: subtitleExpandElapsedMs,
+              total_elapsed_ms: Math.max(0, Date.now() - runStartedAt),
+            };
+          },
+        );
       })
       .catch(function (err) {
         setStatus("error");
