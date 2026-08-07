@@ -189,3 +189,83 @@ accounts:
         "facebook": 14400,
         "instagram": 1200,
     }
+
+
+# ---------------------------------------------------------------------------
+# Template system: unit tests for the merge/resolution helpers
+
+
+def test_deep_merge_nested_dicts_and_list_replacement():
+    from app.services.account_service import _deep_merge
+
+    base = {
+        "slots": ["06:00", "12:00"],
+        "youtube": {"refresh_token": "tok", "slots": ["10:00"]},
+        "name": "Base",
+    }
+    override = {
+        "slots": ["08:00"],
+        "youtube": {"slots": ["11:00"]},
+    }
+    merged = _deep_merge(base, override)
+    # Lists replace wholesale, dicts merge key-by-key.
+    assert merged["slots"] == ["08:00"]
+    assert merged["youtube"] == {"refresh_token": "tok", "slots": ["11:00"]}
+    assert merged["name"] == "Base"
+    # Inputs are not mutated.
+    assert base["slots"] == ["06:00", "12:00"]
+    assert base["youtube"]["slots"] == ["10:00"]
+    assert override["youtube"] == {"slots": ["11:00"]}
+
+
+def test_resolve_templates_order_and_strip():
+    from app.services.account_service import _resolve_templates
+
+    templates = {
+        "a": {"language": "fr", "slots": ["06:00"]},
+        "b": {"slots": ["09:00"], "device": "iphone_16"},
+    }
+    resolved = _resolve_templates(
+        "acc",
+        {"template": ["a", "b"], "name": "Acc", "device": "poco_x7_pro"},
+        templates,
+    )
+    # Later template wins over earlier; account keys win over all.
+    assert resolved == {
+        "language": "fr",
+        "slots": ["09:00"],
+        "device": "poco_x7_pro",
+        "name": "Acc",
+    }
+    assert "template" not in resolved
+
+
+def test_resolve_templates_string_form_and_no_template():
+    from app.services.account_service import _resolve_templates
+
+    templates = {"a": {"language": "fr"}}
+    resolved = _resolve_templates("acc", {"template": "a", "name": "Acc"}, templates)
+    assert resolved == {"language": "fr", "name": "Acc"}
+    # Without a template key the dict passes through unchanged.
+    raw = {"name": "Acc"}
+    assert _resolve_templates("acc", raw, templates) == {"name": "Acc"}
+
+
+def test_resolve_templates_errors():
+    from app.services.account_service import _resolve_templates
+
+    with pytest.raises(ValueError, match="nope"):
+        _resolve_templates("acc", {"template": "nope"}, {})
+    with pytest.raises(ValueError, match="template"):
+        _resolve_templates("acc", {"template": 42}, {})
+    with pytest.raises(ValueError, match="template"):
+        _resolve_templates("acc", {"template": ["a", 42]}, {"a": {}})
+
+
+def test_resolve_templates_ignores_nested_template_key():
+    from app.services.account_service import _resolve_templates
+
+    templates = {"a": {"template": "b", "language": "fr"}, "b": {"language": "en"}}
+    resolved = _resolve_templates("acc", {"template": "a", "name": "Acc"}, templates)
+    # Nested reference is NOT resolved: language comes from "a", not "b".
+    assert resolved == {"language": "fr", "name": "Acc"}

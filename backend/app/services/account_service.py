@@ -31,6 +31,61 @@ def _normalize_slots(value: Any) -> list[str] | None:
     return [str(item) for item in value]
 
 
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Merge override into base without mutating either input.
+
+    Dict values merge recursively key-by-key; every other type — lists
+    included — replaces wholesale, matching per-platform slots semantics.
+    """
+    result = dict(base)
+    for key, value in override.items():
+        existing = result.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            result[key] = _deep_merge(existing, value)
+        else:
+            result[key] = value
+    return result
+
+
+def _resolve_templates(
+    account_id: str,
+    account_raw: dict[str, Any],
+    templates: dict[str, Any],
+) -> dict[str, Any]:
+    """Fold `template:` references left-to-right, account's own keys last.
+
+    Returns a new dict with the `template` key stripped. Raises ValueError on
+    an unknown template name or a malformed `template:` value so the caller's
+    per-account error handling skips only this account.
+    """
+    if "template" not in account_raw:
+        return account_raw
+    ref = account_raw["template"]
+    names = [ref] if isinstance(ref, str) else ref
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        raise ValueError(
+            f"Invalid template reference {ref!r} for account {account_id}; "
+            "expected a template name or list of names"
+        )
+    merged: dict[str, Any] = {}
+    for name in names:
+        template_raw = templates.get(name)
+        if not isinstance(template_raw, dict):
+            raise ValueError(
+                f"Unknown template {name!r} referenced by account {account_id}"
+            )
+        if "template" in template_raw:
+            logger.warning(
+                "Template %r contains a nested 'template' key; templates cannot "
+                "reference other templates — ignoring it",
+                name,
+            )
+            template_raw = {k: v for k, v in template_raw.items() if k != "template"}
+        merged = _deep_merge(merged, template_raw)
+    account_own = {k: v for k, v in account_raw.items() if k != "template"}
+    return _deep_merge(merged, account_own)
+
+
 @dataclass
 class AccountYouTubeConfig:
     refresh_token: str
