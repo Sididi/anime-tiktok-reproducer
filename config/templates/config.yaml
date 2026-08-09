@@ -80,4 +80,4 @@ templates:
     voice_key: maxime
     music_key: credits_song_death
     llm_preset: gemini
-    min_playback_speed: 0.6
+    min_playback_speed: 0.8
