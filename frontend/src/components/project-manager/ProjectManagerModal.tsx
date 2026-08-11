@@ -11,6 +11,7 @@ import { CopyrightMusicModal } from "./CopyrightMusicModal";
 import { CopyrightWarningModal } from "./CopyrightWarningModal";
 import { FacebookDurationModal } from "./FacebookDurationModal";
 import { ScheduledDeleteConfirm } from "./ScheduledDeleteConfirm";
+import { ThumbnailSelectionModal } from "./ThumbnailSelectionModal";
 import { UploadJobsPanel } from "./UploadJobsPanel";
 import { VideoPreviewModal } from "./VideoPreviewModal";
 import { ProjectTable } from "./ProjectTable";
@@ -46,6 +47,7 @@ interface PendingUploadContext {
   instagramStrategy?: UploadDurationStrategy;
   youtubeStrategy?: UploadDurationStrategy;
   copyrightAudioPath?: string;
+  thumbnailTimestampMs?: number | null;
 }
 
 type UploadSessionStatus =
@@ -56,6 +58,7 @@ type UploadSessionStatus =
   | "awaiting_facebook_choice"
   | "checking_youtube"
   | "awaiting_youtube_choice"
+  | "awaiting_thumbnail_choice"
   | "enqueueing";
 
 interface UploadSession {
@@ -101,7 +104,8 @@ function isPromptSessionStatus(status: UploadSessionStatus): boolean {
     status === "awaiting_copyright_music" ||
     status === "awaiting_copyright_warning" ||
     status === "awaiting_facebook_choice" ||
-    status === "awaiting_youtube_choice"
+    status === "awaiting_youtube_choice" ||
+    status === "awaiting_thumbnail_choice"
   );
 }
 
@@ -115,6 +119,7 @@ function uploadButtonLabelForSession(session: UploadSession): string {
     case "awaiting_copyright_warning":
     case "awaiting_facebook_choice":
     case "awaiting_youtube_choice":
+    case "awaiting_thumbnail_choice":
       return "Confirm";
     case "enqueueing":
       return "Queueing";
@@ -460,6 +465,7 @@ export function ProjectManagerModal({
           context.instagramStrategy,
           context.youtubeStrategy,
           context.copyrightAudioPath,
+          context.thumbnailTimestampMs,
         );
         upsertUploadJob(job);
         if (isSessionCurrent(context.projectId, token)) {
@@ -473,6 +479,18 @@ export function ProjectManagerModal({
       }
     },
     [isSessionCurrent, patchUploadSession, removeUploadSession, upsertUploadJob],
+  );
+
+  const continueUploadToThumbnail = useCallback(
+    (context: PendingUploadContext, token: string) => {
+      patchUploadSession(context.projectId, token, {
+        context,
+        status: "awaiting_thumbnail_choice",
+        message: null,
+        youtubeResult: undefined,
+      });
+    },
+    [patchUploadSession],
   );
 
   const continueUploadAfterFacebook = useCallback(
@@ -522,10 +540,10 @@ export function ProjectManagerModal({
         });
         return;
       }
-      await enqueueUpload(context, token);
+      continueUploadToThumbnail(context, token);
     },
     [
-      enqueueUpload,
+      continueUploadToThumbnail,
       isSessionCurrent,
       patchUploadSession,
       removeUploadSession,
@@ -1234,11 +1252,32 @@ export function ProjectManagerModal({
                               instagramStrategy: strategy,
                               youtubeStrategy: strategy,
                             };
-                            void enqueueUpload(nextContext, session.token);
+                            continueUploadToThumbnail(nextContext, session.token);
                           }}
                           onClose={() =>
                             removeUploadSession(session.context.projectId)
                           }
+                        />
+                      );
+                    }
+
+                    if (session.status === "awaiting_thumbnail_choice") {
+                      return (
+                        <ThumbnailSelectionModal
+                          key={`${session.context.projectId}:${session.token}:thumbnail`}
+                          open
+                          stacked
+                          projectId={session.context.projectId}
+                          projectTitle={projectTitle}
+                          onChoice={(timestampMs) => {
+                            void enqueueUpload(
+                              {
+                                ...session.context,
+                                thumbnailTimestampMs: timestampMs,
+                              },
+                              session.token,
+                            );
+                          }}
                         />
                       );
                     }
