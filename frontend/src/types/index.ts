@@ -301,6 +301,20 @@ export interface CopyrightCheckResult {
   drive_video_id?: string | null;
 }
 
+export interface ThumbnailCandidate {
+  index: number;
+  label: string;
+  timestamp_ms: number;
+  image_url: string;
+}
+
+export interface ThumbnailCandidatesResult {
+  state: "ready" | "in_progress" | "error" | "missing";
+  detail?: string;
+  version?: string;
+  candidates?: ThumbnailCandidate[];
+}
+
 export interface Account {
   id: string;
   name: string;

@@ -237,6 +237,7 @@ export const api = {
     instagramStrategy?: string,
     youtubeStrategy?: string,
     copyrightAudioPath?: string,
+    thumbnailTimestampMs?: number | null,
   ) =>
     request<import("@/types").ProjectUploadJob>(
       `/project-manager/projects/${projectId}/upload`,
@@ -248,6 +249,7 @@ export const api = {
           instagram_strategy: instagramStrategy ?? null,
           youtube_strategy: youtubeStrategy ?? null,
           copyright_audio_path: copyrightAudioPath ?? null,
+          thumbnail_timestamp_ms: thumbnailTimestampMs ?? null,
         }),
       },
     ),
@@ -296,6 +298,19 @@ export const api = {
     }>(
       `/project-manager/projects/${projectId}/upload-source-status`,
     ),
+
+  getThumbnailCandidates: async (projectId: string) => {
+    const result = await request<import("@/types").ThumbnailCandidatesResult>(
+      `/project-manager/projects/${projectId}/thumbnail-candidates`,
+    );
+    if (result.candidates) {
+      result.candidates = result.candidates.map((c) => ({
+        ...c,
+        image_url: `${API_BASE}${c.image_url}`,
+      }));
+    }
+    return result;
+  },
 
   checkYouTubeDuration: (projectId: string, accountId?: string) =>
     uploadPreflightRequest<import("@/types").YouTubeCheckResult>(
