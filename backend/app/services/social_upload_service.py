@@ -1584,6 +1584,36 @@ class SocialUploadService:
         return prep
 
     @classmethod
+    def _set_facebook_video_thumbnail(
+        cls,
+        *,
+        session,
+        base: str,
+        video_id: str,
+        token: str,
+        image_path: Path,
+        deadline: float | None,
+    ) -> str | None:
+        """Best-effort custom thumbnail on the classic /videos upload path."""
+        try:
+            with open(image_path, "rb") as fh:
+                resp = session.post(
+                    f"{base}/{video_id}/thumbnails",
+                    data={"access_token": token, "is_preferred": "true"},
+                    files={"source": ("thumbnail.jpg", fh, "image/jpeg")},
+                    timeout=cls._request_timeout_seconds(
+                        deadline=deadline,
+                        platform="Facebook",
+                        operation="thumbnail upload",
+                    ),
+                )
+            if resp.status_code >= 400:
+                return f"Miniature Facebook non appliquée: {_extract_graph_error(resp)}"
+            return None
+        except Exception as exc:
+            return f"Miniature Facebook non appliquée: {exc}"
+
+    @classmethod
     def upload_facebook(
         cls,
         *,
@@ -1597,6 +1627,7 @@ class SocialUploadService:
         scheduled_at: datetime | None = None,
         facebook_strategy: str | None = None,
         facebook_prep_dir: Path | None = None,
+        thumbnail_image_path: Path | None = None,
         max_duration_seconds: float = 90.0,
         deadline: float | None = None,
     ) -> PlatformUploadResult:
@@ -1633,7 +1664,7 @@ class SocialUploadService:
 
         # Scheduling: use Reels API 3-phase upload with video_state=SCHEDULED
         if scheduled_at:
-            return cls._upload_facebook_reel_scheduled(
+            result = cls._upload_facebook_reel_scheduled(
                 video_path=video_path,
                 subtitle_path=subtitle_path,
                 subtitle_locale=subtitle_locale,
@@ -1646,6 +1677,10 @@ class SocialUploadService:
                 max_duration_seconds=max_duration_seconds,
                 deadline=deadline,
             )
+            if thumbnail_image_path is not None and result.status == "uploaded":
+                note = "Miniature personnalisée non supportée pour les Reels programmés"
+                result.detail = f"{result.detail}; {note}" if result.detail else note
+            return result
 
         # Immediate publish: use standard /videos endpoint
         base = cls._graph_base()
@@ -1799,12 +1834,29 @@ class SocialUploadService:
                     detail=f"Subtitle upload unsupported or rejected: {_extract_graph_error(cap_resp)}",
                 )
 
+            thumbnail_warning: str | None = None
+            if thumbnail_image_path is not None and thumbnail_image_path.exists():
+                with cls._create_upload_session() as session:
+                    thumbnail_warning = cls._set_facebook_video_thumbnail(
+                        session=session,
+                        base=base,
+                        video_id=video_id,
+                        token=token,
+                        image_path=thumbnail_image_path,
+                        deadline=deadline,
+                    )
+
+            detail_parts = []
+            if source_mode == "drive_url":
+                detail_parts.append("Uploaded via Drive URL ingestion")
+            if thumbnail_warning:
+                detail_parts.append(thumbnail_warning)
             return PlatformUploadResult(
                 platform="facebook",
                 status="uploaded",
                 url=f"https://www.facebook.com/{video_id}",
                 resource_id=video_id,
-                detail="Uploaded via Drive URL ingestion" if source_mode == "drive_url" else None,
+                detail="; ".join(detail_parts) if detail_parts else None,
             )
         except Exception as exc:
             return PlatformUploadResult(

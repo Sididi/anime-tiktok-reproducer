@@ -84,3 +84,55 @@ def test_set_youtube_thumbnail_failure_returns_warning(tmp_path, monkeypatch):
     )
     assert warning is not None
     assert "Miniature YouTube" in warning
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int, payload: dict | None = None):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.text = str(payload)
+
+    def json(self):
+        return self._payload
+
+
+class _FakeSession:
+    def __init__(self, status_code: int = 200):
+        self.status_code = status_code
+        self.posts: list[dict] = []
+
+    def post(self, url, **kwargs):
+        self.posts.append({"url": url, **kwargs})
+        return _FakeResponse(self.status_code, {"error": {"message": "denied"}})
+
+
+def test_set_facebook_thumbnail_success(tmp_path):
+    image = tmp_path / "thumb.jpg"
+    image.write_bytes(b"\xff\xd8\xff\xd9")
+    session = _FakeSession(200)
+    warning = SocialUploadService._set_facebook_video_thumbnail(
+        session=session,
+        base="https://graph.facebook.com/v25.0",
+        video_id="v1",
+        token="tok",
+        image_path=image,
+        deadline=None,
+    )
+    assert warning is None
+    assert session.posts[0]["url"] == "https://graph.facebook.com/v25.0/v1/thumbnails"
+    assert session.posts[0]["data"]["is_preferred"] == "true"
+
+
+def test_set_facebook_thumbnail_failure_returns_warning(tmp_path):
+    image = tmp_path / "thumb.jpg"
+    image.write_bytes(b"\xff\xd8\xff\xd9")
+    warning = SocialUploadService._set_facebook_video_thumbnail(
+        session=_FakeSession(400),
+        base="https://graph.facebook.com/v25.0",
+        video_id="v1",
+        token="tok",
+        image_path=image,
+        deadline=None,
+    )
+    assert warning is not None
+    assert "Miniature Facebook" in warning

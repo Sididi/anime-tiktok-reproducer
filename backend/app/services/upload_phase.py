@@ -1176,6 +1176,7 @@ class UploadPhaseService:
                 _fb_prep_dir = cls._facebook_prep_dir(project_id)
                 _fb_video_url = None if force_local_upload else direct_drive_download
                 _fb_scheduled_at = platform_scheduled_at.get("facebook")
+                _fb_thumbnail = thumbnail_image_path
                 jobs["facebook"] = lambda: SocialUploadService.upload_facebook(
                     video_path=local_video_path,
                     subtitle_path=subtitle_path,
@@ -1187,6 +1188,7 @@ class UploadPhaseService:
                     scheduled_at=_fb_scheduled_at,
                     facebook_strategy=_fb_strategy,
                     facebook_prep_dir=_fb_prep_dir,
+                    thumbnail_image_path=_fb_thumbnail,
                     max_duration_seconds=facebook_max_duration,
                 )
             elif not account:
@@ -1195,6 +1197,7 @@ class UploadPhaseService:
                     _fb_strategy_global = facebook_strategy
                     _fb_prep_dir_global = cls._facebook_prep_dir(project_id)
                     _fb_video_url_global = None if force_local_upload else direct_drive_download
+                    _fb_thumbnail_global = thumbnail_image_path
                     jobs["facebook"] = lambda: SocialUploadService.upload_facebook(
                         video_path=local_video_path,
                         subtitle_path=subtitle_path,
@@ -1203,6 +1206,7 @@ class UploadPhaseService:
                         video_url=_fb_video_url_global,
                         facebook_strategy=_fb_strategy_global,
                         facebook_prep_dir=_fb_prep_dir_global,
+                        thumbnail_image_path=_fb_thumbnail_global,
                         max_duration_seconds=facebook_max_duration,
                     )
 
