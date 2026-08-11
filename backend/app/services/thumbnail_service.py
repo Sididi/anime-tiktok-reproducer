@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,17 @@ class ThumbnailService:
     _SHIFT_SECONDS = 3.0 / 60.0
     _JPEG_QUALITY = 90
     _THUMBS_CACHE_DIR = settings.cache_dir / "upload_thumbs"
+
+    # Per-project locks guarding the rebuild critical section (rmtree + write
+    # + payload assembly) in build_candidates_payload, same pattern as
+    # UploadPhaseService._source_locks / _source_lock.
+    _build_lock_guard = threading.Lock()
+    _build_locks: dict[str, threading.Lock] = {}
+
+    @classmethod
+    def _build_lock(cls, project_id: str) -> threading.Lock:
+        with cls._build_lock_guard:
+            return cls._build_locks.setdefault(project_id, threading.Lock())
 
     @classmethod
     def load_final_timeline(cls, project_id: str) -> Transcription | None:
@@ -99,48 +111,54 @@ class ThumbnailService:
 
         stat = video_path.stat()
         version = f"{stat.st_mtime_ns}-{stat.st_size}"
-        cache_dir = cls._project_thumbs_dir(project_id) / version
-        if not all(
-            (cache_dir / f"cand_{c.index}.jpg").exists() for c in candidates
-        ):
-            # Source video changed (or first call): rebuild from scratch.
-            shutil.rmtree(cls._project_thumbs_dir(project_id), ignore_errors=True)
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            images = AnimeMatcherService.extract_frames(
-                video_path, [c.timestamp_seconds for c in candidates]
-            )
-            for candidate, image in zip(candidates, images):
-                if image is None:
-                    logger.warning(
-                        "Thumbnail frame extraction failed: project=%s index=%d t=%.3f",
-                        project_id, candidate.index, candidate.timestamp_seconds,
-                    )
-                    continue
-                image.convert("RGB").save(
-                    cache_dir / f"cand_{candidate.index}.jpg",
-                    "JPEG",
-                    quality=cls._JPEG_QUALITY,
-                )
 
-        payload = [
-            {
-                "index": c.index,
-                "label": c.label,
-                "timestamp_ms": c.timestamp_ms,
-                "image_url": (
-                    f"/project-manager/projects/{project_id}"
-                    f"/thumbnail-frame/{c.index}?v={version}"
-                ),
-            }
-            for c in candidates
-            if (cache_dir / f"cand_{c.index}.jpg").exists()
-        ]
-        if not payload:
-            return {
-                "state": "error",
-                "detail": "Extraction des miniatures impossible depuis la vidéo finale",
-            }
-        return {"state": "ready", "version": version, "candidates": payload}
+        # The rmtree-and-rebuild below is not safe against concurrent callers
+        # for the same project (one thread's rmtree can delete files another
+        # thread is mid-write on). Serialize the whole version-check +
+        # rebuild + payload-assembly section per project.
+        with cls._build_lock(project_id):
+            cache_dir = cls._project_thumbs_dir(project_id) / version
+            if not all(
+                (cache_dir / f"cand_{c.index}.jpg").exists() for c in candidates
+            ):
+                # Source video changed (or first call): rebuild from scratch.
+                shutil.rmtree(cls._project_thumbs_dir(project_id), ignore_errors=True)
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                images = AnimeMatcherService.extract_frames(
+                    video_path, [c.timestamp_seconds for c in candidates]
+                )
+                for candidate, image in zip(candidates, images):
+                    if image is None:
+                        logger.warning(
+                            "Thumbnail frame extraction failed: project=%s index=%d t=%.3f",
+                            project_id, candidate.index, candidate.timestamp_seconds,
+                        )
+                        continue
+                    image.convert("RGB").save(
+                        cache_dir / f"cand_{candidate.index}.jpg",
+                        "JPEG",
+                        quality=cls._JPEG_QUALITY,
+                    )
+
+            payload = [
+                {
+                    "index": c.index,
+                    "label": c.label,
+                    "timestamp_ms": c.timestamp_ms,
+                    "image_url": (
+                        f"/project-manager/projects/{project_id}"
+                        f"/thumbnail-frame/{c.index}?v={version}"
+                    ),
+                }
+                for c in candidates
+                if (cache_dir / f"cand_{c.index}.jpg").exists()
+            ]
+            if not payload:
+                return {
+                    "state": "error",
+                    "detail": "Extraction des miniatures impossible depuis la vidéo finale",
+                }
+            return {"state": "ready", "version": version, "candidates": payload}
 
     @classmethod
     def cached_frame_path(cls, project_id: str, index: int) -> Path | None:

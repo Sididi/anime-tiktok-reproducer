@@ -100,7 +100,7 @@ export function ThumbnailSelectionModal({
         <>
           <div
             className={`grid gap-3 ${
-              candidates.length >= 4 ? "grid-cols-5" : "grid-cols-3"
+              candidates.length >= 5 ? "grid-cols-5" : "grid-cols-3"
             }`}
           >
             {candidates.map((candidate) => (

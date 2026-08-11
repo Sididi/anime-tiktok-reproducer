@@ -1104,6 +1104,12 @@ class UploadPhaseService:
                     thumbnail_timestamp_ms / 1000.0,
                     Path(tmp_dir) / "thumbnail.jpg",
                 )
+            # A timestamp was requested but the frame could not be extracted:
+            # YouTube/Facebook proceed without a thumbnail. Surface that on
+            # their platform results instead of failing silently.
+            thumbnail_extraction_failed = (
+                thumbnail_timestamp_ms is not None and thumbnail_image_path is None
+            )
 
             ig_payload = dict(ig_payload_base) if ig_payload_base is not None else None
             ig_prep_needed = False
@@ -1332,6 +1338,10 @@ class UploadPhaseService:
                                 status="failed",
                                 detail=str(exc),
                             )
+                        if thumbnail_extraction_failed:
+                            cls._apply_thumbnail_extraction_warning(
+                                results_by_platform[platform]
+                            )
                         emit_platform_result(results_by_platform[platform])
 
                 if pending:
@@ -1446,6 +1456,10 @@ class UploadPhaseService:
 
     _SOURCE_CACHE_DIR = settings.cache_dir / "upload_source"
     _SOURCE_CACHE_MAX_AGE_SECONDS = 7200  # 2 hours
+
+    _THUMBNAIL_EXTRACTION_FAILED_NOTE = (
+        "Miniature non appliquée: extraction de l'image impossible"
+    )
 
     # Shared final-video preview cache bookkeeping (guarded by _source_download_guard)
     _source_download_guard = threading.Lock()
@@ -1678,6 +1692,27 @@ class UploadPhaseService:
         )
 
     @classmethod
+    def cleanup_stale_thumbnail_cache(cls) -> None:
+        # Same 2-hour horizon as the source-video cache it rides alongside.
+        cls._cleanup_stale_prep_cache(
+            ThumbnailService._THUMBS_CACHE_DIR, cls._SOURCE_CACHE_MAX_AGE_SECONDS
+        )
+
+    @classmethod
+    def _apply_thumbnail_extraction_warning(cls, result: PlatformUploadResult) -> None:
+        """Append a French warning note when a requested thumbnail could not
+        be extracted, so image-native platforms (YouTube, Facebook) surface
+        that instead of silently uploading with no thumbnail applied.
+
+        No-op for any other platform, or for results that are not
+        'uploaded' (skipped/failed already carry their own detail).
+        """
+        if result.platform not in ("youtube", "facebook") or result.status != "uploaded":
+            return
+        note = cls._THUMBNAIL_EXTRACTION_FAILED_NOTE
+        result.detail = f"{result.detail}; {note}" if result.detail else note
+
+    @classmethod
     def _neutral_duration_check_result(cls) -> dict[str, Any]:
         return {
             "needed": False,
@@ -1788,6 +1823,7 @@ class UploadPhaseService:
     ) -> dict[str, Any]:
         cleanup_stale()
         cls.cleanup_stale_source_cache()
+        cls.cleanup_stale_thumbnail_cache()
 
         project = ProjectService.load(project_id)
         if not project:

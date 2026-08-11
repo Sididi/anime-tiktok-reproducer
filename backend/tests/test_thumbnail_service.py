@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -157,6 +158,76 @@ def test_build_candidates_payload_drops_failed_frames(tmp_path, monkeypatch):
     payload = ThumbnailService.build_candidates_payload("p1", video)
     assert payload["state"] == "ready"
     assert [c["index"] for c in payload["candidates"]] == [0, 2]
+
+
+def test_build_candidates_payload_cache_hit_reuses_files(tmp_path, monkeypatch, fake_frames):
+    """Second call for the same version must not re-rebuild (cache hit path)."""
+    monkeypatch.setattr(
+        "app.services.project_service.settings.projects_dir", tmp_path / "projects"
+    )
+    monkeypatch.setattr(ThumbnailService, "_THUMBS_CACHE_DIR", tmp_path / "thumbs")
+    out_dir = tmp_path / "projects" / "p1" / "output"
+    out_dir.mkdir(parents=True)
+    (out_dir / "transcription_timing.json").write_text(
+        '{"language": "fr", "scenes": [{"scene_index": 0, "text": "",'
+        ' "words": [], "start_time": 0.0, "end_time": 4.0, "is_raw": false}]}'
+    )
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00" * 128)
+
+    first = ThumbnailService.build_candidates_payload("p1", video)
+    assert first["state"] == "ready"
+    frame_before = ThumbnailService.cached_frame_path("p1", 0)
+    assert frame_before is not None
+    mtime_before = frame_before.stat().st_mtime_ns
+
+    second = ThumbnailService.build_candidates_payload("p1", video)
+    assert second["state"] == "ready"
+    assert second["version"] == first["version"]
+    frame_after = ThumbnailService.cached_frame_path("p1", 0)
+    assert frame_after is not None
+    # Same file, untouched: rebuild was skipped on the cache-hit path.
+    assert frame_after.stat().st_mtime_ns == mtime_before
+
+
+def test_build_candidates_payload_concurrent_calls_do_not_collide(
+    tmp_path, monkeypatch, fake_frames
+):
+    """Two threads racing build_candidates_payload for the same project must
+    not collide (rmtree-during-write -> FileNotFoundError -> 500)."""
+    monkeypatch.setattr(
+        "app.services.project_service.settings.projects_dir", tmp_path / "projects"
+    )
+    monkeypatch.setattr(ThumbnailService, "_THUMBS_CACHE_DIR", tmp_path / "thumbs")
+    out_dir = tmp_path / "projects" / "p1" / "output"
+    out_dir.mkdir(parents=True)
+    (out_dir / "transcription_timing.json").write_text(
+        '{"language": "fr", "scenes": [{"scene_index": 0, "text": "",'
+        ' "words": [], "start_time": 0.0, "end_time": 4.0, "is_raw": false}]}'
+    )
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00" * 128)
+
+    results: list[dict] = []
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(2)
+
+    def _call():
+        try:
+            barrier.wait(timeout=5)
+            results.append(ThumbnailService.build_candidates_payload("p1", video))
+        except BaseException as exc:  # noqa: BLE001 - want to see any thread failure
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_call) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not errors
+    assert len(results) == 2
+    assert all(r["state"] == "ready" for r in results)
 
 
 def test_extract_frame_image(tmp_path, monkeypatch):

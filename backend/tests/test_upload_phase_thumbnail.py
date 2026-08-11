@@ -1,12 +1,71 @@
 """Instagram thumb_offset scaling for the thumbnail feature."""
 from __future__ import annotations
 
+import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.services.upload_phase import UploadPhaseService
+from app.services.social_upload_service import PlatformUploadResult
+from app.services.thumbnail_service import ThumbnailService
+
+
+def test_cleanup_stale_thumbnail_cache_removes_old_keeps_fresh(tmp_path, monkeypatch):
+    monkeypatch.setattr(ThumbnailService, "_THUMBS_CACHE_DIR", tmp_path)
+
+    old_project = tmp_path / "old-project"
+    old_project.mkdir()
+    (old_project / "marker.txt").write_text("x")
+    old_time = time.time() - UploadPhaseService._SOURCE_CACHE_MAX_AGE_SECONDS - 60
+    os.utime(old_project, (old_time, old_time))
+
+    fresh_project = tmp_path / "fresh-project"
+    fresh_project.mkdir()
+    (fresh_project / "marker.txt").write_text("y")
+
+    UploadPhaseService.cleanup_stale_thumbnail_cache()
+
+    assert not old_project.exists()
+    assert fresh_project.exists()
+
+
+def _result(platform: str, status: str, detail: str | None = None) -> PlatformUploadResult:
+    return PlatformUploadResult(platform=platform, status=status, detail=detail)
+
+
+def test_extraction_warning_appended_to_uploaded_youtube_no_prior_detail():
+    result = _result("youtube", "uploaded")
+    UploadPhaseService._apply_thumbnail_extraction_warning(result)
+    assert result.detail == "Miniature non appliquée: extraction de l'image impossible"
+
+
+def test_extraction_warning_appended_to_uploaded_facebook_with_prior_detail():
+    result = _result("facebook", "uploaded", detail="Publié avec succès")
+    UploadPhaseService._apply_thumbnail_extraction_warning(result)
+    assert result.detail == (
+        "Publié avec succès; Miniature non appliquée: extraction de l'image impossible"
+    )
+
+
+def test_extraction_warning_does_not_touch_skipped_or_failed_results():
+    skipped = _result("youtube", "skipped", detail="not configured")
+    failed = _result("facebook", "failed", detail="boom")
+    UploadPhaseService._apply_thumbnail_extraction_warning(skipped)
+    UploadPhaseService._apply_thumbnail_extraction_warning(failed)
+    assert skipped.detail == "not configured"
+    assert failed.detail == "boom"
+
+
+def test_extraction_warning_does_not_touch_other_platforms():
+    tiktok = _result("tiktok", "uploaded", detail=None)
+    instagram = _result("instagram", "uploaded", detail="ok")
+    UploadPhaseService._apply_thumbnail_extraction_warning(tiktok)
+    UploadPhaseService._apply_thumbnail_extraction_warning(instagram)
+    assert tiktok.detail is None
+    assert instagram.detail == "ok"
 
 
 def test_thumb_offset_passthrough_no_speed():
