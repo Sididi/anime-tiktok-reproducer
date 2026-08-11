@@ -74,7 +74,7 @@ async def _cancel_app_tasks(app: FastAPI) -> None:
 
 async def _warm_storage_box_catalog(library_type: LibraryType) -> None:
     try:
-        await LibraryHydrationService.ensure_catalog_available(library_type)
+        await LibraryHydrationService.reconcile_catalog(library_type)
     except asyncio.CancelledError:
         raise
     except Exception as exc:

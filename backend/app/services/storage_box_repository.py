@@ -38,7 +38,14 @@ REPOSITORY_VERSION = "v1"
 LOCAL_STORAGE_BOX_METADATA = ".atr_storage_box.json"
 TORRENT_METADATA_FILENAME = ".atr_torrents.json"
 HASH_CACHE_FILENAME = ".atr_hash_cache.json"
+STAGING_OWNER_FILENAME = ".atr_publish_owner.json"
+MACHINE_ID_FILENAME = "machine_id"
 MEDIA_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".ts"}
+
+# Grace before the sweep reclaims a staging dir with no owner marker. Such
+# dirs predate the marker, so they cannot be attributed to a machine; a recent
+# one may be another backend mid-upload on an older build.
+UNOWNED_STAGING_GRACE_HOURS = 24.0
 
 # Called from hashing worker threads as (bytes_hashed, bytes_to_hash).
 HashingProgressCallback = Callable[[int, int], None]
@@ -169,10 +176,33 @@ class StorageBoxRepository:
     _catalog_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
     _catalog_cache_ttl_seconds = 30.0
     _background_tasks: set[asyncio.Task[Any]] = set()
+    _machine_id_cache: str | None = None
 
     @classmethod
     def is_enabled(cls) -> bool:
         return StorageBoxSftpClient.is_configured()
+
+    @classmethod
+    def _machine_id(cls) -> str:
+        """Stable identity for this backend install, persisted under data_dir.
+
+        Publish IDs are minted per machine, so they cannot tell "my abandoned
+        staging dir" from "the other machine's live one". This can.
+        """
+        if cls._machine_id_cache is not None:
+            return cls._machine_id_cache
+
+        path = settings.data_dir / MACHINE_ID_FILENAME
+        machine_id = ""
+        with suppress(OSError):
+            machine_id = path.read_text(encoding="utf-8").strip()
+        if not machine_id:
+            machine_id = uuid.uuid4().hex
+            with suppress(OSError):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(machine_id, encoding="utf-8")
+        cls._machine_id_cache = machine_id
+        return machine_id
 
     @staticmethod
     def local_series_metadata_path(series_dir: Path) -> Path:
@@ -574,6 +604,10 @@ class StorageBoxRepository:
             "schema_version": SCHEMA_VERSION,
             "library_type": scoped_type.value,
             "updated_at": _utc_now_iso(),
+            # Only a rebuild derives the catalog from the remote series tree,
+            # so only a rebuild may stamp this. Per-series upserts carry it
+            # through untouched; see LibraryHydrationService.reconcile_catalog.
+            "reconciled_at": _utc_now_iso(),
             "items": items,
         }
 
@@ -1990,6 +2024,10 @@ class StorageBoxRepository:
                     "the release."
                 )
 
+            await cls._write_staging_owner(
+                staging_root, publish_id=record.publish_id
+            )
+
             await StorageBoxRclone.upload_batch(
                 [
                     (Path(a.local_path), PurePosixPath(a.remote_relative_path))
@@ -2110,7 +2148,11 @@ class StorageBoxRepository:
                 backup_path.write_text(existing_current, encoding="utf-8")
         await cls._write_remote_json(tmp_current, current_payload)
         await StorageBoxSftpClient.replace_file(tmp_current, current_path)
-        await cls.rebuild_catalog(scoped_type)
+        await cls.upsert_catalog_entry(
+            scoped_type,
+            current=current_payload,
+            manifest=record.manifest,
+        )
         if series_dir.exists():
             await asyncio.to_thread(
                 cls.write_local_series_metadata,
@@ -2177,6 +2219,14 @@ class StorageBoxRepository:
         Crashed uploads from before the durable pending-publish records (or
         records that were deleted without remote cleanup) leave staging dirs
         behind forever; this reclaims them, scoped to one series.
+
+        Only *this machine's* leftovers are reclaimed. Several backends share
+        one Storage Box and ``_resolve_or_create_series_id`` deliberately
+        converges them on the same ``series_id`` for the same show, so a
+        staging dir here may belong to another machine's in-flight or parked
+        upload — and only that machine holds the pending-publish record needed
+        to resume it. Deleting it would strand the transfer with its artifacts
+        gone, so ownership is checked before anything is removed.
         """
         scoped_type = coerce_library_type(library_type)
         if not cls.is_enabled():
@@ -2186,16 +2236,104 @@ class StorageBoxRepository:
             entries = await StorageBoxSftpClient.listdir(staging_parent)
         except Exception:
             return
+
+        machine_id = cls._machine_id()
         for name in entries:
             if name in {".", ".."} or name in keep_publish_ids:
                 continue
+
+            staging_root = staging_parent / name
+            owner = await cls._read_staging_owner(staging_root)
+            if owner is not None and owner != machine_id:
+                logger.info(
+                    "Leaving remote staging dir %s for series %s alone: "
+                    "owned by another machine (%s)",
+                    name,
+                    series_id,
+                    owner,
+                )
+                continue
+            if owner is None and not await cls._staging_dir_is_reclaimable(staging_root):
+                logger.info(
+                    "Leaving unattributed remote staging dir %s for series %s "
+                    "alone: younger than the %.0fh grace period (or its age is "
+                    "unknown)",
+                    name,
+                    series_id,
+                    UNOWNED_STAGING_GRACE_HOURS,
+                )
+                continue
+
             logger.info(
                 "Sweeping orphaned remote staging dir %s for series %s",
                 name,
                 series_id,
             )
             with suppress(Exception):
-                await StorageBoxSftpClient.remove_tree(staging_parent / name)
+                await StorageBoxSftpClient.remove_tree(staging_root)
+
+    @classmethod
+    async def _write_staging_owner(
+        cls,
+        staging_root: PurePosixPath,
+        *,
+        publish_id: str,
+    ) -> None:
+        """Claim a staging dir for this machine, so other backends skip it."""
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "machine_id": cls._machine_id(),
+            "publish_id": publish_id,
+            "created_at": _utc_now_iso(),
+        }
+        try:
+            await StorageBoxSftpClient.write_text(
+                staging_root / STAGING_OWNER_FILENAME,
+                _json_dumps(payload),
+            )
+        except Exception as exc:
+            # Not worth failing a publish over: the marker only protects this
+            # upload from another machine's sweep.
+            logger.warning(
+                "Could not stamp staging owner for publish %s (%s); another "
+                "backend's sweep may reclaim this staging dir",
+                publish_id,
+                exc,
+            )
+
+    @classmethod
+    async def _read_staging_owner(cls, staging_root: PurePosixPath) -> str | None:
+        """Machine that claimed ``staging_root``, or None if unattributed."""
+        try:
+            raw = await StorageBoxSftpClient.read_text(
+                staging_root / STAGING_OWNER_FILENAME
+            )
+        except Exception:
+            return None
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return str(payload.get("machine_id") or "").strip() or None
+
+    @classmethod
+    async def _staging_dir_is_reclaimable(cls, staging_root: PurePosixPath) -> bool:
+        """True when an unattributed staging dir is old enough to be junk.
+
+        An age we cannot read is not an age we may act on: without proof the
+        dir is stale, leaving it costs quota, and removing it may strand
+        another machine's upload.
+        """
+        try:
+            attrs = await StorageBoxSftpClient.stat(staging_root)
+            mtime = float(getattr(attrs, "mtime", 0.0) or 0.0)
+        except Exception:
+            return False
+        if mtime <= 0.0:
+            return False
+        return (time.time() - mtime) >= UNOWNED_STAGING_GRACE_HOURS * 3600.0
 
     @classmethod
     async def _hardlink_resumable(

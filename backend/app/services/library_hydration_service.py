@@ -11,6 +11,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Awaitable, Callable
 
@@ -161,6 +162,9 @@ class LibraryHydrationService:
     _series_locks: dict[tuple[str, str], asyncio.Lock] = {}
     _library_locks: dict[str, asyncio.Lock] = {}
     _background_tasks: set[asyncio.Task[Any]] = set()
+    # How stale the catalog may get before a startup warmup re-derives it from
+    # the remote series tree. See :meth:`reconcile_catalog`.
+    _catalog_reconcile_interval_hours: float = 12.0
 
     @classmethod
     def _storage_cache_root(cls) -> Path:
@@ -369,13 +373,65 @@ class LibraryHydrationService:
                 await asyncio.to_thread(PendingPublishStore.save, record)
 
     @classmethod
-    async def ensure_catalog_available(cls, library_type: LibraryType | str) -> None:
+    async def reconcile_catalog(cls, library_type: LibraryType | str) -> None:
+        """Ensure the catalog exists, and periodically re-derive it from the
+        remote series tree.
+
+        Publishing a series updates its catalog entry in place, which is one
+        read plus one write instead of a full rescan — but a read-modify-write
+        of a file shared by several backends has no compare-and-swap. Two
+        publishes overlapping from different machines can lose one entry, and
+        an in-place update can never notice, because it never looks at the
+        series tree. A rebuild derives from that tree (ground truth) and heals
+        the drift.
+
+        Paying it on every publish is what made publishing slow; paying it
+        never is what makes drift permanent. So it runs here, bounded by
+        ``_catalog_reconcile_interval_hours``, off a marker stored in the
+        catalog itself — which means the two machines share the schedule
+        rather than each rebuilding on their own restarts.
+        """
         if not StorageBoxRepository.is_enabled():
             return
+
+        if not await cls._catalog_reconcile_is_due(library_type):
+            return
+
+        await StorageBoxRepository.rebuild_catalog(library_type)
+
+    @classmethod
+    async def _catalog_reconcile_is_due(cls, library_type: LibraryType | str) -> bool:
+        scoped_type = coerce_library_type(library_type)
         try:
-            await StorageBoxRepository.list_catalog(library_type)
+            payload = await StorageBoxRepository._read_remote_json(
+                StorageBoxRepository._catalog_path(scoped_type),
+                context=f"{scoped_type.value} catalog",
+            )
         except Exception:
-            await StorageBoxRepository.rebuild_catalog(library_type)
+            # Missing or unreadable: the rebuild is the repair path.
+            return True
+
+        raw_marker = str(payload.get("reconciled_at") or "").strip()
+        if not raw_marker:
+            # Catalog predates the marker (or was only ever upserted).
+            return True
+        try:
+            reconciled_at = datetime.fromisoformat(raw_marker)
+        except ValueError:
+            logger.warning(
+                "Storage Box %s catalog has an unparsable reconciled_at (%r); "
+                "reconciling",
+                scoped_type.value,
+                raw_marker,
+            )
+            return True
+        if reconciled_at.tzinfo is None:
+            reconciled_at = reconciled_at.replace(tzinfo=timezone.utc)
+
+        age_hours = (
+            datetime.now(timezone.utc) - reconciled_at
+        ).total_seconds() / 3600.0
+        return age_hours >= cls._catalog_reconcile_interval_hours
 
     @classmethod
     async def get_activation_state(
