@@ -32,6 +32,7 @@ from .platform_reschedule_service import PlatformRescheduleService
 from .project_service import ProjectService
 from .scheduling_service import SchedulingService
 from .social_upload_service import PlatformUploadResult, SocialUploadService
+from .thumbnail_service import ThumbnailService
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -1093,6 +1094,17 @@ class UploadPhaseService:
                 local_video_path = replaced_video
                 force_local_upload = True
 
+            # Extract the chosen thumbnail frame once for image-native platforms
+            # (YouTube, Facebook). Extracted from the ORIGINAL output video, so
+            # platform-side cut/sped_up retiming cannot shift the image.
+            thumbnail_image_path: Path | None = None
+            if thumbnail_timestamp_ms is not None:
+                thumbnail_image_path = ThumbnailService.extract_frame_image(
+                    local_video_path,
+                    thumbnail_timestamp_ms / 1000.0,
+                    Path(tmp_dir) / "thumbnail.jpg",
+                )
+
             ig_payload = dict(ig_payload_base) if ig_payload_base is not None else None
             ig_prep_needed = False
             if (
@@ -1125,6 +1137,7 @@ class UploadPhaseService:
                 _yt_strategy = youtube_strategy
                 _yt_prep_dir = cls._youtube_prep_dir(project_id)
                 _yt_scheduled_at = platform_scheduled_at.get("youtube")
+                _yt_thumbnail = thumbnail_image_path
                 jobs["youtube"] = lambda: SocialUploadService.upload_youtube(
                     video_path=local_video_path,
                     subtitle_path=subtitle_path,
@@ -1137,11 +1150,13 @@ class UploadPhaseService:
                     channel_id=yt_config.channel_id,
                     youtube_strategy=_yt_strategy,
                     youtube_prep_dir=_yt_prep_dir,
+                    thumbnail_image_path=_yt_thumbnail,
                 )
             elif "youtube" in requested_platforms and not account:
                 # Global (backwards compat)
                 _yt_strategy_global = youtube_strategy
                 _yt_prep_dir_global = cls._youtube_prep_dir(project_id)
+                _yt_thumbnail_global = thumbnail_image_path
                 jobs["youtube"] = lambda: SocialUploadService.upload_youtube(
                     video_path=local_video_path,
                     subtitle_path=subtitle_path,
@@ -1150,6 +1165,7 @@ class UploadPhaseService:
                     metadata=metadata,
                     youtube_strategy=_yt_strategy_global,
                     youtube_prep_dir=_yt_prep_dir_global,
+                    thumbnail_image_path=_yt_thumbnail_global,
                 )
 
             # Facebook job. Instagram is deferred to the VPS scheduler via create_job above.

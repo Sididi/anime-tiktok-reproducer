@@ -32,3 +32,55 @@ def test_thumb_offset_garbage_speed_treated_as_one():
 
 def test_thumb_offset_never_negative():
     assert UploadPhaseService._instagram_thumb_offset(0, None, 90.0) == 0
+
+
+from app.services.social_upload_service import SocialUploadService
+
+
+class _FakeThumbnails:
+    def __init__(self, fail: bool):
+        self._fail = fail
+        self.calls: list[dict] = []
+
+    def set(self, **kwargs):
+        self.calls.append(kwargs)
+        if self._fail:
+            raise RuntimeError("boom")
+        return object()  # request object; execution is monkeypatched
+
+
+class _FakeYouTube:
+    def __init__(self, fail: bool = False):
+        self._thumbnails = _FakeThumbnails(fail)
+
+    def thumbnails(self):
+        return self._thumbnails
+
+
+def test_set_youtube_thumbnail_success_returns_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        SocialUploadService, "_execute_google_request",
+        classmethod(lambda cls, youtube, request, **kw: {}),
+    )
+    image = tmp_path / "thumb.jpg"
+    image.write_bytes(b"\xff\xd8\xff\xd9")
+    yt = _FakeYouTube()
+    warning = SocialUploadService._set_youtube_thumbnail(yt, "vid123", image, None)
+    assert warning is None
+    assert yt.thumbnails().calls[0]["videoId"] == "vid123"
+
+
+def test_set_youtube_thumbnail_failure_returns_warning(tmp_path, monkeypatch):
+    def raise_it(cls, youtube, request, **kw):
+        raise RuntimeError("quota exceeded")
+
+    monkeypatch.setattr(
+        SocialUploadService, "_execute_google_request", classmethod(raise_it)
+    )
+    image = tmp_path / "thumb.jpg"
+    image.write_bytes(b"\xff\xd8\xff\xd9")
+    warning = SocialUploadService._set_youtube_thumbnail(
+        _FakeYouTube(), "vid123", image, None
+    )
+    assert warning is not None
+    assert "Miniature YouTube" in warning

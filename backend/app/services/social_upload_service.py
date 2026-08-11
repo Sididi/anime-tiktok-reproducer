@@ -669,6 +669,31 @@ class SocialUploadService:
         return 8 * 1024 * 1024  # 8MB for smaller files
 
     @classmethod
+    def _set_youtube_thumbnail(
+        cls,
+        youtube,
+        video_id: str,
+        image_path: Path,
+        deadline: float | None,
+    ) -> str | None:
+        """Best-effort custom thumbnail; Shorts honor it only on YPP channels."""
+        try:
+            request = youtube.thumbnails().set(
+                videoId=video_id,
+                media_body=MediaFileUpload(str(image_path), mimetype="image/jpeg"),
+            )
+            cls._execute_google_request(
+                youtube,
+                request,
+                deadline=deadline,
+                platform="YouTube",
+                operation="thumbnail set",
+            )
+            return None
+        except Exception as exc:
+            return f"Miniature YouTube non appliquée: {exc}"
+
+    @classmethod
     def upload_youtube(
         cls,
         *,
@@ -683,6 +708,7 @@ class SocialUploadService:
         channel_id: str | None = None,
         youtube_strategy: str | None = None,
         youtube_prep_dir: Path | None = None,
+        thumbnail_image_path: Path | None = None,
         deadline: float | None = None,
     ) -> PlatformUploadResult:
         deadline = cls._platform_deadline(deadline)
@@ -869,11 +895,19 @@ class SocialUploadService:
                     operation="caption upload",
                 )
 
+                thumbnail_warning: str | None = None
+                if thumbnail_image_path is not None and thumbnail_image_path.exists():
+                    thumbnail_warning = cls._set_youtube_thumbnail(
+                        youtube, video_id, thumbnail_image_path, deadline
+                    )
+
                 detail_parts = []
                 if scheduled_at:
                     detail_parts.append(
                         f"Programmé le {cls._format_french_datetime(scheduled_at)}"
                     )
+                if thumbnail_warning:
+                    detail_parts.append(thumbnail_warning)
 
                 return PlatformUploadResult(
                     platform="youtube",
