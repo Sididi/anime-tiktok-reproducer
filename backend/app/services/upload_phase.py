@@ -826,6 +826,7 @@ class UploadPhaseService:
         instagram_strategy: str | None = None,
         youtube_strategy: str | None = None,
         copyright_audio_path: str | None = None,
+        thumbnail_timestamp_ms: int | None = None,
         reserved_slots: dict[str, tuple[datetime, datetime]] | None = None,
         progress_callback: Callable[[float, str, str], None] | None = None,
         platform_result_callback: Callable[[dict[str, Any]], None] | None = None,

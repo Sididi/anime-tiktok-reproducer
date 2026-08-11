@@ -85,3 +85,23 @@ def test_frame_served_and_404(client, monkeypatch, tmp_path):
     assert ok.headers["content-type"] == "image/jpeg"
     missing = client.get("/api/project-manager/projects/p1/thumbnail-frame/3")
     assert missing.status_code == 404
+
+
+def test_upload_route_forwards_thumbnail_timestamp(client, monkeypatch):
+    captured: dict = {}
+
+    async def fake_enqueue(self, **kwargs):
+        captured.update(kwargs)
+        from app.models.project_upload import ProjectUploadJob  # noqa: PLC0415
+        return ProjectUploadJob(project_id=kwargs["project_id"])
+
+    monkeypatch.setattr(
+        "app.services.project_upload_service.ProjectUploadService.enqueue_upload",
+        fake_enqueue,
+    )
+    resp = client.post(
+        "/api/project-manager/projects/p1/upload",
+        json={"account_id": "acc", "thumbnail_timestamp_ms": 2350},
+    )
+    assert resp.status_code == 200
+    assert captured["thumbnail_timestamp_ms"] == 2350

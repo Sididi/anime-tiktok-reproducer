@@ -29,6 +29,7 @@ class UploadProjectRequest(BaseModel):
     instagram_strategy: Literal["auto", "cut", "sped_up", "skip"] | None = None
     youtube_strategy: Literal["auto", "cut", "sped_up", "skip"] | None = None
     copyright_audio_path: str | None = None
+    thumbnail_timestamp_ms: int | None = None
 
 
 class FacebookCheckRequest(BaseModel):
@@ -78,6 +79,7 @@ async def run_upload_phase(
             instagram_strategy=req.instagram_strategy,
             youtube_strategy=req.youtube_strategy,
             copyright_audio_path=req.copyright_audio_path,
+            thumbnail_timestamp_ms=req.thumbnail_timestamp_ms,
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
