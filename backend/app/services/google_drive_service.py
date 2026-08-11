@@ -91,6 +91,9 @@ class GoogleDriveService:
     _VIDEO_METADATA_HTTP_TIMEOUT_SECONDS = 10
     _VIDEO_METADATA_MAX_ATTEMPTS = 2
     _VIDEO_DURATION_CACHE_TTL_SECONDS = 60.0
+    # Top-level MP4 boxes before moov are few (ftyp, free, mdat); the bound
+    # just keeps a malformed header from turning into an endless range walk.
+    _VIDEO_HEADER_MAX_BOXES = 16
 
     _SMALL_FILE_BYTES = 8 * 1024 * 1024
 
@@ -1046,9 +1049,127 @@ class GoogleDriveService:
             return None
         if duration <= 0:
             return None
+        cls._cache_video_duration(file_id, duration)
+        return duration
+
+    @classmethod
+    def _cache_video_duration(cls, file_id: str, duration: float) -> None:
         with cls._video_duration_cache_lock:
             cls._video_duration_cache[file_id] = (duration, time.monotonic())
-        return duration
+
+    @classmethod
+    def _fetch_file_range(cls, file_id: str, start: int, length: int) -> bytes:
+        """Fetch a byte range of a Drive file, never the whole file.
+
+        A server that ignores ``Range`` answers 200 with the entire media, so
+        the reply is only accepted when Drive confirms partial content.
+        """
+        drive = cls._video_metadata_client()
+        request = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
+        headers = dict(request.headers or {})
+        headers["Range"] = f"bytes={start}-{start + length - 1}"
+        response, content = request.http.request(
+            request.uri, "GET", headers=headers
+        )
+        status = int(getattr(response, "status", 0) or 0)
+        if status != 206:
+            raise DriveVideoMetadataLookupError(
+                f"Drive did not serve a byte range (HTTP {status})"
+            )
+        return content or b""
+
+    @classmethod
+    def probe_video_duration_from_header(cls, file_id: str) -> float | None:
+        """Read the duration out of the MP4/MOV header itself, via byte ranges.
+
+        Drive fills ``videoMediaMetadata`` asynchronously, so a freshly
+        uploaded export answers with no duration for a while — long enough for
+        an upload click to land in the gap. The container always knows: the
+        ``moov/mvhd`` box carries a timescale and a duration. Walking the
+        top-level boxes by their declared sizes reaches ``moov`` in a handful of
+        small range requests, so a multi-hundred-megabyte export costs a few KB
+        and the media itself is never transferred.
+
+        Returns ``None`` whenever the header cannot be read or does not state a
+        usable duration; callers keep their existing fallback.
+        """
+        try:
+            offset = 0
+            for _ in range(cls._VIDEO_HEADER_MAX_BOXES):
+                header = cls._fetch_file_range(file_id, offset, 16)
+                if len(header) < 8:
+                    return None
+                size = int.from_bytes(header[0:4], "big")
+                box_type = header[4:8]
+                header_size = 8
+                if size == 1:
+                    if len(header) < 16:
+                        return None
+                    size = int.from_bytes(header[8:16], "big")
+                    header_size = 16
+                if box_type == b"moov":
+                    duration = cls._duration_from_moov(file_id, offset + header_size)
+                    if duration is not None:
+                        # The remaining platform checks in this preflight run
+                        # reuse it instead of walking the header again.
+                        cls._cache_video_duration(file_id, duration)
+                    return duration
+                if size == 0 or size < header_size:
+                    # Box runs to end of file (or is malformed): nothing left to
+                    # walk past, and it is not the moov we need.
+                    return None
+                offset += size
+            return None
+        except Exception as exc:
+            logger.warning(
+                "Drive video header duration probe failed: file_id=%s error=%s",
+                file_id,
+                exc,
+            )
+            return None
+
+    @classmethod
+    def _duration_from_moov(cls, file_id: str, moov_payload_offset: int) -> float | None:
+        """Find ``mvhd`` among moov's children and decode its duration."""
+        offset = moov_payload_offset
+        for _ in range(cls._VIDEO_HEADER_MAX_BOXES):
+            header = cls._fetch_file_range(file_id, offset, 8)
+            if len(header) < 8:
+                return None
+            size = int.from_bytes(header[0:4], "big")
+            box_type = header[4:8]
+            if box_type == b"mvhd":
+                return cls._duration_from_mvhd(
+                    cls._fetch_file_range(file_id, offset + 8, 32)
+                )
+            if size < 8:
+                return None
+            offset += size
+        return None
+
+    @staticmethod
+    def _duration_from_mvhd(payload: bytes) -> float | None:
+        """Decode ``mvhd``: version, flags, times, timescale, duration."""
+        if len(payload) < 4:
+            return None
+        version = payload[0]
+        if version == 1:
+            timescale_at, duration_at, duration_width = 20, 24, 8
+        else:
+            timescale_at, duration_at, duration_width = 12, 16, 4
+        if len(payload) < duration_at + duration_width:
+            return None
+        timescale = int.from_bytes(payload[timescale_at:timescale_at + 4], "big")
+        duration = int.from_bytes(
+            payload[duration_at:duration_at + duration_width], "big"
+        )
+        # All-ones is the container's "duration unknown" sentinel.
+        if duration in (0, (1 << (duration_width * 8)) - 1):
+            return None
+        if timescale <= 0:
+            return None
+        seconds = duration / timescale
+        return seconds if seconds > 0 else None
 
     @classmethod
     def download_file(cls, file_id: str, destination: Path) -> None:

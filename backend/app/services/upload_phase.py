@@ -1695,6 +1695,17 @@ class UploadPhaseService:
                 ) from exc
             if duration is not None:
                 return duration
+
+            # Drive indexes video metadata asynchronously, so an export that
+            # just landed answers without a duration. The container header
+            # states it regardless: read it over byte ranges (a few KB), which
+            # keeps the no-download guarantee.
+            header_duration = GoogleDriveService.probe_video_duration_from_header(
+                readiness.drive_video_id
+            )
+            if header_duration is not None:
+                return header_duration
+
             raise UploadPreflightUnavailableError(
                 "Google Drive is still processing the final video's duration "
                 "metadata. No video was downloaded and nothing was queued; "

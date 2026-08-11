@@ -150,9 +150,35 @@ def test_preflight_reuses_recent_manager_drive_result(tmp_path, monkeypatch):
     assert readiness.drive_video_id == "d1"
 
 
+def test_unindexed_export_falls_back_to_container_header(check_env, monkeypatch):
+    """A just-uploaded export has no Drive videoMediaMetadata for a while; the
+    MP4 header still knows the duration, so the check must not fail."""
+    monkeypatch.setattr(
+        up.GoogleDriveService, "get_video_duration_seconds",
+        classmethod(lambda cls, fid: None),
+    )
+    monkeypatch.setattr(
+        up.GoogleDriveService, "probe_video_duration_from_header",
+        classmethod(lambda cls, fid: 142.266),
+    )
+    monkeypatch.setattr(
+        UploadPhaseService, "_ensure_source_video",
+        classmethod(lambda cls, pid, r: pytest.fail("must not download")),
+    )
+
+    result = _run_check(monkeypatch, _readiness(), max_duration=180.0)
+
+    assert result["needed"] is False
+    assert result["duration_seconds"] == 142.27
+
+
 def test_missing_metadata_fails_fast_without_downloading(check_env, monkeypatch):
     monkeypatch.setattr(
         up.GoogleDriveService, "get_video_duration_seconds",
+        classmethod(lambda cls, fid: None),
+    )
+    monkeypatch.setattr(
+        up.GoogleDriveService, "probe_video_duration_from_header",
         classmethod(lambda cls, fid: None),
     )
     monkeypatch.setattr(
