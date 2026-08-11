@@ -1,5 +1,6 @@
 """Processing pipeline service for final video generation."""
 
+import array
 import asyncio
 import html
 import json
@@ -305,6 +306,8 @@ class ProcessingService:
 
     FFPROBE_TIMEOUT_SECONDS = 30.0
     AUTO_EDITOR_TIMEOUT_SECONDS = 1800.0
+    # Release ramp on the closing word of the voiceover.
+    TTS_TAIL_FADE_SECONDS = 0.025
     PREMIERE_JSX_TEMPLATE_PATH = (
         Path(__file__).resolve().parent / "templates" / "premiere_import_project_v77.jsx"
     )
@@ -695,18 +698,34 @@ class ProcessingService:
         cls,
         transcription: Transcription,
         resolved_scene_sources: dict[int, ResolvedSceneSource] | None = None,
+        *,
+        contiguous_audio_duration: float | None = None,
     ) -> tuple[Transcription, list[PlaybackAudioSegment]]:
         """Convert aligned TTS timings into the final playback timeline.
 
         Non-raw scenes consume contiguous TTS audio windows using the existing
         next-non-raw-start rule. Raw scenes insert real pauses into the final
         cursor using native matched-source duration.
+
+        The last spoken scene has no successor to borrow an end from, so it
+        would otherwise stop at the aligner's last-word end and amputate the
+        closing word's release. When ``contiguous_audio_duration`` is known, its
+        window runs to the end of the TTS audio instead.
         """
         adjusted_ends = compute_adjusted_scene_end_times(
             scenes=transcription.scenes,
             get_scene_index=lambda s: s.scene_index,
             get_first_word_start=lambda s: s.words[0].start if s.words else None,
             get_last_word_end=lambda s: s.words[-1].end if s.words else None,
+        )
+
+        last_spoken_scene_index = next(
+            (
+                scene.scene_index
+                for scene in reversed(transcription.scenes)
+                if not scene.is_raw and scene.words
+            ),
+            None,
         )
 
         transformed_scenes: list[SceneTranscription] = []
@@ -755,6 +774,11 @@ class ProcessingService:
                     source_end = float(scene.words[-1].end)
                 if source_end < source_start:
                     source_end = source_start
+                if (
+                    contiguous_audio_duration is not None
+                    and scene.scene_index == last_spoken_scene_index
+                ):
+                    source_end = max(source_end, float(contiguous_audio_duration))
 
                 duration = max(source_end - source_start, 0.0)
                 shift = cursor - source_start
@@ -814,6 +838,42 @@ class ProcessingService:
             playback_segments,
         )
 
+    @staticmethod
+    def _apply_tail_fade(
+        frames: bytes,
+        sample_width: int,
+        channels: int,
+        fade_frames: int,
+    ) -> bytes:
+        """Ramp the last ``fade_frames`` frames down to silence.
+
+        ElevenLabs already ends each generated part slightly into the closing
+        word's decay, so even an untruncated window can end on a step. The ramp
+        turns that step into a release.
+        """
+        type_code = {2: "h", 4: "l"}.get(sample_width)
+        if type_code is None or fade_frames <= 0 or channels <= 0:
+            return frames
+
+        samples = array.array(type_code)
+        if samples.itemsize != sample_width:
+            return frames
+        samples.frombytes(frames)
+
+        total_frames = len(samples) // channels
+        fade_frames = min(fade_frames, total_frames)
+        if fade_frames <= 0:
+            return frames
+
+        for offset in range(fade_frames):
+            frame_index = total_frames - fade_frames + offset
+            gain = (fade_frames - offset - 1) / fade_frames
+            base = frame_index * channels
+            for channel in range(channels):
+                samples[base + channel] = int(samples[base + channel] * gain)
+
+        return samples.tobytes()
+
     @classmethod
     def rebuild_tts_audio_with_playback_segments(
         cls,
@@ -821,7 +881,11 @@ class ProcessingService:
         output_audio_path: Path,
         segments: list[PlaybackAudioSegment],
     ) -> None:
-        """Rebuild the final TTS WAV by inserting exact silences for raw scenes."""
+        """Rebuild the final TTS WAV by inserting exact silences for raw scenes.
+
+        The last spoken segment is faded out so the voiceover releases instead of
+        stopping mid-waveform against digital silence.
+        """
         if not contiguous_audio_path.exists():
             raise FileNotFoundError(f"Missing contiguous TTS audio: {contiguous_audio_path}")
 
@@ -840,10 +904,20 @@ class ProcessingService:
             ) as tmp_file:
                 tmp_path = Path(tmp_file.name)
 
+            last_audio_position = max(
+                (
+                    position
+                    for position, segment in enumerate(segments)
+                    if segment.kind == "audio"
+                ),
+                default=None,
+            )
+            fade_frames = int(round(cls.TTS_TAIL_FADE_SECONDS * frame_rate))
+
             try:
                 with wave.open(str(tmp_path), "wb") as dst:
                     dst.setparams(params)
-                    for segment in segments:
+                    for position, segment in enumerate(segments):
                         if segment.kind == "audio":
                             start_frame, end_frame = cls._get_wav_frame_range(
                                 segment.source_start,
@@ -852,7 +926,15 @@ class ProcessingService:
                                 total_frames,
                             )
                             src.setpos(start_frame)
-                            dst.writeframes(src.readframes(end_frame - start_frame))
+                            frames = src.readframes(end_frame - start_frame)
+                            if position == last_audio_position:
+                                frames = cls._apply_tail_fade(
+                                    frames,
+                                    src.getsampwidth(),
+                                    src.getnchannels(),
+                                    fade_frames,
+                                )
+                            dst.writeframes(frames)
                             continue
 
                         silence_frames = max(
@@ -2574,6 +2656,9 @@ class ProcessingService:
                         new_transcription, playback_segments = cls.build_authoritative_playback_timeline(
                             new_transcription,
                             playback_scene_sources,
+                            contiguous_audio_duration=cls._probe_wav_duration(
+                                edited_audio_path
+                            ),
                         )
                         cls.rebuild_tts_audio_with_playback_segments(
                             edited_audio_path,
