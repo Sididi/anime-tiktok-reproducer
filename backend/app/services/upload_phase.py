@@ -697,6 +697,28 @@ class UploadPhaseService:
         return payload
 
     @classmethod
+    def _instagram_thumb_offset(
+        cls,
+        thumbnail_timestamp_ms: int,
+        speed_factor: str | float | None,
+        max_duration_seconds: float,
+    ) -> int:
+        """Map an original-video timestamp to the prepared IG artifact.
+
+        The IG Drive artifact may be sped up (speed_factor > 1) or cut at
+        max_duration_seconds; the Graph API thumb_offset must land inside it.
+        """
+        try:
+            speed = float(speed_factor) if speed_factor is not None else 1.0
+        except (TypeError, ValueError):
+            speed = 1.0
+        if not speed or speed <= 0:
+            speed = 1.0
+        offset = int(round(thumbnail_timestamp_ms / speed))
+        ceiling = max(0, int(max_duration_seconds * 1000) - 500)
+        return max(0, min(offset, ceiling))
+
+    @classmethod
     def _vps_platforms(
         cls,
         requested_platforms: tuple[str, ...],
@@ -819,6 +841,9 @@ class UploadPhaseService:
                 "instagram_drive_video_url": direct_url,
                 "instagram_drive_web_url": web_url,
                 "instagram_drive_filename": cls._INSTAGRAM_DRIVE_FILENAME,
+                "instagram_speed_factor": (
+                    f"{prep.speed_factor}" if prep.transcoded and prep.speed_factor else "1.0"
+                ),
             },
         )
 
@@ -1205,6 +1230,12 @@ class UploadPhaseService:
                         ig_payload["prepared_video_url"] = instagram_drive_metadata[
                             "instagram_drive_video_url"
                         ]
+                        if thumbnail_timestamp_ms is not None:
+                            ig_payload["thumb_offset"] = cls._instagram_thumb_offset(
+                                thumbnail_timestamp_ms,
+                                instagram_drive_metadata.get("instagram_speed_factor"),
+                                instagram_max_duration,
+                            )
 
                 discord_message_id = None
                 try:
