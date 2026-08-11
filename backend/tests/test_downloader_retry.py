@@ -80,6 +80,73 @@ async def test_download_retries_transient_tiktok_rehydration_failure(
 
 
 @pytest.mark.asyncio
+async def test_download_retries_unexpected_tiktok_response_without_impersonation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "project" / "tiktok.mp4"
+    commands: list[list[str]] = []
+
+    async def fake_stream(cls, cmd, *, progress_message_prefix, activity_path=None):
+        commands.append(cmd)
+        if len(commands) == 1:
+            yield _DownloadCommandResult(
+                returncode=1,
+                stderr="ERROR: [TikTok] 123: Unexpected response from webpage request",
+            )
+            return
+
+        output_path.write_bytes(b"video")
+        yield _DownloadCommandResult(returncode=0)
+
+    async def fake_has_audio(video_path: Path) -> bool:
+        return True
+
+    monkeypatch.setattr(
+        DownloaderService,
+        "get_output_path",
+        staticmethod(lambda project_id: output_path),
+    )
+    monkeypatch.setattr(
+        DownloaderService,
+        "_stream_download_command",
+        classmethod(fake_stream),
+    )
+    monkeypatch.setattr(
+        DownloaderService,
+        "_has_audio_stream",
+        staticmethod(fake_has_audio),
+    )
+    monkeypatch.setattr(
+        DownloaderService,
+        "EXTRACTION_RETRY_DELAYS_SECONDS",
+        (0.0, 0.0),
+    )
+
+    events = [
+        event
+        async for event in DownloaderService.download(
+            "https://www.tiktok.com/@demo/video/123",
+            "project",
+        )
+    ]
+
+    assert len(commands) == 2
+    assert commands[0][0].endswith("yt-dlp")
+    assert commands[1][:3] == [
+        sys.executable,
+        "-c",
+        DownloaderService.YTDLP_NO_IMPERSONATION_WRAPPER,
+    ]
+    assert commands[1][3:] == commands[0][1:]
+    assert any(
+        event.status == "downloading" and "retrying (1/2)" in event.message
+        for event in events
+    )
+    assert events[-1].status == "complete"
+
+
+@pytest.mark.asyncio
 async def test_download_retries_transient_audio_recovery_extraction_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

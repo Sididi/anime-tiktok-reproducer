@@ -7,7 +7,11 @@
 
 var ATR_EXTENSION_ID = "com.animetiktok.tiktokreproducer.panel";
 // Must stay in sync with ATR_BUILD_ID in client/constants.js.
-var ATR_HOST_BUILD_ID = "2026-08-07-border-nonfatal-v11";
+var ATR_HOST_BUILD_ID = "2026-08-11-single-roundtrip-v12";
+// Separates runScript()'s status from the non-fatal warnings the executed
+// script published. Must stay in sync with HOST_RUN_WARNING_SEPARATOR in
+// client/main.js.
+var ATR_RUN_WARNING_SEPARATOR = "::ATR_WARN::";
 var __atrEncoderEvents = [];
 var __atrEncoderJobProjectMap = {};
 var __atrEncoderJobMetaMap = {};
@@ -2214,7 +2218,8 @@ function cleanupImportedProjectsForLocalRoots(localRootsJson) {
 /**
  * Execute a .jsx script file with error handling.
  * @param {string} scriptPath - Absolute path to the .jsx file (forward slashes)
- * @returns {string} "OK" on success, "ERROR: ..." on failure
+ * @returns {string} "OK", "OK::ATR_WARN::<warnings>" on success (non-fatal
+ *   issues the script published), or "ERROR: ..." on failure
  */
 function runScript(scriptPath) {
   try {
@@ -2228,12 +2233,20 @@ function runScript(scriptPath) {
       $.global.__ATR_IMPORT_WARNINGS__ = "";
     } catch (eClearImportWarnings) {}
     $.evalFile(file);
+    // Report the warnings in THIS round-trip. The panel used to fetch them with
+    // a second evalScript right after a multi-minute import; that follow-up call
+    // can be swallowed once Premiere returns to its event loop, which stranded
+    // the whole download/import phase even though the import itself succeeded.
+    var warningsText = ATR_getLastImportWarnings();
     // The panel shares one persistent ExtendScript engine across every run.
     // import_project.jsx is a large (~200 KB) script, so reclaim its transient
     // memory after each run to curb the slowdown seen over successive imports.
     try {
       $.gc();
     } catch (eGc) {}
+    if (warningsText) {
+      return "OK" + ATR_RUN_WARNING_SEPARATOR + warningsText;
+    }
     return "OK";
   } catch (e) {
     return "ERROR: " + e.message + " (line " + e.line + ")";
@@ -2245,6 +2258,10 @@ function runScript(scriptPath) {
  * when none), then clear them. Generated import_project.jsx scripts set
  * $.global.__ATR_IMPORT_WARNINGS__ for non-fatal issues such as a missing
  * V2 border; older generated scripts never set it.
+ *
+ * runScript() calls this itself and folds the result into its own return value.
+ * It stays exported for panel builds <= v11, which still call it directly; they
+ * now get an empty string because runScript() already consumed the warnings.
  */
 function ATR_getLastImportWarnings() {
   var warningsText = "";

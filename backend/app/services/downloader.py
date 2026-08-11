@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sys
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,6 +54,14 @@ class DownloaderService:
     EXTRACTION_RETRY_DELAYS_SECONDS = (2.0, 5.0)
     RETRYABLE_EXTRACTION_ERRORS = (
         "Unable to extract universal data for rehydration",
+        "Unexpected response from webpage request",
+    )
+    IMPERSONATION_FALLBACK_ERRORS = (
+        "Unexpected response from webpage request",
+    )
+    YTDLP_NO_IMPERSONATION_WRAPPER = (
+        'import sys; sys.modules["curl_cffi"] = None; '
+        "from yt_dlp import main; main()"
     )
     FFPROBE_TIMEOUT_SECONDS = 30.0
     MUX_TIMEOUT_SECONDS = 300.0
@@ -199,6 +208,20 @@ class DownloaderService:
         )
 
     @classmethod
+    def _needs_no_impersonation_fallback(cls, result: _DownloadCommandResult) -> bool:
+        return any(marker in result.stderr for marker in cls.IMPERSONATION_FALLBACK_ERRORS)
+
+    @classmethod
+    def _build_no_impersonation_command(cls, cmd: list[str]) -> list[str]:
+        """Run yt-dlp without curl_cffi when TikTok's impersonated response is invalid."""
+        return [
+            sys.executable,
+            "-c",
+            cls.YTDLP_NO_IMPERSONATION_WRAPPER,
+            *cmd[1:],
+        ]
+
+    @classmethod
     async def _stream_download_command_with_retries(
         cls,
         cmd: list[str],
@@ -208,10 +231,11 @@ class DownloaderService:
         cleanup_path: Path,
     ) -> AsyncIterator[DownloadProgress | _DownloadCommandResult]:
         retry_delays = cls.EXTRACTION_RETRY_DELAYS_SECONDS
+        active_cmd = cmd
         for attempt in range(len(retry_delays) + 1):
             result: _DownloadCommandResult | None = None
             async for event in cls._stream_download_command(
-                cmd,
+                active_cmd,
                 progress_message_prefix=progress_message_prefix,
             ):
                 if isinstance(event, DownloadProgress):
@@ -229,6 +253,8 @@ class DownloaderService:
                 return
 
             cls._cleanup_paths(cleanup_path)
+            if cls._needs_no_impersonation_fallback(result):
+                active_cmd = cls._build_no_impersonation_command(cmd)
             yield DownloadProgress(
                 "downloading",
                 0,

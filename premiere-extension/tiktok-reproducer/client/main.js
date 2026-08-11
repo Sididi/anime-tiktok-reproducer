@@ -55,6 +55,8 @@
   var EXPORT_POLL_INTERVAL_MS = 5000;
   var ENCODER_POLL_INTERVAL_MS = 1000;
   var ENCODER_POLL_IDLE_TICKS = 10;
+  // Mirrors ATR_RUN_WARNING_SEPARATOR in host/host.jsx.
+  var HOST_RUN_WARNING_SEPARATOR = "::ATR_WARN::";
   var FS_WATCH_RETRY_DELAY_MS = 10000;
   var CLEANUP_IMMEDIATE_MAX_ATTEMPTS = 8;
   var CLEANUP_BACKGROUND_MAX_ATTEMPTS = 3;
@@ -1734,6 +1736,37 @@
     });
   }
 
+  // Long host scripts (an import runs for minutes) own the single ExtendScript
+  // engine for their whole duration. Every evalScript issued meanwhile stacks up
+  // behind them, so background pollers must stand down while this is non-zero.
+  var hostScriptRunsInFlight = 0;
+
+  function evalHostScriptRun(script) {
+    hostScriptRunsInFlight += 1;
+    function release(value) {
+      hostScriptRunsInFlight = Math.max(0, hostScriptRunsInFlight - 1);
+      return value;
+    }
+    return evalHost(script).then(release, function (err) {
+      release();
+      throw err;
+    });
+  }
+
+  function parseHostRunResult(result) {
+    var raw = String(result || "");
+    var separatorIndex = raw.indexOf(HOST_RUN_WARNING_SEPARATOR);
+    if (separatorIndex < 0) {
+      return { status: raw, warnings: "" };
+    }
+    return {
+      status: raw.substring(0, separatorIndex),
+      warnings: raw
+        .substring(separatorIndex + HOST_RUN_WARNING_SEPARATOR.length)
+        .trim(),
+    };
+  }
+
   function runScript(jsxPath) {
     var normalized = String(jsxPath || "").replace(/\\/g, "/");
     var runStartedAt = Date.now();
@@ -1763,43 +1796,40 @@
           );
         }
         hostStartedAt = Date.now();
-        return evalHost('runScript("' + escapeForEval(normalized) + '")');
+        return evalHostScriptRun(
+          'runScript("' + escapeForEval(normalized) + '")',
+        );
       })
       .then(function (result) {
         var hostImportElapsedMs = hostStartedAt
           ? Math.max(0, Date.now() - hostStartedAt)
           : 0;
-        if (result && result.indexOf("ERROR:") === 0) {
+        // Non-fatal warnings ride back with the run status. Never fetch them
+        // with a follow-up evalScript: that second round-trip can be swallowed
+        // after a long import and would strand the phase forever.
+        var runResult = parseHostRunResult(result);
+        if (runResult.status.indexOf("ERROR:") === 0) {
           setStatus("error");
-          throw new Error(result);
+          throw new Error(runResult.status);
         }
         log("Completed: " + path.basename(jsxPath), "success");
         updateGlobalStatus();
-        return evalHost("ATR_getLastImportWarnings()").then(
-          function (warningsRaw) {
-            var warningsText = String(warningsRaw || "").trim();
-            if (warningsText === "EvalScript error.") {
-              // Stale host.jsx without the getter (extension redeployed but
-              // Premiere not restarted) — not a real warning.
-              warningsText = "";
-            }
-            if (warningsText) {
-              log(
-                "Import warning for " +
-                  path.basename(jsxPath) +
-                  ": " +
-                  warningsText,
-                "warn",
-              );
-            }
-            return {
-              host_import_elapsed_ms: hostImportElapsedMs,
-              host_result: result,
-              subtitle_expand_elapsed_ms: subtitleExpandElapsedMs,
-              total_elapsed_ms: Math.max(0, Date.now() - runStartedAt),
-            };
-          },
-        );
+        if (runResult.warnings) {
+          log(
+            "Import warning for " +
+              path.basename(jsxPath) +
+              ": " +
+              runResult.warnings,
+            "warn",
+          );
+        }
+        return {
+          host_import_elapsed_ms: hostImportElapsedMs,
+          host_result: runResult.status,
+          host_warnings: runResult.warnings,
+          subtitle_expand_elapsed_ms: subtitleExpandElapsedMs,
+          total_elapsed_ms: Math.max(0, Date.now() - runStartedAt),
+        };
       })
       .catch(function (err) {
         setStatus("error");
@@ -4459,6 +4489,13 @@
       // evalScript into Premiere has real overhead; when nothing encoder- or
       // proxy-related is running, poll at 1/10th the rate instead of 1 Hz.
       encoderPollTick += 1;
+      if (hostScriptRunsInFlight > 0) {
+        // A host script owns the ExtendScript engine. Polling now cannot
+        // observe anything (the encoder callbacks that fill the event buffer
+        // run on that same blocked engine); it only queues one pointless
+        // evalScript per second behind a run that lasts minutes.
+        return;
+      }
       if (
         !hasActiveEncoderWork() &&
         encoderPollTick % ENCODER_POLL_IDLE_TICKS !== 0
