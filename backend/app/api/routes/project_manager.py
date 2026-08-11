@@ -12,6 +12,7 @@ from ...services.lan_transfer_service import LanTransferService
 from ...services.project_duplication_service import UploadRestrictionService
 from ...services.project_upload_service import project_upload_queue
 from ...services.project_service import ProjectService
+from ...services.thumbnail_service import ThumbnailService
 from ...services.upload_phase import (
     PendingProjectDeletionRequiresConfirmation,
     UploadPreflightUnavailableError,
@@ -224,6 +225,40 @@ async def upload_source_preview(project_id: str):
     if status["state"] == "in_progress":
         return JSONResponse(status_code=202, content=status)
     raise HTTPException(status_code=404, detail=status.get("detail") or "Preview not cached")
+
+
+@router.get("/projects/{project_id}/thumbnail-candidates")
+async def thumbnail_candidates(project_id: str):
+    """Thumbnail candidates for the upload cover; warms the source cache."""
+    try:
+        status = await asyncio.to_thread(
+            UploadPhaseService.start_source_video_download, project_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if status.get("state") != "ready":
+        return {"state": status.get("state"), "detail": status.get("detail")}
+    video_path = UploadPhaseService.cached_source_video(project_id)
+    if video_path is None or not video_path.exists():
+        return {"state": "missing"}
+    return await asyncio.to_thread(
+        ThumbnailService.build_candidates_payload, project_id, video_path
+    )
+
+
+@router.get("/projects/{project_id}/thumbnail-frame/{index}")
+async def thumbnail_frame(project_id: str, index: int, v: str | None = None):
+    """Serve a cached thumbnail candidate JPEG."""
+    path = ThumbnailService.cached_frame_path(project_id, index)
+    if path is None or not path.exists():
+        raise HTTPException(status_code=404, detail="Thumbnail frame not cached")
+    return FileResponse(
+        path=path,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
 
 
 @router.post("/projects/{project_id}/youtube-check")

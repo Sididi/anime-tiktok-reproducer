@@ -1,0 +1,87 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.services.thumbnail_service import ThumbnailService
+from app.services.upload_phase import UploadPhaseService
+
+
+@pytest.fixture
+def client(tmp_path, monkeypatch):
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    monkeypatch.setattr(
+        "app.services.project_service.settings.projects_dir", projects_dir
+    )
+    from app.main import app  # noqa: PLC0415
+    with TestClient(app) as c:
+        yield c
+
+
+def test_candidates_report_in_progress_while_warming(client, monkeypatch):
+    monkeypatch.setattr(
+        UploadPhaseService, "start_source_video_download",
+        classmethod(lambda cls, pid, readiness=None: {"state": "in_progress"}),
+    )
+    resp = client.get("/api/project-manager/projects/p1/thumbnail-candidates")
+    assert resp.status_code == 200
+    assert resp.json()["state"] == "in_progress"
+
+
+def test_candidates_404_when_project_missing(client, monkeypatch):
+    def raise_missing(cls, pid, readiness=None):
+        raise ValueError("Project not found")
+
+    monkeypatch.setattr(
+        UploadPhaseService, "start_source_video_download", classmethod(raise_missing)
+    )
+    resp = client.get("/api/project-manager/projects/p1/thumbnail-candidates")
+    assert resp.status_code == 404
+
+
+def test_candidates_ready_delegates_to_service(client, monkeypatch, tmp_path):
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"\x00")
+    monkeypatch.setattr(
+        UploadPhaseService, "start_source_video_download",
+        classmethod(lambda cls, pid, readiness=None: {"state": "ready"}),
+    )
+    monkeypatch.setattr(
+        UploadPhaseService, "cached_source_video", classmethod(lambda cls, pid: video)
+    )
+    monkeypatch.setattr(
+        ThumbnailService, "build_candidates_payload",
+        classmethod(lambda cls, pid, vp: {
+            "state": "ready",
+            "version": "1-1",
+            "candidates": [{
+                "index": 0, "label": "Scène 1 · début", "timestamp_ms": 50,
+                "image_url": "/project-manager/projects/p1/thumbnail-frame/0?v=1-1",
+            }],
+        }),
+    )
+    resp = client.get("/api/project-manager/projects/p1/thumbnail-candidates")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["state"] == "ready"
+    assert body["candidates"][0]["timestamp_ms"] == 50
+
+
+def test_frame_served_and_404(client, monkeypatch, tmp_path):
+    jpg = tmp_path / "cand_0.jpg"
+    jpg.write_bytes(b"\xff\xd8\xff\xd9")
+    monkeypatch.setattr(
+        ThumbnailService, "cached_frame_path",
+        classmethod(lambda cls, pid, index: jpg if index == 0 else None),
+    )
+    ok = client.get("/api/project-manager/projects/p1/thumbnail-frame/0")
+    assert ok.status_code == 200
+    assert ok.headers["content-type"] == "image/jpeg"
+    missing = client.get("/api/project-manager/projects/p1/thumbnail-frame/3")
+    assert missing.status_code == 404
