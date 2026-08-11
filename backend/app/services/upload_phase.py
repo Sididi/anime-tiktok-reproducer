@@ -672,7 +672,10 @@ class UploadPhaseService:
 
     @classmethod
     def _build_tiktok_payload(
-        cls, account: AccountConfig | None, tiktok_description: str
+        cls,
+        account: AccountConfig | None,
+        tiktok_description: str,
+        thumbnail_timestamp_ms: int | None = None,
     ) -> dict[str, Any] | None:
         """Payload for the VPS server's Post for Me publish (see server TikTokPayload)."""
         if account is None or account.tiktok is None:
@@ -680,7 +683,7 @@ class UploadPhaseService:
         tiktok = account.tiktok
         if not tiktok.post_for_me_account_id:
             return None
-        return {
+        payload: dict[str, Any] = {
             "social_account_id": tiktok.post_for_me_account_id,
             "post_for_me_platform": tiktok.post_for_me_platform,
             "caption": tiktok_description,
@@ -689,6 +692,9 @@ class UploadPhaseService:
             "allow_duet": tiktok.allow_duet,
             "allow_stitch": tiktok.allow_stitch,
         }
+        if thumbnail_timestamp_ms is not None:
+            payload["thumbnail_timestamp_ms"] = int(thumbnail_timestamp_ms)
+        return payload
 
     @classmethod
     def _vps_platforms(
@@ -929,7 +935,9 @@ class UploadPhaseService:
 
         # Build the TikTok payload for the VPS scheduler (server-side publish
         # via Post for Me at slot_time).
-        tiktok_payload = cls._build_tiktok_payload(account, metadata.tiktok.description)
+        tiktok_payload = cls._build_tiktok_payload(
+            account, metadata.tiktok.description, thumbnail_timestamp_ms
+        )
 
         # Public share the drive video before upload phase.
         emit_progress(0.15, "prepare", "Preparing Drive upload assets...")

@@ -202,6 +202,23 @@ async def test_dispatch_tiktok_happy_path(
     assert len(calls["poll"]) == 1
 
 
+async def test_dispatch_tiktok_passes_thumbnail_timestamp(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
+):
+    settings = replace(
+        _settings_for(example_yaml, tmp_server_dir / "avatars"), pfm_api_key="key"
+    )
+    store = JobStore(tmp_path / "jobs.json")
+    discord = AsyncMock()
+    calls = _patch_phases(monkeypatch)
+    job = _tiktok_job()
+    job.tiktok_payload["thumbnail_timestamp_ms"] = 2350
+    await store.create(job)
+    await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    await wait_for_inflight()
+    assert calls["create"][0]["thumbnail_timestamp_ms"] == 2350
+
+
 async def test_dispatch_tiktok_missing_payload_skips(
     tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, caplog
 ):

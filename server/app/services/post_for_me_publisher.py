@@ -331,6 +331,7 @@ async def create_tiktok_post(
     allow_comment: bool = True,
     allow_duet: bool = True,
     allow_stitch: bool = True,
+    thumbnail_timestamp_ms: int | None = None,
     scheduled_at: datetime | None = None,
     base_url: str = DEFAULT_BASE_URL,
     publish_state: TikTokPublishState | dict[str, Any] | None = None,
@@ -353,10 +354,13 @@ async def create_tiktok_post(
             detail=_stage_detail("create_post", "no staged media_url"),
             publish_state=state,
         )
+    media_item: dict[str, Any] = {"url": media_url}
+    if thumbnail_timestamp_ms is not None:
+        media_item["thumbnail_timestamp_ms"] = int(thumbnail_timestamp_ms)
     body: dict[str, Any] = {
         "caption": caption,
         "social_accounts": [social_account_id],
-        "media": [{"url": media_url}],
+        "media": [media_item],
         "platform_configurations": {
             platform_configuration_key: {
                 "privacy_status": privacy_status,
@@ -520,6 +524,7 @@ async def publish_to_tiktok(
     allow_comment: bool = True,
     allow_duet: bool = True,
     allow_stitch: bool = True,
+    thumbnail_timestamp_ms: int | None = None,
     base_url: str = DEFAULT_BASE_URL,
     poll_interval: float = _DEFAULT_POLL_INTERVAL_SECONDS,
     poll_timeout: float = _DEFAULT_POLL_TIMEOUT_SECONDS,
@@ -552,7 +557,8 @@ async def publish_to_tiktok(
         api_key=api_key, social_account_id=social_account_id, caption=caption,
         post_for_me_platform=post_for_me_platform,
         privacy_status=privacy_status, allow_comment=allow_comment,
-        allow_duet=allow_duet, allow_stitch=allow_stitch, scheduled_at=None,
+        allow_duet=allow_duet, allow_stitch=allow_stitch,
+        thumbnail_timestamp_ms=thumbnail_timestamp_ms, scheduled_at=None,
         base_url=base_url, publish_state=staged.publish_state,
         progress_callback=progress_callback,
     )

@@ -328,6 +328,7 @@ async def _dispatch_tiktok_publish(  # noqa: PLR0911, PLR0912, PLR0915
                 allow_comment=bool(payload.get("allow_comment", True)),
                 allow_duet=bool(payload.get("allow_duet", True)),
                 allow_stitch=bool(payload.get("allow_stitch", True)),
+                thumbnail_timestamp_ms=payload.get("thumbnail_timestamp_ms"),
                 scheduled_at=None if instant else sched,
                 publish_state=state,
             )

@@ -248,6 +248,30 @@ async def test_retry_after_failed_reuses_media_and_creates_new_post(fake, tmp_pa
     assert fake.created_posts[0]["media"] == [{"url": "https://media.example/abc.mp4"}]
 
 
+async def test_create_post_includes_thumbnail_timestamp(fake, tmp_path):
+    state = TikTokPublishState(media_url="https://media.example/abc.mp4",
+                               stage="media_uploaded")
+    result = await create_tiktok_post(
+        api_key="key", social_account_id="spc_1", caption="cap",
+        thumbnail_timestamp_ms=2350, publish_state=state,
+    )
+    assert result.success is True
+    assert fake.created_posts[0]["media"] == [
+        {"url": "https://media.example/abc.mp4", "thumbnail_timestamp_ms": 2350}
+    ]
+
+
+async def test_create_post_omits_thumbnail_when_none(fake, tmp_path):
+    state = TikTokPublishState(media_url="https://media.example/abc.mp4",
+                               stage="media_uploaded")
+    result = await create_tiktok_post(
+        api_key="key", social_account_id="spc_1", caption="cap",
+        publish_state=state,
+    )
+    assert result.success is True
+    assert fake.created_posts[0]["media"] == [{"url": "https://media.example/abc.mp4"}]
+
+
 async def test_create_post_http_error_is_failure(fake, tmp_path):
     fake.fail_create_post = True
     result = await _publish(fake, tmp_path)

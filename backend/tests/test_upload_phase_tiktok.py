@@ -40,6 +40,20 @@ def test_build_tiktok_payload_full():
     }
 
 
+def test_build_tiktok_payload_includes_thumbnail_timestamp():
+    account = _account(AccountTikTokConfig(post_for_me_account_id="spc_123"))
+    payload = UploadPhaseService._build_tiktok_payload(
+        account, "desc", thumbnail_timestamp_ms=2350
+    )
+    assert payload["thumbnail_timestamp_ms"] == 2350
+
+
+def test_build_tiktok_payload_omits_thumbnail_when_none():
+    account = _account(AccountTikTokConfig(post_for_me_account_id="spc_123"))
+    payload = UploadPhaseService._build_tiktok_payload(account, "desc")
+    assert "thumbnail_timestamp_ms" not in payload
+
+
 def test_build_tiktok_payload_none_without_pfm_id():
     assert UploadPhaseService._build_tiktok_payload(
         _account(AccountTikTokConfig()), "d"

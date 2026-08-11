@@ -43,6 +43,7 @@ class TikTokPayload(BaseModel):
     allow_comment: bool = True
     allow_duet: bool = True
     allow_stitch: bool = True
+    thumbnail_timestamp_ms: int | None = None
 
 
 class InitialPlatformStatus(BaseModel):
@@ -120,7 +121,7 @@ def _instagram_payload(req: CreateJobRequest) -> dict | None:
 
 
 def _tiktok_payload(req: CreateJobRequest) -> dict | None:
-    return req.tiktok.model_dump() if req.tiktok else None
+    return req.tiktok.model_dump(exclude_none=True) if req.tiktok else None
 
 
 def _normalized_tiktok_payload(payload: dict | None) -> dict | None:
