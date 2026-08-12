@@ -48,8 +48,11 @@ class Settings(BaseSettings):
     # Video settings
     default_fps: float = 30.0
     source_normalization_profile: str = "h264_mp4_aac"
-    match_playback_max_workers: int = 4
-    match_playback_max_workers_per_episode: int = 1
+    # 8 = consumer NVENC concurrent-session cap; safe since the full-GPU encode
+    # rung leaves the CPU nearly idle. Per-episode 4: same-file concurrent reads
+    # measured ~2x throughput on the GPU path (see 2026-08-12 spec).
+    match_playback_max_workers: int = 8
+    match_playback_max_workers_per_episode: int = 4
     min_playback_speed_factor: float = 0.75
 
     # Original matcher compatibility switch.  ATR_MATCHER_V2=1 selects the
