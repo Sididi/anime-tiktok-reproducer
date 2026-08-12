@@ -151,3 +151,146 @@ def test_full_gpu_command_shape(tmp_path: Path) -> None:
     # No CPU pix_fmt flag: the encoder consumes CUDA frames directly.
     assert "-pix_fmt" not in cmd
     assert "+faststart" in cmd and str(out) in cmd
+
+
+@pytest.fixture
+def clip_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    store = tmp_path / "clip_store"
+    store.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        MatchPlaybackService,
+        "_clip_store_dir",
+        classmethod(lambda cls, project_id: store),
+    )
+    return store
+
+
+def _classify(cmd: list[str]) -> str:
+    if "-hwaccel" in cmd:
+        return "full_gpu"
+    if "h264_nvenc" in cmd:
+        return "nvenc_cpu"
+    if "libx264" in cmd:
+        return "libx264"
+    return "other"
+
+
+def _ladder_fake_run(outcomes: dict[str, int], attempts: list[str]):
+    """Fake subprocess.run: rung name -> returncode; rc 0 writes the output."""
+
+    def _fake_run(cmd, **kwargs):
+        rung = _classify(list(cmd))
+        attempts.append(rung)
+        rc = outcomes[rung]
+        if rc == 0:
+            Path(cmd[-1]).write_bytes(b"encoded")
+        return _FakeCompleted(returncode=rc, stderr=f"{rung} boom" if rc else "")
+
+    return _fake_run
+
+
+def _patch_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        MatchPlaybackService,
+        "_validate_clip_sync",
+        classmethod(lambda cls, path: 2.5),
+    )
+
+
+def test_ladder_full_gpu_success_stops_ladder(
+    clip_store: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = _make_plan(tmp_path)
+    attempts: list[str] = []
+    monkeypatch.setattr(
+        MatchPlaybackService, "_is_full_gpu_available_sync", classmethod(lambda cls: True)
+    )
+    monkeypatch.setattr(
+        MatchPlaybackService, "_is_nvenc_available_sync", classmethod(lambda cls: True)
+    )
+    _patch_validation(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.match_playback_service.subprocess.run",
+        _ladder_fake_run({"full_gpu": 0}, attempts),
+    )
+
+    duration = MatchPlaybackService._encode_clip_sync(project_id="proj", plan=plan)
+    assert duration == 2.5
+    assert attempts == ["full_gpu"]
+    assert (clip_store / f"{plan.clip_id}.mp4").exists()
+
+
+def test_ladder_falls_through_gpu_then_nvenc_then_libx264(
+    clip_store: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = _make_plan(tmp_path)
+    attempts: list[str] = []
+    monkeypatch.setattr(
+        MatchPlaybackService, "_is_full_gpu_available_sync", classmethod(lambda cls: True)
+    )
+    monkeypatch.setattr(
+        MatchPlaybackService, "_is_nvenc_available_sync", classmethod(lambda cls: True)
+    )
+    _patch_validation(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.match_playback_service.subprocess.run",
+        _ladder_fake_run({"full_gpu": 1, "nvenc_cpu": 1, "libx264": 0}, attempts),
+    )
+
+    duration = MatchPlaybackService._encode_clip_sync(project_id="proj", plan=plan)
+    assert duration == 2.5
+    assert attempts == ["full_gpu", "nvenc_cpu", "libx264"]
+
+
+def test_ladder_skips_gpu_rung_when_probe_false(
+    clip_store: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = _make_plan(tmp_path)
+    attempts: list[str] = []
+    monkeypatch.setattr(
+        MatchPlaybackService, "_is_full_gpu_available_sync", classmethod(lambda cls: False)
+    )
+    monkeypatch.setattr(
+        MatchPlaybackService, "_is_nvenc_available_sync", classmethod(lambda cls: True)
+    )
+    _patch_validation(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.match_playback_service.subprocess.run",
+        _ladder_fake_run({"nvenc_cpu": 0}, attempts),
+    )
+
+    MatchPlaybackService._encode_clip_sync(project_id="proj", plan=plan)
+    assert attempts == ["nvenc_cpu"]
+
+
+def test_ladder_gpu_output_failing_validation_falls_through(
+    clip_store: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """rc=0 but undecodable GPU output must fall through, not poison the store."""
+    plan = _make_plan(tmp_path)
+    attempts: list[str] = []
+    monkeypatch.setattr(
+        MatchPlaybackService, "_is_full_gpu_available_sync", classmethod(lambda cls: True)
+    )
+    monkeypatch.setattr(
+        MatchPlaybackService, "_is_nvenc_available_sync", classmethod(lambda cls: True)
+    )
+
+    def _validate(cls, path: Path) -> float:
+        # First validation call (the GPU rung's inline check) rejects the clip;
+        # later calls (nvenc output + final gate) accept it.
+        if attempts == ["full_gpu"]:
+            raise RuntimeError("no decodable video stream")
+        return 2.5
+
+    monkeypatch.setattr(
+        MatchPlaybackService, "_validate_clip_sync", classmethod(_validate)
+    )
+    monkeypatch.setattr(
+        "app.services.match_playback_service.subprocess.run",
+        _ladder_fake_run({"full_gpu": 0, "nvenc_cpu": 0}, attempts),
+    )
+
+    duration = MatchPlaybackService._encode_clip_sync(project_id="proj", plan=plan)
+    assert duration == 2.5
+    assert attempts == ["full_gpu", "nvenc_cpu"]

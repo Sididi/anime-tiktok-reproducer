@@ -982,6 +982,41 @@ class MatchPlaybackService:
                 tmp_path.unlink(missing_ok=True)
                 error_details.append("stream_copy: timeout or ffmpeg not found")
 
+        # --- Full-GPU path: NVDEC decode + CUDA scale + NVENC encode ---
+        if not encoded and cls._is_full_gpu_available_sync():
+            gpu_cmd = cls._build_full_gpu_command_sync(
+                plan=plan,
+                profile=profile,
+                duration=duration,
+                output_path=tmp_path,
+            )
+            try:
+                result = subprocess.run(
+                    gpu_cmd,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=cls.FFMPEG_TIMEOUT_SECONDS,
+                    env=get_media_subprocess_env(gpu_cmd),
+                )
+                if result.returncode == 0 and tmp_path.exists() and tmp_path.stat().st_size > 0:
+                    try:
+                        cls._validate_clip_sync(tmp_path)
+                        encoded = True
+                    except RuntimeError:
+                        tmp_path.unlink(missing_ok=True)
+                        error_details.append(
+                            "full_gpu: validation failed, falling back to CPU-decode transcode"
+                        )
+                else:
+                    error_details.append(
+                        f"full_gpu: {result.stderr.strip() or 'unknown error'}"
+                    )
+                    tmp_path.unlink(missing_ok=True)
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                tmp_path.unlink(missing_ok=True)
+                error_details.append("full_gpu: timeout or ffmpeg not found")
+
         # --- Standard transcode path ---
         if not encoded:
             vf = (
