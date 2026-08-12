@@ -120,6 +120,8 @@ class MatchPlaybackService:
     _prepare_locks: dict[str, asyncio.Lock] = {}
     _nvenc_checked = False
     _nvenc_available = False
+    _full_gpu_checked = False
+    _full_gpu_available = False
     _source_web_compat_cache: collections.OrderedDict[str, bool] = collections.OrderedDict()
 
     _PROFILE_MAP: dict[str, _ClipProfile] = {
@@ -629,6 +631,52 @@ class MatchPlaybackService:
             result.returncode == 0 and "h264_nvenc" in result.stdout
         )
         return cls._nvenc_available
+
+    @classmethod
+    def _run_capability_listing_sync(cls, flag: str) -> str | None:
+        """Return stdout of `ffmpeg -hide_banner <flag>`, or None on failure."""
+        cmd = rewrite_media_command(["ffmpeg", "-hide_banner", flag])
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+                env=get_media_subprocess_env(cmd),
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout
+
+    @classmethod
+    def _is_full_gpu_available_sync(cls) -> bool:
+        """True when ffmpeg can run the NVDEC -> scale_cuda -> NVENC pipeline."""
+        if cls._full_gpu_checked:
+            return cls._full_gpu_available
+
+        cls._full_gpu_checked = True
+        cls._full_gpu_available = False
+
+        if not cls._is_nvenc_available_sync():
+            return False
+
+        decoders = cls._run_capability_listing_sync("-decoders")
+        if (
+            decoders is None
+            or "hevc_cuvid" not in decoders
+            or "h264_cuvid" not in decoders
+        ):
+            return False
+
+        filters = cls._run_capability_listing_sync("-filters")
+        if filters is None or "scale_cuda" not in filters:
+            return False
+
+        cls._full_gpu_available = True
+        return True
 
     @classmethod
     def _cache_web_compat(cls, key: str, value: bool) -> bool:
