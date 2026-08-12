@@ -108,3 +108,46 @@ def test_full_gpu_probe_false_when_nvenc_unavailable(
 
     monkeypatch.setattr("app.services.match_playback_service.subprocess.run", _explode)
     assert MatchPlaybackService._is_full_gpu_available_sync() is False
+
+
+def _make_plan(tmp_path: Path, track: str = "tiktok", profile: str = "tiktok_fast") -> _ClipPlan:
+    src = tmp_path / "input.mp4"
+    src.write_bytes(b"fake")
+    return _ClipPlan(
+        scene_index=0,
+        track=track,  # type: ignore[arg-type]
+        input_path=src,
+        start_time=12.5,
+        end_time=15.0,
+        profile=profile,
+        clip_id="clipid0000000000000000000000000000000000",
+        source_key=None,
+    )
+
+
+def test_full_gpu_command_shape(tmp_path: Path) -> None:
+    plan = _make_plan(tmp_path)
+    profile = MatchPlaybackService._PROFILE_MAP["tiktok_fast"]
+    out = tmp_path / "out.mp4"
+    cmd = MatchPlaybackService._build_full_gpu_command_sync(
+        plan=plan, profile=profile, duration=2.5, output_path=out
+    )
+
+    joined = " ".join(cmd)
+    # Decode on GPU, frames stay on GPU.
+    assert "-hwaccel cuda -hwaccel_output_format cuda" in joined
+    # Input seek before -i (fast keyframe seek), exact window.
+    assert cmd.index("-ss") < cmd.index("-i")
+    assert "12.500000" in cmd and "2.500000" in cmd
+    # fps drop BEFORE the CUDA scaler; nv12 handles 10-bit sources.
+    vf = cmd[cmd.index("-vf") + 1]
+    assert vf == (
+        "fps=24,scale_cuda=w=540:h=960:"
+        "force_original_aspect_ratio=decrease:force_divisible_by=2:format=nv12"
+    )
+    # Fastest NVENC preset at the profile's constant QP.
+    assert "h264_nvenc" in cmd and "p1" in cmd
+    assert cmd[cmd.index("-qp") + 1] == "28"
+    # No CPU pix_fmt flag: the encoder consumes CUDA frames directly.
+    assert "-pix_fmt" not in cmd
+    assert "+faststart" in cmd and str(out) in cmd

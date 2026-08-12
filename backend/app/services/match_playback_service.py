@@ -821,6 +821,65 @@ class MatchPlaybackService:
         )
 
     @classmethod
+    def _build_full_gpu_command_sync(
+        cls,
+        *,
+        plan: _ClipPlan,
+        profile: _ClipProfile,
+        duration: float,
+        output_path: Path,
+    ) -> list[str]:
+        """NVDEC decode -> fps drop -> CUDA scale -> NVENC encode, no CPU frames.
+
+        `fps` runs before `scale_cuda` so dropped frames are never scaled;
+        frame selection is identical either way. `format=nv12` converts 10-bit
+        (p010) NVDEC output so h264_nvenc can consume it.
+        """
+        vf = (
+            f"fps={profile.fps},"
+            f"scale_cuda=w={profile.width}:h={profile.height}:"
+            f"force_original_aspect_ratio=decrease:force_divisible_by=2:format=nv12"
+        )
+        return rewrite_media_command(
+            [
+                "ffmpeg",
+                "-y",
+                "-v",
+                "error",
+                "-hwaccel",
+                "cuda",
+                "-hwaccel_output_format",
+                "cuda",
+                "-ss",
+                f"{plan.start_time:.6f}",
+                "-i",
+                str(plan.input_path),
+                "-t",
+                f"{duration:.6f}",
+                "-map",
+                "0:v:0",
+                "-an",
+                "-sn",
+                "-dn",
+                "-vf",
+                vf,
+                "-c:v",
+                "h264_nvenc",
+                "-preset",
+                "p1",
+                "-rc",
+                "constqp",
+                "-qp",
+                str(profile.crf),
+                "-profile:v",
+                "high",
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ]
+        )
+
+    @classmethod
     def _build_cpu_command_sync(
         cls,
         *,
