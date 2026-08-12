@@ -949,6 +949,7 @@ class MatchPlaybackService:
 
         error_details: list[str] = []
         encoded = False
+        validated_duration: float | None = None
 
         # --- Fast path: stream copy for web-compatible sources ---
         if plan.track == "source" and cls._is_source_web_compatible_sync(plan.input_path):
@@ -968,7 +969,7 @@ class MatchPlaybackService:
                 )
                 if result.returncode == 0 and tmp_path.exists() and tmp_path.stat().st_size > 0:
                     try:
-                        cls._validate_clip_sync(tmp_path)
+                        validated_duration = cls._validate_clip_sync(tmp_path)
                         encoded = True
                     except RuntimeError:
                         tmp_path.unlink(missing_ok=True)
@@ -1001,7 +1002,7 @@ class MatchPlaybackService:
                 )
                 if result.returncode == 0 and tmp_path.exists() and tmp_path.stat().st_size > 0:
                     try:
-                        cls._validate_clip_sync(tmp_path)
+                        validated_duration = cls._validate_clip_sync(tmp_path)
                         encoded = True
                     except RuntimeError:
                         tmp_path.unlink(missing_ok=True)
@@ -1089,11 +1090,12 @@ class MatchPlaybackService:
         # zero exit code), we must not leave it behind: reuse detection would
         # later treat it as a valid cached clip and manifest building would then
         # fail on the whole project. Fail cleanly instead, leaving nothing.
-        try:
-            validated_duration = cls._validate_clip_sync(tmp_path)
-        except RuntimeError:
-            tmp_path.unlink(missing_ok=True)
-            raise
+        if validated_duration is None:
+            try:
+                validated_duration = cls._validate_clip_sync(tmp_path)
+            except RuntimeError:
+                tmp_path.unlink(missing_ok=True)
+                raise
 
         tmp_path.replace(output_path)
         cls._write_clip_meta_sync(
@@ -1343,6 +1345,16 @@ class MatchPlaybackService:
                 finally:
                     if source_sem:
                         source_sem.release()
+
+        # Pre-warm both capability probes from the event loop before spawning
+        # worker tasks. Each probe's sync method flips its "_checked" flag to
+        # True before its subprocess finishes; without this, concurrent
+        # asyncio.to_thread workers on a cold process can race the flag and
+        # read checked=True/available=False, permanently skipping the NVENC
+        # or full-GPU rung for clips that get cached.
+        if ordered_plans:
+            await asyncio.to_thread(cls._is_nvenc_available_sync)
+            await asyncio.to_thread(cls._is_full_gpu_available_sync)
 
         tasks = [asyncio.create_task(run_one(plan)) for plan in ordered_plans]
         for completed in asyncio.as_completed(tasks):

@@ -294,3 +294,36 @@ def test_ladder_gpu_output_failing_validation_falls_through(
     duration = MatchPlaybackService._encode_clip_sync(project_id="proj", plan=plan)
     assert duration == 2.5
     assert attempts == ["full_gpu", "nvenc_cpu"]
+
+
+def test_ladder_gpu_success_validates_exactly_once(
+    clip_store: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The GPU rung's inline validation must satisfy the final gate too:
+    no redundant re-probe of the same freshly-encoded file."""
+    plan = _make_plan(tmp_path)
+    attempts: list[str] = []
+    validate_calls: list[Path] = []
+    monkeypatch.setattr(
+        MatchPlaybackService, "_is_full_gpu_available_sync", classmethod(lambda cls: True)
+    )
+    monkeypatch.setattr(
+        MatchPlaybackService, "_is_nvenc_available_sync", classmethod(lambda cls: True)
+    )
+
+    def _counting_validate(cls, path: Path) -> float:
+        validate_calls.append(path)
+        return 2.5
+
+    monkeypatch.setattr(
+        MatchPlaybackService, "_validate_clip_sync", classmethod(_counting_validate)
+    )
+    monkeypatch.setattr(
+        "app.services.match_playback_service.subprocess.run",
+        _ladder_fake_run({"full_gpu": 0}, attempts),
+    )
+
+    duration = MatchPlaybackService._encode_clip_sync(project_id="proj", plan=plan)
+    assert duration == 2.5
+    assert attempts == ["full_gpu"]
+    assert len(validate_calls) == 1
