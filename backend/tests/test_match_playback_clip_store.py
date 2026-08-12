@@ -12,6 +12,15 @@ import pytest
 from app.services.match_playback_service import MatchPlaybackService, _ClipPlan
 
 
+@pytest.fixture(autouse=True)
+def reset_capability_caches(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Class-level probe caches must not leak between tests."""
+    monkeypatch.setattr(MatchPlaybackService, "_nvenc_checked", False)
+    monkeypatch.setattr(MatchPlaybackService, "_nvenc_available", False)
+    monkeypatch.setattr(MatchPlaybackService, "_full_gpu_checked", False)
+    monkeypatch.setattr(MatchPlaybackService, "_full_gpu_available", False)
+
+
 @pytest.fixture
 def clip_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     store = tmp_path / "clip_store"
