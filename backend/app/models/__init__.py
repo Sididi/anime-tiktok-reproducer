@@ -1,4 +1,5 @@
 from ..library_types import LibraryType
+from .cleanup import CleanupState, CleanupZone
 from .project import PlatformSchedule, Project, ProjectPhase
 from .project_startup import ProjectStartupJob
 from .project_upload import ProjectUploadJob
@@ -29,6 +30,7 @@ from .torrent import (
 
 __all__ = [
     "LibraryType",
+    "CleanupState", "CleanupZone",
     "PlatformSchedule", "Project", "ProjectPhase", "Scene", "SceneList",
     "ProjectStartupJob", "ProjectUploadJob",
     "AlternativeMatch", "MatchCandidate", "SceneMatch", "MatchList",

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..config import settings
+from ..library_types import LibraryType
 from ..models import Project, SceneMatch
 from .anime_library import AnimeLibraryService
 from .google_drive_rclone import GoogleDriveRclone
@@ -237,7 +238,10 @@ class ExportService:
 
     @classmethod
     def subtitle_filename(cls, project: Project) -> str:
-        anime = cls.sanitize_slug(project.anime_name or "anime")
+        default_stem = (
+            "video" if project.library_type == LibraryType.PURE else "anime"
+        )
+        anime = cls.sanitize_slug(project.anime_name or default_stem)
         locale = cls.language_to_locale(project.output_language)
         return f"{anime}.{locale}.srt"
 
@@ -265,7 +269,7 @@ class ExportService:
 =========================================
 
 Project ID: {project.id}
-Anime: {project.anime_name or "Unknown"}
+Anime: {project.anime_name or ("Pure (own TikTok reproduction)" if project.library_type == LibraryType.PURE else "Unknown")}
 
 === CONTENTS ===
 

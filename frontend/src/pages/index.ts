@@ -1,4 +1,5 @@
 export { ProjectSetup } from "./ProjectSetup";
+export { CleanupPage } from "./CleanupPage";
 export { SceneValidation } from "./SceneValidation";
 export { MatchValidation } from "./MatchValidation";
 export { TranscriptionPage } from "./TranscriptionPage";

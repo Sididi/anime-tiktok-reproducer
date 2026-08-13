@@ -429,9 +429,10 @@ export const api = {
   },
 
   // Scene Detection
+  // threshold null = backend per-library-type default (pure: 27, others: 16).
   detectScenes: (
     projectId: string,
-    threshold = 16.0,
+    threshold: number | null = null,
     minSceneLen = 10,
     signal?: AbortSignal,
   ) => {
@@ -442,6 +443,52 @@ export const api = {
       signal,
     });
   },
+
+  // Pure-mode cleanup (burned-in subtitle/watermark removal)
+  getCleanupState: (projectId: string) =>
+    request<import("@/types").CleanupState>(`/projects/${projectId}/cleanup`),
+
+  saveCleanupZones: (
+    projectId: string,
+    zones: import("@/types").CleanupZone[],
+  ) =>
+    request<import("@/types").CleanupState>(
+      `/projects/${projectId}/cleanup/zones`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ zones }),
+      },
+    ),
+
+  renderCleanupPreview: (projectId: string, timestamp: number) =>
+    request<{ before_url: string; after_url: string }>(
+      `/projects/${projectId}/cleanup/preview`,
+      {
+        method: "POST",
+        body: JSON.stringify({ timestamp }),
+      },
+    ),
+
+  getCleanupPreviewUrl: (projectId: string, which: "before" | "after") =>
+    `${MEDIA_API_BASE}/projects/${projectId}/cleanup/preview/${which}`,
+
+  runCleanup: (projectId: string) =>
+    request<{ status: string }>(`/projects/${projectId}/cleanup/run`, {
+      method: "POST",
+    }),
+
+  streamCleanup: (projectId: string, signal?: AbortSignal) =>
+    fetch(`${API_BASE}/projects/${projectId}/cleanup/stream`, { signal }),
+
+  cancelCleanup: (projectId: string) =>
+    request<{ status: string }>(`/projects/${projectId}/cleanup/cancel`, {
+      method: "POST",
+    }),
+
+  skipCleanup: (projectId: string) =>
+    request<{ status: string }>(`/projects/${projectId}/cleanup/skip`, {
+      method: "POST",
+    }),
 
   // Matching
   setSources: (projectId: string, paths: string[]) =>

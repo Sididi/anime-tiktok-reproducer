@@ -16,6 +16,7 @@ from typing import Any, AsyncIterator
 from ..models import Word, SceneTranscription, Transcription, Scene, SceneList, SceneMatch, MatchList
 from ..models.raw_scene import RawSceneDetectionResult
 from ..services import ProjectService
+from . import asr_engine
 from ..utils.media_binaries import get_media_subprocess_env, rewrite_media_command
 from ..utils.process_cleanup import shutdown_torch_compile_workers
 
@@ -68,14 +69,6 @@ VIDEO_EXTENSIONS = {
 # where trailing silence inflates the end time.  Use start time for assignment.
 MAX_WORD_DURATION = 1.0
 WHISPERX_SAMPLE_RATE = 16000
-ALIGNMENT_REPAIR_MIN_SEGMENT_DURATION = 4.0
-ALIGNMENT_REPAIR_PADDING_SECONDS = 0.35
-ALIGNMENT_REPAIR_FALLBACK_PADDING_SECONDS = 2.0
-ALIGNMENT_REPAIR_MIN_LEXICAL_DENSITY = 0.8
-ALIGNMENT_REPAIR_MAX_WORD_COUNT = 4
-ALIGNMENT_REPAIR_MIN_MEAN_CONFIDENCE = 0.6
-ALIGNMENT_REPAIR_MIN_WORD_GAIN = 3
-ALIGNMENT_REPAIR_MIN_DENSITY_GAIN = 1.5
 
 logger = logging.getLogger(__name__)
 TRANSCRIPTION_HEARTBEAT_INTERVAL_SECONDS = 5.0
@@ -143,29 +136,16 @@ class TranscriberService:
             align_models = [cls._align_models.pop(key) for key in list(cls._align_models)]
             cls._unload_requested = False
 
-        # --- ASR pipelines (FasterWhisperPipeline) ---
-        # Each holds a CTranslate2 model (own CUDA allocator) + pyannote VAD.
-        for pipeline in asr_models:
-            # 1. CTranslate2 Whisper model – has its own GPU allocator that
-            #    torch.cuda.empty_cache() cannot reach.
-            ct2_model = getattr(getattr(pipeline, "model", None), "model", None)
+        # --- ASR models (faster_whisper.WhisperModel) ---
+        # Each holds a CTranslate2 model with its own CUDA allocator that
+        # torch.cuda.empty_cache() cannot reach — unload it explicitly.
+        for asr_model in asr_models:
+            ct2_model = getattr(asr_model, "model", None)
             if ct2_model is not None:
                 with suppress(Exception):
                     ct2_model.unload_model()
-
-            # 2. Pyannote VAD pipeline – holds a segmentation nn.Module on GPU.
-            vad = getattr(pipeline, "vad_model", None)
-            if vad is not None:
-                vad_pipe = getattr(vad, "vad_pipeline", None)
-                if vad_pipe is not None:
-                    with suppress(Exception):
-                        vad_pipe.to("cpu")
-
-            # Break references so GC can collect the whole graph.
             with suppress(Exception):
-                pipeline.model = None
-            with suppress(Exception):
-                pipeline.vad_model = None
+                asr_model.model = None
 
         # --- Alignment models (PyTorch nn.Module + metadata) ---
         for model_data in align_models:
@@ -377,9 +357,13 @@ class TranscriberService:
             if key in cls._asr_models:
                 return cls._asr_models[key]
 
-            import whisperx
+            # Plain faster-whisper (no whisperx pipeline, no pyannote VAD):
+            # the asr_engine module drives batched decode + coverage repair.
+            from faster_whisper import WhisperModel
 
-            model = whisperx.load_model(model_size, device, compute_type=compute_type)
+            model = WhisperModel(
+                model_size, device=device, compute_type=compute_type
+            )
             cls._asr_models[key] = model
             return model
 
@@ -508,83 +492,6 @@ class TranscriberService:
         return audio[start_sample:end_sample]
 
     @classmethod
-    def _segment_alignment_metrics(cls, segment: dict[str, Any]) -> dict[str, float]:
-        start = segment.get("start")
-        end = segment.get("end")
-        segment_start = float(start) if isinstance(start, (int, float)) else 0.0
-        segment_end = float(end) if isinstance(end, (int, float)) else segment_start
-        duration = max(segment_end - segment_start, 0.0)
-
-        lexical_words = []
-        for word in cls._extract_words_preserving_untimed([segment]):
-            text = str(word.get("text") or "")
-            if not cls._normalize_token(text):
-                continue
-            lexical_words.append(word)
-
-        word_durations = [
-            float(word["end"]) - float(word["start"])
-            for word in lexical_words
-            if isinstance(word.get("start"), (int, float))
-            and isinstance(word.get("end"), (int, float))
-            and float(word["end"]) >= float(word["start"])
-        ]
-        confidences = [
-            float(word["confidence"])
-            for word in lexical_words
-            if isinstance(word.get("confidence"), (int, float))
-        ]
-        mean_confidence = (
-            statistics.fmean(confidences)
-            if confidences
-            else float(segment.get("confidence", 1.0) or 1.0)
-        )
-
-        return {
-            "duration": duration,
-            "word_count": float(len(lexical_words)),
-            "lexical_density": (len(lexical_words) / duration) if duration > 0 else float(len(lexical_words)),
-            "max_word_duration": max(word_durations, default=0.0),
-            "mean_confidence": mean_confidence,
-        }
-
-    @classmethod
-    def _segment_needs_alignment_repair(cls, segment: dict[str, Any]) -> bool:
-        metrics = cls._segment_alignment_metrics(segment)
-        if metrics["duration"] < ALIGNMENT_REPAIR_MIN_SEGMENT_DURATION:
-            return False
-
-        return any((
-            metrics["lexical_density"] < ALIGNMENT_REPAIR_MIN_LEXICAL_DENSITY,
-            metrics["max_word_duration"] > (2 * MAX_WORD_DURATION),
-            metrics["word_count"] <= ALIGNMENT_REPAIR_MAX_WORD_COUNT,
-            metrics["mean_confidence"] < ALIGNMENT_REPAIR_MIN_MEAN_CONFIDENCE,
-        ))
-
-    @classmethod
-    def _should_use_repaired_segment(
-        cls,
-        original_segment: dict[str, Any],
-        repaired_segment: dict[str, Any],
-    ) -> bool:
-        original_metrics = cls._segment_alignment_metrics(original_segment)
-        repaired_metrics = cls._segment_alignment_metrics(repaired_segment)
-
-        if repaired_metrics["word_count"] < (original_metrics["word_count"] + ALIGNMENT_REPAIR_MIN_WORD_GAIN):
-            return False
-
-        if repaired_metrics["lexical_density"] < (
-            original_metrics["lexical_density"] * ALIGNMENT_REPAIR_MIN_DENSITY_GAIN
-        ):
-            return False
-
-        original_max_word_duration = original_metrics["max_word_duration"]
-        if original_max_word_duration > 0:
-            return repaired_metrics["max_word_duration"] < original_max_word_duration
-
-        return repaired_metrics["max_word_duration"] <= (2 * MAX_WORD_DURATION)
-
-    @classmethod
     def _align_segments(
         cls,
         *,
@@ -621,250 +528,6 @@ class TranscriberService:
                 logger.debug("WhisperX alignment failed, keeping segment-level timings", exc_info=True)
 
         return segments, model_a, metadata, device
-
-    @classmethod
-    def _clip_repaired_words_to_segment(
-        cls,
-        *,
-        segments: list[dict],
-        offset_sec: float,
-        start_sec: float,
-        end_sec: float,
-    ) -> list[dict]:
-        clipped_words: list[dict] = []
-        for word in cls._extract_words_preserving_untimed(segments):
-            start = word.get("start")
-            end = word.get("end")
-            if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
-                continue
-
-            shifted_start = float(start) + offset_sec
-            shifted_end = float(end) + offset_sec
-            if shifted_end <= start_sec or shifted_start >= end_sec:
-                continue
-
-            clipped_start = max(shifted_start, start_sec)
-            clipped_end = min(shifted_end, end_sec)
-            if clipped_end <= clipped_start:
-                continue
-
-            clipped_words.append({
-                "text": str(word.get("text") or ""),
-                "start": clipped_start,
-                "end": clipped_end,
-                "confidence": float(word.get("confidence", 1.0)),
-            })
-
-        clipped_words.sort(key=lambda item: (item["start"], item["end"]))
-        return clipped_words
-
-    @classmethod
-    def _build_repaired_segment(
-        cls,
-        *,
-        original_segment: dict[str, Any],
-        repaired_words: list[dict],
-    ) -> dict[str, Any]:
-        text = " ".join(
-            str(word.get("text") or "").strip()
-            for word in repaired_words
-            if str(word.get("text") or "").strip()
-        )
-        return {
-            "start": float(original_segment.get("start", 0.0) or 0.0),
-            "end": float(original_segment.get("end", 0.0) or 0.0),
-            "text": text,
-            "words": [
-                {
-                    "word": str(word.get("text") or ""),
-                    "start": float(word["start"]),
-                    "end": float(word["end"]),
-                    "score": float(word.get("confidence", 1.0)),
-                }
-                for word in repaired_words
-            ],
-        }
-
-    @classmethod
-    def _repair_suspect_segment(
-        cls,
-        *,
-        segment: dict[str, Any],
-        audio: Any,
-        model,
-        batch_size: int,
-        detected_language: str,
-        alignment_model,
-        alignment_metadata: dict[str, Any] | None,
-        align_device: str,
-    ) -> tuple[dict[str, Any] | None, Any, dict[str, Any] | None, str]:
-        segment_start = float(segment.get("start", 0.0) or 0.0)
-        segment_end = float(segment.get("end", 0.0) or 0.0)
-        audio_duration = cls._audio_duration(audio)
-        candidate_paddings = [ALIGNMENT_REPAIR_PADDING_SECONDS]
-        if ALIGNMENT_REPAIR_FALLBACK_PADDING_SECONDS > ALIGNMENT_REPAIR_PADDING_SECONDS:
-            candidate_paddings.append(ALIGNMENT_REPAIR_FALLBACK_PADDING_SECONDS)
-
-        for padding in candidate_paddings:
-            clip_start = max(0.0, segment_start - padding)
-            clip_end = min(audio_duration, segment_end + padding)
-            if clip_end <= clip_start:
-                continue
-
-            clip_audio = cls._slice_audio(audio, clip_start, clip_end)
-
-            try:
-                result = model.transcribe(
-                    clip_audio,
-                    batch_size=1 if batch_size > 0 else batch_size,
-                    num_workers=0,
-                    language=detected_language,
-                )
-            except Exception:
-                logger.debug(
-                    "Local WhisperX repair transcription failed for %.3fs -> %.3fs "
-                    "(padding=%.2fs)",
-                    segment_start,
-                    segment_end,
-                    padding,
-                    exc_info=True,
-                )
-                continue
-
-            repaired_segments = result.get("segments") or []
-            repaired_segments, alignment_model, alignment_metadata, align_device = cls._align_segments(
-                segments=repaired_segments,
-                audio=clip_audio,
-                detected_language=detected_language,
-                align_device=align_device,
-                alignment_model=alignment_model,
-                alignment_metadata=alignment_metadata,
-            )
-
-            repaired_words = cls._clip_repaired_words_to_segment(
-                segments=repaired_segments,
-                offset_sec=clip_start,
-                start_sec=segment_start,
-                end_sec=segment_end,
-            )
-            if not repaired_words:
-                continue
-
-            repaired_segment = cls._build_repaired_segment(
-                original_segment=segment,
-                repaired_words=repaired_words,
-            )
-            if not cls._should_use_repaired_segment(segment, repaired_segment):
-                continue
-
-            original_metrics = cls._segment_alignment_metrics(segment)
-            repaired_metrics = cls._segment_alignment_metrics(repaired_segment)
-            logger.info(
-                "Repaired WhisperX segment %.3fs -> %.3fs with %.2fs padding: "
-                "%.0f -> %.0f words, density %.2f -> %.2f, max_word_duration %.2f -> %.2f",
-                segment_start,
-                segment_end,
-                padding,
-                original_metrics["word_count"],
-                repaired_metrics["word_count"],
-                original_metrics["lexical_density"],
-                repaired_metrics["lexical_density"],
-                original_metrics["max_word_duration"],
-                repaired_metrics["max_word_duration"],
-            )
-            return repaired_segment, alignment_model, alignment_metadata, align_device
-
-        return None, alignment_model, alignment_metadata, align_device
-
-    @classmethod
-    def _uncovered_window_segments(
-        cls,
-        *,
-        segments: list[dict],
-        asr_windows: list[tuple[float, float]],
-    ) -> list[dict]:
-        """Find spans of the raw ASR/VAD windows left uncovered by aligned words.
-
-        The decoder is responsible for the full audio span of each VAD chunk it
-        was handed.  When it silently skips content (a known large-v3 failure
-        mode on speech over music), the aligned words only cover part of the
-        window.  Each uncovered span longer than the repair threshold is
-        returned as an empty pseudo-segment so the degenerate-segment repair
-        pass can re-transcribe it locally.
-        """
-        word_spans = sorted(
-            (float(word["start"]), float(word["end"]))
-            for word in cls._extract_words_from_segments(segments)
-            if word.get("start") is not None and word.get("end") is not None
-        )
-
-        gap_segments: list[dict] = []
-        for window_start, window_end in asr_windows:
-            if window_end - window_start < ALIGNMENT_REPAIR_MIN_SEGMENT_DURATION:
-                continue
-
-            cursor = window_start
-            for word_start, word_end in word_spans:
-                if word_end <= window_start or word_start >= window_end:
-                    continue
-                if word_start - cursor >= ALIGNMENT_REPAIR_MIN_SEGMENT_DURATION:
-                    gap_segments.append({
-                        "start": cursor,
-                        "end": word_start,
-                        "text": "",
-                        "words": [],
-                    })
-                cursor = max(cursor, word_end)
-
-            if window_end - cursor >= ALIGNMENT_REPAIR_MIN_SEGMENT_DURATION:
-                gap_segments.append({
-                    "start": cursor,
-                    "end": window_end,
-                    "text": "",
-                    "words": [],
-                })
-
-        return gap_segments
-
-    @classmethod
-    def _repair_degenerate_aligned_segments(
-        cls,
-        *,
-        segments: list[dict],
-        audio: Any,
-        model,
-        batch_size: int,
-        detected_language: str,
-        alignment_model,
-        alignment_metadata: dict[str, Any] | None,
-        align_device: str,
-    ) -> tuple[list[dict], Any, dict[str, Any] | None, str]:
-        repaired_segments: list[dict] = []
-        active_alignment_model = alignment_model
-        active_alignment_metadata = alignment_metadata
-        active_align_device = align_device
-
-        for segment in segments:
-            segment_copy = copy.deepcopy(segment)
-            if not cls._segment_needs_alignment_repair(segment_copy):
-                repaired_segments.append(segment_copy)
-                continue
-
-            repaired_segment, active_alignment_model, active_alignment_metadata, active_align_device = (
-                cls._repair_suspect_segment(
-                    segment=segment_copy,
-                    audio=audio,
-                    model=model,
-                    batch_size=batch_size,
-                    detected_language=detected_language,
-                    alignment_model=active_alignment_model,
-                    alignment_metadata=active_alignment_metadata,
-                    align_device=active_align_device,
-                )
-            )
-            repaired_segments.append(repaired_segment or segment_copy)
-
-        return repaired_segments, active_alignment_model, active_alignment_metadata, active_align_device
 
     @classmethod
     def _transcribe_sync(
@@ -915,11 +578,15 @@ class TranscriberService:
 
                 try:
                     model = cls._load_asr_model(profile_model_size, device, compute_type)
-                    result = model.transcribe(
-                        audio,
-                        batch_size=batch_size,
-                        num_workers=0,
-                        language=language,
+                    # Batched decode + coverage check + sequential re-decode
+                    # of any speech span the batched pass dropped.
+                    segments, detected_language, speech_regions = (
+                        asr_engine.decode_with_coverage(
+                            model,
+                            audio,
+                            language=None if language in (None, "auto") else language,
+                            batch_size=batch_size,
+                        )
                     )
                 except Exception as exc:
                     last_exc = exc
@@ -930,69 +597,22 @@ class TranscriberService:
                         continue
                     raise
 
-                detected_language = result.get("language") or (language or "en")
-                segments = result.get("segments") or []
-
-                # The raw ASR segments carry the true VAD chunk spans the
-                # decoder was responsible for.  whisperx.align rewrites
-                # start/end to the aligned word span, so degenerate decodes
-                # (e.g. 6 words emitted for an 18s chunk) must be caught on
-                # these windows, before alignment collapses them.
-                asr_windows = [
-                    (float(seg["start"]), float(seg["end"]))
-                    for seg in segments
-                    if isinstance(seg.get("start"), (int, float))
-                    and isinstance(seg.get("end"), (int, float))
-                ]
-
-                align_device = device
-                segments, model_a, metadata, align_device = cls._repair_degenerate_aligned_segments(
+                # wav2vec2 forced alignment: unchanged — this is what makes
+                # the word timings frame-precise.
+                segments, _model_a, _metadata, _align_device = cls._align_segments(
                     segments=segments,
                     audio=audio,
-                    model=model,
-                    batch_size=batch_size,
                     detected_language=detected_language,
+                    align_device=device,
                     alignment_model=None,
                     alignment_metadata=None,
-                    align_device=align_device,
-                )
-                segments, model_a, metadata, align_device = cls._align_segments(
-                    segments=segments,
-                    audio=audio,
-                    detected_language=detected_language,
-                    align_device=align_device,
-                    alignment_model=model_a,
-                    alignment_metadata=metadata,
-                )
-
-                gap_segments = cls._uncovered_window_segments(
-                    segments=segments,
-                    asr_windows=asr_windows,
-                )
-                if gap_segments:
-                    logger.info(
-                        "Transcription left %d uncovered window span(s): %s",
-                        len(gap_segments),
-                        [(round(g["start"], 2), round(g["end"], 2)) for g in gap_segments],
-                    )
-                    segments = sorted(
-                        segments + gap_segments,
-                        key=lambda seg: float(seg.get("start", 0.0) or 0.0),
-                    )
-
-                segments, _, _, _ = cls._repair_degenerate_aligned_segments(
-                    segments=segments,
-                    audio=audio,
-                    model=model,
-                    batch_size=batch_size,
-                    detected_language=detected_language,
-                    alignment_model=model_a,
-                    alignment_metadata=metadata,
-                    align_device=align_device,
                 )
 
                 words = cls._extract_words_from_segments(segments)
                 words.sort(key=lambda word: (word["start"], word["end"]))
+                # Observational only: makes any future coverage regression
+                # loud in the logs instead of silently emptying scenes.
+                asr_engine.log_residual_coverage(words, speech_regions)
                 return words, detected_language
 
             if last_exc is not None:
@@ -1012,7 +632,12 @@ class TranscriberService:
         token = token.strip().lower()
         token = unicodedata.normalize("NFKD", token)
         token = "".join(ch for ch in token if not unicodedata.combining(ch))
-        token = re.sub(r"[^a-z0-9']+", "", token)
+        # Keep any Unicode letter/digit, not just [a-z0-9]: with the old
+        # ASCII-only filter every Devanagari/CJK/etc. token normalized to ""
+        # and non-Latin transcripts scored word_count=0 in the alignment
+        # metrics — all repairs rejected, all segments flagged degenerate
+        # (observed 2026-08-12 on a Hindi Pure project).
+        token = "".join(ch for ch in token if ch.isalnum() or ch == "'")
         return token
 
     @classmethod
@@ -1607,13 +1232,16 @@ class TranscriberService:
                     "Detecting raw scenes (speaker diarization)...",
                 )
 
+                from ..library_types import LibraryType
                 from .raw_scene_detector import RawSceneDetectorService
 
+                is_pure = project.library_type == LibraryType.PURE
                 diarization_future = loop.run_in_executor(
                     None,
                     lambda: RawSceneDetectorService.detect(
                         wav_path,
                         [scene.model_copy(deep=True) for scene in original_scenes],
+                        pure_mode=is_pure,
                     ),
                 )
                 native_futures.append(diarization_future)
@@ -1630,6 +1258,13 @@ class TranscriberService:
                             0.85,
                             "Detecting raw scenes (speaker diarization)...",
                         )
+
+                if detection_result is not None:
+                    # Persist even when NO raw scenes were found, so the UI
+                    # never shows a previous run's stale candidates.
+                    (project_dir / "raw_scene_detection.json").write_text(
+                        detection_result.model_dump_json(indent=2)
+                    )
 
                 if detection_result and detection_result.has_raw_scenes:
                     matches_for_raw_backup = (
@@ -1680,16 +1315,18 @@ class TranscriberService:
                             matches_for_raw_backup.model_dump_json(indent=2)
                         )
 
-                    # Save detection result
-                    detection_file = project_dir / "raw_scene_detection.json"
-                    detection_file.write_text(
-                        detection_result.model_dump_json(indent=2)
-                    )
-
+            completion_message = f"Transcribed {len(words)} words in {detected_lang}"
+            if detection_result is not None and detection_result.error:
+                # Loud canary: a failed diarization must never read as a
+                # clean "no raw scenes" result.
+                completion_message += (
+                    f" — WARNING: raw-scene detection failed"
+                    f" ({detection_result.error[:160]})"
+                )
             yield TranscriptionProgress(
                 "complete",
                 1.0,
-                f"Transcribed {len(words)} words in {detected_lang}",
+                completion_message,
                 transcription=transcription,
             )
 

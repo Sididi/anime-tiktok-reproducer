@@ -34,9 +34,11 @@ torchcodec = ">=0.7.0,<0.8.0"
 pynvvideocodec = "==2.1.0"
 nvidia-npp-cu12 = ">=12.4,<13"
 
-# WhisperX (requires torch 2.8.x) - GPU accelerated transcription
-# Held <3.8: whisperx 3.8+ requires pyannote-audio>=4 (breaking major)
-whisperx = ">=3.7.6,<3.8"
+# WhisperX — now used ONLY for wav2vec2 forced alignment + audio loading
+# (ASR moved to plain faster-whisper via app/services/asr_engine.py, 08-13).
+# 3.8+ pulls pyannote-audio>=4 (used solely by raw-scene diarization).
+# 3.8 is RC-only as of 2026-08; acceptable: our whisperx surface is align-only.
+whisperx = ">=3.8.0rc1"
 
 # FAISS for similarity search (CPU is fast enough for our use case)
 faiss-cpu = ">=1.7.4"
@@ -51,6 +53,10 @@ aiofiles = ">=24.1.0"
 requests = ">=2.32.0"
 anthropic = ">=0.40.0"
 openai = ">=1.50.0"
+
+# ProPainter temporal video inpainting (Pure-mode subtitle/watermark removal);
+# code vendored at modules/propainter, weights downloaded on first use.
+einops = ">=0.7"
 
 # Video/Audio processing
 av = ">=15.0,<16"
@@ -81,8 +87,8 @@ en-core-web-sm = { url = "https://github.com/explosion/spacy-models/releases/dow
 es-core-news-sm = { url = "https://github.com/explosion/spacy-models/releases/download/es_core_news_sm-3.8.0/es_core_news_sm-3.8.0-py3-none-any.whl" }
 
 # Speaker diarization for raw scene detection
-# Held <4: pyannote 4.x is a breaking major (new pipeline API)
-pyannote-audio = ">=3.3.0,<4"
+# pyannote 4 migration done 2026-08 (raw-scene diarization is the only user)
+pyannote-audio = ">=4.0.0"
 
 # YAML config parsing
 pyyaml = ">=6.0"

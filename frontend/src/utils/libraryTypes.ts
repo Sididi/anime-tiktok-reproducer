@@ -8,6 +8,7 @@ export const LIBRARY_TYPE_OPTIONS: Array<{
   { value: "simpsons", label: "Simpsons" },
   { value: "films_series", label: "Films/Séries" },
   { value: "dessin_anime", label: "Dessin Animé" },
+  { value: "pure", label: "Pure" },
 ];
 
 const LIBRARY_TYPE_LABELS: Record<LibraryType, string> = {
@@ -15,6 +16,7 @@ const LIBRARY_TYPE_LABELS: Record<LibraryType, string> = {
   simpsons: "Simpsons",
   films_series: "Films/Séries",
   dessin_anime: "Dessin Animé",
+  pure: "Pure",
 };
 
 export function getLibraryTypeLabel(

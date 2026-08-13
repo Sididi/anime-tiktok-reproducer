@@ -110,6 +110,9 @@ interface MatchCardProps {
   onMergeWithPrevious?: (sceneIndex: number) => void;
   manualMergeHint?: boolean;
   structureActionsDisabled?: boolean;
+  // Pure projects: identity matches onto the project's own video — there is
+  // no episode library to search, so manual match search is meaningless.
+  hideManualMatch?: boolean;
 }
 
 const MAX_MEDIA_SCENES = 16;
@@ -157,6 +160,7 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
       onMergeWithPrevious,
       manualMergeHint = false,
       structureActionsDisabled = false,
+      hideManualMatch = false,
     },
     ref,
   ) {
@@ -681,15 +685,17 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
                   <p className="text-xs text-center opacity-60">
                     {match.alternatives?.length || 0} AI candidates available
                   </p>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setShowManualModal(true)}
-                    className="w-full mt-2"
-                  >
-                    <Edit className="h-3 w-3 mr-1" />
-                    Find Match
-                  </Button>
+                  {!hideManualMatch && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setShowManualModal(true)}
+                      className="w-full mt-2"
+                    >
+                      <Edit className="h-3 w-3 mr-1" />
+                      Find Match
+                    </Button>
+                  )}
                 </div>
               )}
             </div>
@@ -730,20 +736,22 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
               <Play className="h-4 w-4 mr-2" />
               Play Both
             </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setShowManualModal(true)}
-              disabled={Boolean(pendingUpdate)}
-            >
-              <Edit className="h-4 w-4" />
-            </Button>
+            {!hideManualMatch && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setShowManualModal(true)}
+                disabled={Boolean(pendingUpdate)}
+              >
+                <Edit className="h-4 w-4" />
+              </Button>
+            )}
           </div>
         )}
 
         {/* Manual match modal */}
         <ManualMatchModal
-          isOpen={showManualModal}
+          isOpen={showManualModal && !hideManualMatch}
           onClose={() => setShowManualModal(false)}
           scene={scene}
           match={match}
@@ -2766,6 +2774,7 @@ export function MatchValidation() {
                     onMergeWithPrevious={handleMergeWithPrevious}
                     manualMergeHint={manualMergeHints.has(scene.index)}
                     structureActionsDisabled={structureActionsDisabled}
+                    hideManualMatch={project?.library_type === "pure"}
                   />
                 </div>
               );

@@ -77,7 +77,10 @@ function SceneValidationContent() {
   const [detecting, setDetecting] = useState(false);
   const [detectionProgress, setDetectionProgress] = useState<DetectionProgress | null>(null);
   const [skipUiEnabled, setSkipUiEnabled] = useState(false);
-  const [threshold, setThreshold] = useState(16.0);
+  // null = per-library-type default (pure: 27, others: 16)
+  const [threshold, setThreshold] = useState<number | null>(null);
+  const effectiveThreshold =
+    threshold ?? (project?.library_type === "pure" ? 27.0 : 16.0);
   const detectionAbortRef = useRef<AbortController | null>(null);
 
   const currentScene = getSceneAtTime(currentTime);
@@ -112,7 +115,7 @@ function SceneValidationContent() {
     try {
       const response = await api.detectScenes(
         projectId,
-        threshold,
+        effectiveThreshold,
         10,
         controller.signal,
       );
@@ -147,7 +150,7 @@ function SceneValidationContent() {
         setDetecting(false);
       }
     }
-  }, [projectId, setScenes, threshold]);
+  }, [projectId, setScenes, effectiveThreshold]);
 
   useEffect(() => {
     return () => {
@@ -368,7 +371,7 @@ function SceneValidationContent() {
                 min={4}
                 max={30}
                 step={0.5}
-                value={threshold}
+                value={effectiveThreshold}
                 onChange={(e) => setThreshold(Number(e.target.value))}
                 disabled={detecting}
                 className="w-16 px-2 py-1 text-sm bg-[hsl(var(--card))] border border-[hsl(var(--border))] rounded disabled:opacity-50"

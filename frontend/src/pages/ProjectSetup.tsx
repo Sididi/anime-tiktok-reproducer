@@ -34,6 +34,8 @@ export function ProjectSetup() {
   const [sources, setSources] = useState<SourceDetails[]>([]);
   const [selectedSource, setSelectedSource] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
+  // Pure mode reproduces one of our own tiktoks from its output: no series.
+  const isPure = selectedLibraryType === "pure";
 
   // TikTok URL + Start flow
   const [tiktokUrl, setTiktokUrl] = useState("");
@@ -291,25 +293,31 @@ export function ProjectSetup() {
   }, [upsertStartupJob]);
 
   const proceedWithStart = useCallback(async (popup: Window | null) => {
-    if (!tiktokUrl.trim() || !selectedSource) return;
+    if (!tiktokUrl.trim() || (!isPure && !selectedSource)) return;
     setProcessing(true);
     setError(null);
     setStatusText("Launching...");
 
     try {
-      const latestSources = await loadSources({ clearOnError: false });
-      const availableSources = latestSources ?? sources;
-      const selectedSourceDetails = availableSources.find(
-        (source) => source.series_id === selectedSource,
-      );
-      if (!selectedSourceDetails) {
-        throw new Error("Selected source not found");
+      let animeName: string | undefined;
+      let seriesId: string | undefined;
+      if (!isPure) {
+        const latestSources = await loadSources({ clearOnError: false });
+        const availableSources = latestSources ?? sources;
+        const selectedSourceDetails = availableSources.find(
+          (source) => source.series_id === selectedSource,
+        );
+        if (!selectedSourceDetails) {
+          throw new Error("Selected source not found");
+        }
+        animeName = selectedSourceDetails.name;
+        seriesId = selectedSourceDetails.series_id;
       }
 
       const job = await api.startProjectAsync(
         tiktokUrl,
-        selectedSourceDetails.name,
-        selectedSourceDetails.series_id,
+        animeName,
+        seriesId,
         selectedLibraryType,
       );
       if (popup) {
@@ -330,6 +338,7 @@ export function ProjectSetup() {
     tiktokUrl,
     selectedSource,
     selectedLibraryType,
+    isPure,
     sources,
     loadSources,
     upsertStartupJob,
@@ -377,7 +386,7 @@ export function ProjectSetup() {
   );
 
   const handleStart = useCallback(async () => {
-    if (!tiktokUrl.trim() || !selectedSource) return;
+    if (!tiktokUrl.trim() || (!isPure && !selectedSource)) return;
     setError(null);
     setSearchQuery("");
     const popup = openStartupWindow();
@@ -399,7 +408,7 @@ export function ProjectSetup() {
     }
 
     void proceedWithStart(popup);
-  }, [tiktokUrl, selectedSource, openStartupWindow, proceedWithStart]);
+  }, [tiktokUrl, selectedSource, isPure, openStartupWindow, proceedWithStart]);
 
   // ---------------------------------------------------------------------------
   // New source submission (async indexing)
@@ -610,27 +619,38 @@ export function ProjectSetup() {
         onRetry={handleRetryStartup}
       />
 
-      <SearchBar
-        searchQuery={searchQuery}
-        onSearchChange={setSearchQuery}
-        onNewSource={() => setShowNewSource(true)}
-      />
+      {!isPure && (
+        <SearchBar
+          searchQuery={searchQuery}
+          onSearchChange={setSearchQuery}
+          onNewSource={() => setShowNewSource(true)}
+        />
+      )}
 
-      <SourceList
-        sources={sources}
-        selectedSource={selectedSource}
-        deletingSourceId={deletingSourceId}
-        onSelectSource={setSelectedSource}
-        onToggleProtection={handleToggleProtection}
-        onRenameSource={handleOpenRenameSource}
-        onUpdateSource={(source) => {
-          setUpdateSourceName(source.name);
-          setShowFolderBrowser(true);
-        }}
-        onManageTorrents={(source) => setEpisodeSource(source)}
-        onDeleteSource={handleOpenDeleteSource}
-        searchQuery={searchQuery}
-      />
+      {!isPure && (
+        <SourceList
+          sources={sources}
+          selectedSource={selectedSource}
+          deletingSourceId={deletingSourceId}
+          onSelectSource={setSelectedSource}
+          onToggleProtection={handleToggleProtection}
+          onRenameSource={handleOpenRenameSource}
+          onUpdateSource={(source) => {
+            setUpdateSourceName(source.name);
+            setShowFolderBrowser(true);
+          }}
+          onManageTorrents={(source) => setEpisodeSource(source)}
+          onDeleteSource={handleOpenDeleteSource}
+          searchQuery={searchQuery}
+        />
+      )}
+
+      {isPure && (
+        <div className="flex-1 flex items-center justify-center text-sm text-[hsl(var(--muted-foreground))] px-4 text-center">
+          Pure mode: the project is built from the TikTok itself — no series
+          needed. Paste the TikTok URL below and start.
+        </div>
+      )}
 
       {error && (
         <div className="text-sm text-[hsl(var(--destructive))] px-2">
@@ -642,7 +662,7 @@ export function ProjectSetup() {
         tiktokUrl={tiktokUrl}
         onUrlChange={setTiktokUrl}
         onStart={handleStart}
-        disabled={!tiktokUrl.trim() || !selectedSource || processing}
+        disabled={!tiktokUrl.trim() || (!isPure && !selectedSource) || processing}
         loading={processing}
         statusText={statusText}
       />

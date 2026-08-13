@@ -68,6 +68,20 @@ class SceneDetectorService:
     # tuned threshold.
     SENSITIVE_REFINE_THRESHOLD = 8.0
     STATIC_CUT_MOTION_CEILING = 1.0
+    DEFAULT_THRESHOLD = 16.0
+    # Pure mode matches the tiktok against itself: there is no automatic
+    # scene merging downstream to absorb false cuts, so detection is biased
+    # toward confident cuts only (PySceneDetect's own default). Staying
+    # above 16.0 also disables the sensitive-reinject and auto-dense passes.
+    PURE_THRESHOLD = 27.0
+
+    @classmethod
+    def default_threshold(cls, library_type: object) -> float:
+        from ..library_types import LibraryType, coerce_library_type
+
+        if coerce_library_type(library_type) is LibraryType.PURE:
+            return cls.PURE_THRESHOLD
+        return cls.DEFAULT_THRESHOLD
 
     @classmethod
     async def detect_scenes(
@@ -137,11 +151,12 @@ class SceneDetectorService:
     async def detect_project_scenes(
         cls,
         project_id: str,
-        threshold: float = 16.0,
+        threshold: float | None = None,
         min_scene_len: int = 10,
     ) -> AsyncIterator[SceneDetectionProgress]:
         from pathlib import Path
 
+        from ..library_types import LibraryType
         from ..models import ProjectPhase, SceneList
         from .project_service import ProjectService
 
@@ -155,11 +170,20 @@ class SceneDetectorService:
         if not video_path.exists():
             raise RuntimeError("Video file not found")
 
-        from .anime_library import AnimeLibraryService
+        if threshold is None:
+            threshold = cls.default_threshold(project.library_type)
 
-        library_path = AnimeLibraryService.get_library_path(project.library_type)
-        library_type = project.library_type
-        anime_name = project.anime_name
+        if project.library_type == LibraryType.PURE:
+            # Pure has no indexed library: no SSCD merge-direction tiebreak.
+            library_path = None
+            library_type = project.library_type
+            anime_name = None
+        else:
+            from .anime_library import AnimeLibraryService
+
+            library_path = AnimeLibraryService.get_library_path(project.library_type)
+            library_type = project.library_type
+            anime_name = project.anime_name
 
         project.phase = ProjectPhase.SCENE_DETECTION
         ProjectService.save(project)

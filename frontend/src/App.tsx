@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import {
   ProjectSetup,
+  CleanupPage,
   SceneValidation,
   MatchValidation,
   TranscriptionPage,
@@ -15,6 +16,10 @@ function App() {
     <BrowserRouter>
       <Routes>
         <Route path="/" element={<ProjectSetup />} />
+        <Route
+          path="/project/:projectId/cleanup"
+          element={<CleanupPage />}
+        />
         <Route
           path="/project/:projectId/scenes"
           element={<SceneValidation />}

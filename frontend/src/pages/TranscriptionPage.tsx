@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { flushSync } from "react-dom";
 import { useParams, useNavigate } from "react-router-dom";
-import { Loader2, Play, ArrowRight } from "lucide-react";
+import { Loader2, Play, ArrowRight, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui";
 import { ProjectClippedVideoPlayer } from "@/components/video";
 import { FloatingAudioPlayer } from "@/components/FloatingAudioPlayer";
@@ -25,6 +25,7 @@ const LANGUAGES = [
   { value: "en", label: "English" },
   { value: "fr", label: "Français" },
   { value: "es", label: "Español" },
+  { value: "hi", label: "हिन्दी (Hindi)" },
 ];
 
 const autoStartedTranscriptionProjects = new Set<string>();
@@ -65,6 +66,15 @@ export function TranscriptionPage() {
     }
   }, []);
 
+  const languageOptions = useMemo(() => {
+    // Keep whatever language auto-detection produced selectable, even if it
+    // is not in the hardcoded list (e.g. a Pure project in another language).
+    if (language && !LANGUAGES.some((l) => l.value === language)) {
+      return [...LANGUAGES, { value: language, label: language }];
+    }
+    return LANGUAGES;
+  }, [language]);
+
   const scenePositionByIndex = useMemo(() => {
     const map = new Map<number, number>();
     scenes.forEach((scene, position) => {
@@ -104,6 +114,11 @@ export function TranscriptionPage() {
         await loadScenes(projectId);
         const { transcription: loaded } = await api.getTranscription(projectId);
         setTranscription(loaded);
+        if (loaded?.language) {
+          // Default the re-run selector to the language of the existing
+          // transcript (skips auto-detection on re-runs).
+          setLanguage(loaded.language);
+        }
         try {
           const config = await api.getTranscriptionConfig(projectId);
           setFullAutoEnabled(Boolean(config.full_auto_enabled));
@@ -286,12 +301,59 @@ export function TranscriptionPage() {
             </p>
           </div>
           {transcription && (
-            <Button onClick={handleConfirm}>
-              Continue
-              <ArrowRight className="h-4 w-4 ml-2" />
-            </Button>
+            <div className="flex items-center gap-2">
+              <select
+                value={language}
+                onChange={(e) => setLanguage(e.target.value)}
+                disabled={transcribing}
+                title="Language for re-transcription"
+                className="h-9 px-2 rounded-md border border-[hsl(var(--input))] bg-[hsl(var(--background))] text-sm text-[hsl(var(--foreground))]"
+              >
+                {languageOptions.map((lang) => (
+                  <option
+                    key={lang.value}
+                    value={lang.value}
+                    className="bg-[hsl(var(--background))] text-[hsl(var(--foreground))]"
+                  >
+                    {lang.label}
+                  </option>
+                ))}
+              </select>
+              <Button
+                variant="outline"
+                onClick={() => handleStartTranscription()}
+                disabled={transcribing}
+                title="Discard this transcript and transcribe again"
+              >
+                {transcribing ? (
+                  <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                ) : (
+                  <RefreshCw className="h-4 w-4 mr-2" />
+                )}
+                Re-run
+              </Button>
+              <Button onClick={handleConfirm} disabled={transcribing}>
+                Continue
+                <ArrowRight className="h-4 w-4 ml-2" />
+              </Button>
+            </div>
           )}
         </header>
+
+        {transcription && transcribing && progress && progress.status !== "complete" && (
+          <div className="bg-[hsl(var(--card))] rounded-lg p-4 space-y-2">
+            <div className="flex items-center gap-2 text-sm text-[hsl(var(--muted-foreground))]">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              <span>{progress.message}</span>
+            </div>
+            <div className="h-2 bg-[hsl(var(--muted))] rounded-full overflow-hidden">
+              <div
+                className="h-full bg-[hsl(var(--primary))] transition-all duration-300"
+                style={{ width: `${progress.progress * 100}%` }}
+              />
+            </div>
+          </div>
+        )}
 
         {error && (
           <div className="p-3 bg-[hsl(var(--destructive))]/10 rounded-lg">

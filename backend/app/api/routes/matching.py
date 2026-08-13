@@ -13,6 +13,7 @@ import re
 logger = logging.getLogger("uvicorn.error")
 
 from ...config import settings
+from ...library_types import LibraryType
 from ...models import ProjectPhase, MatchList, SceneMatch, SceneList
 from ...services import (
     ProjectService,
@@ -378,13 +379,16 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
         except Exception as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    # Use provided source_path or default to anime_library_path
+    is_pure = project.library_type == LibraryType.PURE
+
+    # Use provided source_path or default to anime_library_path.
+    # Pure projects have no library: the tiktok itself is the source.
     source_path = (
         Path(request.source_path)
         if request.source_path
         else AnimeLibraryService.get_library_path(project.library_type)
     )
-    if not source_path.exists():
+    if not is_pure and not source_path.exists():
         raise HTTPException(status_code=400, detail="Source path not found")
 
     # Load scenes
@@ -425,6 +429,35 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
                 "total_scenes": len(scenes.scenes),
                 "error": None,
             }) + "\n\n"
+
+        if is_pure:
+            # Pure mode: identity mapping onto the project's own video. No
+            # searcher, no locks, no heavy slot — the mapping is trivially
+            # correct, so every match is confirmed up front.
+            from ...services.pure_matcher import PureMatcherService
+
+            final_matches = PureMatcherService.build_identity_matches(
+                video_path, scenes
+            )
+            ProjectService.save_matches(project_id, final_matches)
+            project.phase = ProjectPhase.MATCH_VALIDATION
+            ProjectService.save(project)
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "status": "complete",
+                        "progress": 1.0,
+                        "message": f"Matched {len(final_matches.matches)} scenes.",
+                        "current_scene": len(final_matches.matches),
+                        "total_scenes": len(scenes.scenes),
+                        "error": None,
+                        "matches": final_matches.model_dump(),
+                    }
+                )
+                + "\n\n"
+            )
+            return
 
         # Global scene aligner: dense correspondences, segmentation DP and
         # the Stage-5 native arbitration layer produce the final scene list
@@ -821,8 +854,10 @@ async def merge_with_previous(project_id: str, scene_index: int):
         except Exception as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    is_pure = project.library_type == LibraryType.PURE
+
     source_path = AnimeLibraryService.get_library_path(project.library_type)
-    if not source_path.exists():
+    if not is_pure and not source_path.exists():
         raise HTTPException(status_code=400, detail="Source path not found")
 
     video_path = Path(project.video_path) if project.video_path else None
@@ -842,6 +877,33 @@ async def merge_with_previous(project_id: str, scene_index: int):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     SceneMergerService.save_pre_merge_backup(project_id, backup)
+
+    if is_pure:
+        # Identity re-match over the merged span; instant, no GPU, no slots.
+        from ...services.pure_matcher import PureMatcherService
+
+        rematched_matches = PureMatcherService.rematch_scene(
+            video_path,
+            merged_scenes,
+            scene_index=merged_scene_index,
+            existing_matches=merged_matches,
+        )
+
+        if merged_scene_index < len(rematched_matches.matches):
+            rematched_matches.matches[merged_scene_index].merged_from = (
+                merged_matches.matches[merged_scene_index].merged_from
+            )
+
+        ProjectService.save_scenes(project_id, merged_scenes)
+        ProjectService.save_matches(project_id, rematched_matches)
+
+        project.phase = ProjectPhase.MATCH_VALIDATION
+        ProjectService.save(project)
+
+        return {
+            "scenes": _serialize_scenes(merged_scenes),
+            "matches": [m.model_dump() for m in rematched_matches.matches],
+        }
 
     from ...services import fast_matching
     from ...services.indexation_queue import indexation_queue

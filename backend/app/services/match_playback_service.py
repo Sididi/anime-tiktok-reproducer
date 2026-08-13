@@ -247,6 +247,17 @@ class MatchPlaybackService:
         source_path = Path(decoded_path)
         video_extensions = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".m4v"}
 
+        # The project's own directory is always a trusted source: Pure-mode
+        # identity matches reference the project's (cleaned) tiktok by
+        # absolute path and have no library at all.
+        project_dir = ProjectService.get_project_dir(project.id)
+        if (
+            source_path.is_absolute()
+            and source_path.exists()
+            and cls._is_path_allowed(source_path, [project_dir])
+        ):
+            return source_path
+
         source_dirs: list[Path] = []
         library_root = AnimeLibraryService.get_library_path(project.library_type)
         if project.source_paths:

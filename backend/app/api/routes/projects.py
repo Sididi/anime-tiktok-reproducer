@@ -51,6 +51,8 @@ class ProjectResponse(BaseModel):
     final_upload_discord_message_id: str | None
     upload_completed_at: str | None
     upload_last_result: dict[str, Any] | None
+    cleanup: dict[str, Any] | None
+    original_video_path: str | None
 
     @classmethod
     def from_project(cls, project: Project) -> "ProjectResponse":
@@ -76,6 +78,8 @@ class ProjectResponse(BaseModel):
             final_upload_discord_message_id=project.final_upload_discord_message_id,
             upload_completed_at=project.upload_completed_at.isoformat() if project.upload_completed_at else None,
             upload_last_result=project.upload_last_result,
+            cleanup=project.cleanup.model_dump(mode="json") if project.cleanup else None,
+            original_video_path=project.original_video_path,
         )
 
 

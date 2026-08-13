@@ -22,3 +22,7 @@ class RawSceneDetectionResult(BaseModel):
     speaker_count: int = 0
     # Indexed by updated scene position; value is the pre-split parent scene index.
     scene_parent_indices: list[int] = []
+    # Set when detection could not run (e.g. diarization download/auth
+    # failure). Distinguishes "no raw scenes found" from "detection failed":
+    # speaker_count=0 + error is a failure, never a clean result.
+    error: str | None = None

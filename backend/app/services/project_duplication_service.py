@@ -43,6 +43,9 @@ _EXCLUDED_DIRS = {
     "playback_cache_v3",
     "script_automation_runs",
     "tts_parts",
+    # Pure-mode cleanup working dir (span caches/previews): large and
+    # re-derivable; the cleaned tiktok_clean.mp4 itself is hardlinked.
+    "cleanup",
 }
 # Large immutable media: hardlink instead of copying when possible. Never
 # hardlink JSON/state files — they are rewritten in place and would leak
@@ -125,6 +128,7 @@ class ProjectDuplicationService:
                     "reschedule_pending": {},
                 }
             )
+            cls._rebase_pure_paths(duplicate, source_dir, target_dir)
             ProjectService.save(duplicate)
             logger.info(
                 "Duplicated project %s -> %s (language=%s template=%s root=%s)",
@@ -138,6 +142,42 @@ class ProjectDuplicationService:
         except Exception:
             shutil.rmtree(target_dir, ignore_errors=True)
             raise
+
+    @classmethod
+    def _rebase_pure_paths(cls, duplicate: Project, source_dir, target_dir) -> None:
+        """Pure projects reference their own video by absolute path (project
+        fields + SceneMatch.episode). Point the duplicate at its own copies so
+        it survives deletion of the mother project."""
+        from ..library_types import LibraryType
+
+        if duplicate.library_type != LibraryType.PURE:
+            return
+
+        source_prefix = str(source_dir)
+        target_prefix = str(target_dir)
+
+        def rebase(value: str | None) -> str | None:
+            if value and value.startswith(source_prefix):
+                return target_prefix + value[len(source_prefix):]
+            return value
+
+        duplicate.video_path = rebase(duplicate.video_path)
+        duplicate.original_video_path = rebase(duplicate.original_video_path)
+        if duplicate.cleanup is not None:
+            duplicate.cleanup.cleaned_video_path = rebase(
+                duplicate.cleanup.cleaned_video_path
+            )
+
+        matches = ProjectService.load_matches(duplicate.id)
+        if matches:
+            changed = False
+            for match in matches.matches:
+                rebased = rebase(match.episode)
+                if rebased != match.episode:
+                    match.episode = rebased or match.episode
+                    changed = True
+            if changed:
+                ProjectService.save_matches(duplicate.id, matches)
 
     @classmethod
     def _copy_project_dir(cls, source_dir, target_dir) -> None:

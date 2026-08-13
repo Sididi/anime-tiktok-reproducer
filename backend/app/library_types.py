@@ -9,6 +9,11 @@ class LibraryType(str, Enum):
     SIMPSONS = "simpsons"
     FILMS_SERIES = "films_series"
     DESSIN_ANIME = "dessin_anime"
+    # Pure mode: reproduce one of our own published TikToks from its output.
+    # No series, no index, no hydration — the tiktok itself is the only source.
+    # Intentionally NOT mirrored into modules/anime_searcher/library_types.py:
+    # pure projects never reach the indexing CLI or the searcher.
+    PURE = "pure"
 
 
 DEFAULT_LIBRARY_TYPE = LibraryType.ANIME
@@ -18,6 +23,7 @@ STATIC_OVERLAY_TITLES: dict[LibraryType, str] = {
     LibraryType.FILMS_SERIES: "CE FILM EST INCROYABLE !",
     LibraryType.DESSIN_ANIME: "CE DESSIN ANIMÉ EST INCROYABLE !",
     LibraryType.SIMPSONS: "CET EPISODE EST INCROYABLE !",
+    LibraryType.PURE: "CETTE VIDÉO EST INCROYABLE !",
 }
 
 

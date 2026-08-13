@@ -1,11 +1,12 @@
 from enum import Enum
 from datetime import datetime
 from pydantic import BaseModel, Field, field_validator
-from typing import Any
+from typing import Any, ClassVar
 import uuid
 
 from ..config import settings
 from ..library_types import DEFAULT_LIBRARY_TYPE, LibraryType
+from .cleanup import CleanupState
 
 
 class ProjectPhase(str, Enum):
@@ -13,6 +14,9 @@ class ProjectPhase(str, Enum):
 
     SETUP = "setup"
     DOWNLOADING = "downloading"
+    # Pure mode only: burned-in overlay removal (subtitles/watermark) between
+    # download and scene detection.
+    CLEANUP = "cleanup"
     SCENE_DETECTION = "scene_detection"
     SCENE_VALIDATION = "scene_validation"
     MATCHING = "matching"
@@ -50,6 +54,9 @@ class Project(BaseModel):
 
     # Video metadata (populated after download)
     video_path: str | None = None
+    # Pure mode: raw download preserved when video_path is swapped to the
+    # cleaned (inpainted) file, so cleanup can be re-run.
+    original_video_path: str | None = None
     video_duration: float | None = None
     video_fps: float | None = None
     video_width: int | None = None
@@ -64,6 +71,8 @@ class Project(BaseModel):
     final_upload_discord_message_id: str | None = None
     upload_completed_at: datetime | None = None
     upload_last_result: dict[str, Any] | None = None
+    # Pure mode: burned-in overlay removal state (zones + job status).
+    cleanup: "CleanupState | None" = None
     # Script phase settings
     music_key: str | None = None
     tts_speed: float | None = None
@@ -97,9 +106,17 @@ class Project(BaseModel):
             )
         return value
 
+    # Pure mode: the only extra footage available for gap resolution is the
+    # neighboring scene, so a deeper slow-mo floor absorbs most gaps before
+    # boundary borrowing has to move cuts. An explicit project value still
+    # wins; template/global floors are anime-tuned and are skipped for Pure.
+    PURE_DEFAULT_MIN_PLAYBACK_SPEED: ClassVar[float] = 0.4
+
     def resolved_min_playback_speed(self) -> float:
         if self.min_playback_speed is not None:
             return self.min_playback_speed
+        if self.library_type == LibraryType.PURE:
+            return self.PURE_DEFAULT_MIN_PLAYBACK_SPEED
         template_value = self._resolved_template().min_playback_speed
         if template_value is not None:
             return template_value

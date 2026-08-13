@@ -1,6 +1,7 @@
 export type ProjectPhase =
   | "setup"
   | "downloading"
+  | "cleanup"
   | "scene_detection"
   | "scene_validation"
   | "matching"
@@ -15,7 +16,8 @@ export type LibraryType =
   | "anime"
   | "simpsons"
   | "films_series"
-  | "dessin_anime";
+  | "dessin_anime"
+  | "pure";
 
 export interface Project {
   id: string;
@@ -39,6 +41,28 @@ export interface Project {
   final_upload_discord_message_id: string | null;
   upload_completed_at: string | null;
   upload_last_result: Record<string, unknown> | null;
+  cleanup: CleanupState | null;
+  original_video_path: string | null;
+}
+
+export interface CleanupZone {
+  id: string;
+  kind: "subtitle" | "watermark";
+  // Normalized frame coordinates (0..1 of videoWidth/videoHeight).
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface CleanupState {
+  zones: CleanupZone[];
+  status: "idle" | "running" | "complete" | "error";
+  progress: number;
+  message: string | null;
+  error: string | null;
+  cleaned_video_path: string | null;
+  updated_at: string | null;
 }
 
 export interface PlatformMetadata {

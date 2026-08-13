@@ -5,6 +5,7 @@ from .projects import router as projects_router
 from .startup import router as startup_router
 from .video import router as video_router
 from .scenes import router as scenes_router
+from .cleanup import router as cleanup_router
 from .download import router as download_router
 from .matching import router as matching_router
 from .transcription import router as transcription_router
@@ -25,6 +26,7 @@ api_router.include_router(projects_router)
 api_router.include_router(startup_router)
 api_router.include_router(video_router)
 api_router.include_router(scenes_router)
+api_router.include_router(cleanup_router)
 api_router.include_router(download_router)
 api_router.include_router(matching_router)
 api_router.include_router(transcription_router)

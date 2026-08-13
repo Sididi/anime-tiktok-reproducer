@@ -31,6 +31,14 @@ RAW_EDGE_MARGIN = 0.08
 # Words below this confidence (e.g. interpolated timings from
 # _fill_missing_word_times) are not precise enough to move boundaries
 MIN_SNAP_WORD_CONFIDENCE = 0.3
+
+# Pure-mode gating: Pure projects keep detector-granularity scenes (no
+# matcher merging), so an inter-sentence breath can own an entire tiny scene
+# and get flagged raw. These thresholds classify such spans as pauses, not
+# raw content. Anime behavior is untouched (pure_mode defaults to False).
+PURE_MIN_RAW_SECONDS = 1.0
+PURE_PAUSE_MAX_SECONDS = 2.5
+PURE_PAUSE_WORD_ADJACENCY_SECONDS = 0.75
 # WhisperX artifact guard: words with implausibly long durations carry
 # trailing silence, so their start time is the only reliable anchor
 MAX_WORD_DURATION = 1.0
@@ -63,8 +71,9 @@ class RawSceneDetectorService:
         hf_token = settings.hf_token
         if not hf_token:
             raise RuntimeError(
-                "HF_TOKEN is required for raw scene detection. "
-                "Set it in .env and accept pyannote model licenses on HuggingFace."
+                "HF_TOKEN is required for raw scene detection. Set it in .env "
+                "and accept the model conditions on HuggingFace at "
+                "https://huggingface.co/pyannote/speaker-diarization-community-1"
             )
 
         device = cls._get_device()
@@ -74,9 +83,14 @@ class RawSceneDetectorService:
         pipeline = None
         diarization = None
         try:
+            # pyannote 4: `use_auth_token` renamed to `token`, and legacy
+            # pipeline names redirect to the gated community-1 repo anyway —
+            # load it explicitly. Requires the HF account behind HF_TOKEN to
+            # have accepted the conditions at
+            # https://huggingface.co/pyannote/speaker-diarization-community-1
             pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1",
-                use_auth_token=hf_token,
+                "pyannote/speaker-diarization-community-1",
+                token=hf_token,
             )
 
             if device == "cuda":
@@ -85,8 +99,12 @@ class RawSceneDetectorService:
             logger.info("Running diarization on %s", wav_path.name)
             diarization = pipeline(str(wav_path))
 
+            # pyannote 4 wraps the result in a DiarizeOutput dataclass; the
+            # Annotation with itertracks lives in .speaker_diarization.
+            annotation = getattr(diarization, "speaker_diarization", diarization)
+
             segments = []
-            for turn, _, speaker in diarization.itertracks(yield_label=True):
+            for turn, _, speaker in annotation.itertracks(yield_label=True):
                 segments.append((turn.start, turn.end, speaker))
 
             logger.info("Diarization complete: %d segments found", len(segments))
@@ -425,6 +443,40 @@ class RawSceneDetectorService:
 
         return new_scenes, candidates, scene_parent_indices
 
+    @staticmethod
+    def _is_speech_pause(
+        start: float,
+        end: float,
+        narration_words: list[tuple[float, float]],
+    ) -> bool:
+        """Pure-mode classifier: is this span a pause in continuous narration
+        rather than genuine raw content?
+
+        True when the span is too short to be a usable raw scene, or when it
+        is a short span sandwiched between nearby narration words on both
+        sides (an inter-sentence breath).
+        """
+        duration = end - start
+        if duration < PURE_MIN_RAW_SECONDS:
+            return True
+        if duration <= PURE_PAUSE_MAX_SECONDS:
+            prev_word_end = max(
+                (we for ws, we in narration_words if we <= start + 0.1),
+                default=None,
+            )
+            next_word_start = min(
+                (ws for ws, we in narration_words if ws >= end - 0.1),
+                default=None,
+            )
+            if (
+                prev_word_end is not None
+                and next_word_start is not None
+                and (start - prev_word_end) <= PURE_PAUSE_WORD_ADJACENCY_SECONDS
+                and (next_word_start - end) <= PURE_PAUSE_WORD_ADJACENCY_SECONDS
+            ):
+                return True
+        return False
+
     @classmethod
     def _get_audio_duration(cls, wav_path: Path) -> float:
         """Get audio duration in seconds."""
@@ -437,31 +489,42 @@ class RawSceneDetectorService:
         cls,
         wav_path: Path,
         scenes: list[SceneTranscription],
+        *,
+        pure_mode: bool = False,
     ) -> tuple[list[SceneTranscription], RawSceneDetectionResult]:
         """Run raw scene detection on a WAV file.
 
         Args:
             wav_path: Path to 16kHz mono WAV (same as WhisperX input)
             scenes: Current scene transcriptions
+            pure_mode: Pure projects keep detector-granularity (tiny) scenes,
+                so inter-sentence pauses are filtered out of the raw regions
+                and candidates. False (default) keeps the classic behavior.
 
         Returns:
             (updated_scenes, detection_result)
         """
         if not settings.hf_token:
             logger.info("HF_TOKEN not set, skipping raw scene detection")
-            return scenes, RawSceneDetectionResult(has_raw_scenes=False)
+            return scenes, RawSceneDetectionResult(
+                has_raw_scenes=False, error="HF_TOKEN not set"
+            )
 
         try:
             audio_duration = cls._get_audio_duration(wav_path)
         except Exception as exc:
             logger.warning("Failed to get audio duration: %s", exc)
-            return scenes, RawSceneDetectionResult(has_raw_scenes=False)
+            return scenes, RawSceneDetectionResult(
+                has_raw_scenes=False, error=f"Audio duration probe failed: {exc}"
+            )
 
         try:
             segments = cls._run_diarization(wav_path)
         except Exception as exc:
             logger.error("Diarization failed: %s", exc)
-            return scenes, RawSceneDetectionResult(has_raw_scenes=False)
+            return scenes, RawSceneDetectionResult(
+                has_raw_scenes=False, error=f"Diarization failed: {exc}"
+            )
 
         if not segments:
             return scenes, RawSceneDetectionResult(has_raw_scenes=False)
@@ -484,6 +547,15 @@ class RawSceneDetectorService:
         )
         raw_regions = cls._snap_regions_to_words(raw_regions, narration_words)
 
+        if pure_mode:
+            # Filter BEFORE scene mapping so pause regions never split the
+            # scene structure.
+            raw_regions = [
+                (start, end)
+                for start, end in raw_regions
+                if not cls._is_speech_pause(start, end, narration_words)
+            ]
+
         if not raw_regions:
             return scenes, RawSceneDetectionResult(
                 has_raw_scenes=False,
@@ -494,6 +566,22 @@ class RawSceneDetectorService:
         updated_scenes, candidates, scene_parent_indices = cls._map_raw_regions_to_scenes(
             scenes, raw_regions, tts_speaker, segments,
         )
+
+        if pure_mode:
+            # The empty_no_tts fallback flags any wordless scene; with Pure's
+            # tiny scenes a breath between sentences qualifies. Dropping these
+            # candidates is structurally safe (was_split is always False on
+            # the fallback path — no scene splitting to undo).
+            candidates = [
+                cand
+                for cand in candidates
+                if not (
+                    cand.reason == "empty_no_tts"
+                    and cls._is_speech_pause(
+                        cand.start_time, cand.end_time, narration_words
+                    )
+                )
+            ]
 
         result = RawSceneDetectionResult(
             has_raw_scenes=len(candidates) > 0,

@@ -19,6 +19,7 @@ from typing import Any, AsyncIterator
 import spacy
 
 from ..config import settings
+from ..library_types import LibraryType
 from ..models import MatchList, Project, Transcription, SceneMatch
 from ..models.transcription import Word, SceneTranscription
 from ..utils.media_binaries import is_media_binary_override_error
@@ -2711,17 +2712,67 @@ class ProcessingService:
                 # Skip this check if gaps were already resolved in a previous run
                 gaps_already_resolved = cls.check_gaps_resolved(project.id)
 
+                is_pure = project.library_type == LibraryType.PURE
+
                 if gaps_already_resolved:
                     # User already resolved/skipped gaps in a previous run
                     # Don't ask them to do it again
                     gaps = []
                 else:
-                    gaps = GapResolutionService.calculate_gaps(matches, transcription_data["scenes"])
+                    gaps = GapResolutionService.calculate_gaps(
+                        matches,
+                        transcription_data["scenes"],
+                        # Pure uses its own (deeper) floor — see
+                        # Project.resolved_min_playback_speed; keep the anime
+                        # path on the historical global floor.
+                        min_speed_factor=(
+                            project.resolved_min_playback_speed() if is_pure else None
+                        ),
+                    )
 
                 if gaps:
                     total_gap_duration = sum(g.gap_duration for g in gaps)
 
-                    if settings.gaps_full_auto_enabled:
+                    if is_pure:
+                        # Pure mode: no extra footage exists — resolve fully
+                        # automatically by moving cuts (borrowing source time
+                        # from neighbours with slack); residuals stay at the
+                        # floor and are reported.
+                        yield ProcessingProgress(
+                            "processing",
+                            "gap_detection",
+                            0.36,
+                            f"Auto-resolving {len(gaps)} gap(s) by borrowing "
+                            f"from adjacent scenes...",
+                        )
+
+                        matches_backup_path = project_dir / "matches_before_gaps.json"
+                        if not matches_backup_path.exists():
+                            matches_path = project_dir / "matches.json"
+                            if matches_path.exists():
+                                shutil.copy(matches_path, matches_backup_path)
+
+                        from .pure_matcher import PureMatcherService
+
+                        borrow_report = PureMatcherService.resolve_gaps_by_borrowing(
+                            matches,
+                            gaps,
+                            transcription_data["scenes"],
+                            min_speed=project.resolved_min_playback_speed(),
+                        )
+                        for line in borrow_report:
+                            logger.info("Pure gap resolution: %s", line)
+
+                        ProjectService.save_matches(project.id, MatchList(matches=matches))
+                        (project_dir / "gaps_resolved.flag").touch()
+
+                        yield ProcessingProgress(
+                            "processing",
+                            "gap_detection",
+                            0.4,
+                            f"Auto-resolved {len(gaps)} gap(s) by boundary borrowing",
+                        )
+                    elif settings.gaps_full_auto_enabled:
                         # Resolve gaps inline without frontend round trip
                         yield ProcessingProgress(
                             "processing",

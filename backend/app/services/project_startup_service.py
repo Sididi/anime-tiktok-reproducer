@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from ..config import settings
-from ..library_types import coerce_library_type
+from ..library_types import LibraryType, coerce_library_type
 from ..models.project_startup import ProjectStartupJob
 
 
@@ -275,12 +276,23 @@ class ProjectStartupService:
         await asyncio.to_thread(mux_path.unlink, missing_ok=True)
         await asyncio.to_thread(scenes_path.unlink, missing_ok=True)
 
+        # Pure-mode cleanup artifacts (cleaned video + working dir).
+        from .video_cleanup_service import VideoCleanupService
+
+        clean_path = VideoCleanupService.get_clean_video_path(project_id)
+        cleanup_dir = VideoCleanupService.get_cleanup_dir(project_id)
+        await asyncio.to_thread(clean_path.unlink, missing_ok=True)
+        if cleanup_dir.exists():
+            await asyncio.to_thread(shutil.rmtree, cleanup_dir, ignore_errors=True)
+
         project.phase = ProjectPhase.SETUP
         project.video_path = None
         project.video_duration = None
         project.video_fps = None
         project.video_width = None
         project.video_height = None
+        project.original_video_path = None
+        project.cleanup = None
         ProjectService.save(project)
 
     async def _run_job(self, project_id: str, job_id: str) -> None:
@@ -324,6 +336,30 @@ class ProjectStartupService:
                     progress=0.05 + (0.50 * float(progress.progress or 0.0)),
                     message=progress.message or "Downloading TikTok video...",
                 )
+
+            project = ProjectService.load(project_id)
+            if project is None:
+                raise RuntimeError("Project not found")
+
+            if project.library_type == LibraryType.PURE:
+                # Pure mode: stop after download. The user draws the
+                # subtitle/watermark zones on the Cleanup page; scene
+                # detection runs afterwards on the cleaned video.
+                from ..models.project import ProjectPhase
+
+                project.phase = ProjectPhase.CLEANUP
+                project.original_video_path = project.video_path
+                ProjectService.save(project)
+                await self._set_job_state(
+                    job,
+                    status="complete",
+                    phase="complete",
+                    progress=1.0,
+                    message="Download complete — cleanup ready.",
+                    error=None,
+                    ready_url=f"/project/{project_id}/cleanup",
+                )
+                return
 
             async for progress in SceneDetectorService.detect_project_scenes(
                 project_id,

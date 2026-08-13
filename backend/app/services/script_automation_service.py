@@ -13,7 +13,7 @@ from typing import Any, AsyncIterator
 from pydub import AudioSegment
 
 from ..config import settings
-from ..library_types import resolve_static_overlay_title
+from ..library_types import LibraryType, resolve_static_overlay_title
 from ..models import (
     METADATA_TITLE_CANDIDATE_COUNT,
     METADATA_TITLE_MAX_CHARS,
@@ -851,7 +851,10 @@ class ScriptAutomationService:
                 fixed_category=fixed_category,
             )
 
-        anime_name = project.anime_name or "Inconnu"
+        # Pure projects have no known source work; the pure prompt templates
+        # carry no [OEUVRE] token, so an empty name never reaches the LLM.
+        default_name = "" if project.library_type == LibraryType.PURE else "Inconnu"
+        anime_name = project.anime_name or default_name
         script_summary = cls._script_text_from_payload(script_payload)
         prompt = ScriptPhasePromptService.build_overlay_prompt(
             anime_name=anime_name,
@@ -1159,7 +1162,12 @@ class ScriptAutomationService:
                 yield cls._event("llm_metadata", message=f"Generating metadata JSON ({project.resolved_llm_preset_key()})...")
                 try:
                     metadata_prompt = MetadataService.build_prompt_from_script_payload(
-                        anime_name=project.anime_name or "Inconnu",
+                        anime_name=project.anime_name
+                        or (
+                            ""
+                            if project.library_type == LibraryType.PURE
+                            else "Inconnu"
+                        ),
                         script_payload=script_payload,
                         target_language=target_language,
                         library_type=project.library_type,

@@ -385,3 +385,31 @@ class TestNarratorResumeRegression:
         resumed = next(s for s in new_scenes if "After" in s.text)
         assert resumed.scene_index != cand.scene_index
         assert resumed.text == "After that"
+
+
+class TestPureSpeechPauseClassifier:
+    """Pure-mode gate (2026-08-12): Pure keeps detector-granularity scenes,
+    so inter-sentence breaths own whole tiny scenes and were flagged raw.
+    Anime behavior is untouched (pure_mode defaults to False)."""
+
+    WORDS = [(0.0, 5.0), (7.0, 12.0), (20.0, 25.0)]
+
+    def test_sub_second_span_is_pause(self):
+        assert RawSceneDetectorService._is_speech_pause(5.1, 5.9, self.WORDS)
+
+    def test_short_sandwiched_span_is_pause(self):
+        # 5.0 -> 7.0: 2.0s, words end at 5.0 and resume at 7.0 (adjacent).
+        assert RawSceneDetectorService._is_speech_pause(5.2, 6.9, self.WORDS)
+
+    def test_long_span_is_not_pause(self):
+        # 12.0 -> 20.0: 8s of genuine silence between narration blocks.
+        assert not RawSceneDetectorService._is_speech_pause(12.0, 20.0, self.WORDS)
+
+    def test_short_span_without_adjacent_words_is_not_pause(self):
+        # 2.4s span with the next word 5s away: not a sandwiched breath.
+        assert not RawSceneDetectorService._is_speech_pause(13.0, 15.4, self.WORDS)
+
+    def test_trailing_span_with_no_following_words(self):
+        # After the last word: no next word, so only the duration rule applies.
+        assert RawSceneDetectorService._is_speech_pause(25.0, 25.8, self.WORDS)
+        assert not RawSceneDetectorService._is_speech_pause(25.0, 27.0, self.WORDS)
