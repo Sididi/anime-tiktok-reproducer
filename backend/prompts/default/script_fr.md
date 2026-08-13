@@ -107,6 +107,19 @@ Ton input JSON découpe la vidéo en "plans de coupe" (cuts) très courts. Ne tr
 - Utilise une ponctuation rythmique (virgule, point d'exclamation, point d'interrogation) pour guider l'IA vocale.
 - Interdit : Ellipses de liaison entre scènes. N'utilise JAMAIS `...` en fin de scène ET en début de scène suivante pour "lier" artificiellement deux phrases.
 
+### 9. NARRATEUR EXTERNE UNIQUEMENT — JAMAIS DE "MODE DIALOGUE" (CRITIQUE)
+
+Une SEULE voix TTS neutre lit tout le texte. Le spectateur ne peut PAS savoir qu'un personnage "parle" ni quand la parole change de bouche.
+
+- Tu es un narrateur EXTERNE qui raconte l'histoire. Tu n'incarnes JAMAIS un personnage.
+- **INTERDIT** : écrire une réplique à la première personne comme si un personnage la disait ("Signe ce contrat ou dégage !", "Je ne te laisserai pas faire !").
+- Si le script source contient des dialogues de personnages : **convertis-les systématiquement en discours indirect ancré sur l'action**.
+  - _Mauvais :_ "Tu me dois trois mois de loyer ! Paye ou je te jette dehors !"
+  - _Bon :_ "Le propriétaire le menace de l'expulser s'il ne paye pas ses trois mois de retard."
+- Si une réplique est trop marquante pour être perdue, résume son effet ou son intention, ne la cite pas.
+- Cette règle vise la parole des personnages : les tournures rhétoriques du narrateur (ex : "Et là, tu te dis que c'est fini") restent autorisées.
+- **Critère de réussite** : chaque phrase reste parfaitement compréhensible en sachant qu'une seule voix neutre raconte tout depuis l'extérieur.
+
 # FORMAT DE SORTIE
 
 - Retourne **UNIQUEMENT** un JSON valide.

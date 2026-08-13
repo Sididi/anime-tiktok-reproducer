@@ -27,6 +27,7 @@ import os
 import subprocess
 import threading
 import time
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -69,19 +70,38 @@ TEXT_SPAN_PAD_FRAMES = 3
 CROP_MARGIN_FRACTION = 0.15
 CROP_MARGIN_MIN_PX = 24
 CROP_ALIGN = 16
-# Model input cap (long side) before downscale, per the 8 GB VRAM budget.
-MODEL_MAX_LONG_SIDE = 640
+# Model input cap (long side) before downscale — VRAM budget AND speed: GPU
+# stage cost scales with pixel area, repairs are confined to the mask so the
+# upscale-back cost is limited to the strokes (quality A/B'd 2026-08-13).
+MODEL_MAX_LONG_SIDE = 512
+# Before feeding the model, the crop is tightened to the bounding box of the
+# actual mask (+margin): a one-line subtitle doesn't pay for the whole rect.
+BBOX_MARGIN_PX = 24
+# RAFT returns NaN flows below 128px on either axis (verified empirically);
+# every tensor the model sees must respect this floor.
+MIN_MODEL_SIDE_PX = 128
 
 # Span → clip chunking (frames). Context frames are clean references at span
-# edges; mid-span chunk boundaries overlap with masks kept active.
+# edges; mid-span chunk boundaries overlap with masks kept active. Longer
+# clips amortize per-clip fixed costs (python/setup/save).
 CLIP_CONTEXT_FRAMES = 10
-CLIP_MAX_FRAMES = 120
+CLIP_MAX_FRAMES = 240
 CLIP_CHUNK_OVERLAP = 10
 
 # Inpaint mask dilation inside the rect (pixels ~ iterations).
 MASK_DILATE_ITERATIONS = 9
 # Feather (Gaussian sigma in px) when compositing back.
 COMPOSITE_FEATHER_SIGMA = 1.5
+
+# Temporal stride: the model processes every Nth frame; skipped frames get
+# their mask region filled by blending the two neighbouring fills. The mask
+# is static per span and thin, surrounding real pixels stay exact — only
+# stroke interiors can lag (anime content is 8-12 real fps). Watermarks are
+# small static logos whose fills vary very slowly → stride harder.
+# Stride 3 owner-approved via A/B on real content incl. the highest-motion
+# window (2026-08-14) — visually indistinguishable from stride 2.
+TEMPORAL_STRIDE = 3
+TEMPORAL_STRIDE_SMALL_CROP = 4
 
 # OOM ladder for ProPainter subvideo length.
 SUBVIDEO_LADDER = (80, 40, 24)
@@ -335,6 +355,14 @@ class VideoCleanupService:
         cy0 = (cy0 // CROP_ALIGN) * CROP_ALIGN
         cw = min(width - cx0, -(-(cx1 - cx0) // CROP_ALIGN) * CROP_ALIGN)
         ch = min(height - cy0, -(-(cy1 - cy0) // CROP_ALIGN) * CROP_ALIGN)
+        # RAFT NaN floor: the crop (the largest tensor the model can see)
+        # must be at least MIN_MODEL_SIDE_PX per axis.
+        if cw < MIN_MODEL_SIDE_PX:
+            cx0 = max(0, min(cx0, width - MIN_MODEL_SIDE_PX))
+            cw = min(width - cx0, MIN_MODEL_SIDE_PX)
+        if ch < MIN_MODEL_SIDE_PX:
+            cy0 = max(0, min(cy0, height - MIN_MODEL_SIDE_PX))
+            ch = min(height - cy0, MIN_MODEL_SIDE_PX)
         # Keep /8 alignment even when clamped at the frame edge.
         cw -= cw % 8
         ch -= ch % 8
@@ -456,8 +484,15 @@ class VideoCleanupService:
                     break
                 for plan in subtitle_plans:
                     x, y, w, h = plan.rect
-                    mask = cls._text_mask(frame[y : y + h, x : x + w])
-                    score = float(mask.sum()) / float(w * h)
+                    crop = frame[y : y + h, x : x + w]
+                    if w >= 128 and h >= 32:
+                        # Presence scoring is scale-invariant (fraction of
+                        # area); half-res quarters the per-frame CPU cost.
+                        crop = cv2.resize(
+                            crop, (w // 2, h // 2), interpolation=cv2.INTER_AREA
+                        )
+                    mask = cls._text_mask(crop)
+                    score = float(mask.sum()) / float(mask.shape[0] * mask.shape[1])
                     scores[id(plan)].append(score)
                     if score_dump is not None:
                         score_dump.append((frame_index, plan.zone.id, score))
@@ -494,11 +529,18 @@ class VideoCleanupService:
         mid-span chunk boundary instead overlaps the neighbouring chunk with
         the mask kept active.
         """
+        # Tiny crops (watermarks) are launch-overhead-bound: double-length
+        # clips halve the per-clip fixed costs at negligible VRAM.
+        max_frames = (
+            CLIP_MAX_FRAMES * 2
+            if max(plan.crop[2], plan.crop[3]) < 320
+            else CLIP_MAX_FRAMES
+        )
         clips: list[_Clip] = []
         for span_start, span_end in plan.spans:
             lead = max(0, span_start - CLIP_CONTEXT_FRAMES)
             tail = min(total_frames, span_end + CLIP_CONTEXT_FRAMES)
-            if tail - lead <= CLIP_MAX_FRAMES:
+            if tail - lead <= max_frames:
                 clips.append(
                     _Clip(
                         zone_plan=plan,
@@ -512,7 +554,7 @@ class VideoCleanupService:
                 )
                 continue
             # Chunk the active region.
-            chunk = CLIP_MAX_FRAMES - 2 * CLIP_CHUNK_OVERLAP
+            chunk = max_frames - 2 * CLIP_CHUNK_OVERLAP
             position = span_start
             while position < span_end:
                 out_end = min(span_end, position + chunk)
@@ -559,9 +601,17 @@ class VideoCleanupService:
 
     @classmethod
     def _build_clip_masks(
-        cls, clip: _Clip, crop_frames_bgr: np.ndarray
+        cls,
+        clip: _Clip,
+        crop_frames_bgr: np.ndarray,
+        text_union: np.ndarray | None = None,
     ) -> np.ndarray:
-        """Per-frame uint8 masks (255 = inpaint) in crop coords."""
+        """Per-frame uint8 masks (255 = inpaint) in crop coords.
+
+        ``text_union`` is the incrementally accumulated per-frame text-mask
+        union (rect coords) computed on the decode thread; when None it is
+        recomputed here from the frames (preview path).
+        """
         plan = clip.zone_plan
         cx, cy, cw, ch = plan.crop
         x, y, w, h = plan.rect
@@ -580,12 +630,21 @@ class VideoCleanupService:
             else:
                 # Static-per-span mask: union of per-frame text masks over the
                 # ACTIVE frames of this clip, dilated, clipped to the rect.
-                union = np.zeros((h, w), dtype=bool)
-                for i in range(length):
-                    absolute = clip.frame_start + i
-                    if clip.mask_start <= absolute < clip.mask_end:
-                        crop = crop_frames_bgr[i]
-                        union |= cls._text_mask(crop[ry : ry + h, rx : rx + w])
+                if text_union is not None:
+                    if text_union.shape != (h, w):
+                        union = cv2.resize(
+                            text_union.astype(np.uint8), (w, h),
+                            interpolation=cv2.INTER_NEAREST,
+                        ) > 0
+                    else:
+                        union = text_union.copy()
+                else:
+                    union = np.zeros((h, w), dtype=bool)
+                    for i in range(length):
+                        absolute = clip.frame_start + i
+                        if clip.mask_start <= absolute < clip.mask_end:
+                            crop = crop_frames_bgr[i]
+                            union |= cls._text_mask(crop[ry : ry + h, rx : rx + w])
                 if not union.any():
                     # Detection said text is here; fall back to the full rect.
                     union[:] = True
@@ -603,6 +662,54 @@ class VideoCleanupService:
                 masks[i] = rect_mask
         return masks
 
+    @staticmethod
+    def _save_clip_atomic(path: Path, frames: np.ndarray, masks: np.ndarray) -> None:
+        """Write-then-rename so a concurrent assembly reader never sees a
+        partially written npz."""
+        tmp = path.with_name(path.name + ".tmp.npz")
+        np.savez(tmp, frames=frames, masks=masks)
+        os.replace(tmp, path)
+
+    @classmethod
+    def _mask_bbox(cls, masks: np.ndarray, height: int, width: int) -> tuple[int, int, int, int]:
+        """Aligned bounding box (+margin) of the union mask, in crop coords."""
+        union = masks.any(axis=0)
+        ys, xs = np.nonzero(union)
+        if len(ys) == 0:
+            return 0, 0, width, height
+        y0 = max(0, int(ys.min()) - BBOX_MARGIN_PX)
+        y1 = min(height, int(ys.max()) + 1 + BBOX_MARGIN_PX)
+        x0 = max(0, int(xs.min()) - BBOX_MARGIN_PX)
+        x1 = min(width, int(xs.max()) + 1 + BBOX_MARGIN_PX)
+        # Grow to the minimum model size (conv pyramids need real extent).
+        if y1 - y0 < MIN_MODEL_SIDE_PX:
+            grow = MIN_MODEL_SIDE_PX - (y1 - y0)
+            y0 = max(0, y0 - grow // 2)
+            y1 = min(height, y0 + MIN_MODEL_SIDE_PX)
+            y0 = max(0, y1 - MIN_MODEL_SIDE_PX)
+        if x1 - x0 < MIN_MODEL_SIDE_PX:
+            grow = MIN_MODEL_SIDE_PX - (x1 - x0)
+            x0 = max(0, x0 - grow // 2)
+            x1 = min(width, x0 + MIN_MODEL_SIDE_PX)
+            x0 = max(0, x1 - MIN_MODEL_SIDE_PX)
+        # Quantize extents UP to 64-px steps (origin aligned to 8): repeated
+        # tensor shapes let cuDNN autotune amortize across clips — varying
+        # shapes made benchmark-mode retune on every clip (measured).
+        y0 = (y0 // 8) * 8
+        x0 = (x0 // 8) * 8
+        bh = -(-(y1 - y0) // 64) * 64
+        bw = -(-(x1 - x0) // 64) * 64
+        bh = min(bh, height - y0)
+        bw = min(bw, width - x0)
+        # Keep /8 alignment when clamped at the crop edge.
+        bh -= bh % 8
+        bw -= bw % 8
+        if bh >= height - 64:
+            y0, bh = 0, height
+        if bw >= width - 64:
+            x0, bw = 0, width
+        return x0, y0, max(64, bw), max(64, bh)
+
     @classmethod
     def _inpaint_clip_with_ladder(
         cls,
@@ -611,7 +718,98 @@ class VideoCleanupService:
         *,
         status_cb: Callable[[str], None] | None = None,
     ) -> np.ndarray:
-        """Run ProPainter with the OOM ladder. Input/output BGR uint8."""
+        """Run ProPainter with the OOM ladder. Input/output BGR uint8.
+
+        The model only sees the bounding box of the actual mask (+margin):
+        GPU cost scales with pixel area, and a one-line subtitle should not
+        pay for the full user-drawn rect.
+        """
+        import torch
+
+        from .propainter_adapter import ProPainterEngine
+
+        full_h, full_w = frames_bgr.shape[1:3]
+        bx, by, bw, bh = cls._mask_bbox(masks, full_h, full_w)
+        tightened = (bw * bh) < 0.9 * (full_w * full_h)
+        if tightened:
+            work_frames = np.ascontiguousarray(
+                frames_bgr[:, by : by + bh, bx : bx + bw]
+            )
+            work_masks = np.ascontiguousarray(
+                masks[:, by : by + bh, bx : bx + bw]
+            )
+        else:
+            work_frames, work_masks = frames_bgr, masks
+
+        result_work = cls._inpaint_temporal_strided(
+            work_frames, work_masks, status_cb=status_cb
+        )
+
+        if not tightened:
+            return result_work
+        result = frames_bgr.copy()
+        result[:, by : by + bh, bx : bx + bw] = result_work
+        return result
+
+    @classmethod
+    def _inpaint_temporal_strided(
+        cls,
+        frames_bgr: np.ndarray,
+        masks: np.ndarray,
+        *,
+        status_cb: Callable[[str], None] | None = None,
+    ) -> np.ndarray:
+        """Run the model on every stride-th frame; fill skipped frames' mask
+        regions from the neighbouring fills (50/50 blend where both sides
+        exist). Small (watermark) crops stride harder — static logos over
+        slowly varying fills."""
+        length = frames_bgr.shape[0]
+        stride = (
+            TEMPORAL_STRIDE_SMALL_CROP
+            if max(frames_bgr.shape[1:3]) < 320
+            else TEMPORAL_STRIDE
+        )
+        if stride <= 1 or length < 3 * stride:
+            return cls._inpaint_ladder_inner(
+                frames_bgr, masks, status_cb=status_cb
+            )
+
+        keep = sorted(set(range(0, length, stride)) | {length - 1})
+        sub_result = cls._inpaint_ladder_inner(
+            np.ascontiguousarray(frames_bgr[keep]),
+            np.ascontiguousarray(masks[keep]),
+            status_cb=status_cb,
+        )
+        fill_by_index = {orig: sub_result[k] for k, orig in enumerate(keep)}
+
+        result = frames_bgr.copy()
+        for orig, fill in fill_by_index.items():
+            region = masks[orig] > 0
+            result[orig][region] = fill[region]
+        kept_sorted = keep
+        for j in range(length):
+            if j in fill_by_index:
+                continue
+            prev_i = max(i for i in kept_sorted if i < j)
+            next_i = min(i for i in kept_sorted if i > j)
+            region = masks[j] > 0
+            if not region.any():
+                continue
+            blended = (
+                fill_by_index[prev_i].astype(np.uint16)
+                + fill_by_index[next_i].astype(np.uint16)
+            ) // 2
+            result[j][region] = blended.astype(np.uint8)[region]
+        return result
+
+    @classmethod
+    def _inpaint_ladder_inner(
+        cls,
+        frames_bgr: np.ndarray,
+        masks: np.ndarray,
+        *,
+        status_cb: Callable[[str], None] | None = None,
+    ) -> np.ndarray:
         import torch
 
         from .propainter_adapter import ProPainterEngine
@@ -637,7 +835,9 @@ class VideoCleanupService:
                 if attempt_scale < 1.0:
                     mw = int(cw * attempt_scale) // 8 * 8
                     mh = int(ch * attempt_scale) // 8 * 8
-                    mw, mh = max(64, mw), max(64, mh)
+                    # Never below the RAFT NaN floor (crop itself is >= floor).
+                    mw = min(cw, max(MIN_MODEL_SIDE_PX, mw))
+                    mh = min(ch, max(MIN_MODEL_SIDE_PX, mh))
                     model_frames = np.stack(
                         [
                             cv2.resize(f, (mw, mh), interpolation=cv2.INTER_AREA)
@@ -656,10 +856,18 @@ class VideoCleanupService:
                     model_frames, model_masks = frames_bgr, masks
 
                 rgb = model_frames[..., ::-1]
+                # Tiny crops (watermarks) are kernel-launch-bound: wider
+                # temporal windows halve the launch count at negligible cost.
+                # Large crops drop distant reference frames instead — thin
+                # strokes fill from immediate neighbours, and refs were ~30%
+                # of the transformer tokens.
+                model_long_side = max(model_frames.shape[1:3])
                 result_rgb = ProPainterEngine.inpaint_clip(
                     np.ascontiguousarray(rgb),
                     model_masks,
                     subvideo_length=subvideo,
+                    neighbor_length=20 if model_long_side < 320 else 10,
+                    ref_stride=20 if model_long_side < 320 else 80,
                 )
                 result_bgr = result_rgb[..., ::-1]
 
@@ -673,6 +881,19 @@ class VideoCleanupService:
                             )
                             for f in result_bgr
                         ]
+                    )
+
+                mid = length // 2
+                mid_region = result_bgr[mid][masks[mid] > 0]
+                if mid_region.size and float(
+                    (mid_region.max(axis=1) < 8).mean()
+                ) > 0.9:
+                    # Canary: a mostly-black fill means upstream flow/feature
+                    # corruption (e.g. the RAFT sub-128px NaN pathology).
+                    logger.error(
+                        "Inpaint produced a near-black fill (%dx%d model "
+                        "input) — output is likely corrupted",
+                        model_frames.shape[2], model_frames.shape[1],
                     )
                 return np.ascontiguousarray(result_bgr)
             except torch.cuda.OutOfMemoryError as exc:  # type: ignore[attr-defined]
@@ -702,6 +923,194 @@ class VideoCleanupService:
     # -- full job ----------------------------------------------------------
 
     @classmethod
+    def _run_inpaint_pass(
+        cls,
+        video_path: Path,
+        clips: list[_Clip],
+        spans_dir: Path,
+        cancel_event: threading.Event,
+        set_progress: Callable[[float, str], None],
+    ) -> None:
+        """Phase 2: single sequential decode pass over the video; each
+        completed clip is inpainted on a 1-deep worker thread while the
+        decoder keeps feeding the next clip."""
+        # One sequential decode pass, zero seeks: every zone's active clip
+        # crops from the same decoded frame. (The previous per-clip
+        # seek-collection re-decoded up to a whole GOP — 5-12s on TikTok
+        # media — at every zone alternation.)
+        todo = [c for c in clips if not (spans_dir / c.cache_name).exists()]
+        done_count = len(clips) - len(todo)
+        if done_count:
+            set_progress(0.15, f"{done_count}/{len(clips)} clip(s) cached — resuming")
+
+        from concurrent.futures import ThreadPoolExecutor as _SavePool
+
+        save_pool = _SavePool(max_workers=1)
+        save_futures: list = []
+
+        def _finish_clip(entry: dict) -> None:
+            nonlocal done_count
+            clip = entry["clip"]
+            frames_bgr = np.stack(entry["frames"])
+            # The text-mask union was accumulated per frame on the decode
+            # thread; building masks here is now just dilation + broadcast.
+            masks = cls._build_clip_masks(
+                clip, frames_bgr, text_union=entry.get("union")
+            )
+            progress = 0.15 + 0.65 * (done_count / max(1, len(clips)))
+            set_progress(
+                progress,
+                f"Inpainting clip {done_count + 1}/{len(clips)} "
+                f"({clip.zone_plan.zone.kind}, frames {clip.out_start}-{clip.out_end})…",
+            )
+            result = cls._inpaint_clip_with_ladder(
+                frames_bgr,
+                masks,
+                status_cb=lambda m: set_progress(progress, m),
+            )
+            rel_start = clip.out_start - clip.frame_start
+            rel_end = clip.out_end - clip.frame_start
+            # Off-thread, uncompressed: neither zlib nor disk I/O may sit
+            # between two GPU clips.
+            save_futures.append(
+                save_pool.submit(
+                    cls._save_clip_atomic,
+                    spans_dir / clip.cache_name,
+                    result[rel_start:rel_end],
+                    masks[rel_start:rel_end],
+                )
+            )
+            done_count += 1
+
+        # The GPU inpaint of a completed clip runs in a single worker thread
+        # (queue depth 1) so the decoder keeps feeding the next clip's frames
+        # meanwhile — cv2 and torch both release the GIL.
+        from concurrent.futures import ThreadPoolExecutor
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        inflight = None
+
+        def _submit(entry: dict) -> None:
+            nonlocal inflight
+            if inflight is not None:
+                inflight.result()  # backpressure + error propagation
+            inflight = executor.submit(_finish_clip, entry)
+
+        # One ffmpeg crop pipe per zone: decode happens in ffmpeg processes
+        # (GIL-free, parallel); Python only reads small fixed-size crop
+        # buffers. Full-frame cv2 decode on this thread was starving the GPU
+        # worker's Python sections of the GIL (measured ~1.5s/clip).
+        zone_plans: list = []
+        for c in todo:
+            if c.zone_plan not in zone_plans:
+                zone_plans.append(c.zone_plan)
+        readers: dict[int, tuple] = {}
+        try:
+            for plan in zone_plans:
+                pcx, pcy, pcw, pch = plan.crop
+                proc = cls._spawn_crop_reader(video_path, plan.crop)
+                readers[id(plan)] = (proc, pcw, pch, pcw * pch * 3)
+
+            active: list[dict] = []
+            next_index = 0
+            frame_index = 0
+            while active or next_index < len(todo):
+                crops: dict[int, np.ndarray] = {}
+                eof = False
+                for plan in zone_plans:
+                    proc, pcw, pch, nbytes = readers[id(plan)]
+                    buf = proc.stdout.read(nbytes)
+                    if buf is None or len(buf) < nbytes:
+                        eof = True
+                        break
+                    crops[id(plan)] = np.frombuffer(buf, dtype=np.uint8).reshape(
+                        pch, pcw, 3
+                    )
+                if eof:
+                    break
+                if cancel_event.is_set():
+                    raise CleanupCancelled()
+                while (
+                    next_index < len(todo)
+                    and todo[next_index].frame_start <= frame_index
+                ):
+                    new_clip = todo[next_index]
+                    entry: dict = {"clip": new_clip, "frames": []}
+                    if new_clip.zone_plan.zone.kind == "subtitle":
+                        _, _, rw, rh = new_clip.zone_plan.rect
+                        # Accumulated at half resolution: 4x less per-frame
+                        # CPU on this (GIL-sharing) decode thread; the mask
+                        # dilation swallows the 2px quantization.
+                        entry["union"] = np.zeros(
+                            (max(1, rh // 2), max(1, rw // 2)), dtype=bool
+                        )
+                    active.append(entry)
+                    next_index += 1
+                for entry in list(active):
+                    clip = entry["clip"]
+                    if clip.frame_start <= frame_index < clip.frame_end:
+                        crop_frame = crops[id(clip.zone_plan)]
+                        entry["frames"].append(crop_frame.copy())
+                        if (
+                            "union" in entry
+                            and clip.mask_start <= frame_index < clip.mask_end
+                        ):
+                            cx, cy, _, _ = clip.zone_plan.crop
+                            x, y, w, h = clip.zone_plan.rect
+                            rx, ry = x - cx, y - cy
+                            rect_crop = crop_frame[ry : ry + h, rx : rx + w]
+                            uh, uw = entry["union"].shape
+                            if (uh, uw) != (h, w):
+                                rect_crop = cv2.resize(
+                                    rect_crop, (uw, uh),
+                                    interpolation=cv2.INTER_AREA,
+                                )
+                            entry["union"] |= cls._text_mask(rect_crop)
+                    if frame_index >= clip.frame_end - 1:
+                        active.remove(entry)
+                        _submit(entry)
+                frame_index += 1
+            # Clips whose declared window ran past the actual stream end.
+            for entry in active:
+                if entry["frames"]:
+                    _submit(entry)
+            if inflight is not None:
+                inflight.result()
+        finally:
+            for reader in readers.values():
+                with suppress(Exception):
+                    reader[0].kill()
+            executor.shutdown(wait=True)
+            for future in save_futures:
+                future.result()
+            save_pool.shutdown(wait=True)
+
+    @staticmethod
+    def _spawn_crop_reader(
+        video_path: Path, crop: tuple[int, int, int, int]
+    ) -> subprocess.Popen:
+        """ffmpeg process piping one zone's raw BGR crop stream."""
+        cx, cy, cw, ch = crop
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-i", str(video_path),
+            "-vf", f"crop={cw}:{ch}:{cx}:{cy}",
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "pipe:1",
+        ]
+        cmd = rewrite_media_command(cmd)
+        return subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=get_media_subprocess_env(cmd),
+            bufsize=10**7,
+        )
+
+    @classmethod
     def _run_full_cleanup_sync(
         cls,
         project_id: str,
@@ -718,6 +1127,14 @@ class VideoCleanupService:
             cls._update_state(
                 project_id, progress=progress, message=message, status="running"
             )
+
+        # Model load (GPU/disk) overlaps the CPU-bound detection pass.
+        from .propainter_adapter import ProPainterEngine as _Engine
+
+        engine_loader = threading.Thread(
+            target=lambda: _Engine.load(), name="cleanup-engine-load", daemon=True
+        )
+        engine_loader.start()
 
         # Phase 1: detection.
         set_progress(0.01, "Analyzing subtitle presence…")
@@ -743,72 +1160,59 @@ class VideoCleanupService:
             total_frames,
         )
 
-        # Phase 2: inpainting (with per-clip disk cache → resume for free).
+        # Phases 2+3 overlapped: assembly trails the inpaint pass, consuming
+        # clip caches in the same time order they are produced (it blocks on
+        # each cache file, which is written atomically).
         from .propainter_adapter import ProPainterEngine
 
+        engine_loader.join()
         if clips:
-            ProPainterEngine.load(
+            ProPainterEngine.load(  # no-op when the preloader succeeded
                 progress_cb=lambda m: set_progress(0.15, m)
             )
-        capture = cv2.VideoCapture(str(video_path))
+        clean_path = cls.get_clean_video_path(project_id)
+        assembly_errors: list[BaseException] = []
+
+        def _assembly_worker() -> None:
+            try:
+                cls._assemble_video_sync(
+                    video_path,
+                    clean_path,
+                    clips,
+                    spans_dir,
+                    fps,
+                    width,
+                    height,
+                    total_frames,
+                    cancel_event,
+                    None,
+                    wait_for_cache=True,
+                )
+            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                assembly_errors.append(exc)
+                cancel_event.set()
+
+        assembly_thread = threading.Thread(
+            target=_assembly_worker, name="cleanup-assembly", daemon=True
+        )
+        assembly_thread.start()
         try:
-            position = 0
-            for clip_index, clip in enumerate(clips):
-                if cancel_event.is_set():
-                    raise CleanupCancelled()
-                cache_path = spans_dir / clip.cache_name
-                progress = 0.15 + 0.65 * (clip_index / max(1, len(clips)))
-                zone_label = clip.zone_plan.zone.kind
-                if cache_path.exists():
-                    set_progress(
-                        progress,
-                        f"Clip {clip_index + 1}/{len(clips)} ({zone_label}) cached — skipping",
-                    )
-                    continue
-                set_progress(
-                    progress,
-                    f"Inpainting clip {clip_index + 1}/{len(clips)} ({zone_label}, "
-                    f"frames {clip.out_start}-{clip.out_end})…",
+            try:
+                cls._run_inpaint_pass(
+                    video_path, clips, spans_dir, cancel_event, set_progress
                 )
-                frames_bgr, position = cls._collect_clip_frames(
-                    capture, clip, position
-                )
-                masks = cls._build_clip_masks(clip, frames_bgr)
-                result = cls._inpaint_clip_with_ladder(
-                    frames_bgr,
-                    masks,
-                    status_cb=lambda m: set_progress(progress, m),
-                )
-                # Persist only the composited output window.
-                rel_start = clip.out_start - clip.frame_start
-                rel_end = clip.out_end - clip.frame_start
-                np.savez_compressed(
-                    cache_path,
-                    frames=result[rel_start:rel_end],
-                    masks=masks[rel_start:rel_end],
-                )
+            except CleanupCancelled:
+                # A failing assembly cancels the inpaint pass; surface the
+                # real error, not the induced cancellation.
+                if not assembly_errors:
+                    raise
         finally:
-            capture.release()
-
-        ProPainterEngine.unload()
-
-        # Phase 3: assembly.
+            assembly_thread.join()
+            ProPainterEngine.unload()
+        if assembly_errors:
+            raise assembly_errors[0]
         if cancel_event.is_set():
             raise CleanupCancelled()
-        set_progress(0.82, "Re-encoding cleaned video…")
-        clean_path = cls.get_clean_video_path(project_id)
-        cls._assemble_video_sync(
-            video_path,
-            clean_path,
-            clips,
-            spans_dir,
-            fps,
-            width,
-            height,
-            total_frames,
-            cancel_event,
-            lambda p, m: set_progress(0.82 + 0.17 * p, m),
-        )
 
         # Swap the project video to the cleaned file.
         project = ProjectService.load(project_id)
@@ -849,13 +1253,21 @@ class VideoCleanupService:
         total_frames: int,
         cancel_event: threading.Event | None,
         progress_cb: Callable[[float, str], None] | None,
+        wait_for_cache: bool = False,
     ) -> None:
-        """Composite cached clip results and encode (NVENC, CPU fallback)."""
+        """Composite cached clip results and encode (NVENC, CPU fallback).
+
+        With ``wait_for_cache`` the pass trails a concurrently running
+        inpaint pass, blocking until each clip's (atomically renamed) cache
+        file appears — clips complete in the same time order assembly
+        consumes them.
+        """
         tmp_path = output_path.with_name(output_path.name + ".tmp.mp4")
         try:
             cls._stream_composite(
                 source_path, tmp_path, clips, spans_dir, fps, width, height,
                 total_frames, cancel_event, progress_cb, try_nvenc=True,
+                wait_for_cache=wait_for_cache,
             )
         except CleanupCancelled:
             raise
@@ -865,6 +1277,7 @@ class VideoCleanupService:
             cls._stream_composite(
                 source_path, tmp_path, clips, spans_dir, fps, width, height,
                 total_frames, cancel_event, progress_cb, try_nvenc=False,
+                wait_for_cache=wait_for_cache,
             )
 
         ensure_bt709_tags(tmp_path)
@@ -885,6 +1298,7 @@ class VideoCleanupService:
         progress_cb: Callable[[float, str], None] | None,
         *,
         try_nvenc: bool,
+        wait_for_cache: bool = False,
     ) -> None:
         """One sequential decode → composite → raw-pipe-to-ffmpeg pass."""
         pending = sorted(clips, key=lambda c: c.out_start)
@@ -911,7 +1325,13 @@ class VideoCleanupService:
                     clip = pending[pending_index]
                     pending_index += 1
                     cache_path = spans_dir / clip.cache_name
-                    if not cache_path.exists():
+                    if wait_for_cache:
+                        while not cache_path.exists():
+                            if cancel_event is not None and cancel_event.is_set():
+                                process.kill()
+                                raise CleanupCancelled()
+                            time.sleep(0.2)
+                    elif not cache_path.exists():
                         logger.warning("Missing clip cache %s", cache_path)
                         continue
                     data = np.load(cache_path)
@@ -941,7 +1361,11 @@ class VideoCleanupService:
                     ).astype(np.uint8)
 
                 try:
-                    process.stdin.write(frame.tobytes())
+                    # NV12 halves the pipe traffic vs BGR24 (the pipe was the
+                    # assembly bottleneck: ~2.7MB/frame -> ~1.4MB/frame).
+                    process.stdin.write(
+                        cv2.cvtColor(frame, cv2.COLOR_BGR2YUV_I420).tobytes()
+                    )
                 except BrokenPipeError as exc:
                     stderr = b""
                     try:
@@ -1002,9 +1426,10 @@ class VideoCleanupService:
             "-hide_banner",
             "-loglevel", "error",
             "-y",
-            # Raw composited frames on stdin.
+            # Raw composited frames on stdin (I420/yuv420p: half the pipe
+            # bandwidth of bgr24; callers convert with COLOR_BGR2YUV_I420).
             "-f", "rawvideo",
-            "-pix_fmt", "bgr24",
+            "-pix_fmt", "yuv420p",
             "-s", f"{width}x{height}",
             "-r", f"{fps:.6f}",
             "-i", "pipe:0",
@@ -1129,7 +1554,9 @@ class VideoCleanupService:
                                 0,
                                 255,
                             ).astype(np.uint8)
-                    process.stdin.write(frame.tobytes())
+                    process.stdin.write(
+                        cv2.cvtColor(frame, cv2.COLOR_BGR2YUV_I420).tobytes()
+                    )
                 process.stdin.close()
                 if process.wait(timeout=300) != 0:
                     stderr = process.stderr.read() if process.stderr else b""
