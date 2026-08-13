@@ -668,6 +668,87 @@ class SocialUploadService:
             return 16 * 1024 * 1024  # 16MB chunks
         return 8 * 1024 * 1024  # 8MB for smaller files
 
+    _YOUTUBE_PROCESSING_POLL_SECONDS = 20.0
+    _YOUTUBE_PROCESSING_MAX_WAIT_SECONDS = 600.0
+
+    @classmethod
+    def _wait_for_youtube_processing(
+        cls,
+        youtube,
+        video_id: str,
+        deadline: float | None,
+        *,
+        poll_seconds: float = _YOUTUBE_PROCESSING_POLL_SECONDS,
+        max_wait_seconds: float = _YOUTUBE_PROCESSING_MAX_WAIT_SECONDS,
+    ) -> tuple[str, str | None, float]:
+        """Poll processingDetails until a terminal status, timeout, or deadline.
+
+        Returns (last processingStatus, thumbnailsAvailability, seconds waited);
+        status is "unknown" when a poll itself fails. Never raises.
+        """
+        waited = 0.0
+        availability: str | None = None
+        while True:
+            status = "unknown"
+            try:
+                response = cls._execute_google_request(
+                    youtube,
+                    youtube.videos().list(
+                        part="processingDetails", id=video_id, maxResults=1
+                    ),
+                    deadline=deadline,
+                    platform="YouTube",
+                    operation="processing status poll",
+                )
+                items = response.get("items") or []
+                if items:
+                    details = items[0].get("processingDetails") or {}
+                    status = str(details.get("processingStatus") or "unknown")
+                    availability = details.get("thumbnailsAvailability") or availability
+            except Exception:
+                pass
+            logger.info(
+                "YouTube processing poll: video=%s status=%s thumbnailsAvailability=%s waited=%.0fs",
+                video_id, status, availability, waited,
+            )
+            if status in ("succeeded", "failed", "terminated"):
+                return status, availability, waited
+            if waited + poll_seconds > max_wait_seconds:
+                return status, availability, waited
+            if deadline is not None and time.monotonic() + poll_seconds >= deadline:
+                return status, availability, waited
+            time.sleep(poll_seconds)
+            waited += poll_seconds
+
+    @classmethod
+    def _set_youtube_thumbnail_after_processing(
+        cls,
+        youtube,
+        video_id: str,
+        image_path: Path,
+        deadline: float | None,
+    ) -> str | None:
+        """Wait for YouTube processing to finish, then set the thumbnail.
+
+        A thumbnails.set issued while the video is still processing races
+        YouTube's own thumbnail generation and the visible Shorts cover can
+        end up auto-selected (observed 2026-08-13; a later re-set fixed it).
+        Timeout, deadline pressure, or an unconfirmable status degrade to
+        setting immediately, which is the pre-fix behavior.
+        """
+        status, _availability, waited = cls._wait_for_youtube_processing(
+            youtube, video_id, deadline
+        )
+        warning = cls._set_youtube_thumbnail(youtube, video_id, image_path, deadline)
+        if warning is not None:
+            return warning
+        if status != "succeeded":
+            return (
+                "Miniature appliquée sans confirmation du traitement YouTube "
+                f"(statut {status} après {int(waited)}s)"
+            )
+        return None
+
     @classmethod
     def _set_youtube_thumbnail(
         cls,
@@ -897,7 +978,7 @@ class SocialUploadService:
 
                 thumbnail_warning: str | None = None
                 if thumbnail_image_path is not None and thumbnail_image_path.exists():
-                    thumbnail_warning = cls._set_youtube_thumbnail(
+                    thumbnail_warning = cls._set_youtube_thumbnail_after_processing(
                         youtube, video_id, thumbnail_image_path, deadline
                     )
 

@@ -195,3 +195,165 @@ def test_set_facebook_thumbnail_failure_returns_warning(tmp_path):
     )
     assert warning is not None
     assert "Miniature Facebook" in warning
+
+
+# ---- processing-aware thumbnail set (YouTube Shorts cover race fix) ----
+
+class _FakeYouTubeProcessing:
+    """videos().list() stub; responses are injected via _execute_google_request."""
+
+    def videos(self):
+        return self
+
+    def list(self, **kwargs):
+        return {"list_kwargs": kwargs}
+
+
+def _processing_response(status: str, availability: str | None = "available") -> dict:
+    details: dict = {"processingStatus": status}
+    if availability is not None:
+        details["thumbnailsAvailability"] = availability
+    return {"items": [{"processingDetails": details}]}
+
+
+def _patch_processing_polls(monkeypatch, responses):
+    """Each poll pops the next response; exceptions in the list are raised."""
+    queue = list(responses)
+
+    def fake_exec(cls, youtube, request, **kwargs):
+        item = queue.pop(0) if len(queue) > 1 else queue[0]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    from app.services.social_upload_service import SocialUploadService as svc
+    monkeypatch.setattr(svc, "_execute_google_request", classmethod(fake_exec))
+
+
+def _patch_sleep(monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        "app.services.social_upload_service.time.sleep",
+        lambda seconds: sleeps.append(seconds),
+    )
+    return sleeps
+
+
+def test_wait_for_processing_returns_after_success(monkeypatch):
+    from app.services.social_upload_service import SocialUploadService
+
+    _patch_processing_polls(monkeypatch, [
+        _processing_response("processing"),
+        _processing_response("processing"),
+        _processing_response("succeeded"),
+    ])
+    sleeps = _patch_sleep(monkeypatch)
+    status, availability, waited = SocialUploadService._wait_for_youtube_processing(
+        _FakeYouTubeProcessing(), "vid123", None,
+        poll_seconds=5.0, max_wait_seconds=60.0,
+    )
+    assert status == "succeeded"
+    assert availability == "available"
+    assert waited == 10.0
+    assert sleeps == [5.0, 5.0]
+
+
+def test_wait_for_processing_times_out_while_processing(monkeypatch):
+    from app.services.social_upload_service import SocialUploadService
+
+    _patch_processing_polls(monkeypatch, [_processing_response("processing")])
+    _patch_sleep(monkeypatch)
+    status, availability, waited = SocialUploadService._wait_for_youtube_processing(
+        _FakeYouTubeProcessing(), "vid123", None,
+        poll_seconds=5.0, max_wait_seconds=10.0,
+    )
+    assert status == "processing"
+    assert waited == 10.0
+
+
+def test_wait_for_processing_poll_errors_never_raise(monkeypatch):
+    from app.services.social_upload_service import SocialUploadService
+
+    _patch_processing_polls(monkeypatch, [RuntimeError("boom")])
+    _patch_sleep(monkeypatch)
+    status, availability, waited = SocialUploadService._wait_for_youtube_processing(
+        _FakeYouTubeProcessing(), "vid123", None,
+        poll_seconds=5.0, max_wait_seconds=10.0,
+    )
+    assert status == "unknown"
+    assert availability is None
+
+
+def test_wait_for_processing_terminal_failure_returns_immediately(monkeypatch):
+    from app.services.social_upload_service import SocialUploadService
+
+    _patch_processing_polls(monkeypatch, [_processing_response("failed", None)])
+    sleeps = _patch_sleep(monkeypatch)
+    status, _availability, waited = SocialUploadService._wait_for_youtube_processing(
+        _FakeYouTubeProcessing(), "vid123", None,
+        poll_seconds=5.0, max_wait_seconds=60.0,
+    )
+    assert status == "failed"
+    assert waited == 0.0
+    assert sleeps == []
+
+
+def test_set_after_processing_success_is_silent(monkeypatch, tmp_path):
+    from app.services.social_upload_service import SocialUploadService
+
+    monkeypatch.setattr(
+        SocialUploadService, "_wait_for_youtube_processing",
+        classmethod(lambda cls, yt, vid, deadline: ("succeeded", "available", 40.0)),
+    )
+    calls = []
+    monkeypatch.setattr(
+        SocialUploadService, "_set_youtube_thumbnail",
+        classmethod(lambda cls, yt, vid, image, deadline: calls.append(vid) or None),
+    )
+    image = tmp_path / "thumb.jpg"
+    image.write_bytes(b"\xff\xd8\xff\xd9")
+    warning = SocialUploadService._set_youtube_thumbnail_after_processing(
+        _FakeYouTubeProcessing(), "vid123", image, None,
+    )
+    assert warning is None
+    assert calls == ["vid123"]
+
+
+def test_set_after_processing_unconfirmed_status_noted_in_french(monkeypatch, tmp_path):
+    from app.services.social_upload_service import SocialUploadService
+
+    monkeypatch.setattr(
+        SocialUploadService, "_wait_for_youtube_processing",
+        classmethod(lambda cls, yt, vid, deadline: ("processing", None, 600.0)),
+    )
+    monkeypatch.setattr(
+        SocialUploadService, "_set_youtube_thumbnail",
+        classmethod(lambda cls, yt, vid, image, deadline: None),
+    )
+    image = tmp_path / "thumb.jpg"
+    image.write_bytes(b"\xff\xd8\xff\xd9")
+    warning = SocialUploadService._set_youtube_thumbnail_after_processing(
+        _FakeYouTubeProcessing(), "vid123", image, None,
+    )
+    assert warning is not None
+    assert "traitement" in warning
+    assert "processing" in warning
+
+
+def test_set_after_processing_set_failure_takes_priority(monkeypatch, tmp_path):
+    from app.services.social_upload_service import SocialUploadService
+
+    monkeypatch.setattr(
+        SocialUploadService, "_wait_for_youtube_processing",
+        classmethod(lambda cls, yt, vid, deadline: ("processing", None, 600.0)),
+    )
+    monkeypatch.setattr(
+        SocialUploadService, "_set_youtube_thumbnail",
+        classmethod(lambda cls, yt, vid, image, deadline: "Miniature YouTube non appliquée: boom"),
+    )
+    image = tmp_path / "thumb.jpg"
+    image.write_bytes(b"\xff\xd8\xff\xd9")
+    warning = SocialUploadService._set_youtube_thumbnail_after_processing(
+        _FakeYouTubeProcessing(), "vid123", image, None,
+    )
+    assert warning == "Miniature YouTube non appliquée: boom"
