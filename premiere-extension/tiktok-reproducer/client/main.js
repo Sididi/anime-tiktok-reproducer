@@ -32,6 +32,7 @@
   var SETTINGS_PATH = path.join(STATE_DIR, "settings.json");
 
   var atrConstants = require(getClientFilePath("constants.js"));
+  var lanTrigger = require(getClientFilePath("lan_trigger.js"));
   var hostRpcModule = require(getClientFilePath("host_rpc.js"));
   var hostRpc = hostRpcModule.createHostRpc(function (script, callback) {
     cs.evalScript(script, callback);
@@ -3490,7 +3491,7 @@
       completion_notified_at: null,
       batch_queue_state: acceptance.is_sleeping ? "sleeping" : "active",
     };
-    if (source === "http") {
+    if (source === "http" || source === "lan") {
       nextPatch.orchestration_metrics =
         getOrchestrationMetricsHelper().createInitialMetrics(
           queueOptions.httpReceivedAt || nowIso(),
@@ -4345,6 +4346,8 @@
       server_started: !!localServerStarted,
       server_error: localServerError,
       port: settings.port,
+      listen_host: lanTrigger.getListenHost(settings),
+      lan_auto_trigger_enabled: lanTrigger.isEnabled(settings),
       drive_configured: isDriveConfigured(),
       batch_phase: getBatchPhase(),
       active_batch_projects: getTrackedBatchProjectIds().length,
@@ -4360,6 +4363,69 @@
   function handleLocalRequest(req, res) {
     var parsed = url.parse(req.url || "", true);
     var pathname = parsed.pathname || "/";
+    var lanRoute = lanTrigger.matchRoute(req.method, pathname);
+
+    if (lanRoute) {
+      if (!lanTrigger.isEnabled(settings)) {
+        respondJson(res, 503, {
+          ok: false,
+          error: "LAN auto-trigger is not configured",
+        });
+        return;
+      }
+      if (!lanTrigger.isAuthorized(req, settings)) {
+        respondJson(res, 401, { ok: false, error: "Invalid LAN token" });
+        return;
+      }
+
+      if (lanRoute.type === "ping") {
+        respondJson(res, 200, {
+          ok: true,
+          api_version: lanTrigger.API_VERSION,
+          service: "atr-cep-trigger",
+          batch_phase: getBatchPhase(),
+        });
+        return;
+      }
+
+      if (lanRoute.type === "start_project") {
+        var lanReceivedAt = nowIso();
+        try {
+          var accepted = queueDownloadImport(lanRoute.project_id, "lan", {
+            httpReceivedAt: lanReceivedAt,
+          });
+          var acceptedState = getProjectState(lanRoute.project_id) || {};
+          respondJson(res, 202, {
+            ok: true,
+            accepted: accepted,
+            duplicate: !accepted,
+            project_id: lanRoute.project_id,
+            status: acceptedState.status || null,
+            queue_state: acceptedState.batch_queue_state || null,
+            batch_phase: getBatchPhase(),
+          });
+          log(
+            "LAN auto-trigger received for project " + lanRoute.project_id,
+            "info",
+          );
+        } catch (lanErr) {
+          respondJson(res, 400, { ok: false, error: String(lanErr.message) });
+        }
+        return;
+      }
+    }
+
+    // Binding to 0.0.0.0 is required for the authenticated LAN API. Keep the
+    // historical browser endpoints local-only so exposing the listener does
+    // not also expose project state or an unauthenticated trigger.
+    var remoteAddress =
+      (req.socket && req.socket.remoteAddress) ||
+      (req.connection && req.connection.remoteAddress) ||
+      "";
+    if (!lanTrigger.isLoopbackAddress(remoteAddress)) {
+      respondJson(res, 403, { error: "Local endpoint" });
+      return;
+    }
 
     if (pathname === "/health") {
       respondJson(res, 200, buildHealthPayload());
@@ -4465,11 +4531,16 @@
           settleOnce();
         });
 
-        server.listen(settings.port, "127.0.0.1", function () {
+        var listenHost = lanTrigger.getListenHost(settings);
+        server.listen(settings.port, listenHost, function () {
           localServerStarted = true;
           localServerError = null;
           log(
-            "Local server listening on http://127.0.0.1:" + settings.port,
+            (lanTrigger.isEnabled(settings) ? "Local/LAN" : "Local") +
+              " server listening on " +
+              listenHost +
+              ":" +
+              settings.port,
             "info",
           );
           updateGlobalStatus();

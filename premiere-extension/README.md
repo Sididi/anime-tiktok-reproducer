@@ -46,6 +46,10 @@ network hiccup never poisons later jobs.
   `http://arch-sid.local:8000`, so it survives IP changes)
 - `LAN token` = the same value as the backend's `ATR_LAN_TRANSFER_TOKEN`
 
+With both fields configured, the CEP HTTP listener also binds to the LAN for
+authenticated automatic project starts. The local Discord URL continues to
+work unchanged.
+
 **Disable:** clear `LAN base URL`. The panel then behaves exactly as before
 (Drive only) with no probe.
 
@@ -74,6 +78,36 @@ The panel runs a local server bound to `127.0.0.1` with endpoints:
 - `GET /health`
 - `GET /p/{project_id}`
 - `GET /status/{project_id}`
+
+When LAN mode is configured, the same server listens on all network interfaces,
+but these historical endpoints remain restricted to requests originating from
+the Premiere computer. This preserves the existing Discord-link behavior.
+
+## Automatic LAN Trigger (Backend -> CEP)
+
+With a non-empty `LAN base URL` and `LAN token`, the backend can start a ready
+project without anyone opening its Discord URL:
+
+`POST http://<premiere-host>:48653/api/lan/projects/{project_id}/start`
+
+Send the shared token in the `X-ATR-LAN-Token` header. A successful request
+returns HTTP 202. `accepted: true` means the project was newly accepted;
+`duplicate: true` means it was already seen in the current Premiere session.
+
+The endpoint calls the same project intake used by `/p/{project_id}`. During
+the intake phase it enters the normal download/import queue. During export,
+cleanup, final acknowledgement, or a blocked batch it enters the sleeping
+queue and is promoted after the current batch finishes.
+
+The backend can check reachability and API compatibility first with:
+
+`GET http://<premiere-host>:48653/api/lan/ping`
+
+This request uses the same token header and returns `api_version: 1`. Use the
+Premiere computer's mDNS hostname where available (for example,
+`premiere-pc.local`) so DHCP address changes do not break the trigger. Allow
+inbound TCP traffic to the configured CEP port from the backend computer in
+the Premiere computer's firewall.
 
 On `/p/{project_id}`:
 1. resolve Drive folder `SPM_*_{project_id}` under configured parent,
