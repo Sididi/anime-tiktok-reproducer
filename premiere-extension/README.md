@@ -131,6 +131,7 @@ The historical flow still works:
 
 ## Troubleshooting
 
+- **Host build mismatch / automation disabled**: reinstall the extension and restart Premiere Pro. The panel intentionally refuses automatic work when its JavaScript and the loaded persistent `host.jsx` are from different builds.
 - **Port already in use**: panel logs an explicit error and does not auto-switch port.
 - **Drive ambiguous match**: if multiple `SPM_*_{project_id}` folders match, job is rejected.
 - **No upload after export**: verify export path is exactly `output.mp4` in downloaded project root.

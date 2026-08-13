@@ -10,7 +10,7 @@
  */
 
 module.exports = {
-  ATR_BUILD_ID: "2026-08-11-single-roundtrip-v12",
+  ATR_BUILD_ID: "2026-08-13-host-rpc-v13",
 
   OUTPUT_FILENAME: "output.mp4",
   AUDIO_NO_MUSIC_OUTPUT_FILENAME: "output_no_music.wav",

@@ -7,7 +7,7 @@
 
 var ATR_EXTENSION_ID = "com.animetiktok.tiktokreproducer.panel";
 // Must stay in sync with ATR_BUILD_ID in client/constants.js.
-var ATR_HOST_BUILD_ID = "2026-08-11-single-roundtrip-v12";
+var ATR_HOST_BUILD_ID = "2026-08-13-host-rpc-v13";
 // Separates runScript()'s status from the non-fatal warnings the executed
 // script published. Must stay in sync with HOST_RUN_WARNING_SEPARATOR in
 // client/main.js.
@@ -2274,6 +2274,14 @@ function ATR_getLastImportWarnings() {
     $.global.__ATR_IMPORT_WARNINGS__ = "";
   } catch (eResetImportWarnings) {}
   return warningsText;
+}
+
+/**
+ * Return the loaded host script build so the panel can reject stale mixed
+ * client/host deployments before accepting automated work.
+ */
+function ATR_getHostBuildId() {
+  return ATR_HOST_BUILD_ID;
 }
 
 /**

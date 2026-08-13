@@ -32,6 +32,10 @@
   var SETTINGS_PATH = path.join(STATE_DIR, "settings.json");
 
   var atrConstants = require(getClientFilePath("constants.js"));
+  var hostRpcModule = require(getClientFilePath("host_rpc.js"));
+  var hostRpc = hostRpcModule.createHostRpc(function (script, callback) {
+    cs.evalScript(script, callback);
+  });
 
   var DEFAULT_PORT = 48653;
   var OUTPUT_FILENAME = atrConstants.OUTPUT_FILENAME;
@@ -71,6 +75,9 @@
   var AME_CLEAR_RETRY_DELAY_MS = 2000;
   var VOLATILE_STATE_WRITE_DELAY_MS = 2000;
   var VOLATILE_RENDER_DELAY_MS = 150;
+  var HOST_PRIORITY_HANDSHAKE = 200;
+  var HOST_PRIORITY_IMPORT = 100;
+  var HOST_PRIORITY_BACKGROUND = -100;
 
   var DEFAULT_SETTINGS = {
     client_id: "",
@@ -168,6 +175,11 @@
   var ffprobeAvailable = false;
   var ffmpegAvailabilityChecked = false;
   var ffmpegAvailable = false;
+  var hostCompatibility = {
+    status: "checking",
+    host_build_id: null,
+    error: null,
+  };
 
   // --- Utility ---
 
@@ -1728,12 +1740,12 @@
 
   // --- Host eval ---
 
-  function evalHost(script) {
-    return new Promise(function (resolve) {
-      cs.evalScript(script, function (result) {
-        resolve(result || "");
-      });
-    });
+  function evalHost(script, options) {
+    var opts = options || {};
+    if (!isHostCompatible() && !opts.allowBeforeCompatibilityCheck) {
+      return Promise.reject(buildHostCompatibilityError());
+    }
+    return hostRpc.call(script, options);
   }
 
   // Long host scripts (an import runs for minutes) own the single ExtendScript
@@ -1747,10 +1759,78 @@
       hostScriptRunsInFlight = Math.max(0, hostScriptRunsInFlight - 1);
       return value;
     }
-    return evalHost(script).then(release, function (err) {
+    return evalHost(script, {
+      label: "JSX import",
+      priority: HOST_PRIORITY_IMPORT,
+    }).then(release, function (err) {
       release();
       throw err;
     });
+  }
+
+  function isHostCompatible() {
+    return hostCompatibility.status === "compatible";
+  }
+
+  function buildHostCompatibilityError() {
+    if (hostCompatibility.error) {
+      return new Error(hostCompatibility.error);
+    }
+    if (hostCompatibility.status === "checking") {
+      return new Error("Premiere host compatibility check is still running");
+    }
+    return new Error(
+      "Premiere host script is incompatible with panel build " +
+        PANEL_BUILD_ID +
+        ". Reinstall the extension and restart Premiere Pro.",
+    );
+  }
+
+  function verifyHostCompatibility() {
+    hostCompatibility = {
+      status: "checking",
+      host_build_id: null,
+      error: null,
+    };
+
+    return evalHost("ATR_getHostBuildId()", {
+      label: "Host build handshake",
+      priority: HOST_PRIORITY_HANDSHAKE,
+      allowBeforeCompatibilityCheck: true,
+    })
+      .then(function (result) {
+        var hostBuildId = String(result || "").trim();
+        if (hostBuildId !== PANEL_BUILD_ID) {
+          throw new Error(
+            "Extension build mismatch: panel=" +
+              PANEL_BUILD_ID +
+              ", host=" +
+              (hostBuildId || "unknown") +
+              ". Reinstall the extension and restart Premiere Pro.",
+          );
+        }
+        hostCompatibility = {
+          status: "compatible",
+          host_build_id: hostBuildId,
+          error: null,
+        };
+        return hostBuildId;
+      })
+      .catch(function (err) {
+        var detail =
+          err && err.message ? err.message : "Unknown host compatibility error";
+        if (detail.indexOf("Reinstall the extension") === -1) {
+          detail +=
+            (/[.!?]$/.test(detail) ? " " : ". ") +
+            "Reinstall the extension and restart Premiere Pro.";
+        }
+        hostCompatibility = {
+          status: "incompatible",
+          host_build_id: null,
+          error: detail,
+        };
+        throw new Error(detail);
+      });
   }
 
   function parseHostRunResult(result) {
@@ -1773,6 +1853,10 @@
     var subtitleExpandStartedAt = runStartedAt;
     var subtitleExpandElapsedMs = 0;
     var hostStartedAt = 0;
+
+    if (!isHostCompatible()) {
+      return Promise.reject(buildHostCompatibilityError());
+    }
 
     if (!fs.existsSync(jsxPath)) {
       return Promise.reject(new Error("Script not found: " + jsxPath));
@@ -1811,6 +1895,13 @@
         if (runResult.status.indexOf("ERROR:") === 0) {
           setStatus("error");
           throw new Error(runResult.status);
+        }
+        if (runResult.status !== "OK") {
+          setStatus("error");
+          throw new Error(
+            "Unexpected JSX import response: " +
+              (runResult.status || "<empty>"),
+          );
         }
         log("Completed: " + path.basename(jsxPath), "success");
         updateGlobalStatus();
@@ -3361,6 +3452,9 @@
   }
 
   function queueDownloadImport(projectId, source, options) {
+    if (!isHostCompatible()) {
+      throw buildHostCompatibilityError();
+    }
     if (!validateProjectId(projectId)) {
       throw new Error("Invalid project id: " + projectId);
     }
@@ -4257,6 +4351,9 @@
       sleeping_projects: listSleepingProjectIds().length,
       active_job: jobStore.active ? jobStore.active.type : null,
       queued_jobs: jobStore.queue.length,
+      host_compatibility: hostCompatibility.status,
+      panel_build_id: PANEL_BUILD_ID,
+      host_build_id: hostCompatibility.host_build_id,
     };
   }
 
@@ -4502,7 +4599,11 @@
       ) {
         return;
       }
-      evalHost("pullEncoderEvents()")
+      evalHost("pullEncoderEvents()", {
+        label: "Encoder event poll",
+        priority: HOST_PRIORITY_BACKGROUND,
+        coalesceKey: "encoder_events",
+      })
         .then(function (result) {
           if (!result || result === "[]") {
             return;
@@ -5073,6 +5174,11 @@
   }
 
   function startManagedExportForSelectedProject() {
+    if (!isHostCompatible()) {
+      var compatibilityError = buildHostCompatibilityError();
+      log(compatibilityError.message, "error");
+      return;
+    }
     var runtime = ensureBatchRuntime();
     var exportReadiness = getBatchRuntimeHelper().canStartExport(
       runtime,
@@ -5419,6 +5525,10 @@
   // --- Global status synthesis ---
 
   function updateGlobalStatus() {
+    if (hostCompatibility.status === "incompatible") {
+      setStatus("error");
+      return;
+    }
     if (localServerError) {
       setStatus("error");
       return;
@@ -5585,6 +5695,63 @@
 
   // --- Bootstrap ---
 
+  function initializeCompatibleHostSession() {
+    return evalHost("setPanelPersistent()", {
+      label: "Panel persistence setup",
+    })
+      .then(function (result) {
+        if (result.indexOf("ERROR:") === 0) {
+          log("Panel persistence warning: " + result, "warn");
+        }
+      })
+      .catch(function (err) {
+        log("Panel persistence warning: " + err.message, "warn");
+      })
+      .then(function () {
+        return evalHost("cleanupOrphanTempAudioSequences()", {
+          label: "Orphan temp sequence cleanup",
+        })
+          .then(function (result) {
+            var normalized = String(result).trim();
+            if (normalized.indexOf("ERROR:") === 0) {
+              log(
+                "Temp audio sequence cleanup warning: " + normalized,
+                "warn",
+              );
+              return;
+            }
+            var removedCount = Number(normalized);
+            if (!isNaN(removedCount) && removedCount > 0) {
+              log(
+                "Removed " +
+                  removedCount +
+                  " orphan audio temp sequence(s)",
+                "info",
+              );
+            }
+          })
+          .catch(function (err) {
+            log("Temp audio sequence cleanup warning: " + err.message, "warn");
+          });
+      });
+  }
+
+  function startAutomationServices() {
+    startTriggerWatcher();
+    startEncoderPolling();
+
+    startLocalServer().then(function () {
+      updateGlobalStatus();
+    });
+
+    processJobQueue();
+    log(
+      "Tiktok Reproducer automation initialized (" + PANEL_BUILD_ID + ")",
+      "info",
+    );
+    updateGlobalStatus();
+  }
+
   function init() {
     migrateLegacyBaseDir();
     ensureDir(INBOX_DIR);
@@ -5603,6 +5770,8 @@
     renderQueue();
     renderProjectSelect();
     renderProjectStates();
+    btnBrowse.disabled = true;
+    btnExportProject.disabled = true;
 
     btnBrowse.addEventListener("click", browseAndRun);
     btnExportProject.addEventListener(
@@ -5659,52 +5828,23 @@
       }
     });
 
-    evalHost("setPanelPersistent()")
-      .then(function (result) {
-        if (result && result.indexOf("ERROR:") === 0) {
-          log("Panel persistence warning: " + result, "warn");
-        }
+    verifyHostCompatibility()
+      .then(function (hostBuildId) {
+        log("Premiere host verified (" + hostBuildId + ")", "success");
+        return initializeCompatibleHostSession();
       })
-      .catch(function () {
-        // ignore
-      });
-
-    evalHost("cleanupOrphanTempAudioSequences()")
-      .then(function (result) {
-        var normalized = String(result || "").trim();
-        if (!normalized) {
-          return;
-        }
-        if (normalized.indexOf("ERROR:") === 0) {
-          log("Temp audio sequence cleanup warning: " + normalized, "warn");
-          return;
-        }
-        var removedCount = Number(normalized);
-        if (!isNaN(removedCount) && removedCount > 0) {
-          log(
-            "Removed " + removedCount + " orphan audio temp sequence(s)",
-            "info",
-          );
-        }
+      .then(function () {
+        btnBrowse.disabled = false;
+        btnExportProject.disabled = false;
+        startAutomationServices();
       })
-      .catch(function () {
-        // ignore
+      .catch(function (err) {
+        btnBrowse.disabled = true;
+        btnExportProject.disabled = true;
+        setStatus("error");
+        setSettingsStatus("Premiere host mismatch; reinstall and restart", true);
+        log("Automation disabled: " + err.message, "error");
       });
-
-    startTriggerWatcher();
-    startEncoderPolling();
-
-    startLocalServer().then(function () {
-      updateGlobalStatus();
-    });
-
-    processJobQueue();
-
-    log(
-      "Tiktok Reproducer automation initialized (" + PANEL_BUILD_ID + ")",
-      "info",
-    );
-    updateGlobalStatus();
   }
 
   window.addEventListener("beforeunload", cleanupBeforeUnload);
