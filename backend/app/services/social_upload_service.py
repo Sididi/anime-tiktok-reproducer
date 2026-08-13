@@ -1665,6 +1665,39 @@ class SocialUploadService:
         return prep
 
     @classmethod
+    def _apply_scheduled_reel_thumbnail(
+        cls,
+        result: "PlatformUploadResult",
+        token: str,
+        thumbnail_image_path: Path,
+        deadline: float | None,
+    ) -> None:
+        """Best-effort custom cover on a freshly scheduled (unpublished) Reel.
+
+        The Reels publishing API documents no cover parameter, but the
+        /{video_id}/thumbnails edge is proven to work on published Reels
+        (verified 2026-08-15). Whether it sticks pre-publish is unverified —
+        this attempt costs nothing and the failure note says what happened.
+        """
+        if (
+            result.status != "uploaded"
+            or not result.resource_id
+            or not thumbnail_image_path.exists()
+        ):
+            return
+        with cls._create_upload_session() as session:
+            warning = cls._set_facebook_video_thumbnail(
+                session=session,
+                base=cls._graph_base(),
+                video_id=result.resource_id,
+                token=token,
+                image_path=thumbnail_image_path,
+                deadline=deadline,
+            )
+        if warning:
+            result.detail = f"{result.detail}; {warning}" if result.detail else warning
+
+    @classmethod
     def _set_facebook_video_thumbnail(
         cls,
         *,
@@ -1758,9 +1791,10 @@ class SocialUploadService:
                 max_duration_seconds=max_duration_seconds,
                 deadline=deadline,
             )
-            if thumbnail_image_path is not None and result.status == "uploaded":
-                note = "Miniature personnalisée non supportée pour les Reels programmés"
-                result.detail = f"{result.detail}; {note}" if result.detail else note
+            if thumbnail_image_path is not None:
+                cls._apply_scheduled_reel_thumbnail(
+                    result, token, thumbnail_image_path, deadline
+                )
             return result
 
         # Immediate publish: use standard /videos endpoint

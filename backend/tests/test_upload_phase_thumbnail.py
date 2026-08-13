@@ -357,3 +357,79 @@ def test_set_after_processing_set_failure_takes_priority(monkeypatch, tmp_path):
         _FakeYouTubeProcessing(), "vid123", image, None,
     )
     assert warning == "Miniature YouTube non appliquée: boom"
+
+
+# ---- scheduled Facebook Reel thumbnail attempt (post-YouTube-discovery) ----
+
+def _patch_fb_thumbnail_call(monkeypatch, warning: str | None):
+    from app.services.social_upload_service import SocialUploadService
+
+    calls: list[dict] = []
+
+    def fake_set(cls, *, session, base, video_id, token, image_path, deadline):
+        calls.append({"video_id": video_id, "token": token, "image_path": image_path})
+        return warning
+
+    class _NullSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(
+        SocialUploadService, "_set_facebook_video_thumbnail", classmethod(fake_set)
+    )
+    monkeypatch.setattr(
+        SocialUploadService, "_create_upload_session", classmethod(lambda cls: _NullSession())
+    )
+    return calls
+
+
+def test_scheduled_reel_thumbnail_attempted_silent_on_success(monkeypatch, tmp_path):
+    from app.services.social_upload_service import SocialUploadService
+
+    calls = _patch_fb_thumbnail_call(monkeypatch, None)
+    image = tmp_path / "thumb.jpg"
+    image.write_bytes(b"\xff\xd8\xff\xd9")
+    result = _result("facebook", "uploaded", "Reel programmé le jeudi")
+    result.resource_id = "reel123"
+    SocialUploadService._apply_scheduled_reel_thumbnail(result, "tok", image, None)
+    assert calls == [{"video_id": "reel123", "token": "tok", "image_path": image}]
+    assert result.detail == "Reel programmé le jeudi"
+
+
+def test_scheduled_reel_thumbnail_failure_appends_warning(monkeypatch, tmp_path):
+    from app.services.social_upload_service import SocialUploadService
+
+    _patch_fb_thumbnail_call(monkeypatch, "Miniature Facebook non appliquée: denied")
+    image = tmp_path / "thumb.jpg"
+    image.write_bytes(b"\xff\xd8\xff\xd9")
+    result = _result("facebook", "uploaded", "Reel programmé le jeudi")
+    result.resource_id = "reel123"
+    SocialUploadService._apply_scheduled_reel_thumbnail(result, "tok", image, None)
+    assert result.detail == "Reel programmé le jeudi; Miniature Facebook non appliquée: denied"
+
+
+def test_scheduled_reel_thumbnail_skipped_without_upload_or_id(monkeypatch, tmp_path):
+    from app.services.social_upload_service import SocialUploadService
+
+    calls = _patch_fb_thumbnail_call(monkeypatch, None)
+    image = tmp_path / "thumb.jpg"
+    image.write_bytes(b"\xff\xd8\xff\xd9")
+
+    failed = _result("facebook", "failed", "boom")
+    failed.resource_id = "reel123"
+    SocialUploadService._apply_scheduled_reel_thumbnail(failed, "tok", image, None)
+
+    no_id = _result("facebook", "uploaded")
+    SocialUploadService._apply_scheduled_reel_thumbnail(no_id, "tok", image, None)
+
+    missing = _result("facebook", "uploaded")
+    missing.resource_id = "reel123"
+    SocialUploadService._apply_scheduled_reel_thumbnail(
+        missing, "tok", tmp_path / "absent.jpg", None
+    )
+
+    assert calls == []
+    assert failed.detail == "boom"
