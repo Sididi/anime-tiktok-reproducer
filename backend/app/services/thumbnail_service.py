@@ -205,6 +205,14 @@ class ThumbnailService:
         tmp.replace(path)
 
     @classmethod
+    def _write_error_meta(cls, project_id: str, version: str, detail: str) -> None:
+        """Terminal-failure marker for the current version. candidates_status
+        reads this back as {"state": "error", ...} so the 2s poll stops
+        re-spawning builders. Keyed to the version: a later transcription_timing
+        rewrite or rematch naturally produces a new version and clears it."""
+        cls._write_meta(project_id, version, {"version": version, "error": detail, "candidates": []})
+
+    @classmethod
     def candidates_status(cls, project_id: str) -> dict[str, Any]:
         """Snapshot from meta.json; safe to call from any thread without the
         build lock (readers never mutate)."""
@@ -217,6 +225,9 @@ class ThumbnailService:
         meta = cls._read_meta(project_id, version)
         if meta is None:
             return {"state": "in_progress", "version": version, "pending": 0, "candidates": []}
+        error = meta.get("error")
+        if error:
+            return {"state": "error", "version": version, "detail": error}
 
         payload = []
         pending = 0
@@ -271,10 +282,22 @@ class ThumbnailService:
 
             transcription = cls.load_final_timeline(project_id)
             if transcription is None:
+                # File exists (else _candidates_version returns None above)
+                # but is unreadable/corrupt: may be mid-rewrite, but nothing
+                # to build against right now. Terminal for this version --
+                # a later rewrite bumps the mtime-derived version and clears it.
+                cls._write_error_meta(
+                    project_id, version,
+                    "Timeline finale introuvable (transcription_timing.json)",
+                )
                 return
             matches = ProjectService.load_matches(project_id)
             candidates = cls.compute_candidates(transcription, matches)
             if not candidates:
+                cls._write_error_meta(
+                    project_id, version,
+                    "Aucune scène exploitable dans la timeline finale",
+                )
                 return
             project = ProjectService.load(project_id)
             library_type = project.library_type if project else None
@@ -356,6 +379,17 @@ class ThumbnailService:
                     meta["candidates"] = [
                         e for e in meta["candidates"] if e["source"] != "pending"
                     ]
+                    if not meta["candidates"]:
+                        # Every candidate was dropped: the output video
+                        # exists but yielded nothing usable. A "ready" with
+                        # zero candidates would be a silent-forever dead end
+                        # (start_candidates_build treats "ready" as terminal
+                        # and stops re-spawning) -- represent it as error.
+                        cls._write_error_meta(
+                            project_id, version,
+                            "Extraction des miniatures impossible depuis la vidéo finale",
+                        )
+                        return
                     cls._write_meta(project_id, version, meta)
 
     # Per-project in-flight registry for the background builder, mirroring

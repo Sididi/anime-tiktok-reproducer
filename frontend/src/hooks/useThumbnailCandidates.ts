@@ -42,8 +42,11 @@ export function useThumbnailCandidates(
           setStatus("ready");
           return;
         }
-        if (result.state === "error") {
-          setDetail(result.detail);
+        if (result.state === "error" || result.state === "ready") {
+          // "ready" with zero/absent candidates is a terminal failure too
+          // (a backend that still reports ready-empty instead of the error
+          // marker): treat it the same as an explicit error state.
+          setDetail(result.detail ?? "Aucune miniature disponible");
           setStatus("error");
           return;
         }

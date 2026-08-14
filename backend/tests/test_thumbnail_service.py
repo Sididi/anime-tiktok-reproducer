@@ -327,6 +327,109 @@ def test_candidates_status_error_without_timeline(tmp_path, monkeypatch):
     assert snap["detail"]
 
 
+def test_run_candidates_build_corrupt_timeline_writes_error_state(tmp_path, monkeypatch):
+    """transcription_timing.json exists (mtime works, _candidates_version
+    computes a real version) but is corrupt: load_final_timeline returns
+    None. This must be a terminal error, not a forever-in_progress spin."""
+    projects = _v2_project(tmp_path, monkeypatch, scenes=1, with_matches=False)
+    (projects / "p1" / "output" / "transcription_timing.json").write_text("{not valid json")
+
+    ThumbnailService._run_candidates_build("p1")
+    snap = ThumbnailService.candidates_status("p1")
+    assert snap["state"] == "error"
+    assert snap["detail"]
+
+    # No meta-less "in_progress" limbo: a meta.json was actually written for
+    # the current version (not just implied by absence).
+    version = ThumbnailService._candidates_version("p1")
+    assert ThumbnailService._read_meta("p1", version) is not None
+
+    # start_candidates_build must not re-spawn a builder once error meta
+    # exists for the current version.
+    spawned: list[str] = []
+    real_thread = threading.Thread
+
+    def _tracking_thread(*args, **kwargs):
+        spawned.append("spawned")
+        return real_thread(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "app.services.thumbnail_service.threading.Thread", _tracking_thread
+    )
+    result = ThumbnailService.start_candidates_build("p1")
+    assert result["state"] == "error"
+    assert spawned == []
+
+
+def test_run_candidates_build_empty_scenes_writes_error_state(tmp_path, monkeypatch):
+    """compute_candidates returns [] (no exploitable scenes in the final
+    timeline): must be a terminal error, not a forever-in_progress spin."""
+    _v2_project(tmp_path, monkeypatch, scenes=0, with_matches=False)
+
+    ThumbnailService._run_candidates_build("p1")
+    snap = ThumbnailService.candidates_status("p1")
+    assert snap["state"] == "error"
+    assert snap["detail"] == "Aucune scène exploitable dans la timeline finale"
+
+    spawned: list[str] = []
+    real_thread = threading.Thread
+
+    def _tracking_thread(*args, **kwargs):
+        spawned.append("spawned")
+        return real_thread(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "app.services.thumbnail_service.threading.Thread", _tracking_thread
+    )
+    result = ThumbnailService.start_candidates_build("p1")
+    assert result["state"] == "error"
+    assert spawned == []
+
+
+def test_run_candidates_build_all_candidates_dropped_writes_error_state(tmp_path, monkeypatch):
+    """extract_frames returns all-None while the output video exists: every
+    candidate gets dropped from meta. A "ready" with zero candidates would
+    be a silent-forever dead end for the frontend (start_candidates_build
+    treats "ready" as terminal) -- this must surface as "error" instead."""
+    _v2_project(tmp_path, monkeypatch, scenes=1, with_matches=False)
+    monkeypatch.setattr(
+        ThumbnailService, "_extract_local_clean_frame",
+        classmethod(lambda cls, cand, lt: None),
+    )
+    monkeypatch.setattr(
+        ThumbnailService, "_extract_drive_clean_frame",
+        classmethod(lambda cls, cand, folder: None),
+    )
+    video = tmp_path / "output.mp4"
+    video.write_bytes(b"\x00" * 64)
+    monkeypatch.setattr(
+        "app.services.upload_phase.UploadPhaseService.cached_source_video",
+        classmethod(lambda cls, pid: video),
+    )
+    monkeypatch.setattr(
+        "app.services.thumbnail_service.AnimeMatcherService.extract_frames",
+        classmethod(lambda cls, path, ts: [None for _ in ts]),
+    )
+    ThumbnailService._run_candidates_build("p1")
+    snap = ThumbnailService.candidates_status("p1")
+    assert snap["state"] == "error"
+    assert snap["detail"] == "Extraction des miniatures impossible depuis la vidéo finale"
+
+    spawned: list[str] = []
+    real_thread = threading.Thread
+
+    def _tracking_thread(*args, **kwargs):
+        spawned.append("spawned")
+        return real_thread(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "app.services.thumbnail_service.threading.Thread", _tracking_thread
+    )
+    result = ThumbnailService.start_candidates_build("p1")
+    assert result["state"] == "error"
+    assert spawned == []
+
+
 def test_run_candidates_build_cache_hit_skips_rebuild(tmp_path, monkeypatch):
     """Second call for the same version, once complete, must not re-rebuild."""
     _v2_project(tmp_path, monkeypatch, scenes=1, with_matches=False)
