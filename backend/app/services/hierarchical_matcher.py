@@ -49,6 +49,7 @@ MAX_SOURCE_RATE = 5.0
 TRACK_RESIDUAL_SECONDS = 0.75
 VARIANT_EMBED_FRACTION = 0.25
 VERIFY_FPS = 6.0
+VERIFY_HALF_WINDOW_SECONDS = 0.40
 MAX_ALTERNATIVES = 7
 # A detector-sized micro-fragment may be an unreliable island between longer
 # tracks.  Do not redefine ordinary short scenes: this wider absorption range
@@ -61,6 +62,16 @@ WEAK_MICRO_NEIGHBOR_MIN_CONFIDENCE = 0.50
 WEAK_MICRO_PROPOSAL_MIN_CONFIDENCE = 0.40
 WEAK_MICRO_PROPOSAL_MARGIN = 0.07
 WEAK_MICRO_CLEAR_CUT_RATIO = 0.75
+DUPLICATE_MICRO_MAX_SECONDS = 0.65
+DUPLICATE_MICRO_DETECTOR_MAX_SECONDS = 0.50
+DUPLICATE_MICRO_CONFIDENCE_MARGIN = 0.08
+DUPLICATE_REGION_MIN_SECONDS = 0.40
+# Source index timestamps are spaced at 0.5s.  Affine extrapolation from a
+# short track can therefore land well before the first retrieved frame even
+# when that frame is the first one from the correct source shot.  Keep only a
+# tiny lead-in before concrete in-segment evidence; avoiding a previous-shot
+# flash is more important than preserving a few uncertain opening frames.
+SOURCE_START_MAX_PREROLL_SECONDS = 0.08
 # How much a manual-merge prior tilts the episode vote. Big enough to break a
 # near-tie toward the fragment the owner said this span continues, small enough
 # that a clear body of fresh retrieval still overrules it.
@@ -337,6 +348,11 @@ class HierarchicalMatcherService:
         diagnostics.counters["weak_micro_absorptions"] = float(
             max(0, before_weak_micro - len(segments))
         )
+        before_duplicate_regions = len(segments)
+        segments = cls._collapse_leading_duplicate_regions(segments)
+        diagnostics.counters["duplicate_region_collapses"] = float(
+            max(0, before_duplicate_regions - len(segments))
+        )
         diagnostics.phase_timings["v2_assemble_tracks"] = time.perf_counter() - started
 
         started = time.perf_counter()
@@ -353,6 +369,16 @@ class HierarchicalMatcherService:
         diagnostics.phase_timings["v2_native_verify"] = time.perf_counter() - started
         diagnostics.counters["native_source_seconds"] = native_seconds
         diagnostics.counters["variant_embeddings"] = float(variant_count)
+
+        # Native arbitration can replace one side of a formerly discontinuous
+        # pair with the adjacent affine track.  Re-run the same strict
+        # continuity merge once; this joins only episode/rate-compatible
+        # mappings and avoids leaving a harmless UI split behind.
+        before_final_merge = len(segments)
+        segments = cls._merge_continuous_segments(segments)
+        diagnostics.counters["post_verify_continuous_merges"] = float(
+            max(0, before_final_merge - len(segments))
+        )
 
         started = time.perf_counter()
         final_scenes, matches = cls._build_output(segments, samples, candidates)
@@ -1076,7 +1102,26 @@ class HierarchicalMatcherService:
         line = state.line
         if line is not None:
             a, b = line
-            residual = abs(candidate.t_source - (a * candidate.t_query + b))
+            line_residual = abs(
+                candidate.t_source - (a * candidate.t_query + b)
+            )
+            # Two or three samples on the 0.5s source-index grid commonly
+            # produce a provisional slope of 0x or 2x.  Test the unit-rate
+            # line as well until the track has enough span to establish a
+            # genuine playback-rate change.  The small surcharge prevents a
+            # unit-rate prior from beating an equally good measured line.
+            unit_b = (state.sum_y - state.sum_t) / max(state.sum_w, 1e-9)
+            unit_residual = abs(
+                candidate.t_source - (candidate.t_query + unit_b)
+            )
+            use_unit_line = state.count < 4 or not (
+                MIN_SOURCE_RATE <= a <= MAX_SOURCE_RATE
+            )
+            residual = (
+                min(line_residual, unit_residual + 0.08)
+                if use_unit_line
+                else line_residual
+            )
             if residual > TRACK_RESIDUAL_SECONDS:
                 return None
             if a < MIN_SOURCE_RATE or a > MAX_SOURCE_RATE:
@@ -1133,13 +1178,14 @@ class HierarchicalMatcherService:
             incentive = cls._boundary_incentive(
                 midpoint, detector_boundaries, strong_boundaries
             )
-            # A native diff peak is affirmative cut evidence, not merely a
-            # weaker continuity penalty. Detector-only boundaries remain
-            # soft because they deliberately over-segment flashes/action.
+            # Both signals are priors.  A native diff peak may be motion,
+            # subtitles, or a flash and must not reward abandoning an affine
+            # track.  A real source jump still forces a reset because the
+            # continuation residual/rate checks reject it.
             if incentive >= 1.0:
-                reset_penalty = -0.05
+                reset_penalty = 0.30
             elif incentive > 0.0:
-                reset_penalty = 0.05
+                reset_penalty = 0.20
             else:
                 reset_penalty = 0.95
             expanded: list[_BeamState] = []
@@ -1346,16 +1392,20 @@ class HierarchicalMatcherService:
         detector_boundaries: list[float],
         strong_boundaries: list[float],
     ) -> float:
-        nearby_strong = [
-            value for value in strong_boundaries if abs(value - timestamp) <= 0.45
-        ]
-        if nearby_strong:
-            return min(nearby_strong, key=lambda value: abs(value - timestamp))
+        # PySceneDetect boundaries are actual cut estimates.  The native diff
+        # curve is useful only when the detector missed a cut; preferring a
+        # nearby motion/subtitle peak used to move correct cuts by several
+        # frames and could expose the preceding source shot in the render.
         nearby_detector = [
             value for value in detector_boundaries if abs(value - timestamp) <= 0.30
         ]
         if nearby_detector:
             return min(nearby_detector, key=lambda value: abs(value - timestamp))
+        nearby_strong = [
+            value for value in strong_boundaries if abs(value - timestamp) <= 0.45
+        ]
+        if nearby_strong:
+            return min(nearby_strong, key=lambda value: abs(value - timestamp))
         return timestamp
 
     @classmethod
@@ -1826,7 +1876,13 @@ class HierarchicalMatcherService:
         index = 0
         while len(result) > 1 and index < len(result):
             segment = result[index]
-            if segment.q_end - segment.q_start >= minimum_duration:
+            duration = segment.q_end - segment.q_start
+            is_tiny = duration < minimum_duration
+            is_short_evidence_hole = (
+                segment.episode is None
+                and duration <= DUPLICATE_MICRO_MAX_SECONDS
+            )
+            if not is_tiny and not is_short_evidence_hole:
                 index += 1
                 continue
             if index + 1 < len(result):
@@ -2094,6 +2150,71 @@ class HierarchicalMatcherService:
         return result
 
     @classmethod
+    def _collapse_leading_duplicate_regions(
+        cls,
+        segments: list[TrackSegment],
+    ) -> list[TrackSegment]:
+        """Pool a tiny leading duplicate with a longer supported track.
+
+        This is the automatic counterpart of the manual merge/rematch path.
+        It does not merely stretch the following match: the combined points
+        are collapsed and refit, the longer track must win that pooled vote,
+        and its affine mapping must remain compatible at the join.  Native
+        verification then evaluates the combined region as one unit.
+        """
+        result = list(segments)
+        index = 0
+        while index + 1 < len(result):
+            micro = result[index]
+            following = result[index + 1]
+            if (
+                micro.episode is None
+                or following.episode is None
+                or micro.episode != following.episode
+                or micro.q_end - micro.q_start
+                < DUPLICATE_REGION_MIN_SECONDS
+                or micro.q_end - micro.q_start
+                > DUPLICATE_MICRO_DETECTOR_MAX_SECONDS
+                or following.q_end - following.q_start < 1.0
+                or following.confidence < 0.48
+                or "duplicate_margin" not in micro.doubt_reasons
+                or abs(
+                    following.source_at(micro.q_end)
+                    - micro.source_at(micro.q_end)
+                )
+                < 2.0
+            ):
+                index += 1
+                continue
+            collapsed = cls._collapse_to_single_segment(
+                [micro, following],
+                micro.q_start,
+                following.q_end,
+            )
+            if (
+                collapsed.episode != following.episode
+                or collapsed.confidence
+                < micro.confidence - DUPLICATE_MICRO_CONFIDENCE_MARGIN
+                or abs(
+                    collapsed.source_at(micro.q_end)
+                    - following.source_at(micro.q_end)
+                )
+                > TRACK_RESIDUAL_SECONDS
+            ):
+                index += 1
+                continue
+            collapsed.uncertain = True
+            collapsed.doubt_reasons = sorted(
+                set(
+                    collapsed.doubt_reasons
+                    + ["duplicate_region_collapsed"]
+                )
+            )
+            result[index : index + 2] = [collapsed]
+            index = max(0, index - 1)
+        return result
+
+    @classmethod
     def _line_proposals(
         cls,
         segment: TrackSegment,
@@ -2192,6 +2313,244 @@ class HierarchicalMatcherService:
         return deduped[: MAX_ALTERNATIVES + 2]
 
     @classmethod
+    def _proposal_neighbor_distance(
+        cls,
+        segments: list[TrackSegment],
+        segment_index: int,
+        proposal: LineProposal,
+    ) -> float:
+        segment = segments[segment_index]
+        distances: list[float] = []
+        if segment_index > 0:
+            previous = segments[segment_index - 1]
+            if previous.episode == proposal.episode:
+                distances.append(
+                    abs(
+                        proposal.source_at(segment.q_start)
+                        - previous.source_at(segment.q_start)
+                    )
+                )
+        if segment_index + 1 < len(segments):
+            following = segments[segment_index + 1]
+            if following.episode == proposal.episode:
+                distances.append(
+                    abs(
+                        following.source_at(segment.q_end)
+                        - proposal.source_at(segment.q_end)
+                    )
+                )
+        return min(distances, default=math.inf)
+
+    @classmethod
+    def _verification_alternative(
+        cls,
+        segments: list[TrackSegment],
+        segment_index: int,
+        proposals: list[LineProposal],
+    ) -> tuple[LineProposal | None, float]:
+        """Choose the most useful distinct track for bounded native checking.
+
+        Retrieval proposals are already paid for.  The first globally ranked
+        duplicate is often remote, while a slightly lower-ranked proposal is
+        the obvious continuation of the adjacent source timeline.  Prefer the
+        latter when its retrieval confidence is still competitive; otherwise
+        retain the strongest independent proposal.
+        """
+        segment = segments[segment_index]
+        midpoint = 0.5 * (segment.q_start + segment.q_end)
+        distinct = [
+            proposal
+            for proposal in proposals
+            if proposal.episode != segment.episode
+            or abs(
+                proposal.source_at(midpoint) - segment.source_at(midpoint)
+            )
+            >= 2.0
+        ]
+        # A short duplicate island may have lost the adjacent cluster from its
+        # own top proposals even though the neighbour is a strong affine
+        # hypothesis.  Native verification is exactly the place to test that
+        # hypothesis: add it without treating it as retrieval proof, and merge
+        # only if native frames actually beat the island.
+        if segment.q_end - segment.q_start <= DUPLICATE_MICRO_MAX_SECONDS:
+            for neighbor in (
+                segments[segment_index - 1] if segment_index > 0 else None,
+                (
+                    segments[segment_index + 1]
+                    if segment_index + 1 < len(segments)
+                    else None
+                ),
+            ):
+                if (
+                    neighbor is None
+                    or neighbor.episode is None
+                    or neighbor.q_end - neighbor.q_start < 0.75
+                ):
+                    continue
+                proposal = LineProposal(
+                    neighbor.episode,
+                    neighbor.a,
+                    neighbor.b,
+                    neighbor.confidence,
+                    len(neighbor.points),
+                    "neighbor_continuation",
+                )
+                if (
+                    proposal.episode == segment.episode
+                    and abs(
+                        proposal.source_at(midpoint)
+                        - segment.source_at(midpoint)
+                    )
+                    < 2.0
+                ):
+                    continue
+                if any(
+                    existing.episode == proposal.episode
+                    and abs(
+                        existing.source_at(midpoint)
+                        - proposal.source_at(midpoint)
+                    )
+                    < 2.0
+                    for existing in distinct
+                ):
+                    continue
+                distinct.append(proposal)
+        if not distinct:
+            return None, math.inf
+
+        plausible_gap = max(3.0, 2.0 * (segment.q_end - segment.q_start))
+        local = [
+            (
+                cls._proposal_neighbor_distance(
+                    segments,
+                    segment_index,
+                    proposal,
+                ),
+                proposal,
+            )
+            for proposal in distinct
+            if proposal.confidence >= segment.confidence - 0.08
+            and cls._proposal_neighbor_distance(
+                segments,
+                segment_index,
+                proposal,
+            )
+            <= plausible_gap
+        ]
+        if local:
+            distance, proposal = min(
+                local,
+                key=lambda value: (
+                    value[0],
+                    -value[1].confidence,
+                    -value[1].support,
+                ),
+            )
+            return proposal, distance
+        proposal = max(
+            distinct,
+            key=lambda value: (
+                value.confidence + 0.025 * min(value.support, 6),
+                value.support,
+            ),
+        )
+        return proposal, cls._proposal_neighbor_distance(
+            segments,
+            segment_index,
+            proposal,
+        )
+
+    @classmethod
+    def _verification_priority(
+        cls,
+        segments: list[TrackSegment],
+        segment_index: int,
+        alternative: LineProposal | None,
+        neighbor_distance: float,
+    ) -> float:
+        """Expected ambiguity reduction per fixed-size native window."""
+        segment = segments[segment_index]
+        priority = 0.10 * min(2.0, segment.q_end - segment.q_start)
+        if "duplicate_margin" in segment.doubt_reasons:
+            priority += 0.20
+        if "dominant_retrieval" in segment.doubt_reasons:
+            priority += 0.20
+        if "duplicate_region_collapsed" in segment.doubt_reasons:
+            priority += 3.0
+        priority += max(0.0, 0.40 - segment.confidence)
+        if alternative is None:
+            return priority
+        priority += 8.0 * max(
+            0.0,
+            alternative.confidence - segment.confidence + 0.01,
+        )
+        if alternative.episode != segment.episode:
+            priority += 0.40
+        if alternative.algorithm == "neighbor_continuation":
+            priority += 3.0
+        plausible_gap = max(3.0, 2.0 * (segment.q_end - segment.q_start))
+        left_distance = math.inf
+        right_distance = math.inf
+        if segment_index > 0:
+            previous = segments[segment_index - 1]
+            if previous.episode == alternative.episode:
+                left_distance = abs(
+                    alternative.source_at(segment.q_start)
+                    - previous.source_at(segment.q_start)
+                )
+        if segment_index + 1 < len(segments):
+            following = segments[segment_index + 1]
+            if following.episode == alternative.episode:
+                right_distance = abs(
+                    following.source_at(segment.q_end)
+                    - alternative.source_at(segment.q_end)
+                )
+        # An interior proposal must join *both* sides before continuity can
+        # spend scarce native budget.  Using only the nearer side propagated a
+        # wrong duplicate into an otherwise-correct neighbour.  The final
+        # segment has only a left side and is intentionally allowed: this is a
+        # common place for the last detector sliver to choose a duplicate.
+        continuity_certificate = (
+            segment_index == len(segments) - 1
+            and left_distance <= plausible_gap
+        ) or (
+            0 < segment_index < len(segments) - 1
+            and left_distance <= plausible_gap
+            and right_distance <= plausible_gap
+        )
+        if continuity_certificate:
+            certified_distance = max(
+                value
+                for value in (left_distance, right_distance)
+                if not math.isinf(value)
+            )
+            priority += 1.20 * (
+                1.0 - min(certified_distance, plausible_gap) / plausible_gap
+            )
+        primary = LineProposal(
+            segment.episode or "",
+            segment.a,
+            segment.b,
+            segment.confidence,
+            len(segment.points),
+            "primary",
+        )
+        primary_distance = cls._proposal_neighbor_distance(
+            segments,
+            segment_index,
+            primary,
+        )
+        if continuity_certificate and neighbor_distance < primary_distance:
+            if math.isinf(primary_distance):
+                priority += 2.0
+            else:
+                priority += min(
+                    2.0,
+                    max(0.0, (primary_distance - neighbor_distance) / 3.0),
+                )
+        return priority
+
+    @classmethod
     def _verify_ambiguous_segments(
         cls,
         segments: list[TrackSegment],
@@ -2227,22 +2586,24 @@ class HierarchicalMatcherService:
                     "primary",
                 )
             ]
-            for proposal in cls._line_proposals(segment, candidates, samples):
-                mid = 0.5 * (segment.q_start + segment.q_end)
-                if (
-                    proposal.episode != segment.episode
-                    or abs(proposal.source_at(mid) - segment.source_at(mid)) >= 2.0
-                ):
-                    proposals.append(proposal)
-                    break
+            alternative, neighbor_distance = cls._verification_alternative(
+                segments,
+                segment_index,
+                cls._line_proposals(segment, candidates, samples),
+            )
+            if alternative is not None:
+                proposals.append(alternative)
             query = min(
                 samples,
                 key=lambda value: abs(
                     value.t_query - 0.5 * (segment.q_start + segment.q_end)
                 ),
             )
-            priority = (segment.q_end - segment.q_start) * (
-                1.0 + max(0.0, 0.40 - segment.confidence)
+            priority = cls._verification_priority(
+                segments,
+                segment_index,
+                alternative,
+                neighbor_distance,
             )
             jobs.append((priority, segment_index, query, proposals[:2]))
         jobs.sort(reverse=True, key=lambda value: value[0])
@@ -2254,7 +2615,13 @@ class HierarchicalMatcherService:
             requested = []
             for proposal in proposals:
                 predicted = proposal.source_at(query.t_query)
-                requested.append((proposal.episode, max(0.0, predicted - 0.75), predicted + 0.75))
+                requested.append(
+                    (
+                        proposal.episode,
+                        max(0.0, predicted - VERIFY_HALF_WINDOW_SECONDS),
+                        predicted + VERIFY_HALF_WINDOW_SECONDS,
+                    )
+                )
             incremental = sum(end - start for _, start, end in requested)
             if used + incremental > budget:
                 segments[segment_index].doubt_reasons.append("verification_budget")
@@ -2325,7 +2692,8 @@ class HierarchicalMatcherService:
                 local = [
                     (timestamp, embedding, image)
                     for timestamp, embedding, image in frames
-                    if abs(timestamp - predicted) <= 0.80
+                    if abs(timestamp - predicted)
+                    <= VERIFY_HALF_WINDOW_SECONDS + 0.05
                 ]
                 decoded_any = decoded_any or bool(local)
                 score = (
@@ -2380,22 +2748,38 @@ class HierarchicalMatcherService:
                     "native_timeout" if timed_out else "native_unavailable"
                 )
                 continue
-            best_index = int(np.argmax(scores))
             switch_margin = (
                 0.15
                 if "dominant_retrieval" in segment.doubt_reasons
                 else 0.05
             )
+            best_index = int(np.argmax(scores))
             if (
                 best_index > 0
                 and scores[best_index] >= scores[0] + switch_margin
             ):
                 winner = proposals[best_index]
-                segment.episode = winner.episode
-                segment.a = winner.a
-                segment.b = winner.b
-                segment.confidence = max(segment.confidence, scores[best_index])
-                segment.doubt_reasons.append("native_alternative")
+                replacement = cls._segment_from_proposal(
+                    segment,
+                    segment.q_start,
+                    segment.q_end,
+                    winner,
+                    candidates,
+                    samples,
+                )
+                segment.episode = replacement.episode
+                segment.a = replacement.a
+                segment.b = replacement.b
+                segment.points = replacement.points
+                segment.residual = replacement.residual
+                segment.confidence = max(
+                    replacement.confidence,
+                    scores[best_index],
+                )
+                segment.uncertain = False
+                segment.doubt_reasons = sorted(
+                    set(segment.doubt_reasons + ["native_alternative"])
+                )
             elif scores[best_index] < 0.28:
                 segment.episode = None
                 segment.doubt_reasons.append("native_rejected")
@@ -2425,6 +2809,50 @@ class HierarchicalMatcherService:
             )
             for value in candidates[index][:RETRIEVAL_TOP_K]
         ]
+
+    @staticmethod
+    def _safe_primary_source_interval(
+        segment: TrackSegment,
+    ) -> tuple[float, float]:
+        """Return an affine interval without unsupported previous-shot preroll.
+
+        Only the start is guarded.  End evidence is allowed to extrapolate as
+        before because an early source start creates a visible one-frame flash,
+        while shortening both ends would unnecessarily alter otherwise-good
+        timing.  The guard is applied only when a selected track point exists
+        inside the final query interval.
+        """
+        source_start = max(0.0, segment.source_at(segment.q_start))
+        source_end = max(
+            source_start + 1e-3,
+            segment.source_at(segment.q_end),
+        )
+        if segment.episode is None or segment.a <= 0.0:
+            return source_start, source_end
+        in_span = [
+            point
+            for point in segment.points
+            if point.episode == segment.episode
+            and segment.q_start - 1e-6 <= point.t_query < segment.q_end
+        ]
+        if not in_span:
+            return source_start, source_end
+        first_query = min(point.t_query for point in in_span)
+        first_points = [
+            point
+            for point in in_span
+            if abs(point.t_query - first_query) <= 1e-6
+        ]
+        first_source = max(point.t_source for point in first_points)
+        guarded_start = max(
+            source_start,
+            first_source - SOURCE_START_MAX_PREROLL_SECONDS,
+        )
+        # Preserve a meaningful positive interval even for a pathological
+        # short fit.  In normal tracks this branch is inert by a wide margin.
+        if guarded_start < source_end - 1e-3:
+            source_start = guarded_start
+        return source_start, source_end
 
     @classmethod
     def _build_output(
@@ -2501,8 +2929,7 @@ class HierarchicalMatcherService:
                     )
                 )
                 continue
-            source_start = max(0.0, segment.source_at(segment.q_start))
-            source_end = max(source_start + 1e-3, segment.source_at(segment.q_end))
+            source_start, source_end = cls._safe_primary_source_interval(segment)
             match_list.matches.append(
                 SceneMatch(
                     scene_index=index,

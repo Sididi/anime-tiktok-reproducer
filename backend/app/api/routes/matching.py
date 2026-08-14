@@ -24,6 +24,7 @@ from ...services import (
     LibraryHydrationService,
 )
 from ...services.match_playback_service import MatchPlaybackService
+from ...services.fast_matching import bounded_matcher_enabled
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["matching"])
 
@@ -400,9 +401,19 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
     if not video_path or not video_path.exists():
         raise HTTPException(status_code=400, detail="Video not found")
 
-    # Pre-match: absorb tiny scenes that produce poor matches
+    # Legacy pre-match: absorb tiny scenes that produce poor matches.  The
+    # bounded matcher must see the raw detector fragments so it can choose the
+    # absorption direction from retrieval evidence.  Blindly merging backward
+    # here erased real cuts (notably a short fragment immediately after an
+    # otherwise-correct scene), while its post-track sliver pass can safely
+    # absorb them into the selected following track.
     TINY_SCENE_THRESHOLD = 0.35
-    merged_scenes, tiny_merge_log = scenes.merge_tiny_scenes(TINY_SCENE_THRESHOLD)
+    if bounded_matcher_enabled():
+        tiny_merge_log = []
+    else:
+        merged_scenes, tiny_merge_log = scenes.merge_tiny_scenes(
+            TINY_SCENE_THRESHOLD
+        )
     if tiny_merge_log:
         logger.info(
             "Pre-match tiny scene merge: absorbed %d scene(s) below %.2fs",

@@ -9,6 +9,7 @@ from app.services.hierarchical_matcher import (
     HierarchicalDiagnostics,
     HierarchicalMatcherService,
     HierarchicalResult,
+    LineProposal,
     QueryFrame,
     RetrievalCandidate,
     TrackSegment,
@@ -138,6 +139,28 @@ def test_beam_keeps_one_continuous_track_across_false_detector_cut():
     assert sum(state.breaks) == 1
 
 
+def test_detector_boundary_wins_over_nearby_motion_peak():
+    snapped = HierarchicalMatcherService._snap_boundary(
+        6.08,
+        [6.0],
+        [5.95],
+    )
+    assert snapped == 6.0
+
+
+def test_beam_tolerates_provisional_half_second_grid_slope():
+    samples = [_sample(value) for value in (0.0, 0.25, 0.5, 0.75, 1.0)]
+    # A real-time track quantized to the source index's 0.5s grid.  The first
+    # two equal timestamps make the raw provisional slope 0x.
+    source_times = (10.0, 10.0, 10.5, 10.5, 11.0)
+    values = [
+        [_candidate(index, sample.t_query, source_times[index])]
+        for index, sample in enumerate(samples)
+    ]
+    state = _decode(samples, values, strong=(0.625,))
+    assert sum(state.breaks) == 1
+
+
 def test_beam_splits_source_jump_inside_one_detector_fragment():
     samples = [_sample(value) for value in (0.0, 0.25, 0.5, 0.75, 1.0)]
     values = []
@@ -221,6 +244,24 @@ def test_continuous_adjacent_segments_merge_but_discontinuous_do_not():
     assert len(merged) == 2
     assert merged[0].q_start == 0.0
     assert merged[0].q_end == 2.0
+
+
+def test_short_no_evidence_sliver_is_absorbed_forward():
+    segments = [
+        TrackSegment(0.0, 1.0, "left", 1.0, 10.0, confidence=0.6),
+        TrackSegment(
+            1.0,
+            1.54,
+            None,
+            uncertain=True,
+            doubt_reasons=["no_evidence"],
+        ),
+        TrackSegment(1.54, 3.0, "right", 1.0, 30.0, confidence=0.6),
+    ]
+    merged = HierarchicalMatcherService._absorb_tiny_segments(segments)
+    assert len(merged) == 2
+    assert merged[0].q_end == 1.0
+    assert merged[1].q_start == 1.0
 
 
 def test_weak_micro_fragment_merges_right_when_its_trailing_cut_is_weaker():
@@ -421,6 +462,79 @@ def test_weak_micro_fragment_does_not_bridge_discontinuous_flanks():
     assert merged == segments
 
 
+def test_short_leading_duplicate_can_pool_into_longer_winning_track():
+    micro_points = [
+        _candidate(index, 1.0 + 0.2 * index, 901.0 + 0.2 * index)
+        for index in range(2)
+    ]
+    following_points = [
+        _candidate(index, 1.45 + 0.25 * index, 51.45 + 0.25 * index)
+        for index in range(6)
+    ]
+    segments = [
+        TrackSegment(
+            1.0,
+            1.45,
+            "episode-1",
+            1.0,
+            900.0,
+            points=micro_points,
+            confidence=0.58,
+            uncertain=True,
+            doubt_reasons=["duplicate_margin"],
+        ),
+        TrackSegment(
+            1.45,
+            3.0,
+            "episode-1",
+            1.0,
+            50.0,
+            points=following_points,
+            confidence=0.55,
+            uncertain=True,
+            doubt_reasons=["duplicate_margin"],
+        ),
+    ]
+    collapsed = HierarchicalMatcherService._collapse_leading_duplicate_regions(
+        segments
+    )
+    assert len(collapsed) == 1
+    assert collapsed[0].q_start == 1.0
+    assert collapsed[0].q_end == 3.0
+    assert collapsed[0].source_at(1.45) == pytest.approx(51.45, abs=0.3)
+    assert "duplicate_region_collapsed" in collapsed[0].doubt_reasons
+
+
+def test_sub_four_tenths_leading_shot_is_not_pooled():
+    micro = TrackSegment(
+        1.0,
+        1.36,
+        "episode-1",
+        1.0,
+        900.0,
+        points=[_candidate(0, 1.1, 901.1)],
+        confidence=0.58,
+        uncertain=True,
+        doubt_reasons=["duplicate_margin"],
+    )
+    following = TrackSegment(
+        1.36,
+        3.0,
+        "episode-1",
+        1.0,
+        50.0,
+        points=[
+            _candidate(index, 1.5 + 0.25 * index, 51.5 + 0.25 * index)
+            for index in range(5)
+        ],
+        confidence=0.55,
+    )
+    result = HierarchicalMatcherService._collapse_leading_duplicate_regions(
+        [micro, following]
+    )
+    assert len(result) == 2
+
+
 def test_detector_boundary_splits_only_with_supported_source_jump():
     samples = [_sample(value) for value in np.arange(0.0, 2.0, 0.25)]
     candidates = []
@@ -526,7 +640,71 @@ def test_native_recovery_budget_exhaustion_is_deterministic(monkeypatch):
     )
     assert sum(
         "verification_budget" in segment.doubt_reasons for segment in segments
-    ) == 7
+    ) == 5
+
+
+def test_native_check_prefers_supported_neighbor_timeline_over_remote_duplicate():
+    segments = [
+        TrackSegment(0.0, 1.0, "ep", 1.0, 100.0, confidence=0.60),
+        TrackSegment(1.0, 2.0, "wrong", 1.0, 900.0, confidence=0.58),
+    ]
+    proposals = [
+        # Slightly stronger, but remote from the preceding source timeline.
+        LineProposal("ep", 1.0, 199.0, 0.61, 4, "timeline_cluster"),
+        # Competitive evidence and a plausible shot-to-shot continuation.
+        LineProposal("ep", 1.0, 101.0, 0.57, 4, "timeline_cluster"),
+    ]
+    chosen, distance = HierarchicalMatcherService._verification_alternative(
+        segments,
+        1,
+        proposals,
+    )
+    assert chosen is proposals[1]
+    assert distance == pytest.approx(1.0)
+
+
+def test_native_check_can_test_neighbor_for_short_duplicate_island():
+    segments = [
+        TrackSegment(0.0, 1.0, "ep", 1.0, 100.0, confidence=0.60),
+        TrackSegment(
+            1.0,
+            1.5,
+            "ep",
+            1.0,
+            900.0,
+            confidence=0.58,
+            uncertain=True,
+            doubt_reasons=["duplicate_margin"],
+        ),
+        TrackSegment(1.5, 2.0, "other", 1.0, 300.0, confidence=0.62),
+    ]
+    chosen, distance = HierarchicalMatcherService._verification_alternative(
+        segments,
+        1,
+        [],
+    )
+    assert chosen is not None
+    assert chosen.algorithm == "neighbor_continuation"
+    assert chosen.source_at(1.0) == pytest.approx(101.0)
+    assert distance == pytest.approx(0.0)
+
+
+def test_primary_source_start_does_not_precede_first_in_scene_evidence():
+    point = _candidate(0, 6.0, 161.0)
+    segment = TrackSegment(
+        6.0,
+        6.9,
+        "episode-1",
+        2.0,
+        148.5,  # predicts 160.5s at the query boundary
+        points=[point],
+        confidence=0.53,
+    )
+    source_start, source_end = (
+        HierarchicalMatcherService._safe_primary_source_interval(segment)
+    )
+    assert source_start == pytest.approx(160.92)
+    assert source_end > source_start
 
 
 def test_pyav_decode_preserves_vfr_pts_for_native_diff(monkeypatch):
