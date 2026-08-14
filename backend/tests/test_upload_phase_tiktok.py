@@ -120,3 +120,21 @@ def test_vps_platforms_no_duplicate_tiktok():
     payload = {"social_account_id": "spc_1", "caption": "c"}
     platforms = UploadPhaseService._vps_platforms(("tiktok",), account, payload)
     assert platforms == ["tiktok"]
+
+
+def test_attach_tiktok_cover_business_only():
+    business = {"post_for_me_platform": "tiktok_business", "thumbnail_timestamp_ms": 500}
+    UploadPhaseService._attach_tiktok_cover(business, "https://drive/x.jpg")
+    assert business["thumbnail_url"] == "https://drive/x.jpg"
+    assert business["thumbnail_timestamp_ms"] == 500
+
+    personal = {"post_for_me_platform": "tiktok", "thumbnail_timestamp_ms": 500}
+    UploadPhaseService._attach_tiktok_cover(personal, "https://drive/x.jpg")
+    assert "thumbnail_url" not in personal
+
+
+def test_attach_tiktok_cover_noop_on_none():
+    payload = {"post_for_me_platform": "tiktok_business"}
+    UploadPhaseService._attach_tiktok_cover(payload, None)
+    assert "thumbnail_url" not in payload
+    UploadPhaseService._attach_tiktok_cover(None, "https://drive/x.jpg")  # no raise

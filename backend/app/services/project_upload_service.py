@@ -110,6 +110,7 @@ class UploadRequestSpec:
     youtube_strategy: str | None = None
     copyright_audio_path: str | None = None
     thumbnail_timestamp_ms: int | None = None
+    thumbnail_candidate_index: int | None = None
 
 
 class ProjectUploadService:
@@ -195,6 +196,7 @@ class ProjectUploadService:
         youtube_strategy: str | None = None,
         copyright_audio_path: str | None = None,
         thumbnail_timestamp_ms: int | None = None,
+        thumbnail_candidate_index: int | None = None,
     ) -> ProjectUploadJob:
         project = ProjectService.load(project_id)
         if project is None:
@@ -229,6 +231,7 @@ class ProjectUploadService:
             youtube_strategy=youtube_strategy,
             copyright_audio_path=copyright_audio_path,
             thumbnail_timestamp_ms=thumbnail_timestamp_ms,
+            thumbnail_candidate_index=thumbnail_candidate_index,
         )
         await self._publish_job(job)
         asyncio.create_task(
@@ -388,6 +391,7 @@ class ProjectUploadService:
                 youtube_strategy=request.youtube_strategy,
                 copyright_audio_path=request.copyright_audio_path,
                 thumbnail_timestamp_ms=request.thumbnail_timestamp_ms,
+                thumbnail_candidate_index=request.thumbnail_candidate_index,
                 reserved_slots=reserved_slots,
                 progress_callback=progress_callback,
                 platform_result_callback=platform_result_callback,

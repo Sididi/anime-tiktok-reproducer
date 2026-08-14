@@ -111,7 +111,12 @@ def test_upload_route_forwards_thumbnail_timestamp(client, monkeypatch):
     )
     resp = client.post(
         "/api/project-manager/projects/p1/upload",
-        json={"account_id": "acc", "thumbnail_timestamp_ms": 2350},
+        json={
+            "account_id": "acc",
+            "thumbnail_timestamp_ms": 2350,
+            "thumbnail_candidate_index": 3,
+        },
     )
     assert resp.status_code == 200
     assert captured["thumbnail_timestamp_ms"] == 2350
+    assert captured["thumbnail_candidate_index"] == 3

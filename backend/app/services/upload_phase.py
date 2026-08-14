@@ -698,6 +698,21 @@ class UploadPhaseService:
         return payload
 
     @classmethod
+    def _attach_tiktok_cover(
+        cls,
+        tiktok_payload: dict[str, Any] | None,
+        cover_drive_url: str | None,
+    ) -> None:
+        """Mutates payload in place: a hosted cover image only makes sense for
+        the `tiktok_business` Post for Me connector (personal accounts keep
+        the timestamp-only fallback). No-op on a missing payload or URL."""
+        if tiktok_payload is None or cover_drive_url is None:
+            return
+        if tiktok_payload.get("post_for_me_platform") != "tiktok_business":
+            return
+        tiktok_payload["thumbnail_url"] = cover_drive_url
+
+    @classmethod
     def _instagram_thumb_offset(
         cls,
         thumbnail_timestamp_ms: int,
@@ -859,6 +874,7 @@ class UploadPhaseService:
         youtube_strategy: str | None = None,
         copyright_audio_path: str | None = None,
         thumbnail_timestamp_ms: int | None = None,
+        thumbnail_candidate_index: int | None = None,
         reserved_slots: dict[str, tuple[datetime, datetime]] | None = None,
         progress_callback: Callable[[float, str, str], None] | None = None,
         platform_result_callback: Callable[[dict[str, Any]], None] | None = None,
@@ -1098,18 +1114,57 @@ class UploadPhaseService:
             # (YouTube, Facebook). Extracted from the ORIGINAL output video, so
             # platform-side cut/sped_up retiming cannot shift the image.
             thumbnail_image_path: Path | None = None
-            if thumbnail_timestamp_ms is not None:
+            if thumbnail_candidate_index is not None:
+                thumbnail_image_path = ThumbnailService.cover_image_for(
+                    project_id,
+                    thumbnail_candidate_index,
+                    local_video_path,
+                    Path(tmp_dir) / "thumbnail.jpg",
+                )
+            if thumbnail_image_path is None and thumbnail_timestamp_ms is not None:
                 thumbnail_image_path = ThumbnailService.extract_frame_image(
                     local_video_path,
                     thumbnail_timestamp_ms / 1000.0,
                     Path(tmp_dir) / "thumbnail.jpg",
                 )
-            # A timestamp was requested but the frame could not be extracted:
-            # YouTube/Facebook proceed without a thumbnail. Surface that on
-            # their platform results instead of failing silently.
+            # A timestamp/candidate was requested but the frame could not be
+            # extracted: YouTube/Facebook proceed without a thumbnail. Surface
+            # that on their platform results instead of failing silently.
             thumbnail_extraction_failed = (
-                thumbnail_timestamp_ms is not None and thumbnail_image_path is None
+                (thumbnail_timestamp_ms is not None or thumbnail_candidate_index is not None)
+                and thumbnail_image_path is None
             )
+
+            # Host the composed cover on Drive once, for the VPS-published
+            # platforms that need a public image URL (Instagram cover_url,
+            # TikTok business connector thumbnail_url). Failure degrades to
+            # the existing timestamp-only fallback, never fatal.
+            cover_drive_url: str | None = None
+            wants_hosted_cover = thumbnail_image_path is not None and (
+                ig_payload_base is not None
+                or (
+                    account is not None
+                    and account.tiktok is not None
+                    and account.tiktok.post_for_me_platform == "tiktok_business"
+                )
+            )
+            if wants_hosted_cover:
+                try:
+                    uploaded_cover = GoogleDriveService.upsert_local_file(
+                        parent_id=readiness.drive_folder_id,
+                        filename="thumbnail_cover.jpg",
+                        local_path=thumbnail_image_path,
+                        chunksize=settings.drive_upload_chunk_mb * 1024 * 1024,
+                    )
+                    cover_id = str(uploaded_cover.get("id") or "").strip()
+                    if cover_id:
+                        GoogleDriveService.set_public_read(cover_id)
+                        cover_drive_url = GoogleDriveService.get_direct_download_url(cover_id)
+                except Exception:
+                    logger.warning(
+                        "Cover Drive hosting failed for %s; falling back to timestamps",
+                        project_id, exc_info=True,
+                    )
 
             ig_payload = dict(ig_payload_base) if ig_payload_base is not None else None
             ig_prep_needed = False
@@ -1262,6 +1317,10 @@ class UploadPhaseService:
                                 instagram_drive_metadata.get("instagram_speed_factor"),
                                 instagram_max_duration,
                             )
+                        if cover_drive_url is not None:
+                            ig_payload["cover_url"] = cover_drive_url
+
+                cls._attach_tiktok_cover(tiktok_payload, cover_drive_url)
 
                 discord_message_id = None
                 try:

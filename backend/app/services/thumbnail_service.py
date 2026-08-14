@@ -407,6 +407,66 @@ class ThumbnailService:
         return None
 
     @classmethod
+    def cover_image_for(
+        cls,
+        project_id: str,
+        candidate_index: int,
+        output_video_path: Path | None,
+        dest_path: Path,
+    ) -> Path | None:
+        """Resolve the chosen candidate's composed 1080x1920 cover for upload.
+
+        Cache hit: copies the already-composed cover produced by the
+        progressive builder. Cache miss: recomputes candidates and runs the
+        same extraction ladder for just this one index (local clean frame ->
+        Drive clean frame -> a frame from the rendered output video), then
+        composes and saves it. Never raises; returns None when every source
+        fails.
+        """
+        try:
+            cached = cls.cached_frame_path(project_id, candidate_index)
+            if cached is not None:
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(cached, dest_path)
+                return dest_path
+
+            transcription = cls.load_final_timeline(project_id)
+            if transcription is None:
+                return None
+            matches = ProjectService.load_matches(project_id)
+            candidates = cls.compute_candidates(transcription, matches)
+            candidate = next(
+                (c for c in candidates if c.index == candidate_index), None
+            )
+            if candidate is None:
+                return None
+
+            project = ProjectService.load(project_id)
+            library_type = project.library_type if project else None
+            drive_folder_id = project.drive_folder_id if project else None
+
+            image = cls._extract_local_clean_frame(candidate, library_type)
+            if image is None and drive_folder_id:
+                image = cls._extract_drive_clean_frame(candidate, drive_folder_id)
+            if image is None and output_video_path is not None:
+                image = AnimeMatcherService.extract_frame(
+                    output_video_path, candidate.timestamp_seconds
+                )
+            if image is None:
+                return None
+
+            cover = cls.compose_vertical_cover(image)
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            cover.save(dest_path, "JPEG", quality=cls._JPEG_QUALITY)
+            return dest_path
+        except Exception:
+            logger.warning(
+                "Cover resolution failed: project=%s index=%d",
+                project_id, candidate_index, exc_info=True,
+            )
+            return None
+
+    @classmethod
     def extract_frame_image(
         cls, video_path: Path, timestamp_seconds: float, dest_path: Path
     ) -> Path | None:

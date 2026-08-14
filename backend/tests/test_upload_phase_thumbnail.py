@@ -10,7 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.services.upload_phase import UploadPhaseService
 from app.services.social_upload_service import PlatformUploadResult
-from app.services.thumbnail_service import ThumbnailService
+from app.services.thumbnail_service import ThumbnailCandidate, ThumbnailService
+from app.services.project_service import ProjectService
 
 
 def test_cleanup_stale_thumbnail_cache_removes_old_keeps_fresh(tmp_path, monkeypatch):
@@ -433,3 +434,121 @@ def test_scheduled_reel_thumbnail_skipped_without_upload_or_id(monkeypatch, tmp_
 
     assert calls == []
     assert failed.detail == "boom"
+
+
+# ---- cover_image_for (candidate-index cover resolution for execute_upload) ----
+
+def test_cover_image_for_cache_hit_copies_composed_jpg(tmp_path, monkeypatch):
+    cached = tmp_path / "cand_2.jpg"
+    cached.write_bytes(b"\xff\xd8\xff\xd9composed")
+    monkeypatch.setattr(
+        ThumbnailService, "cached_frame_path",
+        classmethod(lambda cls, pid, index: cached if index == 2 else None),
+    )
+
+    dest = tmp_path / "out" / "thumbnail.jpg"
+    result = ThumbnailService.cover_image_for("proj1", 2, None, dest)
+
+    assert result == dest
+    assert dest.read_bytes() == cached.read_bytes()
+
+
+_FAKE_CANDIDATE = ThumbnailCandidate(
+    index=0,
+    label="Scène 1 · début",
+    timestamp_seconds=1.0,
+    scene_index=0,
+    position="start",
+    episode="Some Anime - 01.mkv",
+    source_timestamp_seconds=1.0,
+)
+
+
+def test_cover_image_for_miss_falls_back_to_output_frame(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        ThumbnailService, "cached_frame_path",
+        classmethod(lambda cls, pid, index: None),
+    )
+    monkeypatch.setattr(
+        ThumbnailService, "load_final_timeline",
+        classmethod(lambda cls, pid: object()),
+    )
+    monkeypatch.setattr(
+        ProjectService, "load_matches", classmethod(lambda cls, pid: None)
+    )
+    monkeypatch.setattr(
+        ThumbnailService, "compute_candidates",
+        classmethod(lambda cls, transcription, matches: [_FAKE_CANDIDATE]),
+    )
+    monkeypatch.setattr(ProjectService, "load", classmethod(lambda cls, pid: None))
+    monkeypatch.setattr(
+        ThumbnailService, "_extract_local_clean_frame",
+        classmethod(lambda cls, candidate, library_type: None),
+    )
+    monkeypatch.setattr(
+        ThumbnailService, "_extract_drive_clean_frame",
+        classmethod(lambda cls, candidate, drive_folder_id: None),
+    )
+
+    from PIL import Image
+    from app.services.anime_matcher import AnimeMatcherService
+
+    fake_image = Image.new("RGB", (1920, 1080), color="red")
+    monkeypatch.setattr(
+        AnimeMatcherService, "extract_frame",
+        classmethod(lambda cls, video_path, timestamp: fake_image),
+    )
+
+    dest = tmp_path / "thumbnail.jpg"
+    result = ThumbnailService.cover_image_for(
+        "proj1", 0, tmp_path / "output.mp4", dest
+    )
+
+    assert result == dest
+    assert dest.exists()
+
+
+def test_cover_image_for_returns_none_when_all_sources_fail(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        ThumbnailService, "cached_frame_path",
+        classmethod(lambda cls, pid, index: None),
+    )
+    monkeypatch.setattr(
+        ThumbnailService, "load_final_timeline",
+        classmethod(lambda cls, pid: object()),
+    )
+    monkeypatch.setattr(
+        ProjectService, "load_matches", classmethod(lambda cls, pid: None)
+    )
+    monkeypatch.setattr(
+        ThumbnailService, "compute_candidates",
+        classmethod(lambda cls, transcription, matches: [_FAKE_CANDIDATE]),
+    )
+    monkeypatch.setattr(ProjectService, "load", classmethod(lambda cls, pid: None))
+    monkeypatch.setattr(
+        ThumbnailService, "_extract_local_clean_frame",
+        classmethod(lambda cls, candidate, library_type: None),
+    )
+    monkeypatch.setattr(
+        ThumbnailService, "_extract_drive_clean_frame",
+        classmethod(lambda cls, candidate, drive_folder_id: None),
+    )
+
+    dest = tmp_path / "thumbnail.jpg"
+    result = ThumbnailService.cover_image_for("proj1", 0, None, dest)
+
+    assert result is None
+    assert not dest.exists()
+
+
+def test_cover_image_for_missing_timeline_returns_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        ThumbnailService, "cached_frame_path",
+        classmethod(lambda cls, pid, index: None),
+    )
+    monkeypatch.setattr(
+        ThumbnailService, "load_final_timeline", classmethod(lambda cls, pid: None)
+    )
+    dest = tmp_path / "thumbnail.jpg"
+    result = ThumbnailService.cover_image_for("proj1", 0, None, dest)
+    assert result is None
