@@ -35,6 +35,7 @@ from ..models import (
     SceneList,
 )
 from .anime_matcher import AnimeMatcherService
+from .episode_names import canonical_episode_stem
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -219,6 +220,7 @@ class HierarchicalMatcherService:
         scenes: SceneList,
         library_type: LibraryType | str,
         anime_name: str | None = None,
+        episode_whitelist: frozenset[str] | None = None,
     ) -> HierarchicalResult:
         if AnimeMatcherService._query_processor is None:
             raise RuntimeError("anime_searcher must be initialized before bounded matching")
@@ -234,7 +236,9 @@ class HierarchicalMatcherService:
         diagnostics.sample_count = len(samples)
 
         started = time.perf_counter()
-        candidates = cls._retrieve(samples, anime_name)
+        candidates = cls._retrieve(
+            samples, anime_name, episode_whitelist=episode_whitelist
+        )
         diagnostics.phase_timings["v2_retrieve"] = time.perf_counter() - started
         diagnostics.correspondence_count = sum(len(values) for values in candidates)
 
@@ -298,6 +302,7 @@ class HierarchicalMatcherService:
                     embedded_variants,
                     variant_to_sample,
                     anime_name,
+                    episode_whitelist=episode_whitelist,
                 )
                 state = cls._decode_beam(
                     samples,
@@ -967,6 +972,7 @@ class HierarchicalMatcherService:
         cls,
         samples: list[QueryFrame],
         anime_name: str | None,
+        episode_whitelist: frozenset[str] | None = None,
     ) -> list[list[RetrievalCandidate]]:
         processor = AnimeMatcherService._query_processor
         if processor is None or not samples:
@@ -996,6 +1002,10 @@ class HierarchicalMatcherService:
                 )
                 for similarity, metadata in values
                 if float(similarity) >= 0.20
+                and (
+                    episode_whitelist is None
+                    or canonical_episode_stem(metadata.episode) in episode_whitelist
+                )
             ]
             output.append(cls._dedupe_candidates(candidates))
         return output
@@ -1309,6 +1319,7 @@ class HierarchicalMatcherService:
         variants: list[QueryFrame],
         variant_to_sample: list[int],
         anime_name: str | None,
+        episode_whitelist: frozenset[str] | None = None,
     ) -> None:
         processor = AnimeMatcherService._query_processor
         if processor is None or not variants:
@@ -1339,6 +1350,10 @@ class HierarchicalMatcherService:
                 )
                 for similarity, metadata in values
                 if float(similarity) >= 0.20
+                and (
+                    episode_whitelist is None
+                    or canonical_episode_stem(metadata.episode) in episode_whitelist
+                )
             ]
             base[sample_index] = cls._dedupe_candidates(base[sample_index] + extra)
 

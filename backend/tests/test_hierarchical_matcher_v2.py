@@ -94,7 +94,7 @@ def test_scene_aligner_adapter_preserves_route_result_shape(monkeypatch):
         HierarchicalMatcherService,
         "align_scenes_sync",
         classmethod(
-            lambda cls, video_path, scenes_arg, library_type, anime_name=None: HierarchicalResult(
+            lambda cls, video_path, scenes_arg, library_type, anime_name=None, episode_whitelist=None: HierarchicalResult(
                 scenes, matches, diagnostics
             )
         ),
@@ -1131,3 +1131,75 @@ def test_undecoded_verification_window_does_not_reject_the_segment(monkeypatch):
 # Imported late so the helpers above remain usable in environments that only
 # collect the flag/target tests without the pytest package injected globally.
 import pytest
+
+
+class _FakeIndexManager:
+    """search_batch stub returning fixed (similarity, metadata) hits per query."""
+
+    def __init__(self, hits):
+        self._hits = hits
+
+    def search_batch(self, embeddings, top_k, threshold, series=None):
+        return [list(self._hits) for _ in range(len(embeddings))]
+
+
+class _FakeMetadata:
+    def __init__(self, episode: str):
+        self.episode = episode
+        self.timestamp = 12.0
+        self.series = "series"
+
+
+def _patch_fake_processor(monkeypatch, hits):
+    from types import SimpleNamespace
+
+    from app.services.anime_matcher import AnimeMatcherService
+
+    monkeypatch.setattr(
+        AnimeMatcherService,
+        "_query_processor",
+        SimpleNamespace(index_manager=_FakeIndexManager(hits)),
+        raising=False,
+    )
+
+
+def test_retrieve_episode_whitelist_filters_by_canonical_stem(monkeypatch):
+    """Whitelist keeps path/extension variants of allowed episodes, drops the rest."""
+    hits = [
+        (0.9, _FakeMetadata("dir/E01.mkv")),
+        (0.8, _FakeMetadata("E02")),
+        (0.7, _FakeMetadata("E01")),
+    ]
+    _patch_fake_processor(monkeypatch, hits)
+    samples = [_sample(0.0), _sample(0.25)]
+
+    unfiltered = HierarchicalMatcherService._retrieve(samples, "series")
+    assert {c.episode for c in unfiltered[0]} == {"dir/E01.mkv", "E02", "E01"}
+
+    filtered = HierarchicalMatcherService._retrieve(
+        samples, "series", episode_whitelist=frozenset({"E01"})
+    )
+    for per_sample in filtered:
+        assert per_sample, "whitelisted hits must survive"
+        assert {c.episode for c in per_sample} == {"dir/E01.mkv", "E01"}
+
+    empty = HierarchicalMatcherService._retrieve(
+        samples, "series", episode_whitelist=frozenset({"E99"})
+    )
+    assert all(not per_sample for per_sample in empty)
+
+
+def test_merge_variant_candidates_respects_episode_whitelist(monkeypatch):
+    hits = [
+        (0.9, _FakeMetadata("dir/E01.mkv")),
+        (0.8, _FakeMetadata("E02")),
+    ]
+    _patch_fake_processor(monkeypatch, hits)
+    variant = QueryFrame(1.0, np.ones(4, dtype=np.float32), None, "crop")
+    base = [[]]
+
+    HierarchicalMatcherService._merge_variant_candidates(
+        base, [variant], [0], "series", episode_whitelist=frozenset({"E01"})
+    )
+    assert base[0], "whitelisted variant hits must be merged"
+    assert {c.episode for c in base[0]} == {"dir/E01.mkv"}

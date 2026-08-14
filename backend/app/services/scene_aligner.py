@@ -9,6 +9,7 @@ import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace as dc_replace
+from functools import partial
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -710,6 +711,7 @@ class SceneAlignerService:
         library_path: Path,
         library_type: LibraryType | str,
         anime_name: str | None = None,
+        episode_whitelist: frozenset[str] | None = None,
     ) -> AsyncIterator[MatchProgress]:
         total = len(scenes.scenes)
         yield MatchProgress("starting", 0.0, "Initializing global aligner...", 0, total)
@@ -746,11 +748,14 @@ class SceneAlignerService:
         )
         result = await loop.run_in_executor(
             None,
-            cls.align_scenes_sync,
-            video_path,
-            scenes,
-            library_type,
-            anime_name,
+            partial(
+                cls.align_scenes_sync,
+                video_path,
+                scenes,
+                library_type,
+                anime_name,
+                episode_whitelist=episode_whitelist,
+            ),
         )
         yield MatchProgress(
             "complete",
@@ -768,6 +773,7 @@ class SceneAlignerService:
         scenes: SceneList,
         library_type: LibraryType | str,
         anime_name: str | None = None,
+        episode_whitelist: frozenset[str] | None = None,
     ) -> AlignmentResult:
         # The bounded matcher is the default route-compatible implementation.
         # ATR_MATCHER_V2=1 selects the old implementation as an emergency
@@ -786,6 +792,11 @@ class SceneAlignerService:
             int(use_legacy_v2),
             flag_source,
         )
+        if use_legacy_v2 and episode_whitelist:
+            logger.warning(
+                "Episode whitelist ignored: legacy V2 matcher active "
+                "(ATR_MATCHER_V2=1); matching runs against all episodes"
+            )
 
         # Both matchers open PyNv source captures through
         # AnimeMatcherService._open_source_capture, so the NVDEC session budget
@@ -810,6 +821,7 @@ class SceneAlignerService:
                 scenes,
                 library_type,
                 anime_name,
+                episode_whitelist=episode_whitelist,
             )
             diagnostics = AlignmentDiagnostics(
                 sample_count=v2_result.diagnostics.sample_count,

@@ -25,25 +25,13 @@ from ...services import (
 )
 from ...services.match_playback_service import MatchPlaybackService
 from ...services.fast_matching import bounded_matcher_enabled
+from ...services.episode_names import (
+    KNOWN_MEDIA_EXTENSIONS,
+    normalize_episode_whitelist,
+    strip_known_media_extension,
+)
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["matching"])
-
-KNOWN_MEDIA_EXTENSIONS = (
-    ".mkv",
-    ".mp4",
-    ".mov",
-    ".avi",
-    ".webm",
-    ".m4v",
-    ".wav",
-    ".mp3",
-    ".m4a",
-    ".aac",
-    ".flac",
-    ".ogg",
-    ".aiff",
-    ".aif",
-)
 
 
 def _etag_for_path(path: Path) -> str:
@@ -60,14 +48,7 @@ def _media_headers(path: Path, *, cache_control: str) -> dict[str, str]:
     }
 
 
-def _strip_known_media_extension(name: str) -> str:
-    """Strip only supported media extensions from a filename-like value."""
-    clean_name = str(name or "").strip()
-    lower_name = clean_name.lower()
-    for ext in KNOWN_MEDIA_EXTENSIONS:
-        if lower_name.endswith(ext):
-            return clean_name[:-len(ext)]
-    return clean_name
+_strip_known_media_extension = strip_known_media_extension
 
 
 def _canonical_episode_ref(episode: str, *, library_type: str | None = None) -> str:
@@ -167,6 +148,7 @@ class SetSourcesRequest(BaseModel):
 class FindMatchesRequest(BaseModel):
     source_path: str | None = None  # Optional, defaults to anime_library_path
     merge_continuous: bool = True  # Auto-merge continuous anime scenes
+    episodes: list[str] | None = None  # Optional episode subset; None = all
 
 
 class PreparePlaybackRequest(BaseModel):
@@ -430,6 +412,10 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
     # Get anime name for filtering (if set on project)
     anime_name = project.anime_name
 
+    # Optional episode subset (pure projects match against their own video,
+    # so a subset is meaningless there and silently ignored).
+    episode_whitelist = normalize_episode_whitelist(request.episodes)
+
     async def stream_progress():
         if tiny_merge_log:
             yield "data: " + json.dumps({
@@ -510,6 +496,7 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
                     source_path,
                     project.library_type,
                     anime_name=anime_name,
+                    episode_whitelist=episode_whitelist,
                 ):
                     if progress.status == "complete":
                         completed = True

@@ -519,6 +519,7 @@ export const api = {
     sourcePath?: string,
     mergeContinuous = true,
     signal?: AbortSignal,
+    episodes?: string[],
   ) => {
     return fetch(`${API_BASE}/projects/${projectId}/matches/find`, {
       method: "POST",
@@ -526,6 +527,7 @@ export const api = {
       body: JSON.stringify({
         source_path: sourcePath,
         merge_continuous: mergeContinuous,
+        episodes,
       }),
       signal,
     });

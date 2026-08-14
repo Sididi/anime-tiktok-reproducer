@@ -32,6 +32,9 @@ import {
 import { Button } from "@/components/ui";
 import { MatchesClipPlayer, ManualMatchModal } from "@/components/video";
 import { TorrentManagementModal } from "@/components/library";
+import { RecomputeEpisodesSplitButton } from "@/components/matches/RecomputeEpisodesSplitButton";
+import { EpisodeSelectModal } from "@/components/matches/EpisodeSelectModal";
+import { proposeEpisodes } from "@/utils/proposeEpisodes";
 import type { MatchesClipPlayerHandle } from "@/components/video/MatchesClipPlayer";
 import type { ManualMatchSaveMeta } from "@/components/video/ManualMatchModal";
 import { useProjectStore, useSceneStore } from "@/stores";
@@ -873,6 +876,7 @@ export function MatchValidation() {
   } | null>(null);
   const [structureUpdating, setStructureUpdating] = useState(false);
   const [mergeContinuous, setMergeContinuous] = useState(true);
+  const [episodeModalOpen, setEpisodeModalOpen] = useState(false);
   // Torrent failure state (deferred download stall detection)
   const [torrentFailure, setTorrentFailure] = useState<{
     sourceName: string;
@@ -1656,8 +1660,12 @@ export function MatchValidation() {
     };
   }, [clearFastWatchBuffers]);
 
-  const handleFindMatches = useCallback(async () => {
+  const handleFindMatches = useCallback(async (episodeSubset?: string[]) => {
     if (!projectId) return;
+    const restrictedEpisodes =
+      Array.isArray(episodeSubset) && episodeSubset.length > 0
+        ? episodeSubset
+        : undefined;
 
     abortActiveStreams();
     const controller = createStreamController();
@@ -1686,6 +1694,7 @@ export function MatchValidation() {
         undefined,
         mergeContinuous,
         signal,
+        restrictedEpisodes,
       );
       const finalEvent = await readSSEStream<MatchProgress>(
         response,
@@ -2033,7 +2042,7 @@ export function MatchValidation() {
     }
   };
 
-  const handleRecomputeMatches = async () => {
+  const handleRecomputeMatches = async (episodeSubset?: string[]) => {
     // Clear existing matches and recompute
     stopFastWatch();
     setPendingSceneUpdates({});
@@ -2042,8 +2051,13 @@ export function MatchValidation() {
     setPlaybackManifest(null);
     setPlaybackProgress(null);
     setPlaybackError(null);
-    await handleFindMatches();
+    await handleFindMatches(episodeSubset);
   };
+
+  const proposedEpisodes = useMemo(
+    () => proposeEpisodes(matches, scenes, episodes),
+    [matches, scenes, episodes],
+  );
 
   const handleAutoFillBestCandidates = useCallback(async () => {
     if (!projectId) return;
@@ -2464,7 +2478,7 @@ export function MatchValidation() {
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={handleRecomputeMatches}
+                  onClick={() => handleRecomputeMatches()}
                   disabled={matching}
                   title="Re-run the matching algorithm"
                 >
@@ -2473,6 +2487,16 @@ export function MatchValidation() {
                   />
                   Recompute
                 </Button>
+                {project?.library_type !== "pure" && (
+                  <RecomputeEpisodesSplitButton
+                    proposedCount={proposedEpisodes.length}
+                    matching={matching}
+                    onRecomputeProposed={() =>
+                      handleRecomputeMatches(proposedEpisodes)
+                    }
+                    onOpenModal={() => setEpisodeModalOpen(true)}
+                  />
+                )}
                 <label className="flex items-center gap-1.5 text-xs text-[hsl(var(--muted-foreground))]">
                   <input
                     type="checkbox"
@@ -2548,7 +2572,7 @@ export function MatchValidation() {
               )}
             </div>
             <div className="flex flex-col items-center gap-3">
-              <Button onClick={handleFindMatches} disabled={!projectId}>
+              <Button onClick={() => handleFindMatches()} disabled={!projectId}>
                 <Search className="h-4 w-4 mr-2" />
                 Find Matches
               </Button>
@@ -2884,6 +2908,19 @@ export function MatchValidation() {
           </div>
         </div>
       )}
+
+      {/* Episode subset recompute configuration */}
+      <EpisodeSelectModal
+        open={episodeModalOpen}
+        episodes={episodes}
+        proposed={proposedEpisodes}
+        matching={matching}
+        onClose={() => setEpisodeModalOpen(false)}
+        onLaunch={(selected) => {
+          setEpisodeModalOpen(false);
+          void handleRecomputeMatches(selected);
+        }}
+      />
 
       {/* Torrent replacement modal (triggered by stall detection) */}
       {torrentFailure && showTorrentModal && (
