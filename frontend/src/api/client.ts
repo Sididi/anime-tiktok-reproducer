@@ -639,6 +639,29 @@ export const api = {
       method: "POST",
     }),
 
+  // Extensive zoom search — per-scene async background job
+  startZoomSearch: (projectId: string, sceneIndex: number) =>
+    request<{ job: import("@/types").ZoomSearchJob }>(
+      `/projects/${projectId}/matches/zoom-search/${sceneIndex}`,
+      { method: "POST" },
+    ),
+
+  listZoomSearchJobs: (projectId: string) =>
+    request<{ jobs: import("@/types").ZoomSearchJob[] }>(
+      `/projects/${projectId}/matches/zoom-search/jobs`,
+    ),
+
+  streamZoomSearchJobs: (projectId: string, signal?: AbortSignal) =>
+    fetch(`${API_BASE}/projects/${projectId}/matches/zoom-search/jobs/stream`, {
+      signal,
+    }),
+
+  ackZoomSearchJob: (projectId: string, jobId: string) =>
+    request<{ job: import("@/types").ZoomSearchJob }>(
+      `/projects/${projectId}/matches/zoom-search/jobs/${jobId}/ack`,
+      { method: "POST" },
+    ),
+
   // Source video
   getSourceVideoUrl: (projectId: string, episodePath: string) =>
     `${MEDIA_API_BASE}/projects/${projectId}/video/source?path=${encodeURIComponent(episodePath)}`,

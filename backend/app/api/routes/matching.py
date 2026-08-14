@@ -25,6 +25,7 @@ from ...services import (
 )
 from ...services.match_playback_service import MatchPlaybackService
 from ...services.fast_matching import bounded_matcher_enabled
+from ...services.zoom_search_service import zoom_search_service
 from ...services.episode_names import (
     KNOWN_MEDIA_EXTENSIONS,
     normalize_episode_whitelist,
@@ -382,6 +383,10 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
     video_path = Path(project.video_path) if project.video_path else None
     if not video_path or not video_path.exists():
         raise HTTPException(status_code=400, detail="Video not found")
+
+    # A full recompute renumbers scene indices; pending per-scene zoom
+    # searches would land on the wrong scene.
+    zoom_search_service.invalidate_project(project_id, reason="recompute")
 
     # Legacy pre-match: absorb tiny scenes that produce poor matches.  The
     # bounded matcher must see the raw detector fragments so it can choose the
@@ -842,6 +847,9 @@ async def merge_with_previous(project_id: str, scene_index: int):
     if scene_index <= 0 or scene_index >= len(scenes.scenes):
         raise HTTPException(status_code=400, detail="Invalid scene index")
 
+    # Merging renumbers scene indices; pending zoom searches become stale.
+    zoom_search_service.invalidate_project(project_id, reason="merge")
+
     if project.series_id:
         try:
             await LibraryHydrationService.ensure_matcher_ready_for_project(
@@ -1167,6 +1175,10 @@ async def undo_merge(project_id: str, scene_index: int):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    # Undoing a merge renumbers scene indices; pending zoom searches become
+    # stale.
+    zoom_search_service.invalidate_project(project_id, reason="undo_merge")
+
     result = SceneMergerService.undo_merge(project_id, scene_index)
     if not result:
         raise HTTPException(
@@ -1179,3 +1191,69 @@ async def undo_merge(project_id: str, scene_index: int):
         "scenes": _serialize_scenes(restored_scenes),
         "matches": [m.model_dump() for m in restored_matches.matches],
     }
+
+
+@router.post("/matches/zoom-search/{scene_index}", status_code=202)
+async def start_zoom_search(project_id: str, scene_index: int):
+    """Queue an extensive zoom search for one scene (async background job)."""
+    project = ProjectService.load(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if project.library_type == LibraryType.PURE:
+        raise HTTPException(
+            status_code=400,
+            detail="Zoom search is not available for pure projects",
+        )
+
+    scenes = ProjectService.load_scenes(project_id)
+    if not scenes or not scenes.scenes:
+        raise HTTPException(status_code=404, detail="No scenes found")
+    if not 0 <= scene_index < len(scenes.scenes):
+        raise HTTPException(status_code=400, detail="Invalid scene index")
+
+    video_path = Path(project.video_path) if project.video_path else None
+    if not video_path or not video_path.exists():
+        raise HTTPException(status_code=400, detail="Video not found")
+
+    job = await zoom_search_service.enqueue(project_id, scene_index)
+    return {"job": job.model_dump(mode="json")}
+
+
+@router.get("/matches/zoom-search/jobs")
+async def list_zoom_search_jobs(project_id: str):
+    """Snapshot of this project's zoom-search jobs."""
+    return {
+        "jobs": [
+            job.model_dump(mode="json")
+            for job in zoom_search_service.list_jobs(project_id)
+        ]
+    }
+
+
+@router.get("/matches/zoom-search/jobs/stream")
+async def stream_zoom_search_jobs(project_id: str):
+    """SSE stream of this project's zoom-search job updates.
+
+    Events are wrapped as ``{"kind": "zoom_job", "job": {...}}`` so a job in
+    the ``error`` state never puts a top-level ``status: "error"`` on the
+    wire (the frontend's generic SSE reader throws on those).
+    """
+
+    async def generate():
+        async for data in zoom_search_service.stream_jobs(project_id):
+            yield "data: " + json.dumps({"kind": "zoom_job", "job": data}) + "\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
+@router.post("/matches/zoom-search/jobs/{job_id}/ack")
+async def ack_zoom_search_job(project_id: str, job_id: str):
+    """Mark a zoom-search job's alert as acknowledged (dismissed)."""
+    job = zoom_search_service.ack(job_id)
+    if job is None or job.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"job": job.model_dump(mode="json")}

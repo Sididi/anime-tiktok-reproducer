@@ -162,3 +162,13 @@ body {
 .publish-error-glow {
   animation: publish-error-glow 1.4s ease-in-out infinite;
 }
+
+/* Extensive zoom search: a finished scene's card glows until its alert is
+   dismissed (alert click, Play Both, or a committed timing change). */
+@keyframes zoom-search-alert-glow {
+  0%, 100% { box-shadow: 0 0 5px 1px rgba(52, 211, 153, 0.35); }
+  50% { box-shadow: 0 0 14px 4px rgba(52, 211, 153, 0.8); }
+}
+.zoom-search-alert-glow {
+  animation: zoom-search-alert-glow 2s ease-in-out infinite;
+}

@@ -28,12 +28,17 @@ import {
   Download,
   ChevronUp,
   ChevronDown,
+  Clock,
+  ScanSearch,
 } from "lucide-react";
 import { Button } from "@/components/ui";
 import { MatchesClipPlayer, ManualMatchModal } from "@/components/video";
 import { TorrentManagementModal } from "@/components/library";
 import { RecomputeEpisodesSplitButton } from "@/components/matches/RecomputeEpisodesSplitButton";
 import { EpisodeSelectModal } from "@/components/matches/EpisodeSelectModal";
+import { ZoomSearchJobsBridge } from "@/components/matches/ZoomSearchJobsBridge";
+import { ZoomSearchAlertStack } from "@/components/matches/ZoomSearchAlertStack";
+import { useZoomSearchAlertStore } from "@/stores/zoomSearchAlertStore";
 import { proposeEpisodes } from "@/utils/proposeEpisodes";
 import type { MatchesClipPlayerHandle } from "@/components/video/MatchesClipPlayer";
 import type { ManualMatchSaveMeta } from "@/components/video/ManualMatchModal";
@@ -113,6 +118,12 @@ interface MatchCardProps {
   onMergeWithPrevious?: (sceneIndex: number) => void;
   manualMergeHint?: boolean;
   structureActionsDisabled?: boolean;
+  // Extensive zoom search (async background job) for this scene.
+  onZoomSearch?: (sceneIndex: number) => void;
+  // Fired on the user's Play Both click — dismisses the scene's zoom alert.
+  onPlayBothActivated?: (sceneIndex: number) => void;
+  zoomSearchState?: "queued" | "running" | null;
+  zoomSearchGlow?: boolean;
   // Pure projects: identity matches onto the project's own video — there is
   // no episode library to search, so manual match search is meaningless.
   hideManualMatch?: boolean;
@@ -163,6 +174,10 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
       onMergeWithPrevious,
       manualMergeHint = false,
       structureActionsDisabled = false,
+      onZoomSearch,
+      onPlayBothActivated,
+      zoomSearchState = null,
+      zoomSearchGlow = false,
       hideManualMatch = false,
     },
     ref,
@@ -539,9 +554,11 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
           "rounded-lg p-4 space-y-4",
           continuityTintClass,
           isActive && "ring-2 ring-[hsl(var(--primary))]",
+          zoomSearchGlow && "zoom-search-alert-glow",
         )}
         data-scene-index={scene.index}
         data-continuity-kind={continuityClaim?.kind}
+        data-zoom-search-alert={zoomSearchGlow ? "true" : "false"}
       >
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
@@ -582,17 +599,45 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
               </span>
             )}
           </div>
-          {hasMatchedScene ? (
-            <span className="flex items-center gap-1 text-sm text-emerald-500">
-              <Check className="h-4 w-4" />
-              {Math.round(match.confidence * 100)}% match
-            </span>
-          ) : (
-            <span className="flex items-center gap-1 text-sm text-amber-500">
-              <AlertCircle className="h-4 w-4" />
-              No match found
-            </span>
-          )}
+          <div className="flex items-center gap-2">
+            {!hideManualMatch && onZoomSearch && (
+              <button
+                type="button"
+                aria-label="Extensive zoom search"
+                title="Extensive zoom search (slow, thorough — handles heavy zooms and motion zooms)"
+                data-zoom-search-button="true"
+                data-zoom-search-scene-index={scene.index}
+                data-zoom-search-state={zoomSearchState ?? "idle"}
+                disabled={Boolean(zoomSearchState)}
+                onClick={() => onZoomSearch(scene.index)}
+                className="flex items-center gap-1 text-xs px-1.5 py-0.5 rounded border border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))] transition-colors enabled:hover:bg-[hsl(var(--secondary))] enabled:hover:text-[hsl(var(--foreground))] disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                {zoomSearchState === "running" ? (
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                ) : zoomSearchState === "queued" ? (
+                  <Clock className="h-3 w-3" />
+                ) : (
+                  <ScanSearch className="h-3 w-3" />
+                )}
+                {zoomSearchState === "running"
+                  ? "Searching…"
+                  : zoomSearchState === "queued"
+                    ? "Queued"
+                    : "Zoom search"}
+              </button>
+            )}
+            {hasMatchedScene ? (
+              <span className="flex items-center gap-1 text-sm text-emerald-500">
+                <Check className="h-4 w-4" />
+                {Math.round(match.confidence * 100)}% match
+              </span>
+            ) : (
+              <span className="flex items-center gap-1 text-sm text-amber-500">
+                <AlertCircle className="h-4 w-4" />
+                No match found
+              </span>
+            )}
+          </div>
         </div>
 
         <div className="grid grid-cols-2 gap-4">
@@ -733,7 +778,10 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
               variant="outline"
               size="sm"
               className="flex-1"
-              onClick={playBothFromStart}
+              onClick={() => {
+                onPlayBothActivated?.(scene.index);
+                void playBothFromStart();
+              }}
               disabled={Boolean(pendingUpdate)}
             >
               <Play className="h-4 w-4 mr-2" />
@@ -743,6 +791,7 @@ const MatchCard = forwardRef<MatchCardHandle, MatchCardProps>(
               <Button
                 variant="outline"
                 size="sm"
+                aria-label="Edit match timing"
                 onClick={() => setShowManualModal(true)}
                 disabled={Boolean(pendingUpdate)}
               >
@@ -1108,6 +1157,69 @@ export function MatchValidation() {
       el.scrollIntoView({ behavior: "instant", block: "center" });
     }
   }, []);
+
+  // ---------------------------------------------------------------------
+  // Extensive zoom search — async per-scene jobs + completion alerts
+  const upsertZoomJob = useZoomSearchAlertStore((s) => s.upsertJob);
+  const dismissZoomScene = useZoomSearchAlertStore((s) => s.dismissScene);
+  const clearZoomProject = useZoomSearchAlertStore((s) => s.clearProject);
+  const zoomAlerts = useZoomSearchAlertStore((s) => s.alerts);
+  const zoomJobsBySceneIndex = useZoomSearchAlertStore(
+    (s) => s.jobsBySceneIndex,
+  );
+
+  const zoomAlertSceneIndices = useMemo(() => {
+    const indices = new Set<number>();
+    for (const alert of zoomAlerts) {
+      if (alert.projectId === projectId) indices.add(alert.sceneIndex);
+    }
+    return indices;
+  }, [zoomAlerts, projectId]);
+
+  const dismissZoomAlertsForScene = useCallback(
+    (sceneIndex: number) => {
+      if (!projectId) return;
+      const jobIds = dismissZoomScene(projectId, sceneIndex);
+      for (const jobId of jobIds) {
+        void api.ackZoomSearchJob(projectId, jobId).catch(() => {
+          // Ack is best-effort; the alert is already dismissed locally.
+        });
+      }
+    },
+    [projectId, dismissZoomScene],
+  );
+
+  const handleZoomSearch = useCallback(
+    async (sceneIndex: number) => {
+      if (!projectId) return;
+      try {
+        const { job } = await api.startZoomSearch(projectId, sceneIndex);
+        upsertZoomJob(projectId, job);
+      } catch (err) {
+        showToast(
+          "error",
+          err instanceof Error ? err.message : "Failed to start zoom search",
+        );
+      }
+    },
+    [projectId, upsertZoomJob, showToast],
+  );
+
+  const handleZoomAlertJump = useCallback(
+    (sceneIndex: number) => {
+      setActiveSceneIndex(sceneIndex);
+      scrollToScene(sceneIndex, true);
+      dismissZoomAlertsForScene(sceneIndex);
+    },
+    [scrollToScene, dismissZoomAlertsForScene],
+  );
+
+  const handlePlayBothActivated = useCallback(
+    (sceneIndex: number) => {
+      dismissZoomAlertsForScene(sceneIndex);
+    },
+    [dismissZoomAlertsForScene],
+  );
 
   const playFastWatchFromScene = useCallback(
     async (startSceneIndex: number) => {
@@ -1667,6 +1779,10 @@ export function MatchValidation() {
         ? episodeSubset
         : undefined;
 
+    // A recompute renumbers scene indices: pending zoom-search jobs and
+    // alerts are stale (the server invalidates its side too).
+    clearZoomProject(projectId);
+
     abortActiveStreams();
     const controller = createStreamController();
     matchRunControllerRef.current = controller;
@@ -1767,6 +1883,7 @@ export function MatchValidation() {
     abortActiveStreams,
     createStreamController,
     releaseStreamController,
+    clearZoomProject,
   ]);
 
   // Auto-start matching when skipUiEnabled and no matches exist
@@ -1880,6 +1997,9 @@ export function MatchValidation() {
           },
         );
         persisted = true;
+        // A committed timing change (manual edit or AI-candidate save)
+        // resolves this scene's zoom-search alert.
+        dismissZoomAlertsForScene(sceneIndex);
 
         if (signal.aborted) return;
 
@@ -2033,6 +2153,7 @@ export function MatchValidation() {
       showToast,
       createStreamController,
       releaseStreamController,
+      dismissZoomAlertsForScene,
     ],
   );
 
@@ -2174,6 +2295,8 @@ export function MatchValidation() {
         setPendingSceneUpdates({});
         setSceneWarnings({});
         setToast(null);
+        // Undo renumbers scene indices → zoom-search state is stale.
+        clearZoomProject(projectId);
         const result = await api.undoMerge(projectId, sceneIndex);
         const matchesWithTracking = result.matches.map((m) => ({
           ...m,
@@ -2199,7 +2322,14 @@ export function MatchValidation() {
         setStructureUpdating(false);
       }
     },
-    [projectId, stopFastWatch, applyStructuralSceneChange, setScenes, showToast],
+    [
+      projectId,
+      stopFastWatch,
+      applyStructuralSceneChange,
+      setScenes,
+      showToast,
+      clearZoomProject,
+    ],
   );
 
   const handleMergeWithPrevious = useCallback(
@@ -2212,6 +2342,8 @@ export function MatchValidation() {
         setPendingSceneUpdates({});
         setSceneWarnings({});
         setToast(null);
+        // Merging renumbers scene indices → zoom-search state is stale.
+        clearZoomProject(projectId);
         const result = await api.mergeMatchWithPrevious(projectId, sceneIndex);
         const matchesWithTracking = result.matches.map((m) => ({
           ...m,
@@ -2228,7 +2360,13 @@ export function MatchValidation() {
         setStructureUpdating(false);
       }
     },
-    [projectId, stopFastWatch, applyStructuralSceneChange, showToast],
+    [
+      projectId,
+      stopFastWatch,
+      applyStructuralSceneChange,
+      showToast,
+      clearZoomProject,
+    ],
   );
 
   // Count confirmed matches (those with valid match data)
@@ -2798,6 +2936,12 @@ export function MatchValidation() {
                     onMergeWithPrevious={handleMergeWithPrevious}
                     manualMergeHint={manualMergeHints.has(scene.index)}
                     structureActionsDisabled={structureActionsDisabled}
+                    onZoomSearch={handleZoomSearch}
+                    onPlayBothActivated={handlePlayBothActivated}
+                    zoomSearchState={
+                      zoomJobsBySceneIndex[scene.index]?.status ?? null
+                    }
+                    zoomSearchGlow={zoomAlertSceneIndices.has(scene.index)}
                     hideManualMatch={project?.library_type === "pure"}
                   />
                 </div>
@@ -2907,6 +3051,17 @@ export function MatchValidation() {
             {toast.message}
           </div>
         </div>
+      )}
+
+      {/* Extensive zoom search: job stream subscription + completion alerts */}
+      {projectId && project?.library_type !== "pure" && (
+        <>
+          <ZoomSearchJobsBridge projectId={projectId} />
+          <ZoomSearchAlertStack
+            projectId={projectId}
+            onAlertClick={handleZoomAlertJump}
+          />
+        </>
       )}
 
       {/* Episode subset recompute configuration */}

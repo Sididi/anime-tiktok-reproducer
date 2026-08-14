@@ -409,6 +409,22 @@ export interface SceneMatch {
   merged_from?: number[] | null; // Original scene indices before merge
 }
 
+// Per-scene extensive zoom search background job (async server-side).
+export interface ZoomSearchJob {
+  id: string;
+  project_id: string;
+  scene_index: number;
+  status: "queued" | "running" | "complete" | "error" | "cancelled";
+  message: string;
+  changed: boolean | null;
+  applied: boolean | null;
+  old_match: SceneMatch | null;
+  new_match: SceneMatch | null;
+  error: string | null;
+  acknowledged: boolean;
+  created_at: number;
+}
+
 export interface ScenePlaybackClip {
   scene_index: number;
   track: "tiktok" | "source";
