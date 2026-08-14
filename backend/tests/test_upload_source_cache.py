@@ -61,6 +61,9 @@ def test_ensure_source_video_downloads_from_drive(source_cache, monkeypatch):
     monkeypatch.setattr(
         up.GoogleDriveService, "download_file", classmethod(fake_download)
     )
+    monkeypatch.setattr(
+        up.GoogleDriveService, "get_file_size", classmethod(lambda cls, fid: 10000)
+    )
     readiness = _readiness(drive_video_id="d1", drive_video_name="final.mp4")
     result = UploadPhaseService._ensure_source_video("p1", readiness)
     assert result.read_bytes() == b"drive-bytes"
@@ -77,6 +80,9 @@ def test_ensure_source_video_reuses_cache(source_cache, monkeypatch):
         up.GoogleDriveService,
         "download_file",
         classmethod(lambda cls, fid, dest: calls.append(fid) or dest.write_bytes(b"x")),
+    )
+    monkeypatch.setattr(
+        up.GoogleDriveService, "get_file_size", classmethod(lambda cls, fid: 10000)
     )
     readiness = _readiness(drive_video_id="d1", drive_video_name="final.mp4")
     UploadPhaseService._ensure_source_video("p1", readiness)
@@ -118,6 +124,9 @@ def test_start_download_background_success(source_cache, monkeypatch):
         "download_file",
         classmethod(lambda cls, fid, dest: dest.write_bytes(b"bg")),
     )
+    monkeypatch.setattr(
+        up.GoogleDriveService, "get_file_size", classmethod(lambda cls, fid: 10000)
+    )
     readiness = _readiness(drive_video_id="d1", drive_video_name="final.mp4")
     status = UploadPhaseService.start_source_video_download("p1", readiness)
     assert status["state"] in ("in_progress", "ready")
@@ -133,6 +142,9 @@ def test_start_download_background_error(source_cache, monkeypatch):
         raise RuntimeError("drive down")
 
     monkeypatch.setattr(up.GoogleDriveService, "download_file", classmethod(boom))
+    monkeypatch.setattr(
+        up.GoogleDriveService, "get_file_size", classmethod(lambda cls, fid: None)
+    )
     readiness = _readiness(drive_video_id="d1", drive_video_name="final.mp4")
     UploadPhaseService.start_source_video_download("p1", readiness)
     assert _wait_until(
@@ -147,6 +159,65 @@ def test_start_download_short_circuits_when_ready(source_cache):
     (cache_dir / "final.mp4").write_bytes(b"x")
     status = UploadPhaseService.start_source_video_download("p1", _readiness())
     assert status["state"] == "ready"
+
+
+class _FakeFilesRequest:
+    def __init__(self, result):
+        self._result = result
+
+    def execute(self):
+        if isinstance(self._result, Exception):
+            raise self._result
+        return self._result
+
+
+class _FakeFiles:
+    def __init__(self, result):
+        self._result = result
+
+    def get(self, fileId, fields, supportsAllDrives):
+        return _FakeFilesRequest(self._result)
+
+
+class _FakeDriveClient:
+    def __init__(self, result):
+        self._result = result
+
+    def files(self):
+        return _FakeFiles(self._result)
+
+
+def test_get_file_size_success(monkeypatch):
+    from app.services.google_drive_service import GoogleDriveService
+
+    monkeypatch.setattr(
+        GoogleDriveService,
+        "_client",
+        classmethod(lambda cls: _FakeDriveClient({"size": "123"})),
+    )
+    assert GoogleDriveService.get_file_size("f1") == 123
+
+
+def test_get_file_size_missing_key(monkeypatch):
+    from app.services.google_drive_service import GoogleDriveService
+
+    monkeypatch.setattr(
+        GoogleDriveService,
+        "_client",
+        classmethod(lambda cls: _FakeDriveClient({})),
+    )
+    assert GoogleDriveService.get_file_size("f1") is None
+
+
+def test_get_file_size_on_exception(monkeypatch):
+    from app.services.google_drive_service import GoogleDriveService
+
+    monkeypatch.setattr(
+        GoogleDriveService,
+        "_client",
+        classmethod(lambda cls: _FakeDriveClient(RuntimeError("boom"))),
+    )
+    assert GoogleDriveService.get_file_size("f1") is None
 
 
 def test_source_status_reports_bytes_progress(tmp_path, monkeypatch):
