@@ -341,3 +341,62 @@ def test_extract_frame_image(tmp_path, monkeypatch):
         classmethod(lambda cls, video_path, timestamp: None),
     )
     assert ThumbnailService.extract_frame_image(video, 1.5, tmp_path / "t2.jpg") is None
+
+
+def test_compose_vertical_cover_landscape_blurred_extend():
+    frame = Image.new("RGB", (1920, 1080), (200, 30, 30))
+    # paint a bright column so we can verify the foreground band placement
+    for x in range(900, 1020):
+        for y in range(0, 1080, 7):
+            frame.putpixel((x, y), (0, 255, 0))
+    cover = ThumbnailService.compose_vertical_cover(frame)
+    assert cover.size == (1080, 1920)
+    # foreground band: full-width 16:9 => height 607/608, vertically centered
+    import numpy as np
+    arr = np.asarray(cover)
+    center_band = arr[930:990, :, :]
+    top_band = arr[0:200, :, :]
+    # background is darkened: top band strictly darker on average than center band
+    assert float(top_band.mean()) < float(center_band.mean())
+
+
+def test_compose_vertical_cover_portrait_passthrough_resize():
+    frame = Image.new("RGB", (540, 960), (10, 10, 200))
+    cover = ThumbnailService.compose_vertical_cover(frame)
+    assert cover.size == (1080, 1920)
+
+
+def test_extract_local_clean_frame_resolves_and_composes(monkeypatch, tmp_path):
+    episode = tmp_path / "ep1.mkv"
+    episode.write_bytes(b"\x00")
+    monkeypatch.setattr(
+        "app.services.thumbnail_service.AnimeLibraryService.resolve_episode_path",
+        classmethod(lambda cls, name, manifest=None, library_type=None: episode),
+    )
+    monkeypatch.setattr(
+        "app.services.thumbnail_service.AnimeMatcherService.extract_frame",
+        classmethod(lambda cls, path, ts: Image.new("RGB", (1920, 1080), (5, 5, 5))),
+    )
+    cand = ThumbnailCandidate(
+        index=0, label="Scène 1 · début", timestamp_seconds=0.05,
+        scene_index=0, position="start",
+        episode="ep1.mkv", source_timestamp_seconds=100.05,
+    )
+    frame = ThumbnailService._extract_local_clean_frame(cand, None)
+    assert frame is not None and frame.size == (1920, 1080)
+
+
+def test_extract_local_clean_frame_none_without_source_or_file(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.thumbnail_service.AnimeLibraryService.resolve_episode_path",
+        classmethod(lambda cls, name, manifest=None, library_type=None: None),
+    )
+    no_source = ThumbnailCandidate(
+        index=0, label="x", timestamp_seconds=0.05, scene_index=0, position="start",
+    )
+    assert ThumbnailService._extract_local_clean_frame(no_source, None) is None
+    with_source = ThumbnailCandidate(
+        index=0, label="x", timestamp_seconds=0.05, scene_index=0, position="start",
+        episode="gone.mkv", source_timestamp_seconds=1.0,
+    )
+    assert ThumbnailService._extract_local_clean_frame(with_source, None) is None

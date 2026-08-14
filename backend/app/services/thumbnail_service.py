@@ -14,9 +14,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from PIL import Image
+
 from ..config import settings
 from ..models.match import MatchList, SceneMatch
 from ..models.transcription import Transcription
+from .anime_library import AnimeLibraryService
 from .anime_matcher import AnimeMatcherService
 from .export_service import ExportService
 from .project_service import ProjectService
@@ -246,5 +249,58 @@ class ThumbnailService:
             logger.warning(
                 "Thumbnail image extraction failed: %s t=%.3f",
                 video_path, timestamp_seconds, exc_info=True,
+            )
+            return None
+
+    _COVER_SIZE = (1080, 1920)
+
+    @classmethod
+    def compose_vertical_cover(cls, image: Image.Image) -> Image.Image:
+        """1080×1920 blurred-extend: frame full-width centered over a blurred,
+        darkened self-fill background (the rendered videos' look, minus text)."""
+        from PIL import ImageEnhance, ImageFilter, ImageOps  # local: PIL submodules
+
+        target_w, target_h = cls._COVER_SIZE
+        src = image.convert("RGB")
+        if src.height >= src.width:  # already portrait-ish: plain fit
+            return ImageOps.fit(src, cls._COVER_SIZE, Image.LANCZOS)
+        background = ImageOps.fit(src, cls._COVER_SIZE, Image.LANCZOS)
+        background = background.filter(ImageFilter.GaussianBlur(radius=40))
+        background = ImageEnhance.Brightness(background).enhance(0.45)
+        fg_h = int(round(target_w * src.height / src.width))
+        foreground = src.resize((target_w, fg_h), Image.LANCZOS)
+        background.paste(foreground, (0, (target_h - fg_h) // 2))
+        return background
+
+    @classmethod
+    def _resolve_local_episode(cls, episode: str, library_type) -> Path | None:
+        try:
+            resolved = AnimeLibraryService.resolve_episode_path(
+                episode, library_type=library_type
+            )
+        except Exception:
+            logger.warning("Episode resolution failed for %r", episode, exc_info=True)
+            return None
+        if resolved is not None and resolved.exists():
+            return resolved
+        return None
+
+    @classmethod
+    def _extract_local_clean_frame(
+        cls, candidate: ThumbnailCandidate, library_type
+    ) -> Image.Image | None:
+        if not candidate.episode or candidate.source_timestamp_seconds is None:
+            return None
+        path = cls._resolve_local_episode(candidate.episode, library_type)
+        if path is None:
+            return None
+        try:
+            return AnimeMatcherService.extract_frame(
+                path, candidate.source_timestamp_seconds
+            )
+        except Exception:
+            logger.warning(
+                "Local clean-frame extraction failed: %s t=%.3f",
+                path, candidate.source_timestamp_seconds, exc_info=True,
             )
             return None
