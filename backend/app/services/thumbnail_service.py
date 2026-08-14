@@ -34,24 +34,6 @@ from .project_service import ProjectService
 logger = logging.getLogger(__name__)
 
 
-def __getattr__(name: str) -> Any:
-    """PEP 562 module lazy-attribute: resolves UploadPhaseService on demand.
-
-    upload_phase.py imports ThumbnailService at module level, so importing
-    UploadPhaseService here at module level would be a real import cycle.
-    _run_candidates_build imports it lazily inside the method instead; this
-    hook exists only so `monkeypatch.setattr("app.services.thumbnail_service.
-    UploadPhaseService...", ...)` (string-path resolution) can still reach
-    the real class in tests, patching the same singleton our lazy import
-    picks up at call time.
-    """
-    if name == "UploadPhaseService":
-        from .upload_phase import UploadPhaseService
-
-        return UploadPhaseService
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
 @dataclass(frozen=True)
 class ThumbnailCandidate:
     index: int
@@ -269,7 +251,8 @@ class ThumbnailService:
             project_thumbs_dir = cls._project_thumbs_dir(project_id)
             version_dir = project_thumbs_dir / version
             existing_meta = cls._read_meta(project_id, version)
-            if version_dir.exists() and existing_meta is not None:
+            resuming = version_dir.exists() and existing_meta is not None
+            if resuming:
                 pending = sum(
                     1 for c in existing_meta.get("candidates", [])
                     if c.get("source") == "pending"
@@ -277,7 +260,11 @@ class ThumbnailService:
                 if pending == 0:
                     return  # cache hit: nothing left to resolve
 
-            # Fresh build (or resume): version changed -> wipe stale versions.
+            # Fresh build: version changed -> wipe stale versions. Resume
+            # (version dir + meta already present, pending > 0) keeps the
+            # existing meta/JPEGs as-is: already-resolved candidates must
+            # not flicker back to "pending" for concurrent status readers,
+            # nor get re-extracted.
             if not version_dir.exists():
                 shutil.rmtree(project_thumbs_dir, ignore_errors=True)
             version_dir.mkdir(parents=True, exist_ok=True)
@@ -293,24 +280,32 @@ class ThumbnailService:
             library_type = project.library_type if project else None
             drive_folder_id = project.drive_folder_id if project else None
 
-            meta_candidates = [
-                {
-                    "index": c.index,
-                    "label": c.label,
-                    "timestamp_ms": c.timestamp_ms,
-                    "scene_index": c.scene_index,
-                    "position": c.position,
-                    "source": "pending",
-                }
-                for c in candidates
-            ]
-            meta = {"version": version, "candidates": meta_candidates}
-            cls._write_meta(project_id, version, meta)
-
             by_index = {c.index: c for c in candidates}
 
-            # Step 1: local clean frame, else Drive clean frame.
+            if resuming:
+                meta = existing_meta
+                meta_candidates = meta.setdefault("candidates", [])
+            else:
+                meta_candidates = [
+                    {
+                        "index": c.index,
+                        "label": c.label,
+                        "timestamp_ms": c.timestamp_ms,
+                        "scene_index": c.scene_index,
+                        "position": c.position,
+                        "source": "pending",
+                    }
+                    for c in candidates
+                ]
+                meta = {"version": version, "candidates": meta_candidates}
+                cls._write_meta(project_id, version, meta)
+
+            # Step 1: local clean frame, else Drive clean frame. Only
+            # candidates still "pending" (fresh build: all of them; resume:
+            # whatever didn't resolve last time) are attempted.
             for entry in meta_candidates:
+                if entry.get("source") != "pending":
+                    continue
                 candidate = by_index[entry["index"]]
                 if candidate.episode is None or candidate.source_timestamp_seconds is None:
                     continue

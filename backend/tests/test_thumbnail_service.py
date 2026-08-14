@@ -221,7 +221,7 @@ def test_progressive_build_clean_then_pending_fallback(tmp_path, monkeypatch):
     )
     # output video NOT cached yet
     monkeypatch.setattr(
-        "app.services.thumbnail_service.UploadPhaseService.cached_source_video",
+        "app.services.upload_phase.UploadPhaseService.cached_source_video",
         classmethod(lambda cls, pid: None),
     )
     ThumbnailService._run_candidates_build("p1")  # synchronous internal for tests
@@ -233,6 +233,53 @@ def test_progressive_build_clean_then_pending_fallback(tmp_path, monkeypatch):
     assert by_index[0]["image_url"].startswith("/project-manager/projects/p1/thumbnail-frame/0")
     scene1_pending = [c for c in snap["candidates"] if c["source"] == "pending"]
     assert snap["pending"] == len(scene1_pending) > 0
+
+
+def test_run_candidates_build_resume_preserves_resolved_clean_candidate(tmp_path, monkeypatch):
+    """A resume call (existing meta, pending > 0) must not discard already-
+    resolved candidates: no re-extraction, no file rewrite, no flicker back
+    to "pending" for concurrent status readers."""
+    _v2_project(tmp_path, monkeypatch, scenes=2)
+    local_calls: list[int] = []
+
+    def _local_extract(cls, cand, lt):
+        local_calls.append(cand.scene_index)
+        if cand.scene_index == 0:
+            return Image.new("RGB", (1920, 1080), (9, 9, 9))
+        return None
+
+    monkeypatch.setattr(
+        ThumbnailService, "_extract_local_clean_frame", classmethod(_local_extract)
+    )
+    monkeypatch.setattr(
+        ThumbnailService, "_extract_drive_clean_frame",
+        classmethod(lambda cls, cand, folder: None),
+    )
+    # output video NOT cached on either call: scene-1 candidates stay pending
+    monkeypatch.setattr(
+        "app.services.upload_phase.UploadPhaseService.cached_source_video",
+        classmethod(lambda cls, pid: None),
+    )
+
+    ThumbnailService._run_candidates_build("p1")
+    snap = ThumbnailService.candidates_status("p1")
+    assert snap["state"] == "partial"
+    frame = ThumbnailService.cached_frame_path("p1", 0)
+    assert frame is not None
+    mtime_before = frame.stat().st_mtime_ns
+    assert 0 in local_calls  # scene-0 was attempted on the fresh build
+
+    local_calls.clear()
+    ThumbnailService._run_candidates_build("p1")  # resume: pending > 0
+
+    frame_after = ThumbnailService.cached_frame_path("p1", 0)
+    assert frame_after is not None
+    assert frame_after.stat().st_mtime_ns == mtime_before  # not rewritten
+    assert 0 not in local_calls  # not re-extracted on resume
+
+    snap_after = ThumbnailService.candidates_status("p1")
+    by_index = {c["index"]: c for c in snap_after["candidates"]}
+    assert by_index[0]["source"] == "clean"  # never flipped back to "pending"
 
 
 def test_progressive_build_completes_with_output_fallback(tmp_path, monkeypatch):
@@ -249,7 +296,7 @@ def test_progressive_build_completes_with_output_fallback(tmp_path, monkeypatch)
     video = tmp_path / "output.mp4"
     video.write_bytes(b"\x00" * 64)
     monkeypatch.setattr(
-        "app.services.thumbnail_service.UploadPhaseService.cached_source_video",
+        "app.services.upload_phase.UploadPhaseService.cached_source_video",
         classmethod(lambda cls, pid: video),
     )
     monkeypatch.setattr(
@@ -294,7 +341,7 @@ def test_run_candidates_build_cache_hit_skips_rebuild(tmp_path, monkeypatch):
     video = tmp_path / "output.mp4"
     video.write_bytes(b"\x00" * 64)
     monkeypatch.setattr(
-        "app.services.thumbnail_service.UploadPhaseService.cached_source_video",
+        "app.services.upload_phase.UploadPhaseService.cached_source_video",
         classmethod(lambda cls, pid: video),
     )
     monkeypatch.setattr(
@@ -329,7 +376,7 @@ def test_run_candidates_build_drops_candidates_when_output_fallback_fails(tmp_pa
     video = tmp_path / "output.mp4"
     video.write_bytes(b"\x00" * 64)
     monkeypatch.setattr(
-        "app.services.thumbnail_service.UploadPhaseService.cached_source_video",
+        "app.services.upload_phase.UploadPhaseService.cached_source_video",
         classmethod(lambda cls, pid: video),
     )
     monkeypatch.setattr(
@@ -359,7 +406,7 @@ def test_run_candidates_build_concurrent_calls_do_not_collide(tmp_path, monkeypa
     video = tmp_path / "output.mp4"
     video.write_bytes(b"\x00" * 64)
     monkeypatch.setattr(
-        "app.services.thumbnail_service.UploadPhaseService.cached_source_video",
+        "app.services.upload_phase.UploadPhaseService.cached_source_video",
         classmethod(lambda cls, pid: video),
     )
     monkeypatch.setattr(
