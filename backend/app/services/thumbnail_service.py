@@ -1,8 +1,11 @@
 """Thumbnail candidate computation and frame extraction for upload covers.
 
 Candidates are timestamps in the FINAL rendered video, computed from the
-authoritative playback timeline (output/transcription_timing.json). Preview
-JPEGs are extracted from the shared upload_source cache in one decode pass.
+authoritative playback timeline (output/transcription_timing.json). A
+background progressive builder resolves each candidate's composed 1080x1920
+cover from the cleanest source available: a local clean-library frame, a
+Drive range-fetch of the same, or (once cached) a frame from the rendered
+output video — see _run_candidates_build for the meta.json state machine.
 """
 from __future__ import annotations
 
@@ -31,6 +34,24 @@ from .project_service import ProjectService
 logger = logging.getLogger(__name__)
 
 
+def __getattr__(name: str) -> Any:
+    """PEP 562 module lazy-attribute: resolves UploadPhaseService on demand.
+
+    upload_phase.py imports ThumbnailService at module level, so importing
+    UploadPhaseService here at module level would be a real import cycle.
+    _run_candidates_build imports it lazily inside the method instead; this
+    hook exists only so `monkeypatch.setattr("app.services.thumbnail_service.
+    UploadPhaseService...", ...)` (string-path resolution) can still reach
+    the real class in tests, patching the same singleton our lazy import
+    picks up at call time.
+    """
+    if name == "UploadPhaseService":
+        from .upload_phase import UploadPhaseService
+
+        return UploadPhaseService
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 @dataclass(frozen=True)
 class ThumbnailCandidate:
     index: int
@@ -53,7 +74,7 @@ class ThumbnailService:
     _THUMBS_CACHE_DIR = settings.cache_dir / "upload_thumbs"
 
     # Per-project locks guarding the rebuild critical section (rmtree + write
-    # + payload assembly) in build_candidates_payload, same pattern as
+    # + progressive meta updates) in _run_candidates_build, same pattern as
     # UploadPhaseService._source_locks / _source_lock.
     _build_lock_guard = threading.Lock()
     _build_locks: dict[str, threading.Lock] = {}
@@ -157,74 +178,227 @@ class ThumbnailService:
     def _project_thumbs_dir(cls, project_id: str) -> Path:
         return cls._THUMBS_CACHE_DIR / project_id
 
+    # ── Progressive builder (meta.json state machine) ─────────────────────
+    #
+    # Cache layout: upload_thumbs/<project>/<version>/cand_<i>.jpg (composed
+    # covers) + meta.json {"version", "candidates": [{"index", "label",
+    # "timestamp_ms", "scene_index", "position", "source"}]}, source one of
+    # "clean" | "output" | "pending". Version tracks transcription_timing.json
+    # + matches.json mtimes so a rematch or a re-render invalidates the cache.
+
     @classmethod
-    def build_candidates_payload(
-        cls, project_id: str, video_path: Path
-    ) -> dict[str, Any]:
-        """Compute candidates, extract+cache JPEGs, return the API payload."""
-        transcription = cls.load_final_timeline(project_id)
-        if transcription is None:
+    def _candidates_version(cls, project_id: str) -> str | None:
+        tt_path = ExportService.get_output_dir(project_id) / "transcription_timing.json"
+        if not tt_path.exists():
+            return None
+        tt_mtime_ns = tt_path.stat().st_mtime_ns
+        matches_path = ProjectService.get_matches_file(project_id)
+        mm_mtime_ns = matches_path.stat().st_mtime_ns if matches_path.exists() else 0
+        return f"{tt_mtime_ns}-{mm_mtime_ns}"
+
+    @classmethod
+    def _meta_path(cls, project_id: str, version: str) -> Path:
+        return cls._project_thumbs_dir(project_id) / version / "meta.json"
+
+    @classmethod
+    def _read_meta(cls, project_id: str, version: str) -> dict[str, Any] | None:
+        path = cls._meta_path(project_id, version)
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            logger.warning(
+                "Unreadable thumbnail meta.json: project=%s version=%s",
+                project_id, version, exc_info=True,
+            )
+            return None
+
+    @classmethod
+    def _write_meta(cls, project_id: str, version: str, meta: dict[str, Any]) -> None:
+        path = cls._meta_path(project_id, version)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(meta))
+        tmp.replace(path)
+
+    @classmethod
+    def candidates_status(cls, project_id: str) -> dict[str, Any]:
+        """Snapshot from meta.json; safe to call from any thread without the
+        build lock (readers never mutate)."""
+        version = cls._candidates_version(project_id)
+        if version is None:
             return {
                 "state": "error",
                 "detail": "Timeline finale introuvable (transcription_timing.json)",
             }
-        candidates = cls.compute_candidates(transcription, ProjectService.load_matches(project_id))
-        if not candidates:
-            return {
-                "state": "error",
-                "detail": "Aucune scène exploitable dans la timeline finale",
+        meta = cls._read_meta(project_id, version)
+        if meta is None:
+            return {"state": "in_progress", "version": version, "pending": 0, "candidates": []}
+
+        payload = []
+        pending = 0
+        for c in meta.get("candidates", []):
+            source = c.get("source")
+            entry = {
+                "index": c["index"],
+                "label": c["label"],
+                "timestamp_ms": c["timestamp_ms"],
+                "source": source,
             }
-
-        stat = video_path.stat()
-        version = f"{stat.st_mtime_ns}-{stat.st_size}"
-
-        # The rmtree-and-rebuild below is not safe against concurrent callers
-        # for the same project (one thread's rmtree can delete files another
-        # thread is mid-write on). Serialize the whole version-check +
-        # rebuild + payload-assembly section per project.
-        with cls._build_lock(project_id):
-            cache_dir = cls._project_thumbs_dir(project_id) / version
-            if not all(
-                (cache_dir / f"cand_{c.index}.jpg").exists() for c in candidates
-            ):
-                # Source video changed (or first call): rebuild from scratch.
-                shutil.rmtree(cls._project_thumbs_dir(project_id), ignore_errors=True)
-                cache_dir.mkdir(parents=True, exist_ok=True)
-                images = AnimeMatcherService.extract_frames(
-                    video_path, [c.timestamp_seconds for c in candidates]
+            if source == "pending":
+                pending += 1
+            else:
+                entry["image_url"] = (
+                    f"/project-manager/projects/{project_id}"
+                    f"/thumbnail-frame/{c['index']}?v={version}"
                 )
-                for candidate, image in zip(candidates, images):
-                    if image is None:
-                        logger.warning(
-                            "Thumbnail frame extraction failed: project=%s index=%d t=%.3f",
-                            project_id, candidate.index, candidate.timestamp_seconds,
-                        )
-                        continue
-                    image.convert("RGB").save(
-                        cache_dir / f"cand_{candidate.index}.jpg",
-                        "JPEG",
-                        quality=cls._JPEG_QUALITY,
-                    )
+            payload.append(entry)
+        state = "ready" if pending == 0 else "partial"
+        return {"state": state, "version": version, "pending": pending, "candidates": payload}
 
-            payload = [
+    @classmethod
+    def _run_candidates_build(cls, project_id: str) -> None:
+        """Synchronous builder body; callers get progress via candidates_status.
+        Safe to call directly from tests (bypasses the background thread)."""
+        with cls._build_lock(project_id):
+            version = cls._candidates_version(project_id)
+            if version is None:
+                return  # candidates_status reports the "error" state
+
+            project_thumbs_dir = cls._project_thumbs_dir(project_id)
+            version_dir = project_thumbs_dir / version
+            existing_meta = cls._read_meta(project_id, version)
+            if version_dir.exists() and existing_meta is not None:
+                pending = sum(
+                    1 for c in existing_meta.get("candidates", [])
+                    if c.get("source") == "pending"
+                )
+                if pending == 0:
+                    return  # cache hit: nothing left to resolve
+
+            # Fresh build (or resume): version changed -> wipe stale versions.
+            if not version_dir.exists():
+                shutil.rmtree(project_thumbs_dir, ignore_errors=True)
+            version_dir.mkdir(parents=True, exist_ok=True)
+
+            transcription = cls.load_final_timeline(project_id)
+            if transcription is None:
+                return
+            matches = ProjectService.load_matches(project_id)
+            candidates = cls.compute_candidates(transcription, matches)
+            if not candidates:
+                return
+            project = ProjectService.load(project_id)
+            library_type = project.library_type if project else None
+            drive_folder_id = project.drive_folder_id if project else None
+
+            meta_candidates = [
                 {
                     "index": c.index,
                     "label": c.label,
                     "timestamp_ms": c.timestamp_ms,
-                    "image_url": (
-                        f"/project-manager/projects/{project_id}"
-                        f"/thumbnail-frame/{c.index}?v={version}"
-                    ),
+                    "scene_index": c.scene_index,
+                    "position": c.position,
+                    "source": "pending",
                 }
                 for c in candidates
-                if (cache_dir / f"cand_{c.index}.jpg").exists()
             ]
-            if not payload:
-                return {
-                    "state": "error",
-                    "detail": "Extraction des miniatures impossible depuis la vidéo finale",
-                }
-            return {"state": "ready", "version": version, "candidates": payload}
+            meta = {"version": version, "candidates": meta_candidates}
+            cls._write_meta(project_id, version, meta)
+
+            by_index = {c.index: c for c in candidates}
+
+            # Step 1: local clean frame, else Drive clean frame.
+            for entry in meta_candidates:
+                candidate = by_index[entry["index"]]
+                if candidate.episode is None or candidate.source_timestamp_seconds is None:
+                    continue
+                image = cls._extract_local_clean_frame(candidate, library_type)
+                if image is None and drive_folder_id:
+                    image = cls._extract_drive_clean_frame(candidate, drive_folder_id)
+                if image is None:
+                    continue
+                cover = cls.compose_vertical_cover(image)
+                cover.save(
+                    version_dir / f"cand_{candidate.index}.jpg",
+                    "JPEG",
+                    quality=cls._JPEG_QUALITY,
+                )
+                entry["source"] = "clean"
+                cls._write_meta(project_id, version, meta)  # progressive visibility
+
+            # Step 2: rendered-output fallback for whatever is still pending.
+            still_pending = [e for e in meta_candidates if e["source"] == "pending"]
+            if still_pending:
+                from .upload_phase import UploadPhaseService  # lazy: import cycle
+
+                video_path = UploadPhaseService.cached_source_video(project_id)
+                if video_path is not None:
+                    timestamps = [
+                        by_index[e["index"]].timestamp_seconds for e in still_pending
+                    ]
+                    images = AnimeMatcherService.extract_frames(video_path, timestamps)
+                    for entry, image in zip(still_pending, images):
+                        if image is None:
+                            logger.warning(
+                                "Thumbnail output-fallback extraction failed: "
+                                "project=%s index=%d",
+                                project_id, entry["index"],
+                            )
+                            continue
+                        cover = cls.compose_vertical_cover(image)
+                        cover.save(
+                            version_dir / f"cand_{entry['index']}.jpg",
+                            "JPEG",
+                            quality=cls._JPEG_QUALITY,
+                        )
+                        entry["source"] = "output"
+                    cls._write_meta(project_id, version, meta)
+
+                    # Candidates the output fallback also failed on: drop
+                    # from meta entirely (mirrors v1 dropped-frame behavior).
+                    meta["candidates"] = [
+                        e for e in meta["candidates"] if e["source"] != "pending"
+                    ]
+                    cls._write_meta(project_id, version, meta)
+
+    # Per-project in-flight registry for the background builder, mirroring
+    # UploadPhaseService._source_downloads_in_flight.
+    _builds_in_flight_guard = threading.Lock()
+    _builds_in_flight: set[str] = set()
+
+    @classmethod
+    def start_candidates_build(cls, project_id: str) -> dict[str, Any]:
+        """Kick the background builder when needed; return the current snapshot."""
+        with cls._builds_in_flight_guard:
+            if project_id in cls._builds_in_flight:
+                return cls.candidates_status(project_id)
+
+        status = cls.candidates_status(project_id)
+        if status["state"] in ("ready", "error"):
+            return status
+
+        with cls._builds_in_flight_guard:
+            if project_id in cls._builds_in_flight:
+                return cls.candidates_status(project_id)
+            cls._builds_in_flight.add(project_id)
+
+        def _worker() -> None:
+            try:
+                cls._run_candidates_build(project_id)
+            except Exception:
+                logger.warning(
+                    "Thumbnail candidates build failed for %s", project_id, exc_info=True,
+                )
+            finally:
+                with cls._builds_in_flight_guard:
+                    cls._builds_in_flight.discard(project_id)
+
+        threading.Thread(
+            target=_worker, name=f"thumb-candidates-{project_id}", daemon=True
+        ).start()
+        return cls.candidates_status(project_id)
 
     @classmethod
     def cached_frame_path(cls, project_id: str, index: int) -> Path | None:

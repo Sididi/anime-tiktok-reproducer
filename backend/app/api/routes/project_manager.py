@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from typing import Literal
 
 from fastapi import APIRouter, Body, HTTPException
@@ -18,6 +19,7 @@ from ...services.upload_phase import (
     UploadPreflightUnavailableError,
 )
 
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/project-manager", tags=["project-manager"])
 
@@ -231,23 +233,17 @@ async def upload_source_preview(project_id: str):
 
 @router.get("/projects/{project_id}/thumbnail-candidates")
 async def thumbnail_candidates(project_id: str):
-    """Thumbnail candidates for the upload cover; warms the source cache."""
+    """Progressive thumbnail candidates; warms the output cache for fallbacks."""
     try:
-        status = await asyncio.to_thread(
+        await asyncio.to_thread(
             UploadPhaseService.start_source_video_download, project_id
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    if status.get("state") != "ready":
-        return {"state": status.get("state"), "detail": status.get("detail")}
-    video_path = UploadPhaseService.cached_source_video(project_id)
-    if video_path is None or not video_path.exists():
-        return {"state": "missing"}
-    return await asyncio.to_thread(
-        ThumbnailService.build_candidates_payload, project_id, video_path
-    )
+    except Exception:
+        # cache warming is best-effort here; clean tiles don't need it
+        logger.warning("Source warm failed for %s", project_id, exc_info=True)
+    return await asyncio.to_thread(ThumbnailService.start_candidates_build, project_id)
 
 
 @router.get("/projects/{project_id}/thumbnail-frame/{index}")

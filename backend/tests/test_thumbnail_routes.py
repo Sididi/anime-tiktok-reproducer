@@ -24,14 +24,31 @@ def client(tmp_path, monkeypatch):
         yield c
 
 
-def test_candidates_report_in_progress_while_warming(client, monkeypatch):
+def test_candidates_delegates_to_start_candidates_build(client, monkeypatch):
     monkeypatch.setattr(
         UploadPhaseService, "start_source_video_download",
         classmethod(lambda cls, pid, readiness=None: {"state": "in_progress"}),
     )
+    snapshot = {
+        "state": "partial",
+        "version": "1-1",
+        "pending": 1,
+        "candidates": [
+            {
+                "index": 0, "label": "Scène 1 · début", "timestamp_ms": 50,
+                "source": "clean",
+                "image_url": "/project-manager/projects/p1/thumbnail-frame/0?v=1-1",
+            },
+            {"index": 1, "label": "Scène 1 · fin", "timestamp_ms": 900, "source": "pending"},
+        ],
+    }
+    monkeypatch.setattr(
+        ThumbnailService, "start_candidates_build",
+        classmethod(lambda cls, pid: snapshot),
+    )
     resp = client.get("/api/project-manager/projects/p1/thumbnail-candidates")
     assert resp.status_code == 200
-    assert resp.json()["state"] == "in_progress"
+    assert resp.json() == snapshot
 
 
 def test_candidates_404_when_project_missing(client, monkeypatch):
@@ -45,32 +62,25 @@ def test_candidates_404_when_project_missing(client, monkeypatch):
     assert resp.status_code == 404
 
 
-def test_candidates_ready_delegates_to_service(client, monkeypatch, tmp_path):
-    video = tmp_path / "video.mp4"
-    video.write_bytes(b"\x00")
+def test_candidates_warm_failure_is_best_effort(client, monkeypatch):
+    """A non-ValueError warm failure must not 500 — the builder still runs
+    off the clean-frame path, which doesn't need the source cache."""
+    def raise_generic(cls, pid, readiness=None):
+        raise RuntimeError("boom")
+
     monkeypatch.setattr(
-        UploadPhaseService, "start_source_video_download",
-        classmethod(lambda cls, pid, readiness=None: {"state": "ready"}),
+        UploadPhaseService, "start_source_video_download", classmethod(raise_generic)
     )
+    snapshot = {"state": "in_progress", "version": "1-1", "pending": 0, "candidates": []}
+    called: list[str] = []
     monkeypatch.setattr(
-        UploadPhaseService, "cached_source_video", classmethod(lambda cls, pid: video)
-    )
-    monkeypatch.setattr(
-        ThumbnailService, "build_candidates_payload",
-        classmethod(lambda cls, pid, vp: {
-            "state": "ready",
-            "version": "1-1",
-            "candidates": [{
-                "index": 0, "label": "Scène 1 · début", "timestamp_ms": 50,
-                "image_url": "/project-manager/projects/p1/thumbnail-frame/0?v=1-1",
-            }],
-        }),
+        ThumbnailService, "start_candidates_build",
+        classmethod(lambda cls, pid: called.append(pid) or snapshot),
     )
     resp = client.get("/api/project-manager/projects/p1/thumbnail-candidates")
     assert resp.status_code == 200
-    body = resp.json()
-    assert body["state"] == "ready"
-    assert body["candidates"][0]["timestamp_ms"] == 50
+    assert resp.json() == snapshot
+    assert called == ["p1"]
 
 
 def test_frame_served_and_404(client, monkeypatch, tmp_path):

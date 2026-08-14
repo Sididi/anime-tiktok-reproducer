@@ -181,136 +181,199 @@ def test_load_final_timeline_reads_output_json(tmp_path, monkeypatch):
     assert ThumbnailService.load_final_timeline("missing") is None
 
 
-@pytest.fixture
-def fake_frames(monkeypatch):
-    def _extract_frames(video_path, timestamps):
-        return [Image.new("RGB", (4, 4), (255, 0, 0)) for _ in timestamps]
+def _v2_project(tmp_path, monkeypatch, scenes=2, with_matches=True):
+    projects = tmp_path / "projects"
+    monkeypatch.setattr("app.services.project_service.settings.projects_dir", projects)
+    monkeypatch.setattr(ThumbnailService, "_THUMBS_CACHE_DIR", tmp_path / "thumbs")
+    out_dir = projects / "p1" / "output"
+    out_dir.mkdir(parents=True)
+    scene_json = ",".join(
+        f'{{"scene_index": {i}, "text": "", "words": [], "start_time": {i * 2}.0,'
+        f' "end_time": {i * 2 + 2}.0, "is_raw": false}}'
+        for i in range(scenes)
+    )
+    (out_dir / "transcription_timing.json").write_text(
+        f'{{"language": "fr", "scenes": [{scene_json}]}}'
+    )
+    if with_matches:
+        ml = MatchList(matches=[
+            SceneMatch(scene_index=i, episode=f"ep{i}.mkv", start_time=10.0 * i,
+                       end_time=10.0 * i + 4.0, confidence=1.0, speed_ratio=1.0)
+            for i in range(scenes)
+        ])
+        (projects / "p1" / "matches.json").write_text(ml.model_dump_json())
+    (projects / "p1" / "project.json").write_text(
+        '{"id": "p1", "url": "https://example.com/v", "drive_folder_id": "folder-1"}'
+    )
+    return projects
 
+
+def test_progressive_build_clean_then_pending_fallback(tmp_path, monkeypatch):
+    _v2_project(tmp_path, monkeypatch, scenes=2)
+    monkeypatch.setattr(
+        ThumbnailService, "_extract_local_clean_frame",
+        classmethod(lambda cls, cand, lt: Image.new("RGB", (1920, 1080), (9, 9, 9))
+                    if cand.scene_index == 0 else None),
+    )
+    monkeypatch.setattr(
+        ThumbnailService, "_extract_drive_clean_frame",
+        classmethod(lambda cls, cand, folder: None),
+    )
+    # output video NOT cached yet
+    monkeypatch.setattr(
+        "app.services.thumbnail_service.UploadPhaseService.cached_source_video",
+        classmethod(lambda cls, pid: None),
+    )
+    ThumbnailService._run_candidates_build("p1")  # synchronous internal for tests
+    snap = ThumbnailService.candidates_status("p1")
+    assert snap["state"] == "partial"
+    by_index = {c["index"]: c for c in snap["candidates"]}
+    # scene-0 candidates clean, scene-1 candidates pending (no local, no drive, no output)
+    assert by_index[0]["source"] == "clean"
+    assert by_index[0]["image_url"].startswith("/project-manager/projects/p1/thumbnail-frame/0")
+    scene1_pending = [c for c in snap["candidates"] if c["source"] == "pending"]
+    assert snap["pending"] == len(scene1_pending) > 0
+
+
+def test_progressive_build_completes_with_output_fallback(tmp_path, monkeypatch):
+    _v2_project(tmp_path, monkeypatch, scenes=2)
+    monkeypatch.setattr(
+        ThumbnailService, "_extract_local_clean_frame",
+        classmethod(lambda cls, cand, lt: Image.new("RGB", (1920, 1080), (9, 9, 9))
+                    if cand.scene_index == 0 else None),
+    )
+    monkeypatch.setattr(
+        ThumbnailService, "_extract_drive_clean_frame",
+        classmethod(lambda cls, cand, folder: None),
+    )
+    video = tmp_path / "output.mp4"
+    video.write_bytes(b"\x00" * 64)
+    monkeypatch.setattr(
+        "app.services.thumbnail_service.UploadPhaseService.cached_source_video",
+        classmethod(lambda cls, pid: video),
+    )
     monkeypatch.setattr(
         "app.services.thumbnail_service.AnimeMatcherService.extract_frames",
-        classmethod(lambda cls, video_path, timestamps: _extract_frames(video_path, timestamps)),
+        classmethod(lambda cls, path, ts: [Image.new("RGB", (1080, 1920)) for _ in ts]),
     )
+    ThumbnailService._run_candidates_build("p1")
+    snap = ThumbnailService.candidates_status("p1")
+    assert snap["state"] == "ready"
+    assert snap["pending"] == 0
+    sources = {c["index"]: c["source"] for c in snap["candidates"]}
+    assert "output" in sources.values() and "clean" in sources.values()
+    # every candidate has a served composed cover
+    for c in snap["candidates"]:
+        p = ThumbnailService.cached_frame_path("p1", c["index"])
+        assert p is not None and p.exists()
+        with Image.open(p) as img:
+            assert img.size == (1080, 1920)
 
 
-def test_build_candidates_payload_caches_jpegs(tmp_path, monkeypatch, fake_frames):
-    monkeypatch.setattr(
-        "app.services.project_service.settings.projects_dir", tmp_path / "projects"
-    )
+def test_candidates_status_error_without_timeline(tmp_path, monkeypatch):
+    monkeypatch.setattr("app.services.project_service.settings.projects_dir", tmp_path / "projects")
+    (tmp_path / "projects").mkdir()
     monkeypatch.setattr(ThumbnailService, "_THUMBS_CACHE_DIR", tmp_path / "thumbs")
-    out_dir = tmp_path / "projects" / "p1" / "output"
-    out_dir.mkdir(parents=True)
-    (out_dir / "transcription_timing.json").write_text(
-        '{"language": "fr", "scenes": [{"scene_index": 0, "text": "",'
-        ' "words": [], "start_time": 0.0, "end_time": 4.0, "is_raw": false}]}'
-    )
-    video = tmp_path / "video.mp4"
-    video.write_bytes(b"\x00" * 128)
-
-    payload = ThumbnailService.build_candidates_payload("p1", video)
-    assert payload["state"] == "ready"
-    assert len(payload["candidates"]) == 3
-    first = payload["candidates"][0]
-    assert first["index"] == 0
-    assert first["timestamp_ms"] == 50
-    assert first["image_url"].startswith("/project-manager/projects/p1/thumbnail-frame/0")
-    frame = ThumbnailService.cached_frame_path("p1", 0)
-    assert frame is not None and frame.exists()
+    ThumbnailService._run_candidates_build("p1")
+    snap = ThumbnailService.candidates_status("p1")
+    assert snap["state"] == "error"
+    assert snap["detail"]
 
 
-def test_build_candidates_payload_error_without_timeline(tmp_path, monkeypatch):
+def test_run_candidates_build_cache_hit_skips_rebuild(tmp_path, monkeypatch):
+    """Second call for the same version, once complete, must not re-rebuild."""
+    _v2_project(tmp_path, monkeypatch, scenes=1, with_matches=False)
     monkeypatch.setattr(
-        "app.services.project_service.settings.projects_dir", tmp_path / "projects"
+        ThumbnailService, "_extract_local_clean_frame",
+        classmethod(lambda cls, cand, lt: None),
     )
-    monkeypatch.setattr(ThumbnailService, "_THUMBS_CACHE_DIR", tmp_path / "thumbs")
-    video = tmp_path / "video.mp4"
-    video.write_bytes(b"\x00" * 128)
-    payload = ThumbnailService.build_candidates_payload("p1", video)
-    assert payload["state"] == "error"
-    assert payload["detail"]
-
-
-def test_build_candidates_payload_drops_failed_frames(tmp_path, monkeypatch):
     monkeypatch.setattr(
-        "app.services.project_service.settings.projects_dir", tmp_path / "projects"
+        ThumbnailService, "_extract_drive_clean_frame",
+        classmethod(lambda cls, cand, folder: None),
     )
-    monkeypatch.setattr(ThumbnailService, "_THUMBS_CACHE_DIR", tmp_path / "thumbs")
-    out_dir = tmp_path / "projects" / "p1" / "output"
-    out_dir.mkdir(parents=True)
-    (out_dir / "transcription_timing.json").write_text(
-        '{"language": "fr", "scenes": [{"scene_index": 0, "text": "",'
-        ' "words": [], "start_time": 0.0, "end_time": 4.0, "is_raw": false}]}'
+    video = tmp_path / "output.mp4"
+    video.write_bytes(b"\x00" * 64)
+    monkeypatch.setattr(
+        "app.services.thumbnail_service.UploadPhaseService.cached_source_video",
+        classmethod(lambda cls, pid: video),
     )
-    video = tmp_path / "video.mp4"
-    video.write_bytes(b"\x00" * 128)
     monkeypatch.setattr(
         "app.services.thumbnail_service.AnimeMatcherService.extract_frames",
-        classmethod(
-            lambda cls, video_path, timestamps: [
-                None if i == 1 else Image.new("RGB", (4, 4)) for i in range(len(timestamps))
-            ]
-        ),
+        classmethod(lambda cls, path, ts: [Image.new("RGB", (1080, 1920)) for _ in ts]),
     )
-    payload = ThumbnailService.build_candidates_payload("p1", video)
-    assert payload["state"] == "ready"
-    assert [c["index"] for c in payload["candidates"]] == [0, 2]
-
-
-def test_build_candidates_payload_cache_hit_reuses_files(tmp_path, monkeypatch, fake_frames):
-    """Second call for the same version must not re-rebuild (cache hit path)."""
-    monkeypatch.setattr(
-        "app.services.project_service.settings.projects_dir", tmp_path / "projects"
-    )
-    monkeypatch.setattr(ThumbnailService, "_THUMBS_CACHE_DIR", tmp_path / "thumbs")
-    out_dir = tmp_path / "projects" / "p1" / "output"
-    out_dir.mkdir(parents=True)
-    (out_dir / "transcription_timing.json").write_text(
-        '{"language": "fr", "scenes": [{"scene_index": 0, "text": "",'
-        ' "words": [], "start_time": 0.0, "end_time": 4.0, "is_raw": false}]}'
-    )
-    video = tmp_path / "video.mp4"
-    video.write_bytes(b"\x00" * 128)
-
-    first = ThumbnailService.build_candidates_payload("p1", video)
-    assert first["state"] == "ready"
+    ThumbnailService._run_candidates_build("p1")
+    snap = ThumbnailService.candidates_status("p1")
+    assert snap["state"] == "ready"
     frame_before = ThumbnailService.cached_frame_path("p1", 0)
     assert frame_before is not None
     mtime_before = frame_before.stat().st_mtime_ns
 
-    second = ThumbnailService.build_candidates_payload("p1", video)
-    assert second["state"] == "ready"
-    assert second["version"] == first["version"]
+    ThumbnailService._run_candidates_build("p1")  # cache hit: pending == 0
     frame_after = ThumbnailService.cached_frame_path("p1", 0)
     assert frame_after is not None
-    # Same file, untouched: rebuild was skipped on the cache-hit path.
     assert frame_after.stat().st_mtime_ns == mtime_before
 
 
-def test_build_candidates_payload_concurrent_calls_do_not_collide(
-    tmp_path, monkeypatch, fake_frames
-):
-    """Two threads racing build_candidates_payload for the same project must
-    not collide (rmtree-during-write -> FileNotFoundError -> 500)."""
+def test_run_candidates_build_drops_candidates_when_output_fallback_fails(tmp_path, monkeypatch):
+    """Mirrors v1's dropped-frame behavior: output-fallback failure while the
+    video exists removes the candidate from meta entirely."""
+    _v2_project(tmp_path, monkeypatch, scenes=1, with_matches=False)
     monkeypatch.setattr(
-        "app.services.project_service.settings.projects_dir", tmp_path / "projects"
+        ThumbnailService, "_extract_local_clean_frame",
+        classmethod(lambda cls, cand, lt: None),
     )
-    monkeypatch.setattr(ThumbnailService, "_THUMBS_CACHE_DIR", tmp_path / "thumbs")
-    out_dir = tmp_path / "projects" / "p1" / "output"
-    out_dir.mkdir(parents=True)
-    (out_dir / "transcription_timing.json").write_text(
-        '{"language": "fr", "scenes": [{"scene_index": 0, "text": "",'
-        ' "words": [], "start_time": 0.0, "end_time": 4.0, "is_raw": false}]}'
+    monkeypatch.setattr(
+        ThumbnailService, "_extract_drive_clean_frame",
+        classmethod(lambda cls, cand, folder: None),
     )
-    video = tmp_path / "video.mp4"
-    video.write_bytes(b"\x00" * 128)
+    video = tmp_path / "output.mp4"
+    video.write_bytes(b"\x00" * 64)
+    monkeypatch.setattr(
+        "app.services.thumbnail_service.UploadPhaseService.cached_source_video",
+        classmethod(lambda cls, pid: video),
+    )
+    monkeypatch.setattr(
+        "app.services.thumbnail_service.AnimeMatcherService.extract_frames",
+        classmethod(lambda cls, path, ts: [
+            None if i == 1 else Image.new("RGB", (1080, 1920)) for i in range(len(ts))
+        ]),
+    )
+    ThumbnailService._run_candidates_build("p1")
+    snap = ThumbnailService.candidates_status("p1")
+    assert snap["state"] == "ready"
+    assert [c["index"] for c in snap["candidates"]] == [0, 2]
 
-    results: list[dict] = []
+
+def test_run_candidates_build_concurrent_calls_do_not_collide(tmp_path, monkeypatch):
+    """Two threads racing _run_candidates_build for the same project must
+    not collide (rmtree-during-write -> FileNotFoundError)."""
+    _v2_project(tmp_path, monkeypatch, scenes=1, with_matches=False)
+    monkeypatch.setattr(
+        ThumbnailService, "_extract_local_clean_frame",
+        classmethod(lambda cls, cand, lt: None),
+    )
+    monkeypatch.setattr(
+        ThumbnailService, "_extract_drive_clean_frame",
+        classmethod(lambda cls, cand, folder: None),
+    )
+    video = tmp_path / "output.mp4"
+    video.write_bytes(b"\x00" * 64)
+    monkeypatch.setattr(
+        "app.services.thumbnail_service.UploadPhaseService.cached_source_video",
+        classmethod(lambda cls, pid: video),
+    )
+    monkeypatch.setattr(
+        "app.services.thumbnail_service.AnimeMatcherService.extract_frames",
+        classmethod(lambda cls, path, ts: [Image.new("RGB", (1080, 1920)) for _ in ts]),
+    )
+
     errors: list[BaseException] = []
     barrier = threading.Barrier(2)
 
     def _call():
         try:
             barrier.wait(timeout=5)
-            results.append(ThumbnailService.build_candidates_payload("p1", video))
+            ThumbnailService._run_candidates_build("p1")
         except BaseException as exc:  # noqa: BLE001 - want to see any thread failure
             errors.append(exc)
 
@@ -321,8 +384,9 @@ def test_build_candidates_payload_concurrent_calls_do_not_collide(
         t.join(timeout=10)
 
     assert not errors
-    assert len(results) == 2
-    assert all(r["state"] == "ready" for r in results)
+    snap = ThumbnailService.candidates_status("p1")
+    assert snap["state"] == "ready"
+    assert snap["pending"] == 0
 
 
 def test_extract_frame_image(tmp_path, monkeypatch):
