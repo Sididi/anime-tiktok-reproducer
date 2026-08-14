@@ -369,6 +369,62 @@ async def test_container_creation_retries_without_cover_url_on_failure():
 
 
 @respx.mock
+async def test_container_creation_cover_retry_failure_still_reaches_rupload_fallback(
+    tmp_path,
+):
+    """cover retry failing must not swallow the existing video_url→rupload
+    fallback, and the operator-facing detail must still mention the original
+    cover_url failure (not just the retry's)."""
+    prepared_dir = tmp_path / "prepared"
+    _mock_video_download()
+    create_route = respx.post(f"{BASE}/{IG_USER_ID}/media").mock(
+        side_effect=[
+            httpx.Response(400, json={"error": {"message": "Invalid cover_url"}}),
+            httpx.Response(400, json={"error": {"message": "Video URL unreachable"}}),
+            httpx.Response(200, json={"id": CONTAINER_ID, "uri": UPLOAD_URI}),
+        ]
+    )
+    respx.get(f"{BASE}/{CONTAINER_ID}").mock(
+        return_value=httpx.Response(200, json={"status_code": "FINISHED", "id": CONTAINER_ID})
+    )
+    respx.post(f"{BASE}/{IG_USER_ID}/media_publish").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID})
+    )
+    respx.get(f"{BASE}/{MEDIA_ID}").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID, "permalink": PERMALINK_URL})
+    )
+
+    result = await publish_to_instagram(
+        **_COMMON,
+        poll_interval=0.01,
+        poll_timeout=1.0,
+        project_id="ig-job",
+        prepared_media_dir=prepared_dir,
+        public_base_url="https://tiktok.sididi.tv",
+        cover_url="https://cdn.example.com/bad-cover.jpg",
+    )
+
+    assert result.success is True
+    assert create_route.call_count == 3
+    # 1: primary video_url attempt, with cover_url
+    assert "cover_url" in _form_call(create_route, 0)
+    assert "video_url" in _form_call(create_route, 0)
+    # 2: cover retry, same upload method, cover_url dropped
+    assert "cover_url" not in _form_call(create_route, 1)
+    assert "video_url" in _form_call(create_route, 1)
+    # 3: rupload fallback, never carries cover_url
+    assert "cover_url" not in _form_call(create_route, 2)
+    assert _form_call(create_route, 2)["upload_type"][0] == "resumable"
+    assert result.publish_state is not None
+    assert result.publish_state.upload_method == "rupload"
+    assert result.publish_state.fallback_reason is not None
+    # the combined detail must mention the ORIGINAL cover failure, not just
+    # the cover-retry's failure
+    assert "Invalid cover_url" in result.publish_state.fallback_reason
+    assert "Video URL unreachable" in result.publish_state.fallback_reason
+
+
+@respx.mock
 async def test_polling_sees_error_status():
     """Container status returns ERROR → success=False."""
     _mock_video_download()

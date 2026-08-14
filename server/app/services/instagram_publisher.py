@@ -1499,10 +1499,15 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                     except (
                         httpx.HTTPStatusError, httpx.HTTPError, KeyError, ValueError,
                     ) as retry_e:
-                        first_detail = (
+                        cover_retry_detail = (
                             _response_detail(retry_e.response)
                             if isinstance(retry_e, httpx.HTTPStatusError)
                             else f"{type(retry_e).__name__}: {retry_e}"
+                        )
+                        # Combine, don't clobber: the operator must still see the
+                        # original cover_url failure, not just the retry's.
+                        first_detail = (
+                            f"{first_detail} [cover retry: {cover_retry_detail}]"
                         )
                     else:
                         created_at = _utc_now()
