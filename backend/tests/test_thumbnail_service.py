@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pytest
 from PIL import Image
 
+from app.models.match import MatchList, SceneMatch
 from app.models.transcription import SceneTranscription, Transcription
 from app.services.thumbnail_service import ThumbnailCandidate, ThumbnailService
 
@@ -26,48 +27,142 @@ def _transcription(bounds: list[tuple[float, float]]) -> Transcription:
     )
 
 
-def test_five_candidates_with_shift_and_mid():
+def _matches(specs: list[tuple[int, str, float, float, float]]) -> MatchList:
+    return MatchList(matches=[
+        SceneMatch(
+            scene_index=i, episode=ep, start_time=s, end_time=e,
+            confidence=1.0, speed_ratio=r,
+        )
+        for i, ep, s, e, r in specs
+    ])
+
+
+def test_seven_candidates_with_shift_and_mid():
     tr = _transcription([(0.0, 4.0), (4.0, 7.0), (7.0, 11.0)])
-    cands = ThumbnailService.compute_candidates(tr)
-    assert [c.index for c in cands] == [0, 1, 2, 3, 4]
+    cands = ThumbnailService.compute_candidates(tr, None)
+    assert [c.index for c in cands] == [0, 1, 2, 3, 4, 5, 6]
+    assert [(c.scene_index, c.position) for c in cands] == [
+        (0, "start"), (0, "mid"), (0, "end"),
+        (1, "start"), (2, "start"), (2, "end"), (1, "end"),
+    ]
     assert cands[0].timestamp_seconds == pytest.approx(0.05)   # scene 1 start + shift
     assert cands[1].timestamp_seconds == pytest.approx(2.0)    # scene 1 mid, no shift
     assert cands[2].timestamp_seconds == pytest.approx(3.95)   # scene 1 end - shift
     assert cands[3].timestamp_seconds == pytest.approx(4.05)   # scene 2 start + shift
     assert cands[4].timestamp_seconds == pytest.approx(7.05)   # scene 3 start + shift
+    assert cands[5].timestamp_seconds == pytest.approx(10.95)  # scene 3 end - shift
+    assert cands[6].timestamp_seconds == pytest.approx(6.95)   # scene 2 end - shift
     assert cands[0].label == "Scène 1 · début"
     assert cands[1].label == "Scène 1 · milieu"
     assert cands[2].label == "Scène 1 · fin"
     assert cands[3].label == "Scène 2 · début"
     assert cands[4].label == "Scène 3 · début"
+    assert cands[5].label == "Dernière scène · fin"
+    assert cands[6].label == "Avant-dernière scène · fin"
+
+
+def test_eleven_candidates_on_long_video():
+    bounds = [(float(i), float(i) + 2.0) for i in range(9)]  # 9 scenes of 2s
+    tr = _transcription(bounds)
+    cands = ThumbnailService.compute_candidates(tr, None)
+    assert len(cands) == 11
+    assert [(c.scene_index, c.position) for c in cands] == [
+        (0, "start"), (0, "mid"), (0, "end"),
+        (1, "start"), (2, "start"), (3, "start"), (4, "start"), (5, "start"),
+        (8, "end"), (7, "end"), (6, "end"),
+    ]
+    assert cands[0].label == "Scène 1 · début"
+    assert cands[3].label == "Scène 2 · début"
+    assert cands[8].label == "Dernière scène · fin"
+    assert cands[9].label == "Avant-dernière scène · fin"
+    assert cands[10].label == "Avant-avant-dernière scène · fin"
+    assert [c.index for c in cands] == list(range(11))
+
+
+def test_dedupe_on_short_videos():
+    # 1 scene: only the scene-1 triple survives (last-scene ends dedupe onto (0,"end"))
+    tr1 = _transcription([(0.0, 4.0)])
+    assert [(c.scene_index, c.position) for c in ThumbnailService.compute_candidates(tr1, None)] == [
+        (0, "start"), (0, "mid"), (0, "end"),
+    ]
+    # 4 scenes: starts of 1-4, ends of scenes 4,3,2
+    tr4 = _transcription([(0.0, 2.0), (2.0, 4.0), (4.0, 6.0), (6.0, 8.0)])
+    pairs = [(c.scene_index, c.position) for c in ThumbnailService.compute_candidates(tr4, None)]
+    assert pairs == [
+        (0, "start"), (0, "mid"), (0, "end"),
+        (1, "start"), (2, "start"), (3, "start"),
+        (3, "end"), (2, "end"), (1, "end"),
+    ]
+
+
+def test_source_coordinates_mapped_with_speed_ratio():
+    tr = _transcription([(0.0, 2.0), (2.0, 4.0)])
+    # scene 0: source 100..104 at speed_ratio 0.5 (output 2s from source 4s)
+    matches = _matches([(0, "ep1.mkv", 100.0, 104.0, 0.5), (1, "ep2.mkv", 50.0, 52.0, 1.0)])
+    cands = ThumbnailService.compute_candidates(tr, matches)
+    by_key = {(c.scene_index, c.position): c for c in cands}
+    shift_src = 0.05 / 0.5  # output shift / speed_ratio = 0.1s in source time
+    assert by_key[(0, "start")].episode == "ep1.mkv"
+    assert by_key[(0, "start")].source_timestamp_seconds == pytest.approx(100.0 + shift_src)
+    assert by_key[(0, "mid")].source_timestamp_seconds == pytest.approx(102.0)
+    assert by_key[(0, "end")].source_timestamp_seconds == pytest.approx(104.0 - shift_src)
+    assert by_key[(1, "start")].source_timestamp_seconds == pytest.approx(50.05)
+    # output timestamps unchanged from v1 math
+    assert by_key[(0, "start")].timestamp_seconds == pytest.approx(0.05)
+
+
+def test_source_shift_clamps_to_source_mid_and_bad_ratio_defaults():
+    tr = _transcription([(0.0, 2.0)])
+    # tiny source span: start+shift and end-shift clamp to source mid
+    matches = _matches([(0, "ep.mkv", 10.0, 10.06, 1.0)])
+    cands = ThumbnailService.compute_candidates(tr, matches)
+    by_key = {(c.scene_index, c.position): c for c in cands}
+    assert by_key[(0, "start")].source_timestamp_seconds == pytest.approx(10.03)
+    assert by_key[(0, "end")].source_timestamp_seconds == pytest.approx(10.03)
+    # zero/negative speed_ratio treated as 1.0
+    matches2 = _matches([(0, "ep.mkv", 10.0, 20.0, 0.0)])
+    c2 = {(c.scene_index, c.position): c for c in ThumbnailService.compute_candidates(tr, matches2)}
+    assert c2[(0, "start")].source_timestamp_seconds == pytest.approx(10.05)
+
+
+def test_scene_without_match_or_empty_episode_has_no_source():
+    tr = _transcription([(0.0, 2.0), (2.0, 4.0)])
+    matches = _matches([(0, "", 0.0, 4.0, 1.0)])  # scene 0 empty episode, scene 1 missing
+    cands = ThumbnailService.compute_candidates(tr, matches)
+    for c in cands:
+        assert c.episode is None
+        assert c.source_timestamp_seconds is None
 
 
 def test_timestamp_ms_rounds():
-    c = ThumbnailCandidate(index=0, label="x", timestamp_seconds=1.2345)
+    c = ThumbnailCandidate(
+        index=0, label="x", timestamp_seconds=1.2345, scene_index=0, position="start"
+    )
     assert c.timestamp_ms == 1234  # int(round(1.2345 * 1000)) == 1234 (banker's-free)
 
 
 def test_fewer_scenes_yield_fewer_candidates():
     tr = _transcription([(0.0, 4.0)])
-    cands = ThumbnailService.compute_candidates(tr)
+    cands = ThumbnailService.compute_candidates(tr, None)
     assert len(cands) == 3
+    # 2 scenes: triple for scene 1 + (scene 2, start) + (scene 2, end) = 5
     tr2 = _transcription([(0.0, 4.0), (4.0, 7.0)])
-    assert len(ThumbnailService.compute_candidates(tr2)) == 4
+    assert len(ThumbnailService.compute_candidates(tr2, None)) == 5
 
 
 def test_tiny_scene_shift_clamped_to_mid():
     # Scene shorter than 2×shift: start+shift and end-shift both clamp to mid.
     tr = _transcription([(0.0, 0.06)])
-    cands = ThumbnailService.compute_candidates(tr)
+    cands = ThumbnailService.compute_candidates(tr, None)
     mid = 0.03
     assert cands[0].timestamp_seconds == pytest.approx(mid)
     assert cands[2].timestamp_seconds == pytest.approx(mid)
 
 
 def test_empty_or_degenerate_scenes_skipped():
-    assert ThumbnailService.compute_candidates(_transcription([])) == []
+    assert ThumbnailService.compute_candidates(_transcription([]), None) == []
     # zero-length scene is ignored entirely
-    assert ThumbnailService.compute_candidates(_transcription([(2.0, 2.0)])) == []
+    assert ThumbnailService.compute_candidates(_transcription([(2.0, 2.0)]), None) == []
 
 
 def test_load_final_timeline_reads_output_json(tmp_path, monkeypatch):

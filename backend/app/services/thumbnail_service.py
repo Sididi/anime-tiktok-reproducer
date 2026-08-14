@@ -15,9 +15,11 @@ from pathlib import Path
 from typing import Any
 
 from ..config import settings
+from ..models.match import MatchList, SceneMatch
 from ..models.transcription import Transcription
 from .anime_matcher import AnimeMatcherService
 from .export_service import ExportService
+from .project_service import ProjectService
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,10 @@ class ThumbnailCandidate:
     index: int
     label: str
     timestamp_seconds: float
+    scene_index: int
+    position: str  # "start" | "mid" | "end"
+    episode: str | None = None
+    source_timestamp_seconds: float | None = None
 
     @property
     def timestamp_ms(self) -> int:
@@ -64,28 +70,81 @@ class ThumbnailService:
             )
             return None
 
+    _LAST_END_LABELS = (
+        "Dernière scène · fin",
+        "Avant-dernière scène · fin",
+        "Avant-avant-dernière scène · fin",
+    )
+
     @classmethod
-    def compute_candidates(cls, transcription: Transcription) -> list[ThumbnailCandidate]:
+    def compute_candidates(
+        cls,
+        transcription: Transcription,
+        matches: "MatchList | None",
+    ) -> list[ThumbnailCandidate]:
         scenes = [s for s in transcription.scenes if s.end_time > s.start_time]
         if not scenes:
             return []
         shift = cls._SHIFT_SECONDS
-        first = scenes[0]
-        mid = (first.start_time + first.end_time) / 2
-        spots: list[tuple[str, float]] = [
-            ("Scène 1 · début", min(first.start_time + shift, mid)),
-            ("Scène 1 · milieu", mid),
-            ("Scène 1 · fin", max(first.end_time - shift, mid)),
+
+        def output_ts(scene, position: str) -> float:
+            mid = (scene.start_time + scene.end_time) / 2
+            if position == "start":
+                return min(scene.start_time + shift, mid)
+            if position == "end":
+                return max(scene.end_time - shift, mid)
+            return mid
+
+        match_by_scene: dict[int, "SceneMatch"] = {}
+        if matches is not None:
+            for match in matches.matches:
+                if match.episode:
+                    match_by_scene[match.scene_index] = match
+
+        def source_coord(scene, position: str) -> tuple[str | None, float | None]:
+            match = match_by_scene.get(scene.scene_index)
+            if match is None or match.end_time <= match.start_time:
+                return None, None
+            ratio = match.speed_ratio if match.speed_ratio and match.speed_ratio > 0 else 1.0
+            src_shift = shift / ratio
+            src_mid = (match.start_time + match.end_time) / 2
+            if position == "start":
+                return match.episode, min(match.start_time + src_shift, src_mid)
+            if position == "end":
+                return match.episode, max(match.end_time - src_shift, src_mid)
+            return match.episode, src_mid
+
+        spots: list[tuple[object, str, str]] = [
+            (scenes[0], "start", "Scène 1 · début"),
+            (scenes[0], "mid", "Scène 1 · milieu"),
+            (scenes[0], "end", "Scène 1 · fin"),
         ]
-        for ordinal, scene in enumerate(scenes[1:3], start=2):
-            scene_mid = (scene.start_time + scene.end_time) / 2
-            spots.append(
-                (f"Scène {ordinal} · début", min(scene.start_time + shift, scene_mid))
-            )
-        return [
-            ThumbnailCandidate(index=i, label=label, timestamp_seconds=round(ts, 3))
-            for i, (label, ts) in enumerate(spots)
-        ]
+        for ordinal, scene in enumerate(scenes[1:6], start=2):
+            spots.append((scene, "start", f"Scène {ordinal} · début"))
+        for offset, label in enumerate(cls._LAST_END_LABELS):
+            pos = len(scenes) - 1 - offset
+            if pos < 0:
+                break
+            spots.append((scenes[pos], "end", label))
+
+        candidates: list[ThumbnailCandidate] = []
+        seen: set[tuple[int, str]] = set()
+        for scene, position, label in spots:
+            key = (scene.scene_index, position)
+            if key in seen:
+                continue
+            seen.add(key)
+            episode, src_ts = source_coord(scene, position)
+            candidates.append(ThumbnailCandidate(
+                index=len(candidates),
+                label=label,
+                timestamp_seconds=round(output_ts(scene, position), 3),
+                scene_index=scene.scene_index,
+                position=position,
+                episode=episode,
+                source_timestamp_seconds=round(src_ts, 3) if src_ts is not None else None,
+            ))
+        return candidates
 
     @classmethod
     def _project_thumbs_dir(cls, project_id: str) -> Path:
@@ -102,7 +161,7 @@ class ThumbnailService:
                 "state": "error",
                 "detail": "Timeline finale introuvable (transcription_timing.json)",
             }
-        candidates = cls.compute_candidates(transcription)
+        candidates = cls.compute_candidates(transcription, ProjectService.load_matches(project_id))
         if not candidates:
             return {
                 "state": "error",
