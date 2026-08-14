@@ -3,13 +3,14 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Check, Image as ImageIcon, Loader2, X } from "lucide-react";
 import { Button } from "@/components/ui";
 import { useThumbnailCandidates } from "@/hooks/useThumbnailCandidates";
+import type { ThumbnailCandidate } from "@/types";
 
 interface ThumbnailSelectionModalProps {
   open: boolean;
   projectId: string;
   projectTitle?: string | null;
-  /** Resolves the step: a candidate timestamp (ms) or null for "no thumbnail". */
-  onChoice: (timestampMs: number | null) => void;
+  /** Resolves the step: a candidate timestamp (ms) + its index, or (null, null) for "no thumbnail". */
+  onChoice: (timestampMs: number | null, candidateIndex: number | null) => void;
   stacked?: boolean;
 }
 
@@ -21,15 +22,31 @@ export function ThumbnailSelectionModal({
   stacked = false,
 }: ThumbnailSelectionModalProps) {
   const { status, candidates, detail } = useThumbnailCandidates(projectId, open);
-  const [selectedIndex, setSelectedIndex] = useState(0);
+  const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
 
-  const selected =
-    candidates.find((c) => c.index === selectedIndex) ?? candidates[0];
-  const defaultTimestampMs = candidates[0]?.timestamp_ms ?? null;
+  const isReady = (c: ThumbnailCandidate) => c.source !== "pending";
 
-  // Skip/close always falls back to the default candidate: the upload never
+  // Derived selection: the user's pick if that tile is ready, else candidate
+  // 0 if ready, else the lowest-index ready tile. Never a pending tile.
+  const userPick =
+    selectedIndex !== null
+      ? candidates.find((c) => c.index === selectedIndex)
+      : undefined;
+  const candidateZero = candidates.find((c) => c.index === 0);
+  const lowestReady = [...candidates]
+    .filter(isReady)
+    .sort((a, b) => a.index - b.index)[0];
+  const selected: ThumbnailCandidate | undefined =
+    userPick && isReady(userPick)
+      ? userPick
+      : candidateZero && isReady(candidateZero)
+        ? candidateZero
+        : lowestReady;
+
+  // Skip/close always falls back to the derived selection: the upload never
   // blocks on this step (approved design decision).
-  const resolveWithDefault = () => onChoice(selected?.timestamp_ms ?? defaultTimestampMs);
+  const resolveWithDefault = () =>
+    onChoice(selected?.timestamp_ms ?? null, selected?.index ?? null);
 
   useEffect(() => {
     if (!open || stacked) return;
@@ -90,51 +107,78 @@ export function ThumbnailSelectionModal({
           <span className="text-sm">
             Miniatures indisponibles{detail ? ` : ${detail}` : ""}
           </span>
-          <Button size="sm" onClick={() => onChoice(null)}>
+          <Button size="sm" onClick={() => onChoice(null, null)}>
             Continuer sans miniature
           </Button>
         </div>
       )}
 
-      {status === "ready" && (
+      {(status === "ready" || status === "partial") && (
         <>
           <div
             className={`grid gap-3 ${
-              candidates.length >= 5 ? "grid-cols-5" : "grid-cols-3"
+              candidates.length > 6
+                ? "grid-cols-6"
+                : candidates.length >= 5
+                  ? "grid-cols-5"
+                  : "grid-cols-3"
             }`}
           >
-            {candidates.map((candidate) => (
-              <button
-                key={candidate.index}
-                type="button"
-                onClick={() => setSelectedIndex(candidate.index)}
-                className={`relative rounded-lg overflow-hidden aspect-9/16 bg-black border-2 transition-colors ${
-                  selected?.index === candidate.index
-                    ? "border-[hsl(var(--primary))]"
-                    : "border-transparent hover:border-[hsl(var(--border))]"
-                }`}
-              >
-                <img
-                  src={candidate.image_url}
-                  alt={candidate.label}
-                  className="w-full h-full object-cover"
-                />
-                {selected?.index === candidate.index && (
-                  <div className="absolute top-1.5 right-1.5 bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))] rounded-full p-1">
-                    <Check className="h-3 w-3" />
+            {candidates.map((candidate) => {
+              const pending = candidate.source === "pending";
+              return (
+                <button
+                  key={candidate.index}
+                  type="button"
+                  disabled={pending}
+                  onClick={() => setSelectedIndex(candidate.index)}
+                  className={`relative rounded-lg overflow-hidden aspect-9/16 bg-black border-2 transition-colors ${
+                    pending ? "cursor-default" : ""
+                  } ${
+                    selected?.index === candidate.index
+                      ? "border-[hsl(var(--primary))]"
+                      : "border-transparent hover:border-[hsl(var(--border))]"
+                  }`}
+                >
+                  {pending ? (
+                    <div className="w-full h-full flex items-center justify-center bg-white/5">
+                      <Loader2 className="h-5 w-5 animate-spin text-[hsl(var(--muted-foreground))]" />
+                    </div>
+                  ) : (
+                    <img
+                      src={candidate.image_url}
+                      alt={candidate.label}
+                      className="w-full h-full object-cover"
+                    />
+                  )}
+                  {selected?.index === candidate.index && (
+                    <div className="absolute top-1.5 right-1.5 bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))] rounded-full p-1">
+                      <Check className="h-3 w-3" />
+                    </div>
+                  )}
+                  {candidate.source === "output" && (
+                    <div className="absolute bottom-1 left-1 bg-amber-500/80 text-black text-[9px] px-1 rounded">
+                      aperçu sortie
+                    </div>
+                  )}
+                  <div className="absolute bottom-0 inset-x-0 bg-black/70 text-white text-[10px] px-1.5 py-1 text-center">
+                    {candidate.label}
                   </div>
-                )}
-                <div className="absolute bottom-0 inset-x-0 bg-black/70 text-white text-[10px] px-1.5 py-1 text-center">
-                  {candidate.label}
-                </div>
-              </button>
-            ))}
+                </button>
+              );
+            })}
           </div>
+          {status === "partial" && (
+            <p className="text-xs text-[hsl(var(--muted-foreground))] text-center -mt-2">
+              Certaines vignettes arrivent encore…
+            </p>
+          )}
           <div className="flex items-center justify-center gap-3 pt-1">
             <Button
               size="sm"
               className="active:scale-95 transition-transform"
-              onClick={() => onChoice(selected?.timestamp_ms ?? null)}
+              disabled={!selected}
+              onClick={() => onChoice(selected?.timestamp_ms ?? null, selected?.index ?? null)}
             >
               <Check className="h-4 w-4 mr-1.5" />
               Utiliser cette miniature
@@ -143,7 +187,7 @@ export function ThumbnailSelectionModal({
               variant="outline"
               size="sm"
               className="active:scale-95 transition-transform text-[hsl(var(--muted-foreground))]"
-              onClick={() => onChoice(null)}
+              onClick={() => onChoice(null, null)}
             >
               Continuer sans miniature
             </Button>

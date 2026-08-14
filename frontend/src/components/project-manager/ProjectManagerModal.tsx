@@ -48,6 +48,7 @@ interface PendingUploadContext {
   youtubeStrategy?: UploadDurationStrategy;
   copyrightAudioPath?: string;
   thumbnailTimestampMs?: number | null;
+  thumbnailCandidateIndex?: number | null;
 }
 
 type UploadSessionStatus =
@@ -466,6 +467,7 @@ export function ProjectManagerModal({
           context.youtubeStrategy,
           context.copyrightAudioPath,
           context.thumbnailTimestampMs,
+          context.thumbnailCandidateIndex,
         );
         upsertUploadJob(job);
         if (isSessionCurrent(context.projectId, token)) {
@@ -1269,11 +1271,12 @@ export function ProjectManagerModal({
                           stacked
                           projectId={session.context.projectId}
                           projectTitle={projectTitle}
-                          onChoice={(timestampMs) => {
+                          onChoice={(timestampMs, candidateIndex) => {
                             void enqueueUpload(
                               {
                                 ...session.context,
                                 thumbnailTimestampMs: timestampMs,
+                                thumbnailCandidateIndex: candidateIndex,
                               },
                               session.token,
                             );

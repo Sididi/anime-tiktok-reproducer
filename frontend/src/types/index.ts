@@ -329,13 +329,15 @@ export interface ThumbnailCandidate {
   index: number;
   label: string;
   timestamp_ms: number;
-  image_url: string;
+  source: "clean" | "output" | "pending";
+  image_url?: string;
 }
 
 export interface ThumbnailCandidatesResult {
-  state: "ready" | "in_progress" | "error" | "missing";
+  state: "ready" | "partial" | "in_progress" | "error";
   detail?: string;
   version?: string;
+  pending?: number;
   candidates?: ThumbnailCandidate[];
 }
 

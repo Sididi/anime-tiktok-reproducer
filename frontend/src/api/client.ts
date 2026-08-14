@@ -238,6 +238,7 @@ export const api = {
     youtubeStrategy?: string,
     copyrightAudioPath?: string,
     thumbnailTimestampMs?: number | null,
+    thumbnailCandidateIndex?: number | null,
   ) =>
     request<import("@/types").ProjectUploadJob>(
       `/project-manager/projects/${projectId}/upload`,
@@ -250,6 +251,7 @@ export const api = {
           youtube_strategy: youtubeStrategy ?? null,
           copyright_audio_path: copyrightAudioPath ?? null,
           thumbnail_timestamp_ms: thumbnailTimestampMs ?? null,
+          thumbnail_candidate_index: thumbnailCandidateIndex ?? null,
         }),
       },
     ),
@@ -306,7 +308,7 @@ export const api = {
     if (result.candidates) {
       result.candidates = result.candidates.map((c) => ({
         ...c,
-        image_url: `${API_BASE}${c.image_url}`,
+        ...(c.image_url ? { image_url: `${API_BASE}${c.image_url}` } : {}),
       }));
     }
     return result;
